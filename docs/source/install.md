@@ -2,9 +2,11 @@
 # Installation
 
 ## Installation through PyPi
-If you already have Python version 3.11.0 or greater, then you can install scarf using `pip`
+Scarf requires Python 3.14. Install with:
 
-    pip install scarf[extra]
+    uv pip install scarf[extra]
+
+Existing Zarr v2 datasets can still be opened. New data written by Scarf uses Zarr v3 with sharding.
 
 
 ````{note}
@@ -21,7 +23,7 @@ This will enable long path lengths on Window. Read more [here](https://docs.micr
 
 ## Installing Python
 
-To use Scarf you need the Python programming language, version 3.10 or upwards, installed.
+To use Scarf you need Python 3.14 installed.
 
 **Step 1:**
 
@@ -54,9 +56,9 @@ Okay, once you have got a terminal window open, type `python --version` and pres
 
 Now you may see one of the following three kinds of output:
 
-- If your output shows you have `Python 3.11.0` or a more recent version.
+- If your output shows you have `Python 3.14.0` or a more recent 3.14 release.
   In this case, you are good to go, and you can skip Step 3.
-- If you have an earlier version than 3.10, for example 3.5 or 2.7, then see step 3.
+- If you have an earlier version than 3.14, see step 3.
 - If you see an error containing words `not found` or `not recognized` then most
   likely you do not have a Python version installed on your system. Move to step 3.
 - On Windows you may see a blank line which means that either Python is not installed or that Windows doesn't know where it is installed
@@ -93,7 +95,7 @@ That's it now you have the required build tools.
 
 We recommend that you first create an environment that you then install scarf into. 
 If you have followed the steps above, and you are using conda you create an environment
-by typing ``conda create --name scarf_env python=3.11`` in your terminal (Windows users must use Anaconda Prompt)
+by typing ``conda create --name scarf_env python=3.14`` in your terminal (Windows users must use Anaconda Prompt)
 
 This will also install python 3.10 into that environment. One of the benefits of working with
 environments is that you minimize the risk of some required package that you are using for
@@ -109,7 +111,7 @@ https://conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.h
 **Step 4:**
 
 Now, in your terminal, type this to install the latest version of Scarf:
-`pip install scarf[extra]`
+`uv pip install scarf[extra]`
 
 **Step 4.5 (Optional)**
 

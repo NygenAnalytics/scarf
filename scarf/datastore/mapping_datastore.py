@@ -1,9 +1,9 @@
 import os
-from typing import Generator, Tuple, List, Dict, Union, Callable, Optional
+from collections.abc import Generator, Callable
 
 import numpy as np
 import pandas as pd
-from dask import array as daskarr
+from ..chunked import ChunkedArray
 from loguru import logger
 from scipy.sparse import csr_matrix
 
@@ -34,9 +34,9 @@ class MappingDatastore(GraphDataStore):
         target_name: str,
         target_feat_key: str,
         target_cell_key: str = "I",
-        from_assay: Optional[str] = None,
+        from_assay: str | None = None,
         cell_key: str = "I",
-        feat_key: Optional[str] = None,
+        feat_key: str | None = None,
         save_k: int = 3,
         batch_size: int = 1000,
         ref_mu: bool = True,
@@ -45,8 +45,8 @@ class MappingDatastore(GraphDataStore):
         exclude_missing: bool = False,
         filter_null: bool = False,
         feat_scaling: bool = True,
-        ann_index_fetcher: Optional[Callable] = None,
-        ann_index_saver: Optional[Callable] = None,
+        ann_index_fetcher: Callable | None = None,
+        ann_index_saver: Callable | None = None,
     ) -> None:
         """Projects cells from external assays into the cell-neighbourhood
         graph using existing PCA loadings and ANN index. For each external cell
@@ -140,22 +140,35 @@ class MappingDatastore(GraphDataStore):
             )
         if run_coral:
             feat_scaling = False
-        ann_obj = self.make_graph(
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=ann_feat_key,
-            return_ann_object=True,
-            update_keys=False,
-            feat_scaling=feat_scaling,
-            ann_index_fetcher=ann_index_fetcher,
-            ann_index_saver=ann_index_saver,
-        )
+        if (
+            ann_feat_key == feat_key
+            and ann_index_fetcher is None
+            and ann_index_saver is None
+            and self._has_ann_stream_cache(from_assay, cell_key, ann_feat_key)
+        ):
+            ann_obj = self._load_ann_stream(
+                from_assay,
+                cell_key,
+                ann_feat_key,
+                feat_scaling=feat_scaling,
+            )
+        else:
+            ann_obj = self.make_graph(
+                from_assay=from_assay,
+                cell_key=cell_key,
+                feat_key=ann_feat_key,
+                return_ann_object=True,
+                update_keys=False,
+                feat_scaling=feat_scaling,
+                ann_index_fetcher=ann_index_fetcher,
+                ann_index_saver=ann_index_saver,
+            )
         if save_k > ann_obj.k:
             logger.warning(f"`save_k` was decreased to {ann_obj.k}")
             save_k = ann_obj.k
-        target_data = daskarr.from_zarr(
+        target_data = ChunkedArray(
             target_assay.z[f"normed__{target_cell_key}__{target_feat_key}/data"],
-            inline_array=True,
+            nthreads=self.nthreads,
         )
         if run_coral is True:
             # Reversing coral here to correct target data
@@ -167,11 +180,11 @@ class MappingDatastore(GraphDataStore):
                 target_cell_key,
                 self.nthreads,
             )
-            target_data = daskarr.from_zarr(
+            target_data = ChunkedArray(
                 target_assay.z[
                     f"normed__{target_cell_key}__{target_feat_key}/data_coral"
                 ],
-                inline_array=True,
+                nthreads=self.nthreads,
             )
         if ann_obj.method == "pca" and run_coral is False:
             if ref_mu is False:
@@ -211,14 +224,14 @@ class MappingDatastore(GraphDataStore):
     def get_mapping_score(
         self,
         target_name: str,
-        target_groups: Optional[np.ndarray] = None,
-        from_assay: Optional[str] = None,
+        target_groups: np.ndarray | None = None,
+        from_assay: str | None = None,
         cell_key: str = "I",
         log_transform: bool = True,
         multiplier: float = 1000,
         weighted: bool = True,
         fixed_weight: float = 0.1,
-    ) -> Generator[Tuple[str, np.ndarray], None, None]:
+    ) -> Generator[tuple[str, np.ndarray], None, None]:
         """Yields the mapping scores that were a result of a mapping.
 
         Mapping scores are an indication of degree of similarity of reference cells in the graph to the target cells.
@@ -287,11 +300,11 @@ class MappingDatastore(GraphDataStore):
     def get_target_classes(
         self,
         target_name: str,
-        from_assay: Optional[str] = None,
+        from_assay: str | None = None,
         cell_key: str = "I",
-        reference_class_group: Optional[str] = None,
+        reference_class_group: str | None = None,
         threshold_fraction: float = 0.5,
-        target_subset: Optional[List[int]] = None,
+        target_subset: list[int] | None = None,
         na_val: str = "NA",
     ) -> pd.Series:
         """Perform classification of target cells using a reference group.
@@ -368,10 +381,10 @@ class MappingDatastore(GraphDataStore):
         from_assay: str,
         cell_key: str,
         feat_key: str,
-        target_names: List[str],
+        target_names: list[str],
         use_k: int,
         target_weight: float,
-    ) -> Tuple[List[int], csr_matrix]:
+    ) -> tuple[list[int], csr_matrix]:
         """This is similar to ``load_graph`` but includes projected cells and
         their edges.
 
@@ -395,12 +408,13 @@ class MappingDatastore(GraphDataStore):
         if feat_key is None:
             feat_key = self._get_latest_feat_key(from_assay)
         graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
-        edges = self.zw[graph_loc].edges[:]
-        weights = self.zw[graph_loc].weights[:]
+        graph_group = self.zw[graph_loc]
+        edges = graph_group["edges"][:]
+        weights = graph_group["weights"][:]
         ref_n_cells = self.cells.fetch_all(cell_key).sum()
-        store = self.zw[from_assay].projections
-        pidx = np.vstack([store[x].indices[:, :use_k] for x in target_names])
-        n_cells = [ref_n_cells] + [store[x].indices.shape[0] for x in target_names]
+        store = self.zw[from_assay]["projections"]
+        pidx = np.vstack([store[x]["indices"][:, :use_k] for x in target_names])
+        n_cells = [ref_n_cells] + [store[x]["indices"].shape[0] for x in target_names]
         ne = []
         nw = []
         for n, i in enumerate(pidx):
@@ -440,11 +454,11 @@ class MappingDatastore(GraphDataStore):
         cell_key: str,
         label: str,
         embedding: np.ndarray,
-        n_cells: List[int],
-        target_names: List[str],
+        n_cells: list[int],
+        target_names: list[str],
     ) -> None:
         g = create_zarr_dataset(
-            self.zw[from_assay].projections,
+            self.zw[from_assay]["projections"],
             label,
             (1000, 2),
             "float64",
@@ -466,10 +480,10 @@ class MappingDatastore(GraphDataStore):
 
     def run_unified_umap(
         self,
-        target_names: List[str],
-        from_assay: Optional[str] = None,
+        target_names: list[str],
+        from_assay: str | None = None,
         cell_key: str = "I",
-        feat_key: Optional[str] = None,
+        feat_key: str | None = None,
         use_k: int = 3,
         target_weight: float = 0.1,
         spread: float = 2.0,
@@ -482,7 +496,7 @@ class MappingDatastore(GraphDataStore):
         ini_embed_with: str = "kmeans",
         label: str = "unified_UMAP",
         parallel: bool = False,
-        nthreads: Optional[int] = None,
+        nthreads: int | None = None,
     ) -> None:
         """Calculates the UMAP embedding for graph obtained using
         ``load_unified_graph``.
@@ -572,10 +586,10 @@ class MappingDatastore(GraphDataStore):
 
     def run_unified_tsne(
         self,
-        target_names: List[str],
-        from_assay: Optional[str] = None,
+        target_names: list[str],
+        from_assay: str | None = None,
         cell_key: str = "I",
-        feat_key: Optional[str] = None,
+        feat_key: str | None = None,
         use_k: int = 3,
         target_weight: float = 0.5,
         lambda_scale: float = 1.0,
@@ -662,15 +676,15 @@ class MappingDatastore(GraphDataStore):
 
     def plot_unified_layout(
         self,
-        from_assay: Optional[str] = None,
-        layout_key: Optional[str] = None,
+        from_assay: str | None = None,
+        layout_key: str | None = None,
         show_target_only: bool = False,
         ref_name: str = "reference",
-        target_groups: Optional[List[str]] = None,
+        target_groups: list[str] | None = None,
         width: float = 6,
         height: float = 6,
-        cmap: Optional[str] = None,
-        color_key: Optional[Dict] = None,
+        cmap: str | None = None,
+        color_key: dict | None = None,
         mask_color: str = "k",
         point_size: float = 10,
         ax_label_size: float = 12,
@@ -682,21 +696,21 @@ class MappingDatastore(GraphDataStore):
         legend_onside: bool = True,
         legend_size: float = 12,
         legends_per_col: int = 20,
-        title: Union[str, List[str], None] = None,
+        title: str | list[str] | None = None,
         title_size: int = 12,
         hide_title: bool = False,
         cbar_shrink: float = 0.6,
         marker_scale: float = 70,
         lspacing: float = 0.1,
         cspacing: float = 1,
-        savename: Optional[str] = None,
+        savename: str | None = None,
         save_dpi: int = 300,
         ax=None,
         force_ints_as_cats: bool = True,
         n_columns: int = 1,
         w_pad: float = 1,
         h_pad: float = 1,
-        scatter_kwargs: Optional[Dict] = None,
+        scatter_kwargs: dict | None = None,
         shuffle_zorder: bool = True,
         show_fig: bool = True,
     ):
@@ -781,8 +795,9 @@ class MappingDatastore(GraphDataStore):
                 "that for either `run_unified_umap` or `run_unified_tsne`. Please see the default values "
                 "for `label` parameter in those functions if unsure."
             )
-        t = self.zw[from_assay].projections[layout_key][:]
-        attrs = dict(self.zw[from_assay].projections[layout_key].attrs)
+        projections = self.zw[from_assay]["projections"]
+        t = projections[layout_key][:]
+        attrs = dict(projections[layout_key].attrs)
         t_names = attrs["target_names"]
         ref_n_cells = attrs["n_cells"][0]
         t_n_cells = attrs["n_cells"][1:]

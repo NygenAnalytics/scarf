@@ -1,6 +1,0 @@
-pytest
-pytest-cov
-topacedo
-anndata==0.11.4
-black
-scalene

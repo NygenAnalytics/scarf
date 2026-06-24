@@ -175,7 +175,7 @@ Please checkout the API of the `Metadata` class to get information on how to per
 
 +++
 
-Scarf uses Zarr format so that data can be stored in rectangular chunks. The raw data is saved in the `counts` level within each assay level in the Zarr hierarchy. It can easily be accessed as a [Dask](https://dask.org/) array using the `rawData` attribute of the assay. Note that for a standard analysis one would not interact with the raw data directly. Scarf internally optimizes the use of this Dask array to minimize the memory requirement of all operations.
+Scarf uses Zarr format so that data can be stored in rectangular chunks. The raw data is saved in the `counts` level within each assay level in the Zarr hierarchy. It can easily be accessed as a chunked array using the `rawData` attribute of the assay. This chunked array exposes a NumPy-like interface (indexing, reductions, ufuncs) but evaluates lazily by streaming over row chunks, which keeps the memory requirement bounded regardless of dataset size. Note that for a standard analysis one would not interact with the raw data directly. Scarf internally optimizes the use of this chunked array to minimize the memory requirement of all operations.
 
 ```{code-cell} ipython3
 ds.RNA.rawData
@@ -291,6 +291,19 @@ ds.export_markers_to_csv(
     min_score=0.2,
     min_frac_exp=0.1
 )
+```
+
+---
+### 6) Zarr v3 and sharded count arrays
+
+Scarf 0.33+ writes new datasets as Zarr v3. Existing v2 stores remain readable; new metadata written into a v2 store still uses v2-compatible codecs.
+
+Count matrices created by the writers are finalized as sharded arrays (default profile `fast_local`: chunks 512×512, shards 4096×4096). Inspect layout with `show_zarr_tree`, which prints chunk and shard info for arrays at each node.
+
+Set the storage profile with the `SCARF_ZARR_PROFILE` environment variable (`fast_local` or `cloud`) or the `zarrProfile` argument when opening a `DataStore`. To convert an older store to v3 with sharding:
+
+```bash
+uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_local
 ```
 
 ---

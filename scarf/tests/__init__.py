@@ -7,7 +7,14 @@ from ..utils import logger
 logger.remove()
 logger.add(sys.stderr, level="ERROR")
 
-__all__ = ["full_path", "remove"]
+__all__ = ["full_path", "remove", "dask_total_sum"]
+
+
+def dask_total_sum(raw_data) -> int:
+    total = 0
+    for block in raw_data.blocks:
+        total += int(block.compute().sum())
+    return total
 
 
 def full_path(fn, *args):

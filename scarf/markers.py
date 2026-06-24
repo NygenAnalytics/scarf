@@ -1,6 +1,5 @@
 """Module to find biomarkers."""
 
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -105,7 +104,7 @@ def find_markers_by_rank(
     feat_key: str,
     batch_size: int,
     use_prenormed: bool,
-    prenormed_store: Optional[str],
+    prenormed_store: str | None,
     n_threads: int,
     **norm_params,
 ) -> dict:

@@ -1,13 +1,14 @@
 import os
-from typing import Callable, List, Optional, Tuple, Union
+from collections.abc import Callable
 
 import numpy as np
 import pandas as pd
-from dask.array import from_zarr  # type: ignore
+from ..chunked import ChunkedArray
 from loguru import logger
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ..assay import Assay
+from ..storage.zarr_store import zarr_root_path
 from ..utils import clean_array, show_dask_progress, system_call, tqdmbar
 from ..writers import create_zarr_dataset
 from .base_datastore import BaseDataStore
@@ -364,10 +365,10 @@ class GraphDataStore(BaseDataStore):
 
     def _get_latest_keys(
         self,
-        from_assay: Optional[str],
-        cell_key: Optional[str],
-        feat_key: Optional[str],
-    ) -> Tuple[str, str, str]:
+        from_assay: str | None,
+        cell_key: str | None,
+        feat_key: str | None,
+    ) -> tuple[str, str, str]:
         if from_assay is None:
             from_assay = self._defaultAssay
         if cell_key is None:
@@ -424,6 +425,136 @@ class GraphDataStore(BaseDataStore):
         latest_knn = ann_loc.attrs["latest_knn"]
         return latest_knn
 
+    def _has_ann_stream_cache(
+        self,
+        from_assay: str,
+        cell_key: str,
+        feat_key: str,
+        knn_loc: str | None = None,
+    ) -> bool:
+        try:
+            if knn_loc is None:
+                normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
+                if normed_loc not in self.zw:
+                    return False
+                reduction_loc = self.zw[normed_loc].attrs["latest_reduction"]
+                ann_loc = self.zw[reduction_loc].attrs["latest_ann"]
+                knn_loc = self.zw[ann_loc].attrs["latest_knn"]
+            else:
+                ann_loc = knn_loc.rsplit("/", 1)[0]
+
+            if knn_loc not in self.zw:
+                return False
+            zw_root = zarr_root_path(self.zw)
+            if zw_root is None:
+                return False
+            return os.path.exists(os.path.join(zw_root, ann_loc, "ann_idx"))
+        except KeyError:
+            return False
+
+    def _load_ann_stream(
+        self,
+        from_assay: str,
+        cell_key: str,
+        feat_key: str,
+        feat_scaling: bool = True,
+        knn_loc: str | None = None,
+    ):
+        """Load an AnnStream from an existing graph without recomputing KNN."""
+        from ..ann import AnnStream
+
+        if knn_loc is None:
+            normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
+            if normed_loc not in self.zw:
+                raise KeyError(f"No normalized data at {normed_loc}")
+            reduction_loc = self.zw[normed_loc].attrs["latest_reduction"]
+            ann_loc = self.zw[reduction_loc].attrs["latest_ann"]
+            knn_loc = self.zw[ann_loc].attrs["latest_knn"]
+        else:
+            ann_loc = knn_loc.rsplit("/", 1)[0]
+            reduction_loc = ann_loc.rsplit("/ann__", 1)[0]
+            normed_loc = reduction_loc.rsplit("/reduction__", 1)[0]
+
+        if knn_loc not in self.zw:
+            raise KeyError(f"KNN graph not found at {knn_loc}")
+
+        ann_parts = ann_loc.rsplit("/", 1)[-1].split("__")
+        ann_metric = ann_parts[1]
+        ann_efc, ann_ef, ann_m, rand_state = map(int, ann_parts[2:6])
+        red_parts = reduction_loc.rsplit("/", 1)[-1].split("__")
+        reduction_method, dims, pca_cell_key = red_parts[1], int(red_parts[2]), red_parts[3]
+        k = int(knn_loc.rsplit("/", 1)[-1].split("__")[-1])
+
+        data = ChunkedArray(self.zw[normed_loc + "/data"], nthreads=self.nthreads)
+        mu, sigma = np.ndarray([]), np.ndarray([])
+        if reduction_method in ["pca", "manual"]:
+            mu = self.zw[normed_loc]["mu"][:]
+            sigma = self.zw[normed_loc]["sigma"][:]
+
+        loadings = None
+        if "reduction" in self.zw[reduction_loc]:
+            loadings = self.zw[reduction_loc]["reduction"][:]
+
+        harmonize = self.zw[ann_loc].attrs.get("isHarmonized", False)
+        harmonized_data = None
+        batches = None
+        if harmonize and "harmonizedData" in self.zw[reduction_loc]:
+            harmonized_data = ChunkedArray(
+                self.zw[reduction_loc]["harmonizedData"], nthreads=self.nthreads
+            )
+            batch_columns = self.zw[reduction_loc]["harmonizedData"].attrs.get(
+                "batches"
+            )
+            if batch_columns:
+                batches = pd.DataFrame(
+                    {
+                        x: self.cells.fetch(x, key=cell_key).astype(object)
+                        for x in batch_columns
+                    }
+                )
+
+        zw_root = zarr_root_path(self.zw)
+        if zw_root is None:
+            raise FileNotFoundError("Cannot load ANN index without a local zarr path")
+        ann_index_fn = os.path.join(zw_root, ann_loc, "ann_idx")
+        if not os.path.exists(ann_index_fn):
+            raise FileNotFoundError(f"ANN index not found at {ann_index_fn}")
+
+        import hnswlib
+
+        temp_dim = dims if dims > 0 else data.shape[1]
+        ann_idx = hnswlib.Index(space=ann_metric, dim=temp_dim)
+        ann_idx.load_index(ann_index_fn)
+
+        use_for_pca = self.cells.fetch(pca_cell_key, key=cell_key)
+        logger.info(f"Loaded existing ANN stream from {ann_loc}")
+        return AnnStream(
+            data=data,
+            k=k,
+            n_cluster=2,
+            reduction_method=reduction_method,
+            dims=dims,
+            loadings=loadings,
+            use_for_pca=use_for_pca,
+            mu=mu,
+            sigma=sigma,
+            ann_metric=ann_metric,
+            ann_efc=ann_efc,
+            ann_ef=ann_ef,
+            ann_m=ann_m,
+            nthreads=self.nthreads,
+            ann_parallel=False,
+            rand_state=rand_state,
+            do_kmeans_fit=False,
+            disable_scaling=not feat_scaling,
+            ann_idx=ann_idx,
+            lsi_skip_first=True,
+            lsi_params={},
+            harmonize=harmonize,
+            harmonized_data=harmonized_data,
+            batches=batches,
+        )
+
     def _get_ini_embed(
         self, from_assay: str, cell_key: str, feat_key: str, n_comps: int
     ) -> np.ndarray:
@@ -456,7 +587,7 @@ class GraphDataStore(BaseDataStore):
         clusters = self.zw[kmeans_loc]["cluster_labels"][:].astype(np.uint32)
         return np.array([pc[x] for x in clusters]).astype(np.float32, order="C")
 
-    def _get_graph_ncells_k(self, graph_loc: str) -> Tuple[int, int]:
+    def _get_graph_ncells_k(self, graph_loc: str) -> tuple[int, int]:
         """
 
         Args:
@@ -472,7 +603,7 @@ class GraphDataStore(BaseDataStore):
         return knn_loc["indices"].shape
 
     def _store_to_sparse(
-        self, graph_loc: str, sparse_format: str = "csr", use_k: Optional[int] = None
+        self, graph_loc: str, sparse_format: str = "csr", use_k: int | None = None
     ) -> tuple:
         """
 
@@ -512,35 +643,35 @@ class GraphDataStore(BaseDataStore):
 
     def make_graph(
         self,
-        from_assay: Optional[str] = None,
-        cell_key: Optional[str] = None,
-        feat_key: Optional[str] = None,
-        pca_cell_key: Optional[str] = None,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        pca_cell_key: str | None = None,
         reduction_method: str = "auto",
-        dims: Optional[int] = None,
-        k: Optional[int] = None,
-        ann_metric: Optional[str] = None,
-        ann_efc: Optional[int] = None,
-        ann_ef: Optional[int] = None,
-        ann_m: Optional[int] = None,
+        dims: int | None = None,
+        k: int | None = None,
+        ann_metric: str | None = None,
+        ann_efc: int | None = None,
+        ann_ef: int | None = None,
+        ann_m: int | None = None,
         ann_parallel: bool = False,
-        rand_state: Optional[int] = None,
-        n_centroids: Optional[int] = None,
-        batch_size: Optional[int] = None,
-        log_transform: Optional[bool] = None,
-        renormalize_subset: Optional[bool] = None,
-        local_connectivity: Optional[float] = None,
-        bandwidth: Optional[float] = None,
+        rand_state: int | None = None,
+        n_centroids: int | None = None,
+        batch_size: int | None = None,
+        log_transform: bool | None = None,
+        renormalize_subset: bool | None = None,
+        local_connectivity: float | None = None,
+        bandwidth: float | None = None,
         update_keys: bool = True,
         return_ann_object: bool = False,
-        custom_loadings: Optional[np.ndarray] = None,
+        custom_loadings: np.ndarray | None = None,
         feat_scaling: bool = True,
         lsi_skip_first: bool = True,
         harmonize: bool = False,
-        batch_columns: Optional[List[str]] = None,
+        batch_columns: list[str] | None = None,
         show_elbow_plot: bool = False,
-        ann_index_fetcher: Optional[Callable] = None,
-        ann_index_saver: Optional[Callable] = None,
+        ann_index_fetcher: Callable | None = None,
+        ann_index_saver: Callable | None = None,
     ):
         """Creates a cell neighbourhood graph. Performs following steps in the
         process:
@@ -809,8 +940,8 @@ class GraphDataStore(BaseDataStore):
                         self.zw[reduction_loc]["harmonizedData"].attrs["batches"]
                         == batch_columns
                     ):
-                        harmonized_data = from_zarr(
-                            self.zw[reduction_loc]["harmonizedData"], inline_array=True
+                        harmonized_data = ChunkedArray(
+                            self.zw[reduction_loc]["harmonizedData"], nthreads=self.nthreads
                         )
 
         if custom_loadings is None:
@@ -853,10 +984,9 @@ class GraphDataStore(BaseDataStore):
                 del self.zw[ann_loc]
             else:
                 if ann_index_fetcher is None:
-                    if hasattr(self.zw.chunk_store, "path"):
-                        ann_index_fn = os.path.join(
-                            self.zw.chunk_store.path, ann_loc, "ann_idx"
-                        )
+                    zwRoot = zarr_root_path(self.zw)
+                    if zwRoot is not None:
+                        ann_index_fn = os.path.join(zwRoot, ann_loc, "ann_idx")
                     else:
                         ann_index_fn = None
                         logger.warning(
@@ -941,9 +1071,10 @@ class GraphDataStore(BaseDataStore):
             self.zw.create_group(ann_loc, overwrite=True)
         if ann_idx is None:
             if ann_index_saver is None:
-                if hasattr(self.zw.chunk_store, "path"):
+                zwRoot = zarr_root_path(self.zw)
+                if zwRoot is not None:
                     ann_obj.annIdx.save_index(
-                        os.path.join(self.zw.chunk_store.path, ann_loc, "ann_idx")
+                        os.path.join(zwRoot, ann_loc, "ann_idx")
                     )
                 else:
                     logger.warning(
@@ -1021,13 +1152,13 @@ class GraphDataStore(BaseDataStore):
 
     def load_graph(
         self,
-        from_assay: Optional[str] = None,
-        cell_key: Optional[str] = None,
-        feat_key: Optional[str] = None,
-        symmetric: Optional[bool] = None,
-        upper_only: Optional[bool] = None,
-        use_k: Optional[int] = None,
-        graph_loc: Optional[str] = None,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        symmetric: bool | None = None,
+        upper_only: bool | None = None,
+        use_k: int | None = None,
+        graph_loc: str | None = None,
     ) -> csr_matrix:
         """Load the cell neighbourhood as a scipy sparse matrix.
 
@@ -1217,12 +1348,12 @@ class GraphDataStore(BaseDataStore):
 
     def run_umap(
         self,
-        from_assay: Optional[str] = None,
-        cell_key: Optional[str] = None,
-        feat_key: Optional[str] = None,
-        symmetric_graph: Optional[bool] = False,
-        graph_upper_only: Optional[bool] = False,
-        ini_embed: Optional[np.ndarray] = None,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        symmetric_graph: bool | None = False,
+        graph_upper_only: bool | None = False,
+        ini_embed: np.ndarray | None = None,
         umap_dims: int = 2,
         spread: float = 2.0,
         min_dist: float = 1,
@@ -1236,9 +1367,9 @@ class GraphDataStore(BaseDataStore):
         dens_var_shift: float = 0.1,
         random_seed: int = 4444,
         label: str = "UMAP",
-        integrated_graph: Optional[str] = None,
+        integrated_graph: str | None = None,
         parallel: bool = False,
-        nthreads: Optional[int] = None,
+        nthreads: int | None = None,
     ) -> None:
         """Runs UMAP algorithm using the precomputed cell-neighbourhood graph.
         The calculated UMAP coordinates are saved in the cell metadata table.
@@ -1325,8 +1456,9 @@ class GraphDataStore(BaseDataStore):
             graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
             knn_loc = graph_loc.rsplit("/", 1)[0]
             logger.trace(f"Loading KNN dists and indices from {knn_loc}")
-            dists = self.zw[knn_loc].distances[:]
-            indices = self.zw[knn_loc].indices[:]
+            knn_group = self.zw[knn_loc]
+            dists = knn_group["distances"][:]
+            indices = knn_group["indices"][:]
             dmat = csr_matrix(
                 (
                     dists.flatten(),
@@ -1378,11 +1510,11 @@ class GraphDataStore(BaseDataStore):
 
     def run_leiden_clustering(
         self,
-        from_assay: Optional[str] = None,
-        cell_key: Optional[str] = None,
-        feat_key: Optional[str] = None,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
         resolution: float = 1.0,
-        integrated_graph: Optional[str] = None,
+        integrated_graph: str | None = None,
         symmetric_graph: bool = False,
         graph_upper_only: bool = False,
         label: str = "leiden_cluster",
@@ -1460,16 +1592,16 @@ class GraphDataStore(BaseDataStore):
 
     def run_clustering(
         self,
-        from_assay: Optional[str] = None,
-        cell_key: Optional[str] = None,
-        feat_key: Optional[str] = None,
-        n_clusters: Optional[int] = None,
-        integrated_graph: Optional[str] = None,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        n_clusters: int | None = None,
+        integrated_graph: str | None = None,
         symmetric_graph: bool = False,
         graph_upper_only: bool = False,
         balanced_cut: bool = False,
-        max_size: Optional[int] = None,
-        min_size: Optional[int] = None,
+        max_size: int | None = None,
+        min_size: int | None = None,
         max_distance_fc: float = 2,
         force_recalc: bool = False,
         label: str = "cluster",
@@ -1585,11 +1717,11 @@ class GraphDataStore(BaseDataStore):
 
     def run_topacedo_sampler(
         self,
-        from_assay: Optional[str] = None,
-        cell_key: Optional[str] = None,
-        feat_key: Optional[str] = None,
-        cluster_key: Optional[str] = None,
-        use_k: Optional[int] = None,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        cluster_key: str | None = None,
+        use_k: int | None = None,
         density_depth: int = 2,
         density_bandwidth: float = 5.0,
         max_sampling_rate: float = 0.05,
@@ -1606,7 +1738,7 @@ class GraphDataStore(BaseDataStore):
         save_seeds_key: str = "sketch_seeds",
         rand_state: int = 4466,
         return_edges: bool = False,
-    ) -> Union[None, List]:
+    ) -> None | list:
         """Perform sub-sampling (aka sketching) of cells using TopACeDo
         algorithm. Sub-sampling required that cells are partitioned in cluster
         already. Since, sub-sampling is dependent on cluster information,
@@ -1728,10 +1860,10 @@ class GraphDataStore(BaseDataStore):
 
     def get_imputed(
         self,
-        from_assay: Optional[str] = None,
-        cell_key: Optional[str] = None,
-        feature_name: Optional[str] = None,
-        feat_key: Optional[str] = None,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feature_name: str | None = None,
+        feat_key: str | None = None,
         t: int = 2,
         cache_operator: bool = True,
     ) -> np.ndarray:
@@ -1817,15 +1949,15 @@ class GraphDataStore(BaseDataStore):
 
     def run_pseudotime_scoring(
         self,
-        from_assay: Optional[str] = None,
-        cell_key: Optional[str] = None,
-        subset_cell_key: Optional[str] = None,
-        feat_key: Optional[str] = None,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        subset_cell_key: str | None = None,
+        feat_key: str | None = None,
         n_singular_vals: int = 30,
-        source_sink_key: Optional[str] = None,
-        sources: Optional[List] = None,
-        sinks: Optional[List] = None,
-        ss_vec: Optional[np.ndarray] = None,
+        source_sink_key: str | None = None,
+        sources: list | None = None,
+        sinks: list | None = None,
+        ss_vec: np.ndarray | None = None,
         min_max_norm_ptime: bool = True,
         random_seed: int = 4444,
         label: str = "pseudotime",
@@ -2004,7 +2136,7 @@ class GraphDataStore(BaseDataStore):
 
     def integrate_assays(
         self,
-        assays: List[str],
+        assays: list[str],
         label: str,
         method: str = "snn",
         chunk_size: int = 10000,

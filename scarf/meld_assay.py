@@ -12,13 +12,12 @@
 
 import gzip
 import logging
-from typing import Tuple, List, Union
 
 import numpy as np
 import pandas as pd
 from numba import jit
 from scipy.sparse import coo_matrix
-from zarr import hierarchy
+import zarr
 
 from .utils import controlled_compute, logger, tqdmbar
 from .writers import create_zarr_count_assay
@@ -53,7 +52,7 @@ class GffReader:
         self.down = down_offset
         self.chunksize = chunk_size
 
-    def fetch_header_lines(self) -> List[str]:
+    def fetch_header_lines(self) -> list[str]:
         """Fetch header lines (starting with '#') from GFF file.
 
         Returns: A list of all the header lines
@@ -87,7 +86,7 @@ class GffReader:
         for df in stream:
             yield df
 
-    def get_promoter(self, v: pd.Series) -> Tuple[int, int]:
+    def get_promoter(self, v: pd.Series) -> tuple[int, int]:
         """Create strand-aware promoter coordinates using gene start and end
         coordinates.
 
@@ -104,7 +103,7 @@ class GffReader:
         else:
             raise ValueError(f"ERROR: Unknown symbol for strand: {v[6]}")
 
-    def get_body(self, v: pd.Series) -> Tuple[int, int]:
+    def get_body(self, v: pd.Series) -> tuple[int, int]:
         """Create strand-aware gene body + promoter coordinates using gene
         start and end coordinates.
 
@@ -122,7 +121,7 @@ class GffReader:
             raise ValueError(f"ERROR: Unknown symbol for strand: {v[6]}")
 
     @staticmethod
-    def get_ids_names(v: pd.Series) -> Tuple[str, str]:
+    def get_ids_names(v: pd.Series) -> tuple[str, str]:
         """Extracts gene_id and gene_name values from last (9th) column of GFF
         file record.
 
@@ -298,7 +297,7 @@ def get_ranges(df: pd.DataFrame, idx: np.ndarray) -> np.ndarray:
 
 def get_feature_mappings(
     peaks_bed_df: pd.DataFrame, features_bed_df: pd.DataFrame
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Identify which intervals from `features_bed_df` overlap with those from
     `peaks_bed_df`.
 
@@ -383,7 +382,7 @@ def get_feature_mappings(
 
 def create_counts_mat(
     assay,
-    store: hierarchy,
+    store: zarr.Array,
     cross_map: np.ndarray,
     scalar_coeff: float,
     renormalization: bool,
@@ -391,7 +390,7 @@ def create_counts_mat(
     """Populate the count matrix in the Zarr store.
 
     Args:
-        assay: Scarf Assay object which contains the rawData attribute representing Dask array of count matrix
+        assay: Scarf Assay object which contains the rawData attribute representing a chunked array of count matrix
         store: Output Zarr Dataset
         cross_map: Mapping of indices. as obtained from get_feature_mappings function
         scalar_coeff: An arbitrary scalar multiplier. Only used when renormalization is True.
@@ -435,7 +434,7 @@ def create_counts_mat(
 
 def coordinate_melding(
     assay,
-    workspace: Union[str, None],
+    workspace: str | None,
     feature_bed: pd.DataFrame,
     new_assay_name: str,
     peaks_col: str = "ids",
@@ -453,7 +452,7 @@ def coordinate_melding(
     new assay.
 
     Args:
-        assay: Scarf Assay object which contains the rawData attribute representing Dask array of count matrix.
+        assay: Scarf Assay object which contains the rawData attribute representing a chunked array of count matrix.
         workspace:
         feature_bed: DataFrame containing reference intervals. Must have at least 5 columns representing
                     'chrom', 'start', 'end', 'ids', 'names'. But the column names should 0,1,2,3,4
@@ -472,8 +471,12 @@ def coordinate_melding(
     peaks_bed = create_bed_from_coord_ids(assay.feats.fetch_all(peaks_col))
     feat_ids, feat_names, mappings = get_feature_mappings(peaks_bed, feature_bed)
 
+    from .storage.zarr_store import zarr_root_path
+    import zarr
+
+    store_root = zarr.open_group(zarr_root_path(assay.z), mode="r+")
     g = create_zarr_count_assay(
-        z=assay.z["/"],
+        z=store_root,
         assay_name=new_assay_name,
         workspace=workspace,
         chunk_size=assay.rawData.chunksize,

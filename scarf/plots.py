@@ -1,6 +1,5 @@
 """Contains the code for plotting in Scarf."""
 
-from typing import Tuple, Optional, Union, List
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -231,10 +230,10 @@ def plot_qc(
     data: pd.DataFrame,
     color: str = "steelblue",
     cmap: str = "tab20",
-    fig_size: Optional[Tuple] = None,
+    fig_size: tuple | None = None,
     label_size: float = 10.0,
     title_size: float = 10,
-    sup_title: Optional[str] = None,
+    sup_title: str | None = None,
     sup_title_size: float = 12,
     scatter_size: float = 1.0,
     max_points: int = 10000,
@@ -345,9 +344,9 @@ def plot_mean_var(
     n_cells: np.ndarray,
     hvg: np.ndarray,
     ax_label_fs: float = 12,
-    fig_size: Tuple[float, float] = (4.5, 4.0),
-    ss: Tuple[float, float] = (3, 30),
-    cmaps: Tuple[str, str] = ("winter", "magma_r"),
+    fig_size: tuple[float, float] = (4.5, 4.0),
+    ss: tuple[float, float] = (3, 30),
+    cmaps: tuple[str, str] = ("winter", "magma_r"),
 ):
     """Shows a mean-variance plot."""
     _, ax = plt.subplots(1, 1, figsize=fig_size)
@@ -371,7 +370,7 @@ def plot_mean_var(
     plt.show()
 
 
-def plot_elbow(var_exp, figsize: Tuple[float, float] = (None, 2)):
+def plot_elbow(var_exp, figsize: tuple[float, float] = (None, 2)):
     from kneed import KneeLocator
 
     x = range(len(var_exp))
@@ -438,15 +437,19 @@ def _scatter_fix_type(v: pd.Series, ints_as_cats: bool) -> pd.Series:
     vt = v.dtype
     if v.nunique() == 1:
         return pd.Series(np.ones(len(v)), index=v.index).astype(np.float64)
-    if vt in [np.bool_]:
+    if vt in [bool, np.bool]:
         # converting first to int to handle bool
-        return v.astype(np.int_).astype("category")
-    if vt in [str, object] or vt.name == "category":
+        return v.astype(int).astype("category")
+    if (
+        vt in [str, object]
+        or vt.name in ("category", "string")
+        or pd.api.types.is_string_dtype(v)
+    ):
         return v.astype("category")
     elif np.issubdtype(vt.type, np.integer) and ints_as_cats:
         if v.nunique() > 100:
             logger.warning("Too many categories. set force_ints_as_cats to false")
-        return v.astype(np.int_).astype("category")
+        return v.astype(int).astype("category")
     else:
         return v.astype(np.float64)
 
@@ -468,7 +471,7 @@ def _scatter_fix_mask(v: pd.Series, mask_vals: list, mask_name: str) -> pd.Serie
 
 
 def _scatter_make_colors(
-    v: pd.Series, cmap, color_key: Optional[dict], mask_color: str, mask_name: str
+    v: pd.Series, cmap, color_key: dict | None, mask_color: str, mask_name: str
 ):
     from matplotlib.pyplot import get_cmap
 
@@ -846,7 +849,7 @@ def shade_scatter(
     legend_onside: bool = True,
     legend_size: float = 12,
     legends_per_col: int = 20,
-    titles: Union[str, List[str]] = None,
+    titles: str | list[str] = None,
     title_size: int = 12,
     hide_title: bool = False,
     cbar_shrink: float = 0.6,

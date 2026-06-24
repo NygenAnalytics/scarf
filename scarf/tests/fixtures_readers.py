@@ -1,36 +1,33 @@
+import os
+import tarfile
+
 import pytest
 
-from . import full_path, remove
+from . import full_path
 
 
 @pytest.fixture(scope="session")
-def toy_crdir_reader():
+def toy_crdir_reader(tmp_path_factory):
     from ..readers import CrDirReader
-    import tarfile
 
-    fn = full_path("toy_cr_dir.tar.gz")
-    out_fn = fn.replace(".tar.gz", "")
-    remove(out_fn)
-    tar = tarfile.open(fn, "r:gz")
-    tar.extractall(out_fn)
-    reader = CrDirReader(out_fn)
+    out_fn = tmp_path_factory.mktemp("toy_cr_dir")
+    with tarfile.open(full_path("toy_cr_dir.tar.gz"), "r:gz") as tar:
+        tar.extractall(out_fn, filter="data")
+    reader = CrDirReader(str(out_fn))
     reader.rename_assays({"ASSAY4": "HTO"})
     yield reader
-    remove(out_fn)
+
 
 @pytest.fixture(scope="session")
-def toy_crdir_empty():
+def toy_crdir_empty(tmp_path_factory):
     from ..readers import CrDirReader
-    import tarfile
 
-    fn = full_path("toy_cr_dir_empty.tar.gz")
-    out_fn = fn.replace(".tar.gz", "")
-    remove(out_fn)
-    tar = tarfile.open(fn, "r:gz")
-    tar.extractall(out_fn)
-    reader = CrDirReader(out_fn)
+    out_fn = tmp_path_factory.mktemp("toy_cr_dir_empty")
+    with tarfile.open(full_path("toy_cr_dir_empty.tar.gz"), "r:gz") as tar:
+        tar.extractall(out_fn, filter="data")
+    reader = CrDirReader(str(out_fn))
     yield reader
-    remove(out_fn)
+
 
 @pytest.fixture(scope="session")
 def crh5_reader():
@@ -40,17 +37,21 @@ def crh5_reader():
 
 
 @pytest.fixture(scope="session")
-def mtx_dir(datastore):
-    from ..writers import to_mtx
-
-    fn = full_path("1K_pbmc_citeseq_dir")
-    to_mtx(datastore.RNA, fn, compress=True)
-    yield fn
-    remove(fn)
+def mtx_dir(tmp_path_factory):
+    fn = full_path("1K_pbmc_citeseq_dir.tar.gz")
+    if not os.path.isfile(fn):
+        pytest.skip(
+            f"Bundled MTX fixture missing at {fn}. "
+            "Add 1K_pbmc_citeseq_dir.tar.gz under scarf/tests/datasets/."
+        )
+    base = tmp_path_factory.mktemp("mtx_dir")
+    with tarfile.open(fn, "r:gz") as tar:
+        tar.extractall(base, filter="data")
+    yield str(base / "1K_pbmc_citeseq_dir")
 
 
 @pytest.fixture(scope="session")
-def crdir_reader(datastore, mtx_dir):
+def crdir_reader(mtx_dir):
     from ..readers import CrDirReader
 
     reader = CrDirReader(mtx_dir)

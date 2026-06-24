@@ -1,4 +1,3 @@
-from typing import List, Dict
 
 import networkx as nx
 import numpy as np
@@ -118,7 +117,7 @@ class BalancedCut:
         self.maxDistFc = max_distance_fc
         self.branchpoints = self._get_branchpoints()
 
-    def _successors(self, start: int, min_leaves: int) -> List[int]:
+    def _successors(self, start: int, min_leaves: int) -> list[int]:
         """Get tree downstream of a node."""
         q = [start]
         d = []
@@ -150,7 +149,7 @@ class BalancedCut:
                     return False
         return True
 
-    def _get_branchpoints(self) -> Dict[int, List[int]]:
+    def _get_branchpoints(self) -> dict[int, list[int]]:
         """Aggregate leaves bottom up until target size is reached."""
         n_leaves = int((self.graph.number_of_nodes() + 1) / 2)
         leaves = {x: None for x in range(n_leaves)}

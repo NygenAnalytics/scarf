@@ -10,8 +10,6 @@ prune docs
 prune scarf/tests
 prune .circleci
 prune .github
-include requirements.txt
-include requirements_extra.txt
 include VERSION
 include pypi_README.rst
 graft bin

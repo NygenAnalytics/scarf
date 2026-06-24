@@ -2,12 +2,14 @@
 Methods and classes for evluation
 """
 
-from typing import Iterable, Optional, Sequence, Tuple, Union
+from collections.abc import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
-from zarr.core import Array as zarrArrayType
+import zarr
+
+zarrArrayType = zarr.Array
 
 from .ann import AnnStream
 from .datastore.datastore import DataStore
@@ -289,10 +291,10 @@ def calculate_top_k_neighbor_distances(
 
 def process_cluster(
     cluster_cells: np.ndarray,
-    hvg_data: Union[np.ndarray, zarrArrayType],
+    hvg_data: np.ndarray | zarrArrayType,
     ann_obj: AnnStream,
     k: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Process a cluster of cells to prepare data for silhouette scoring.
 
     Randomly splits cluster cells into two groups and applies dimensionality reduction.
@@ -304,7 +306,7 @@ def process_cluster(
         k: Number of cells to sample from cluster
 
     Returns:
-        Tuple[np.ndarray, np.ndarray]: Two arrays containing reduced data for
+        tuple[np.ndarray, np.ndarray]: Two arrays containing reduced data for
         different subsets of cells from the cluster
     """
     np.random.shuffle(cluster_cells)
@@ -321,10 +323,10 @@ def silhouette_scoring(
     ds: DataStore,
     ann_obj: AnnStream,
     graph: csr_matrix,
-    hvg_data: Union[np.ndarray, zarrArrayType],
+    hvg_data: np.ndarray | zarrArrayType,
     assay_type: str,
     res_label: str,
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     """Compute modified silhouette scores for clusters in single-cell data.
 
     This implementation differs from the standard silhouette score by using
@@ -339,7 +341,7 @@ def silhouette_scoring(
         res_label: Label for clustering resolution
 
     Returns:
-        Optional[np.ndarray]: Array of silhouette scores for each cluster,
+        np.ndarray | None: Array of silhouette scores for each cluster,
         or None if cluster labels are not found
 
     Notes:
@@ -435,7 +437,7 @@ def silhouette_scoring(
 
 def integration_score(
     batch_labels: Sequence[np.ndarray], metric: str = "ari"
-) -> Optional[float]:
+) -> float | None:
     """Calculate integration score between two sets of batch labels.
 
     Args:
@@ -445,7 +447,7 @@ def integration_score(
             - 'nmi': Normalized Mutual Information
 
     Returns:
-        Optional[float]: Integration score between 0 and 1, or None if metric
+        float | None: Integration score between 0 and 1, or None if metric
         is not recognized
 
     Notes:

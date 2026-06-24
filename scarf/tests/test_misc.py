@@ -1,7 +1,6 @@
-from . import full_path, remove
 
 
-def test_export_knn_to_mtx(datastore, make_graph):
+def test_export_knn_to_mtx(datastore, make_graph, tmp_path):
     from ..knn_utils import export_knn_to_mtx
 
     graph = datastore.load_graph(
@@ -11,7 +10,6 @@ def test_export_knn_to_mtx(datastore, make_graph):
         symmetric=False,
         upper_only=False,
     )
-    fn = full_path("test_export_mtx_from_graph.mtx")
+    fn = str(tmp_path / "test_export_mtx_from_graph.mtx")
     ret_val = export_knn_to_mtx(fn, graph)
     assert ret_val is None
-    remove(fn)

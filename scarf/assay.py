@@ -9,84 +9,82 @@
                 method for feature selection.
 """
 
-from typing import Generator, List, Optional, Tuple, Union
+from collections.abc import Generator
 
 import numpy as np
 import pandas as pd
 import zarr
-from dask.array.core import Array as daskArrayType
-from dask.array.core import from_zarr
 from scipy.sparse import csr_matrix, vstack
-from zarr import hierarchy as z_hierarchy
 
+from .chunked import ChunkedArray
 from .metadata import MetaData
 from .utils import controlled_compute, logger, show_dask_progress
 
 __all__ = ["Assay", "RNAassay", "ATACassay", "ADTassay"]
 
 
-def norm_dummy(_, counts: daskArrayType) -> daskArrayType:
+def norm_dummy(_, counts: ChunkedArray) -> ChunkedArray:
     """A dummy normalizer. Doesn't perform any normalization. This is useful
     when the 'raw data' is already normalized.
 
     Args:
         _:
-        counts: A dask array with 'raw' counts data
+        counts: A chunked array with 'raw' counts data
 
-    Returns: Dask array
+    Returns: A chunked array
     """
     return counts
 
 
-def norm_lib_size(assay, counts: daskArrayType) -> daskArrayType:
+def norm_lib_size(assay, counts: ChunkedArray) -> ChunkedArray:
     """Performs library size normalization on the data. This is the default
     method for RNA assays.
 
     Args:
         assay: An instance of the assay object
-        counts: A dask array with raw counts data
+        counts: A chunked array with raw counts data
 
-    Returns:  A dask array (delayed matrix) containing normalized data.
+    Returns:  A chunked array (delayed matrix) containing normalized data.
     """
     return assay.sf * counts / assay.scalar.reshape(-1, 1)
 
 
-def norm_lib_size_log(assay, counts: daskArrayType) -> daskArrayType:
+def norm_lib_size_log(assay, counts: ChunkedArray) -> ChunkedArray:
     """Performs library size normalization and then transforms the values into
     log scale.
 
     Args:
         assay: An instance of the assay object
-        counts: A dask array with raw counts data
+        counts: A chunked array with raw counts data
 
-    Returns: A dask array (delayed matrix) containing normalized data.
+    Returns: A chunked array (delayed matrix) containing normalized data.
     """
     return np.log1p(assay.sf * counts / assay.scalar.reshape(-1, 1))
 
 
-def norm_clr(_, counts: daskArrayType) -> daskArrayType:
+def norm_clr(_, counts: ChunkedArray) -> ChunkedArray:
     """Performs centered log-ratio normalization (ADT). This is the default
     method for ADT assays.
 
     Args:
         _:
-        counts: A dask array with raw counts data
+        counts: A chunked array with raw counts data
 
-    Returns: A dask array (delayed matrix) containing normalized data.
+    Returns: A chunked array (delayed matrix) containing normalized data.
     """
     f = np.exp(np.log1p(counts).sum(axis=0) / len(counts))
     return np.log1p(counts / f)
 
 
-def norm_tf_idf(assay, counts: daskArrayType) -> daskArrayType:
+def norm_tf_idf(assay, counts: ChunkedArray) -> ChunkedArray:
     """Performs TF-IDF normalization This is the default method for ATAC
     assays.
 
     Args:
         assay: An instance of the assay object
-        counts: A dask array with raw counts data
+        counts: A chunked array with raw counts data
 
-    Returns: A dask array (delayed matrix) containing normalized data.
+    Returns: A chunked array (delayed matrix) containing normalized data.
     """
     t_f = counts / assay.n_term_per_doc.reshape(-1, 1)
     # TODO: Split TF and IDF functionality to make it similar to norml_lib and zscaling
@@ -100,10 +98,10 @@ class Assay:
     for later KNN graph construction.
 
     Args:
-        z (z_hierarchy.Group): Zarr hierarchy where raw data is located
+        z (zarr.Group): Zarr hierarchy where raw data is located
         name (str): A label/name for assay.
         cell_data: Metadata class object for the cell attributes.
-        nthreads: number for threads to use for dask parallel computations
+        nthreads: number of threads to use for parallel computations
         min_cells_per_feature:
 
     Attributes:
@@ -111,7 +109,7 @@ class Assay:
         z: Zarr group that contains the assay
         cells: A Metadata class object for cell attributes
         nthreads: number of threads to use for computations
-        rawData: dask array containing the raw data
+        rawData: chunked array containing the raw data
         feats: a MetaData class object for feature attributes
         attrs: Zarr attributes for the zarr group of the assay
         normMethod: normalization method to use.
@@ -120,8 +118,8 @@ class Assay:
 
     def __init__(
         self,
-        z: z_hierarchy.Group,
-        workspace: Union[str, None],
+        z: zarr.Group,
+        workspace: str | None,
         name: str,  # FIXME change to assay_name
         cell_data: MetaData,
         nthreads: int,
@@ -131,11 +129,11 @@ class Assay:
         self.cells = cell_data
         self.nthreads = nthreads
         if workspace is None:
-            self.rawData = from_zarr(z[f"{name}/counts"], inline_array=True)
+            self.rawData = ChunkedArray(z[f"{name}/counts"], nthreads=nthreads)
             self.feats = MetaData(z[f"{name}/featureData"])  # type: ignore
             self.z: zarr.Group = z[self.name]  # type: ignore
         else:
-            self.rawData = from_zarr(z[f"matrices/{name}/counts"], inline_array=True)
+            self.rawData = ChunkedArray(z[f"matrices/{name}/counts"], nthreads=nthreads)
             self.feats = MetaData(z[f"{workspace}/{name}/featureData"])  # type: ignore
             self.z = z[f"{workspace}/{name}"]
         self.attrs = self.z.attrs
@@ -147,11 +145,11 @@ class Assay:
 
     def normed(
         self,
-        cell_idx: Optional[np.ndarray] = None,
-        feat_idx: Optional[np.ndarray] = None,
+        cell_idx: np.ndarray | None = None,
+        feat_idx: np.ndarray | None = None,
         **kwargs,
-    ) -> daskArrayType:
-        """This function normalizes the raw and returns a delayed dask array of
+    ) -> ChunkedArray:
+        """This function normalizes the raw and returns a delayed chunked array of
         the normalized data.
 
         Args:
@@ -163,7 +161,7 @@ class Assay:
                       feature attribute table)
             **kwargs:
 
-        Returns: A dask array (delayed matrix) containing normalized data.
+        Returns: A chunked array (delayed matrix) containing normalized data.
         """
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
@@ -296,7 +294,7 @@ class Assay:
 
     def _get_cell_feat_idx(
         self, cell_key: str, feat_key: str
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Verifies the provided key by calling _verify_keys and fetches the
         indices of rows that have True value in respective column.
 
@@ -329,7 +327,7 @@ class Assay:
         return hash(tuple([hash(tuple(cell_idx)), hash(tuple(feat_idx))]))
 
     @staticmethod
-    def _get_summary_stats_loc(cell_key: str) -> Tuple[str, str]:
+    def _get_summary_stats_loc(cell_key: str) -> tuple[str, str]:
         """A convenience method that returns the location of feature-wise
         summary statistics Currently summaries are stored under pattern:
         summary_stats_{cell_key}
@@ -406,7 +404,7 @@ class Assay:
         log_transform: bool,
         renormalize_subset: bool,
         update_keys: bool,
-    ) -> daskArrayType:
+    ) -> ChunkedArray:
         """Create a new zarr group and saves the normalized data in the group
         for the selected features only.
 
@@ -429,7 +427,7 @@ class Assay:
                          don't intend to use it directly. For example, when mapping onto a different
                          dataset and aligning features to that dataset.
 
-        Returns: Dask array containing the normalized data
+        Returns: A chunked array containing the normalized data
         """
 
         from .writers import dask_to_zarr
@@ -457,7 +455,7 @@ class Assay:
                         feat_key.split("__", 1)[1] if feat_key != "I" else "I"
                     )
                     self.attrs["latest_cell_key"] = cell_key
-                return from_zarr(self.z[location + "/data"], inline_array=True)
+                return ChunkedArray(self.z[location + "/data"], nthreads=self.nthreads)
             else:
                 # Creating group here to overwrite all children
                 self.z.create_group(location, overwrite=True)
@@ -475,17 +473,17 @@ class Assay:
                 feat_key.split("__", 1)[1] if feat_key != "I" else "I"
             )
             self.attrs["latest_cell_key"] = cell_key
-        return from_zarr(self.z[location + "/data"], inline_array=True)
+        return ChunkedArray(self.z[location + "/data"], nthreads=self.nthreads)
 
     def iter_normed_feature_wise(
         self,
-        cell_key: Optional[str],
-        feat_key: Optional[str],
+        cell_key: str | None,
+        feat_key: str | None,
         batch_size: int,
-        msg: Optional[str],
+        msg: str | None,
         as_dataframe: bool = True,
         **norm_params,
-    ) -> Generator[Union[pd.DataFrame, Tuple[np.ndarray, np.ndarray]], None, None]:
+    ) -> Generator[pd.DataFrame | tuple[np.ndarray, np.ndarray], None, None]:
         """This generator iterates over all the features marked by `feat_key`
         in batches.
 
@@ -515,7 +513,7 @@ class Assay:
         if msg is None:
             msg = ""
 
-        data: daskArrayType = self.normed(
+        data: ChunkedArray = self.normed(
             cell_idx=cell_idx,
             feat_idx=feat_idx,
             **norm_params,
@@ -537,7 +535,7 @@ class Assay:
                 )
 
     def save_normed_for_query(
-        self, feat_key: Optional[str], batch_size: int, overwrite: bool = True
+        self, feat_key: str | None, batch_size: int, overwrite: bool = True
     ) -> None:
         """This methods dumps normalized values for features (as marked by
         `feat_key`) onto disk  in the 'prenormed' slot under the assay's own
@@ -685,7 +683,7 @@ class Assay:
             self.z[location].attrs["hashes"] = hashes
             self.z[location].attrs["params"] = params
 
-        ret_val1 = from_zarr(self.z[location + "/data"], inline_array=True)
+        ret_val1 = ChunkedArray(self.z[location + "/data"], nthreads=self.nthreads)
         ret_val2 = self.z[location + "/feature_indices"][:]
 
         if location + "/valid_features" in self.z:
@@ -697,7 +695,7 @@ class Assay:
 
     def score_features(
         self,
-        feature_names: List[str],
+        feature_names: list[str],
         cell_key: str,
         ctrl_size: int,
         n_bins: int,
@@ -755,7 +753,7 @@ class RNAassay(Assay):
     normalization of scRNA-Seq data.
 
     Args:
-        z (z_hierarchy.Group): Zarr hierarchy where raw data is located
+        z (zarr.Group): Zarr hierarchy where raw data is located
         name (str): A label/name for assay.
         cell_data: Metadata class object for the cell attributes.
         **kwargs: kwargs to be passed to the Assay class
@@ -767,7 +765,7 @@ class RNAassay(Assay):
                 It is set to None until normed method is called.
     """
 
-    def __init__(self, z: z_hierarchy.Group, name: str, cell_data: MetaData, **kwargs):
+    def __init__(self, z: zarr.Group, name: str, cell_data: MetaData, **kwargs):
         super().__init__(z=z, name=name, cell_data=cell_data, **kwargs)
         self.normMethod = norm_lib_size
         if "size_factor" in self.attrs:
@@ -779,13 +777,13 @@ class RNAassay(Assay):
 
     def normed(
         self,
-        cell_idx: Optional[np.ndarray] = None,
-        feat_idx: Optional[np.ndarray] = None,
+        cell_idx: np.ndarray | None = None,
+        feat_idx: np.ndarray | None = None,
         renormalize_subset: bool = False,
         log_transform: bool = False,
         **kwargs,
-    ) -> daskArrayType:
-        """This function normalizes the raw and returns a delayed dask array of
+    ) -> ChunkedArray:
+        """This function normalizes the raw and returns a delayed chunked array of
         the normalized data. Unlike the `normed` method in the generic Assay
         class this method is optimized for scRNA-Seq data and takes additional
         parameters that will be used by `norm_lib_size` (default normalization
@@ -805,7 +803,7 @@ class RNAassay(Assay):
             **kwargs: kwargs have no effect here.
 
         Returns:
-            A dask array (delayed matrix) containing normalized data.
+            A chunked array (delayed matrix) containing normalized data.
         """
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
@@ -898,7 +896,7 @@ class RNAassay(Assay):
 
     def set_summary_stats(
         self, cell_key: str = None, n_bins: int = 200, lowess_frac: float = 0.1
-    ) -> Tuple[str, str]:
+    ) -> tuple[str, str]:
         """Calculates summary statistics for the features of the assay using only cells that are marked True by the 'cell_key' parameter.
 
         Args:
@@ -1078,12 +1076,12 @@ class ATACassay(Assay):
     """This subclass of Assay is designed for feature selection and
     normalization of scATAC-Seq data."""
 
-    def __init__(self, z: z_hierarchy.Group, name: str, cell_data: MetaData, **kwargs):
+    def __init__(self, z: zarr.Group, name: str, cell_data: MetaData, **kwargs):
         """This Assay subclass is designed for feature selection and
         normalization of scATAC-Seq data.
 
         Args:
-            z (z_hierarchy.Group): Zarr hierarchy where raw data is located
+            z (zarr.Group): Zarr hierarchy where raw data is located
             name (str): A label/name for assay.
             cell_data: Metadata class object for the cell attributes.
             **kwargs:
@@ -1102,11 +1100,11 @@ class ATACassay(Assay):
 
     def normed(
         self,
-        cell_idx: Optional[np.ndarray] = None,
-        feat_idx: Optional[np.ndarray] = None,
+        cell_idx: np.ndarray | None = None,
+        feat_idx: np.ndarray | None = None,
         **kwargs,
-    ) -> daskArrayType:
-        """This function normalizes the raw and returns a delayed dask array of
+    ) -> ChunkedArray:
+        """This function normalizes the raw and returns a delayed chunked array of
         the normalized data. Unlike the `normed` method in the generic Assay
         class this method is optimized for scATAC-Seq data. This method uses
         the the normalization indicated by attribute self.normMethod which by
@@ -1123,13 +1121,13 @@ class ATACassay(Assay):
                       feature attribute table)
             **kwargs:
 
-        Returns: A dask array (delayed matrix) containing normalized data.
+        Returns: A chunked array (delayed matrix) containing normalized data.
         """
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:
             feat_idx = self.feats.active_index("I")
-        counts: daskArrayType = self.rawData[:, feat_idx][cell_idx, :]
+        counts: ChunkedArray = self.rawData[:, feat_idx][cell_idx, :]
         self.n_term_per_doc = self.cells.fetch_all(self.name + "_nFeatures")[cell_idx]
         self.n_docs = len(cell_idx)
         self.n_docs_per_term = self.feats.fetch_all("nCells")[feat_idx]
@@ -1210,7 +1208,7 @@ class ADTassay(Assay):
     (feature-barcodes library) data from CITE-Seq experiments.
 
     Args:
-        z (z_hierarchy.Group): Zarr hierarchy where raw data is located
+        z (zarr.Group): Zarr hierarchy where raw data is located
         name (str): A label/name for assay.
         cell_data: Metadata class object for the cell attributes.
         **kwargs:
@@ -1219,7 +1217,7 @@ class ADTassay(Assay):
         normMethod: Pointer to the function to be used for normalization of the raw data
     """
 
-    def __init__(self, z: z_hierarchy.Group, name: str, cell_data: MetaData, **kwargs):
+    def __init__(self, z: zarr.Group, name: str, cell_data: MetaData, **kwargs):
         """This subclass of Assay is designed for normalization of ADT/HTO
         (feature-barcodes library) data from CITE-Seq experiments."""
         super().__init__(z=z, name=name, cell_data=cell_data, **kwargs)
@@ -1227,11 +1225,11 @@ class ADTassay(Assay):
 
     def normed(
         self,
-        cell_idx: Optional[np.ndarray] = None,
-        feat_idx: Optional[np.ndarray] = None,
+        cell_idx: np.ndarray | None = None,
+        feat_idx: np.ndarray | None = None,
         **kwargs,
-    ) -> daskArrayType:
-        """This function normalizes the raw and returns a delayed dask array of
+    ) -> ChunkedArray:
+        """This function normalizes the raw and returns a delayed chunked array of
         the normalized data. This method uses the the normalization indicated
         by attribute self.normMethod which by default is set to `norm_clr`. The
         centered log-ratio normalization is performed using only the cells and
@@ -1246,7 +1244,7 @@ class ADTassay(Assay):
                       feature attribute table)
             **kwargs:
 
-        Returns: A dask array (delayed matrix) containing normalized data.
+        Returns: A chunked array (delayed matrix) containing normalized data.
         """
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")

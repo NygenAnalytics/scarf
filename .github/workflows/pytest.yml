@@ -12,26 +12,27 @@ on:
 
 jobs:
   test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-22.04, windows-2019]
-        python-version: [3.11.9]
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+    - name: Install system build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libigraph-dev libfftw3-dev libmetis-dev
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
       with:
-        python-version: ${{ matrix.python-version }}
+        python-version: "3.14"
     - name: Install dependencies
+      run: uv sync --extra test --extra extra
+    - name: Test with pytest (parallel)
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install -r requirements_extra.txt
-        pip install pytest pytest-cov topacedo anndata==0.11.4 pcst_fast
-    - name: Test with pytest
-      run: |
-        pytest --cov=.
+        uv run pytest \
+          -n auto \
+          --dist loadfile \
+          --cov=scarf \
+          --cov-report=xml \
+          --cov-report=term
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v3
       with:

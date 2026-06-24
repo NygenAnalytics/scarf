@@ -7,7 +7,7 @@
 ## What is Scarf
 
 Scarf is a Python package that performs memory-efficient analysis of **single-cell genomics data**.
-Using an efficient data chunking process (using [Zarr] and [Dask]) Scarf manages to perform the core
+Using an efficient data chunking process (built on [Zarr]) Scarf manages to perform the core
 steps of single-cell genomics data analysis with very low memory consumption. Scarf's core step
 is to efficiently generate a neighbourhood graph (KNN graph) of cells. This graph forms the basis for
 downstream steps of the analysis thus maximizing concordance between those steps. Read below to see what
@@ -82,6 +82,5 @@ those methods.
 [github]: https://github.com/parashardhapola/scarf
 [Source code on Github]: https://github.com/parashardhapola/scarf
 [Zarr]: http://zarr.readthedocs.io
-[Dask]: http://dask.org
 [Chen et. al.]: https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1854-5
 [Luecken et. al.]: https://www.biorxiv.org/content/10.1101/2020.05.22.111161v2.full

@@ -1,16 +1,10 @@
 import zarr
 
-from . import full_path, remove
 
-
-def test_assay_merge(datastore):
-    # TODO: Evaluate the resulting merged file
-    """
-    Test the AssayMerge class by merging two assays of same type from the same dataset.
-    """
+def test_assay_merge(datastore, rna_raw_total, tmp_path):
     from ..merge import AssayMerge
 
-    fn = full_path("merged_zarr.zarr")
+    fn = str(tmp_path / "merged.zarr")
     writer = AssayMerge(
         zarr_path=fn,
         assays=[datastore.RNA, datastore.RNA],
@@ -22,77 +16,54 @@ def test_assay_merge(datastore):
     writer.dump()
     tmp = zarr.open(fn + "/RNA/counts")
     assert tmp.shape[0] == 2 * datastore.cells.N
-    assert int(tmp[...].sum()) == int(datastore.RNA.rawData.compute().sum() * 2)
-    remove(fn)
+    assert int(tmp[...].sum()) == rna_raw_total * 2
 
 
-def test_dataset_merge_2(datastore):
-    """
-    Test the DatasetMerge class by merging two datasets. This will test the merging of all assays in the dataset.
-    """
+def test_dataset_merge_2(datastore, rna_raw_total, assay2_raw_total, tmp_path):
     from ..merge import DatasetMerge
 
-    fn = full_path("merged_zarr.zarr")
+    fn = str(tmp_path / "merged.zarr")
     writer = DatasetMerge(
         zarr_path=fn,
         datasets=[datastore, datastore],
         names=["self1", "self2"],
         prepend_text="",
-        overwrite=True
+        overwrite=True,
     )
     writer.dump()
-    # Check if the merged file has the correct shape and counts
-    # Load the merged counts file
     rna_count = zarr.open(fn + "/RNA/counts")
     assay2_count = zarr.open(fn + "/assay2/counts")
-    # We merged only two datasets, so the shape should be 2*original_shape
-    # Check the number of cells
     assert rna_count.shape[0] == 2 * datastore.cells.N
     assert assay2_count.shape[0] == 2 * datastore.cells.N
-    # Check the count values through sum
-    assert int(rna_count[...].sum()) == int(datastore.RNA.rawData.compute().sum() * 2)
-    assert int(assay2_count[...].sum()) == int(
-        datastore.assay2.rawData.compute().sum() * 2
-    )
-    remove(fn)
+    assert int(rna_count[...].sum()) == rna_raw_total * 2
+    assert int(assay2_count[...].sum()) == assay2_raw_total * 2
 
 
-def test_dataset_merge_3(datastore):
-    """
-    Test the DatasetMerge class by merging two datasets. This will test the merging of all assays in the dataset.
-    If merging is successful for more than two datasets, it should work for any number of datasets.
-    """
+def test_dataset_merge_3(datastore, rna_raw_total, assay2_raw_total, tmp_path):
     from ..merge import DatasetMerge
 
-    fn = full_path("merged_zarr.zarr")
+    fn = str(tmp_path / "merged.zarr")
     writer = DatasetMerge(
         zarr_path=fn,
         datasets=[datastore, datastore, datastore],
         names=["self1", "self2", "self3"],
         prepend_text="",
-        overwrite=True
+        overwrite=True,
     )
     writer.dump()
-    # Check if the merged file has the correct shape and counts
-    # Load the merged counts file
     rna_count = zarr.open(fn + "/RNA/counts")
     assay2_count = zarr.open(fn + "/assay2/counts")
-    # We merged only three datasets, so the shape should be 3*original_shape
-    # Check the number of cells
     assert rna_count.shape[0] == 3 * datastore.cells.N
     assert assay2_count.shape[0] == 3 * datastore.cells.N
-    # Check the count values through sum
-    assert int(rna_count[...].sum()) == int(datastore.RNA.rawData.compute().sum() * 3)
-    assert int(assay2_count[...].sum()) == int(
-        datastore.assay2.rawData.compute().sum() * 3
-    )
-    remove(fn)
+    assert int(rna_count[...].sum()) == rna_raw_total * 3
+    assert int(assay2_count[...].sum()) == assay2_raw_total * 3
 
-def test_dataset_merge_cells(datastore):
-    from ..merge import DatasetMerge
+
+def test_dataset_merge_cells(datastore, tmp_path):
     from ..datastore.datastore import DataStore
+    from ..merge import DatasetMerge
 
-    fn = full_path("merged_zarr.zarr")
+    fn = str(tmp_path / "merged.zarr")
     writer = DatasetMerge(
         zarr_path=fn,
         datasets=[datastore, datastore],
@@ -106,7 +77,7 @@ def test_dataset_merge_cells(datastore):
         fn,
         default_assay="RNA",
     )
-    
+
     df = ds.cells.to_pandas_dataframe(ds.cells.columns)
-    df_diff = df[df['orig_RNA_nCounts'] != df['RNA_nCounts']]
+    df_diff = df[df["orig_RNA_nCounts"] != df["RNA_nCounts"]]
     assert len(df_diff) == 0

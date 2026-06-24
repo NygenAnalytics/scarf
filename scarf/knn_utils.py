@@ -1,6 +1,5 @@
 """Utility functions for running the KNN algorithm."""
 
-from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -212,7 +211,7 @@ def calc_snn(indices: np.ndarray) -> np.ndarray:
 
 def weight_sort_indices(
     i: np.ndarray, w: np.ndarray, wn: np.ndarray, n: int
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Sort the array i and w based on values of wn. Only keep the top n
     values.
 
@@ -235,7 +234,7 @@ def weight_sort_indices(
     return i[idx][:n], w[idx][:n]
 
 
-def merge_graphs(csr_mats: List[csr_matrix]) -> coo_matrix:
+def merge_graphs(csr_mats: list[csr_matrix]) -> coo_matrix:
     """Merge multiple graphs of same size and shape such that the merged graph
     have the same size and shape. Edge values are sorted based on their weight
     and the shared neighbours.
@@ -307,7 +306,7 @@ def wnn_integration(
         a = np.sqrt(((ld - le) ** 2).sum(axis=1))
         d = a - b
         d[d < 0] = 0
-        return np.exp(((-1 * d) / (c - d)).astype(np.float128))
+        return np.exp(((-1 * d) / (c - d)).astype(np.longdouble))
 
     def calc_affinity_ratios(
         g_self, g_other, ld, sigma: int = -2, epsilon: float = 10e-4, name=""
@@ -325,7 +324,7 @@ def wnn_integration(
         theta_self = calc_theta(ld, l_self, b, c)
         theta_cross = calc_theta(ld, l_cross, b, c)
 
-        return (theta_self / (theta_cross + epsilon)).astype(np.float128)
+        return (theta_self / (theta_cross + epsilon)).astype(np.longdouble)
 
     from threadpoolctl import threadpool_limits
 

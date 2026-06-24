@@ -1,23 +1,22 @@
 import numpy as np
 import pytest
 
-from . import full_path, remove
-
 
 @pytest.fixture
-def dummy_metadata():
+def dummy_metadata(tmp_path):
     import zarr
+
     from ..metadata import MetaData
 
-    fn = full_path("dummy_metadata.zarr")
-    remove(fn)
-    g = zarr.open(fn)
+    fn = str(tmp_path / "dummy_metadata.zarr")
+    g = zarr.open_group(fn, mode="w")
     data = np.array([1, 1, 1, 1, 0, 0, 1, 1, 1]).astype(bool)
-    g.create_dataset(
-        "I", data=data, chunks=(100000,), shape=len(data), dtype=data.dtype
+    g.create_array(
+        "I",
+        data=data,
+        chunks=(100000,),
     )
     yield MetaData(g)
-    remove(fn)
 
 
 def test_metadata_attrs(dummy_metadata):

@@ -5,7 +5,7 @@
     - create_zarr_obj_array: Creates and returns a Zarr object array.
     - create_zarr_count_assay: Creates and returns a Zarr array with name 'counts'.
     - subset_assay_zarr: Selects a subset of the data in an assay in the specified Zarr hierarchy.
-    - dask_to_zarr: Creates a Zarr hierarchy from a Dask array.
+    - dask_to_zarr: Creates a Zarr hierarchy from a chunked array.
     - to_h5ad: Convert a Zarr file to H5ad format
     - to_mtx: Convert a Zarr file to MTX format
 
@@ -19,15 +19,20 @@
 """
 
 import os
-from typing import Any, Tuple, List, Union, Dict, Optional
+from typing import Any
 
 import numpy as np
 import pandas as pd
-import polars as pl
 import zarr
-from scipy.sparse import csr_matrix, coo_matrix
+from scipy.sparse import csr_matrix
 
 from .readers import CrReader, H5adReader, NaboH5Reader, LoomReader, CSVReader
+from .storage.zarr_store import (
+    ZarrArraySpec,
+    create_metadata_column,
+    create_numeric_array,
+    finalize_sharded_counts,
+)
 from .utils import (
     controlled_compute,
     logger,
@@ -58,9 +63,9 @@ __all__ = [
 def create_zarr_dataset(
     g: zarr.Group,
     name: str,
-    chunks: tuple,
+    chunks: tuple | int,
     dtype: Any,
-    shape: Tuple,
+    shape: tuple,
     overwrite: bool = True,
 ) -> zarr.Array:
     """Creates and returns a Zarr array.
@@ -76,99 +81,45 @@ def create_zarr_dataset(
     Returns:
         A Zarr Array.
     """
-    from numcodecs import Blosc
-
-    compressor = Blosc(cname="lz4", clevel=5, shuffle=Blosc.BITSHUFFLE)
-    return g.create_dataset(
-        name,
+    spec = ZarrArraySpec(
+        shape=shape,
         chunks=chunks,
         dtype=dtype,
-        shape=shape,
-        compressor=compressor,
         overwrite=overwrite,
     )
-
-
-def dtype_fix(dtype, data: np.ndarray):
-    if dtype is None or dtype == object:
-        return "U" + str(max([len(str(x)) for x in data]))
-    if np.issubdtype(data.dtype, np.dtype("S")):
-        try:
-            adata = data.astype("U")
-        except UnicodeDecodeError:
-            adata = np.array([x.decode("UTF-8") for x in data]).astype("U")
-        return adata.dtype
-    return dtype
+    return create_numeric_array(g, name, spec)
 
 
 def create_zarr_obj_array(
     g: zarr.Group,
     name: str,
     data,
-    dtype: Union[str, Any] = None,
+    dtype: str | Any = None,
     overwrite: bool = True,
     chunk_size: int = 100000,
-    shape: Optional[int] = None,
+    shape: int | None = None,
 ) -> zarr.Array:
-    """Creates and returns a Zarr object array.
+    """Creates and returns a metadata column array."""
+    return create_metadata_column(
+        g,
+        name,
+        data=data,
+        dtype=dtype,
+        overwrite=overwrite,
+        chunkSize=chunk_size,
+        shape=shape if data is None else None,
+    )
 
-    A Zarr object array can contain any type of object.
-    https://zarr.readthedocs.io/en/stable/tutorial.html#object-arrays
-
-    Args:
-        g (zarr.hierarchy):
-        name (str):
-        data ():
-        dtype (Union[str, Any]):
-        overwrite (bool):
-        chunk_size (int):
-        shape:
-
-    Returns:
-        A Zarr object Array.
-    """
-
-    from numcodecs import Blosc
-
-    compressor = Blosc(cname="lz4", clevel=5, shuffle=Blosc.BITSHUFFLE)
-
-    if chunk_size is None or chunk_size is False:
-        chunks = False
-    else:
-        chunks = (chunk_size,)
-
-    if data is not None:
-        data = np.array(data)
-        dtype = dtype_fix(dtype, data)
-
-        return g.create_dataset(
-            name,
-            data=data,
-            chunks=chunks,
-            shape=len(data),
-            dtype=dtype,
-            overwrite=overwrite,
-            compressor=compressor,
-        )
-    else:
-        return g.create_dataset(
-            name,
-            chunks=chunks,
-            shape=shape,
-            dtype=dtype,
-            overwrite=overwrite,
-            compressor=compressor,
-        )
 
 
 def create_zarr_count_assay(
     z: zarr.Group,
     assay_name: str,
-    workspace: Union[str, None],
-    chunk_size: Tuple[int, int],
+    workspace: str | None,
+    chunk_size: tuple[int, int],
     n_cells: int,
-    feat_ids: Union[np.ndarray, List[str]],
-    feat_names: Union[np.ndarray, List[str]],
+    feat_ids: np.ndarray | list[str],
+    feat_names: np.ndarray | list[str],
     dtype: str = "uint32",
 ) -> zarr.Array:
     """Creates and returns a Zarr array with name 'counts'.
@@ -176,11 +127,11 @@ def create_zarr_count_assay(
     Args:
         z (zarr.Group):
         assay_name (str):
-        workspace (Union[str, None]):
-        chunk_size (Tuple[int, int]):
+        workspace (str | None):
+        chunk_size (tuple[int, int]):
         n_cells (int):
-        feat_ids (Union[np.ndarray, List[str]]):
-        feat_names (Union[np.ndarray, List[str]]):
+        feat_ids (np.ndarray | list[str]):
+        feat_names (np.ndarray | list[str]):
         dtype (str = 'uint32'):
 
     Returns:
@@ -204,8 +155,16 @@ def create_zarr_count_assay(
     )
 
 
+def finalize_writer_counts(
+    store: zarr.Group,
+    assay_name: str,
+    workspace: str | None = None,
+) -> zarr.Array:
+    return finalize_sharded_counts(store, assay_name, workspace)
+
+
 def load_count_store(
-    z: zarr.Group, assay_name: str, workspace: Union[str, None]
+    z: zarr.Group, assay_name: str, workspace: str | None
 ) -> zarr.Array:
     if workspace is None:
         return z[f"{assay_name}/counts"]  # type: ignore
@@ -214,7 +173,7 @@ def load_count_store(
 
 
 def create_cell_data(
-    z: zarr.Group, workspace: Union[str, None], ids: np.ndarray, names: np.ndarray
+    z: zarr.Group, workspace: str | None, ids: np.ndarray, names: np.ndarray
 ) -> zarr.Group:
     if workspace is None:
         g = z.create_group("cellData")
@@ -264,7 +223,7 @@ class CrToZarr:
         zarr_loc: ZARRLOC,
         chunk_size=(1000, 1000),
         dtype: str = "uint32",
-        workspace: Optional[str] = None,
+        workspace: str | None = None,
     ):
         self.cr = cr
         self.chunkSizes = chunk_size
@@ -289,7 +248,7 @@ class CrToZarr:
             )
 
     @staticmethod
-    def _prep_assay_input_ranges(af: pd.DataFrame) -> Dict[str, List[List[int]]]:
+    def _prep_assay_input_ranges(af: pd.DataFrame) -> dict[str, list[list[int]]]:
         assay_order = (
             af.T.nFeatures.groupby(af.columns).sum().sort_values(ascending=False).index
         )
@@ -307,8 +266,8 @@ class CrToZarr:
 
     @staticmethod
     def _prep_feat_index_offset(
-        ranges: Dict[str, List[List[int]]]
-    ) -> Dict[str, List[int]]:
+        ranges: dict[str, list[list[int]]]
+    ) -> dict[str, list[int]]:
         feat_offset = {}
         for i in ranges:
             feat_offset[i] = []
@@ -362,6 +321,8 @@ class CrToZarr:
                 "ERROR: This is a bug in CrToZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
+        for assay in input_ranges:
+            finalize_writer_counts(self.z, assay, self.workspace)
 
 
 class H5adToZarr:
@@ -385,8 +346,8 @@ class H5adToZarr:
         self,
         h5ad: H5adReader,
         zarr_loc: ZARRLOC,
-        assay_name: Optional[str] = None,
-        workspace: Union[str, None] = None,
+        assay_name: str | None = None,
+        workspace: str | None = None,
         chunk_size=(1000, 1000),
     ):
         # TODO: support for multiple assay. One of the `var` datasets can be used to group features in separate assays
@@ -455,6 +416,7 @@ class H5adToZarr:
                 "ERROR: This is a bug in H5adToZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
+        finalize_writer_counts(self.z, self.assayName, self.workspace)
 
 
 class NaboH5ToZarr:
@@ -480,8 +442,8 @@ class NaboH5ToZarr:
         self,
         h5: NaboH5Reader,
         zarr_loc: ZARRLOC,
-        assay_name: Optional[str] = None,
-        workspace: Union[str, None] = None,
+        assay_name: str | None = None,
+        workspace: str | None = None,
         chunk_size=(1000, 1000),
         dtype: str = "uint32",
     ):
@@ -544,6 +506,7 @@ class NaboH5ToZarr:
                 "ERROR: This is a bug in NaboH5ToZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
+        finalize_writer_counts(self.z, self.assayName, self.workspace)
 
 
 class LoomToZarr:
@@ -568,8 +531,8 @@ class LoomToZarr:
         self,
         loom: LoomReader,
         zarr_loc: ZARRLOC,
-        assay_name: Optional[str] = None,
-        workspace: Union[str, None] = None,
+        assay_name: str | None = None,
+        workspace: str | None = None,
         chunk_size=(1000, 1000),
     ):
         # TODO: support for multiple assay. Data from within individual layers can be treated as separate assays
@@ -640,6 +603,7 @@ class LoomToZarr:
                 "ERROR: This is a bug in LoomToZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
+        finalize_writer_counts(self.z, self.assayName, self.workspace)
 
 
 class SparseToZarr:
@@ -669,13 +633,13 @@ class SparseToZarr:
         self,
         csr_mat: csr_matrix,
         zarr_loc: ZARRLOC,
-        cell_ids: Union[np.ndarray, List[str]],
-        feature_ids: Union[np.ndarray, List[str]],
-        assay_name: Optional[str] = None,
-        workspace: Union[str, None] = None,
-        feature_names: Union[np.ndarray, List[str], None] = None,
+        cell_ids: np.ndarray | list[str],
+        feature_ids: np.ndarray | list[str],
+        assay_name: str | None = None,
+        workspace: str | None = None,
+        feature_names: np.ndarray | list[str] | None = None,
         chunk_size=(1000, 1000),
-        matrix_dtype: Optional[np.dtype] = None,
+        matrix_dtype: np.dtype | None = None,
     ):
         self.mat = csr_mat
         self.chunkSizes = chunk_size
@@ -722,7 +686,7 @@ class SparseToZarr:
             dtype=str(self.matrixDtype),
         )
 
-    def dump(self, batch_size: Optional[int] = None) -> None:
+    def dump(self, batch_size: int | None = None) -> None:
         """Write out the data matrix into the Zarr hierarchy.
 
         Args:
@@ -770,6 +734,7 @@ class SparseToZarr:
                 "ERROR: This is a bug in SparseToZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
+        finalize_writer_counts(self.z, self.assayName, self.workspace)
 
 
 class CSVtoZarr:
@@ -795,8 +760,8 @@ class CSVtoZarr:
         zarr_loc: ZARRLOC,
         assay_name: str,
         chunk_size=(1000, 1000),
-        workspace: Union[str, None] = None,
-        dtype: Optional[np.dtype] = None,
+        workspace: str | None = None,
+        dtype: np.dtype | None = None,
     ):
         self.csvr = cr
         self.assayName = assay_name
@@ -869,9 +834,10 @@ class CSVtoZarr:
             s = e
         if e != self.csvr.nCells:
             raise AssertionError(
-                "ERROR: This is a bug in LoomToZarr. All cells might not have been successfully "
+                "ERROR: This is a bug in CSVtoZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
+        finalize_writer_counts(self.z, self.assayName, self.workspace)
 
 
 def subset_assay_zarr(
@@ -912,12 +878,11 @@ def subset_assay_zarr(
     return None
 
 
-def dask_to_zarr(df, z, loc, chunk_size, nthreads: int, msg: Optional[str] = None):
-    # TODO: perhaps change name of Dask array so it does not get confused with a dataframe
-    """Creates a Zarr hierarchy from a Dask array.
+def dask_to_zarr(df, z, loc, chunk_size, nthreads: int, msg: str | None = None):
+    """Creates a Zarr hierarchy from a chunked array.
 
     Args:
-        df (): Dask array.
+        df (): A ChunkedArray.
         z (): Zarr hierarchy.
         loc (): Location to write data/Zarr hierarchy to.
         chunk_size (): Size of chunks to load into memory and process.
@@ -955,10 +920,10 @@ class SubsetZarr:
         self,
         zarr_loc: ZARRLOC,
         assays: list,
-        in_workspace: Union[str, None] = None,
-        out_workspace: Union[str, None] = None,
-        cell_key: Optional[str] = None,
-        cell_idx: Optional[np.ndarray] = None,
+        in_workspace: str | None = None,
+        out_workspace: str | None = None,
+        cell_key: str | None = None,
+        cell_idx: np.ndarray | None = None,
         reset_cell_filter: bool = True,
         overwrite_existing_file: bool = False,
         overwrite_cell_data: bool = False,
@@ -1054,10 +1019,7 @@ class SubsetZarr:
         else:
             g: zarr.Group = self.z.create_group(cell_slot)
 
-        if self.outWorkspace is None:
-            cell_data = self.assays[0].z["/cellData"]
-        else:
-            cell_data = self.assays[0].z[f"/{self.inWorkspace}/cellData"]
+        cell_data = self.assays[0].cells.locations["primary"]
 
         n_cells = len(self.cellIdx)
         for i in cell_data.keys():
@@ -1108,12 +1070,13 @@ class SubsetZarr:
                     e += a.shape[0]
                     store[s:e] = a.compute()
                     s = e
+            finalize_writer_counts(self.z, assay.name, self.outWorkspace)
 
 
 def to_h5ad(
     assay,
     h5ad_filename: str,
-    embeddings_cols: Optional[List[str]] = None,
+    embeddings_cols: list[str] | None = None,
     skip_recalc_nfeats: bool = True,
     n_threads: int = 4,
 ) -> None:
@@ -1131,7 +1094,6 @@ def to_h5ad(
         None
     """
     import h5py
-    from dask import array as da
 
     def save_attr(group, col, scarf_col, md):
         d = md.fetch_all(scarf_col)
@@ -1154,7 +1116,7 @@ def to_h5ad(
         assay.cells.insert(
             f"{assay.name}_nFeatures",
             show_dask_progress(
-                da.count_nonzero(assay.rawData, axis=1),  # type: ignore
+                assay.rawData.count_nonzero(axis=1),
                 msg="Preflight: recalculating nFeatures",
                 nthreads=n_threads,
             ),
@@ -1307,7 +1269,7 @@ def to_mtx(assay, mtx_directory: str, compress: bool = False):
 def bed_to_sparse_array(
     bed_fn: str,
     bin_size: int,
-    chrom_sizes: Dict[str, int],
+    chrom_sizes: dict[str, int],
     min_counts_per_cell: int = 500,
     read_chunk_size=1e6,
     sep: str = "\t",

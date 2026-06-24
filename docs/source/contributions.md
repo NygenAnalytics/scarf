@@ -7,14 +7,14 @@ idea to introduce the proposed feature and discuss it. This can be done on the [
 page]. The code is written using [black] style. Please make sure you blacken any edited files. 
 
 ## Testing locally
-You can run the tests locally on your branch by running [pytest]. The configurations
-for pytest are already set in `pyproject.toml`. The extra requirements for running the
-tests can be installed from the `requirements.txt` file that is under the 'tests' folder.
+You can run the tests locally on your branch with [pytest]. Configurations are in `pyproject.toml`.
+Install dependencies with `uv sync --extra test --extra extra`, then run `uv run pytest`.
+Python 3.14 is required (`requires-python >=3.14,<3.15`).
 
 ## Contributions to the documentation
 You may contribute to the documentation by either adding new sections or modifying existing
 sections. All the required packages for building the documentation locally can be installed
-from another `requirements.txt` file that is under the 'docs' directory. The documentation is built
+with `uv pip install -e ".[extra,docs]"`. The documentation is built
 using [Sphinx]. The markdown files are parsed using [MyST] parser. If you want to add a notebook
 to  the documentation then please convert your `ipynb` files to `markdown` format using [Jupytext].
 The markdown files are saved with extension `mdnb` so that they can be recognized by [nbshpinx]

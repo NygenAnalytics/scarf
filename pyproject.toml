@@ -1,19 +1,112 @@
-[build.system]
-requires = [
-    "setuptools",
-    "wheel"
-]
+[build-system]
+requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "scarf"
+dynamic = ["version"]
+description = "Scarf: A scalable tool for single-cell omics data analysis"
+readme = {file = "pypi_README.rst", content-type = "text/x-rst"}
+requires-python = ">=3.14,<3.15"
+license = "BSD-3-Clause"
+authors = [
+    {name = "Parashar Dhapola", email = "parashar.dhapola@gmail.com"},
+]
+keywords = ["single-cell"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "h5py>=3.16",
+    "hnswlib",
+    "joblib",
+    "leidenalg",
+    "loguru",
+    "networkx",
+    "numba>=0.65",
+    "numcodecs>=0.16",
+    "numpy>=2.4",
+    "packaging",
+    "pandas>=2.3",
+    "scikit-learn>=1.9",
+    "scikit-network>=0.33.5",
+    "scipy>=1.18",
+    "setuptools",
+    "statsmodels",
+    "threadpoolctl",
+    "tqdm",
+    "umap-learn",
+    "zarr>=3.0",
+]
+
+[project.optional-dependencies]
+extra = [
+    "requests",
+    "kneed",
+    "matplotlib",
+    "seaborn",
+    "cmocean",
+    "datashader",
+    "ipython-autotime",
+    "ipywidgets",
+]
+test = [
+    "pytest",
+    "pytest-cov",
+    "pytest-xdist",
+    "topacedo",
+    "anndata",
+    "black",
+    "matplotlib",
+    "seaborn",
+    "cmocean",
+]
+docs = [
+    "jinja2",
+    "jedi",
+    "myst-parser",
+    "myst-nb",
+    "sphinx",
+    "sphinx_autodoc_typehints",
+    "sphinx-book-theme",
+    "sphinx-copybutton",
+    "sphinx-external-toc",
+    "sphinx-tabs",
+    "topacedo",
+    "nbclient",
+]
+
+[project.urls]
+Homepage = "https://github.com/parashardhapola/scarf"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.dynamic]
+version = {file = "VERSION"}
+
+[tool.setuptools.packages.find]
+exclude = ["tests*"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
-addopts = "-ra -v"
+addopts = "-ra -v -m 'not integration' -n auto --dist loadfile"
+markers = [
+    "integration: live network tests for OSF downloader",
+]
 testpaths = [
     "scarf/tests",
 ]
 norecursedirs = [
     "scarf/tests"
 ]
+
+[tool.coverage.run]
+source = ["scarf"]
+parallel = true
 
 [tool.interrogate]
 ignore-init-method = true

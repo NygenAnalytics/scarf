@@ -1,41 +1,57 @@
 """Utility functions for the mapping."""
 
-from typing import Tuple
 
-import dask.array as daskarr
 import numpy as np
 import pandas as pd
 
 from .assay import Assay
+from .chunked import ChunkedArray
 from .utils import controlled_compute, show_dask_progress, logger, tqdmbar
 
 __all__ = ["align_features", "coral"]
 
 
-def _cov_diaged(da: daskarr) -> daskarr:
-    a = daskarr.cov(da, rowvar=0)
+def _streaming_covariance(data, nthreads: int, msg: str) -> np.ndarray:
+    """Computes the (features x features) covariance by streaming row-blocks.
+
+    Uses the identity cov = (XtX - n * mean (x) mean) / (n - 1), accumulating
+    the cross-product XtX and the column sums over row-blocks so peak memory
+    stays bounded by a single block plus the small (features x features) matrix.
+    """
+    n_cols = data.shape[1]
+    xtx = np.zeros((n_cols, n_cols), dtype=np.float64)
+    col_sum = np.zeros(n_cols, dtype=np.float64)
+    n_rows = 0
+    for block in tqdmbar(data.blocks, total=data.numblocks[0], desc=msg):
+        a = controlled_compute(block, nthreads).astype(np.float64, copy=False)
+        xtx += a.T @ a
+        col_sum += a.sum(axis=0)
+        n_rows += a.shape[0]
+    mean = col_sum / n_rows
+    cov = (xtx - n_rows * np.outer(mean, mean)) / (n_rows - 1)
+    return cov
+
+
+def _cov_diaged(data, nthreads: int, msg: str) -> np.ndarray:
+    a = _streaming_covariance(data, nthreads, msg)
     a[a == np.inf] = 0
     a[a == np.nan] = 0
     return a + np.eye(a.shape[0])
 
 
-def _correlation_alignment(s: daskarr, t: daskarr, nthreads: int) -> daskarr:
+def _correlation_alignment(s, t, nthreads: int) -> ChunkedArray:
     from scipy.linalg import fractional_matrix_power as fmp
     from threadpoolctl import threadpool_limits
 
-    s_cov = show_dask_progress(
-        _cov_diaged(s), f"CORAL: Computing source covariance", nthreads
-    )
-    t_cov = show_dask_progress(
-        _cov_diaged(t), f"CORAL: Computing target covariance", nthreads
-    )
+    s_cov = _cov_diaged(s, nthreads, "CORAL: Computing source covariance")
+    t_cov = _cov_diaged(t, nthreads, "CORAL: Computing target covariance")
     logger.info(
         "Calculating fractional power of covariance matrices. This might take a while... "
     )
     with threadpool_limits(limits=nthreads):
         a_coral = np.dot(fmp(s_cov, -0.5), fmp(t_cov, 0.5))
     logger.info("Fractional power calculation complete")
-    return daskarr.dot(s, a_coral)
+    return s.dot(a_coral)
 
 
 def coral(source_data, target_data, assay, feat_key: str, cell_key: str, nthreads: int):
@@ -87,9 +103,9 @@ def coral(source_data, target_data, assay, feat_key: str, cell_key: str, nthread
     )
     dask_to_zarr(
         data,
-        assay.z["/"],
-        f"{assay.z.name}/normed__{cell_key}__{feat_key}/data_coral",
-        1000,
+        assay.z,
+        f"normed__{cell_key}__{feat_key}/data_coral",
+        data.chunksize if hasattr(data, "chunksize") else 1000,
         nthreads,
         msg="Writing out coral corrected data",
     )
@@ -103,7 +119,7 @@ def _order_features(
     exclude_missing: bool,
     nthreads: int,
     target_cell_key: str = "I",
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     s_ids = pd.Series(s_assay.feats.fetch_all("ids"))
     t_ids = pd.Series(t_assay.feats.fetch_all("ids"))
     t_idx = t_ids.isin(s_feat_ids)
@@ -192,17 +208,20 @@ def align_features(
     normed_data = target_assay.normed(
         target_assay.cells.active_index(target_cell_key), sorted_t_idx, **norm_params
     )
-    loc = f"{target_assay.z.name}/normed__{target_cell_key}__{target_feat_key}/data"
-
+    normed_loc = f"normed__{target_cell_key}__{target_feat_key}"
     og = create_zarr_dataset(
-        target_assay.z["/"], loc, (1000,), "float64", (normed_data.shape[0], len(t_idx))
+        target_assay.z,
+        f"{normed_loc}/data",
+        (1000, len(t_idx)),
+        "float64",
+        (normed_data.shape[0], len(t_idx)),
     )
     pos_start, pos_end = 0, 0
     unsorter_idx = np.argsort(np.argsort(t_idx[t_idx != -1]))
     for i in tqdmbar(
         normed_data.blocks,
         total=normed_data.numblocks[0],
-        desc=f"({target_assay.name}) Writing aligned data to {loc.split('/')[1]}",
+        desc=f"({target_assay.name}) Writing aligned data to {normed_loc}",
     ):
         pos_end += i.shape[0]
         a = np.ones((i.shape[0], len(t_idx)))

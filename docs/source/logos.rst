@@ -6,10 +6,6 @@
 	:height: 25px
 	:target: http://zarr.readthedocs.io
 	:figwidth: 28px
-.. figure:: _static/external_logos/dask.png
-	:height: 25px
-	:target: http://dask.org
-	:figwidth: 28px
 .. figure:: _static/external_logos/numpy.png
 	:height: 25px
 	:target: http://numpy.org

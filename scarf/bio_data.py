@@ -3,11 +3,10 @@
 g. cell cycle genes).
 """
 
-from typing import List
 
 __all__ = ["s_phase_genes", "g2m_phase_genes"]
 
-s_phase_genes: List[str] = [
+s_phase_genes: list[str] = [
     "MCM5",
     "PCNA",
     "TYMS",
@@ -53,7 +52,7 @@ s_phase_genes: List[str] = [
     "E2F8",
 ]
 
-g2m_phase_genes: List[str] = [
+g2m_phase_genes: list[str] = [
     "HMGB2",
     "CDK1",
     "NUSAP1",

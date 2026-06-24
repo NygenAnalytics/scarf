@@ -1,4 +1,3 @@
-from typing import List, Union, Optional
 
 import numpy as np
 import zarr
@@ -10,7 +9,7 @@ from ..utils import show_dask_progress, controlled_compute, load_zarr, ZARRLOC
 
 
 def sanitize_hierarchy(
-    z: zarr.Group, assay_name: str, workspace: Union[str, None]
+    z: zarr.Group, assay_name: str, workspace: str | None
 ) -> bool:
     """Test if an assay node in zarr object was created properly.
 
@@ -85,7 +84,7 @@ class BaseDataStore:
         ribo_pattern: str,
         nthreads: int,
         zarr_mode: str,
-        workspace: Union[str, None],
+        workspace: str | None,
         synchronizer,
     ):
         self.z = load_zarr(zarr_loc=zarr_loc, mode=zarr_mode, synchronizer=synchronizer)
@@ -125,7 +124,7 @@ class BaseDataStore:
         return MetaData(cell_data)
 
     @property
-    def assay_names(self) -> List[str]:
+    def assay_names(self) -> list[str]:
         """Load all assay names present in the Zarr file. Zarr writers create
         an 'is_assay' attribute in the assay level and this function looks for
         presence of those attributes to load assay names.
@@ -140,7 +139,7 @@ class BaseDataStore:
                 assays.append(i)
         return assays
 
-    def _load_default_assay(self, assay_name: Optional[str] = None) -> str:
+    def _load_default_assay(self, assay_name: str | None = None) -> str:
         """This function sets a given assay name as defaultAssay attribute. If
         `assay_name` value is None then the top-level directory attributes in
         the Zarr file are looked up for presence of previously used default
@@ -182,7 +181,7 @@ class BaseDataStore:
         return assay_name
 
     def _load_assays(
-        self, min_cells: int, custom_assay_types: Optional[dict] = None
+        self, min_cells: int, custom_assay_types: dict | None = None
     ) -> None:
         """This function loads all the assay names present in attribute
         `assayNames` as Assay objects. An attempt is made to automatically
@@ -281,8 +280,8 @@ class BaseDataStore:
 
     def _get_assay(
         self,
-        from_assay: Union[str, None],
-    ) -> Union[Assay, RNAassay, ADTassay, ATACassay]:
+        from_assay: str | None,
+    ) -> Assay | RNAassay | ADTassay | ATACassay:
         """This is a convenience function used internally to quickly obtain the
         assay object that is linked to an assay name.
 
@@ -324,8 +323,8 @@ class BaseDataStore:
     def _ini_cell_props(
         self,
         min_features: int,
-        mito_pattern: Optional[str],
-        ribo_pattern: Optional[str],
+        mito_pattern: str | None,
+        ribo_pattern: str | None,
     ) -> None:
         """This function is called on class initialization. For each assay, it
         calculates per-cell statistics i.e. nCounts, nFeatures, percentMito and

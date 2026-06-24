@@ -12,12 +12,12 @@
 import math
 import os
 from abc import ABC, abstractmethod
-from typing import IO, Dict, Generator, List, Optional, Tuple, Union
+from typing import IO
+from collections.abc import Generator
 
 import h5py
 import numpy as np
 import pandas as pd
-import polars as pl
 from scipy.sparse import coo_matrix
 
 from .utils import logger, tqdmbar
@@ -84,7 +84,7 @@ class CrReader(ABC):
             "ADT": "ADT",
             "HTO": "HTO",
         }
-        self.grpNames: Dict = grp_names
+        self.grpNames: dict = grp_names
         self.nFeatures: int = len(self.feature_names())
         self.nCells: int = len(self.cell_names())
         self.assayFeats = self._make_feat_table()
@@ -95,7 +95,7 @@ class CrReader(ABC):
         pass
 
     @abstractmethod
-    def _read_dataset(self, key: Optional[str] = None) -> List:
+    def _read_dataset(self, key: str | None = None) -> list:
         pass
 
     @abstractmethod
@@ -103,7 +103,7 @@ class CrReader(ABC):
         """Returns a generator that yield chunks of data."""
         pass
 
-    def _subset_by_assay(self, v, assay) -> List:
+    def _subset_by_assay(self, v, assay) -> list:
         if assay is None:
             return v
         elif assay not in self.assayFeats:
@@ -123,7 +123,7 @@ class CrReader(ABC):
 
     def _make_feat_table(self) -> pd.DataFrame:
         s = self.feature_types()
-        span: List[Tuple] = []
+        span: list[tuple] = []
         last = s[0]
         last_n: int = 0
         for n, i in enumerate(s[1:], 1):
@@ -147,7 +147,7 @@ class CrReader(ABC):
                 new_names.append(k)
         self.assayFeats.columns = new_names
 
-    def rename_assays(self, name_map: Dict[str, str]) -> None:
+    def rename_assays(self, name_map: dict[str, str]) -> None:
         """Renames specified assays in the Reader.
 
         Args:
@@ -155,7 +155,7 @@ class CrReader(ABC):
         """
         self.assayFeats.rename(columns=name_map, inplace=True)
 
-    def feature_ids(self, assay: str = None) -> List[str]:
+    def feature_ids(self, assay: str = None) -> list[str]:
         """Returns a list of feature IDs in a specified assay.
 
         Args:
@@ -163,7 +163,7 @@ class CrReader(ABC):
         """
         return self._subset_by_assay(self._read_dataset("feature_ids"), assay)
 
-    def feature_names(self, assay: str = None) -> List[str]:
+    def feature_names(self, assay: str = None) -> list[str]:
         """Returns a list of features in the dataset.
 
         Args:
@@ -175,7 +175,7 @@ class CrReader(ABC):
             vals = self._read_dataset("feature_ids")
         return self._subset_by_assay(vals, assay)
 
-    def feature_types(self) -> List[str]:
+    def feature_types(self) -> list[str]:
         """Returns a list of feature types in the dataset."""
         if self.grpNames["feature_types"] is not None:
             ret_val = self._read_dataset("feature_types")
@@ -184,7 +184,7 @@ class CrReader(ABC):
         default_name = list(self.autoNames.keys())[0]
         return [default_name for _ in range(self.nFeatures)]
 
-    def cell_names(self) -> List[str]:
+    def cell_names(self) -> list[str]:
         """Returns a list of names of the cells in the dataset."""
         return self._read_dataset("cell_names")
 
@@ -261,10 +261,10 @@ class CrH5Reader(CrReader):
         assert len(indptr) == (s + len(idx))
         return np.where(np.hstack(valid_idx))[0]
 
-    def _read_dataset(self, key: Optional[str] = None):
+    def _read_dataset(self, key: str | None = None):
         return [x.decode("UTF-8") for x in self.grp[self.grpNames[key]][:]]
 
-    def cell_names(self) -> List[str]:
+    def cell_names(self) -> list[str]:
         """Returns a list of names of the cells in the dataset."""
         vals = np.array(self._read_dataset("cell_names"))
         if self.validBarcodeIdx is not None:
@@ -377,7 +377,7 @@ class CrDirReader(CrReader):
             "cell_names": (cell_fn, 0),
         }
 
-    def _read_dataset(self, key: Optional[str] = None):
+    def _read_dataset(self, key: str | None = None):
         try:
             vals = [
                 x.split("\t")[self.grpNames[key][1]]
@@ -415,18 +415,17 @@ class CrDirReader(CrReader):
             )
         return header
 
-    def process_batch(self, dfs: List[pd.DataFrame], filtering_cutoff: int) -> np.array:
+    def process_batch(self, dfs: list[pd.DataFrame], filtering_cutoff: int) -> np.array:
         """Returns a list of valid barcodes after filtering out background barcodes for a given batch.
 
         Args:
             dfs: A Polar DataFrame containing a chunk of data from the MTX file.
             filtering_cutoff: The cutoff value for filtering out background barcodes
         """
-        pl_dfs = [pl.DataFrame(df) for df in dfs]
-        pl_dfs = pl.concat(pl_dfs)
-        dfs_ = pl_dfs.group_by("barcode").agg(pl.sum("count"))
-        dfs_ = dfs_.filter(pl.col("count") > filtering_cutoff)
-        return np.sort(dfs_["barcode"])
+        merged = pd.concat(dfs, ignore_index=True)
+        summed = merged.groupby("barcode")["count"].sum()
+        valid = summed[summed > filtering_cutoff].index.to_numpy()
+        return np.sort(valid)
 
     def _get_valid_barcodes(
         self,
@@ -517,22 +516,22 @@ class CrDirReader(CrReader):
             dtype=dtype,
         )
 
-    def cell_names(self) -> List[str]:
+    def cell_names(self) -> list[str]:
         """Returns a list of names of the cells in the dataset."""
         vals = np.array(self._read_dataset("cell_names"))
         if self.validBarcodeIdx is not None:
             vals = vals[(self.validBarcodeIdx + self.indexOffset)]
         return list(vals)
 
-    def rename_batches(self, collect: List[pd.DataFrame]) -> List:
-        collect = [pl.DataFrame(df) for df in collect]
-        df = pl.concat(collect)
-        barcodes = np.array(df["barcode"])
+    def rename_batches(self, collect: list[pd.DataFrame]) -> list:
+        df = pd.concat(collect, ignore_index=True)
+        barcodes = df["barcode"].to_numpy()
         count_hash = {}
         for i, x in enumerate(np.unique(barcodes)):
             count_hash[x] = i
         cell_idx = np.array([count_hash[x] for x in barcodes])
-        df = df.with_columns([pl.Series("barcode", cell_idx)])
+        df = df.copy()
+        df["barcode"] = cell_idx
         return np.array(df)
 
     # noinspection DuplicatedCode
@@ -779,7 +778,7 @@ class H5adReader:
         return self.feat_ids()
 
     def _replace_category_values(
-        self, v: Union[np.ndarray, h5py.Group, h5py.Dataset], key: str, group: str
+        self, v: np.ndarray | h5py.Group | h5py.Dataset, key: str, group: str
     ) -> np.ndarray:
         # check if v is a Group with codes + categories structure
         if isinstance(v, h5py.Group):
@@ -820,8 +819,8 @@ class H5adReader:
         return v
 
     def _get_col_data(
-        self, group: str, ignore_keys: List[str]
-    ) -> Generator[Tuple[str, np.ndarray], None, None]:
+        self, group: str, ignore_keys: list[str]
+    ) -> Generator[tuple[str, np.ndarray], None, None]:
         if self.groupCodes[group] == 1:
             for i in tqdmbar(
                 self.h5[group].dtype.names,
@@ -844,7 +843,7 @@ class H5adReader:
 
     def _get_obsm_data(
         self, group: str
-    ) -> Generator[Tuple[str, np.ndarray], None, None]:
+    ) -> Generator[tuple[str, np.ndarray], None, None]:
         if self.groupCodes[group] == 2:
             for i in tqdmbar(
                 self.h5[group].keys(), desc=f"Reading attributes from group {group}"
@@ -864,14 +863,14 @@ class H5adReader:
                 f"Reading of obsm failed because it either does not exist or is not in expected format"  # noqa: F541
             )
 
-    def get_cell_columns(self) -> Generator[Tuple[str, np.ndarray], None, None]:
+    def get_cell_columns(self) -> Generator[tuple[str, np.ndarray], None, None]:
         """Creates a Generator that yields the cell columns."""
         for i, j in self._get_col_data(self.cellAttrsKey, [self.cellIdsKey]):
             yield i, j
         for i, j in self._get_obsm_data(self.obsmAttrsKey):
             yield i, j
 
-    def get_feat_columns(self) -> Generator[Tuple[str, np.ndarray], None, None]:
+    def get_feat_columns(self) -> Generator[tuple[str, np.ndarray], None, None]:
         """Creates a Generator that yields the feature columns."""
         for i, j in self._get_col_data(
             self.featureAttrsKey, [self.featIdsKey, self.featNamesKey]
@@ -943,7 +942,7 @@ class NaboH5Reader:
                 raise KeyError(f"ERROR: Expected group: {i} is missing in the H5 file")
         return True
 
-    def cell_ids(self) -> List[str]:
+    def cell_ids(self) -> list[str]:
         """Returns a list of cell IDs."""
         return [x.decode("UTF-8") for x in self.h5["names"]["cells"][:]]
 
@@ -951,7 +950,7 @@ class NaboH5Reader:
         """Returns a list of feature IDs."""
         return np.array([f"feature_{x}" for x in range(self.nFeatures)])
 
-    def feat_names(self) -> List[str]:
+    def feat_names(self) -> list[str]:
         """Returns a list of feature names."""
         return [
             x.decode("UTF-8").rsplit("_", 1)[0] for x in self.h5["names"]["genes"][:]
@@ -1040,7 +1039,7 @@ class LoomReader:
             )
         return True
 
-    def cell_names(self) -> List[str]:
+    def cell_names(self) -> list[str]:
         """Returns a list of names of the cells in the dataset."""
         if self.cellAttrsKey not in self.h5:
             pass
@@ -1052,13 +1051,13 @@ class LoomReader:
             return self.h5[self.cellAttrsKey][self.cellNamesKey][:]
         return [f"cell_{x}" for x in range(self.nCells)]
 
-    def cell_ids(self) -> List[str]:
+    def cell_ids(self) -> list[str]:
         """Returns a list of cell IDs."""
         return self.cell_names()
 
     def _stream_attrs(
         self, key, ignore
-    ) -> Generator[Tuple[str, np.ndarray], None, None]:
+    ) -> Generator[tuple[str, np.ndarray], None, None]:
         if key in self.h5:
             for i in tqdmbar(self.h5[key].keys(), desc=f"Reading {key} attributes"):
                 if i in [ignore]:
@@ -1071,11 +1070,11 @@ class LoomReader:
                     for j in vals.dtype.names:
                         yield i + "_" + str(j), vals[j]
 
-    def get_cell_attrs(self) -> Generator[Tuple[str, np.ndarray], None, None]:
+    def get_cell_attrs(self) -> Generator[tuple[str, np.ndarray], None, None]:
         """Returns a Generator that yields the cells' attributes."""
         return self._stream_attrs(self.cellAttrsKey, [self.cellNamesKey])
 
-    def feature_names(self) -> List[str]:
+    def feature_names(self) -> list[str]:
         """Returns a list of feature names."""
         if self.featureAttrsKey not in self.h5:
             pass
@@ -1087,7 +1086,7 @@ class LoomReader:
             return self.h5[self.featureAttrsKey][self.featureNamesKey][:]
         return [f"feature_{x}" for x in range(self.nFeatures)]
 
-    def feature_ids(self) -> List[str]:
+    def feature_ids(self) -> list[str]:
         """Returns a list of feature IDs."""
         if self.featureAttrsKey not in self.h5:
             pass
@@ -1101,7 +1100,7 @@ class LoomReader:
             return self.h5[self.featureAttrsKey][self.featureIdsKey][:]
         return [f"feature_{x}" for x in range(self.nFeatures)]
 
-    def get_feature_attrs(self) -> Generator[Tuple[str, np.ndarray], None, None]:
+    def get_feature_attrs(self) -> Generator[tuple[str, np.ndarray], None, None]:
         """Returns a Generator that yields the features' attributes."""
         return self._stream_attrs(
             self.featureAttrsKey, [self.featureIdsKey, self.featureNamesKey]
@@ -1146,14 +1145,14 @@ class CSVReader:
         self,
         csv_fn: str,
         has_header: bool = True,
-        id_column: Optional[int] = None,
+        id_column: int | None = None,
         rows_are_cells: bool = True,
         sep: str = ",",
         skip_rows: int = 0,
-        skip_cols: Optional[List[str]] = None,
-        cell_data_cols: Optional[List[str]] = None,
+        skip_cols: list[str] | None = None,
+        cell_data_cols: list[str] | None = None,
         batch_size=10000,
-        pandas_kwargs: Optional[dict] = None,
+        pandas_kwargs: dict | None = None,
     ):
         self._fn = csv_fn
         if rows_are_cells is False:
@@ -1199,14 +1198,14 @@ class CSVReader:
 
     def _consistency_check(
         self,
-    ) -> Tuple[
+    ) -> tuple[
         int,
         int,
-        Optional[np.ndarray],
-        Optional[np.ndarray],
-        Optional[List[int]],
-        Optional[List[np.dtype]],
-        Optional[List[int]],
+        np.ndarray | None,
+        np.ndarray | None,
+        list[int] | None,
+        list[np.dtype] | None,
+        list[int] | None,
     ]:
         stream = self._get_streamer()
         n_cells = 0
@@ -1280,7 +1279,7 @@ class CSVReader:
         else:
             return self.featureIds
 
-    def consume(self) -> Generator[Tuple[np.ndarray, Optional[np.ndarray]], None, None]:
+    def consume(self) -> Generator[tuple[np.ndarray, np.ndarray | None], None, None]:
         """Returns a generator that yield chunks of data."""
         stream = self._get_streamer()
         if self.keepCols is None:

@@ -1,47 +1,42 @@
 import numpy as np
 
-from . import full_path, remove
 
-
-def test_crtozarr(crh5_reader):
+def test_crtozarr(crh5_reader, tmp_path):
     from ..writers import CrToZarr
 
-    fn = full_path("dummy_1K_pbmc_citeseq.zarr")
+    fn = str(tmp_path / "dummy_1K_pbmc_citeseq.zarr")
     writer = CrToZarr(crh5_reader, zarr_loc=fn)
     writer.dump()
-    remove(fn)
 
 
-def test_crtozarr_fromdir(crdir_reader):
+def test_crtozarr_fromdir(crdir_reader, tmp_path):
     from ..writers import CrToZarr
 
-    fn = full_path("1K_pbmc_citeseq_dir.zarr")
+    fn = str(tmp_path / "1K_pbmc_citeseq_dir.zarr")
     writer = CrToZarr(crdir_reader, zarr_loc=fn)
     writer.dump()
-    remove(fn)
 
 
-def test_h5adtozarr(h5ad_reader):
+def test_h5adtozarr(h5ad_reader, tmp_path):
     from ..writers import H5adToZarr
 
-    fn = full_path("bastidas.zarr")
+    fn = str(tmp_path / "bastidas.zarr")
     writer = H5adToZarr(h5ad_reader, zarr_loc=fn)
     writer.dump()
-    remove(fn)
 
 
-def test_loomtozarr(loom_reader):
+def test_loomtozarr(loom_reader, tmp_path):
     from ..writers import LoomToZarr
 
-    fn = full_path("sympathetic.zarr")
+    fn = str(tmp_path / "sympathetic.zarr")
     writer = LoomToZarr(loom_reader, zarr_loc=fn)
     writer.dump()
-    remove(fn)
 
 
-def test_sparsetozarr():
-    from ..writers import SparseToZarr
+def test_sparsetozarr(tmp_path):
     from scipy.sparse import csr_matrix
+
+    from ..writers import SparseToZarr
 
     cols = [1, 3, 8, 2, 3, 1, 2, 8, 9]
     rows = [0, 0, 0, 1, 1, 1, 2, 2, 2]
@@ -49,7 +44,7 @@ def test_sparsetozarr():
     mat = (data, (rows, cols))
     mat = csr_matrix(mat, shape=(3, 10))
 
-    fn = full_path("dummy_sparse.zarr")
+    fn = str(tmp_path / "dummy_sparse.zarr")
 
     writer = SparseToZarr(
         mat,
@@ -58,35 +53,58 @@ def test_sparsetozarr():
         feature_ids=[f"feat_{x}" for x in range(10)],
     )
     writer.dump()
-    remove(fn)
 
 
-def test_to_h5ad(datastore):
-    # TODO: Evaluate the resulting H5ad file
+def test_sparsetozarr_sharded_layout(tmp_path):
+    import zarr
+    from scipy.sparse import csr_matrix
+
+    from ..writers import SparseToZarr
+
+    n_cells, n_feats = 5000, 200
+    rng = np.random.default_rng(0)
+    rows = rng.integers(0, n_cells, size=50_000)
+    cols = rng.integers(0, n_feats, size=50_000)
+    data = np.ones(50_000, dtype=np.uint32)
+    mat = csr_matrix((data, (rows, cols)), shape=(n_cells, n_feats))
+    fn = str(tmp_path / "dummy_sparse_sharded.zarr")
+    writer = SparseToZarr(
+        mat,
+        zarr_loc=fn,
+        cell_ids=[f"cell_{x}" for x in range(n_cells)],
+        feature_ids=[f"feat_{x}" for x in range(n_feats)],
+    )
+    writer.dump()
+    store = zarr.open_group(fn, mode="r")
+    counts = store["RNA/counts"]
+    assert counts.shape == (n_cells, n_feats)
+    assert counts.metadata.shards is not None
+    assert int(counts[...].sum()) > 0
+
+
+def test_v2_fixture_read_only(datastore):
+    assert datastore.RNA.rawData.shape[0] > 0
+
+
+def test_to_h5ad(datastore, tmp_path):
     from ..writers import to_h5ad
 
-    fn = full_path("test_1K_pbmc_citeseq.h5ad")
+    fn = str(tmp_path / "test_1K_pbmc_citeseq.h5ad")
     to_h5ad(datastore.RNA, fn)
-    remove(fn)
 
 
-def test_to_mtx(datastore):
-    # TODO: Evaluate the resulting MTX directory
+def test_to_mtx(datastore, tmp_path):
     from ..writers import to_mtx
 
-    fn = full_path("test_1K_pbmc_citeseq_dir")
+    fn = str(tmp_path / "test_1K_pbmc_citeseq_dir")
     to_mtx(datastore.RNA, fn)
-    remove(fn)
 
 
-def test_zarr_subset(datastore):
-    # TODO: Evaluate the resulting subsetted file
-
+def test_zarr_subset(datastore, tmp_path):
     from ..writers import SubsetZarr
 
-    zarr_path = full_path("subset.zarr")
+    zarr_path = str(tmp_path / "subset.zarr")
     writer = SubsetZarr(
         zarr_loc=zarr_path, assays=[datastore.RNA], cell_idx=np.array([1, 10, 100, 500])
     )
     writer.dump()
-    remove(zarr_path)

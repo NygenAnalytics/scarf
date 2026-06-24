@@ -34,11 +34,9 @@ PyPI: https://pypi.org/project/scarf/
 
 import warnings
 
-from dask.array import PerformanceWarning
-from importlib_metadata import version
+from importlib.metadata import version
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-warnings.filterwarnings("ignore", category=PerformanceWarning)
 
 try:
     __version__ = version("scarf")

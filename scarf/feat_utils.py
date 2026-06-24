@@ -1,6 +1,5 @@
 """Utility functions for features."""
 
-from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -47,11 +46,11 @@ def fit_lowess(a, b, n_bins: int, lowess_frac: float) -> np.ndarray:
 
 def binned_sampling(
     values: pd.Series,
-    feature_list: List[str],
+    feature_list: list[str],
     ctrl_size: int,
     n_bins: int,
     rand_seed: int,
-) -> List[str]:
+) -> list[str]:
     """Score a set of genes [Satija15]_. The score is the average expression of
     a set of genes subtracted with the average expression of a reference set of
     genes. The reference set is randomly sampled from the `gene_pool` for each
@@ -119,7 +118,7 @@ def hto_demux(hto_counts: pd.DataFrame) -> pd.Series:
         kmeans.fit(df)
         return kmeans.labels_
 
-    def calc_cluster_avg_exp(df: pd.DataFrame) -> Tuple[pd.Series, pd.DataFrame]:
+    def calc_cluster_avg_exp(df: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
         df["cluster"] = calc_cluster_labels(df)
         return df["cluster"], df.groupby("cluster").mean()
 

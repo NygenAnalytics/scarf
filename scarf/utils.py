@@ -2,22 +2,19 @@
 
 - Methods:
     - clean_array: returns input array with nan and infinite values removed
-    - controlled_compute: performs computation with Dask
+    - controlled_compute: materializes a ChunkedArray into NumPy
     - rescale_array: performs edge trimming on values of the input vector
-    - show_progress: performs computation with Dask and shows progress bar
+    - show_progress: materializes a ChunkedArray and shows a progress bar
     - system_call: executes a command in the underlying operative system
     - rolling_window: applies rolling window mean over a vector
 """
 
 import sys
-from typing import List, Optional, TypeAlias, Union
 
 import numpy as np
 import zarr
-from dask.array.core import Array
 from loguru import logger
 from numba import jit
-from tqdm.dask import TqdmCallback
 
 __all__ = [
     "logger",
@@ -46,7 +43,7 @@ tqdm_params = {
     "colour": "#34abeb",
 }
 
-ZARRLOC: TypeAlias = Union[str, zarr.LRUStoreCache]
+type ZARRLOC = str
 
 
 def get_log_level():
@@ -87,7 +84,7 @@ def tqdmbar(*args, **kwargs):
         return tqdm(*args, **kwargs, **params)
 
 
-def set_verbosity(level: Optional[str] = None, filepath: Optional[str] = None):
+def set_verbosity(level: str | None = None, filepath: str | None = None):
     """Set verbosity level of Scarf's output. Setting value of level='CRITICAL'
     should silence all logs. Progress bars are automatically disabled for
     levels above 'INFO'.
@@ -154,65 +151,43 @@ def clean_array(x, fill_val: int = 0):
 
 
 def load_zarr(
-    zarr_loc: ZARRLOC, mode: str, synchronizer: Optional[zarr.ThreadSynchronizer] = None
+    zarr_loc: ZARRLOC, mode: str, synchronizer=None
 ) -> zarr.Group:
-    if synchronizer is None:
-        synchronizer = zarr.ThreadSynchronizer()
-    if isinstance(zarr_loc, str):
-        return zarr.open_group(zarr_loc, mode=mode, synchronizer=synchronizer)
-    else:
-        return zarr.group(zarr_loc, synchronizer=synchronizer)
+    if synchronizer is not None:
+        logger.debug("ThreadSynchronizer is ignored under Zarr v3")
+    return zarr.open_group(zarr_loc, mode=mode)
 
 
 def controlled_compute(arr, nthreads):
-    """Performs computation with Dask.
+    """Materializes a ChunkedArray, Block or deferred reduction into NumPy.
 
     Args:
-        arr:
+        arr: A ChunkedArray, Block, deferred reduction, or an already-evaluated
+             NumPy array.
         nthreads: number of threads to use for computation
 
     Returns:
-        Result of computation.
+        Result of computation as a NumPy array.
     """
-    import dask
-
-    try:
-        # Multiprocessing may be faster, but it throws exception if SemLock is not implemented.
-        # For example, multiprocessing won't work on AWS Lambda, in those scenarios we switch ThreadPoolExecutor
-        from multiprocessing.pool import ThreadPool
-
-        pool = ThreadPool(nthreads)
-    except Exception:
-        from concurrent.futures import ThreadPoolExecutor
-
-        pool = ThreadPoolExecutor(nthreads)
-
-    with dask.config.set(schedular="threads", pool=pool):  # type: ignore
-        res = arr.compute()
-    return res
+    if hasattr(arr, "compute"):
+        return arr.compute(nthreads)
+    return np.asarray(arr)
 
 
-def show_dask_progress(arr: Array, msg: Optional[str] = None, nthreads: int = 1):
-    """Performs computation with Dask and shows progress bar.
+def show_dask_progress(arr, msg: str | None = None, nthreads: int = 1):
+    """Materializes a ChunkedArray/reduction while showing a progress bar.
 
     Args:
-        arr: A Dask array
+        arr: A ChunkedArray, Block or deferred reduction.
         msg: message to log, default None
         nthreads: number of threads to use for computation, default 1
 
     Returns:
-        Result of computation.
+        Result of computation as a NumPy array.
     """
-
-    params = dict(tqdm_params)
-    if "disable" not in params:
-        if get_log_level() <= 20:
-            params["disable"] = False
-        else:
-            params["disable"] = True
-    with TqdmCallback(desc=msg, **params):
-        res = controlled_compute(arr, nthreads)
-    return res
+    if hasattr(arr, "compute"):
+        return arr.compute(nthreads, msg)
+    return np.asarray(arr)
 
 
 def system_call(command):
@@ -252,7 +227,7 @@ def rolling_window(a, w):
     return b
 
 
-def permute_into_chunks(size: int, chunk_size: int, seed: int = 42) -> List[np.ndarray]:
+def permute_into_chunks(size: int, chunk_size: int, seed: int = 42) -> list[np.ndarray]:
     """
     Permute the chunks of an array of the given size.
     Args:

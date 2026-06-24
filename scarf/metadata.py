@@ -2,18 +2,18 @@
 and features."""
 
 import re
-from typing import List, Iterable, Any, Dict, Tuple, Optional, Union
+from typing import Any
+from collections.abc import Iterable
 
 import numpy as np
 import pandas as pd
-import polars as pl
-from zarr import hierarchy as z_hierarchy
+import zarr
 
 from .feat_utils import fit_lowess
 from .utils import logger
 from .writers import create_zarr_obj_array
 
-zarrGroup = z_hierarchy.Group
+zarrGroup = zarr.Group
 
 __all__ = ["MetaData"]
 
@@ -49,7 +49,7 @@ class MetaData:
         Args:
             zgrp: Zarr hierarchy object wherein metadata arrays are saved.
         """
-        self.locations: Dict[str, zarrGroup] = {"primary": zgrp}
+        self.locations: dict[str, zarrGroup] = {"primary": zgrp}
         self.N = self._get_size(self.locations["primary"], strict_mode=True)
         self.index = np.array(range(self.N))
 
@@ -96,14 +96,14 @@ class MetaData:
             return f"{loc}_{col}"
         return col
 
-    def _column_map(self) -> Dict[str, Union[str, Tuple[str, str]]]:
+    def _column_map(self) -> dict[str, str | tuple[str, str]]:
         """
 
         Returns:
 
         """
         reserved_cols = ["I", "ids", "names"]
-        col_map: Dict[str, Union[str, Tuple[str, str]]] = {
+        col_map: dict[str, str | tuple[str, str]] = {
             x: "primary" for x in reserved_cols
         }
         for loc, zgrp in self.locations.items():
@@ -117,7 +117,7 @@ class MetaData:
                 col_map[j] = (loc, i)
         return col_map
 
-    def _get_loc(self, column: str) -> Tuple[str, str]:
+    def _get_loc(self, column: str) -> tuple[str, str]:
         """
 
         Args:
@@ -129,10 +129,13 @@ class MetaData:
         col_map = self._column_map()
         if column not in col_map:
             raise KeyError(f"{column} does not exist in the metadata columns.")
-        loc, col = col_map[column]
+        entry = col_map[column]
+        if entry == "primary":
+            return "primary", column
+        loc, col = entry
         return loc, col
 
-    def _get_array(self, column: str) -> z_hierarchy.Array:
+    def _get_array(self, column: str) -> zarr.Array:
         """
 
         Args:
@@ -214,7 +217,7 @@ class MetaData:
         self.locations.pop(identifier)
 
     @property
-    def columns(self) -> List[str]:
+    def columns(self) -> list[str]:
         """
 
         Returns:
@@ -337,7 +340,7 @@ class MetaData:
                 return a
 
     def get_index_by(
-        self, value_targets: List[Any], column: str, key: Optional[str] = None
+        self, value_targets: list[Any], column: str, key: str | None = None
     ) -> np.ndarray:
         """
 
@@ -395,7 +398,7 @@ class MetaData:
     def insert(
         self,
         column_name: str,
-        values: Union[np.ndarray, List],
+        values: np.ndarray | list,
         fill_value: Any = np.nan,
         key: str = "I",
         overwrite: bool = False,
@@ -506,7 +509,7 @@ class MetaData:
 
     def multi_sift(
         self,
-        columns: List[str],
+        columns: list[str],
         lows: Iterable,
         highs: Iterable,
         keep_bounds: bool = False,
@@ -545,7 +548,7 @@ class MetaData:
         return df
 
     def to_pandas_dataframe(
-        self, columns: List[str], key: Optional[str] = None
+        self, columns: list[str], key: str | None = None
     ) -> pd.DataFrame:
         """Returns the requested columns as a Pandas dataframe, sorted on
         key."""
@@ -555,18 +558,7 @@ class MetaData:
             df = df.reindex(self.active_index(key))
         return df
 
-    def to_polars_dataframe(
-        self, columns: List[str], key: Optional[str] = None
-    ) -> pl.DataFrame:  
-        """Returns the requested columns as a Polars DataFrame, sorted on
-        key."""
-        valid_cols = self.columns
-        df = pl.DataFrame({x: self.fetch_all(x) for x in columns if x in valid_cols})
-        if key is not None:
-            df = df[self.active_index(key)]
-        return df
-
-    def grep(self, pattern: str, only_valid=False) -> List[str]:
+    def grep(self, pattern: str, only_valid=False) -> list[str]:
         """
 
         Args:

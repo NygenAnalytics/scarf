@@ -1,10 +1,9 @@
-from typing import Optional
 
-import dask.array as da
 import numpy as np
 import pandas as pd
 from threadpoolctl import threadpool_limits
 
+from .chunked import ChunkedArray
 from .harmony import run_harmony
 from .utils import controlled_compute, logger, tqdmbar
 
@@ -77,8 +76,8 @@ class AnnStream:
         lsi_skip_first: bool,
         lsi_params: dict,
         harmonize: bool,
-        harmonized_data: Optional[da.Array] = None,
-        batches: Optional[pd.DataFrame] = None,
+        harmonized_data: ChunkedArray | None = None,
+        batches: pd.DataFrame | None = None,
     ):
         self.data = data
         self.k = k
@@ -310,9 +309,10 @@ class AnnStream:
         )
         if self.harmonize:
             if self.harmonizedData is None:
-                self.harmonizedData = da.from_array(
+                self.harmonizedData = ChunkedArray.from_numpy(
                     run_harmony(_transform_values(), self.batches).T,
-                    chunks=self.data.chunksize,
+                    block_size=self.data.chunksize[0],
+                    nthreads=self.nthreads,
                 )
             for i in tqdmbar(
                 self.harmonizedData.blocks,
