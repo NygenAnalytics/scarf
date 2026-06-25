@@ -160,12 +160,14 @@ def finalize_writer_counts(
     assay_name: str,
     workspace: str | None = None,
 ) -> zarr.Array:
+    """Repack count arrays to sharded layout after writing completes."""
     return finalize_sharded_counts(store, assay_name, workspace)
 
 
 def load_count_store(
     z: zarr.Group, assay_name: str, workspace: str | None
 ) -> zarr.Array:
+    """Return the counts Zarr array for an assay in the given workspace."""
     if workspace is None:
         return z[f"{assay_name}/counts"]  # type: ignore
     else:
@@ -175,6 +177,7 @@ def load_count_store(
 def create_cell_data(
     z: zarr.Group, workspace: str | None, ids: np.ndarray, names: np.ndarray
 ) -> zarr.Group:
+    """Create the cellData group with ids, names, and default ``I`` filter column."""
     if workspace is None:
         g = z.create_group("cellData")
     else:
@@ -186,6 +189,11 @@ def create_cell_data(
 
 
 def sparse_writer(store: zarr.Array, data_stream, n_cells: int, batch_size: int) -> int:
+    """Write CSR batches into a Zarr count array row-wise.
+
+    Returns:
+        Number of rows written.
+    """
     (
         s,
         e,
@@ -396,10 +404,13 @@ class H5adToZarr:
                 create_zarr_obj_array(g, i, j, j.dtype)
 
     def dump(self, batch_size: int = 1000) -> None:
-        # TODO: add informed description to docstring
-        """
+        """Write h5ad matrix data into the Zarr counts array.
+
+        Args:
+            batch_size: Number of cells written per sparse_writer batch.
+
         Raises:
-            AssertionError: Catches eventual bugs in the class, if number of cells does not match after transformation.
+            AssertionError: If written cell count does not match expected nCells.
 
         Returns:
             None
@@ -480,10 +491,13 @@ class NaboH5ToZarr:
         )
 
     def dump(self, batch_size: int = 500) -> None:
-        # TODO: add informed description to docstring
-        """
+        """Write Nabo H5 matrix data into the Zarr counts array.
+
+        Args:
+            batch_size: Number of cells written per batch.
+
         Raises:
-            AssertionError: Catches eventual bugs in the class, if number of cells does not match after transformation.
+            AssertionError: If written cell count does not match expected nCells.
 
         Returns:
             None
@@ -583,10 +597,13 @@ class LoomToZarr:
             create_zarr_obj_array(g, i, j, j.dtype)
 
     def dump(self, batch_size: int = 1000) -> None:
-        # TODO: add informed description to docstring
-        """
+        """Write Loom matrix data into the Zarr counts array.
+
+        Args:
+            batch_size: Number of cells written per sparse_writer batch.
+
         Raises:
-            AssertionError: Catches eventual bugs in the class, if number of cells does not match after transformation.
+            AssertionError: If written cell count does not match expected nCells.
 
         Returns:
             None
@@ -858,9 +875,9 @@ def subset_assay_zarr(
         zarr_loc: The file name for the Zarr hierarchy.
         in_grp: Group in Zarr hierarchy to subset.
         out_grp: Group name in Zarr hierarchy to write subsetted assay to.
-        cells_idx: A list of cell indices to (keep | drop ?).
-        feat_idx: A list of feature indices to (keep | drop ?).
-        chunk_size: The requested size of chunks to load into memory and process.
+        cells_idx: Indices of cells to keep in the subset.
+        feat_idx: Indices of features to keep in the subset.
+        chunk_size: Chunk size for the output Zarr array.
 
     Returns:
         None
@@ -882,12 +899,12 @@ def dask_to_zarr(df, z, loc, chunk_size, nthreads: int, msg: str | None = None):
     """Creates a Zarr hierarchy from a chunked array.
 
     Args:
-        df (): A ChunkedArray.
-        z (): Zarr hierarchy.
-        loc (): Location to write data/Zarr hierarchy to.
-        chunk_size (): Size of chunks to load into memory and process.
-        nthreads (int): Number of threads to use.
-        msg (str): Message to use with progress bar (Default: f"Writing data to {loc}").
+        df: ChunkedArray to materialize and write.
+        z: Root Zarr group.
+        loc: Array path within the group.
+        chunk_size: Zarr chunk shape for the output array.
+        nthreads: Threads for block compute.
+        msg: Progress bar message (default: ``Writing data to {loc}``).
     """
     if msg is None:
         msg = f"Writing data to {loc}"
@@ -906,14 +923,16 @@ class SubsetZarr:
     Args:
         zarr_loc: Path for the output (subsetted) Zarr file
         assays: Source assays to be subsetted. These assays must be from the same dataset
+        in_workspace: Source workspace name (None for legacy layout).
+        out_workspace: Target workspace name in the output Zarr file.
         cell_key: Name of a boolean column in cell metadata. The cells with value True are included in the
                   subset. Only used when cell_idx is None.
-        cell_idx: Indices of the cells to be included in the subsetted.
+        cell_idx: Explicit indices of cells to include in the subset.
         reset_cell_filter: If True, then the cell filtering information is removed, i.e. even the filtered out cells
                            are set as True as in the 'I' column. To keep the filtering information set the value for
                            this parameter to False. (Default value: True)
         overwrite_existing_file: If True, then overwrites the existing data. (Default value: False)
-        overwrite_cell_data: If True, then overwrites cell data (Default value: True)
+        overwrite_cell_data: If True, then overwrites cell data (Default value: False)
     """
 
     def __init__(

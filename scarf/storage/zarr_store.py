@@ -21,6 +21,8 @@ PROFILE_METADATA_CHUNK = 100_000
 
 @dataclass
 class ZarrArraySpec:
+    """Specification for creating a numeric Zarr array."""
+
     shape: tuple[int, ...]
     chunks: tuple[int, ...]
     dtype: Any
@@ -32,6 +34,7 @@ class ZarrArraySpec:
 
 
 def get_compressors(profile: StorageProfile = "fast_local", zarrFormat: int = 3) -> list:
+    """Return codec list for the given storage profile and Zarr format."""
     if zarrFormat == 2:
         from numcodecs import Blosc
 
@@ -49,6 +52,7 @@ def _group_zarr_format(group: zarr.Group) -> int:
 
 
 def zarr_root_path(group: zarr.Group) -> str | None:
+    """Return filesystem path for a Zarr group, if available."""
     store = group.store
     root = getattr(store, "root", None)
     if root is not None:
@@ -60,6 +64,7 @@ def zarr_root_path(group: zarr.Group) -> str | None:
 
 
 def normalize_chunks(chunks: tuple[int, ...] | int, shape: tuple[int, ...]) -> tuple[int, ...]:
+    """Map chunk specification to a valid per-dimension chunk tuple for ``shape``."""
     if isinstance(chunks, int):
         chunks = (chunks,)
     if len(chunks) == len(shape):
@@ -78,11 +83,13 @@ _activeProfile: StorageProfile | None = None
 
 
 def set_storage_profile(profile: StorageProfile | None) -> None:
+    """Override the active Zarr storage profile for this process."""
     global _activeProfile
     _activeProfile = profile
 
 
 def get_storage_profile() -> StorageProfile:
+    """Return active profile from override or ``SCARF_ZARR_PROFILE`` env var."""
     if _activeProfile is not None:
         return _activeProfile
     envProfile = os.environ.get("SCARF_ZARR_PROFILE", "fast_local")
@@ -98,6 +105,7 @@ def count_array_spec(
     profile: StorageProfile | None = None,
     sharded: bool = False,
 ) -> ZarrArraySpec:
+    """Build array spec for assay count matrices."""
     profile = profile or get_storage_profile()
     chunks = PROFILE_COUNT_CHUNKS[profile]
     shards = PROFILE_COUNT_SHARDS[profile] if sharded else None
@@ -116,6 +124,7 @@ def metadata_array_spec(
     dtype: Any,
     profile: StorageProfile | None = None,
 ) -> ZarrArraySpec:
+    """Build array spec for 1D metadata columns."""
     chunkSize = min(PROFILE_METADATA_CHUNK, max(length, 1))
     return ZarrArraySpec(
         shape=(length,),
@@ -126,6 +135,7 @@ def metadata_array_spec(
 
 
 def open_store(path: str, mode: str = "r") -> zarr.Group:
+    """Open a Zarr group at ``path``."""
     return zarr.open_group(path, mode=mode)
 
 
@@ -134,6 +144,7 @@ def create_numeric_array(
     name: str,
     spec: ZarrArraySpec,
 ) -> zarr.Array:
+    """Create a numeric Zarr array from a ``ZarrArraySpec``."""
     zarrFormat = spec.zarrFormat if spec.zarrFormat != 3 else _group_zarr_format(group)
     chunks = normalize_chunks(spec.chunks, spec.shape)
     kwargs: dict[str, Any] = {
@@ -151,6 +162,7 @@ def create_numeric_array(
 
 
 def dtype_fix(dtype, data: np.ndarray):
+    """Infer or adjust dtype for metadata arrays from sample values."""
     if dtype is None or dtype == object:
         return "U" + str(max([len(str(x)) for x in data]))
     if np.issubdtype(data.dtype, np.dtype("S")):
@@ -172,6 +184,7 @@ def create_metadata_column(
     shape: int | None = None,
     profile: StorageProfile | None = None,
 ) -> zarr.Array:
+    """Create a 1D metadata column, optionally from provided data."""
     if chunkSize is None or chunkSize is False:
         chunks: tuple[int, ...] | bool = False
     else:
@@ -218,6 +231,7 @@ def repack_to_sharded(
     profile: StorageProfile | None = None,
     overwrite: bool = True,
 ) -> zarr.Array:
+    """Copy ``srcArray`` into a new sharded array in ``dstGroup``."""
     chunks = chunks or tuple(srcArray.chunks)
     spec = ZarrArraySpec(
         shape=srcArray.shape,
@@ -246,6 +260,7 @@ def finalize_sharded_counts(
     workspace: str | None = None,
     profile: StorageProfile | None = None,
 ) -> zarr.Array:
+    """Repack assay counts to sharded layout when not already sharded."""
     profile = profile or get_storage_profile()
     if workspace is None:
         countsPath = f"{assayName}/counts"
@@ -312,6 +327,7 @@ def finalize_sharded_counts(
 
 
 def array_info(array: zarr.Array) -> str:
+    """Return a short summary string for a Zarr array."""
     metadata = array.metadata
     parts = [f"shape={array.shape}", f"dtype={array.dtype}", f"chunks={array.chunks}"]
     if metadata.shards is not None:

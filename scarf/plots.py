@@ -187,7 +187,16 @@ custom_palettes = {
 
 
 def clean_axis(ax, ts=11, ga=0.4):
-    """Cleans a given matplotlib axis."""
+    """Clean matplotlib axis spines and add a light grid.
+
+    Args:
+        ax: Matplotlib axis.
+        ts: Tick label font size.
+        ga: Grid line alpha.
+
+    Returns:
+        True
+    """
     ax.xaxis.set_tick_params(labelsize=ts)
     ax.yaxis.set_tick_params(labelsize=ts)
     for i in ["top", "bottom", "left", "right"]:
@@ -199,7 +208,11 @@ def clean_axis(ax, ts=11, ga=0.4):
 
 
 def plot_graph_qc(g):
-    # TODO: add docstring description. Is this for qc of a graph, or for plotting a qc plot of a graph?
+    """Plot KNN graph QC: node degree distribution and edge weight histogram.
+
+    Args:
+        g: Sparse adjacency matrix (CSR or COO) for the KNN graph.
+    """
     _, axis = plt.subplots(1, 2, figsize=(12, 4))
     ax = axis[0]
     x = np.array((g != 0).sum(axis=0))[0]
@@ -240,7 +253,22 @@ def plot_qc(
     show_on_single_row: bool = True,
     show_fig: bool = True,
 ):
-    # TODO: add docstring description. Is this for qc of a plot, or for plotting a qc plot?
+    """Plot per-metric QC violin plots grouped by ``groups`` column.
+
+    Args:
+        data: DataFrame with a ``groups`` column and numeric metric columns.
+        color: Violin fill when a single group is shown.
+        cmap: Colormap when multiple groups are shown.
+        fig_size: Figure size tuple (auto if None).
+        label_size: Axis label font size.
+        title_size: Subplot title font size.
+        sup_title: Figure suptitle.
+        sup_title_size: Suptitle font size.
+        scatter_size: Unused (kept for API compatibility).
+        max_points: Unused (kept for API compatibility).
+        show_on_single_row: Lay out metrics in one row vs one column.
+        show_fig: Call ``plt.show()`` when True; otherwise return the figure.
+    """
     n_plots = data.shape[1] - 1
     n_groups = data["groups"].nunique()
     if n_groups > 5 and show_on_single_row is True:
@@ -348,7 +376,18 @@ def plot_mean_var(
     ss: tuple[float, float] = (3, 30),
     cmaps: tuple[str, str] = ("winter", "magma_r"),
 ):
-    """Shows a mean-variance plot."""
+    """Show a mean-variance scatter plot with HVGs highlighted.
+
+    Args:
+        nzm: Non-zero mean expression per feature.
+        fv: Variance (or corrected variance) per feature.
+        n_cells: Number of cells expressing each feature (for coloring).
+        hvg: Boolean mask of highly variable features.
+        ax_label_fs: Axis label font size.
+        fig_size: Figure size.
+        ss: Scatter sizes for non-HVG and HVG points.
+        cmaps: Colormaps for non-HVG and HVG points.
+    """
     _, ax = plt.subplots(1, 1, figsize=fig_size)
     nzm = np.log2(nzm)
     fv = np.log2(fv)
@@ -371,6 +410,12 @@ def plot_mean_var(
 
 
 def plot_elbow(var_exp, figsize: tuple[float, float] = (None, 2)):
+    """Plot PCA variance explained with an automatic elbow marker.
+
+    Args:
+        var_exp: Percent variance explained per component.
+        figsize: Figure size; width auto-scales with component count if None.
+    """
     from kneed import KneeLocator
 
     x = range(len(var_exp))
@@ -401,7 +446,20 @@ def plot_heatmap(
     show_fig: bool = True,
     **heatmap_kwargs,
 ):
-    """Shows a heatmap plot."""
+    """Show a clustered heatmap of the input DataFrame.
+
+    Args:
+        cdf: Data to cluster and plot.
+        fontsize: Base font size for auto figsize.
+        width_factor: Width scaling per column.
+        height_factor: Height scaling per row.
+        cmap: Colormap name or object.
+        savename: If set, save figure to this path.
+        save_dpi: DPI for saved figure.
+        figsize: Explicit figure size (auto if None).
+        show_fig: Show interactively when True.
+        **heatmap_kwargs: Extra kwargs passed to ``sns.clustermap``.
+    """
     if figsize is None:
         figsize = (
             cdf.shape[1] * fontsize * width_factor,
@@ -744,10 +802,47 @@ def plot_scatter(
     show_fig: bool = True,
     scatter_kwargs: dict = None,
 ):
-    """Shows scatter plots.
+    """Show one or more 2D scatter plots from annotation DataFrames.
 
-    If more then one dataframe is provided it will place the
-    scatterplots in a grid.
+    Each DataFrame must contain x, y, and value columns. When multiple
+    DataFrames are provided, plots are arranged in a grid.
+
+    Args:
+        dfs: List of DataFrames with columns [x, y, value].
+        in_ax: Existing axes array to draw into (optional).
+        width: Subplot width in inches.
+        height: Subplot height in inches.
+        default_color: Color for continuous values without a colormap.
+        color_map: Matplotlib colormap name or object.
+        color_key: Dict mapping category values to colors.
+        mask_values: Values to render with ``mask_color``.
+        mask_name: Label for masked values in legend.
+        mask_color: Color for masked points.
+        point_size: Scatter marker size.
+        ax_label_size: Axis label font size.
+        frame_offset: Axis limit padding fraction.
+        spine_width: Spine line width.
+        spine_color: Spine color.
+        displayed_sides: Tuple of spines to show.
+        legend_ondata: Draw category labels on data points.
+        legend_onside: Draw legend table beside the plot.
+        legend_size: Legend font size.
+        legends_per_col: Max legend entries per column.
+        titles: Subplot title or list of titles.
+        title_size: Title font size.
+        hide_title: Suppress titles when True.
+        cbar_shrink: Colorbar shrink factor.
+        marker_scale: Scale for on-data legend markers.
+        lspacing: Legend label spacing.
+        cspacing: Legend column spacing.
+        savename: Save path (optional).
+        dpi: Save DPI.
+        force_ints_as_cats: Treat integer columns as categorical.
+        n_columns: Grid columns when plotting multiple panels.
+        w_pad: Width padding between subplots.
+        h_pad: Height padding between subplots.
+        show_fig: Show interactively when True.
+        scatter_kwargs: Extra kwargs passed to ``ax.scatter`` (not ``c`` or ``s``).
     """
     from matplotlib.colors import to_hex
 
@@ -864,10 +959,44 @@ def shade_scatter(
     h_pad: float = None,
     show_fig: bool = True,
 ):
-    """Shows shaded scatter plots.
+    """Show datashader-density scatter plots for large cell embeddings.
 
-    If more then one dataframe is provided it will place the
-    scatterplots in a grid.
+    Args:
+        dfs: List of DataFrames with columns [x, y, value].
+        in_ax: Existing axes to draw into.
+        figsize: Subplot width and height in inches.
+        pixels: Canvas resolution for datashader aggregation.
+        spread_px: Pixel spread for categorical shading.
+        spread_threshold: Minimum fraction of pixels to apply spread.
+        min_alpha: Minimum alpha for rendered pixels.
+        color_map: Colormap for continuous values.
+        color_key: Dict mapping categories to colors.
+        mask_values: Values to treat as masked.
+        mask_name: Label for masked category.
+        mask_color: Color for masked values.
+        ax_label_size: Axis label font size.
+        frame_offset: Axis limit padding.
+        spine_width: Spine line width.
+        spine_color: Spine color.
+        displayed_sides: Visible spines.
+        legend_ondata: Draw labels on data.
+        legend_onside: Draw side legend table.
+        legend_size: Legend font size.
+        legends_per_col: Legend entries per column.
+        titles: Subplot title(s).
+        title_size: Title font size.
+        hide_title: Suppress titles.
+        cbar_shrink: Colorbar shrink factor.
+        marker_scale: On-data legend marker scale.
+        lspacing: Legend label spacing.
+        cspacing: Legend column spacing.
+        savename: Save path (optional).
+        dpi: Save DPI.
+        force_ints_as_cats: Treat integers as categorical.
+        n_columns: Grid columns for multiple panels.
+        w_pad: Width padding between subplots.
+        h_pad: Height padding between subplots.
+        show_fig: Show interactively when True.
     """
     import datashader as dsh
     from datashader.mpl_ext import dsshow
@@ -1136,11 +1265,38 @@ def plot_cluster_hierarchy(
     savename: str = None,
     save_dpi=300,
 ):
-    """Shows a plot showing cluster hierarchy.
+    """Plot a cluster hierarchy tree with colored leaf nodes.
+
+    Args:
+        sg: NetworkX graph of the cluster hierarchy.
+        clusts: Cluster id per leaf cell.
+        color_values: Values for leaf coloring (default: cluster ids).
+        force_ints_as_cats: Treat integer color values as categorical.
+        width: Horizontal layout width for hierarchy positioning.
+        lvr_factor: Blend between leaf-only and root-based layout (0-1).
+        vert_gap: Vertical gap between hierarchy levels.
+        min_node_size: Minimum node marker size.
+        node_size_multiplier: Scale factor for node sizes.
+        node_power: Exponent applied to node leaf counts for sizing.
+        root_size: Marker size for root node.
+        non_leaf_size: Marker size for internal nodes.
+        show_labels: Draw cluster labels on internal nodes.
+        fontsize: Label font size.
+        root_color: Root node color.
+        non_leaf_color: Internal node color.
+        cmap: Colormap for continuous color values.
+        color_key: Dict mapping categories to colors.
+        edgecolors: Node edge color.
+        edgewidth: Node edge width.
+        alpha: Node alpha.
+        figsize: Figure size when ``ax`` is None.
+        ax: Existing axis to draw into.
+        show_fig: Show interactively when True.
+        savename: Save path (optional).
+        save_dpi: Save DPI.
 
     Returns:
-        If requested (with parameter `show_fig`) a matplotlib Axes object containing the plot
-        (which is the modified `ax` parameter if given).
+        Matplotlib Axes when ``show_fig`` is False.
     """
     import networkx as nx
     import math
@@ -1264,6 +1420,28 @@ def plot_annotated_heatmap(
     save_dpi: int = 300,
     show_fig: bool = True,
 ):
+    """Plot a heatmap with pseudotime and cluster annotation bars.
+
+    Args:
+        df: 2D expression matrix (features x ordering bins).
+        xbar_values: Values for the bottom pseudotime bar.
+        ybar_values: Values for the right cluster color bar.
+        display_row_labels: Subset of row labels to show on the heatmap.
+        row_labels: Labels for all rows (default: index strings).
+        width: Figure width in inches.
+        height: Figure height in inches.
+        vmin: Heatmap color scale minimum.
+        vmax: Heatmap color scale maximum.
+        heatmap_cmap: Colormap for the main heatmap.
+        xbar_cmap: Colormap for the pseudotime bar.
+        ybar_cmap: Colormap for the cluster bar.
+        tick_fontsize: Colorbar tick font size.
+        axis_fontsize: Title font size.
+        row_label_fontsize: Row label font size.
+        savename: Save path (optional).
+        save_dpi: Save DPI.
+        show_fig: Show interactively when True.
+    """
     import matplotlib.ticker as mticker
 
     if display_row_labels is None:

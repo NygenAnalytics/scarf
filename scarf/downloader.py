@@ -24,22 +24,15 @@ __all__ = ["show_available_datasets", "fetch_dataset"]
 
 
 class OSFdownloader:
-    """
-    A class for downloading datasets from OSF.
+    """Download datasets from an OSF project via the OSF API.
 
     Attributes:
-        projectId:
-        storages:
-        url:
-        datasets:
-        sourceFile:
-        sources:
-
-    Methods:
-        get_json:
-        get_all_pages:
-        show_datasets:
-        get_dataset_file_ids:
+        projectId: OSF node identifier.
+        storages: Storage providers to search.
+        url: OSF files API endpoint.
+        datasets: Parsed dataset metadata table.
+        sourceFile: Raw OSF file listing JSON.
+        sources: Mapping of dataset names to download URLs.
     """
 
     def __init__(self, project_id):

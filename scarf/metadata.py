@@ -514,17 +514,7 @@ class MetaData:
         highs: Iterable,
         keep_bounds: bool = False,
     ) -> np.ndarray:
-        """
-
-        Args:
-            columns:
-            lows:
-            highs:
-            keep_bounds:
-
-        Returns:
-
-        """
+        """Return boolean mask where all column filters are satisfied."""
         ret_val = _all_true(
             np.array(
                 [
@@ -536,22 +526,22 @@ class MetaData:
         return ret_val
 
     def head(self, n: int = 5) -> pd.DataFrame:
-        """
-
-        Args:
-            n:
-
-        Returns:
-
-        """
+        """Return first ``n`` rows of all metadata columns as a DataFrame."""
         df = pd.DataFrame({x: self.fetch_all(x)[:n] for x in self.columns})
         return df
 
     def to_pandas_dataframe(
         self, columns: list[str], key: str | None = None
     ) -> pd.DataFrame:
-        """Returns the requested columns as a Pandas dataframe, sorted on
-        key."""
+        """Return requested columns as a DataFrame, optionally filtered by ``key``.
+
+        Args:
+            columns: Metadata column names to include.
+            key: If set, restrict rows to those active for this boolean key.
+
+        Returns:
+            Pandas DataFrame of the selected columns.
+        """
         valid_cols = self.columns
         df = pd.DataFrame({x: self.fetch_all(x) for x in columns if x in valid_cols})
         if key is not None:
@@ -559,14 +549,14 @@ class MetaData:
         return df
 
     def grep(self, pattern: str, only_valid=False) -> list[str]:
-        """
+        """Return feature names matching a regex pattern (case insensitive).
 
         Args:
-            pattern:
-            only_valid:
+            pattern: Regular expression matched against ``names`` column.
+            only_valid: Restrict to features active in ``I``.
 
         Returns:
-
+            Sorted list of matching names.
         """
         names = np.array(list(map(str.upper, self.fetch_all("names"))))
         if only_valid:
@@ -583,17 +573,17 @@ class MetaData:
         lowess_frac: float = 0.1,
         fill_value: float = 0,
     ) -> np.ndarray:
-        """
+        """Remove a LOWESS trend of column ``y`` with respect to column ``x``.
 
         Args:
-            x:
-            y:
-            n_bins:
-            lowess_frac:
-            fill_value:
+            x: Column name for the independent variable.
+            y: Column name for the dependent variable.
+            n_bins: Bins for LOWESS fitting.
+            lowess_frac: LOWESS smoothing fraction.
+            fill_value: Value returned where trend cannot be estimated.
 
         Returns:
-
+            Residual values of ``y`` after trend removal.
         """
         a = self.fetch(x).astype(float)
         b = self.fetch(y).astype(float)

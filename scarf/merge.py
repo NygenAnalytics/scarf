@@ -63,6 +63,8 @@ class AssayMerge:
                `assays` parameter.
         merge_assay_name: Name of assay in the merged Zarr file. For example, for scRNA-Seq it could be simply,
                           'RNA'.
+        in_workspaces: Source workspace per assay (None uses each assay's default layout).
+        out_workspace: Target workspace name in the merged Zarr file.
         chunk_size: Tuple of cell and feature chunk size. (Default value: (1000, 1000)).
         dtype: Dtype of the raw values in the assay. Dtype is automatically inferred from the provided assays. If
                assays have different dtypes then a float type is used.
@@ -72,7 +74,6 @@ class AssayMerge:
                            are set as True as in the 'I' column. To keep the filtering information set the value for
                            this parameter to False. (Default value: True)
         seed: Seed for randomization of rows in the assays.
-        feat_name_ids_same: If True, then feature names and feature ids are same in the assays. (Default value: False)
 
     Attributes:
         assays: List of assay objects to be merged. For example, [ds1.RNA, ds2.RNA].

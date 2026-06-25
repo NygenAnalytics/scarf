@@ -23,7 +23,27 @@ def run_harmony(
     random_state=0,
     cluster_fn="kmeans",
 ):
-    """Run Harmony."""
+    """Run Harmony batch correction on a PCA embedding.
+
+    Args:
+        data_mat: Embedding matrix, shape (n_dims, n_cells).
+        meta_data: Batch metadata DataFrame (one column per batch variable).
+        theta: Cluster diversity penalty per batch level (default: 1 per level).
+        lamb: Ridge penalty per batch level (default: 1 per level).
+        sigma: Kernel width(s) for soft k-means clustering.
+        nclust: Number of Harmony clusters (default: min(round(N/30), 100)).
+        tau: Protects small batches when > 0.
+        block_size: Fraction of cells per update block.
+        max_iter_harmony: Maximum Harmony iterations.
+        max_iter_kmeans: Maximum k-means iterations per round.
+        epsilon_cluster: Convergence threshold for clustering.
+        epsilon_harmony: Convergence threshold for Harmony.
+        random_state: Random seed.
+        cluster_fn: Clustering backend (``'kmeans'``).
+
+    Returns:
+        Batch-corrected embedding matrix, shape (n_dims, n_cells).
+    """
 
     N = data_mat.shape[1]
     if nclust is None:

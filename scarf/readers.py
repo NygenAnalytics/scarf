@@ -100,7 +100,15 @@ class CrReader(ABC):
 
     @abstractmethod
     def consume(self, batch_size: int, lines_in_mem: int):
-        """Returns a generator that yield chunks of data."""
+        """Yield CSR matrix chunks of cell rows.
+
+        Args:
+            batch_size: Number of cells per yielded chunk.
+            lines_in_mem: MTX lines buffered in memory (CrDirReader only).
+
+        Yields:
+            scipy.sparse.coo_matrix chunks.
+        """
         pass
 
     def _subset_by_assay(self, v, assay) -> list:
@@ -275,6 +283,12 @@ class CrH5Reader(CrReader):
     def consume(
         self, batch_size: int, lines_in_mem: int = None
     ) -> Generator[coo_matrix, None, None]:
+        """Yield CSR chunks from the Cell Ranger H5 matrix.
+
+        Args:
+            batch_size: Number of cells per chunk.
+            lines_in_mem: Unused; kept for CrReader API compatibility.
+        """
         indptr = self.grp["indptr"][:]
         for s in range(0, len(self.validBarcodeIdx), batch_size):
             v_pos = self.validBarcodeIdx[s : s + batch_size]

@@ -55,15 +55,15 @@ def _correlation_alignment(s, t, nthreads: int) -> ChunkedArray:
 
 
 def coral(source_data, target_data, assay, feat_key: str, cell_key: str, nthreads: int):
-    """Applies CORAL error correction to the input data.
+    """Apply CORAL batch correction and write corrected data to Zarr.
 
     Args:
-        source_data ():
-        target_data ():
-        assay ():
-        feat_key ():
-        cell_key ():
-        nthreads ():
+        source_data: Source ChunkedArray (reference modality).
+        target_data: Target ChunkedArray to align.
+        assay: Target Assay whose Zarr group receives corrected data.
+        feat_key: Feature selection key used in output path.
+        cell_key: Cell selection key used in output path.
+        nthreads: Threads for streaming statistics and writes.
     """
     from .writers import dask_to_zarr
     from .utils import clean_array
@@ -175,16 +175,18 @@ def align_features(
     """Aligns target features to source features.
 
     Args:
-        source_assay ():
-        target_assay ():
-        source_cell_key ():
-        source_feat_key ():
-        target_feat_key ():
-        filter_null ():
-        exclude_missing ():
-        nthreads ():
+        source_assay: Reference assay with features to align to.
+        target_assay: Target assay whose features are reordered and saved.
+        source_cell_key: Cell key for source normalization params.
+        source_feat_key: Feature key on the source assay.
+        target_feat_key: Feature key label for saved target data.
+        target_cell_key: Cell key on the target assay.
+        filter_null: Drop target features with zero counts in selected cells.
+        exclude_missing: Exclude source features absent from target.
+        nthreads: Threads for streaming alignment.
 
     Returns:
+        Target feature index array aligned to source order.
     """
     from .writers import create_zarr_dataset
 

@@ -207,6 +207,16 @@ class DataStore(MappingDatastore):
         cell_key: str | None = None,
         label: str = "Hashtag_identity",
     ) -> None:
+        """Assign HTO hashtag identities to cells using demultiplexing.
+
+        Args:
+            from_assay: HTO assay name (default: ``'HTO'``).
+            cell_key: Boolean cell metadata column selecting cells (default: latest for assay).
+            label: Column name to store identities in cell metadata.
+
+        Returns:
+            None
+        """
         if from_assay is None:
             from_assay = "HTO"
         if cell_key is None:
@@ -257,7 +267,7 @@ class DataStore(MappingDatastore):
                        to identify rare populations of cells. Very small values might lead to a higher signal-to-noise
                        ratio in the selected features. By default, a value is set assuming smallest population has no
                        less than 1% of all cells. So for example, if you have 1000 cells (as per cell_key parameter)
-                       then `min-cells` will be set to 10.
+                       then `min_cells` will be set to 10.
             max_cells: Maximum number of cells where a gene should have non-zero expression values for it to be
                        considered a candidate for HVG selection. This can be useful to filter out genes that are
                        expressed in too many cells. Default value is infinity, meaning no upper limit.
@@ -335,8 +345,7 @@ class DataStore(MappingDatastore):
             cell_key: Cells to use for selection of most prevalent peaks. By default, all cells with True value in
                       'I' will be used. The provided value for `cell_key` should be a column in cell metadata table
                       with boolean values.
-            top_n: Number of top prevalent peaks to be selected. This value is ignored if a value is provided
-                   for `min_var` parameter. (Default: 500)
+            top_n: Number of top prevalent peaks to be selected. (Default: 10000)
             prevalence_key_name: Base label for marking prevalent peaks in the features metadata column. The value for
                                 'cell_key' parameter is prepended to this value. (Default value: 'prevalent_peaks')
 
@@ -377,18 +386,17 @@ class DataStore(MappingDatastore):
                        how the cells will be grouped. Usually this would be a column denoting cell clusters.
             cell_key: To run the test on specific subset of cells, provide the name of a boolean column in
                         the cell metadata table. (Default value: 'I')
-            feat_key:
-            gene_batch_size: Number of genes to be loaded in memory at a time. All cells (from ell_key) are loaded for
-                             these number of cells at a time.
-            use_prenormed: If True then prenormalized cache generated using Assay.save_normed_for_query is used.
-                           This can speed up the results. (Default value: True)
-            prenormed_store: If prenormalized values were computed in a custom manner then, the Zarr group's location
-                             can be provided here. (Default value: None)
-            n_threads: Number of threads to use to run the marker search. Only used if use_prenormed is True.
-            skip_save: If True then the results are not saved to the Zarr hierarchy.
+            feat_key: Boolean feature metadata column selecting features (default: ``'I'``).
+            gene_batch_size: Number of genes loaded per batch; all selected cells are loaded for each batch.
+            use_prenormed: If True, use prenormalized cache from ``Assay.save_normed_for_query``.
+                           (Default value: False)
+            prenormed_store: Custom Zarr group with prenormalized values (default: None).
+            n_threads: Threads for marker search when ``use_prenormed`` is True.
+            skip_save: If True, return results without writing to Zarr.
+            **norm_params: Extra keyword arguments forwarded to ``normed``.
 
         Returns:
-            None
+            Marker dict if ``skip_save`` is True, else None.
         """
         from ..markers import find_markers_by_rank
 
@@ -454,12 +462,13 @@ class DataStore(MappingDatastore):
             from_assay: Name of the assay to be used. If no value is provided then the default assay will be used.
             cell_key: To run the test on specific subset of cells, provide the name of a boolean column in
                         the cell metadata table. (Default value: 'I')
-            feat_key:
+            feat_key: Boolean feature metadata column selecting features (default: ``'I'``).
             pseudotime_key: Required parameter. This has to be a column name from cell metadata table. This column
                             contains values for pseudotime ordering of the cells.
             min_cells: Minimum number of cells where a gene should have non-zero value to be considered for test.
                        (Default: 10)
             gene_batch_size: Number of genes to be loaded in memory at a time. (Default value: 50).
+            **norm_params: Extra keyword arguments forwarded to ``normed``.
 
         Returns: None
         """
@@ -1183,6 +1192,20 @@ class DataStore(MappingDatastore):
     def calc_membership_strength(
         self, from_assay: str, cell_key: str, feat_key: str, clust_key: str
     ) -> None:
+        """Store per-cell cluster membership strength from the latest KNN graph.
+
+        For each cell, computes the fraction of KNN neighbors sharing the most
+        common cluster label and saves it in cell metadata.
+
+        Args:
+            from_assay: Assay used to locate the KNN graph.
+            cell_key: Boolean column selecting cells.
+            feat_key: Feature key used when the graph was built.
+            clust_key: Cell metadata column with cluster assignments.
+
+        Returns:
+            None
+        """
         loc = self._get_latest_graph_loc(
             from_assay=from_assay, cell_key=cell_key, feat_key=feat_key
         )

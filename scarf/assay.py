@@ -99,10 +99,11 @@ class Assay:
 
     Args:
         z (zarr.Group): Zarr hierarchy where raw data is located
+        workspace: Workspace name when assays live under ``matrices/`` (None for legacy layout)
         name (str): A label/name for assay.
         cell_data: Metadata class object for the cell attributes.
         nthreads: number of threads to use for parallel computations
-        min_cells_per_feature:
+        min_cells_per_feature: Minimum cells expressing a feature for it to be kept
 
     Attributes:
         name: A label for the assay instance
@@ -422,7 +423,7 @@ class Assay:
                                 to the documentation of the 'normed' method of the RNAassay for
                                 further description of this parameter.
             update_keys: Whether to update the keys. If True then the 'latest_feat_key' and
-                         'latest_feat_key' attributes of the assay will be updated. It can be useful
+                         'latest_cell_key' attributes of the assay will be updated. It can be useful
                          to set False in case where you only need to save the normalized data but
                          don't intend to use it directly. For example, when mapping onto a different
                          dataset and aligning features to that dataset.
@@ -496,8 +497,10 @@ class Assay:
             batch_size: Number of genes to be loaded in the memory at a time.
             msg: Message to be displayed in the progress bar
             as_dataframe: If true (default) then the yielded matrices are pandas dataframe
+            **norm_params: Extra keyword arguments forwarded to ``normed``.
 
         Returns:
+            Generator yielding DataFrames or (matrix, feature index) tuples.
         """
         from .utils import tqdmbar
 
@@ -585,22 +588,22 @@ class Assay:
         batch_size: int = 100,
         **norm_params,
     ):
-        """
+        """Bin normalized expression along a cell ordering and cache the result.
 
         Args:
-            cell_key: Name of the key (column) from cell attribute table. The data will be fetched for only those cells.
-            feat_key: Name of the key (column) from feature attribute table.
-            ordering_key:
-            min_exp:
-            window_size:
-            chunk_size:
-            smoothen:
-            z_scale:
-            batch_size:
-            **norm_params:
+            cell_key: Boolean column in cell metadata selecting cells.
+            feat_key: Boolean column in feature metadata selecting features.
+            ordering_key: Cell metadata column with pseudotime or ordering values.
+            min_exp: Minimum mean expression to retain a feature.
+            window_size: Rolling window size for smoothing along ordering.
+            chunk_size: Number of ordering bins stored per feature row.
+            smoothen: Whether to apply rolling-window smoothing.
+            z_scale: Whether to z-scale values within each feature.
+            batch_size: Feature batch size for iteration.
+            **norm_params: Extra keyword arguments forwarded to ``normed``.
 
         Returns:
-
+            None
         """
 
         from .utils import rolling_window
@@ -1107,7 +1110,7 @@ class ATACassay(Assay):
         """This function normalizes the raw and returns a delayed chunked array of
         the normalized data. Unlike the `normed` method in the generic Assay
         class this method is optimized for scATAC-Seq data. This method uses
-        the the normalization indicated by attribute self.normMethod which by
+        the normalization indicated by attribute self.normMethod which by
         default is set to `norm_tf_idf`. The TF-IDF normalization is performed
         using only the cells and features indicated by the 'cell_idx' and
         'feat_idx' parameters.
@@ -1173,8 +1176,7 @@ class ATACassay(Assay):
         Args:
            cell_key: Cells to use for selection of most prevalent peaks. The provided value for `cell_key` should be a
                      column in cell attributes table with boolean values.
-           top_n: Number of top prevalent peaks to be selected. This value is ignored if a value is provided
-                   for `min_var` parameter.
+           top_n: Number of top prevalent peaks to be selected. (Default: 500)
            prevalence_key_name: Base label for marking prevalent peaks in the features attributes column. The value for
                                 'cell_key' parameter is prepended to this value.
 
@@ -1218,8 +1220,14 @@ class ADTassay(Assay):
     """
 
     def __init__(self, z: zarr.Group, name: str, cell_data: MetaData, **kwargs):
-        """This subclass of Assay is designed for normalization of ADT/HTO
-        (feature-barcodes library) data from CITE-Seq experiments."""
+        """Initialize ADTassay with CLR normalization.
+
+        Args:
+            z: Zarr hierarchy where raw data is located.
+            name: Assay label.
+            cell_data: Cell metadata object.
+            **kwargs: Forwarded to ``Assay.__init__`` (workspace, nthreads, etc.).
+        """
         super().__init__(z=z, name=name, cell_data=cell_data, **kwargs)
         self.normMethod = norm_clr
 
@@ -1230,7 +1238,7 @@ class ADTassay(Assay):
         **kwargs,
     ) -> ChunkedArray:
         """This function normalizes the raw and returns a delayed chunked array of
-        the normalized data. This method uses the the normalization indicated
+        the normalized data. This method uses the normalization indicated
         by attribute self.normMethod which by default is set to `norm_clr`. The
         centered log-ratio normalization is performed using only the cells and
         features indicated by the 'cell_idx' and 'feat_idx' parameters.

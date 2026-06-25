@@ -47,11 +47,13 @@ type ZARRLOC = str
 
 
 def get_log_level():
+    """Return the current minimum log level configured for Scarf's logger."""
     # noinspection PyUnresolvedReferences
     return logger._core.min_level  # type: ignore
 
 
 def is_notebook() -> bool:
+    """Return True when running inside a Jupyter notebook kernel."""
     try:
         shell = get_ipython().__class__.__name__  # type: ignore
         if shell == "ZMQInteractiveShell":
@@ -65,6 +67,7 @@ def is_notebook() -> bool:
 
 
 def tqdmbar(*args, **kwargs):
+    """Return a tqdm progress bar with Scarf defaults and log-level aware disable."""
     params = dict(tqdm_params)
     for i in kwargs:
         if i in params:
@@ -95,6 +98,7 @@ def set_verbosity(level: str | None = None, filepath: str | None = None):
                   is provided then all the logs are printed on standard output.
 
     Returns:
+        None
     """
     # noinspection PyUnresolvedReferences
     available_levels = logger._core.levels.keys()  # type: ignore
@@ -117,14 +121,15 @@ def set_verbosity(level: str | None = None, filepath: str | None = None):
 def rescale_array(a: np.ndarray, frac: float = 0.9) -> np.ndarray:
     """Performs edge trimming on values of the input vector.
 
-    Performs edge trimming on values of the input vector and constraints them between within frac and 1-frac density of
-    normal distribution created with the sample mean and std. dev. of a.
+    Performs edge trimming on values of the input vector and constrains them
+    between frac and 1-frac density of a normal distribution created with the
+    sample mean and std. dev. of a.
 
     Args:
         a: numeric vector
         frac: Value between 0 and 1.
 
-    Return:
+    Returns:
         The input array, edge trimmed and constrained.
     """
     from scipy.stats import norm
@@ -141,7 +146,7 @@ def clean_array(x, fill_val: int = 0):
     """Returns input array with nan and infinite values removed.
 
     Args:
-        x (np.ndarray): input array
+        x: input array
         fill_val: value to fill zero values with (default: 0)
     """
     x = np.nan_to_num(x, copy=True)
@@ -153,6 +158,16 @@ def clean_array(x, fill_val: int = 0):
 def load_zarr(
     zarr_loc: ZARRLOC, mode: str, synchronizer=None
 ) -> zarr.Group:
+    """Open a Zarr group at the given path.
+
+    Args:
+        zarr_loc: Path to the Zarr store.
+        mode: Zarr open mode, e.g. ``'r'``, ``'r+'``, or ``'w'``.
+        synchronizer: Optional synchronizer (ignored under Zarr v3).
+
+    Returns:
+        Root Zarr group.
+    """
     if synchronizer is not None:
         logger.debug("ThreadSynchronizer is ignored under Zarr v3")
     return zarr.open_group(zarr_loc, mode=mode)
@@ -191,7 +206,14 @@ def show_dask_progress(arr, msg: str | None = None, nthreads: int = 1):
 
 
 def system_call(command):
-    """Executes a command in the underlying operative system."""
+    """Executes a command in the underlying operative system.
+
+    Args:
+        command: Shell command string to run.
+
+    Returns:
+        None
+    """
     import shlex
     import subprocess
 
@@ -208,6 +230,15 @@ def system_call(command):
 
 @jit(nopython=True)
 def rolling_window(a, w):
+    """Apply a centered rolling mean with window size w along axis 0.
+
+    Args:
+        a: 2D numeric array.
+        w: Window size (number of rows).
+
+    Returns:
+        Array of the same shape as a with smoothed values.
+    """
     n, m = a.shape
     b = np.zeros(shape=(n, m))
     for i in range(n):
@@ -230,11 +261,14 @@ def rolling_window(a, w):
 def permute_into_chunks(size: int, chunk_size: int, seed: int = 42) -> list[np.ndarray]:
     """
     Permute the chunks of an array of the given size.
+
     Args:
-        size: The size of the array to be permuted
-        chunk_size: The size of the chunks to permute
+        size: The size of the array to be permuted.
+        chunk_size: The size of the chunks to permute.
+        seed: Random seed for chunk permutations.
+
     Returns:
-        A permuted array of the given size
+        List of permuted chunk index arrays.
     Examples:
     >>> permute_into_chunks(10, 3)
     [array([2, 1, 0]), array([3, 5, 4]), array([7, 8, 6]), array([9])]

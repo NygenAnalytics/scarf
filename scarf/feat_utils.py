@@ -11,12 +11,13 @@ def fit_lowess(a, b, n_bins: int, lowess_frac: float) -> np.ndarray:
     """Fits a LOWESS (Locally Weighted Scatterplot Smoothing) curve.
 
     Args:
-        a:
-        b:
-        n_bins:
-        lowess_frac:
+        a: Log-binned x values (e.g. log mean expression).
+        b: Log y values to regress against (e.g. log variance).
+        n_bins: Number of histogram bins for grouping genes.
+        lowess_frac: LOWESS smoothing fraction.
 
     Returns:
+        Per-feature corrected variance estimates.
     """
     from statsmodels.nonparametric.smoothers_lowess import lowess
 

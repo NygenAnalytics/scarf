@@ -1,5 +1,5 @@
 """
-Methods and classes for evluation
+Methods and classes for evaluation
 """
 
 from collections.abc import Iterable, Sequence
@@ -61,9 +61,8 @@ def compute_lisi(
     for i, label in enumerate(label_colnames):
         logger.info(f"Computing LISI for {label}")
         labels = pd.Categorical(metadata[label])
-        n_categories = len(labels.categories)
         simpson = compute_simpson(
-            distances.T, indices.T, labels, n_categories, perplexity
+            distances.T, indices.T, labels, perplexity
         )
         lisi_df[:, i] = 1 / simpson
     return lisi_df
@@ -462,6 +461,6 @@ def integration_score(
         return normalized_mutual_info_score(batch_labels[0], batch_labels[1])
     else:
         logger.error(
-            f"Metric {metric} not recognized. Please choose from 'ari', 'nmi', 'calinski_harabasz', or 'davies_bouldin'."
+            f"Metric {metric} not recognized. Please choose from 'ari' or 'nmi'."
         )
         return None

@@ -8,8 +8,15 @@ __all__ = ["BalancedCut", "CoalesceTree", "make_digraph"]
 
 
 def make_digraph(d: np.ndarray, clust_info=None) -> nx.DiGraph:
-    """Convert dendrogram into directed graph."""
+    """Convert a scipy linkage matrix into a directed tree graph.
 
+    Args:
+        d: Linkage matrix from hierarchical clustering.
+        clust_info: Optional cluster label per leaf (-1 if unknown).
+
+    Returns:
+        Directed graph with merge nodes and leaf cluster annotations.
+    """
     g = nx.DiGraph()
     n = d.shape[0] + 1  # Dendrogram contains one less sample
     if clust_info is not None:
@@ -38,6 +45,7 @@ def make_digraph(d: np.ndarray, clust_info=None) -> nx.DiGraph:
 
 
 def CoalesceTree(graph: nx.DiGraph, clusters: np.ndarray) -> nx.DiGraph:
+    """Coalesce a hierarchy graph to the nodes holding each cluster partition."""
     def calc_steps_to_top(g: nx.DiGraph, c: np.ndarray):
         import pandas as pd
 
@@ -103,6 +111,15 @@ def CoalesceTree(graph: nx.DiGraph, clusters: np.ndarray) -> nx.DiGraph:
 
 
 class BalancedCut:
+    """Identify balanced cluster splits from a hierarchical clustering dendrogram.
+
+    Args:
+        dendrogram: Linkage matrix from hierarchical clustering.
+        max_size: Maximum leaves allowed in a cluster before splitting.
+        min_size: Minimum leaves required before merging subtrees.
+        max_distance_fc: Max fold-change in merge distance for subtree merging.
+    """
+
     def __init__(
         self,
         dendrogram: np.ndarray,

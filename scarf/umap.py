@@ -13,6 +13,7 @@ __all__ = ["fit_transform"]
 
 
 def calc_dens_map_params(graph, dists):
+    """Compute densMAP correction terms from graph and KNN distances."""
     import numpy as np
 
     n_vertices = graph.shape[0]
@@ -53,6 +54,7 @@ def simplicial_set_embedding(
     nthreads,
     verbose,
 ):
+    """Run UMAP simplicial-set embedding with optional densMAP."""
     import numba
     from threadpoolctl import threadpool_limits
     from umap.umap_ import make_epochs_per_sample
@@ -116,6 +118,7 @@ def simplicial_set_embedding(
 
 
 def fuzzy_simplicial_set(g, set_op_mix_ratio):
+    """Combine directed and undirected graph components for UMAP."""
     tg = g.transpose()
     prod = g.multiply(tg)
     res = set_op_mix_ratio * (g + tg - prod) + (1.0 - set_op_mix_ratio) * prod
@@ -138,6 +141,26 @@ def fit_transform(
     nthreads,
     verbose,
 ):
+    """Fit UMAP embedding from a fuzzy simplicial set graph.
+
+    Args:
+        graph: Sparse COO adjacency graph.
+        ini_embed: Initial embedding coordinates.
+        spread: UMAP spread parameter.
+        min_dist: UMAP min_dist parameter.
+        n_epochs: Number of optimization epochs.
+        random_seed: Random seed.
+        repulsion_strength: UMAP repulsion strength (gamma).
+        initial_alpha: Initial learning rate.
+        negative_sample_rate: Negative sampling rate.
+        densmap_kwds: Extra densMAP kwargs (empty dict disables densMAP).
+        parallel: Whether to run layout optimization in parallel.
+        nthreads: Thread limit for layout optimization.
+        verbose: Verbose UMAP output.
+
+    Returns:
+        Tuple of (embedding, a, b) UMAP parameters.
+    """
     from umap.umap_ import find_ab_params
     import warnings
 

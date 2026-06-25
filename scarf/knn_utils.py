@@ -23,13 +23,13 @@ def self_query_knn(ann_obj: AnnStream, store, chunk_size: int, nthreads: int) ->
     """Constructs KNN graph.
 
     Args:
-        ann_obj ():
-        store ():
-        chunk_size ():
-        nthreads (): Number of threads to use.
+        ann_obj: Fitted AnnStream with reducer and ANN index.
+        store: Zarr group where ``indices`` and ``distances`` arrays are written.
+        chunk_size: Row chunk size for output Zarr arrays.
+        nthreads: Number of threads to use.
 
     Returns:
-        None
+        Approximate recall percentage (fraction of queries with a self neighbor).
     """
 
     def get_transformed_data():
@@ -89,12 +89,12 @@ def smoothen_dists(store, z_idx, z_dist, lc: float, bw: float, chunk_size: int):
     """Smoothens KNN distances.
 
     Args:
-        store ():
-        z_idx ():
-        z_dist ():
-        lc ():
-        bw ():
-        chunk_size ():
+        store: Zarr group for edge arrays.
+        z_idx: Zarr array of KNN neighbor indices.
+        z_dist: Zarr array of KNN distances.
+        lc: UMAP local connectivity.
+        bw: UMAP bandwidth.
+        chunk_size: Row batch size for streaming smooth knn.
 
     Returns:
         None
@@ -242,8 +242,8 @@ def merge_graphs(csr_mats: list[csr_matrix]) -> coo_matrix:
     Args:
         csr_mats: A list of two or more CSR matrices representing the graphs to be merged.
 
-    Returns: A merged graph in CSR matrix form.
-             The merged graph has the same number of edges as each input graph
+    Returns:
+        coo_matrix: Merged graph with the same shape and edge count as inputs.
     """
     try:
         assert len(set([x.shape for x in csr_mats])) == 1
@@ -276,19 +276,19 @@ def merge_graphs(csr_mats: list[csr_matrix]) -> coo_matrix:
 def wnn_integration(
     name1: str, g1: csr_matrix, ld1, name2: str, g2: csr_matrix, ld2, n_threads: int
 ):
-    """
+    """Build a weighted nearest-neighbor graph from two modality-specific KNN graphs.
 
     Args:
-        name1:
-        g1:
-        ld1:
-        name2:
-        g2:
-        ld2:
-        n_threads:
+        name1: Label for the first modality (used in log messages).
+        g1: CSR KNN graph for modality 1.
+        ld1: Latent embedding matrix for modality 1, shape (n_cells, n_dims).
+        name2: Label for the second modality.
+        g2: CSR KNN graph for modality 2.
+        ld2: Latent embedding matrix for modality 2.
+        n_threads: Thread limit for affinity calculations.
 
     Returns:
-
+        coo_matrix: WNN graph combining both modalities.
     """
 
     def make_estimates(g, ld, msg=""):

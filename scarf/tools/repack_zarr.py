@@ -45,6 +45,14 @@ def repack_store(
     profile: StorageProfile = "fast_local",
     shard_counts: bool = True,
 ) -> None:
+    """Copy a Zarr store to a new path and optionally shard count arrays.
+
+    Args:
+        input_path: Source Zarr directory.
+        output_path: Destination Zarr directory (created or overwritten).
+        profile: Storage profile for compressors and shard sizes.
+        shard_counts: Repack assay count arrays to sharded layout when True.
+    """
     src = open_store(input_path, mode="r")
     dst = open_store(output_path, mode="w")
     _copy_group(src, dst, profile)

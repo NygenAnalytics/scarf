@@ -13,6 +13,21 @@ __all__ = ["AnnStream", "instantiate_knn_index", "fix_knn_query"]
 def instantiate_knn_index(
     space, dim, max_elements, ef_construction, M, random_seed, ef, num_threads
 ):
+    """Create and configure an hnswlib KNN index.
+
+    Args:
+        space: Distance metric name accepted by hnswlib (e.g. ``'l2'``, ``'cosine'``).
+        dim: Embedding dimensionality.
+        max_elements: Maximum number of vectors the index can hold.
+        ef_construction: ``ef_construction`` parameter for index building.
+        M: ``M`` parameter controlling graph connectivity.
+        random_seed: Random seed for index construction.
+        ef: ``ef`` search parameter set after index creation.
+        num_threads: Number of threads for hnswlib queries.
+
+    Returns:
+        Configured hnswlib Index instance.
+    """
     import hnswlib
 
     ann_idx = hnswlib.Index(space=space, dim=dim)
@@ -28,6 +43,17 @@ def instantiate_knn_index(
 
 
 def fix_knn_query(indices: np.ndarray, distances: np.ndarray, ref_idx: np.ndarray):
+    """Remove self-neighbor entries from KNN query results when recall is imperfect.
+
+    Args:
+        indices: Neighbor indices from ``knn_query``, shape (n_queries, k).
+        distances: Neighbor distances matching ``indices``.
+        ref_idx: Global index of each query row (used to detect missing self loops).
+
+    Returns:
+        Tuple of (fixed_indices, fixed_distances, n_mis) where ``n_mis`` counts
+        queries whose first neighbor was not a self match.
+    """
     fixed_ind, fixed_dist = indices.copy()[:, 1:], distances.copy()[:, 1:]
     # Identify positions where first index is not a self loop
     mis_idx = indices[:, 0].reshape(1, -1)[0] != ref_idx
@@ -52,6 +78,35 @@ def fix_knn_query(indices: np.ndarray, distances: np.ndarray, ref_idx: np.ndarra
 
 
 class AnnStream:
+    """Stream row blocks through dimensionality reduction and fit ANN / k-means.
+
+    Args:
+        data: ChunkedArray of cell-by-feature counts.
+        k: Number of nearest neighbors to query.
+        n_cluster: Number of k-means clusters for seed partitions.
+        reduction_method: One of ``'pca'``, ``'lsi'``, or ``'custom'``.
+        dims: Number of reduced dimensions (or loadings columns) to use.
+        loadings: Precomputed loading matrix; if None, loadings are fit from data.
+        use_for_pca: Boolean mask of cells used when fitting PCA.
+        mu: Feature means for scaling (PCA).
+        sigma: Feature std devs for scaling (PCA).
+        ann_metric: hnswlib distance metric.
+        ann_efc: hnswlib ``ef_construction``.
+        ann_ef: hnswlib ``ef`` search parameter.
+        ann_m: hnswlib ``M`` connectivity parameter.
+        nthreads: Thread limit for sklearn / block compute.
+        ann_parallel: If True, use ``nthreads`` for hnswlib as well.
+        rand_state: Random seed.
+        do_kmeans_fit: Whether to fit MiniBatchKMeans seed partitions.
+        disable_scaling: Skip z-scaling before PCA projection.
+        ann_idx: Existing hnswlib index to reuse instead of fitting.
+        lsi_skip_first: Drop first LSI component (depth) when using LSI.
+        lsi_params: Extra kwargs forwarded to gensim LsiModel (minus reserved keys).
+        harmonize: Whether to run Harmony batch correction before ANN fitting.
+        harmonized_data: Precomputed harmonized ChunkedArray (optional).
+        batches: Batch metadata DataFrame for Harmony.
+    """
+
     def __init__(
         self,
         data,
@@ -184,15 +239,28 @@ class AnnStream:
         return batch_size
 
     def iter_blocks(self, msg: str = "") -> np.ndarray:
+        """Yield row blocks of raw data as NumPy arrays with optional progress bar."""
         for i in tqdmbar(self.data.blocks, desc=msg, total=self.data.numblocks[0]):
             yield controlled_compute(i, self.nthreads)
 
     def transform_z(self, a: np.ndarray) -> np.ndarray:
+        """Z-score a block using fitted ``mu`` and ``sigma``."""
         return (a - self.mu) / self.sigma
 
     def transform_ann(
         self, a: np.ndarray, k: int = None, self_indices: np.ndarray = None
     ) -> tuple:
+        """Query the ANN index for neighbors of transformed rows in ``a``.
+
+        Args:
+            a: Transformed embedding block, shape (n_rows, n_dims).
+            k: Number of neighbors; defaults to ``self.k``.
+            self_indices: Global row indices for self-neighbor correction.
+
+        Returns:
+            Tuple of (indices, distances) from hnswlib, optionally corrected
+            when ``self_indices`` is provided.
+        """
         if k is None:
             k = self.k
         # Adding +1 to k because first neighbour will be the query itself

@@ -16,6 +16,7 @@ def sanitize_hierarchy(
     Args:
         z: Zarr hierarchy object
         assay_name: String value with name of assay.
+        workspace: Workspace name (None for legacy layout without ``matrices/``).
 
     Returns:
         True if assay_name is present in z and contains `counts` and `featureData` child nodes else raises error
@@ -66,6 +67,7 @@ class BaseDataStore:
         synchronizer: Used as `synchronizer` parameter when opening the Zarr file. Please refer to this page for
                       more details: https://zarr.readthedocs.io/en/stable/api/sync.html. By default
                       ThreadSynchronizer will be used.
+        workspace: Workspace name within the Zarr store (None for legacy single-workspace layout).
 
     Attributes:
         cells: MetaData object with cells and info about each cell (e. g. RNA_nCounts ids).
@@ -450,14 +452,12 @@ class BaseDataStore:
         given feature from normalized matrix.
 
         Args:
-            from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
-            cell_key: One of the columns from cell metadata table that indicates the cells to be used. The values in
-                      the chosen column should be boolean (Default value: 'I')
-            k: A cell metadata column or name of a feature.
-            clip_fraction: This value is multiplied by 100 and the percentiles are soft-clipped from either end.
-                           (Default value: 0)
-            use_precached: Whether to use pre-calculated values from 'prenormed' slot. Used only if 'prenormed' is
-                           present (Default value: True)
+            from_assay: Name of assay to be used.
+            cell_key: Boolean column in cell metadata selecting cells (default: ``'I'``).
+            k: Cell metadata column name or feature name whose values are fetched.
+            clip_fraction: Fraction (0-1) for soft percentile clipping of numeric values.
+            use_precached: Use values from the ``prenormed`` slot when available.
+            cache_key: Zarr group name for precached feature values (default: ``'prenormed'``).
 
         Returns:
             The requested values
