@@ -316,7 +316,9 @@ class CrH5Reader(CrReader):
             row_ranges = [
                 np.arange(x, y) for x, y in zip(indptr[v_pos], indptr[v_pos + 1])
             ]
-            cell_idx = np.repeat(np.arange(len(row_ranges)), [len(x) for x in row_ranges])
+            cell_idx = np.repeat(
+                np.arange(len(row_ranges)), [len(x) for x in row_ranges]
+            )
             idx = np.hstack(row_ranges)
             data = self.grp["data"][idx[0] : idx[-1] + 1]
             data = data[idx - idx[0]]
@@ -424,13 +426,11 @@ class CrDirReader(CrReader):
         grp_entry = self.grpNames[key]
         try:
             vals = [
-                x.split("\t")[grp_entry[1]]
-                for x in read_file(self.loc + grp_entry[0])
+                x.split("\t")[grp_entry[1]] for x in read_file(self.loc + grp_entry[0])
             ]
         except IndexError:
             logger.warning(
-                f"{key} extraction failed from {grp_entry[0]} "
-                f"in column {grp_entry[1]}",
+                f"{key} extraction failed from {grp_entry[0]} in column {grp_entry[1]}",
                 flush=True,
             )
             vals = None

@@ -403,7 +403,7 @@ def create_numeric_array(
 
 def dtype_fix(dtype: Any, data: np.ndarray) -> Any:
     """Infer or adjust dtype for metadata arrays from sample values."""
-    if dtype is None or dtype is object:
+    if dtype is None or dtype == object:
         return "U" + str(max([len(str(x)) for x in data]))
     if np.issubdtype(data.dtype, np.dtype("S")):
         try:

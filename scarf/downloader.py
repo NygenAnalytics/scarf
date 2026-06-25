@@ -48,9 +48,7 @@ class OSFdownloader:
         self.datasets, self.sourceFile = self._populate_datasets()
         self.sources = self._populate_sources()
 
-    def get_json(
-        self, storage: str, endpoint: str, url: str | None
-    ) -> Any:
+    def get_json(self, storage: str, endpoint: str, url: str | None) -> Any:
         import requests
 
         if endpoint != "":

@@ -311,7 +311,9 @@ class BaseDataStore:
         """
         if from_assay is None or from_assay == "":
             from_assay = self._defaultAssay
-        return cast(Assay | RNAassay | ADTassay | ATACassay, self.__getattribute__(from_assay))
+        return cast(
+            Assay | RNAassay | ADTassay | ATACassay, self.__getattribute__(from_assay)
+        )
 
     def _get_latest_feat_key(self, from_assay: str) -> str:
         """Looks up the value in assay level attributes for key

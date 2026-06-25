@@ -167,7 +167,7 @@ class MetaData:
         Returns: None
         """
 
-        if self.get_dtype(key) is not bool:
+        if self.get_dtype(key) != bool:  # noqa: E721
             raise TypeError(
                 "ERROR: `key` should be name of a boolean type column in Metadata table"
             )
@@ -293,7 +293,11 @@ class MetaData:
         return None
 
     def _fill_to_index(
-        self, values: np.ndarray, fill_value: Any, key: str, auto_fill_disable: bool = False
+        self,
+        values: np.ndarray,
+        fill_value: Any,
+        key: str,
+        auto_fill_disable: bool = False,
     ) -> np.ndarray:
         """Makes sure that the array being added to the table is of the same
         shape. If the array has same shape as the table then the input array is

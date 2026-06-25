@@ -381,9 +381,7 @@ def get_feature_mappings(
             "bug on Github"
         )
     assert (
-        feats_ids_arr.shape[0]
-        == feats_names_arr.shape[0]
-        == cross_indices_arr.shape[0]
+        feats_ids_arr.shape[0] == feats_names_arr.shape[0] == cross_indices_arr.shape[0]
     )
     return feats_ids_arr, feats_names_arr, cross_indices_arr
 

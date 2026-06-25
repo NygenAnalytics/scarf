@@ -172,9 +172,7 @@ class MappingDatastore(GraphDataStore):
             save_k = ann_obj.k
         target_data = ChunkedArray(
             as_zarr_array(
-                target_assay.z[
-                    f"normed__{target_cell_key}__{target_feat_key}/data"
-                ],
+                target_assay.z[f"normed__{target_cell_key}__{target_feat_key}/data"],
                 name=f"normed__{target_cell_key}__{target_feat_key}/data",
             ),
             nthreads=self.nthreads,
@@ -194,9 +192,7 @@ class MappingDatastore(GraphDataStore):
                     target_assay.z[
                         f"normed__{target_cell_key}__{target_feat_key}/data_coral"
                     ],
-                    name=(
-                        f"normed__{target_cell_key}__{target_feat_key}/data_coral"
-                    ),
+                    name=(f"normed__{target_cell_key}__{target_feat_key}/data_coral"),
                 ),
                 nthreads=self.nthreads,
             )
@@ -217,9 +213,7 @@ class MappingDatastore(GraphDataStore):
                 ann_obj.sigma = clean_array(sigma, 1)
         if "projections" not in source_assay.z:
             source_assay.z.create_group("projections")
-        projections = as_zarr_group(
-            source_assay.z["projections"], name="projections"
-        )
+        projections = as_zarr_group(source_assay.z["projections"], name="projections")
         store = projections.create_group(target_name, overwrite=True)
         nc = target_assay.cells.active_index(target_cell_key).shape[0]
         nk = save_k
@@ -283,12 +277,8 @@ class MappingDatastore(GraphDataStore):
             )
         store = as_zarr_group(self.zw[store_loc], name=store_loc)
 
-        indices = np.asarray(
-            as_zarr_array(store["indices"], name="indices")[:]
-        )
-        dists = np.asarray(
-            as_zarr_array(store["distances"], name="distances")[:]
-        )
+        indices = np.asarray(as_zarr_array(store["indices"], name="indices")[:])
+        dists = np.asarray(as_zarr_array(store["distances"], name="distances")[:])
         # TODO: add more robust options for distance calculation here
         dists = 1 / (np.log1p(dists) + 1)
         n_cells, n_k = indices.shape
@@ -372,12 +362,8 @@ class MappingDatastore(GraphDataStore):
             target_subset_set = {x: None for x in target_subset}
 
         store = as_zarr_group(self.zw[store_loc], name=store_loc)
-        indices = np.asarray(
-            as_zarr_array(store["indices"], name="indices")[:]
-        )
-        dists = np.asarray(
-            as_zarr_array(store["distances"], name="distances")[:]
-        )
+        indices = np.asarray(as_zarr_array(store["indices"], name="indices")[:])
+        dists = np.asarray(as_zarr_array(store["distances"], name="distances")[:])
 
         preds = []
         weights = 1 - (dists / dists.max(axis=1).reshape(-1, 1))
@@ -437,12 +423,8 @@ class MappingDatastore(GraphDataStore):
             feat_key = self._get_latest_feat_key(from_assay)
         graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
         graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
-        edges = np.asarray(
-            as_zarr_array(graph_group["edges"], name="edges")[:]
-        )
-        weights = np.asarray(
-            as_zarr_array(graph_group["weights"], name="weights")[:]
-        )
+        edges = np.asarray(as_zarr_array(graph_group["edges"], name="edges")[:])
+        weights = np.asarray(as_zarr_array(graph_group["weights"], name="weights")[:])
         ref_n_cells = self.cells.active_index(cell_key).shape[0]
         projections = as_zarr_group(
             as_zarr_group(self.zw[from_assay], name=from_assay)["projections"],

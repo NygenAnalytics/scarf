@@ -585,9 +585,7 @@ def _scatter_make_colors(
         return None, color_key
 
 
-def _scatter_cleanup(
-    ax: Any, sw: float, sc: str, ds: tuple[str, ...]
-) -> None:
+def _scatter_cleanup(ax: Any, sw: float, sc: str, ds: tuple[str, ...]) -> None:
     for i in ["bottom", "left", "top", "right"]:
         spine = ax.spines[i]
         if i in ds:
@@ -602,9 +600,7 @@ def _scatter_cleanup(
     return None
 
 
-def _scatter_label_axis(
-    df: pd.DataFrame, ax: Any, fs: float, fo: float
-) -> None:
+def _scatter_label_axis(df: pd.DataFrame, ax: Any, fs: float, fo: float) -> None:
     x, y = df.columns[:2]
     ax.set_xlabel(x, fontsize=fs)
     ax.set_ylabel(y, fontsize=fs)
@@ -788,9 +784,7 @@ def _iter_dataframes(
         yield n, df
 
 
-def _handle_titles_type(
-    titles: str | list[str] | None, n_df: int
-) -> list[str] | None:
+def _handle_titles_type(titles: str | list[str] | None, n_df: int) -> list[str] | None:
     if titles is not None:
         if n_df > 1:
             if len(titles) != n_df or not isinstance(titles, list):
@@ -1536,9 +1530,7 @@ def plot_annotated_heatmap(
         display_row_labels = [
             x for x in display_row_labels if x.lower() in row_label_index
         ]
-        heatmap_ax.set_yticks(
-            [row_label_index[x.lower()] for x in display_row_labels]
-        )
+        heatmap_ax.set_yticks([row_label_index[x.lower()] for x in display_row_labels])
         heatmap_ax.set_yticklabels(display_row_labels, fontsize=row_label_fontsize)
 
     heatmap_ax.set_title(f"{df.shape[0]} features", fontsize=axis_fontsize)

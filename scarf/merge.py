@@ -559,7 +559,11 @@ class AssayMerge:
             return load_zarr(zarr_loc, mode="r+", storage_options=self.storage_options)
         except ValueError, FileNotFoundError:
             # So no zarr file with same name exists. Check if a non zarr folder with the same name exists
-            if is_local_zarr_path(zarr_loc) and isinstance(zarr_loc, str) and os.path.exists(zarr_loc):
+            if (
+                is_local_zarr_path(zarr_loc)
+                and isinstance(zarr_loc, str)
+                and os.path.exists(zarr_loc)
+            ):
                 raise ValueError(
                     f"ERROR: Directory/file with name `{zarr_loc}`exists. "
                     f"Either delete it or use another name"

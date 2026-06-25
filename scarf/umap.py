@@ -15,7 +15,9 @@ locale.setlocale(locale.LC_NUMERIC, "C")
 __all__ = ["fit_transform"]
 
 
-def calc_dens_map_params(graph: Any, dists: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def calc_dens_map_params(
+    graph: Any, dists: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     """Compute densMAP correction terms from graph and KNN distances."""
     n_vertices = graph.shape[0]
     mu_sum = np.zeros(n_vertices, dtype=np.float32)

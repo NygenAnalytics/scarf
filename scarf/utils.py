@@ -149,9 +149,7 @@ def rescale_array(a: np.ndarray, frac: float = 0.9) -> np.ndarray:
     return a
 
 
-def clean_array(
-    x: NDArray[Any] | list[Any], fill_val: int | float = 0
-) -> NDArray[Any]:
+def clean_array(x: NDArray[Any] | list[Any], fill_val: int | float = 0) -> NDArray[Any]:
     """Returns input array with nan and infinite values removed.
 
     Args:

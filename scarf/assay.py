@@ -67,9 +67,7 @@ def norm_lib_size_log(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
     Returns: A chunked array (delayed matrix) containing normalized data.
     """
     assert assay.sf is not None and assay.scalar is not None
-    return cast(
-        ChunkedArray, np.log1p(assay.sf * counts / assay.scalar.reshape(-1, 1))
-    )
+    return cast(ChunkedArray, np.log1p(assay.sf * counts / assay.scalar.reshape(-1, 1)))
 
 
 def norm_clr(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
@@ -493,9 +491,7 @@ class Assay:
                     )
                     self.attrs["latest_cell_key"] = cell_key
                 return ChunkedArray(
-                    as_zarr_array(
-                        self.z[location + "/data"], name=location + "/data"
-                    ),
+                    as_zarr_array(self.z[location + "/data"], name=location + "/data"),
                     nthreads=self.nthreads,
                 )
             else:
@@ -904,9 +900,7 @@ class RNAassay(Assay):
                     )
                     self.attrs["latest_cell_key"] = cell_key
                 return ChunkedArray(
-                    as_zarr_array(
-                        self.z[location + "/data"], name=location + "/data"
-                    ),
+                    as_zarr_array(self.z[location + "/data"], name=location + "/data"),
                     nthreads=self.nthreads,
                 )
         self.z.create_group(location, overwrite=True)

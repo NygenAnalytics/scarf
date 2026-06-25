@@ -1157,7 +1157,9 @@ class SubsetZarr:
             if i in cell_group and self.overCells is False:
                 continue
             if i in ["I"] and self.resetCells:
-                create_zarr_obj_array(cell_group, "I", [True for _ in range(n_cells)], "bool")
+                create_zarr_obj_array(
+                    cell_group, "I", [True for _ in range(n_cells)], "bool"
+                )
                 continue
             v = cell_data[i][:][self.cellIdx]
             create_zarr_obj_array(cell_group, i, v, dtype=v.dtype)
@@ -1487,7 +1489,8 @@ def bed_to_sparse_array(
     mat_arr = np.vstack(mat_chunks)
     gc.collect()
     mat = csr_matrix(
-        (mat_arr[:, 2], (mat_arr[:, 0], mat_arr[:, 1])), shape=(len(cell_idx), n_feats + 1)
+        (mat_arr[:, 2], (mat_arr[:, 0], mat_arr[:, 1])),
+        shape=(len(cell_idx), n_feats + 1),
     )
     gc.collect()
     idx = np.array(mat.sum(axis=1))[:, 0] > min_counts_per_cell

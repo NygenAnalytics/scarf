@@ -1210,7 +1210,9 @@ class DataStore(MappingDatastore):
         from ..storage.zarr_store import array_info
 
         root = start.strip("/")
-        node: zarr.Group = self.zw if root == "" else as_zarr_group(self.zw[root], name=root)
+        node: zarr.Group = (
+            self.zw if root == "" else as_zarr_group(self.zw[root], name=root)
+        )
         print(node.tree(level=depth))
         for key in node.array_keys():
             print(f"  {key}: {array_info(as_zarr_array(node[key], name=key))}")

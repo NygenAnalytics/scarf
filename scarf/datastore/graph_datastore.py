@@ -249,7 +249,7 @@ class GraphDataStore(BaseDataStore):
                     raise ValueError(
                         f"ERROR: `pca_use_cell_key` {pca_cell_key} does not exist in cell metadata"
                     )
-                if self.cells.get_dtype(pca_cell_key) is not bool:
+                if self.cells.get_dtype(pca_cell_key) != bool:  # noqa: E721
                     raise TypeError(
                         "ERROR: Type of `pca_use_cell_key` column in cell metadata should be `bool`"
                     )
@@ -269,7 +269,9 @@ class GraphDataStore(BaseDataStore):
             or rand_state is None
         ):
             if reduction_loc in self.zw:
-                reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+                reduction_grp = as_zarr_group(
+                    self.zw[reduction_loc], name=reduction_loc
+                )
                 if "latest_ann" in reduction_grp.attrs:
                     ann_loc_attr = cast(str, reduction_grp.attrs["latest_ann"])
                     (
@@ -336,7 +338,9 @@ class GraphDataStore(BaseDataStore):
 
         if k is None:
             if reduction_loc in self.zw:
-                reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+                reduction_grp = as_zarr_group(
+                    self.zw[reduction_loc], name=reduction_loc
+                )
                 if "latest_ann" in reduction_grp.attrs:
                     ann_loc_attr = cast(str, reduction_grp.attrs["latest_ann"])
                     ann_grp = as_zarr_group(self.zw[ann_loc_attr], name=ann_loc_attr)
@@ -361,7 +365,9 @@ class GraphDataStore(BaseDataStore):
 
         if n_centroids is None:
             if reduction_loc in self.zw:
-                reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+                reduction_grp = as_zarr_group(
+                    self.zw[reduction_loc], name=reduction_loc
+                )
                 if "latest_kmeans" in reduction_grp.attrs:
                     kmeans_loc_attr = cast(str, reduction_grp.attrs["latest_kmeans"])
                     n_centroids = int(
@@ -477,8 +483,18 @@ class GraphDataStore(BaseDataStore):
         if from_assay not in self.assay_names:
             raise ValueError(f"ERROR: Assay {from_assay} does not exist")
 
-        latest_cell_key = cast(str, as_zarr_group(self.zw[from_assay], name=from_assay).attrs["latest_cell_key"])
-        latest_feat_key = cast(str, as_zarr_group(self.zw[from_assay], name=from_assay).attrs["latest_feat_key"])
+        latest_cell_key = cast(
+            str,
+            as_zarr_group(self.zw[from_assay], name=from_assay).attrs[
+                "latest_cell_key"
+            ],
+        )
+        latest_feat_key = cast(
+            str,
+            as_zarr_group(self.zw[from_assay], name=from_assay).attrs[
+                "latest_feat_key"
+            ],
+        )
         normed_loc = f"{from_assay}/normed__{latest_cell_key}__{latest_feat_key}"
         normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
         reduction_loc = cast(str, normed_grp.attrs["latest_reduction"])
@@ -497,7 +513,9 @@ class GraphDataStore(BaseDataStore):
         normed_loc: str,
     ) -> bool:
         """Return True when an ANN stream can be loaded or rebuilt without a full make_graph."""
-        if ann_loc in self.zw and has_ann_index(as_zarr_group(self.zw[ann_loc], name=ann_loc)):
+        if ann_loc in self.zw and has_ann_index(
+            as_zarr_group(self.zw[ann_loc], name=ann_loc)
+        ):
             return True
         legacy = legacy_ann_index_path(zarr_root_path(self.zw), ann_loc)
         if legacy is not None and os.path.exists(legacy):
@@ -521,7 +539,9 @@ class GraphDataStore(BaseDataStore):
     ) -> Any:
         """Load ANN index from zarr, legacy file, custom fetcher, or return None to rebuild."""
         ann_group: zarr.Group | None = (
-            as_zarr_group(self.zw[ann_loc], name=ann_loc) if ann_loc in self.zw else None
+            as_zarr_group(self.zw[ann_loc], name=ann_loc)
+            if ann_loc in self.zw
+            else None
         )
 
         if ann_index_fetcher is not None:
@@ -582,7 +602,9 @@ class GraphDataStore(BaseDataStore):
                     return False
                 normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
                 reduction_loc = cast(str, normed_grp.attrs["latest_reduction"])
-                reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+                reduction_grp = as_zarr_group(
+                    self.zw[reduction_loc], name=reduction_loc
+                )
                 ann_loc = cast(str, reduction_grp.attrs["latest_ann"])
                 ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
                 knn_loc = cast(str, ann_grp.attrs["latest_knn"])
@@ -620,9 +642,7 @@ class GraphDataStore(BaseDataStore):
                 )
             )
             if self.zarr_mode == "r+":
-                g = create_zarr_dataset(
-                    normed_grp, "mu", (100000,), "f8", mu.shape
-                )
+                g = create_zarr_dataset(normed_grp, "mu", (100000,), "f8", mu.shape)
                 g[:] = mu
             else:
                 logger.debug("Skipping mu persistence on read-only store")
@@ -710,9 +730,7 @@ class GraphDataStore(BaseDataStore):
                 reduction_grp["harmonizedData"], name="harmonizedData"
             )
             harmonized_data = ChunkedArray(harmonized_arr, nthreads=self.nthreads)
-            batch_columns = cast(
-                list[str] | None, harmonized_arr.attrs.get("batches")
-            )
+            batch_columns = cast(list[str] | None, harmonized_arr.attrs.get("batches"))
             if batch_columns:
                 batches = pd.DataFrame(
                     {
@@ -1078,11 +1096,9 @@ class GraphDataStore(BaseDataStore):
             bool_col_parts = [
                 x.split("__", 1)
                 for x in assay.feats.columns
-                if assay.feats.get_dtype(x) is bool and x != "I"
+                if assay.feats.get_dtype(x) == bool and x != "I"  # noqa: E721
             ]
-            bool_cols_msg = " ".join(
-                f"{part[1]}({part[0]})" for part in bool_col_parts
-            )
+            bool_cols_msg = " ".join(f"{part[1]}({part[0]})" for part in bool_col_parts)
             raise ValueError(
                 "ERROR: You have to choose which features that should be used for graph construction. "
                 "Ideally you should have performed a feature selection step before making this graph. "
@@ -1169,7 +1185,8 @@ class GraphDataStore(BaseDataStore):
             update_keys,
         )
         subset_hash = cast(
-            str, as_zarr_group(self.zw[normed_loc], name=normed_loc).attrs["subset_hash"]
+            str,
+            as_zarr_group(self.zw[normed_loc], name=normed_loc).attrs["subset_hash"],
         )
         subset_params = cast(
             dict[str, Any],
@@ -1182,7 +1199,9 @@ class GraphDataStore(BaseDataStore):
         try:
             if cache_enabled:
                 if cache_base is None:
-                    raise RuntimeError("cache_base must be set when cache_enabled is True")
+                    raise RuntimeError(
+                        "cache_base must be set when cache_enabled is True"
+                    )
                 normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
                 data = self._stage_normed_data(
                     as_zarr_array(normed_grp["data"], name="data"),
@@ -1804,9 +1823,7 @@ class GraphDataStore(BaseDataStore):
             dists = np.asarray(
                 as_zarr_array(knn_group["distances"], name="distances")[:]
             )
-            indices = np.asarray(
-                as_zarr_array(knn_group["indices"], name="indices")[:]
-            )
+            indices = np.asarray(as_zarr_array(knn_group["indices"], name="indices")[:])
             dmat = csr_matrix(
                 (
                     dists.flatten(),
@@ -2044,9 +2061,9 @@ class GraphDataStore(BaseDataStore):
                 (graph.shape[0] - 1, 4),
             )
             g[:] = dendrogram
-        as_zarr_group(self.zw[graph_loc], name=graph_loc).attrs[
-            "latest_dendrogram"
-        ] = dendrogram_loc
+        as_zarr_group(self.zw[graph_loc], name=graph_loc).attrs["latest_dendrogram"] = (
+            dendrogram_loc
+        )
 
         if balanced_cut:
             from ..dendrogram import BalancedCut
@@ -2305,9 +2322,9 @@ class GraphDataStore(BaseDataStore):
             for i, j in zip(["row", "col", "data"], ["uint32", "uint32", "float32"]):
                 zg = create_zarr_dataset(store, i, (1000000,), j, shape)
                 zg[:] = getattr(diff_op, i)
-            as_zarr_group(self.zw[graph_loc], name=graph_loc).attrs[
-                "latest_magic"
-            ] = magic_loc
+            as_zarr_group(self.zw[graph_loc], name=graph_loc).attrs["latest_magic"] = (
+                magic_loc
+            )
             if cache_operator:
                 self._cachedMagicOperator = diff_op
                 self._cachedMagicOperatorLoc = magic_loc  # type: ignore[assignment]
@@ -2549,7 +2566,9 @@ class GraphDataStore(BaseDataStore):
                 update_keys=False,
             )
             if ao is None:
-                raise RuntimeError(f"make_graph did not return AnnStream for {assay_name}")
+                raise RuntimeError(
+                    f"make_graph did not return AnnStream for {assay_name}"
+                )
             if ao.loadings is None:
                 logger.warning(
                     f"No dimension reduction was user for {assay_name} data. "

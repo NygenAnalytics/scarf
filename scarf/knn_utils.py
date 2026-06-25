@@ -207,9 +207,7 @@ def smoothen_dists(
     return None
 
 
-def export_knn_to_mtx(
-    mtx: str, csr_graph: csr_matrix, batch_size: int = 1000
-) -> None:
+def export_knn_to_mtx(mtx: str, csr_graph: csr_matrix, batch_size: int = 1000) -> None:
     """Exports KNN matrix in Matrix Market format.
 
     Args:
@@ -316,7 +314,9 @@ def run_sgtsne(
             os.system(cmd)
         try:
             emb = np.asarray(
-                pd.read_csv(out_fn, header=None, sep=" ")[list(range(tsne_dims))].values.T
+                pd.read_csv(out_fn, header=None, sep=" ")[
+                    list(range(tsne_dims))
+                ].values.T
             )
         finally:
             for fn in (out_fn, knn_mtx_fn, ini_emb_fn):

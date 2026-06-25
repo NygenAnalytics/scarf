@@ -130,9 +130,7 @@ def _matmul_op(b: np.ndarray) -> _Op:
     return _Op("matmul", operand=b)
 
 
-def _classify_operand(
-    other: object, n_rows: int, n_cols: int
-) -> tuple[BType, object]:
+def _classify_operand(other: object, n_rows: int, n_cols: int) -> tuple[BType, object]:
     """Classify a binary operand for per-block broadcasting.
 
     Returns one of 'scalar', 'col' (per-row vector), 'row' (per-feature
@@ -159,8 +157,12 @@ def _classify_operand(
     return "row", arr
 
 
-def _binary_op(func: Callable[..., NDArray[Any]], other: object, side: str, kind: BType) -> _Op:
-    return _Op("binary", func=func, operand=other, side=cast(UfuncSide, side), btype=kind)
+def _binary_op(
+    func: Callable[..., NDArray[Any]], other: object, side: str, kind: BType
+) -> _Op:
+    return _Op(
+        "binary", func=func, operand=other, side=cast(UfuncSide, side), btype=kind
+    )
 
 
 class Block:
@@ -220,7 +222,9 @@ class _Reduction:
 
     __slots__ = ("_parent", "_op", "_axis", "_cached")
 
-    def __init__(self, parent: "ChunkedArray", op: ReductionOp, axis: int | None) -> None:
+    def __init__(
+        self, parent: "ChunkedArray", op: ReductionOp, axis: int | None
+    ) -> None:
         self._parent = parent
         self._op = op
         self._axis = axis
@@ -246,9 +250,7 @@ class _Reduction:
     ) -> Any:
         if method != "__call__":
             return NotImplemented
-        resolved = tuple(
-            i._arr if isinstance(i, _Reduction) else i for i in inputs
-        )
+        resolved = tuple(i._arr if isinstance(i, _Reduction) else i for i in inputs)
         return ufunc(*resolved, **kwargs)
 
     def __getattr__(self, item: str) -> Any:
@@ -439,9 +441,7 @@ class ChunkedArray:
                     (slice(int(row_sel[0]), int(row_sel[-1]) + 1), self._cols)
                 )
             )
-        return np.asarray(
-            zarr_backing.get_orthogonal_selection((row_sel, self._cols))
-        )
+        return np.asarray(zarr_backing.get_orthogonal_selection((row_sel, self._cols)))
 
     def _materialize_range(self, start: int, end: int) -> np.ndarray:
         a = self._read(start, end)

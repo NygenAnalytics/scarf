@@ -198,22 +198,27 @@ class AnnStream:
                 loadings = self.loadings
                 if disable_scaling:
                     if disable_reduction:
+
                         def reducer(x: np.ndarray) -> np.ndarray:
                             return x
                     else:
                         assert loadings is not None
                         loadings_mat = loadings
+
                         def reducer(x: np.ndarray) -> np.ndarray:
                             return np.asarray(x.dot(loadings_mat))
                 else:
                     if disable_reduction:
+
                         def reducer(x: np.ndarray) -> np.ndarray:
                             return self.transform_z(x)
                     else:
                         assert loadings is not None
                         loadings_mat = loadings
+
                         def reducer(x: np.ndarray) -> np.ndarray:
                             return np.asarray(self.transform_z(x).dot(loadings_mat))
+
                 self.reducer = reducer
             elif self.method == "lsi":
                 if self.loadings is None or len(self.loadings) == 0:
@@ -226,13 +231,16 @@ class AnnStream:
                     self.dims = self.loadings.shape[1]
                 loadings = self.loadings
                 if disable_reduction:
+
                     def reducer(x: np.ndarray) -> np.ndarray:
                         return x
                 else:
                     assert loadings is not None
                     loadings_mat = loadings
+
                     def reducer(x: np.ndarray) -> np.ndarray:
                         return np.asarray(x.dot(loadings_mat))
+
                 self.reducer = reducer
             elif self.method == "custom":
                 if self.loadings is None or len(self.loadings) == 0:
@@ -243,13 +251,16 @@ class AnnStream:
                     self.dims = self.loadings.shape[1]
                 loadings = self.loadings
                 if disable_reduction:
+
                     def reducer(x: np.ndarray) -> np.ndarray:
                         return x
                 else:
                     assert loadings is not None
                     loadings_mat = loadings
+
                     def reducer(x: np.ndarray) -> np.ndarray:
                         return np.asarray(x.dot(loadings_mat))
+
                 self.reducer = reducer
             else:
                 raise ValueError(f"ERROR: Unknown reduction method: {self.method}")
@@ -325,9 +336,7 @@ class AnnStream:
         dims = self.dims
 
         # We fit 1 extra PC dim than specified and then ignore the last PC.
-        self._pca = IncrementalPCA(
-            n_components=dims + 1, batch_size=self.batchSize
-        )
+        self._pca = IncrementalPCA(n_components=dims + 1, batch_size=self.batchSize)
         do_sample_subset = False if use_for_pca.sum() == self.nCells else True
         s, e = 0, 0
         # We store the first block of values here. if such a case arises that we are left with less dims+1 cells to fit
@@ -409,7 +418,11 @@ class AnnStream:
                 pca_array.append(self.reducer(_i))
             return np.vstack(pca_array).T
 
-        ann_dims = self.dims if self.dims is not None and self.dims >= 1 else self.data.shape[1]
+        ann_dims = (
+            self.dims
+            if self.dims is not None and self.dims >= 1
+            else self.data.shape[1]
+        )
 
         ann_idx = instantiate_knn_index(
             self.annMetric,

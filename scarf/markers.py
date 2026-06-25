@@ -192,7 +192,9 @@ def find_markers_by_rank(
         return np.asarray(r / r.sum())
 
     @jit(nopython=True)
-    def calc_frac_fc(v: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def calc_frac_fc(
+        v: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Calculates the mean rank of the data."""
         m = np.zeros(n_groups)
         m_o = np.zeros(n_groups)
@@ -213,7 +215,9 @@ def find_markers_by_rank(
 
     active_prenormed_store = prenormed_store
 
-    def prenormed_mean_rank_wrapper(gene_idx: int | str) -> tuple[int | str, np.ndarray]:
+    def prenormed_mean_rank_wrapper(
+        gene_idx: int | str,
+    ) -> tuple[int | str, np.ndarray]:
         assert active_prenormed_store is not None
         d = np.asarray(as_zarr_array(active_prenormed_store[str(gene_idx)])[cell_idx])
         r = calc_rank_mean(rankdata(d, method="dense"))
@@ -363,9 +367,7 @@ def knn_clustering(
     from .utils import controlled_compute, tqdmbar, show_dask_progress
     from scipy.sparse import csr_matrix
 
-    def make_knn_mat(
-        data: ChunkedArray, k: int, t: int
-    ) -> csr_matrix:
+    def make_knn_mat(data: ChunkedArray, k: int, t: int) -> csr_matrix:
         """Create a sparse KNN adjacency matrix from the input data.
 
         Args:
@@ -436,9 +438,7 @@ def knn_clustering(
             np.ndarray: Reordered cluster assignments (1-based indexing)
         """
 
-        idxmax = show_dask_progress(
-            data.argmax(axis=1), "Sorting clusters", t
-        )
+        idxmax = show_dask_progress(data.argmax(axis=1), "Sorting clusters", t)
         cmm = pd.DataFrame([idxmax, clusters]).T.groupby(1).median()[0].sort_values()
         return np.asarray(
             pd.Series(clusters)
