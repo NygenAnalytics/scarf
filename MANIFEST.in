@@ -7,7 +7,7 @@ exclude .readthedocs.yml
 exclude Dockerfile
 prune scarf_toolkit.egg-info
 prune docs
-prune scarf/tests
+prune tests
 prune .circleci
 prune .github
 include VERSION

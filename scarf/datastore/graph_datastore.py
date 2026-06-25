@@ -541,6 +541,52 @@ class GraphDataStore(BaseDataStore):
         except KeyError:
             return False
 
+    def _load_or_compute_norm_stats(
+        self,
+        normed_loc: str,
+        data: ChunkedArray,
+        reduction_method: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        mu, sigma = np.ndarray([]), np.ndarray([])
+        if reduction_method not in ["pca", "manual"]:
+            return mu, sigma
+        if "mu" in self.zw[normed_loc]:
+            mu = self.zw[normed_loc]["mu"][:]
+        else:
+            mu = clean_array(
+                show_dask_progress(
+                    data.mean(axis=0),
+                    "Calculating mean of norm. data",
+                    self.nthreads,
+                )
+            )
+            if self.zarr_mode == "r+":
+                g = create_zarr_dataset(
+                    self.zw[normed_loc], "mu", (100000,), "f8", mu.shape
+                )
+                g[:] = mu
+            else:
+                logger.debug("Skipping mu persistence on read-only store")
+        if "sigma" in self.zw[normed_loc]:
+            sigma = self.zw[normed_loc]["sigma"][:]
+        else:
+            sigma = clean_array(
+                show_dask_progress(
+                    data.std(axis=0),
+                    "Calculating std. dev. of norm. data",
+                    self.nthreads,
+                ),
+                1,
+            )
+            if self.zarr_mode == "r+":
+                g = create_zarr_dataset(
+                    self.zw[normed_loc], "sigma", (100000,), "f8", sigma.shape
+                )
+                g[:] = sigma
+            else:
+                logger.debug("Skipping sigma persistence on read-only store")
+        return mu, sigma
+
     def _load_ann_stream(
         self,
         from_assay: str,
@@ -575,10 +621,9 @@ class GraphDataStore(BaseDataStore):
         k = int(knn_loc.rsplit("/", 1)[-1].split("__")[-1])
 
         data = ChunkedArray(self.zw[normed_loc + "/data"], nthreads=self.nthreads)
-        mu, sigma = np.ndarray([]), np.ndarray([])
-        if reduction_method in ["pca", "manual"]:
-            mu = self.zw[normed_loc]["mu"][:]
-            sigma = self.zw[normed_loc]["sigma"][:]
+        mu, sigma = self._load_or_compute_norm_stats(
+            normed_loc, data, reduction_method
+        )
 
         loadings = None
         if "reduction" in self.zw[reduction_loc]:
@@ -1151,40 +1196,11 @@ class GraphDataStore(BaseDataStore):
             )
         loadings = None
         fit_kmeans = True
-        mu, sigma = np.ndarray([]), np.ndarray([])
+        mu, sigma = self._load_or_compute_norm_stats(
+            normed_loc, data, reduction_method
+        )
         use_for_pca = self.cells.fetch(pca_cell_key, key=cell_key)
         harmonized_data = None
-
-        if reduction_method in ["pca", "manual"]:
-            if "mu" in self.zw[normed_loc]:
-                mu = self.zw[normed_loc]["mu"][:]
-            else:
-                mu = clean_array(
-                    show_dask_progress(
-                        data.mean(axis=0),
-                        "Calculating mean of norm. data",
-                        self.nthreads,
-                    )
-                )
-                g = create_zarr_dataset(
-                    self.zw[normed_loc], "mu", (100000,), "f8", mu.shape
-                )
-                g[:] = mu
-            if "sigma" in self.zw[normed_loc]:
-                sigma = self.zw[normed_loc]["sigma"][:]
-            else:
-                sigma = clean_array(
-                    show_dask_progress(
-                        data.std(axis=0),
-                        "Calculating std. dev. of norm. data",
-                        self.nthreads,
-                    ),
-                    1,
-                )
-                g = create_zarr_dataset(
-                    self.zw[normed_loc], "sigma", (100000,), "f8", sigma.shape
-                )
-                g[:] = sigma
         if reduction_loc in self.zw:
             if "reduction" in self.zw[reduction_loc]:
                 loadings = self.zw[reduction_loc]["reduction"][:]
@@ -1506,9 +1522,7 @@ class GraphDataStore(BaseDataStore):
 
         Returns:
         """
-        from uuid import uuid4
-        from ..knn_utils import export_knn_to_mtx
-        from pathlib import Path
+        from ..knn_utils import run_sgtsne
         import sys
 
         if sys.platform not in ["posix", "linux"]:
@@ -1519,8 +1533,6 @@ class GraphDataStore(BaseDataStore):
             from_assay, cell_key, feat_key
         )
 
-        uid = str(uuid4())
-        knn_mtx_fn = Path(temp_file_loc, f"{uid}.mtx").resolve()
         graph = self.load_graph(
             from_assay=from_assay,
             cell_key=cell_key,
@@ -1528,22 +1540,16 @@ class GraphDataStore(BaseDataStore):
             symmetric=symmetric_graph,
             upper_only=graph_upper_only,
         )
-        export_knn_to_mtx(str(knn_mtx_fn), graph)
-
-        ini_emb_fn = Path(temp_file_loc, f"{uid}.txt").resolve()
-        with open(ini_emb_fn, "w") as h:
-            if ini_embed is None:
-                ini_embed = self._get_ini_embed(
-                    from_assay, cell_key, feat_key, tsne_dims
-                ).flatten()
-            else:
-                if ini_embed.shape != (graph.shape[0], tsne_dims):
-                    raise ValueError(
-                        "ERROR: Provided initial embedding does not shape required shape: "
-                        f"{(graph.shape[0], tsne_dims)}"
-                    )
-            h.write("\n".join(map(str, ini_embed)))
-        out_fn = Path(temp_file_loc, f"{uid}_output.txt").resolve()
+        if ini_embed is None:
+            ini_embed = self._get_ini_embed(
+                from_assay, cell_key, feat_key, tsne_dims
+            )
+        else:
+            if ini_embed.shape != (graph.shape[0], tsne_dims):
+                raise ValueError(
+                    "ERROR: Provided initial embedding does not shape required shape: "
+                    f"{(graph.shape[0], tsne_dims)}"
+                )
         if parallel:
             if nthreads is None:
                 nthreads = self.nthreads
@@ -1551,18 +1557,21 @@ class GraphDataStore(BaseDataStore):
                 assert type(nthreads) == int
         else:
             nthreads = 1
-        cmd = (
-            f"sgtsne -m {max_iter} -l {lambda_scale} -d {tsne_dims} -e {early_iter} -p {nthreads} -a {alpha}"
-            f" -h {box_h} -i {ini_emb_fn} -o {out_fn} {knn_mtx_fn}"
-        )
-        if verbose:
-            system_call(cmd)
-        else:
-            os.system(cmd)
         try:
-            emb = pd.read_csv(out_fn, header=None, sep=" ")[
-                list(range(tsne_dims))
-            ].values.T
+            emb = run_sgtsne(
+                graph,
+                ini_embed,
+                tsne_dims=tsne_dims,
+                max_iter=max_iter,
+                early_iter=early_iter,
+                alpha=alpha,
+                lambda_scale=lambda_scale,
+                box_h=box_h,
+                temp_file_loc=temp_file_loc,
+                verbose=verbose,
+                parallel=parallel,
+                nthreads=nthreads,
+            )
             for i in range(tsne_dims):
                 self.cells.insert(
                     self._col_renamer(from_assay, cell_key, f"{label}{i + 1}"),
@@ -1570,15 +1579,11 @@ class GraphDataStore(BaseDataStore):
                     key=cell_key,
                     overwrite=True,
                 )
-            for fn in [out_fn, knn_mtx_fn, ini_emb_fn]:
-                Path.unlink(fn)
-        except FileNotFoundError:
+        except (FileNotFoundError, ImportError) as exc:
             logger.error(
-                "SG-tSNE failed, possibly due to missing libraries or file permissions. SG-tSNE currently "
-                "fails on readthedocs"
+                "SG-tSNE failed, possibly due to missing sgtsne executable or "
+                f"sgtsnepi package: {exc}"
             )
-            for fn in [knn_mtx_fn, ini_emb_fn]:
-                Path.unlink(fn)
 
     def run_umap(
         self,
@@ -2457,15 +2462,16 @@ class GraphDataStore(BaseDataStore):
         store.attrs["n_cells"] = n_cells
         store.attrs["n_neighbors"] = n_neighbors
 
+        edge_chunk = chunk_size * n_neighbors
         zge = create_zarr_dataset(
             store,
             f"edges",
-            (chunk_size,),
-            (np.uint32, np.uint32),
+            (edge_chunk,),
+            ("u8", "u8"),
             (n_cells * n_neighbors, 2),
         )
         zgw = create_zarr_dataset(
-            store, f"weights", (chunk_size,), np.float64, (n_cells * n_neighbors)
+            store, f"weights", (edge_chunk,), "f8", (n_cells * n_neighbors,)
         )
 
         zge[:, 0] = merged_graph.row

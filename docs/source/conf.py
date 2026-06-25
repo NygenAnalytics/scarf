@@ -62,7 +62,10 @@ htmlhelp_basename = "Scarf Documentation"
 man_pages = [(master_doc, "scarf", "Scarf Documentation", [author], 1)]
 
 nb_execution_allow_errors = True
-nb_execution_mode = "auto"
+nb_execution_mode = "cache"
+nb_execution_cache_path = os.path.join(
+    os.path.dirname(__file__), "..", ".jupyter_cache"
+)
 nb_execution_timeout = 200
 
 import matplotlib

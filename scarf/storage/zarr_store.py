@@ -346,7 +346,7 @@ def make_store(
                 from zarr.storage import ObjectStore
             except ImportError as exc:
                 raise ImportError(
-                    "Remote Zarr stores require obstore. Install with: pip install scarf[cloud]"
+                    "Remote Zarr stores require obstore."
                 ) from exc
             _maybe_auto_cloud_profile(location)
             obstore = obstore_from_url(location, **(storage_options or {}))
@@ -377,13 +377,13 @@ def create_numeric_array(
     spec: ZarrArraySpec,
 ) -> zarr.Array:
     """Create a numeric Zarr array from a ``ZarrArraySpec``."""
-    zarrFormat = spec.zarrFormat if spec.zarrFormat != 3 else _group_zarr_format(group)
+    zarrFormat = _group_zarr_format(group)
     chunks = normalize_chunks(spec.chunks, spec.shape)
     kwargs: dict[str, Any] = {
         "shape": spec.shape,
         "chunks": chunks,
         "dtype": spec.dtype,
-        "compressors": spec.compressors or get_compressors(zarrFormat=zarrFormat),
+        "compressors": get_compressors(zarrFormat=zarrFormat),
         "overwrite": spec.overwrite,
     }
     if spec.shards is not None:

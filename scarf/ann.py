@@ -101,7 +101,7 @@ class AnnStream:
         disable_scaling: Skip z-scaling before PCA projection.
         ann_idx: Existing hnswlib index to reuse instead of fitting.
         lsi_skip_first: Drop first LSI component (depth) when using LSI.
-        lsi_params: Extra kwargs forwarded to gensim LsiModel (minus reserved keys).
+        lsi_params: Extra kwargs forwarded to sklearn TruncatedSVD (minus reserved keys).
         harmonize: Whether to run Harmony batch correction before ANN fitting.
         harmonized_data: Precomputed harmonized ChunkedArray (optional).
         batches: Batch metadata DataFrame for Harmony.
@@ -330,36 +330,28 @@ class AnnStream:
         self.loadings = self._pca.components_[:-1, :].T
 
     def _fit_lsi(self, lsi_skip_first, lsi_params) -> None:
-        import warnings
+        from sklearn.decomposition import TruncatedSVD
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", UserWarning)
-            from gensim.models import LsiModel
-            from gensim.matutils import Dense2Corpus
-
-        for i in ["corpus", "num_topics", "id2word", "chunksize", "dtype"]:
-            if i in lsi_params:
-                del lsi_params[i]
+        reserved = {"n_components", "random_state"}
+        for key in list(lsi_params):
+            if key in reserved:
+                del lsi_params[key]
                 logger.warning(
-                    f"Provided parameter, {i}, for LSI model will not be used"
+                    f"Provided parameter, {key}, for LSI model will not be used"
                 )
-        self._lsiModel = LsiModel(
-            corpus=Dense2Corpus(
-                controlled_compute(self.data.blocks[0], self.nthreads).T
-            ),
-            num_topics=self.dims + 1,  # +1 because first dim will be discarded
-            chunksize=self.data.chunksize[0],
-            id2word={x: x for x in range(self.data.shape[1])},
+
+        mat = np.vstack(list(self.iter_blocks(msg="Fitting LSI model")))
+        svd = TruncatedSVD(
+            n_components=self.dims + 1,
+            random_state=self.randState,
             **lsi_params,
         )
-        for n, i in enumerate(self.iter_blocks(msg="Fitting LSI model")):
-            if n == 0:
-                continue
-            self._lsiModel.add_documents(Dense2Corpus(i.T))
+        svd.fit(mat)
+        components = svd.components_.T
         if lsi_skip_first:
-            self.loadings = self._lsiModel.get_topics().T[:, 1:]
+            self.loadings = components[:, 1:]
         else:
-            self.loadings = self._lsiModel.get_topics().T
+            self.loadings = components
 
     def _fit_ann(self):
         def _transform_values():

@@ -35,7 +35,7 @@ class MappingDatastore(GraphDataStore):
         target_feat_key: str,
         target_cell_key: str = "I",
         from_assay: str | None = None,
-        cell_key: str = "I",
+        cell_key: str | None = None,
         feat_key: str | None = None,
         save_k: int = 3,
         batch_size: int = 1000,
@@ -204,7 +204,8 @@ class MappingDatastore(GraphDataStore):
         if "projections" not in source_assay.z:
             source_assay.z.create_group("projections")
         store = source_assay.z["projections"].create_group(target_name, overwrite=True)
-        nc, nk = target_assay.cells.fetch_all("I").sum(), save_k
+        nc = target_assay.cells.active_index(target_cell_key).shape[0]
+        nk = save_k
         zi = create_zarr_dataset(store, "indices", (batch_size,), "u8", (nc, nk))
         zd = create_zarr_dataset(store, "distances", (batch_size,), "f8", (nc, nk))
         entry_start = 0
@@ -226,7 +227,7 @@ class MappingDatastore(GraphDataStore):
         target_name: str,
         target_groups: np.ndarray | None = None,
         from_assay: str | None = None,
-        cell_key: str = "I",
+        cell_key: str | None = None,
         log_transform: bool = True,
         multiplier: float = 1000,
         weighted: bool = True,
@@ -255,8 +256,7 @@ class MappingDatastore(GraphDataStore):
         Yields:
             A tuple of group name and mapping score of reference cells for that target group.
         """
-        if from_assay is None:
-            from_assay = self._defaultAssay
+        from_assay, cell_key, _ = self._get_latest_keys(from_assay, cell_key, None)
         store_loc = f"{from_assay}/projections/{target_name}"
         if store_loc not in self.zw:
             raise KeyError(
@@ -281,7 +281,7 @@ class MappingDatastore(GraphDataStore):
         else:
             groups = pd.Series(np.zeros(n_cells))
 
-        ref_n_cells = self.cells.fetch_all(cell_key).sum()
+        ref_n_cells = self.cells.active_index(cell_key).shape[0]
         for group in sorted(groups.unique()):
             coi = {x: None for x in groups[groups == group].index.values}
             ms = np.zeros(ref_n_cells)
@@ -301,7 +301,7 @@ class MappingDatastore(GraphDataStore):
         self,
         target_name: str,
         from_assay: str | None = None,
-        cell_key: str = "I",
+        cell_key: str | None = None,
         reference_class_group: str | None = None,
         threshold_fraction: float = 0.5,
         target_subset: list[int] | None = None,
@@ -325,8 +325,7 @@ class MappingDatastore(GraphDataStore):
 
         Returns: A pandas Series containing predicted class for each cell in the projected sample (`target_name`).
         """
-        if from_assay is None:
-            from_assay = self._defaultAssay
+        from_assay, cell_key, _ = self._get_latest_keys(from_assay, cell_key, None)
         store_loc = f"{from_assay}/projections/{target_name}"
         if store_loc not in self.zw:
             raise KeyError(
@@ -378,9 +377,9 @@ class MappingDatastore(GraphDataStore):
 
     def load_unified_graph(
         self,
-        from_assay: str,
-        cell_key: str,
-        feat_key: str,
+        from_assay: str | None,
+        cell_key: str | None,
+        feat_key: str | None,
         target_names: list[str],
         use_k: int,
         target_weight: float,
@@ -405,13 +404,15 @@ class MappingDatastore(GraphDataStore):
 
         if from_assay is None:
             from_assay = self._defaultAssay
+        if cell_key is None:
+            cell_key = self._get_latest_cell_key(from_assay)
         if feat_key is None:
             feat_key = self._get_latest_feat_key(from_assay)
         graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
         graph_group = self.zw[graph_loc]
         edges = graph_group["edges"][:]
         weights = graph_group["weights"][:]
-        ref_n_cells = self.cells.fetch_all(cell_key).sum()
+        ref_n_cells = self.cells.active_index(cell_key).shape[0]
         store = self.zw[from_assay]["projections"]
         pidx = np.vstack([store[x]["indices"][:, :use_k] for x in target_names])
         n_cells = [ref_n_cells] + [store[x]["indices"].shape[0] for x in target_names]
@@ -482,7 +483,7 @@ class MappingDatastore(GraphDataStore):
         self,
         target_names: list[str],
         from_assay: str | None = None,
-        cell_key: str = "I",
+        cell_key: str | None = None,
         feat_key: str | None = None,
         use_k: int = 3,
         target_weight: float = 0.1,
@@ -546,10 +547,9 @@ class MappingDatastore(GraphDataStore):
         from ..umap import fit_transform
         from ..utils import get_log_level
 
-        if from_assay is None:
-            from_assay = self._defaultAssay
-        if feat_key is None:
-            feat_key = self._get_latest_feat_key(from_assay)
+        from_assay, cell_key, feat_key = self._get_latest_keys(
+            from_assay, cell_key, feat_key
+        )
         n_cells, graph = self.load_unified_graph(
             from_assay=from_assay,
             cell_key=cell_key,
@@ -588,7 +588,7 @@ class MappingDatastore(GraphDataStore):
         self,
         target_names: list[str],
         from_assay: str | None = None,
-        cell_key: str = "I",
+        cell_key: str | None = None,
         feat_key: str | None = None,
         use_k: int = 3,
         target_weight: float = 0.5,
@@ -632,14 +632,11 @@ class MappingDatastore(GraphDataStore):
 
         Returns:
         """
-        from uuid import uuid4
-        from ..knn_utils import export_knn_to_mtx
-        from pathlib import Path
+        from ..knn_utils import run_sgtsne
 
-        if from_assay is None:
-            from_assay = self._defaultAssay
-        if feat_key is None:
-            feat_key = self._get_latest_feat_key(from_assay)
+        from_assay, cell_key, feat_key = self._get_latest_keys(
+            from_assay, cell_key, feat_key
+        )
         n_cells, graph = self.load_unified_graph(
             from_assay=from_assay,
             cell_key=cell_key,
@@ -651,27 +648,19 @@ class MappingDatastore(GraphDataStore):
         ini_embed = self._get_uni_ini_embed(
             from_assay, cell_key, feat_key, graph, ini_embed_with, n_cells[0]
         )
-
-        uid = str(uuid4())
-        ini_emb_fn = Path(temp_file_loc, f"{uid}.txt").resolve()
-        with open(ini_emb_fn, "w") as h:
-            h.write("\n".join(map(str, ini_embed.flatten())))
-        del ini_embed
-        knn_mtx_fn = Path(temp_file_loc, f"{uid}.mtx").resolve()
-        export_knn_to_mtx(str(knn_mtx_fn), graph)
-        out_fn = Path(temp_file_loc, f"{uid}_output.txt").resolve()
-        cmd = (
-            f"sgtsne -m {max_iter} -l {lambda_scale} -d {2} -e {early_iter} -p 1 -a {alpha}"
-            f" -h {box_h} -i {ini_emb_fn} -o {out_fn} {knn_mtx_fn}"
+        emb = run_sgtsne(
+            graph,
+            ini_embed,
+            tsne_dims=2,
+            max_iter=max_iter,
+            early_iter=early_iter,
+            alpha=alpha,
+            lambda_scale=lambda_scale,
+            box_h=box_h,
+            temp_file_loc=temp_file_loc,
+            verbose=verbose,
         )
-        if verbose:
-            system_call(cmd)
-        else:
-            os.system(cmd)
-        t = pd.read_csv(out_fn, header=None, sep=" ")[[0, 1]].values
-        self._save_embedding(from_assay, cell_key, label, t, n_cells, target_names)
-        for fn in [out_fn, knn_mtx_fn, ini_emb_fn]:
-            Path.unlink(fn)
+        self._save_embedding(from_assay, cell_key, label, emb.T, n_cells, target_names)
         return None
 
     def plot_unified_layout(

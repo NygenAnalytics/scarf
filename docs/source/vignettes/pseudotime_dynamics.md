@@ -174,7 +174,7 @@ There are two primary results of `run_pseudotime_aggregation`:
 
 ```{code-cell} ipython3
 # The binned data matrix. Here we print the shape of the matrix indicating the number of features and numner of bins respectively
-ds.z.RNA.aggregated_I_I_RNA_pseudotime.data.shape
+ds.RNA.z['aggregated_I_I_RNA_pseudotime/data'].shape
 ```
 
 ```{code-cell} ipython3

@@ -1,5 +1,5 @@
 ignore:
-  - "scarf/tests/*"
+  - "tests/*"
   - "setup.py"
 
 github_checks: false

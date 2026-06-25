@@ -14,8 +14,10 @@ Python 3.14 is required (`requires-python >=3.14,<3.15`).
 ## Contributions to the documentation
 You may contribute to the documentation by either adding new sections or modifying existing
 sections. All the required packages for building the documentation locally can be installed
-with `uv pip install -e ".[extra,docs]"`. The documentation is built
-using [Sphinx]. The markdown files are parsed using [MyST] parser. If you want to add a notebook
+with `uv pip install -e ".[extra,docs]"`. After editing vignettes, execute them locally with
+`cd docs && make execute-notebooks`, then commit `docs/.jupyter_cache/`. Read the Docs
+builds HTML with Sphinx and reuses that cache instead of re-running notebooks. The documentation is built using [Sphinx].
+The markdown files are parsed using [MyST] parser. If you want to add a notebook
 to  the documentation then please convert your `ipynb` files to `markdown` format using [Jupytext].
 The markdown files are saved with extension `mdnb` so that they can be recognized by [nbshpinx]
 extension. 

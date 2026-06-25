@@ -40,12 +40,11 @@ dependencies = [
     "tqdm",
     "umap-learn",
     "zarr>=3.0",
+    "obstore",
+    "sgtsnepi",
 ]
 
 [project.optional-dependencies]
-cloud = [
-    "obstore",
-]
 extra = [
     "requests",
     "kneed",
@@ -62,10 +61,6 @@ test = [
     "pytest-xdist",
     "topacedo",
     "anndata",
-    "black",
-    "matplotlib",
-    "seaborn",
-    "cmocean",
 ]
 docs = [
     "jinja2",
@@ -101,10 +96,10 @@ markers = [
     "integration: live network tests for OSF downloader",
 ]
 testpaths = [
-    "scarf/tests",
+    "tests",
 ]
 norecursedirs = [
-    "scarf/tests"
+    "datasets",
 ]
 
 [tool.coverage.run]
@@ -126,7 +121,7 @@ fail-under = 50
 exclude = [
     "setup.py",
     "docs",
-    "scarf/tests"
+    "tests"
 ]
 ignore-regex = [
     "^get$",

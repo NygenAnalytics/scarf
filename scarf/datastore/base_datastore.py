@@ -328,7 +328,7 @@ class BaseDataStore:
             Name of the latest feature that was used to run `save_normalized_data`
         """
         assay = self._get_assay(from_assay)
-        return assay.attrs["latest_cell_key"]
+        return assay.attrs.get("latest_cell_key", "I")
 
     def _ini_cell_props(
         self,

@@ -150,6 +150,8 @@ ds.cells.insert(
 If we try to add values for a column that already exists then Scarf will throw an error. For example, if we simply rerun the command above, we should get an error
 
 ```{code-cell} ipython3
+:tags: [raises-exception]
+
 ds.cells.insert(
     column_name='is_clust1',
     values=is_clust_1

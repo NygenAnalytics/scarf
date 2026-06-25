@@ -15,6 +15,7 @@ __all__ = [
     "self_query_knn",
     "smoothen_dists",
     "export_knn_to_mtx",
+    "run_sgtsne",
     "merge_graphs",
     "wnn_integration",
 ]
@@ -208,6 +209,114 @@ def export_knn_to_mtx(mtx: str, csr_graph, batch_size: int = 1000) -> None:
                 "ERROR: Internal loop count error in export_knn_to_mtx. Please report this bug"
             )
     return None
+
+
+def run_sgtsne(
+    graph,
+    ini_embed: np.ndarray,
+    *,
+    tsne_dims: int = 2,
+    max_iter: int = 500,
+    early_iter: int = 200,
+    alpha: int = 10,
+    lambda_scale: float = 1.0,
+    box_h: float = 0.7,
+    temp_file_loc: str = ".",
+    verbose: bool = True,
+    parallel: bool = False,
+    nthreads: int = 1,
+) -> np.ndarray:
+    """Run SG-t-SNE on a sparse graph.
+
+    Uses the ``sgtsne`` executable when available, otherwise falls back to the
+    ``sgtsnepi`` Python package.
+
+    Args:
+        graph: Sparse cell-neighbourhood graph.
+        ini_embed: Initial embedding with shape (n_cells, tsne_dims).
+        tsne_dims: Number of tSNE dimensions.
+        max_iter: Maximum number of iterations.
+        early_iter: Number of early exaggeration iterations.
+        alpha: Early exaggeration multiplier.
+        lambda_scale: Lambda rescaling parameter.
+        box_h: Grid side length (accuracy control).
+        temp_file_loc: Directory for temporary files used by the CLI backend.
+        verbose: Whether to print SG-t-SNE logs.
+        parallel: Whether to run tSNE in parallel mode (CLI backend only).
+        nthreads: Number of threads for parallel CLI runs.
+
+    Returns:
+        Embedding array with shape (tsne_dims, n_cells).
+    """
+    import os
+    import shutil
+    from pathlib import Path
+    from uuid import uuid4
+
+    from loguru import logger
+
+    from .utils import system_call
+
+    n_cells = graph.shape[0]
+    ini_embed = np.asarray(ini_embed)
+    if ini_embed.shape == (n_cells * tsne_dims,):
+        ini_embed = ini_embed.reshape(n_cells, tsne_dims)
+    if ini_embed.shape != (n_cells, tsne_dims):
+        raise ValueError(
+            f"ini_embed must have shape ({n_cells}, {tsne_dims}), got {ini_embed.shape}"
+        )
+
+    if shutil.which("sgtsne") is not None:
+        uid = str(uuid4())
+        knn_mtx_fn = Path(temp_file_loc, f"{uid}.mtx").resolve()
+        export_knn_to_mtx(str(knn_mtx_fn), graph)
+        ini_emb_fn = Path(temp_file_loc, f"{uid}.txt").resolve()
+        with open(ini_emb_fn, "w") as h:
+            h.write("\n".join(map(str, ini_embed.flatten())))
+        out_fn = Path(temp_file_loc, f"{uid}_output.txt").resolve()
+        threads = nthreads if parallel else 1
+        cmd = (
+            f"sgtsne -m {max_iter} -l {lambda_scale} -d {tsne_dims} -e {early_iter} "
+            f"-p {threads} -a {alpha} -h {box_h} -i {ini_emb_fn} -o {out_fn} {knn_mtx_fn}"
+        )
+        if verbose:
+            system_call(cmd)
+        else:
+            os.system(cmd)
+        try:
+            emb = pd.read_csv(out_fn, header=None, sep=" ")[
+                list(range(tsne_dims))
+            ].values.T
+        finally:
+            for fn in (out_fn, knn_mtx_fn, ini_emb_fn):
+                if fn.exists():
+                    fn.unlink()
+        return emb
+
+    try:
+        from sgtsnepi import sgtsnepi
+    except ImportError as exc:
+        raise ImportError(
+            "SG-t-SNE requires the sgtsne executable on PATH or the sgtsnepi package."
+        ) from exc
+
+    if parallel:
+        logger.warning(
+            "parallel=True is not supported by the sgtsnepi Python backend; "
+            "running single-threaded"
+        )
+
+    return sgtsnepi(
+        graph,
+        y0=ini_embed.T,
+        d=tsne_dims,
+        max_iter=max_iter,
+        early_exag=early_iter,
+        lambda_par=lambda_scale,
+        h=box_h,
+        alpha=alpha,
+        silent=not verbose,
+    )
 
 
 @jit(nopython=True)

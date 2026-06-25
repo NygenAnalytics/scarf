@@ -407,8 +407,7 @@ class DataStore(MappingDatastore):
                 "ERROR: Please provide a value for `group_key`. This should be the name of a column from "
                 "cell metadata object that has information on how cells should be grouped."
             )
-        if cell_key is None:
-            cell_key = "I"
+        from_assay, cell_key, _ = self._get_latest_keys(from_assay, cell_key, None)
         if feat_key is None:
             feat_key = "I"
         if n_threads is None:
@@ -646,7 +645,7 @@ class DataStore(MappingDatastore):
         """
 
         if cell_key is None:
-            cell_key = "I"
+            from_assay, cell_key, _ = self._get_latest_keys(from_assay, cell_key, None)
         if group_key is None:
             raise ValueError(
                 "ERROR: Please provide a value for group_key. "
@@ -678,21 +677,23 @@ class DataStore(MappingDatastore):
         for gid in gids:
             group_name = str(gid)
             if group_name in g:
-                cols = [g[group_name][x][:] for x in out_cols]  # type: ignore
+                available_cols = [col for col in out_cols if col in g[group_name]]
+                cols = [g[group_name][x][:] for x in available_cols]  # type: ignore
                 df = pd.DataFrame(
                     cols,
-                    index=out_cols,
+                    index=available_cols,
                 ).T
                 df["group_id"] = gid
                 df["feature_name"] = assay.feats.fetch_all("names")[
                     df.feature_index.astype("int")
                 ]
+                df = df[["group_id", "feature_name"] + available_cols]
             else:
                 logger.debug(f"No markers found for {gid} returning empty dataframe")
                 df = pd.DataFrame([[] for _ in out_cols], index=out_cols).T
                 df["group_id"] = []
                 df["feature_name"] = []
-            df = df[["group_id", "feature_name"] + out_cols]
+                df = df[["group_id", "feature_name"] + out_cols]
             dfs.append(df)
         dfs = pd.concat(dfs)
         return dfs[
@@ -1547,7 +1548,7 @@ class DataStore(MappingDatastore):
         if from_assay is None:
             from_assay = self._defaultAssay
         if cell_key is None:
-            cell_key = "I"
+            cell_key = self._get_latest_cell_key(from_assay)
         if layout_key is None:
             raise ValueError("Please provide a value for `layout_key` parameter.")
         if clip_fraction >= 0.5:
@@ -2159,9 +2160,12 @@ class DataStore(MappingDatastore):
             Higher scores indicate more mixing between different labels.
         """
 
+        if from_assay is None:
+            from_assay = self._load_default_assay()
+
         if use_latest_knn and knn_loc is None:
             knn_loc = self._get_latest_knn_loc(from_assay)
-            cell_key = self.zw[self._load_default_assay()].attrs["latest_cell_key"]
+            cell_key = self._get_latest_cell_key(from_assay)
             logger.info(f"Using the latest knn graph at location: {knn_loc}")
 
         else:
@@ -2170,6 +2174,8 @@ class DataStore(MappingDatastore):
             if knn_loc not in self.zw:
                 raise ValueError(f"Could not find the knn graph at location: {knn_loc}")
 
+            normed_part = knn_loc.split("/")[1]
+            _, cell_key, _ = normed_part.split("__")
             logger.info(f"Using the knn graph at location: {knn_loc}")
 
         knn = self.zw[knn_loc]
@@ -2194,7 +2200,9 @@ class DataStore(MappingDatastore):
         if save_result:
             for col, vals in zip(label_colnames, lisi_scores.T):
                 col_name = f"lisi__{col}__{knn_loc.split('/')[-1]}"
-                self.cells.insert(column_name=col_name, values=vals, overwrite=True)
+                self.cells.insert(
+                    column_name=col_name, values=vals, overwrite=True, key=cell_key
+                )
 
         if return_lisi:
             return list(zip(label_colnames, lisi_scores.T))
