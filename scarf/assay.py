@@ -778,6 +778,71 @@ class RNAassay(Assay):
             self.attrs["size_factor"] = self.sf
         self.scalar = None
 
+    def save_normalized_data(
+        self,
+        cell_key: str,
+        feat_key: str,
+        batch_size: int,
+        location: str,
+        log_transform: bool,
+        renormalize_subset: bool,
+        update_keys: bool,
+    ) -> ChunkedArray:
+        if not renormalize_subset:
+            return super().save_normalized_data(
+                cell_key,
+                feat_key,
+                batch_size,
+                location,
+                log_transform,
+                renormalize_subset,
+                update_keys,
+            )
+
+        from .writers import write_renorm_subset_to_zarr
+
+        if feat_key != "I":
+            feat_key = cell_key + "__" + feat_key
+        cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
+        subset_hash = self._create_subset_hash(cell_idx, feat_idx)
+        subset_params = {
+            "log_transform": log_transform,
+            "renormalize_subset": renormalize_subset,
+        }
+        if location in self.z:
+            if (
+                subset_hash == self.z[location].attrs["subset_hash"]
+                and subset_params == self.z[location].attrs["subset_params"]
+            ):
+                logger.info(
+                    f"Using existing normalized data with cell key {cell_key} and feat key {feat_key}"
+                )
+                if update_keys:
+                    self.attrs["latest_feat_key"] = (
+                        feat_key.split("__", 1)[1] if feat_key != "I" else "I"
+                    )
+                    self.attrs["latest_cell_key"] = cell_key
+                return ChunkedArray(self.z[location + "/data"], nthreads=self.nthreads)
+        self.z.create_group(location, overwrite=True)
+
+        write_renorm_subset_to_zarr(
+            self,
+            cell_idx,
+            feat_idx,
+            self.z,
+            location + "/data",
+            self.nthreads,
+            log_transform=log_transform,
+        )
+        self.z[location].attrs["subset_hash"] = subset_hash
+        self.z[location].attrs["subset_params"] = subset_params
+        if update_keys:
+            self.attrs["latest_feat_key"] = (
+                feat_key.split("__", 1)[1] if feat_key != "I" else "I"
+            )
+            self.attrs["latest_cell_key"] = cell_key
+        return ChunkedArray(self.z[location + "/data"], nthreads=self.nthreads)
+
     def normed(
         self,
         cell_idx: np.ndarray | None = None,

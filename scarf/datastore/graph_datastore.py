@@ -1,4 +1,6 @@
 import os
+import shutil
+import tempfile
 from collections.abc import Callable
 
 import numpy as np
@@ -8,7 +10,17 @@ from loguru import logger
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ..assay import Assay
-from ..storage.zarr_store import zarr_root_path
+from ..storage.zarr_store import (
+    copy_zarr_array,
+    has_ann_index,
+    is_remote_datastore,
+    legacy_ann_index_path,
+    load_ann_index,
+    load_ann_index_from_path,
+    open_or_create_staged_normed_array,
+    save_ann_index,
+    zarr_root_path,
+)
 from ..utils import clean_array, show_dask_progress, system_call, tqdmbar
 from ..writers import create_zarr_dataset
 from .base_datastore import BaseDataStore
@@ -425,6 +437,82 @@ class GraphDataStore(BaseDataStore):
         latest_knn = ann_loc.attrs["latest_knn"]
         return latest_knn
 
+    def _ann_stream_recoverable(
+        self,
+        ann_loc: str,
+        reduction_loc: str,
+        normed_loc: str,
+    ) -> bool:
+        """Return True when an ANN stream can be loaded or rebuilt without a full make_graph."""
+        if ann_loc in self.zw and has_ann_index(self.zw[ann_loc]):
+            return True
+        legacy = legacy_ann_index_path(zarr_root_path(self.zw), ann_loc)
+        if legacy is not None and os.path.exists(legacy):
+            return True
+        if reduction_loc in self.zw and "reduction" in self.zw[reduction_loc]:
+            if normed_loc in self.zw and "data" in self.zw[normed_loc]:
+                return True
+        return False
+
+    def _resolve_ann_index(
+        self,
+        ann_loc: str,
+        ann_metric: str,
+        dim: int,
+        ann_index_fetcher: Callable | None = None,
+        persist: bool = True,
+    ):
+        """Load ANN index from zarr, legacy file, custom fetcher, or return None to rebuild."""
+        ann_group = self.zw[ann_loc] if ann_loc in self.zw else None
+
+        if ann_index_fetcher is not None:
+            try:
+                ann_index_fn = ann_index_fetcher(ann_loc)
+            except Exception:
+                ann_index_fn = None
+                logger.warning("Custom `ann_index_fetcher` failed")
+            if ann_index_fn is not None and os.path.exists(ann_index_fn):
+                return load_ann_index_from_path(ann_index_fn, ann_metric, dim)
+
+        if ann_group is not None and has_ann_index(ann_group):
+            return load_ann_index(ann_group, ann_metric, dim)
+
+        legacy = legacy_ann_index_path(zarr_root_path(self.zw), ann_loc)
+        if legacy is not None and os.path.exists(legacy):
+            idx = load_ann_index_from_path(legacy, ann_metric, dim)
+            if (
+                persist
+                and self.zarr_mode == "r+"
+                and ann_group is not None
+            ):
+                save_ann_index(ann_group, idx)
+            return idx
+
+        logger.info(
+            "ANN index not found in store; will rebuild from normalized data and loadings"
+        )
+        return None
+
+    def _persist_ann_index(
+        self,
+        ann_loc: str,
+        ann_idx,
+        ann_index_saver: Callable | None = None,
+    ) -> None:
+        """Save an hnswlib index into the zarr hierarchy or via a custom saver."""
+        if ann_index_saver is not None:
+            try:
+                ann_index_saver(ann_idx, ann_loc)
+                return
+            except Exception:
+                logger.warning("Custom `ann_index_saver` failed")
+        if ann_loc not in self.zw:
+            self.zw.create_group(ann_loc, overwrite=True)
+        if self.zarr_mode != "r+":
+            logger.debug("Skipping ANN index persistence on read-only store")
+            return
+        save_ann_index(self.zw[ann_loc], ann_idx)
+
     def _has_ann_stream_cache(
         self,
         from_assay: str,
@@ -445,10 +533,11 @@ class GraphDataStore(BaseDataStore):
 
             if knn_loc not in self.zw:
                 return False
-            zw_root = zarr_root_path(self.zw)
-            if zw_root is None:
+            if ann_loc not in self.zw:
                 return False
-            return os.path.exists(os.path.join(zw_root, ann_loc, "ann_idx"))
+            reduction_loc = ann_loc.rsplit("/ann__", 1)[0]
+            normed_loc = reduction_loc.rsplit("/reduction__", 1)[0]
+            return self._ann_stream_recoverable(ann_loc, reduction_loc, normed_loc)
         except KeyError:
             return False
 
@@ -513,22 +602,19 @@ class GraphDataStore(BaseDataStore):
                     }
                 )
 
-        zw_root = zarr_root_path(self.zw)
-        if zw_root is None:
-            raise FileNotFoundError("Cannot load ANN index without a local zarr path")
-        ann_index_fn = os.path.join(zw_root, ann_loc, "ann_idx")
-        if not os.path.exists(ann_index_fn):
-            raise FileNotFoundError(f"ANN index not found at {ann_index_fn}")
-
-        import hnswlib
-
         temp_dim = dims if dims > 0 else data.shape[1]
-        ann_idx = hnswlib.Index(space=ann_metric, dim=temp_dim)
-        ann_idx.load_index(ann_index_fn)
+        ann_idx = self._resolve_ann_index(
+            ann_loc,
+            ann_metric,
+            temp_dim,
+            ann_index_fetcher=None,
+            persist=(self.zarr_mode == "r+"),
+        )
+        rebuilt_ann = ann_idx is None
 
         use_for_pca = self.cells.fetch(pca_cell_key, key=cell_key)
         logger.info(f"Loaded existing ANN stream from {ann_loc}")
-        return AnnStream(
+        ann_obj = AnnStream(
             data=data,
             k=k,
             n_cluster=2,
@@ -554,6 +640,9 @@ class GraphDataStore(BaseDataStore):
             harmonized_data=harmonized_data,
             batches=batches,
         )
+        if rebuilt_ann and self.zarr_mode == "r+":
+            self._persist_ann_index(ann_loc, ann_obj.annIdx)
+        return ann_obj
 
     def _get_ini_embed(
         self, from_assay: str, cell_key: str, feat_key: str, n_comps: int
@@ -641,6 +730,64 @@ class GraphDataStore(BaseDataStore):
                 (w, (e[:, 0], e[:, 1])), shape=(n_cells, n_cells)
             )
 
+    @staticmethod
+    def _resolve_local_cache_plan(
+        zarr_loc,
+        group,
+        local_cache: bool | str,
+    ) -> tuple[bool, str | None, bool]:
+        """Return whether to stage, cache base directory, and remove-on-success flag."""
+        if local_cache is False or not is_remote_datastore(zarr_loc, group):
+            return False, None, False
+        if local_cache is True or local_cache == "auto":
+            return True, tempfile.mkdtemp(prefix="scarf_local_cache_"), True
+        if isinstance(local_cache, str):
+            os.makedirs(local_cache, exist_ok=True)
+            return True, local_cache, False
+        raise TypeError(
+            f"local_cache must be 'auto', True, False, or a path string, got {local_cache!r}"
+        )
+
+    def _normed_cache_key(self, subset_hash: str, subset_params: dict) -> str:
+        import hashlib
+        import json
+
+        payload = json.dumps(
+            {"subset_hash": subset_hash, "subset_params": subset_params},
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+    def _stage_normed_data(
+        self,
+        remote_array,
+        subset_hash: str,
+        subset_params: dict,
+        cache_base: str,
+    ) -> ChunkedArray:
+        """Copy normalized data to a local scratch Zarr for multi-pass graph building."""
+        cache_key = self._normed_cache_key(subset_hash, subset_params)
+        cache_path = os.path.join(cache_base, cache_key, "normed.zarr")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        staged = open_or_create_staged_normed_array(cache_path, remote_array)
+        if (
+            staged.attrs.get("staged_subset_hash") == subset_hash
+            and staged.attrs.get("staged_subset_params") == subset_params
+            and staged.attrs.get("staged_complete")
+        ):
+            logger.info(f"Reusing staged normalized data at {cache_path}")
+        else:
+            logger.info(f"Staging normalized data locally at {cache_path}")
+            copy_zarr_array(
+                remote_array,
+                staged,
+                msg="Staging normalized data locally",
+            )
+            staged.attrs["staged_subset_hash"] = subset_hash
+            staged.attrs["staged_subset_params"] = subset_params
+            staged.attrs["staged_complete"] = True
+        return ChunkedArray(staged, nthreads=self.nthreads)
+
     def make_graph(
         self,
         from_assay: str | None = None,
@@ -672,6 +819,7 @@ class GraphDataStore(BaseDataStore):
         show_elbow_plot: bool = False,
         ann_index_fetcher: Callable | None = None,
         ann_index_saver: Callable | None = None,
+        local_cache: bool | str = "auto",
     ):
         """Creates a cell neighbourhood graph. Performs following steps in the
         process:
@@ -778,12 +926,16 @@ class GraphDataStore(BaseDataStore):
                             existing PCA loadings or custom loadings. (Default value: False)
             ann_index_fetcher:
             ann_index_saver:
+            local_cache: When ``'auto'`` or ``True``, remote stores copy the normalized
+                         matrix to a local scratch Zarr before PCA/ANN/kmeans/KNN so
+                         multi-pass reads hit local disk instead of object storage.
+                         A string value is treated as a persistent scratch base path
+                         keyed by ``subset_hash`` (~8 GB for 1M cells x 2000 HVGs in
+                         float32). ``False`` disables staging.
 
         Returns:
             Either None or `AnnStream` object
         """
-        from ..ann import AnnStream
-
         if from_assay is None:
             from_assay = self._defaultAssay
         assay = self._get_assay(from_assay)
@@ -884,6 +1036,114 @@ class GraphDataStore(BaseDataStore):
             renormalize_subset,
             update_keys,
         )
+        subset_hash = self.zw[normed_loc].attrs["subset_hash"]
+        subset_params = self.zw[normed_loc].attrs["subset_params"]
+        cache_enabled, cache_base, remove_on_success = self._resolve_local_cache_plan(
+            self.zarr_loc, self.z, local_cache
+        )
+        graph_succeeded = False
+        try:
+            if cache_enabled:
+                data = self._stage_normed_data(
+                    self.zw[normed_loc]["data"],
+                    subset_hash,
+                    subset_params,
+                    cache_base,
+                )
+            result = self._run_graph_from_normed_data(
+                data=data,
+                assay=assay,
+                from_assay=from_assay,
+                cell_key=cell_key,
+                feat_key=feat_key,
+                normed_loc=normed_loc,
+                reduction_loc=reduction_loc,
+                ann_loc=ann_loc,
+                knn_loc=knn_loc,
+                kmeans_loc=kmeans_loc,
+                graph_loc=graph_loc,
+                batch_size=batch_size,
+                custom_loadings=custom_loadings,
+                reduction_method=reduction_method,
+                dims=dims,
+                pca_cell_key=pca_cell_key,
+                harmonize=harmonize,
+                batch_columns=batch_columns,
+                batches=batches,
+                ann_metric=ann_metric,
+                ann_efc=ann_efc,
+                ann_ef=ann_ef,
+                ann_m=ann_m,
+                ann_parallel=ann_parallel,
+                rand_state=rand_state,
+                k=k,
+                n_centroids=n_centroids,
+                local_connectivity=local_connectivity,
+                bandwidth=bandwidth,
+                feat_scaling=feat_scaling,
+                lsi_skip_first=lsi_skip_first,
+                ann_index_fetcher=ann_index_fetcher,
+                ann_index_saver=ann_index_saver,
+                return_ann_object=return_ann_object,
+                show_elbow_plot=show_elbow_plot,
+            )
+            graph_succeeded = True
+            return result
+        finally:
+            if cache_enabled and cache_base is not None:
+                if remove_on_success:
+                    if graph_succeeded and not return_ann_object:
+                        shutil.rmtree(cache_base, ignore_errors=True)
+                    elif not graph_succeeded:
+                        logger.warning(
+                            f"Graph build failed; local cache scratch retained at {cache_base}"
+                        )
+                elif not graph_succeeded:
+                    logger.warning(
+                        f"Graph build failed; local cache retained at {cache_base}"
+                    )
+
+    def _run_graph_from_normed_data(
+        self,
+        *,
+        data,
+        assay,
+        from_assay,
+        cell_key,
+        feat_key,
+        normed_loc,
+        reduction_loc,
+        ann_loc,
+        knn_loc,
+        kmeans_loc,
+        graph_loc,
+        batch_size,
+        custom_loadings,
+        reduction_method,
+        dims,
+        pca_cell_key,
+        harmonize,
+        batch_columns,
+        batches,
+        ann_metric,
+        ann_efc,
+        ann_ef,
+        ann_m,
+        ann_parallel,
+        rand_state,
+        k,
+        n_centroids,
+        local_connectivity,
+        bandwidth,
+        feat_scaling,
+        lsi_skip_first,
+        ann_index_fetcher,
+        ann_index_saver,
+        return_ann_object,
+        show_elbow_plot,
+    ):
+        from ..ann import AnnStream
+
         if custom_loadings is not None and data.shape[1] != custom_loadings.shape[0]:
             raise ValueError(
                 f"Provided custom loadings has {custom_loadings.shape[0]} features while the data "
@@ -983,32 +1243,16 @@ class GraphDataStore(BaseDataStore):
             if reset_ann:
                 del self.zw[ann_loc]
             else:
-                if ann_index_fetcher is None:
-                    zwRoot = zarr_root_path(self.zw)
-                    if zwRoot is not None:
-                        ann_index_fn = os.path.join(zwRoot, ann_loc, "ann_idx")
-                    else:
-                        ann_index_fn = None
-                        logger.warning(
-                            f"No custom `ann_index_fetcher` provided and zarr path is not local"
-                        )
-                else:
-                    # noinspection PyBroadException
-                    try:
-                        ann_index_fn = ann_index_fetcher(ann_loc)
-                    except:
-                        ann_index_fn = None
-                        logger.warning(f"Custom `ann_index_fetcher` failed")
-                if ann_index_fn is None or os.path.exists(ann_index_fn) is False:
-                    logger.warning(f"Ann index file expected but could not be found")
-                else:
-                    import hnswlib
-
-                    temp = dims if dims > 0 else data.shape[1]
-                    ann_idx = hnswlib.Index(space=ann_metric, dim=temp)
-                    ann_idx.load_index(ann_index_fn)
-                    # TODO: check if ANN is index is trained with expected number of cells.
-                    logger.info(f"Using existing ANN index")
+                temp = dims if dims > 0 else data.shape[1]
+                ann_idx = self._resolve_ann_index(
+                    ann_loc,
+                    ann_metric,
+                    temp,
+                    ann_index_fetcher=ann_index_fetcher,
+                    persist=(self.zarr_mode == "r+"),
+                )
+                if ann_idx is not None:
+                    logger.info("Using existing ANN index")
 
         if kmeans_loc in self.zw:
             fit_kmeans = False
@@ -1070,21 +1314,11 @@ class GraphDataStore(BaseDataStore):
             logger.debug(f"Saving ANN index to {ann_loc}")
             self.zw.create_group(ann_loc, overwrite=True)
         if ann_idx is None:
-            if ann_index_saver is None:
-                zwRoot = zarr_root_path(self.zw)
-                if zwRoot is not None:
-                    ann_obj.annIdx.save_index(
-                        os.path.join(zwRoot, ann_loc, "ann_idx")
-                    )
-                else:
-                    logger.warning(
-                        "No custom `ann_index_saver` provided and local path is unknown"
-                    )
-            if ann_index_saver is not None:
-                try:
-                    ann_index_saver(ann_obj.annIdx, ann_loc)
-                except:
-                    logger.warning("Custom `ann_index_saver` failed")
+            self._persist_ann_index(
+                ann_loc,
+                ann_obj.annIdx,
+                ann_index_saver=ann_index_saver,
+            )
 
         if fit_kmeans:
             logger.debug(f"Saving kmeans clusters to {kmeans_loc}")

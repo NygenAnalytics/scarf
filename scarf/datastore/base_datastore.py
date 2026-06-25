@@ -88,8 +88,16 @@ class BaseDataStore:
         zarr_mode: str,
         workspace: str | None,
         synchronizer,
+        storage_options: dict | None = None,
     ):
-        self.z = load_zarr(zarr_loc=zarr_loc, mode=zarr_mode, synchronizer=synchronizer)
+        self.zarr_mode = zarr_mode
+        self.zarr_loc = zarr_loc
+        self.z = load_zarr(
+            zarr_loc=zarr_loc,
+            mode=zarr_mode,
+            synchronizer=synchronizer,
+            storage_options=storage_options,
+        )
         self.workspace = workspace
         self.nthreads = nthreads
         # The order is critical here:

@@ -7,7 +7,8 @@ from numba import jit
 from scipy.sparse import csr_matrix, coo_matrix
 
 from .ann import AnnStream
-from .utils import tqdmbar, controlled_compute
+from .utils import tqdmbar, controlled_compute, prefetch_blocks
+from .storage.zarr_store import profile_prefetch_depth
 from .writers import create_zarr_dataset
 
 __all__ = [
@@ -35,17 +36,17 @@ def self_query_knn(ann_obj: AnnStream, store, chunk_size: int, nthreads: int) ->
     def get_transformed_data():
         msg = "Identifying neighbors"
         if ann_obj.harmonizedData is None:
-            for _i in tqdmbar(
-                ann_obj.data.blocks, desc=msg, total=ann_obj.data.numblocks[0]
-            ):
-                yield ann_obj.reducer(controlled_compute(_i, nthreads))
+            source = ann_obj.data
+            transform = lambda block: ann_obj.reducer(controlled_compute(block, nthreads))
         else:
-            for _i in tqdmbar(
-                ann_obj.harmonizedData.blocks,
-                desc=msg,
-                total=ann_obj.harmonizedData.numblocks[0],
-            ):
-                yield controlled_compute(_i, nthreads)
+            source = ann_obj.harmonizedData
+            transform = lambda block: controlled_compute(block, nthreads)
+        blocks = prefetch_blocks(
+            source.blocks,
+            transform,
+            max_ahead=profile_prefetch_depth(),
+        )
+        yield from tqdmbar(blocks, desc=msg, total=source.numblocks[0])
 
     from threadpoolctl import threadpool_limits
 
@@ -85,6 +86,29 @@ def _is_umap_version_new():
         return False
 
 
+def _patch_null_weights(
+    zgw,
+    null_positions: list[int],
+    fill_value: float,
+    patch_chunk: int,
+) -> None:
+    """Patch zero edge weights without loading the full weights array."""
+    if not null_positions:
+        return None
+    null_positions = np.array(null_positions, dtype=np.int64)
+    n_weights = zgw.shape[0]
+    for chunk_start in range(0, n_weights, patch_chunk):
+        chunk_end = min(chunk_start + patch_chunk, n_weights)
+        in_chunk = (null_positions >= chunk_start) & (null_positions < chunk_end)
+        if not np.any(in_chunk):
+            continue
+        local_idx = null_positions[in_chunk] - chunk_start
+        block = zgw[chunk_start:chunk_end]
+        block[local_idx] = fill_value
+        zgw[chunk_start:chunk_end] = block
+    return None
+
+
 def smoothen_dists(store, z_idx, z_dist, lc: float, bw: float, chunk_size: int):
     """Smoothens KNN distances.
 
@@ -116,7 +140,7 @@ def smoothen_dists(store, z_idx, z_dist, lc: float, bw: float, chunk_size: int):
     )
     last_row = 0
     val_counts = 0
-    null_idx = []
+    null_positions: list[int] = []
     global_min = 1
     for i in tqdmbar(range(0, n_cells, chunk_size), desc="Smoothening KNN distances"):
         if i + chunk_size > n_cells:
@@ -140,21 +164,16 @@ def smoothen_dists(store, z_idx, z_dist, lc: float, bw: float, chunk_size: int):
         zge[start:end, 1] = cols
         zgw[start:end] = vals
 
-        # Fixing edges with 0 weights
-        # We are doing these steps here to have minimum operations outside
-        # the scope of a progress bar
-        nidx = vals == 0
-        if nidx.sum() > 0:
-            min_val = vals[~nidx].min()
-            if min_val < global_min:
-                global_min = min_val
-        null_idx.extend(nidx)
+        local_null = np.flatnonzero(vals == 0)
+        if local_null.size > 0:
+            nz_vals = vals[vals != 0]
+            if nz_vals.size > 0:
+                min_val = nz_vals.min()
+                if min_val < global_min:
+                    global_min = min_val
+            null_positions.extend((start + local_null).tolist())
 
-    # The whole zarr array needs to copied, modified and written back.
-    # Or is this assumption wrong?
-    w = zgw[:]
-    w[null_idx] = global_min
-    zgw[:] = w
+    _patch_null_weights(zgw, null_positions, global_min, chunk_size * n_neighbors)
     return None
 
 

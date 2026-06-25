@@ -471,10 +471,9 @@ def coordinate_melding(
     peaks_bed = create_bed_from_coord_ids(assay.feats.fetch_all(peaks_col))
     feat_ids, feat_names, mappings = get_feature_mappings(peaks_bed, feature_bed)
 
-    from .storage.zarr_store import zarr_root_path
-    import zarr
+    from .storage.zarr_store import zarr_group_root
 
-    store_root = zarr.open_group(zarr_root_path(assay.z), mode="r+")
+    store_root = zarr_group_root(assay.z, mode="r+")
     g = create_zarr_count_assay(
         z=store_root,
         assay_name=new_assay_name,

@@ -58,6 +58,7 @@ class DataStore(MappingDatastore):
         workspace: str | None = None,
         synchronizer=None,
         zarrProfile: Literal["fast_local", "cloud"] | None = None,
+        storage_options: dict | None = None,
     ):
         from ..storage.zarr_store import set_storage_profile
 
@@ -78,6 +79,7 @@ class DataStore(MappingDatastore):
             zarr_mode=zarr_mode,
             workspace=workspace,
             synchronizer=synchronizer,
+            storage_options=storage_options,
         )
 
     def get_assay(self, assay_name: str) -> Assay:

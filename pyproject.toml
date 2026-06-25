@@ -43,6 +43,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cloud = [
+    "obstore",
+]
 extra = [
     "requests",
     "kneed",

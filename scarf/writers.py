@@ -32,6 +32,9 @@ from .storage.zarr_store import (
     create_metadata_column,
     create_numeric_array,
     finalize_sharded_counts,
+    is_local_zarr_path,
+    normed_array_spec,
+    profile_prefetch_depth,
 )
 from .utils import (
     controlled_compute,
@@ -39,6 +42,7 @@ from .utils import (
     tqdmbar,
     show_dask_progress,
     load_zarr,
+    prefetch_blocks,
     ZARRLOC,
 )
 
@@ -48,6 +52,7 @@ __all__ = [
     "create_zarr_count_assay",
     "subset_assay_zarr",
     "dask_to_zarr",
+    "write_renorm_subset_to_zarr",
     "SubsetZarr",
     "CrToZarr",
     "H5adToZarr",
@@ -232,11 +237,15 @@ class CrToZarr:
         chunk_size=(1000, 1000),
         dtype: str = "uint32",
         workspace: str | None = None,
+        storage_options: dict | None = None,
     ):
         self.cr = cr
         self.chunkSizes = chunk_size
         self.workspace = workspace
-        self.z = load_zarr(zarr_loc=zarr_loc, mode="w")
+        self.storage_options = storage_options
+        self.z = load_zarr(
+            zarr_loc=zarr_loc, mode="w", storage_options=storage_options
+        )
         create_cell_data(
             z=self.z,
             workspace=self.workspace,
@@ -357,11 +366,13 @@ class H5adToZarr:
         assay_name: str | None = None,
         workspace: str | None = None,
         chunk_size=(1000, 1000),
+        storage_options: dict | None = None,
     ):
         # TODO: support for multiple assay. One of the `var` datasets can be used to group features in separate assays
         self.h5ad = h5ad
         self.chunkSizes = chunk_size
         self.workspace = workspace
+        self.storage_options = storage_options
         if assay_name is None:
             logger.info(
                 f"No value provided for assay names. Will use default value: 'RNA'"
@@ -369,7 +380,9 @@ class H5adToZarr:
             self.assayName = "RNA"
         else:
             self.assayName = assay_name
-        self.z = load_zarr(zarr_loc=zarr_loc, mode="w")
+        self.z = load_zarr(
+            zarr_loc=zarr_loc, mode="w", storage_options=storage_options
+        )
         self._ini_cell_data()
         create_zarr_count_assay(
             z=self.z,
@@ -457,10 +470,12 @@ class NaboH5ToZarr:
         workspace: str | None = None,
         chunk_size=(1000, 1000),
         dtype: str = "uint32",
+        storage_options: dict | None = None,
     ):
         self.h5 = h5
         self.chunkSizes = chunk_size
         self.workspace = workspace
+        self.storage_options = storage_options
         if assay_name is None:
             logger.info(
                 f"No value provided for assay names. Will use default value: 'RNA'"
@@ -468,7 +483,9 @@ class NaboH5ToZarr:
             self.assayName = "RNA"
         else:
             self.assayName = assay_name
-        self.z = load_zarr(zarr_loc, mode="w")  # type: ignore
+        self.z = load_zarr(
+            zarr_loc, mode="w", storage_options=storage_options
+        )  # type: ignore
         self._ini_cell_data()
         create_zarr_count_assay(
             z=self.z,
@@ -548,11 +565,13 @@ class LoomToZarr:
         assay_name: str | None = None,
         workspace: str | None = None,
         chunk_size=(1000, 1000),
+        storage_options: dict | None = None,
     ):
         # TODO: support for multiple assay. Data from within individual layers can be treated as separate assays
         self.loom = loom
         self.chunkSizes = chunk_size
         self.workspace = workspace
+        self.storage_options = storage_options
         if assay_name is None:
             logger.info(
                 f"No value provided for assay names. Will use default value: 'RNA'"
@@ -560,7 +579,7 @@ class LoomToZarr:
             self.assayName = "RNA"
         else:
             self.assayName = assay_name
-        self.z = load_zarr(zarr_loc, mode="w")
+        self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
         self._ini_cell_data()
         create_zarr_count_assay(
             z=self.z,
@@ -657,10 +676,12 @@ class SparseToZarr:
         feature_names: np.ndarray | list[str] | None = None,
         chunk_size=(1000, 1000),
         matrix_dtype: np.dtype | None = None,
+        storage_options: dict | None = None,
     ):
         self.mat = csr_mat
         self.chunkSizes = chunk_size
         self.workspace = workspace
+        self.storage_options = storage_options
         cell_ids = np.array(cell_ids)
         if matrix_dtype is None:
             self.matrixDtype = self.mat.dtype
@@ -683,7 +704,7 @@ class SparseToZarr:
                 "ERROR: Number of feature ids are not same as number of features in the matrix"
             )
 
-        self.z = load_zarr(zarr_loc, mode="w")
+        self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
         _ = create_cell_data(
             z=self.z,
             workspace=self.workspace,
@@ -779,12 +800,14 @@ class CSVtoZarr:
         chunk_size=(1000, 1000),
         workspace: str | None = None,
         dtype: np.dtype | None = None,
+        storage_options: dict | None = None,
     ):
         self.csvr = cr
         self.assayName = assay_name
         self.chunkSizes = chunk_size
         self.workspace = workspace
-        self.z = load_zarr(zarr_loc, mode="w")
+        self.storage_options = storage_options
+        self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
         if dtype is not None:
             self.dtype = dtype
         else:
@@ -864,6 +887,7 @@ def subset_assay_zarr(
     cells_idx: np.ndarray,
     feat_idx: np.ndarray,
     chunk_size: tuple,
+    storage_options: dict | None = None,
 ):
     """Selects a subset of the data in an assay in the specified Zarr
     hierarchy.
@@ -882,7 +906,7 @@ def subset_assay_zarr(
     Returns:
         None
     """
-    z = load_zarr(zarr_loc, "r+")
+    z = load_zarr(zarr_loc, "r+", storage_options=storage_options)
     ig: zarr.Array = z[in_grp]  # type: ignore
     og = create_zarr_dataset(
         z, out_grp, chunk_size, "uint32", (len(cells_idx), len(feat_idx))
@@ -895,6 +919,50 @@ def subset_assay_zarr(
     return None
 
 
+def write_renorm_subset_to_zarr(
+    assay,
+    cell_idx: np.ndarray,
+    feat_idx: np.ndarray,
+    z,
+    loc: str,
+    nthreads: int,
+    log_transform: bool = False,
+    msg: str | None = None,
+) -> None:
+    """Write library-size normalized subset data in a single scattered read pass.
+
+    For HVG subsets the per-cell scale factor is the row sum within each block,
+    so a separate ``counts.sum(axis=1)`` pass is not needed before writing.
+    """
+    counts = assay.rawData[:, feat_idx][cell_idx, :]
+    if msg is None:
+        msg = f"Writing data to {loc}"
+    spec = normed_array_spec(counts.shape[0], counts.shape[1])
+    og = create_numeric_array(z, loc, spec)
+    sf = assay.sf
+    pos_start = 0
+
+    def normalize_block(block):
+        block = np.asarray(block)
+        row_sum = block.sum(axis=1)
+        row_sum[row_sum == 0] = 1
+        out = sf * block / row_sum[:, np.newaxis]
+        if log_transform:
+            out = np.log1p(out)
+        return out.astype(np.float32, copy=False)
+
+    blocks = prefetch_blocks(
+        counts.blocks,
+        lambda block: normalize_block(controlled_compute(block, nthreads)),
+        max_ahead=profile_prefetch_depth(),
+    )
+    for block in tqdmbar(blocks, total=counts.numblocks[0], desc=msg):
+        pos_end = pos_start + block.shape[0]
+        og[pos_start:pos_end, :] = block
+        pos_start = pos_end
+    return None
+
+
 def dask_to_zarr(df, z, loc, chunk_size, nthreads: int, msg: str | None = None):
     """Creates a Zarr hierarchy from a chunked array.
 
@@ -902,17 +970,23 @@ def dask_to_zarr(df, z, loc, chunk_size, nthreads: int, msg: str | None = None):
         df: ChunkedArray to materialize and write.
         z: Root Zarr group.
         loc: Array path within the group.
-        chunk_size: Zarr chunk shape for the output array.
+        chunk_size: Legacy row chunk hint (superseded by profile spec when writing normed data).
         nthreads: Threads for block compute.
         msg: Progress bar message (default: ``Writing data to {loc}``).
     """
     if msg is None:
         msg = f"Writing data to {loc}"
-    og = create_zarr_dataset(z, loc, chunk_size, "float64", df.shape)
+    spec = normed_array_spec(df.shape[0], df.shape[1])
+    og = create_numeric_array(z, loc, spec)
     pos_start, pos_end = 0, 0
-    for i in tqdmbar(df.blocks, total=df.numblocks[0], desc=msg):
-        pos_end += i.shape[0]
-        og[pos_start:pos_end, :] = controlled_compute(i, nthreads)
+    blocks = prefetch_blocks(
+        df.blocks,
+        lambda block: controlled_compute(block, nthreads).astype(np.float32, copy=False),
+        max_ahead=profile_prefetch_depth(),
+    )
+    for block in tqdmbar(blocks, total=df.numblocks[0], desc=msg):
+        pos_end += block.shape[0]
+        og[pos_start:pos_end, :] = block
         pos_start = pos_end
     return None
 
@@ -946,19 +1020,21 @@ class SubsetZarr:
         reset_cell_filter: bool = True,
         overwrite_existing_file: bool = False,
         overwrite_cell_data: bool = False,
+        storage_options: dict | None = None,
     ) -> None:
         self.resetCells = reset_cell_filter
         self.overFn = overwrite_existing_file
         self.overCells = overwrite_cell_data
         self.inWorkspace = in_workspace
         self.outWorkspace = out_workspace
+        self.storage_options = storage_options
         self.z = self._check_files(zarr_loc)
         self.assays = self._check_assays(assays)
         self.cellIdx = self._check_idx(cell_key, cell_idx)
 
     def _check_files(self, zarr_loc: ZARRLOC):
         if (
-            isinstance(zarr_loc, str)
+            is_local_zarr_path(zarr_loc)
             and os.path.isdir(zarr_loc)
             and self.overFn is False
         ):
@@ -967,7 +1043,9 @@ class SubsetZarr:
                 f"If you want to overwrite it then please set  overwrite_existing_file to True. "
                 f"No subsetting was performed."
             )
-        return load_zarr(zarr_loc=zarr_loc, mode="w")
+        return load_zarr(
+            zarr_loc=zarr_loc, mode="w", storage_options=self.storage_options
+        )
 
     @staticmethod
     def _check_assays(assays):

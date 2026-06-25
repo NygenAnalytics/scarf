@@ -277,7 +277,9 @@ class ChunkedArray:
             if self._is_numpy:
                 block_size = self._n_rows if self._n_rows > 0 else 1
             else:
-                block_size = int(backing.chunks[0])
+                from .storage.zarr_store import streaming_block_size
+
+                block_size = streaming_block_size(self._backing)
         self._block_size = max(int(block_size), 1)
 
     @classmethod

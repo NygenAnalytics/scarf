@@ -13,6 +13,7 @@ import sys
 
 import numpy as np
 import zarr
+from zarr.abc.store import Store
 from loguru import logger
 from numba import jit
 
@@ -29,6 +30,7 @@ __all__ = [
     "permute_into_chunks",
     "show_dask_progress",
     "controlled_compute",
+    "prefetch_blocks",
     "rolling_window",
 ]
 
@@ -43,7 +45,7 @@ tqdm_params = {
     "colour": "#34abeb",
 }
 
-type ZARRLOC = str
+type ZARRLOC = str | Store
 
 
 def get_log_level():
@@ -156,21 +158,74 @@ def clean_array(x, fill_val: int = 0):
 
 
 def load_zarr(
-    zarr_loc: ZARRLOC, mode: str, synchronizer=None
+    zarr_loc: ZARRLOC,
+    mode: str,
+    synchronizer=None,
+    storage_options: dict | None = None,
 ) -> zarr.Group:
-    """Open a Zarr group at the given path.
+    """Open a Zarr group at the given path, URI, or store object.
 
     Args:
-        zarr_loc: Path to the Zarr store.
+        zarr_loc: Path, remote URI (s3://, gs://, ...), or a zarr Store instance.
         mode: Zarr open mode, e.g. ``'r'``, ``'r+'``, or ``'w'``.
         synchronizer: Optional synchronizer (ignored under Zarr v3).
+        storage_options: Credentials and backend options for remote URIs (obstore S3Config keys).
 
     Returns:
         Root Zarr group.
     """
+    from .storage.zarr_store import configure_zarr_io_for_profile, make_store
+
     if synchronizer is not None:
         logger.debug("ThreadSynchronizer is ignored under Zarr v3")
-    return zarr.open_group(zarr_loc, mode=mode)
+    store = make_store(
+        zarr_loc,
+        storage_options=storage_options,
+        read_only=(mode == "r"),
+    )
+    configure_zarr_io_for_profile()
+    if isinstance(store, str):
+        return zarr.open_group(store, mode=mode)
+    return zarr.open_group(store=store, mode=mode)
+
+
+def prefetch_blocks(block_iter, fn, max_ahead: int = 1):
+    """Apply ``fn`` to blocks with bounded read-ahead while preserving order.
+
+    Args:
+        block_iter: Iterable of block objects to process.
+        fn: Callable invoked on each block; its return value is yielded.
+        max_ahead: Maximum number of blocks to compute ahead of the consumer.
+
+    Yields:
+        Results of ``fn(block)`` in the same order as ``block_iter``.
+    """
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    if max_ahead < 1:
+        max_ahead = 1
+    block_iter = iter(block_iter)
+
+    with ThreadPoolExecutor(max_workers=max_ahead) as ex:
+        pending: deque = deque()
+
+        def enqueue() -> bool:
+            try:
+                block = next(block_iter)
+            except StopIteration:
+                return False
+            pending.append(ex.submit(fn, block))
+            return True
+
+        for _ in range(max_ahead):
+            if not enqueue():
+                break
+
+        while pending:
+            result = pending.popleft().result()
+            enqueue()
+            yield result
 
 
 def controlled_compute(arr, nthreads):

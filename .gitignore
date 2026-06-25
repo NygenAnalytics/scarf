@@ -3,9 +3,16 @@
 __pycache__
 build
 dist
+*.egg-info
 scarf.egg-info
 scarf_toolkit.egg-info
+.venv
+.venv*/
+.ruff_cache
 dask-worker-space
+# zarr ":memory:" URL materialized as a local directory by older tests
+:memory:
+:memory:/
 *.ipynb_checkpoints
 *.ipynb
 docs/source/vignettes/README.md
@@ -15,6 +22,8 @@ docs/source/vignettes/*.txt
 docs/source/vignettes/*.mtx
 docs/jupyter_execute
 .coverage
+coverage.xml
+htmlcov/
 .pytest_cache
 interrogate_badge.svg
 scarf/tests/datasets/*

@@ -24,6 +24,7 @@ from .utils import (
     permute_into_chunks,
     tqdmbar,
 )
+from .storage.zarr_store import is_local_zarr_path
 from .writers import create_zarr_count_assay, create_zarr_obj_array, create_zarr_dataset
 
 __all__ = [
@@ -102,6 +103,7 @@ class AssayMerge:
         prepend_text: str | None = "orig",
         reset_cell_filter: bool = True,
         seed: int | None = 42,
+        storage_options: dict | None = None,
     ):
         self.assays = assays
         self.names = names
@@ -109,6 +111,7 @@ class AssayMerge:
         self.outWorkspace = out_workspace
         self.merge_assay_name = merge_assay_name
         self.chunk_size = chunk_size
+        self.storage_options = storage_options
         (
             self.permutations_rows,
             self.permutations_rows_offset,
@@ -523,7 +526,7 @@ class AssayMerge:
             assay_slot = f"{self.outWorkspace}/merge_assay_name"
 
         try:
-            z = load_zarr(zarr_loc, mode="r")
+            z = load_zarr(zarr_loc, mode="r", storage_options=self.storage_options)
             if cell_slot not in z:
                 raise ValueError(
                     f"ERROR: Zarr file exists but seems corrupted. Either delete the "  # noqa: F541
@@ -548,16 +551,16 @@ class AssayMerge:
                     f"ERROR: 'cell data seems corrupted. Either delete the "  # noqa: F541
                     "existing file or choose another path"
                 )
-            return load_zarr(zarr_loc, mode="r+")
+            return load_zarr(zarr_loc, mode="r+", storage_options=self.storage_options)
         except (ValueError, FileNotFoundError):
             # So no zarr file with same name exists. Check if a non zarr folder with the same name exists
-            if isinstance(zarr_loc, str) and os.path.exists(zarr_loc):
+            if is_local_zarr_path(zarr_loc) and os.path.exists(zarr_loc):
                 raise ValueError(
                     f"ERROR: Directory/file with name `{zarr_loc}`exists. "
                     f"Either delete it or use another name"
                 )
             # creating a new zarr file
-            return load_zarr(zarr_loc, mode="w")
+            return load_zarr(zarr_loc, mode="w", storage_options=self.storage_options)
 
     def _ini_cell_data(self, overwrite) -> None:
         """Save cell attributes to Zarr.
@@ -715,6 +718,7 @@ class DatasetMerge:
         prepend_text: str | None = "orig",
         reset_cell_filter: bool = True,
         seed: int | None = 42,
+        storage_options: dict | None = None,
     ):
         self.datasets = datasets
         self.names = names
@@ -727,6 +731,7 @@ class DatasetMerge:
         self.prepend_text = prepend_text
         self.reset_cell_filter = reset_cell_filter
         self.seed = seed
+        self.storage_options = storage_options
         self.unique_assays = self.get_unique_assays()
         self.n_unique_assays = len(self.unique_assays)
         self.merge_generators = self.create_merge_generators()
@@ -768,6 +773,7 @@ class DatasetMerge:
                     prepend_text=self.prepend_text,
                     reset_cell_filter=self.reset_cell_filter,
                     seed=self.seed,
+                    storage_options=self.storage_options,
                 )
             )
         return gens

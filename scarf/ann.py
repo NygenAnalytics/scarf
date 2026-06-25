@@ -240,8 +240,15 @@ class AnnStream:
 
     def iter_blocks(self, msg: str = "") -> np.ndarray:
         """Yield row blocks of raw data as NumPy arrays with optional progress bar."""
-        for i in tqdmbar(self.data.blocks, desc=msg, total=self.data.numblocks[0]):
-            yield controlled_compute(i, self.nthreads)
+        from .storage.zarr_store import profile_prefetch_depth
+        from .utils import prefetch_blocks
+
+        blocks = prefetch_blocks(
+            self.data.blocks,
+            lambda block: controlled_compute(block, self.nthreads),
+            max_ahead=profile_prefetch_depth(),
+        )
+        yield from tqdmbar(blocks, desc=msg, total=self.data.numblocks[0])
 
     def transform_z(self, a: np.ndarray) -> np.ndarray:
         """Z-score a block using fitted ``mu`` and ``sigma``."""

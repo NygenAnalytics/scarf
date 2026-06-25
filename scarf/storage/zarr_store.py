@@ -4,9 +4,12 @@ from typing import Any, Literal
 
 import numpy as np
 import zarr
+from zarr.abc.store import Store
 from zarr.codecs import BloscCodec, ZstdCodec
 
 StorageProfile = Literal["fast_local", "cloud"]
+
+type ZarrLocation = str | Store
 
 PROFILE_COUNT_CHUNKS: dict[StorageProfile, tuple[int, int]] = {
     "fast_local": (512, 512),
@@ -17,6 +20,19 @@ PROFILE_COUNT_SHARDS: dict[StorageProfile, tuple[int, int]] = {
     "cloud": (8192, 8192),
 }
 PROFILE_METADATA_CHUNK = 100_000
+PROFILE_NORMED_TARGET_SHARD_BYTES = 256 * 1024 * 1024
+PROFILE_STREAM_TARGET_BYTES: dict[StorageProfile, int] = {
+    "fast_local": 64 * 1024 * 1024,
+    "cloud": 192 * 1024 * 1024,
+}
+PROFILE_ASYNC_CONCURRENCY: dict[StorageProfile, int] = {
+    "fast_local": 10,
+    "cloud": 64,
+}
+PROFILE_PREFETCH_DEPTH: dict[StorageProfile, int] = {
+    "fast_local": 1,
+    "cloud": 4,
+}
 
 
 @dataclass
@@ -49,6 +65,11 @@ def _group_zarr_format(group: zarr.Group) -> int:
     if metadata is not None and getattr(metadata, "zarr_format", None) is not None:
         return int(metadata.zarr_format)
     return 3
+
+
+def zarr_group_root(group: zarr.Group, mode: str = "r+") -> zarr.Group:
+    """Open the root Zarr group sharing the same store as ``group``."""
+    return zarr.open_group(store=group.store, mode=mode)
 
 
 def zarr_root_path(group: zarr.Group) -> str | None:
@@ -98,6 +119,16 @@ def get_storage_profile() -> StorageProfile:
     return "fast_local"
 
 
+def profile_prefetch_depth() -> int:
+    """Return bounded read-ahead depth for the active storage profile."""
+    return PROFILE_PREFETCH_DEPTH[get_storage_profile()]
+
+
+def configure_zarr_io_for_profile() -> None:
+    """Apply zarr async IO settings for the active storage profile."""
+    zarr.config.set({"async.concurrency": PROFILE_ASYNC_CONCURRENCY[get_storage_profile()]})
+
+
 def count_array_spec(
     nCells: int,
     nFeats: int,
@@ -134,9 +165,210 @@ def metadata_array_spec(
     )
 
 
-def open_store(path: str, mode: str = "r") -> zarr.Group:
-    """Open a Zarr group at ``path``."""
-    return zarr.open_group(path, mode=mode)
+def _aligned_shard_dim(shard_target: int, chunk: int, dim: int) -> int:
+    """Snap a shard edge to a multiple of ``chunk``, capped at ``dim``."""
+    if dim <= 0:
+        return 1
+    chunk = min(chunk, dim)
+    shard_target = min(shard_target, dim)
+    if shard_target <= chunk:
+        return chunk
+    aligned = (shard_target // chunk) * chunk
+    if aligned < chunk:
+        return chunk
+    return aligned
+
+
+def normed_array_spec(
+    nCells: int,
+    nFeats: int,
+    profile: StorageProfile | None = None,
+) -> ZarrArraySpec:
+    """Build array spec for normalized expression matrices (graph-building slot)."""
+    profile = profile or get_storage_profile()
+    n_cols = min(nFeats, 2048) if nFeats > 0 else 1
+    row_chunk = min(2048, max(nCells, 1))
+    chunks = (row_chunk, n_cols)
+    shards = None
+    if profile == "cloud" and nCells > 0 and nFeats > 0:
+        col_shard = _aligned_shard_dim(min(8192, nFeats), n_cols, nFeats)
+        shard_rows = min(16384, nCells)
+        bytes_per_row = col_shard * 4
+        if bytes_per_row * shard_rows > PROFILE_NORMED_TARGET_SHARD_BYTES:
+            shard_rows = max(
+                row_chunk,
+                PROFILE_NORMED_TARGET_SHARD_BYTES // max(bytes_per_row, 1),
+            )
+        shard_rows = _aligned_shard_dim(shard_rows, row_chunk, nCells)
+        shards = (shard_rows, col_shard)
+    return ZarrArraySpec(
+        shape=(nCells, nFeats),
+        chunks=chunks,
+        shards=shards,
+        dtype="float32",
+        compressors=get_compressors(profile),
+        fillValue=0.0,
+    )
+
+
+def streaming_block_size(
+    backing,
+    profile: StorageProfile | None = None,
+    target_bytes: int | None = None,
+) -> int:
+    """Pick a row block size for streaming reads that targets a byte budget."""
+    import numpy as np
+
+    profile = profile or get_storage_profile()
+    if target_bytes is None:
+        target_bytes = PROFILE_STREAM_TARGET_BYTES[profile]
+    n_rows, n_cols = backing.shape
+    if n_rows == 0:
+        return 1
+    itemsize = int(np.dtype(backing.dtype).itemsize)
+    chunk_rows = int(backing.chunks[0]) if getattr(backing, "chunks", None) else n_rows
+    block_rows = max(chunk_rows, target_bytes // max(n_cols * itemsize, 1))
+    metadata = getattr(backing, "metadata", None)
+    shard_rows = getattr(metadata, "shards", None)
+    if shard_rows is not None and len(shard_rows) > 0:
+        shard_rows = int(shard_rows[0])
+        if shard_rows > chunk_rows and block_rows >= shard_rows:
+            block_rows = (block_rows // shard_rows) * shard_rows
+            if block_rows < shard_rows:
+                block_rows = shard_rows
+    return min(max(int(block_rows), 1), n_rows)
+
+
+def is_remote_zarr_location(location: str) -> bool:
+    """Return True when ``location`` is a non-local URI (e.g. s3://, gs://)."""
+    if "://" not in location:
+        return False
+    return not location.startswith("file://")
+
+
+def is_local_zarr_path(location: ZarrLocation) -> bool:
+    """Return True when ``location`` is a plain local filesystem path string."""
+    return isinstance(location, str) and not is_remote_zarr_location(location)
+
+
+def is_remote_datastore(zarr_loc: ZarrLocation, group: zarr.Group) -> bool:
+    """Return True when the datastore primary store is a remote/object backend."""
+    if isinstance(zarr_loc, str):
+        return is_remote_zarr_location(zarr_loc)
+    if zarr_root_path(group) is not None:
+        return False
+    store_name = type(group.store).__name__
+    if store_name in ("MemoryStore", "LocalStore"):
+        return False
+    return True
+
+
+def copy_zarr_array(
+    src: zarr.Array,
+    dst: zarr.Array,
+    block_rows: int | None = None,
+    msg: str | None = None,
+) -> None:
+    """Stream-copy a 2D Zarr array in row blocks."""
+    from ..utils import tqdmbar
+
+    if src.shape != dst.shape:
+        raise ValueError(f"Shape mismatch: src {src.shape} vs dst {dst.shape}")
+    if len(src.shape) != 2:
+        raise ValueError("copy_zarr_array only supports 2D arrays")
+    n_rows = src.shape[0]
+    if n_rows == 0:
+        return None
+    if block_rows is None:
+        block_rows = streaming_block_size(src, profile="fast_local")
+    block_rows = max(int(block_rows), 1)
+    if msg is None:
+        msg = "Copying Zarr array"
+    n_blocks = int(np.ceil(n_rows / block_rows))
+    for start in tqdmbar(range(0, n_rows, block_rows), desc=msg, total=n_blocks):
+        end = min(start + block_rows, n_rows)
+        dst[start:end, :] = np.asarray(src[start:end, :])
+    return None
+
+
+def open_or_create_staged_normed_array(
+    cache_path: str,
+    src: zarr.Array,
+) -> zarr.Array:
+    """Open a reusable local scratch array for staged normalized data."""
+    import os
+
+    if os.path.exists(os.path.join(cache_path, "zarr.json")):
+        root = zarr.open_group(cache_path, mode="r+")
+        if "data" in root:
+            arr: zarr.Array = root["data"]  # type: ignore[assignment]
+            if arr.shape == src.shape:
+                return arr
+    root = zarr.open_group(cache_path, mode="w")
+    spec = normed_array_spec(src.shape[0], src.shape[1], profile="fast_local")
+    return create_numeric_array(root, "data", spec)
+
+
+def _is_obstore_native_store(obj: object) -> bool:
+    return type(obj).__module__.startswith("obstore.")
+
+
+def _maybe_auto_cloud_profile(location: ZarrLocation) -> None:
+    """Select the cloud storage profile when opening a remote store without an explicit profile."""
+    if _activeProfile is not None:
+        return
+    if isinstance(location, str) and not is_remote_zarr_location(location):
+        return
+    if isinstance(location, Store):
+        return
+    set_storage_profile("cloud")
+
+
+def make_store(
+    location: ZarrLocation,
+    *,
+    storage_options: dict[str, Any] | None = None,
+    read_only: bool = False,
+) -> str | Store:
+    """Resolve a path, URI, or store object into something ``zarr.open_group`` accepts."""
+    if isinstance(location, Store):
+        return location
+
+    if _is_obstore_native_store(location):
+        from zarr.storage import ObjectStore
+
+        return ObjectStore(store=location, read_only=read_only)
+
+    if isinstance(location, str):
+        if is_remote_zarr_location(location):
+            try:
+                from obstore.store import from_url as obstore_from_url
+                from zarr.storage import ObjectStore
+            except ImportError as exc:
+                raise ImportError(
+                    "Remote Zarr stores require obstore. Install with: pip install scarf[cloud]"
+                ) from exc
+            _maybe_auto_cloud_profile(location)
+            obstore = obstore_from_url(location, **(storage_options or {}))
+            return ObjectStore(store=obstore, read_only=read_only)
+        return location
+
+    raise TypeError(
+        f"zarr location must be a path string or zarr Store, got {type(location)!r}"
+    )
+
+
+def open_store(
+    path: ZarrLocation,
+    mode: str = "r",
+    storage_options: dict[str, Any] | None = None,
+) -> zarr.Group:
+    """Open a Zarr group at ``path`` or from a store object."""
+    store = make_store(path, storage_options=storage_options, read_only=(mode == "r"))
+    configure_zarr_io_for_profile()
+    if isinstance(store, str):
+        return zarr.open_group(store, mode=mode)
+    return zarr.open_group(store=store, mode=mode)
 
 
 def create_numeric_array(
@@ -333,3 +565,91 @@ def array_info(array: zarr.Array) -> str:
     if metadata.shards is not None:
         parts.append(f"shards={metadata.shards}")
     return ", ".join(parts)
+
+
+ANN_INDEX_ARRAY = "ann_idx_bytes"
+ANN_INDEX_FORMAT = "zarr-uint8-v1"
+ANN_INDEX_CHUNK_BYTES = 8 * 1024 * 1024
+
+
+def has_ann_index(group: zarr.Group, name: str = ANN_INDEX_ARRAY) -> bool:
+    """Return True when an in-zarr ANN index byte array exists."""
+    return name in group
+
+
+def legacy_ann_index_path(zw_root: str | None, ann_loc: str) -> str | None:
+    """Return filesystem path to a legacy hnswlib sibling index file, if applicable."""
+    if zw_root is None:
+        return None
+    return os.path.join(zw_root, ann_loc, "ann_idx")
+
+
+def save_ann_index(
+    group: zarr.Group,
+    ann_idx,
+    name: str = ANN_INDEX_ARRAY,
+    profile: StorageProfile | None = None,
+) -> None:
+    """Persist an hnswlib index as a chunked uint8 array inside ``group``."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        path = tmp.name
+    try:
+        ann_idx.save_index(path)
+        data = np.fromfile(path, dtype=np.uint8)
+    finally:
+        os.unlink(path)
+
+    if name in group:
+        del group[name]
+    chunk_size = min(ANN_INDEX_CHUNK_BYTES, max(int(data.shape[0]), 1))
+    zarr_format = _group_zarr_format(group)
+    arr = group.create_array(
+        name,
+        shape=data.shape,
+        chunks=(chunk_size,),
+        dtype="uint8",
+        overwrite=True,
+        compressors=get_compressors(
+            profile or get_storage_profile(),
+            zarrFormat=zarr_format,
+        ),
+    )
+    arr[:] = data
+    group.attrs["annIndexFormat"] = ANN_INDEX_FORMAT
+    arr.attrs["byteLength"] = int(data.shape[0])
+
+
+def load_ann_index(
+    group: zarr.Group,
+    space: str,
+    dim: int,
+    name: str = ANN_INDEX_ARRAY,
+):
+    """Load an hnswlib index from an in-zarr uint8 byte array."""
+    import tempfile
+
+    import hnswlib
+
+    if name not in group:
+        raise FileNotFoundError(f"ANN index array {name!r} not found in group")
+    data = np.asarray(group[name][:], dtype=np.uint8)
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        path = tmp.name
+    try:
+        data.tofile(path)
+        idx = hnswlib.Index(space=space, dim=dim)
+        idx.load_index(path)
+        return idx
+    finally:
+        os.unlink(path)
+
+
+def load_ann_index_from_path(path: str, space: str, dim: int):
+    """Load an hnswlib index from a legacy filesystem path."""
+    import hnswlib
+
+    idx = hnswlib.Index(space=space, dim=dim)
+    idx.load_index(path)
+    return idx
