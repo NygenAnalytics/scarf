@@ -113,7 +113,6 @@ def test_explicit_profile_not_overridden_by_remote(monkeypatch):
 
 def test_normed_array_spec_cloud_sharding():
     from scarf.storage.zarr_store import (
-        create_numeric_array,
         normed_array_spec,
         set_storage_profile,
     )
@@ -127,7 +126,11 @@ def test_normed_array_spec_cloud_sharding():
 
 @pytest.mark.parametrize("n_feats", [500, 2000, 3000, 5000, 8192, 30_000])
 def test_normed_array_spec_cloud_creates_array(tmp_path, n_feats):
-    from scarf.storage.zarr_store import create_numeric_array, normed_array_spec, set_storage_profile
+    from scarf.storage.zarr_store import (
+        create_numeric_array,
+        normed_array_spec,
+        set_storage_profile,
+    )
 
     set_storage_profile("cloud")
     spec = normed_array_spec(1_000_000, n_feats)
@@ -144,7 +147,9 @@ def test_streaming_block_size(tmp_path):
 
     set_storage_profile("fast_local")
     root = zarr.open_group(str(tmp_path / "stream.zarr"), mode="w")
-    arr = root.create_array("x", shape=(10_000, 500), chunks=(256, 500), dtype="float32")
+    arr = root.create_array(
+        "x", shape=(10_000, 500), chunks=(256, 500), dtype="float32"
+    )
     block = streaming_block_size(arr)
     assert block >= 256
     assert block <= 10_000
@@ -175,4 +180,3 @@ def test_ann_index_round_trip(tmp_path):
     i2, d2 = loaded.knn_query(q, k=3)
     np.testing.assert_array_equal(i1, i2)
     np.testing.assert_allclose(d1, d2, rtol=1e-5)
-

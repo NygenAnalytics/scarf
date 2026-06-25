@@ -7,6 +7,8 @@ import zarr
 from zarr.abc.store import Store
 from zarr.codecs import BloscCodec, ZstdCodec
 
+from .._types import ZarrMode, as_zarr_array, as_zarr_group, array_metadata_shards
+
 StorageProfile = Literal["fast_local", "cloud"]
 
 type ZarrLocation = str | Store
@@ -49,7 +51,9 @@ class ZarrArraySpec:
     overwrite: bool = True
 
 
-def get_compressors(profile: StorageProfile = "fast_local", zarrFormat: int = 3) -> list:
+def get_compressors(
+    profile: StorageProfile = "fast_local", zarrFormat: int = 3
+) -> list:
     """Return codec list for the given storage profile and Zarr format."""
     if zarrFormat == 2:
         from numcodecs import Blosc
@@ -67,7 +71,7 @@ def _group_zarr_format(group: zarr.Group) -> int:
     return 3
 
 
-def zarr_group_root(group: zarr.Group, mode: str = "r+") -> zarr.Group:
+def zarr_group_root(group: zarr.Group, mode: ZarrMode = "r+") -> zarr.Group:
     """Open the root Zarr group sharing the same store as ``group``."""
     return zarr.open_group(store=group.store, mode=mode)
 
@@ -77,14 +81,16 @@ def zarr_root_path(group: zarr.Group) -> str | None:
     store = group.store
     root = getattr(store, "root", None)
     if root is not None:
-        return root
+        return str(root)
     storePath = getattr(group, "store_path", None)
     if storePath and str(storePath).startswith("file://"):
         return str(storePath)[7:]
     return None
 
 
-def normalize_chunks(chunks: tuple[int, ...] | int, shape: tuple[int, ...]) -> tuple[int, ...]:
+def normalize_chunks(
+    chunks: tuple[int, ...] | int, shape: tuple[int, ...]
+) -> tuple[int, ...]:
     """Map chunk specification to a valid per-dimension chunk tuple for ``shape``."""
     if isinstance(chunks, int):
         chunks = (chunks,)
@@ -114,8 +120,10 @@ def get_storage_profile() -> StorageProfile:
     if _activeProfile is not None:
         return _activeProfile
     envProfile = os.environ.get("SCARF_ZARR_PROFILE", "fast_local")
-    if envProfile in ("fast_local", "cloud"):
-        return envProfile  # type: ignore[return-value]
+    if envProfile == "cloud":
+        return "cloud"
+    if envProfile == "fast_local":
+        return "fast_local"
     return "fast_local"
 
 
@@ -126,7 +134,9 @@ def profile_prefetch_depth() -> int:
 
 def configure_zarr_io_for_profile() -> None:
     """Apply zarr async IO settings for the active storage profile."""
-    zarr.config.set({"async.concurrency": PROFILE_ASYNC_CONCURRENCY[get_storage_profile()]})
+    zarr.config.set(
+        {"async.concurrency": PROFILE_ASYNC_CONCURRENCY[get_storage_profile()]}
+    )
 
 
 def count_array_spec(
@@ -212,7 +222,7 @@ def normed_array_spec(
 
 
 def streaming_block_size(
-    backing,
+    backing: zarr.Array,
     profile: StorageProfile | None = None,
     target_bytes: int | None = None,
 ) -> int:
@@ -301,7 +311,7 @@ def open_or_create_staged_normed_array(
     if os.path.exists(os.path.join(cache_path, "zarr.json")):
         root = zarr.open_group(cache_path, mode="r+")
         if "data" in root:
-            arr: zarr.Array = root["data"]  # type: ignore[assignment]
+            arr = as_zarr_array(root["data"], name="data")
             if arr.shape == src.shape:
                 return arr
     root = zarr.open_group(cache_path, mode="w")
@@ -337,7 +347,7 @@ def make_store(
     if _is_obstore_native_store(location):
         from zarr.storage import ObjectStore
 
-        return ObjectStore(store=location, read_only=read_only)
+        return ObjectStore(store=location, read_only=read_only)  # type: ignore[type-var]
 
     if isinstance(location, str):
         if is_remote_zarr_location(location):
@@ -345,12 +355,10 @@ def make_store(
                 from obstore.store import from_url as obstore_from_url
                 from zarr.storage import ObjectStore
             except ImportError as exc:
-                raise ImportError(
-                    "Remote Zarr stores require obstore."
-                ) from exc
+                raise ImportError("Remote Zarr stores require obstore.") from exc
             _maybe_auto_cloud_profile(location)
             obstore = obstore_from_url(location, **(storage_options or {}))
-            return ObjectStore(store=obstore, read_only=read_only)
+            return ObjectStore(store=obstore, read_only=read_only)  # type: ignore[type-var]
         return location
 
     raise TypeError(
@@ -360,7 +368,7 @@ def make_store(
 
 def open_store(
     path: ZarrLocation,
-    mode: str = "r",
+    mode: ZarrMode = "r",
     storage_options: dict[str, Any] | None = None,
 ) -> zarr.Group:
     """Open a Zarr group at ``path`` or from a store object."""
@@ -393,9 +401,9 @@ def create_numeric_array(
     return group.create_array(name, **kwargs)
 
 
-def dtype_fix(dtype, data: np.ndarray):
+def dtype_fix(dtype: Any, data: np.ndarray) -> Any:
     """Infer or adjust dtype for metadata arrays from sample values."""
-    if dtype is None or dtype == object:
+    if dtype is None or dtype is object:
         return "U" + str(max([len(str(x)) for x in data]))
     if np.issubdtype(data.dtype, np.dtype("S")):
         try:
@@ -412,7 +420,7 @@ def create_metadata_column(
     data: np.ndarray | list | None = None,
     dtype: Any = None,
     overwrite: bool = True,
-    chunkSize: int | None = None,
+    chunkSize: int | bool | None = None,
     shape: int | None = None,
     profile: StorageProfile | None = None,
 ) -> zarr.Array:
@@ -496,13 +504,13 @@ def finalize_sharded_counts(
     profile = profile or get_storage_profile()
     if workspace is None:
         countsPath = f"{assayName}/counts"
-        assayGroup = store[assayName]
+        assayGroup = as_zarr_group(store[assayName], name=assayName)
     else:
         countsPath = f"matrices/{assayName}/counts"
-        assayGroup = store[f"matrices/{assayName}"]
+        assayGroup = as_zarr_group(store[f"matrices/{assayName}"], name=assayName)
 
-    srcArray = store[countsPath]
-    if srcArray.metadata.shards is not None:
+    srcArray = as_zarr_array(store[countsPath], name=countsPath)
+    if array_metadata_shards(srcArray) is not None:
         return srcArray
     if _group_zarr_format(store) == 2:
         return srcArray
@@ -536,7 +544,7 @@ def finalize_sharded_counts(
     )
     del assayGroup["counts"]
     repack_to_sharded(
-        assayGroup[tmpName],
+        as_zarr_array(assayGroup[tmpName], name=tmpName),
         assayGroup,
         "counts",
         shards=shards,
@@ -546,24 +554,24 @@ def finalize_sharded_counts(
     del assayGroup[tmpName]
 
     if workspace is None:
-        assayGroup = store[assayName]
+        assayGroup = as_zarr_group(store[assayName], name=assayName)
     else:
-        assayGroup = store[f"matrices/{assayName}"]
+        assayGroup = as_zarr_group(store[f"matrices/{assayName}"], name=assayName)
     assayGroup.attrs["scarf:zarr_spec"] = {
         "profile": profile,
         "chunks": list(chunks),
         "shards": list(shards),
         "zarr_format": 3,
     }
-    return store[countsPath]
+    return as_zarr_array(store[countsPath], name=countsPath)
 
 
 def array_info(array: zarr.Array) -> str:
     """Return a short summary string for a Zarr array."""
-    metadata = array.metadata
     parts = [f"shape={array.shape}", f"dtype={array.dtype}", f"chunks={array.chunks}"]
-    if metadata.shards is not None:
-        parts.append(f"shards={metadata.shards}")
+    shards_meta = array_metadata_shards(array)
+    if shards_meta is not None:
+        parts.append(f"shards={shards_meta}")
     return ", ".join(parts)
 
 
@@ -586,7 +594,7 @@ def legacy_ann_index_path(zw_root: str | None, ann_loc: str) -> str | None:
 
 def save_ann_index(
     group: zarr.Group,
-    ann_idx,
+    ann_idx: Any,
     name: str = ANN_INDEX_ARRAY,
     profile: StorageProfile | None = None,
 ) -> None:
@@ -626,7 +634,7 @@ def load_ann_index(
     space: str,
     dim: int,
     name: str = ANN_INDEX_ARRAY,
-):
+) -> Any:
     """Load an hnswlib index from an in-zarr uint8 byte array."""
     import tempfile
 
@@ -634,7 +642,7 @@ def load_ann_index(
 
     if name not in group:
         raise FileNotFoundError(f"ANN index array {name!r} not found in group")
-    data = np.asarray(group[name][:], dtype=np.uint8)
+    data = np.asarray(as_zarr_array(group[name], name=name)[:], dtype=np.uint8)
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         path = tmp.name
     try:
@@ -646,7 +654,7 @@ def load_ann_index(
         os.unlink(path)
 
 
-def load_ann_index_from_path(path: str, space: str, dim: int):
+def load_ann_index_from_path(path: str, space: str, dim: int) -> Any:
     """Load an hnswlib index from a legacy filesystem path."""
     import hnswlib
 

@@ -37,6 +37,7 @@ def test_toy_crdir_reader_cells_feats(toy_crdir_reader):
         "a3",
     ]
 
+
 def test_toy_crdir_empty(toy_crdir_empty):
     assert toy_crdir_empty.nCells == 0
     assert toy_crdir_empty.nFeatures == 4
@@ -57,6 +58,7 @@ def test_toy_crdir_empty(toy_crdir_empty):
         toy_crdir_empty.read_header()
     except ValueError:
         pass
+
 
 def test_crh5reader(crh5_reader):
     assert crh5_reader.nCells == 892

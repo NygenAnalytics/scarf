@@ -134,7 +134,10 @@ def test_stage_normed_data_recopies_when_subset_params_change(
     store.nthreads = rna.nthreads
     cache_base = str(tmp_path / "scratch_params")
     store._stage_normed_data(
-        remote, "hash1", {"log_transform": False, "renormalize_subset": True}, cache_base
+        remote,
+        "hash1",
+        {"log_transform": False, "renormalize_subset": True},
+        cache_base,
     )
     store._stage_normed_data(
         remote, "hash1", {"log_transform": True, "renormalize_subset": True}, cache_base

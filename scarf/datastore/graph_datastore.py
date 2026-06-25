@@ -2,14 +2,19 @@ import os
 import shutil
 import tempfile
 from collections.abc import Callable
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
-from ..chunked import ChunkedArray
+import zarr
 from loguru import logger
+from numpy.typing import NDArray
 from scipy.sparse import coo_matrix, csr_matrix
 
+from .._types import as_zarr_array, as_zarr_group
+from ..ann import AnnStream
 from ..assay import Assay
+from ..chunked import ChunkedArray
 from ..storage.zarr_store import (
     copy_zarr_array,
     has_ann_index,
@@ -21,7 +26,7 @@ from ..storage.zarr_store import (
     save_ann_index,
     zarr_root_path,
 )
-from ..utils import clean_array, show_dask_progress, system_call, tqdmbar
+from ..utils import clean_array, show_dask_progress, tqdmbar
 from ..writers import create_zarr_dataset
 from .base_datastore import BaseDataStore
 
@@ -39,7 +44,7 @@ class GraphDataStore(BaseDataStore):
         z: The Zarr file (directory) used for this datastore instance.
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
 
     @staticmethod
@@ -75,24 +80,39 @@ class GraphDataStore(BaseDataStore):
 
     def _set_graph_params(
         self,
-        from_assay,
-        cell_key,
-        feat_key,
-        log_transform=None,
-        renormalize_subset=None,
-        reduction_method="auto",
-        dims=None,
-        pca_cell_key=None,
-        ann_metric=None,
-        ann_efc=None,
-        ann_ef=None,
-        ann_m=None,
-        rand_state=None,
-        k=None,
-        n_centroids=None,
-        local_connectivity=None,
-        bandwidth=None,
-    ) -> tuple:
+        from_assay: str,
+        cell_key: str,
+        feat_key: str,
+        log_transform: bool | None = None,
+        renormalize_subset: bool | None = None,
+        reduction_method: str = "auto",
+        dims: int | None = None,
+        pca_cell_key: str | None = None,
+        ann_metric: str | None = None,
+        ann_efc: int | None = None,
+        ann_ef: int | None = None,
+        ann_m: int | None = None,
+        rand_state: int | None = None,
+        k: int | None = None,
+        n_centroids: int | None = None,
+        local_connectivity: float | None = None,
+        bandwidth: float | None = None,
+    ) -> tuple[
+        bool,
+        bool,
+        str,
+        int,
+        str,
+        str,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        float,
+        float,
+    ]:
         """This function allows determination of values for the parameters of
         `make_graph` function. This function harbours the default values for
         each parameter.  If parameter value is None, then before choosing the
@@ -123,7 +143,12 @@ class GraphDataStore(BaseDataStore):
             Finalized values for the all the optional parameters in the same order
         """
 
-        def log_message(category, name, value, custom_msg=None):
+        def log_message(
+            category: str,
+            name: str,
+            value: Any,
+            custom_msg: str | None = None,
+        ) -> bool:
             """Convenience function to log variable usage messages for
             make_graph.
 
@@ -149,7 +174,7 @@ class GraphDataStore(BaseDataStore):
                     logger.info(custom_msg)
             return True
 
-        default_values = {
+        default_values: dict[str, Any] = {
             "log_transform": True,
             "renormalize_subset": True,
             "dims": 11,
@@ -163,13 +188,19 @@ class GraphDataStore(BaseDataStore):
 
         normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
         if log_transform is None or renormalize_subset is None:
-            if normed_loc in self.zw and "subset_params" in self.zw[normed_loc].attrs:
-                # This works in coordination with save_normalized_data
-                subset_params = self.zw[normed_loc].attrs["subset_params"]
-                c_log_transform, c_renormalize_subset = (
-                    subset_params["log_transform"],
-                    subset_params["renormalize_subset"],
-                )
+            if normed_loc in self.zw:
+                normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+                if "subset_params" in normed_grp.attrs:
+                    # This works in coordination with save_normalized_data
+                    subset_params = cast(
+                        dict[str, Any], normed_grp.attrs["subset_params"]
+                    )
+                    c_log_transform, c_renormalize_subset = (
+                        subset_params["log_transform"],
+                        subset_params["renormalize_subset"],
+                    )
+                else:
+                    c_log_transform, c_renormalize_subset = None, None
             else:
                 c_log_transform, c_renormalize_subset = None, None
             if log_transform is None:
@@ -190,12 +221,13 @@ class GraphDataStore(BaseDataStore):
         renormalize_subset = bool(renormalize_subset)
 
         if dims is None or pca_cell_key is None:
-            if (
-                normed_loc in self.zw
-                and "latest_reduction" in self.zw[normed_loc].attrs
-            ):
-                reduction_loc = self.zw[normed_loc].attrs["latest_reduction"]
-                c_dims, c_pca_cell_key = reduction_loc.rsplit("__", 2)[1:]
+            if normed_loc in self.zw:
+                normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+                if "latest_reduction" in normed_grp.attrs:
+                    reduction_loc_attr = cast(str, normed_grp.attrs["latest_reduction"])
+                    c_dims, c_pca_cell_key = reduction_loc_attr.rsplit("__", 2)[1:]
+                else:
+                    c_dims, c_pca_cell_key = None, None
             else:
                 c_dims, c_pca_cell_key = None, None
             if dims is None:
@@ -217,7 +249,7 @@ class GraphDataStore(BaseDataStore):
                     raise ValueError(
                         f"ERROR: `pca_use_cell_key` {pca_cell_key} does not exist in cell metadata"
                     )
-                if self.cells.get_dtype(pca_cell_key) != bool:
+                if self.cells.get_dtype(pca_cell_key) is not bool:
                     raise TypeError(
                         "ERROR: Type of `pca_use_cell_key` column in cell metadata should be `bool`"
                     )
@@ -236,18 +268,25 @@ class GraphDataStore(BaseDataStore):
             or ann_m is None
             or rand_state is None
         ):
-            if (
-                reduction_loc in self.zw
-                and "latest_ann" in self.zw[reduction_loc].attrs
-            ):
-                ann_loc = self.zw[reduction_loc].attrs["latest_ann"]
-                (
-                    c_ann_metric,
-                    c_ann_efc,
-                    c_ann_ef,
-                    c_ann_m,
-                    c_rand_state,
-                ) = ann_loc.rsplit("/", 1)[1].split("__")[1:]
+            if reduction_loc in self.zw:
+                reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+                if "latest_ann" in reduction_grp.attrs:
+                    ann_loc_attr = cast(str, reduction_grp.attrs["latest_ann"])
+                    (
+                        c_ann_metric,
+                        c_ann_efc,
+                        c_ann_ef,
+                        c_ann_m,
+                        c_rand_state,
+                    ) = ann_loc_attr.rsplit("/", 1)[1].split("__")[1:]
+                else:
+                    c_ann_metric, c_ann_efc, c_ann_ef, c_ann_m, c_rand_state = (
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
             else:
                 c_ann_metric, c_ann_efc, c_ann_ef, c_ann_m, c_rand_state = (
                     None,
@@ -269,14 +308,14 @@ class GraphDataStore(BaseDataStore):
                     log_message("cached", "ann_efc", ann_efc)
                 else:
                     ann_efc = None  # Will be set after value for k is determined
-                    log_message("default", "ann_efc", f"min(100, max(k * 3, 50))")
+                    log_message("default", "ann_efc", "min(100, max(k * 3, 50))")
             if ann_ef is None:
                 if c_ann_ef is not None:
                     ann_ef = int(c_ann_ef)
                     log_message("cached", "ann_ef", ann_ef)
                 else:
                     ann_ef = None  # Will be set after value for k is determined
-                    log_message("default", "ann_ef", f"min(100, max(k * 3, 50))")
+                    log_message("default", "ann_ef", "min(100, max(k * 3, 50))")
             if ann_m is None:
                 if c_ann_m is not None:
                     ann_m = int(c_ann_m)
@@ -296,14 +335,17 @@ class GraphDataStore(BaseDataStore):
         rand_state = int(rand_state)
 
         if k is None:
-            if (
-                reduction_loc in self.zw
-                and "latest_ann" in self.zw[reduction_loc].attrs
-            ):
-                ann_loc = self.zw[reduction_loc].attrs["latest_ann"]
-                knn_loc = self.zw[ann_loc].attrs["latest_knn"]
-                k = int(knn_loc.rsplit("__", 1)[1])
-                log_message("cached", "k", k)
+            if reduction_loc in self.zw:
+                reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+                if "latest_ann" in reduction_grp.attrs:
+                    ann_loc_attr = cast(str, reduction_grp.attrs["latest_ann"])
+                    ann_grp = as_zarr_group(self.zw[ann_loc_attr], name=ann_loc_attr)
+                    knn_loc_attr = cast(str, ann_grp.attrs["latest_knn"])
+                    k = int(knn_loc_attr.rsplit("__", 1)[1])
+                    log_message("cached", "k", k)
+                else:
+                    k = default_values["k"]
+                    log_message("default", "k", k)
             else:
                 k = default_values["k"]
                 log_message("default", "k", k)
@@ -318,27 +360,32 @@ class GraphDataStore(BaseDataStore):
         knn_loc = f"{ann_loc}/knn__{k}"
 
         if n_centroids is None:
-            if (
-                reduction_loc in self.zw
-                and "latest_kmeans" in self.zw[reduction_loc].attrs
-            ):
-                kmeans_loc = self.zw[reduction_loc].attrs["latest_kmeans"]
-                n_centroids = int(
-                    kmeans_loc.split("/")[-1].split("__")[1]
-                )  # depends on param_joiner
-                log_message("default", "n_centroids", n_centroids)
+            if reduction_loc in self.zw:
+                reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+                if "latest_kmeans" in reduction_grp.attrs:
+                    kmeans_loc_attr = cast(str, reduction_grp.attrs["latest_kmeans"])
+                    n_centroids = int(
+                        kmeans_loc_attr.split("/")[-1].split("__")[1]
+                    )  # depends on param_joiner
+                    log_message("default", "n_centroids", n_centroids)
+                else:
+                    n_centroids = default_values["n_centroids"]
+                    log_message("default", "n_centroids", n_centroids)
             else:
-                # n_centroids = min(data.shape[0]/10, max(500, data.shape[0]/100))
                 n_centroids = default_values["n_centroids"]
                 log_message("default", "n_centroids", n_centroids)
         n_centroids = int(n_centroids)
 
         if local_connectivity is None or bandwidth is None:
-            if knn_loc in self.zw and "latest_graph" in self.zw[knn_loc].attrs:
-                graph_loc = self.zw[knn_loc].attrs["latest_graph"]
-                c_local_connectivity, c_bandwidth = map(
-                    float, graph_loc.rsplit("/")[-1].split("__")[1:]
-                )
+            if knn_loc in self.zw:
+                knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
+                if "latest_graph" in knn_grp.attrs:
+                    graph_loc_attr = cast(str, knn_grp.attrs["latest_graph"])
+                    c_local_connectivity, c_bandwidth = map(
+                        float, graph_loc_attr.rsplit("/")[-1].split("__")[1:]
+                    )
+                else:
+                    c_local_connectivity, c_bandwidth = None, None
             else:
                 c_local_connectivity, c_bandwidth = None, None
             if local_connectivity is None:
@@ -404,12 +451,16 @@ class GraphDataStore(BaseDataStore):
             Path of graph in the Zarr hierarchy
         """
         normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
-        reduction_loc = self.zw[normed_loc].attrs["latest_reduction"]
-        ann_loc = self.zw[reduction_loc].attrs["latest_ann"]
-        knn_loc = self.zw[ann_loc].attrs["latest_knn"]
-        return self.zw[knn_loc].attrs["latest_graph"]
+        normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+        reduction_loc = cast(str, normed_grp.attrs["latest_reduction"])
+        reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+        ann_loc = cast(str, reduction_grp.attrs["latest_ann"])
+        ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
+        knn_loc = cast(str, ann_grp.attrs["latest_knn"])
+        knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
+        return cast(str, knn_grp.attrs["latest_graph"])
 
-    def _get_latest_knn_loc(self, from_assay: str = None) -> str:
+    def _get_latest_knn_loc(self, from_assay: str | None = None) -> str:
         """Convenience function to identify location of the latest KNN graph in
         the Zarr hierarchy.
 
@@ -426,15 +477,17 @@ class GraphDataStore(BaseDataStore):
         if from_assay not in self.assay_names:
             raise ValueError(f"ERROR: Assay {from_assay} does not exist")
 
-        latest_cell_key = self.zw[from_assay].attrs["latest_cell_key"]
-        latest_feat_key = self.zw[from_assay].attrs["latest_feat_key"]
+        latest_cell_key = cast(str, as_zarr_group(self.zw[from_assay], name=from_assay).attrs["latest_cell_key"])
+        latest_feat_key = cast(str, as_zarr_group(self.zw[from_assay], name=from_assay).attrs["latest_feat_key"])
         normed_loc = f"{from_assay}/normed__{latest_cell_key}__{latest_feat_key}"
-        reduction_loc = self.zw[normed_loc].attrs["latest_reduction"]
-        if "reduction" not in self.zw[reduction_loc]:
+        normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+        reduction_loc = cast(str, normed_grp.attrs["latest_reduction"])
+        reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+        if "reduction" not in reduction_grp:
             raise ValueError(f"ERROR: PCA Reduction not found in {reduction_loc}")
-        latest_ann = self.zw[reduction_loc].attrs["latest_ann"]
-        ann_loc = self.zw[latest_ann]
-        latest_knn = ann_loc.attrs["latest_knn"]
+        latest_ann = cast(str, reduction_grp.attrs["latest_ann"])
+        ann_grp = as_zarr_group(self.zw[latest_ann], name=latest_ann)
+        latest_knn = cast(str, ann_grp.attrs["latest_knn"])
         return latest_knn
 
     def _ann_stream_recoverable(
@@ -444,14 +497,18 @@ class GraphDataStore(BaseDataStore):
         normed_loc: str,
     ) -> bool:
         """Return True when an ANN stream can be loaded or rebuilt without a full make_graph."""
-        if ann_loc in self.zw and has_ann_index(self.zw[ann_loc]):
+        if ann_loc in self.zw and has_ann_index(as_zarr_group(self.zw[ann_loc], name=ann_loc)):
             return True
         legacy = legacy_ann_index_path(zarr_root_path(self.zw), ann_loc)
         if legacy is not None and os.path.exists(legacy):
             return True
-        if reduction_loc in self.zw and "reduction" in self.zw[reduction_loc]:
-            if normed_loc in self.zw and "data" in self.zw[normed_loc]:
-                return True
+        if reduction_loc in self.zw:
+            reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+            if "reduction" in reduction_grp:
+                if normed_loc in self.zw:
+                    normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+                    if "data" in normed_grp:
+                        return True
         return False
 
     def _resolve_ann_index(
@@ -461,9 +518,11 @@ class GraphDataStore(BaseDataStore):
         dim: int,
         ann_index_fetcher: Callable | None = None,
         persist: bool = True,
-    ):
+    ) -> Any:
         """Load ANN index from zarr, legacy file, custom fetcher, or return None to rebuild."""
-        ann_group = self.zw[ann_loc] if ann_loc in self.zw else None
+        ann_group: zarr.Group | None = (
+            as_zarr_group(self.zw[ann_loc], name=ann_loc) if ann_loc in self.zw else None
+        )
 
         if ann_index_fetcher is not None:
             try:
@@ -480,11 +539,7 @@ class GraphDataStore(BaseDataStore):
         legacy = legacy_ann_index_path(zarr_root_path(self.zw), ann_loc)
         if legacy is not None and os.path.exists(legacy):
             idx = load_ann_index_from_path(legacy, ann_metric, dim)
-            if (
-                persist
-                and self.zarr_mode == "r+"
-                and ann_group is not None
-            ):
+            if persist and self.zarr_mode == "r+" and ann_group is not None:
                 save_ann_index(ann_group, idx)
             return idx
 
@@ -496,7 +551,7 @@ class GraphDataStore(BaseDataStore):
     def _persist_ann_index(
         self,
         ann_loc: str,
-        ann_idx,
+        ann_idx: Any,
         ann_index_saver: Callable | None = None,
     ) -> None:
         """Save an hnswlib index into the zarr hierarchy or via a custom saver."""
@@ -511,7 +566,7 @@ class GraphDataStore(BaseDataStore):
         if self.zarr_mode != "r+":
             logger.debug("Skipping ANN index persistence on read-only store")
             return
-        save_ann_index(self.zw[ann_loc], ann_idx)
+        save_ann_index(as_zarr_group(self.zw[ann_loc], name=ann_loc), ann_idx)
 
     def _has_ann_stream_cache(
         self,
@@ -525,9 +580,12 @@ class GraphDataStore(BaseDataStore):
                 normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
                 if normed_loc not in self.zw:
                     return False
-                reduction_loc = self.zw[normed_loc].attrs["latest_reduction"]
-                ann_loc = self.zw[reduction_loc].attrs["latest_ann"]
-                knn_loc = self.zw[ann_loc].attrs["latest_knn"]
+                normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+                reduction_loc = cast(str, normed_grp.attrs["latest_reduction"])
+                reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+                ann_loc = cast(str, reduction_grp.attrs["latest_ann"])
+                ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
+                knn_loc = cast(str, ann_grp.attrs["latest_knn"])
             else:
                 ann_loc = knn_loc.rsplit("/", 1)[0]
 
@@ -550,8 +608,9 @@ class GraphDataStore(BaseDataStore):
         mu, sigma = np.ndarray([]), np.ndarray([])
         if reduction_method not in ["pca", "manual"]:
             return mu, sigma
-        if "mu" in self.zw[normed_loc]:
-            mu = self.zw[normed_loc]["mu"][:]
+        normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+        if "mu" in normed_grp:
+            mu = np.asarray(as_zarr_array(normed_grp["mu"], name="mu")[:])
         else:
             mu = clean_array(
                 show_dask_progress(
@@ -562,13 +621,13 @@ class GraphDataStore(BaseDataStore):
             )
             if self.zarr_mode == "r+":
                 g = create_zarr_dataset(
-                    self.zw[normed_loc], "mu", (100000,), "f8", mu.shape
+                    normed_grp, "mu", (100000,), "f8", mu.shape
                 )
                 g[:] = mu
             else:
                 logger.debug("Skipping mu persistence on read-only store")
-        if "sigma" in self.zw[normed_loc]:
-            sigma = self.zw[normed_loc]["sigma"][:]
+        if "sigma" in normed_grp:
+            sigma = np.asarray(as_zarr_array(normed_grp["sigma"], name="sigma")[:])
         else:
             sigma = clean_array(
                 show_dask_progress(
@@ -580,7 +639,7 @@ class GraphDataStore(BaseDataStore):
             )
             if self.zarr_mode == "r+":
                 g = create_zarr_dataset(
-                    self.zw[normed_loc], "sigma", (100000,), "f8", sigma.shape
+                    normed_grp, "sigma", (100000,), "f8", sigma.shape
                 )
                 g[:] = sigma
             else:
@@ -594,17 +653,19 @@ class GraphDataStore(BaseDataStore):
         feat_key: str,
         feat_scaling: bool = True,
         knn_loc: str | None = None,
-    ):
+    ) -> AnnStream:
         """Load an AnnStream from an existing graph without recomputing KNN."""
-        from ..ann import AnnStream
 
         if knn_loc is None:
             normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
             if normed_loc not in self.zw:
                 raise KeyError(f"No normalized data at {normed_loc}")
-            reduction_loc = self.zw[normed_loc].attrs["latest_reduction"]
-            ann_loc = self.zw[reduction_loc].attrs["latest_ann"]
-            knn_loc = self.zw[ann_loc].attrs["latest_knn"]
+            normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+            reduction_loc = cast(str, normed_grp.attrs["latest_reduction"])
+            reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+            ann_loc = cast(str, reduction_grp.attrs["latest_ann"])
+            ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
+            knn_loc = cast(str, ann_grp.attrs["latest_knn"])
         else:
             ann_loc = knn_loc.rsplit("/", 1)[0]
             reduction_loc = ann_loc.rsplit("/ann__", 1)[0]
@@ -617,27 +678,40 @@ class GraphDataStore(BaseDataStore):
         ann_metric = ann_parts[1]
         ann_efc, ann_ef, ann_m, rand_state = map(int, ann_parts[2:6])
         red_parts = reduction_loc.rsplit("/", 1)[-1].split("__")
-        reduction_method, dims, pca_cell_key = red_parts[1], int(red_parts[2]), red_parts[3]
+        reduction_method, dims, pca_cell_key = (
+            red_parts[1],
+            int(red_parts[2]),
+            red_parts[3],
+        )
         k = int(knn_loc.rsplit("/", 1)[-1].split("__")[-1])
 
-        data = ChunkedArray(self.zw[normed_loc + "/data"], nthreads=self.nthreads)
-        mu, sigma = self._load_or_compute_norm_stats(
-            normed_loc, data, reduction_method
+        data = ChunkedArray(
+            as_zarr_array(
+                as_zarr_group(self.zw[normed_loc], name=normed_loc)["data"],
+                name="data",
+            ),
+            nthreads=self.nthreads,
         )
+        mu, sigma = self._load_or_compute_norm_stats(normed_loc, data, reduction_method)
 
-        loadings = None
-        if "reduction" in self.zw[reduction_loc]:
-            loadings = self.zw[reduction_loc]["reduction"][:]
+        loadings: NDArray[Any] | None = None
+        reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+        if "reduction" in reduction_grp:
+            loadings = np.asarray(
+                as_zarr_array(reduction_grp["reduction"], name="reduction")[:]
+            )
 
-        harmonize = self.zw[ann_loc].attrs.get("isHarmonized", False)
+        ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
+        harmonize = cast(bool, ann_grp.attrs.get("isHarmonized", False))
         harmonized_data = None
         batches = None
-        if harmonize and "harmonizedData" in self.zw[reduction_loc]:
-            harmonized_data = ChunkedArray(
-                self.zw[reduction_loc]["harmonizedData"], nthreads=self.nthreads
+        if harmonize and "harmonizedData" in reduction_grp:
+            harmonized_arr = as_zarr_array(
+                reduction_grp["harmonizedData"], name="harmonizedData"
             )
-            batch_columns = self.zw[reduction_loc]["harmonizedData"].attrs.get(
-                "batches"
+            harmonized_data = ChunkedArray(harmonized_arr, nthreads=self.nthreads)
+            batch_columns = cast(
+                list[str] | None, harmonized_arr.attrs.get("batches")
             )
             if batch_columns:
                 batches = pd.DataFrame(
@@ -711,14 +785,21 @@ class GraphDataStore(BaseDataStore):
         from ..utils import rescale_array
 
         normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
-        reduction_loc = self.zw[normed_loc].attrs["latest_reduction"]
-        kmeans_loc = self.zw[reduction_loc].attrs["latest_kmeans"]
+        normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+        reduction_loc = cast(str, normed_grp.attrs["latest_reduction"])
+        reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+        kmeans_loc = cast(str, reduction_grp.attrs["latest_kmeans"])
+        kmeans_grp = as_zarr_group(self.zw[kmeans_loc], name=kmeans_loc)
         pc = PCA(n_components=n_comps).fit_transform(
-            self.zw[kmeans_loc]["cluster_centers"][:]
+            np.asarray(
+                as_zarr_array(kmeans_grp["cluster_centers"], name="cluster_centers")[:]
+            )
         )
         for i in range(n_comps):
             pc[:, i] = rescale_array(pc[:, i])
-        clusters = self.zw[kmeans_loc]["cluster_labels"][:].astype(np.uint32)
+        clusters = np.asarray(
+            as_zarr_array(kmeans_grp["cluster_labels"], name="cluster_labels")[:]
+        ).astype(np.uint32)
         return np.array([pc[x] for x in clusters]).astype(np.float32, order="C")
 
     def _get_graph_ncells_k(self, graph_loc: str) -> tuple[int, int]:
@@ -731,14 +812,18 @@ class GraphDataStore(BaseDataStore):
 
         """
         if graph_loc.startswith(self._integratedGraphsLoc):
-            attrs = self.zw[graph_loc].attrs
-            return attrs["n_cells"], attrs["n_neighbors"]
-        knn_loc = self.zw[graph_loc.rsplit("/", 1)[0]]
-        return knn_loc["indices"].shape
+            graph_grp = as_zarr_group(self.zw[graph_loc], name=graph_loc)
+            attrs = dict(graph_grp.attrs)
+            return cast(int, attrs["n_cells"]), cast(int, attrs["n_neighbors"])
+        knn_grp = as_zarr_group(
+            self.zw[graph_loc.rsplit("/", 1)[0]], name=graph_loc.rsplit("/", 1)[0]
+        )
+        indices = as_zarr_array(knn_grp["indices"], name="indices")
+        return indices.shape[0], indices.shape[1]
 
     def _store_to_sparse(
         self, graph_loc: str, sparse_format: str = "csr", use_k: int | None = None
-    ) -> tuple:
+    ) -> tuple[int, csr_matrix | coo_matrix]:
         """
 
         Args:
@@ -750,7 +835,7 @@ class GraphDataStore(BaseDataStore):
 
         """
         logger.debug(f"Loading graph from location: {graph_loc}")
-        store = self.zw[graph_loc]
+        store = as_zarr_group(self.zw[graph_loc], name=graph_loc)
         n_cells, k = self._get_graph_ncells_k(graph_loc)
         # TODO: can we have a progress bar for graph loading. Append to coo matrix?
         if use_k is None:
@@ -763,7 +848,8 @@ class GraphDataStore(BaseDataStore):
             indexer = np.tile([True] * use_k + [False] * (k - use_k), n_cells)
         else:
             indexer = None
-        w, e = store["weights"][:], store["edges"][:]
+        w = np.asarray(as_zarr_array(store["weights"], name="weights")[:])
+        e = np.asarray(as_zarr_array(store["edges"], name="edges")[:])
         if indexer is not None:
             w, e = w[indexer], e[indexer]
         if sparse_format == "csr":
@@ -777,8 +863,8 @@ class GraphDataStore(BaseDataStore):
 
     @staticmethod
     def _resolve_local_cache_plan(
-        zarr_loc,
-        group,
+        zarr_loc: Any,
+        group: zarr.Group,
         local_cache: bool | str,
     ) -> tuple[bool, str | None, bool]:
         """Return whether to stage, cache base directory, and remove-on-success flag."""
@@ -793,7 +879,7 @@ class GraphDataStore(BaseDataStore):
             f"local_cache must be 'auto', True, False, or a path string, got {local_cache!r}"
         )
 
-    def _normed_cache_key(self, subset_hash: str, subset_params: dict) -> str:
+    def _normed_cache_key(self, subset_hash: str, subset_params: dict[str, Any]) -> str:
         import hashlib
         import json
 
@@ -805,9 +891,9 @@ class GraphDataStore(BaseDataStore):
 
     def _stage_normed_data(
         self,
-        remote_array,
+        remote_array: zarr.Array,
         subset_hash: str,
-        subset_params: dict,
+        subset_params: dict[str, Any],
         cache_base: str,
     ) -> ChunkedArray:
         """Copy normalized data to a local scratch Zarr for multi-pass graph building."""
@@ -865,7 +951,7 @@ class GraphDataStore(BaseDataStore):
         ann_index_fetcher: Callable | None = None,
         ann_index_saver: Callable | None = None,
         local_cache: bool | str = "auto",
-    ):
+    ) -> AnnStream | None:
         """Creates a cell neighbourhood graph. Performs following steps in the
         process:
 
@@ -989,19 +1075,20 @@ class GraphDataStore(BaseDataStore):
         if cell_key is None:
             cell_key = "I"
         if feat_key is None:
-            bool_cols = [
+            bool_col_parts = [
                 x.split("__", 1)
                 for x in assay.feats.columns
-                if assay.feats.get_dtype(x) == bool and x != "I"
+                if assay.feats.get_dtype(x) is bool and x != "I"
             ]
-            bool_cols = [f"{x[1]}({x[0]})" for x in bool_cols]
-            bool_cols = " ".join(map(str, bool_cols))
+            bool_cols_msg = " ".join(
+                f"{part[1]}({part[0]})" for part in bool_col_parts
+            )
             raise ValueError(
                 "ERROR: You have to choose which features that should be used for graph construction. "
                 "Ideally you should have performed a feature selection step before making this graph. "
                 "Feature selection step adds a column to your feature table. \n"
                 "You have following boolean columns in the feature "
-                f"metadata of assay {from_assay} which you can choose from: {bool_cols}\n The values in "
+                f"metadata of assay {from_assay} which you can choose from: {bool_cols_msg}\n The values in "
                 f"brackets indicate the cell_key for which the feat_key is available. Choosing 'I' "
                 f"as `feat_key` means that you will use all the genes for graph creation."
             )
@@ -1050,11 +1137,11 @@ class GraphDataStore(BaseDataStore):
         batches = None
         if harmonize:
             if batch_columns is None:
-                raise ValueError(f"Harmonization requested but no batches provided")
+                raise ValueError("Harmonization requested but no batches provided")
             else:
                 if isinstance(batch_columns, list) is False:
                     raise ValueError(
-                        f"batches must be a list of columns in cell metadata that represent batches"
+                        "batches must be a list of columns in cell metadata that represent batches"
                     )
                 batches = pd.DataFrame(
                     {
@@ -1081,16 +1168,24 @@ class GraphDataStore(BaseDataStore):
             renormalize_subset,
             update_keys,
         )
-        subset_hash = self.zw[normed_loc].attrs["subset_hash"]
-        subset_params = self.zw[normed_loc].attrs["subset_params"]
+        subset_hash = cast(
+            str, as_zarr_group(self.zw[normed_loc], name=normed_loc).attrs["subset_hash"]
+        )
+        subset_params = cast(
+            dict[str, Any],
+            as_zarr_group(self.zw[normed_loc], name=normed_loc).attrs["subset_params"],
+        )
         cache_enabled, cache_base, remove_on_success = self._resolve_local_cache_plan(
             self.zarr_loc, self.z, local_cache
         )
         graph_succeeded = False
         try:
             if cache_enabled:
+                if cache_base is None:
+                    raise RuntimeError("cache_base must be set when cache_enabled is True")
+                normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
                 data = self._stage_normed_data(
-                    self.zw[normed_loc]["data"],
+                    as_zarr_array(normed_grp["data"], name="data"),
                     subset_hash,
                     subset_params,
                     cache_base,
@@ -1151,73 +1246,74 @@ class GraphDataStore(BaseDataStore):
     def _run_graph_from_normed_data(
         self,
         *,
-        data,
-        assay,
-        from_assay,
-        cell_key,
-        feat_key,
-        normed_loc,
-        reduction_loc,
-        ann_loc,
-        knn_loc,
-        kmeans_loc,
-        graph_loc,
-        batch_size,
-        custom_loadings,
-        reduction_method,
-        dims,
-        pca_cell_key,
-        harmonize,
-        batch_columns,
-        batches,
-        ann_metric,
-        ann_efc,
-        ann_ef,
-        ann_m,
-        ann_parallel,
-        rand_state,
-        k,
-        n_centroids,
-        local_connectivity,
-        bandwidth,
-        feat_scaling,
-        lsi_skip_first,
-        ann_index_fetcher,
-        ann_index_saver,
-        return_ann_object,
-        show_elbow_plot,
-    ):
-        from ..ann import AnnStream
+        data: ChunkedArray,
+        assay: Assay,
+        from_assay: str,
+        cell_key: str,
+        feat_key: str,
+        normed_loc: str,
+        reduction_loc: str,
+        ann_loc: str,
+        knn_loc: str,
+        kmeans_loc: str,
+        graph_loc: str,
+        batch_size: int,
+        custom_loadings: NDArray[Any] | None,
+        reduction_method: str,
+        dims: int,
+        pca_cell_key: str,
+        harmonize: bool,
+        batch_columns: list[str] | None,
+        batches: pd.DataFrame | None,
+        ann_metric: str,
+        ann_efc: int,
+        ann_ef: int,
+        ann_m: int,
+        ann_parallel: bool,
+        rand_state: int,
+        k: int,
+        n_centroids: int,
+        local_connectivity: float,
+        bandwidth: float,
+        feat_scaling: bool,
+        lsi_skip_first: bool,
+        ann_index_fetcher: Callable | None,
+        ann_index_saver: Callable | None,
+        return_ann_object: bool,
+        show_elbow_plot: bool,
+    ) -> AnnStream | None:
 
         if custom_loadings is not None and data.shape[1] != custom_loadings.shape[0]:
             raise ValueError(
                 f"Provided custom loadings has {custom_loadings.shape[0]} features while the data "
                 f"has {data.shape[1]} features."
             )
-        loadings = None
+        loadings: NDArray[Any] | None = None
         fit_kmeans = True
-        mu, sigma = self._load_or_compute_norm_stats(
-            normed_loc, data, reduction_method
-        )
+        mu, sigma = self._load_or_compute_norm_stats(normed_loc, data, reduction_method)
         use_for_pca = self.cells.fetch(pca_cell_key, key=cell_key)
         harmonized_data = None
         if reduction_loc in self.zw:
-            if "reduction" in self.zw[reduction_loc]:
-                loadings = self.zw[reduction_loc]["reduction"][:]
+            reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+            if "reduction" in reduction_grp:
+                loadings = np.asarray(
+                    as_zarr_array(reduction_grp["reduction"], name="reduction")[:]
+                )
                 if data.shape[1] != loadings.shape[0]:
                     logger.warning(
                         "Consistency breached in loading pre-cached loadings. Will perform fresh reduction."
                     )
                     loadings = None
                     del self.zw[reduction_loc]
-            if harmonize and "harmonizedData" in self.zw[reduction_loc]:
-                if "batches" in self.zw[reduction_loc]["harmonizedData"].attrs:
-                    if (
-                        self.zw[reduction_loc]["harmonizedData"].attrs["batches"]
-                        == batch_columns
-                    ):
+            if harmonize and "harmonizedData" in reduction_grp:
+                harmonized_arr = as_zarr_array(
+                    reduction_grp["harmonizedData"], name="harmonizedData"
+                )
+                if "batches" in harmonized_arr.attrs:
+                    if harmonized_arr.attrs["batches"] == batch_columns:
                         harmonized_data = ChunkedArray(
-                            self.zw[reduction_loc]["harmonizedData"], nthreads=self.nthreads
+                            harmonized_arr,
+                            nthreads=self.nthreads,
                         )
 
         if custom_loadings is None:
@@ -1242,9 +1338,10 @@ class GraphDataStore(BaseDataStore):
 
         ann_idx = None
         if ann_loc in self.zw:
+            ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
             reset_ann = False
-            if "isHarmonized" in self.zw[ann_loc].attrs:
-                if self.zw[ann_loc].attrs["isHarmonized"]:
+            if "isHarmonized" in ann_grp.attrs:
+                if cast(bool, ann_grp.attrs["isHarmonized"]):
                     if harmonize is False:
                         reset_ann = True
                     if harmonized_data is None:
@@ -1272,7 +1369,7 @@ class GraphDataStore(BaseDataStore):
 
         if kmeans_loc in self.zw:
             fit_kmeans = False
-            logger.info(f"using existing kmeans cluster centers")
+            logger.info("using existing kmeans cluster centers")
         disable_scaling = True if feat_scaling is False else False
 
         # TODO: expose LSImodel parameters
@@ -1306,10 +1403,11 @@ class GraphDataStore(BaseDataStore):
         if reduction_loc not in self.zw:
             logger.debug(f"Saving loadings to {reduction_loc}")
             self.zw.create_group(reduction_loc, overwrite=True)
+            reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
             if ann_obj.loadings is not None:
                 # can be None when no dimred is performed
                 g = create_zarr_dataset(
-                    self.zw[reduction_loc],
+                    reduction_grp,
                     "reduction",
                     data.chunksize,
                     "f8",
@@ -1317,8 +1415,9 @@ class GraphDataStore(BaseDataStore):
                 )
                 g[:, :] = ann_obj.loadings
         if harmonize and harmonized_data is None and ann_obj.harmonizedData is not None:
+            reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
             g = create_zarr_dataset(
-                self.zw[reduction_loc],
+                reduction_grp,
                 "harmonizedData",
                 data.chunksize,
                 "f8",
@@ -1337,10 +1436,13 @@ class GraphDataStore(BaseDataStore):
             )
 
         if fit_kmeans:
+            if ann_obj.kmeans is None:
+                raise RuntimeError("kmeans model missing despite fit_kmeans=True")
             logger.debug(f"Saving kmeans clusters to {kmeans_loc}")
             self.zw.create_group(kmeans_loc, overwrite=True)
+            kmeans_grp = as_zarr_group(self.zw[kmeans_loc], name=kmeans_loc)
             g = create_zarr_dataset(
-                self.zw[kmeans_loc],
+                kmeans_grp,
                 "cluster_centers",
                 (1000, 1000),
                 "f8",
@@ -1348,7 +1450,7 @@ class GraphDataStore(BaseDataStore):
             )
             g[:, :] = ann_obj.kmeans.cluster_centers_
             g = create_zarr_dataset(
-                self.zw[kmeans_loc],
+                kmeans_grp,
                 "cluster_labels",
                 (100000,),
                 "f8",
@@ -1356,24 +1458,25 @@ class GraphDataStore(BaseDataStore):
             )
             g[:] = ann_obj.clusterLabels
         if knn_loc in self.zw and graph_loc in self.zw:
-            logger.info(f"KNN graph already exists will not recompute.")
+            logger.info("KNN graph already exists will not recompute.")
         else:
             from ..knn_utils import self_query_knn, smoothen_dists
 
-            recall = None
+            recall: str | None = None
             if knn_loc not in self.zw:
-                recall = self_query_knn(
+                recall_val = self_query_knn(
                     ann_obj=ann_obj,
                     store=self.zw.create_group(knn_loc, overwrite=True),
                     chunk_size=batch_size,
                     nthreads=self.nthreads,
                 )
-                recall = "%.2f" % recall
+                recall = "%.2f" % recall_val
 
+            knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
             smoothen_dists(
                 self.zw.create_group(graph_loc, overwrite=True),
-                self.zw[knn_loc]["indices"],
-                self.zw[knn_loc]["distances"],
+                as_zarr_array(knn_grp["indices"], name="indices"),
+                as_zarr_array(knn_grp["distances"], name="distances"),
                 local_connectivity,
                 bandwidth,
                 batch_size,
@@ -1381,12 +1484,16 @@ class GraphDataStore(BaseDataStore):
             if recall is not None:
                 logger.info(f"ANN recall: {recall}%")
 
-        self.zw[normed_loc].attrs["latest_reduction"] = reduction_loc
-        self.zw[reduction_loc].attrs["latest_ann"] = ann_loc
-        self.zw[reduction_loc].attrs["latest_kmeans"] = kmeans_loc
-        self.zw[ann_loc].attrs["isHarmonized"] = harmonize
-        self.zw[ann_loc].attrs["latest_knn"] = knn_loc
-        self.zw[knn_loc].attrs["latest_graph"] = graph_loc
+        normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+        reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+        ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
+        knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
+        normed_grp.attrs["latest_reduction"] = reduction_loc
+        reduction_grp.attrs["latest_ann"] = ann_loc
+        reduction_grp.attrs["latest_kmeans"] = kmeans_loc
+        ann_grp.attrs["isHarmonized"] = harmonize
+        ann_grp.attrs["latest_knn"] = knn_loc
+        knn_grp.attrs["latest_graph"] = graph_loc
         if return_ann_object:
             return ann_obj
         if show_elbow_plot:
@@ -1430,7 +1537,7 @@ class GraphDataStore(BaseDataStore):
             A scipy sparse matrix representing cell neighbourhood graph.
         """
 
-        def symmetrize(g):
+        def symmetrize(g: csr_matrix) -> csr_matrix:
             t = g + g.T
             t = t - g.multiply(g.T)
             return t
@@ -1468,12 +1575,12 @@ class GraphDataStore(BaseDataStore):
 
     def run_tsne(
         self,
-        from_assay: str = None,
-        cell_key: str = None,
-        feat_key: str = None,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
         symmetric_graph: bool = False,
         graph_upper_only: bool = False,
-        ini_embed: np.ndarray = None,
+        ini_embed: np.ndarray | None = None,
         tsne_dims: int = 2,
         lambda_scale: float = 1.0,
         max_iter: int = 500,
@@ -1484,7 +1591,7 @@ class GraphDataStore(BaseDataStore):
         label: str = "tSNE",
         verbose: bool = True,
         parallel: bool = False,
-        nthreads: int = None,
+        nthreads: int | None = None,
     ) -> None:
         """Run SGtSNE-pi (Read more here:
         https://github.com/fcdimitr/sgtsnepi/tree/v1.0.1). This is an
@@ -1541,9 +1648,7 @@ class GraphDataStore(BaseDataStore):
             upper_only=graph_upper_only,
         )
         if ini_embed is None:
-            ini_embed = self._get_ini_embed(
-                from_assay, cell_key, feat_key, tsne_dims
-            )
+            ini_embed = self._get_ini_embed(from_assay, cell_key, feat_key, tsne_dims)
         else:
             if ini_embed.shape != (graph.shape[0], tsne_dims):
                 raise ValueError(
@@ -1554,7 +1659,7 @@ class GraphDataStore(BaseDataStore):
             if nthreads is None:
                 nthreads = self.nthreads
             else:
-                assert type(nthreads) == int
+                assert isinstance(nthreads, int)
         else:
             nthreads = 1
         try:
@@ -1695,9 +1800,13 @@ class GraphDataStore(BaseDataStore):
             graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
             knn_loc = graph_loc.rsplit("/", 1)[0]
             logger.trace(f"Loading KNN dists and indices from {knn_loc}")
-            knn_group = self.zw[knn_loc]
-            dists = knn_group["distances"][:]
-            indices = knn_group["indices"][:]
+            knn_group = as_zarr_group(self.zw[knn_loc], name=knn_loc)
+            dists = np.asarray(
+                as_zarr_array(knn_group["distances"], name="distances")[:]
+            )
+            indices = np.asarray(
+                as_zarr_array(knn_group["indices"], name="indices")[:]
+            )
             dmat = csr_matrix(
                 (
                     dists.flatten(),
@@ -1709,7 +1818,7 @@ class GraphDataStore(BaseDataStore):
                 shape=(indices.shape[0], indices.shape[0]),
             )
             # dmat = dmat.maximum(dmat.transpose()).todok()
-            logger.trace(f"Created sparse KNN dists and indices")
+            logger.trace("Created sparse KNN dists and indices")
             densmap_kwds = {
                 "lambda": dens_lambda,
                 "frac": dens_frac,
@@ -1910,7 +2019,9 @@ class GraphDataStore(BaseDataStore):
         dendrogram_loc = f"{graph_loc}/dendrogram"
         # tuple are changed to list when saved as zarr attrs
         if dendrogram_loc in self.zw and force_recalc is False:
-            dendrogram = self.zw[dendrogram_loc][:]
+            dendrogram = np.asarray(
+                as_zarr_array(self.zw[dendrogram_loc], name=dendrogram_loc)[:]
+            )
             logger.info("Using existing dendrogram")
         else:
             paris = skn.hierarchy.Paris(reorder=False)
@@ -1924,19 +2035,23 @@ class GraphDataStore(BaseDataStore):
             )
             dendrogram = paris.fit_transform(graph)
             dendrogram[dendrogram == np.inf] = 0
+            graph_grp = as_zarr_group(self.zw[graph_loc], name=graph_loc)
             g = create_zarr_dataset(
-                self.zw[graph_loc],
+                graph_grp,
                 dendrogram_loc.rsplit("/", 1)[1],
                 (5000,),
                 "f8",
                 (graph.shape[0] - 1, 4),
             )
             g[:] = dendrogram
-        self.zw[graph_loc].attrs["latest_dendrogram"] = dendrogram_loc
+        as_zarr_group(self.zw[graph_loc], name=graph_loc).attrs[
+            "latest_dendrogram"
+        ] = dendrogram_loc
 
         if balanced_cut:
             from ..dendrogram import BalancedCut
 
+            assert max_size is not None and min_size is not None
             labels = BalancedCut(
                 dendrogram, max_size, min_size, max_distance_fc
             ).get_clusters()
@@ -1953,6 +2068,7 @@ class GraphDataStore(BaseDataStore):
             key=cell_key,
             overwrite=True,
         )
+        return None
 
     def run_topacedo_sampler(
         self,
@@ -1977,7 +2093,7 @@ class GraphDataStore(BaseDataStore):
         save_seeds_key: str = "sketch_seeds",
         rand_state: int = 4466,
         return_edges: bool = False,
-    ) -> None | list:
+    ) -> None | list[Any]:
         """Perform sub-sampling (aka sketching) of cells using TopACeDo
         algorithm. Sub-sampling required that cells are partitioned in cluster
         already. Since, sub-sampling is dependent on cluster information,
@@ -2045,7 +2161,12 @@ class GraphDataStore(BaseDataStore):
         )
         graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
         try:
-            dendrogram = self.zw[f"{graph_loc}/dendrogram"][:]
+            dendrogram = np.asarray(
+                as_zarr_array(
+                    self.zw[f"{graph_loc}/dendrogram"],
+                    name=f"{graph_loc}/dendrogram",
+                )[:]
+            )
         except KeyError:
             raise KeyError(
                 "ERROR: Couldn't find the dendrogram for clustering. Please note that "
@@ -2095,7 +2216,8 @@ class GraphDataStore(BaseDataStore):
         logger.debug(f"Seed cells saved under column: '{key}'")
 
         if return_edges:
-            return edges
+            return cast(list[Any], edges)
+        return None
 
     def get_imputed(
         self,
@@ -2149,17 +2271,23 @@ class GraphDataStore(BaseDataStore):
         if magic_loc in self.zw:
             logger.info("Using existing MAGIC diffusion operator")
             if self._cachedMagicOperatorLoc == magic_loc:
-                diff_op = self._cachedMagicOperator
+                diff_op = cast(coo_matrix, self._cachedMagicOperator)
             else:
                 n_cells, _ = self._get_graph_ncells_k(graph_loc)
-                store = self.zw[magic_loc]
+                store = as_zarr_group(self.zw[magic_loc], name=magic_loc)
                 diff_op = coo_matrix(
-                    (store["data"][:], (store["row"][:], store["col"][:])),
+                    (
+                        np.asarray(as_zarr_array(store["data"], name="data")[:]),
+                        (
+                            np.asarray(as_zarr_array(store["row"], name="row")[:]),
+                            np.asarray(as_zarr_array(store["col"], name="col")[:]),
+                        ),
+                    ),
                     shape=(n_cells, n_cells),
                 )
                 if cache_operator:
                     self._cachedMagicOperator = diff_op
-                    self._cachedMagicOperatorLoc = magic_loc
+                    self._cachedMagicOperatorLoc = magic_loc  # type: ignore[assignment]
                 else:
                     self._cachedMagicOperator = None
                     self._cachedMagicOperatorLoc = None
@@ -2176,15 +2304,17 @@ class GraphDataStore(BaseDataStore):
             store = self.zw.create_group(magic_loc, overwrite=True)
             for i, j in zip(["row", "col", "data"], ["uint32", "uint32", "float32"]):
                 zg = create_zarr_dataset(store, i, (1000000,), j, shape)
-                zg[:] = diff_op.__getattribute__(i)
-            self.zw[graph_loc].attrs["latest_magic"] = magic_loc
+                zg[:] = getattr(diff_op, i)
+            as_zarr_group(self.zw[graph_loc], name=graph_loc).attrs[
+                "latest_magic"
+            ] = magic_loc
             if cache_operator:
                 self._cachedMagicOperator = diff_op
-                self._cachedMagicOperatorLoc = magic_loc
+                self._cachedMagicOperatorLoc = magic_loc  # type: ignore[assignment]
             else:
                 self._cachedMagicOperator = None
                 self._cachedMagicOperatorLoc = None
-        return diff_op.dot(data)
+        return cast(np.ndarray, diff_op.dot(data))
 
     def run_pseudotime_scoring(
         self,
@@ -2194,8 +2324,8 @@ class GraphDataStore(BaseDataStore):
         feat_key: str | None = None,
         n_singular_vals: int = 30,
         source_sink_key: str | None = None,
-        sources: list | None = None,
-        sinks: list | None = None,
+        sources: list[Any] | None = None,
+        sinks: list[Any] | None = None,
         ss_vec: np.ndarray | None = None,
         min_max_norm_ptime: bool = True,
         random_seed: int = 4444,
@@ -2234,18 +2364,20 @@ class GraphDataStore(BaseDataStore):
 
         from scipy.sparse.linalg import svds
 
-        def inverse_degree(g):
+        def inverse_degree(g: csr_matrix) -> csr_matrix:
             d = np.ravel(g.sum(axis=1))
             n = g.shape[0]
             d[d != 0] = 1 / d[d != 0]
             return csr_matrix((d, (range(n), range(n))), shape=[n, n])
 
-        def laplacian(g, inv_deg):
+        def laplacian(g: csr_matrix, inv_deg: csr_matrix) -> csr_matrix:
             n = g.shape[0]
             identity = csr_matrix((np.ones(n), (range(n), range(n))), shape=[n, n])
             return identity - g.dot(inv_deg)
 
-        def make_source_sink_vector(c, source, sink):
+        def make_source_sink_vector(
+            c: pd.Series, source: list[Any], sink: list[Any]
+        ) -> NDArray[Any]:
             ss = list(source) + list(sink)
 
             r = np.zeros(c.shape[0])
@@ -2257,7 +2389,12 @@ class GraphDataStore(BaseDataStore):
             r[~c.isin(ss)] = v
             return r
 
-        def pseudo_inverse(lap, k, rseed, r):
+        def pseudo_inverse(
+            lap: csr_matrix,
+            k: int,
+            rseed: int,
+            r: NDArray[Any],
+        ) -> NDArray[Any]:
             random_state = np.random.RandomState(rseed)
             # noinspection PyArgumentList
             v0 = random_state.rand(lap.shape[0])
@@ -2348,8 +2485,8 @@ class GraphDataStore(BaseDataStore):
                 )
             if ss_vec.sum() > 1e-10:
                 raise ValueError(
-                    f"ERROR: The sum of all the values in `ss_vec` should be zero. Here we test if the sum is less"
-                    f" 1e-10"
+                    "ERROR: The sum of all the values in `ss_vec` should be zero. Here we test if the sum is less"
+                    " 1e-10"
                 )
 
         ss_vec = ss_vec.reshape(-1, 1)
@@ -2397,7 +2534,7 @@ class GraphDataStore(BaseDataStore):
         """
         from ..knn_utils import merge_graphs, wnn_integration
 
-        def load_pca_knn(assay_name):
+        def load_pca_knn(assay_name: str) -> tuple[csr_matrix, NDArray[Any]]:
             g = self.load_graph(
                 from_assay=assay_name,
                 cell_key=None,
@@ -2411,14 +2548,15 @@ class GraphDataStore(BaseDataStore):
                 return_ann_object=True,
                 update_keys=False,
             )
+            if ao is None:
+                raise RuntimeError(f"make_graph did not return AnnStream for {assay_name}")
             if ao.loadings is None:
                 logger.warning(
                     f"No dimension reduction was user for {assay_name} data. "
                     f"Memory consumption will be high."
                 )
                 return g, ao.data.compute()
-            else:
-                return g, ao.data.dot(ao.loadings).compute()
+            return g, ao.data.dot(ao.loadings).compute()
 
         if method == "snn":
             merged_graph = []
@@ -2456,7 +2594,8 @@ class GraphDataStore(BaseDataStore):
         ig_loc = self._integratedGraphsLoc
         if ig_loc not in self.zw:
             self.zw.create_group(ig_loc)
-        if label in self.zw[ig_loc]:
+        ig_grp = as_zarr_group(self.zw[ig_loc], name=ig_loc)
+        if label in ig_grp:
             del self.zw[f"{ig_loc}/{label}"]
         store = self.zw.create_group(f"{ig_loc}/{label}")
         store.attrs["n_cells"] = n_cells
@@ -2465,13 +2604,13 @@ class GraphDataStore(BaseDataStore):
         edge_chunk = chunk_size * n_neighbors
         zge = create_zarr_dataset(
             store,
-            f"edges",
+            "edges",
             (edge_chunk,),
             ("u8", "u8"),
             (n_cells * n_neighbors, 2),
         )
         zgw = create_zarr_dataset(
-            store, f"weights", (edge_chunk,), "f8", (n_cells * n_neighbors,)
+            store, "weights", (edge_chunk,), "f8", (n_cells * n_neighbors,)
         )
 
         zge[:, 0] = merged_graph.row

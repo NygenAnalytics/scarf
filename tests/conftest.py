@@ -1,4 +1,5 @@
-from .fixtures_downloader import *
-from .fixtures_readers import *
-from .fixtures_datastore import *
-
+pytest_plugins = [
+    "tests.fixtures_downloader",
+    "tests.fixtures_readers",
+    "tests.fixtures_datastore",
+]

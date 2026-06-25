@@ -3,7 +3,6 @@
 g. cell cycle genes).
 """
 
-
 __all__ = ["s_phase_genes", "g2m_phase_genes"]
 
 s_phase_genes: list[str] = [

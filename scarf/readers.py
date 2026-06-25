@@ -12,12 +12,13 @@
 import math
 import os
 from abc import ABC, abstractmethod
-from typing import IO
+from typing import IO, Any
 from collections.abc import Generator
 
 import h5py
 import numpy as np
 import pandas as pd
+from numpy.typing import DTypeLike
 from scipy.sparse import coo_matrix
 
 from .utils import logger, tqdmbar
@@ -46,11 +47,11 @@ def get_file_handle(fn: str) -> IO:
             return gzip.open(fn, mode="rt")
         else:
             return open(fn, "r")
-    except (OSError, IOError, FileNotFoundError):
+    except OSError, IOError, FileNotFoundError:
         raise FileNotFoundError("ERROR: FILE NOT FOUND: %s" % fn)
 
 
-def read_file(fn: str):
+def read_file(fn: str) -> Generator[str, None, None]:
     """Yields the lines from the file the given file name points to.
 
     Args:
@@ -75,8 +76,8 @@ class CrReader(ABC):
         assayFeats: A DataFrame with information about the features in the assay.
     """
 
-    def __init__(self, grp_names):
-        self.autoNames = {
+    def __init__(self, grp_names: dict[str, Any]) -> None:
+        self.autoNames: dict[str, str] = {
             "Gene Expression": "RNA",
             "Peaks": "ATAC",
             "Antibody Capture": "ADT",
@@ -84,22 +85,24 @@ class CrReader(ABC):
             "ADT": "ADT",
             "HTO": "HTO",
         }
-        self.grpNames: dict = grp_names
+        self.grpNames: dict[str, Any] = grp_names
         self.nFeatures: int = len(self.feature_names())
         self.nCells: int = len(self.cell_names())
         self.assayFeats = self._make_feat_table()
         self._auto_rename_assay_names()
 
     @abstractmethod
-    def _handle_version(self):
+    def _handle_version(self) -> dict[str, Any]:
         pass
 
     @abstractmethod
-    def _read_dataset(self, key: str | None = None) -> list:
+    def _read_dataset(self, key: str | None = None) -> list[Any] | None:
         pass
 
     @abstractmethod
-    def consume(self, batch_size: int, lines_in_mem: int):
+    def consume(
+        self, batch_size: int, lines_in_mem: int
+    ) -> Generator[coo_matrix, None, None]:
         """Yield CSR matrix chunks of cell rows.
 
         Args:
@@ -111,13 +114,13 @@ class CrReader(ABC):
         """
         pass
 
-    def _subset_by_assay(self, v, assay) -> list:
+    def _subset_by_assay(self, v: list[Any], assay: str | None) -> list[Any]:
         if assay is None:
             return v
         elif assay not in self.assayFeats:
             raise ValueError(f"ERROR: Assay ID {assay} is not valid")
         if len(self.assayFeats[assay].shape) == 2:
-            ret_val = []
+            ret_val: list[Any] = []
             for i in self.assayFeats[assay].values[1:3].T:
                 ret_val.extend(list(v[i[0] : i[1]]))
             return ret_val
@@ -146,7 +149,7 @@ class CrReader(ABC):
         df["nFeatures"] = df.end - df.start
         return df.T
 
-    def _auto_rename_assay_names(self):
+    def _auto_rename_assay_names(self) -> None:
         new_names = []
         for k, v in self.assayFeats.T["type"].to_dict().items():
             if v in self.autoNames:
@@ -163,15 +166,18 @@ class CrReader(ABC):
         """
         self.assayFeats.rename(columns=name_map, inplace=True)
 
-    def feature_ids(self, assay: str = None) -> list[str]:
+    def feature_ids(self, assay: str | None = None) -> list[str]:
         """Returns a list of feature IDs in a specified assay.
 
         Args:
             assay: Select which assay to retrieve feature IDs from.
         """
-        return self._subset_by_assay(self._read_dataset("feature_ids"), assay)
+        vals = self._read_dataset("feature_ids")
+        if vals is None:
+            return []
+        return self._subset_by_assay(vals, assay)
 
-    def feature_names(self, assay: str = None) -> list[str]:
+    def feature_names(self, assay: str | None = None) -> list[str]:
         """Returns a list of features in the dataset.
 
         Args:
@@ -181,6 +187,8 @@ class CrReader(ABC):
         if vals is None:
             logger.warning("Feature names extraction failed using feature IDs")
             vals = self._read_dataset("feature_ids")
+        if vals is None:
+            return []
         return self._subset_by_assay(vals, assay)
 
     def feature_types(self) -> list[str]:
@@ -194,7 +202,10 @@ class CrReader(ABC):
 
     def cell_names(self) -> list[str]:
         """Returns a list of names of the cells in the dataset."""
-        return self._read_dataset("cell_names")
+        vals = self._read_dataset("cell_names")
+        if vals is None:
+            return []
+        return vals
 
 
 class CrH5Reader(CrReader):
@@ -216,10 +227,15 @@ class CrH5Reader(CrReader):
         grp: Current active group in the hierarchy.
     """
 
-    def __init__(self, h5_fn, is_filtered: bool = True, filtering_cutoff: int = 500):
-        self.h5obj = h5py.File(h5_fn, mode="r")
-        self.grp = None
-        self.validBarcodeIdx = None
+    def __init__(
+        self,
+        h5_fn: str,
+        is_filtered: bool = True,
+        filtering_cutoff: int = 500,
+    ) -> None:
+        self.h5obj: h5py.File = h5py.File(h5_fn, mode="r")
+        self.grp: h5py.Group
+        self.validBarcodeIdx: np.ndarray | None = None
         super().__init__(self._handle_version())
         if is_filtered:
             self.validBarcodeIdx = np.array(range(self.nCells))
@@ -227,11 +243,11 @@ class CrH5Reader(CrReader):
             self.validBarcodeIdx = self._get_valid_barcodes(filtering_cutoff)
         self.nCells = len(self.validBarcodeIdx)
 
-    def _handle_version(self):
+    def _handle_version(self) -> dict[str, str | None]:
         root_key = list(self.h5obj.keys())[0]
         self.grp = self.h5obj[root_key]
         if root_key == "matrix":
-            grps = {
+            grps: dict[str, str | None] = {
                 "feature_ids": "features/id",
                 "feature_names": "features/name",
                 "feature_types": "features/feature_type",
@@ -269,8 +285,11 @@ class CrH5Reader(CrReader):
         assert len(indptr) == (s + len(idx))
         return np.where(np.hstack(valid_idx))[0]
 
-    def _read_dataset(self, key: str | None = None):
-        return [x.decode("UTF-8") for x in self.grp[self.grpNames[key]][:]]
+    def _read_dataset(self, key: str | None = None) -> list[str]:
+        if key is None:
+            raise ValueError("Dataset key must be provided")
+        grp_key = self.grpNames[key]
+        return [x.decode("UTF-8") for x in self.grp[grp_key][:]]
 
     def cell_names(self) -> list[str]:
         """Returns a list of names of the cells in the dataset."""
@@ -281,7 +300,7 @@ class CrH5Reader(CrReader):
 
     # noinspection DuplicatedCode
     def consume(
-        self, batch_size: int, lines_in_mem: int = None
+        self, batch_size: int, lines_in_mem: int | None = None
     ) -> Generator[coo_matrix, None, None]:
         """Yield CSR chunks from the Cell Ranger H5 matrix.
 
@@ -289,12 +308,16 @@ class CrH5Reader(CrReader):
             batch_size: Number of cells per chunk.
             lines_in_mem: Unused; kept for CrReader API compatibility.
         """
+        valid_idx = self.validBarcodeIdx
+        assert valid_idx is not None
         indptr = self.grp["indptr"][:]
-        for s in range(0, len(self.validBarcodeIdx), batch_size):
-            v_pos = self.validBarcodeIdx[s : s + batch_size]
-            idx = [np.arange(x, y) for x, y in zip(indptr[v_pos], indptr[v_pos + 1])]
-            cell_idx = np.repeat(np.arange(len(idx)), [len(x) for x in idx])
-            idx = np.hstack(idx)
+        for s in range(0, len(valid_idx), batch_size):
+            v_pos = valid_idx[s : s + batch_size]
+            row_ranges = [
+                np.arange(x, y) for x, y in zip(indptr[v_pos], indptr[v_pos + 1])
+            ]
+            cell_idx = np.repeat(np.arange(len(row_ranges)), [len(x) for x in row_ranges])
+            idx = np.hstack(row_ranges)
             data = self.grp["data"][idx[0] : idx[-1] + 1]
             data = data[idx - idx[0]]
             indices = self.grp["indices"][idx[0] : idx[-1] + 1]
@@ -327,17 +350,17 @@ class CrDirReader(CrReader):
 
     def __init__(
         self,
-        loc,
+        loc: str,
         mtx_separator: str = " ",
         index_offset: int = -1,
         is_filtered: bool = True,
         filtering_cutoff: int = 500,
-    ):
+    ) -> None:
         self.loc: str = loc.rstrip("/") + "/"
-        self.matFn = None
+        self.matFn: str
         self.sep = mtx_separator
         self.indexOffset = index_offset
-        self.validBarcodeIdx = None
+        self.validBarcodeIdx: np.ndarray | None = None
         super().__init__(self._handle_version())
         if is_filtered:
             self.validBarcodeIdx = np.array(range(self.nCells))
@@ -346,12 +369,15 @@ class CrDirReader(CrReader):
             self.validBarcodeIdx = self._get_valid_barcodes(filtering_cutoff)
         self.nCells = len(self.validBarcodeIdx)
 
-    def _handle_version(self):
+    def _handle_version(self) -> dict[str, tuple[str, int] | None]:
         show_error = False
+        mat_fn: str | None = None
+        feat_fn: str | None = None
+        cell_fn: str | None = None
         if os.path.isfile(self.loc + "matrix.mtx.gz"):
-            self.matFn = self.loc + "matrix.mtx.gz"
+            mat_fn = self.loc + "matrix.mtx.gz"
         elif os.path.isfile(self.loc + "matrix.mtx"):
-            self.matFn = self.loc + "matrix.mtx"
+            mat_fn = self.loc + "matrix.mtx"
         else:
             show_error = True
         if os.path.isfile(self.loc + "features.tsv.gz"):
@@ -376,14 +402,15 @@ class CrDirReader(CrReader):
         else:
             cell_fn = None
             show_error = True
-        if show_error:
-            raise IOError(
+        if show_error or mat_fn is None or feat_fn is None or cell_fn is None:
+            raise OSError(
                 "ERROR: Couldn't find either of these expected combinations of files:\n"
                 "\t- matrix.mtx, barcodes.tsv and genes.tsv\n"
                 "\t- matrix.mtx.gz, barcodes.tsv.gz and features.tsv.gz\n"
                 "Please make sure that you have not compressed or uncompressed the Cellranger output files "
                 "manually"
             )
+        self.matFn = mat_fn
         return {
             "feature_ids": (feat_fn, 0),
             "feature_names": (feat_fn, 1),
@@ -391,16 +418,19 @@ class CrDirReader(CrReader):
             "cell_names": (cell_fn, 0),
         }
 
-    def _read_dataset(self, key: str | None = None):
+    def _read_dataset(self, key: str | None = None) -> list[str] | None:
+        if key is None:
+            raise ValueError("Dataset key must be provided")
+        grp_entry = self.grpNames[key]
         try:
             vals = [
-                x.split("\t")[self.grpNames[key][1]]
-                for x in read_file(self.loc + self.grpNames[key][0])
+                x.split("\t")[grp_entry[1]]
+                for x in read_file(self.loc + grp_entry[0])
             ]
         except IndexError:
             logger.warning(
-                f"{key} extraction failed from {self.grpNames[key][0]} "
-                f"in column {self.grpNames[key][1]}",
+                f"{key} extraction failed from {grp_entry[0]} "
+                f"in column {grp_entry[1]}",
                 flush=True,
             )
             vals = None
@@ -429,7 +459,9 @@ class CrDirReader(CrReader):
             )
         return header
 
-    def process_batch(self, dfs: list[pd.DataFrame], filtering_cutoff: int) -> np.array:
+    def process_batch(
+        self, dfs: list[pd.DataFrame], filtering_cutoff: int
+    ) -> np.ndarray:
         """Returns a list of valid barcodes after filtering out background barcodes for a given batch.
 
         Args:
@@ -510,7 +542,7 @@ class CrDirReader(CrReader):
         assert test_counter == header["nCounts"][0]
         return np.sort(np.unique(np.hstack(valid_idx)))
 
-    def to_sparse(self, a: np.ndarray, dtype) -> coo_matrix:
+    def to_sparse(self, a: np.ndarray, dtype: DTypeLike) -> coo_matrix:
         """Returns the input data as a sparse (COO) matrix.
 
         Args:
@@ -537,7 +569,7 @@ class CrDirReader(CrReader):
             vals = vals[(self.validBarcodeIdx + self.indexOffset)]
         return list(vals)
 
-    def rename_batches(self, collect: list[pd.DataFrame]) -> list:
+    def rename_batches(self, collect: list[pd.DataFrame]) -> np.ndarray:
         df = pd.concat(collect, ignore_index=True)
         barcodes = df["barcode"].to_numpy()
         count_hash = {}
@@ -553,7 +585,7 @@ class CrDirReader(CrReader):
         self,
         batch_size: int,
         lines_in_mem: int = int(1e5),
-        dtype=np.uint32,
+        dtype: DTypeLike = np.uint32,
     ) -> Generator[coo_matrix, None, None]:
         """Yields chunks of data from the MTX file.
 
@@ -570,12 +602,12 @@ class CrDirReader(CrReader):
             chunksize=lines_in_mem,
             names=["gene", "barcode", "count"],
         )
-        unique_list = []
-        collect = []
+        unique_list: list[Any] = []
+        collect: list[pd.DataFrame] = []
         for chunk in matrixIO:
             chunk = chunk[chunk["barcode"].isin(self.validBarcodeIdx)]
             in_uniques = np.unique(chunk["barcode"].values)
-            unique_list.extend(in_uniques)
+            unique_list.extend(in_uniques.tolist())
             unique_list = list(set(unique_list))
             if len(unique_list) > batch_size:
                 diff = batch_size - (len(unique_list) - len(in_uniques))
@@ -583,18 +615,17 @@ class CrDirReader(CrReader):
                 mask_neg = in_uniques[diff:]
                 extra = chunk[chunk["barcode"].isin(mask_pos)]
                 collect.append(extra)
-                collect = self.rename_batches(collect)
-                mtx = self.to_sparse(np.array(collect), dtype=dtype)
+                batch_arr = self.rename_batches(collect)
+                mtx = self.to_sparse(batch_arr, dtype=dtype)
                 yield mtx
                 left_out = chunk[chunk["barcode"].isin(mask_neg)]
-                collect = []
-                unique_list = list(mask_neg)
-                collect.append(left_out)
+                collect = [left_out]
+                unique_list = mask_neg.tolist()
             else:
                 collect.append(chunk)
         if len(collect) > 0:
-            collect = self.rename_batches(collect)
-            mtx = self.to_sparse(np.array(collect), dtype=dtype)
+            batch_arr = self.rename_batches(collect)
+            mtx = self.to_sparse(batch_arr, dtype=dtype)
             yield mtx
 
 
@@ -642,16 +673,16 @@ class H5adReader:
         matrix_key: str = "X",
         obsm_attrs_key: str = "obsm",
         category_names_key: str = "__categories",
-        dtype: str = None,
-    ):
-        self.h5 = h5py.File(h5ad_fn, mode="r")
+        dtype: str | None = None,
+    ) -> None:
+        self.h5: h5py.File = h5py.File(h5ad_fn, mode="r")
         self.matrixKey = matrix_key
         self.cellAttrsKey, self.featureAttrsKey, self.obsmAttrsKey = (
             cell_attrs_key,
             feature_attrs_key,
             obsm_attrs_key,
         )
-        self.groupCodes = {
+        self.groupCodes: dict[str, int] = {
             self.cellAttrsKey: self._validate_group(self.cellAttrsKey),
             self.featureAttrsKey: self._validate_group(self.featureAttrsKey),
             self.obsmAttrsKey: self._validate_group(self.obsmAttrsKey),
@@ -665,7 +696,7 @@ class H5adReader:
         self.featIdsKey = self._fix_name_key(self.featureAttrsKey, feature_ids_key)
         self.featNamesKey = feature_name_key
         self.catNamesKey = category_names_key
-        self.matrixDtype = self._get_matrix_dtype() if dtype is None else dtype
+        self.matrixDtype: Any = self._get_matrix_dtype() if dtype is None else dtype
 
     def _validate_group(self, group: str) -> int:
         if group not in self.h5:
@@ -703,7 +734,7 @@ class H5adReader:
                     )
         return ret_val
 
-    def _get_matrix_dtype(self):
+    def _get_matrix_dtype(self) -> Any:
         if self.groupCodes[self.matrixKey] == 1:
             return self.h5[self.matrixKey].dtype
         elif self.groupCodes[self.matrixKey] == 2:
@@ -738,18 +769,18 @@ class H5adReader:
     def _get_n(self, group: str) -> int:
         if self.groupCodes[group] == 0:
             if self._check_exists(self.matrixKey, "shape"):
-                return self.h5[self.matrixKey]["shape"][0]
+                return int(self.h5[self.matrixKey]["shape"][0])
             else:
                 raise KeyError(
                     f"ERROR: `{group}` not found and `shape` key is missing in the {self.matrixKey} group. "
                     f"Aborting read process."
                 )
         elif self.groupCodes[group] == 1:
-            return self.h5[group].shape[0]
+            return int(self.h5[group].shape[0])
         else:
             for i in self.h5[group].keys():
                 if isinstance(self.h5[group][i], h5py.Dataset):
-                    return self.h5[group][i].shape[0]
+                    return int(self.h5[group][i].shape[0])
             raise KeyError(
                 f"ERROR: `{group}` key doesn't contain any child node of Dataset type."
                 f"Aborting because unexpected H5ad format."
@@ -759,9 +790,9 @@ class H5adReader:
         """Returns a list of cell IDs."""
         if self._check_exists(self.cellAttrsKey, self.cellIdsKey):
             if self.groupCodes[self.cellAttrsKey] == 1:
-                return self.h5[self.cellAttrsKey][self.cellIdsKey]
+                return np.asarray(self.h5[self.cellAttrsKey][self.cellIdsKey])
             else:
-                return self.h5[self.cellAttrsKey][self.cellIdsKey][:]
+                return np.asarray(self.h5[self.cellAttrsKey][self.cellIdsKey][:])
         logger.warning(f"Could not find cells ids key: {self.cellIdsKey} in `obs`.")
         return np.array([f"cell_{x}" for x in range(self.nCells)])
 
@@ -770,9 +801,9 @@ class H5adReader:
         """Returns a list of feature IDs."""
         if self._check_exists(self.featureAttrsKey, self.featIdsKey):
             if self.groupCodes[self.featureAttrsKey] == 1:
-                return self.h5[self.featureAttrsKey][self.featIdsKey]
+                return np.asarray(self.h5[self.featureAttrsKey][self.featIdsKey])
             else:
-                return self.h5[self.featureAttrsKey][self.featIdsKey][:]
+                return np.asarray(self.h5[self.featureAttrsKey][self.featIdsKey][:])
         logger.warning(
             f"Could not find feature ids key: {self.featIdsKey} in {self.featureAttrsKey}."
         )
@@ -801,18 +832,20 @@ class H5adReader:
                 categories = v["categories"][:]
                 try:
                     return np.array([categories[x] for x in codes])
-                except (IndexError, TypeError):
+                except IndexError, TypeError:
                     logger.warning(f"Failed to decode categorical data for {key}")
                     return np.array([f"feature_{x}" for x in range(len(codes))])
             else:
                 # It's a Group but doesn't have the expected structure, try to read it as dataset
-                logger.warning(f"{key} is a Group but missing 'codes' or 'categories', attempting to extract data")
-                return v[:]
-        
+                logger.warning(
+                    f"{key} is a Group but missing 'codes' or 'categories', attempting to extract data"
+                )
+                return np.asarray(v[:])
+
         # if v is a Dataset
         if isinstance(v, h5py.Dataset):
             v = v[:]
-        
+
         if self.catNamesKey is not None:
             if self._check_exists(group, self.catNamesKey):
                 cat_g = self.h5[group][self.catNamesKey]
@@ -821,16 +854,16 @@ class H5adReader:
                         c = cat_g[key][:]
                         try:
                             return np.array([c[x] for x in v])
-                        except (IndexError, TypeError):
+                        except IndexError, TypeError:
                             return v
         if "uns" in self.h5:
             if key + "_categories" in self.h5["uns"]:
                 c = self.h5["uns"][key + "_categories"][:]
                 try:
                     return np.array([c[x] for x in v])
-                except (IndexError, TypeError):
+                except IndexError, TypeError:
                     return v
-        return v
+        return np.asarray(v)
 
     def _get_col_data(
         self, group: str, ignore_keys: list[str]
@@ -871,7 +904,7 @@ class H5adReader:
                     continue
                 if isinstance(g, h5py.Dataset):
                     for j in range(g.shape[1]):
-                        yield f"{i}{j+1}", g[:, j]
+                        yield f"{i}{j + 1}", g[:, j]
         else:
             logger.warning(
                 f"Reading of obsm failed because it either does not exist or is not in expected format"  # noqa: F541
@@ -924,12 +957,15 @@ class H5adReader:
             )
             s = e
 
-    def consume(self, batch_size: int):
+    def consume(self, batch_size: int) -> Generator[coo_matrix, None, None]:
         """Returns a generator that yield chunks of data."""
         if self.groupCodes[self.matrixKey] == 1:
             return self.consume_dataset(batch_size)
         elif self.groupCodes[self.matrixKey] == 2:
             return self.consume_group(batch_size)
+        raise ValueError(
+            f"ERROR: {self.matrixKey} is neither Dataset or Group type. Will not consume data"
+        )
 
 
 class NaboH5Reader:
@@ -944,8 +980,8 @@ class NaboH5Reader:
         nFeatures: Number of features in dataset.
     """
 
-    def __init__(self, h5_fn: str):
-        self.h5 = h5py.File(h5_fn, mode="r")
+    def __init__(self, h5_fn: str) -> None:
+        self.h5: h5py.File = h5py.File(h5_fn, mode="r")
         self._check_integrity()
         self.nCells = self.h5["names"]["cells"].shape[0]
         self.nFeatures = self.h5["names"]["genes"].shape[0]
@@ -1022,14 +1058,14 @@ class LoomReader:
         self,
         loom_fn: str,
         matrix_key: str = "matrix",
-        cell_attrs_key="col_attrs",
+        cell_attrs_key: str = "col_attrs",
         cell_names_key: str = "obs_names",
         feature_attrs_key: str = "row_attrs",
         feature_names_key: str = "var_names",
-        feature_ids_key: str = None,
-        dtype: str = None,
+        feature_ids_key: str | None = None,
+        dtype: str | None = None,
     ) -> None:
-        self.h5 = h5py.File(loom_fn, mode="r")
+        self.h5: h5py.File = h5py.File(loom_fn, mode="r")
         self.matrixKey = matrix_key
         self.cellAttrsKey, self.featureAttrsKey = cell_attrs_key, feature_attrs_key
         self.cellNamesKey, self.featureNamesKey = cell_names_key, feature_names_key
@@ -1062,7 +1098,7 @@ class LoomReader:
                 f"Cell names/ids key ({self.cellNamesKey}) is missing in attributes"
             )
         else:
-            return self.h5[self.cellAttrsKey][self.cellNamesKey][:]
+            return list(self.h5[self.cellAttrsKey][self.cellNamesKey][:])
         return [f"cell_{x}" for x in range(self.nCells)]
 
     def cell_ids(self) -> list[str]:
@@ -1070,11 +1106,18 @@ class LoomReader:
         return self.cell_names()
 
     def _stream_attrs(
-        self, key, ignore
+        self, key: str, ignore: str | list[str] | None
     ) -> Generator[tuple[str, np.ndarray], None, None]:
+        ignored: set[str]
+        if isinstance(ignore, str):
+            ignored = {ignore}
+        elif ignore is None:
+            ignored = set()
+        else:
+            ignored = {name for name in ignore if name is not None}
         if key in self.h5:
             for i in tqdmbar(self.h5[key].keys(), desc=f"Reading {key} attributes"):
-                if i in [ignore]:
+                if i in ignored:
                     continue
                 vals = self.h5[key][i][:]
                 if vals.dtype.names is None:
@@ -1097,7 +1140,7 @@ class LoomReader:
                 f"Feature names key ({self.featureNamesKey}) is missing in attributes"
             )
         else:
-            return self.h5[self.featureAttrsKey][self.featureNamesKey][:]
+            return list(self.h5[self.featureAttrsKey][self.featureNamesKey][:])
         return [f"feature_{x}" for x in range(self.nFeatures)]
 
     def feature_ids(self) -> list[str]:
@@ -1111,14 +1154,15 @@ class LoomReader:
                 f"Feature names key ({self.featureIdsKey}) is missing in attributes"
             )
         else:
-            return self.h5[self.featureAttrsKey][self.featureIdsKey][:]
+            return list(self.h5[self.featureAttrsKey][self.featureIdsKey][:])
         return [f"feature_{x}" for x in range(self.nFeatures)]
 
     def get_feature_attrs(self) -> Generator[tuple[str, np.ndarray], None, None]:
         """Returns a Generator that yields the features' attributes."""
-        return self._stream_attrs(
-            self.featureAttrsKey, [self.featureIdsKey, self.featureNamesKey]
-        )
+        ignore_keys = [
+            key for key in (self.featureIdsKey, self.featureNamesKey) if key is not None
+        ]
+        return self._stream_attrs(self.featureAttrsKey, ignore_keys)
 
     def consume(self, batch_size: int = 1000) -> Generator[np.ndarray, None, None]:
         """Returns a generator that yield chunks of data."""
@@ -1165,9 +1209,9 @@ class CSVReader:
         skip_rows: int = 0,
         skip_cols: list[str] | None = None,
         cell_data_cols: list[str] | None = None,
-        batch_size=10000,
-        pandas_kwargs: dict | None = None,
-    ):
+        batch_size: int = 10000,
+        pandas_kwargs: dict[str, Any] | None = None,
+    ) -> None:
         self._fn = csv_fn
         if rows_are_cells is False:
             raise NotImplementedError(
@@ -1178,13 +1222,14 @@ class CSVReader:
         else:
             if not isinstance(pandas_kwargs, dict):
                 logger.error("")
+        header_row: int | None
         if has_header is False:
-            has_header = None
+            header_row = None
         else:
-            has_header = 0
-        self.pandas_kwargs = pandas_kwargs
+            header_row = 0
+        self.pandas_kwargs: dict[str, Any] = pandas_kwargs
         self.pandas_kwargs["sep"] = sep
-        self.pandas_kwargs["header"] = has_header
+        self.pandas_kwargs["header"] = header_row
         self.pandas_kwargs["skiprows"] = skip_rows
         self.pandas_kwargs["chunksize"] = batch_size
         self.pandas_kwargs["index_col"] = id_column
@@ -1207,8 +1252,9 @@ class CSVReader:
             self.cellDataIdx,
         ) = self._consistency_check()
 
-    def _get_streamer(self) -> Generator:
-        return pd.read_csv(self._fn, **self.pandas_kwargs)
+    def _get_streamer(self) -> Generator[pd.DataFrame, None, None]:
+        reader = pd.read_csv(self._fn, **self.pandas_kwargs)
+        yield from reader
 
     def _consistency_check(
         self,
@@ -1224,19 +1270,19 @@ class CSVReader:
         stream = self._get_streamer()
         n_cells = 0
         n_features = 0
-        feature_ids = None
-        cell_data_dtypes = None
-        cell_data_idx = None
-        if self.pandas_kwargs["index_col"] is None:
-            cell_ids = None
-        else:
-            cell_ids = []
+        feature_ids: np.ndarray | None = None
+        cell_data_dtypes: list[np.dtype] | None = None
+        cell_data_idx: list[int] | None = None
+        cell_ids: np.ndarray | None = None
+        collected_cell_ids: list[Any] | None = None
+        if self.pandas_kwargs["index_col"] is not None:
+            collected_cell_ids = []
         for df in tqdmbar(stream, desc="Performing CSV file consistency check"):
             n_cells += df.shape[0]
             if n_features == 0:
                 n_features = df.shape[1]
                 if self.pandas_kwargs["header"] is not None:
-                    feature_ids = df.columns.values
+                    feature_ids = np.asarray(df.columns.values)
                     if len(feature_ids) != n_features:
                         raise ValueError(
                             "Header length not same as number of features. This can happen if you did not"
@@ -1255,9 +1301,9 @@ class CSVReader:
                         "Number of columns changed in the CSV during consistency check."
                         " Maybe a problem with the delimiter."
                     )
-        if cell_ids is not None:
-            cell_ids = np.ndarray(cell_ids)
-        keep_cols = None
+        if collected_cell_ids is not None:
+            cell_ids = np.asarray(collected_cell_ids)
+        keep_cols: list[int] | None = None
         if feature_ids is not None:
             skip_names = list(set(self.skipCols).union(self.cellDataCols))
             if len(skip_names) > 0:
@@ -1276,7 +1322,7 @@ class CSVReader:
             cell_data_idx,
         )
 
-    def _n_features(self):
+    def _n_features(self) -> np.ndarray:
         return np.array([f"feature_{x}" for x in range(self.nFeatures)])
 
     def cell_ids(self) -> np.ndarray:

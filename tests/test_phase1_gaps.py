@@ -78,9 +78,7 @@ def test_crtozarr_forwards_storage_options(monkeypatch):
 
     monkeypatch.setattr("scarf.writers.load_zarr", fake_load_zarr)
     monkeypatch.setattr("scarf.writers.create_cell_data", lambda **kwargs: None)
-    monkeypatch.setattr(
-        "scarf.writers.create_zarr_count_assay", lambda **kwargs: None
-    )
+    monkeypatch.setattr("scarf.writers.create_zarr_count_assay", lambda **kwargs: None)
 
     class FakeCr:
         def cell_names(self):

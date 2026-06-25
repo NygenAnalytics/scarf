@@ -1,5 +1,6 @@
 """Utility functions for features."""
 
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -7,7 +8,9 @@ import pandas as pd
 __all__ = ["fit_lowess", "binned_sampling", "hto_demux"]
 
 
-def fit_lowess(a, b, n_bins: int, lowess_frac: float) -> np.ndarray:
+def fit_lowess(
+    a: np.ndarray, b: np.ndarray, n_bins: int, lowess_frac: float
+) -> np.ndarray:
     """Fits a LOWESS (Locally Weighted Scatterplot Smoothing) curve.
 
     Args:
@@ -24,21 +27,21 @@ def fit_lowess(a, b, n_bins: int, lowess_frac: float) -> np.ndarray:
     stats = pd.DataFrame({"a": a, "b": b}).apply(np.log)
     bin_edges = np.histogram(stats.a, bins=n_bins)[1]
     bin_edges[-1] += 0.1  # For including last gene
-    bin_idx = []
+    bin_idx: list[list[Any]] = []
     for i in range(n_bins):
         idx = pd.Series((stats.a >= bin_edges[i]) & (stats.a < bin_edges[i + 1]))
         if sum(idx) > 0:
             bin_idx.append(list(idx[idx].index))
-    bin_vals = []
+    bin_vals: list[list[float]] = []
     for idx in bin_idx:
         temp_stat = stats.reindex(idx)
         temp_gene = temp_stat.idxmin().b
         bin_vals.append([temp_stat.b[temp_gene], temp_stat.a[temp_gene]])
-    bin_vals = np.array(bin_vals).T
+    bin_array = np.array(bin_vals).T
     bin_cor_fac = lowess(
-        bin_vals[0], bin_vals[1], return_sorted=False, frac=lowess_frac, it=100
+        bin_array[0], bin_array[1], return_sorted=False, frac=lowess_frac, it=100
     ).T
-    fixed_var = {}
+    fixed_var: dict[Any, float] = {}
     for bcf, indices in zip(bin_cor_fac, bin_idx):
         for idx in indices:
             fixed_var[idx] = np.e ** (stats.b[idx] - bcf)
@@ -73,13 +76,11 @@ def binned_sampling(
         A list of sampled features.
     """
     n_items = int(np.round(len(values) / (n_bins - 1)))
-    feature_list = set(feature_list)
-    # Made following more linter friendly
-    # obs_cut = obs_avg.rank(method='min') // n_items
+    feature_set = set(feature_list)
     obs_cut: pd.Series = values.fillna(0).rank(method="min").divide(n_items).astype(int)
 
-    control_genes = set()
-    for cut in np.unique(obs_cut[list(feature_list)]):
+    control_genes: set[Any] = set()
+    for cut in np.unique(obs_cut[list(feature_set)]):
         sub_obs = obs_cut[obs_cut == cut]
         if len(sub_obs) == 0:
             continue
@@ -89,7 +90,7 @@ def binned_sampling(
             sample_size = ctrl_size
         r_genes = sub_obs.sample(n=sample_size, random_state=rand_seed).index
         control_genes.update(set(r_genes))
-    return list(control_genes - feature_list)
+    return list(control_genes - feature_set)
 
 
 def hto_demux(hto_counts: pd.DataFrame) -> pd.Series:
@@ -112,12 +113,12 @@ def hto_demux(hto_counts: pd.DataFrame) -> pd.Series:
 
     def calc_cluster_labels(
         df: pd.DataFrame, n_centers: int | None = None, n_starts: int = 100
-    ):
+    ) -> np.ndarray:
         if n_centers is None:
             n_centers = df.shape[1] + 1
         kmeans = KMeans(n_clusters=n_centers, init="random", n_init=n_starts)
         kmeans.fit(df)
-        return kmeans.labels_
+        return np.asarray(kmeans.labels_)
 
     def calc_cluster_avg_exp(df: pd.DataFrame) -> tuple[pd.Series, pd.DataFrame]:
         df["cluster"] = calc_cluster_labels(df)
@@ -131,20 +132,20 @@ def hto_demux(hto_counts: pd.DataFrame) -> pd.Series:
         p = 1 / (1 + np.exp(fit.params[0]) * fit.params[1])
         n = np.exp(fit.params[0]) * p / (1 - p)
         dist = nbinom(n=n, p=p, loc=mu)
-        return round(dist.ppf(quantile))
+        return int(round(dist.ppf(quantile)))
 
     def discretize_counts(
         df: pd.DataFrame, clust_labels: pd.Series, clust_exp: pd.DataFrame
     ) -> pd.DataFrame:
         min_clust = clust_exp.idxmin()
-        cutoffs = {}
+        cutoffs: dict[Any, int] = {}
         for hto in df:
             bg_values = df[hto][clust_labels == min_clust[hto]].values
             cutoffs[hto] = get_background_cutoff(bg_values)
-        cutoffs = pd.Series(cutoffs)
-        return df > cutoffs
+        cutoff_series = pd.Series(cutoffs)
+        return df > cutoff_series
 
-    def identity_renamer(x: int):
+    def identity_renamer(x: int) -> str:
         if x == 0:
             return "Negative"
         elif x == 1:

@@ -9,8 +9,6 @@ import pandas as pd
 from scipy.sparse import csr_matrix
 import zarr
 
-zarrArrayType = zarr.Array
-
 from .ann import AnnStream
 from .datastore.datastore import DataStore
 from .utils import (
@@ -18,11 +16,13 @@ from .utils import (
     tqdmbar,
 )
 
+type ZarrArray = zarr.Array
+
 
 # LISI - The Local Inverse Simpson Index
 def compute_lisi(
-    distances: zarrArrayType,
-    indices: zarrArrayType,
+    distances: ZarrArray,
+    indices: ZarrArray,
     metadata: pd.DataFrame,
     label_colnames: Iterable[str],
     perplexity: float = 30,
@@ -53,17 +53,16 @@ def compute_lisi(
     """
 
     n_cells = metadata.shape[0]
-    n_labels = len(label_colnames)
+    label_cols = list(label_colnames)
+    n_labels = len(label_cols)
     # Don't count yourself
-    indices = indices[:, 1:]
-    distances = distances[:, 1:]
+    index_arr = np.asarray(indices[:, 1:])
+    dist_arr = np.asarray(distances[:, 1:])
     lisi_df = np.zeros((n_cells, n_labels))
-    for i, label in enumerate(label_colnames):
+    for i, label in enumerate(label_cols):
         logger.info(f"Computing LISI for {label}")
         labels = pd.Categorical(metadata[label])
-        simpson = compute_simpson(
-            distances.T, indices.T, labels, perplexity
-        )
+        simpson = compute_simpson(dist_arr.T, index_arr.T, labels, perplexity)
         lisi_df[:, i] = 1 / simpson
     return lisi_df
 
@@ -91,12 +90,12 @@ def compute_simpson(
         np.ndarray: Array of Simpson's diversity indices, one per point
     """
     n = distances.shape[1]
-    P = np.zeros(distances.shape[0])
-    simpson = np.zeros(n)
+    P = np.zeros(distances.shape[0], dtype=np.float64)
+    simpson = np.zeros(n, dtype=np.float64)
     logU = np.log(perplexity)
     # Loop through each cell.
     for i in tqdmbar(range(n), desc="Computing Simpson's Diversity Index"):
-        beta = 1
+        beta = 1.0
         betamin = -np.inf
         betamax = np.inf
         # Compute Hdiff
@@ -290,7 +289,7 @@ def calculate_top_k_neighbor_distances(
 
 def process_cluster(
     cluster_cells: np.ndarray,
-    hvg_data: np.ndarray | zarrArrayType,
+    hvg_data: np.ndarray | ZarrArray,
     ann_obj: AnnStream,
     k: int,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -309,11 +308,13 @@ def process_cluster(
         different subsets of cells from the cluster
     """
     np.random.shuffle(cluster_cells)
+    sample_indices = sorted(cluster_cells[:k])
+    holdout_indices = sorted(cluster_cells[k : 2 * k])
     data_cells = np.array(
-        [ann_obj.reducer(hvg_data[i]) for i in sorted(cluster_cells[:k])]
+        [ann_obj.reducer(np.asarray(hvg_data[row_idx])) for row_idx in sample_indices]
     )
     data_cells_2 = np.array(
-        [ann_obj.reducer(hvg_data[i]) for i in sorted(cluster_cells[k : 2 * k])]
+        [ann_obj.reducer(np.asarray(hvg_data[row_idx])) for row_idx in holdout_indices]
     )
     return data_cells, data_cells_2
 
@@ -322,7 +323,7 @@ def silhouette_scoring(
     ds: DataStore,
     ann_obj: AnnStream,
     graph: csr_matrix,
-    hvg_data: np.ndarray | zarrArrayType,
+    hvg_data: np.ndarray | ZarrArray,
     assay_type: str,
     res_label: str,
 ) -> np.ndarray | None:
@@ -456,9 +457,9 @@ def integration_score(
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
     if metric == "ari":
-        return adjusted_rand_score(batch_labels[0], batch_labels[1])
+        return float(adjusted_rand_score(batch_labels[0], batch_labels[1]))
     elif metric == "nmi":
-        return normalized_mutual_info_score(batch_labels[0], batch_labels[1])
+        return float(normalized_mutual_info_score(batch_labels[0], batch_labels[1]))
     else:
         logger.error(
             f"Metric {metric} not recognized. Please choose from 'ari' or 'nmi'."

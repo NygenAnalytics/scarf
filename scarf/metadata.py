@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import zarr
 
+from ._types import as_zarr_array
 from .feat_utils import fit_lowess
 from .utils import logger
 from .writers import create_zarr_obj_array
@@ -29,7 +30,7 @@ def _all_true(bools: np.ndarray) -> np.ndarray:
     """
     a = bools.sum(axis=0)
     a[a < bools.shape[0]] = 0
-    return a.astype(bool)
+    return np.asarray(a, dtype=bool)
 
 
 class MetaData:
@@ -66,7 +67,9 @@ class MetaData:
         sizes = []
         for i in zgrp.keys():
             try:
-                sizes.append(zgrp[i].shape[0])
+                child = zgrp[i]
+                if isinstance(child, zarr.Array):
+                    sizes.append(child.shape[0])
             except Exception:
                 pass
         if len(sizes) > 0:
@@ -130,7 +133,7 @@ class MetaData:
         if column not in col_map:
             raise KeyError(f"{column} does not exist in the metadata columns.")
         entry = col_map[column]
-        if entry == "primary":
+        if isinstance(entry, str):
             return "primary", column
         loc, col = entry
         return loc, col
@@ -145,9 +148,9 @@ class MetaData:
 
         """
         loc, col = self._get_loc(column)
-        return self.locations[loc][col]  # type: ignore
+        return as_zarr_array(self.locations[loc][col], name=col)
 
-    def get_dtype(self, column: str) -> type:
+    def get_dtype(self, column: str) -> np.dtype[Any]:
         """Returns the dtype for the given column.
 
         Args:
@@ -164,7 +167,7 @@ class MetaData:
         Returns: None
         """
 
-        if self.get_dtype(key) != bool:
+        if self.get_dtype(key) is not bool:
             raise TypeError(
                 "ERROR: `key` should be name of a boolean type column in Metadata table"
             )
@@ -193,9 +196,9 @@ class MetaData:
         cols = self.columns
         conflict_names = [x for x in new_cols if x in cols]
         if len(conflict_names) > 0:
-            conflict_names = " ".join(conflict_names)
+            conflict_str = " ".join(conflict_names)
             raise ValueError(
-                f"ERROR: These names in location conflict with existing names: {conflict_names}\n. "
+                f"ERROR: These names in location conflict with existing names: {conflict_str}\n. "
                 f"Please try with a different identifier value."
             )
         self.locations[identifier] = zgrp
@@ -234,7 +237,7 @@ class MetaData:
         Returns:
 
         """
-        return self._get_array(column)[:]
+        return np.asarray(self._get_array(column)[:])
 
     def active_index(self, key: str) -> np.ndarray:
         """
@@ -246,7 +249,7 @@ class MetaData:
 
         """
         if self._verify_bool(key):
-            return self.index[self.fetch_all(key)]
+            return np.asarray(self.index[self.fetch_all(key)])
         else:
             raise ValueError(
                 "ERROR: Unexpected error when verifying boolean key. Please report this issue"
@@ -262,7 +265,7 @@ class MetaData:
         Returns:
         """
 
-        return self.fetch_all(column)[self.active_index(key)]
+        return np.asarray(self.fetch_all(column)[self.active_index(key)])
 
     def _save(
         self, column_name: str, values: np.ndarray, location: str = "primary"
@@ -290,7 +293,7 @@ class MetaData:
         return None
 
     def _fill_to_index(
-        self, values: np.ndarray, fill_value, key: str, auto_fill_disable: bool = False
+        self, values: np.ndarray, fill_value: Any, key: str, auto_fill_disable: bool = False
     ) -> np.ndarray:
         """Makes sure that the array being added to the table is of the same
         shape. If the array has same shape as the table then the input array is
@@ -356,7 +359,7 @@ class MetaData:
                 values = self.fetch_all(column)
             else:
                 values = self.fetch(column, key)
-            value_map = {}
+            value_map: dict[str, list[int]] = {}
             for n, x in enumerate(values):
                 x = x.upper()
                 if x not in value_map:
@@ -548,7 +551,7 @@ class MetaData:
             df = df.reindex(self.active_index(key))
         return df
 
-    def grep(self, pattern: str, only_valid=False) -> list[str]:
+    def grep(self, pattern: str, only_valid: bool = False) -> list[str]:
         """Return feature names matching a regex pattern (case insensitive).
 
         Args:
@@ -598,5 +601,5 @@ class MetaData:
         ret_val[idx] = c
         return ret_val
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"MetaData of {self.fetch_all('I').sum()}({self.N}) elements"

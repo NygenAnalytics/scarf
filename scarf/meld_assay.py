@@ -12,6 +12,8 @@
 
 import gzip
 import logging
+from collections.abc import Callable, Iterable
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -19,6 +21,7 @@ from numba import jit
 from scipy.sparse import coo_matrix
 import zarr
 
+from .assay import Assay
 from .utils import controlled_compute, logger, tqdmbar
 from .writers import create_zarr_count_assay
 
@@ -33,7 +36,7 @@ class GffReader:
         gff_fn: str,
         up_offset: int = 1000,
         down_offset: int = 500,
-        chunk_size=100000,
+        chunk_size: int = 100000,
     ):
         """
 
@@ -121,7 +124,7 @@ class GffReader:
             raise ValueError(f"ERROR: Unknown symbol for strand: {v[6]}")
 
     @staticmethod
-    def get_ids_names(v: pd.Series) -> tuple[str, str]:
+    def get_ids_names(v: pd.Series) -> tuple[str | None, str | None]:
         """Extracts gene_id and gene_name values from last (9th) column of GFF
         file record.
 
@@ -141,7 +144,7 @@ class GffReader:
         return gid, name
 
     @staticmethod
-    def d_apply(d: pd.DataFrame, func) -> np.ndarray:
+    def d_apply(d: pd.DataFrame, func: Callable[[pd.Series], Any]) -> np.ndarray:
         """A convenience method to apply arbitrary functions over a dataframe.
 
         Args:
@@ -200,7 +203,7 @@ class GffReader:
         return None
 
 
-def create_bed_from_coord_ids(ids: list) -> pd.DataFrame:
+def create_bed_from_coord_ids(ids: Iterable[str]) -> pd.DataFrame:
     """Creates a 3 column BED file from list of strings in format: <chr:start-
     end>
 
@@ -292,7 +295,7 @@ def get_ranges(df: pd.DataFrame, idx: np.ndarray) -> np.ndarray:
         A numpy array with start and end positions
     """
 
-    return df[[1, 2]][idx].values.astype(int)
+    return np.asarray(df[[1, 2]][idx].values, dtype=int)
 
 
 def get_feature_mappings(
@@ -316,8 +319,9 @@ def get_feature_mappings(
         then that row has value [-1, -1].
     """
 
-    cross_indices = []
-    feats_ids, feats_names = [], []
+    cross_indices: list[list[int] | None] = []
+    feats_ids: list[str] = []
+    feats_names: list[str] = []
     id_counter = {}
     n_no_match = 0
     for chrom in peaks_bed_df[0].unique():
@@ -358,30 +362,34 @@ def get_feature_mappings(
         raise ValueError(
             "ERROR: None of the features were found in the assay. Melding failed"
         )
-    feats_ids = np.array(feats_ids)
-    feats_names = np.array(feats_names)
-    cross_indices = np.array(cross_indices, dtype=object)
-    if n_no_match == len(cross_indices):
+    feats_ids_arr = np.array(feats_ids)
+    feats_names_arr = np.array(feats_names)
+    cross_indices_arr = np.array(cross_indices, dtype=object)
+    if n_no_match == len(cross_indices_arr):
         logging.critical(
             "None of the provided features overlap with the peak coordinates. "
             "Melding has possibly failed."
         )
     else:
         logger.info(
-            f"{n_no_match}/{feats_ids.shape[0]} features did not overlap with any peak"
+            f"{n_no_match}/{feats_ids_arr.shape[0]} features did not overlap with any peak"
         )
-    if len(set(feats_ids)) != feats_ids.shape[0]:
+    if len(set(feats_ids_arr)) != feats_ids_arr.shape[0]:
         raise ValueError(
             "ERROR: encountered an unexpected error. Somehow the feature ids are not unique "
             "despite our attempt to make them unique by appending a suffix. Please report this "
             "bug on Github"
         )
-    assert feats_ids.shape[0] == feats_names.shape[0] == cross_indices.shape[0]
-    return feats_ids, feats_names, cross_indices
+    assert (
+        feats_ids_arr.shape[0]
+        == feats_names_arr.shape[0]
+        == cross_indices_arr.shape[0]
+    )
+    return feats_ids_arr, feats_names_arr, cross_indices_arr
 
 
 def create_counts_mat(
-    assay,
+    assay: Assay,
     store: zarr.Array,
     cross_map: np.ndarray,
     scalar_coeff: float,
@@ -433,7 +441,7 @@ def create_counts_mat(
 
 
 def coordinate_melding(
-    assay,
+    assay: Assay,
     workspace: str | None,
     feature_bed: pd.DataFrame,
     new_assay_name: str,

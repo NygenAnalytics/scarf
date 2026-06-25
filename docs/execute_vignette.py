@@ -72,16 +72,18 @@ def execute_vignette(
     return {"name": name, "metadata": metadata}
 
 
-def merge_caches(
-    source_dirs: list[Path], target_dir: Path = DEFAULT_CACHE
-) -> None:
+def merge_caches(source_dirs: list[Path], target_dir: Path = DEFAULT_CACHE) -> None:
     target_dir.mkdir(parents=True, exist_ok=True)
     target_executed = target_dir / "executed"
     target_executed.mkdir(parents=True, exist_ok=True)
     version_file = target_dir / "__version__.txt"
     if not version_file.exists() and source_dirs:
         first_version = next(
-            (d / "__version__.txt" for d in source_dirs if (d / "__version__.txt").exists()),
+            (
+                d / "__version__.txt"
+                for d in source_dirs
+                if (d / "__version__.txt").exists()
+            ),
             None,
         )
         if first_version is not None:

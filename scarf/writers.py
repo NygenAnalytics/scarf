@@ -19,13 +19,15 @@
 """
 
 import os
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import zarr
-from scipy.sparse import csr_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 
+from ._types import as_zarr_array, as_zarr_group
 from .readers import CrReader, H5adReader, NaboH5Reader, LoomReader, CSVReader
 from .storage.zarr_store import (
     ZarrArraySpec,
@@ -65,12 +67,18 @@ __all__ = [
 ]
 
 
+def _normalize_chunks(chunks: tuple[int, ...] | int) -> tuple[int, ...]:
+    if isinstance(chunks, int):
+        return (chunks,)
+    return chunks
+
+
 def create_zarr_dataset(
     g: zarr.Group,
     name: str,
-    chunks: tuple | int,
+    chunks: tuple[int, ...] | int,
     dtype: Any,
-    shape: tuple,
+    shape: tuple[int, ...],
     overwrite: bool = True,
 ) -> zarr.Array:
     """Creates and returns a Zarr array.
@@ -88,7 +96,7 @@ def create_zarr_dataset(
     """
     spec = ZarrArraySpec(
         shape=shape,
-        chunks=chunks,
+        chunks=_normalize_chunks(chunks),
         dtype=dtype,
         overwrite=overwrite,
     )
@@ -98,7 +106,7 @@ def create_zarr_dataset(
 def create_zarr_obj_array(
     g: zarr.Group,
     name: str,
-    data,
+    data: Any,
     dtype: str | Any = None,
     overwrite: bool = True,
     chunk_size: int = 100000,
@@ -114,7 +122,6 @@ def create_zarr_obj_array(
         chunkSize=chunk_size,
         shape=shape if data is None else None,
     )
-
 
 
 def create_zarr_count_assay(
@@ -174,9 +181,11 @@ def load_count_store(
 ) -> zarr.Array:
     """Return the counts Zarr array for an assay in the given workspace."""
     if workspace is None:
-        return z[f"{assay_name}/counts"]  # type: ignore
-    else:
-        return z[f"matrices/{assay_name}/counts"]  # type: ignore
+        return as_zarr_array(z[f"{assay_name}/counts"], name=f"{assay_name}/counts")
+    return as_zarr_array(
+        z[f"matrices/{assay_name}/counts"],
+        name=f"matrices/{assay_name}/counts",
+    )
 
 
 def create_cell_data(
@@ -193,7 +202,12 @@ def create_cell_data(
     return g
 
 
-def sparse_writer(store: zarr.Array, data_stream, n_cells: int, batch_size: int) -> int:
+def sparse_writer(
+    store: zarr.Array,
+    data_stream: Iterator[coo_matrix],
+    n_cells: int,
+    batch_size: int,
+) -> int:
     """Write CSR batches into a Zarr count array row-wise.
 
     Returns:
@@ -234,18 +248,16 @@ class CrToZarr:
         self,
         cr: CrReader,
         zarr_loc: ZARRLOC,
-        chunk_size=(1000, 1000),
+        chunk_size: tuple[int, int] = (1000, 1000),
         dtype: str = "uint32",
         workspace: str | None = None,
-        storage_options: dict | None = None,
-    ):
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
         self.cr = cr
         self.chunkSizes = chunk_size
         self.workspace = workspace
         self.storage_options = storage_options
-        self.z = load_zarr(
-            zarr_loc=zarr_loc, mode="w", storage_options=storage_options
-        )
+        self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
         create_cell_data(
             z=self.z,
             workspace=self.workspace,
@@ -283,9 +295,9 @@ class CrToZarr:
 
     @staticmethod
     def _prep_feat_index_offset(
-        ranges: dict[str, list[list[int]]]
+        ranges: dict[str, list[list[int]]],
     ) -> dict[str, list[int]]:
-        feat_offset = {}
+        feat_offset: dict[str, list[int]] = {}
         for i in ranges:
             feat_offset[i] = []
             lv = 0
@@ -330,7 +342,7 @@ class CrToZarr:
                     )
                 else:
                     logger.warning(
-                        f"No feature captured from chunk {s} to {s+a.shape[0]} for assay: {assay}"
+                        f"No feature captured from chunk {s} to {s + a.shape[0]} for assay: {assay}"
                     )
             s += a.shape[0]
         if s != self.cr.nCells:
@@ -365,9 +377,9 @@ class H5adToZarr:
         zarr_loc: ZARRLOC,
         assay_name: str | None = None,
         workspace: str | None = None,
-        chunk_size=(1000, 1000),
-        storage_options: dict | None = None,
-    ):
+        chunk_size: tuple[int, int] = (1000, 1000),
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
         # TODO: support for multiple assay. One of the `var` datasets can be used to group features in separate assays
         self.h5ad = h5ad
         self.chunkSizes = chunk_size
@@ -375,14 +387,12 @@ class H5adToZarr:
         self.storage_options = storage_options
         if assay_name is None:
             logger.info(
-                f"No value provided for assay names. Will use default value: 'RNA'"
+                "No value provided for assay names. Will use default value: 'RNA'"
             )
             self.assayName = "RNA"
         else:
             self.assayName = assay_name
-        self.z = load_zarr(
-            zarr_loc=zarr_loc, mode="w", storage_options=storage_options
-        )
+        self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
         self._ini_cell_data()
         create_zarr_count_assay(
             z=self.z,
@@ -396,7 +406,7 @@ class H5adToZarr:
         )
         self._ini_feature_data()
 
-    def _ini_cell_data(self):
+    def _ini_cell_data(self) -> None:
         ids = self.h5ad.cell_ids()
         g = create_cell_data(
             z=self.z,
@@ -407,14 +417,20 @@ class H5adToZarr:
         for i, j in self.h5ad.get_cell_columns():
             create_zarr_obj_array(g, i, j, j.dtype)
 
-    def _ini_feature_data(self):
+    def _ini_feature_data(self) -> None:
         if self.workspace is None:
-            g: zarr.Group = self.z[f"{self.assayName}/featureData"]  # type: ignore
+            feat_group = as_zarr_group(
+                self.z[f"{self.assayName}/featureData"],
+                name=f"{self.assayName}/featureData",
+            )
         else:
-            g: zarr.Group = self.z[f"{self.workspace}/{self.assayName}/featureData"]  # type: ignore
+            feat_group = as_zarr_group(
+                self.z[f"{self.workspace}/{self.assayName}/featureData"],
+                name=f"{self.workspace}/{self.assayName}/featureData",
+            )
         for i, j in self.h5ad.get_feat_columns():
-            if i not in g:
-                create_zarr_obj_array(g, i, j, j.dtype)
+            if i not in feat_group:
+                create_zarr_obj_array(feat_group, i, j, j.dtype)
 
     def dump(self, batch_size: int = 1000) -> None:
         """Write h5ad matrix data into the Zarr counts array.
@@ -468,24 +484,22 @@ class NaboH5ToZarr:
         zarr_loc: ZARRLOC,
         assay_name: str | None = None,
         workspace: str | None = None,
-        chunk_size=(1000, 1000),
+        chunk_size: tuple[int, int] = (1000, 1000),
         dtype: str = "uint32",
-        storage_options: dict | None = None,
-    ):
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
         self.h5 = h5
         self.chunkSizes = chunk_size
         self.workspace = workspace
         self.storage_options = storage_options
         if assay_name is None:
             logger.info(
-                f"No value provided for assay names. Will use default value: 'RNA'"
+                "No value provided for assay names. Will use default value: 'RNA'"
             )
             self.assayName = "RNA"
         else:
             self.assayName = assay_name
-        self.z = load_zarr(
-            zarr_loc, mode="w", storage_options=storage_options
-        )  # type: ignore
+        self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
         self._ini_cell_data()
         create_zarr_count_assay(
             z=self.z,
@@ -498,7 +512,7 @@ class NaboH5ToZarr:
             dtype=dtype,
         )
 
-    def _ini_cell_data(self):
+    def _ini_cell_data(self) -> None:
         ids = self.h5.cell_ids()
         _ = create_cell_data(
             z=self.z,
@@ -564,9 +578,9 @@ class LoomToZarr:
         zarr_loc: ZARRLOC,
         assay_name: str | None = None,
         workspace: str | None = None,
-        chunk_size=(1000, 1000),
-        storage_options: dict | None = None,
-    ):
+        chunk_size: tuple[int, int] = (1000, 1000),
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
         # TODO: support for multiple assay. Data from within individual layers can be treated as separate assays
         self.loom = loom
         self.chunkSizes = chunk_size
@@ -574,7 +588,7 @@ class LoomToZarr:
         self.storage_options = storage_options
         if assay_name is None:
             logger.info(
-                f"No value provided for assay names. Will use default value: 'RNA'"
+                "No value provided for assay names. Will use default value: 'RNA'"
             )
             self.assayName = "RNA"
         else:
@@ -593,9 +607,9 @@ class LoomToZarr:
         )
         self._ini_feature_data()
 
-    def _ini_cell_data(self):
+    def _ini_cell_data(self) -> None:
         ids = np.array(self.loom.cell_ids())
-        g = create_cell_data(
+        cell_group = create_cell_data(
             z=self.z,
             workspace=self.workspace,
             ids=ids,
@@ -603,17 +617,23 @@ class LoomToZarr:
         )
         for i, j in self.loom.get_cell_attrs():
             try:
-                create_zarr_obj_array(g, i, j, j.dtype)
+                create_zarr_obj_array(cell_group, i, j, j.dtype)
             except UnicodeDecodeError:
                 logger.warning(f"Could not import {i} cell(column) attribute")
 
-    def _ini_feature_data(self):
+    def _ini_feature_data(self) -> None:
         if self.workspace is None:
-            g: zarr.Group = self.z[f"{self.assayName}/featureData"]  # type: ignore
+            feat_group = as_zarr_group(
+                self.z[f"{self.assayName}/featureData"],
+                name=f"{self.assayName}/featureData",
+            )
         else:
-            g: zarr.Group = self.z[f"{self.workspace}/{self.assayName}/featureData"]  # type: ignore
+            feat_group = as_zarr_group(
+                self.z[f"{self.workspace}/{self.assayName}/featureData"],
+                name=f"{self.workspace}/{self.assayName}/featureData",
+            )
         for i, j in self.loom.get_feature_attrs():
-            create_zarr_obj_array(g, i, j, j.dtype)
+            create_zarr_obj_array(feat_group, i, j, j.dtype)
 
     def dump(self, batch_size: int = 1000) -> None:
         """Write Loom matrix data into the Zarr counts array.
@@ -674,10 +694,10 @@ class SparseToZarr:
         assay_name: str | None = None,
         workspace: str | None = None,
         feature_names: np.ndarray | list[str] | None = None,
-        chunk_size=(1000, 1000),
+        chunk_size: tuple[int, int] = (1000, 1000),
         matrix_dtype: np.dtype | None = None,
-        storage_options: dict | None = None,
-    ):
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
         self.mat = csr_mat
         self.chunkSizes = chunk_size
         self.workspace = workspace
@@ -689,7 +709,7 @@ class SparseToZarr:
             self.matrixDtype = matrix_dtype
         if assay_name is None:
             logger.info(
-                f"No value provided for assay names. Will use default value: 'RNA'"
+                "No value provided for assay names. Will use default value: 'RNA'"
             )
             self.assayName = "RNA"
         else:
@@ -762,7 +782,7 @@ class SparseToZarr:
                 )
             if e > self.nCells:
                 e = self.nCells
-            a = self.mat[s:e].tocoo()  # type: ignore
+            a = self.mat[s:e].tocoo()
             store.set_coordinate_selection(
                 (a.row + s, a.col), a.data.astype(self.matrixDtype)
             )
@@ -797,11 +817,11 @@ class CSVtoZarr:
         cr: CSVReader,
         zarr_loc: ZARRLOC,
         assay_name: str,
-        chunk_size=(1000, 1000),
+        chunk_size: tuple[int, int] = (1000, 1000),
         workspace: str | None = None,
         dtype: np.dtype | None = None,
-        storage_options: dict | None = None,
-    ):
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
         self.csvr = cr
         self.assayName = assay_name
         self.chunkSizes = chunk_size
@@ -843,12 +863,12 @@ class CSVtoZarr:
         """
 
         store = load_count_store(self.z, self.assayName, self.workspace)
-        cell_data_grp: zarr.Group = self.z["cellData"]  # type: ignore
+        cell_data_grp = as_zarr_group(self.z["cellData"], name="cellData")
         cell_data = [
             create_zarr_obj_array(
                 cell_data_grp, name=x, data=None, dtype=y, shape=self.csvr.nCells
             )
-            for x, y in zip(self.csvr.cellDataCols, self.csvr.cellDataDtypes)  # type: ignore
+            for x, y in zip(self.csvr.cellDataCols, self.csvr.cellDataDtypes or [])
         ]
         batch_size = self.csvr.pandas_kwargs["chunksize"]
         (
@@ -886,9 +906,9 @@ def subset_assay_zarr(
     out_grp: str,
     cells_idx: np.ndarray,
     feat_idx: np.ndarray,
-    chunk_size: tuple,
-    storage_options: dict | None = None,
-):
+    chunk_size: tuple[int, int],
+    storage_options: dict[str, Any] | None = None,
+) -> None:
     """Selects a subset of the data in an assay in the specified Zarr
     hierarchy.
 
@@ -907,7 +927,7 @@ def subset_assay_zarr(
         None
     """
     z = load_zarr(zarr_loc, "r+", storage_options=storage_options)
-    ig: zarr.Array = z[in_grp]  # type: ignore
+    ig = as_zarr_array(z[in_grp], name=in_grp)
     og = create_zarr_dataset(
         z, out_grp, chunk_size, "uint32", (len(cells_idx), len(feat_idx))
     )
@@ -920,10 +940,10 @@ def subset_assay_zarr(
 
 
 def write_renorm_subset_to_zarr(
-    assay,
+    assay: Any,
     cell_idx: np.ndarray,
     feat_idx: np.ndarray,
-    z,
+    z: zarr.Group,
     loc: str,
     nthreads: int,
     log_transform: bool = False,
@@ -942,14 +962,14 @@ def write_renorm_subset_to_zarr(
     sf = assay.sf
     pos_start = 0
 
-    def normalize_block(block):
+    def normalize_block(block: Any) -> np.ndarray:
         block = np.asarray(block)
         row_sum = block.sum(axis=1)
         row_sum[row_sum == 0] = 1
         out = sf * block / row_sum[:, np.newaxis]
         if log_transform:
             out = np.log1p(out)
-        return out.astype(np.float32, copy=False)
+        return np.asarray(out, dtype=np.float32)
 
     blocks = prefetch_blocks(
         counts.blocks,
@@ -963,7 +983,14 @@ def write_renorm_subset_to_zarr(
     return None
 
 
-def dask_to_zarr(df, z, loc, chunk_size, nthreads: int, msg: str | None = None):
+def dask_to_zarr(
+    df: Any,
+    z: zarr.Group,
+    loc: str,
+    chunk_size: tuple[int, int],
+    nthreads: int,
+    msg: str | None = None,
+) -> None:
     """Creates a Zarr hierarchy from a chunked array.
 
     Args:
@@ -981,7 +1008,9 @@ def dask_to_zarr(df, z, loc, chunk_size, nthreads: int, msg: str | None = None):
     pos_start, pos_end = 0, 0
     blocks = prefetch_blocks(
         df.blocks,
-        lambda block: controlled_compute(block, nthreads).astype(np.float32, copy=False),
+        lambda block: controlled_compute(block, nthreads).astype(
+            np.float32, copy=False
+        ),
         max_ahead=profile_prefetch_depth(),
     )
     for block in tqdmbar(blocks, total=df.numblocks[0], desc=msg):
@@ -1012,7 +1041,7 @@ class SubsetZarr:
     def __init__(
         self,
         zarr_loc: ZARRLOC,
-        assays: list,
+        assays: list[Any],
         in_workspace: str | None = None,
         out_workspace: str | None = None,
         cell_key: str | None = None,
@@ -1020,7 +1049,7 @@ class SubsetZarr:
         reset_cell_filter: bool = True,
         overwrite_existing_file: bool = False,
         overwrite_cell_data: bool = False,
-        storage_options: dict | None = None,
+        storage_options: dict[str, Any] | None = None,
     ) -> None:
         self.resetCells = reset_cell_filter
         self.overFn = overwrite_existing_file
@@ -1032,9 +1061,10 @@ class SubsetZarr:
         self.assays = self._check_assays(assays)
         self.cellIdx = self._check_idx(cell_key, cell_idx)
 
-    def _check_files(self, zarr_loc: ZARRLOC):
+    def _check_files(self, zarr_loc: ZARRLOC) -> zarr.Group:
         if (
             is_local_zarr_path(zarr_loc)
+            and isinstance(zarr_loc, str)
             and os.path.isdir(zarr_loc)
             and self.overFn is False
         ):
@@ -1048,7 +1078,7 @@ class SubsetZarr:
         )
 
     @staticmethod
-    def _check_assays(assays):
+    def _check_assays(assays: list[Any]) -> list[Any]:
         # if type(assays) != list:
         if isinstance(assays, list) is False:
             raise TypeError(
@@ -1070,10 +1100,13 @@ class SubsetZarr:
             )
         return assays
 
-    def _check_idx(self, cell_key, cell_idx):
+    def _check_idx(
+        self, cell_key: str | None, cell_idx: np.ndarray | None
+    ) -> np.ndarray:
         if cell_key is None and cell_idx is None:
             raise ValueError("Both `cell_key` and `cell_idx` parameters cannot be None")
         if cell_idx is None:
+            resolved: np.ndarray | None = None
             for assay in self.assays:
                 try:
                     idx = assay.cells.fetch_all(cell_key)
@@ -1085,15 +1118,16 @@ class SubsetZarr:
                     raise ValueError(
                         f"ERROR: {cell_key} is not of boolean type. Cannot perform subsetting"
                     )
-                if cell_idx is None:
-                    cell_idx = idx
-                else:
-                    if np.all(cell_idx == idx) is False:
-                        raise ValueError(
-                            f"ERROR: Provided cell_key {cell_key} is not consistent across the assays. "
-                            f"Please make sure that the assays are from the same DataStore."
-                        )
-            cell_idx = np.where(cell_idx)[0]
+                if resolved is None:
+                    resolved = idx
+                elif np.all(resolved == idx) is False:
+                    raise ValueError(
+                        f"ERROR: Provided cell_key {cell_key} is not consistent across the assays. "
+                        f"Please make sure that the assays are from the same DataStore."
+                    )
+            if resolved is None:
+                raise ValueError("No assays available for cell index resolution")
+            cell_idx = np.where(resolved)[0]
         else:
             cell_idx = np.array(cell_idx)
             if np.issubdtype(cell_idx.dtype, np.integer) is False:
@@ -1106,29 +1140,29 @@ class SubsetZarr:
                 )
         return cell_idx
 
-    def _prep_cell_data(self):
+    def _prep_cell_data(self) -> None:
         if self.outWorkspace is None:
             cell_slot = "cellData"
         else:
             cell_slot = f"{self.outWorkspace}/cellData"
         if cell_slot in self.z:
-            g: zarr.Group = self.z[cell_slot]  # type: ignore
+            cell_group = as_zarr_group(self.z[cell_slot], name=cell_slot)
         else:
-            g: zarr.Group = self.z.create_group(cell_slot)
+            cell_group = self.z.create_group(cell_slot)
 
         cell_data = self.assays[0].cells.locations["primary"]
 
         n_cells = len(self.cellIdx)
         for i in cell_data.keys():
-            if i in g and self.overCells is False:
+            if i in cell_group and self.overCells is False:
                 continue
             if i in ["I"] and self.resetCells:
-                create_zarr_obj_array(g, "I", [True for _ in range(n_cells)], "bool")
+                create_zarr_obj_array(cell_group, "I", [True for _ in range(n_cells)], "bool")
                 continue
             v = cell_data[i][:][self.cellIdx]
-            create_zarr_obj_array(g, i, v, dtype=v.dtype)
+            create_zarr_obj_array(cell_group, i, v, dtype=v.dtype)
 
-    def _prep_counts(self):
+    def _prep_counts(self) -> None:
         n_cells = len(self.cellIdx)
         for assay in self.assays:
             create_zarr_count_assay(
@@ -1142,15 +1176,21 @@ class SubsetZarr:
                 dtype=assay.rawData.dtype,
             )
 
-    def dump(self):
+    def dump(self) -> None:
         self._prep_cell_data()
         self._prep_counts()
         for assay in self.assays:
             raw_data = assay.rawData[self.cellIdx]
             if self.outWorkspace is None:
-                store = self.z[f"{assay.name}/counts"]
+                store = as_zarr_array(
+                    self.z[f"{assay.name}/counts"],
+                    name=f"{assay.name}/counts",
+                )
             else:
-                store = self.z[f"matrices/{assay.name}/counts"]
+                store = as_zarr_array(
+                    self.z[f"matrices/{assay.name}/counts"],
+                    name=f"matrices/{assay.name}/counts",
+                )
             (
                 s,
                 e,
@@ -1171,7 +1211,7 @@ class SubsetZarr:
 
 
 def to_h5ad(
-    assay,
+    assay: Any,
     h5ad_filename: str,
     embeddings_cols: list[str] | None = None,
     skip_recalc_nfeats: bool = True,
@@ -1192,7 +1232,7 @@ def to_h5ad(
     """
     import h5py
 
-    def save_attr(group, col, scarf_col, md):
+    def save_attr(group: str, col: str, scarf_col: str, md: Any) -> None:
         d = md.fetch_all(scarf_col)
         d_type = d.dtype
         if np.issubdtype(d_type, np.number) or np.issubdtype(d_type, bool):
@@ -1200,7 +1240,7 @@ def to_h5ad(
         else:
             d_type = h5py.special_dtype(vlen=str)
         try:
-            h5[group].create_dataset(col, data=d.astype(d_type))  # type: ignore
+            h5[group].create_dataset(col, data=d.astype(d_type))
         except TypeError:
             logger.warning(f"Dtype issue in {col}, {d.type} ({d_type})")
 
@@ -1230,11 +1270,11 @@ def to_h5ad(
             mat_dtype = assay.rawData.dtype
         else:
             mat_dtype = int
-        h5["X"].create_dataset(  # type: ignore
+        h5["X"].create_dataset(
             i, (s,), chunks=True, compression="gzip", dtype=mat_dtype
         )
 
-    h5["X/indptr"][:] = np.array([0] + list(n_feats_per_cell.cumsum())).astype(int)  # type: ignore
+    h5["X/indptr"][:] = np.array([0] + list(n_feats_per_cell.cumsum())).astype(int)
 
     s, e = 0, 0
     for i in tqdmbar(
@@ -1244,8 +1284,8 @@ def to_h5ad(
     ):
         i = csr_matrix(i.compute())
         e += i.data.shape[0]
-        h5["X/data"][s:e] = i.data  # type: ignore
-        h5["X/indices"][s:e] = i.indices  # type: ignore
+        h5["X/data"][s:e] = i.data
+        h5["X/indices"][s:e] = i.indices
         s = e
     attrs = {
         "encoding-type": "csr_matrix",
@@ -1306,11 +1346,11 @@ def to_h5ad(
         h5["var"].attrs[i] = j
 
     if len(emb_cols) > 0:
-        emb_cols = np.array(emb_cols)
-        c = pd.Series([x[:-1] for x in emb_cols])
+        emb_names = np.array(emb_cols)
+        c = pd.Series([x[:-1] for x in emb_names])
         for i in c.unique():
-            data = np.array([assay.cells.fetch_all(x) for x in emb_cols[c == i]]).T
-            h5["obsm"].create_dataset(  # type: ignore
+            data = np.array([assay.cells.fetch_all(x) for x in emb_names[c == i]]).T
+            h5["obsm"].create_dataset(
                 i.lower().replace(f"{assay.name.lower()}_", "X_"), data=data
             )
 
@@ -1318,7 +1358,7 @@ def to_h5ad(
     return None
 
 
-def to_mtx(assay, mtx_directory: str, compress: bool = False):
+def to_mtx(assay: Any, mtx_directory: str, compress: bool = False) -> None:
     """Save an assay as a Matrix Market directory.
 
     Args:
@@ -1368,7 +1408,7 @@ def bed_to_sparse_array(
     bin_size: int,
     chrom_sizes: dict[str, int],
     min_counts_per_cell: int = 500,
-    read_chunk_size=1e6,
+    read_chunk_size: float = 1e6,
     sep: str = "\t",
     chrom_col: int = 0,
     start_col: int = 1,
@@ -1377,8 +1417,8 @@ def bed_to_sparse_array(
     count_col: int = 4,
     comments_startswith: str = "#",
     disable_tqdm: bool = False,
-    chrom_modifier=None,
-):
+    chrom_modifier: Any = None,
+) -> tuple[csr_matrix, pd.Series, pd.Series]:
     """
 
     Args:
@@ -1402,18 +1442,18 @@ def bed_to_sparse_array(
     """
     import gc
 
-    def feat_mapper(x):
+    def feat_mapper(x: str) -> int:
         return feat_idx.get(x, n_feats)
 
-    def default_chrom_modifier(x):
+    def default_chrom_modifier(x: str) -> str:
         return x + "_"
 
-    feat_idx = {}
+    feat_idx: dict[str, int] = {}
     for i in tqdmbar(chrom_sizes, disable=disable_tqdm, desc="Calculating bin indices"):
         for j in range((chrom_sizes[i] // bin_size) + 1):
             feat_idx[f"{i}_{j}"] = len(feat_idx)
-    cell_idx = {}
-    mat = []
+    cell_idx: dict[Any, int] = {}
+    mat_chunks: list[np.ndarray] = []
     n_feats = len(feat_idx)
     if chrom_modifier is None:
         chrom_modifier = default_chrom_modifier
@@ -1435,7 +1475,7 @@ def bed_to_sparse_array(
         for i in df[barcode_col].unique():
             if i not in cell_idx:
                 cell_idx[i] = len(cell_idx)
-        mat.append(
+        mat_chunks.append(
             np.vstack(
                 [
                     np.fromiter(map(cell_idx.get, df[barcode_col].values), dtype=int),
@@ -1444,10 +1484,10 @@ def bed_to_sparse_array(
                 ]
             ).T
         )
-    mat = np.vstack(mat)
+    mat_arr = np.vstack(mat_chunks)
     gc.collect()
     mat = csr_matrix(
-        (mat[:, 2], (mat[:, 0], mat[:, 1])), shape=(len(cell_idx), n_feats + 1)
+        (mat_arr[:, 2], (mat_arr[:, 0], mat_arr[:, 1])), shape=(len(cell_idx), n_feats + 1)
     )
     gc.collect()
     idx = np.array(mat.sum(axis=1))[:, 0] > min_counts_per_cell

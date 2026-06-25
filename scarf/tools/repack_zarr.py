@@ -3,6 +3,7 @@
 import argparse
 from pathlib import Path
 
+import numpy as np
 import zarr
 
 from scarf.storage.zarr_store import (
@@ -32,7 +33,7 @@ def _copy_group(
         chunks = normalize_chunks(node.chunks, node.shape)
         dst.create_array(
             key,
-            data=node[...],
+            data=np.asarray(node[...]),
             chunks=chunks,
             compressors=get_compressors(profile, zarrFormat=3),
             overwrite=True,
@@ -69,7 +70,9 @@ def repack_store(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Repack Zarr v2 stores to v3 with sharding")
+    parser = argparse.ArgumentParser(
+        description="Repack Zarr v2 stores to v3 with sharding"
+    )
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument(

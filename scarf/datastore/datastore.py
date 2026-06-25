@@ -1,12 +1,15 @@
-from typing import Literal
 from collections.abc import Iterable
+from typing import Any, Literal, cast
 
 import numpy as np
 import pandas as pd
-from ..chunked import ChunkedArray
+import zarr
 from loguru import logger
+from numpy.typing import NDArray
 
+from .._types import ZarrMode, as_zarr_array, as_zarr_group
 from ..assay import Assay, ATACassay, RNAassay
+from ..chunked import ChunkedArray
 from ..feat_utils import hto_demux
 from ..utils import ZARRLOC, controlled_compute, tqdmbar
 from ..writers import create_zarr_dataset, create_zarr_obj_array
@@ -47,19 +50,19 @@ class DataStore(MappingDatastore):
     def __init__(
         self,
         zarr_loc: ZARRLOC,
-        assay_types: dict | None = None,
+        assay_types: dict[str, str] | None = None,
         default_assay: str | None = None,
         min_features_per_cell: int = 10,
         min_cells_per_feature: int = 20,
         mito_pattern: str | None = None,
         ribo_pattern: str | None = None,
         nthreads: int = 2,
-        zarr_mode: str = "r+",
+        zarr_mode: ZarrMode = "r+",
         workspace: str | None = None,
-        synchronizer=None,
+        synchronizer: Any = None,
         zarrProfile: Literal["fast_local", "cloud"] | None = None,
-        storage_options: dict | None = None,
-    ):
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
         from ..storage.zarr_store import set_storage_profile
 
         set_storage_profile(zarrProfile)
@@ -94,7 +97,7 @@ class DataStore(MappingDatastore):
         if assay_name not in self.assay_names:
             raise ValueError(f"ERROR: Assay {assay_name} not found in the Zarr file")
         else:
-            return getattr(self, assay_name)
+            return cast(Assay, getattr(self, assay_name))
 
     def filter_cells(
         self,
@@ -253,8 +256,8 @@ class DataStore(MappingDatastore):
         keep_bounds: bool = False,
         show_plot: bool = True,
         hvg_key_name: str = "hvgs",
-        max_cells: int | None = np.inf,
-        **plot_kwargs,
+        max_cells: float | None = None,
+        **plot_kwargs: Any,
     ) -> None:
         """Identify and mark genes as highly variable genes (HVGs). This is a
         critical and required feature selection step and is only applicable to
@@ -311,11 +314,15 @@ class DataStore(MappingDatastore):
                 f"of cells will be considered HVGs."
             )
         if max_cells is None:
-            max_cells = np.inf
+            max_cells_int = assay.feats.N
+        elif max_cells == np.inf:
+            max_cells_int = assay.feats.N
+        else:
+            max_cells_int = int(max_cells)
         assay.mark_hvgs(
             cell_key=cell_key,
             min_cells=min_cells,
-            max_cells=max_cells,
+            max_cells=max_cells_int,
             top_n=top_n,
             min_var=min_var,
             max_var=max_var,
@@ -372,11 +379,11 @@ class DataStore(MappingDatastore):
         feat_key: str | None = None,
         gene_batch_size: int = 50,
         use_prenormed: bool = False,
-        prenormed_store: str | None = None,
+        prenormed_store: zarr.Group | str | None = None,
         n_threads: int | None = None,
         skip_save: bool = False,
-        **norm_params,
-    ) -> dict | None:
+        **norm_params: Any,
+    ) -> dict[str, Any] | None:
         """Identifies group specific features for a given assay.
 
         Please check out the ``find_markers_by_rank`` function for further details of how marker features for groups
@@ -415,10 +422,19 @@ class DataStore(MappingDatastore):
         assay = self._get_assay(from_assay)
 
         slot_name = f"{cell_key}__{group_key}"
-        z = self.zw[assay.name]
-        if "markers" not in z:
-            z.create_group("markers")
-        group = z["markers"].create_group(slot_name, overwrite=True)
+        assay_grp = as_zarr_group(self.zw[assay.name], name=assay.name)
+        if "markers" not in assay_grp:
+            assay_grp.create_group("markers")
+        markers_grp = as_zarr_group(assay_grp["markers"], name="markers")
+        group = markers_grp.create_group(slot_name, overwrite=True)
+
+        prenormed_group: zarr.Group | None
+        if isinstance(prenormed_store, str):
+            prenormed_group = as_zarr_group(
+                self.zw[prenormed_store], name=prenormed_store
+            )
+        else:
+            prenormed_group = prenormed_store
 
         markers = find_markers_by_rank(
             assay=assay,
@@ -427,7 +443,7 @@ class DataStore(MappingDatastore):
             feat_key=feat_key,
             batch_size=gene_batch_size,
             use_prenormed=use_prenormed,
-            prenormed_store=prenormed_store,
+            prenormed_store=prenormed_group,
             n_threads=n_threads,
             **norm_params,
         )
@@ -451,7 +467,7 @@ class DataStore(MappingDatastore):
         pseudotime_key: str | None = None,
         min_cells: int = 10,
         gene_batch_size: int = 50,
-        **norm_params,
+        **norm_params: Any,
     ) -> None:
         """Identify genes that a correlated with a given pseudotime ordering of
         cells. The results are saved in feature attribute tables. For example,
@@ -653,7 +669,11 @@ class DataStore(MappingDatastore):
             )
         assay = self._get_assay(from_assay)
         try:
-            g = assay.z["markers"][f"{cell_key}__{group_key}"]  # type: ignore
+            markers_grp = as_zarr_group(assay.z["markers"], name="markers")
+            g = as_zarr_group(
+                markers_grp[f"{cell_key}__{group_key}"],
+                name=f"{cell_key}__{group_key}",
+            )
         except KeyError:
             raise KeyError(
                 "ERROR: Couldn't find the location of markers. Please make sure that you have already called "
@@ -677,8 +697,12 @@ class DataStore(MappingDatastore):
         for gid in gids:
             group_name = str(gid)
             if group_name in g:
-                available_cols = [col for col in out_cols if col in g[group_name]]
-                cols = [g[group_name][x][:] for x in available_cols]  # type: ignore
+                marker_grp = as_zarr_group(g[group_name], name=group_name)
+                available_cols = [col for col in out_cols if col in marker_grp]
+                cols = [
+                    np.asarray(as_zarr_array(marker_grp[x], name=x)[:])
+                    for x in available_cols
+                ]
                 df = pd.DataFrame(
                     cols,
                     index=available_cols,
@@ -1004,8 +1028,8 @@ class DataStore(MappingDatastore):
         feature_label: Literal["index", "id", "name"] = "index",
         remove_empty_features: bool = True,
         pseudo_reps: int = 1,
-        null_vals: list | None = None,
-        secondary_null_vals: list | None = None,
+        null_vals: list[Any] | None = None,
+        secondary_null_vals: list[Any] | None = None,
         random_seed: int = 4466,
     ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
         """Merge data from cells to create a bulk profile.
@@ -1031,10 +1055,10 @@ class DataStore(MappingDatastore):
             is returned. The second dataframe contains the fraction of cells expressing each feature in each group.
         """
 
-        def make_reps(v, n_reps: int, seed: int) -> list[np.ndarray]:
-            v = list(v)
+        def make_reps(v: NDArray[Any], n_reps: int, seed: int) -> list[NDArray[Any]]:
+            v_list = list(v)
             random_state = np.random.RandomState(seed)
-            shuffled_idx = random_state.choice(v, len(v), replace=False)
+            shuffled_idx = random_state.choice(v_list, len(v_list), replace=False)
             rep_idx = np.array_split(shuffled_idx, n_reps)
             return [np.array(sorted(x)) for x in rep_idx]
 
@@ -1050,8 +1074,8 @@ class DataStore(MappingDatastore):
             groups = self.cells.fetch_all(group_key)
             groups_set = sorted(set(self.cells.fetch(group_key, key=cell_key)))
         if secondary_group_key is None:
-            sec_groups = [None]
-            sec_groups_set = [None]
+            sec_groups: NDArray[Any] = np.array([None], dtype=object)
+            sec_groups_set: list[Any] = [None]
         else:
             sec_groups = self.cells.fetch_all(secondary_group_key)
             sec_groups_set = sorted(
@@ -1060,8 +1084,8 @@ class DataStore(MappingDatastore):
 
         assay = self._get_assay(from_assay)
 
-        vals = {}
-        fracs = {}
+        vals: dict[str, NDArray[Any]] = {}
+        fracs: dict[str, NDArray[Any]] = {}
         all_feat_idx = np.arange(assay.feats.N)
         for g in tqdmbar(groups_set):
             if g in null_vals:
@@ -1104,41 +1128,40 @@ class DataStore(MappingDatastore):
                             (assay.rawData[idx] > 0).mean(axis=0).compute()
                         )
 
-        vals = pd.DataFrame(vals).fillna(0)
+        vals_df = pd.DataFrame(vals).fillna(0)
 
         empty_idx = None
         if remove_empty_features:
-            empty_idx = vals.sum(axis=1) != 0
-            vals = vals.loc[empty_idx]
+            empty_idx = vals_df.sum(axis=1) != 0
+            vals_df = vals_df.loc[empty_idx]
 
         if feature_label == "id":
-            vals.set_index(
-                pd.Series(assay.feats.fetch_all("ids")).reindex(vals.index).values,
+            vals_df.set_index(
+                pd.Series(assay.feats.fetch_all("ids")).reindex(vals_df.index).values,
                 inplace=True,
                 drop=True,
             )
         elif feature_label == "name":
-            vals.set_index(
-                pd.Series(assay.feats.fetch_all("names")).reindex(vals.index).values,
+            vals_df.set_index(
+                pd.Series(assay.feats.fetch_all("names")).reindex(vals_df.index).values,
                 inplace=True,
                 drop=True,
             )
 
         if return_fraction:
-            fracs = pd.DataFrame(fracs).fillna(0)
+            fracs_df = pd.DataFrame(fracs).fillna(0)
             if empty_idx is not None:
-                fracs = fracs[empty_idx]
-            fracs.set_index(vals.index, inplace=True, drop=True)
-            return vals, fracs
-        else:
-            return vals
+                fracs_df = fracs_df[empty_idx]
+            fracs_df.set_index(vals_df.index, inplace=True, drop=True)
+            return vals_df, fracs_df
+        return vals_df
 
     def to_anndata(
         self,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        layers: dict | None = None,
-    ):
+        layers: dict[str, str] | None = None,
+    ) -> Any:
         """Writes an assay of the Zarr hierarchy to AnnData file format.
 
         Args:
@@ -1187,10 +1210,10 @@ class DataStore(MappingDatastore):
         from ..storage.zarr_store import array_info
 
         root = start.strip("/")
-        node = self.zw if root == "" else self.zw[root]
+        node: zarr.Group = self.zw if root == "" else as_zarr_group(self.zw[root], name=root)
         print(node.tree(level=depth))
         for key in node.array_keys():
-            print(f"  {key}: {array_info(node[key])}")
+            print(f"  {key}: {array_info(as_zarr_array(node[key], name=key))}")
 
     def calc_membership_strength(
         self, from_assay: str, cell_key: str, feat_key: str, clust_key: str
@@ -1214,7 +1237,9 @@ class DataStore(MappingDatastore):
         )
         n_cells, k = self._get_graph_ncells_k(graph_loc=loc)
         clusts = self.cells.fetch(clust_key, key=cell_key)
-        v = pd.DataFrame(clusts[self.zw[loc]["edges"][:, 1].reshape(k, n_cells)])
+        graph_grp = as_zarr_group(self.zw[loc], name=loc)
+        edges = np.asarray(as_zarr_array(graph_grp["edges"], name="edges")[:])
+        v = pd.DataFrame(clusts[edges[:, 1].reshape(k, n_cells)])
         x = np.array([v[x].value_counts().index[0] for x in v])
         self.cells.insert(
             f"{from_assay}_{cell_key}_cluster_membership_strength",
@@ -1275,6 +1300,7 @@ class DataStore(MappingDatastore):
             return ret_val
         else:
             self.cells.insert(new_col_name, ret_val, overwrite=True)
+            return None
 
     def plot_cells_dists(
         self,
@@ -1385,8 +1411,8 @@ class DataStore(MappingDatastore):
         self,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        layout_key: str | None = None,
-        color_by: str | None = None,
+        layout_key: str | list[str] | None = None,
+        color_by: str | list[str] | None = None,
         subselection_key: str | None = None,
         size_vals: np.ndarray | list[float] | None = None,
         clip_fraction: float = 0.01,
@@ -1394,8 +1420,8 @@ class DataStore(MappingDatastore):
         height: float = 6,
         default_color: str = "steelblue",
         cmap: str | None = None,
-        color_key: dict | None = None,
-        mask_values: list | None = None,
+        color_key: dict[str, str] | None = None,
+        mask_values: list[Any] | None = None,
         mask_name: str = "NA",
         mask_color: str = "k",
         point_size: float = 10,
@@ -1408,7 +1434,7 @@ class DataStore(MappingDatastore):
         frame_offset: float = 0.05,
         spine_width: float = 0.5,
         spine_color: str = "k",
-        displayed_sides: tuple = ("bottom", "left"),
+        displayed_sides: tuple[str, ...] = ("bottom", "left"),
         legend_ondata: bool = True,
         legend_onside: bool = True,
         legend_size: float = 12,
@@ -1424,14 +1450,14 @@ class DataStore(MappingDatastore):
         sort_values: bool = False,
         savename: str | None = None,
         save_dpi: int = 300,
-        ax=None,
+        ax: Any = None,
         force_ints_as_cats: bool = True,
         n_columns: int = 4,
         w_pad: float = 1,
         h_pad: float = 1,
         show_fig: bool = True,
-        scatter_kwargs: dict | None = None,
-    ):
+        scatter_kwargs: dict[str, Any] | None = None,
+    ) -> Any:
         """Create a scatter plot with a chosen layout. The method fetches the
         coordinates based from the cell metadata columns with `layout_key`
         prefix. DataShader library is used to draw fast rasterized image is
@@ -1555,19 +1581,23 @@ class DataStore(MappingDatastore):
             raise ValueError(
                 "ERROR: clip_fraction cannot be larger than or equal to 0.5"
             )
-        if isinstance(layout_key, str):
-            layout_key: list[str] = [layout_key]
+        if isinstance(layout_key, list):
+            layout_keys = layout_key
+        else:
+            layout_keys = [layout_key]
         # If a list of layout keys and color_by (e.g. layout_key=['UMAP', 'tSNE'], color_by=['gene1', 'gene2'] the
         # grid layout will be: plot1: UMAP + gene1, plot2: UMAP + gene2, plot3: tSNE + gene1, plot4: tSNE + gene2
         dfs = []
-        for lk in layout_key:
+        for lk in layout_keys:
             x = self.cells.fetch(f"{lk}1", key=cell_key)
             y = self.cells.fetch(f"{lk}2", key=cell_key)
             if color_by is None:
-                color_by = "vc"
-            if isinstance(color_by, str):
-                color_by: list[str] = [color_by]
-            for c in color_by:
+                color_cols = ["vc"]
+            elif isinstance(color_by, str):
+                color_cols = [color_by]
+            else:
+                color_cols = color_by
+            for c in color_cols:
                 if c == "vc":
                     v = np.ones(len(x)).astype(int)
                 else:
@@ -1698,17 +1728,17 @@ class DataStore(MappingDatastore):
         fontsize: float = 10,
         root_color: str = "#C0C0C0",
         non_leaf_color: str = "k",
-        cmap="tab20",
-        color_key: dict | None = None,
+        cmap: str = "tab20",
+        color_key: dict[str, str] | None = None,
         edgecolors: str = "k",
         edgewidth: float = 1,
         alpha: float = 0.7,
-        figsize=(5, 5),
-        ax=None,
+        figsize: tuple[float, float] = (5, 5),
+        ax: Any = None,
         show_fig: bool = True,
         savename: str | None = None,
         save_dpi: int = 300,
-    ):
+    ) -> None:
         """Plots a hierarchical layout of the clusters detected using
         `run_clustering` in a binary tree form. This helps evaluate the
         relationships between the clusters. This figure can complement
@@ -1790,25 +1820,45 @@ class DataStore(MappingDatastore):
             )
         clusts = self.cells.fetch(cluster_key, key=cell_key)
         graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
-        dendrogram_loc = self.zw[graph_loc].attrs["latest_dendrogram"]
+        graph_grp = as_zarr_group(self.zw[graph_loc], name=graph_loc)
+        dendrogram_loc = cast(str, graph_grp.attrs["latest_dendrogram"])
         n_clusts = len(set(clusts))
         coalesced_loc = dendrogram_loc + f"_coalesced_{n_clusts}"
         if coalesced_loc in self.zw:
             subgraph = DiGraph()
-            subgraph.add_edges_from(self.zw[coalesced_loc + "/edgelist"][:])
-            for i, j in zip(
-                self.zw[coalesced_loc + "/nodelist"][:],
-                self.zw[coalesced_loc + "/partition_id"][:],
-            ):
+            subgraph.add_edges_from(
+                np.asarray(
+                    as_zarr_array(
+                        self.zw[coalesced_loc + "/edgelist"],
+                        name=f"{coalesced_loc}/edgelist",
+                    )[:]
+                )
+            )
+            nodelist = np.asarray(
+                as_zarr_array(
+                    self.zw[coalesced_loc + "/nodelist"],
+                    name=f"{coalesced_loc}/nodelist",
+                )[:]
+            )
+            partition_ids = np.asarray(
+                as_zarr_array(
+                    self.zw[coalesced_loc + "/partition_id"],
+                    name=f"{coalesced_loc}/partition_id",
+                )[:]
+            )
+            for i, j in zip(nodelist, partition_ids):
                 node = int(i[0])
                 subgraph.nodes[node]["nleaves"] = int(i[1])
                 if j != "-1":
                     subgraph.nodes[node]["partition_id"] = j
         else:
-            subgraph = CoalesceTree(make_digraph(self.zw[dendrogram_loc][:]), clusts)
+            dendrogram = np.asarray(
+                as_zarr_array(self.zw[dendrogram_loc], name=dendrogram_loc)[:]
+            )
+            subgraph = CoalesceTree(make_digraph(dendrogram), clusts)
             edge_list = to_pandas_edgelist(subgraph).values
             store = create_zarr_dataset(
-                self.zw, coalesced_loc + "/edgelist", (100000,), "u8", edge_list.shape
+                self.zw, f"{coalesced_loc}/edgelist", (100000,), "u8", edge_list.shape
             )
             store[:] = edge_list
             node_list = []
@@ -1819,19 +1869,19 @@ class DataStore(MappingDatastore):
                 node_list.append((i, d["nleaves"]))
                 partition_id_list.append(str(p))
 
-            node_list = np.array(node_list)
+            node_list_arr = np.array(node_list)
             store = create_zarr_dataset(
                 self.zw,
-                coalesced_loc + "/nodelist",
+                f"{coalesced_loc}/nodelist",
                 (100000,),
-                node_list.dtype,
-                node_list.shape,
+                node_list_arr.dtype,
+                node_list_arr.shape,
             )
-            store[:] = node_list
+            store[:] = node_list_arr
 
             store = create_zarr_dataset(
                 self.zw,
-                coalesced_loc + "/partition_id",
+                f"{coalesced_loc}/partition_id",
                 (100000,),
                 str,
                 (len(partition_id_list),),
@@ -1872,6 +1922,7 @@ class DataStore(MappingDatastore):
             savename=savename,
             save_dpi=save_dpi,
         )
+        return None
 
     def plot_marker_heatmap(
         self,
@@ -1885,8 +1936,8 @@ class DataStore(MappingDatastore):
         savename: str | None = None,
         save_dpi: int = 300,
         show_fig: bool = True,
-        **heatmap_kwargs,
-    ):
+        **heatmap_kwargs: Any,
+    ) -> None:
         """Displays a heatmap of top marker gene expression for the chosen
         groups (usually cell clusters).
 
@@ -1922,26 +1973,35 @@ class DataStore(MappingDatastore):
             raise ValueError("ERROR: Please provide a value for `group_key`")
         if cell_key is None:
             cell_key = "I"
-        if "markers" not in self.zw[assay.name]:
+        assay_grp = as_zarr_group(self.zw[assay.name], name=assay.name)
+        if "markers" not in assay_grp:
             raise KeyError("ERROR: Please run `run_marker_search` first")
         slot_name = f"{cell_key}__{group_key}"
-        if slot_name not in self.zw[assay.name]["markers"]:
+        markers_grp = as_zarr_group(assay_grp["markers"], name="markers")
+        if slot_name not in markers_grp:
             raise KeyError(
                 f"ERROR: Please run `run_marker_search` first with {group_key} as `group_key` and "
                 f"{cell_key} as `cell_key`"
             )
-        g = self.zw[assay.name]["markers"][slot_name]
-        feat_idx = []
-        for i in g.keys():
-            if "feature_index" in g[i]:
-                feat_idx.extend(g[i]["feature_index"][:][:topn])
+        g = as_zarr_group(markers_grp[slot_name], name=slot_name)
+        feat_idx: list[Any] = []
+        for i in g.group_keys():
+            marker_grp = as_zarr_group(g[i], name=i)
+            if "feature_index" in marker_grp:
+                feat_idx.extend(
+                    np.asarray(
+                        as_zarr_array(
+                            marker_grp["feature_index"], name="feature_index"
+                        )[:topn]
+                    )
+                )
         if len(feat_idx) == 0:
             raise ValueError("ERROR: Marker list is empty for all the groups")
-        feat_idx = np.array(sorted(set(feat_idx))).astype(int)
+        feat_idx_arr = np.array(sorted(set(feat_idx))).astype(int)
         cell_idx = np.array(assay.cells.active_index(cell_key))
         normed_data = assay.normed(
             cell_idx=cell_idx,
-            feat_idx=feat_idx,
+            feat_idx=feat_idx_arr,
             log_transform=log_transform,
         )
         groups = assay.cells.fetch(group_key, cell_key)
@@ -1977,7 +2037,7 @@ class DataStore(MappingDatastore):
             index=labels,
         )
         df = df.apply(lambda x: (x - x.mean()) / x.std(), axis=0)
-        df.columns = assay.feats.fetch_all("names")[feat_idx]
+        df.columns = assay.feats.fetch_all("names")[feat_idx_arr]
         df = df.T
         # noinspection PyTypeChecker
         df[df < vmin] = vmin
@@ -1998,7 +2058,7 @@ class DataStore(MappingDatastore):
         feat_key: str | None = None,
         feature_cluster_key: str | None = None,
         pseudotime_key: str | None = None,
-        show_features: list | None = None,
+        show_features: list[str] | None = None,
         width: int = 5,
         height: int = 10,
         vmin: float = -2.0,
@@ -2062,12 +2122,18 @@ class DataStore(MappingDatastore):
         from ..plots import plot_annotated_heatmap
 
         assay = self._get_assay(from_assay)
-        for i in [cell_key, feat_key, feature_cluster_key, feature_cluster_key]:
-            if i is None:
-                var_name = list(dict(i=i).keys())[0]  # Trick to get variables own name
-                raise ValueError(
-                    f"ERROR: Please provide a value for parameter `{var_name}`"
-                )
+        if cell_key is None:
+            raise ValueError("ERROR: Please provide a value for parameter `cell_key`")
+        if feat_key is None:
+            raise ValueError("ERROR: Please provide a value for parameter `feat_key`")
+        if feature_cluster_key is None:
+            raise ValueError(
+                "ERROR: Please provide a value for parameter `feature_cluster_key`"
+            )
+        if pseudotime_key is None:
+            raise ValueError(
+                "ERROR: Please provide a value for parameter `pseudotime_key`"
+            )
 
         cell_ordering = assay.cells.fetch(pseudotime_key, key=cell_key)
         # noinspection PyProtectedMember
@@ -2080,16 +2146,20 @@ class DataStore(MappingDatastore):
                 f"Please make sure that you have run `run_pseudotime_aggregation` with the same values for "
                 f"parameters: `cell_key`, `feat_key` and `pseudotime_key`"
             )
-        else:
-            if hashes != assay.z[location].attrs["hashes"]:
-                raise ValueError(
-                    "ERROR: The values under one or more of these columns: `cell_key`, `feat_key` or/and "
-                    "`pseudotime_key have been updated after running `run_pseudotime_aggregation`"
-                )
+        agg_grp = as_zarr_group(assay.z[location], name=location)
+        if hashes != cast(list[int], agg_grp.attrs["hashes"]):
+            raise ValueError(
+                "ERROR: The values under one or more of these columns: `cell_key`, `feat_key` or/and "
+                "`pseudotime_key have been updated after running `run_pseudotime_aggregation`"
+            )
 
-        da = ChunkedArray(assay.z[location + "/data"], nthreads=self.nthreads)
-        feature_indices = assay.z[location + "/feature_indices"][:]
-        da = da[: feature_indices.shape[0]]
+        da = ChunkedArray(
+            as_zarr_array(agg_grp["data"], name="data"), nthreads=self.nthreads
+        )
+        feature_indices = np.asarray(
+            as_zarr_array(agg_grp["feature_indices"], name="feature_indices")[:]
+        )
+        da_arr = np.asarray(da[: feature_indices.shape[0]])
 
         feature_clusters = assay.feats.fetch_all(feature_cluster_key)[feature_indices]
         feature_labels = assay.feats.fetch_all("names")[feature_indices]
@@ -2097,12 +2167,12 @@ class DataStore(MappingDatastore):
         idx = np.argsort(feature_clusters)
         feature_clusters = feature_clusters[idx]
         feature_labels = feature_labels[idx]
-        da = da.compute()[idx]
+        da_arr = da_arr[idx]
 
         ordering = assay.cells.fetch(pseudotime_key, key=cell_key)
 
         plot_annotated_heatmap(
-            df=da,
+            df=da_arr,
             xbar_values=ordering,
             ybar_values=feature_clusters,
             display_row_labels=show_features,
@@ -2178,14 +2248,14 @@ class DataStore(MappingDatastore):
             _, cell_key, _ = normed_part.split("__")
             logger.info(f"Using the knn graph at location: {knn_loc}")
 
-        knn = self.zw[knn_loc]
+        knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
 
-        distances = knn["distances"]
-        indices = knn["indices"]
+        distances = as_zarr_array(knn_grp["distances"], name="distances")
+        indices = as_zarr_array(knn_grp["indices"], name="indices")
 
         try:
             metadata = self.cells.to_pandas_dataframe(
-                columns=label_colnames + [cell_key]
+                columns=list(label_colnames) + [cell_key]
             )
             metadata = metadata[metadata[cell_key]]
         except KeyError:
@@ -2243,11 +2313,13 @@ class DataStore(MappingDatastore):
             NaN values indicate clusters that couldn't be scored due to size constraints.
         """
 
-        def compute_graph_feats(knn_loc: str):
-            k = knn_loc.rsplit("/", 1)[-1].split("__")[-1]
-            dims = knn_loc.rsplit("/", 2)[0].split("__")[-2]
-            feat_key = knn_loc.split("/")[1].split("__")[-1]
-            return k, dims, feat_key
+        def compute_graph_feats(
+            knn_path: str,
+        ) -> tuple[str, str, str]:
+            k = knn_path.rsplit("/", 1)[-1].split("__")[-1]
+            dims = knn_path.rsplit("/", 2)[0].split("__")[-2]
+            feat_key_parsed = knn_path.split("/")[1].split("__")[-1]
+            return k, dims, feat_key_parsed
 
         if from_assay is None:
             from_assay = self._load_default_assay()
@@ -2264,13 +2336,10 @@ class DataStore(MappingDatastore):
                 raise ValueError("Please provide values for the KNN graph location.")
             if knn_loc not in self.zw:
                 raise ValueError(f"Could not find the knn graph at location: {knn_loc}")
-            k, dims, feat_key, from_assay = compute_graph_feats(knn_loc)
+            k, dims, feat_key = compute_graph_feats(knn_loc)
             logger.info(f"Using the knn graph at location: {knn_loc}")
 
         from ..metrics import knn_to_csr_matrix, silhouette_scoring
-
-        ann_loc = knn_loc.rsplit("/", 1)[0]
-        isHarmonized = self.zw[ann_loc].attrs["isHarmonized"]
 
         normed_part = knn_loc.split("/")[1]
         _, cell_key, feat_key_parsed = normed_part.split("__")
@@ -2281,13 +2350,22 @@ class DataStore(MappingDatastore):
             knn_loc=knn_loc,
         )
 
-        knn_group = self.z[knn_loc]
-        graph = knn_to_csr_matrix(knn_group["indices"], knn_group["distances"])
-        hvg_data = self.z[knn_loc.rsplit("/", 3)[0] + "/data"]
+        knn_grp = as_zarr_group(self.z[knn_loc], name=knn_loc)
+        graph = knn_to_csr_matrix(
+            np.asarray(as_zarr_array(knn_grp["indices"], name="indices")[:]),
+            np.asarray(as_zarr_array(knn_grp["distances"], name="distances")[:]),
+        )
+        reduction_root = knn_loc.rsplit("/", 3)[0]
+        hvg_data = np.asarray(
+            as_zarr_array(
+                as_zarr_group(self.z[reduction_root], name=reduction_root)["data"],
+                name="data",
+            )[:]
+        )
         scores = silhouette_scoring(
             self, ann_obj, graph, hvg_data, from_assay, res_label
         )
-        return scores
+        return cast(NDArray[Any], scores)
 
     def metric_integration(
         self, batch_labels: list[str], metric: Literal["ari", "nmi"] = "ari"

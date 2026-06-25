@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from functools import partial
 
 import numpy as np
@@ -6,23 +7,25 @@ from sklearn.cluster import KMeans
 
 from .utils import tqdmbar, logger
 
+type ClusterFn = str | Callable[[np.ndarray, int], np.ndarray]
+
 
 def run_harmony(
     data_mat: np.ndarray,
     meta_data: pd.DataFrame,
-    theta=None,
-    lamb=None,
-    sigma=0.1,
-    nclust=None,
-    tau=0,
-    block_size=0.05,
-    max_iter_harmony=50,
-    max_iter_kmeans=20,
-    epsilon_cluster=1e-5,
-    epsilon_harmony=1e-4,
-    random_state=0,
-    cluster_fn="kmeans",
-):
+    theta: float | int | np.ndarray | list[float] | None = None,
+    lamb: float | int | np.ndarray | list[float] | None = None,
+    sigma: float | np.ndarray = 0.1,
+    nclust: int | None = None,
+    tau: float = 0,
+    block_size: float = 0.05,
+    max_iter_harmony: int = 50,
+    max_iter_kmeans: int = 20,
+    epsilon_cluster: float = 1e-5,
+    epsilon_harmony: float = 1e-4,
+    random_state: int = 0,
+    cluster_fn: ClusterFn = "kmeans",
+) -> np.ndarray:
     """Run Harmony batch correction on a PCA embedding.
 
     Args:
@@ -87,13 +90,16 @@ def run_harmony(
 
     np.random.seed(random_state)
 
+    sigma_arr = np.asarray(sigma)
+    theta_arr = np.asarray(theta)
+
     ho = Harmony(
         data_mat,
         phi,
         phi_moe,
         Pr_b,
-        sigma,
-        theta,
+        sigma_arr,
+        theta_arr,
         max_iter_harmony,
         max_iter_kmeans,
         epsilon_cluster,
@@ -108,25 +114,25 @@ def run_harmony(
     return ho.result()
 
 
-class Harmony(object):
+class Harmony:
     def __init__(
         self,
-        Z,
-        Phi,
-        Phi_moe,
-        Pr_b,
-        sigma,
-        theta,
-        max_iter_harmony,
-        max_iter_kmeans,
-        epsilon_kmeans,
-        epsilon_harmony,
-        K,
-        block_size,
-        lamb,
-        random_state=None,
-        cluster_fn="kmeans",
-    ):
+        Z: np.ndarray,
+        Phi: np.ndarray,
+        Phi_moe: np.ndarray,
+        Pr_b: np.ndarray,
+        sigma: np.ndarray,
+        theta: np.ndarray,
+        max_iter_harmony: int,
+        max_iter_kmeans: int,
+        epsilon_kmeans: float,
+        epsilon_harmony: float,
+        K: int,
+        block_size: float,
+        lamb: np.ndarray,
+        random_state: int | None = None,
+        cluster_fn: ClusterFn = "kmeans",
+    ) -> None:
         self.Z_corr = np.array(Z)
         self.Z_orig = np.array(Z)
 
@@ -152,23 +158,28 @@ class Harmony(object):
         self.max_iter_kmeans = max_iter_kmeans
         self.theta = theta
 
-        self.objective_harmony = []
-        self.objective_kmeans = []
-        self.objective_kmeans_dist = []
-        self.objective_kmeans_entropy = []
-        self.objective_kmeans_cross = []
-        self.kmeans_rounds = []
+        self.objective_harmony: list[float] = []
+        self.objective_kmeans: list[float] = []
+        self.objective_kmeans_dist: list[float] = []
+        self.objective_kmeans_entropy: list[float] = []
+        self.objective_kmeans_cross: list[float] = []
+        self.kmeans_rounds: list[int] = []
 
         self.allocate_buffers()
-        if cluster_fn == "kmeans":
-            cluster_fn = partial(Harmony._cluster_kmeans, random_state=random_state)
-        self.init_cluster(cluster_fn)
+        resolved_cluster_fn: Callable[[np.ndarray, int], np.ndarray]
+        if isinstance(cluster_fn, str):
+            resolved_cluster_fn = partial(
+                Harmony._cluster_kmeans, random_state=random_state
+            )
+        else:
+            resolved_cluster_fn = cluster_fn
+        self.init_cluster(resolved_cluster_fn)
         self.harmonize(self.max_iter_harmony)
 
-    def result(self):
+    def result(self) -> np.ndarray:
         return self.Z_corr
 
-    def allocate_buffers(self):
+    def allocate_buffers(self) -> None:
         self._scale_dist = np.zeros((self.K, self.N))
         self.dist_mat = np.zeros((self.K, self.N))
         self.O = np.zeros((self.K, self.B))
@@ -177,9 +188,11 @@ class Harmony(object):
         self.Phi_Rk = np.zeros((self.B + 1, self.N))
 
     @staticmethod
-    def _cluster_kmeans(data, K, random_state):
+    def _cluster_kmeans(
+        data: np.ndarray, K: int, random_state: int | None
+    ) -> np.ndarray:
         # Start with cluster centroids
-        return (
+        centers = (
             KMeans(
                 n_clusters=K,
                 init="k-means++",
@@ -190,8 +203,9 @@ class Harmony(object):
             .fit(data)
             .cluster_centers_
         )
+        return np.asarray(centers)
 
-    def init_cluster(self, cluster_fn):
+    def init_cluster(self, cluster_fn: Callable[[np.ndarray, int], np.ndarray]) -> None:
         self.Y = cluster_fn(self.Z_cos.T, self.K).T
         # (1) Normalize
         self.Y = self.Y / np.linalg.norm(self.Y, ord=2, axis=0)
@@ -209,7 +223,7 @@ class Harmony(object):
         # Save results
         self.objective_harmony.append(self.objective_kmeans[-1])
 
-    def compute_objective(self):
+    def compute_objective(self) -> None:
         kmeans_error = np.sum(np.multiply(self.R, self.dist_mat))
         # Entropy
         _entropy = np.sum(safe_entropy(self.R) * self.sigma[:, np.newaxis])
@@ -225,7 +239,7 @@ class Harmony(object):
         self.objective_kmeans_entropy.append(_entropy)
         self.objective_kmeans_cross.append(_cross_entropy)
 
-    def harmonize(self, iter_harmony=10):
+    def harmonize(self, iter_harmony: int = 10) -> int:
         converged = False
         for i in tqdmbar(range(1, iter_harmony + 1), desc="Harmonizing batches"):
             # STEP 1: Clustering
@@ -248,7 +262,7 @@ class Harmony(object):
             logger.warning("Stopped before convergence")
         return 0
 
-    def cluster(self):
+    def cluster(self) -> int:
         # Z_cos has changed
         # R is assumed to not have changed
         # Update Y to match new integrated data
@@ -272,7 +286,7 @@ class Harmony(object):
         self.objective_harmony.append(self.objective_kmeans[-1])
         return 0
 
-    def update_R(self):
+    def update_R(self) -> int:
         self._scale_dist = -self.dist_mat
         self._scale_dist = self._scale_dist / self.sigma[:, None]
         self._scale_dist -= np.max(self._scale_dist, axis=0)
@@ -300,7 +314,7 @@ class Harmony(object):
             self.O += np.dot(self.R[:, b], self.Phi[:, b].T)
         return 0
 
-    def check_convergence(self, i_type):
+    def check_convergence(self, i_type: int) -> bool:
         obj_old = 0.0
         obj_new = 0.0
         # Clustering, compute new window mean
@@ -324,13 +338,21 @@ class Harmony(object):
         return True
 
 
-def safe_entropy(x: np.array):
+def safe_entropy(x: np.ndarray) -> np.ndarray:
     y = np.multiply(x, np.log(x))
     y[~np.isfinite(y)] = 0.0
-    return y
+    return np.asarray(y)
 
 
-def moe_correct_ridge(Z_orig, R, W, K, Phi_Rk, Phi_moe, lamb):
+def moe_correct_ridge(
+    Z_orig: np.ndarray,
+    R: np.ndarray,
+    W: np.ndarray,
+    K: int,
+    Phi_Rk: np.ndarray,
+    Phi_moe: np.ndarray,
+    lamb: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     Z_corr = Z_orig.copy()
     for i in range(K):
         Phi_Rk = np.multiply(Phi_moe, R[i, :])

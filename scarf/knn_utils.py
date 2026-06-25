@@ -1,10 +1,13 @@
 """Utility functions for running the KNN algorithm."""
 
+from collections.abc import Generator
+from typing import cast
 
 import numpy as np
 import pandas as pd
 from numba import jit
 from scipy.sparse import csr_matrix, coo_matrix
+import zarr
 
 from .ann import AnnStream
 from .utils import tqdmbar, controlled_compute, prefetch_blocks
@@ -21,7 +24,9 @@ __all__ = [
 ]
 
 
-def self_query_knn(ann_obj: AnnStream, store, chunk_size: int, nthreads: int) -> float:
+def self_query_knn(
+    ann_obj: AnnStream, store: zarr.Group, chunk_size: int, nthreads: int
+) -> float:
     """Constructs KNN graph.
 
     Args:
@@ -34,14 +39,19 @@ def self_query_knn(ann_obj: AnnStream, store, chunk_size: int, nthreads: int) ->
         Approximate recall percentage (fraction of queries with a self neighbor).
     """
 
-    def get_transformed_data():
+    def get_transformed_data() -> Generator[np.ndarray, None, None]:
         msg = "Identifying neighbors"
         if ann_obj.harmonizedData is None:
             source = ann_obj.data
-            transform = lambda block: ann_obj.reducer(controlled_compute(block, nthreads))
+
+            def transform(block: np.ndarray) -> np.ndarray:
+                return ann_obj.reducer(controlled_compute(block, nthreads))
         else:
             source = ann_obj.harmonizedData
-            transform = lambda block: controlled_compute(block, nthreads)
+
+            def transform(block: np.ndarray) -> np.ndarray:
+                return controlled_compute(block, nthreads)
+
         blocks = prefetch_blocks(
             source.blocks,
             transform,
@@ -63,21 +73,24 @@ def self_query_knn(ann_obj: AnnStream, store, chunk_size: int, nthreads: int) ->
     with threadpool_limits(limits=nthreads):
         for i in get_transformed_data():
             nsample_end = nsample_start + i.shape[0]
-            ki, kv, nm = ann_obj.transform_ann(
-                i,
-                k=n_neighbors,
-                self_indices=np.arange(nsample_start, nsample_end),
+            ki, kv, nm = cast(
+                tuple[np.ndarray, np.ndarray, int],
+                ann_obj.transform_ann(
+                    i,
+                    k=n_neighbors,
+                    self_indices=np.arange(nsample_start, nsample_end),
+                ),
             )
             z_knn[nsample_start:nsample_end, :] = ki
             z_dist[nsample_start:nsample_end, :] = kv
             nsample_start = nsample_end
             tnm += nm
     recall = ann_obj.data.shape[0] - tnm
-    recall = 100 * recall / ann_obj.data.shape[0]
-    return recall
+    recall_pct = 100.0 * recall / ann_obj.data.shape[0]
+    return recall_pct
 
 
-def _is_umap_version_new():
+def _is_umap_version_new() -> bool:
     import umap
     from packaging import version
 
@@ -88,29 +101,38 @@ def _is_umap_version_new():
 
 
 def _patch_null_weights(
-    zgw,
+    zgw: zarr.Array,
     null_positions: list[int],
     fill_value: float,
     patch_chunk: int,
 ) -> None:
     """Patch zero edge weights without loading the full weights array."""
     if not null_positions:
-        return None
-    null_positions = np.array(null_positions, dtype=np.int64)
+        return
+    null_positions_arr = np.asarray(null_positions, dtype=np.int64)
     n_weights = zgw.shape[0]
     for chunk_start in range(0, n_weights, patch_chunk):
         chunk_end = min(chunk_start + patch_chunk, n_weights)
-        in_chunk = (null_positions >= chunk_start) & (null_positions < chunk_end)
+        in_chunk = (null_positions_arr >= chunk_start) & (
+            null_positions_arr < chunk_end
+        )
         if not np.any(in_chunk):
             continue
-        local_idx = null_positions[in_chunk] - chunk_start
-        block = zgw[chunk_start:chunk_end]
+        local_idx = null_positions_arr[in_chunk] - chunk_start
+        block = np.asarray(zgw[chunk_start:chunk_end], dtype=np.float64)
         block[local_idx] = fill_value
         zgw[chunk_start:chunk_end] = block
-    return None
+    return
 
 
-def smoothen_dists(store, z_idx, z_dist, lc: float, bw: float, chunk_size: int):
+def smoothen_dists(
+    store: zarr.Group,
+    z_idx: zarr.Array,
+    z_dist: zarr.Array,
+    lc: float,
+    bw: float,
+    chunk_size: int,
+) -> None:
     """Smoothens KNN distances.
 
     Args:
@@ -131,13 +153,13 @@ def smoothen_dists(store, z_idx, z_dist, lc: float, bw: float, chunk_size: int):
     n_cells, n_neighbors = z_idx.shape
     zge = create_zarr_dataset(
         store,
-        f"edges",
+        "edges",
         (chunk_size * n_neighbors,),
         ("u8", "u8"),
         (n_cells * n_neighbors, 2),
     )
     zgw = create_zarr_dataset(
-        store, f"weights", (chunk_size * n_neighbors,), "f8", (n_cells * n_neighbors,)
+        store, "weights", (chunk_size * n_neighbors,), "f8", (n_cells * n_neighbors,)
     )
     last_row = 0
     val_counts = 0
@@ -148,14 +170,21 @@ def smoothen_dists(store, z_idx, z_dist, lc: float, bw: float, chunk_size: int):
             ki, kv = z_idx[i:n_cells, :], z_dist[i:n_cells, :]
         else:
             ki, kv = z_idx[i : i + chunk_size, :], z_dist[i : i + chunk_size, :]
-        kv = kv.astype(np.float32, order="C")
+        ki_arr = np.asarray(ki)
+        kv_arr = np.asarray(kv, dtype=np.float32)
+        if kv_arr.flags.c_contiguous is False:
+            kv_arr = np.ascontiguousarray(kv_arr)
         sigmas, rhos = smooth_knn_dist(
-            kv, k=n_neighbors, local_connectivity=lc, bandwidth=bw
+            kv_arr, k=n_neighbors, local_connectivity=lc, bandwidth=bw
         )
         if umap_is_latest:
-            rows, cols, vals, _ = compute_membership_strengths(ki, kv, sigmas, rhos)
+            rows, cols, vals, _ = compute_membership_strengths(
+                ki_arr, kv_arr, sigmas, rhos
+            )
         else:
-            rows, cols, vals = compute_membership_strengths(ki, kv, sigmas, rhos)
+            rows, cols, vals = compute_membership_strengths(
+                ki_arr, kv_arr, sigmas, rhos
+            )
         rows = rows + last_row
         start = val_counts
         end = val_counts + len(rows)
@@ -178,7 +207,9 @@ def smoothen_dists(store, z_idx, z_dist, lc: float, bw: float, chunk_size: int):
     return None
 
 
-def export_knn_to_mtx(mtx: str, csr_graph, batch_size: int = 1000) -> None:
+def export_knn_to_mtx(
+    mtx: str, csr_graph: csr_matrix, batch_size: int = 1000
+) -> None:
     """Exports KNN matrix in Matrix Market format.
 
     Args:
@@ -212,7 +243,7 @@ def export_knn_to_mtx(mtx: str, csr_graph, batch_size: int = 1000) -> None:
 
 
 def run_sgtsne(
-    graph,
+    graph: csr_matrix | coo_matrix,
     ini_embed: np.ndarray,
     *,
     tsne_dims: int = 2,
@@ -284,9 +315,9 @@ def run_sgtsne(
         else:
             os.system(cmd)
         try:
-            emb = pd.read_csv(out_fn, header=None, sep=" ")[
-                list(range(tsne_dims))
-            ].values.T
+            emb = np.asarray(
+                pd.read_csv(out_fn, header=None, sep=" ")[list(range(tsne_dims))].values.T
+            )
         finally:
             for fn in (out_fn, knn_mtx_fn, ini_emb_fn):
                 if fn.exists():
@@ -306,16 +337,18 @@ def run_sgtsne(
             "running single-threaded"
         )
 
-    return sgtsnepi(
-        graph,
-        y0=ini_embed.T,
-        d=tsne_dims,
-        max_iter=max_iter,
-        early_exag=early_iter,
-        lambda_par=lambda_scale,
-        h=box_h,
-        alpha=alpha,
-        silent=not verbose,
+    return np.asarray(
+        sgtsnepi(
+            graph,
+            y0=ini_embed.T,
+            d=tsne_dims,
+            max_iter=max_iter,
+            early_exag=early_iter,
+            lambda_par=lambda_scale,
+            h=box_h,
+            alpha=alpha,
+            silent=not verbose,
+        )
     )
 
 
@@ -334,7 +367,7 @@ def calc_snn(indices: np.ndarray) -> np.ndarray:
         for j in range(nk):
             k = indices[i][j]
             snn[i][j] = len(set(indices[i]).intersection(set(indices[k])))
-    return snn / (nk - 1)
+    return np.asarray(snn / (nk - 1))
 
 
 def weight_sort_indices(
@@ -357,9 +390,9 @@ def weight_sort_indices(
     i = i[idx]
     w = w[idx]
     # Removing duplicate neighbours
-    _, idx = np.unique(i, return_index=True)
-    idx = sorted(idx)
-    return i[idx][:n], w[idx][:n]
+    _, unique_idx = np.unique(i, return_index=True)
+    unique_idx_arr = np.asarray(sorted(unique_idx))
+    return i[unique_idx_arr][:n], w[unique_idx_arr][:n]
 
 
 def merge_graphs(csr_mats: list[csr_matrix]) -> coo_matrix:
@@ -388,7 +421,8 @@ def merge_graphs(csr_mats: list[csr_matrix]) -> coo_matrix:
         snns.append(
             calc_snn(mat.indices.reshape((mat.shape[0], mat[0].indices.shape[0])))
         )
-    col, data = [], []
+    col: list[int] = []
+    data: list[float] = []
     for i in tqdmbar(range(csr_mats[0].shape[0]), desc="Merging graph edges"):
         mi = np.hstack([mat[i].indices for mat in csr_mats])
         mwn = np.hstack([mat[i].data + snns[n][i] for n, mat in enumerate(csr_mats)])
@@ -402,8 +436,14 @@ def merge_graphs(csr_mats: list[csr_matrix]) -> coo_matrix:
 
 
 def wnn_integration(
-    name1: str, g1: csr_matrix, ld1, name2: str, g2: csr_matrix, ld2, n_threads: int
-):
+    name1: str,
+    g1: csr_matrix,
+    ld1: np.ndarray,
+    name2: str,
+    g2: csr_matrix,
+    ld2: np.ndarray,
+    n_threads: int,
+) -> coo_matrix:
     """Build a weighted nearest-neighbor graph from two modality-specific KNN graphs.
 
     Args:
@@ -419,7 +459,7 @@ def wnn_integration(
         coo_matrix: WNN graph combining both modalities.
     """
 
-    def make_estimates(g, ld, msg=""):
+    def make_estimates(g: csr_matrix, ld: np.ndarray, msg: str = "") -> np.ndarray:
         return np.array(
             [
                 ld[g[i].indices].mean(axis=0)
@@ -427,18 +467,25 @@ def wnn_integration(
             ]
         )
 
-    def get_kth_l(g, ld, k):
+    def get_kth_l(g: csr_matrix, ld: np.ndarray, k: int) -> np.ndarray:
         return ld[[g[x].indices[k] for x in range(g.shape[0])]]
 
-    def calc_theta(ld, le, b, c):
+    def calc_theta(
+        ld: np.ndarray, le: np.ndarray, b: np.ndarray, c: np.ndarray
+    ) -> np.ndarray:
         a = np.sqrt(((ld - le) ** 2).sum(axis=1))
         d = a - b
         d[d < 0] = 0
-        return np.exp(((-1 * d) / (c - d)).astype(np.longdouble))
+        return np.asarray(np.exp(((-1 * d) / (c - d)).astype(np.longdouble)))
 
     def calc_affinity_ratios(
-        g_self, g_other, ld, sigma: int = -2, epsilon: float = 10e-4, name=""
-    ):
+        g_self: csr_matrix,
+        g_other: csr_matrix,
+        ld: np.ndarray,
+        sigma: int = -2,
+        epsilon: float = 10e-4,
+        name: str = "",
+    ) -> np.ndarray:
         l_self = make_estimates(
             g_self, ld, msg=f"({name}) Predicting within modality profile"
         )
@@ -464,18 +511,19 @@ def wnn_integration(
         wp = np.exp(sp) / (np.exp(sr) + np.exp(sp))
 
     nk = g1[0].indices.shape[0]
-    col, data = [], []
+    col_parts: list[np.ndarray] = []
+    data_parts: list[np.ndarray] = []
     for n in tqdmbar(range(g1.shape[0]), desc="Building WNN graph"):
         mixed_k = np.array(sorted(set(g1[n].indices).union(g2[n].indices)))
         dr = np.sqrt(((ld1[n] - ld1[mixed_k]) ** 2).sum(axis=1)) * wr[n]
         dp = np.sqrt(((ld2[n] - ld2[mixed_k]) ** 2).sum(axis=1)) * wp[n]
         w_d = dr + dp
         idx = np.argsort(w_d)[:nk]
-        col.append(mixed_k[idx])
+        col_parts.append(mixed_k[idx])
         v = w_d[idx]
-        data.append(np.exp(-((v - v[0]) / (v - v[0]).mean())))
+        data_parts.append(np.exp(-((v - v[0]) / (v - v[0]).mean())))
 
-    data = np.hstack(data)
-    row = np.repeat(range(g1.shape[0]), nk)
-    col = np.hstack(col)
-    return coo_matrix((data, (row, col)), shape=g1.shape)
+    merged_data = np.hstack(data_parts)
+    row = np.repeat(np.arange(g1.shape[0]), nk)
+    merged_col = np.hstack(col_parts)
+    return coo_matrix((merged_data, (row, merged_col)), shape=g1.shape)

@@ -33,6 +33,7 @@ def test_metric_integration_ari(datastore, make_graph, leiden_clustering):
     )
     _ = datastore.metric_integration(batch_labels=["lables1", "lables2"], metric="ari")
 
+
 def test_metric_integration_nmi(datastore, make_graph, leiden_clustering):
     lables1 = np.random.randint(0, 2, datastore.cells.N)
     lables2 = np.random.randint(0, 2, datastore.cells.N)

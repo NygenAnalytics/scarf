@@ -1,5 +1,6 @@
 """Utility functions for the mapping."""
 
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -11,7 +12,7 @@ from .utils import controlled_compute, show_dask_progress, logger, tqdmbar
 __all__ = ["align_features", "coral"]
 
 
-def _streaming_covariance(data, nthreads: int, msg: str) -> np.ndarray:
+def _streaming_covariance(data: ChunkedArray, nthreads: int, msg: str) -> np.ndarray:
     """Computes the (features x features) covariance by streaming row-blocks.
 
     Uses the identity cov = (XtX - n * mean (x) mean) / (n - 1), accumulating
@@ -32,14 +33,16 @@ def _streaming_covariance(data, nthreads: int, msg: str) -> np.ndarray:
     return cov
 
 
-def _cov_diaged(data, nthreads: int, msg: str) -> np.ndarray:
+def _cov_diaged(data: ChunkedArray, nthreads: int, msg: str) -> np.ndarray:
     a = _streaming_covariance(data, nthreads, msg)
     a[a == np.inf] = 0
     a[a == np.nan] = 0
     return a + np.eye(a.shape[0])
 
 
-def _correlation_alignment(s, t, nthreads: int) -> ChunkedArray:
+def _correlation_alignment(
+    s: ChunkedArray, t: ChunkedArray, nthreads: int
+) -> ChunkedArray:
     from scipy.linalg import fractional_matrix_power as fmp
     from threadpoolctl import threadpool_limits
 
@@ -54,7 +57,14 @@ def _correlation_alignment(s, t, nthreads: int) -> ChunkedArray:
     return s.dot(a_coral)
 
 
-def coral(source_data, target_data, assay, feat_key: str, cell_key: str, nthreads: int):
+def coral(
+    source_data: ChunkedArray,
+    target_data: ChunkedArray,
+    assay: Assay,
+    feat_key: str,
+    cell_key: str,
+    nthreads: int,
+) -> None:
     """Apply CORAL batch correction and write corrected data to Zarr.
 
     Args:
@@ -105,15 +115,15 @@ def coral(source_data, target_data, assay, feat_key: str, cell_key: str, nthread
         data,
         assay.z,
         f"normed__{cell_key}__{feat_key}/data_coral",
-        data.chunksize if hasattr(data, "chunksize") else 1000,
+        data.chunksize,
         nthreads,
         msg="Writing out coral corrected data",
     )
 
 
 def _order_features(
-    s_assay,
-    t_assay,
+    s_assay: Assay,
+    t_assay: Assay,
     s_feat_ids: np.ndarray,
     filter_null: bool,
     exclude_missing: bool,
@@ -204,7 +214,9 @@ def align_features(
     )
     logger.info(f"{(t_idx == -1).sum()} features missing in target data")
     normed_loc = f"normed__{source_cell_key}__{source_feat_key}"
-    norm_params = source_assay.z[normed_loc].attrs["subset_params"]
+    norm_params = cast(
+        dict[str, Any], source_assay.z[normed_loc].attrs["subset_params"]
+    )
     sorted_t_idx = np.array(sorted(t_idx[t_idx != -1]))
 
     normed_data = target_assay.normed(

@@ -6,12 +6,14 @@ Methods and classes for merging datasets
 import os
 import re
 from collections import Counter
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import zarr
 from scipy.sparse import coo_matrix
 
+from ._types import as_zarr_array, as_zarr_group
 from .chunked import ChunkedArray
 from .assay import Assay
 from .datastore.datastore import DataStore
@@ -53,6 +55,9 @@ class DummyAssay:
         self.name = name
 
 
+type MergeAssay = Assay | DummyAssay
+
+
 class AssayMerge:
     # class ZarrMerge is renamed to AssayMerge for better understanding
     """Merge multiple Zarr files into a single Zarr file.
@@ -92,19 +97,19 @@ class AssayMerge:
     def __init__(
         self,
         zarr_path: ZARRLOC,
-        assays: list[Assay],
+        assays: list[MergeAssay],
         names: list[str],
         merge_assay_name: str,
         in_workspaces: list[str] | None = None,
         out_workspace: str | None = None,
-        chunk_size=(1000, 1000),
+        chunk_size: tuple[int, int] = (1000, 1000),
         dtype: str | None = None,
         overwrite: bool = False,
         prepend_text: str | None = "orig",
         reset_cell_filter: bool = True,
         seed: int | None = 42,
-        storage_options: dict | None = None,
-    ):
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
         self.assays = assays
         self.names = names
         self.inWorkspaces = in_workspaces
@@ -123,15 +128,14 @@ class AssayMerge:
         self.nCells: int = self.mergedCells.shape[0]
         self.featCollection: list[dict[str, str]] = self._get_feat_ids(assays)
         self.feat_name_ids_same: bool = self.check_feat_ids(self.featCollection)
+        self.featCollection_map: list[dict[str, str]]
 
         if self.feat_name_ids_same is True:
             self.feat_suffix: dict[int, int] = self.get_feat_suffix()
             self.featCollection = self.update_feat_ids()
-            self.featCollection_map: list[dict[str, str]] = (
-                self.update_feat_ids_for_map()
-            )
+            self.featCollection_map = self.update_feat_ids_for_map()
         else:
-            self.featCollection_map: list[dict[str, str]] = self.featCollection.copy()
+            self.featCollection_map = self.featCollection.copy()
 
         self.mergedFeats: pd.DataFrame = self._merge_order_feats(self.featCollection)
         self.mergedFeats_map: pd.DataFrame = self._merge_order_feats(
@@ -139,11 +143,12 @@ class AssayMerge:
         )
         self.nFeats: int = self.mergedFeats_map.shape[0]
         self.featOrder: list[np.ndarray] = self._ref_order_feat_idx()
+        self.featOrder_map: list[np.ndarray]
 
         if self.feat_name_ids_same is True:
-            self.featOrder_map: list[np.ndarray] = self._ref_order_feat_idx_map()
+            self.featOrder_map = self._ref_order_feat_idx_map()
         else:
-            self.featOrder_map: list[np.ndarray] = self.featOrder.copy()
+            self.featOrder_map = self.featOrder.copy()
 
         self.cellOrder: dict[int, dict[int, np.ndarray]] = self._ref_order_cell_idx()
         self.z: zarr.Group = self._use_existing_zarr(
@@ -309,11 +314,12 @@ class AssayMerge:
         # Here we merge the cell metadata tables for each sample. We simply concatenate the tables and reset the index.
         ret_val_df = pd.concat(ret_val, axis=0).reset_index(drop=True)
         # Now we use the offsets stored in permutations_rows_offset along with the coordinates_permutations to reorder the cells in the merged assay. The offsets are used to bring the cells in the same order as the rows in the merged assay.
-        compiled_idx = [
-            self.permutations_rows_offset[i][j]
-            for i, j in self.coordinates_permutations
-        ]
-        compiled_idx = np.concatenate(compiled_idx)
+        compiled_idx = np.concatenate(
+            [
+                self.permutations_rows_offset[i][j]
+                for i, j in self.coordinates_permutations
+            ]
+        )
         # Index the merged cell metadata table with the compiled_idx to get the final randomized merged cell metadata table.
         ret_val_df = ret_val_df.iloc[compiled_idx]
         if sum([x.cells.N for x in self.assays]) != ret_val_df.shape[0]:
@@ -324,7 +330,7 @@ class AssayMerge:
         return ret_val_df
 
     @staticmethod
-    def _get_feat_ids(assays) -> list[dict[str, str]]:
+    def _get_feat_ids(assays: list[MergeAssay]) -> list[dict[str, str]]:
         """Fetches ID->names mapping of features from each assay.
 
         Args:
@@ -407,7 +413,7 @@ class AssayMerge:
                     if counter[val] == 1:  # Unique value
                         in_dict[val] = val
                     else:  # Multiple values -- update
-                        updated_val = f"{val}_{min_val+sum_counter[val]}"
+                        updated_val = f"{val}_{min_val + sum_counter[val]}"
                         in_dict[updated_val] = updated_val
                     sum_counter[val] += 1
             else:
@@ -417,7 +423,7 @@ class AssayMerge:
                         num = int(val.split("_")[-1])
                         # replace the number with min_val
                         updated_val = pattern.sub(
-                            f"_{min_val-self.feat_suffix[i]+num}", val
+                            f"_{min_val - self.feat_suffix[i] + num}", val
                         )
                         in_dict[updated_val] = updated_val
                     else:
@@ -439,26 +445,24 @@ class AssayMerge:
         pattern = re.compile(r"_\d+$")
         new_featCollection = []
         for dict_ in self.featCollection:
-            in_dict = {}
-            for x in dict_.values():
-                # check if the value ends with a number
-                if pattern.search(x):
-                    val = x.split("_")[:-1]
-                    val = "_".join(val)
-                    if val not in in_dict:
-                        in_dict[val] = val
+            in_dict: dict[str, str] = {}
+            for feat_val in dict_.values():
+                if pattern.search(feat_val):
+                    base_val = "_".join(feat_val.split("_")[:-1])
+                    if base_val not in in_dict:
+                        in_dict[base_val] = base_val
                 else:
-                    in_dict[x] = x
+                    in_dict[feat_val] = feat_val
             new_featCollection.append(in_dict)
         return new_featCollection
 
-    def _merge_order_feats(self, FeatCollection) -> pd.DataFrame:
+    def _merge_order_feats(self, feat_collection: list[dict[str, str]]) -> pd.DataFrame:
         """Merge features from all the assays and determine their order.
 
         Returns:
         """
-        union_set = {}
-        for ids in FeatCollection:
+        union_set: dict[str, str] = {}
+        for ids in feat_collection:
             for i in ids:
                 if i not in union_set:
                     union_set[i] = ids[i]
@@ -516,7 +520,7 @@ class AssayMerge:
         return featorder
 
     def _use_existing_zarr(
-        self, zarr_loc: ZARRLOC, merge_assay_name, overwrite
+        self, zarr_loc: ZARRLOC, merge_assay_name: str, overwrite: bool
     ) -> zarr.Group:
         if self.outWorkspace is None:
             cell_slot = "cellData"
@@ -539,9 +543,10 @@ class AssayMerge:
                         "a different zarr path or a different assay name. Otherwise set overwrite to True"
                     )
             try:
+                cell_data = as_zarr_group(z[cell_slot], name=cell_slot)
+                cell_ids = as_zarr_array(cell_data["ids"], name="ids")
                 if not all(
-                    z[cell_slot]["ids"][:]
-                    == np.array(np.array(self.mergedCells["ids"]))  # type: ignore
+                    np.asarray(cell_ids[:]) == np.array(self.mergedCells["ids"])
                 ):
                     raise ValueError(
                         f"ERROR: order of cells does not match the one in existing file"  # noqa: F541
@@ -552,9 +557,9 @@ class AssayMerge:
                     "existing file or choose another path"
                 )
             return load_zarr(zarr_loc, mode="r+", storage_options=self.storage_options)
-        except (ValueError, FileNotFoundError):
+        except ValueError, FileNotFoundError:
             # So no zarr file with same name exists. Check if a non zarr folder with the same name exists
-            if is_local_zarr_path(zarr_loc) and os.path.exists(zarr_loc):
+            if is_local_zarr_path(zarr_loc) and isinstance(zarr_loc, str) and os.path.exists(zarr_loc):
                 raise ValueError(
                     f"ERROR: Directory/file with name `{zarr_loc}`exists. "
                     f"Either delete it or use another name"
@@ -562,7 +567,7 @@ class AssayMerge:
             # creating a new zarr file
             return load_zarr(zarr_loc, mode="w", storage_options=self.storage_options)
 
-    def _ini_cell_data(self, overwrite) -> None:
+    def _ini_cell_data(self, overwrite: bool) -> None:
         """Save cell attributes to Zarr.
 
         Returns:
@@ -584,7 +589,11 @@ class AssayMerge:
             )
 
     def _dask_to_coo(
-        self, d_arr, order: np.ndarray, order_map: np.ndarray, n_threads: int
+        self,
+        d_arr: Any,
+        order: np.ndarray,
+        order_map: np.ndarray,
+        n_threads: int,
     ) -> coo_matrix:
         """
         Convert a chunked array block to a sparse COO matrix.
@@ -608,7 +617,9 @@ class AssayMerge:
 
         computed_data = controlled_compute(d_arr, n_threads)
         consolidation_map = {orig: cons for orig, cons in zip(order, order_map)}
-        rows, cols, data = [], [], []
+        rows: list[int] = []
+        cols: list[int] = []
+        data: list[Any] = []
         for i, col_data in enumerate(computed_data.T):
             consolidated_idx = consolidation_map[order[i]]
             nz = np.flatnonzero(col_data)
@@ -617,11 +628,9 @@ class AssayMerge:
             rows.extend(nz)
             cols.extend([consolidated_idx] * nz.size)
             data.extend(col_data[nz])
-        return coo_matrix(
-            (data, (rows, cols)), shape=(d_arr.shape[0], self.nFeats)
-        )
+        return coo_matrix((data, (rows, cols)), shape=(d_arr.shape[0], self.nFeats))
 
-    def dump(self, nthreads=4):
+    def dump(self, nthreads: int = 4) -> None:
         """Copy the values from individual assays to the merged assay.
 
         Args:
@@ -636,7 +645,7 @@ class AssayMerge:
             for j, block in tqdmbar(
                 enumerate(assay.rawData.blocks),
                 total=assay.rawData.numblocks[0],
-                desc=f"Writing data from assay {i+1}/{len(self.assays)} to merged file",
+                desc=f"Writing data from assay {i + 1}/{len(self.assays)} to merged file",
             ):
                 # Perform the inter-chunk permutation of the rows
                 perm_order = self.permutations_rows[i][j]
@@ -663,7 +672,7 @@ class ZarrMerge(AssayMerge):
     Alias for AssayMerge for backward compatibility.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         logger.warning(
             "The 'ZarrMerge' class is deprecated and will be removed in a future release. Please use 'AssayMerge' instead."
         )
@@ -712,14 +721,14 @@ class DatasetMerge:
         names: list[str],
         in_workspaces: list[str] | None = None,
         out_workspace: str | None = None,
-        chunk_size=(1000, 1000),
+        chunk_size: tuple[int, int] = (1000, 1000),
         dtype: str | None = None,
         overwrite: bool = False,
         prepend_text: str | None = "orig",
         reset_cell_filter: bool = True,
         seed: int | None = 42,
-        storage_options: dict | None = None,
-    ):
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
         self.datasets = datasets
         self.names = names
         self.zarr_path = zarr_path
@@ -749,16 +758,14 @@ class DatasetMerge:
         """
         Create AssayMerge objects for each unique assay
         """
-        gens = []
+        gens: list[AssayMerge] = []
         for assay in self.unique_assays:
-            assay_list = []
+            assay_list: list[MergeAssay] = []
             for ds in self.datasets:
                 if assay in ds.assay_names:
                     assay_list.append(ds.get_assay(assay))
                 else:
-                    # Generate a dummy assay on the fly
-                    dummy_assay: DummyAssay = self.generate_dummy_assay(ds, assay)
-                    assay_list.append(dummy_assay)
+                    assay_list.append(self.generate_dummy_assay(ds, assay))
             gens.append(
                 AssayMerge(
                     zarr_path=self.zarr_path,
@@ -817,7 +824,7 @@ class DatasetMerge:
         logger.info(f"Generated dummy {assay_name} assay for datastore {ds}")
         return dummy_assay
 
-    def dump(self, nthreads=4) -> None:
+    def dump(self, nthreads: int = 4) -> None:
         """
         Dump the merged data to the zarr file
         """

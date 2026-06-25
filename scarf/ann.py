@@ -1,3 +1,5 @@
+from collections.abc import Callable, Generator
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -11,8 +13,15 @@ __all__ = ["AnnStream", "instantiate_knn_index", "fix_knn_query"]
 
 
 def instantiate_knn_index(
-    space, dim, max_elements, ef_construction, M, random_seed, ef, num_threads
-):
+    space: str,
+    dim: int,
+    max_elements: int,
+    ef_construction: int,
+    M: int,
+    random_seed: int,
+    ef: int,
+    num_threads: int,
+) -> Any:
     """Create and configure an hnswlib KNN index.
 
     Args:
@@ -42,7 +51,11 @@ def instantiate_knn_index(
     return ann_idx
 
 
-def fix_knn_query(indices: np.ndarray, distances: np.ndarray, ref_idx: np.ndarray):
+def fix_knn_query(
+    indices: np.ndarray,
+    distances: np.ndarray,
+    ref_idx: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int]:
     """Remove self-neighbor entries from KNN query results when recall is imperfect.
 
     Args:
@@ -57,7 +70,7 @@ def fix_knn_query(indices: np.ndarray, distances: np.ndarray, ref_idx: np.ndarra
     fixed_ind, fixed_dist = indices.copy()[:, 1:], distances.copy()[:, 1:]
     # Identify positions where first index is not a self loop
     mis_idx = indices[:, 0].reshape(1, -1)[0] != ref_idx
-    n_mis = mis_idx.sum()
+    n_mis = int(mis_idx.sum())
     if n_mis > 0:
         for n, i, j, k in zip(
             np.where(mis_idx)[0], ref_idx[mis_idx], indices[mis_idx], distances[mis_idx]
@@ -107,14 +120,16 @@ class AnnStream:
         batches: Batch metadata DataFrame for Harmony.
     """
 
+    reducer: Callable[[np.ndarray], np.ndarray]
+
     def __init__(
         self,
-        data,
+        data: ChunkedArray,
         k: int,
         n_cluster: int,
         reduction_method: str,
-        dims: int,
-        loadings: np.ndarray,
+        dims: int | None,
+        loadings: np.ndarray | None,
         use_for_pca: np.ndarray,
         mu: np.ndarray,
         sigma: np.ndarray,
@@ -127,13 +142,13 @@ class AnnStream:
         rand_state: int,
         do_kmeans_fit: bool,
         disable_scaling: bool,
-        ann_idx,
+        ann_idx: Any | None,
         lsi_skip_first: bool,
-        lsi_params: dict,
+        lsi_params: dict[str, Any],
         harmonize: bool,
         harmonized_data: ChunkedArray | None = None,
         batches: pd.DataFrame | None = None,
-    ):
+    ) -> None:
         self.data = data
         self.k = k
         if self.k >= self.data.shape[0]:
@@ -163,7 +178,7 @@ class AnnStream:
         self.harmonizedData = harmonized_data
         self.batches = batches
         disable_reduction = False
-        if self.dims < 1:
+        if self.dims is not None and self.dims < 1:
             disable_reduction = True
         with threadpool_limits(limits=self.nthreads):
             if self.method == "pca":
@@ -180,16 +195,26 @@ class AnnStream:
                     # AnnStream, it could still be overwritten by _handle_batch_size. Hence need to hard set it here.
                     self.dims = self.loadings.shape[1]
                     # it is okay for dimensions to be larger than batch size here because we will not fit the PCA
+                loadings = self.loadings
                 if disable_scaling:
                     if disable_reduction:
-                        self.reducer = lambda x: x
+                        def reducer(x: np.ndarray) -> np.ndarray:
+                            return x
                     else:
-                        self.reducer = lambda x: x.dot(self.loadings)
+                        assert loadings is not None
+                        loadings_mat = loadings
+                        def reducer(x: np.ndarray) -> np.ndarray:
+                            return np.asarray(x.dot(loadings_mat))
                 else:
                     if disable_reduction:
-                        self.reducer = lambda x: self.transform_z(x)
+                        def reducer(x: np.ndarray) -> np.ndarray:
+                            return self.transform_z(x)
                     else:
-                        self.reducer = lambda x: self.transform_z(x).dot(self.loadings)
+                        assert loadings is not None
+                        loadings_mat = loadings
+                        def reducer(x: np.ndarray) -> np.ndarray:
+                            return np.asarray(self.transform_z(x).dot(loadings_mat))
+                self.reducer = reducer
             elif self.method == "lsi":
                 if self.loadings is None or len(self.loadings) == 0:
                     if disable_reduction is False:
@@ -199,10 +224,16 @@ class AnnStream:
                     if lsi_skip_first:
                         self.loadings = self.loadings[:, 1:]
                     self.dims = self.loadings.shape[1]
+                loadings = self.loadings
                 if disable_reduction:
-                    self.reducer = lambda x: x
+                    def reducer(x: np.ndarray) -> np.ndarray:
+                        return x
                 else:
-                    self.reducer = lambda x: x.dot(self.loadings)
+                    assert loadings is not None
+                    loadings_mat = loadings
+                    def reducer(x: np.ndarray) -> np.ndarray:
+                        return np.asarray(x.dot(loadings_mat))
+                self.reducer = reducer
             elif self.method == "custom":
                 if self.loadings is None or len(self.loadings) == 0:
                     logger.warning(
@@ -210,10 +241,16 @@ class AnnStream:
                     )
                 else:
                     self.dims = self.loadings.shape[1]
+                loadings = self.loadings
                 if disable_reduction:
-                    self.reducer = lambda x: x
+                    def reducer(x: np.ndarray) -> np.ndarray:
+                        return x
                 else:
-                    self.reducer = lambda x: x.dot(self.loadings)
+                    assert loadings is not None
+                    loadings_mat = loadings
+                    def reducer(x: np.ndarray) -> np.ndarray:
+                        return np.asarray(x.dot(loadings_mat))
+                self.reducer = reducer
             else:
                 raise ValueError(f"ERROR: Unknown reduction method: {self.method}")
             if ann_idx is None:
@@ -224,11 +261,11 @@ class AnnStream:
                 self.annIdx.set_num_threads(self.annThreads)
             self.kmeans = self._fit_kmeans(do_kmeans_fit)
 
-    def _handle_batch_size(self):
-        if self.dims > self.data.shape[0]:
+    def _handle_batch_size(self) -> int:
+        if self.dims is not None and self.dims > self.data.shape[0]:
             self.dims = self.data.shape[0]
         batch_size = self.data.chunksize[0]  # Assuming all chunks are same size
-        if self.dims >= batch_size:
+        if self.dims is not None and self.dims >= batch_size:
             self.dims = batch_size - 1  # -1 because we will do PCA +1
             logger.info(
                 f"Number of PCA/LSI components reduced to batch size of {batch_size}"
@@ -238,7 +275,7 @@ class AnnStream:
             logger.info(f"Cluster number reduced to batch size of {batch_size}")
         return batch_size
 
-    def iter_blocks(self, msg: str = "") -> np.ndarray:
+    def iter_blocks(self, msg: str = "") -> Generator[np.ndarray, None, None]:
         """Yield row blocks of raw data as NumPy arrays with optional progress bar."""
         from .storage.zarr_store import profile_prefetch_depth
         from .utils import prefetch_blocks
@@ -252,11 +289,14 @@ class AnnStream:
 
     def transform_z(self, a: np.ndarray) -> np.ndarray:
         """Z-score a block using fitted ``mu`` and ``sigma``."""
-        return (a - self.mu) / self.sigma
+        return np.asarray((a - self.mu) / self.sigma)
 
     def transform_ann(
-        self, a: np.ndarray, k: int = None, self_indices: np.ndarray = None
-    ) -> tuple:
+        self,
+        a: np.ndarray,
+        k: int | None = None,
+        self_indices: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, int]:
         """Query the ANN index for neighbors of transformed rows in ``a``.
 
         Args:
@@ -273,18 +313,20 @@ class AnnStream:
         # Adding +1 to k because first neighbour will be the query itself
         if self_indices is None:
             i, d = self.annIdx.knn_query(a, k=k)
-            return i, d
-        else:
-            i, d = self.annIdx.knn_query(a, k=k + 1)
-            return fix_knn_query(i, d, self_indices)
+            return np.asarray(i), np.asarray(d)
+        i, d = self.annIdx.knn_query(a, k=k + 1)
+        return fix_knn_query(i, d, self_indices)
 
-    def _fit_pca(self, disable_scaling, use_for_pca) -> None:
+    def _fit_pca(self, disable_scaling: bool, use_for_pca: np.ndarray) -> None:
         from sklearn.decomposition import IncrementalPCA
         from numpy.linalg import LinAlgError
 
+        assert self.dims is not None
+        dims = self.dims
+
         # We fit 1 extra PC dim than specified and then ignore the last PC.
         self._pca = IncrementalPCA(
-            n_components=self.dims + 1, batch_size=self.batchSize
+            n_components=dims + 1, batch_size=self.batchSize
         )
         do_sample_subset = False if use_for_pca.sum() == self.nCells else True
         s, e = 0, 0
@@ -292,9 +334,9 @@ class AnnStream:
         # then those cells can be added to end_reservoir for fitting. if there are no such cells then end reservoir is
         # just by itself after fitting rest of the cells. If may be the case that the first batch itself has less than
         # dims+1 cells. in that we keep adding cells to carry_over pile until it is big enough.
-        end_reservoir = []
+        end_reservoir: np.ndarray | None = None
         # carry_over store cells that can yet not be added to end_reservoir ot be used for fitting pca directly.
-        carry_over = []
+        carry_over: np.ndarray | None = None
         for i in self.iter_blocks(msg="Fitting PCA"):
             if do_sample_subset:
                 e = s + i.shape[0]
@@ -302,13 +344,13 @@ class AnnStream:
                 s = e
             if disable_scaling is False:
                 i = self.transform_z(i)
-            if len(carry_over) > 0:
+            if carry_over is not None:
                 i = np.vstack((carry_over, i))
-                carry_over = []
-            if len(i) < (self.dims + 1):
+                carry_over = None
+            if len(i) < (dims + 1):
                 carry_over = i
                 continue
-            if len(end_reservoir) == 0:
+            if end_reservoir is None:
                 end_reservoir = i
                 continue
             try:
@@ -316,12 +358,16 @@ class AnnStream:
             except LinAlgError:
                 # Add retry counter to make memory consumption doesn't escalate
                 carry_over = i
-        if len(carry_over) > 0:
-            i = np.vstack((end_reservoir, carry_over))
+        if carry_over is not None:
+            if end_reservoir is not None:
+                fit_batch = np.vstack((end_reservoir, carry_over))
+            else:
+                fit_batch = carry_over
         else:
-            i = end_reservoir
+            assert end_reservoir is not None
+            fit_batch = end_reservoir
         try:
-            self._pca.partial_fit(i, check_input=False)
+            self._pca.partial_fit(fit_batch, check_input=False)
         except LinAlgError:
             logger.warning(
                 "{i.shape[0]} samples were not used in PCA fitting due to LinAlgError",
@@ -329,8 +375,11 @@ class AnnStream:
             )
         self.loadings = self._pca.components_[:-1, :].T
 
-    def _fit_lsi(self, lsi_skip_first, lsi_params) -> None:
+    def _fit_lsi(self, lsi_skip_first: bool, lsi_params: dict[str, Any]) -> None:
         from sklearn.decomposition import TruncatedSVD
+
+        assert self.dims is not None
+        dims = self.dims
 
         reserved = {"n_components", "random_state"}
         for key in list(lsi_params):
@@ -342,7 +391,7 @@ class AnnStream:
 
         mat = np.vstack(list(self.iter_blocks(msg="Fitting LSI model")))
         svd = TruncatedSVD(
-            n_components=self.dims + 1,
+            n_components=dims + 1,
             random_state=self.randState,
             **lsi_params,
         )
@@ -353,20 +402,18 @@ class AnnStream:
         else:
             self.loadings = components
 
-    def _fit_ann(self):
-        def _transform_values():
+    def _fit_ann(self) -> Any:
+        def _transform_values() -> np.ndarray:
             pca_array = []
             for _i in self.iter_blocks(msg="Calculating uncorrected latent dimensions"):
                 pca_array.append(self.reducer(_i))
             return np.vstack(pca_array).T
 
-        dims = self.dims
-        if dims < 1:
-            dims = self.data.shape[1]
+        ann_dims = self.dims if self.dims is not None and self.dims >= 1 else self.data.shape[1]
 
         ann_idx = instantiate_knn_index(
             self.annMetric,
-            dims,
+            ann_dims,
             self.nCells,
             self.annEfc,
             self.annM,
@@ -392,7 +439,7 @@ class AnnStream:
                 ann_idx.add_items(self.reducer(i))
         return ann_idx
 
-    def _fit_kmeans(self, do_ann_fit):
+    def _fit_kmeans(self, do_ann_fit: bool) -> Any | None:
         from sklearn.cluster import MiniBatchKMeans
 
         if do_ann_fit is False:
@@ -403,7 +450,7 @@ class AnnStream:
             batch_size=self.batchSize,
             n_init=3,
         )
-        temp = []
+        temp: list[int] = []
         with threadpool_limits(limits=self.nthreads):
             for i in self.iter_blocks(msg="Fitting kmeans"):
                 kmeans.partial_fit(self.reducer(i))

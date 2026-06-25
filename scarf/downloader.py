@@ -15,12 +15,18 @@ import os
 import tarfile
 import time
 from json import JSONDecodeError
+from typing import Any
 
 import pandas as pd
 
 from .utils import logger, tqdmbar
 
 __all__ = ["show_available_datasets", "fetch_dataset"]
+
+type JsonDict = dict[str, Any]
+type DatasetEntry = tuple[str, str]
+type DatasetsMap = dict[str, DatasetEntry]
+type FileMap = dict[str, str]
 
 
 class OSFdownloader:
@@ -35,14 +41,16 @@ class OSFdownloader:
         sources: Mapping of dataset names to download URLs.
     """
 
-    def __init__(self, project_id):
+    def __init__(self, project_id: str) -> None:
         self.projectId = project_id
         self.storages = ["osfstorage", "figshare"]
         self.url = f"https://api.osf.io/v2/nodes/{self.projectId}/files/"
         self.datasets, self.sourceFile = self._populate_datasets()
         self.sources = self._populate_sources()
 
-    def get_json(self, storage, endpoint, url):
+    def get_json(
+        self, storage: str, endpoint: str, url: str | None
+    ) -> Any:
         import requests
 
         if endpoint != "":
@@ -51,7 +59,7 @@ class OSFdownloader:
             url = self.url + f"{storage}/{endpoint}"
         return requests.get(url).json()
 
-    def get_all_pages(self, storage, endpoint=""):
+    def get_all_pages(self, storage: str, endpoint: str = "") -> list[JsonDict]:
         data = []
         url = None
         n_attempts = 0
@@ -73,10 +81,10 @@ class OSFdownloader:
         return data
 
     @staticmethod
-    def _process_path(node):
-        return node["attributes"]["path"].rstrip("/").lstrip("/")
+    def _process_path(node: JsonDict) -> str:
+        return str(node["attributes"]["path"]).rstrip("/").lstrip("/")
 
-    def _populate_datasets(self):
+    def _populate_datasets(self) -> tuple[DatasetsMap, str]:
         datasets = {}
         source_fn = ""
         for storage in self.storages:
@@ -88,7 +96,7 @@ class OSFdownloader:
                 datasets[i["attributes"]["name"]] = (path, storage)
         return datasets, source_fn
 
-    def _populate_sources(self):
+    def _populate_sources(self) -> dict[str, Any]:
         import requests
 
         n_attempts = 0
@@ -97,7 +105,7 @@ class OSFdownloader:
                 source_fn = self._get_files_for_node("osfstorage", self.sourceFile)[
                     "sources.csv"
                 ]
-                return (
+                return dict(
                     pd.read_csv(io.StringIO(requests.get(source_fn).text))
                     .set_index("id")
                     .to_dict()
@@ -105,11 +113,13 @@ class OSFdownloader:
             except KeyError:
                 time.sleep(1)
                 n_attempts += 1
+        msg = "Failed to load dataset sources after 5 attempts"
+        raise KeyError(msg)
 
-    def show_datasets(self):
+    def show_datasets(self) -> None:
         print("\n".join(sorted(self.datasets.keys())))
 
-    def _get_files_for_node(self, storage, file_id):
+    def _get_files_for_node(self, storage: str, file_id: str) -> FileMap:
         base_url = f"https://files.de-1.osf.io/v1/resources/{self.projectId}/providers/"
         ret_val = {}
         for i in self.get_all_pages(storage, file_id):
@@ -117,17 +127,18 @@ class OSFdownloader:
             ret_val[i["attributes"]["name"]] = base_url + f"{storage}/{path}"
         return ret_val
 
-    def get_dataset_file_ids(self, dataset_name):
+    def get_dataset_file_ids(self, dataset_name: str) -> FileMap:
         if dataset_name not in self.datasets:
+            available = "\n".join(sorted(self.datasets.keys()))
             raise KeyError(
                 f"ERROR: {dataset_name} was not found. "
-                f"Please choose one of the following:\n{self.show_datasets()}"
+                f"Please choose one of the following:\n{available}"
             )
         file_id, storage = self.datasets[dataset_name]
         return self._get_files_for_node(storage, file_id)
 
 
-osfd = None
+osfd: OSFdownloader | None = None
 
 
 def handle_download(url: str, out_fn: str, seq_counter: str = "") -> None:
@@ -199,17 +210,18 @@ def fetch_dataset(
 
     zarr_ext = ".zarr.tar.gz"
 
-    def has_zarr(entry):
+    def has_zarr(entry: FileMap) -> bool:
         for e in entry:
             if e.endswith(zarr_ext):
                 return True
         return False
 
-    def get_zarr_entry(entry):
+    def get_zarr_entry(entry: FileMap) -> tuple[str, str]:
         for e in entry:
             if e.endswith(zarr_ext):
                 return e, entry[e]
-        return False, False
+        msg = "No zarr entry found in dataset files"
+        raise KeyError(msg)
 
     global osfd
     if osfd is None:

@@ -10,12 +10,17 @@
 """
 
 import sys
+from collections.abc import Callable, Iterable, Iterator
+from typing import Any
 
 import numpy as np
 import zarr
 from zarr.abc.store import Store
 from loguru import logger
 from numba import jit
+from numpy.typing import NDArray
+
+from ._types import ZarrMode
 
 __all__ = [
     "logger",
@@ -48,16 +53,16 @@ tqdm_params = {
 type ZARRLOC = str | Store
 
 
-def get_log_level():
+def get_log_level() -> int:
     """Return the current minimum log level configured for Scarf's logger."""
     # noinspection PyUnresolvedReferences
-    return logger._core.min_level  # type: ignore
+    return int(logger._core.min_level)  # type: ignore[attr-defined]
 
 
 def is_notebook() -> bool:
     """Return True when running inside a Jupyter notebook kernel."""
     try:
-        shell = get_ipython().__class__.__name__  # type: ignore
+        shell = get_ipython().__class__.__name__  # type: ignore[name-defined]
         if shell == "ZMQInteractiveShell":
             return True
         elif shell == "TerminalInteractiveShell":
@@ -68,7 +73,7 @@ def is_notebook() -> bool:
         return False
 
 
-def tqdmbar(*args, **kwargs):
+def tqdmbar(*args: Any, **kwargs: Any) -> Any:
     """Return a tqdm progress bar with Scarf defaults and log-level aware disable."""
     params = dict(tqdm_params)
     for i in kwargs:
@@ -89,7 +94,7 @@ def tqdmbar(*args, **kwargs):
         return tqdm(*args, **kwargs, **params)
 
 
-def set_verbosity(level: str | None = None, filepath: str | None = None):
+def set_verbosity(level: str | None = None, filepath: str | None = None) -> None:
     """Set verbosity level of Scarf's output. Setting value of level='CRITICAL'
     should silence all logs. Progress bars are automatically disabled for
     levels above 'INFO'.
@@ -103,7 +108,7 @@ def set_verbosity(level: str | None = None, filepath: str | None = None):
         None
     """
     # noinspection PyUnresolvedReferences
-    available_levels = logger._core.levels.keys()  # type: ignore
+    available_levels = logger._core.levels.keys()  # type: ignore[attr-defined]
 
     if level is None or level not in available_levels:
         raise ValueError(
@@ -111,9 +116,9 @@ def set_verbosity(level: str | None = None, filepath: str | None = None):
         )
     logger.remove()
     if filepath is None:
-        filepath = sys.stdout  # type: ignore
+        filepath = sys.stdout  # type: ignore[assignment]
     logger.add(
-        filepath,  # type: ignore
+        filepath,  # type: ignore[arg-type]
         colorize=True,
         format="<level>{level}</level>: {message}",
         level=level,
@@ -144,24 +149,27 @@ def rescale_array(a: np.ndarray, frac: float = 0.9) -> np.ndarray:
     return a
 
 
-def clean_array(x, fill_val: int = 0):
+def clean_array(
+    x: NDArray[Any] | list[Any], fill_val: int | float = 0
+) -> NDArray[Any]:
     """Returns input array with nan and infinite values removed.
 
     Args:
         x: input array
         fill_val: value to fill zero values with (default: 0)
     """
-    x = np.nan_to_num(x, copy=True)
-    x[(x == np.inf) | (x == -np.inf)] = 0
-    x[x == 0] = fill_val
-    return x
+    arr = np.asarray(x, dtype=np.float64)
+    arr = np.nan_to_num(arr, copy=True)
+    arr[(arr == np.inf) | (arr == -np.inf)] = 0
+    arr[arr == 0] = fill_val
+    return arr
 
 
 def load_zarr(
     zarr_loc: ZARRLOC,
-    mode: str,
-    synchronizer=None,
-    storage_options: dict | None = None,
+    mode: ZarrMode,
+    synchronizer: Any = None,
+    storage_options: dict[str, Any] | None = None,
 ) -> zarr.Group:
     """Open a Zarr group at the given path, URI, or store object.
 
@@ -189,7 +197,11 @@ def load_zarr(
     return zarr.open_group(store=store, mode=mode)
 
 
-def prefetch_blocks(block_iter, fn, max_ahead: int = 1):
+def prefetch_blocks(
+    block_iter: Iterable[Any],
+    fn: Callable[[Any], Any],
+    max_ahead: int = 1,
+) -> Iterator[Any]:
     """Apply ``fn`` to blocks with bounded read-ahead while preserving order.
 
     Args:
@@ -201,14 +213,14 @@ def prefetch_blocks(block_iter, fn, max_ahead: int = 1):
         Results of ``fn(block)`` in the same order as ``block_iter``.
     """
     from collections import deque
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import Future, ThreadPoolExecutor
 
     if max_ahead < 1:
         max_ahead = 1
     block_iter = iter(block_iter)
 
     with ThreadPoolExecutor(max_workers=max_ahead) as ex:
-        pending: deque = deque()
+        pending: deque[Future[Any]] = deque()
 
         def enqueue() -> bool:
             try:
@@ -228,7 +240,7 @@ def prefetch_blocks(block_iter, fn, max_ahead: int = 1):
             yield result
 
 
-def controlled_compute(arr, nthreads):
+def controlled_compute(arr: Any, nthreads: int) -> np.ndarray:
     """Materializes a ChunkedArray, Block or deferred reduction into NumPy.
 
     Args:
@@ -240,11 +252,13 @@ def controlled_compute(arr, nthreads):
         Result of computation as a NumPy array.
     """
     if hasattr(arr, "compute"):
-        return arr.compute(nthreads)
+        return np.asarray(arr.compute(nthreads))
     return np.asarray(arr)
 
 
-def show_dask_progress(arr, msg: str | None = None, nthreads: int = 1):
+def show_dask_progress(
+    arr: Any, msg: str | None = None, nthreads: int = 1
+) -> np.ndarray:
     """Materializes a ChunkedArray/reduction while showing a progress bar.
 
     Args:
@@ -256,11 +270,11 @@ def show_dask_progress(arr, msg: str | None = None, nthreads: int = 1):
         Result of computation as a NumPy array.
     """
     if hasattr(arr, "compute"):
-        return arr.compute(nthreads, msg)
+        return np.asarray(arr.compute(nthreads, msg))
     return np.asarray(arr)
 
 
-def system_call(command):
+def system_call(command: str) -> None:
     """Executes a command in the underlying operative system.
 
     Args:
@@ -274,7 +288,7 @@ def system_call(command):
 
     process = subprocess.Popen(shlex.split(command), stdout=subprocess.PIPE)
     while True:
-        output = process.stdout.readline()  # type: ignore
+        output = process.stdout.readline()  # type: ignore[union-attr]
         if process.poll() is not None:
             break
         if output:
@@ -284,7 +298,7 @@ def system_call(command):
 
 
 @jit(nopython=True)
-def rolling_window(a, w):
+def rolling_window(a: np.ndarray, w: int) -> np.ndarray:
     """Apply a centered rolling mean with window size w along axis 0.
 
     Args:

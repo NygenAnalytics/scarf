@@ -4,18 +4,19 @@
 # License: BSD 3 clause
 
 import locale
+from typing import Any
 
-from .utils import logger
+import numpy as np
+
+from .utils import logger, tqdm_params as default_tqdm_params
 
 locale.setlocale(locale.LC_NUMERIC, "C")
 
 __all__ = ["fit_transform"]
 
 
-def calc_dens_map_params(graph, dists):
+def calc_dens_map_params(graph: Any, dists: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Compute densMAP correction terms from graph and KNN distances."""
-    import numpy as np
-
     n_vertices = graph.shape[0]
     mu_sum = np.zeros(n_vertices, dtype=np.float32)
     ro = np.zeros(n_vertices, dtype=np.float32)
@@ -40,28 +41,26 @@ def calc_dens_map_params(graph, dists):
 
 
 def simplicial_set_embedding(
-    g,
-    embedding,
-    n_epochs,
-    a,
-    b,
-    random_seed,
-    gamma,
-    initial_alpha,
-    negative_sample_rate,
-    densmap_kwds,
-    parallel,
-    nthreads,
-    verbose,
-):
+    g: Any,
+    embedding: np.ndarray,
+    n_epochs: int,
+    a: float,
+    b: float,
+    random_seed: int,
+    gamma: float,
+    initial_alpha: float,
+    negative_sample_rate: float,
+    densmap_kwds: dict[str, Any],
+    parallel: bool,
+    nthreads: int,
+    verbose: bool,
+) -> np.ndarray:
     """Run UMAP simplicial-set embedding with optional densMAP."""
     import numba
     from threadpoolctl import threadpool_limits
     from umap.umap_ import make_epochs_per_sample
     from umap.layouts import optimize_layout_euclidean
     from sklearn.utils import check_random_state
-    import numpy as np
-    from .utils import tqdm_params
 
     # g.data[g.data < (g.data.max() / float(n_epochs))] = 0.0
     # g.eliminate_zeros()
@@ -89,7 +88,7 @@ def simplicial_set_embedding(
 
     # tqdm will be activated if https://github.com/lmcinnes/umap/pull/739
     # is merged and when it is released
-    tqdm_params = dict(tqdm_params)
+    tqdm_params = dict(default_tqdm_params)
     tqdm_params["desc"] = "Training UMAP"
 
     with threadpool_limits(limits=nthreads):
@@ -114,10 +113,10 @@ def simplicial_set_embedding(
             tqdm_kwds=tqdm_params,
             move_other=True,
         )
-    return embedding
+    return np.asarray(embedding)
 
 
-def fuzzy_simplicial_set(g, set_op_mix_ratio):
+def fuzzy_simplicial_set(g: Any, set_op_mix_ratio: float) -> Any:
     """Combine directed and undirected graph components for UMAP."""
     tg = g.transpose()
     prod = g.multiply(tg)
@@ -127,20 +126,20 @@ def fuzzy_simplicial_set(g, set_op_mix_ratio):
 
 
 def fit_transform(
-    graph,
-    ini_embed,
-    spread,
-    min_dist,
-    n_epochs,
-    random_seed,
-    repulsion_strength,
-    initial_alpha,
-    negative_sample_rate,
-    densmap_kwds,
-    parallel,
-    nthreads,
-    verbose,
-):
+    graph: Any,
+    ini_embed: np.ndarray,
+    spread: float,
+    min_dist: float,
+    n_epochs: int,
+    random_seed: int,
+    repulsion_strength: float,
+    initial_alpha: float,
+    negative_sample_rate: float,
+    densmap_kwds: dict[str, Any],
+    parallel: bool,
+    nthreads: int,
+    verbose: bool,
+) -> tuple[np.ndarray, float, float]:
     """Fit UMAP embedding from a fuzzy simplicial set graph.
 
     Args:
@@ -161,8 +160,9 @@ def fit_transform(
     Returns:
         Tuple of (embedding, a, b) UMAP parameters.
     """
-    from umap.umap_ import find_ab_params
     import warnings
+
+    from umap.umap_ import find_ab_params
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)

@@ -157,7 +157,10 @@ def umap(make_graph, datastore):
 
 @pytest.fixture(scope="session")
 def marker_search(datastore, paris_clustering):
-    if "markers" not in datastore.z["RNA"] or "I__RNA_cluster" not in datastore.z["RNA"]["markers"]:
+    if (
+        "markers" not in datastore.z["RNA"]
+        or "I__RNA_cluster" not in datastore.z["RNA"]["markers"]
+    ):
         datastore.run_marker_search(group_key="RNA_cluster")
 
 
@@ -241,9 +244,9 @@ def cell_cycle_scoring(datastore):
 
 @pytest.fixture(scope="session")
 def topacedo_sampler(paris_clustering, datastore):
-    try:
-        import topacedo
-    except ImportError:
+    import importlib.util
+
+    if importlib.util.find_spec("topacedo") is None:
         pytest.skip("topacedo package not installed")
     if not _cell_has(datastore, "RNA_sketched"):
         datastore.run_topacedo_sampler(cluster_key="RNA_cluster")

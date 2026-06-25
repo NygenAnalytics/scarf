@@ -1,5 +1,3 @@
-
-
 def test_export_knn_to_mtx(datastore, make_graph, tmp_path):
     from scarf.knn_utils import export_knn_to_mtx
 

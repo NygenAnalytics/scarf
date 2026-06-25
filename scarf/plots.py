@@ -1,12 +1,15 @@
 """Contains the code for plotting in Scarf."""
 
+from collections.abc import Iterator
+from typing import Any
 
-import matplotlib as mpl
-import matplotlib.pyplot as plt
+import matplotlib as mpl  # type: ignore[import-not-found]
+import matplotlib.pyplot as plt  # type: ignore[import-not-found]
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 import seaborn as sns
-from cmocean import cm
+from cmocean import cm  # type: ignore[import-not-found]
 
 from .utils import logger
 
@@ -186,7 +189,7 @@ custom_palettes = {
 }
 
 
-def clean_axis(ax, ts=11, ga=0.4):
+def clean_axis(ax: Any, ts: int = 11, ga: float = 0.4) -> bool:
     """Clean matplotlib axis spines and add a light grid.
 
     Args:
@@ -207,7 +210,7 @@ def clean_axis(ax, ts=11, ga=0.4):
     return True
 
 
-def plot_graph_qc(g):
+def plot_graph_qc(g: Any) -> None:
     """Plot KNN graph QC: node degree distribution and edge weight histogram.
 
     Args:
@@ -252,7 +255,7 @@ def plot_qc(
     max_points: int = 10000,
     show_on_single_row: bool = True,
     show_fig: bool = True,
-):
+) -> Any | None:
     """Plot per-metric QC violin plots grouped by ``groups`` column.
 
     Args:
@@ -273,8 +276,8 @@ def plot_qc(
     n_groups = data["groups"].nunique()
     if n_groups > 5 and show_on_single_row is True:
         logger.info(
-            f"Too many groups in the plot. If you think that plot is too wide then consider turning "
-            f"`show_on_single_row` parameter to False"
+            "Too many groups in the plot. If you think that plot is too wide then consider turning "
+            "`show_on_single_row` parameter to False"
         )
     if show_on_single_row is True:
         n_rows = 1
@@ -291,12 +294,12 @@ def plot_qc(
     for i in range(n_plots):
         if data.columns[i] == "groups":
             continue
-        vals = {"g": [], "v": []}
+        vals_raw: dict[str, list[Any]] = {"g": [], "v": []}
         for j in sorted(data["groups"].unique()):
             val = grouped.get_group(j)[data.columns[i]].values
-            vals["g"].extend([j for _ in range(len(val))])
-            vals["v"].extend(list(val))
-        vals = pd.DataFrame(vals)
+            vals_raw["g"].extend([j for _ in range(len(val))])
+            vals_raw["v"].extend(list(val))
+        vals = pd.DataFrame(vals_raw)
         ax = fig.add_subplot(n_rows, n_cols, i + 1)
         if n_groups == 1:
             sns.violinplot(
@@ -362,8 +365,8 @@ def plot_qc(
     plt.tight_layout()
     if show_fig:
         plt.show()
-    else:
-        return fig
+        return None
+    return fig
 
 
 def plot_mean_var(
@@ -375,7 +378,7 @@ def plot_mean_var(
     fig_size: tuple[float, float] = (4.5, 4.0),
     ss: tuple[float, float] = (3, 30),
     cmaps: tuple[str, str] = ("winter", "magma_r"),
-):
+) -> None:
     """Show a mean-variance scatter plot with HVGs highlighted.
 
     Args:
@@ -409,14 +412,17 @@ def plot_mean_var(
     plt.show()
 
 
-def plot_elbow(var_exp, figsize: tuple[float, float] = (None, 2)):
+def plot_elbow(
+    var_exp: npt.NDArray[Any] | list[float],
+    figsize: tuple[float | None, float] = (None, 2),
+) -> None:
     """Plot PCA variance explained with an automatic elbow marker.
 
     Args:
         var_exp: Percent variance explained per component.
         figsize: Figure size; width auto-scales with component count if None.
     """
-    from kneed import KneeLocator
+    from kneed import KneeLocator  # type: ignore[import-not-found]
 
     x = range(len(var_exp))
     kneedle = KneeLocator(x, var_exp, S=1.0, curve="convex", direction="decreasing")
@@ -435,17 +441,17 @@ def plot_elbow(var_exp, figsize: tuple[float, float] = (None, 2)):
 
 
 def plot_heatmap(
-    cdf,
+    cdf: pd.DataFrame,
     fontsize: float = 10,
     width_factor: float = 0.03,
     height_factor: float = 0.02,
-    cmap=cm.matter_r,
-    savename: str = None,
+    cmap: Any = cm.matter_r,
+    savename: str | None = None,
     save_dpi: int = 300,
-    figsize=None,
+    figsize: tuple[float, float] | None = None,
     show_fig: bool = True,
-    **heatmap_kwargs,
-):
+    **heatmap_kwargs: Any,
+) -> Any:
     """Show a clustered heatmap of the input DataFrame.
 
     Args:
@@ -487,8 +493,8 @@ def plot_heatmap(
         plt.savefig(savename, dpi=save_dpi)
     if show_fig:
         plt.show()
-    else:
-        return cgx
+        return None
+    return cgx
 
 
 def _scatter_fix_type(v: pd.Series, ints_as_cats: bool) -> pd.Series:
@@ -512,7 +518,9 @@ def _scatter_fix_type(v: pd.Series, ints_as_cats: bool) -> pd.Series:
         return v.astype(np.float64)
 
 
-def _scatter_fix_mask(v: pd.Series, mask_vals: list, mask_name: str) -> pd.Series:
+def _scatter_fix_mask(
+    v: pd.Series, mask_vals: list[Any] | None, mask_name: str
+) -> pd.Series:
     if mask_vals is None:
         mask_vals = []
     mask_vals += [np.nan]
@@ -529,9 +537,13 @@ def _scatter_fix_mask(v: pd.Series, mask_vals: list, mask_name: str) -> pd.Serie
 
 
 def _scatter_make_colors(
-    v: pd.Series, cmap, color_key: dict | None, mask_color: str, mask_name: str
-):
-    from matplotlib.pyplot import get_cmap
+    v: pd.Series,
+    cmap: Any,
+    color_key: dict[Any, Any] | None,
+    mask_color: str,
+    mask_name: str,
+) -> tuple[Any | None, dict[Any, Any] | None]:
+    from matplotlib.pyplot import get_cmap  # type: ignore[import-not-found]
 
     na_idx = v == mask_name
     uv = v[~na_idx].unique()
@@ -573,7 +585,9 @@ def _scatter_make_colors(
         return None, color_key
 
 
-def _scatter_cleanup(ax, sw: float, sc: str, ds: tuple) -> None:
+def _scatter_cleanup(
+    ax: Any, sw: float, sc: str, ds: tuple[str, ...]
+) -> None:
     for i in ["bottom", "left", "top", "right"]:
         spine = ax.spines[i]
         if i in ds:
@@ -588,7 +602,9 @@ def _scatter_cleanup(ax, sw: float, sc: str, ds: tuple) -> None:
     return None
 
 
-def _scatter_label_axis(df, ax, fs: float, fo: float):
+def _scatter_label_axis(
+    df: pd.DataFrame, ax: Any, fs: float, fo: float
+) -> None:
     x, y = df.columns[:2]
     ax.set_xlabel(x, fontsize=fs)
     ax.set_ylabel(y, fontsize=fs)
@@ -602,14 +618,14 @@ def _scatter_label_axis(df, ax, fs: float, fo: float):
 
 
 def _scatter_legends(
-    df,
-    ax,
-    cmap,
-    ck,
+    df: pd.DataFrame,
+    ax: Any,
+    cmap: Any,
+    ck: dict[Any, Any] | None,
     ondata: bool,
     onside: bool,
     fontsize: float,
-    title: str,
+    title: str | None,
     title_fontsize: float,
     hide_title: bool,
     n_per_col: int,
@@ -639,8 +655,8 @@ def _scatter_legends(
     Returns:
 
     """
-    from matplotlib.colors import Normalize
-    from matplotlib.colorbar import ColorbarBase, make_axes_gridspec
+    from matplotlib.colors import Normalize  # type: ignore[import-not-found]
+    from matplotlib.colorbar import ColorbarBase, make_axes_gridspec  # type: ignore[import-not-found]
 
     x, y, vc = df.columns[:3]
     v = df[vc]
@@ -667,6 +683,7 @@ def _scatter_legends(
                     va="center",
                 )
             if onside:
+                assert ck is not None
                 ax.scatter(
                     [float(centers[i][x])],
                     [float(centers[i][y])],
@@ -703,7 +720,14 @@ def _scatter_legends(
     return None
 
 
-def _make_grid(width, height, w_pad, h_pad, n_panels, n_columns):
+def _make_grid(
+    width: float,
+    height: float,
+    w_pad: float | None,
+    h_pad: float | None,
+    n_panels: int,
+    n_columns: int,
+) -> tuple[Any, npt.NDArray[Any]]:
     n_columns = np.minimum(n_panels, n_columns)
     n_rows = np.ceil(n_panels / n_columns).astype(int)
     if w_pad is None and h_pad is None:
@@ -727,12 +751,20 @@ def _make_grid(width, height, w_pad, h_pad, n_panels, n_columns):
     return fig, axes
 
 
-def _create_axes(dfs, in_ax, width, height, w_pad, h_pad, n_columns):
+def _create_axes(
+    dfs: list[pd.DataFrame],
+    in_ax: npt.NDArray[Any] | Any | None,
+    width: float,
+    height: float,
+    w_pad: float | None,
+    h_pad: float | None,
+    n_columns: int,
+) -> npt.NDArray[Any]:
     if len(dfs) > 1:
         if in_ax is not None:
             logger.warning(
-                f"'in_ax' will not be used as multiple attributes will be plotted. Using internal grid"
-                f"layout"
+                "'in_ax' will not be used as multiple attributes will be plotted. Using internal grid"
+                "layout"
             )
         _, axs = _make_grid(width, height, w_pad, h_pad, len(dfs), n_columns)
     else:
@@ -743,7 +775,12 @@ def _create_axes(dfs, in_ax, width, height, w_pad, h_pad, n_columns):
     return axs
 
 
-def _iter_dataframes(dfs, mask_values, mask_name, force_ints_as_cats):
+def _iter_dataframes(
+    dfs: list[pd.DataFrame],
+    mask_values: list[Any] | None,
+    mask_name: str,
+    force_ints_as_cats: bool,
+) -> Iterator[tuple[int, pd.DataFrame]]:
     for n, df in enumerate(dfs):
         vc = df.columns[2]
         v = _scatter_fix_mask(df[vc].copy(), mask_values, mask_name)
@@ -751,29 +788,31 @@ def _iter_dataframes(dfs, mask_values, mask_name, force_ints_as_cats):
         yield n, df
 
 
-def _handle_titles_type(titles, n_df):
+def _handle_titles_type(
+    titles: str | list[str] | None, n_df: int
+) -> list[str] | None:
     if titles is not None:
         if n_df > 1:
-            if len(titles) != n_df or type(titles) != list:
+            if len(titles) != n_df or not isinstance(titles, list):
                 logger.warning(
                     "Number of titles is not same as the the number of titles. Provided titles cannot be used"
                 )
                 titles = None
         else:
-            if type(titles) == str:
+            if isinstance(titles, str):
                 titles = [titles]
     return titles
 
 
 def plot_scatter(
-    dfs,
-    in_ax=None,
+    dfs: list[pd.DataFrame],
+    in_ax: npt.NDArray[Any] | Any | None = None,
     width: float = 6,
     height: float = 6,
     default_color: str = "steelblue",
-    color_map=None,
-    color_key: dict = None,
-    mask_values: list = None,
+    color_map: Any | None = None,
+    color_key: dict[Any, Any] | None = None,
+    mask_values: list[Any] | None = None,
     mask_name: str = "NA",
     mask_color: str = "k",
     point_size: float = 10,
@@ -781,27 +820,27 @@ def plot_scatter(
     frame_offset: float = 0.05,
     spine_width: float = 0.5,
     spine_color: str = "k",
-    displayed_sides: tuple = ("bottom", "left"),
+    displayed_sides: tuple[str, ...] = ("bottom", "left"),
     legend_ondata: bool = True,
     legend_onside: bool = True,
     legend_size: float = 12,
     legends_per_col: int = 20,
-    titles: str = None,
+    titles: str | list[str] | None = None,
     title_size: int = 12,
     hide_title: bool = False,
     cbar_shrink: float = 0.6,
     marker_scale: float = 70,
     lspacing: float = 0.1,
     cspacing: float = 1,
-    savename: str = None,
+    savename: str | None = None,
     dpi: int = 300,
     force_ints_as_cats: bool = True,
     n_columns: int = 4,
     w_pad: float = 1,
     h_pad: float = 1,
     show_fig: bool = True,
-    scatter_kwargs: dict = None,
-):
+    scatter_kwargs: dict[str, Any] | None = None,
+) -> npt.NDArray[Any] | None:
     """Show one or more 2D scatter plots from annotation DataFrames.
 
     Each DataFrame must contain x, y, and value columns. When multiple
@@ -844,9 +883,9 @@ def plot_scatter(
         show_fig: Show interactively when True.
         scatter_kwargs: Extra kwargs passed to ``ax.scatter`` (not ``c`` or ``s``).
     """
-    from matplotlib.colors import to_hex
+    from matplotlib.colors import to_hex  # type: ignore[import-not-found]
 
-    def _handle_scatter_kwargs(sk):
+    def _handle_scatter_kwargs(sk: dict[str, Any] | None) -> dict[str, Any]:
         if sk is None:
             sk = {}
         if "c" in sk:
@@ -870,6 +909,7 @@ def plot_scatter(
             v, color_map, color_key, mask_color, mask_name
         )
         if v.dtype.name == "category":
+            assert col_key is not None
             df["c"] = [col_key[x] for x in v]
         else:
             if v.nunique() == 1:
@@ -877,6 +917,7 @@ def plot_scatter(
             else:
                 v = v.copy().fillna(0)
                 mmv = (v - v.min()) / (v.max() - v.min())
+                assert col_map is not None
                 df["c"] = [to_hex(col_map(x)) for x in mmv]
         if "s" not in df:
             df["s"] = [point_size for _ in df.index]
@@ -918,47 +959,47 @@ def plot_scatter(
         plt.savefig(savename, dpi=dpi, bbox_inches="tight")
     if show_fig:
         plt.show()
-    else:
-        return axs
+        return None
+    return axs
 
 
 def shade_scatter(
-    dfs,
-    in_ax=None,
+    dfs: list[pd.DataFrame],
+    in_ax: npt.NDArray[Any] | Any | None = None,
     figsize: float = 6,
     pixels: int = 1000,
     spread_px: int = 1,
     spread_threshold: float = 0.2,
     min_alpha: int = 10,
-    color_map=None,
-    color_key: dict = None,
-    mask_values: list = None,
+    color_map: Any | None = None,
+    color_key: dict[Any, Any] | None = None,
+    mask_values: list[Any] | None = None,
     mask_name: str = "NA",
     mask_color: str = "k",
     ax_label_size: float = 12,
     frame_offset: float = 0.05,
     spine_width: float = 0.5,
     spine_color: str = "k",
-    displayed_sides: tuple = ("bottom", "left"),
+    displayed_sides: tuple[str, ...] = ("bottom", "left"),
     legend_ondata: bool = True,
     legend_onside: bool = True,
     legend_size: float = 12,
     legends_per_col: int = 20,
-    titles: str | list[str] = None,
+    titles: str | list[str] | None = None,
     title_size: int = 12,
     hide_title: bool = False,
     cbar_shrink: float = 0.6,
     marker_scale: float = 70,
     lspacing: float = 0.1,
     cspacing: float = 1,
-    savename: str = None,
+    savename: str | None = None,
     dpi: int = 300,
     force_ints_as_cats: bool = True,
     n_columns: int = 4,
-    w_pad: float = None,
-    h_pad: float = None,
+    w_pad: float | None = None,
+    h_pad: float | None = None,
     show_fig: bool = True,
-):
+) -> npt.NDArray[Any] | None:
     """Show datashader-density scatter plots for large cell embeddings.
 
     Args:
@@ -998,9 +1039,9 @@ def shade_scatter(
         h_pad: Height padding between subplots.
         show_fig: Show interactively when True.
     """
-    import datashader as dsh
-    from datashader.mpl_ext import dsshow
-    import datashader.transfer_functions as tf
+    import datashader as dsh  # type: ignore[import-not-found]
+    from datashader.mpl_ext import dsshow  # type: ignore[import-not-found]
+    import datashader.transfer_functions as tf  # type: ignore[import-not-found]
     from functools import partial
 
     titles = _handle_titles_type(titles, len(dfs))
@@ -1020,7 +1061,7 @@ def shade_scatter(
                 agg = dsh.mean(vc)
 
         ax = axs[int(n / n_columns), n % n_columns]
-        artist = dsshow(
+        dsshow(
             df,
             dsh.Point(dim1, dim2),
             aggregator=agg,
@@ -1067,11 +1108,18 @@ def shade_scatter(
         plt.savefig(savename, dpi=dpi, bbox_inches="tight")
     if show_fig:
         plt.show()
-    else:
-        return axs
+        return None
+    return axs
 
 
-def _draw_pie(ax, dist, colors, xpos, ypos, size):
+def _draw_pie(
+    ax: Any,
+    dist: npt.NDArray[Any],
+    colors: list[Any],
+    xpos: float,
+    ypos: float,
+    size: float,
+) -> None:
     # https://stackoverflow.com/questions/56337732/how-to-plot-scatter-pie-chart-using-matplotlib
     cumsum = np.cumsum(dist)
     cumsum = cumsum / cumsum[-1]
@@ -1085,8 +1133,13 @@ def _draw_pie(ax, dist, colors, xpos, ypos, size):
 
 
 def hierarchy_pos(
-    g, root=None, width=1.0, vert_gap=0.2, vert_loc=0, leaf_vs_root_factor=0.5
-):
+    g: Any,
+    root: Any | None = None,
+    width: float = 1.0,
+    vert_gap: float = 0.2,
+    vert_loc: float = 0,
+    leaf_vs_root_factor: float = 0.5,
+) -> dict[Any, tuple[float, float]]:
     """This function was lifted from here: https://github.com/springer-
     math/Mathematics-of-Epidemics-on-
     Networks/blob/80c8accbe0c6b7710c0a189df17529696ac31bf9/EoN/auxiliary.py.
@@ -1143,18 +1196,18 @@ def hierarchy_pos(
             root = np.random.choice(list(g.nodes))
 
     def _hierarchy_pos(
-        g,
-        root,
-        leftmost,
-        width,
-        leafdx=0.2,
-        vert_gap=0.2,
-        vert_loc=0,
-        xcenter=0.5,
-        rootpos=None,
-        leafpos=None,
-        parent=None,
-    ):
+        g: Any,
+        root: Any,
+        leftmost: float,
+        width: float,
+        leafdx: float = 0.2,
+        vert_gap: float = 0.2,
+        vert_loc: float = 0,
+        xcenter: float = 0.5,
+        rootpos: dict[Any, tuple[float, float]] | None = None,
+        leafpos: dict[Any, tuple[float, float]] | None = None,
+        parent: Any | None = None,
+    ) -> tuple[dict[Any, tuple[float, float]], dict[Any, tuple[float, float]], int]:
         """
         see hierarchy_pos docstring for most arguments
         pos: a dict saying where all nodes go if they have been assigned
@@ -1238,9 +1291,9 @@ def hierarchy_pos(
 
 
 def plot_cluster_hierarchy(
-    sg,
-    clusts,
-    color_values=None,
+    sg: Any,
+    clusts: Any,
+    color_values: Any | None = None,
     force_ints_as_cats: bool = True,
     width: float = 2,
     lvr_factor: float = 0.5,
@@ -1251,20 +1304,20 @@ def plot_cluster_hierarchy(
     root_size: float = 100,
     non_leaf_size: float = 10,
     show_labels: bool = False,
-    fontsize=10,
+    fontsize: float = 10,
     root_color: str = "#C0C0C0",
     non_leaf_color: str = "k",
-    cmap: str = None,
-    color_key: bool = None,
+    cmap: str | None = None,
+    color_key: dict[Any, Any] | None = None,
     edgecolors: str = "k",
     edgewidth: float = 1,
     alpha: float = 0.7,
-    figsize=(5, 5),
-    ax=None,
+    figsize: tuple[float, float] = (5, 5),
+    ax: Any | None = None,
     show_fig: bool = True,
-    savename: str = None,
-    save_dpi=300,
-):
+    savename: str | None = None,
+    save_dpi: int = 300,
+) -> Any | None:
     """Plot a cluster hierarchy tree with colored leaf nodes.
 
     Args:
@@ -1300,7 +1353,7 @@ def plot_cluster_hierarchy(
     """
     import networkx as nx
     import math
-    from matplotlib.colors import to_hex
+    from matplotlib.colors import to_hex  # type: ignore[import-not-found]
 
     if color_values is None:
         color_values = pd.Series(clusts)
@@ -1309,7 +1362,7 @@ def plot_cluster_hierarchy(
         color_values = pd.Series(color_values)
         using_clust_for_colors = False
     color_values = _scatter_fix_type(color_values, force_ints_as_cats)
-    cmap, color_key = _scatter_make_colors(
+    colormap, color_key = _scatter_make_colors(
         color_values, cmap, color_key, "k", "longdummyvaluesofh3489hfpiqehdcbla"
     )
     pos = hierarchy_pos(
@@ -1328,9 +1381,12 @@ def plot_cluster_hierarchy(
         mmv: pd.Series = (cluster_values - cluster_values.min()) / (
             cluster_values.max() - cluster_values.min()
         )
-        color_key = {k: to_hex(cmap(v)) for k, v in mmv.to_dict().items()}
+        assert colormap is not None
+        color_key = {k: to_hex(colormap(v)) for k, v in mmv.to_dict().items()}
     else:
         cluster_values = None
+
+    assert color_key is not None
 
     cs = pd.Series(clusts).value_counts()
     cs = (node_size_multiplier * ((cs / cs.sum()) ** node_power)).to_dict()
@@ -1396,30 +1452,30 @@ def plot_cluster_hierarchy(
         plt.savefig(savename, dpi=save_dpi)
     if show_fig:
         plt.show()
-    else:
-        return ax
+        return None
+    return ax
 
 
 def plot_annotated_heatmap(
-    df: np.array,
-    xbar_values: np.ndarray,
-    ybar_values: np.ndarray,
-    display_row_labels: list = None,
-    row_labels: list = None,
+    df: npt.NDArray[Any],
+    xbar_values: npt.NDArray[Any],
+    ybar_values: npt.NDArray[Any],
+    display_row_labels: list[str] | None = None,
+    row_labels: list[str] | None = None,
     width: int = 5,
     height: int = 10,
     vmin: float = -2.0,
     vmax: float = 2.0,
-    heatmap_cmap: str = None,
-    xbar_cmap: str = None,
-    ybar_cmap: str = None,
+    heatmap_cmap: str | None = None,
+    xbar_cmap: Any | None = None,
+    ybar_cmap: str | None = None,
     tick_fontsize: int = 10,
     axis_fontsize: int = 12,
     row_label_fontsize: int = 12,
-    savename: str = None,
+    savename: str | None = None,
     save_dpi: int = 300,
     show_fig: bool = True,
-):
+) -> None:
     """Plot a heatmap with pseudotime and cluster annotation bars.
 
     Args:
@@ -1442,7 +1498,7 @@ def plot_annotated_heatmap(
         save_dpi: Save DPI.
         show_fig: Show interactively when True.
     """
-    import matplotlib.ticker as mticker
+    import matplotlib.ticker as mticker  # type: ignore[import-not-found]
 
     if display_row_labels is None:
         display_row_labels = []
@@ -1476,9 +1532,13 @@ def plot_annotated_heatmap(
     )
 
     if len(display_row_labels) > 0:
-        row_labels = {x.lower(): n for n, x in enumerate(row_labels)}
-        display_row_labels = [x for x in display_row_labels if x.lower() in row_labels]
-        heatmap_ax.set_yticks([row_labels[x.lower()] for x in display_row_labels])
+        row_label_index = {x.lower(): n for n, x in enumerate(row_labels)}
+        display_row_labels = [
+            x for x in display_row_labels if x.lower() in row_label_index
+        ]
+        heatmap_ax.set_yticks(
+            [row_label_index[x.lower()] for x in display_row_labels]
+        )
         heatmap_ax.set_yticklabels(display_row_labels, fontsize=row_label_fontsize)
 
     heatmap_ax.set_title(f"{df.shape[0]} features", fontsize=axis_fontsize)

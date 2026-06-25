@@ -17,18 +17,31 @@ partial results, which keeps peak memory bounded and independent of the task
 graph topology.
 """
 
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Literal, cast
 
 import numpy as np
+import zarr
+from numpy.typing import NDArray
 
 __all__ = ["ChunkedArray", "Block"]
+
+type OpKind = Literal["unary", "binary", "matmul"]
+type BType = Literal["scalar", "col", "row", "full"]
+type Backing = np.ndarray | zarr.Array
+type ReductionOp = Literal["sum", "mean", "var", "std", "count_nonzero", "argmax"]
+type UfuncSide = Literal["left", "right"]
+type BlockFn = Callable[[int, int, int], NDArray[Any]]
 
 
 def _is_contiguous(idx: np.ndarray) -> bool:
     """True if idx is a strictly increasing run of consecutive integers."""
     if idx.size == 0:
         return True
-    return bool(idx[0] >= 0 and np.array_equal(idx, np.arange(idx[0], idx[0] + idx.size)))
+    return bool(
+        idx[0] >= 0 and np.array_equal(idx, np.arange(idx[0], idx[0] + idx.size))
+    )
 
 
 class _Op:
@@ -42,45 +55,74 @@ class _Op:
 
     __slots__ = ("kind", "func", "operand", "side", "btype")
 
-    def __init__(self, kind, func=None, operand=None, side="left", btype=None):
+    def __init__(
+        self,
+        kind: OpKind,
+        func: Callable[..., NDArray[Any]] | None = None,
+        operand: object | None = None,
+        side: UfuncSide = "left",
+        btype: BType | None = None,
+    ) -> None:
         self.kind = kind  # 'unary' | 'binary' | 'matmul'
         self.func = func
         self.operand = operand
         self.side = side
         self.btype = btype  # for 'binary': 'scalar' | 'col' | 'row' | 'full'
 
-    def apply(self, a, start, end):
+    def apply(self, a: NDArray[Any], start: int, end: int) -> NDArray[Any]:
         if self.kind == "unary":
-            return self.func(a)
+            assert self.func is not None
+            return np.asarray(self.func(a))
         if self.kind == "matmul":
-            return a @ self.operand
+            return np.asarray(a @ self.operand)
+        assert self.func is not None
         o = self.operand
         if self.btype == "col":
             o = np.asarray(o)[start:end]
-            if o.ndim == 1:
-                o = o.reshape(-1, 1)
+            if np.asarray(o).ndim == 1:
+                o = np.asarray(o).reshape(-1, 1)
         elif self.btype == "full":
             o = np.asarray(o)[start:end]
-        return self.func(a, o) if self.side == "left" else self.func(o, a)
+        return (
+            np.asarray(self.func(a, o))
+            if self.side == "left"
+            else np.asarray(self.func(o, a))
+        )
 
     def subset_cols(self, col_idx: np.ndarray) -> "_Op":
         if self.kind == "matmul":
             raise NotImplementedError("Column-indexing after .dot is not supported")
         if self.kind == "binary" and self.btype == "row":
-            return _Op("binary", self.func, np.asarray(self.operand)[col_idx], self.side, "row")
+            return _Op(
+                "binary", self.func, np.asarray(self.operand)[col_idx], self.side, "row"
+            )
         if self.kind == "binary" and self.btype == "full":
-            return _Op("binary", self.func, np.asarray(self.operand)[:, col_idx], self.side, "full")
+            return _Op(
+                "binary",
+                self.func,
+                np.asarray(self.operand)[:, col_idx],
+                self.side,
+                "full",
+            )
         return self
 
     def subset_rows(self, row_idx: np.ndarray) -> "_Op":
         if self.kind == "binary" and self.btype == "col":
-            return _Op("binary", self.func, np.asarray(self.operand)[row_idx], self.side, "col")
+            return _Op(
+                "binary", self.func, np.asarray(self.operand)[row_idx], self.side, "col"
+            )
         if self.kind == "binary" and self.btype == "full":
-            return _Op("binary", self.func, np.asarray(self.operand)[row_idx], self.side, "full")
+            return _Op(
+                "binary",
+                self.func,
+                np.asarray(self.operand)[row_idx],
+                self.side,
+                "full",
+            )
         return self
 
 
-def _unary_op(func) -> _Op:
+def _unary_op(func: Callable[..., NDArray[Any]]) -> _Op:
     return _Op("unary", func=func)
 
 
@@ -88,7 +130,9 @@ def _matmul_op(b: np.ndarray) -> _Op:
     return _Op("matmul", operand=b)
 
 
-def _classify_operand(other, n_rows: int, n_cols: int) -> tuple[str, object]:
+def _classify_operand(
+    other: object, n_rows: int, n_cols: int
+) -> tuple[BType, object]:
     """Classify a binary operand for per-block broadcasting.
 
     Returns one of 'scalar', 'col' (per-row vector), 'row' (per-feature
@@ -100,9 +144,13 @@ def _classify_operand(other, n_rows: int, n_cols: int) -> tuple[str, object]:
     if arr.ndim == 0:
         return "scalar", arr
     shape = arr.shape
-    if (arr.ndim == 1 and shape[0] == n_rows) or (arr.ndim == 2 and shape == (n_rows, 1)):
+    if (arr.ndim == 1 and shape[0] == n_rows) or (
+        arr.ndim == 2 and shape == (n_rows, 1)
+    ):
         return "col", arr
-    if (arr.ndim == 1 and shape[0] == n_cols) or (arr.ndim == 2 and shape == (1, n_cols)):
+    if (arr.ndim == 1 and shape[0] == n_cols) or (
+        arr.ndim == 2 and shape == (1, n_cols)
+    ):
         return "row", arr
     if arr.ndim == 2 and shape[0] == n_rows:
         return "full", arr
@@ -111,8 +159,8 @@ def _classify_operand(other, n_rows: int, n_cols: int) -> tuple[str, object]:
     return "row", arr
 
 
-def _binary_op(func, other, side: str, kind: str) -> _Op:
-    return _Op("binary", func=func, operand=other, side=side, btype=kind)
+def _binary_op(func: Callable[..., NDArray[Any]], other: object, side: str, kind: BType) -> _Op:
+    return _Op("binary", func=func, operand=other, side=cast(UfuncSide, side), btype=kind)
 
 
 class Block:
@@ -120,7 +168,13 @@ class Block:
 
     __slots__ = ("_parent", "_start", "_end", "_row_perm")
 
-    def __init__(self, parent: "ChunkedArray", start: int, end: int, row_perm=None):
+    def __init__(
+        self,
+        parent: "ChunkedArray",
+        start: int,
+        end: int,
+        row_perm: np.ndarray | None = None,
+    ) -> None:
         self._parent = parent
         self._start = start
         self._end = end
@@ -132,20 +186,22 @@ class Block:
         return (n, self._parent.out_cols)
 
     @property
-    def dtype(self):
+    def dtype(self) -> np.dtype[Any]:
         return self._parent.dtype
 
-    def compute(self, nthreads: int | None = None, msg: str | None = None) -> np.ndarray:
+    def compute(
+        self, nthreads: int | None = None, msg: str | None = None
+    ) -> np.ndarray:
         a = self._parent._materialize_range(self._start, self._end)
         if self._row_perm is not None:
             a = a[self._row_perm]
         return a
 
-    def __array__(self, dtype=None):
+    def __array__(self, dtype: np.dtype[Any] | None = None) -> np.ndarray:
         a = self.compute()
         return a.astype(dtype) if dtype is not None else a
 
-    def __getitem__(self, key):
+    def __getitem__(self, key: object) -> "Block":
         # Supports block[row_index, :] used during merge row permutation.
         if isinstance(key, tuple):
             row_key = key[0]
@@ -164,13 +220,15 @@ class _Reduction:
 
     __slots__ = ("_parent", "_op", "_axis", "_cached")
 
-    def __init__(self, parent: "ChunkedArray", op: str, axis: int | None):
+    def __init__(self, parent: "ChunkedArray", op: ReductionOp, axis: int | None) -> None:
         self._parent = parent
         self._op = op
         self._axis = axis
         self._cached: np.ndarray | None = None
 
-    def compute(self, nthreads: int | None = None, msg: str | None = None) -> np.ndarray:
+    def compute(
+        self, nthreads: int | None = None, msg: str | None = None
+    ) -> np.ndarray:
         if self._cached is None:
             self._cached = self._parent._reduce(self._op, self._axis, nthreads, msg)
         return self._cached
@@ -179,69 +237,78 @@ class _Reduction:
     def _arr(self) -> np.ndarray:
         return self.compute()
 
-    def __array__(self, dtype=None):
+    def __array__(self, dtype: np.dtype[Any] | None = None) -> np.ndarray:
         a = self._arr
         return a.astype(dtype) if dtype is not None else a
 
-    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+    def __array_ufunc__(
+        self, ufunc: Any, method: str, *inputs: Any, **kwargs: Any
+    ) -> Any:
         if method != "__call__":
             return NotImplemented
-        inputs = [i._arr if isinstance(i, _Reduction) else i for i in inputs]
-        return ufunc(*inputs, **kwargs)
+        resolved = tuple(
+            i._arr if isinstance(i, _Reduction) else i for i in inputs
+        )
+        return ufunc(*resolved, **kwargs)
 
-    def __getattr__(self, item):
+    def __getattr__(self, item: str) -> Any:
         return getattr(self._arr, item)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._arr)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Any]:
         return iter(self._arr)
 
-    def __getitem__(self, key):
-        return self._arr[key]
+    def __getitem__(self, key: object) -> Any:
+        return self._arr[cast(Any, key)]
 
-    def _bin(self, other, func, side):
-        o = other._arr if isinstance(other, _Reduction) else other
-        return func(self._arr, o) if side == "left" else func(o, self._arr)
+    def _bin(
+        self,
+        other: object,
+        func: Callable[[NDArray[Any], NDArray[Any]], NDArray[Any]],
+        side: UfuncSide,
+    ) -> NDArray[Any]:
+        o_arr = other._arr if isinstance(other, _Reduction) else np.asarray(other)
+        return func(self._arr, o_arr) if side == "left" else func(o_arr, self._arr)
 
-    def __mul__(self, o):
+    def __mul__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.multiply, "left")
 
-    def __rmul__(self, o):
+    def __rmul__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.multiply, "right")
 
-    def __truediv__(self, o):
+    def __truediv__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.true_divide, "left")
 
-    def __rtruediv__(self, o):
+    def __rtruediv__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.true_divide, "right")
 
-    def __add__(self, o):
+    def __add__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.add, "left")
 
-    def __radd__(self, o):
+    def __radd__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.add, "right")
 
-    def __sub__(self, o):
+    def __sub__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.subtract, "left")
 
-    def __rsub__(self, o):
+    def __rsub__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.subtract, "right")
 
-    def __gt__(self, o):
+    def __gt__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.greater, "left")
 
-    def __lt__(self, o):
+    def __lt__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.less, "left")
 
-    def __ge__(self, o):
+    def __ge__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.greater_equal, "left")
 
-    def __le__(self, o):
+    def __le__(self, o: object) -> NDArray[Any]:
         return self._bin(o, np.less_equal, "left")
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<deferred {self._op}(axis={self._axis})>"
 
 
@@ -252,7 +319,7 @@ class ChunkedArray:
 
     def __init__(
         self,
-        backing,
+        backing: Backing,
         rows: np.ndarray | None = None,
         cols: np.ndarray | None = None,
         ops: list[_Op] | None = None,
@@ -260,7 +327,7 @@ class ChunkedArray:
         block_size: int | None = None,
         nthreads: int = 1,
         is_numpy: bool | None = None,
-    ):
+    ) -> None:
         self._backing = backing
         self._rows = None if rows is None else np.asarray(rows)
         self._cols = None if cols is None else np.asarray(cols)
@@ -279,11 +346,13 @@ class ChunkedArray:
             else:
                 from .storage.zarr_store import streaming_block_size
 
-                block_size = streaming_block_size(self._backing)
+                block_size = streaming_block_size(cast(zarr.Array, self._backing))
         self._block_size = max(int(block_size), 1)
 
     @classmethod
-    def from_numpy(cls, arr: np.ndarray, block_size: int | None = None, nthreads: int = 1) -> "ChunkedArray":
+    def from_numpy(
+        cls, arr: np.ndarray, block_size: int | None = None, nthreads: int = 1
+    ) -> "ChunkedArray":
         arr = np.asarray(arr)
         return cls(arr, block_size=block_size, nthreads=nthreads, is_numpy=True)
 
@@ -296,14 +365,17 @@ class ChunkedArray:
         return self._out_cols
 
     @property
-    def dtype(self):
+    def dtype(self) -> np.dtype[Any]:
         if not self._ops:
             return self._backing.dtype
         return np.dtype(np.float64)
 
     @property
     def chunksize(self) -> tuple[int, int]:
-        return (min(self._block_size, self._n_rows) if self._n_rows else self._block_size, self._out_cols)
+        return (
+            min(self._block_size, self._n_rows) if self._n_rows else self._block_size,
+            self._out_cols,
+        )
 
     @property
     def numblocks(self) -> tuple[int, int]:
@@ -341,23 +413,35 @@ class ChunkedArray:
             row_sel = self._rows[start:end]
             rows_contiguous = _is_contiguous(row_sel)
         if self._is_numpy:
+            numpy_backing = cast(np.ndarray, self._backing)
             if self._cols is None:
-                return np.asarray(self._backing[row_sel])
-            return np.asarray(self._backing[row_sel][:, self._cols])
+                return np.asarray(numpy_backing[row_sel])
+            return np.asarray(numpy_backing[row_sel][:, self._cols])
         # Zarr backing
+        zarr_backing = cast(zarr.Array, self._backing)
         if self._cols is None:
             if isinstance(row_sel, slice):
-                return self._backing[row_sel, :]
+                return np.asarray(zarr_backing[row_sel, :])
             if rows_contiguous:
-                return self._backing[int(row_sel[0]):int(row_sel[-1]) + 1, :]
-            return self._backing.get_orthogonal_selection((row_sel, slice(None)))
-        if isinstance(row_sel, slice):
-            return self._backing.get_orthogonal_selection((row_sel, self._cols))
-        if rows_contiguous:
-            return self._backing.get_orthogonal_selection(
-                (slice(int(row_sel[0]), int(row_sel[-1]) + 1), self._cols)
+                return np.asarray(
+                    zarr_backing[int(row_sel[0]) : int(row_sel[-1]) + 1, :]
+                )
+            return np.asarray(
+                zarr_backing.get_orthogonal_selection((row_sel, slice(None)))
             )
-        return self._backing.get_orthogonal_selection((row_sel, self._cols))
+        if isinstance(row_sel, slice):
+            return np.asarray(
+                zarr_backing.get_orthogonal_selection((row_sel, self._cols))
+            )
+        if rows_contiguous:
+            return np.asarray(
+                zarr_backing.get_orthogonal_selection(
+                    (slice(int(row_sel[0]), int(row_sel[-1]) + 1), self._cols)
+                )
+            )
+        return np.asarray(
+            zarr_backing.get_orthogonal_selection((row_sel, self._cols))
+        )
 
     def _materialize_range(self, start: int, end: int) -> np.ndarray:
         a = self._read(start, end)
@@ -366,17 +450,25 @@ class ChunkedArray:
         return a
 
     # -- block parallelism ----------------------------------------------
-    def _map_blocks(self, fn, nthreads: int | None, msg: str | None) -> list:
+    def _map_blocks(
+        self,
+        fn: BlockFn,
+        nthreads: int | None,
+        msg: str | None,
+    ) -> list[NDArray[Any]]:
         from .utils import tqdmbar
 
         ranges = self._ranges()
         nthreads = self._nthreads if nthreads is None else nthreads
         bar = tqdmbar(total=len(ranges), desc=msg) if msg is not None else None
-        results: list = [None] * len(ranges)
+        results: list[NDArray[Any] | None] = [None] * len(ranges)
         if nthreads is not None and nthreads > 1 and len(ranges) > 1:
             with ThreadPoolExecutor(max_workers=nthreads) as ex:
-                futures = {ex.submit(fn, i, r[0], r[1]): i for i, r in enumerate(ranges)}
-                for fut, i in futures.items():
+                futures = {
+                    ex.submit(fn, i, r[0], r[1]): i for i, r in enumerate(ranges)
+                }
+                for fut in futures:
+                    i = futures[fut]
                     results[i] = fut.result()
                     if bar is not None:
                         bar.update(1)
@@ -387,25 +479,27 @@ class ChunkedArray:
                     bar.update(1)
         if bar is not None:
             bar.close()
-        return results
+        return [np.asarray(r) for r in results]
 
-    def compute(self, nthreads: int | None = None, msg: str | None = None) -> np.ndarray:
+    def compute(
+        self, nthreads: int | None = None, msg: str | None = None
+    ) -> np.ndarray:
         if self._n_rows == 0:
             return np.empty((0, self._out_cols), dtype=self.dtype)
 
-        def fn(i, s, e):
+        def fn(i: int, s: int, e: int) -> NDArray[Any]:
             return self._materialize_range(s, e)
 
         parts = self._map_blocks(fn, nthreads, msg)
         return np.vstack(parts) if len(parts) > 1 else parts[0]
 
-    def __array__(self, dtype=None):
+    def __array__(self, dtype: np.dtype[Any] | None = None) -> np.ndarray:
         a = self.compute()
         return a.astype(dtype) if dtype is not None else a
 
     # -- blocks ----------------------------------------------------------
     @property
-    def blocks(self):
+    def blocks(self) -> Iterator[Block]:
         for s, e in self._ranges():
             yield Block(self, s, e)
 
@@ -422,16 +516,20 @@ class ChunkedArray:
             is_numpy=self._is_numpy,
         )
 
-    def _unary(self, func) -> "ChunkedArray":
+    def _unary(self, func: Callable[..., NDArray[Any]]) -> "ChunkedArray":
         return self._with_op(_unary_op(func))
 
-    def _binary(self, func, other, side: str) -> "ChunkedArray":
+    def _binary(
+        self, func: Callable[..., NDArray[Any]], other: object, side: str
+    ) -> "ChunkedArray":
         if isinstance(other, _Reduction):
             other = other._arr
         kind, operand = _classify_operand(other, self._n_rows, self._out_cols)
         return self._with_op(_binary_op(func, operand, side, kind))
 
-    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+    def __array_ufunc__(
+        self, ufunc: Any, method: str, *inputs: Any, **kwargs: Any
+    ) -> Any:
         if method != "__call__" or kwargs.get("out") is not None:
             return NotImplemented
         if len(inputs) == 1:
@@ -443,49 +541,49 @@ class ChunkedArray:
             return self._binary(ufunc, a, "right")
         return NotImplemented
 
-    def __mul__(self, o):
+    def __mul__(self, o: object) -> "ChunkedArray":
         return self._binary(np.multiply, o, "left")
 
-    def __rmul__(self, o):
+    def __rmul__(self, o: object) -> "ChunkedArray":
         return self._binary(np.multiply, o, "right")
 
-    def __truediv__(self, o):
+    def __truediv__(self, o: object) -> "ChunkedArray":
         return self._binary(np.true_divide, o, "left")
 
-    def __rtruediv__(self, o):
+    def __rtruediv__(self, o: object) -> "ChunkedArray":
         return self._binary(np.true_divide, o, "right")
 
-    def __add__(self, o):
+    def __add__(self, o: object) -> "ChunkedArray":
         return self._binary(np.add, o, "left")
 
-    def __radd__(self, o):
+    def __radd__(self, o: object) -> "ChunkedArray":
         return self._binary(np.add, o, "right")
 
-    def __sub__(self, o):
+    def __sub__(self, o: object) -> "ChunkedArray":
         return self._binary(np.subtract, o, "left")
 
-    def __rsub__(self, o):
+    def __rsub__(self, o: object) -> "ChunkedArray":
         return self._binary(np.subtract, o, "right")
 
-    def __gt__(self, o):
+    def __gt__(self, o: object) -> "ChunkedArray":
         return self._binary(np.greater, o, "left")
 
-    def __lt__(self, o):
+    def __lt__(self, o: object) -> "ChunkedArray":
         return self._binary(np.less, o, "left")
 
-    def __ge__(self, o):
+    def __ge__(self, o: object) -> "ChunkedArray":
         return self._binary(np.greater_equal, o, "left")
 
-    def __le__(self, o):
+    def __le__(self, o: object) -> "ChunkedArray":
         return self._binary(np.less_equal, o, "left")
 
-    def dot(self, b) -> "ChunkedArray":
-        b = np.asarray(b)
-        return self._with_op(_matmul_op(b), out_cols=b.shape[1])
+    def dot(self, b: np.ndarray | NDArray[Any]) -> "ChunkedArray":
+        b_arr = np.asarray(b)
+        return self._with_op(_matmul_op(b_arr), out_cols=b_arr.shape[1])
 
     # -- indexing --------------------------------------------------------
     @staticmethod
-    def _local_positions(key, length: int) -> np.ndarray | None:
+    def _local_positions(key: object, length: int) -> np.ndarray | None:
         """Resolve an index key into integer positions within ``length``.
 
         Returns None for a full slice (no-op).
@@ -493,13 +591,13 @@ class ChunkedArray:
         if isinstance(key, slice):
             if key == slice(None):
                 return None
-            return np.arange(length)[key]
-        key = np.asarray(key)
-        if key.dtype == bool:
-            return np.arange(length)[key]
-        return key.astype(int)
+            return np.asarray(np.arange(length)[key])
+        key_arr = np.asarray(key)
+        if key_arr.dtype == bool:
+            return np.asarray(np.arange(length)[key_arr])
+        return np.asarray(key_arr.astype(int))
 
-    def __getitem__(self, key) -> "ChunkedArray":
+    def __getitem__(self, key: object) -> "ChunkedArray":
         if isinstance(key, tuple):
             if len(key) != 2:
                 raise IndexError("ChunkedArray supports at most 2D indexing")
@@ -559,58 +657,75 @@ class ChunkedArray:
     def argmax(self, axis: int | None = None) -> _Reduction:
         return _Reduction(self, "argmax", axis)
 
-    def _reduce(self, op: str, axis: int | None, nthreads: int | None, msg: str | None) -> np.ndarray:
+    def _reduce(
+        self,
+        op: ReductionOp,
+        axis: int | None,
+        nthreads: int | None,
+        msg: str | None,
+    ) -> np.ndarray:
         if axis == 1 or axis is None:
             return self._reduce_axis1(op, axis, nthreads, msg)
         return self._reduce_axis0(op, nthreads, msg)
 
-    def _reduce_axis1(self, op: str, axis, nthreads, msg) -> np.ndarray:
-        def fn(i, s, e):
+    def _reduce_axis1(
+        self,
+        op: ReductionOp,
+        axis: int | None,
+        nthreads: int | None,
+        msg: str | None,
+    ) -> np.ndarray:
+        def fn(i: int, s: int, e: int) -> NDArray[Any]:
             a = self._materialize_range(s, e)
             if op == "sum":
-                return a.sum(axis=axis)
+                return np.asarray(a.sum(axis=axis))
             if op == "mean":
-                return a.mean(axis=axis)
+                return np.asarray(a.mean(axis=axis))
             if op == "var":
-                return a.var(axis=axis)
+                return np.asarray(a.var(axis=axis))
             if op == "std":
-                return a.std(axis=axis)
+                return np.asarray(a.std(axis=axis))
             if op == "count_nonzero":
-                return np.count_nonzero(a, axis=axis)
+                return np.asarray(np.count_nonzero(a, axis=axis))
             if op == "argmax":
-                return a.argmax(axis=axis)
+                return np.asarray(a.argmax(axis=axis))
             raise ValueError(f"Unknown reduction {op}")
 
         parts = self._map_blocks(fn, nthreads, msg)
         if axis is None:
-            arr = np.array(parts)
+            arr = np.asarray(parts)
             if op == "sum":
-                return arr.sum()
+                return np.asarray(arr.sum())
             if op == "mean":
-                return arr.mean()
+                return np.asarray(arr.mean())
             raise ValueError(f"Reduction {op} with axis=None is not supported")
         return np.concatenate(parts)
 
-    def _reduce_axis0(self, op: str, nthreads, msg) -> np.ndarray:
+    def _reduce_axis0(
+        self, op: ReductionOp, nthreads: int | None, msg: str | None
+    ) -> np.ndarray:
         if op in ("sum", "mean"):
-            def fn(i, s, e):
+
+            def fn(i: int, s: int, e: int) -> NDArray[Any]:
                 a = self._materialize_range(s, e)
-                return a.sum(axis=0)
+                return np.asarray(a.sum(axis=0))
 
             parts = self._map_blocks(fn, nthreads, msg)
             total = np.sum(parts, axis=0)
             if op == "mean":
-                return total / self._n_rows
-            return total
+                return np.asarray(total / self._n_rows)
+            return np.asarray(total)
         if op == "count_nonzero":
-            def fn(i, s, e):
+
+            def fn(i: int, s: int, e: int) -> NDArray[Any]:
                 a = self._materialize_range(s, e)
-                return np.count_nonzero(a, axis=0)
+                return np.asarray(np.count_nonzero(a, axis=0))
 
             parts = self._map_blocks(fn, nthreads, msg)
-            return np.sum(parts, axis=0)
+            return np.asarray(np.sum(parts, axis=0))
         if op in ("var", "std"):
-            def fn(i, s, e):
+
+            def fn(i: int, s: int, e: int) -> NDArray[Any]:
                 a = self._materialize_range(s, e).astype(np.float64, copy=False)
                 return np.array([a.sum(axis=0), np.square(a).sum(axis=0)])
 
@@ -620,7 +735,9 @@ class ChunkedArray:
             n = self._n_rows
             mean = s1 / n
             variance = s2 / n - np.square(mean)
-            return np.sqrt(np.clip(variance, 0, None)) if op == "std" else variance
+            if op == "std":
+                return np.asarray(np.sqrt(np.clip(variance, 0, None)))
+            return np.asarray(variance)
         if op == "argmax":
             raise NotImplementedError("argmax(axis=0) is not supported")
         raise ValueError(f"Unknown reduction {op}")

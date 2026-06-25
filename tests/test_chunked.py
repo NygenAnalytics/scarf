@@ -126,7 +126,12 @@ class TestPublicApiCompat:
         # Pattern from the MNIST vignette.
         fidx = np.arange(20)
         cidx = datastore.RNA.cells.active_index("I")[:50]
-        out = datastore.RNA.rawData[:, fidx][cidx, :].mean(axis=0).compute().reshape(1, -1)
+        out = (
+            datastore.RNA.rawData[:, fidx][cidx, :]
+            .mean(axis=0)
+            .compute()
+            .reshape(1, -1)
+        )
         assert out.shape == (1, 20)
 
     def test_normed_mean_axis1_compute(self, datastore):

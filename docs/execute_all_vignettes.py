@@ -70,7 +70,10 @@ def main() -> None:
                 print(f"[{name}] FAILED: {exc}", flush=True)
 
     if completed_caches:
-        print(f"Merging {len(completed_caches)} caches into docs/.jupyter_cache", flush=True)
+        print(
+            f"Merging {len(completed_caches)} caches into docs/.jupyter_cache",
+            flush=True,
+        )
         merge_caches(completed_caches, DEFAULT_CACHE)
 
     if PARALLEL_CACHE.exists():
@@ -82,7 +85,10 @@ def main() -> None:
             print(f"  - {name}: {msg}", flush=True)
         raise SystemExit(1)
 
-    print(f"All {len(names)} vignettes executed and merged into docs/.jupyter_cache", flush=True)
+    print(
+        f"All {len(names)} vignettes executed and merged into docs/.jupyter_cache",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

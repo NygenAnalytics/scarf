@@ -1,20 +1,30 @@
 """Module to find biomarkers."""
 
+from collections.abc import Generator
+from typing import Any
 
 import numpy as np
 import pandas as pd
 from numba import jit
 from scipy.stats import linregress, norm
 from scipy.stats import rankdata
+import zarr
 
+from scarf._types import as_zarr_array, as_zarr_group
 from scarf.assay import Assay
+from scarf.chunked import ChunkedArray
 from scarf.utils import logger, tqdmbar
 
 
-def read_prenormed_batches(store, cell_idx: np.ndarray, batch_size: int, desc: str):
-    batch = {}
+def read_prenormed_batches(
+    store: zarr.Group,
+    cell_idx: np.ndarray,
+    batch_size: int,
+    desc: str,
+) -> Generator[pd.DataFrame, None, None]:
+    batch: dict[int, np.ndarray] = {}
     for i in tqdmbar(store.keys(), desc=desc):
-        batch[int(i)] = store[i][:][cell_idx]
+        batch[int(i)] = np.asarray(as_zarr_array(store[str(i)])[cell_idx])
         if len(batch) == batch_size:
             yield pd.DataFrame(batch)
             batch = {}
@@ -22,13 +32,17 @@ def read_prenormed_batches(store, cell_idx: np.ndarray, batch_size: int, desc: s
         yield pd.DataFrame(batch)
 
 
-def mannwhitneyu_from_ranks(ranked_df, groups, group_set):
+def mannwhitneyu_from_ranks(
+    ranked_df: pd.DataFrame,
+    groups: np.ndarray,
+    group_set: np.ndarray,
+) -> pd.DataFrame:
     """
     Vectorized Mann-Whitney U test using pre-computed ranks with tie correction.
 
-    This function calculates two-sided p-values by reusing rank data that has 
-    already been computed, avoiding redundant ranking operations. Includes tie 
-    correction which is critical for zero-inflated data (e.g., scRNA-seq) where 
+    This function calculates two-sided p-values by reusing rank data that has
+    already been computed, avoiding redundant ranking operations. Includes tie
+    correction which is critical for zero-inflated data (e.g., scRNA-seq) where
     many values are identical.
 
     Args:
@@ -51,7 +65,7 @@ def mannwhitneyu_from_ranks(ranked_df, groups, group_set):
     # This is critical for zero-inflated data where many cells have the same value
     # T = Σ(t³ - t) / (n * (n - 1)) where t is the size of each tied group
     tie_corrections = np.zeros(ranked_df.shape[1])
-    
+
     for col_idx in range(ranked_df.shape[1]):
         ranks = ranked_df.iloc[:, col_idx].values
         # Count occurrences of each unique rank
@@ -60,7 +74,7 @@ def mannwhitneyu_from_ranks(ranked_df, groups, group_set):
         tied_counts = counts[counts > 1]
         if len(tied_counts) > 0:
             # Σ(t³ - t) for all tied groups
-            tie_sum = np.sum(tied_counts ** 3 - tied_counts)
+            tie_sum = np.sum(tied_counts**3 - tied_counts)
             # Normalize by n*(n-1) to get the correction term
             tie_corrections[col_idx] = tie_sum / (n_total * (n_total - 1))
 
@@ -104,10 +118,10 @@ def find_markers_by_rank(
     feat_key: str,
     batch_size: int,
     use_prenormed: bool,
-    prenormed_store: str | None,
+    prenormed_store: zarr.Group | None,
     n_threads: int,
-    **norm_params,
-) -> dict:
+    **norm_params: Any,
+) -> dict[Any, pd.DataFrame]:
     """Identify marker genes/features for given groups using a rank-based approach.
 
     Uses a two-sided Mann-Whitney U test with tie correction to identify genes
@@ -132,7 +146,7 @@ def find_markers_by_rank(
 
     from joblib import Parallel, delayed
 
-    def calc(vdf):
+    def calc(vdf: pd.DataFrame) -> np.ndarray:
         # Rank data once for all subsequent calculations
         ranked_vdf = vdf.rank(method="dense")
         ranked_vdf_average = vdf.rank(method="average")
@@ -170,15 +184,15 @@ def find_markers_by_rank(
         ).T
 
     @jit(nopython=True)
-    def calc_rank_mean(v):
+    def calc_rank_mean(v: np.ndarray) -> np.ndarray:
         """Calculates the mean rank of the data."""
         r = np.ones(n_groups)
         for x in range(n_groups):
             r[x] = v[int_indices == x].mean()
-        return r / r.sum()
+        return np.asarray(r / r.sum())
 
     @jit(nopython=True)
-    def calc_frac_fc(v):
+    def calc_frac_fc(v: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Calculates the mean rank of the data."""
         m = np.zeros(n_groups)
         m_o = np.zeros(n_groups)
@@ -197,8 +211,11 @@ def find_markers_by_rank(
                 fc[x] = m[x] / (m_o[x])
         return m, m_o, e, e_o, fc
 
-    def prenormed_mean_rank_wrapper(gene_idx):
-        d = prenormed_store[gene_idx][:][cell_idx]
+    active_prenormed_store = prenormed_store
+
+    def prenormed_mean_rank_wrapper(gene_idx: int | str) -> tuple[int | str, np.ndarray]:
+        assert active_prenormed_store is not None
+        d = np.asarray(as_zarr_array(active_prenormed_store[str(gene_idx)])[cell_idx])
         r = calc_rank_mean(rankdata(d, method="dense"))
         m, m_o, e, e_o, fc = calc_frac_fc(d)
         # Calculate p-values for this single feature
@@ -223,27 +240,28 @@ def find_markers_by_rank(
         "fold_change",
         "p_value",
     ]
+    results: dict[Any, pd.DataFrame] = {}
     if use_prenormed:
         if prenormed_store is None:
             if "prenormed" in assay.z:
-                prenormed_store = assay.z["prenormed"]
+                prenormed_store = as_zarr_group(assay.z["prenormed"], name="prenormed")
             else:
                 raise ValueError(
                     "Could not find prenormed values. Run with use_prenormed=False or create pre-normed values."
                 )
 
-        results = {x: [] for x in group_set}
+        prenormed_rows: dict[Any, list[list[Any]]] = {x: [] for x in group_set}
         cell_idx = assay.cells.active_index(cell_key)
         batch_iterator = tqdmbar(prenormed_store.keys(), desc="Finding markers")
         temp = Parallel(n_jobs=n_threads)(
             delayed(prenormed_mean_rank_wrapper)(i) for i in batch_iterator
         )
         for i in temp:
-            for j, k in zip(group_set, i[1].T):
-                results[j].append([i[0]] + list(k))
-        for i in results:
-            results[i] = (
-                pd.DataFrame(results[i], columns=out_cols)
+            for j, k in zip(group_set, i[1].T, strict=True):
+                prenormed_rows[j].append([i[0]] + list(k))
+        for group_id, rows in prenormed_rows.items():
+            results[group_id] = (
+                pd.DataFrame(rows, columns=out_cols)
                 .sort_values(by="score", ascending=False)
                 .round(5)
             )
@@ -257,14 +275,13 @@ def find_markers_by_rank(
             **norm_params,
         )
         temp = np.vstack([calc(x) for x in batch_iterator])
-        results = {}
         feat_index = assay.feats.active_index(feat_key)
         pval_col = "p_value"
         for n, i in enumerate(group_set):
             df = pd.DataFrame(
                 temp[:, n, :], columns=out_cols[1:], index=feat_index
             ).sort_values(by="score", ascending=False)
-            
+
             cols_to_round = [col for col in df.columns if col != pval_col]
             df.loc[:, cols_to_round] = df.loc[:, cols_to_round].round(5)
             results[i] = df
@@ -281,7 +298,7 @@ def find_markers_by_regression(
     regressor: np.ndarray,
     min_cells: int,
     batch_size: int = 50,
-    **norm_params,
+    **norm_params: Any,
 ) -> pd.DataFrame:
     """Find features that correlate with a continuous variable using linear regression.
 
@@ -300,27 +317,33 @@ def find_markers_by_regression(
             - p_value: Statistical significance of correlation
     """
 
-    res = {}
-    for df in assay.iter_normed_feature_wise(
+    res: dict[Any, tuple[float, float]] = {}
+    for feature_batch in assay.iter_normed_feature_wise(
         cell_key=cell_key,
         feat_key=feat_key,
         batch_size=batch_size,
         msg="Finding correlated features",
         **norm_params,
     ):
-        for i in df:
-            v = df[i].values
+        if not isinstance(feature_batch, pd.DataFrame):
+            raise TypeError("Expected normalized feature batches as DataFrames.")
+        for i in feature_batch:
+            v = np.asarray(feature_batch[i].values)
             if (v > 0).sum() > min_cells:
                 lin_obj = linregress(regressor, v)
-                res[i] = (lin_obj.rvalue, lin_obj.pvalue)
+                res[i] = (float(lin_obj.rvalue), float(lin_obj.pvalue))
             else:
-                res[i] = (0, 1)
+                res[i] = (0.0, 1.0)
     res = pd.DataFrame(res, index=["r_value", "p_value"]).T
     return res
 
 
 def knn_clustering(
-    d_array, n_neighbours: int, n_clusters: int, n_threads: int, ann_params: dict = None
+    d_array: ChunkedArray,
+    n_neighbours: int,
+    n_clusters: int,
+    n_threads: int,
+    ann_params: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """
 
@@ -340,7 +363,9 @@ def knn_clustering(
     from .utils import controlled_compute, tqdmbar, show_dask_progress
     from scipy.sparse import csr_matrix
 
-    def make_knn_mat(data, k, t):
+    def make_knn_mat(
+        data: ChunkedArray, k: int, t: int
+    ) -> csr_matrix:
         """Create a sparse KNN adjacency matrix from the input data.
 
         Args:
@@ -356,7 +381,7 @@ def knn_clustering(
             i = controlled_compute(i, t)
             ann_idx.add_items(i)
         s, e = 0, 0
-        indices = []
+        neighbor_indices: list[np.ndarray] = []
         for i in tqdmbar(
             data.blocks, desc="Identifying feature KNNs", total=data.numblocks[0]
         ):
@@ -364,23 +389,23 @@ def knn_clustering(
             i = controlled_compute(i, t)
             inds, d = ann_idx.knn_query(i, k=k + 1)
             inds, _, _ = fix_knn_query(inds, d, np.arange(s, e))
-            indices.append(inds)
+            neighbor_indices.append(inds)
             s = e
-        indices = np.vstack(indices)
-        assert indices.shape[0] == data.shape[0]
+        indices_mat = np.vstack(neighbor_indices)
+        assert indices_mat.shape[0] == data.shape[0]
 
         return csr_matrix(
             (
-                np.ones(indices.shape[0] * indices.shape[1]),
+                np.ones(indices_mat.shape[0] * indices_mat.shape[1]),
                 (
-                    np.repeat(range(indices.shape[0]), indices.shape[1]),
-                    indices.flatten(),
+                    np.repeat(np.arange(indices_mat.shape[0]), indices_mat.shape[1]),
+                    indices_mat.flatten(),
                 ),
             ),
-            shape=(indices.shape[0], indices.shape[0]),
+            shape=(indices_mat.shape[0], indices_mat.shape[0]),
         )
 
-    def make_clusters(mat, nc):
+    def make_clusters(mat: csr_matrix, nc: int) -> np.ndarray:
         """Generate clusters from a KNN adjacency matrix using hierarchical clustering.
 
         Args:
@@ -395,9 +420,11 @@ def knn_clustering(
         paris = skn.hierarchy.Paris(reorder=False)
         logger.info("Performing clustering, this might take a while...")
         dendrogram = paris.fit_transform(mat)
-        return skn.hierarchy.cut_straight(dendrogram, n_clusters=nc)
+        return np.asarray(skn.hierarchy.cut_straight(dendrogram, n_clusters=nc))
 
-    def fix_cluster_order(data, clusters, t):
+    def fix_cluster_order(
+        data: ChunkedArray, clusters: np.ndarray, t: int
+    ) -> np.ndarray:
         """Reorder cluster labels based on feature expression patterns.
 
         Args:
@@ -409,15 +436,17 @@ def knn_clustering(
             np.ndarray: Reordered cluster assignments (1-based indexing)
         """
 
-        idxmax = show_dask_progress(data.argmax(axis=1), "Sorting clusters", t)
+        idxmax = show_dask_progress(
+            data.argmax(axis=1), "Sorting clusters", t
+        )
         cmm = pd.DataFrame([idxmax, clusters]).T.groupby(1).median()[0].sort_values()
-        return (
+        return np.asarray(
             pd.Series(clusters)
-            .replace(dict(zip(cmm.index, range(1, 1 + len(cmm)))))
+            .replace(dict(zip(cmm.index, range(1, 1 + len(cmm)), strict=True)))
             .values
         )
 
-    default_ann_params = {
+    default_ann_params: dict[str, Any] = {
         "space": "l2",
         "dim": d_array.shape[1],
         "max_elements": d_array.shape[0],
@@ -430,7 +459,16 @@ def knn_clustering(
     if ann_params is None:
         ann_params = {}
     default_ann_params.update(ann_params)
-    ann_idx = instantiate_knn_index(**default_ann_params)
+    ann_idx = instantiate_knn_index(
+        space=str(default_ann_params["space"]),
+        dim=int(default_ann_params["dim"]),
+        max_elements=int(default_ann_params["max_elements"]),
+        ef_construction=int(default_ann_params["ef_construction"]),
+        M=int(default_ann_params["M"]),
+        random_seed=int(default_ann_params["random_seed"]),
+        ef=int(default_ann_params["ef"]),
+        num_threads=int(default_ann_params["num_threads"]),
+    )
     return fix_cluster_order(
         d_array,
         make_clusters(make_knn_mat(d_array, n_neighbours, n_threads), n_clusters),

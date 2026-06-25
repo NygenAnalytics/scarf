@@ -1,13 +1,15 @@
+from collections.abc import Iterator
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 
 from .utils import logger, tqdmbar
 
 __all__ = ["BalancedCut", "CoalesceTree", "make_digraph"]
 
 
-def make_digraph(d: np.ndarray, clust_info=None) -> nx.DiGraph:
+def make_digraph(d: np.ndarray, clust_info: np.ndarray | None = None) -> nx.DiGraph:
     """Convert a scipy linkage matrix into a directed tree graph.
 
     Args:
@@ -28,14 +30,14 @@ def make_digraph(d: np.ndarray, clust_info=None) -> nx.DiGraph:
         clust_info = np.ones(d.shape[0] + 1) * -1
     for i in tqdmbar(d, desc="Constructing graph from dendrogram"):
         v = i[2]  # Distance between clusters
-        i = i.astype(int)
-        g.add_node(n, nleaves=i[3], dist=v)
-        if i[0] <= d.shape[0]:
-            g.add_node(i[0], nleaves=0, dist=v, cluster=clust_info[i[0]])
-        if i[1] <= d.shape[0]:
-            g.add_node(i[1], nleaves=0, dist=v, cluster=clust_info[i[1]])
-        g.add_edge(n, i[0])
-        g.add_edge(n, i[1])
+        row = i.astype(int)
+        g.add_node(n, nleaves=row[3], dist=v)
+        if row[0] <= d.shape[0]:
+            g.add_node(row[0], nleaves=0, dist=v, cluster=clust_info[row[0]])
+        if row[1] <= d.shape[0]:
+            g.add_node(row[1], nleaves=0, dist=v, cluster=clust_info[row[1]])
+        g.add_edge(n, row[0])
+        g.add_edge(n, row[1])
         n += 1
     if g.number_of_edges() != d.shape[0] * 2:
         logger.warning(
@@ -46,10 +48,9 @@ def make_digraph(d: np.ndarray, clust_info=None) -> nx.DiGraph:
 
 def CoalesceTree(graph: nx.DiGraph, clusters: np.ndarray) -> nx.DiGraph:
     """Coalesce a hierarchy graph to the nodes holding each cluster partition."""
-    def calc_steps_to_top(g: nx.DiGraph, c: np.ndarray):
-        import pandas as pd
 
-        s = {}
+    def calc_steps_to_top(g: nx.DiGraph, c: np.ndarray) -> pd.Series:
+        s: dict[int, int] = {}
         for i in range(len(c)):
             s[i] = 0
             q = [i]
@@ -59,46 +60,46 @@ def CoalesceTree(graph: nx.DiGraph, clusters: np.ndarray) -> nx.DiGraph:
                     q.append(j)
         return pd.Series(s).sort_values()
 
-    def iter_predecessors(g: nx.DiGraph, v):
+    def iter_predecessors(g: nx.DiGraph, v: int) -> Iterator[int]:
         q = [v]
         while len(q) > 0:
             for i in g.predecessors(q.pop(0)):
                 yield i
                 q.append(i)
 
-    def aggregate_leaves(g: nx.DiGraph, v):
+    def aggregate_leaves(g: nx.DiGraph, v: int) -> list[int]:
         q = [v]
-        l = []
+        leaves: list[int] = []
         while len(q) > 0:
             for i in g.successors(q.pop(0)):
                 if g.nodes[i]["nleaves"] == 0:
-                    l.append(i)
+                    leaves.append(i)
                 else:
                     q.append(i)
-        return l
+        return leaves
 
-    def get_holding_nodes(g: nx.DiGraph, c):
-        hn = {}
+    def get_holding_nodes(g: nx.DiGraph, c: np.ndarray) -> dict[int, int]:
+        hn: dict[int, int] = {}
         s = calc_steps_to_top(g, c)
         for i in tqdmbar(set(c), desc="Identifying the top node for cluster"):
-            l = set(np.where(c == i)[0])
-            nl = len(l)
-            for j in iter_predecessors(g, s.reindex(l).idxmin()):
+            cluster_nodes = set(np.where(c == i)[0])
+            nl = len(cluster_nodes)
+            for j in iter_predecessors(g, s.reindex(cluster_nodes).idxmin()):
                 if g.nodes[j]["nleaves"] >= nl:
                     l2 = aggregate_leaves(g, j)
-                    if len(l.intersection(l2)) == nl:
+                    if len(cluster_nodes.intersection(l2)) == nl:
                         hn[j] = i
                         break
         return hn
 
-    def aggregate_predecessors(g: nx.DiGraph, v):
-        p = []
+    def aggregate_predecessors(g: nx.DiGraph, v: int) -> list[int]:
+        p: list[int] = []
         for i in iter_predecessors(g, v):
             p.append(i)
         return p
 
-    def make_subgraph(g: nx.DiGraph, vs):
-        sn = list(vs.keys())
+    def make_subgraph(g: nx.DiGraph, vs: dict[int, int]) -> nx.DiGraph:
+        sn: list[int] = list(vs.keys())
         for i in vs:
             sn.extend(aggregate_predecessors(g, i))
         sn = list(set(sn))
@@ -120,6 +121,9 @@ class BalancedCut:
         max_distance_fc: Max fold-change in merge distance for subtree merging.
     """
 
+    graph: nx.DiGraph
+    branchpoints: dict[int, list[int]]
+
     def __init__(
         self,
         dendrogram: np.ndarray,
@@ -137,7 +141,7 @@ class BalancedCut:
     def _successors(self, start: int, min_leaves: int) -> list[int]:
         """Get tree downstream of a node."""
         q = [start]
-        d = []
+        d: list[int] = []
         while len(q) > 0:
             i = q.pop(0)
             if self.graph.nodes[i]["nleaves"] > min_leaves:
@@ -148,7 +152,7 @@ class BalancedCut:
     def _get_mean_dist(self, start_node: int) -> float:
         """Get mean distances in downstream tree of a node."""
         s_nodes = self._successors(start_node, -1)
-        return np.array([self.graph.nodes[x]["dist"] for x in s_nodes]).mean()
+        return float(np.array([self.graph.nodes[x]["dist"] for x in s_nodes]).mean())
 
     def _are_subtrees_mergeable(self, s1: int, s2: int) -> bool:
         n1, n2 = self.graph.nodes[s1]["nleaves"], self.graph.nodes[s2]["nleaves"]
@@ -169,8 +173,8 @@ class BalancedCut:
     def _get_branchpoints(self) -> dict[int, list[int]]:
         """Aggregate leaves bottom up until target size is reached."""
         n_leaves = int((self.graph.number_of_nodes() + 1) / 2)
-        leaves = {x: None for x in range(n_leaves)}
-        bps = {}
+        leaves: dict[int, None] = {x: None for x in range(n_leaves)}
+        bps: dict[int, list[int]] = {}
         pbar = tqdmbar(total=len(leaves), desc="Identifying nodes to split")
         while len(leaves) > 0:
             leaf, _ = leaves.popitem()
@@ -211,7 +215,7 @@ class BalancedCut:
         return bps
 
     def _valid_names_in_branchpoints(self) -> None:
-        leaves = []
+        leaves: list[int] = []
         for i in self.branchpoints:
             leaves.extend(self.branchpoints[i])
         n_leaves = len(leaves)
@@ -239,17 +243,3 @@ class BalancedCut:
             logger.warning(f"{(c == 0).sum()} samples were not assigned a cluster")
             c[c == 0] = -1
         return c
-
-    # def test(self):
-    # n = 30
-    # np.random.seed(154)
-    # randz = ward(gamma.rvs(0.3, size=n * 4).reshape((n, 4)))
-    #
-    # graph = z_to_g(randz)
-    # branchpoints = get_branchpoints(graph, max_leaf=10, min_leaves=2, fc=1.5)
-    # clusters = bps_to_clusts(branchpoints)
-    # dend = dendrogram(randz)
-    # clusters[dend['leaves']]
-    #
-    # res = [9, 5, 5, 1, 1, 1, 1, 7, 7, 7, 3, 3, 3, 3, 3, 4, 4, 4, 2, 2, 2, 8,
-    #        8, 8, 6, 6, 6, 6, 6, 6]

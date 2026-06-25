@@ -1,16 +1,17 @@
-
 import numpy as np
 import zarr
+from collections.abc import Iterable
+from typing import Any, cast
+
 from loguru import logger
 
+from .._types import ZarrMode, as_zarr_array, as_zarr_group
 from ..assay import RNAassay, ATACassay, ADTassay, Assay
 from ..metadata import MetaData
 from ..utils import show_dask_progress, controlled_compute, load_zarr, ZARRLOC
 
 
-def sanitize_hierarchy(
-    z: zarr.Group, assay_name: str, workspace: str | None
-) -> bool:
+def sanitize_hierarchy(z: zarr.Group, assay_name: str, workspace: str | None) -> bool:
     """Test if an assay node in zarr object was created properly.
 
     Args:
@@ -24,21 +25,23 @@ def sanitize_hierarchy(
     if workspace is None:
         zw = z
     else:
-        zw = z[workspace]
-    if assay_name in zw:
-        if "featureData" not in zw[assay_name]:
-            raise KeyError(f"ERROR: 'featureData' not found in {assay_name}")
-    else:
+        zw = as_zarr_group(z[workspace], name=workspace)
+    if assay_name not in zw:
         raise KeyError(f"ERROR: {assay_name} not found in zarr file")
+    assay_zw = as_zarr_group(zw[assay_name], name=assay_name)
+    if "featureData" not in assay_zw:
+        raise KeyError(f"ERROR: 'featureData' not found in {assay_name}")
     if workspace is None:
-        if "counts" not in z[assay_name]:
+        if "counts" not in assay_zw:
             raise KeyError(f"ERROR: 'counts' not found in {assay_name}")
     else:
         if "matrices" not in z:
-            raise KeyError(f"ERROR: Workspace defined but no 'matrices' slot found")
-        if assay_name not in z["matrices"]:
+            raise KeyError("ERROR: Workspace defined but no 'matrices' slot found")
+        matrices = as_zarr_group(z["matrices"], name="matrices")
+        if assay_name not in matrices:
             raise KeyError(f"ERROR: {assay_name} not found in workspace matrices slot")
-        if "counts" not in z["matrices"][assay_name]:
+        matrix_assay = as_zarr_group(matrices[assay_name], name=assay_name)
+        if "counts" not in matrix_assay:
             raise KeyError(
                 f"ERROR: 'counts' not found in {assay_name} in workspace matrices slot"
             )
@@ -78,17 +81,17 @@ class BaseDataStore:
     def __init__(
         self,
         zarr_loc: ZARRLOC,
-        assay_types: dict,
+        assay_types: dict[str, str],
         default_assay: str,
         min_features_per_cell: int,
         min_cells_per_feature: int,
         mito_pattern: str,
         ribo_pattern: str,
         nthreads: int,
-        zarr_mode: str,
+        zarr_mode: ZarrMode,
         workspace: str | None,
-        synchronizer,
-        storage_options: dict | None = None,
+        synchronizer: Any,
+        storage_options: dict[str, Any] | None = None,
     ):
         self.zarr_mode = zarr_mode
         self.zarr_loc = zarr_loc
@@ -128,7 +131,7 @@ class BaseDataStore:
             Metadata object
         """
         try:
-            cell_data: zarr.Group = self.zw["cellData"]  # type: ignore
+            cell_data = as_zarr_group(self.zw["cellData"], name="cellData")
         except KeyError as e:
             raise KeyError(f"cellData not found in zarr file at {self.z.path}") from e
         return MetaData(cell_data)
@@ -163,7 +166,7 @@ class BaseDataStore:
         """
         if assay_name is None:
             if "defaultAssay" in self.zw.attrs:
-                assay_name = self.zw.attrs["defaultAssay"]
+                assay_name = cast(str, self.zw.attrs["defaultAssay"])
             else:
                 if len(self.assay_names) == 1:
                     assay_name = self.assay_names[0]
@@ -188,6 +191,7 @@ class BaseDataStore:
                     f"Please Choose one from: {' '.join(self.assay_names)}\n"
                     "Please note that the names are case-sensitive."
                 )
+        assert assay_name is not None
         return assay_name
 
     def _load_assays(
@@ -235,7 +239,12 @@ class BaseDataStore:
         )
         if "assayTypes" not in self.zw.attrs:
             self.zw.attrs["assayTypes"] = {}
-        z_attrs = dict(self.zw.attrs["assayTypes"])
+        raw_types = self.zw.attrs["assayTypes"]
+        z_attrs: dict[str, str] = (
+            {str(k): str(v) for k, v in raw_types.items()}
+            if isinstance(raw_types, dict)
+            else {}
+        )
         if custom_assay_types is None:
             custom_assay_types = {}
         for i in self.assay_names:
@@ -302,7 +311,7 @@ class BaseDataStore:
         """
         if from_assay is None or from_assay == "":
             from_assay = self._defaultAssay
-        return self.__getattribute__(from_assay)
+        return cast(Assay | RNAassay | ADTassay | ATACassay, self.__getattribute__(from_assay))
 
     def _get_latest_feat_key(self, from_assay: str) -> str:
         """Looks up the value in assay level attributes for key
@@ -315,7 +324,7 @@ class BaseDataStore:
             Name of the latest feature that was used to run `save_normalized_data`
         """
         assay = self._get_assay(from_assay)
-        return assay.attrs["latest_feat_key"]
+        return cast(str, assay.attrs["latest_feat_key"])
 
     def _get_latest_cell_key(self, from_assay: str) -> str:
         """Looks up the value in assay level attributes for key
@@ -328,7 +337,7 @@ class BaseDataStore:
             Name of the latest feature that was used to run `save_normalized_data`
         """
         assay = self._get_assay(from_assay)
-        return assay.attrs.get("latest_cell_key", "I")
+        return cast(str, assay.attrs.get("latest_cell_key", "I"))
 
     def _ini_cell_props(
         self,
@@ -359,7 +368,7 @@ class BaseDataStore:
                     self.nthreads,
                 )
                 self.cells.insert(var_name, n_c.astype(np.float64), overwrite=True)
-                if type(assay) == RNAassay:
+                if isinstance(assay, RNAassay):
                     min_nc = min(n_c)
                     if min(n_c) < assay.sf:
                         logger.warning(
@@ -375,7 +384,7 @@ class BaseDataStore:
                 )
                 self.cells.insert(var_name, n_f.astype(np.float64), overwrite=True)
 
-            if type(assay) == RNAassay:
+            if isinstance(assay, RNAassay):
                 if mito_pattern == "":
                     pass
                 else:
@@ -441,7 +450,9 @@ class BaseDataStore:
         """
         if assay_name not in self.assay_names:
             available = ", ".join(self.assay_names)
-            raise ValueError(f"Assay '{assay_name}' not found. Available assays: {available}")
+            raise ValueError(
+                f"Assay '{assay_name}' not found. Available assays: {available}"
+            )
         self._defaultAssay = assay_name
         self.zw.attrs["defaultAssay"] = assay_name
 
@@ -483,12 +494,17 @@ class BaseDataStore:
                     )
             vals = None
             if use_precached and cache_key in assay.z:
-                g = assay.z[cache_key]
+                g = as_zarr_group(assay.z[cache_key], name=cache_key)
                 vals = np.zeros(assay.cells.N)
                 n_feats = 0
                 for i in feat_idx:
-                    if i in g:
-                        vals += assay.z[cache_key][i][:]
+                    feat_key = str(i)
+                    if feat_key in g:
+                        feat_vals = np.asarray(
+                            as_zarr_array(g[feat_key], name=feat_key)[:],
+                            dtype=np.float64,
+                        )
+                        vals += feat_vals
                         n_feats += 1
                 if n_feats == 0:
                     logger.debug(f"Could not find prenormed values for feat: {k}")
@@ -517,8 +533,8 @@ class BaseDataStore:
                 vals[vals > max_v] = max_v
         return vals
 
-    def __repr__(self):
-        def formatter(label, iter_vals):
+    def __repr__(self) -> str:
+        def formatter(label: str | None, iter_vals: Iterable[str]) -> str:
             if label is None:
                 line = ""
             else:
@@ -552,11 +568,15 @@ class BaseDataStore:
                 f"features and following metadata:"
             )
             res += formatter(None, assay.feats.columns)
-            if "projections" in self.zw[i]:
-                targets = []
-                layouts = []
-                for j in self.zw[i]["projections"]:
-                    if isinstance(self.zw[i]["projections"][j], zarr.Group):  # type: ignore
+            assay_group = as_zarr_group(self.zw[i], name=i)
+            if "projections" in assay_group:
+                targets: list[str] = []
+                layouts: list[str] = []
+                projections = as_zarr_group(
+                    assay_group["projections"], name="projections"
+                )
+                for j in projections:
+                    if isinstance(projections[j], zarr.Group):
                         targets.append(j)
                     else:
                         layouts.append(j)

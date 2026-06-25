@@ -9,21 +9,27 @@
                 method for feature selection.
 """
 
-from collections.abc import Generator
+from collections.abc import Callable, Generator
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 import zarr
+from numpy.typing import NDArray
 from scipy.sparse import csr_matrix, vstack
 
+from ._types import as_zarr_array, as_zarr_group
 from .chunked import ChunkedArray
 from .metadata import MetaData
 from .utils import controlled_compute, logger, show_dask_progress
 
 __all__ = ["Assay", "RNAassay", "ATACassay", "ADTassay"]
 
+type NormMethod = Callable[["Assay", ChunkedArray], ChunkedArray]
+type PercentFeatures = dict[str, str]
 
-def norm_dummy(_, counts: ChunkedArray) -> ChunkedArray:
+
+def norm_dummy(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """A dummy normalizer. Doesn't perform any normalization. This is useful
     when the 'raw data' is already normalized.
 
@@ -36,7 +42,7 @@ def norm_dummy(_, counts: ChunkedArray) -> ChunkedArray:
     return counts
 
 
-def norm_lib_size(assay, counts: ChunkedArray) -> ChunkedArray:
+def norm_lib_size(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """Performs library size normalization on the data. This is the default
     method for RNA assays.
 
@@ -46,10 +52,11 @@ def norm_lib_size(assay, counts: ChunkedArray) -> ChunkedArray:
 
     Returns:  A chunked array (delayed matrix) containing normalized data.
     """
+    assert assay.sf is not None and assay.scalar is not None
     return assay.sf * counts / assay.scalar.reshape(-1, 1)
 
 
-def norm_lib_size_log(assay, counts: ChunkedArray) -> ChunkedArray:
+def norm_lib_size_log(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """Performs library size normalization and then transforms the values into
     log scale.
 
@@ -59,10 +66,13 @@ def norm_lib_size_log(assay, counts: ChunkedArray) -> ChunkedArray:
 
     Returns: A chunked array (delayed matrix) containing normalized data.
     """
-    return np.log1p(assay.sf * counts / assay.scalar.reshape(-1, 1))
+    assert assay.sf is not None and assay.scalar is not None
+    return cast(
+        ChunkedArray, np.log1p(assay.sf * counts / assay.scalar.reshape(-1, 1))
+    )
 
 
-def norm_clr(_, counts: ChunkedArray) -> ChunkedArray:
+def norm_clr(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """Performs centered log-ratio normalization (ADT). This is the default
     method for ADT assays.
 
@@ -72,11 +82,11 @@ def norm_clr(_, counts: ChunkedArray) -> ChunkedArray:
 
     Returns: A chunked array (delayed matrix) containing normalized data.
     """
-    f = np.exp(np.log1p(counts).sum(axis=0) / len(counts))
-    return np.log1p(counts / f)
+    f = np.exp(cast(NDArray[Any], np.log1p(counts).sum(axis=0)) / len(counts))
+    return cast(ChunkedArray, np.log1p(counts / f))
 
 
-def norm_tf_idf(assay, counts: ChunkedArray) -> ChunkedArray:
+def norm_tf_idf(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """Performs TF-IDF normalization This is the default method for ATAC
     assays.
 
@@ -86,6 +96,11 @@ def norm_tf_idf(assay, counts: ChunkedArray) -> ChunkedArray:
 
     Returns: A chunked array (delayed matrix) containing normalized data.
     """
+    assert (
+        assay.n_term_per_doc is not None
+        and assay.n_docs is not None
+        and assay.n_docs_per_term is not None
+    )
     t_f = counts / assay.n_term_per_doc.reshape(-1, 1)
     # TODO: Split TF and IDF functionality to make it similar to norml_lib and zscaling
     idf = np.log2(1 + (assay.n_docs / (assay.n_docs_per_term + 1)))
@@ -125,30 +140,48 @@ class Assay:
         cell_data: MetaData,
         nthreads: int,
         min_cells_per_feature: int = 10,
-    ):
+    ) -> None:
         self.name = name
         self.cells = cell_data
         self.nthreads = nthreads
         if workspace is None:
-            self.rawData = ChunkedArray(z[f"{name}/counts"], nthreads=nthreads)
+            self.rawData = ChunkedArray(
+                as_zarr_array(z[f"{name}/counts"], name=f"{name}/counts"),
+                nthreads=nthreads,
+            )
             self.feats = MetaData(z[f"{name}/featureData"])  # type: ignore
-            self.z: zarr.Group = z[self.name]  # type: ignore
+            self.z = as_zarr_group(z[self.name], name=self.name)
         else:
-            self.rawData = ChunkedArray(z[f"matrices/{name}/counts"], nthreads=nthreads)
+            self.rawData = ChunkedArray(
+                as_zarr_array(
+                    z[f"matrices/{name}/counts"], name=f"matrices/{name}/counts"
+                ),
+                nthreads=nthreads,
+            )
             self.feats = MetaData(z[f"{workspace}/{name}/featureData"])  # type: ignore
-            self.z = z[f"{workspace}/{name}"]
+            self.z = as_zarr_group(z[f"{workspace}/{name}"], name=f"{workspace}/{name}")
         self.attrs = self.z.attrs
         if "percentFeatures" not in self.attrs:
             self.attrs["percentFeatures"] = {}
-        self.normMethod = norm_dummy
-        self.sf = None
+        self.normMethod: NormMethod = norm_dummy
+        self.sf: int | None = None
+        self.scalar: np.ndarray | None = None
+        self.n_term_per_doc: np.ndarray | None = None
+        self.n_docs: int | None = None
+        self.n_docs_per_term: np.ndarray | None = None
         self._ini_feature_props(min_cells_per_feature)
+
+    def _percent_features(self) -> PercentFeatures:
+        raw = self.attrs.get("percentFeatures", {})
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): str(v) for k, v in raw.items()}
 
     def normed(
         self,
         cell_idx: np.ndarray | None = None,
         feat_idx: np.ndarray | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> ChunkedArray:
         """This function normalizes the raw and returns a delayed chunked array of
         the normalized data.
@@ -171,7 +204,7 @@ class Assay:
         counts = self.rawData[:, feat_idx][cell_idx, :]
         return self.normMethod(self, counts)
 
-    def to_raw_sparse(self, cell_key) -> csr_matrix:
+    def to_raw_sparse(self, cell_key: str) -> csr_matrix:
         """
 
         Args:
@@ -234,13 +267,14 @@ class Assay:
         Returns:
 
         """
-        if name in self.attrs["percentFeatures"]:
-            if self.attrs["percentFeatures"][name] == feat_pattern:
+        if name in self._percent_features():
+            if self._percent_features()[name] == feat_pattern:
                 return None
             else:
                 logger.info(f"Pattern for percentage feature {name} updated.")
+        percent_features = self._percent_features()
         self.attrs["percentFeatures"] = {
-            **{k: v for k, v in self.attrs["percentFeatures"].items()},
+            **percent_features,
             **{name: feat_pattern},
         }
         feat_idx = sorted(
@@ -391,7 +425,9 @@ class Assay:
                 f"Summary statistics have not been calculated for cell key: {cell_key}"
             )
         if identifier not in self.feats.locations:
-            self.feats.mount_location(self.z[stats_loc], identifier)
+            self.feats.mount_location(
+                as_zarr_group(self.z[stats_loc], name=stats_loc), identifier
+            )
         else:
             logger.debug(f"Location ({stats_loc}) already mounted")
         return identifier
@@ -456,7 +492,12 @@ class Assay:
                         feat_key.split("__", 1)[1] if feat_key != "I" else "I"
                     )
                     self.attrs["latest_cell_key"] = cell_key
-                return ChunkedArray(self.z[location + "/data"], nthreads=self.nthreads)
+                return ChunkedArray(
+                    as_zarr_array(
+                        self.z[location + "/data"], name=location + "/data"
+                    ),
+                    nthreads=self.nthreads,
+                )
             else:
                 # Creating group here to overwrite all children
                 self.z.create_group(location, overwrite=True)
@@ -466,7 +507,7 @@ class Assay:
             log_transform=log_transform,
             renormalize_subset=renormalize_subset,
         )
-        dask_to_zarr(vals, self.z, location + "/data", batch_size, self.nthreads)
+        dask_to_zarr(vals, self.z, location + "/data", vals.chunksize, self.nthreads)
         self.z[location].attrs["subset_hash"] = subset_hash
         self.z[location].attrs["subset_params"] = subset_params
         if update_keys:
@@ -474,7 +515,10 @@ class Assay:
                 feat_key.split("__", 1)[1] if feat_key != "I" else "I"
             )
             self.attrs["latest_cell_key"] = cell_key
-        return ChunkedArray(self.z[location + "/data"], nthreads=self.nthreads)
+        return ChunkedArray(
+            as_zarr_array(self.z[location + "/data"], name=location + "/data"),
+            nthreads=self.nthreads,
+        )
 
     def iter_normed_feature_wise(
         self,
@@ -483,7 +527,7 @@ class Assay:
         batch_size: int,
         msg: str | None,
         as_dataframe: bool = True,
-        **norm_params,
+        **norm_params: Any,
     ) -> Generator[pd.DataFrame | tuple[np.ndarray, np.ndarray], None, None]:
         """This generator iterates over all the features marked by `feat_key`
         in batches.
@@ -586,8 +630,8 @@ class Assay:
         smoothen: bool = True,
         z_scale: bool = True,
         batch_size: int = 100,
-        **norm_params,
-    ):
+        **norm_params: Any,
+    ) -> tuple[ChunkedArray, NDArray[Any]]:
         """Bin normalized expression along a cell ordering and cache the result.
 
         Args:
@@ -642,10 +686,10 @@ class Assay:
                 (feat_idx.shape[0], chunk_size),
             )
             ordering_idx = np.argsort(cell_ordering)
-            feat_idx = []
-            valid_feats = []
+            stored_feat_idx: list[int] = []
+            valid_feat_flags: list[bool] = []
             s = 0
-            for df in self.iter_normed_feature_wise(
+            for item in self.iter_normed_feature_wise(
                 cell_key,
                 feat_key,
                 batch_size,
@@ -653,8 +697,9 @@ class Assay:
                 True,
                 **norm_params,
             ):
-                valid_feats.extend(list((df.mean() > min_exp).values))
-                feat_idx.extend(list(df.columns))
+                df = cast(pd.DataFrame, item)
+                valid_feat_flags.extend(list((df.mean() > min_exp).values))
+                stored_feat_idx.extend(list(df.columns))
                 if smoothen:
                     df = rolling_window(df.reindex(ordering_idx).values, window_size)
                 if z_scale:
@@ -668,29 +713,43 @@ class Assay:
             g = create_zarr_dataset(
                 self.z,
                 location + "/feature_indices",
-                (len(feat_idx),),
+                (len(stored_feat_idx),),
                 "uint64",
-                (len(feat_idx),),
+                (len(stored_feat_idx),),
             )
-            g[:] = np.array(feat_idx).astype(int)
+            g[:] = np.array(stored_feat_idx).astype(int)
 
             g = create_zarr_dataset(
                 self.z,
                 location + "/valid_features",
-                (len(feat_idx),),
+                (len(stored_feat_idx),),
                 "bool",
-                (len(feat_idx),),
+                (len(stored_feat_idx),),
             )
-            g[:] = np.array(valid_feats).astype(int)
+            g[:] = np.array(valid_feat_flags).astype(int)
 
             self.z[location].attrs["hashes"] = hashes
-            self.z[location].attrs["params"] = params
+            self.z[location].attrs["params"] = cast(Any, params)
 
-        ret_val1 = ChunkedArray(self.z[location + "/data"], nthreads=self.nthreads)
-        ret_val2 = self.z[location + "/feature_indices"][:]
+        ret_val1 = ChunkedArray(
+            as_zarr_array(self.z[location + "/data"], name=location + "/data"),
+            nthreads=self.nthreads,
+        )
+        ret_val2 = np.asarray(
+            as_zarr_array(
+                self.z[location + "/feature_indices"],
+                name=location + "/feature_indices",
+            )[:]
+        )
 
         if location + "/valid_features" in self.z:
-            valid_feats = self.z[location + "/valid_features"][:]
+            valid_feats = np.asarray(
+                as_zarr_array(
+                    self.z[location + "/valid_features"],
+                    name=location + "/valid_features",
+                )[:],
+                dtype=bool,
+            )
             ret_val1 = ret_val1[valid_feats]
             ret_val2 = ret_val2[valid_feats]
 
@@ -721,12 +780,16 @@ class Assay:
 
         from .feat_utils import binned_sampling
 
-        def _names_to_idx(i):
+        def _names_to_idx(i: list[str]) -> np.ndarray:
             return self.feats.get_index_by(i, "names", None)
 
-        def _calc_mean(i):
+        def _calc_mean(i: np.ndarray | list[str]) -> np.ndarray:
+            if isinstance(i, list):
+                feat_selection = self.feats.get_index_by(i, "names", None)
+            else:
+                feat_selection = i
             return (
-                self.normed(cell_idx=cell_idx, feat_idx=np.array(sorted(i)))
+                self.normed(cell_idx=cell_idx, feat_idx=np.sort(feat_selection))
                 .mean(axis=1)
                 .compute()
             )
@@ -743,9 +806,9 @@ class Assay:
             obs_avg, list(feature_idx), ctrl_size, n_bins, rand_seed
         )
         cell_idx, _ = self._get_cell_feat_idx(cell_key, "I")
-        return _calc_mean(feature_idx) - _calc_mean(control_idx)
+        return np.asarray(_calc_mean(feature_idx) - _calc_mean(control_idx))
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         f = self.feats.fetch_all("I")
         assay_name = str(self.__class__).split(".")[-1][:-2]
         return f"{assay_name} {self.name} with {f.sum()}({len(f)}) features"
@@ -768,15 +831,33 @@ class RNAassay(Assay):
                 It is set to None until normed method is called.
     """
 
-    def __init__(self, z: zarr.Group, name: str, cell_data: MetaData, **kwargs):
-        super().__init__(z=z, name=name, cell_data=cell_data, **kwargs)
+    def __init__(
+        self,
+        z: zarr.Group,
+        name: str,
+        cell_data: MetaData,
+        *,
+        workspace: str | None = None,
+        nthreads: int = 1,
+        min_cells_per_feature: int = 10,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            z=z,
+            workspace=workspace,
+            name=name,
+            cell_data=cell_data,
+            nthreads=nthreads,
+            min_cells_per_feature=min_cells_per_feature,
+            **kwargs,
+        )
         self.normMethod = norm_lib_size
         if "size_factor" in self.attrs:
-            self.sf = int(self.attrs["size_factor"])
+            self.sf = int(cast(int, self.attrs["size_factor"]))
         else:
             self.sf = 1000
             self.attrs["size_factor"] = self.sf
-        self.scalar = None
+        self.scalar: np.ndarray | None = None
 
     def save_normalized_data(
         self,
@@ -822,7 +903,12 @@ class RNAassay(Assay):
                         feat_key.split("__", 1)[1] if feat_key != "I" else "I"
                     )
                     self.attrs["latest_cell_key"] = cell_key
-                return ChunkedArray(self.z[location + "/data"], nthreads=self.nthreads)
+                return ChunkedArray(
+                    as_zarr_array(
+                        self.z[location + "/data"], name=location + "/data"
+                    ),
+                    nthreads=self.nthreads,
+                )
         self.z.create_group(location, overwrite=True)
 
         write_renorm_subset_to_zarr(
@@ -841,7 +927,10 @@ class RNAassay(Assay):
                 feat_key.split("__", 1)[1] if feat_key != "I" else "I"
             )
             self.attrs["latest_cell_key"] = cell_key
-        return ChunkedArray(self.z[location + "/data"], nthreads=self.nthreads)
+        return ChunkedArray(
+            as_zarr_array(self.z[location + "/data"], name=location + "/data"),
+            nthreads=self.nthreads,
+        )
 
     def normed(
         self,
@@ -849,7 +938,7 @@ class RNAassay(Assay):
         feat_idx: np.ndarray | None = None,
         renormalize_subset: bool = False,
         log_transform: bool = False,
-        **kwargs,
+        **kwargs: Any,
     ) -> ChunkedArray:
         """This function normalizes the raw and returns a delayed chunked array of
         the normalized data. Unlike the `normed` method in the generic Assay
@@ -931,7 +1020,9 @@ class RNAassay(Assay):
         # n_cells, tot, sigmas = n_cells[idx], tot[idx], sigmas[idx]
 
         self.z.create_group(stats_loc, overwrite=True)
-        self.feats.mount_location(self.z[stats_loc], identifier)
+        self.feats.mount_location(
+            as_zarr_group(self.z[stats_loc], name=stats_loc), identifier
+        )
         self.feats.insert(
             "normed_tot", tot.astype(float), overwrite=True, location=identifier
         )
@@ -963,7 +1054,7 @@ class RNAassay(Assay):
         return None
 
     def set_summary_stats(
-        self, cell_key: str = None, n_bins: int = 200, lowess_frac: float = 0.1
+        self, cell_key: str | None = None, n_bins: int = 200, lowess_frac: float = 0.1
     ) -> tuple[str, str]:
         """Calculates summary statistics for the features of the assay using only cells that are marked True by the 'cell_key' parameter.
 
@@ -979,7 +1070,7 @@ class RNAassay(Assay):
             c_var_col: The name of the column in the feature attribute table that contains the corrected variance values.
         """
 
-        def col_renamer(x):
+        def col_renamer(x: str) -> str:
             return f"{identifier}_{x}"
 
         if cell_key is None:
@@ -1024,7 +1115,7 @@ class RNAassay(Assay):
         keep_bounds: bool,
         show_plot: bool,
         max_cells: int,
-        **plot_kwargs,
+        **plot_kwargs: Any,
     ) -> None:
         """Identifies highly variable genes in the dataset.
 
@@ -1070,7 +1161,7 @@ class RNAassay(Assay):
             **plot_kwargs: Keyword arguments for matplotlib.pyplot.scatter function
         """
 
-        def col_renamer(x):
+        def col_renamer(x: str) -> str:
             return f"{identifier}_{x}"
 
         logger.info("Calculating summary statistics")
@@ -1144,7 +1235,17 @@ class ATACassay(Assay):
     """This subclass of Assay is designed for feature selection and
     normalization of scATAC-Seq data."""
 
-    def __init__(self, z: zarr.Group, name: str, cell_data: MetaData, **kwargs):
+    def __init__(
+        self,
+        z: zarr.Group,
+        name: str,
+        cell_data: MetaData,
+        *,
+        workspace: str | None = None,
+        nthreads: int = 1,
+        min_cells_per_feature: int = 10,
+        **kwargs: Any,
+    ) -> None:
         """This Assay subclass is designed for feature selection and
         normalization of scATAC-Seq data.
 
@@ -1160,17 +1261,25 @@ class ATACassay(Assay):
             n_docs: Number of cells. Used for TF-IDF normalization
             n_docs_per_term: Number of cells per feature. Used for TF-IDF normalization
         """
-        super().__init__(z=z, name=name, cell_data=cell_data, **kwargs)
+        super().__init__(
+            z=z,
+            workspace=workspace,
+            name=name,
+            cell_data=cell_data,
+            nthreads=nthreads,
+            min_cells_per_feature=min_cells_per_feature,
+            **kwargs,
+        )
         self.normMethod = norm_tf_idf
-        self.n_term_per_doc = None
-        self.n_docs = None
-        self.n_docs_per_term = None
+        self.n_term_per_doc: np.ndarray | None = None
+        self.n_docs: int | None = None
+        self.n_docs_per_term: np.ndarray | None = None
 
     def normed(
         self,
         cell_idx: np.ndarray | None = None,
         feat_idx: np.ndarray | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> ChunkedArray:
         """This function normalizes the raw and returns a delayed chunked array of
         the normalized data. Unlike the `normed` method in the generic Assay
@@ -1223,7 +1332,9 @@ class ATACassay(Assay):
             self.nthreads,
         )
         self.z.create_group(stats_loc, overwrite=True)
-        self.feats.mount_location(self.z[stats_loc], identifier)
+        self.feats.mount_location(
+            as_zarr_group(self.z[stats_loc], name=stats_loc), identifier
+        )
         self.feats.insert(
             "prevalence", prevalence.astype(float), overwrite=True, location=identifier
         )
@@ -1284,7 +1395,17 @@ class ADTassay(Assay):
         normMethod: Pointer to the function to be used for normalization of the raw data
     """
 
-    def __init__(self, z: zarr.Group, name: str, cell_data: MetaData, **kwargs):
+    def __init__(
+        self,
+        z: zarr.Group,
+        name: str,
+        cell_data: MetaData,
+        *,
+        workspace: str | None = None,
+        nthreads: int = 1,
+        min_cells_per_feature: int = 10,
+        **kwargs: Any,
+    ) -> None:
         """Initialize ADTassay with CLR normalization.
 
         Args:
@@ -1293,14 +1414,22 @@ class ADTassay(Assay):
             cell_data: Cell metadata object.
             **kwargs: Forwarded to ``Assay.__init__`` (workspace, nthreads, etc.).
         """
-        super().__init__(z=z, name=name, cell_data=cell_data, **kwargs)
+        super().__init__(
+            z=z,
+            workspace=workspace,
+            name=name,
+            cell_data=cell_data,
+            nthreads=nthreads,
+            min_cells_per_feature=min_cells_per_feature,
+            **kwargs,
+        )
         self.normMethod = norm_clr
 
     def normed(
         self,
         cell_idx: np.ndarray | None = None,
         feat_idx: np.ndarray | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> ChunkedArray:
         """This function normalizes the raw and returns a delayed chunked array of
         the normalized data. This method uses the normalization indicated

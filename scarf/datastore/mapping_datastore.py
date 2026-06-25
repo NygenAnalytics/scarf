@@ -1,20 +1,22 @@
-import os
-from collections.abc import Generator, Callable
+from collections.abc import Callable, Generator
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
-from ..chunked import ChunkedArray
 from loguru import logger
+from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 
-from .graph_datastore import GraphDataStore
+from .._types import as_zarr_array, as_zarr_group
+from ..ann import AnnStream
 from ..assay import Assay, RNAassay
+from ..chunked import ChunkedArray
+from .graph_datastore import GraphDataStore
 from ..utils import (
     show_dask_progress,
     clean_array,
     tqdmbar,
     controlled_compute,
-    system_call,
 )
 from ..writers import create_zarr_dataset
 
@@ -24,9 +26,6 @@ class MappingDatastore(GraphDataStore):
     projection of cells from one DataStore onto another. It also contains the methods
     required for label transfer, mapping score generation and co-embedding.
     """
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
 
     def run_mapping(
         self,
@@ -97,13 +96,13 @@ class MappingDatastore(GraphDataStore):
         )
         source_assay = self._get_assay(from_assay)
 
-        if type(target_assay) != type(source_assay):
+        if type(target_assay) is not type(source_assay):
             raise TypeError(
                 f"ERROR: Source assay ({type(source_assay)}) and target assay "
                 f"({type(target_assay)}) are of different types. "
                 f"Mapping can only be performed between same assay types"
             )
-        if type(target_assay) == RNAassay:
+        if isinstance(target_assay, RNAassay):
             if target_assay.sf != source_assay.sf:
                 logger.info(
                     f"Resetting target assay's size factor from {target_assay.sf} to {source_assay.sf}"
@@ -133,10 +132,13 @@ class MappingDatastore(GraphDataStore):
             ann_feat_key = feat_key
         else:
             ann_feat_key = f"{feat_key}_common_{target_name}"
-            a = np.zeros(source_assay.feats.N).astype(bool)
-            a[feat_idx] = True
+            feat_mask = np.zeros(source_assay.feats.N).astype(bool)
+            feat_mask[feat_idx] = True
             source_assay.feats.insert(
-                cell_key + "__" + ann_feat_key, a, fill_value=False, overwrite=True
+                cell_key + "__" + ann_feat_key,
+                feat_mask,
+                fill_value=False,
+                overwrite=True,
             )
         if run_coral:
             feat_scaling = False
@@ -146,7 +148,7 @@ class MappingDatastore(GraphDataStore):
             and ann_index_saver is None
             and self._has_ann_stream_cache(from_assay, cell_key, ann_feat_key)
         ):
-            ann_obj = self._load_ann_stream(
+            ann_obj: AnnStream | None = self._load_ann_stream(
                 from_assay,
                 cell_key,
                 ann_feat_key,
@@ -163,11 +165,18 @@ class MappingDatastore(GraphDataStore):
                 ann_index_fetcher=ann_index_fetcher,
                 ann_index_saver=ann_index_saver,
             )
+        if ann_obj is None:
+            raise ValueError("ERROR: AnnStream could not be created for mapping")
         if save_k > ann_obj.k:
             logger.warning(f"`save_k` was decreased to {ann_obj.k}")
             save_k = ann_obj.k
         target_data = ChunkedArray(
-            target_assay.z[f"normed__{target_cell_key}__{target_feat_key}/data"],
+            as_zarr_array(
+                target_assay.z[
+                    f"normed__{target_cell_key}__{target_feat_key}/data"
+                ],
+                name=f"normed__{target_cell_key}__{target_feat_key}/data",
+            ),
             nthreads=self.nthreads,
         )
         if run_coral is True:
@@ -181,9 +190,14 @@ class MappingDatastore(GraphDataStore):
                 self.nthreads,
             )
             target_data = ChunkedArray(
-                target_assay.z[
-                    f"normed__{target_cell_key}__{target_feat_key}/data_coral"
-                ],
+                as_zarr_array(
+                    target_assay.z[
+                        f"normed__{target_cell_key}__{target_feat_key}/data_coral"
+                    ],
+                    name=(
+                        f"normed__{target_cell_key}__{target_feat_key}/data_coral"
+                    ),
+                ),
                 nthreads=self.nthreads,
             )
         if ann_obj.method == "pca" and run_coral is False:
@@ -203,7 +217,10 @@ class MappingDatastore(GraphDataStore):
                 ann_obj.sigma = clean_array(sigma, 1)
         if "projections" not in source_assay.z:
             source_assay.z.create_group("projections")
-        store = source_assay.z["projections"].create_group(target_name, overwrite=True)
+        projections = as_zarr_group(
+            source_assay.z["projections"], name="projections"
+        )
+        store = projections.create_group(target_name, overwrite=True)
         nc = target_assay.cells.active_index(target_cell_key).shape[0]
         nk = save_k
         zi = create_zarr_dataset(store, "indices", (batch_size,), "u8", (nc, nk))
@@ -214,8 +231,9 @@ class MappingDatastore(GraphDataStore):
             desc=f"Mapping cells from {target_name}",
             total=target_data.numblocks[0],
         ):
-            a: np.ndarray = controlled_compute(i, self.nthreads)
-            ki, kd = ann_obj.transform_ann(ann_obj.reducer(a), k=save_k)
+            block: NDArray[Any] = controlled_compute(i, self.nthreads)
+            knn_query = ann_obj.transform_ann(ann_obj.reducer(block), k=save_k)
+            ki, kd = knn_query[0], knn_query[1]
             entry_end = entry_start + len(ki)
             zi[entry_start:entry_end, :] = ki
             zd[entry_start:entry_end, :] = kd
@@ -263,10 +281,14 @@ class MappingDatastore(GraphDataStore):
                 f"ERROR: Projections have not been computed for {target_name} in th latest graph. Please"
                 f" run `run_mapping` or update latest_graph by running `make_graph` with desired parameters"
             )
-        store = self.zw[store_loc]
+        store = as_zarr_group(self.zw[store_loc], name=store_loc)
 
-        indices = store["indices"][:]
-        dists = store["distances"][:]
+        indices = np.asarray(
+            as_zarr_array(store["indices"], name="indices")[:]
+        )
+        dists = np.asarray(
+            as_zarr_array(store["distances"], name="distances")[:]
+        )
         # TODO: add more robust options for distance calculation here
         dists = 1 / (np.log1p(dists) + 1)
         n_cells, n_k = indices.shape
@@ -343,19 +365,24 @@ class MappingDatastore(GraphDataStore):
             raise ValueError(
                 "ERROR: `threshold_fraction` should have a value between 0 and 1"
             )
+        target_subset_set: dict[int, None] | None = None
         if target_subset is not None:
-            if type(target_subset) != list:
+            if not isinstance(target_subset, list):
                 raise TypeError("ERROR:  `target_subset` should be <list> type")
-            target_subset = {x: None for x in target_subset}
+            target_subset_set = {x: None for x in target_subset}
 
-        store = self.zw[store_loc]
-        indices = store["indices"][:]
-        dists = store["distances"][:]
+        store = as_zarr_group(self.zw[store_loc], name=store_loc)
+        indices = np.asarray(
+            as_zarr_array(store["indices"], name="indices")[:]
+        )
+        dists = np.asarray(
+            as_zarr_array(store["distances"], name="distances")[:]
+        )
 
         preds = []
         weights = 1 - (dists / dists.max(axis=1).reshape(-1, 1))
         for n in range(indices.shape[0]):
-            if target_subset is not None and n not in target_subset:
+            if target_subset_set is not None and n not in target_subset_set:
                 continue
             wd = {}
             for i, j in zip(indices[n, :-1], weights[n, :-1]):
@@ -409,13 +436,36 @@ class MappingDatastore(GraphDataStore):
         if feat_key is None:
             feat_key = self._get_latest_feat_key(from_assay)
         graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
-        graph_group = self.zw[graph_loc]
-        edges = graph_group["edges"][:]
-        weights = graph_group["weights"][:]
+        graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
+        edges = np.asarray(
+            as_zarr_array(graph_group["edges"], name="edges")[:]
+        )
+        weights = np.asarray(
+            as_zarr_array(graph_group["weights"], name="weights")[:]
+        )
         ref_n_cells = self.cells.active_index(cell_key).shape[0]
-        store = self.zw[from_assay]["projections"]
-        pidx = np.vstack([store[x]["indices"][:, :use_k] for x in target_names])
-        n_cells = [ref_n_cells] + [store[x]["indices"].shape[0] for x in target_names]
+        projections = as_zarr_group(
+            as_zarr_group(self.zw[from_assay], name=from_assay)["projections"],
+            name="projections",
+        )
+        pidx = np.vstack(
+            [
+                np.asarray(
+                    as_zarr_array(
+                        as_zarr_group(projections[x], name=x)["indices"],
+                        name="indices",
+                    )[:, :use_k]
+                )
+                for x in target_names
+            ]
+        )
+        n_cells = [ref_n_cells] + [
+            as_zarr_array(
+                as_zarr_group(projections[x], name=x)["indices"],
+                name="indices",
+            ).shape[0]
+            for x in target_names
+        ]
         ne = []
         nw = []
         for n, i in enumerate(pidx):
@@ -459,7 +509,10 @@ class MappingDatastore(GraphDataStore):
         target_names: list[str],
     ) -> None:
         g = create_zarr_dataset(
-            self.zw[from_assay]["projections"],
+            as_zarr_group(
+                as_zarr_group(self.zw[from_assay], name=from_assay)["projections"],
+                name="projections",
+            ),
             label,
             (1000, 2),
             "float64",
@@ -673,14 +726,14 @@ class MappingDatastore(GraphDataStore):
         width: float = 6,
         height: float = 6,
         cmap: str | None = None,
-        color_key: dict | None = None,
+        color_key: dict[Any, Any] | None = None,
         mask_color: str = "k",
         point_size: float = 10,
         ax_label_size: float = 12,
         frame_offset: float = 0.05,
         spine_width: float = 0.5,
         spine_color: str = "k",
-        displayed_sides: tuple = ("bottom", "left"),
+        displayed_sides: tuple[str, ...] = ("bottom", "left"),
         legend_ondata: bool = False,
         legend_onside: bool = True,
         legend_size: float = 12,
@@ -694,15 +747,15 @@ class MappingDatastore(GraphDataStore):
         cspacing: float = 1,
         savename: str | None = None,
         save_dpi: int = 300,
-        ax=None,
+        ax: Any = None,
         force_ints_as_cats: bool = True,
         n_columns: int = 1,
         w_pad: float = 1,
         h_pad: float = 1,
-        scatter_kwargs: dict | None = None,
+        scatter_kwargs: dict[Any, Any] | None = None,
         shuffle_zorder: bool = True,
         show_fig: bool = True,
-    ):
+    ) -> Any:
         """Plots the reference and target cells in their unified space.
 
         This function helps to plot the reference and target cells, the coordinates for which were obtained from
@@ -784,22 +837,31 @@ class MappingDatastore(GraphDataStore):
                 "that for either `run_unified_umap` or `run_unified_tsne`. Please see the default values "
                 "for `label` parameter in those functions if unsure."
             )
-        projections = self.zw[from_assay]["projections"]
-        t = projections[layout_key][:]
-        attrs = dict(projections[layout_key].attrs)
-        t_names = attrs["target_names"]
-        ref_n_cells = attrs["n_cells"][0]
-        t_n_cells = attrs["n_cells"][1:]
+        projections = as_zarr_group(
+            as_zarr_group(self.zw[from_assay], name=from_assay)["projections"],
+            name="projections",
+        )
+        layout = as_zarr_array(projections[layout_key], name=layout_key)
+        t = np.asarray(layout[:])
+        attrs = dict(layout.attrs)
+        t_names = cast(list[str], attrs["target_names"])
+        n_cells_attr = cast(list[int], attrs["n_cells"])
+        ref_n_cells = n_cells_attr[0]
+        t_n_cells = n_cells_attr[1:]
         x = t[:, 0]
         y = t[:, 1]
         df = pd.DataFrame({f"{layout_key}1": x, f"{layout_key}2": y})
+        plot_color_key = color_key
+        plot_mask_values: list[Any] | None
+        mask_name: str
+        group_col: NDArray[Any]
         if target_groups is None:
-            if color_key is not None:
+            if plot_color_key is not None:
                 temp_raise_error = False
-                if ref_name not in color_key:
+                if ref_name not in plot_color_key:
                     temp_raise_error = True
                 for i in t_names:
-                    if i not in color_key:
+                    if i not in plot_color_key:
                         temp_raise_error = True
                 if temp_raise_error:
                     temp = " ".join(t_names)
@@ -810,38 +872,40 @@ class MappingDatastore(GraphDataStore):
                 import seaborn as sns
 
                 temp_cmap = sns.color_palette("hls", n_colors=len(t_names) + 1).as_hex()
-                color_key = {k: v for k, v in zip(t_names, temp_cmap[1:])}
-                color_key[ref_name] = temp_cmap[0]
-            target_groups = []
+                plot_color_key = {k: v for k, v in zip(t_names, temp_cmap[1:])}
+                plot_color_key[ref_name] = temp_cmap[0]
+            group_labels: list[str] = []
             for i, j in zip(t_names, t_n_cells):
-                target_groups.extend([i for _ in range(j)])
-            target_groups = np.array(target_groups).astype(object)
-            mask_values = None
+                group_labels.extend([i for _ in range(j)])
+            group_col = np.array(group_labels, dtype=object)
+            plot_mask_values = None
             mask_name = "NA"
         else:
-            if len(target_groups) == len(t_names):
-                temp = []
-                for i in target_groups:
-                    temp.extend(list(i))
-                target_groups = list(temp)
-            color_key = None
-            mask_values = [ref_name]
+            group_labels = list(target_groups)
+            if len(group_labels) == len(t_names):
+                flattened: list[str] = []
+                for entry in group_labels:
+                    flattened.extend(list(entry))
+                group_labels = flattened
+            plot_color_key = None
+            plot_mask_values = [ref_name]
             mask_name = ref_name
-            target_groups = np.array(target_groups).astype(object)
-        if len(target_groups) != sum(t_n_cells):
+            group_col = np.array(group_labels, dtype=object)
+        if len(group_col) != sum(t_n_cells):
             raise ValueError(
                 "ERROR: Number of values in `target_groups` should be same as no. of target cells"
             )
         # Turning array to object forces np.NaN to 'nan'
-        if any(target_groups == "nan"):
+        if np.any(group_col == "nan"):
             raise ValueError("ERROR: `target_groups` cannot contain nan values")
         df["vc"] = np.hstack(
-            [[ref_name for _ in range(ref_n_cells)], target_groups]
+            [[ref_name for _ in range(ref_n_cells)], group_col]
         ).astype(object)
         if show_target_only:
             df = df[ref_n_cells:]
         if shuffle_zorder:
             df = df.sample(frac=1)
+        plot_title = title if isinstance(title, str) else None
         return plot_scatter(
             [df],
             ax,
@@ -849,8 +913,8 @@ class MappingDatastore(GraphDataStore):
             height,
             mask_color,
             cmap,
-            color_key,
-            mask_values,
+            plot_color_key or {},
+            plot_mask_values or [],
             mask_name,
             mask_color,
             point_size,
@@ -863,19 +927,19 @@ class MappingDatastore(GraphDataStore):
             legend_onside,
             legend_size,
             legends_per_col,
-            title,
+            plot_title,
             title_size,
             hide_title,
             cbar_shrink,
             marker_scale,
             lspacing,
             cspacing,
-            savename,
+            savename or "",
             save_dpi,
             force_ints_as_cats,
             n_columns,
             w_pad,
             h_pad,
             show_fig,
-            scatter_kwargs,
+            scatter_kwargs or {},
         )

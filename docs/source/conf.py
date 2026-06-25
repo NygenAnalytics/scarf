@@ -1,6 +1,8 @@
 import os
 import sys
 
+import matplotlib
+
 sys.path.insert(0, os.path.abspath("../.."))
 
 project = "Scarf"
@@ -67,7 +69,5 @@ nb_execution_cache_path = os.path.join(
     os.path.dirname(__file__), "..", ".jupyter_cache"
 )
 nb_execution_timeout = 200
-
-import matplotlib
 
 matplotlib.use("agg")

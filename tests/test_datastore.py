@@ -121,15 +121,15 @@ class TestDataStore:
     def test_get_markers(self, marker_search, paris_clustering, datastore):
         precalc_markers = pd.read_csv(full_path("markers_cluster1.csv"), index_col=0)
         markers = datastore.get_markers(group_key="RNA_cluster", group_id=1)
-        
+
         # Check feature names and scores (always required)
         assert markers.feature_name.equals(precalc_markers.feature_name)
         diff = (markers.score - precalc_markers.score).values
         assert np.all(diff < 1e-3)
-        
+
         # Check p_values only if they exist in reference data (backward compatible)
-        if 'p_value' in precalc_markers.columns:
-            assert 'p_value' in markers.columns, "p_value column missing in output"
+        if "p_value" in precalc_markers.columns:
+            assert "p_value" in markers.columns, "p_value column missing in output"
             # P-values should match within reasonable tolerance
             p_diff = (markers.p_value - precalc_markers.p_value).values
             assert np.all(np.abs(p_diff) < 1e-3), "p_values differ from reference"
@@ -195,7 +195,9 @@ class TestDataStore:
         precalc_values = np.load(full_path("aggregated_feat_idx.npy"))
         agg_group = datastore.z["RNA"]["aggregated_I_I_RNA_pseudotime"]
         test_values = agg_group["feature_indices"][:]
-        assert np.array_equal(precalc_values.astype(np.int64), test_values.astype(np.int64))
+        assert np.array_equal(
+            precalc_values.astype(np.int64), test_values.astype(np.int64)
+        )
 
         precalc_values = np.load(full_path("aggregated_df_top_10.npy"))
         test_values = agg_group["data"][:10]
