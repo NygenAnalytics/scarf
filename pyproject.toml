@@ -48,7 +48,6 @@ extra = [
     "kneed",
     "matplotlib",
     "seaborn",
-    "cmocean",
     "datashader",
     "ipython-autotime",
     "ipywidgets",

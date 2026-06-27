@@ -344,7 +344,9 @@ def find_markers_by_rank(
         batch_iterator = tqdmbar(prenormed_store.keys(), desc="Finding markers")
         if n_threads > 1:
             with ThreadPoolExecutor(max_workers=n_threads) as ex:
-                prenormed_temp = list(ex.map(prenormed_mean_rank_wrapper, batch_iterator))
+                prenormed_temp = list(
+                    ex.map(prenormed_mean_rank_wrapper, batch_iterator)
+                )
         else:
             prenormed_temp = [prenormed_mean_rank_wrapper(i) for i in batch_iterator]
         for i in prenormed_temp:
@@ -380,7 +382,9 @@ def find_markers_by_rank(
             scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
             sf = assay.sf
             if sf is None:
-                raise ValueError("RNA library-size normalization requires a size factor")
+                raise ValueError(
+                    "RNA library-size normalization requires a size factor"
+                )
             stats_matrix = np.vstack(
                 [
                     _batch_stats(mat, int_indices, group_counts, n_total)

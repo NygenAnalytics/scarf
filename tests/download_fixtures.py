@@ -13,9 +13,7 @@ import h5py
 import pandas as pd
 from scipy.sparse import csr_matrix
 
-_FIXTURES_BASE_URL = (
-    "https://raw.githubusercontent.com/parashardhapola/scarf/master/scarf/tests/datasets"
-)
+_FIXTURES_BASE_URL = "https://raw.githubusercontent.com/parashardhapola/scarf/master/scarf/tests/datasets"
 
 FIXTURE_FILES = (
     "1K_pbmc_citeseq.h5",

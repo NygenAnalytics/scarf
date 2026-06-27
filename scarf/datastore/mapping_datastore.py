@@ -756,7 +756,7 @@ class MappingDatastore(GraphDataStore):
             width: Figure width (Default value: 6)
             height: Figure height (Default value: 6)
             cmap: A matplotlib colourmap to be used to colour categorical or continuous values plotted on the cells.
-                  (Default value: tab20 for categorical variables and cmocean.deep for continuous variables)
+                  (Default value: tab20 for categorical variables and viridis for continuous variables)
             color_key: A custom colour map for cells. These can be used for categorical variables only. The keys in this
                        dictionary should be the category label as present in the `color_by` column and values should be
                        valid matplotlib colour names or hex codes of colours. (Default value: None)

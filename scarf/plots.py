@@ -9,8 +9,6 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 import seaborn as sns
-from cmocean import cm  # type: ignore[import-not-found]
-
 from .utils import logger
 
 plt.rcParams["svg.fonttype"] = "none"
@@ -446,7 +444,7 @@ def plot_heatmap(
     fontsize: float = 10,
     width_factor: float = 0.03,
     height_factor: float = 0.02,
-    cmap: Any = cm.matter_r,
+    cmap: Any = "magma_r",
     savename: str | None = None,
     save_dpi: int = 300,
     figsize: tuple[float, float] | None = None,
@@ -551,7 +549,7 @@ def _scatter_make_colors(
 
     if v.dtype.name != "category":
         if cmap is None:
-            return cm.deep, None
+            return get_cmap("viridis"), None
         else:
             return get_cmap(cmap), None
     else:
@@ -1560,7 +1558,7 @@ def plot_annotated_heatmap(
 
     binned_ptime = [x.mean() for x in np.array_split(sorted(xbar_values), df.shape[1])]
     if xbar_cmap is None:
-        xbar_cmap = cm.deep
+        xbar_cmap = "viridis"
     ptime_ax.imshow([binned_ptime], aspect="auto", cmap=xbar_cmap)
     ptime_ax.set_xticks([])
     ptime_ax.set_yticks([])

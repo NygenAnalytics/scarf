@@ -242,20 +242,6 @@ wheels = [
 ]
 
 [[package]]
-name = "cmocean"
-version = "4.0.3"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "matplotlib" },
-    { name = "numpy" },
-    { name = "packaging" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/0e/93/6ce32a2749968071b5239c96c54a229f9cb666d1c2d2cead7246ef28282c/cmocean-4.0.3.tar.gz", hash = "sha256:37868399fb5f41b4eac596e69803f9bfaea49946514dfb2e7f48886854250d7c", size = 7145175, upload-time = "2024-04-06T01:05:26.398Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/86/7b/97754548e9da3d41d7334e375b2cd712e9406a3f48823a5f0a166f42d63d/cmocean-4.0.3-py3-none-any.whl", hash = "sha256:f2fc1d5e349db122ee0c9eac80bba969aa92dd2806548fce58dc8bef962f309e", size = 421873, upload-time = "2024-04-06T01:05:24.069Z" },
-]
-
-[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -1917,7 +1903,6 @@ docs = [
     { name = "topacedo" },
 ]
 extra = [
-    { name = "cmocean" },
     { name = "datashader" },
     { name = "ipython-autotime" },
     { name = "ipywidgets" },
@@ -1943,7 +1928,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anndata", marker = "extra == 'test'" },
-    { name = "cmocean", marker = "extra == 'extra'" },
     { name = "datashader", marker = "extra == 'extra'" },
     { name = "h5py", specifier = ">=3.16" },
     { name = "hnswlib" },

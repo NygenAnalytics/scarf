@@ -1520,7 +1520,7 @@ class DataStore(MappingDatastore):
             height: Figure height (Default value: 6)
             default_color: A default color for the cells. (Default value: steelblue)
             cmap: A matplotlib colourmap to be used to colour categorical or continuous values plotted on the cells.
-                  (Default value: tab20 for categorical variables and cmocean.deep for continuous variables)
+                  (Default value: tab20 for categorical variables and viridis for continuous variables)
             color_key: A custom colour map for cells. These can be used for categorical variables only. The keys in this
                        dictionary should be the category label as present in the `color_by` column and values should be
                        valid matplotlib colour names or hex codes of colours. (Default value: None)
@@ -2137,7 +2137,7 @@ class DataStore(MappingDatastore):
                   value. (Default value: 2.0)
             heatmap_cmap: Colormap for the heatmap (Default value: coolwarm)
             pseudotime_cmap: Colormap for the pseudotime bar. It should be some kind of continuous colormap.
-                             (Default value: cmocean.deep)
+                             (Default value: viridis)
             clusterbar_cmap: Colormap for the cluster bar showing the span of each feature cluster.
                              (Default value: tab20)
             tick_fontsize: Font size for cbar ticks (Default value: 10)
