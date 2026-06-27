@@ -5,13 +5,14 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from numba import jit
+import numba
+from numba import jit, njit, prange, set_num_threads
 from scipy.stats import linregress, norm
 from scipy.stats import rankdata
 import zarr
 
 from scarf._types import as_zarr_array, as_zarr_group
-from scarf.assay import Assay
+from scarf.assay import Assay, RNAassay, norm_lib_size
 from scarf.chunked import ChunkedArray
 from scarf.utils import logger, tqdmbar
 
@@ -111,6 +112,125 @@ def mannwhitneyu_from_ranks(
     return pd.DataFrame(pvals, index=ranked_df.columns).T
 
 
+@njit(parallel=True, cache=True)
+def _marker_stats_batch(
+    data: np.ndarray,
+    int_indices: np.ndarray,
+    group_counts: np.ndarray,
+    n_total: float,
+) -> np.ndarray:
+    """Compute per-gene, per-group marker statistics for a batch.
+
+    For each feature column a single argsort yields average ranks (for the
+    Mann-Whitney U rank sums), tie sums for tie correction, and dense ranks
+    (for the score). Per-group sum, count, and nonzero counts are accumulated
+    in the same pass. Returns an array of shape ``(n_genes, n_groups, 7)`` with
+    the last axis ordered as ``[score, mean, mean_rest, frac_exp,
+    frac_exp_rest, fold_change, z]``; the z statistic is converted to a p-value
+    by the caller.
+    """
+    n_cells = data.shape[0]
+    n_genes = data.shape[1]
+    n_groups = group_counts.shape[0]
+    out = np.zeros((n_genes, n_groups, 7))
+    for g in prange(n_genes):
+        v = data[:, g]
+        order = np.argsort(v)
+        ar = np.empty(n_cells)
+        dr = np.empty(n_cells)
+        tie_sum = 0.0
+        i = 0
+        rank = 0.0
+        while i < n_cells:
+            j = i
+            vi = v[order[i]]
+            while j + 1 < n_cells and v[order[j + 1]] == vi:
+                j += 1
+            avg = (i + j + 2) / 2.0
+            rank += 1.0
+            t = j - i + 1
+            for k in range(i, j + 1):
+                ar[order[k]] = avg
+                dr[order[k]] = rank
+            if t > 1:
+                tie_sum += t * t * t - t
+            i = j + 1
+        sum_g = np.zeros(n_groups)
+        nz_g = np.zeros(n_groups)
+        rank_g = np.zeros(n_groups)
+        drank_g = np.zeros(n_groups)
+        for c in range(n_cells):
+            grp = int_indices[c]
+            val = v[c]
+            sum_g[grp] += val
+            if val > 0:
+                nz_g[grp] += 1.0
+            rank_g[grp] += ar[c]
+            drank_g[grp] += dr[c]
+        total_sum = 0.0
+        total_nz = 0.0
+        for x in range(n_groups):
+            total_sum += sum_g[x]
+            total_nz += nz_g[x]
+        r_sum = 0.0
+        r_vals = np.empty(n_groups)
+        for x in range(n_groups):
+            cnt = group_counts[x]
+            r_vals[x] = drank_g[x] / cnt if cnt > 0 else 0.0
+            r_sum += r_vals[x]
+        if n_total > 1:
+            tie_corr = tie_sum / (n_total * (n_total - 1))
+        else:
+            tie_corr = 0.0
+        for x in range(n_groups):
+            cnt = group_counts[x]
+            rest = n_total - cnt
+            m = sum_g[x] / cnt if cnt > 0 else 0.0
+            m_o = (total_sum - sum_g[x]) / rest if rest > 0 else 0.0
+            e = nz_g[x] / cnt if cnt > 0 else 0.0
+            e_o = (total_nz - nz_g[x]) / rest if rest > 0 else 0.0
+            if m_o == 0.0:
+                fc = 0.0 if m == 0.0 else 100.1
+            else:
+                fc = m / m_o
+            r = r_vals[x] / r_sum if r_sum > 0 else 0.0
+            n1 = cnt
+            n2 = rest
+            r1 = rank_g[x]
+            u1 = r1 - (n1 * (n1 + 1.0)) / 2.0
+            mu = (n1 * n2) / 2.0
+            var = (n1 * n2 / 12.0) * ((n_total + 1.0) - tie_corr)
+            if var > 0.0:
+                z = (u1 - mu - 0.5) / np.sqrt(var)
+            else:
+                z = 0.0
+            out[g, x, 0] = r
+            out[g, x, 1] = m
+            out[g, x, 2] = m_o
+            out[g, x, 3] = e
+            out[g, x, 4] = e_o
+            out[g, x, 5] = fc
+            out[g, x, 6] = z
+    return out
+
+
+def _batch_stats(
+    data: np.ndarray,
+    int_indices: np.ndarray,
+    group_counts: np.ndarray,
+    n_total: int,
+) -> np.ndarray:
+    """Run the numba marker kernel and convert z statistics to p-values."""
+    out = _marker_stats_batch(
+        np.ascontiguousarray(data, dtype=np.float64),
+        int_indices,
+        group_counts.astype(np.float64),
+        float(n_total),
+    )
+    out[:, :, 6] = 2.0 * norm.sf(np.abs(out[:, :, 6]))
+    return np.asarray(out)
+
+
 def find_markers_by_rank(
     assay: Assay,
     group_key: str,
@@ -120,6 +240,7 @@ def find_markers_by_rank(
     use_prenormed: bool,
     prenormed_store: zarr.Group | None,
     n_threads: int,
+    prefetch_depth: int = 1,
     **norm_params: Any,
 ) -> dict[Any, pd.DataFrame]:
     """Identify marker genes/features for given groups using a rank-based approach.
@@ -137,6 +258,7 @@ def find_markers_by_rank(
         use_prenormed: Whether to use pre-normalized data if available
         prenormed_store: Name of the store containing pre-normalized data
         n_threads: Number of threads to use for parallel processing
+        prefetch_depth: Number of feature batches to read ahead in parallel
         **norm_params: Additional parameters to pass to normalization functions
 
     Returns:
@@ -144,44 +266,7 @@ def find_markers_by_rank(
               like fold changes, two-sided p-values, and effect sizes
     """
 
-    from joblib import Parallel, delayed
-
-    def calc(vdf: pd.DataFrame) -> np.ndarray:
-        # Rank data once for all subsequent calculations
-        ranked_vdf = vdf.rank(method="dense")
-        ranked_vdf_average = vdf.rank(method="average")
-
-        # Calculate normalized mean ranks
-        r = ranked_vdf.groupby(groups).mean().reindex(group_set)
-        r = r / r.sum()
-
-        g = np.array([pd.Series(groups).value_counts().reindex(group_set).values]).T
-        g_o = len(groups) - g
-
-        s = vdf.groupby(groups).sum().reindex(group_set)
-        m = s / g
-        m_o = (s.sum() - s) / g_o
-
-        s = (vdf > 0).groupby(groups).sum().reindex(group_set)
-        e = s / g
-        e_o = (s.sum() - s) / g_o
-
-        fc = (m / m_o).fillna(0)
-
-        # Vectorized Mann-Whitney U test using pre-computed ranks
-        pvals = mannwhitneyu_from_ranks(ranked_vdf_average, groups, group_set)
-
-        return np.array(
-            [
-                r.values,
-                m.values,
-                m_o.values,
-                e.values,
-                e_o.values,
-                fc.values,
-                pvals.values,
-            ]
-        ).T
+    from concurrent.futures import ThreadPoolExecutor
 
     @jit(nopython=True)
     def calc_rank_mean(v: np.ndarray) -> np.ndarray:
@@ -257,10 +342,12 @@ def find_markers_by_rank(
         prenormed_rows: dict[Any, list[list[Any]]] = {x: [] for x in group_set}
         cell_idx = assay.cells.active_index(cell_key)
         batch_iterator = tqdmbar(prenormed_store.keys(), desc="Finding markers")
-        temp = Parallel(n_jobs=n_threads)(
-            delayed(prenormed_mean_rank_wrapper)(i) for i in batch_iterator
-        )
-        for i in temp:
+        if n_threads > 1:
+            with ThreadPoolExecutor(max_workers=n_threads) as ex:
+                prenormed_temp = list(ex.map(prenormed_mean_rank_wrapper, batch_iterator))
+        else:
+            prenormed_temp = [prenormed_mean_rank_wrapper(i) for i in batch_iterator]
+        for i in prenormed_temp:
             for j, k in zip(group_set, i[1].T, strict=True):
                 prenormed_rows[j].append([i[0]] + list(k))
         for group_id, rows in prenormed_rows.items():
@@ -271,19 +358,67 @@ def find_markers_by_rank(
             )
         return results
     else:
-        batch_iterator = assay.iter_normed_feature_wise(
-            cell_key=cell_key,
-            feat_key=feat_key,
-            batch_size=batch_size,
-            msg="Finding markers",
-            **norm_params,
+        set_num_threads(min(max(1, n_threads), numba.config.NUMBA_NUM_THREADS))
+        group_counts = pd.Series(groups).value_counts().reindex(group_set).values
+        n_total = len(groups)
+
+        renormalize_subset = bool(norm_params.get("renormalize_subset", False))
+        log_transform = bool(norm_params.get("log_transform", False))
+        use_fast = (
+            assay.normMethod is norm_lib_size
+            and not renormalize_subset
+            and assay.sf is not None
         )
-        temp = np.vstack([calc(x) for x in batch_iterator])
+
+        if use_fast:
+            if not isinstance(assay, RNAassay):
+                raise TypeError(
+                    "Fast raw-count marker search requires an RNAassay instance"
+                )
+            cell_idx = assay.cells.active_index(cell_key)
+            feat_idx = assay.feats.active_index(feat_key)
+            scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
+            sf = assay.sf
+            if sf is None:
+                raise ValueError("RNA library-size normalization requires a size factor")
+            stats_matrix = np.vstack(
+                [
+                    _batch_stats(mat, int_indices, group_counts, n_total)
+                    for mat, _ in assay.iter_raw_feature_columns(
+                        cell_idx=cell_idx,
+                        feat_idx=feat_idx,
+                        batch_size=batch_size,
+                        scalar=scalar,
+                        sf=float(sf),
+                        log_transform=log_transform,
+                        prefetch_depth=prefetch_depth,
+                        msg="Finding markers",
+                    )
+                ]
+            )
+        else:
+            stats_matrix = np.vstack(
+                [
+                    _batch_stats(
+                        mat.to_numpy() if isinstance(mat, pd.DataFrame) else mat[0],
+                        int_indices,
+                        group_counts,
+                        n_total,
+                    )
+                    for mat in assay.iter_normed_feature_wise(
+                        cell_key=cell_key,
+                        feat_key=feat_key,
+                        batch_size=batch_size,
+                        msg="Finding markers",
+                        **norm_params,
+                    )
+                ]
+            )
         feat_index = assay.feats.active_index(feat_key)
         pval_col = "p_value"
         for n, i in enumerate(group_set):
             df = pd.DataFrame(
-                temp[:, n, :], columns=out_cols[1:], index=feat_index
+                stats_matrix[:, n, :], columns=out_cols[1:], index=feat_index
             ).sort_values(by="score", ascending=False)
 
             cols_to_round = [col for col in df.columns if col != pval_col]

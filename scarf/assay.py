@@ -29,6 +29,35 @@ type NormMethod = Callable[["Assay", ChunkedArray], ChunkedArray]
 type PercentFeatures = dict[str, str]
 
 
+def _read_block(
+    zarr_arr: zarr.Array,
+    row_idx: np.ndarray,
+    col_idx: np.ndarray,
+) -> np.ndarray:
+    """Read ``zarr_arr[row_idx, col_idx]`` returning rows/cols in index order.
+
+    A basic slice is used only for an index run that is provably contiguous
+    (consecutive ascending integers), so it selects exactly the requested
+    positions and never includes neighbouring rows or columns. Any other
+    selection falls back to orthogonal (fancy) indexing, which preserves the
+    order of the index arrays. This centralizes the read path so callers never
+    hand-roll ``slice(idx[0], idx[-1] + 1)``.
+    """
+    from .chunked import _is_contiguous
+
+    def axis_sel(idx: np.ndarray) -> slice | np.ndarray:
+        idx = np.asarray(idx)
+        if idx.size > 0 and _is_contiguous(idx):
+            return slice(int(idx[0]), int(idx[-1]) + 1)
+        return idx
+
+    row_sel = axis_sel(row_idx)
+    col_sel = axis_sel(col_idx)
+    if isinstance(row_sel, slice) and isinstance(col_sel, slice):
+        return np.asarray(zarr_arr[row_sel, col_sel])
+    return np.asarray(zarr_arr.get_orthogonal_selection((row_sel, col_sel)))
+
+
 def norm_dummy(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """A dummy normalizer. Doesn't perform any normalization. This is useful
     when the 'raw data' is already normalized.
@@ -595,7 +624,7 @@ class Assay:
         Returns:
             None
         """
-        from joblib import Parallel, delayed
+        from concurrent.futures import ThreadPoolExecutor
 
         from .writers import create_zarr_obj_array
 
@@ -610,10 +639,13 @@ class Assay:
         for mat, inds in self.iter_normed_feature_wise(
             None, feat_key, batch_size, "Saving features", False
         ):
-            Parallel(n_jobs=self.nthreads)(
-                delayed(write_wrapper)(inds[i], mat[i])
-                for i in range(len(inds))  # type: ignore
-            )
+            write_args = ((inds[i], mat[i]) for i in range(len(inds)))  # type: ignore
+            if self.nthreads > 1:
+                with ThreadPoolExecutor(max_workers=self.nthreads) as ex:
+                    list(ex.map(lambda args: write_wrapper(*args), write_args))
+            else:
+                for args in write_args:
+                    write_wrapper(*args)
 
     def save_aggregated_ordering(
         self,
@@ -779,9 +811,12 @@ class Assay:
         def _names_to_idx(i: list[str]) -> np.ndarray:
             return self.feats.get_index_by(i, "names", None)
 
-        def _calc_mean(i: np.ndarray | list[str]) -> np.ndarray:
+        def _calc_mean(i: np.ndarray | list[str] | list[int]) -> np.ndarray:
             if isinstance(i, list):
-                feat_selection = self.feats.get_index_by(i, "names", None)
+                if not i or isinstance(i[0], str):
+                    feat_selection = self.feats.get_index_by(i, "names", None)
+                else:
+                    feat_selection = np.asarray(i, dtype=int)
             else:
                 feat_selection = i
             return (
@@ -802,6 +837,15 @@ class Assay:
             obs_avg, list(feature_idx), ctrl_size, n_bins, rand_seed
         )
         cell_idx, _ = self._get_cell_feat_idx(cell_key, "I")
+        if isinstance(self, RNAassay) and self.normMethod is norm_lib_size:
+            means = self._mean_normed_feature_groups(
+                cell_idx,
+                {
+                    "target": np.asarray(feature_idx, dtype=int),
+                    "control": np.asarray(control_idx, dtype=int),
+                },
+            )
+            return np.asarray(means["target"] - means["control"])
         return np.asarray(_calc_mean(feature_idx) - _calc_mean(control_idx))
 
     def __repr__(self) -> str:
@@ -976,6 +1020,250 @@ class RNAassay(Assay):
         self.normMethod = norm_method_cache
         return val
 
+    def iter_raw_feature_columns(
+        self,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
+        batch_size: int,
+        scalar: np.ndarray,
+        sf: float,
+        log_transform: bool = False,
+        prefetch_depth: int = 1,
+        msg: str | None = None,
+    ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Iterate library-size normalized feature columns without streaming
+        the full normalized matrix.
+
+        Raw count columns are read directly from the backing Zarr array in
+        chunk-aligned batches and normalized in memory using a precomputed
+        per-cell scalar (library size). Reads are prefetched in parallel.
+
+        Args:
+            cell_idx: Integer indices of cells to include (in output order).
+            feat_idx: Integer indices of features to iterate over.
+            batch_size: Number of feature columns per batch.
+            scalar: Per-cell normalization factor aligned to ``cell_idx``.
+            sf: Size factor multiplier applied before dividing by ``scalar``.
+            log_transform: If True, apply ``log1p`` after normalization.
+            prefetch_depth: Number of batches to read ahead in parallel.
+            msg: Progress bar description.
+
+        Yields:
+            Tuples of ``(normed_batch, feat_index_batch)`` where ``normed_batch``
+            has shape ``(len(cell_idx), batch_columns)``.
+        """
+        from .storage.budget import bounded_prefetch
+        from .utils import prefetch_blocks, tqdmbar
+
+        zarr_arr = cast(zarr.Array, self.rawData._backing)
+        cell_idx = np.asarray(cell_idx)
+        feat_idx = np.asarray(feat_idx)
+        scalar_col = np.asarray(scalar, dtype=np.float32).reshape(-1, 1)
+        scalar_col[scalar_col == 0] = 1
+
+        batch_size = max(1, batch_size)
+        batches = [
+            feat_idx[s : s + batch_size] for s in range(0, len(feat_idx), batch_size)
+        ]
+
+        def read(cols: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            return _read_block(zarr_arr, cell_idx, cols), cols
+
+        # Bound read-ahead by the actual band size (raw uint32 plus the float32
+        # normalized copy) rather than trusting a layout-derived depth.
+        raw_itemsize = int(np.dtype(zarr_arr.dtype).itemsize)
+        band_bytes = max(1, len(cell_idx) * batch_size * (raw_itemsize + 4))
+        max_ahead = bounded_prefetch(band_bytes, requested=max(1, prefetch_depth))
+
+        consumer = prefetch_blocks(batches, read, max_ahead=max_ahead)
+        for raw, cols in tqdmbar(consumer, desc=msg or "", total=len(batches)):
+            normed = (sf * raw.astype(np.float32)) / scalar_col
+            if log_transform:
+                normed = np.log1p(normed)
+            yield normed, cols
+
+    def _mean_normed_feature_groups(
+        self,
+        cell_idx: np.ndarray,
+        feature_groups: dict[str, np.ndarray],
+        block_rows: int | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Per-cell mean of library-size normalized counts for each feature group.
+
+        Reads the union of all requested feature columns once and streams over
+        row blocks (sized by the active resource budget) so the peak transient
+        stays bounded. This avoids the full ChunkedArray normalization path (and
+        its repeated wide-chunk reads) used by ``normed`` when scoring small,
+        scattered gene sets such as cell cycle markers. Values are computed in
+        float64 to match ``norm_lib_size``. Row blocks are read ahead in
+        parallel and accumulated as they arrive (each writes a disjoint row
+        slice, so order does not matter).
+        """
+        from .storage.budget import (
+            bounded_prefetch,
+            get_resource_budget,
+            tile_rows_for_width,
+        )
+        from .utils import prefetch_blocks
+
+        zarr_arr = cast(zarr.Array, self.rawData._backing)
+        cell_idx = np.asarray(cell_idx)
+        if self.normMethod is norm_lib_size and self.sf is None:
+            raise ValueError(
+                "RNA library-size normalization requires a size factor (sf), got None"
+            )
+        sf = float(self.sf) if self.sf is not None else 1.0
+        scalar = np.asarray(
+            self.cells.fetch_all(self.name + "_nCounts")[cell_idx], dtype=np.float64
+        )
+        scalar[scalar == 0] = 1
+
+        union = np.unique(
+            np.concatenate([np.asarray(v, dtype=int) for v in feature_groups.values()])
+        )
+        local_pos = {
+            key: np.searchsorted(union, np.asarray(idx, dtype=int))
+            for key, idx in feature_groups.items()
+        }
+
+        n_cells = len(cell_idx)
+        out = {key: np.empty(n_cells, dtype=np.float64) for key in feature_groups}
+        if n_cells == 0:
+            return out
+
+        if block_rows is None:
+            chunk_rows = (
+                int(zarr_arr.chunks[0]) if getattr(zarr_arr, "chunks", None) else 1
+            )
+            raw_itemsize = int(np.dtype(zarr_arr.dtype).itemsize)
+            budget = get_resource_budget()
+            # The float64 normalized copy dominates the transient; size against it.
+            block_rows = tile_rows_for_width(
+                n_cols=len(union),
+                itemsize=raw_itemsize + 8,
+                budget=budget,
+                chunk_rows=chunk_rows,
+                n_rows=n_cells,
+            )
+        block_rows = max(1, int(block_rows))
+
+        starts = range(0, n_cells, block_rows)
+
+        def read(start: int) -> tuple[int, np.ndarray]:
+            rows = cell_idx[start : start + block_rows]
+            return start, _read_block(zarr_arr, rows, union)
+
+        band_bytes = max(1, block_rows * len(union) * 8)
+        max_ahead = bounded_prefetch(band_bytes)
+        for start, raw in prefetch_blocks(starts, read, max_ahead=max_ahead):
+            end = start + raw.shape[0]
+            normed = (sf * raw.astype(np.float64)) / scalar[start:end, None]
+            for key, pos in local_pos.items():
+                out[key][start:end] = normed[:, pos].mean(axis=1)
+        return out
+
+    def _streaming_feature_stats(
+        self,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Per-feature library-size normalized stats in one tiled pass.
+
+        Streams raw-count tiles, normalizes them in float64, and accumulates
+        per-feature nonzero count, sum, and sum of squares, so the normalized
+        matrix is never fully materialized. Tiles are aligned to the on-disk
+        chunk grid: when a full-width row band of one row chunk fits the
+        per-worker budget the read is full width; otherwise the columns are
+        split into chunk-aligned blocks so the in-memory band stays bounded
+        regardless of feature count (the legacy wide-row-chunk case). Each
+        on-disk chunk is read exactly once. Values match ``norm_lib_size``.
+        Returns ``normed_tot`` (sum), ``normed_n`` (nonzero count), and
+        ``sigmas`` (population variance).
+        """
+        from .storage.budget import bounded_prefetch, get_resource_budget
+        from .utils import prefetch_blocks, tqdmbar
+
+        zarr_arr = cast(zarr.Array, self.rawData._backing)
+        cell_idx = np.asarray(cell_idx)
+        feat_idx = np.asarray(feat_idx)
+        if self.normMethod is norm_lib_size and self.sf is None:
+            raise ValueError(
+                "RNA library-size normalization requires a size factor (sf), got None"
+            )
+        sf = float(self.sf) if self.sf is not None else 1.0
+        scalar = np.asarray(
+            self.cells.fetch_all(self.name + "_nCounts")[cell_idx], dtype=np.float64
+        )
+        scalar[scalar == 0] = 1
+        inv_scalar = 1.0 / scalar
+
+        n_features = len(feat_idx)
+        n_cells = len(cell_idx)
+        nz = np.zeros(n_features, dtype=np.float64)
+        s1 = np.zeros(n_features, dtype=np.float64)
+        s2 = np.zeros(n_features, dtype=np.float64)
+        if n_cells == 0 or n_features == 0:
+            return {"normed_tot": s1, "normed_n": nz, "sigmas": s2}
+
+        budget = get_resource_budget()
+        chunks = getattr(zarr_arr, "chunks", None)
+        chunk_rows = int(chunks[0]) if chunks else 1
+        chunk_cols = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
+        raw_itemsize = int(np.dtype(zarr_arr.dtype).itemsize)
+        # Per element we hold the raw value plus a float64 normalized copy and a
+        # transient for the squared term.
+        elem_bytes = raw_itemsize + 16
+        max_elems = max(1, budget.perWorkerBytes // elem_bytes)
+
+        # Prefer a single full-width band; fall back to chunk-aligned column
+        # blocks only when one row chunk's worth of full width busts the budget.
+        rows_full_width = max_elems // n_features
+        if rows_full_width >= chunk_rows:
+            block_rows = min(
+                n_cells, max(chunk_rows, (rows_full_width // chunk_rows) * chunk_rows)
+            )
+            col_block = n_features
+        else:
+            block_rows = min(n_cells, chunk_rows)
+            cols_fit = max_elems // max(1, block_rows)
+            col_block = max(chunk_cols, (cols_fit // chunk_cols) * chunk_cols)
+            col_block = min(col_block, n_features)
+
+        col_starts = range(0, n_features, col_block)
+        row_starts = range(0, n_cells, block_rows)
+        n_tiles = len(col_starts) * len(row_starts)
+
+        def tiles() -> Generator[tuple[int, int], None, None]:
+            for r in row_starts:
+                for c in col_starts:
+                    yield r, c
+
+        def read(tile: tuple[int, int]) -> tuple[int, int, np.ndarray]:
+            r, c = tile
+            rows = cell_idx[r : r + block_rows]
+            cols = feat_idx[c : c + col_block]
+            return r, c, _read_block(zarr_arr, rows, cols)
+
+        # Read band is raw-only; the float64 transients live on the consumer.
+        band_bytes = max(1, block_rows * col_block * raw_itemsize)
+        max_ahead = bounded_prefetch(band_bytes)
+
+        consumer = prefetch_blocks(tiles(), read, max_ahead=max_ahead)
+        for r, c, raw in tqdmbar(
+            consumer, desc=f"({self.name}) Computing feature stats", total=n_tiles
+        ):
+            width = raw.shape[1]
+            normed = (sf * raw.astype(np.float64)) * inv_scalar[
+                r : r + raw.shape[0], None
+            ]
+            nz[c : c + width] += (raw > 0).sum(axis=0)
+            s1[c : c + width] += normed.sum(axis=0)
+            s2[c : c + width] += (normed * normed).sum(axis=0)
+
+        mean = s1 / n_cells
+        sigmas = s2 / n_cells - np.square(mean)
+        return {"normed_tot": s1, "normed_n": nz, "sigmas": sigmas}
+
     def set_feature_stats(self, cell_key: str) -> None:
         """Calculates summary statistics for the features of the assay using
         only cells that are marked True by the 'cell_key' parameter.
@@ -994,21 +1282,32 @@ class RNAassay(Assay):
         else:
             if identifier in self.feats.locations:
                 del self.feats.locations[identifier]
-        n_cells = show_dask_progress(
-            (self.normed(cell_idx, feat_idx) > 0).sum(axis=0),
-            f"({self.name}) Computing nCells",
-            self.nthreads,
-        )
-        tot = show_dask_progress(
-            self.normed(cell_idx, feat_idx).sum(axis=0),
-            f"({self.name}) Computing normed_tot",
-            self.nthreads,
-        )
-        sigmas = show_dask_progress(
-            self.normed(cell_idx, feat_idx).var(axis=0),
-            f"({self.name}) Computing sigmas",
-            self.nthreads,
-        )
+        n_used = int(len(cell_idx))
+        # The single-pass streaming path only implements the library-size
+        # normalization formula (sf * raw / nCounts). Any other norm method
+        # (e.g. log-transformed or renormalized variants) falls back to the
+        # generic ChunkedArray reductions, which honour self.normMethod.
+        if self.normMethod is norm_lib_size:
+            stats = self._streaming_feature_stats(cell_idx, feat_idx)
+            n_cells = stats["normed_n"]
+            tot = stats["normed_tot"]
+            sigmas = stats["sigmas"]
+        else:
+            n_cells = show_dask_progress(
+                (self.normed(cell_idx, feat_idx) > 0).sum(axis=0),
+                f"({self.name}) Computing nCells",
+                self.nthreads,
+            )
+            tot = show_dask_progress(
+                self.normed(cell_idx, feat_idx).sum(axis=0),
+                f"({self.name}) Computing normed_tot",
+                self.nthreads,
+            )
+            sigmas = show_dask_progress(
+                self.normed(cell_idx, feat_idx).var(axis=0),
+                f"({self.name}) Computing sigmas",
+                self.nthreads,
+            )
         # idx = n_cells > min_cells
         # self.feats.update_key(idx, key=feat_key)
         # n_cells, tot, sigmas = n_cells[idx], tot[idx], sigmas[idx]
@@ -1020,9 +1319,12 @@ class RNAassay(Assay):
         self.feats.insert(
             "normed_tot", tot.astype(float), overwrite=True, location=identifier
         )
+        # Mean over the cells actually used (cell_key subset), matching the
+        # denominator of the variance computed above. self.cells.N counts all
+        # primary cells, including those filtered out, so it is not used here.
         self.feats.insert(
             "avg",
-            (tot / self.cells.N).astype(float),
+            (tot / max(1, n_used)).astype(float),
             overwrite=True,
             location=identifier,
         )
@@ -1108,7 +1410,7 @@ class RNAassay(Assay):
         hvg_key_name: str,
         keep_bounds: bool,
         show_plot: bool,
-        max_cells: int,
+        max_cells: int | float,
         **plot_kwargs: Any,
     ) -> None:
         """Identifies highly variable genes in the dataset.
@@ -1190,11 +1492,17 @@ class RNAassay(Assay):
                 keep_bounds=keep_bounds,
             )
             idx = idx & self.feats.fetch_all("I") & bl
-            n_valid_feats = idx.sum()
-            if top_n > n_valid_feats:
+            n_valid_feats = int(idx.sum())
+            if n_valid_feats == 0:
+                raise ValueError(
+                    "No features passed HVG candidate filters "
+                    f"(min_cells={min_cells}, max_cells={max_cells}, "
+                    f"min_mean={min_mean}, max_mean={max_mean})."
+                )
+            if top_n >= n_valid_feats:
                 logger.warning(
                     f"WARNING: Number of valid features are less then value "
-                    f"of parameter `top_n`: {top_n}. Resetting `top_n` to {n_valid_feats}"
+                    f"of parameter `top_n`: {top_n}. Resetting `top_n` to {n_valid_feats - 1}"
                 )
                 top_n = n_valid_feats - 1
             min_var = (

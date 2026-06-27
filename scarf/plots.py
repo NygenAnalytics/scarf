@@ -290,7 +290,7 @@ def plot_qc(
         fig_height = 1 + 2.5 * n_rows
         fig_size = (fig_width, fig_height)
     fig = plt.figure(figsize=fig_size)
-    grouped = data.groupby("groups")
+    grouped = data.groupby("groups", observed=False)
     for i in range(n_plots):
         if data.columns[i] == "groups":
             continue
@@ -361,7 +361,8 @@ def plot_qc(
         # clean_axis(ax)
         ax.figure.patch.set_alpha(0)
         ax.patch.set_alpha(0)
-    fig.suptitle(sup_title, fontsize=sup_title_size)
+    if sup_title is not None:
+        fig.suptitle(sup_title, fontsize=sup_title_size)
     plt.tight_layout()
     if show_fig:
         plt.show()
@@ -667,7 +668,7 @@ def _scatter_legends(
             else:
                 ax.title.set_text(vc)
             ax.title.set_fontsize(title_fontsize)
-        centers = df[[x, y, vc]].groupby(vc).median().T
+        centers = df[[x, y, vc]].groupby(vc, observed=False).median().T
         for i in centers:
             if ondata:
                 ax.text(
@@ -712,7 +713,9 @@ def _scatter_legends(
                 cb.set_label(vc, fontsize=title_fontsize)
         cb.ax.xaxis.set_label_position("bottom")
         cb.ax.xaxis.set_ticks_position("top")
-        cb.outline.set_visible(False)
+        outline = cb.ax.spines.get("outline")
+        if outline is not None:
+            outline.set_visible(False)
     return None
 
 
@@ -1369,7 +1372,7 @@ def plot_cluster_hierarchy(
     if color_key is None:
         cluster_values = (
             pd.DataFrame({"clusters": clusts, "v": color_values})
-            .groupby("clusters")
+            .groupby("clusters", observed=False)
             .mean()["v"]
         )
         mmv: pd.Series = (cluster_values - cluster_values.min()) / (

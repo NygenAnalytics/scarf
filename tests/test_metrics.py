@@ -48,3 +48,17 @@ def test_metric_integration_nmi(datastore, make_graph, leiden_clustering):
         overwrite=True,
     )
     _ = datastore.metric_integration(batch_labels=["lables1", "lables2"], metric="nmi")
+
+
+def test_silhouette_scoring_missing_cluster_labels(datastore):
+    from scarf.metrics import silhouette_scoring
+
+    result = silhouette_scoring(
+        datastore,
+        ann_obj=None,
+        graph=None,
+        hvg_data=None,
+        assay_type="RNA",
+        res_label="missing_resolution_label",
+    )
+    assert result is None

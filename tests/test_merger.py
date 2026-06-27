@@ -1,3 +1,4 @@
+import pytest
 import zarr
 
 
@@ -81,3 +82,44 @@ def test_dataset_merge_cells(datastore, tmp_path):
     df = ds.cells.to_pandas_dataframe(ds.cells.columns)
     df_diff = df[df["orig_RNA_nCounts"] != df["RNA_nCounts"]]
     assert len(df_diff) == 0
+
+
+def test_assay_merge_rejects_duplicate_sample_names(datastore, tmp_path):
+    from scarf.merge import AssayMerge
+
+    fn = str(tmp_path / "merged_dup_names.zarr")
+    with pytest.raises(ValueError, match="unique name"):
+        AssayMerge(
+            zarr_path=fn,
+            assays=[datastore.RNA, datastore.RNA],
+            names=["dup", "dup"],
+            merge_assay_name="RNA",
+            prepend_text="",
+            overwrite=True,
+        )
+
+
+def test_dummy_assay_holds_zero_counts(datastore):
+    import zarr
+    from zarr.storage import MemoryStore
+
+    from scarf.chunked import ChunkedArray
+    from scarf.merge import DummyAssay
+    from scarf.writers import create_zarr_dataset
+
+    mem = zarr.open_group(store=MemoryStore(), mode="w")
+    dummy_array = create_zarr_dataset(
+        mem,
+        "counts",
+        datastore.RNA.rawData.chunksize,
+        datastore.RNA.rawData.dtype,
+        (datastore.cells.N, datastore.RNA.feats.N),
+    )
+    dummy = DummyAssay(
+        datastore,
+        ChunkedArray(dummy_array, nthreads=1),
+        datastore.RNA.feats,
+        "RNA",
+    )
+    assert dummy.name == "RNA"
+    assert int(dummy.rawData.compute().sum()) == 0

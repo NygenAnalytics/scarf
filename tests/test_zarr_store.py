@@ -142,6 +142,53 @@ def test_normed_array_spec_cloud_creates_array(tmp_path, n_feats):
         assert spec.shards[1] % spec.chunks[1] == 0
 
 
+def test_compute_zarr_layout_scales_with_cells():
+    from scarf.storage.zarr_store import compute_zarr_layout
+
+    small = compute_zarr_layout(1_000, 2_000, remote=True)
+    large = compute_zarr_layout(1_000_000, 50_000, remote=True)
+    assert large.countChunks[0] >= small.countChunks[0]
+    assert large.countShards[0] >= small.countShards[0]
+    assert large.asyncConcurrency >= small.asyncConcurrency
+    assert large.streamTargetBytes >= small.streamTargetBytes
+
+
+def test_marker_batch_size_aligns_and_respects_budget():
+    from scarf.storage.zarr_store import compute_zarr_layout, marker_batch_size
+
+    layout = compute_zarr_layout(10_000, 50_000, remote=True)
+    col_chunk = layout.countChunks[1]
+
+    bs = marker_batch_size(10_000, 50_000, layout)
+    # Chunk-aligned when the budget allows at least one column chunk.
+    assert bs % col_chunk == 0
+    assert bs <= 50_000
+    # Stays within the streaming memory budget (float32).
+    assert bs * 10_000 * 4 <= layout.streamTargetBytes
+
+    # Many cells force a smaller, memory-bounded batch.
+    huge = compute_zarr_layout(5_000_000, 50_000, remote=True)
+    bs_huge = marker_batch_size(5_000_000, 50_000, huge)
+    assert bs_huge >= 1
+    assert bs_huge < marker_batch_size(10_000, 50_000, huge)
+
+    # Never exceeds the available feature count.
+    assert marker_batch_size(1_000, 32, layout) <= 32
+
+
+def test_marker_batch_size_snaps_to_chunk_divisor_when_below_chunk():
+    from scarf.storage.zarr_store import compute_zarr_layout, marker_batch_size
+
+    # Many cells force a sub-chunk batch; it must divide the column chunk so
+    # batches never straddle a chunk boundary.
+    layout = compute_zarr_layout(5_000_000, 50_000, remote=True)
+    col_chunk = layout.countChunks[1]
+    bs = marker_batch_size(5_000_000, 50_000, layout)
+    assert bs >= 1
+    assert bs <= col_chunk
+    assert col_chunk % bs == 0
+
+
 def test_streaming_block_size(tmp_path):
     from scarf.storage.zarr_store import streaming_block_size, set_storage_profile
 
@@ -153,6 +200,55 @@ def test_streaming_block_size(tmp_path):
     block = streaming_block_size(arr)
     assert block >= 256
     assert block <= 10_000
+
+
+def test_streaming_block_size_aligns_and_shrinks_under_budget(tmp_path):
+    from scarf.storage.budget import ResourceBudget, set_resource_budget
+    from scarf.storage.zarr_store import set_storage_profile, streaming_block_size
+
+    set_storage_profile("fast_local")
+    root = zarr.open_group(str(tmp_path / "stream.zarr"), mode="w")
+    arr = root.create_array(
+        "x", shape=(100_000, 5_000), chunks=(256, 5_000), dtype="float32"
+    )
+    try:
+        set_resource_budget(ResourceBudget(memoryBytes=8 * 1024**3, workers=1))
+        big = streaming_block_size(arr)
+        assert big % 256 == 0
+
+        set_resource_budget(ResourceBudget(memoryBytes=8 * 1024**3, workers=16))
+        small = streaming_block_size(arr)
+        assert small % 256 == 0
+        assert small <= big
+    finally:
+        set_resource_budget(None)
+
+
+def test_compute_zarr_layout_caps_under_small_budget():
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.zarr_store import compute_zarr_layout
+
+    generous = ResourceBudget(memoryBytes=64 * 1024**3, workers=2)
+    tight = ResourceBudget(memoryBytes=512 * 1024**2, workers=8)
+
+    big = compute_zarr_layout(1_000_000, 50_000, remote=True, budget=generous)
+    small = compute_zarr_layout(1_000_000, 50_000, remote=True, budget=tight)
+
+    assert small.streamTargetBytes <= tight.perWorkerBytes
+    assert small.streamTargetBytes <= big.streamTargetBytes
+    assert small.asyncConcurrency <= big.asyncConcurrency
+    assert small.prefetchDepth >= 1
+
+
+def test_compute_zarr_layout_shard_chunk_alignment():
+    from scarf.storage.zarr_store import compute_zarr_layout
+
+    layout = compute_zarr_layout(100_000, 50_000, remote=True)
+    row_chunk, col_chunk = layout.countChunks
+    shard_rows, shard_cols = layout.countShards
+    assert shard_cols % col_chunk == 0
+    assert shard_rows % row_chunk == 0
+    assert col_chunk <= 512
 
 
 def test_ann_index_round_trip(tmp_path):

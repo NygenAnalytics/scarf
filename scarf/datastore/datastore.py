@@ -45,6 +45,9 @@ class DataStore(MappingDatastore):
         synchronizer: Used as `synchronizer` parameter when opening the Zarr file. Please refer to this page for
                       more details: https://zarr.readthedocs.io/en/stable/api/sync.html. By default
                       ThreadSynchronizer will be used.
+        mem_budget: Memory budget bounding streaming and concurrency. Accepts bytes, a suffixed size
+                    (e.g. '8G'), or a fraction of available memory (e.g. '0.6'). When None, it is
+                    auto-detected (SCARF_MEM_BUDGET env var, else a fraction of available memory).
     """
 
     def __init__(
@@ -62,10 +65,17 @@ class DataStore(MappingDatastore):
         synchronizer: Any = None,
         zarrProfile: Literal["fast_local", "cloud"] | None = None,
         storage_options: dict[str, Any] | None = None,
+        mem_budget: int | str | None = None,
     ) -> None:
-        from ..storage.zarr_store import set_storage_profile
+        from ..storage.budget import resolve_budget, set_resource_budget
+        from ..storage.zarr_store import (
+            configure_zarr_io_for_profile,
+            set_storage_profile,
+        )
 
         set_storage_profile(zarrProfile)
+        set_resource_budget(resolve_budget(memory=mem_budget, workers=nthreads))
+        configure_zarr_io_for_profile()
         if zarr_mode not in ["r", "r+"]:
             raise ValueError(
                 "ERROR: Zarr file can only be accessed using either 'r' or 'r+' mode"
@@ -313,10 +323,8 @@ class DataStore(MappingDatastore):
                 f"Setting `min_cells` to {min_cells}. Only those genes that are present in atleast this number "
                 f"of cells will be considered HVGs."
             )
-        if max_cells is None:
-            max_cells_int = assay.feats.N
-        elif max_cells == np.inf:
-            max_cells_int = assay.feats.N
+        if max_cells is None or max_cells == np.inf:
+            max_cells_int: int | float = np.inf
         else:
             max_cells_int = int(max_cells)
         assay.mark_hvgs(
@@ -377,7 +385,7 @@ class DataStore(MappingDatastore):
         group_key: str | None = None,
         cell_key: str | None = None,
         feat_key: str | None = None,
-        gene_batch_size: int = 50,
+        gene_batch_size: int | None = None,
         use_prenormed: bool = False,
         prenormed_store: zarr.Group | str | None = None,
         n_threads: int | None = None,
@@ -397,6 +405,8 @@ class DataStore(MappingDatastore):
                         the cell metadata table. (Default value: 'I')
             feat_key: Boolean feature metadata column selecting features (default: ``'I'``).
             gene_batch_size: Number of genes loaded per batch; all selected cells are loaded for each batch.
+                             When None (default), the batch size is derived from the dimension-aware Zarr
+                             layout (memory budget and column-chunk alignment).
             use_prenormed: If True, use prenormalized cache from ``Assay.save_normed_for_query``.
                            (Default value: False)
             prenormed_store: Custom Zarr group with prenormalized values (default: None).
@@ -408,6 +418,12 @@ class DataStore(MappingDatastore):
             Marker dict if ``skip_save`` is True, else None.
         """
         from ..markers import find_markers_by_rank
+        from ..storage.zarr_store import (
+            compute_zarr_layout,
+            get_zarr_layout,
+            is_remote_datastore,
+            marker_batch_size,
+        )
 
         if group_key is None:
             raise ValueError(
@@ -420,6 +436,19 @@ class DataStore(MappingDatastore):
         if n_threads is None:
             n_threads = self.nthreads
         assay = self._get_assay(from_assay)
+
+        n_cells = len(assay.cells.active_index(cell_key))
+        n_features = len(assay.feats.active_index(feat_key))
+        layout = get_zarr_layout()
+        if layout is None:
+            layout = compute_zarr_layout(
+                n_cells,
+                n_features,
+                remote=is_remote_datastore(self.zarr_loc, self.z),
+            )
+        if gene_batch_size is None:
+            gene_batch_size = marker_batch_size(n_cells, n_features, layout)
+        prefetch_depth = layout.prefetchDepth
 
         slot_name = f"{cell_key}__{group_key}"
         assay_grp = as_zarr_group(self.zw[assay.name], name=assay.name)
@@ -445,6 +474,7 @@ class DataStore(MappingDatastore):
             use_prenormed=use_prenormed,
             prenormed_store=prenormed_group,
             n_threads=n_threads,
+            prefetch_depth=prefetch_depth,
             **norm_params,
         )
 

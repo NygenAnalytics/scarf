@@ -1880,7 +1880,6 @@ source = { editable = "." }
 dependencies = [
     { name = "h5py" },
     { name = "hnswlib" },
-    { name = "joblib" },
     { name = "leidenalg" },
     { name = "loguru" },
     { name = "networkx" },
@@ -1952,7 +1951,6 @@ requires-dist = [
     { name = "ipywidgets", marker = "extra == 'extra'" },
     { name = "jedi", marker = "extra == 'docs'" },
     { name = "jinja2", marker = "extra == 'docs'" },
-    { name = "joblib" },
     { name = "kneed", marker = "extra == 'extra'" },
     { name = "leidenalg" },
     { name = "loguru" },

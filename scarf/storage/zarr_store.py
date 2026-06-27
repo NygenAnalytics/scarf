@@ -1,3 +1,4 @@
+import math
 import os
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -8,6 +9,11 @@ from zarr.abc.store import Store
 from zarr.codecs import BloscCodec, ZstdCodec
 
 from .._types import ZarrMode, as_zarr_array, as_zarr_group, array_metadata_shards
+from .budget import (
+    ResourceBudget,
+    concurrency_for_chunk,
+    get_resource_budget,
+)
 
 StorageProfile = Literal["fast_local", "cloud"]
 
@@ -35,6 +41,146 @@ PROFILE_PREFETCH_DEPTH: dict[StorageProfile, int] = {
     "fast_local": 1,
     "cloud": 4,
 }
+
+
+@dataclass(frozen=True)
+class ZarrLayout:
+    """Dimension-aware Zarr IO layout (chunks, shards, streaming, concurrency)."""
+
+    countChunks: tuple[int, int]
+    countShards: tuple[int, int]
+    normedRowChunk: int
+    normedColChunk: int
+    metadataChunk: int
+    streamTargetBytes: int
+    asyncConcurrency: int
+    prefetchDepth: int
+    remote: bool = False
+
+
+def _log_interp(
+    value: float, lo: float, hi: float, outLo: float, outHi: float
+) -> float:
+    value = max(lo, min(hi, value))
+    if hi <= lo:
+        return outLo
+    t = (math.log10(value) - math.log10(lo)) / (math.log10(hi) - math.log10(lo))
+    return outLo + t * (outHi - outLo)
+
+
+def compute_zarr_layout(
+    nCells: int,
+    nFeatures: int,
+    *,
+    remote: bool = False,
+    budget: ResourceBudget | None = None,
+) -> ZarrLayout:
+    """Derive chunk, shard, and IO settings from matrix dimensions.
+
+    Memory-driven knobs (streaming bytes, async concurrency, prefetch depth)
+    are capped by ``budget`` so peak memory tracks ``workers * tileBytes``.
+    """
+    nCells = max(int(nCells), 1)
+    nFeatures = max(int(nFeatures), 1)
+    matrixSize = nCells * nFeatures
+    budget = budget or get_resource_budget()
+
+    rowChunk = int(_log_interp(nCells, 1e3, 1e6, 256, 4096))
+    # Narrow feature chunks keep scattered-feature reads from dragging full
+    # wide chunks; row scans still read every chunk regardless of width.
+    colChunk = int(_log_interp(nFeatures, 1e3, 5e4, 128, 512))
+    rowChunk = min(rowChunk, nCells)
+    colChunk = min(colChunk, nFeatures)
+
+    shardRows = int(_log_interp(nCells, 1e3, 1e6, 2048, 16384))
+    shardCols = int(_log_interp(nFeatures, 1e3, 5e4, 2048, 8192))
+    shardRows = min(shardRows, nCells)
+    shardCols = min(shardCols, nFeatures)
+    if remote:
+        shardRows = min(nCells, max(shardRows, rowChunk * 4))
+        # Wide feature shards span many features per object (fewer R2 objects).
+        shardCols = min(nFeatures, max(shardCols, colChunk * 16))
+    # Keep shard edges as whole multiples of the chunk size.
+    shardCols = max(colChunk, (shardCols // colChunk) * colChunk)
+    shardRows = max(rowChunk, (shardRows // rowChunk) * rowChunk)
+    shardCols = min(shardCols, nFeatures)
+    shardRows = min(shardRows, nCells)
+
+    normedRow = min(2048, nCells)
+    normedCol = min(
+        nFeatures,
+        int(_log_interp(nFeatures, 500, 5e4, 512, 2048)),
+    )
+    streamBytes = int(
+        _log_interp(matrixSize, 1e7, 5e10, 64 * 1024 * 1024, 512 * 1024 * 1024)
+    )
+    if remote:
+        streamBytes = min(streamBytes * 2, 1024 * 1024 * 1024)
+    streamBytes = min(streamBytes, budget.perWorkerBytes)
+
+    asyncConcurrency = int(_log_interp(nCells, 1e3, 1e6, 8, 64 if remote else 32))
+    chunkBytes = rowChunk * colChunk * 4
+    asyncConcurrency = min(asyncConcurrency, concurrency_for_chunk(chunkBytes, budget))
+    prefetchDepth = max(1, int(_log_interp(nCells, 1e3, 1e6, 1, 6 if remote else 2)))
+    prefetchDepth = max(
+        1, min(prefetchDepth, budget.memoryBytes // max(1, streamBytes))
+    )
+    metadataChunk = min(PROFILE_METADATA_CHUNK, nCells)
+
+    return ZarrLayout(
+        countChunks=(rowChunk, colChunk),
+        countShards=(shardRows, shardCols),
+        normedRowChunk=normedRow,
+        normedColChunk=normedCol,
+        metadataChunk=metadataChunk,
+        streamTargetBytes=streamBytes,
+        asyncConcurrency=asyncConcurrency,
+        prefetchDepth=prefetchDepth,
+        remote=remote,
+    )
+
+
+def marker_batch_size(
+    nCells: int,
+    nFeatures: int,
+    layout: ZarrLayout,
+    itemsize: int = 4,
+) -> int:
+    """Number of feature columns to load per marker batch.
+
+    Bounded by ``layout.streamTargetBytes`` (assuming float32 normalized
+    values) and aligned to the count column chunk so cloud reads do not
+    amplify across partial chunks.
+    """
+    nCells = max(int(nCells), 1)
+    nFeatures = max(int(nFeatures), 1)
+    colChunk = max(1, layout.countChunks[1])
+    cols = max(1, layout.streamTargetBytes // (nCells * itemsize))
+    if cols >= colChunk:
+        cols = (cols // colChunk) * colChunk
+    else:
+        # The budget cannot fit a whole column chunk. Snap down to the largest
+        # divisor of the chunk so each batch stays inside one column chunk and
+        # batches do not straddle chunk boundaries (which would re-read chunks).
+        while colChunk % cols != 0 and cols > 1:
+            cols -= 1
+    cols = min(cols, nFeatures)
+    return int(max(1, cols))
+
+
+_activeLayout: ZarrLayout | None = None
+
+
+def set_zarr_layout(layout: ZarrLayout | None) -> None:
+    """Apply dimension-aware layout overrides for this process."""
+    global _activeLayout
+    _activeLayout = layout
+    if layout is not None:
+        zarr.config.set({"async.concurrency": layout.asyncConcurrency})
+
+
+def get_zarr_layout() -> ZarrLayout | None:
+    return _activeLayout
 
 
 @dataclass
@@ -129,14 +275,23 @@ def get_storage_profile() -> StorageProfile:
 
 def profile_prefetch_depth() -> int:
     """Return bounded read-ahead depth for the active storage profile."""
-    return PROFILE_PREFETCH_DEPTH[get_storage_profile()]
+    if _activeLayout is not None:
+        return _activeLayout.prefetchDepth
+    budget = get_resource_budget()
+    return max(1, min(PROFILE_PREFETCH_DEPTH[get_storage_profile()], budget.workers))
 
 
 def configure_zarr_io_for_profile() -> None:
     """Apply zarr async IO settings for the active storage profile."""
-    zarr.config.set(
-        {"async.concurrency": PROFILE_ASYNC_CONCURRENCY[get_storage_profile()]}
+    if _activeLayout is not None:
+        zarr.config.set({"async.concurrency": _activeLayout.asyncConcurrency})
+        return
+    budget = get_resource_budget()
+    concurrency = min(
+        PROFILE_ASYNC_CONCURRENCY[get_storage_profile()],
+        concurrency_for_chunk(8 * 1024 * 1024, budget),
     )
+    zarr.config.set({"async.concurrency": concurrency})
 
 
 def count_array_spec(
@@ -145,17 +300,36 @@ def count_array_spec(
     dtype: Any = "uint32",
     profile: StorageProfile | None = None,
     sharded: bool = False,
+    layout: ZarrLayout | None = None,
 ) -> ZarrArraySpec:
     """Build array spec for assay count matrices."""
     profile = profile or get_storage_profile()
-    chunks = PROFILE_COUNT_CHUNKS[profile]
-    shards = PROFILE_COUNT_SHARDS[profile] if sharded else None
+    layout = layout or _activeLayout
+    if layout is not None:
+        chunks = tuple(min(c, d) for c, d in zip(layout.countChunks, (nCells, nFeats)))
+        shards = (
+            tuple(min(s, d) for s, d in zip(layout.countShards, (nCells, nFeats)))
+            if sharded
+            else None
+        )
+    else:
+        chunks = tuple(
+            min(c, d) for c, d in zip(PROFILE_COUNT_CHUNKS[profile], (nCells, nFeats))
+        )
+        shards = (
+            tuple(
+                min(s, d)
+                for s, d in zip(PROFILE_COUNT_SHARDS[profile], (nCells, nFeats))
+            )
+            if sharded
+            else None
+        )
     return ZarrArraySpec(
         shape=(nCells, nFeats),
         chunks=chunks,
         shards=shards,
         dtype=dtype,
-        compressors=get_compressors(profile),
+        compressors=get_compressors("cloud" if (layout and layout.remote) else profile),
         fillValue=0,
     )
 
@@ -164,9 +338,14 @@ def metadata_array_spec(
     length: int,
     dtype: Any,
     profile: StorageProfile | None = None,
+    layout: ZarrLayout | None = None,
 ) -> ZarrArraySpec:
     """Build array spec for 1D metadata columns."""
-    chunkSize = min(PROFILE_METADATA_CHUNK, max(length, 1))
+    layout = layout or _activeLayout
+    if layout is not None:
+        chunkSize = min(layout.metadataChunk, max(length, 1))
+    else:
+        chunkSize = min(PROFILE_METADATA_CHUNK, max(length, 1))
     return ZarrArraySpec(
         shape=(length,),
         chunks=(chunkSize,),
@@ -193,14 +372,21 @@ def normed_array_spec(
     nCells: int,
     nFeats: int,
     profile: StorageProfile | None = None,
+    layout: ZarrLayout | None = None,
 ) -> ZarrArraySpec:
     """Build array spec for normalized expression matrices (graph-building slot)."""
     profile = profile or get_storage_profile()
-    n_cols = min(nFeats, 2048) if nFeats > 0 else 1
-    row_chunk = min(2048, max(nCells, 1))
+    layout = layout or _activeLayout
+    if layout is not None:
+        n_cols = min(nFeats, layout.normedColChunk) if nFeats > 0 else 1
+        row_chunk = min(layout.normedRowChunk, max(nCells, 1))
+    else:
+        n_cols = min(nFeats, 2048) if nFeats > 0 else 1
+        row_chunk = min(2048, max(nCells, 1))
     chunks = (row_chunk, n_cols)
     shards = None
-    if profile == "cloud" and nCells > 0 and nFeats > 0:
+    useCloudShards = layout.remote if layout is not None else profile == "cloud"
+    if useCloudShards and nCells > 0 and nFeats > 0:
         col_shard = _aligned_shard_dim(min(8192, nFeats), n_cols, nFeats)
         shard_rows = min(16384, nCells)
         bytes_per_row = col_shard * 4
@@ -216,7 +402,7 @@ def normed_array_spec(
         chunks=chunks,
         shards=shards,
         dtype="float32",
-        compressors=get_compressors(profile),
+        compressors=get_compressors("cloud" if useCloudShards else profile),
         fillValue=0.0,
     )
 
@@ -225,19 +411,31 @@ def streaming_block_size(
     backing: zarr.Array,
     profile: StorageProfile | None = None,
     target_bytes: int | None = None,
+    layout: ZarrLayout | None = None,
 ) -> int:
     """Pick a row block size for streaming reads that targets a byte budget."""
     import numpy as np
 
     profile = profile or get_storage_profile()
+    layout = layout or _activeLayout
     if target_bytes is None:
-        target_bytes = PROFILE_STREAM_TARGET_BYTES[profile]
+        if layout is not None:
+            target_bytes = layout.streamTargetBytes
+        else:
+            target_bytes = PROFILE_STREAM_TARGET_BYTES[profile]
+    # Bound by a single worker's memory slice. The backing is typically uint32
+    # but reductions materialize float64 plus transients, so reserve headroom.
+    budget = get_resource_budget()
+    expansion_factor = 4
+    target_bytes = min(target_bytes, budget.perWorkerBytes // expansion_factor)
     n_rows, n_cols = backing.shape
     if n_rows == 0:
         return 1
     itemsize = int(np.dtype(backing.dtype).itemsize)
     chunk_rows = int(backing.chunks[0]) if getattr(backing, "chunks", None) else n_rows
     block_rows = max(chunk_rows, target_bytes // max(n_cols * itemsize, 1))
+    # Keep blocks aligned to whole row chunks for predictable, minimal reads.
+    block_rows = max(chunk_rows, (block_rows // chunk_rows) * chunk_rows)
     metadata = getattr(backing, "metadata", None)
     shard_rows = getattr(metadata, "shards", None)
     if shard_rows is not None and len(shard_rows) > 0:
@@ -403,7 +601,7 @@ def create_numeric_array(
 
 def dtype_fix(dtype: Any, data: np.ndarray) -> Any:
     """Infer or adjust dtype for metadata arrays from sample values."""
-    if dtype is None or dtype == object:
+    if dtype is None or np.dtype(dtype).kind == "O":
         return "U" + str(max([len(str(x)) for x in data]))
     if np.issubdtype(data.dtype, np.dtype("S")):
         try:
@@ -499,9 +697,11 @@ def finalize_sharded_counts(
     assayName: str,
     workspace: str | None = None,
     profile: StorageProfile | None = None,
+    layout: ZarrLayout | None = None,
 ) -> zarr.Array:
     """Repack assay counts to sharded layout when not already sharded."""
     profile = profile or get_storage_profile()
+    layout = layout or _activeLayout
     if workspace is None:
         countsPath = f"{assayName}/counts"
         assayGroup = as_zarr_group(store[assayName], name=assayName)
@@ -515,12 +715,16 @@ def finalize_sharded_counts(
     if _group_zarr_format(store) == 2:
         return srcArray
 
-    shards = tuple(
-        min(s, d) for s, d in zip(PROFILE_COUNT_SHARDS[profile], srcArray.shape)
-    )
-    chunks = tuple(
-        min(c, d) for c, d in zip(PROFILE_COUNT_CHUNKS[profile], srcArray.shape)
-    )
+    if layout is not None:
+        shards = tuple(min(s, d) for s, d in zip(layout.countShards, srcArray.shape))
+        chunks = tuple(min(c, d) for c, d in zip(layout.countChunks, srcArray.shape))
+    else:
+        shards = tuple(
+            min(s, d) for s, d in zip(PROFILE_COUNT_SHARDS[profile], srcArray.shape)
+        )
+        chunks = tuple(
+            min(c, d) for c, d in zip(PROFILE_COUNT_CHUNKS[profile], srcArray.shape)
+        )
     normalized: list[tuple[int, int]] = []
     for shardDim, chunkDim in zip(shards, chunks):
         if shardDim <= chunkDim or shardDim % chunkDim != 0:

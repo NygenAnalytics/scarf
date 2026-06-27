@@ -66,6 +66,20 @@ def test_downloader_as_zarr(mock_osf_downloader, monkeypatch, tmp_path):
     assert downloaded[0][1].endswith("tenx_5K_pbmc.zarr.tar.gz")
 
 
+def test_fetch_dataset_unknown_name_raises(mock_osf_downloader):
+    from scarf.downloader import fetch_dataset
+
+    with pytest.raises(KeyError):
+        fetch_dataset("this_dataset_does_not_exist", save_path=".")
+
+
+def test_fetch_dataset_as_zarr_missing_file(mock_osf_downloader, tmp_path):
+    from scarf.downloader import fetch_dataset
+
+    fetch_dataset("dataset_0", as_zarr=True, save_path=str(tmp_path))
+    assert not any(tmp_path.iterdir())
+
+
 @pytest.mark.integration
 def test_downloader_live_osf():
     from scarf.downloader import OSFdownloader

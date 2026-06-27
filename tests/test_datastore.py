@@ -268,6 +268,13 @@ class TestDataStore:
         with pytest.raises(TypeError):
             atac_datastore.mark_hvgs()
 
+    def test_mark_hvgs_default_max_cells_unbounded(self, auto_filter_cells, datastore):
+        from unittest.mock import patch
+
+        with patch.object(datastore.RNA, "mark_hvgs") as mock:
+            datastore.mark_hvgs(show_plot=False, top_n=10)
+        assert mock.call_args.kwargs["max_cells"] == np.inf
+
     def test_mark_prevalent_peaks_with_rna_assay(self, datastore):
         import pytest
 
@@ -282,3 +289,77 @@ class TestDataStore:
 
     def test_run_marker_search_with_cellkey(self, datastore, paris_clustering):
         datastore.run_marker_search(group_key="RNA_cluster", cell_key="I")
+
+    def test_streaming_feature_stats_matches_three_pass(self, datastore):
+        from scarf.utils import controlled_compute
+
+        assay = datastore.RNA
+        cell_idx, feat_idx = assay._get_cell_feat_idx("I", "I")
+
+        tiled = assay._streaming_feature_stats(cell_idx, feat_idx)
+
+        normed = assay.normed(cell_idx, feat_idx)
+        legacy_n = controlled_compute((normed > 0).sum(axis=0), assay.nthreads)
+        legacy_tot = controlled_compute(normed.sum(axis=0), assay.nthreads)
+        legacy_sigmas = controlled_compute(normed.var(axis=0), assay.nthreads)
+
+        np.testing.assert_allclose(tiled["normed_n"], legacy_n, rtol=0, atol=1e-6)
+        np.testing.assert_allclose(
+            tiled["normed_tot"], legacy_tot, rtol=1e-6, atol=1e-6
+        )
+        np.testing.assert_allclose(tiled["sigmas"], legacy_sigmas, rtol=1e-5, atol=1e-6)
+
+    def test_streaming_feature_stats_column_block_branch(self, datastore):
+        # A tiny budget forces the chunk-aligned column-block path; results must
+        # still match the full-width reductions.
+        from scarf.storage.budget import ResourceBudget, set_resource_budget
+        from scarf.utils import controlled_compute
+
+        assay = datastore.RNA
+        cell_idx, feat_idx = assay._get_cell_feat_idx("I", "I")
+        normed = assay.normed(cell_idx, feat_idx)
+        legacy_tot = controlled_compute(normed.sum(axis=0), assay.nthreads)
+        legacy_sigmas = controlled_compute(normed.var(axis=0), assay.nthreads)
+
+        try:
+            set_resource_budget(ResourceBudget(memoryBytes=1 * 1024 * 1024, workers=2))
+            tiled = assay._streaming_feature_stats(cell_idx, feat_idx)
+        finally:
+            set_resource_budget(None)
+
+        np.testing.assert_allclose(
+            tiled["normed_tot"], legacy_tot, rtol=1e-6, atol=1e-6
+        )
+        np.testing.assert_allclose(tiled["sigmas"], legacy_sigmas, rtol=1e-5, atol=1e-6)
+
+    def test_streaming_feature_stats_requires_sf(self, datastore):
+        import pytest
+
+        assay = datastore.RNA
+        cell_idx, feat_idx = assay._get_cell_feat_idx("I", "I")
+        original = assay.sf
+        try:
+            assay.sf = None
+            with pytest.raises(ValueError):
+                assay._streaming_feature_stats(cell_idx, feat_idx)
+        finally:
+            assay.sf = original
+
+    def test_read_block_preserves_order_and_selection(self, datastore):
+        from scarf.assay import _read_block
+
+        backing = datastore.RNA.rawData._backing
+
+        rows = np.array([3, 4, 5, 6])
+        cols = np.array([0, 1, 2])
+        contiguous = _read_block(backing, rows, cols)
+        reference = np.asarray(backing.get_orthogonal_selection((rows, cols)))
+        np.testing.assert_array_equal(contiguous, reference)
+
+        scattered_rows = np.array([7, 2, 9])
+        scattered_cols = np.array([4, 0, 2])
+        scattered = _read_block(backing, scattered_rows, scattered_cols)
+        ref2 = np.asarray(
+            backing.get_orthogonal_selection((scattered_rows, scattered_cols))
+        )
+        np.testing.assert_array_equal(scattered, ref2)

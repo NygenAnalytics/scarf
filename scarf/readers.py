@@ -58,8 +58,11 @@ def read_file(fn: str) -> Generator[str, None, None]:
         fn: The path to the file (file name).
     """
     fh = get_file_handle(fn)
-    for line in fh:
-        yield line.rstrip()
+    try:
+        for line in fh:
+            yield line.rstrip()
+    finally:
+        fh.close()
 
 
 class CrReader(ABC):

@@ -30,4 +30,7 @@ htmlcov/
 .pytest_cache
 interrogate_badge.svg
 tests/datasets/*
+tests/.env
+tests/.env.*
+!tests/.env.example
 test_data

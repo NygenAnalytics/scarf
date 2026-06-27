@@ -21,7 +21,6 @@ classifiers = [
 dependencies = [
     "h5py>=3.16",
     "hnswlib",
-    "joblib",
     "leidenalg",
     "loguru",
     "networkx",
@@ -92,7 +91,7 @@ exclude = ["tests*"]
 minversion = "6.0"
 addopts = "-ra -v -m 'not integration' -n auto --dist loadfile"
 markers = [
-    "integration: live network tests for OSF downloader",
+    "integration: live network tests (OSF downloader, R2 benchmarks)",
 ]
 testpaths = [
     "tests",
