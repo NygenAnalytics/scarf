@@ -25,6 +25,8 @@ jobs:
         python-version: "3.14"
     - name: Install dependencies
       run: uv sync --extra test --extra extra
+    - name: Download test fixtures
+      run: uv run python -m tests.download_fixtures --with-h5ad
     - name: Test with pytest (parallel)
       run: |
         uv run pytest \
