@@ -744,7 +744,7 @@ class GraphDataStore(BaseDataStore):
                 subset_hash == grp.attrs["subset_hash"]
                 and subset_params == grp.attrs["subset_params"]
             )
-        except (KeyError, ValueError, AttributeError):
+        except KeyError, ValueError, AttributeError:
             return False
 
     @staticmethod
@@ -1576,9 +1576,7 @@ class GraphDataStore(BaseDataStore):
 
         save_loadings = reduction_loc not in self.zw
         save_harmonized = (
-            harmonize
-            and harmonized_data is None
-            and ann_obj.harmonizedData is not None
+            harmonize and harmonized_data is None and ann_obj.harmonizedData is not None
         )
         save_ann = ann_idx is None
         save_kmeans = fit_kmeans
@@ -1605,15 +1603,16 @@ class GraphDataStore(BaseDataStore):
                 reduction_grp = as_zarr_group(
                     self.zw[reduction_loc], name=reduction_loc
                 )
-                g = create_zarr_dataset(
-                    reduction_grp,
-                    "harmonizedData",
-                    data.chunksize,
-                    "f8",
-                    ann_obj.harmonizedData.shape,
-                )
-                g[:] = ann_obj.harmonizedData
-                g.attrs["batches"] = batch_columns
+                if ann_obj.harmonizedData is not None:
+                    g = create_zarr_dataset(
+                        reduction_grp,
+                        "harmonizedData",
+                        data.chunksize,
+                        "f8",
+                        ann_obj.harmonizedData.shape,
+                    )
+                    g[:] = ann_obj.harmonizedData
+                    g.attrs["batches"] = batch_columns
             if save_ann:
                 if ann_loc not in self.zw:
                     logger.debug(f"Saving ANN index to {ann_loc}")
@@ -1672,9 +1671,7 @@ class GraphDataStore(BaseDataStore):
                     pass
 
             knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
-            with progress.step(
-                "smooth KNN distances into graph", cached=cached_graph
-            ):
+            with progress.step("smooth KNN distances into graph", cached=cached_graph):
                 smoothen_dists(
                     self.zw.create_group(graph_loc, overwrite=True),
                     as_zarr_array(knn_grp["indices"], name="indices"),
