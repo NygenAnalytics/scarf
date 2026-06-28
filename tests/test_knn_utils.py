@@ -1,8 +1,16 @@
 import numpy as np
 import pytest
-from scipy.sparse import csr_matrix, coo_matrix
+import zarr
+from scipy.sparse import coo_matrix, csr_matrix
 
-from scarf.knn_utils import calc_snn, merge_graphs, weight_sort_indices
+from scarf.knn_utils import (
+    _patch_null_weights,
+    calc_snn,
+    merge_graphs,
+    smoothen_dists,
+    weight_sort_indices,
+)
+from scarf.writers import create_zarr_dataset
 
 
 def _simple_knn_graph(n: int, k: int = 3) -> csr_matrix:
@@ -49,3 +57,39 @@ def test_merge_graphs_rejects_mismatched_shapes():
     g2 = _simple_knn_graph(8, k=3)
     with pytest.raises(ValueError, match="same shape"):
         merge_graphs([g1, g2])
+
+
+def test_patch_null_weights_matches_full_rewrite(tmp_path):
+    weights = np.array([0.0, 0.2, 0.0, 0.5, 0.0, 0.3], dtype=np.float64)
+    null_positions = np.flatnonzero(weights == 0).tolist()
+    fill = 0.15
+
+    expected = weights.copy()
+    expected[null_positions] = fill
+
+    root = zarr.open_group(str(tmp_path / "weights.zarr"), mode="w")
+    zgw = create_zarr_dataset(root, "weights", (2,), "f8", weights.shape)
+    zgw[:] = weights
+    _patch_null_weights(zgw, null_positions, fill, patch_chunk=2)
+    np.testing.assert_allclose(zgw[:], expected)
+
+
+def test_smoothen_dists_runs(tmp_path):
+    pytest.importorskip("umap")
+    n_cells, n_neighbors = 24, 5
+    chunk_size = 8
+    rng = np.random.default_rng(0)
+    dist = rng.random((n_cells, n_neighbors)).astype(np.float64)
+    dist[:, 0] = 0.0
+    idx = np.tile(np.arange(n_cells), (n_cells, 1)) % n_cells
+
+    root = zarr.open_group(str(tmp_path / "graph.zarr"), mode="w")
+    knn = root.create_group("knn")
+    z_idx = create_zarr_dataset(knn, "indices", (chunk_size,), "u8", idx.shape)
+    z_dist = create_zarr_dataset(knn, "distances", (chunk_size,), "f8", dist.shape)
+    z_idx[:] = idx
+    z_dist[:] = dist
+    graph = root.create_group("graph")
+    smoothen_dists(graph, z_idx, z_dist, lc=1.0, bw=1.5, chunk_size=chunk_size)
+    assert graph["weights"].shape[0] == graph["edges"].shape[0]
+    assert graph["weights"].shape[0] > 0

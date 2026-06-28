@@ -63,7 +63,7 @@ Scarf uses [Zarr format](https://zarr.readthedocs.io/en/stable/) to store raw co
 - Availability of compression algorithms like [LZ4](https://github.com/lz4/lz4) that provides very high compression and decompression speeds.
 - Automatic storage of intermediate and processed data
 
-In Scarf, the data is always synchronized between hard disk and RAM and as such there is no need to save data manually or synchronize the
+In Scarf, the data is always synchronized between hard disk and RAM and as such there is no need to save data manually or synchronize the store by hand.
 
 We can inspect how the data is organized within the Zarr file using `show_zarr_tree` method of the `DataStore`. 
 
@@ -306,6 +306,27 @@ Set the storage profile with the `SCARF_ZARR_PROFILE` environment variable (`fas
 
 ```bash
 uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_local
+```
+
+### Memory budget and remote stores
+
+Bound streaming memory when opening a store:
+
+```python
+ds = scarf.DataStore('path/to/data.zarr', mem_budget='8G', nthreads=4)
+```
+
+For object-storage backed Zarr, use `zarrProfile='cloud'` or set `SCARF_ZARR_PROFILE=cloud`. Pass `local_cache=True` to `make_graph` to stage normalized data locally before PCA and KNN, which reduces repeated remote reads.
+
+After Harmony batch correction, corrected embeddings are stored under the PCA reduction group as `harmonizedData` with attribute `isHarmonized=True`.
+
+### Metadata query helpers
+
+Subset cells programmatically without exporting full tables:
+
+```python
+idx = ds.cells.get_index_by('RNA_cluster', 3)
+ds.cells.sift(idx)
 ```
 
 ---

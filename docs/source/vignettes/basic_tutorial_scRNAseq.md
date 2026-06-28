@@ -18,7 +18,7 @@ kernelspec:
 
 ## Scarf's basic workflow for scRNA-Seq
 
-This workflow is meant to familiarize users with the Scarf API and how data is internally handled in Scarf. Please checkout the quick start guide if you are interested in the minimal steps required to run the analysis.
+This workflow is meant to familiarize users with the Scarf API and how data is internally handled in Scarf. For a minimal pipeline see {ref}`Quick start <quickstart>`. For batch correction on merged data see {ref}`integration methods guide <integration_guide>`.
 
 ```{code-cell} ipython3
 %load_ext autotime
@@ -206,6 +206,19 @@ ds.run_umap(
 )
 ```
 
+Optional: enable density-preserving UMAP (densMAP) when local density structure matters:
+
+```{code-cell} ipython3
+ds.run_umap(
+    n_epochs=250,
+    spread=5,
+    min_dist=1,
+    parallel=True,
+    use_density_map=True,
+    label='dUMAP'
+)
+```
+
 The UMAP results are saved in the cell metadata table as seen below in columns: **RNA_UMAP1** and **RNA_UMAP2**
 
 ```{code-cell} ipython3
@@ -245,7 +258,7 @@ NOTE: The tSNE implementation is currently not supported on Windows.
 </div>
 
 ```{code-cell} ipython3
-# Here we run plot_layout under exception catching because if you are not on Linux then the `run_tnse` would have failed.
+# Here we run plot_layout under exception catching because if you are not on Linux then the `run_tsne` would have failed.
 try:
     ds.plot_layout(layout_key='RNA_tSNE')
 except KeyError:
@@ -294,7 +307,7 @@ leiden_clusters = ds.cells.to_pandas_dataframe(
 leiden_clusters.head()
 ```
 
-Now we run Paris clustering algorithm using `run_clustering` method. Paris clustering requires only one parameter: `n_clusters`, which determines the number of clusters to create. Here we set the number of clusters same as that were obtained using Leiden clustering.leiden_clusters.nunique()
+Now we run Paris clustering algorithm using `run_clustering` method. Paris clustering requires only one parameter: `n_clusters`, which determines the number of clusters to create. Here we set the number of clusters same as that were obtained using Leiden clustering.
 
 ```{code-cell} ipython3
 ds.run_clustering(n_clusters=leiden_clusters.nunique()[0])

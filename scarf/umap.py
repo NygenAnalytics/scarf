@@ -88,10 +88,10 @@ def simplicial_set_embedding(
     else:
         densmap = False
 
-    # tqdm will be activated if https://github.com/lmcinnes/umap/pull/739
-    # is merged and when it is released
     tqdm_params = dict(default_tqdm_params)
     tqdm_params["desc"] = "Training UMAP"
+    if "disable" not in tqdm_params:
+        tqdm_params["disable"] = not verbose
 
     with threadpool_limits(limits=nthreads):
         embedding = optimize_layout_euclidean(
@@ -109,7 +109,7 @@ def simplicial_set_embedding(
             initial_alpha=initial_alpha,
             negative_sample_rate=negative_sample_rate,
             parallel=parallel,
-            verbose=verbose,
+            verbose=False,
             densmap=densmap,
             densmap_kwds=densmap_kwds,
             tqdm_kwds=tqdm_params,

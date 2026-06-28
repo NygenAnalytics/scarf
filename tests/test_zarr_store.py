@@ -6,9 +6,15 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.storage.zarr_store import (
+    copy_zarr_array,
+    create_numeric_array,
     get_storage_profile,
+    is_local_zarr_path,
+    is_remote_datastore,
     is_remote_zarr_location,
     make_store,
+    normed_array_spec,
+    open_or_create_staged_normed_array,
     open_store,
     set_storage_profile,
 )
@@ -27,6 +33,76 @@ def test_is_remote_zarr_location():
     assert is_remote_zarr_location("gs://bucket/path") is True
     assert is_remote_zarr_location("/tmp/foo.zarr") is False
     assert is_remote_zarr_location("file:///tmp/foo.zarr") is False
+
+
+def test_is_local_zarr_path():
+    assert is_local_zarr_path("/tmp/foo.zarr") is True
+    assert is_local_zarr_path("s3://bucket/path") is False
+    assert is_local_zarr_path("gs://bucket/path") is False
+    assert is_local_zarr_path(MemoryStore()) is False
+
+
+def test_load_zarr_forwards_storage_options_to_make_store(monkeypatch):
+    captured = {}
+
+    def fake_make_store(location, storage_options=None, read_only=False):
+        captured["location"] = location
+        captured["storage_options"] = storage_options
+        captured["read_only"] = read_only
+        return MemoryStore()
+
+    monkeypatch.setattr("scarf.storage.zarr_store.make_store", fake_make_store)
+    monkeypatch.setattr(
+        "scarf.storage.zarr_store.configure_zarr_io_for_profile", lambda: None
+    )
+    monkeypatch.setattr("zarr.open_group", lambda **kwargs: object())
+    load_zarr(
+        "s3://bucket/path",
+        mode="r",
+        storage_options={"secret_access_key": "secret"},
+    )
+    assert captured["storage_options"] == {"secret_access_key": "secret"}
+    assert captured["read_only"] is True
+
+
+def _memory_group():
+    return zarr.open_group(store=MemoryStore(), mode="w")
+
+
+def test_is_remote_datastore():
+    local_root = _memory_group()
+    assert is_remote_datastore("/tmp/foo.zarr", local_root) is False
+    assert is_remote_datastore("s3://bucket/path", local_root) is True
+
+
+def test_copy_zarr_array_round_trip(tmp_path):
+    src_root = zarr.open_group(str(tmp_path / "src.zarr"), mode="w")
+    spec = normed_array_spec(64, 8, profile="fast_local")
+    src = create_numeric_array(src_root, "data", spec)
+    expected = np.random.rand(64, 8).astype(np.float32)
+    src[:] = expected
+
+    dst_root = zarr.open_group(str(tmp_path / "dst.zarr"), mode="w")
+    dst = create_numeric_array(dst_root, "data", spec)
+    copy_zarr_array(src, dst, block_rows=16)
+    np.testing.assert_allclose(dst[:], expected, rtol=1e-6)
+
+
+def test_open_or_create_staged_normed_array_reuses_shape(tmp_path):
+    src_root = zarr.open_group(str(tmp_path / "src.zarr"), mode="w")
+    spec = normed_array_spec(32, 4, profile="cloud")
+    src = create_numeric_array(src_root, "data", spec)
+    src[:] = np.ones((32, 4), dtype=np.float32)
+
+    cache_path = str(tmp_path / "cache" / "abc123" / "normed.zarr")
+    staged = open_or_create_staged_normed_array(cache_path, src)
+    copy_zarr_array(src, staged, block_rows=8)
+    staged.attrs["staged_subset_hash"] = "abc123"
+    staged.attrs["staged_complete"] = True
+
+    reopened = open_or_create_staged_normed_array(cache_path, src)
+    assert reopened.shape == src.shape
+    np.testing.assert_allclose(reopened[:], np.ones((32, 4), dtype=np.float32))
 
 
 def test_make_store_local_path_returns_str(tmp_path):

@@ -107,7 +107,7 @@ writer.dump()
 #### From Anndata H5ad file format
 
 ```{code-cell} ipython3
- # Note here we only give name of directory containing MTX file (along with barcodes and features file)
+ # Note: H5adReader takes the path to the .h5ad file directly
 reader = scarf.H5adReader(
     'scarf_datasets/bastidas-ponce_4K_pancreas-d15_rnaseq/data.h5ad', 
     cell_ids_key = 'index',               # Where Cell/barcode ids are saved under 'obs' slot
@@ -147,7 +147,7 @@ scarf.writers.to_mtx(
 
 #### To H5ad format
 
-Conversion to H5ad is the preferred mode as it runs much faster and produces files with smaller footprints. Updates are underway to include all the data from Zarr file like UMAP, PCA and graph, into anndata.
+`to_h5ad` exports the count matrix and selected cell metadata columns. For a richer AnnData object including embeddings, use `DataStore.to_anndata` (see the cell subsampling vignette).
 
 ```{code-cell} ipython3
 ds = scarf.DataStore('scarf_datasets/differentiating_pancreatic_cells.zarr')
@@ -159,6 +159,13 @@ scarf.writers.to_h5ad(
     h5ad_filename='scarf_datasets/diff_pancreas.h5ad'
 )
 ```
+
+---
+### 4) CSV, sparse, and Dask writers
+
+`CSVReader` and `CSVtoZarr` import dense CSV count matrices. `SparseToZarr` accepts a SciPy sparse matrix. `dask_to_zarr` writes from a Dask array when lazy out-of-core conversion is needed.
+
+`DatasetMerge` merges multiple full DataStores (all assays per dataset) into one Zarr file. See `AssayMerge` in the merging datasets vignette for single-assay merges.
 
 ---
 That is all for this vignette.

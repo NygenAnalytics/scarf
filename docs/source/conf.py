@@ -45,6 +45,7 @@ html_theme = "sphinx_book_theme"
 html_favicon = "favicon.ico"
 html_logo = "logo.png"
 html_title = "Scarf documentation"
+html_baseurl = "https://scarf.readthedocs.io/en/latest/"
 html_theme_options = {
     "repository_url": "https://github.com/parashardhapola/scarf",
     "home_page_in_toc": True,

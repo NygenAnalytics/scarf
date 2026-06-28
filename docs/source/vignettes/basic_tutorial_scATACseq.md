@@ -179,7 +179,7 @@ Now we have the annotations and are ready to calculate the 'GeneScores'. The `ad
 Now we explain the parameters that are usually passed to the `add_melded_assay`.
 - `from_assay`: Name of the assay to be acted on. You can generally skip if you have only one assay. We use this parameter here only for demonstration puspose
 - `external_bed_fn`: This is the annotation file. Here we pass the annotation for human GRCh37/hg19 assembly based GENCODE v38 annotations.
-- `peak_col`: This is the column in `ds.ATAC.feats` table that contains the peak coordinates. In this case it is 'ids', but could be anyt other column. Please note that the coordinate information in this column should be in format 'chr:start-end' (please note the positions of colon and hyphen)
+- `peaks_col`: Column in `ds.ATAC.feats` with peak coordinates in `chr:start-end` format.
 - `renormalization`: By overriding the default value of True to False here, we turned off 'renormalization' step. The renormalization step makes sure that all the feature values for each cells in the melded assay sum up to the same value. Here we turned this off because we will have 'GeneScores' as an 'RNAassay' which uses library size normalization that has the same effect as 'renormalization'.
 - `assay_label`: The label/name of the melded/output assay. Because we are using gene bodies as our input, 'GeneScores' is sensible choice.
 - `assay_type`: Here we set the type of assay as 'RNA' which means that the new melded assay will be treated as if it was an scRNA-Seq assay. Alternatively, we could have set it as a generic 'Assay'
@@ -218,7 +218,7 @@ ds.plot_layout(
 )
 ```
 
-We stop here in this vignette. But will soon add other vignettes that show how we can other kinds of melded assays like motifs, enhancers, etc. We will also explore how we can use the 'GeneScores' to integrate scATAC-Seq datasets with scRNA-Seq datasets from same population of cells (but not the exact same set of cells)
+The same melding approach maps any coordinate bed file onto peaks, including motif or enhancer annotations via `GffReader` and `coordinate_melding`. For cross-dataset integration using GeneScores, see {ref}`integration methods guide <integration_guide>` and {ref}`data projection <data_projection>`.
 
 +++
 

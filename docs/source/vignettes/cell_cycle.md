@@ -64,7 +64,7 @@ present.
 - The average expression of phase genes (Ep) and control genes (Ec) is calculated per cell.
 - A phase score is calculated as: Ep-Ec
 Cell cycle phase is assigned to each cell based on following rule set:
-- G1 phase: S score < -1 > G2M sore
+- G1 phase: S score < -1 and G2M score < -1
 - S phase: S score > G2M score
 - G2M phase: G2M score > S score
 

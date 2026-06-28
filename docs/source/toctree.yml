@@ -3,6 +3,10 @@ subtrees:
   - entries:
       - file: install
         title: Installation
+      - file: quickstart
+        title: Quick start
+      - file: integration_guide
+        title: Integration methods guide
       - file: contributions
         title: For developers
       - file: faq
@@ -15,19 +19,19 @@ subtrees:
         title: Workflow for scRNA-Seq data
       - file: vignettes/basic_tutorial_scATACseq
         title: Workflow for scATAC-Seq data
-  - caption: Multi-omics/Multimodal analysis
-    entries: 
+  - caption: Multi-omics and multimodal analysis
+    entries:
       - file: vignettes/multiple_modalities
-        title: Transcriptome + Surface Proteome
-  - caption: Data integration tutorials
+        title: "CITE-seq: SNN and WNN integration"
+  - caption: Data integration
     entries:
-      - file: vignettes/data_projection
-        title: Integration through projection
       - file: vignettes/merging_datasets
-        title: Merging samples and datasets
-  - caption: Trajectory analysis tutorials
+        title: "Merge, Harmony, and integration metrics"
+      - file: vignettes/data_projection
+        title: "Projection, label transfer, and unified embeddings"
+  - caption: Trajectory analysis
     entries:
-      - file: vignettes/pseudotime_dynamics.md
+      - file: vignettes/pseudotime_dynamics
         title: Pseudotime dynamics
   - caption: Vignettes
     entries:
@@ -35,10 +39,14 @@ subtrees:
         title: Data organization in Scarf
       - file: vignettes/download_conversion
         title: Data import and export
+      - file: vignettes/graph_imputation
+        title: Graph-based imputation
       - file: vignettes/cell_subsampling_tutorial
         title: Automated cell downsampling
       - file: vignettes/cell_cycle
         title: Estimate cell-cycle phases
+  - caption: Examples and extras
+    entries:
       - file: vignettes/mnist
         title: Exploring MNIST dataset
   - caption: Useful links
@@ -52,5 +60,6 @@ subtrees:
   - caption: Reference manual
     entries:
       - file: api
+      - file: glossary
       - file: license
       - file: genindex

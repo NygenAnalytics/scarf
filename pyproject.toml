@@ -12,7 +12,17 @@ license = "BSD-3-Clause"
 authors = [
     {name = "Parashar Dhapola", email = "parashar.dhapola@gmail.com"},
 ]
-keywords = ["single-cell"]
+keywords = [
+    "single-cell",
+    "scRNA-seq",
+    "scATAC-seq",
+    "CITE-seq",
+    "Harmony",
+    "WNN",
+    "batch-correction",
+    "Zarr",
+    "memory-efficient",
+]
 classifiers = [
     "Natural Language :: English",
     "Programming Language :: Python :: 3",

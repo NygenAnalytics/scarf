@@ -2243,13 +2243,15 @@ class DataStore(MappingDatastore):
             use_latest_knn: Whether to use the most recent KNN graph (default: True)
             from_assay: Name of assay to use if not using latest KNN
             knn_loc: Location of KNN graph if not using latest (default: None)
-            save_result: Whether to save LISI scores to cell metadata (default: True)
-            return_lisi: Whether to return LISI scores (default: False)
+            save_result: Whether to save LISI scores to cell metadata (default: False)
+            return_lisi: Whether to return LISI scores (default: True)
 
         Returns:
             If return_lisi is True, returns list of tuples containing:
+
             - Label column name
             - numpy array of LISI scores for that label
+
             If return_lisi is False, returns None
 
         Raises:

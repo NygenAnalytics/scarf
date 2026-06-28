@@ -11,6 +11,8 @@ from .utils import controlled_compute, logger, tqdmbar
 
 __all__ = ["AnnStream", "instantiate_knn_index", "fix_knn_query"]
 
+EMBEDDING_CACHE_MAX_BYTES = 256 * 1024 * 1024
+
 
 def instantiate_knn_index(
     space: str,
@@ -148,8 +150,10 @@ class AnnStream:
         harmonize: bool,
         harmonized_data: ChunkedArray | None = None,
         batches: pd.DataFrame | None = None,
+        cache_embeddings: bool = True,
     ) -> None:
         self.data = data
+        self._embeddings: np.ndarray | None = None
         self.k = k
         if self.k >= self.data.shape[0]:
             self.k = self.data.shape[0] - 1
@@ -264,6 +268,8 @@ class AnnStream:
                 self.reducer = reducer
             else:
                 raise ValueError(f"ERROR: Unknown reduction method: {self.method}")
+            if cache_embeddings:
+                self._maybe_build_embeddings()
             if ann_idx is None:
                 self.annIdx = self._fit_ann()
             else:
@@ -271,6 +277,26 @@ class AnnStream:
                 self.annIdx.set_ef(self.annEf)
                 self.annIdx.set_num_threads(self.annThreads)
             self.kmeans = self._fit_kmeans(do_kmeans_fit)
+
+    @property
+    def embeddings(self) -> np.ndarray | None:
+        """Reduced cell embeddings when cached in memory, else None."""
+        return self._embeddings
+
+    def _embedding_bytes(self) -> int:
+        if self.dims is None or self.dims < 1:
+            cols = self.nFeats
+        else:
+            cols = self.dims
+        return self.nCells * cols * 8
+
+    def _maybe_build_embeddings(self) -> None:
+        if self.harmonize or self._embedding_bytes() > EMBEDDING_CACHE_MAX_BYTES:
+            return
+        parts: list[np.ndarray] = []
+        for block in self.iter_blocks(msg="Building cell embeddings"):
+            parts.append(self.reducer(block))
+        self._embeddings = np.vstack(parts)
 
     def _handle_batch_size(self) -> int:
         if self.dims is not None and self.dims > self.data.shape[0]:
@@ -447,6 +473,16 @@ class AnnStream:
                 total=self.harmonizedData.numblocks[0],
             ):
                 ann_idx.add_items(controlled_compute(i, self.nthreads))
+        elif self._embeddings is not None:
+            bs = self.batchSize
+            n_blocks = int(np.ceil(self.nCells / bs))
+            for start in tqdmbar(
+                range(0, self.nCells, bs),
+                desc="Fitting ANN",
+                total=n_blocks,
+            ):
+                end = min(start + bs, self.nCells)
+                ann_idx.add_items(self._embeddings[start:end])
         else:
             for i in self.iter_blocks(msg="Fitting ANN"):
                 ann_idx.add_items(self.reducer(i))
@@ -465,9 +501,30 @@ class AnnStream:
         )
         temp: list[int] = []
         with threadpool_limits(limits=self.nthreads):
-            for i in self.iter_blocks(msg="Fitting kmeans"):
-                kmeans.partial_fit(self.reducer(i))
-            for i in self.iter_blocks(msg="Estimating seed partitions"):
-                temp.extend(kmeans.predict(self.reducer(i)))
+            if self._embeddings is not None:
+                bs = self.batchSize
+                n_blocks = int(np.ceil(self.nCells / bs))
+                # Two phases: predict must run on the fully fitted model, so it
+                # cannot be interleaved with partial_fit. Both passes read the
+                # already-materialized embeddings, so no extra data reads occur.
+                for start in tqdmbar(
+                    range(0, self.nCells, bs),
+                    desc="Fitting kmeans",
+                    total=n_blocks,
+                ):
+                    end = min(start + bs, self.nCells)
+                    kmeans.partial_fit(self._embeddings[start:end])
+                for start in tqdmbar(
+                    range(0, self.nCells, bs),
+                    desc="Estimating seed partitions",
+                    total=n_blocks,
+                ):
+                    end = min(start + bs, self.nCells)
+                    temp.extend(kmeans.predict(self._embeddings[start:end]))
+            else:
+                for i in self.iter_blocks(msg="Fitting kmeans"):
+                    kmeans.partial_fit(self.reducer(i))
+                for i in self.iter_blocks(msg="Estimating seed partitions"):
+                    temp.extend(kmeans.predict(self.reducer(i)))
         self.clusterLabels = np.array(temp)
         return kmeans

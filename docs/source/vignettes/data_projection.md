@@ -12,7 +12,9 @@ kernelspec:
   name: python3
 ---
 
-## Projection of cells across datasets
+(data_projection)=
+
+## Projection, label transfer, and unified embeddings
 
 Scarf allows projections (aka mapping) of cells from one dataset to another. Such projection can help in  understanding how cells are related between the two datasets. Projection/mapping is a lightweight alternative to full-blown data integration which focuses on biological interpretation. In this notebook we use data from [Kang et. al.](https://www.nature.com/articles/nbt.4042). We have already preprocessed the raw count matrix to generate UMAPs and clustering of the data ([notebook here](https://github.com/parashardhapola/scarf_vignettes/blob/main/kang_et_al_processing.ipynb)). We will use two datasets from this study: control and IFN-B treated PBMCs.
 
@@ -90,10 +92,16 @@ ds_ctrl.run_mapping(
     target_assay=ds_stim.RNA,
     target_name='stim',
     target_feat_key='hvgs_ctrl',
-    save_k=5, 
+    save_k=5,
     run_coral=True
 )
 ```
+
+Key mapping parameters:
+- `save_k`: number of reference neighbors stored per target cell (default 3)
+- `run_coral`: align feature distributions between reference and target
+- `exclude_missing`: drop target features absent from reference instead of imputing zeros
+- `filter_null`: remove target cells with no valid features after alignment
 
 ---
 ### 3) Mapping scores
@@ -207,6 +215,27 @@ ds_ctrl.plot_unified_layout(
     show_target_only=True, 
     legend_ondata=True,
     target_groups=ds_stim.cells.fetch('cluster_labels')
+)
+```
+
+---
+### 6) Unified tSNE
+
+Unified tSNE co-embeds reference and target cells using the same unified graph as unified UMAP:
+
+```{code-cell} ipython3
+ds_ctrl.run_unified_tsne(
+    target_names=['stim'],
+    ini_embed_with='RNA_UMAP',
+    target_weight=1,
+    use_k=5,
+    max_iter=500
+)
+
+ds_ctrl.plot_unified_layout(
+    layout_key='unified_tSNE',
+    show_target_only=False,
+    ref_name='ctrl'
 )
 ```
 

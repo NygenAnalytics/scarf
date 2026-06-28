@@ -35,6 +35,7 @@ PyPI: https://pypi.org/project/scarf/
 import warnings
 
 from importlib.metadata import version
+from zarr.errors import UnstableSpecificationWarning
 
 from .datastore.datastore import DataStore
 from .downloader import fetch_dataset, show_available_datasets
@@ -84,6 +85,7 @@ from .writers import (
 )
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 
 try:
     __version__ = version("scarf")

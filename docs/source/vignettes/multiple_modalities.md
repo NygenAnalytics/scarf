@@ -1,4 +1,5 @@
 ---
+description: CITE-seq multimodal analysis with SNN and WNN integration for RNA and ADT.
 jupytext:
   text_representation:
     extension: .md
@@ -339,7 +340,58 @@ ds.cells.columns
 
 The UMAP and clustering calculated on the integrated graph are here saved under cell attribute table with prefix *RNA+ADT*
 
-+++
+---
+(wnn_integration)=
+### 7) WNN integration
+
+The default `integrate_assays` method uses shared nearest neighbors (SNN). Scarf also supports weighted nearest neighbors (WNN), which can weight modalities differently. WNN requires exactly two assays:
+
+```{code-cell} ipython3
+ds.integrate_assays(
+    assays=['RNA', 'ADT'],
+    label='RNA+ADT_wnn',
+    method='wnn'
+)
+
+ds.run_umap(
+    integrated_graph='RNA+ADT_wnn',
+    n_epochs=500,
+    spread=5,
+    min_dist=0.5,
+    parallel=True
+)
+
+ds.run_leiden_clustering(
+    integrated_graph='RNA+ADT_wnn',
+    resolution=1.75
+)
+```
+
+```{code-cell} ipython3
+ds.plot_layout(
+    layout_key=['RNA+ADT_UMAP', 'RNA+ADT_wnn_UMAP'],
+    color_by='RNA+ADT_wnn_leiden_cluster',
+    cmap='tab20',
+    point_size=5,
+    width=4,
+    height=4,
+    n_columns=2
+)
+```
+
+SNN supports two or more assays; WNN is limited to two. Try WNN when one modality is sparse or weaker than the other.
+
+---
+### 8) HTO demultiplexing (hashtag oligos)
+
+Multiplexed experiments with hashtag oligos (HTO) can be demultiplexed with `mark_hto_identities`. The assay should be named `HTO` (or pass `from_assay`). This CITE-seq tutorial dataset contains RNA and ADT only; below is the API pattern for multiplexed Cell Ranger output:
+
+```python
+# After loading a DataStore with an HTO assay:
+ds.mark_hto_identities(from_assay='HTO', label='Hashtag_identity')
+```
+
+Demultiplexing follows a Seurat-style algorithm in `hto_demux`. A dedicated executable vignette will be added when a public HTO dataset is available on the Scarf OSF repository.
 
 ---
 That is all for this vignette.

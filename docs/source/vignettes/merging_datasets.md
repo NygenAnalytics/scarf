@@ -1,4 +1,5 @@
 ---
+description: Merge scRNA-seq datasets with Harmony batch correction, partial PCA, and LISI integration metrics.
 jupytext:
   text_representation:
     extension: .md
@@ -11,9 +12,11 @@ kernelspec:
   name: python3
 ---
 
-## Merging datasets and partial training
+## Merging datasets, Harmony, and integration metrics
 
-This vignette demonstrates how to merge datasets, which are present in different zarr files. The vignette will also demonstrate the steps for performing partial training. Partial PCA training is a lightweight alternative to perform batch effect correction, that often helps obtain a well-integrated embedding and clustering.
+(harmony_batch_correction)=
+
+This vignette demonstrates how to merge datasets in different Zarr files, correct batch effects with partial PCA or Harmony, and quantify integration with LISI and related metrics. See also the {ref}`integration methods guide <integration_guide>`.
 
 ```{code-cell} ipython3
 %load_ext autotime
@@ -64,21 +67,13 @@ ds_stim
 ---
 ### 2) Merging datasets
 
-The merging step will make sure that the features are in the same order as in the merged file. The merged data will be dumped into a new Zarr file. `ZarrMerge` class allows merging multiple samples at the same time. Though only one kind of assays can be added at a time, other modalities for the same cells can be added at a later point. 
+The merging step will make sure that the features are in the same order as in the merged file. The merged data will be dumped into a new Zarr file. Use `AssayMerge` to merge multiple samples (the `ZarrMerge` name is a deprecated alias that emits a warning).
 
 ```{code-cell} ipython3
-#Can be used to merge multiple assays
-scarf.ZarrMerge(
-    # Path where merged Zarr files will be saved
-    zarr_path='scarf_datasets/kang_merged_pbmc_rnaseq.zarr',  
-    
-    # assays to be merged
+scarf.AssayMerge(
+    zarr_path='scarf_datasets/kang_merged_pbmc_rnaseq.zarr',
     assays=[ds_ctrl.RNA, ds_stim.RNA],
-    
-    # these names will be preprended to the cell ids with '__' delimiter
     names=['ctrl', 'stim'],
-    
-    # Name of the merged assay. `overwrite` will remove an existing Zarr file.
     merge_assay_name='RNA',
     overwrite=True
 ).dump()
@@ -279,6 +274,71 @@ ds.plot_layout(
     legend_ondata=False
 )
 ```
+
+---
+### 5) Harmony batch correction
+
+Harmony runs inside `make_graph` on the PCA embedding before KNN construction. Pass `harmonize=True` and the batch column name:
+
+```{code-cell} ipython3
+ds.make_graph(
+    feat_key='hvgs',
+    k=21,
+    dims=25,
+    n_centroids=100,
+    harmonize=True,
+    batch_columns=['sample_id'],
+)
+
+ds.run_umap(
+    n_epochs=250,
+    spread=5,
+    min_dist=1,
+    parallel=True,
+    label='hUMAP'
+)
+
+ds.run_leiden_clustering(resolution=1.0)
+```
+
+```{code-cell} ipython3
+ds.plot_layout(
+    layout_key='RNA_hUMAP',
+    color_by='sample_id',
+    cmap='RdBu',
+    legend_ondata=False
+)
+
+ds.plot_layout(
+    layout_key='RNA_hUMAP',
+    color_by='imported_labels',
+    legend_ondata=False
+)
+```
+
+Harmony is often preferred when multiple batches need to mix without choosing a single reference sample. Partial PCA (section 4) is lighter when one sample defines the embedding.
+
+---
+(lisi_metrics)=
+### 6) Quantifying integration quality
+
+LISI measures how well labels mix in each cell's KNN neighborhood. Run after naive, partial PCA, and Harmony graphs to compare approaches:
+
+```{code-cell} ipython3
+ds.metric_lisi(
+    label_colnames=['sample_id', 'imported_labels'],
+    save_result=True,
+)
+
+ds.metric_silhouette(res_label='RNA_leiden_cluster')
+
+ds.metric_integration(
+    batch_labels=['sample_id', 'imported_labels'],
+    metric='ari'
+)
+```
+
+Higher batch LISI generally indicates better batch mixing. Compare saved columns such as `lisi__sample_id__*` on UMAP layouts. Silhouette scores near 1 indicate well-separated clusters.
 
 ---
 That is all for this vignette.

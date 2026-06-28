@@ -7,7 +7,6 @@ from scarf._types import as_zarr_array, as_zarr_group, array_metadata_shards
 from scarf.utils import (
     clean_array,
     permute_into_chunks,
-    prefetch_blocks,
     rescale_array,
     rolling_window,
     set_verbosity,
@@ -82,13 +81,3 @@ def test_permute_into_chunks_preserves_all_indices():
     chunks = permute_into_chunks(10, 3, seed=7)
     merged = np.concatenate(chunks)
     assert np.array_equal(np.sort(merged), np.arange(10))
-
-
-def test_prefetch_blocks_preserves_order():
-    blocks = list(range(8))
-
-    def double(x: int) -> int:
-        return x * 2
-
-    results = list(prefetch_blocks(blocks, double, max_ahead=3))
-    assert results == [x * 2 for x in blocks]

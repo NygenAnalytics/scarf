@@ -23,7 +23,9 @@ docs/source/vignettes/dev
 docs/source/vignettes/*.txt
 docs/source/vignettes/*.mtx
 docs/build/
+docs/_build/
 docs/jupyter_execute
+docs/source/scarf_datasets/
 .coverage
 coverage.xml
 htmlcov/

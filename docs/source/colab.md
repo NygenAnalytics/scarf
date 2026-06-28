@@ -4,28 +4,24 @@
 ## Wish to try Scarf without installation?
 
 Google Colab allows running Python code directly on Google's server through a notebook interface.
-With the following links you can try running any of the vignettes on Colab. This is a quick way to
-try Scarf without installing it.
+With the following links you can try running any of the vignettes on Colab.
 
 ## Before you run notebooks on Colab
 
-Paste the following code on the top of the notebook before running any other cell on Colab notebook
+Paste the following at the top of the notebook before running any other cell:
 
     !pip install ipython-autotime
-    !pip install scarf
-    !pip install -U numpy scipy
+    !pip install "scarf[extra]"
 
-Google Colab has older versions of Numpy and Scipy which are not compatible with Scarf.
-Once `scipy` and `numpy` have updated you will see a `RESTART RUNTIME` button.
-Click on it to activate latest versions.
-Now you are free to execute rest of the notebook.
+Scarf requires Python 3.14. Use a Colab runtime that provides 3.14, or a local environment instead.
+If dependency errors appear, restart the runtime after installing packages.
 
 ## Colab links
 
 ### Basic pipelines
 
 - [Workflow for scRNA-Seq data](https://colab.research.google.com/github/parashardhapola/scarf_vignettes/blob/main/basic_tutorial_scRNAseq.ipynb)
-- [Workflow for scATAC-Seq count matrices](https://colab.research.google.com/github//parashardhapola/scarf_vignettes/blob/main/basic_tutorial_scATACseq.ipynb)
+- [Workflow for scATAC-Seq count matrices](https://colab.research.google.com/github/parashardhapola/scarf_vignettes/blob/main/basic_tutorial_scATACseq.ipynb)
 
 ### Multi-omics/Multimodal analysis
 
@@ -45,4 +41,5 @@ Now you are free to execute rest of the notebook.
 - [Understanding how data is organized in Scarf](https://colab.research.google.com/github/parashardhapola/scarf_vignettes/blob/main/zarr_explanation.ipynb)
 - [Getting data in and out of Scarf](https://colab.research.google.com/github/parashardhapola/scarf_vignettes/blob/main/download_conversion.ipynb)
 - [Cell subsampling using TopACeDo](https://colab.research.google.com/github/parashardhapola/scarf_vignettes/blob/main/cell_subsampling_tutorial.ipynb)
+- [Estimate cell-cycle phases](https://colab.research.google.com/github/parashardhapola/scarf_vignettes/blob/main/cell_cycle.ipynb)
 - [Demonstrating Scarf on MNIST dataset](https://colab.research.google.com/github/parashardhapola/scarf_vignettes/blob/main/mnist.ipynb)

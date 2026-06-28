@@ -63,7 +63,7 @@ ds.plot_layout(
 ---
 ### 2) Estimate pseudotime ordering
 
-In Scarf we use a memory efficient implementation of [PBA algorithm](https://github.com/AllonKleinLab/PBA) ([Weinreb et al. 2018, PNAS](https://www.pnas.org/content/115/10/E2467)) to estimate a pseudotime ordering of cells. The function `run_pseudotime_ordering` can be run on any Assay for which we have calculated a neighbourhood graph. The the pseudotime is estimated in a supervised manner and hence, the user needs to provide the source (stem/progenitor/precursor cells) and sink (differentiated cell states) cell clusters/groups. 
+In Scarf we use a memory efficient implementation of [PBA algorithm](https://github.com/AllonKleinLab/PBA) ([Weinreb et al. 2018, PNAS](https://www.pnas.org/content/115/10/E2467)) to estimate a pseudotime ordering of cells. The function `run_pseudotime_scoring` can be run on any Assay for which we have calculated a neighbourhood graph. The pseudotime is estimated in a supervised manner and hence, the user needs to provide the source (stem/progenitor/precursor cells) and sink (differentiated cell states) cell clusters/groups. 
 
 ```{code-cell} ipython3
 ds.run_pseudotime_scoring(

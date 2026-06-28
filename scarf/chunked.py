@@ -651,6 +651,28 @@ class ChunkedArray:
     def std(self, axis: int | None = None) -> _Reduction:
         return _Reduction(self, "std", axis)
 
+    def mean_and_std(
+        self,
+        axis: int = 0,
+        nthreads: int | None = None,
+        msg: str | None = None,
+    ) -> tuple[NDArray[Any], NDArray[Any]]:
+        """Compute column mean and std in a single pass over row blocks."""
+        if axis != 0:
+            raise NotImplementedError("mean_and_std only supports axis=0")
+
+        def fn(i: int, s: int, e: int) -> NDArray[Any]:
+            a = self._materialize_range(s, e).astype(np.float64, copy=False)
+            return np.array([a.sum(axis=0), np.square(a).sum(axis=0)])
+
+        parts = self._map_blocks(fn, nthreads, msg)
+        stacked = np.sum(parts, axis=0)
+        s1, s2 = stacked[0], stacked[1]
+        n = self._n_rows
+        mean = s1 / n
+        variance = s2 / n - np.square(mean)
+        return np.asarray(mean), np.asarray(np.sqrt(np.clip(variance, 0, None)))
+
     def count_nonzero(self, axis: int | None = None) -> _Reduction:
         return _Reduction(self, "count_nonzero", axis)
 

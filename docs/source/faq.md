@@ -1,3 +1,4 @@
+(faq)=
 # FAQs
 
 
@@ -19,31 +20,39 @@ Benefits of Scarf over Scanpy:
 - Low memory requirement, so one can analyze large datasets or many small- to
   medium-sized datasets in parallel.
 - Performs topology-conserving data downsampling
-- Supports multiple single-cell genomics, like: scRNA-Seq, CITE-Seq, scATAC-Seq
+- Supports multiple single-cell genomics modalities: scRNA-Seq, CITE-Seq, scATAC-Seq
+- Built-in Harmony batch correction, WNN/SNN multimodal integration, and LISI metrics
 
 Benefits of Scanpy over Scarf:
 - Faster performance on small- and medium-sized datasets
-- Has multiple external tools integrated into its API and provides seamless access
-  to those tools, like sample integration and trajectory inference
-- Anndata format is supported much more widely
+- Broader ecosystem of external trajectory and integration tools
+- AnnData format is supported much more widely
 
-We see Scarf as a complementary tool to Scanpy and an analysis workflow for large
-data should make use of both these tools. For example, make UMAP and clustering on
-Scarf and then bring the downsampled cells into Scanpy to perform other downstream
-analyses.
+We see Scarf as a complementary tool to Scanpy. For large data, run UMAP and clustering in
+Scarf, then export a downsampled subset to Scanpy for specialized downstream tools.
+
+## How do I run Harmony batch correction in Scarf?
+
+Pass `harmonize=True` and `batch_columns` to `make_graph` on a merged dataset. See {ref}`Harmony batch correction <harmony_batch_correction>` and the {ref}`integration methods guide <integration_guide>`.
+
+## What is the difference between SNN and WNN integration?
+
+Both merge modality-specific KNN graphs with `integrate_assays`. SNN (default) supports two or more assays. WNN (`method='wnn'`) requires exactly two assays and can weight modalities differently. See {ref}`WNN integration <wnn_integration>`.
+
+## How do I compute LISI in Scarf?
+
+Use `metric_lisi` on the latest KNN graph after integration. See {ref}`LISI metrics <lisi_metrics>`.
 
 ## Should I use tSNE or UMAP?
-tSNE and UMAP are complementary data visualization tools. tSNE focuses on highlighting
-the largest differences in the dataset while tSNE highlights the even smaller ones. UMAP
-preserves the global structure which may sometimes come at cost of local resolution. We
-suggest using tSNE for large (>50k cells) and atlas scale datasets because of its quick
-runtime and ability to reveal the cellular diversity. UMAP is favoured when identification
-of relationship of clusters is important. UMAP runtime can span in hours on atlas scale
-datasets. In Scarf, UMAP and tSNE use the same initial embedding by default and have the
-same input graph.
 
+tSNE and UMAP are complementary visualization tools. tSNE emphasizes local structure and can reveal fine-grained diversity. UMAP preserves more global structure, which helps when cluster relationships matter. We suggest tSNE for large (>50k cells) atlas-scale datasets because of its quick runtime. UMAP runtime can span hours on atlas-scale datasets. In Scarf, UMAP and tSNE use the same initial embedding by default and share the same input graph.
+
+## What is densMAP?
+
+Enable density-preserving UMAP with `run_umap(use_density_map=True)`. Useful when preserving local density structure matters alongside cluster separation.
 
 ## Which clustering should we use, Paris or Leiden?
+
 The Leiden clustering method is faster than Paris, especially when it comes to large scale
 datasets. On small datasets that we have tested, Leiden clustering results seem to be more
 concordant with UMAP clustering. Paris, however, clearly shows relationship between clusters
@@ -54,14 +63,12 @@ visualize them together using `plot_cluster_tree` like this::
     ds.plot_cluster_tree(cluster_key='RNA_cluster',
                          fill_by_value='RNA_leiden_cluster')
 
-This will allow you test the robustness of clusters and visualize the relationship between
-Leiden clusters as well.
-
 ## How do I create a count matrix for my single-cell data?
-Generating count matrices is the primary step of single-cell data analysis. For scRNA-Seq one can
+
+Generating count matrices is the primary step of single-cell data analysis. For scRNA-Seq you can use
 tools like [STARsolo], [alevin-fry] or [kallisto|bustools]. If your data was generated using
 10x's commercial solution then you can use [Cell Ranger]. In the case of single-cell ATAC-Seq data,
-there you may try following protocol from [Yan et al] or [Cusanovich et al]. [Cell Ranger ATAC] can
+try the protocol from [Yan et al] or [Cusanovich et al]. [Cell Ranger ATAC] can
 be used if your data was generated using 10x's kit.
 
 [STARsolo]: https://github.com/alexdobin/STAR/blob/master/docs/STARsolo.md
@@ -73,13 +80,19 @@ be used if your data was generated using 10x's kit.
 [Cell Ranger ATAC]: https://support.10xgenomics.com/single-cell-atac/software/pipelines/latest/what-is-cell-ranger-atac
 
 ## Can I use Scarf from R?
-Unfortunately, not yet! Please let the developers know if you would like to create an R API for Scarf.
+
+Not yet. Please open a discussion on GitHub if an R API would be useful.
 
 ## Can I try Scarf without installing anything on my computer?
-Yes, you may try Scarf on Google Colab, an online notebook environment that allows running any
-Python code. {ref}`Check this out <colab>` for more details.
+
+Yes, you may try Scarf on Google Colab. {ref}`Check this out <colab>` for links.
+
+## What Python version does Scarf require?
+
+Python 3.14 (`requires-python >=3.14,<3.15`). See {ref}`installation <installation>`.
 
 ## What does Scarf's logo signify?
+
 Scarf's logo is highly inspired by the Human Cell Atlas's logo.
 Scarf's logo is composed of three circular fields, each composed of Voronoi cells representing
 atlas-scale datasets composed of multiple cell types. The arrangement of these 'atlases' symbolizes

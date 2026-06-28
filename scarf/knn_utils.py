@@ -41,6 +41,17 @@ def self_query_knn(
 
     def get_transformed_data() -> Generator[np.ndarray, None, None]:
         msg = "Identifying neighbors"
+        if ann_obj.embeddings is not None:
+            bs = ann_obj.batchSize
+            n_blocks = int(np.ceil(ann_obj.nCells / bs))
+            for start in tqdmbar(
+                range(0, ann_obj.nCells, bs),
+                desc=msg,
+                total=n_blocks,
+            ):
+                end = min(start + bs, ann_obj.nCells)
+                yield ann_obj.embeddings[start:end]
+            return
         if ann_obj.harmonizedData is None:
             source = ann_obj.data
 

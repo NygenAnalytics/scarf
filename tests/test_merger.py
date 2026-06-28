@@ -1,10 +1,11 @@
 import pytest
 import zarr
+from zarr.storage import MemoryStore
+
+from scarf.merge import AssayMerge
 
 
 def test_assay_merge(datastore, rna_raw_total, tmp_path):
-    from scarf.merge import AssayMerge
-
     fn = str(tmp_path / "merged.zarr")
     writer = AssayMerge(
         zarr_path=fn,
@@ -85,8 +86,6 @@ def test_dataset_merge_cells(datastore, tmp_path):
 
 
 def test_assay_merge_rejects_duplicate_sample_names(datastore, tmp_path):
-    from scarf.merge import AssayMerge
-
     fn = str(tmp_path / "merged_dup_names.zarr")
     with pytest.raises(ValueError, match="unique name"):
         AssayMerge(
@@ -97,6 +96,24 @@ def test_assay_merge_rejects_duplicate_sample_names(datastore, tmp_path):
             prepend_text="",
             overwrite=True,
         )
+
+
+def test_assay_merge_store_skips_local_exists_guard(monkeypatch):
+    calls = []
+
+    def fake_load_zarr(zarr_loc, mode, storage_options=None):
+        calls.append((zarr_loc, mode, storage_options))
+        if mode == "r":
+            raise FileNotFoundError("missing")
+        return zarr.open_group(store=MemoryStore(), mode="w")
+
+    monkeypatch.setattr("scarf.merge.load_zarr", fake_load_zarr)
+    merge = object.__new__(AssayMerge)
+    merge.outWorkspace = None
+    merge.storage_options = {"region": "us-east-1"}
+    root = AssayMerge._use_existing_zarr(merge, MemoryStore(), "RNA", False)
+    assert isinstance(root, zarr.Group)
+    assert calls[-1] == (calls[-1][0], "w", {"region": "us-east-1"})
 
 
 def test_dummy_assay_holds_zero_counts(datastore):

@@ -1,4 +1,9 @@
 import numpy as np
+import pytest
+import zarr
+from zarr.storage import MemoryStore
+
+from scarf.writers import CrToZarr, SubsetZarr
 
 
 def test_crtozarr(crh5_reader, tmp_path):
@@ -101,10 +106,83 @@ def test_to_mtx(datastore, tmp_path):
 
 
 def test_zarr_subset(datastore, tmp_path):
-    from scarf.writers import SubsetZarr
-
     zarr_path = str(tmp_path / "subset.zarr")
     writer = SubsetZarr(
         zarr_loc=zarr_path, assays=[datastore.RNA], cell_idx=np.array([1, 10, 100, 500])
     )
     writer.dump()
+
+
+def test_subset_zarr_local_path_guard(tmp_path):
+    existing = tmp_path / "out.zarr"
+    existing.mkdir()
+    subset = object.__new__(SubsetZarr)
+    subset.overFn = False
+    subset.storage_options = None
+    with pytest.raises(ValueError, match="already exists"):
+        SubsetZarr._check_files(subset, str(existing))
+
+
+def test_subset_zarr_store_skips_local_guard():
+    mem = MemoryStore()
+    subset = object.__new__(SubsetZarr)
+    subset.overFn = False
+    subset.storage_options = None
+    root = SubsetZarr._check_files(subset, mem)
+    assert isinstance(root, zarr.Group)
+
+
+def test_subset_zarr_remote_uri_skips_local_guard(monkeypatch):
+    calls = []
+
+    def fake_load_zarr(zarr_loc, mode, storage_options=None):
+        calls.append((zarr_loc, mode, storage_options))
+        return zarr.open_group(store=MemoryStore(), mode="w")
+
+    monkeypatch.setattr("scarf.writers.load_zarr", fake_load_zarr)
+    subset = object.__new__(SubsetZarr)
+    subset.overFn = False
+    subset.storage_options = {"access_key_id": "key"}
+    SubsetZarr._check_files(subset, "s3://bucket/out.zarr")
+    assert calls == [("s3://bucket/out.zarr", "w", {"access_key_id": "key"})]
+
+
+def test_crtozarr_forwards_storage_options(monkeypatch):
+    captured = {}
+
+    def fake_load_zarr(zarr_loc, mode, storage_options=None, synchronizer=None):
+        captured["zarr_loc"] = zarr_loc
+        captured["mode"] = mode
+        captured["storage_options"] = storage_options
+        return zarr.open_group(store=MemoryStore(), mode="w")
+
+    monkeypatch.setattr("scarf.writers.load_zarr", fake_load_zarr)
+    monkeypatch.setattr("scarf.writers.create_cell_data", lambda **kwargs: None)
+    monkeypatch.setattr("scarf.writers.create_zarr_count_assay", lambda **kwargs: None)
+
+    class FakeCr:
+        def cell_names(self):
+            return ["c1"]
+
+        @property
+        def assayFeats(self):
+            import pandas as pd
+
+            return pd.DataFrame({"RNA": [0, 1]})
+
+        @property
+        def nCells(self):
+            return 1
+
+        def feature_ids(self, assay_name):
+            return ["f1"]
+
+        def feature_names(self, assay_name):
+            return ["f1"]
+
+    CrToZarr(
+        FakeCr(),
+        zarr_loc="s3://bucket/out.zarr",
+        storage_options={"access_key_id": "id"},
+    )
+    assert captured["storage_options"] == {"access_key_id": "id"}

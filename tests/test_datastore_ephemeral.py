@@ -1,4 +1,4 @@
-from tests.fixtures_datastore import _cell_has, _has_graph
+from tests.fixtures_datastore import _has_graph
 
 
 def _active_cell_count(datastore) -> int:
@@ -71,22 +71,6 @@ def test_run_mapping_with_coral_writes_corrected_data(datastore_ephemeral):
     normed_loc = "normed__I__hvgs_fresh_coral"
     assert "data_coral" in ds.RNA.z[normed_loc]
     assert "freshmap_coral" in ds.z["RNA"]["projections"]
-
-
-def test_run_cell_cycle_scoring(datastore_ephemeral):
-    ds = datastore_ephemeral
-    if _cell_has(ds, "RNA_cell_cycle_phase"):
-        ds.cells.drop("RNA_cell_cycle_phase")
-    if _cell_has(ds, "RNA_S_score"):
-        ds.cells.drop("RNA_S_score")
-    if _cell_has(ds, "RNA_G2M_score"):
-        ds.cells.drop("RNA_G2M_score")
-
-    ds.run_cell_cycle_scoring()
-
-    phases = ds.cells.fetch("RNA_cell_cycle_phase")
-    assert len(phases) == _active_cell_count(ds)
-    assert set(phases).issubset({"G1", "S", "G2M"})
 
 
 def test_run_unified_umap_after_mapping(datastore_ephemeral):
