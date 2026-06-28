@@ -869,7 +869,6 @@ class MappingDatastore(GraphDataStore):
                 for entry in group_labels:
                     flattened.extend(list(entry))
                 group_labels = flattened
-            plot_color_key = None
             plot_mask_values = [ref_name]
             mask_name = ref_name
             group_col = np.array(group_labels, dtype=object)
@@ -895,7 +894,7 @@ class MappingDatastore(GraphDataStore):
             height,
             mask_color,
             cmap,
-            plot_color_key or {},
+            plot_color_key,
             plot_mask_values or [],
             mask_name,
             mask_color,

@@ -252,6 +252,26 @@ class TestDataStore:
     def test_plot_unified_layout(self, run_unified_umap, datastore):
         datastore.plot_unified_layout(layout_key="unified_UMAP", show_fig=False)
 
+    def test_plot_unified_layout_target_groups(
+        self, run_unified_umap, paris_clustering, datastore
+    ):
+        from scarf._types import as_zarr_array, as_zarr_group
+
+        projections = as_zarr_group(
+            as_zarr_group(datastore.zw["RNA"], name="RNA")["projections"],
+            name="projections",
+        )
+        layout = as_zarr_array(projections["unified_UMAP"], name="unified_UMAP")
+        n_target_cells = int(layout.attrs["n_cells"][1])
+        target_groups = paris_clustering[:n_target_cells]
+        datastore.plot_unified_layout(
+            layout_key="unified_UMAP",
+            show_target_only=True,
+            legend_ondata=True,
+            target_groups=target_groups,
+            show_fig=False,
+        )
+
     def test_plot_pseudotime_heatmap(self, pseudotime_aggregation, datastore):
         datastore.plot_pseudotime_heatmap(
             cell_key="I",
