@@ -250,6 +250,191 @@ class DataStore(MappingDatastore):
             key=cell_key,
         )
 
+    def run_doublet_detection(
+        self,
+        cluster_key: str,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        cluster_sample_fraction: float = 0.05,
+        max_cells_per_cluster: int = 100,
+        simulation_ratio: float = 1.0,
+        heterotypic_fraction: float = 0.8,
+        save_k: int = 5,
+        smoothing_t: int = 2,
+        normalize_scores: bool = True,
+        label: str = "doublet_score",
+        batch_size: int = 1000,
+        random_seed: int = 4444,
+    ) -> None:
+        """Flag potential doublets by simulating and mapping synthetic doublets.
+
+        Synthetic doublets are simulated by summing the raw counts of pairs of
+        observed cells drawn from a per-cluster subsample, with a tunable bias
+        toward cross-cluster (heterotypic) pairs. The simulated profiles are
+        projected onto the existing reference graph with `run_mapping`, and each
+        reference cell is scored by how frequently it appears among the nearest
+        neighbours of the simulated doublets (`get_mapping_score`). The score is
+        then diffused over the KNN graph using the same operator as
+        `get_imputed`. The final per-cell score is written to cell metadata so
+        that users can threshold and filter doublets themselves. This is a
+        graph-native adaptation of the Scrublet and DoubletFinder approach.
+
+        Args:
+            cluster_key: Cell metadata column with cluster or group labels used
+                to stratify the candidate pool (for example ``'RNA_cluster'``).
+            from_assay: Assay to use. Defaults to the latest used assay. Only
+                RNAassay type assays are supported.
+            cell_key: Cell key matching the desired graph (default: ``'I'``).
+            feat_key: Feature key matching the desired graph. Defaults to the
+                latest used feature key for the assay.
+            cluster_sample_fraction: Fraction of cells sampled from each cluster
+                to build the candidate pool. (Default value: 0.05)
+            max_cells_per_cluster: Cap on the number of cells sampled per cluster.
+                (Default value: 100)
+            simulation_ratio: Number of simulated doublets expressed as a
+                multiple of the number of reference cells. (Default value: 1.0)
+            heterotypic_fraction: Fraction of simulated doublets forced to be
+                cross-cluster. Set to 0 to disable the bias. (Default value: 0.8)
+            save_k: Number of reference neighbours stored per simulated doublet.
+                (Default value: 5)
+            smoothing_t: Diffusion power used to smoothen scores over the graph,
+                same as the ``t`` parameter of `get_imputed`. (Default value: 2)
+            normalize_scores: If True, the final score is min-max scaled to the
+                0-1 range for interpretability. (Default value: True)
+            label: Base name for the score column in cell metadata. The assay
+                name (and cell key when not ``'I'``) is prepended.
+                (Default value: 'doublet_score')
+            batch_size: Number of simulated doublets written per batch.
+                (Default value: 1000)
+            random_seed: Seed for reproducible sampling. (Default value: 4444)
+
+        Returns:
+            None
+        """
+        import shutil
+        import tempfile
+
+        from scipy.sparse import csr_matrix
+
+        from ..doublet_utils import (
+            sample_cluster_pool,
+            simulate_doublet_pairs,
+            write_doublet_target_zarr,
+        )
+
+        from_assay, cell_key, feat_key = self._get_latest_keys(
+            from_assay, cell_key, feat_key
+        )
+        source_assay = self._get_assay(from_assay)
+        if type(source_assay) != RNAassay:  # noqa: E721
+            raise TypeError(
+                "ERROR: Doublet detection is only supported for RNAassay type assays. "
+                f"The provided assay is {type(source_assay)} type"
+            )
+        if cluster_key not in self.cells.columns:
+            raise ValueError(
+                f"ERROR: `cluster_key` {cluster_key} not found in cell metadata. Provide a column "
+                f"with cluster or group labels, for example '{from_assay}_cluster'"
+            )
+
+        rng = np.random.default_rng(random_seed)
+        active_idx = self.cells.active_index(cell_key)
+        n_active = len(active_idx)
+        clusters = self.cells.fetch(cluster_key, key=cell_key)
+
+        pool_positions = sample_cluster_pool(
+            clusters, cluster_sample_fraction, max_cells_per_cluster, rng
+        )
+        pool_clusters = np.asarray(clusters)[pool_positions]
+        pool_raw_rows = np.asarray(active_idx)[pool_positions]
+        logger.info(
+            f"Sampled {len(pool_positions)} cells across "
+            f"{len(np.unique(pool_clusters))} clusters to seed doublet simulation"
+        )
+
+        pool_counts = controlled_compute(
+            source_assay.rawData[pool_raw_rows, :], self.nthreads
+        )
+        pool_csr = csr_matrix(pool_counts)
+
+        n_sim = max(1, int(round(simulation_ratio * n_active)))
+        left, right = simulate_doublet_pairs(
+            pool_clusters, n_sim, heterotypic_fraction, rng
+        )
+        sim_counts = (pool_csr[left] + pool_csr[right]).tocsr()
+        logger.info(f"Simulated {n_sim} synthetic doublets")
+
+        temp_dir = tempfile.mkdtemp(prefix="scarf_doublet_")
+        target_name = f"_doublet_sim_{from_assay}"
+        target_feat_key = f"{feat_key}_doublet"
+        try:
+            write_doublet_target_zarr(
+                zarr_loc=temp_dir,
+                assay_name=from_assay,
+                sim_counts=sim_counts,
+                feat_ids=source_assay.feats.fetch_all("ids"),
+                feat_names=source_assay.feats.fetch_all("names"),
+                dtype=str(source_assay.rawData.dtype),
+                batch_size=batch_size,
+            )
+            target_ds = DataStore(
+                temp_dir,
+                default_assay=from_assay,
+                assay_types={from_assay: "RNA"},
+                nthreads=self.nthreads,
+            )
+            self.run_mapping(
+                target_assay=target_ds._get_assay(from_assay),
+                target_name=target_name,
+                target_feat_key=target_feat_key,
+                from_assay=from_assay,
+                cell_key=cell_key,
+                feat_key=feat_key,
+                save_k=save_k,
+                batch_size=batch_size,
+            )
+
+            raw_scores = None
+            for _, score in self.get_mapping_score(
+                target_name=target_name,
+                from_assay=from_assay,
+                cell_key=cell_key,
+                log_transform=True,
+            ):
+                raw_scores = score
+            if raw_scores is None:
+                raise RuntimeError(
+                    "ERROR: Mapping scores could not be computed for simulated doublets"
+                )
+
+            temp_col = self._col_renamer(from_assay, cell_key, f"{label}__raw")
+            self.cells.insert(temp_col, raw_scores, key=cell_key, overwrite=True)
+            smoothed = self.get_imputed(
+                from_assay=from_assay,
+                cell_key=cell_key,
+                feature_name=temp_col,
+                feat_key=feat_key,
+                t=smoothing_t,
+            )
+            self.cells.drop(temp_col)
+
+            scores = np.asarray(smoothed, dtype=float)
+            if normalize_scores:
+                lo, hi = scores.min(), scores.max()
+                scores = (scores - lo) / (hi - lo) if hi > lo else np.zeros_like(scores)
+            final_col = self._col_renamer(from_assay, cell_key, label)
+            self.cells.insert(final_col, scores, key=cell_key, overwrite=True)
+            logger.info(f"Doublet scores stored in cell metadata column '{final_col}'")
+        finally:
+            store_loc = f"{from_assay}/projections/{target_name}"
+            try:
+                if store_loc in self.zw:
+                    del self.zw[store_loc]
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Could not remove temporary projection group: {e}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
     def mark_hvgs(
         self,
         from_assay: str | None = None,

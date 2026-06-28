@@ -174,6 +174,30 @@ class TestDataStore:
         values = datastore.get_imputed(feature_name="CD4")
         assert values.shape == datastore.cells.fetch("I").shape
 
+    def test_run_doublet_detection(self, make_graph, paris_clustering, datastore):
+        datastore.run_doublet_detection(
+            cluster_key="RNA_cluster", simulation_ratio=0.5, random_seed=1
+        )
+        col = "RNA_doublet_score"
+        assert col in datastore.cells.columns
+        scores = datastore.cells.fetch(col)
+        n_active = datastore.cells.active_index("I").shape[0]
+        assert scores.shape[0] == n_active
+        assert not np.isnan(scores).any()
+        assert scores.min() >= 0.0 and scores.max() <= 1.0
+        # scratch column used for smoothing should be removed
+        assert "RNA_doublet_score__raw" not in datastore.cells.columns
+        # temporary simulated-doublet projection should be cleaned up
+        projections = datastore.z["RNA"].get("projections", None)
+        if projections is not None:
+            assert "_doublet_sim_RNA" not in projections
+
+    def test_run_doublet_detection_bad_cluster_key(self, make_graph, datastore):
+        import pytest
+
+        with pytest.raises(ValueError):
+            datastore.run_doublet_detection(cluster_key="not_a_column")
+
     def test_run_pseudotime_scoring(self, pseudotime_scoring, cell_attrs):
         diff = pseudotime_scoring - cell_attrs["RNA_pseudotime"].values
         assert np.all(np.abs(diff) < 0.08)
