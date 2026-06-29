@@ -354,6 +354,26 @@ class CrToZarr:
             finalize_writer_counts(self.z, assay, self.workspace)
 
 
+_H5AD_CELL_QC_ALIASES: dict[str, tuple[str, ...]] = {
+    "RNA_nCounts": ("nCount_RNA", "total_counts", "n_counts"),
+    "RNA_nFeatures": ("nFeature_RNA", "n_genes", "n_genes_by_counts"),
+    "RNA_percentMito": ("percent.mt", "pct_counts_mt", "percent_mito"),
+    "RNA_percentRibo": ("percent.ribo", "pct_counts_ribo", "percent_ribo"),
+}
+
+
+def _h5ad_cell_columns(h5ad: H5adReader) -> dict[str, np.ndarray]:
+    columns = {name: values for name, values in h5ad.get_cell_columns()}
+    for target, sources in _H5AD_CELL_QC_ALIASES.items():
+        if target in columns:
+            continue
+        for source in sources:
+            if source in columns:
+                columns[target] = np.asarray(columns[source], dtype=np.float64)
+                break
+    return columns
+
+
 class H5adToZarr:
     """A class for converting data in anndata's H5ad format to Zarr hierarchy.
 
@@ -414,7 +434,7 @@ class H5adToZarr:
             ids=ids,
             names=ids,
         )
-        for i, j in self.h5ad.get_cell_columns():
+        for i, j in _h5ad_cell_columns(self.h5ad).items():
             create_zarr_obj_array(g, i, j, j.dtype)
 
     def _ini_feature_data(self) -> None:
