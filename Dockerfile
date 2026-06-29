@@ -1,7 +1,7 @@
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 RUN apt update -y && apt autoremove -y && apt clean -y && apt autoclean -y && apt upgrade -y
-RUN apt install -y wget build-essential git nano curl libigraph-dev libfftw3-dev libmetis-dev libtbb-dev
+RUN apt install -y wget build-essential git nano curl libfftw3-dev libmetis-dev libtbb-dev
 
 ARG TZ="Europe/Stockholm"
 RUN DEBIAN_FRONTEND="noninteractive" TZ=$TZ apt-get -y install tzdata

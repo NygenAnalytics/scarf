@@ -47,7 +47,7 @@ def get_file_handle(fn: str) -> IO:
             return gzip.open(fn, mode="rt")
         else:
             return open(fn, "r")
-    except OSError, IOError, FileNotFoundError:
+    except (OSError, IOError, FileNotFoundError):
         raise FileNotFoundError("ERROR: FILE NOT FOUND: %s" % fn)
 
 
@@ -835,7 +835,7 @@ class H5adReader:
                 categories = v["categories"][:]
                 try:
                     return np.array([categories[x] for x in codes])
-                except IndexError, TypeError:
+                except (IndexError, TypeError):
                     logger.warning(f"Failed to decode categorical data for {key}")
                     return np.array([f"feature_{x}" for x in range(len(codes))])
             else:
@@ -857,14 +857,14 @@ class H5adReader:
                         c = cat_g[key][:]
                         try:
                             return np.array([c[x] for x in v])
-                        except IndexError, TypeError:
+                        except (IndexError, TypeError):
                             return v
         if "uns" in self.h5:
             if key + "_categories" in self.h5["uns"]:
                 c = self.h5["uns"][key + "_categories"][:]
                 try:
                     return np.array([c[x] for x in v])
-                except IndexError, TypeError:
+                except (IndexError, TypeError):
                     return v
         return np.asarray(v)
 

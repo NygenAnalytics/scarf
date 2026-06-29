@@ -557,7 +557,7 @@ class AssayMerge:
                     "existing file or choose another path"
                 )
             return load_zarr(zarr_loc, mode="r+", storage_options=self.storage_options)
-        except ValueError, FileNotFoundError:
+        except (ValueError, FileNotFoundError):
             # So no zarr file with same name exists. Check if a non zarr folder with the same name exists
             if (
                 is_local_zarr_path(zarr_loc)

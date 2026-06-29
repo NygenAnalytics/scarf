@@ -11,5 +11,5 @@ prune tests
 prune .circleci
 prune .github
 include VERSION
-include pypi_README.rst
+include README.md
 graft bin

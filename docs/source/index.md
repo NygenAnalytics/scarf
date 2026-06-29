@@ -6,7 +6,7 @@ description: Memory-efficient single-cell RNA-seq, ATAC-seq, and CITE-seq analys
 
 # Overview of Scarf
 
-{ref}`Jump to installation <installation>` | {ref}`Quick start <quickstart>` | {ref}`Try live code <colab>` | [Source code on Github]
+{ref}`Jump to installation <installation>` | {ref}`Quick start <quickstart>` | [Source code on Github]
 
 ## What is Scarf
 

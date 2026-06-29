@@ -12,30 +12,57 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+        resolution: [locked]
+        include:
+          - python-version: "3.12"
+            resolution: lowest-direct
     steps:
     - uses: actions/checkout@v4
     - name: Install system build dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y build-essential libigraph-dev libfftw3-dev libmetis-dev
+        sudo apt-get install -y build-essential libfftw3-dev libmetis-dev
     - name: Install uv
       uses: astral-sh/setup-uv@v5
       with:
-        python-version: "3.14"
-    - name: Install dependencies
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies (locked)
+      if: matrix.resolution == 'locked'
       run: uv sync --extra test --extra extra
+    - name: Install dependencies (lowest-direct)
+      if: matrix.resolution == 'lowest-direct'
+      run: uv pip install --resolution lowest-direct -e ".[test,extra]"
     - name: Download test fixtures
-      run: uv run python -m tests.download_fixtures --with-h5ad
+      run: |
+        if [ "${{ matrix.resolution }}" = "lowest-direct" ]; then
+          uv run --no-sync python -m tests.download_fixtures --with-h5ad
+        else
+          uv run python -m tests.download_fixtures --with-h5ad
+        fi
     - name: Test with pytest (parallel)
       run: |
-        uv run pytest \
-          -n auto \
-          --dist loadfile \
-          --cov=scarf \
-          --cov-report=xml \
-          --cov-report=term
+        if [ "${{ matrix.resolution }}" = "lowest-direct" ]; then
+          uv run --no-sync pytest \
+            -n auto \
+            --dist loadfile \
+            --cov=scarf \
+            --cov-report=xml \
+            --cov-report=term
+        else
+          uv run pytest \
+            -n auto \
+            --dist loadfile \
+            --cov=scarf \
+            --cov-report=xml \
+            --cov-report=term
+        fi
     - name: Upload coverage to Codecov
+      if: matrix.resolution == 'locked' && matrix.python-version == '3.14'
       uses: codecov/codecov-action@v3
       with:
         fail_ci_if_error: false

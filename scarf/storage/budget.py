@@ -51,7 +51,7 @@ def detect_available_memory_bytes() -> int:
         avail_pages = os.sysconf("SC_AVPHYS_PAGES")
         if page_size > 0 and avail_pages > 0:
             return int(page_size) * int(avail_pages)
-    except ValueError, OSError, AttributeError:
+    except (ValueError, OSError, AttributeError):
         pass
     return _FALLBACK_MEMORY_BYTES
 

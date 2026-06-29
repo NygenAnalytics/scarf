@@ -3,7 +3,7 @@
 
 ## Installation through PyPi
 
-Scarf requires Python 3.14. Install [uv](https://docs.astral.sh/uv/) if needed, then run:
+Scarf requires Python 3.12. Install [uv](https://docs.astral.sh/uv/) if needed, then run:
 
     uv pip install scarf[extra]
 
@@ -34,7 +34,7 @@ uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_l
 
 ## Installing Python
 
-To use Scarf you need Python 3.14 installed.
+To use Scarf you need Python 3.12 or newer installed.
 
 **Step 1:**
 
@@ -65,19 +65,19 @@ window (aka command prompt).
 
 Type `python --version` and press `ENTER`:
 
-- If your output shows `Python 3.14.0` or a more recent 3.14 release, skip Step 3.
+- If your output shows `Python 3.12.0` or a more recent release, skip Step 3.
 - If you have an earlier version, see step 3.
 - If you see an error containing `not found` or `not recognized`, move to step 3.
 
 **Step 3:**
 
-We suggest Miniconda with Python 3.14. Download from https://conda.io/miniconda.html and follow the [installation guide](https://conda.io/projects/conda/en/latest/user-guide/install/index.html#regular-installation).
+We suggest Miniconda with Python 3.12 or newer. Download from https://conda.io/miniconda.html and follow the [installation guide](https://conda.io/projects/conda/en/latest/user-guide/install/index.html#regular-installation).
 
 **Step 3.5 (Optional but recommended)**
 
-Create an environment with Python 3.14:
+Create an environment with Python 3.12 or newer:
 
-    conda create --name scarf_env python=3.14
+    conda create --name scarf_env python=3.12
 
 Activate with `conda activate scarf_env`.
 

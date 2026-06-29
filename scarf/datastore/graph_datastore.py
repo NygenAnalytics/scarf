@@ -744,7 +744,7 @@ class GraphDataStore(BaseDataStore):
                 subset_hash == grp.attrs["subset_hash"]
                 and subset_params == grp.attrs["subset_params"]
             )
-        except KeyError, ValueError, AttributeError:
+        except (KeyError, ValueError, AttributeError):
             return False
 
     @staticmethod

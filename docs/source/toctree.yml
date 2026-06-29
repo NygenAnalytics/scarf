@@ -11,8 +11,6 @@ subtrees:
         title: For developers
       - file: faq
         title: Frequently asked questions
-      - file: colab
-        title: Interactive tutorials on Colab
   - caption: Basic pipelines
     entries:
       - file: vignettes/basic_tutorial_scRNAseq

@@ -83,13 +83,9 @@ be used if your data was generated using 10x's kit.
 
 Not yet. Please open a discussion on GitHub if an R API would be useful.
 
-## Can I try Scarf without installing anything on my computer?
-
-Yes, you may try Scarf on Google Colab. {ref}`Check this out <colab>` for links.
-
 ## What Python version does Scarf require?
 
-Python 3.14 (`requires-python >=3.14,<3.15`). See {ref}`installation <installation>`.
+Python 3.12 or newer (`requires-python >=3.12`). See {ref}`installation <installation>`.
 
 ## What does Scarf's logo signify?
 

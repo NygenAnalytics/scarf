@@ -11,7 +11,7 @@ The code is written using [black] style. Please make sure you blacken any edited
 
 You can run the tests locally on your branch with [pytest]. Configurations are in `pyproject.toml`.
 Install dependencies with `uv sync --extra test --extra extra`, then run `uv run pytest`.
-Python 3.14 is required (`requires-python >=3.14,<3.15`).
+Python 3.12 or newer is required (`requires-python >=3.12`).
 
 ## Contributions to the documentation
 
