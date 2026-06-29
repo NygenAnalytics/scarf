@@ -6,6 +6,8 @@ Requires tests/.env with R2 credentials when using s3:// URIs.
 Usage (from repo root):
     uv run python -m tests.r2_profile --uri s3://bucket/prefix/data.zarr
     uv run python -m tests.r2_profile --from-h5ad data.h5ad --uri s3://bucket/prefix/data.zarr
+    uv run python -m tests.r2_profile --from-h5ad-url https://datasets.cellxgene.cziscience.com/<id>.h5ad \\
+        --auto-r2-uri cellxgene_<id>.zarr
     uv run python -m tests.r2_profile --from-mtx cellranger_out/ --uri s3://bucket/prefix/data.zarr
 """
 
@@ -17,11 +19,15 @@ import resource
 import sys
 import time
 import tracemalloc
+import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
+
+import h5py
 
 from scarf.datastore.datastore import DataStore
 from scarf.readers import CrDirReader, H5adReader
@@ -30,6 +36,15 @@ from scarf.storage.zarr_store import compute_zarr_layout, set_zarr_layout
 from scarf.writers import CrToZarr, H5adToZarr
 
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
+_DEFAULT_DOWNLOAD_DIR = Path(__file__).resolve().parent / "datasets" / "cellxgene"
+_FEATURE_NAME_CANDIDATES = (
+    "feature_name",
+    "gene_symbols",
+    "gene_short_name",
+    "name",
+    "_index",
+    "index",
+)
 STEPS = ("create", "open", "filter", "hvg", "graph", "leiden", "umap")
 WORKFLOW_STEPS = STEPS[1:]
 
@@ -45,6 +60,85 @@ def load_env() -> None:
         key, value = key.strip(), value.strip().strip('"').strip("'")
         if key and key not in os.environ:
             os.environ[key] = value
+
+
+def resolve_r2_uri(zarr_name: str) -> str:
+    bucket = os.environ.get("SCARF_R2_BUCKET", "")
+    prefix = os.environ.get("SCARF_R2_PREFIX", "").strip("/")
+    if not bucket:
+        raise RuntimeError("SCARF_R2_BUCKET is not set")
+    zarr_name = zarr_name.lstrip("/")
+    if prefix:
+        return f"s3://{bucket}/{prefix}/{zarr_name}"
+    return f"s3://{bucket}/{zarr_name}"
+
+
+def h5ad_url_basename(url: str) -> str:
+    name = Path(urlparse(url).path).name
+    if not name.endswith(".h5ad"):
+        raise ValueError(f"expected .h5ad URL, got: {url}")
+    return name
+
+
+def download_h5ad(url: str, dest: Path, *, force: bool = False) -> Path:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.is_file() and not force:
+        print(f"using cached h5ad: {dest}", flush=True)
+        return dest
+    print(f"downloading {url}", flush=True)
+    print(f"  -> {dest}", flush=True)
+    urllib.request.urlretrieve(url, dest)
+    return dest
+
+
+def inspect_h5ad(path: Path) -> dict[str, Any]:
+    with h5py.File(path, "r") as h5:
+        var_keys = sorted(h5["var"].keys()) if "var" in h5 else []
+        obs_keys = sorted(h5["obs"].keys()) if "obs" in h5 else []
+        reader = H5adReader(
+            str(path),
+            feature_name_key=resolve_feature_name_key(path, "auto"),
+        )
+        info: dict[str, Any] = {
+            "path": str(path),
+            "nCells": reader.nCells,
+            "nFeatures": reader.nFeatures,
+            "matrixDtype": str(reader.matrixDtype),
+            "obsKeys": obs_keys[:20],
+            "varKeys": var_keys[:20],
+            "featureNameKey": reader.featNamesKey,
+            "featureIdsKey": reader.featIdsKey,
+            "cellIdsKey": reader.cellIdsKey,
+        }
+        reader.h5.close()
+        return info
+
+
+def resolve_feature_name_key(path: Path, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    with h5py.File(path, "r") as h5:
+        if "var" not in h5:
+            return "gene_short_name"
+        keys = set(h5["var"].keys())
+        for candidate in _FEATURE_NAME_CANDIDATES:
+            alt = candidate.lstrip("_")
+            if candidate in keys:
+                return candidate
+            if alt in keys:
+                return alt
+    return "_index"
+
+
+def parse_local_cache(value: str) -> bool | str:
+    lowered = value.lower()
+    if lowered == "auto":
+        return "auto"
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return value
 
 
 def storage_options(uri: str) -> dict[str, str] | None:
@@ -135,14 +229,16 @@ def timed_step(name: str):
         )
 
 
-def graph_params(nCells: int, nFeatures: int) -> dict[str, int | str]:
+def graph_params(
+    nCells: int, nFeatures: int, *, localCache: bool | str
+) -> dict[str, int | str]:
     topN = min(2000, max(500, nFeatures // 25))
     return {
         "top_n": topN,
         "k": 11,
         "dims": min(50, max(11, topN)),
         "n_centroids": max(100, nCells // 100),
-        "local_cache": "auto",
+        "local_cache": localCache,
     }
 
 
@@ -156,17 +252,19 @@ def write_zarr_from_input(
     h5adCellIdsKey: str,
     h5adFeatureIdsKey: str,
     h5adFeatureNameKey: str,
+    dumpBatchSize: int,
 ) -> None:
     opts = storage_options(uri)
     remote = uri.startswith("s3://")
     set_resource_budget(resolve_budget(memory=mem_budget, workers=nthreads))
 
     if kind == "h5ad":
+        feature_name_key = resolve_feature_name_key(source, h5adFeatureNameKey)
         reader = H5adReader(
             str(source),
             cell_ids_key=h5adCellIdsKey,
             feature_ids_key=h5adFeatureIdsKey,
-            feature_name_key=h5adFeatureNameKey,
+            feature_name_key=feature_name_key,
         )
         n_cells, n_features = reader.nCells, reader.nFeatures
         layout = compute_zarr_layout(n_cells, n_features, remote=remote)
@@ -178,7 +276,7 @@ def write_zarr_from_input(
             storage_options=opts,
         )
         try:
-            writer.dump()
+            writer.dump(batch_size=dumpBatchSize)
         finally:
             reader.h5.close()
         return
@@ -207,6 +305,8 @@ def run_workflow(
     h5adCellIdsKey: str,
     h5adFeatureIdsKey: str,
     h5adFeatureNameKey: str,
+    dumpBatchSize: int,
+    localCache: bool | str,
 ) -> tuple[list[dict[str, Any]], DataStore | None]:
     opts = storage_options(uri)
     ds: DataStore | None = None
@@ -228,6 +328,7 @@ def run_workflow(
                     h5adCellIdsKey=h5adCellIdsKey,
                     h5adFeatureIdsKey=h5adFeatureIdsKey,
                     h5adFeatureNameKey=h5adFeatureNameKey,
+                    dumpBatchSize=dumpBatchSize,
                 )
 
             with timed_step("create") as r:
@@ -252,7 +353,9 @@ def run_workflow(
                     ds.cells.N, ds.RNA.feats.N, remote=uri.startswith("s3://")
                 )
                 set_zarr_layout(layout)
-                gparams = graph_params(ds.cells.N, ds.RNA.feats.N)
+                gparams = graph_params(
+                    ds.cells.N, ds.RNA.feats.N, localCache=localCache
+                )
 
             with timed_step("open") as r:
                 do_open()
@@ -287,7 +390,7 @@ def run_workflow(
                     k=int(gparams["k"]),
                     dims=int(gparams["dims"]),
                     n_centroids=int(gparams["n_centroids"]),
-                    local_cache=str(gparams["local_cache"]),
+                    local_cache=localCache,
                 )
 
             with timed_step("graph") as r:
@@ -320,12 +423,34 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--uri",
-        required=True,
+        default=None,
         help="Zarr store path (local dir or s3://bucket/prefix/data.zarr)",
+    )
+    parser.add_argument(
+        "--auto-r2-uri",
+        metavar="ZARR_NAME",
+        default=None,
+        help="Build s3:// URI from SCARF_R2_BUCKET and SCARF_R2_PREFIX",
     )
     src = parser.add_mutually_exclusive_group()
     src.add_argument("--from-h5ad", type=Path, metavar="PATH")
+    src.add_argument(
+        "--from-h5ad-url",
+        metavar="URL",
+        help="Download an h5ad file before profiling",
+    )
     src.add_argument("--from-mtx", type=Path, metavar="DIR")
+    parser.add_argument(
+        "--download-dir",
+        type=Path,
+        default=_DEFAULT_DOWNLOAD_DIR,
+        help="Cache directory for --from-h5ad-url downloads",
+    )
+    parser.add_argument(
+        "--force-download",
+        action="store_true",
+        help="Re-download even if the h5ad file is cached",
+    )
     parser.add_argument(
         "--steps",
         nargs="+",
@@ -340,8 +465,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--h5ad-feature-name-key",
-        default="gene_short_name",
-        help="var column for gene names",
+        default="auto",
+        help="var column for gene names (auto detects cellxgene-style keys)",
+    )
+    parser.add_argument(
+        "--dump-batch-size",
+        type=int,
+        default=1000,
+        help="Cells per batch when writing h5ad/mtx to Zarr",
+    )
+    parser.add_argument(
+        "--local-cache",
+        type=parse_local_cache,
+        default="auto",
+        help="local_cache for make_graph: auto, true, false, or a directory path",
     )
     parser.add_argument(
         "--nthreads",
@@ -351,6 +488,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mem-budget", default=None)
     parser.add_argument("--json", type=Path, default=None, help="Write results JSON")
     args = parser.parse_args()
+
+    if args.auto_r2_uri:
+        if args.uri:
+            parser.error("use either --uri or --auto-r2-uri, not both")
+        args.uri = resolve_r2_uri(args.auto_r2_uri)
+    if not args.uri:
+        parser.error("--uri or --auto-r2-uri is required")
+
+    if args.from_h5ad_url:
+        dest = args.download_dir / h5ad_url_basename(args.from_h5ad_url)
+        args.from_h5ad = download_h5ad(
+            args.from_h5ad_url, dest, force=args.force_download
+        )
 
     if args.from_h5ad and not args.from_h5ad.is_file():
         parser.error(f"--from-h5ad not found: {args.from_h5ad}")
@@ -375,7 +525,20 @@ def main() -> int:
     elif args.from_mtx:
         input_kind = "mtx"
 
-    print(f"uri={args.uri}  nthreads={args.nthreads}", flush=True)
+    dataset_info: dict[str, Any] | None = None
+    if input_kind == "h5ad" and input_source is not None:
+        dataset_info = inspect_h5ad(input_source)
+        print(
+            f"dataset: {dataset_info['nCells']} cells x {dataset_info['nFeatures']} features  "
+            f"feature_name_key={dataset_info['featureNameKey']}",
+            flush=True,
+        )
+
+    print(
+        f"uri={args.uri}  nthreads={args.nthreads}  "
+        f"dump_batch_size={args.dump_batch_size}  local_cache={args.local_cache!r}",
+        flush=True,
+    )
     if input_source:
         print(f"input={input_source} ({input_kind})", flush=True)
 
@@ -391,6 +554,8 @@ def main() -> int:
             h5adCellIdsKey=args.h5ad_cell_ids_key,
             h5adFeatureIdsKey=args.h5ad_feature_ids_key,
             h5adFeatureNameKey=args.h5ad_feature_name_key,
+            dumpBatchSize=args.dump_batch_size,
+            localCache=args.local_cache,
         )
     except Exception as exc:
         print(f"aborted: {exc}", file=sys.stderr, flush=True)
@@ -399,6 +564,14 @@ def main() -> int:
     payload = {
         "uri": args.uri,
         "input": str(input_source) if input_source else None,
+        "inputUrl": args.from_h5ad_url,
+        "dataset": dataset_info,
+        "tuning": {
+            "nthreads": args.nthreads,
+            "memBudget": args.mem_budget,
+            "dumpBatchSize": args.dump_batch_size,
+            "localCache": args.local_cache,
+        },
         "started": started,
         "finished": datetime.now(UTC).isoformat(),
         "steps": results,
