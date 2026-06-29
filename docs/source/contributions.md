@@ -16,20 +16,53 @@ Python 3.12 or newer is required (`requires-python >=3.12`).
 ## Contributions to the documentation
 
 You may contribute to the documentation by either adding new sections or modifying existing
-sections. Install doc dependencies with `uv pip install -e ".[extra,docs]"`.
+sections. Install doc dependencies with `uv sync --extra docs --extra extra`.
 
-Vignettes are MyST markdown files under `docs/source/vignettes/` with executable `{code-cell}` blocks.
-After editing a vignette, execute it locally with:
+Executable docs are MyST markdown files with `{code-cell}` blocks, not standalone `.ipynb` files.
+Sources live in `docs/source/quickstart.md` and `docs/source/vignettes/`. Executed outputs
+are stored in `docs/.jupyter_cache/` and committed to the repo so Read the Docs can build HTML
+without re-running notebooks on every build.
 
-    cd docs && make execute-notebooks
+### Refresh the docs cache
 
-Then commit both the source `.md` files and `docs/.jupyter_cache/`. Read the Docs
-builds HTML with Sphinx and reuses that cache instead of re-running notebooks on every build.
+After editing a vignette or quickstart page:
+
+    uv sync --extra docs --extra extra
+    cd docs && make execute-docs
+
+This runs all executable pages in parallel, updates `docs/.jupyter_cache/`, and prunes stale
+cache entries for deleted source files. Commit both the edited `.md` files and `docs/.jupyter_cache/`.
+
+### Other doc commands
+
+Run one page only:
+
+    cd docs && make execute-vignette VIGNETTE=basic_tutorial_scRNAseq
+
+Build HTML locally without re-executing notebooks:
+
+    cd docs && make html
+
+Remove orphaned cache entries only:
+
+    cd docs && make prune-stale-cache
+
+Full sequential re-execution via Sphinx (slower fallback):
+
+    cd docs && make execute-notebooks-all
+
+### Adding a new vignette
+
+1. Add `docs/source/vignettes/your_vignette.md` with MyST `{code-cell}` blocks (or convert from Jupyter with [Jupytext]).
+2. Register it in `docs/source/toctree.yml`.
+3. Run `cd docs && make execute-docs`.
+4. Commit the `.md` file and `docs/.jupyter_cache/`.
 
 The documentation uses [Sphinx], the [MyST] parser, and [myst_nb] for notebook execution.
-To add a tutorial from an existing Jupyter notebook, convert it with [Jupytext] to MyST markdown.
+Sphinx reads the committed cache via `nb_execution_mode = "cache"` in `docs/source/conf.py`.
 
-Use `scarf.set_verbosity('DEBUG')` when debugging vignette execution locally.
+Use `scarf.set_verbosity('DEBUG')` when debugging vignette execution locally. Vignettes
+download datasets over the network. Timeout per page is 200 seconds (`nb_execution_timeout` in `conf.py`).
 
 # Acknowledgements
 

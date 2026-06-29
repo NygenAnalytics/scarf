@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import sqlite3
 import sys
@@ -15,6 +16,8 @@ from myst_nb.core.read import create_nb_reader
 DOCS_ROOT = Path(__file__).resolve().parent
 DEFAULT_CACHE = DOCS_ROOT / ".jupyter_cache"
 VIGNETTES_DIR = DOCS_ROOT / "source" / "vignettes"
+
+os.environ.setdefault("IPYTHONDIR", str(DOCS_ROOT / ".ipython"))
 
 
 class _Logger:
@@ -30,8 +33,63 @@ class _Logger:
         pass
 
 
+def resolve_doc_path(name: str) -> Path:
+    if name == "quickstart":
+        path = DOCS_ROOT / "source" / "quickstart.md"
+    else:
+        path = VIGNETTES_DIR / f"{name}.md"
+    if not path.exists():
+        raise FileNotFoundError(f"Executable doc not found: {path}")
+    return path
+
+
+def list_executable_docs() -> list[str]:
+    names = ["quickstart"]
+    names.extend(sorted(p.stem for p in VIGNETTES_DIR.glob("*.md")))
+    return names
+
+
 def list_vignettes() -> list[str]:
-    return sorted(p.stem for p in VIGNETTES_DIR.glob("*.md"))
+    return list_executable_docs()
+
+
+def prune_stale_cache(cache_path: Path = DEFAULT_CACHE) -> list[str]:
+    """Drop cache rows and executed notebooks whose source .md no longer exists."""
+    db_path = cache_path / "global.db"
+    if not db_path.exists():
+        return []
+
+    removed: list[str] = []
+    db = sqlite3.connect(db_path)
+    try:
+        for (uri,) in db.execute("SELECT uri FROM nbproject").fetchall():
+            if Path(uri).exists():
+                continue
+            row = db.execute(
+                "SELECT hashkey FROM nbcache WHERE uri = ?", (uri,)
+            ).fetchone()
+            if row is not None:
+                executed_dir = cache_path / "executed" / row[0]
+                if executed_dir.exists():
+                    shutil.rmtree(executed_dir)
+            db.execute("DELETE FROM nbproject WHERE uri = ?", (uri,))
+            db.execute("DELETE FROM nbcache WHERE uri = ?", (uri,))
+            removed.append(uri)
+
+        valid_hashkeys = {
+            row[0] for row in db.execute("SELECT hashkey FROM nbcache").fetchall()
+        }
+        executed_root = cache_path / "executed"
+        if executed_root.exists():
+            for entry in executed_root.iterdir():
+                if entry.is_dir() and entry.name not in valid_hashkeys:
+                    shutil.rmtree(entry)
+                    removed.append(f"orphan:{entry.name}")
+
+        db.commit()
+    finally:
+        db.close()
+    return removed
 
 
 def execute_vignette(
@@ -40,9 +98,7 @@ def execute_vignette(
     cache_path: Path | None = None,
     execution_in_temp: bool = False,
 ) -> dict:
-    path = VIGNETTES_DIR / f"{name}.md"
-    if not path.exists():
-        raise FileNotFoundError(f"Vignette not found: {path}")
+    path = resolve_doc_path(name)
 
     cache_path = cache_path or DEFAULT_CACHE
     cache_path.mkdir(parents=True, exist_ok=True)

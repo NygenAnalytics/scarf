@@ -48,9 +48,14 @@ def main() -> None:
 
     repo_root = DOCS_ROOT.parent
     sys.path.insert(0, str(repo_root))
-    from docs.execute_vignette import DEFAULT_CACHE, list_vignettes, merge_caches
+    from docs.execute_vignette import (
+        DEFAULT_CACHE,
+        list_executable_docs,
+        merge_caches,
+        prune_stale_cache,
+    )
 
-    names = args.vignettes or list_vignettes()
+    names = args.vignettes or list_executable_docs()
     if not names:
         raise SystemExit("No vignettes found")
 
@@ -78,6 +83,10 @@ def main() -> None:
 
     if PARALLEL_CACHE.exists():
         shutil.rmtree(PARALLEL_CACHE, ignore_errors=True)
+
+    pruned = prune_stale_cache(DEFAULT_CACHE)
+    if pruned:
+        print(f"Pruned {len(pruned)} stale cache entries", flush=True)
 
     if failures:
         print("\nFailed vignettes:", flush=True)

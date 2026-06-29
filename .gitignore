@@ -17,6 +17,7 @@ dask-worker-space
 *.ipynb
 !docs/.jupyter_cache/executed/**/base.ipynb
 docs/.jupyter_cache/_parallel/
+docs/.ipython/
 docs/source/vignettes/README.md
 docs/source/vignettes/scarf_datasets
 docs/source/vignettes/dev
