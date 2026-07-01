@@ -167,7 +167,7 @@ name = "cffi"
 version = "2.0.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pycparser" },
+    { name = "pycparser", marker = "implementation_name != 'PyPy'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-2.0.0.tar.gz", hash = "sha256:44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529", size = 523588, upload-time = "2025-09-08T23:24:04.541Z" }
 wheels = [
@@ -1841,7 +1841,7 @@ name = "pexpect"
 version = "4.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "ptyprocess" },
+    { name = "ptyprocess", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/42/92/cc564bf6381ff43ce1f4d06852fc19a2f11d180f23dc32d9588bee2f149d/pexpect-4.9.0.tar.gz", hash = "sha256:ee7d41123f3c9911050ea2c2dac107568dc43b2d3b0c7557a33212c398ead30f", size = 166450, upload-time = "2023-11-25T09:07:26.339Z" }
 wheels = [
@@ -2480,8 +2480,8 @@ requires-dist = [
     { name = "jinja2", marker = "extra == 'docs'" },
     { name = "kneed", marker = "extra == 'extra'", specifier = ">=0.8" },
     { name = "leidenalg", specifier = ">=0.12" },
-    { name = "loguru" },
-    { name = "matplotlib", marker = "extra == 'extra'", specifier = ">=3.7" },
+    { name = "loguru", specifier = ">=0.7" },
+    { name = "matplotlib", marker = "extra == 'extra'", specifier = ">=3.9" },
     { name = "myst-nb", marker = "extra == 'docs'" },
     { name = "myst-parser", marker = "extra == 'docs'" },
     { name = "nbclient", marker = "extra == 'docs'" },
@@ -2492,12 +2492,12 @@ requires-dist = [
     { name = "obstore" },
     { name = "packaging" },
     { name = "pandas", specifier = ">=2.2.2" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=6.0" },
+    { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=4" },
     { name = "pytest-xdist", marker = "extra == 'test'", specifier = ">=3" },
     { name = "requests", marker = "extra == 'extra'", specifier = ">=2.28" },
     { name = "scikit-learn", specifier = ">=1.5" },
-    { name = "scikit-network", specifier = ">=0.33" },
+    { name = "scikit-network", specifier = ">=0.33.1" },
     { name = "scipy", specifier = ">=1.13,!=1.17.0" },
     { name = "seaborn", marker = "extra == 'extra'", specifier = ">=0.13" },
     { name = "setuptools", specifier = ">=61" },
@@ -2508,13 +2508,13 @@ requires-dist = [
     { name = "sphinx-copybutton", marker = "extra == 'docs'" },
     { name = "sphinx-external-toc", marker = "extra == 'docs'" },
     { name = "sphinx-tabs", marker = "extra == 'docs'" },
-    { name = "statsmodels", specifier = ">=0.14" },
+    { name = "statsmodels", specifier = ">=0.14.2" },
     { name = "threadpoolctl" },
     { name = "topacedo", marker = "extra == 'docs'" },
-    { name = "topacedo", marker = "extra == 'test'" },
+    { name = "topacedo", marker = "extra == 'test'", specifier = ">=0.2.10" },
     { name = "tqdm", specifier = ">=4.60" },
     { name = "umap-learn", specifier = ">=0.5.6" },
-    { name = "zarr", specifier = ">=3.1" },
+    { name = "zarr", specifier = ">=3.1.2" },
 ]
 provides-extras = ["extra", "test", "docs"]
 

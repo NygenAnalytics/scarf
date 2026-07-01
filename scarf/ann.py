@@ -290,13 +290,20 @@ class AnnStream:
             cols = self.dims
         return self.nCells * cols * 8
 
+    def _reduced_blocks(self, msg: str) -> list[np.ndarray]:
+        """Apply the reducer to every row block in parallel, preserving order."""
+        return self.data.map_blocks(
+            lambda _i, s, e: self.reducer(self.data._materialize_range(s, e)),
+            nthreads=self.nthreads,
+            msg=msg,
+        )
+
     def _maybe_build_embeddings(self) -> None:
         if self.harmonize or self._embedding_bytes() > EMBEDDING_CACHE_MAX_BYTES:
             return
-        parts: list[np.ndarray] = []
-        for block in self.iter_blocks(msg="Building cell embeddings"):
-            parts.append(self.reducer(block))
-        self._embeddings = np.vstack(parts)
+        self._embeddings = np.vstack(
+            self._reduced_blocks(msg="Building cell embeddings")
+        )
 
     def _handle_batch_size(self) -> int:
         if self.dims is not None and self.dims > self.data.shape[0]:
@@ -314,15 +321,7 @@ class AnnStream:
 
     def iter_blocks(self, msg: str = "") -> Generator[np.ndarray, None, None]:
         """Yield row blocks of raw data as NumPy arrays with optional progress bar."""
-        from .storage.zarr_store import profile_prefetch_depth
-        from .utils import prefetch_blocks
-
-        blocks = prefetch_blocks(
-            self.data.blocks,
-            lambda block: controlled_compute(block, self.nthreads),
-            max_ahead=profile_prefetch_depth(),
-        )
-        yield from tqdmbar(blocks, desc=msg, total=self.data.numblocks[0])
+        yield from self.data.stream_blocks(nthreads=self.nthreads, msg=msg)
 
     def transform_z(self, a: np.ndarray) -> np.ndarray:
         """Z-score a block using fitted ``mu`` and ``sigma``."""
@@ -439,10 +438,9 @@ class AnnStream:
 
     def _fit_ann(self) -> Any:
         def _transform_values() -> np.ndarray:
-            pca_array = []
-            for _i in self.iter_blocks(msg="Calculating uncorrected latent dimensions"):
-                pca_array.append(self.reducer(_i))
-            return np.vstack(pca_array).T
+            return np.vstack(
+                self._reduced_blocks(msg="Calculating uncorrected latent dimensions")
+            ).T
 
         ann_dims = (
             self.dims
@@ -524,7 +522,14 @@ class AnnStream:
             else:
                 for i in self.iter_blocks(msg="Fitting kmeans"):
                     kmeans.partial_fit(self.reducer(i))
-                for i in self.iter_blocks(msg="Estimating seed partitions"):
-                    temp.extend(kmeans.predict(self.reducer(i)))
+                predicted = self.data.map_blocks(
+                    lambda _i, s, e: np.asarray(
+                        kmeans.predict(self.reducer(self.data._materialize_range(s, e)))
+                    ),
+                    nthreads=self.nthreads,
+                    msg="Estimating seed partitions",
+                )
+                for part in predicted:
+                    temp.extend(part)
         self.clusterLabels = np.array(temp)
         return kmeans

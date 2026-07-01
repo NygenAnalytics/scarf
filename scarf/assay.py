@@ -459,6 +459,19 @@ class Assay:
             logger.debug(f"Location ({stats_loc}) already mounted")
         return identifier
 
+    @staticmethod
+    def _finalize_staged_mirror(
+        mirror: zarr.Array | None,
+        subset_hash: str,
+        subset_params: dict[str, Any],
+    ) -> None:
+        """Mark a mirrored staging array complete so staging reuses it as-is."""
+        if mirror is None:
+            return
+        mirror.attrs["staged_subset_hash"] = subset_hash
+        mirror.attrs["staged_subset_params"] = subset_params
+        mirror.attrs["staged_complete"] = True
+
     def save_normalized_data(
         self,
         cell_key: str,
@@ -468,6 +481,7 @@ class Assay:
         log_transform: bool,
         renormalize_subset: bool,
         update_keys: bool,
+        mirror: zarr.Array | None = None,
     ) -> ChunkedArray:
         """Create a new zarr group and saves the normalized data in the group
         for the selected features only.
@@ -532,9 +546,17 @@ class Assay:
             log_transform=log_transform,
             renormalize_subset=renormalize_subset,
         )
-        dask_to_zarr(vals, self.z, location + "/data", vals.chunksize, self.nthreads)
+        dask_to_zarr(
+            vals,
+            self.z,
+            location + "/data",
+            vals.chunksize,
+            self.nthreads,
+            mirror=mirror,
+        )
         self.z[location].attrs["subset_hash"] = subset_hash
         self.z[location].attrs["subset_params"] = subset_params
+        self._finalize_staged_mirror(mirror, subset_hash, subset_params)
         if update_keys:
             self.attrs["latest_feat_key"] = (
                 feat_key.split("__", 1)[1] if feat_key != "I" else "I"
@@ -908,6 +930,7 @@ class RNAassay(Assay):
         log_transform: bool,
         renormalize_subset: bool,
         update_keys: bool,
+        mirror: zarr.Array | None = None,
     ) -> ChunkedArray:
         if not renormalize_subset:
             return super().save_normalized_data(
@@ -918,6 +941,7 @@ class RNAassay(Assay):
                 log_transform,
                 renormalize_subset,
                 update_keys,
+                mirror=mirror,
             )
 
         from .writers import write_renorm_subset_to_zarr
@@ -957,9 +981,11 @@ class RNAassay(Assay):
             location + "/data",
             self.nthreads,
             log_transform=log_transform,
+            mirror=mirror,
         )
         self.z[location].attrs["subset_hash"] = subset_hash
         self.z[location].attrs["subset_params"] = subset_params
+        self._finalize_staged_mirror(mirror, subset_hash, subset_params)
         if update_keys:
             self.attrs["latest_feat_key"] = (
                 feat_key.split("__", 1)[1] if feat_key != "I" else "I"
@@ -1052,7 +1078,7 @@ class RNAassay(Assay):
             Tuples of ``(normed_batch, feat_index_batch)`` where ``normed_batch``
             has shape ``(len(cell_idx), batch_columns)``.
         """
-        from .storage.budget import bounded_prefetch
+        from .storage.budget import worker_prefetch_depth
         from .utils import prefetch_blocks, tqdmbar
 
         zarr_arr = cast(zarr.Array, self.rawData._backing)
@@ -1069,11 +1095,7 @@ class RNAassay(Assay):
         def read(cols: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             return _read_block(zarr_arr, cell_idx, cols), cols
 
-        # Bound read-ahead by the actual band size (raw uint32 plus the float32
-        # normalized copy) rather than trusting a layout-derived depth.
-        raw_itemsize = int(np.dtype(zarr_arr.dtype).itemsize)
-        band_bytes = max(1, len(cell_idx) * batch_size * (raw_itemsize + 4))
-        max_ahead = bounded_prefetch(band_bytes, requested=max(1, prefetch_depth))
+        max_ahead = worker_prefetch_depth(requested=max(1, prefetch_depth))
 
         consumer = prefetch_blocks(batches, read, max_ahead=max_ahead)
         for raw, cols in tqdmbar(consumer, desc=msg or "", total=len(batches)):
@@ -1091,19 +1113,15 @@ class RNAassay(Assay):
         """Per-cell mean of library-size normalized counts for each feature group.
 
         Reads the union of all requested feature columns once and streams over
-        row blocks (sized by the active resource budget) so the peak transient
-        stays bounded. This avoids the full ChunkedArray normalization path (and
+        row blocks aligned to the array's on-disk row chunk. This avoids the
+        full ChunkedArray normalization path (and
         its repeated wide-chunk reads) used by ``normed`` when scoring small,
         scattered gene sets such as cell cycle markers. Values are computed in
         float64 to match ``norm_lib_size``. Row blocks are read ahead in
         parallel and accumulated as they arrive (each writes a disjoint row
         slice, so order does not matter).
         """
-        from .storage.budget import (
-            bounded_prefetch,
-            get_resource_budget,
-            tile_rows_for_width,
-        )
+        from .storage.budget import worker_prefetch_depth
         from .utils import prefetch_blocks
 
         zarr_arr = cast(zarr.Array, self.rawData._backing)
@@ -1132,19 +1150,8 @@ class RNAassay(Assay):
             return out
 
         if block_rows is None:
-            chunk_rows = (
-                int(zarr_arr.chunks[0]) if getattr(zarr_arr, "chunks", None) else 1
-            )
-            raw_itemsize = int(np.dtype(zarr_arr.dtype).itemsize)
-            budget = get_resource_budget()
-            # The float64 normalized copy dominates the transient; size against it.
-            block_rows = tile_rows_for_width(
-                n_cols=len(union),
-                itemsize=raw_itemsize + 8,
-                budget=budget,
-                chunk_rows=chunk_rows,
-                n_rows=n_cells,
-            )
+            chunks = getattr(zarr_arr, "chunks", None)
+            block_rows = int(chunks[0]) if chunks else n_cells
         block_rows = max(1, int(block_rows))
 
         starts = range(0, n_cells, block_rows)
@@ -1153,8 +1160,7 @@ class RNAassay(Assay):
             rows = cell_idx[start : start + block_rows]
             return start, _read_block(zarr_arr, rows, union)
 
-        band_bytes = max(1, block_rows * len(union) * 8)
-        max_ahead = bounded_prefetch(band_bytes)
+        max_ahead = worker_prefetch_depth()
         for start, raw in prefetch_blocks(starts, read, max_ahead=max_ahead):
             end = start + raw.shape[0]
             normed = (sf * raw.astype(np.float64)) / scalar[start:end, None]
@@ -1167,20 +1173,17 @@ class RNAassay(Assay):
         cell_idx: np.ndarray,
         feat_idx: np.ndarray,
     ) -> dict[str, np.ndarray]:
-        """Per-feature library-size normalized stats in one tiled pass.
+        """Per-feature library-size normalized stats in one streaming pass.
 
-        Streams raw-count tiles, normalizes them in float64, and accumulates
+        Reads the raw counts one feature-chunk column block at a time (across
+        all selected cells), normalizes each block in float64, and accumulates
         per-feature nonzero count, sum, and sum of squares, so the normalized
-        matrix is never fully materialized. Tiles are aligned to the on-disk
-        chunk grid: when a full-width row band of one row chunk fits the
-        per-worker budget the read is full width; otherwise the columns are
-        split into chunk-aligned blocks so the in-memory band stays bounded
-        regardless of feature count (the legacy wide-row-chunk case). Each
-        on-disk chunk is read exactly once. Values match ``norm_lib_size``.
-        Returns ``normed_tot`` (sum), ``normed_n`` (nonzero count), and
-        ``sigmas`` (population variance).
+        matrix is never fully materialized. The column block follows the array's
+        on-disk feature chunk width, and blocks are read ahead in parallel up to
+        the worker count. Values match ``norm_lib_size``. Returns ``normed_tot``
+        (sum), ``normed_n`` (nonzero count), and ``sigmas`` (population variance).
         """
-        from .storage.budget import bounded_prefetch, get_resource_budget
+        from .storage.budget import worker_prefetch_depth
         from .utils import prefetch_blocks, tqdmbar
 
         zarr_arr = cast(zarr.Array, self.rawData._backing)
@@ -1205,57 +1208,23 @@ class RNAassay(Assay):
         if n_cells == 0 or n_features == 0:
             return {"normed_tot": s1, "normed_n": nz, "sigmas": s2}
 
-        budget = get_resource_budget()
         chunks = getattr(zarr_arr, "chunks", None)
-        chunk_rows = int(chunks[0]) if chunks else 1
-        chunk_cols = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
-        raw_itemsize = int(np.dtype(zarr_arr.dtype).itemsize)
-        # Per element we hold the raw value plus a float64 normalized copy and a
-        # transient for the squared term.
-        elem_bytes = raw_itemsize + 16
-        max_elems = max(1, budget.perWorkerBytes // elem_bytes)
-
-        # Prefer a single full-width band; fall back to chunk-aligned column
-        # blocks only when one row chunk's worth of full width busts the budget.
-        rows_full_width = max_elems // n_features
-        if rows_full_width >= chunk_rows:
-            block_rows = min(
-                n_cells, max(chunk_rows, (rows_full_width // chunk_rows) * chunk_rows)
-            )
-            col_block = n_features
-        else:
-            block_rows = min(n_cells, chunk_rows)
-            cols_fit = max_elems // max(1, block_rows)
-            col_block = max(chunk_cols, (cols_fit // chunk_cols) * chunk_cols)
-            col_block = min(col_block, n_features)
-
+        col_block = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
+        col_block = max(1, min(col_block, n_features))
         col_starts = range(0, n_features, col_block)
-        row_starts = range(0, n_cells, block_rows)
-        n_tiles = len(col_starts) * len(row_starts)
 
-        def tiles() -> Generator[tuple[int, int], None, None]:
-            for r in row_starts:
-                for c in col_starts:
-                    yield r, c
-
-        def read(tile: tuple[int, int]) -> tuple[int, int, np.ndarray]:
-            r, c = tile
-            rows = cell_idx[r : r + block_rows]
+        def read(c: int) -> tuple[int, np.ndarray]:
             cols = feat_idx[c : c + col_block]
-            return r, c, _read_block(zarr_arr, rows, cols)
+            return c, _read_block(zarr_arr, cell_idx, cols)
 
-        # Read band is raw-only; the float64 transients live on the consumer.
-        band_bytes = max(1, block_rows * col_block * raw_itemsize)
-        max_ahead = bounded_prefetch(band_bytes)
-
-        consumer = prefetch_blocks(tiles(), read, max_ahead=max_ahead)
-        for r, c, raw in tqdmbar(
-            consumer, desc=f"({self.name}) Computing feature stats", total=n_tiles
+        consumer = prefetch_blocks(col_starts, read, max_ahead=worker_prefetch_depth())
+        for c, raw in tqdmbar(
+            consumer,
+            desc=f"({self.name}) Computing feature stats",
+            total=len(col_starts),
         ):
             width = raw.shape[1]
-            normed = (sf * raw.astype(np.float64)) * inv_scalar[
-                r : r + raw.shape[0], None
-            ]
+            normed = (sf * raw.astype(np.float64)) * inv_scalar[:, None]
             nz[c : c + width] += (raw > 0).sum(axis=0)
             s1[c : c + width] += normed.sum(axis=0)
             s2[c : c + width] += (normed * normed).sum(axis=0)

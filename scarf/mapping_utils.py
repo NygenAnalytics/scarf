@@ -7,7 +7,7 @@ import pandas as pd
 
 from .assay import Assay
 from .chunked import ChunkedArray
-from .utils import controlled_compute, show_dask_progress, logger, tqdmbar
+from .utils import controlled_compute, show_dask_progress, logger
 
 __all__ = ["align_features", "coral"]
 
@@ -23,8 +23,8 @@ def _streaming_covariance(data: ChunkedArray, nthreads: int, msg: str) -> np.nda
     xtx = np.zeros((n_cols, n_cols), dtype=np.float64)
     col_sum = np.zeros(n_cols, dtype=np.float64)
     n_rows = 0
-    for block in tqdmbar(data.blocks, total=data.numblocks[0], desc=msg):
-        a = controlled_compute(block, nthreads).astype(np.float64, copy=False)
+    for block in data.stream_blocks(nthreads=nthreads, msg=msg):
+        a = block.astype(np.float64, copy=False)
         xtx += a.T @ a
         col_sum += a.sum(axis=0)
         n_rows += a.shape[0]
@@ -232,16 +232,13 @@ def align_features(
     )
     pos_start, pos_end = 0, 0
     unsorter_idx = np.argsort(np.argsort(t_idx[t_idx != -1]))
-    for i in tqdmbar(
-        normed_data.blocks,
-        total=normed_data.numblocks[0],
-        desc=f"({target_assay.name}) Writing aligned data to {normed_loc}",
+    for i in normed_data.stream_blocks(
+        nthreads=nthreads,
+        msg=f"({target_assay.name}) Writing aligned data to {normed_loc}",
     ):
         pos_end += i.shape[0]
         a = np.ones((i.shape[0], len(t_idx)))
-        a[:, np.where(t_idx != -1)[0]] = controlled_compute(i, nthreads)[
-            :, unsorter_idx
-        ]
+        a[:, np.where(t_idx != -1)[0]] = i[:, unsorter_idx]
         og[pos_start:pos_end, :] = a
         pos_start = pos_end
     return s_idx

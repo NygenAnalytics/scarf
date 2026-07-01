@@ -31,12 +31,18 @@ from ._types import as_zarr_array, as_zarr_group
 from .readers import CrReader, H5adReader, NaboH5Reader, LoomReader, CSVReader
 from .storage.zarr_store import (
     ZarrArraySpec,
+    _group_zarr_format,
+    accumulate_sparse_to_shards,
+    array_shard_rows,
+    count_array_spec,
     create_metadata_column,
     create_numeric_array,
     finalize_sharded_counts,
+    get_storage_profile,
     is_local_zarr_path,
     normed_array_spec,
-    profile_prefetch_depth,
+    write_dense_from_row_batches,
+    write_dense_in_shard_rows,
 )
 from .utils import (
     controlled_compute,
@@ -44,7 +50,6 @@ from .utils import (
     tqdmbar,
     show_dask_progress,
     load_zarr,
-    prefetch_blocks,
     ZARRLOC,
 )
 
@@ -162,8 +167,17 @@ def create_zarr_count_assay(
     )
     if workspace is not None:
         g = z.create_group(f"matrices/{assay_name}", overwrite=True)
+    n_feats = len(feat_ids)
+    if _group_zarr_format(g) >= 3:
+        spec = count_array_spec(
+            n_cells,
+            n_feats,
+            dtype=dtype,
+            remote=get_storage_profile() == "cloud",
+        )
+        return create_numeric_array(g, "counts", spec)
     return create_zarr_dataset(
-        g, "counts", chunk_size, dtype, (n_cells, len(feat_ids)), overwrite=True
+        g, "counts", chunk_size, dtype, (n_cells, n_feats), overwrite=True
     )
 
 
@@ -213,19 +227,7 @@ def sparse_writer(
     Returns:
         Number of rows written.
     """
-    (
-        s,
-        e,
-    ) = (
-        0,
-        0,
-    )
-    n_chunks = n_cells // batch_size + 1
-    for a in tqdmbar(data_stream, total=n_chunks):
-        e += a.shape[0]
-        store.set_coordinate_selection((a.row + s, a.col), a.data)
-        s = e
-    return e
+    return accumulate_sparse_to_shards(store, data_stream, dtype=store.dtype)
 
 
 class CrToZarr:
@@ -534,13 +536,9 @@ class NaboH5ToZarr:
             None
         """
         store = load_count_store(self.z, self.assayName, self.workspace)
-        (
-            s,
-            e,
-        ) = (
-            0,
-            0,
-        )
+        batch_size = array_shard_rows(store)
+        s = 0
+        e = 0
         n_chunks = self.h5.nCells // batch_size + 1
         for a in tqdmbar(self.h5.consume(batch_size), total=n_chunks):
             e += a.shape[0]
@@ -761,32 +759,23 @@ class SparseToZarr:
 
         store = load_count_store(self.z, self.assayName, self.workspace)
         if batch_size is None:
-            batch_size = int(store.chunks[0])
-        (
-            s,
-            e,
-        ) = (
-            0,
-            0,
+            batch_size = array_shard_rows(store)
+
+        def row_batches() -> Iterator[coo_matrix]:
+            s = 0
+            for end in range(batch_size, self.nCells + batch_size, batch_size):
+                if s == self.nCells:
+                    break
+                if end > self.nCells:
+                    end = self.nCells
+                yield self.mat[s:end].tocoo()
+                s = end
+
+        e = accumulate_sparse_to_shards(
+            store,
+            row_batches(),
+            dtype=self.matrixDtype,
         )
-        n_chunks = self.nCells // batch_size + 1
-        for e in tqdmbar(
-            range(batch_size, self.nCells + batch_size, batch_size),
-            total=n_chunks,
-            desc="Writing data matrix",
-        ):
-            if s == self.nCells:
-                raise ValueError(
-                    "Unexpected error encountered in writing to Zarr. The last iteration has failed. "
-                    "Please report this issue."
-                )
-            if e > self.nCells:
-                e = self.nCells
-            a = self.mat[s:e].tocoo()
-            store.set_coordinate_selection(
-                (a.row + s, a.col), a.data.astype(self.matrixDtype)
-            )
-            s = e
         if e != self.nCells:
             raise AssertionError(
                 "ERROR: This is a bug in SparseToZarr. All cells might not have been successfully "
@@ -870,28 +859,25 @@ class CSVtoZarr:
             )
             for x, y in zip(self.csvr.cellDataCols, self.csvr.cellDataDtypes or [])
         ]
-        batch_size = self.csvr.pandas_kwargs["chunksize"]
-        (
-            s,
-            e,
-        ) = (
-            0,
-            0,
+
+        def count_batches() -> Iterator[np.ndarray]:
+            s = 0
+            for a, c in self.csvr.consume():
+                e = s + a.shape[0]
+                if c is not None:
+                    for n, i in enumerate(c.T):
+                        cell_data[n][s:e] = i
+                s = e
+                if self.dtype is not None:
+                    yield a.astype(self.dtype)
+                else:
+                    yield a
+
+        e = write_dense_from_row_batches(
+            store,
+            count_batches(),
+            msg="Writing CSV counts",
         )
-        if self.csvr.nCells % batch_size == 0:
-            n_chunks = int(self.csvr.nCells / batch_size)
-        else:
-            n_chunks = (self.csvr.nCells // batch_size) + 1
-        for a, c in tqdmbar(self.csvr.consume(), total=n_chunks):
-            e += a.shape[0]
-            if self.dtype is not None:
-                store[s:e] = a.astype(self.dtype)
-            else:
-                store[s:e] = a
-            if c is not None:
-                for n, i in enumerate(c.T):
-                    cell_data[n][s:e] = i
-            s = e
         if e != self.csvr.nCells:
             raise AssertionError(
                 "ERROR: This is a bug in CSVtoZarr. All cells might not have been successfully "
@@ -928,14 +914,15 @@ def subset_assay_zarr(
     """
     z = load_zarr(zarr_loc, "r+", storage_options=storage_options)
     ig = as_zarr_array(z[in_grp], name=in_grp)
-    og = create_zarr_dataset(
-        z, out_grp, chunk_size, "uint32", (len(cells_idx), len(feat_idx))
+    spec = count_array_spec(len(cells_idx), len(feat_idx), dtype="uint32")
+    og = create_numeric_array(z, out_grp, spec)
+    write_dense_in_shard_rows(
+        og,
+        lambda start, end: ig.get_orthogonal_selection(
+            (cells_idx[start:end], feat_idx)
+        ),
+        msg="Subsetting assay",
     )
-    pos_start, pos_end = 0, 0
-    for i in tqdmbar(np.array_split(cells_idx, len(cells_idx) // chunk_size[0] + 1)):
-        pos_end += len(i)
-        og[pos_start:pos_end, :] = ig.get_orthogonal_selection((i, feat_idx))
-        pos_start = pos_end
     return None
 
 
@@ -948,6 +935,7 @@ def write_renorm_subset_to_zarr(
     nthreads: int,
     log_transform: bool = False,
     msg: str | None = None,
+    mirror: zarr.Array | None = None,
 ) -> None:
     """Write library-size normalized subset data in a single scattered read pass.
 
@@ -960,7 +948,6 @@ def write_renorm_subset_to_zarr(
     spec = normed_array_spec(counts.shape[0], counts.shape[1])
     og = create_numeric_array(z, loc, spec)
     sf = assay.sf
-    pos_start = 0
 
     def normalize_block(block: Any) -> np.ndarray:
         block = np.asarray(block)
@@ -971,15 +958,14 @@ def write_renorm_subset_to_zarr(
             out = np.log1p(out)
         return np.asarray(out, dtype=np.float32)
 
-    blocks = prefetch_blocks(
-        counts.blocks,
-        lambda block: normalize_block(controlled_compute(block, nthreads)),
-        max_ahead=profile_prefetch_depth(),
+    write_dense_in_shard_rows(
+        og,
+        lambda start, end: normalize_block(
+            controlled_compute(counts[start:end, :], nthreads)
+        ),
+        msg=msg,
+        also_write_to=mirror,
     )
-    for block in tqdmbar(blocks, total=counts.numblocks[0], desc=msg):
-        pos_end = pos_start + block.shape[0]
-        og[pos_start:pos_end, :] = block
-        pos_start = pos_end
     return None
 
 
@@ -990,6 +976,7 @@ def dask_to_zarr(
     chunk_size: tuple[int, int],
     nthreads: int,
     msg: str | None = None,
+    mirror: zarr.Array | None = None,
 ) -> None:
     """Creates a Zarr hierarchy from a chunked array.
 
@@ -1000,23 +987,21 @@ def dask_to_zarr(
         chunk_size: Legacy row chunk hint (superseded by profile spec when writing normed data).
         nthreads: Threads for block compute.
         msg: Progress bar message (default: ``Writing data to {loc}``).
+        mirror: Optional second array of the same shape to write each band into
+            during the same pass (local staging cache).
     """
     if msg is None:
         msg = f"Writing data to {loc}"
     spec = normed_array_spec(df.shape[0], df.shape[1])
     og = create_numeric_array(z, loc, spec)
-    pos_start, pos_end = 0, 0
-    blocks = prefetch_blocks(
-        df.blocks,
-        lambda block: controlled_compute(block, nthreads).astype(
+    write_dense_in_shard_rows(
+        og,
+        lambda start, end: controlled_compute(df[start:end, :], nthreads).astype(
             np.float32, copy=False
         ),
-        max_ahead=profile_prefetch_depth(),
+        msg=msg,
+        also_write_to=mirror,
     )
-    for block in tqdmbar(blocks, total=df.numblocks[0], desc=msg):
-        pos_end += block.shape[0]
-        og[pos_start:pos_end, :] = block
-        pos_start = pos_end
     return None
 
 
@@ -1193,22 +1178,11 @@ class SubsetZarr:
                     self.z[f"matrices/{assay.name}/counts"],
                     name=f"matrices/{assay.name}/counts",
                 )
-            (
-                s,
-                e,
-            ) = (
-                0,
-                0,
+            write_dense_in_shard_rows(
+                store,
+                lambda start, end: raw_data[start:end, :].compute(),
+                msg=f"Subsetting assay: {assay.name}",
             )
-            for a in tqdmbar(
-                raw_data.blocks,
-                desc=f"Subsetting assay: {assay.name}",
-                total=raw_data.numblocks[0],
-            ):
-                if a.shape[0] > 0:
-                    e += a.shape[0]
-                    store[s:e] = a.compute()
-                    s = e
             finalize_writer_counts(self.z, assay.name, self.outWorkspace)
 
 

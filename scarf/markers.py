@@ -503,7 +503,7 @@ def knn_clustering(
     """
 
     from .ann import instantiate_knn_index, fix_knn_query
-    from .utils import controlled_compute, tqdmbar, show_dask_progress
+    from .utils import show_dask_progress
     from scipy.sparse import csr_matrix
 
     def make_knn_mat(data: ChunkedArray, k: int, t: int) -> csr_matrix:
@@ -518,16 +518,12 @@ def knn_clustering(
             scipy.sparse.csr_matrix: Sparse adjacency matrix representing the KNN graph
         """
 
-        for i in tqdmbar(data.blocks, desc="Fitting KNNs", total=data.numblocks[0]):
-            i = controlled_compute(i, t)
+        for i in data.stream_blocks(nthreads=t, msg="Fitting KNNs"):
             ann_idx.add_items(i)
         s, e = 0, 0
         neighbor_indices: list[np.ndarray] = []
-        for i in tqdmbar(
-            data.blocks, desc="Identifying feature KNNs", total=data.numblocks[0]
-        ):
+        for i in data.stream_blocks(nthreads=t, msg="Identifying feature KNNs"):
             e += i.shape[0]
-            i = controlled_compute(i, t)
             inds, d = ann_idx.knn_query(i, k=k + 1)
             inds, _, _ = fix_knn_query(inds, d, np.arange(s, e))
             neighbor_indices.append(inds)

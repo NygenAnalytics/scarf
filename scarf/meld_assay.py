@@ -12,7 +12,7 @@
 
 import gzip
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import numpy as np
@@ -22,6 +22,7 @@ from scipy.sparse import coo_matrix
 import zarr
 
 from .assay import Assay
+from .storage.zarr_store import accumulate_sparse_to_shards
 from .utils import controlled_compute, logger, tqdmbar
 from .writers import create_zarr_count_assay
 
@@ -417,25 +418,30 @@ def create_counts_mat(
     n_docs = n_term_per_doc.shape[0]
     n_docs_per_term = assay.feats.fetch_all("nCells")
 
-    s = 0
-    for a in tqdmbar(assay.rawData.blocks, total=assay.rawData.numblocks[0]):
-        a = controlled_compute(a, assay.nthreads)
-        tf = a / n_term_per_doc[s : s + a.shape[0]].reshape(-1, 1)
-        idf = np.log2(1 + (n_docs / (n_docs_per_term + 1)))
-        a = tf * idf
+    def block_stream() -> Iterator[coo_matrix]:
+        s = 0
+        for a in tqdmbar(assay.rawData.blocks, total=assay.rawData.numblocks[0]):
+            a = controlled_compute(a, assay.nthreads)
+            tf = a / n_term_per_doc[s : s + a.shape[0]].reshape(-1, 1)
+            idf = np.log2(1 + (n_docs / (n_docs_per_term + 1)))
+            a = tf * idf
 
-        df = pd.DataFrame(a[:, peak_idx]).T
-        df["fidx"] = feat_idx
-        df = df.groupby("fidx").sum().T
-        if renormalization:
-            df = (scalar_coeff * df) / df.sum(axis=1).values.reshape(-1, 1)
-        assert df.shape[1] == idx.shape[0]
+            df = pd.DataFrame(a[:, peak_idx]).T
+            df["fidx"] = feat_idx
+            df = df.groupby("fidx").sum().T
+            if renormalization:
+                df = (scalar_coeff * df) / df.sum(axis=1).values.reshape(-1, 1)
+            assert df.shape[1] == idx.shape[0]
 
-        coord_renamer = dict(enumerate(df.columns))
-        coo = coo_matrix(df.values)
-        coo.col = np.array([coord_renamer[x] for x in coo.col])
-        store.set_coordinate_selection((s + coo.row, coo.col), coo.data)
-        s += a.shape[0]
+            coord_renamer = dict(enumerate(df.columns))
+            coo = coo_matrix(df.values)
+            coo.col = np.array([coord_renamer[x] for x in coo.col])
+            yield coo_matrix(
+                (coo.data, (coo.row, coo.col)), shape=(a.shape[0], len(idx))
+            )
+            s += a.shape[0]
+
+    accumulate_sparse_to_shards(store, block_stream())
 
 
 def coordinate_melding(

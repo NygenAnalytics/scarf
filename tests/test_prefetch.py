@@ -3,12 +3,12 @@ import time
 
 import pytest
 
-from scarf.storage.budget import ResourceBudget, set_resource_budget
-from scarf.storage.zarr_store import (
-    PROFILE_PREFETCH_DEPTH,
-    profile_prefetch_depth,
-    set_storage_profile,
+from scarf.storage.budget import (
+    ResourceBudget,
+    set_resource_budget,
+    worker_prefetch_depth,
 )
+from scarf.storage.zarr_store import set_storage_profile
 from scarf.utils import prefetch_blocks
 
 
@@ -51,10 +51,10 @@ def test_prefetch_blocks_respects_max_ahead():
     assert max_seen <= 3
 
 
-def test_profile_prefetch_depth():
+def test_worker_prefetch_depth_from_budget():
     set_resource_budget(ResourceBudget(memoryBytes=8 * 1024**3, workers=4))
-    set_storage_profile("fast_local")
-    assert profile_prefetch_depth() == PROFILE_PREFETCH_DEPTH["fast_local"]
-    set_storage_profile("cloud")
-    assert profile_prefetch_depth() == PROFILE_PREFETCH_DEPTH["cloud"]
-    set_resource_budget(None)
+    try:
+        assert worker_prefetch_depth() == 4
+        assert worker_prefetch_depth(requested=2) == 2
+    finally:
+        set_resource_budget(None)

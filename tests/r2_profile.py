@@ -26,7 +26,6 @@ from typing import Any, Literal
 from scarf.datastore.datastore import DataStore
 from scarf.readers import CrDirReader, H5adReader
 from scarf.storage.budget import resolve_budget, set_resource_budget
-from scarf.storage.zarr_store import compute_zarr_layout, set_zarr_layout
 from scarf.writers import CrToZarr, H5adToZarr
 
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
@@ -158,7 +157,6 @@ def write_zarr_from_input(
     h5adFeatureNameKey: str,
 ) -> None:
     opts = storage_options(uri)
-    remote = uri.startswith("s3://")
     set_resource_budget(resolve_budget(memory=mem_budget, workers=nthreads))
 
     if kind == "h5ad":
@@ -168,15 +166,7 @@ def write_zarr_from_input(
             feature_ids_key=h5adFeatureIdsKey,
             feature_name_key=h5adFeatureNameKey,
         )
-        n_cells, n_features = reader.nCells, reader.nFeatures
-        layout = compute_zarr_layout(n_cells, n_features, remote=remote)
-        set_zarr_layout(layout)
-        writer = H5adToZarr(
-            reader,
-            uri,
-            chunk_size=layout.countChunks,
-            storage_options=opts,
-        )
+        writer = H5adToZarr(reader, uri, storage_options=opts)
         try:
             writer.dump()
         finally:
@@ -184,15 +174,7 @@ def write_zarr_from_input(
         return
 
     reader = CrDirReader(str(source))
-    n_cells, n_features = reader.nCells, reader.nFeatures
-    layout = compute_zarr_layout(n_cells, n_features, remote=remote)
-    set_zarr_layout(layout)
-    writer = CrToZarr(
-        reader,
-        uri,
-        chunk_size=layout.countChunks,
-        storage_options=opts,
-    )
+    writer = CrToZarr(reader, uri, storage_options=opts)
     writer.dump()
 
 
@@ -248,10 +230,6 @@ def run_workflow(
                     zarrProfile="cloud" if uri.startswith("s3://") else None,
                     mem_budget=mem_budget,
                 )
-                layout = compute_zarr_layout(
-                    ds.cells.N, ds.RNA.feats.N, remote=uri.startswith("s3://")
-                )
-                set_zarr_layout(layout)
                 gparams = graph_params(ds.cells.N, ds.RNA.feats.N)
 
             with timed_step("open") as r:

@@ -4,18 +4,10 @@ import pytest
 
 from scarf.storage.budget import (
     ResourceBudget,
-    bounded_prefetch,
     detect_available_memory_bytes,
     resolve_budget,
-    tile_rows_for_width,
+    worker_prefetch_depth,
 )
-
-
-def test_per_worker_bytes_scales_with_workers():
-    one = ResourceBudget(memoryBytes=16 * 1024**3, workers=1)
-    four = ResourceBudget(memoryBytes=16 * 1024**3, workers=4)
-    assert one.perWorkerBytes == 16 * 1024**3
-    assert four.perWorkerBytes == one.perWorkerBytes // 4
 
 
 def test_resolve_budget_parses_suffix(monkeypatch):
@@ -59,35 +51,6 @@ def test_detect_memory_fallback_when_meminfo_absent(monkeypatch):
     monkeypatch.setattr(builtins, "open", fake_open)
     monkeypatch.setattr("os.sysconf", lambda name: -1)
     assert detect_available_memory_bytes() == 8 * 1024 * 1024 * 1024
-
-
-def test_tile_rows_alignment_and_caps():
-    budget = ResourceBudget(memoryBytes=1 * 1024**3, workers=1)
-    rows = tile_rows_for_width(
-        n_cols=50_000, itemsize=8, budget=budget, chunk_rows=256, n_rows=100_000
-    )
-    assert rows % 256 == 0
-    assert rows >= 256
-    assert rows <= 100_000
-
-    tiny = ResourceBudget(memoryBytes=1024, workers=1)
-    rows_tiny = tile_rows_for_width(
-        n_cols=50_000, itemsize=8, budget=tiny, chunk_rows=256, n_rows=100_000
-    )
-    assert rows_tiny == 256
-
-    rows_capped = tile_rows_for_width(
-        n_cols=10, itemsize=8, budget=budget, chunk_rows=1, n_rows=50
-    )
-    assert rows_capped == 50
-
-
-def test_tile_rows_shrinks_with_more_workers():
-    wide = ResourceBudget(memoryBytes=8 * 1024**3, workers=1)
-    narrow = ResourceBudget(memoryBytes=8 * 1024**3, workers=8)
-    rows_wide = tile_rows_for_width(50_000, 8, wide, chunk_rows=1)
-    rows_narrow = tile_rows_for_width(50_000, 8, narrow, chunk_rows=1)
-    assert rows_narrow < rows_wide
 
 
 @pytest.mark.parametrize(
@@ -151,13 +114,27 @@ def test_fraction_uses_available_memory(monkeypatch):
     assert abs(got - int(avail * 0.25)) <= avail * 0.01
 
 
-def test_bounded_prefetch_caps_by_workers_and_fit():
+def test_worker_prefetch_depth_capped_by_workers():
     budget = ResourceBudget(memoryBytes=4 * 1024**3, workers=4)
-    # Tiny band: capped by workers, not by fit.
-    assert bounded_prefetch(1024, budget) == 4
-    # Band equal to the whole per-worker slice: only one in flight.
-    assert bounded_prefetch(budget.perWorkerBytes, budget) == 1
-    # Requested below the worker ceiling is honored.
-    assert bounded_prefetch(1024, budget, requested=2) == 2
-    # Band larger than per-worker slice still allows at least one.
-    assert bounded_prefetch(budget.perWorkerBytes * 10, budget) == 1
+    assert worker_prefetch_depth(budget=budget) == 4
+    assert worker_prefetch_depth(requested=2, budget=budget) == 2
+    assert worker_prefetch_depth(requested=10, budget=budget) == 4
+    assert worker_prefetch_depth(requested=0, budget=budget) == 1
+
+
+def test_working_copies_from_env(monkeypatch):
+    monkeypatch.delenv("SCARF_MEM_BUDGET", raising=False)
+    monkeypatch.setenv("SCARF_WORKING_COPIES", "8")
+    budget = resolve_budget(memory="4G", workers=1)
+    assert budget.workingCopies == 8
+
+
+def test_layout_geometry_independent_of_workers():
+    from scarf.storage.zarr_store import matrix_layout
+
+    one = ResourceBudget(memoryBytes=8 * 1024**3, workers=1, workingCopies=4)
+    eight = ResourceBudget(memoryBytes=8 * 1024**3, workers=8, workingCopies=4)
+    c1, s1 = matrix_layout(1_000_000, 50_000, budget=one, itemsize=4)
+    c8, s8 = matrix_layout(1_000_000, 50_000, budget=eight, itemsize=4)
+    assert c1 == c8
+    assert s1 == s8

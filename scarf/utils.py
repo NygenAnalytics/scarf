@@ -210,32 +210,9 @@ def prefetch_blocks(
     Yields:
         Results of ``fn(block)`` in the same order as ``block_iter``.
     """
-    from collections import deque
-    from concurrent.futures import Future, ThreadPoolExecutor
+    from .parallel import stream_shards
 
-    if max_ahead < 1:
-        max_ahead = 1
-    block_iter = iter(block_iter)
-
-    with ThreadPoolExecutor(max_workers=max_ahead) as ex:
-        pending: deque[Future[Any]] = deque()
-
-        def enqueue() -> bool:
-            try:
-                block = next(block_iter)
-            except StopIteration:
-                return False
-            pending.append(ex.submit(fn, block))
-            return True
-
-        for _ in range(max_ahead):
-            if not enqueue():
-                break
-
-        while pending:
-            result = pending.popleft().result()
-            enqueue()
-            yield result
+    yield from stream_shards(block_iter, fn, workers=max(1, max_ahead))
 
 
 def controlled_compute(arr: Any, nthreads: int) -> np.ndarray:

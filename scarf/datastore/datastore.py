@@ -603,12 +603,6 @@ class DataStore(MappingDatastore):
             Marker dict if ``skip_save`` is True, else None.
         """
         from ..markers import find_markers_by_rank
-        from ..storage.zarr_store import (
-            compute_zarr_layout,
-            get_zarr_layout,
-            is_remote_datastore,
-            marker_batch_size,
-        )
 
         if group_key is None:
             raise ValueError(
@@ -622,18 +616,12 @@ class DataStore(MappingDatastore):
             n_threads = self.nthreads
         assay = self._get_assay(from_assay)
 
-        n_cells = len(assay.cells.active_index(cell_key))
         n_features = len(assay.feats.active_index(feat_key))
-        layout = get_zarr_layout()
-        if layout is None:
-            layout = compute_zarr_layout(
-                n_cells,
-                n_features,
-                remote=is_remote_datastore(self.zarr_loc, self.z),
-            )
         if gene_batch_size is None:
-            gene_batch_size = marker_batch_size(n_cells, n_features, layout)
-        prefetch_depth = layout.prefetchDepth
+            backing = getattr(assay.rawData, "_backing", None)
+            chunks = getattr(backing, "chunks", None)
+            col_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
+            gene_batch_size = max(1, min(col_chunk, n_features))
 
         slot_name = f"{cell_key}__{group_key}"
         assay_grp = as_zarr_group(self.zw[assay.name], name=assay.name)
@@ -659,7 +647,6 @@ class DataStore(MappingDatastore):
             use_prenormed=use_prenormed,
             prenormed_store=prenormed_group,
             n_threads=n_threads,
-            prefetch_depth=prefetch_depth,
             **norm_params,
         )
 
@@ -1102,6 +1089,8 @@ class DataStore(MappingDatastore):
         Returns: None
         """
 
+        from ..storage.zarr_store import write_dense_in_shard_rows
+
         from ..writers import create_zarr_count_assay
 
         if assay_label is None:
@@ -1135,17 +1124,22 @@ class DataStore(MappingDatastore):
         )
 
         cell_idx = np.array(list(range(assay.cells.N)))
+        n_groups = len(group_set)
+        matrix = np.zeros((assay.cells.N, n_groups), dtype=np.float64)
         for n, i in tqdmbar(
-            enumerate(group_set), desc="Writing to Zarr", total=len(group_set)
+            enumerate(group_set), desc="Computing grouped means", total=len(group_set)
         ):
             feat_idx = np.where(groups == i)[0]
-            temp = np.zeros(assay.cells.N)
-            temp[cell_idx] = (
+            matrix[:, n] = (
                 assay.normed(cell_idx=cell_idx, feat_idx=feat_idx)
                 .mean(axis=1)
                 .compute()
             )
-            g[:, n] = temp
+        write_dense_in_shard_rows(
+            g,
+            lambda start, end: matrix[start:end, :],
+            msg="Writing grouped assay",
+        )
 
         self._load_assays(min_cells=0, custom_assay_types={assay_label: "Assay"})
         self._ini_cell_props(min_features=0, mito_pattern="", ribo_pattern="")

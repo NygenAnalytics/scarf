@@ -354,8 +354,8 @@ class TestDataStore:
         np.testing.assert_allclose(tiled["sigmas"], legacy_sigmas, rtol=1e-5, atol=1e-6)
 
     def test_streaming_feature_stats_column_block_branch(self, datastore):
-        # A tiny budget forces the chunk-aligned column-block path; results must
-        # still match the full-width reductions.
+        # Feature stats stream one feature-chunk column block at a time; results
+        # must match the full-width reductions regardless of worker count.
         from scarf.storage.budget import ResourceBudget, set_resource_budget
         from scarf.utils import controlled_compute
 

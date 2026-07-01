@@ -18,7 +18,6 @@ graph topology.
 """
 
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -346,9 +345,9 @@ class ChunkedArray:
             if self._is_numpy:
                 block_size = self._n_rows if self._n_rows > 0 else 1
             else:
-                from .storage.zarr_store import streaming_block_size
+                from .storage.zarr_store import array_shard_rows
 
-                block_size = streaming_block_size(cast(zarr.Array, self._backing))
+                block_size = array_shard_rows(cast(zarr.Array, self._backing))
         self._block_size = max(int(block_size), 1)
 
     @classmethod
@@ -456,30 +455,47 @@ class ChunkedArray:
         nthreads: int | None,
         msg: str | None,
     ) -> list[NDArray[Any]]:
-        from .utils import tqdmbar
+        from .parallel import map_shards
 
         ranges = self._ranges()
         nthreads = self._nthreads if nthreads is None else nthreads
-        bar = tqdmbar(total=len(ranges), desc=msg) if msg is not None else None
-        results: list[NDArray[Any] | None] = [None] * len(ranges)
-        if nthreads is not None and nthreads > 1 and len(ranges) > 1:
-            with ThreadPoolExecutor(max_workers=nthreads) as ex:
-                futures = {
-                    ex.submit(fn, i, r[0], r[1]): i for i, r in enumerate(ranges)
-                }
-                for fut in futures:
-                    i = futures[fut]
-                    results[i] = fut.result()
-                    if bar is not None:
-                        bar.update(1)
-        else:
-            for i, r in enumerate(ranges):
-                results[i] = fn(i, r[0], r[1])
-                if bar is not None:
-                    bar.update(1)
-        if bar is not None:
-            bar.close()
+        results = map_shards(ranges, fn, workers=nthreads, msg=msg)
         return [np.asarray(r) for r in results]
+
+    def stream_blocks(
+        self,
+        nthreads: int | None = None,
+        msg: str | None = None,
+        prefetch: int | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Yield materialized row blocks in order with bounded read-ahead.
+
+        For sequential consumers (PCA/k-means/ANN fitting) that must see blocks
+        in order while the next few are fetched in the background.
+        """
+        from .storage.budget import worker_prefetch_depth
+        from .parallel import stream_shards
+
+        threads = self._nthreads if nthreads is None else nthreads
+        depth = worker_prefetch_depth(prefetch)
+        ranges = self._ranges()
+        yield from stream_shards(
+            ranges,
+            lambda r: self._materialize_range(r[0], r[1]),
+            workers=depth,
+            within_block_threads=threads if threads and threads > 1 else None,
+            msg=msg,
+            total=len(ranges),
+        )
+
+    def map_blocks(
+        self,
+        fn: BlockFn,
+        nthreads: int | None = None,
+        msg: str | None = None,
+    ) -> list[NDArray[Any]]:
+        """Public ordered map of ``fn(block_idx, start, end)`` over row blocks."""
+        return self._map_blocks(fn, nthreads, msg)
 
     def compute(
         self, nthreads: int | None = None, msg: str | None = None

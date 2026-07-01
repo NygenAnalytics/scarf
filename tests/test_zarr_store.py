@@ -18,6 +18,7 @@ from scarf.storage.zarr_store import (
     open_store,
     set_storage_profile,
 )
+from scarf._types import array_metadata_shards
 from scarf.utils import load_zarr
 
 
@@ -187,21 +188,21 @@ def test_explicit_profile_not_overridden_by_remote(monkeypatch):
     assert get_storage_profile() == "fast_local"
 
 
-def test_normed_array_spec_cloud_sharding():
-    from scarf.storage.zarr_store import (
-        normed_array_spec,
-        set_storage_profile,
-    )
+def test_normed_array_spec_plain_chunks():
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.zarr_store import normed_array_spec, set_storage_profile
 
     set_storage_profile("cloud")
-    spec = normed_array_spec(1_000_000, 2000)
+    budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=4, workingCopies=4)
+    spec = normed_array_spec(1_000_000, 2000, budget=budget)
     assert spec.dtype == "float32"
-    assert spec.shards is not None
-    assert spec.shards[1] == 2000
+    assert spec.shards is None
+    assert spec.chunks[1] == 2000
+    assert spec.chunks[0] >= 1
 
 
 @pytest.mark.parametrize("n_feats", [500, 2000, 3000, 5000, 8192, 30_000])
-def test_normed_array_spec_cloud_creates_array(tmp_path, n_feats):
+def test_normed_array_spec_creates_array(tmp_path, n_feats):
     from scarf.storage.zarr_store import (
         create_numeric_array,
         normed_array_spec,
@@ -213,118 +214,84 @@ def test_normed_array_spec_cloud_creates_array(tmp_path, n_feats):
     root = zarr.open_group(str(tmp_path / f"normed_{n_feats}.zarr"), mode="w")
     create_numeric_array(root, "data", spec)
     assert root["data"].shape == (1_000_000, n_feats)
-    if spec.shards is not None:
-        assert spec.shards[0] % spec.chunks[0] == 0
-        assert spec.shards[1] % spec.chunks[1] == 0
+    assert spec.shards is None
 
 
-def test_compute_zarr_layout_scales_with_cells():
-    from scarf.storage.zarr_store import compute_zarr_layout
-
-    small = compute_zarr_layout(1_000, 2_000, remote=True)
-    large = compute_zarr_layout(1_000_000, 50_000, remote=True)
-    assert large.countChunks[0] >= small.countChunks[0]
-    assert large.countShards[0] >= small.countShards[0]
-    assert large.asyncConcurrency >= small.asyncConcurrency
-    assert large.streamTargetBytes >= small.streamTargetBytes
-
-
-def test_marker_batch_size_aligns_and_respects_budget():
-    from scarf.storage.zarr_store import compute_zarr_layout, marker_batch_size
-
-    layout = compute_zarr_layout(10_000, 50_000, remote=True)
-    col_chunk = layout.countChunks[1]
-
-    bs = marker_batch_size(10_000, 50_000, layout)
-    # Chunk-aligned when the budget allows at least one column chunk.
-    assert bs % col_chunk == 0
-    assert bs <= 50_000
-    # Stays within the streaming memory budget (float32).
-    assert bs * 10_000 * 4 <= layout.streamTargetBytes
-
-    # Many cells force a smaller, memory-bounded batch.
-    huge = compute_zarr_layout(5_000_000, 50_000, remote=True)
-    bs_huge = marker_batch_size(5_000_000, 50_000, huge)
-    assert bs_huge >= 1
-    assert bs_huge < marker_batch_size(10_000, 50_000, huge)
-
-    # Never exceeds the available feature count.
-    assert marker_batch_size(1_000, 32, layout) <= 32
-
-
-def test_marker_batch_size_snaps_to_chunk_divisor_when_below_chunk():
-    from scarf.storage.zarr_store import compute_zarr_layout, marker_batch_size
-
-    # Many cells force a sub-chunk batch; it must divide the column chunk so
-    # batches never straddle a chunk boundary.
-    layout = compute_zarr_layout(5_000_000, 50_000, remote=True)
-    col_chunk = layout.countChunks[1]
-    bs = marker_batch_size(5_000_000, 50_000, layout)
-    assert bs >= 1
-    assert bs <= col_chunk
-    assert col_chunk % bs == 0
-
-
-def test_streaming_block_size(tmp_path):
-    from scarf.storage.zarr_store import streaming_block_size, set_storage_profile
-
-    set_storage_profile("fast_local")
-    root = zarr.open_group(str(tmp_path / "stream.zarr"), mode="w")
-    arr = root.create_array(
-        "x", shape=(10_000, 500), chunks=(256, 500), dtype="float32"
-    )
-    block = streaming_block_size(arr)
-    assert block >= 256
-    assert block <= 10_000
-
-
-def test_streaming_block_size_aligns_and_shrinks_under_budget(tmp_path):
-    from scarf.storage.budget import ResourceBudget, set_resource_budget
-    from scarf.storage.zarr_store import set_storage_profile, streaming_block_size
-
-    set_storage_profile("fast_local")
-    root = zarr.open_group(str(tmp_path / "stream.zarr"), mode="w")
-    arr = root.create_array(
-        "x", shape=(100_000, 5_000), chunks=(256, 5_000), dtype="float32"
-    )
-    try:
-        set_resource_budget(ResourceBudget(memoryBytes=8 * 1024**3, workers=1))
-        big = streaming_block_size(arr)
-        assert big % 256 == 0
-
-        set_resource_budget(ResourceBudget(memoryBytes=8 * 1024**3, workers=16))
-        small = streaming_block_size(arr)
-        assert small % 256 == 0
-        assert small <= big
-    finally:
-        set_resource_budget(None)
-
-
-def test_compute_zarr_layout_caps_under_small_budget():
+def test_memory_first_layout_worked_example():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import compute_zarr_layout
+    from scarf.storage.zarr_store import matrix_layout
 
-    generous = ResourceBudget(memoryBytes=64 * 1024**3, workers=2)
-    tight = ResourceBudget(memoryBytes=512 * 1024**2, workers=8)
+    budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=8, workingCopies=4)
+    chunks, shards = matrix_layout(1_000_000, 50_000, budget=budget, itemsize=4)
+    assert shards is not None
+    row_shard, shard_cols = shards
+    feature_chunk = chunks[1]
+    work = (8 * 1024**3) // 4
+    assert row_shard == work // (50_000 * 4)
+    assert feature_chunk == work // (1_000_000 * 4)
+    assert shard_cols % feature_chunk == 0
+    assert shard_cols >= 50_000
 
-    big = compute_zarr_layout(1_000_000, 50_000, remote=True, budget=generous)
-    small = compute_zarr_layout(1_000_000, 50_000, remote=True, budget=tight)
 
-    assert small.streamTargetBytes <= tight.perWorkerBytes
-    assert small.streamTargetBytes <= big.streamTargetBytes
-    assert small.asyncConcurrency <= big.asyncConcurrency
-    assert small.prefetchDepth >= 1
+def test_ceil_pad_awkward_feature_count():
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.zarr_store import matrix_layout
+
+    budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=1, workingCopies=4)
+    chunks, shards = matrix_layout(1_000_000, 36_601, budget=budget, itemsize=4)
+    assert shards is not None
+    feature_chunk = chunks[1]
+    shard_cols = shards[1]
+    assert feature_chunk >= 1
+    assert shard_cols % feature_chunk == 0
+    assert shard_cols >= 36_601
 
 
-def test_compute_zarr_layout_shard_chunk_alignment():
-    from scarf.storage.zarr_store import compute_zarr_layout
+def test_float64_halves_row_shard():
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.zarr_store import matrix_layout
 
-    layout = compute_zarr_layout(100_000, 50_000, remote=True)
-    row_chunk, col_chunk = layout.countChunks
-    shard_rows, shard_cols = layout.countShards
+    budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=1, workingCopies=4)
+    u32, _ = matrix_layout(100_000, 20_000, budget=budget, itemsize=4)
+    f64, _ = matrix_layout(100_000, 20_000, budget=budget, itemsize=8)
+    assert f64[0] <= u32[0]
+
+
+def test_matrix_layout_scales_with_cells():
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.zarr_store import matrix_layout
+
+    budget = ResourceBudget(memoryBytes=64 * 1024**3, workers=2, workingCopies=4)
+    small_chunks, small_shards = matrix_layout(1_000, 2_000, budget=budget, itemsize=4)
+    large_chunks, large_shards = matrix_layout(
+        1_000_000, 50_000, budget=budget, itemsize=4
+    )
+    assert small_shards is not None and large_shards is not None
+    assert large_chunks[0] >= small_chunks[0]
+    assert large_shards[0] >= small_shards[0]
+
+
+def test_matrix_layout_shard_chunk_alignment():
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.zarr_store import matrix_layout
+
+    budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=4, workingCopies=4)
+    chunks, shards = matrix_layout(100_000, 50_000, budget=budget, itemsize=4)
+    assert shards is not None
+    row_chunk, col_chunk = chunks
+    shard_rows, shard_cols = shards
     assert shard_cols % col_chunk == 0
     assert shard_rows % row_chunk == 0
-    assert col_chunk <= 512
+    assert shard_cols >= 50_000
+
+
+def test_v2_group_skips_shards(tmp_path):
+    from scarf.storage.zarr_store import count_array_spec, create_numeric_array
+
+    root = zarr.open_group(str(tmp_path / "v2.zarr"), mode="w", zarr_format=2)
+    spec = count_array_spec(100, 50, dtype="uint32")
+    arr = create_numeric_array(root, "counts", spec)
+    assert array_metadata_shards(arr) is None
 
 
 def test_ann_index_round_trip(tmp_path):

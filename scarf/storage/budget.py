@@ -1,44 +1,33 @@
-"""Process-wide resource budget for predictable, worker-scaled memory use.
+"""Process-wide resource budget for predictable memory use.
 
-A single :class:`ResourceBudget` (total memory bytes and worker count) is the
-source of truth for every default that drives peak memory: streaming block
-size, async concurrency, prefetch depth, and tiled reductions. The intent is
-that peak memory stays close to ``workers * perWorkerTileBytes`` so adding a
-worker raises memory predictably while improving runtime.
+A single :class:`ResourceBudget` (total memory bytes, worker count, working
+copies) is the source of truth. Write-time chunk and shard geometry is derived
+from ``memoryBytes // workingCopies``; ``workers`` sets read concurrency and
+async IO parallelism. Once files are written, reads follow the on-disk chunk
+and shard geometry with no additional memory heuristics.
 """
 
 import os
 from dataclasses import dataclass
 
 _DEFAULT_MEMORY_FRACTION = 0.6
+_DEFAULT_WORKING_COPIES = 4
 _FALLBACK_MEMORY_BYTES = 8 * 1024 * 1024 * 1024
 _SUFFIXES = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-# Numeric specs below this (without a unit suffix) are almost certainly a
-# mistake (e.g. "1.0" meant as a fraction), so we reject them with guidance.
 _MIN_RAW_BYTES = 1024 * 1024
-# Headroom multiplier for streaming reductions: the raw band plus its float64
-# normalized copy and a transient. Used to size tiles against the budget.
-DEFAULT_TEMP_FACTOR = 3
 
 
 @dataclass(frozen=True)
 class ResourceBudget:
-    """Memory and worker budget that bounds streaming and concurrency."""
+    """Memory and worker budget for write-time geometry and read concurrency."""
 
     memoryBytes: int
     workers: int
-
-    @property
-    def perWorkerBytes(self) -> int:
-        return max(1, self.memoryBytes // max(1, self.workers))
+    workingCopies: int = _DEFAULT_WORKING_COPIES
 
 
 def detect_available_memory_bytes() -> int:
-    """Best-effort available system memory in bytes.
-
-    Prefers ``/proc/meminfo`` ``MemAvailable`` (Linux/WSL), then sysconf, then
-    a conservative fallback so the budget is always defined.
-    """
+    """Best-effort available system memory in bytes."""
     try:
         with open("/proc/meminfo") as handle:
             for line in handle:
@@ -61,14 +50,6 @@ def detect_workers() -> int:
 
 
 def _parse_memory_spec(spec: str | int | float) -> int:
-    """Parse a memory spec into bytes.
-
-    Accepts raw byte counts (int), suffixed sizes such as ``"8G"`` or
-    ``"512M"``, and fractions of available memory strictly between 0 and 1
-    (e.g. ``"0.6"``). A bare numeric ``>= 1`` is treated as raw bytes; values
-    that are clearly too small to be a real budget (and likely a mistaken
-    fraction such as ``"1.0"``) are rejected with guidance.
-    """
     guidance = (
         "Use raw bytes, a suffixed size like '8G'/'512M', "
         "or a fraction strictly between 0 and 1 like '0.6'."
@@ -109,16 +90,33 @@ def _parse_memory_spec(spec: str | int | float) -> int:
     return int(number)
 
 
+def _resolve_working_copies(working_copies: int | None = None) -> int:
+    if working_copies is not None:
+        copies = int(working_copies)
+        if copies <= 0:
+            raise ValueError(f"workingCopies must be positive, got {copies!r}.")
+        return copies
+    env = os.environ.get("SCARF_WORKING_COPIES")
+    if env:
+        try:
+            copies = int(env)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid SCARF_WORKING_COPIES={env!r}; expected an integer."
+            ) from exc
+        if copies <= 0:
+            raise ValueError(f"SCARF_WORKING_COPIES must be positive, got {copies!r}.")
+        return copies
+    return _DEFAULT_WORKING_COPIES
+
+
 def resolve_budget(
     memory: int | str | None = None,
     workers: int | None = None,
+    *,
+    working_copies: int | None = None,
 ) -> ResourceBudget:
-    """Build a :class:`ResourceBudget`, auto-detecting unset fields.
-
-    ``memory`` falls back to ``SCARF_MEM_BUDGET`` then to
-    ``_DEFAULT_MEMORY_FRACTION`` of available memory. ``workers`` falls back to
-    ``SCARF_WORKERS`` then to the detected CPU count.
-    """
+    """Build a :class:`ResourceBudget`, auto-detecting unset fields."""
     if memory is None:
         env_mem = os.environ.get("SCARF_MEM_BUDGET")
         if env_mem:
@@ -145,7 +143,9 @@ def resolve_budget(
         worker_count = int(workers)
 
     return ResourceBudget(
-        memoryBytes=max(1, memory_bytes), workers=max(1, worker_count)
+        memoryBytes=max(1, memory_bytes),
+        workers=max(1, worker_count),
+        workingCopies=_resolve_working_copies(working_copies),
     )
 
 
@@ -157,7 +157,6 @@ def set_resource_budget(budget: ResourceBudget | None) -> None:
     """Install the process-wide active budget (None resets to auto)."""
     global _activeBudget, _cachedDefault
     _activeBudget = budget
-    # Invalidate the lazily resolved default so a reset re-detects fresh.
     _cachedDefault = None
 
 
@@ -171,65 +170,68 @@ def get_resource_budget() -> ResourceBudget:
     return _cachedDefault
 
 
-def tile_rows_for_width(
-    n_cols: int,
-    itemsize: int,
-    budget: ResourceBudget | None = None,
-    *,
-    temp_factor: int = DEFAULT_TEMP_FACTOR,
-    chunk_rows: int = 1,
-    n_rows: int | None = None,
-) -> int:
-    """Rows per tile so one in-flight tile fits a worker's memory slice.
-
-    The result is aligned down to a multiple of ``chunk_rows`` (never below
-    one chunk) and capped at ``n_rows`` when provided. ``temp_factor`` reserves
-    headroom for the normalized output and transient copies.
-    """
-    budget = budget or get_resource_budget()
-    n_cols = max(1, int(n_cols))
-    itemsize = max(1, int(itemsize))
-    chunk_rows = max(1, int(chunk_rows))
-    denom = n_cols * itemsize * max(1, temp_factor)
-    rows = budget.perWorkerBytes // denom
-    rows = max(chunk_rows, (rows // chunk_rows) * chunk_rows)
-    if n_rows is not None:
-        rows = min(rows, max(1, int(n_rows)))
-    return int(max(1, rows))
-
-
-def concurrency_for_chunk(
-    chunk_bytes: int,
-    budget: ResourceBudget | None = None,
-    *,
-    factor: int = 2,
-    floor: int = 4,
-) -> int:
-    """Max concurrent chunk decompressions that fit the memory budget."""
-    budget = budget or get_resource_budget()
-    chunk_bytes = max(1, int(chunk_bytes))
-    cap = budget.memoryBytes // (chunk_bytes * max(1, factor))
-    return int(max(floor, cap))
-
-
-def bounded_prefetch(
-    band_bytes: int,
-    budget: ResourceBudget | None = None,
-    *,
+def worker_prefetch_depth(
     requested: int | None = None,
+    budget: ResourceBudget | None = None,
 ) -> int:
-    """Read-ahead depth so in-flight bands fit the per-worker memory slice.
+    """Read-ahead depth for parallel block reads, capped by worker count.
 
-    Bounds the number of concurrently prefetched read bands by both the worker
-    count and how many bands of ``band_bytes`` fit in ``perWorkerBytes``. This
-    is sized from the actual read band rather than a precomputed layout, so it
-    stays correct even when the on-disk geometry differs from the layout used
-    for new writes.
+    Defaults to one in-flight block per worker. A consumer may ``request`` a
+    smaller depth; the worker count is always the ceiling.
     """
     budget = budget or get_resource_budget()
-    band_bytes = max(1, int(band_bytes))
-    fit = budget.perWorkerBytes // band_bytes
-    ceiling = (
-        budget.workers if requested is None else min(int(requested), budget.workers)
+    workers = max(1, budget.workers)
+    if requested is None:
+        return workers
+    return max(1, min(int(requested), workers))
+
+
+# Returns flatten beyond ~4-8 shards processed at once (benchmarked on local and
+# R2); across-shard depth is the dominant lever, so this caps it while memory
+# (workingCopies) is the real ceiling for very large data.
+ACROSS_SHARD_CAP = 8
+
+
+@dataclass(frozen=True)
+class ShardPlan:
+    """How to split a worker budget for shard-parallel processing.
+
+    ``across`` is the number of shards processed concurrently (the dominant
+    lever). ``ioConcurrency`` feeds Zarr's ``async.concurrency`` for the
+    duration of the op, and ``withinBlockThreads`` bounds BLAS/OpenMP threads
+    per shard. The product ``across * max(ioConcurrency, withinBlockThreads)``
+    stays near ``workers`` so nested concurrency never fans out to ``workers``
+    squared in-flight requests.
+    """
+
+    across: int
+    ioConcurrency: int
+    withinBlockThreads: int
+
+
+def shard_parallelism(
+    workers: int | None = None,
+    n_shards: int | None = None,
+    *,
+    budget: ResourceBudget | None = None,
+) -> ShardPlan:
+    """Derive a :class:`ShardPlan` from the resource budget.
+
+    Spends the budget on across-shard depth (capped by ``ACROSS_SHARD_CAP``,
+    ``workingCopies`` and the shard count) and keeps within-block BLAS threads
+    at one, matching the benchmark finding that across-shard parallelism is the
+    lever and extra BLAS threads add little. The remaining budget becomes the
+    Zarr IO concurrency for the op.
+    """
+    budget = budget or get_resource_budget()
+    workers = budget.workers if workers is None else max(1, int(workers))
+    caps = [workers, ACROSS_SHARD_CAP, max(1, budget.workingCopies)]
+    if n_shards is not None:
+        caps.append(max(1, int(n_shards)))
+    across = max(1, min(caps))
+    remainder = max(1, workers // across)
+    return ShardPlan(
+        across=across,
+        ioConcurrency=remainder,
+        withinBlockThreads=1,
     )
-    return int(max(1, min(ceiling, fit)))

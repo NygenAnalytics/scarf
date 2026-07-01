@@ -11,7 +11,7 @@ import zarr
 
 from .ann import AnnStream
 from .utils import tqdmbar, controlled_compute, prefetch_blocks
-from .storage.zarr_store import profile_prefetch_depth
+from .storage.budget import worker_prefetch_depth
 from .writers import create_zarr_dataset
 
 __all__ = [
@@ -66,7 +66,7 @@ def self_query_knn(
         blocks = prefetch_blocks(
             source.blocks,
             transform,
-            max_ahead=profile_prefetch_depth(),
+            max_ahead=worker_prefetch_depth(),
         )
         yield from tqdmbar(blocks, desc=msg, total=source.numblocks[0])
 

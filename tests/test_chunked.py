@@ -26,10 +26,10 @@ def backed_pair(tmp_path):
 class TestChunkedArrayParity:
     def test_shape_and_blocks(self, backed_pair):
         ca, dense = backed_pair
-        from scarf.storage.zarr_store import streaming_block_size
+        from scarf.storage.zarr_store import array_shard_rows
 
         assert ca.shape == dense.shape
-        stream_rows = streaming_block_size(ca._backing)
+        stream_rows = array_shard_rows(ca._backing)
         assert ca.numblocks[0] == int(np.ceil(dense.shape[0] / stream_rows))
         assert sum(b.shape[0] for b in ca.blocks) == dense.shape[0]
         recon = np.vstack([b.compute() for b in ca.blocks])

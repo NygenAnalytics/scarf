@@ -1,9 +1,11 @@
+import os
+
 import numpy as np
 import zarr
 from zarr.storage import MemoryStore
 
 from scarf.datastore.graph_datastore import GraphDataStore
-from scarf.storage.zarr_store import copy_zarr_array
+from scarf.storage.zarr_store import copy_zarr_array, create_or_open_staged_normed_array
 
 
 def _memory_group():
@@ -98,3 +100,50 @@ def test_stage_normed_data_recopies_when_subset_params_change(
         remote, "hash1", {"log_transform": True, "renormalize_subset": True}, cache_base
     )
     assert calls["n"] == 2
+
+
+def test_mirror_write_lets_staging_skip_copy(toy_crdir_ds, tmp_path, monkeypatch):
+    from scarf.assay import Assay
+    from scarf.writers import write_renorm_subset_to_zarr
+
+    rna = toy_crdir_ds.RNA
+    cell_idx = np.arange(rna.cells.N)
+    feat_idx = np.array([0, 1, 3])
+    subset_hash = "mirror_hash"
+    subset_params = {"log_transform": False, "renormalize_subset": True}
+
+    store = GraphDataStore.__new__(GraphDataStore)
+    store.nthreads = rna.nthreads
+    cache_base = str(tmp_path / "cache")
+    cache_key = store._normed_cache_key(subset_hash, subset_params)
+    cache_path = os.path.join(cache_base, cache_key, "normed.zarr")
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    mirror = create_or_open_staged_normed_array(
+        cache_path, (len(cell_idx), len(feat_idx))
+    )
+
+    loc = "mirror_src"
+    rna.z.create_group(loc, overwrite=True)
+    write_renorm_subset_to_zarr(
+        rna, cell_idx, feat_idx, rna.z, f"{loc}/data", rna.nthreads, mirror=mirror
+    )
+    remote = rna.z[f"{loc}/data"]
+    Assay._finalize_staged_mirror(mirror, subset_hash, subset_params)
+
+    assert mirror.attrs["staged_complete"] is True
+    assert mirror.attrs["staged_subset_hash"] == subset_hash
+    assert np.array_equal(np.asarray(mirror[:]), np.asarray(remote[:]))
+
+    calls = {"n": 0}
+    orig_copy = copy_zarr_array
+
+    def counting_copy(*args, **kwargs):
+        calls["n"] += 1
+        return orig_copy(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "scarf.datastore.graph_datastore.copy_zarr_array", counting_copy
+    )
+    staged = store._stage_normed_data(remote, subset_hash, subset_params, cache_base)
+    assert calls["n"] == 0
+    assert np.array_equal(np.asarray(staged.compute()), np.asarray(remote[:]))

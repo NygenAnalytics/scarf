@@ -19,6 +19,7 @@ from ..assay import Assay
 from ..chunked import ChunkedArray
 from ..storage.zarr_store import (
     copy_zarr_array,
+    create_or_open_staged_normed_array,
     has_ann_index,
     is_remote_datastore,
     legacy_ann_index_path,
@@ -1296,6 +1297,28 @@ class GraphDataStore(BaseDataStore):
             planned += 1
         progress = _GraphBuildProgress(planned)
 
+        # When caching locally and the normalized matrix must be recomputed,
+        # mirror each normalized band straight into the local staging cache
+        # during the write pass so it never has to be downloaded back from the
+        # remote store afterwards.
+        staged_mirror = None
+        if cache_enabled and not cached_normed and cache_base is not None:
+            resolved_feat = feat_key if feat_key == "I" else f"{cell_key}__{feat_key}"
+            pre_cell_idx, pre_feat_idx = assay._get_cell_feat_idx(
+                cell_key, resolved_feat
+            )
+            pre_hash = assay._create_subset_hash(pre_cell_idx, pre_feat_idx)
+            pre_params = {
+                "log_transform": log_transform,
+                "renormalize_subset": renormalize_subset,
+            }
+            pre_cache_key = self._normed_cache_key(pre_hash, pre_params)
+            pre_cache_path = os.path.join(cache_base, pre_cache_key, "normed.zarr")
+            os.makedirs(os.path.dirname(pre_cache_path), exist_ok=True)
+            staged_mirror = create_or_open_staged_normed_array(
+                pre_cache_path, (len(pre_cell_idx), len(pre_feat_idx))
+            )
+
         with progress.step("normalize expression matrix", cached=cached_normed):
             data = assay.save_normalized_data(
                 cell_key,
@@ -1305,6 +1328,7 @@ class GraphDataStore(BaseDataStore):
                 log_transform,
                 renormalize_subset,
                 update_keys,
+                mirror=staged_mirror,
             )
         subset_hash = cast(
             str,

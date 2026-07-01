@@ -13,7 +13,7 @@ import zarr
 from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 
-from .utils import logger, tqdmbar
+from .utils import logger
 
 __all__ = [
     "sample_cluster_pool",
@@ -118,6 +118,7 @@ def write_doublet_target_zarr(
     Returns:
         The root Zarr group of the written store.
     """
+    from .storage.zarr_store import write_dense_in_shard_rows
     from .utils import load_zarr
     from .writers import (
         create_cell_data,
@@ -141,13 +142,11 @@ def write_doublet_target_zarr(
         dtype=dtype,
     )
     store = load_count_store(z, assay_name, None)
-    for s in tqdmbar(
-        range(0, n_sim, batch_size),
-        total=int(np.ceil(n_sim / batch_size)),
-        desc="Writing simulated doublets",
-    ):
-        e = min(s + batch_size, n_sim)
-        store[s:e, :] = sim_counts[s:e].toarray().astype(dtype)
+    write_dense_in_shard_rows(
+        store,
+        lambda s, e: sim_counts[s:e].toarray().astype(dtype),
+        msg="Writing simulated doublets",
+    )
     finalize_writer_counts(z, assay_name, None)
     logger.debug(f"Wrote {n_sim} simulated doublets to {zarr_loc}")
     return z
