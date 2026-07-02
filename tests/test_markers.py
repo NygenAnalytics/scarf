@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from scarf.markers import _batch_stats, mannwhitneyu_from_ranks
+from scarf.markers import _batch_stats, mannwhitneyu_from_ranks, sort_marker_results
 from scarf.utils import controlled_compute
 
 
@@ -126,7 +126,9 @@ def test_compact_marker_save_roundtrip():
             "p_value": [0.01, 0.02, 0.03],
         },
         index=index,
-    ).sort_values(by="score", ascending=False)
+    )
+    source["feature_index"] = source.index
+    source = sort_marker_results(source)
     markers = {1: source}
     root = zarr.open_group(store=MemoryStore(), mode="w")
     slot = root.create_group("slot")

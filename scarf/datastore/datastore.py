@@ -11,6 +11,7 @@ from .._types import ZarrMode, as_zarr_array, as_zarr_group
 from ..assay import Assay, ATACassay, RNAassay
 from ..chunked import ChunkedArray
 from ..feat_utils import hto_demux
+from ..markers import sort_marker_results
 from ..utils import ZARRLOC, controlled_compute, tqdmbar
 from ..writers import create_zarr_dataset
 from .mapping_datastore import MappingDatastore
@@ -78,9 +79,7 @@ def _load_marker_cluster_frame(
         df["feature_index"] = feature_index
         df["feature_name"] = feature_names[feature_index.astype(int)]
         df["group_id"] = group_id
-        return df[["group_id", "feature_name", *out_cols[1:]]].sort_values(
-            by="score", ascending=False
-        )
+        return sort_marker_results(df[["group_id", "feature_name", *out_cols[1:]]])
 
     available_cols = [col for col in out_cols if col in cluster_group]
     if not available_cols:

@@ -16,6 +16,24 @@ from scarf.assay import Assay, RNAassay, norm_lib_size
 from scarf.chunked import ChunkedArray
 from scarf.utils import logger, tqdmbar
 
+_MARKER_SORT_BY = ("score", "p_value")
+_MARKER_SORT_ASCENDING = (False, True)
+
+
+def sort_marker_results(df: pd.DataFrame) -> pd.DataFrame:
+    frame = df.copy()
+    if "feature_index" not in frame.columns:
+        frame["feature_index"] = frame.index
+    sort_by = list(_MARKER_SORT_BY)
+    ascending = list(_MARKER_SORT_ASCENDING)
+    if "feature_name" in frame.columns:
+        sort_by.append("feature_name")
+        ascending.append(True)
+    else:
+        sort_by.append("feature_index")
+        ascending.append(True)
+    return frame.sort_values(by=sort_by, ascending=ascending)
+
 
 def read_prenormed_batches(
     store: zarr.Group,
@@ -353,11 +371,10 @@ def find_markers_by_rank(
             for j, k in zip(group_set, i[1].T, strict=True):
                 prenormed_rows[j].append([i[0]] + list(k))
         for group_id, rows in prenormed_rows.items():
-            results[group_id] = (
-                pd.DataFrame(rows, columns=out_cols)
-                .sort_values(by="score", ascending=False)
-                .round(5)
-            )
+            frame = pd.DataFrame(rows, columns=out_cols)
+            cols_to_round = [col for col in frame.columns if col != "p_value"]
+            frame.loc[:, cols_to_round] = frame.loc[:, cols_to_round].round(5)
+            results[group_id] = sort_marker_results(frame)
         return results
     else:
         set_num_threads(min(max(1, n_threads), numba.config.NUMBA_NUM_THREADS))
@@ -440,14 +457,11 @@ def find_markers_by_rank(
         for n, i in enumerate(group_set):
             df = pd.DataFrame(
                 stats_matrix[:, n, :], columns=out_cols[1:], index=feat_index
-            ).sort_values(by="score", ascending=False)
-
+            )
             cols_to_round = [col for col in df.columns if col != pval_col]
             df.loc[:, cols_to_round] = df.loc[:, cols_to_round].round(5)
-            results[i] = df
-
-            results[i]["feature_index"] = results[i].index
-            results[i] = results[i][out_cols]
+            df["feature_index"] = df.index
+            results[i] = sort_marker_results(df)[out_cols]
         return results
 
 
