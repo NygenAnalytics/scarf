@@ -707,7 +707,7 @@ class DataStore(MappingDatastore):
             gene_batch_size = max(1, min(col_chunk, n_features))
 
         slot_name = f"{cell_key}__{group_key}"
-        logger.info(
+        logger.debug(
             f"Running marker search for {from_assay}/{slot_name} "
             f"(feat_key={feat_key}, batch_size={gene_batch_size})"
         )

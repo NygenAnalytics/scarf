@@ -1072,7 +1072,7 @@ class RNAassay(Assay):
         ]
         n_blocks = len(batches)
         if msg:
-            logger.info(
+            logger.debug(
                 f"({self.name}) {msg}: {len(feat_idx)} features in "
                 f"{n_blocks} batches (width {batch_size})"
             )
@@ -1144,7 +1144,7 @@ class RNAassay(Assay):
             if log_transform:
                 normed = np.log1p(normed)
             if msg:
-                logger.info(
+                logger.debug(
                     f"({self.name}) {msg} batch {block_idx + 1}/{n_batches}: "
                     f"cols={len(cols)} read {read_sec:.1f}s ({source}) "
                     f"norm {time.perf_counter() - t0:.1f}s "

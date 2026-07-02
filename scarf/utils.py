@@ -429,7 +429,7 @@ def iter_column_blocks(
     ) as pipeline:
         for block_idx in tqdmbar(block_range, desc=msg or "", total=n_blocks):
             if msg:
-                logger.info(
+                logger.debug(
                     f"{msg}: reading block {block_idx + 1}/{n_blocks} "
                     f"(rss {process_rss_mb():.0f} MiB)"
                 )

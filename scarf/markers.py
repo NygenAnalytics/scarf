@@ -401,7 +401,7 @@ def find_markers_by_rank(
             cell_idx = assay.cells.active_index(cell_key)
             feat_idx = assay.feats.active_index(feat_key)
             n_batches = max(1, (len(feat_idx) + batch_size - 1) // batch_size)
-            logger.info(
+            logger.debug(
                 f"Marker search (fast): {len(feat_idx)} features, {n_groups} groups, "
                 f"{n_batches} batches of {batch_size}"
             )
@@ -427,7 +427,7 @@ def find_markers_by_rank(
                 batch_stats.append(
                     _batch_stats(normed, int_indices, group_counts, n_total)
                 )
-                logger.info(
+                logger.debug(
                     f"({assay.name}) Finding markers batch {block_idx + 1}/{n_batches}: "
                     f"cols={len(_cols)} read {read_sec:.1f}s ({source}) "
                     f"stats {time.perf_counter() - t0:.1f}s "
