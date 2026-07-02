@@ -1,5 +1,18 @@
+import sys
+
+import pytest
+
+from scarf.utils import logger
+
 pytest_plugins = [
     "tests.fixtures_downloader",
     "tests.fixtures_readers",
     "tests.fixtures_datastore",
 ]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _quiet_test_logs() -> None:
+    """Keep pytest output readable; r2_profile and other CLIs keep INFO logs."""
+    logger.remove()
+    logger.add(sys.stderr, level="ERROR")

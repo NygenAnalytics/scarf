@@ -322,11 +322,15 @@ class CrH5Reader(CrReader):
             cell_idx = np.repeat(
                 np.arange(len(row_ranges)), [len(x) for x in row_ranges]
             )
-            idx = np.hstack(row_ranges)
-            data = self.grp["data"][idx[0] : idx[-1] + 1]
-            data = data[idx - idx[0]]
-            indices = self.grp["indices"][idx[0] : idx[-1] + 1]
-            indices = indices[idx - idx[0]]
+            idx = np.hstack(row_ranges) if row_ranges else np.array([], dtype=np.int64)
+            if idx.size == 0:
+                yield coo_matrix(
+                    ([], ([], [])),
+                    shape=(len(v_pos), self.nFeatures),
+                )
+                continue
+            data = np.asarray(self.grp["data"][idx])
+            indices = np.asarray(self.grp["indices"][idx])
             yield coo_matrix(
                 (data, (cell_idx, indices)), shape=(len(v_pos), self.nFeatures)
             )

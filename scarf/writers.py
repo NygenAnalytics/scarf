@@ -72,6 +72,30 @@ __all__ = [
 ]
 
 
+def _apply_budget_override(
+    mem_budget: int | str | None,
+    nthreads: int | None,
+    working_copies: int | None,
+) -> None:
+    """Install a process resource budget from writer-level overrides, if given.
+
+    Write-time chunk and shard geometry is derived from the active resource
+    budget. Passing any of these lets a caller simulate writing on a machine
+    with a different memory size or core count than the one running the code.
+    When all three are None the currently active budget is left untouched, so
+    callers that set it themselves keep control.
+    """
+    if mem_budget is None and nthreads is None and working_copies is None:
+        return
+    from .storage.budget import resolve_budget, set_resource_budget
+
+    set_resource_budget(
+        resolve_budget(
+            memory=mem_budget, workers=nthreads, working_copies=working_copies
+        )
+    )
+
+
 def _normalize_chunks(chunks: tuple[int, ...] | int) -> tuple[int, ...]:
     if isinstance(chunks, int):
         return (chunks,)
@@ -239,6 +263,12 @@ class CrToZarr:
         zarr_loc: The file name for the Zarr hierarchy or a store
         chunk_size: The requested size of chunks to load into memory and process.
         dtype: the dtype of the data.
+        mem_budget: Memory budget driving write-time chunk and shard geometry. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
+                    Set it to simulate writing on a machine with a different memory size.
+        nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        working_copies: Number of concurrent in-memory working copies the memory budget is divided
+                        across. When None, uses SCARF_WORKING_COPIES env var or the default.
 
     Attributes:
         cr: A CrReader object, containing the Cellranger data.
@@ -254,7 +284,11 @@ class CrToZarr:
         dtype: str = "uint32",
         workspace: str | None = None,
         storage_options: dict[str, Any] | None = None,
+        mem_budget: int | str | None = None,
+        nthreads: int | None = None,
+        working_copies: int | None = None,
     ) -> None:
+        _apply_budget_override(mem_budget, nthreads, working_copies)
         self.cr = cr
         self.chunkSizes = chunk_size
         self.workspace = workspace
@@ -365,6 +399,12 @@ class H5adToZarr:
         assay_name: the name of the assay (e. g. 'RNA')
         workspace: An optional workspace id.
         chunk_size: The requested size of chunks to load into memory and process.
+        mem_budget: Memory budget driving write-time chunk and shard geometry. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
+                    Set it to simulate writing on a machine with a different memory size.
+        nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        working_copies: Number of concurrent in-memory working copies the memory budget is divided
+                        across. When None, uses SCARF_WORKING_COPIES env var or the default.
 
     Attributes:
         h5ad: A h5ad object (h5 file with added AnnData structure).
@@ -381,8 +421,12 @@ class H5adToZarr:
         workspace: str | None = None,
         chunk_size: tuple[int, int] = (1000, 1000),
         storage_options: dict[str, Any] | None = None,
+        mem_budget: int | str | None = None,
+        nthreads: int | None = None,
+        working_copies: int | None = None,
     ) -> None:
         # TODO: support for multiple assay. One of the `var` datasets can be used to group features in separate assays
+        _apply_budget_override(mem_budget, nthreads, working_copies)
         self.h5ad = h5ad
         self.chunkSizes = chunk_size
         self.workspace = workspace
@@ -918,8 +962,8 @@ def subset_assay_zarr(
     og = create_numeric_array(z, out_grp, spec)
     write_dense_in_shard_rows(
         og,
-        lambda start, end: ig.get_orthogonal_selection(
-            (cells_idx[start:end], feat_idx)
+        lambda start, end: np.asarray(
+            ig.get_orthogonal_selection((cells_idx[start:end], feat_idx))
         ),
         msg="Subsetting assay",
     )

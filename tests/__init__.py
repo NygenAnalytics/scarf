@@ -1,11 +1,5 @@
 import os
 import shutil
-import sys
-
-from scarf.utils import logger
-
-logger.remove()
-logger.add(sys.stderr, level="ERROR")
 
 __all__ = ["full_path", "remove", "dask_total_sum"]
 

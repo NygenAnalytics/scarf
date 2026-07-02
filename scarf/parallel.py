@@ -1,14 +1,18 @@
 """Generic shard-parallel processing over row-banded arrays.
 
-One primitive drives every "process many shards on the cell axis" path:
+Both primitives process shards in order with a shallow read-ahead so the next
+band downloads while the current one is worked on; the worker budget is spent
+parallelising inner-chunk IO *within* a shard (BLAS stays single-threaded for
+reproducibility) rather than fanning out over many shards at once (which only
+inflates peak memory).
 
 - ``map_shards``: budget-aware ordered map over ``(start, end)`` row ranges,
-  used by ChunkedArray reductions/compute and the write pipeline. It sets a
-  modest Zarr ``async.concurrency`` for the duration, bounds per-shard BLAS
-  threads, and preserves result order.
+  used by ChunkedArray reductions/compute and the write pipeline. It sets Zarr
+  ``async.concurrency`` and per-shard BLAS threads from the plan and preserves
+  result order.
 - ``stream_shards``: an ordered, bounded read-ahead generator used by
   sequential consumers (PCA / k-means / ANN fitting) that must see blocks in
-  order while the next few are fetched in the background.
+  order while the next one is fetched in the background.
 
 Threads are the default backend: the per-shard hot paths (numpy ufuncs, BLAS
 ``dot``, scipy sparse, hnswlib) release the GIL, so a thread pool already uses
@@ -17,7 +21,7 @@ exists for tiny inputs and tests, and as the seam for a future process backend.
 
 A thread-local ``active`` flag guards against nested fan-out: a ``map_shards``
 invoked from inside another shard worker runs serially so total in-flight
-requests never multiply to ``workers`` squared.
+requests stay bounded.
 """
 
 import threading
@@ -118,7 +122,7 @@ def _resolve_plan(
     workers: int | None, n_shards: int | None, backend: Backend
 ) -> ShardPlan:
     if backend == "serial" or in_shard_context():
-        return ShardPlan(across=1, ioConcurrency=1, withinBlockThreads=1)
+        return ShardPlan(readAhead=1, ioConcurrency=1, withinBlockThreads=1)
     return shard_parallelism(workers=workers, n_shards=n_shards)
 
 
@@ -153,7 +157,8 @@ def stream_shards(
     """
     workers = max(1, int(workers))
     if backend == "serial" or workers <= 1 or in_shard_context():
-        yield from _progress((fn(item) for item in items), msg, total)
+        with _io_concurrency(io_concurrency), _blas_limit(within_block_threads):
+            yield from _progress((fn(item) for item in items), msg, total)
         return
     with _io_concurrency(io_concurrency):
         base = _imap_ordered(
@@ -187,14 +192,18 @@ def map_shards(
         idx, (start, end) = item
         return produce(idx, start, end)
 
-    if plan.across <= 1:
-        return list(_progress((call(it) for it in indexed), msg, n))
+    if plan.readAhead <= 1:
+        with _io_concurrency(plan.ioConcurrency), _blas_limit(plan.withinBlockThreads):
+            return list(_progress((call(it) for it in indexed), msg, n))
 
-    with _shard_context(), _io_concurrency(plan.ioConcurrency):
+    with (
+        _shard_context(),
+        _io_concurrency(plan.ioConcurrency),
+    ):
         stream = _imap_ordered(
             indexed,
             call,
-            workers=plan.across,
+            workers=plan.readAhead,
             within_block_threads=plan.withinBlockThreads,
         )
         return list(_progress(stream, msg, n))

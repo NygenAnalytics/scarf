@@ -180,8 +180,12 @@ def count_array_spec(
         itemsize=itemsize,
     )
     assert shards_raw is not None
-    shards = tuple(min(s, d) for s, d in zip(shards_raw, (nCells, nFeats)))
-    chunks = tuple(min(c, d) for c, d in zip(chunks, (nCells, nFeats)))
+    # shards_raw's feature dimension is deliberately ceil-padded to a multiple
+    # of chunks[1] (see matrix_layout); clipping it down to nFeats here would
+    # make the shard size no longer divisible by the chunk size, which Zarr
+    # v3 rejects. matrix_layout already bounds both chunk dims by (nCells,
+    # nFeats) and the row shard dim by nCells, so no further clipping needed.
+    shards = shards_raw
 
     return ZarrArraySpec(
         shape=(nCells, nFeats),
@@ -318,10 +322,10 @@ def write_dense_in_shard_rows(
 ) -> None:
     """Write a 2D array in row-shard bands via ``produce(start, end)``.
 
-    The produce side (read + compute) runs with bounded across-shard
-    parallelism; the writes stay single-threaded so we never race on a shared
-    chunk/shard file regardless of how the caller's band size aligns to the
-    on-disk geometry.
+    The produce side (read + compute) runs in order with a shallow read-ahead so
+    the next band is fetched while the current one is written; the writes stay
+    single-threaded so we never race on a shared chunk/shard file regardless of
+    how the caller's band size aligns to the on-disk geometry.
 
     ``also_write_to`` mirrors each produced band into a second array of the same
     shape during the same pass. This populates a local staging cache while
@@ -350,9 +354,9 @@ def write_dense_in_shard_rows(
     produced = stream_shards(
         slices,
         produce_band,
-        workers=plan.across,
-        within_block_threads=plan.withinBlockThreads if plan.across > 1 else None,
-        io_concurrency=plan.ioConcurrency if plan.across > 1 else None,
+        workers=plan.readAhead,
+        within_block_threads=plan.withinBlockThreads,
+        io_concurrency=plan.ioConcurrency,
     )
     for start, end, block in tqdmbar(produced, desc=msg, total=len(slices)):
         dst[start:end, :] = block
@@ -478,6 +482,30 @@ def copy_zarr_array(
     return None
 
 
+def copy_zarr_group_tree(
+    src: zarr.Group,
+    dst: zarr.Group,
+    *,
+    overwrite: bool = True,
+) -> None:
+    """Recursively copy a Zarr group tree from ``src`` into ``dst``."""
+    from ..writers import create_zarr_obj_array
+
+    for name, node in src.members():
+        if isinstance(node, zarr.Group):
+            child = dst.create_group(name, overwrite=overwrite)
+            copy_zarr_group_tree(node, child, overwrite=overwrite)
+        else:
+            arr = as_zarr_array(node, name=name)
+            create_zarr_obj_array(
+                dst,
+                name,
+                np.asarray(arr[:]),
+                dtype=arr.dtype,
+                overwrite=overwrite,
+            )
+
+
 def create_or_open_staged_normed_array(
     cache_path: str,
     shape: tuple[int, int],
@@ -501,7 +529,9 @@ def open_or_create_staged_normed_array(
     src: zarr.Array,
 ) -> zarr.Array:
     """Open a reusable local scratch array matching ``src``'s shape."""
-    return create_or_open_staged_normed_array(cache_path, tuple(src.shape))
+    return create_or_open_staged_normed_array(
+        cache_path, (int(src.shape[0]), int(src.shape[1]))
+    )
 
 
 def _is_obstore_native_store(obj: object) -> bool:

@@ -7,6 +7,7 @@ from zarr.storage import MemoryStore
 
 from scarf.storage.zarr_store import (
     copy_zarr_array,
+    copy_zarr_group_tree,
     create_numeric_array,
     get_storage_profile,
     is_local_zarr_path,
@@ -87,6 +88,20 @@ def test_copy_zarr_array_round_trip(tmp_path):
     dst = create_numeric_array(dst_root, "data", spec)
     copy_zarr_array(src, dst, block_rows=16)
     np.testing.assert_allclose(dst[:], expected, rtol=1e-6)
+
+
+def test_copy_zarr_group_tree(tmp_path):
+    from scarf.writers import create_zarr_obj_array
+
+    src_root = zarr.open_group(str(tmp_path / "src.zarr"), mode="w")
+    slot = src_root.create_group("I__cluster")
+    cluster = slot.create_group("0")
+    create_zarr_obj_array(cluster, "score", [1.0, 2.0, 3.0], dtype="float64")
+
+    dst_root = zarr.open_group(str(tmp_path / "dst.zarr"), mode="w")
+    dst_slot = dst_root.create_group("I__cluster")
+    copy_zarr_group_tree(slot, dst_slot)
+    np.testing.assert_array_equal(dst_slot["0"]["score"][:], [1.0, 2.0, 3.0])
 
 
 def test_open_or_create_staged_normed_array_reuses_shape(tmp_path):

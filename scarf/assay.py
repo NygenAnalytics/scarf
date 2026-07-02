@@ -462,7 +462,7 @@ class Assay:
     @staticmethod
     def _finalize_staged_mirror(
         mirror: zarr.Array | None,
-        subset_hash: str,
+        subset_hash: int,
         subset_params: dict[str, Any],
     ) -> None:
         """Mark a mirrored staging array complete so staging reuses it as-is."""
@@ -521,9 +521,10 @@ class Assay:
             "renormalize_subset": renormalize_subset,
         }
         if location in self.z:
+            attrs = self.z[location].attrs
             if (
-                subset_hash == self.z[location].attrs["subset_hash"]
-                and subset_params == self.z[location].attrs["subset_params"]
+                attrs.get("subset_hash") == subset_hash
+                and attrs.get("subset_params") == subset_params
             ):
                 logger.info(
                     f"Using existing normalized data with cell key {cell_key} and feat key {feat_key}"
@@ -955,9 +956,10 @@ class RNAassay(Assay):
             "renormalize_subset": renormalize_subset,
         }
         if location in self.z:
+            attrs = self.z[location].attrs
             if (
-                subset_hash == self.z[location].attrs["subset_hash"]
-                and subset_params == self.z[location].attrs["subset_params"]
+                attrs.get("subset_hash") == subset_hash
+                and attrs.get("subset_params") == subset_params
             ):
                 logger.info(
                     f"Using existing normalized data with cell key {cell_key} and feat key {feat_key}"
@@ -971,7 +973,7 @@ class RNAassay(Assay):
                     as_zarr_array(self.z[location + "/data"], name=location + "/data"),
                     nthreads=self.nthreads,
                 )
-        self.z.create_group(location, overwrite=True)
+            self.z.create_group(location, overwrite=True)
 
         write_renorm_subset_to_zarr(
             self,
@@ -1046,6 +1048,47 @@ class RNAassay(Assay):
         self.normMethod = norm_method_cache
         return val
 
+    def iter_raw_column_blocks(
+        self,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
+        batch_size: int,
+        msg: str | None = None,
+    ) -> Generator[tuple[int, np.ndarray, np.ndarray, float, str], None, None]:
+        """Read raw count column batches with remote-aware staging.
+
+        Yields ``(block_idx, raw, feat_cols, read_sec, source)`` where ``raw`` has
+        shape ``(len(cell_idx), len(feat_cols))``.
+        """
+        from .storage.zarr_store import is_remote_datastore
+        from .utils import iter_column_blocks
+
+        zarr_arr = cast(zarr.Array, self.rawData._backing)
+        cell_idx = np.asarray(cell_idx)
+        feat_idx = np.asarray(feat_idx)
+        batch_size = max(1, batch_size)
+        batches = [
+            feat_idx[s : s + batch_size] for s in range(0, len(feat_idx), batch_size)
+        ]
+        n_blocks = len(batches)
+        if msg:
+            logger.info(
+                f"({self.name}) {msg}: {len(feat_idx)} features in "
+                f"{n_blocks} batches (width {batch_size})"
+            )
+
+        def read_block(block_idx: int) -> np.ndarray:
+            return _read_block(zarr_arr, cell_idx, batches[block_idx])
+
+        remote = is_remote_datastore("", self.z)
+        for block_idx, raw, read_sec, source in iter_column_blocks(
+            n_blocks,
+            read_block,
+            remote=remote,
+            msg=msg,
+        ):
+            yield block_idx, raw, batches[block_idx], read_sec, source
+
     def iter_raw_feature_columns(
         self,
         cell_idx: np.ndarray,
@@ -1078,30 +1121,35 @@ class RNAassay(Assay):
             Tuples of ``(normed_batch, feat_index_batch)`` where ``normed_batch``
             has shape ``(len(cell_idx), batch_columns)``.
         """
-        from .storage.budget import worker_prefetch_depth
-        from .utils import prefetch_blocks, tqdmbar
+        import time
 
-        zarr_arr = cast(zarr.Array, self.rawData._backing)
+        from .utils import process_rss_mb
+
         cell_idx = np.asarray(cell_idx)
-        feat_idx = np.asarray(feat_idx)
         scalar_col = np.asarray(scalar, dtype=np.float32).reshape(-1, 1)
         scalar_col[scalar_col == 0] = 1
+        feat_idx = np.asarray(feat_idx)
+        n_batches = max(
+            1, (len(feat_idx) + max(1, batch_size) - 1) // max(1, batch_size)
+        )
 
-        batch_size = max(1, batch_size)
-        batches = [
-            feat_idx[s : s + batch_size] for s in range(0, len(feat_idx), batch_size)
-        ]
-
-        def read(cols: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-            return _read_block(zarr_arr, cell_idx, cols), cols
-
-        max_ahead = worker_prefetch_depth(requested=max(1, prefetch_depth))
-
-        consumer = prefetch_blocks(batches, read, max_ahead=max_ahead)
-        for raw, cols in tqdmbar(consumer, desc=msg or "", total=len(batches)):
+        for block_idx, raw, cols, read_sec, source in self.iter_raw_column_blocks(
+            cell_idx=cell_idx,
+            feat_idx=feat_idx,
+            batch_size=batch_size,
+            msg=msg,
+        ):
+            t0 = time.perf_counter()
             normed = (sf * raw.astype(np.float32)) / scalar_col
             if log_transform:
                 normed = np.log1p(normed)
+            if msg:
+                logger.info(
+                    f"({self.name}) {msg} batch {block_idx + 1}/{n_batches}: "
+                    f"cols={len(cols)} read {read_sec:.1f}s ({source}) "
+                    f"norm {time.perf_counter() - t0:.1f}s "
+                    f"rss {process_rss_mb():.0f} MiB"
+                )
             yield normed, cols
 
     def _mean_normed_feature_groups(
@@ -1178,13 +1226,15 @@ class RNAassay(Assay):
         Reads the raw counts one feature-chunk column block at a time (across
         all selected cells), normalizes each block in float64, and accumulates
         per-feature nonzero count, sum, and sum of squares, so the normalized
-        matrix is never fully materialized. The column block follows the array's
-        on-disk feature chunk width, and blocks are read ahead in parallel up to
-        the worker count. Values match ``norm_lib_size``. Returns ``normed_tot``
-        (sum), ``normed_n`` (nonzero count), and ``sigmas`` (population variance).
+        Further blocks (up to ``disk_ahead``) are staged on local disk one at a time
+        while compute continues; the next block is prefetched into RAM. Values
+        match ``norm_lib_size``. Returns ``normed_tot`` (sum), ``normed_n`` (nonzero count), and
+        ``sigmas`` (population variance).
         """
-        from .storage.budget import worker_prefetch_depth
-        from .utils import prefetch_blocks, tqdmbar
+        import time
+
+        from .storage.zarr_store import is_remote_datastore
+        from .utils import iter_column_blocks, process_rss_mb
 
         zarr_arr = cast(zarr.Array, self.rawData._backing)
         cell_idx = np.asarray(cell_idx)
@@ -1211,23 +1261,38 @@ class RNAassay(Assay):
         chunks = getattr(zarr_arr, "chunks", None)
         col_block = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
         col_block = max(1, min(col_block, n_features))
-        col_starts = range(0, n_features, col_block)
+        col_starts = list(range(0, n_features, col_block))
+        n_blocks = len(col_starts)
+        remote = is_remote_datastore("", self.z)
 
-        def read(c: int) -> tuple[int, np.ndarray]:
-            cols = feat_idx[c : c + col_block]
-            return c, _read_block(zarr_arr, cell_idx, cols)
+        def read_block(block_idx: int) -> np.ndarray:
+            start = col_starts[block_idx]
+            cols = feat_idx[start : start + col_block]
+            return _read_block(zarr_arr, cell_idx, cols)
 
-        consumer = prefetch_blocks(col_starts, read, max_ahead=worker_prefetch_depth())
-        for c, raw in tqdmbar(
-            consumer,
-            desc=f"({self.name}) Computing feature stats",
-            total=len(col_starts),
-        ):
+        def accumulate_block(raw: np.ndarray, start: int) -> None:
             width = raw.shape[1]
-            normed = (sf * raw.astype(np.float64)) * inv_scalar[:, None]
-            nz[c : c + width] += (raw > 0).sum(axis=0)
-            s1[c : c + width] += normed.sum(axis=0)
-            s2[c : c + width] += (normed * normed).sum(axis=0)
+            scaled = (sf * raw.astype(np.float64)) * inv_scalar[:, None]
+            nz[start : start + width] += (raw > 0).sum(axis=0)
+            s1[start : start + width] += scaled.sum(axis=0)
+            s2[start : start + width] += np.einsum("ij,ij->j", scaled, scaled)
+
+        for block_idx, raw, read_sec, source in iter_column_blocks(
+            n_blocks,
+            read_block,
+            remote=remote,
+            msg=f"({self.name}) Computing feature stats",
+        ):
+            start = col_starts[block_idx]
+            t_compute = time.perf_counter()
+            accumulate_block(raw, start)
+            compute_sec = time.perf_counter() - t_compute
+            logger.info(
+                f"({self.name}) feature stats block {block_idx + 1}/{n_blocks}: "
+                f"read {read_sec:.1f}s ({source}) compute {compute_sec:.1f}s "
+                f"rss {process_rss_mb():.0f} MiB"
+            )
+            del raw
 
         mean = s1 / n_cells
         sigmas = s2 / n_cells - np.square(mean)

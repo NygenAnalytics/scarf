@@ -12,10 +12,86 @@ from ..assay import Assay, ATACassay, RNAassay
 from ..chunked import ChunkedArray
 from ..feat_utils import hto_demux
 from ..utils import ZARRLOC, controlled_compute, tqdmbar
-from ..writers import create_zarr_dataset, create_zarr_obj_array
+from ..writers import create_zarr_dataset
 from .mapping_datastore import MappingDatastore
 
 __all__ = ["DataStore"]
+
+_MARKER_LAYOUT_V2 = "compact_v2"
+_MARKER_STAT_COLUMNS = (
+    "score",
+    "mean",
+    "mean_rest",
+    "frac_exp",
+    "frac_exp_rest",
+    "fold_change",
+    "p_value",
+)
+_MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
+
+
+def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray:
+    for vals in markers.values():
+        if len(vals) != 0:
+            return np.sort(np.asarray(vals.index.values, dtype=np.int32))
+    raise ValueError("Cannot save empty marker results")
+
+
+def _marker_stats_matrix(vals: pd.DataFrame, feature_index: np.ndarray) -> np.ndarray:
+    aligned = vals.reindex(feature_index)
+    return np.asarray(
+        aligned.loc[:, list(_MARKER_STAT_COLUMNS)].to_numpy(dtype=np.float64)
+    )
+
+
+def _write_compact_marker_stats(
+    cluster_group: zarr.Group,
+    stats: np.ndarray,
+) -> None:
+    from ..storage.zarr_store import ZarrArraySpec, create_numeric_array
+
+    n_features = int(stats.shape[0])
+    spec = ZarrArraySpec(
+        shape=(n_features, len(_MARKER_STAT_COLUMNS)),
+        chunks=(n_features, len(_MARKER_STAT_COLUMNS)),
+        dtype="float64",
+        overwrite=True,
+    )
+    arr = create_numeric_array(cluster_group, "stats", spec)
+    arr[:] = stats
+
+
+def _load_marker_cluster_frame(
+    slot_group: zarr.Group,
+    cluster_group: zarr.Group,
+    feature_names: np.ndarray,
+    *,
+    group_id: Any,
+) -> pd.DataFrame:
+    out_cols = list(_MARKER_OUT_COLUMNS)
+    if slot_group.attrs.get("layout") == _MARKER_LAYOUT_V2 and "stats" in cluster_group:
+        feature_index = np.asarray(
+            as_zarr_array(slot_group["feature_index"], name="feature_index")[:]
+        )
+        stats = np.asarray(as_zarr_array(cluster_group["stats"], name="stats")[:])
+        df = pd.DataFrame(stats, columns=list(_MARKER_STAT_COLUMNS))
+        df["feature_index"] = feature_index
+        df["feature_name"] = feature_names[feature_index.astype(int)]
+        df["group_id"] = group_id
+        return df[["group_id", "feature_name", *out_cols[1:]]].sort_values(
+            by="score", ascending=False
+        )
+
+    available_cols = [col for col in out_cols if col in cluster_group]
+    if not available_cols:
+        return pd.DataFrame([[] for _ in out_cols], index=out_cols).T
+    cols = [
+        np.asarray(as_zarr_array(cluster_group[x], name=x)[:]) for x in available_cols
+    ]
+    df = pd.DataFrame(cols, index=available_cols).T
+    df["group_id"] = group_id
+    df["feature_name"] = feature_names[df.feature_index.astype("int")]
+    return df[["group_id", "feature_name", *available_cols[1:]]]
 
 
 class DataStore(MappingDatastore):
@@ -46,8 +122,11 @@ class DataStore(MappingDatastore):
                       more details: https://zarr.readthedocs.io/en/stable/api/sync.html. By default
                       ThreadSynchronizer will be used.
         mem_budget: Memory budget bounding streaming and concurrency. Accepts bytes, a suffixed size
-                    (e.g. '8G'), or a fraction of available memory (e.g. '0.6'). When None, it is
-                    auto-detected (SCARF_MEM_BUDGET env var, else a fraction of available memory).
+                    (e.g. '8G'), or a fraction of total system memory (e.g. '0.6'). When None, it is
+                    auto-detected (SCARF_MEM_BUDGET env var, else total system memory). Override it to
+                    simulate reading on a machine with a different memory size than the writer.
+        working_copies: Number of concurrent in-memory working copies the memory budget is divided
+                        across. When None, uses SCARF_WORKING_COPIES env var or the default.
     """
 
     def __init__(
@@ -66,6 +145,7 @@ class DataStore(MappingDatastore):
         zarrProfile: Literal["fast_local", "cloud"] | None = None,
         storage_options: dict[str, Any] | None = None,
         mem_budget: int | str | None = None,
+        working_copies: int | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget, set_resource_budget
         from ..storage.zarr_store import (
@@ -74,7 +154,11 @@ class DataStore(MappingDatastore):
         )
 
         set_storage_profile(zarrProfile)
-        set_resource_budget(resolve_budget(memory=mem_budget, workers=nthreads))
+        set_resource_budget(
+            resolve_budget(
+                memory=mem_budget, workers=nthreads, working_copies=working_copies
+            )
+        )
         configure_zarr_io_for_profile()
         if zarr_mode not in ["r", "r+"]:
             raise ValueError(
@@ -624,11 +708,14 @@ class DataStore(MappingDatastore):
             gene_batch_size = max(1, min(col_chunk, n_features))
 
         slot_name = f"{cell_key}__{group_key}"
+        logger.info(
+            f"Running marker search for {from_assay}/{slot_name} "
+            f"(feat_key={feat_key}, batch_size={gene_batch_size})"
+        )
         assay_grp = as_zarr_group(self.zw[assay.name], name=assay.name)
         if "markers" not in assay_grp:
             assay_grp.create_group("markers")
         markers_grp = as_zarr_group(assay_grp["markers"], name="markers")
-        group = markers_grp.create_group(slot_name, overwrite=True)
 
         prenormed_group: zarr.Group | None
         if isinstance(prenormed_store, str):
@@ -652,14 +739,67 @@ class DataStore(MappingDatastore):
 
         if skip_save:
             return markers
-        else:
-            for i in markers:
-                g = group.create_group(str(i))
-                vals = markers[i]
-                if len(vals) != 0:
-                    for j in vals.columns:
-                        create_zarr_obj_array(g, j, vals[j].values, dtype=vals[j].dtype)
-            return None
+
+        import time
+
+        from ..storage.zarr_store import is_remote_datastore
+
+        remote = is_remote_datastore(self.zarr_loc, self.z)
+        t_save = time.perf_counter()
+        remote_slot = markers_grp.create_group(slot_name, overwrite=True)
+        workers = max(1, int(n_threads or self.nthreads))
+        self._write_marker_slot(
+            remote_slot,
+            markers,
+            workers=workers if remote else 1,
+        )
+        logger.info(
+            f"Saved marker results to {assay.name}/markers/{slot_name} "
+            f"in {time.perf_counter() - t_save:.1f}s "
+            f"({len(markers)} clusters, layout={_MARKER_LAYOUT_V2})"
+        )
+        return None
+
+    @staticmethod
+    def _write_marker_slot(
+        group: zarr.Group,
+        markers: dict[Any, pd.DataFrame],
+        *,
+        workers: int = 1,
+    ) -> None:
+        from ..storage.zarr_store import create_metadata_column
+
+        feature_index = _shared_marker_feature_index(markers)
+        group.attrs["layout"] = _MARKER_LAYOUT_V2
+        group.attrs["statColumns"] = list(_MARKER_STAT_COLUMNS)
+        create_metadata_column(
+            group,
+            "feature_index",
+            data=feature_index,
+            dtype=np.int32,
+            overwrite=True,
+        )
+
+        def write_cluster(item: tuple[Any, pd.DataFrame]) -> None:
+            cluster_id, vals = item
+            if len(vals) == 0:
+                return
+            cluster_group = group.create_group(str(cluster_id))
+            _write_compact_marker_stats(
+                cluster_group,
+                _marker_stats_matrix(vals, feature_index),
+            )
+
+        items = list(markers.items())
+        if workers <= 1:
+            for item in items:
+                write_cluster(item)
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(write_cluster, items))
 
     def run_pseudotime_marker_search(
         self,
@@ -881,45 +1021,29 @@ class DataStore(MappingDatastore):
                 "ERROR: Couldn't find the location of markers. Please make sure that you have already called "
                 "`run_marker_search` method with same value of `cell_key` and `group_key`"
             )
-        out_cols = [
-            "feature_index",
-            "score",
-            "mean",
-            "mean_rest",
-            "frac_exp",
-            "frac_exp_rest",
-            "fold_change",
-            "p_value",
-        ]
+        out_cols = list(_MARKER_OUT_COLUMNS)
         gids = sorted(set(assay.cells.fetch(group_key, key=cell_key)))
         if group_id is not None:
             gids = [group_id]
 
+        feature_names = assay.feats.fetch_all("names")
         dfs = []
         for gid in gids:
             group_name = str(gid)
             if group_name in g:
                 marker_grp = as_zarr_group(g[group_name], name=group_name)
-                available_cols = [col for col in out_cols if col in marker_grp]
-                cols = [
-                    np.asarray(as_zarr_array(marker_grp[x], name=x)[:])
-                    for x in available_cols
-                ]
-                df = pd.DataFrame(
-                    cols,
-                    index=available_cols,
-                ).T
-                df["group_id"] = gid
-                df["feature_name"] = assay.feats.fetch_all("names")[
-                    df.feature_index.astype("int")
-                ]
-                df = df[["group_id", "feature_name"] + available_cols]
+                df = _load_marker_cluster_frame(
+                    g,
+                    marker_grp,
+                    feature_names,
+                    group_id=gid,
+                )
             else:
                 logger.debug(f"No markers found for {gid} returning empty dataframe")
                 df = pd.DataFrame([[] for _ in out_cols], index=out_cols).T
                 df["group_id"] = []
                 df["feature_name"] = []
-                df = df[["group_id", "feature_name"] + out_cols]
+                df = df[["group_id", "feature_name"] + list(out_cols[1:])]
             dfs.append(df)
         dfs = pd.concat(dfs)
         return dfs[
@@ -2196,16 +2320,28 @@ class DataStore(MappingDatastore):
             )
         g = as_zarr_group(markers_grp[slot_name], name=slot_name)
         feat_idx: list[Any] = []
-        for i in g.group_keys():
-            marker_grp = as_zarr_group(g[i], name=i)
-            if "feature_index" in marker_grp:
-                feat_idx.extend(
-                    np.asarray(
-                        as_zarr_array(
-                            marker_grp["feature_index"], name="feature_index"
-                        )[:topn]
+        if g.attrs.get("layout") == _MARKER_LAYOUT_V2 and "feature_index" in g:
+            shared_index = np.asarray(
+                as_zarr_array(g["feature_index"], name="feature_index")[:]
+            )
+            for cluster_name in g.group_keys():
+                marker_grp = as_zarr_group(g[cluster_name], name=cluster_name)
+                if "stats" not in marker_grp:
+                    continue
+                stats = np.asarray(as_zarr_array(marker_grp["stats"], name="stats")[:])
+                top = np.argsort(-stats[:, 0])[:topn]
+                feat_idx.extend(shared_index[top])
+        else:
+            for i in g.group_keys():
+                marker_grp = as_zarr_group(g[i], name=i)
+                if "feature_index" in marker_grp:
+                    feat_idx.extend(
+                        np.asarray(
+                            as_zarr_array(
+                                marker_grp["feature_index"], name="feature_index"
+                            )[:topn]
+                        )
                     )
-                )
         if len(feat_idx) == 0:
             raise ValueError("ERROR: Marker list is empty for all the groups")
         feat_idx_arr = np.array(sorted(set(feat_idx))).astype(int)

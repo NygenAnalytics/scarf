@@ -222,10 +222,10 @@ def _batch_stats(
 ) -> np.ndarray:
     """Run the numba marker kernel and convert z statistics to p-values."""
     out = _marker_stats_batch(
-        np.ascontiguousarray(data, dtype=np.float64),
+        np.ascontiguousarray(data, dtype=np.float32),
         int_indices,
-        group_counts.astype(np.float64),
-        float(n_total),
+        group_counts.astype(np.float32),
+        np.float32(n_total),
     )
     out[:, :, 6] = 2.0 * norm.sf(np.abs(out[:, :, 6]))
     return np.asarray(out)
@@ -377,29 +377,46 @@ def find_markers_by_rank(
                 raise TypeError(
                     "Fast raw-count marker search requires an RNAassay instance"
                 )
+            import time
+
+            from scarf.utils import process_rss_mb
+
             cell_idx = assay.cells.active_index(cell_key)
             feat_idx = assay.feats.active_index(feat_key)
+            n_batches = max(1, (len(feat_idx) + batch_size - 1) // batch_size)
+            logger.info(
+                f"Marker search (fast): {len(feat_idx)} features, {n_groups} groups, "
+                f"{n_batches} batches of {batch_size}"
+            )
             scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
             sf = assay.sf
             if sf is None:
                 raise ValueError(
                     "RNA library-size normalization requires a size factor"
                 )
-            stats_matrix = np.vstack(
-                [
-                    _batch_stats(mat, int_indices, group_counts, n_total)
-                    for mat, _ in assay.iter_raw_feature_columns(
-                        cell_idx=cell_idx,
-                        feat_idx=feat_idx,
-                        batch_size=batch_size,
-                        scalar=scalar,
-                        sf=float(sf),
-                        log_transform=log_transform,
-                        prefetch_depth=prefetch_depth,
-                        msg="Finding markers",
-                    )
-                ]
-            )
+            scalar_col = np.asarray(scalar, dtype=np.float32).reshape(-1, 1)
+            scalar_col[scalar_col == 0] = 1
+            batch_stats: list[np.ndarray] = []
+            for block_idx, raw, _cols, read_sec, source in assay.iter_raw_column_blocks(
+                cell_idx=cell_idx,
+                feat_idx=feat_idx,
+                batch_size=batch_size,
+                msg="Finding markers",
+            ):
+                t0 = time.perf_counter()
+                normed = (float(sf) * raw.astype(np.float32)) / scalar_col
+                if log_transform:
+                    normed = np.log1p(normed)
+                batch_stats.append(
+                    _batch_stats(normed, int_indices, group_counts, n_total)
+                )
+                logger.info(
+                    f"({assay.name}) Finding markers batch {block_idx + 1}/{n_batches}: "
+                    f"cols={len(_cols)} read {read_sec:.1f}s ({source}) "
+                    f"stats {time.perf_counter() - t0:.1f}s "
+                    f"rss {process_rss_mb():.0f} MiB"
+                )
+            stats_matrix = np.vstack(batch_stats)
         else:
             stats_matrix = np.vstack(
                 [

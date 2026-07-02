@@ -3,8 +3,9 @@ import builtins
 import pytest
 
 from scarf.storage.budget import (
+    READ_AHEAD,
     ResourceBudget,
-    detect_available_memory_bytes,
+    detect_total_memory_bytes,
     resolve_budget,
     worker_prefetch_depth,
 )
@@ -25,18 +26,18 @@ def test_resolve_budget_raw_bytes_and_explicit_workers(monkeypatch):
     assert budget.workers == 2
 
 
-def test_resolve_budget_fraction_of_available(monkeypatch):
+def test_resolve_budget_fraction_of_total(monkeypatch):
     monkeypatch.delenv("SCARF_MEM_BUDGET", raising=False)
-    avail = detect_available_memory_bytes()
+    total = detect_total_memory_bytes()
     budget = resolve_budget(memory="0.5", workers=1)
-    assert abs(budget.memoryBytes - int(avail * 0.5)) <= avail * 0.01
+    assert abs(budget.memoryBytes - int(total * 0.5)) <= total * 0.01
 
 
-def test_resolve_budget_default_fraction(monkeypatch):
+def test_resolve_budget_default_is_total_memory(monkeypatch):
     monkeypatch.delenv("SCARF_MEM_BUDGET", raising=False)
     monkeypatch.delenv("SCARF_WORKERS", raising=False)
     budget = resolve_budget()
-    assert budget.memoryBytes > 0
+    assert budget.memoryBytes == detect_total_memory_bytes()
     assert budget.workers >= 1
 
 
@@ -50,7 +51,7 @@ def test_detect_memory_fallback_when_meminfo_absent(monkeypatch):
 
     monkeypatch.setattr(builtins, "open", fake_open)
     monkeypatch.setattr("os.sysconf", lambda name: -1)
-    assert detect_available_memory_bytes() == 8 * 1024 * 1024 * 1024
+    assert detect_total_memory_bytes() == 8 * 1024 * 1024 * 1024
 
 
 @pytest.mark.parametrize(
@@ -91,13 +92,13 @@ def test_detect_memory_uses_sysconf_when_meminfo_unavailable(monkeypatch):
     def fake_sysconf(name):
         if name == "SC_PAGE_SIZE":
             return 4096
-        if name == "SC_AVPHYS_PAGES":
+        if name == "SC_PHYS_PAGES":
             return 1024
         return -1
 
     monkeypatch.setattr(builtins, "open", fake_open)
     monkeypatch.setattr("os.sysconf", fake_sysconf)
-    assert detect_available_memory_bytes() == 4096 * 1024
+    assert detect_total_memory_bytes() == 4096 * 1024
 
 
 def test_invalid_workers_env_rejected(monkeypatch):
@@ -107,19 +108,24 @@ def test_invalid_workers_env_rejected(monkeypatch):
         resolve_budget(memory="8G")
 
 
-def test_fraction_uses_available_memory(monkeypatch):
+def test_fraction_uses_total_memory(monkeypatch):
     monkeypatch.delenv("SCARF_MEM_BUDGET", raising=False)
-    avail = detect_available_memory_bytes()
+    total = detect_total_memory_bytes()
     got = resolve_budget(memory="0.25", workers=1).memoryBytes
-    assert abs(got - int(avail * 0.25)) <= avail * 0.01
+    assert abs(got - int(total * 0.25)) <= total * 0.01
 
 
-def test_worker_prefetch_depth_capped_by_workers():
-    budget = ResourceBudget(memoryBytes=4 * 1024**3, workers=4)
-    assert worker_prefetch_depth(budget=budget) == 4
-    assert worker_prefetch_depth(requested=2, budget=budget) == 2
-    assert worker_prefetch_depth(requested=10, budget=budget) == 4
+def test_worker_prefetch_depth_capped_by_read_ahead():
+    budget = ResourceBudget(memoryBytes=4 * 1024**3, workers=4, workingCopies=8)
+    assert worker_prefetch_depth(budget=budget) == READ_AHEAD
+    assert worker_prefetch_depth(requested=1, budget=budget) == 1
+    assert worker_prefetch_depth(requested=10, budget=budget) == READ_AHEAD
     assert worker_prefetch_depth(requested=0, budget=budget) == 1
+
+
+def test_worker_prefetch_depth_capped_by_working_copies():
+    budget = ResourceBudget(memoryBytes=4 * 1024**3, workers=4, workingCopies=1)
+    assert worker_prefetch_depth(budget=budget) == 1
 
 
 def test_working_copies_from_env(monkeypatch):

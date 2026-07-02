@@ -751,7 +751,7 @@ class GraphDataStore(BaseDataStore):
     @staticmethod
     def _staged_normed_cached(
         cache_path: str,
-        subset_hash: str,
+        subset_hash: int,
         subset_params: dict[str, Any],
     ) -> bool:
         if not os.path.isfile(os.path.join(cache_path, "zarr.json")):
@@ -1001,7 +1001,7 @@ class GraphDataStore(BaseDataStore):
             f"local_cache must be 'auto', True, False, or a path string, got {local_cache!r}"
         )
 
-    def _normed_cache_key(self, subset_hash: str, subset_params: dict[str, Any]) -> str:
+    def _normed_cache_key(self, subset_hash: int, subset_params: dict[str, Any]) -> str:
         import hashlib
         import json
 
@@ -1014,7 +1014,7 @@ class GraphDataStore(BaseDataStore):
     def _stage_normed_data(
         self,
         remote_array: zarr.Array,
-        subset_hash: str,
+        subset_hash: int,
         subset_params: dict[str, Any],
         cache_base: str,
     ) -> ChunkedArray:
@@ -1330,14 +1330,16 @@ class GraphDataStore(BaseDataStore):
                 update_keys,
                 mirror=staged_mirror,
             )
-        subset_hash = cast(
-            str,
-            as_zarr_group(self.zw[normed_loc], name=normed_loc).attrs["subset_hash"],
-        )
-        subset_params = cast(
-            dict[str, Any],
-            as_zarr_group(self.zw[normed_loc], name=normed_loc).attrs["subset_params"],
-        )
+        normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+        subset_hash = normed_grp.attrs.get("subset_hash")
+        subset_params = normed_grp.attrs.get("subset_params")
+        if subset_hash is None or subset_params is None:
+            raise RuntimeError(
+                f"Normalized matrix at {normed_loc} is missing subset metadata; "
+                "delete the partial group and retry make_graph"
+            )
+        subset_hash = cast(int, subset_hash)
+        subset_params = cast(dict[str, Any], subset_params)
         graph_succeeded = False
         try:
             if cache_enabled:

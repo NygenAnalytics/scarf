@@ -9,6 +9,7 @@ from zarr.storage import MemoryStore
 from scarf.chunked import ChunkedArray
 from scarf.parallel import in_shard_context, map_shards, stream_shards
 from scarf.storage.budget import (
+    READ_AHEAD,
     ResourceBudget,
     set_resource_budget,
     shard_parallelism,
@@ -24,22 +25,24 @@ def budget():
     set_resource_budget(None)
 
 
-def test_shard_parallelism_spends_budget_on_across_depth(budget):
+def test_shard_parallelism_spends_budget_within_shard(budget):
     plan = shard_parallelism(workers=8, n_shards=20)
-    assert plan.across == 8
+    assert plan.readAhead == READ_AHEAD
+    assert plan.ioConcurrency == 8
     assert plan.withinBlockThreads == 1
-    assert plan.across * plan.ioConcurrency <= 8
 
 
-def test_shard_parallelism_capped_by_shard_count(budget):
-    plan = shard_parallelism(workers=8, n_shards=3)
-    assert plan.across == 3
+def test_shard_parallelism_read_ahead_capped_by_shard_count(budget):
+    plan = shard_parallelism(workers=8, n_shards=1)
+    assert plan.readAhead == 1
 
 
-def test_shard_parallelism_across_cap():
-    big = ResourceBudget(memoryBytes=64 * 1024**3, workers=32, workingCopies=32)
-    plan = shard_parallelism(workers=32, n_shards=100, budget=big)
-    assert plan.across == 8
+def test_shard_parallelism_read_ahead_capped_by_working_copies():
+    tight = ResourceBudget(memoryBytes=32 * 1024**3, workers=8, workingCopies=1)
+    plan = shard_parallelism(workers=8, n_shards=100, budget=tight)
+    assert plan.readAhead == 1
+    assert plan.ioConcurrency == 8
+    assert plan.withinBlockThreads == 1
 
 
 def test_map_shards_preserves_order(budget):
@@ -69,7 +72,7 @@ def test_map_shards_bounds_in_flight(budget):
         return idx
 
     map_shards(ranges, produce, workers=8)
-    assert max_seen <= 8
+    assert max_seen <= READ_AHEAD
 
 
 def test_map_shards_serial_backend_runs_inline(budget):
@@ -138,9 +141,10 @@ def test_map_shards_sets_io_concurrency_from_plan(budget):
             seen.append(zarr.config.get("async.concurrency"))
             return idx
 
-        # budget: workers=8, workingCopies=8; 4 shards -> across=4, io=8//4=2
+        # budget: workers=8; the whole worker budget is spent within a shard, so
+        # async.concurrency is set to 8 for the duration of the op.
         map_shards([(i, i + 1) for i in range(4)], produce, workers=8)
-        assert seen and all(s == 2 for s in seen)
+        assert seen and all(s == 8 for s in seen)
         assert zarr.config.get("async.concurrency") == 99
 
 

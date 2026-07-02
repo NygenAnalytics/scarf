@@ -10,8 +10,7 @@ and shard geometry with no additional memory heuristics.
 import os
 from dataclasses import dataclass
 
-_DEFAULT_MEMORY_FRACTION = 0.6
-_DEFAULT_WORKING_COPIES = 4
+_DEFAULT_WORKING_COPIES = 8
 _FALLBACK_MEMORY_BYTES = 8 * 1024 * 1024 * 1024
 _SUFFIXES = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
 _MIN_RAW_BYTES = 1024 * 1024
@@ -26,20 +25,25 @@ class ResourceBudget:
     workingCopies: int = _DEFAULT_WORKING_COPIES
 
 
-def detect_available_memory_bytes() -> int:
-    """Best-effort available system memory in bytes."""
+def detect_total_memory_bytes() -> int:
+    """Best-effort total physical system memory in bytes.
+
+    Uses total (installed) memory rather than currently free memory so the
+    derived write-time geometry is a property of the machine, not of transient
+    load at the moment the process happens to run.
+    """
     try:
         with open("/proc/meminfo") as handle:
             for line in handle:
-                if line.startswith("MemAvailable:"):
+                if line.startswith("MemTotal:"):
                     return int(line.split()[1]) * 1024
     except OSError:
         pass
     try:
         page_size = os.sysconf("SC_PAGE_SIZE")
-        avail_pages = os.sysconf("SC_AVPHYS_PAGES")
-        if page_size > 0 and avail_pages > 0:
-            return int(page_size) * int(avail_pages)
+        total_pages = os.sysconf("SC_PHYS_PAGES")
+        if page_size > 0 and total_pages > 0:
+            return int(page_size) * int(total_pages)
     except (ValueError, OSError, AttributeError):
         pass
     return _FALLBACK_MEMORY_BYTES
@@ -81,7 +85,7 @@ def _parse_memory_spec(spec: str | int | float) -> int:
     if number <= 0:
         raise ValueError(f"Memory budget must be positive, got {spec!r}.")
     if number < 1:
-        return max(1, int(number * detect_available_memory_bytes()))
+        return max(1, int(number * detect_total_memory_bytes()))
     if number < _MIN_RAW_BYTES:
         raise ValueError(
             f"Ambiguous memory spec {spec!r}: a bare number >= 1 is read as bytes, "
@@ -122,9 +126,7 @@ def resolve_budget(
         if env_mem:
             memory_bytes = _parse_memory_spec(env_mem)
         else:
-            memory_bytes = int(
-                detect_available_memory_bytes() * _DEFAULT_MEMORY_FRACTION
-            )
+            memory_bytes = detect_total_memory_bytes()
     else:
         memory_bytes = _parse_memory_spec(memory)
 
@@ -174,37 +176,43 @@ def worker_prefetch_depth(
     requested: int | None = None,
     budget: ResourceBudget | None = None,
 ) -> int:
-    """Read-ahead depth for parallel block reads, capped by worker count.
+    """Read-ahead depth for parallel block reads, capped by ``READ_AHEAD``.
 
-    Defaults to one in-flight block per worker. A consumer may ``request`` a
-    smaller depth; the worker count is always the ceiling.
+    Matches the shard read-ahead model: at most ``READ_AHEAD`` blocks are kept in
+    flight so IO overlaps compute without inflating peak memory. A consumer may
+    ``request`` a smaller depth; ``READ_AHEAD`` (bounded by ``workingCopies``) is
+    the ceiling.
     """
     budget = budget or get_resource_budget()
-    workers = max(1, budget.workers)
+    ceiling = max(1, min(READ_AHEAD, budget.workingCopies))
     if requested is None:
-        return workers
-    return max(1, min(int(requested), workers))
+        return ceiling
+    return max(1, min(int(requested), ceiling))
 
 
-# Returns flatten beyond ~4-8 shards processed at once (benchmarked on local and
-# R2); across-shard depth is the dominant lever, so this caps it while memory
-# (workingCopies) is the real ceiling for very large data.
-ACROSS_SHARD_CAP = 8
+# Shards are processed in order with this shallow read-ahead so the next band
+# downloads while the current one is being processed. A deeper queue only
+# inflates peak memory (more resident bands) without improving throughput, since
+# the whole worker budget is already spent parallelising IO and compute *within*
+# each shard.
+READ_AHEAD = 2
 
 
 @dataclass(frozen=True)
 class ShardPlan:
-    """How to split a worker budget for shard-parallel processing.
+    """How to run a shard-parallel op.
 
-    ``across`` is the number of shards processed concurrently (the dominant
-    lever). ``ioConcurrency`` feeds Zarr's ``async.concurrency`` for the
-    duration of the op, and ``withinBlockThreads`` bounds BLAS/OpenMP threads
-    per shard. The product ``across * max(ioConcurrency, withinBlockThreads)``
-    stays near ``workers`` so nested concurrency never fans out to ``workers``
-    squared in-flight requests.
+    Shards are processed in order with a shallow read-ahead: up to ``readAhead``
+    bands may be in flight so IO overlaps compute. The worker budget is spent on
+    ``ioConcurrency`` for Zarr's ``async.concurrency`` (parallel inner-chunk IO
+    within a shard); ``withinBlockThreads`` stays at 1 so BLAS/OpenMP reductions
+    stay single-threaded and bit-identical regardless of the worker count. Peak
+    resident bands is bounded by ``readAhead`` (kept at or below
+    ``workingCopies``), so memory stays within the budget the geometry was sized
+    against.
     """
 
-    across: int
+    readAhead: int
     ioConcurrency: int
     withinBlockThreads: int
 
@@ -217,21 +225,21 @@ def shard_parallelism(
 ) -> ShardPlan:
     """Derive a :class:`ShardPlan` from the resource budget.
 
-    Spends the budget on across-shard depth (capped by ``ACROSS_SHARD_CAP``,
-    ``workingCopies`` and the shard count) and keeps within-block BLAS threads
-    at one, matching the benchmark finding that across-shard parallelism is the
-    lever and extra BLAS threads add little. The remaining budget becomes the
-    Zarr IO concurrency for the op.
+    Spends the worker budget on parallel inner-chunk IO within a shard and
+    pipelines a shallow ``READ_AHEAD`` of shards so the next band downloads while
+    the current one is processed. BLAS threads are pinned to one so results stay
+    bit-identical across worker counts (extra BLAS threads were benchmarked to
+    add little). Read-ahead is bounded by ``workingCopies`` and the shard count
+    so peak resident memory stays within budget.
     """
     budget = budget or get_resource_budget()
     workers = budget.workers if workers is None else max(1, int(workers))
-    caps = [workers, ACROSS_SHARD_CAP, max(1, budget.workingCopies)]
+    caps = [READ_AHEAD, max(1, budget.workingCopies)]
     if n_shards is not None:
         caps.append(max(1, int(n_shards)))
-    across = max(1, min(caps))
-    remainder = max(1, workers // across)
+    read_ahead = max(1, min(caps))
     return ShardPlan(
-        across=across,
-        ioConcurrency=remainder,
+        readAhead=read_ahead,
+        ioConcurrency=workers,
         withinBlockThreads=1,
     )

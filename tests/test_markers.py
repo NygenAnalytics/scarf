@@ -106,3 +106,40 @@ def test_read_prenormed_batches_yields_expected_chunks():
     assert first_chunk.nunique() == 1
     assert last_chunk.nunique() == 1
     assert set(first_chunk.unique()).issubset({0.0, 1.0, 2.0, 3.0, 4.0})
+
+
+def test_compact_marker_save_roundtrip():
+    import zarr
+    from zarr.storage import MemoryStore
+
+    from scarf.datastore.datastore import DataStore, _load_marker_cluster_frame
+
+    index = np.array([10, 5, 7], dtype=np.int32)
+    source = pd.DataFrame(
+        {
+            "score": [0.9, 0.4, 0.2],
+            "mean": [1.0, 2.0, 3.0],
+            "mean_rest": [0.5, 0.5, 0.5],
+            "frac_exp": [0.8, 0.2, 0.1],
+            "frac_exp_rest": [0.3, 0.3, 0.3],
+            "fold_change": [2.0, 4.0, 6.0],
+            "p_value": [0.01, 0.02, 0.03],
+        },
+        index=index,
+    ).sort_values(by="score", ascending=False)
+    markers = {1: source}
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    slot = root.create_group("slot")
+    DataStore._write_marker_slot(slot, markers)
+    feature_names = np.array([f"g{i}" for i in range(11)])
+    loaded = _load_marker_cluster_frame(
+        slot,
+        slot["1"],
+        feature_names,
+        group_id=1,
+    )
+    assert slot.attrs["layout"] == "compact_v2"
+    assert list(slot.group_keys()) == ["1", "feature_index"] or "feature_index" in slot
+    assert len(loaded) == 3
+    assert loaded.iloc[0]["score"] == 0.9
+    assert loaded.iloc[0]["feature_name"] == "g10"
