@@ -17,12 +17,57 @@ StorageProfile = Literal["fast_local", "cloud"]
 type ZarrLocation = str | Store
 
 PROFILE_METADATA_CHUNK = 100_000
+# numcodecs Blosc rejects buffers larger than a signed 32-bit byte count.
+_BLOSC_MAX_BYTES = 2_147_483_647
 
 
 def _ceil_pad(n: int, chunk: int) -> int:
     chunk = max(1, int(chunk))
     n = max(1, int(n))
     return math.ceil(n / chunk) * chunk
+
+
+def _fit_shard_to_byte_limit(
+    row_shard: int,
+    feature_chunk: int,
+    shard_cols: int,
+    n_features: int,
+    *,
+    itemsize: int,
+    max_bytes: int,
+) -> tuple[int, int, int]:
+    """Shrink shard geometry so ``row_shard * shard_cols * itemsize <= max_bytes``."""
+
+    def shard_bytes(rs: int, sc: int) -> int:
+        return rs * sc * itemsize
+
+    while shard_bytes(row_shard, shard_cols) > max_bytes:
+        if row_shard > 1:
+            row_shard = max(1, max_bytes // (shard_cols * itemsize))
+            while row_shard > 1 and shard_bytes(row_shard, shard_cols) > max_bytes:
+                row_shard -= 1
+        elif shard_cols > feature_chunk:
+            shard_cols = max(
+                feature_chunk,
+                (max_bytes // (row_shard * itemsize) // feature_chunk) * feature_chunk,
+            )
+            if shard_bytes(row_shard, shard_cols) > max_bytes:
+                shard_cols = max(feature_chunk, shard_cols - feature_chunk)
+        elif feature_chunk > 1:
+            feature_chunk = max(1, max_bytes // (row_shard * itemsize))
+            shard_cols = _ceil_pad(n_features, feature_chunk)
+            if shard_bytes(row_shard, shard_cols) > max_bytes:
+                shard_cols = max(
+                    feature_chunk,
+                    (max_bytes // (row_shard * itemsize) // feature_chunk)
+                    * feature_chunk,
+                )
+        else:
+            feature_chunk = max(1, max_bytes // itemsize)
+            shard_cols = feature_chunk
+            row_shard = 1
+            break
+    return row_shard, feature_chunk, shard_cols
 
 
 def matrix_layout(
@@ -56,6 +101,15 @@ def matrix_layout(
     row_shard = max(1, min(n_cells, work // (n_features * itemsize)))
     feature_chunk = max(1, min(n_features, work // (n_cells * itemsize)))
     shard_cols = _ceil_pad(n_features, feature_chunk)
+    max_shard_bytes = min(work, _BLOSC_MAX_BYTES)
+    row_shard, feature_chunk, shard_cols = _fit_shard_to_byte_limit(
+        row_shard,
+        feature_chunk,
+        shard_cols,
+        n_features,
+        itemsize=itemsize,
+        max_bytes=max_shard_bytes,
+    )
     chunks = (row_shard, feature_chunk)
     shards = (row_shard, shard_cols)
     return chunks, shards

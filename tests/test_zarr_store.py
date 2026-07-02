@@ -234,7 +234,7 @@ def test_normed_array_spec_creates_array(tmp_path, n_feats):
 
 def test_memory_first_layout_worked_example():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import matrix_layout
+    from scarf.storage.zarr_store import _BLOSC_MAX_BYTES, matrix_layout
 
     budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=8, workingCopies=4)
     chunks, shards = matrix_layout(1_000_000, 50_000, budget=budget, itemsize=4)
@@ -242,10 +242,10 @@ def test_memory_first_layout_worked_example():
     row_shard, shard_cols = shards
     feature_chunk = chunks[1]
     work = (8 * 1024**3) // 4
-    assert row_shard == work // (50_000 * 4)
     assert feature_chunk == work // (1_000_000 * 4)
     assert shard_cols % feature_chunk == 0
     assert shard_cols >= 50_000
+    assert row_shard * shard_cols * 4 <= _BLOSC_MAX_BYTES
 
 
 def test_ceil_pad_awkward_feature_count():
@@ -288,7 +288,7 @@ def test_matrix_layout_scales_with_cells():
 
 def test_matrix_layout_shard_chunk_alignment():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import matrix_layout
+    from scarf.storage.zarr_store import _BLOSC_MAX_BYTES, matrix_layout
 
     budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=4, workingCopies=4)
     chunks, shards = matrix_layout(100_000, 50_000, budget=budget, itemsize=4)
@@ -298,6 +298,40 @@ def test_matrix_layout_shard_chunk_alignment():
     assert shard_cols % col_chunk == 0
     assert shard_rows % row_chunk == 0
     assert shard_cols >= 50_000
+    assert shard_rows * shard_cols * 4 <= _BLOSC_MAX_BYTES
+
+
+def test_matrix_layout_respects_blosc_limit():
+    from scarf.storage.budget import get_resource_budget
+    from scarf.storage.zarr_store import _BLOSC_MAX_BYTES, matrix_layout
+
+    budget = get_resource_budget()
+    for n_cells, n_feats in [
+        (10_000, 89_796),
+        (1_000_000, 50_000),
+        (1_000_000, 36_601),
+    ]:
+        chunks, shards = matrix_layout(n_cells, n_feats, budget=budget, itemsize=4)
+        assert shards is not None
+        row_shard, shard_cols = shards
+        feature_chunk = chunks[1]
+        assert row_shard * shard_cols * 4 <= _BLOSC_MAX_BYTES
+        assert shard_cols % feature_chunk == 0
+        assert row_shard % chunks[0] == 0
+
+
+def test_large_atac_count_array_accepts_sparse_writes(tmp_path):
+    import numpy as np
+
+    from scarf.storage.zarr_store import count_array_spec, create_numeric_array
+
+    n_cells, n_feats = 10_000, 89_796
+    spec = count_array_spec(n_cells, n_feats, dtype="uint32")
+    root = zarr.open_group(str(tmp_path / "atac.zarr"), mode="w")
+    arr = create_numeric_array(root, "counts", spec)
+    rows = np.arange(1000, dtype=np.int64)
+    cols = np.arange(1000, dtype=np.int64)
+    arr.set_coordinate_selection((rows, cols), np.ones(1000, dtype=np.uint32))
 
 
 def test_v2_group_skips_shards(tmp_path):
