@@ -28,7 +28,6 @@ FIXTURE_FILES = (
     "knn_weights.npy",
     "atac_knn_indices.npy",
     "atac_knn_distances.npy",
-    "markers_all_clusters.csv",
     "markers_cluster1.csv",
     "unified_UMAP_coords.npy",
     "pseudotime_markers_r_values.csv",
