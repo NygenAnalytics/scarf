@@ -152,7 +152,12 @@ dev = [
 ]
 
 [tool.uv]
-no-binary-package = ["pcst-fast"]
+no-binary-package = ["pcst-fast", "hnswlib"]
+extra-build-variables = { hnswlib = { HNSWLIB_NO_NATIVE = "1" } }
+
+[tool.uv.pip]
+no-binary = ["hnswlib"]
+extra-build-variables = { hnswlib = { HNSWLIB_NO_NATIVE = "1" } }
 
 [tool.uv.extra-build-dependencies]
 pcst-fast = ["pybind11>=2.11"]
