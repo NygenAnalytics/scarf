@@ -21,7 +21,7 @@ execute-vignette:
 
 # Execute quickstart + all vignettes in parallel; merge into docs/.jupyter_cache.
 execute-vignettes execute-docs:
-	@uv run python execute_all_vignettes.py -j $(or $(JOBS),4)
+	@uv run python execute_all_vignettes.py -j $(or $(JOBS),1)
 
 # Remove cache entries whose source .md files were deleted.
 prune-stale-cache:

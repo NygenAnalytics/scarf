@@ -18,12 +18,12 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from numba import jit
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csc_matrix, csr_matrix, diags
 import zarr
 
 from .assay import Assay
 from .storage.zarr_store import accumulate_sparse_to_shards
-from .utils import controlled_compute, logger, tqdmbar
+from .utils import logger, tqdmbar
 from .writers import create_zarr_count_assay
 
 __all__ = ["GffReader", "coordinate_melding"]
@@ -213,14 +213,21 @@ def create_bed_from_coord_ids(ids: Iterable[str]) -> pd.DataFrame:
 
     Returns:
         A 3 column Pandas dataframe sorted by chromosome and start position
+        while preserving input indices so rows still align with assay feature
+        positions.
     """
 
-    out = []
-    for i in ids:
-        j = i.split(":")
-        o = [j[0], int(j[1].split("-")[0]), int(j[1].split("-")[1])]
-        out.append(o)
-    return pd.DataFrame(out).sort_values(by=[0, 1])
+    ser = pd.Series(list(ids), dtype="object")
+    chrom_rest = ser.str.split(":", expand=True)
+    start_end = chrom_rest[1].str.split("-", expand=True)
+    df = pd.DataFrame(
+        {
+            0: chrom_rest[0].to_numpy(),
+            1: start_end[0].astype(np.int64).to_numpy(),
+            2: start_end[1].astype(np.int64).to_numpy(),
+        }
+    )
+    return df.sort_values(by=[0, 1])
 
 
 @jit(nopython=True)
@@ -301,7 +308,7 @@ def get_ranges(df: pd.DataFrame, idx: np.ndarray) -> np.ndarray:
 
 def get_feature_mappings(
     peaks_bed_df: pd.DataFrame, features_bed_df: pd.DataFrame
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, csc_matrix]:
     """Identify which intervals from `features_bed_df` overlap with those from
     `peaks_bed_df`.
 
@@ -310,30 +317,35 @@ def get_feature_mappings(
                       'chrom', 'start', 'end'. It should be sorted by chromosome and start
         features_bed_df: DataFrame containing reference intervals. Must have at least 5 columns:
                          'chrom', 'start', 'end', 'ids', 'names'.
-                         It should be sorted by chromosome and start
+                         It should be sorted by chromosome and start. Features are retained even
+                         when their chromosome has no peaks.
 
     Returns:
-        A tuple containing three numpy arrays, the first two are simply the 'ids' and 'names'
-        columns from `features_bed_df`. These are returned to ensure that they are in same order
-        as the indices in the third array. The third array has shape (features_bed_df.shape[0], 2).
-        The values are indices of the overlapping intervals from peaks_bed_df. If no overlap is found
-        then that row has value [-1, -1].
+        A tuple containing the 'ids' and 'names' columns from `features_bed_df` (as numpy arrays)
+        and a sparse mapping matrix. The mapping has shape (n_peaks, n_features) where n_peaks is
+        `peaks_bed_df.shape[0]` and n_features is the number of features. A nonzero at position
+        (p, f) means peak `p` (indexed by its position in the assay) overlaps feature `f`. Peak
+        row indices use `peaks_bed_df.index` so they align with the columns of the assay count
+        matrix. Features are kept in the sorted feature BED order of the returned id/name arrays.
     """
 
-    cross_indices: list[list[int] | None] = []
     feats_ids: list[str] = []
     feats_names: list[str] = []
-    id_counter = {}
+    id_counter: dict[str, int] = {}
+    map_peak_rows: list[int] = []
+    map_feat_cols: list[int] = []
     n_no_match = 0
-    for chrom in peaks_bed_df[0].unique():
-        feats_chrom_idx = np.array(features_bed_df[0] == chrom)
-        if feats_chrom_idx.shape[0] == 0:
-            logger.warning(f"Chromosome {chrom} not in the input feature BED")
-            continue
+    feat_col = 0
+    peak_chroms = set(peaks_bed_df[0].unique())
 
-        feats_names.extend(features_bed_df[4][feats_chrom_idx].values)
+    for chrom in features_bed_df[0].unique():
+        feats_chrom_idx = (features_bed_df[0] == chrom).values
+        chrom_names = features_bed_df[4][feats_chrom_idx].values
+        chrom_ids = features_bed_df[3][feats_chrom_idx].values
+
+        feats_names.extend(chrom_names)
         # Making IDs unique
-        for i in features_bed_df[3][feats_chrom_idx].values:
+        for i in chrom_ids:
             if i not in id_counter:
                 id_counter[i] = 0
             id_counter[i] += 1
@@ -341,23 +353,31 @@ def get_feature_mappings(
                 i = i + f"_{id_counter[i]}"
             feats_ids.append(i)
 
-        peaks_chrom_idx = np.array(peaks_bed_df[0] == chrom)
+        if chrom not in peak_chroms:
+            # Features on this chromosome are kept but overlap nothing, so no peak is present.
+            logger.warning(f"Chromosome {chrom} not in the input peak coordinates")
+            n_no_match += len(chrom_ids)
+            feat_col += len(chrom_ids)
+            continue
+
+        peaks_chrom_idx = (peaks_bed_df[0] == chrom).values
 
         match_indices = binary_search(
             get_ranges(peaks_bed_df, peaks_chrom_idx),
             get_ranges(features_bed_df, feats_chrom_idx),
         ).astype(int)
 
-        # Now this is the main trick. Since the peak_bed_df is a sorted dataframe.
-        # The dataframe index might itself not be in sorted order.
+        # The peaks dataframe is sorted, so its positional index might not be in sorted order.
         peak_idx = np.array(peaks_bed_df.index[peaks_chrom_idx])
-        for i in match_indices:
-            if i[0] == -1:
-                assert i[1] == -1
-                cross_indices.append(None)
+        for m in match_indices:
+            if m[0] == -1:
+                assert m[1] == -1
                 n_no_match += 1
             else:
-                cross_indices.append(list(peak_idx[i[0] : i[1]]))
+                peaks_for_feat = peak_idx[m[0] : m[1]]
+                map_peak_rows.extend(peaks_for_feat.tolist())
+                map_feat_cols.extend([feat_col] * peaks_for_feat.shape[0])
+            feat_col += 1
 
     if len(feats_ids) == 0:
         raise ValueError(
@@ -365,41 +385,51 @@ def get_feature_mappings(
         )
     feats_ids_arr = np.array(feats_ids)
     feats_names_arr = np.array(feats_names)
-    cross_indices_arr = np.array(cross_indices, dtype=object)
-    if n_no_match == len(cross_indices_arr):
+    n_features = feats_ids_arr.shape[0]
+    if n_no_match == n_features:
         logging.critical(
             "None of the provided features overlap with the peak coordinates. "
             "Melding has possibly failed."
         )
     else:
-        logger.info(
-            f"{n_no_match}/{feats_ids_arr.shape[0]} features did not overlap with any peak"
-        )
-    if len(set(feats_ids_arr)) != feats_ids_arr.shape[0]:
+        logger.info(f"{n_no_match}/{n_features} features did not overlap with any peak")
+    if len(set(feats_ids_arr)) != n_features:
         raise ValueError(
             "ERROR: encountered an unexpected error. Somehow the feature ids are not unique "
             "despite our attempt to make them unique by appending a suffix. Please report this "
             "bug on Github"
         )
-    assert (
-        feats_ids_arr.shape[0] == feats_names_arr.shape[0] == cross_indices_arr.shape[0]
-    )
-    return feats_ids_arr, feats_names_arr, cross_indices_arr
+    assert feats_ids_arr.shape[0] == feats_names_arr.shape[0]
+    mapping = coo_matrix(
+        (
+            np.ones(len(map_peak_rows), dtype=np.float64),
+            (
+                np.asarray(map_peak_rows, dtype=np.int64),
+                np.asarray(map_feat_cols, dtype=np.int64),
+            ),
+        ),
+        shape=(peaks_bed_df.shape[0], n_features),
+    ).tocsc()
+    return feats_ids_arr, feats_names_arr, mapping
 
 
 def create_counts_mat(
     assay: Assay,
     store: zarr.Array,
-    cross_map: np.ndarray,
+    mapping: csc_matrix,
     scalar_coeff: float,
     renormalization: bool,
 ) -> None:
     """Populate the count matrix in the Zarr store.
 
+    The melded value of a feature for a given cell is the sum of the TF-IDF normalized values of
+    all peaks overlapping that feature. This is computed per block as a sparse matrix product
+    between the TF-IDF matrix and the peak-to-feature `mapping` matrix.
+
     Args:
         assay: Scarf Assay object which contains the rawData attribute representing a chunked array of count matrix
         store: Output Zarr Dataset
-        cross_map: Mapping of indices. as obtained from get_feature_mappings function
+        mapping: Sparse peak-to-feature mapping of shape (n_peaks, n_features) from get_feature_mappings
         scalar_coeff: An arbitrary scalar multiplier. Only used when renormalization is True.
         renormalization: Whether to rescale the sum of feature values for each cell to `scalar_coeff`
 
@@ -407,38 +437,28 @@ def create_counts_mat(
         None
     """
 
-    idx = np.where(cross_map)[0]
-    feat_idx = np.repeat(idx, list(map(len, cross_map[idx])))
-    peak_idx = np.array(
-        sum(list(cross_map[idx]), [])
-    )  # There is no guarantee that these are in sorted order
-    assert feat_idx.shape == peak_idx.shape
-
     n_term_per_doc = assay.cells.fetch_all(assay.name + "_nFeatures")
     n_docs = n_term_per_doc.shape[0]
     n_docs_per_term = assay.feats.fetch_all("nCells")
+    idf = np.log2(1 + (n_docs / (n_docs_per_term + 1)))
 
     def block_stream() -> Iterator[coo_matrix]:
         s = 0
-        for a in tqdmbar(assay.rawData.blocks, total=assay.rawData.numblocks[0]):
-            a = controlled_compute(a, assay.nthreads)
+        # stream_blocks yields materialized, in-order row blocks with bounded
+        # read-ahead so the next block is fetched while the current one is
+        # normalized and written. This overlaps read latency with compute and
+        # writes, which matters most for remote (cloud) stores.
+        for a in assay.rawData.stream_blocks(msg="Melding assay"):
             tf = a / n_term_per_doc[s : s + a.shape[0]].reshape(-1, 1)
-            idf = np.log2(1 + (n_docs / (n_docs_per_term + 1)))
-            a = tf * idf
-
-            df = pd.DataFrame(a[:, peak_idx]).T
-            df["fidx"] = feat_idx
-            df = df.groupby("fidx").sum().T
+            tfidf = tf * idf
+            block = (csr_matrix(tfidf) @ mapping).tocsr()
             if renormalization:
-                df = (scalar_coeff * df) / df.sum(axis=1).values.reshape(-1, 1)
-            assert df.shape[1] == idx.shape[0]
-
-            coord_renamer = dict(enumerate(df.columns))
-            coo = coo_matrix(df.values)
-            coo.col = np.array([coord_renamer[x] for x in coo.col])
-            yield coo_matrix(
-                (coo.data, (coo.row, coo.col)), shape=(a.shape[0], len(idx))
-            )
+                row_sums = np.asarray(block.sum(axis=1)).reshape(-1)
+                scale = np.zeros(row_sums.shape[0], dtype=np.float64)
+                nz = row_sums != 0
+                scale[nz] = scalar_coeff / row_sums[nz]
+                block = diags(scale) @ block
+            yield block.tocoo()
             s += a.shape[0]
 
     accumulate_sparse_to_shards(store, block_stream())
@@ -452,6 +472,7 @@ def coordinate_melding(
     peaks_col: str = "ids",
     scalar_coeff: float = 1e5,
     renormalization: bool = True,
+    peaks_coords: np.ndarray | None = None,
 ) -> None:
     """This function the coordinates of the features of the given assay and
     overlaps (genomics intersection) them with a user provided set of external
@@ -461,13 +482,15 @@ def coordinate_melding(
     from original feature. Similarly, a single original feature may overlap
     with multiple new features and hence its value will used for multiple new
     features. The values are TF-IDF normalized before they are saved into the
-    new assay.
+    new assay. Features that do not overlap any peak are retained with zero
+    counts; DataStore reload marks those zero-count features invalid.
 
     Args:
         assay: Scarf Assay object which contains the rawData attribute representing a chunked array of count matrix.
         workspace:
         feature_bed: DataFrame containing reference intervals. Must have at least 5 columns representing
-                    'chrom', 'start', 'end', 'ids', 'names'. But the column names should 0,1,2,3,4
+                    'chrom', 'start', 'end', 'ids', 'names'. But the column names should 0,1,2,3,4.
+                    Output feature order follows this dataframe.
         new_assay_name: Name of the new melded assay
         peaks_col: The name of the column in the feature metadata that contains the coordinate information. This
                    column should have coordinates in this format <chrom:start-end>. The values from this
@@ -475,13 +498,17 @@ def coordinate_melding(
         scalar_coeff: An arbitrary scalar multiplier. Only used when renormalization is True (Default value: 1e5)
         renormalization: Whether to rescale the sum of feature values for each cell to `scalar_coeff`
                          (Default value: True)
+        peaks_coords: Optional pre-fetched peak coordinate strings for `peaks_col`. When provided,
+                      the coordinates are not fetched again from the assay.
 
     Returns:
         None
     """
 
-    peaks_bed = create_bed_from_coord_ids(assay.feats.fetch_all(peaks_col))
-    feat_ids, feat_names, mappings = get_feature_mappings(peaks_bed, feature_bed)
+    if peaks_coords is None:
+        peaks_coords = assay.feats.fetch_all(peaks_col)
+    peaks_bed = create_bed_from_coord_ids(peaks_coords)
+    feat_ids, feat_names, mapping = get_feature_mappings(peaks_bed, feature_bed)
 
     from .storage.zarr_store import zarr_group_root
 
@@ -500,7 +527,7 @@ def coordinate_melding(
     create_counts_mat(
         assay=assay,
         store=g,
-        cross_map=mappings,
+        mapping=mapping,
         scalar_coeff=scalar_coeff,
         renormalization=renormalization,
     )

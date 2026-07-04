@@ -1630,14 +1630,20 @@ class GraphDataStore(BaseDataStore):
                     self.zw[reduction_loc], name=reduction_loc
                 )
                 if ann_obj.harmonizedData is not None:
+                    harmonized = ann_obj.harmonizedData
                     g = create_zarr_dataset(
                         reduction_grp,
                         "harmonizedData",
-                        data.chunksize,
+                        harmonized.chunksize,
                         "f8",
-                        ann_obj.harmonizedData.shape,
+                        harmonized.shape,
                     )
-                    g[:] = ann_obj.harmonizedData
+                    start = 0
+                    for block in harmonized.blocks:
+                        values = np.asarray(block.compute())
+                        stop = start + values.shape[0]
+                        g[start:stop, :] = values
+                        start = stop
                     g.attrs["batches"] = batch_columns
             if save_ann:
                 if ann_loc not in self.zw:

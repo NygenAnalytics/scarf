@@ -1286,6 +1286,8 @@ class DataStore(MappingDatastore):
 
         This method has been designed for snATAC-Seq data and can be used to quantify accessibility of specific
         genomic loci such as gene bodies, promoters, enhancers, motifs, etc.
+        Features from the BED file are retained even when they do not overlap any peak; those zero-count features
+        are marked invalid during assay initialization.
 
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
@@ -1326,15 +1328,22 @@ class DataStore(MappingDatastore):
         )
 
         peaks_coords = assay.feats.fetch_all(peaks_col)
-        for n, i in enumerate(peaks_coords):
-            error_msg = (
-                f"ERROR: Coordinate format check failed for element: {i} (position {n}). The format should "
-                f"be chr:start-end. Please note the colon and hyphen position"
+        coords_ser = pd.Series(peaks_coords, dtype="object")
+        string_mask = coords_ser.map(lambda x: isinstance(x, str))
+        colon_counts = coords_ser.str.count(":")
+        hyphen_counts = coords_ser.str.split(":").str[-1].str.count("-")
+        invalid_mask = (
+            ~string_mask
+            | colon_counts.ne(1).fillna(True)
+            | hyphen_counts.ne(1).fillna(True)
+        )
+        invalid_coords = invalid_mask.to_numpy(dtype=bool)
+        if invalid_coords.any():
+            n = int(np.flatnonzero(invalid_coords)[0])
+            raise ValueError(
+                f"ERROR: Coordinate format check failed for element: {peaks_coords[n]} (position {n}). "
+                f"The format should be chr:start-end. Please note the colon and hyphen position"
             )
-            if len(i.split(":")) != 2:
-                raise ValueError(error_msg)
-            if len(i.split(":")[1].split("-")) != 2:
-                raise ValueError(error_msg)
 
         coordinate_melding(
             assay,
@@ -1344,6 +1353,7 @@ class DataStore(MappingDatastore):
             peaks_col=peaks_col,
             scalar_coeff=scalar_coeff,
             renormalization=renormalization,
+            peaks_coords=peaks_coords,
         )
 
         self._load_assays(min_cells=10, custom_assay_types={assay_label: assay_type})

@@ -5,28 +5,52 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+from docs.execute_vignette import configure_doc_execution_env
 
 DOCS_ROOT = Path(__file__).resolve().parent
 PARALLEL_CACHE = DOCS_ROOT / ".jupyter_cache" / "_parallel"
+EXECUTE_SCRIPT = DOCS_ROOT / "execute_vignette.py"
 
 
-def _worker(name: str) -> Path:
-    repo_root = DOCS_ROOT.parent
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    from docs.execute_vignette import execute_vignette
-
+def _run_vignette_subprocess(name: str) -> Path:
+    """Run one vignette in a fresh Python process so memory is fully released."""
     cache_path = PARALLEL_CACHE / name
     if cache_path.exists():
         shutil.rmtree(cache_path)
-    execute_vignette(
-        name,
-        cache_path=cache_path,
-        execution_in_temp=True,
+
+    env = os.environ.copy()
+    configure_doc_execution_env()
+    env.update(
+        {
+            "SCARF_MEM_BUDGET": os.environ["SCARF_MEM_BUDGET"],
+            "SCARF_WORKING_COPIES": os.environ["SCARF_WORKING_COPIES"],
+            "SCARF_WORKERS": os.environ["SCARF_WORKERS"],
+            "OMP_NUM_THREADS": os.environ["OMP_NUM_THREADS"],
+            "MKL_NUM_THREADS": os.environ["MKL_NUM_THREADS"],
+            "OPENBLAS_NUM_THREADS": os.environ["OPENBLAS_NUM_THREADS"],
+            "NUMEXPR_NUM_THREADS": os.environ["NUMEXPR_NUM_THREADS"],
+        }
     )
+    cmd = [
+        sys.executable,
+        str(EXECUTE_SCRIPT),
+        name,
+        "--cache-path",
+        str(cache_path),
+        "--force",
+    ]
+    result = subprocess.run(
+        cmd,
+        cwd=DOCS_ROOT.parent,
+        env=env,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd)
     return cache_path
 
 
@@ -36,8 +60,11 @@ def main() -> None:
         "-j",
         "--jobs",
         type=int,
-        default=min(4, os.cpu_count() or 1),
-        help="Number of parallel workers (default: min(4, cpu_count))",
+        default=1,
+        help=(
+            "Number of vignettes to run concurrently (default: 1). "
+            "Each vignette runs in its own Python process."
+        ),
     )
     parser.add_argument(
         "vignettes",
@@ -45,6 +72,13 @@ def main() -> None:
         help="Vignette names without .md extension (default: all)",
     )
     args = parser.parse_args()
+    if args.jobs < 1:
+        raise SystemExit("--jobs must be >= 1")
+    if args.jobs > 1:
+        print(
+            "WARNING: Each vignette can use several GB. Prefer -j 1 on WSL.",
+            flush=True,
+        )
 
     repo_root = DOCS_ROOT.parent
     sys.path.insert(0, str(repo_root))
@@ -64,12 +98,15 @@ def main() -> None:
 
     failures: list[tuple[str, str]] = []
     completed_caches: list[Path] = []
-    with ProcessPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(_worker, name): name for name in names}
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = {pool.submit(_run_vignette_subprocess, name): name for name in names}
         for future in as_completed(futures):
             name = futures[future]
             try:
                 completed_caches.append(future.result())
+            except subprocess.CalledProcessError as exc:
+                failures.append((name, f"exit code {exc.returncode}"))
+                print(f"[{name}] FAILED: exit code {exc.returncode}", flush=True)
             except Exception as exc:
                 failures.append((name, str(exc)))
                 print(f"[{name}] FAILED: {exc}", flush=True)
