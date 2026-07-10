@@ -6,6 +6,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.storage.zarr_store import (
+    accumulate_sparse_to_shards,
     copy_zarr_array,
     copy_zarr_group_tree,
     create_numeric_array,
@@ -88,6 +89,42 @@ def test_copy_zarr_array_round_trip(tmp_path):
     dst = create_numeric_array(dst_root, "data", spec)
     copy_zarr_array(src, dst, block_rows=16)
     np.testing.assert_allclose(dst[:], expected, rtol=1e-6)
+
+
+def test_accumulate_sparse_to_shards_preserves_offsets_across_zero_runs():
+    from scipy.sparse import coo_matrix
+
+    root = _memory_group()
+    dst = root.create_array(
+        "counts",
+        shape=(36, 3),
+        chunks=(2, 3),
+        dtype=np.uint32,
+        fill_value=0,
+    )
+
+    zero_batch = coo_matrix((1, 3), dtype=np.uint32)
+    batches = [
+        coo_matrix(
+            (np.array([11], dtype=np.uint32), ([0], [0])),
+            shape=(1, 3),
+        ),
+        *[zero_batch for _ in range(32)],
+        coo_matrix(
+            (np.array([22, 33], dtype=np.uint32), ([0, 1], [1, 2])),
+            shape=(2, 3),
+        ),
+        zero_batch,
+    ]
+
+    rows_written = accumulate_sparse_to_shards(dst, iter(batches), shard_rows=2)
+
+    expected = np.zeros((36, 3), dtype=np.uint32)
+    expected[0, 0] = 11
+    expected[33, 1] = 22
+    expected[34, 2] = 33
+    assert rows_written == 36
+    np.testing.assert_array_equal(dst[:], expected)
 
 
 def test_copy_zarr_group_tree(tmp_path):

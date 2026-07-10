@@ -1,3 +1,5 @@
+import threading
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -48,6 +50,16 @@ class _MergeAssay:
             I=np.ones(len(cell_ids), dtype=bool),
         )
         self.feats = _MergeMeta(ids=feature_ids, names=feature_names)
+
+
+class _MergeDataStore:
+    def __init__(self, assays):
+        self._assays = {assay.name: assay for assay in assays}
+        self.assay_names = list(self._assays)
+        self.cells = assays[0].cells
+
+    def get_assay(self, name):
+        return self._assays[name]
 
 
 @pytest.fixture
@@ -134,6 +146,87 @@ def test_assay_merge_maps_features_and_preserves_row_order(
     assert counts_array.fill_value == 0
 
 
+def test_assay_merge_preserves_order_when_prefetch_finishes_out_of_order(
+    monkeypatch,
+    tmp_path,
+    tiny_merge_budget,
+):
+    import scarf.merge as merge_module
+
+    cell_ids = ["c0", "c1", "c2", "c3"]
+    left = _MergeAssay(
+        "RNA",
+        [[1, 10], [2, 20], [3, 30], [4, 40]],
+        cell_ids,
+        ["id_a", "id_b"],
+        ["A", "B"],
+        block_size=1,
+    )
+    right = _MergeAssay(
+        "RNA",
+        [[50, 500], [60, 600], [70, 700], [80, 800]],
+        cell_ids,
+        ["id_b", "id_c"],
+        ["B", "C"],
+        block_size=4,
+    )
+    first_started = threading.Event()
+    second_finished = threading.Event()
+    lock = threading.Lock()
+    call_count = 0
+    completed: list[int] = []
+    original_compute = merge_module.controlled_compute
+
+    def delayed_compute(arr, nthreads):
+        nonlocal call_count
+        with lock:
+            call_index = call_count
+            call_count += 1
+        if call_index == 0:
+            first_started.set()
+            if not second_finished.wait(timeout=2):
+                raise RuntimeError("Second prefetched block did not complete")
+        elif call_index == 1:
+            if not first_started.wait(timeout=2):
+                raise RuntimeError("First prefetched block did not start")
+
+        result = original_compute(arr, nthreads)
+        with lock:
+            completed.append(call_index)
+        if call_index == 1:
+            second_finished.set()
+        return result
+
+    monkeypatch.setattr(merge_module, "controlled_compute", delayed_compute)
+    fn = str(tmp_path / "out_of_order_prefetch.zarr")
+    writer = AssayMerge(
+        zarr_path=fn,
+        assays=[left, right],
+        names=["left", "right"],
+        merge_assay_name="RNA",
+        prepend_text="",
+        seed=3,
+    )
+    writer.dump()
+
+    assert completed.index(1) < completed.index(0)
+    root = zarr.open_group(fn, mode="r")
+    counts = np.asarray(root["RNA/counts"][:])
+    merged_cell_ids = np.asarray(root["cellData/ids"][:]).astype(str)
+    expected = {
+        "left__c0": [1, 10, 0],
+        "left__c1": [2, 20, 0],
+        "left__c2": [3, 30, 0],
+        "left__c3": [4, 40, 0],
+        "right__c0": [0, 50, 500],
+        "right__c1": [0, 60, 600],
+        "right__c2": [0, 70, 700],
+        "right__c3": [0, 80, 800],
+    }
+    for cell_id, row in zip(merged_cell_ids, counts, strict=True):
+        np.testing.assert_array_equal(row, expected[cell_id])
+
+
 def test_dask_to_coo_sums_consolidated_features():
     merge = object.__new__(AssayMerge)
     merge.nFeats = 1
@@ -148,6 +241,166 @@ def test_dask_to_coo_sums_consolidated_features():
 
     assert result.nnz == 2
     np.testing.assert_array_equal(result.toarray(), [[5], [12]])
+
+
+def test_dataset_merge_shares_row_order_across_assay_chunk_sizes(
+    tmp_path,
+    tiny_merge_budget,
+):
+    from scarf.merge import DatasetMerge
+
+    cell_ids = ["c0", "c1", "c2", "c3", "c4"]
+    left = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                [[1, 10], [2, 20], [3, 30], [4, 40], [5, 50]],
+                cell_ids,
+                ["rna_a", "rna_b"],
+                ["RNA A", "RNA B"],
+                block_size=3,
+            ),
+            _MergeAssay(
+                "ADT",
+                [[101, 110], [102, 120], [103, 130], [104, 140], [105, 150]],
+                cell_ids,
+                ["adt_a", "adt_b"],
+                ["ADT A", "ADT B"],
+                block_size=2,
+            ),
+        ]
+    )
+    right = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                [[6, 60], [7, 70], [8, 80], [9, 90], [10, 100]],
+                cell_ids,
+                ["rna_a", "rna_b"],
+                ["RNA A", "RNA B"],
+                block_size=3,
+            ),
+            _MergeAssay(
+                "ADT",
+                [[106, 160], [107, 170], [108, 180], [109, 190], [110, 200]],
+                cell_ids,
+                ["adt_a", "adt_b"],
+                ["ADT A", "ADT B"],
+                block_size=2,
+            ),
+        ]
+    )
+    fn = str(tmp_path / "mixed_assay_chunks.zarr")
+
+    writer = DatasetMerge(
+        datasets=[left, right],
+        zarr_path=fn,
+        names=["left", "right"],
+        prepend_text="",
+        seed=3,
+    )
+    writer.dump()
+
+    assert writer.unique_assays == ["RNA", "ADT"]
+    for generator in writer.merge_generators:
+        assert (
+            max(
+                rows.size
+                for blocks in generator.permutations_rows.values()
+                for rows in blocks.values()
+            )
+            <= 2
+        )
+    root = zarr.open_group(fn, mode="r")
+    merged_cell_ids = np.asarray(root["cellData/ids"][:]).astype(str)
+    rna = np.asarray(root["RNA/counts"][:])
+    adt = np.asarray(root["ADT/counts"][:])
+    expected = {
+        "left__c0": ([1, 10], [101, 110]),
+        "left__c1": ([2, 20], [102, 120]),
+        "left__c2": ([3, 30], [103, 130]),
+        "left__c3": ([4, 40], [104, 140]),
+        "left__c4": ([5, 50], [105, 150]),
+        "right__c0": ([6, 60], [106, 160]),
+        "right__c1": ([7, 70], [107, 170]),
+        "right__c2": ([8, 80], [108, 180]),
+        "right__c3": ([9, 90], [109, 190]),
+        "right__c4": ([10, 100], [110, 200]),
+    }
+    for cell_id, rna_row, adt_row in zip(
+        merged_cell_ids,
+        rna,
+        adt,
+        strict=True,
+    ):
+        expected_rna, expected_adt = expected[cell_id]
+        np.testing.assert_array_equal(rna_row, expected_rna)
+        np.testing.assert_array_equal(adt_row, expected_adt)
+
+
+def test_dataset_merge_shared_row_plan_handles_missing_assays(
+    tmp_path,
+    tiny_merge_budget,
+):
+    from scarf.merge import DatasetMerge
+
+    cell_ids = ["c0", "c1", "c2"]
+    left = _MergeDataStore(
+        [
+            _MergeAssay(
+                "RNA",
+                [[1, 10], [2, 20], [3, 30]],
+                cell_ids,
+                ["rna_a", "rna_b"],
+                ["RNA A", "RNA B"],
+                block_size=3,
+            )
+        ]
+    )
+    right = _MergeDataStore(
+        [
+            _MergeAssay(
+                "ADT",
+                [[101, 110], [102, 120], [103, 130]],
+                cell_ids,
+                ["adt_a", "adt_b"],
+                ["ADT A", "ADT B"],
+                block_size=2,
+            )
+        ]
+    )
+    fn = str(tmp_path / "missing_assays.zarr")
+
+    writer = DatasetMerge(
+        datasets=[left, right],
+        zarr_path=fn,
+        names=["left", "right"],
+        prepend_text="",
+        seed=3,
+    )
+    writer.dump()
+
+    root = zarr.open_group(fn, mode="r")
+    merged_cell_ids = np.asarray(root["cellData/ids"][:]).astype(str)
+    rna = np.asarray(root["RNA/counts"][:])
+    adt = np.asarray(root["ADT/counts"][:])
+    expected = {
+        "left__c0": ([1, 10], [0, 0]),
+        "left__c1": ([2, 20], [0, 0]),
+        "left__c2": ([3, 30], [0, 0]),
+        "right__c0": ([0, 0], [101, 110]),
+        "right__c1": ([0, 0], [102, 120]),
+        "right__c2": ([0, 0], [103, 130]),
+    }
+    for cell_id, rna_row, adt_row in zip(
+        merged_cell_ids,
+        rna,
+        adt,
+        strict=True,
+    ):
+        expected_rna, expected_adt = expected[cell_id]
+        np.testing.assert_array_equal(rna_row, expected_rna)
+        np.testing.assert_array_equal(adt_row, expected_adt)
 
 
 def test_dataset_merge_2(datastore, rna_raw_total, assay2_raw_total, tmp_path):

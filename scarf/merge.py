@@ -15,7 +15,7 @@ import zarr
 from scipy.sparse import coo_matrix
 
 from ._types import as_zarr_array, as_zarr_group
-from .chunked import ChunkedArray
+from .chunked import Block, ChunkedArray
 from .assay import Assay
 from .datastore.datastore import DataStore
 from .metadata import MetaData
@@ -64,6 +64,12 @@ class DummyAssay:
 
 
 type MergeAssay = Assay | DummyAssay
+
+type _RowPlan = tuple[
+    dict[int, dict[int, np.ndarray]],
+    dict[int, dict[int, np.ndarray]],
+    np.ndarray,
+]
 
 
 class AssayMerge:
@@ -117,6 +123,8 @@ class AssayMerge:
         reset_cell_filter: bool = True,
         seed: int | None = 42,
         storage_options: dict[str, Any] | None = None,
+        _row_plan: _RowPlan | None = None,
+        _row_chunk_sizes: list[int] | None = None,
     ) -> None:
         self.assays = assays
         self.names = names
@@ -125,11 +133,25 @@ class AssayMerge:
         self.merge_assay_name = merge_assay_name
         self.chunk_size = chunk_size
         self.storage_options = storage_options
+        self._usesSharedRowPlan = _row_plan is not None or _row_chunk_sizes is not None
+        row_plan = (
+            self.perform_randomization_rows(seed, _row_chunk_sizes)
+            if _row_plan is None
+            else _row_plan
+        )
         (
             self.permutations_rows,
             self.permutations_rows_offset,
             self.coordinates_permutations,
-        ) = self.perform_randomization_rows(seed)
+        ) = row_plan
+        for assay_idx, assay in enumerate(self.assays):
+            planned_rows = sum(
+                rows.size for rows in self.permutations_rows[assay_idx].values()
+            )
+            if planned_rows != assay.rawData.shape[0]:
+                raise ValueError(
+                    "All assays from a datastore must contain the same number of cells"
+                )
         self.mergedCells: pd.DataFrame = self._merge_cell_table(
             reset_cell_filter, prepend_text
         )
@@ -181,7 +203,9 @@ class AssayMerge:
         )
 
     def perform_randomization_rows(
-        self, seed: int | None = 42
+        self,
+        seed: int | None = 42,
+        row_chunk_sizes: list[int] | None = None,
     ) -> tuple[
         dict[int, dict[int, np.ndarray]], dict[int, dict[int, np.ndarray]], np.ndarray
     ]:
@@ -192,7 +216,14 @@ class AssayMerge:
         Returns:
         """
         rng = np.random.default_rng(seed=seed)
-        chunkSize = np.array([x.rawData.chunksize[0] for x in self.assays])
+        if row_chunk_sizes is None:
+            chunkSize = np.array([x.rawData.chunksize[0] for x in self.assays])
+        else:
+            if len(row_chunk_sizes) != len(self.assays):
+                raise ValueError("Row chunk sizes must match the number of assays")
+            chunkSize = np.asarray(row_chunk_sizes, dtype=int)
+            if np.any(chunkSize <= 0):
+                raise ValueError("Row chunk sizes must be positive")
         nCells = np.array([x.rawData.shape[0] for x in self.assays])
         permutations = {
             i: permute_into_chunks(nCells[i], chunkSize[i])
@@ -645,7 +676,11 @@ class AssayMerge:
 
         Returns:
         """
-        assay_blocks = [list(assay.rawData.blocks) for assay in self.assays]
+        assay_blocks = (
+            []
+            if self._usesSharedRowPlan
+            else [list(assay.rawData.blocks) for assay in self.assays]
+        )
         coordinates = [
             (int(assay_idx), int(block_idx))
             for assay_idx, block_idx in self.coordinates_permutations
@@ -663,8 +698,18 @@ class AssayMerge:
         def convert_block(coordinate: tuple[int, int]) -> coo_matrix:
             assay_idx, block_idx = coordinate
             perm_order = self.permutations_rows[assay_idx][block_idx]
-            perm_order = perm_order - perm_order.min()
-            block = assay_blocks[assay_idx][block_idx][perm_order, :]
+            if self._usesSharedRowPlan:
+                row_start = int(perm_order.min())
+                row_end = int(perm_order.max()) + 1
+                block = Block(
+                    self.assays[assay_idx].rawData,
+                    row_start,
+                    row_end,
+                    row_perm=perm_order - row_start,
+                )
+            else:
+                local_order = perm_order - perm_order.min()
+                block = assay_blocks[assay_idx][block_idx][local_order, :]
             return self._dask_to_coo(
                 block,
                 self.featOrder[assay_idx],
@@ -783,16 +828,28 @@ class DatasetMerge:
         """
         Get unique assays from both datasets
         """
-        unique_assays = set()
+        unique_assays = []
+        seen = set()
         for ds in self.datasets:
-            unique_assays.update(ds.assay_names)
-        return list(unique_assays)
+            for assay_name in ds.assay_names:
+                if assay_name not in seen:
+                    seen.add(assay_name)
+                    unique_assays.append(assay_name)
+        return unique_assays
 
     def create_merge_generators(self) -> list[AssayMerge]:
         """
         Create AssayMerge objects for each unique assay
         """
         gens: list[AssayMerge] = []
+        shared_row_plan: _RowPlan | None = None
+        row_chunk_sizes = [
+            min(
+                int(ds.get_assay(assay_name).rawData.chunksize[0])
+                for assay_name in ds.assay_names
+            )
+            for ds in self.datasets
+        ]
         for assay in self.unique_assays:
             assay_list: list[MergeAssay] = []
             for ds in self.datasets:
@@ -800,23 +857,30 @@ class DatasetMerge:
                     assay_list.append(ds.get_assay(assay))
                 else:
                     assay_list.append(self.generate_dummy_assay(ds, assay))
-            gens.append(
-                AssayMerge(
-                    zarr_path=self.zarr_path,
-                    assays=assay_list,
-                    names=self.names,
-                    merge_assay_name=assay,
-                    in_workspaces=self.in_workspaces,
-                    out_workspace=self.out_workspace,
-                    chunk_size=self.chunk_size,
-                    dtype=self.dtype,
-                    overwrite=self.overwrite,
-                    prepend_text=self.prepend_text,
-                    reset_cell_filter=self.reset_cell_filter,
-                    seed=self.seed,
-                    storage_options=self.storage_options,
-                )
+            generator = AssayMerge(
+                zarr_path=self.zarr_path,
+                assays=assay_list,
+                names=self.names,
+                merge_assay_name=assay,
+                in_workspaces=self.in_workspaces,
+                out_workspace=self.out_workspace,
+                chunk_size=self.chunk_size,
+                dtype=self.dtype,
+                overwrite=self.overwrite,
+                prepend_text=self.prepend_text,
+                reset_cell_filter=self.reset_cell_filter,
+                seed=self.seed,
+                storage_options=self.storage_options,
+                _row_plan=shared_row_plan,
+                _row_chunk_sizes=row_chunk_sizes,
             )
+            gens.append(generator)
+            if shared_row_plan is None:
+                shared_row_plan = (
+                    generator.permutations_rows,
+                    generator.permutations_rows_offset,
+                    generator.coordinates_permutations,
+                )
         return gens
 
     def generate_dummy_assay(self, ds: DataStore, assay_name: str) -> DummyAssay:
