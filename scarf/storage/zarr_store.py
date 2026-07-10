@@ -475,9 +475,10 @@ def accumulate_sparse_to_shards(
         coo = batch if hasattr(batch, "row") else coo_matrix(batch)
         if coo.shape[0] == 0:
             continue
-        buf_row.append(np.asarray(coo.row, dtype=np.int64) + s)
-        buf_col.append(np.asarray(coo.col, dtype=np.int64))
-        buf_data.append(np.asarray(coo.data))
+        if coo.nnz:
+            buf_row.append(np.asarray(coo.row, dtype=np.int64) + s)
+            buf_col.append(np.asarray(coo.col, dtype=np.int64))
+            buf_data.append(np.asarray(coo.data))
         s += coo.shape[0]
         flush_through(s)
 

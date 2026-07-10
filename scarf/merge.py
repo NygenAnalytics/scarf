@@ -6,6 +6,7 @@ Methods and classes for merging datasets
 import os
 import re
 from collections import Counter
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
@@ -24,10 +25,17 @@ from .utils import (
     load_zarr,
     logger,
     permute_into_chunks,
+    prefetch_blocks,
     tqdmbar,
 )
-from .storage.zarr_store import is_local_zarr_path
-from .writers import create_zarr_count_assay, create_zarr_obj_array, create_zarr_dataset
+from .storage.budget import worker_prefetch_depth
+from .storage.zarr_store import accumulate_sparse_to_shards, is_local_zarr_path
+from .writers import (
+    create_zarr_count_assay,
+    create_zarr_dataset,
+    create_zarr_obj_array,
+    finalize_writer_counts,
+)
 
 __all__ = [
     "DatasetMerge",
@@ -527,7 +535,7 @@ class AssayMerge:
             assay_slot = merge_assay_name
         else:
             cell_slot = f"{self.outWorkspace}/cellData"
-            assay_slot = f"{self.outWorkspace}/merge_assay_name"
+            assay_slot = f"{self.outWorkspace}/{merge_assay_name}"
 
         try:
             z = load_zarr(zarr_loc, mode="r", storage_options=self.storage_options)
@@ -557,7 +565,7 @@ class AssayMerge:
                     "existing file or choose another path"
                 )
             return load_zarr(zarr_loc, mode="r+", storage_options=self.storage_options)
-        except (ValueError, FileNotFoundError):
+        except FileNotFoundError:
             # So no zarr file with same name exists. Check if a non zarr folder with the same name exists
             if (
                 is_local_zarr_path(zarr_loc)
@@ -609,30 +617,25 @@ class AssayMerge:
         Returns:
             Sparse COO matrix
 
-        This function takes a chunked array block and converts it to a sparse COO matrix.
-        The `order` is the original feature indices and `order_map` is the consolidated feature indices
-        i.e. the indices of the features in the merged assay. If the `order` and `order_map` are the same,
-        then the function will directly convert the block to a COO matrix. If they are different,
-        then the function will consolidate the data from the block to the COO matrix using the `order_map`.
-        For multiple indices mapping to the same consolidated index, the data is summed up.
+        Each source column is remapped through `order_map` to its merged feature
+        index. If multiple source columns map to the same merged feature, their
+        values are summed.
         """
-        if np.array_equal(order, order_map):
-            return coo_matrix(controlled_compute(d_arr, n_threads))
-
         computed_data = controlled_compute(d_arr, n_threads)
-        consolidation_map = {orig: cons for orig, cons in zip(order, order_map)}
-        rows: list[int] = []
-        cols: list[int] = []
-        data: list[Any] = []
-        for i, col_data in enumerate(computed_data.T):
-            consolidated_idx = consolidation_map[order[i]]
-            nz = np.flatnonzero(col_data)
-            if nz.size == 0:
-                continue
-            rows.extend(nz)
-            cols.extend([consolidated_idx] * nz.size)
-            data.extend(col_data[nz])
-        return coo_matrix((data, (rows, cols)), shape=(d_arr.shape[0], self.nFeats))
+        if (
+            order.shape != order_map.shape
+            or order_map.shape[0] != computed_data.shape[1]
+        ):
+            raise ValueError("Feature order does not match the source matrix width")
+
+        source = coo_matrix(computed_data)
+        mapped = coo_matrix(
+            (source.data, (source.row, order_map[source.col])),
+            shape=(computed_data.shape[0], self.nFeats),
+        )
+        if not np.array_equal(order, order_map):
+            mapped.sum_duplicates()
+        return mapped
 
     def dump(self, nthreads: int = 4) -> None:
         """Copy the values from individual assays to the merged assay.
@@ -642,32 +645,59 @@ class AssayMerge:
 
         Returns:
         """
-        counter = 0
-        for i, (assay, feat_order, feat_order_map) in enumerate(
-            zip(self.assays, self.featOrder, self.featOrder_map)
-        ):
-            for j, block in tqdmbar(
-                enumerate(assay.rawData.blocks),
-                total=assay.rawData.numblocks[0],
-                desc=f"Writing data from assay {i + 1}/{len(self.assays)} to merged file",
-            ):
-                # Perform the inter-chunk permutation of the rows
-                perm_order = self.permutations_rows[i][j]
-                perm_order = perm_order - perm_order.min()
-                block = block[perm_order, :]
-                a = self._dask_to_coo(block, feat_order, feat_order_map, nthreads)
-                # Here we use the one-to-one mapping of the chunks in the assays to the chunks in the merged assay to bring the data in the same order.
-                row_idx = self.cellOrder[i][j]
-                self.assayGroup.set_coordinate_selection(
-                    (a.row + row_idx.min(), a.col), a.data.astype(self.assayGroup.dtype)
+        assay_blocks = [list(assay.rawData.blocks) for assay in self.assays]
+        coordinates = [
+            (int(assay_idx), int(block_idx))
+            for assay_idx, block_idx in self.coordinates_permutations
+        ]
+
+        expected_start = 0
+        for assay_idx, block_idx in coordinates:
+            row_idx = self.cellOrder[assay_idx][block_idx]
+            if row_idx.size == 0 or int(row_idx[0]) != expected_start:
+                raise AssertionError(
+                    "ERROR: Merged block order does not match the cell metadata order."
                 )
-                counter += a.shape[0]
-        try:
-            assert counter == self.nCells
-        except AssertionError:
+            expected_start += row_idx.size
+
+        def convert_block(coordinate: tuple[int, int]) -> coo_matrix:
+            assay_idx, block_idx = coordinate
+            perm_order = self.permutations_rows[assay_idx][block_idx]
+            perm_order = perm_order - perm_order.min()
+            block = assay_blocks[assay_idx][block_idx][perm_order, :]
+            return self._dask_to_coo(
+                block,
+                self.featOrder[assay_idx],
+                self.featOrder_map[assay_idx],
+                nthreads,
+            )
+
+        def block_stream() -> Iterator[coo_matrix]:
+            blocks = prefetch_blocks(
+                coordinates,
+                convert_block,
+                max_ahead=worker_prefetch_depth(),
+            )
+            yield from tqdmbar(
+                blocks,
+                total=len(coordinates),
+                desc="Writing merged assay",
+            )
+
+        counter = accumulate_sparse_to_shards(
+            self.assayGroup,
+            block_stream(),
+            dtype=self.assayGroup.dtype,
+        )
+        if counter != self.nCells or expected_start != self.nCells:
             raise AssertionError(
                 "ERROR: Mismatch in number of cells in the merged assay. Please report this issue."
             )
+        self.assayGroup = finalize_writer_counts(
+            self.z,
+            self.merge_assay_name,
+            self.outWorkspace,
+        )
 
 
 # Alias for ZarrMerge
