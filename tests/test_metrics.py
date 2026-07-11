@@ -4,6 +4,8 @@ import pytest
 from scipy.sparse import csr_matrix
 
 from scarf.metrics import (
+    _effective_perplexity,
+    _neighbor_probabilities,
     calculate_knn_cluster_similarity,
     calculate_top_k_neighbor_distances,
     calculate_weighted_cluster_similarity,
@@ -39,6 +41,97 @@ def test_compute_lisi_rejects_missing_labels():
 
     with pytest.raises(ValueError, match="missing values"):
         compute_lisi(distances, indices, metadata, ["batch"])
+
+
+def test_compute_lisi_returns_empty_matrix_when_no_labels_are_requested():
+    metadata = pd.DataFrame(index=np.arange(2))
+    distances = np.empty((2, 0))
+    indices = np.empty((2, 0), dtype=np.int64)
+
+    scores = compute_lisi(distances, indices, metadata, [])
+
+    assert scores.shape == (2, 0)
+    assert scores.dtype == np.float64
+
+
+def test_compute_lisi_handles_more_categories_than_neighbors():
+    metadata = pd.DataFrame({"batch": ["a", "b", "c", "d"]})
+    indices = np.array(
+        [
+            [0, 1, 2],
+            [1, 2, 3],
+            [2, 3, 0],
+            [3, 0, 1],
+        ]
+    )
+    distances = np.ones_like(indices, dtype=np.float64)
+
+    scores = compute_lisi(
+        distances,
+        indices,
+        metadata,
+        label_colnames=["batch"],
+        perplexity=1,
+    )
+
+    assert np.allclose(scores[:, 0], 3.0)
+
+
+def test_compute_lisi_caps_perplexity_to_neighbor_capacity():
+    metadata = pd.DataFrame({"batch": [0, 0, 1, 1]})
+    indices = np.tile(np.array([0, 1, 2, 3, 0, 1]), (4, 1))
+    distances = np.tile(np.arange(6, dtype=np.float64), (4, 1))
+
+    capped = compute_lisi(distances, indices, metadata, ["batch"], perplexity=2)
+    oversized = compute_lisi(distances, indices, metadata, ["batch"], perplexity=30)
+
+    assert np.allclose(oversized, capped)
+
+
+@pytest.mark.parametrize("perplexity", [0.5, np.inf, np.nan])
+def test_effective_perplexity_rejects_invalid_values(perplexity):
+    with pytest.raises(ValueError, match="finite value"):
+        _effective_perplexity(perplexity, n_neighbors=3)
+
+
+def test_effective_perplexity_requires_three_neighbors():
+    with pytest.raises(ValueError, match="at least three"):
+        _effective_perplexity(perplexity=1, n_neighbors=2)
+
+
+def test_neighbor_probabilities_calibrate_diffuse_and_concentrated_rows():
+    distances = np.array(
+        [
+            [0.0, 0.1, 0.2, 0.3],
+            [0.0, 10.0, 20.0, 30.0],
+        ]
+    )
+
+    probabilities = _neighbor_probabilities(
+        distances,
+        perplexity=2,
+        tol=1e-8,
+        max_iter=100,
+    )
+    log_probabilities = np.log(
+        probabilities,
+        out=np.zeros_like(probabilities),
+        where=probabilities > 0,
+    )
+    calibrated_perplexity = np.exp(-np.sum(probabilities * log_probabilities, axis=1))
+
+    assert np.allclose(probabilities.sum(axis=1), 1.0)
+    assert np.allclose(calibrated_perplexity, 2.0, rtol=1e-7)
+
+
+def test_compute_lisi_rejects_invalid_neighbor_distances():
+    metadata = pd.DataFrame({"batch": [0, 0, 1, 1]})
+    indices = np.tile(np.array([0, 1, 2]), (4, 1))
+    distances = np.ones_like(indices, dtype=np.float64)
+    distances[0, 0] = -1
+
+    with pytest.raises(ValueError, match="finite, non-negative"):
+        compute_lisi(distances, indices, metadata, ["batch"], perplexity=1)
 
 
 def test_metric_lisi_single_category_is_one(datastore, make_graph):
@@ -112,6 +205,54 @@ def test_top_k_distances_accept_all_candidates():
     )
 
     assert np.allclose(np.sort(distances[0]), [1.0, 2.0])
+
+
+def test_top_k_cosine_distances_handle_opposite_and_zero_vectors():
+    distances = calculate_top_k_neighbor_distances(
+        np.array([[1.0, 0.0], [0.0, 0.0]]),
+        np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]),
+        k=10,
+        metric="cosine",
+    )
+
+    assert np.allclose(
+        np.sort(distances, axis=1),
+        np.array(
+            [
+                [0.0, 1.0, 2.0],
+                [1.0, 1.0, 1.0],
+            ]
+        ),
+    )
+
+
+def test_top_k_inner_product_distances_are_clipped_at_zero():
+    distances = calculate_top_k_neighbor_distances(
+        np.array([[2.0, 0.0], [0.5, 0.0]]),
+        np.array([[1.0, 0.0], [0.25, 0.0], [-1.0, 0.0]]),
+        k=3,
+        metric="ip",
+    )
+
+    assert np.allclose(
+        np.sort(distances, axis=1),
+        np.array(
+            [
+                [0.0, 0.5, 3.0],
+                [0.5, 0.875, 1.5],
+            ]
+        ),
+    )
+
+
+def test_top_k_distances_reject_unsupported_metric():
+    with pytest.raises(ValueError, match="Unsupported neighbor metric"):
+        calculate_top_k_neighbor_distances(
+            np.array([[0.0]]),
+            np.array([[1.0]]),
+            k=1,
+            metric="manhattan",
+        )
 
 
 def test_metric_silhouette(datastore, make_graph, leiden_clustering):

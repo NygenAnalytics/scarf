@@ -1,7 +1,16 @@
 import numpy as np
 import pandas as pd
+import pytest
 
-from scarf.markers import _batch_stats, mannwhitneyu_from_ranks, sort_marker_results
+from scarf.assay import norm_lib_size
+from scarf.markers import (
+    _batch_stats,
+    _marker_stats_batch,
+    find_markers_by_rank,
+    find_markers_by_regression,
+    mannwhitneyu_from_ranks,
+    sort_marker_results,
+)
 from scarf.utils import controlled_compute
 
 
@@ -49,6 +58,244 @@ def test_batch_stats_matches_pandas_reference():
     assert np.allclose(got[:, :, 5][finite], ref[:, :, 5][finite], atol=1e-6)
     # two-sided p-values
     assert np.allclose(got[:, :, 6], ref[:, :, 6], atol=1e-6)
+
+
+def test_batch_stats_distinguishes_zero_fold_change_from_zero_rest_sentinel():
+    data = np.array(
+        [
+            [0.0, 2.0, 1.0],
+            [0.0, 4.0, 3.0],
+            [0.0, 0.0, 2.0],
+            [0.0, 0.0, 2.0],
+        ]
+    )
+    stats = _batch_stats(
+        data,
+        int_indices=np.array([0, 0, 1, 1]),
+        group_counts=np.array([2, 2]),
+        n_total=4,
+    )
+
+    assert np.array_equal(stats[0, :, 5], [0.0, 0.0])
+    assert stats[1, 0, 5] == pytest.approx(100.1)
+    assert stats[1, 1, 5] == pytest.approx(0.0)
+    assert np.array_equal(stats[2, :, 5], [1.0, 1.0])
+    assert np.array_equal(stats[0, :, 6], [1.0, 1.0])
+
+
+def test_marker_stats_python_kernel_matches_compiled_kernel():
+    data = np.array(
+        [
+            [0.0, 5.0, 0.0, 1.0],
+            [0.0, 4.0, 1.0, 1.0],
+            [0.0, 0.0, 2.0, 2.0],
+            [0.0, 0.0, 3.0, 2.0],
+            [0.0, 0.0, 4.0, 3.0],
+            [0.0, 0.0, 5.0, 3.0],
+        ],
+        dtype=np.float32,
+    )
+    int_indices = np.array([0, 0, 1, 1, 2, 2])
+    group_counts = np.array([2, 2, 2], dtype=np.float32)
+    n_total = np.float32(len(data))
+
+    python_stats = _marker_stats_batch.py_func(
+        data,
+        int_indices,
+        group_counts,
+        n_total,
+    )
+    compiled_stats = _marker_stats_batch(
+        data,
+        int_indices,
+        group_counts,
+        n_total,
+    )
+
+    np.testing.assert_allclose(python_stats, compiled_stats)
+    assert python_stats[1, 0, 5] == pytest.approx(100.1)
+    assert np.array_equal(python_stats[0, :, 5], [0.0, 0.0, 0.0])
+
+
+def test_marker_stats_python_kernel_handles_single_cell_population():
+    stats = _marker_stats_batch.py_func(
+        np.array([[0.0, 2.0]], dtype=np.float32),
+        np.array([0]),
+        np.array([1], dtype=np.float32),
+        np.float32(1),
+    )
+
+    np.testing.assert_allclose(
+        stats[:, 0, :],
+        np.array(
+            [
+                [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [1.0, 2.0, 0.0, 1.0, 0.0, 100.1, 0.0],
+            ]
+        ),
+    )
+
+
+def test_sort_marker_results_adds_deterministic_tie_breakers():
+    named = pd.DataFrame(
+        {
+            "score": [0.8, 0.8, 0.8],
+            "p_value": [0.02, 0.01, 0.01],
+            "feature_name": ["zeta", "beta", "alpha"],
+        },
+        index=[7, 8, 9],
+    )
+
+    sorted_named = sort_marker_results(named)
+    unnamed = named.drop(columns="feature_name").iloc[[0, 2]].copy()
+    unnamed["p_value"] = 0.01
+    sorted_unnamed = sort_marker_results(unnamed)
+
+    assert "feature_index" not in named
+    assert sorted_named["feature_name"].tolist() == ["alpha", "beta", "zeta"]
+    assert sorted_named["feature_index"].tolist() == [9, 8, 7]
+    assert sorted_unnamed["feature_index"].tolist() == [7, 9]
+
+
+def test_find_markers_by_regression_handles_expression_threshold():
+    class Assay:
+        @staticmethod
+        def iter_normed_feature_wise(**_kwargs):
+            yield pd.DataFrame(
+                {
+                    "correlated": [0.0, 1.0, 2.0, 3.0],
+                    "too_sparse": [0.0, 0.0, 1.0, 0.0],
+                }
+            )
+
+    result = find_markers_by_regression(
+        Assay(),
+        cell_key="I",
+        feat_key="I",
+        regressor=np.arange(4),
+        min_cells=1,
+    )
+
+    assert result.loc["correlated", "r_value"] == pytest.approx(1.0)
+    assert result.loc["correlated", "p_value"] < 1e-10
+    assert np.array_equal(result.loc["too_sparse"].to_numpy(), [0.0, 1.0])
+
+
+def test_find_markers_by_regression_rejects_non_dataframe_batches():
+    class Assay:
+        @staticmethod
+        def iter_normed_feature_wise(**_kwargs):
+            yield np.ones((3, 1))
+
+    with pytest.raises(TypeError, match="DataFrames"):
+        find_markers_by_regression(
+            Assay(),
+            cell_key="I",
+            feat_key="I",
+            regressor=np.arange(3),
+            min_cells=1,
+        )
+
+
+def test_find_markers_by_rank_requires_requested_prenormed_values():
+    class Cells:
+        @staticmethod
+        def fetch(_group_key, _cell_key):
+            return np.array([0, 1])
+
+    class Assay:
+        cells = Cells()
+        z = {}
+
+    with pytest.raises(ValueError, match="Could not find prenormed values"):
+        find_markers_by_rank(
+            Assay(),
+            group_key="cluster",
+            cell_key="I",
+            feat_key="I",
+            batch_size=2,
+            use_prenormed=True,
+            prenormed_store=None,
+            n_threads=1,
+        )
+
+
+def test_find_markers_by_rank_rejects_fast_path_for_non_rna_assay():
+    class Cells:
+        @staticmethod
+        def fetch(_group_key, _cell_key):
+            return np.array([0, 1])
+
+    class Assay:
+        def __init__(self):
+            self.cells = Cells()
+            self.normMethod = norm_lib_size
+            self.sf = 1.0
+
+    with pytest.raises(TypeError, match="requires an RNAassay"):
+        find_markers_by_rank(
+            Assay(),
+            group_key="cluster",
+            cell_key="I",
+            feat_key="I",
+            batch_size=2,
+            use_prenormed=False,
+            prenormed_store=None,
+            n_threads=1,
+        )
+
+
+def test_find_markers_by_rank_slow_path_returns_groupwise_statistics():
+    data = np.array(
+        [
+            [2.0, 0.0, 0.0, 1.0],
+            [4.0, 0.0, 0.0, 1.0],
+            [0.0, 0.0, 5.0, 1.0],
+            [0.0, 0.0, 5.0, 1.0],
+        ]
+    )
+
+    class Cells:
+        @staticmethod
+        def fetch(_group_key, _cell_key):
+            return np.array(["a", "a", "b", "b"])
+
+    class Feats:
+        @staticmethod
+        def active_index(_feat_key):
+            return np.array([10, 11, 12, 13])
+
+    class Assay:
+        cells = Cells()
+        feats = Feats()
+        normMethod = None
+        sf = None
+
+        @staticmethod
+        def iter_normed_feature_wise(**_kwargs):
+            yield pd.DataFrame(data[:, :2])
+            yield pd.DataFrame(data[:, 2:])
+
+    results = find_markers_by_rank(
+        Assay(),
+        group_key="cluster",
+        cell_key="I",
+        feat_key="I",
+        batch_size=2,
+        use_prenormed=False,
+        prenormed_store=None,
+        n_threads=1,
+    )
+    group_a = results["a"].set_index("feature_index")
+    group_b = results["b"].set_index("feature_index")
+
+    assert group_a.loc[10, "fold_change"] == pytest.approx(100.1)
+    assert group_a.loc[11, "fold_change"] == pytest.approx(0.0)
+    assert group_a.loc[13, "fold_change"] == pytest.approx(1.0)
+    assert group_b.loc[12, "fold_change"] == pytest.approx(100.1)
+    assert group_b.loc[10, "fold_change"] == pytest.approx(0.0)
+    assert np.isfinite(group_a["p_value"]).all()
+    assert np.isfinite(group_b["p_value"]).all()
 
 
 def test_iter_raw_feature_columns_matches_normed(datastore):

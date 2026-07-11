@@ -3,7 +3,36 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.writers import CrToZarr, SubsetZarr
+from scarf.readers import CSVReader
+from scarf.writers import (
+    CSVtoZarr,
+    CrToZarr,
+    SubsetZarr,
+    bed_to_sparse_array,
+    subset_assay_zarr,
+)
+
+
+class _FakeCells:
+    def __init__(
+        self, n_cells: int, columns: dict[str, np.ndarray] | None = None
+    ) -> None:
+        self.N = n_cells
+        self._columns = columns or {}
+
+    def fetch_all(self, key: str) -> np.ndarray:
+        return self._columns[key]
+
+
+class _FakeAssay:
+    def __init__(
+        self,
+        name: str,
+        n_cells: int,
+        columns: dict[str, np.ndarray] | None = None,
+    ) -> None:
+        self.name = name
+        self.cells = _FakeCells(n_cells, columns)
 
 
 def test_crtozarr(crh5_reader, tmp_path):
@@ -87,6 +116,127 @@ def test_sparsetozarr_sharded_layout(tmp_path):
     assert int(counts[...].sum()) > 0
 
 
+def test_csv_to_zarr_round_trip(tmp_path):
+    csv_path = tmp_path / "counts.csv"
+    csv_path.write_text(
+        "quality,geneA,geneB,geneC\n"
+        "10,1,0,2\n"
+        "20,0,3,0\n"
+        "30,4,5,6\n"
+        "40,7,0,8\n"
+        "50,9,10,0\n",
+        encoding="utf-8",
+    )
+    reader = CSVReader(
+        str(csv_path),
+        cell_data_cols=["quality"],
+        batch_size=2,
+    )
+    store = MemoryStore()
+    writer = CSVtoZarr(
+        reader,
+        zarr_loc=store,
+        assay_name="RNA",
+        dtype=np.dtype("uint16"),
+    )
+
+    writer.dump()
+
+    root = zarr.open_group(store=store, mode="r")
+    expected = np.array(
+        [
+            [1, 0, 2],
+            [0, 3, 0],
+            [4, 5, 6],
+            [7, 0, 8],
+            [9, 10, 0],
+        ],
+        dtype=np.uint16,
+    )
+    np.testing.assert_array_equal(root["RNA/counts"][:], expected)
+    np.testing.assert_array_equal(
+        root["RNA/featureData/ids"][:],
+        np.array(["geneA", "geneB", "geneC"]),
+    )
+    np.testing.assert_array_equal(
+        root["cellData/ids"][:],
+        np.array(["cell_0", "cell_1", "cell_2", "cell_3", "cell_4"]),
+    )
+    np.testing.assert_array_equal(
+        root["cellData/quality"][:],
+        np.array([10, 20, 30, 40, 50]),
+    )
+
+
+def test_subset_assay_zarr_selects_ordered_rows_and_columns():
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    source = root.create_array(
+        "source",
+        shape=(5, 4),
+        chunks=(2, 2),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    values = np.arange(20, dtype=np.uint16).reshape(5, 4)
+    source[:] = values
+    cells = np.array([4, 1, 3])
+    features = np.array([3, 0])
+
+    result = subset_assay_zarr(
+        store,
+        in_grp="source",
+        out_grp="selected",
+        cells_idx=cells,
+        feat_idx=features,
+        chunk_size=(2, 2),
+    )
+
+    selected = root["selected"]
+    assert result is None
+    assert selected.dtype == np.dtype(np.uint32)
+    np.testing.assert_array_equal(
+        selected[:],
+        values[np.ix_(cells, features)],
+    )
+
+
+def test_bed_to_sparse_array_bins_filters_and_drops_unknown_features(tmp_path):
+    bed_path = tmp_path / "fragments.bed"
+    bed_path.write_text(
+        "# test fragments\n"
+        "chr1\t0\t20\tcellB\t2\n"
+        "chr1\t100\t120\tcellA\t3\n"
+        "chr2\t0\t20\tcellB\t4\n"
+        "chr1\t0\t10\tcellC\t5\n"
+        "chr1\t10\t20\tcellA\t1\n"
+        "chr2\t200\t220\tcellD\t1\n",
+        encoding="utf-8",
+    )
+
+    matrix, cell_ids, feature_ids = bed_to_sparse_array(
+        str(bed_path),
+        bin_size=100,
+        chrom_sizes={"chr1": 199, "chr2": 99},
+        min_counts_per_cell=3,
+        read_chunk_size=2,
+        disable_tqdm=True,
+    )
+
+    assert cell_ids.tolist() == ["cellB", "cellA", "cellC"]
+    assert feature_ids.tolist() == ["chr1_0", "chr1_1", "chr2_0"]
+    np.testing.assert_array_equal(
+        matrix.toarray(),
+        np.array(
+            [
+                [2, 0, 4],
+                [1, 3, 0],
+                [5, 0, 0],
+            ]
+        ),
+    )
+
+
 def test_v2_fixture_read_only(datastore):
     assert datastore.RNA.rawData.shape[0] > 0
 
@@ -111,6 +261,70 @@ def test_zarr_subset(datastore, tmp_path):
         zarr_loc=zarr_path, assays=[datastore.RNA], cell_idx=np.array([1, 10, 100, 500])
     )
     writer.dump()
+
+
+def test_subset_zarr_rejects_invalid_assay_inputs():
+    with pytest.raises(TypeError, match="should be a list"):
+        SubsetZarr._check_assays("RNA")
+    with pytest.raises(ValueError, match="actual assay objects"):
+        SubsetZarr._check_assays([object()])
+    with pytest.raises(ValueError, match="same numer of cells"):
+        SubsetZarr._check_assays(
+            [
+                _FakeAssay("RNA", 3),
+                _FakeAssay("ATAC", 4),
+            ]
+        )
+
+
+def test_subset_zarr_requires_cell_key_or_indices():
+    subset = object.__new__(SubsetZarr)
+    subset.assays = [_FakeAssay("RNA", 3)]
+
+    with pytest.raises(ValueError, match="cannot be None"):
+        subset._check_idx(None, None)
+
+
+@pytest.mark.parametrize(
+    ("cell_idx", "message"),
+    [
+        (np.array([0.5]), "integer type"),
+        (np.array([3]), "max value"),
+    ],
+)
+def test_subset_zarr_rejects_invalid_explicit_indices(cell_idx, message):
+    subset = object.__new__(SubsetZarr)
+    subset.assays = [_FakeAssay("RNA", 3)]
+
+    with pytest.raises(ValueError, match=message):
+        subset._check_idx(None, cell_idx)
+
+
+def test_subset_zarr_validates_cell_key():
+    subset = object.__new__(SubsetZarr)
+    subset.assays = [_FakeAssay("RNA", 3)]
+    with pytest.raises(ValueError, match="was not found"):
+        subset._check_idx("selected", None)
+
+    subset.assays = [
+        _FakeAssay("RNA", 3, {"selected": np.array([1, 0, 1])}),
+    ]
+    with pytest.raises(ValueError, match="not of boolean type"):
+        subset._check_idx("selected", None)
+
+
+def test_subset_zarr_resolves_consistent_cell_key():
+    selected = np.array([True, False, True, False])
+    subset = object.__new__(SubsetZarr)
+    subset.assays = [
+        _FakeAssay("RNA", 4, {"selected": selected}),
+        _FakeAssay("ATAC", 4, {"selected": selected.copy()}),
+    ]
+
+    np.testing.assert_array_equal(
+        subset._check_idx("selected", None),
+        np.array([0, 2]),
+    )
 
 
 def test_subset_zarr_local_path_guard(tmp_path):

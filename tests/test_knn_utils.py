@@ -4,11 +4,13 @@ import numpy as np
 import pytest
 import zarr
 from scipy.sparse import coo_matrix, csr_matrix
+from zarr.storage import MemoryStore
 
 from scarf.knn_utils import (
     _patch_null_weights,
     calc_snn,
     merge_graphs,
+    self_query_knn,
     smoothen_dists,
     weight_sort_indices,
     wnn_integration,
@@ -52,6 +54,104 @@ def _multimodal_wnn_inputs() -> tuple[csr_matrix, np.ndarray, csr_matrix, np.nda
         dtype=np.float64,
     ).reshape(-1, 1)
     return g1, ld1, g2, ld2
+
+
+class _BlockSource:
+    def __init__(self, blocks: list[np.ndarray]):
+        self.blocks = blocks
+        self.numblocks = (len(blocks), 1)
+        self.shape = (sum(len(block) for block in blocks), blocks[0].shape[1])
+
+
+class _SyntheticAnn:
+    def __init__(
+        self,
+        data: _BlockSource,
+        embeddings: np.ndarray | None,
+        harmonized_data: _BlockSource | None,
+    ):
+        self.data = data
+        self.embeddings = embeddings
+        self.harmonizedData = harmonized_data
+        self.nCells = data.shape[0]
+        self.k = 2
+        self.batchSize = 2
+        self.queries: list[tuple[np.ndarray, np.ndarray]] = []
+
+    @staticmethod
+    def reducer(values: np.ndarray) -> np.ndarray:
+        return np.asarray(values) + 10
+
+    def transform_ann(
+        self,
+        values: np.ndarray,
+        k: int,
+        self_indices: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, int]:
+        self.queries.append((np.asarray(values).copy(), self_indices.copy()))
+        offsets = np.arange(1, k + 1)
+        indices = (self_indices[:, None] + offsets) % self.nCells
+        distances = np.broadcast_to(offsets, indices.shape).astype(np.float64)
+        missed_self = int(np.count_nonzero(self_indices % 2))
+        return indices, distances, missed_self
+
+
+def test_self_query_knn_uses_cached_embeddings_and_writes_graph():
+    raw = np.arange(10, dtype=np.float64).reshape(5, 2)
+    data = _BlockSource([raw[:2], raw[2:4], raw[4:]])
+    embeddings = raw + 100
+    ann = _SyntheticAnn(data, embeddings=embeddings, harmonized_data=None)
+    store = zarr.open_group(store=MemoryStore(), mode="w")
+
+    recall = self_query_knn(ann, store, chunk_size=2, nthreads=1)
+
+    expected_indices = (np.arange(5)[:, None] + np.array([1, 2], dtype=np.int64)) % 5
+    assert recall == pytest.approx(60.0)
+    np.testing.assert_array_equal(store["indices"][:], expected_indices)
+    np.testing.assert_allclose(store["distances"][:], [[1.0, 2.0]] * 5)
+    np.testing.assert_array_equal(
+        np.vstack([values for values, _ in ann.queries]),
+        embeddings,
+    )
+    np.testing.assert_array_equal(
+        np.concatenate([indices for _, indices in ann.queries]),
+        np.arange(5),
+    )
+
+
+@pytest.mark.parametrize("use_harmonized", [False, True])
+def test_self_query_knn_streams_reduced_or_harmonized_blocks(use_harmonized):
+    raw = np.arange(10, dtype=np.float64).reshape(5, 2)
+    data = _BlockSource([raw[:2], raw[2:4], raw[4:]])
+    harmonized_values = raw + 100
+    harmonized_data = (
+        _BlockSource(
+            [
+                harmonized_values[:2],
+                harmonized_values[2:4],
+                harmonized_values[4:],
+            ]
+        )
+        if use_harmonized
+        else None
+    )
+    ann = _SyntheticAnn(
+        data,
+        embeddings=None,
+        harmonized_data=harmonized_data,
+    )
+    store = zarr.open_group(store=MemoryStore(), mode="w")
+
+    recall = self_query_knn(ann, store, chunk_size=3, nthreads=1)
+
+    expected_queries = harmonized_values if use_harmonized else raw + 10
+    assert recall == pytest.approx(60.0)
+    np.testing.assert_array_equal(
+        np.vstack([values for values, _ in ann.queries]),
+        expected_queries,
+    )
+    assert store["indices"].shape == (5, 2)
+    assert store["distances"].shape == (5, 2)
 
 
 def test_calc_snn_returns_normalized_overlap():

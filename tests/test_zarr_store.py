@@ -10,6 +10,7 @@ from scarf.storage.zarr_store import (
     copy_zarr_array,
     copy_zarr_group_tree,
     create_numeric_array,
+    finalize_sharded_counts,
     get_storage_profile,
     is_local_zarr_path,
     is_remote_datastore,
@@ -19,6 +20,7 @@ from scarf.storage.zarr_store import (
     open_or_create_staged_normed_array,
     open_store,
     set_storage_profile,
+    write_dense_from_row_batches,
 )
 from scarf._types import array_metadata_shards
 from scarf.utils import load_zarr
@@ -89,6 +91,97 @@ def test_copy_zarr_array_round_trip(tmp_path):
     dst = create_numeric_array(dst_root, "data", spec)
     copy_zarr_array(src, dst, block_rows=16)
     np.testing.assert_allclose(dst[:], expected, rtol=1e-6)
+
+
+def test_write_dense_from_row_batches_flushes_at_shard_boundaries():
+    root = _memory_group()
+    dst = root.create_array(
+        "counts",
+        shape=(7, 3),
+        chunks=(2, 3),
+        shards=(4, 3),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    expected = np.arange(21, dtype=np.int64).reshape(7, 3)
+    writes = []
+    write_dtypes = []
+
+    class RecordingArray:
+        def __init__(self, array):
+            self._array = array
+            self.metadata = array.metadata
+            self.shape = array.shape
+
+        def __setitem__(self, selection, value):
+            row_slice = selection[0]
+            writes.append((row_slice.start, row_slice.stop))
+            write_dtypes.append(value.dtype)
+            self._array[selection] = value
+
+    rows_written = write_dense_from_row_batches(
+        RecordingArray(dst),
+        iter(
+            [
+                expected[:1],
+                expected[1:5],
+                np.empty((0, 3), dtype=np.int64),
+                expected[5:],
+            ]
+        ),
+        dtype=np.uint16,
+    )
+
+    assert rows_written == 7
+    assert writes == [(0, 4), (4, 7)]
+    assert write_dtypes == [np.dtype(np.uint16), np.dtype(np.uint16)]
+    np.testing.assert_array_equal(dst[:], expected.astype(np.uint16))
+
+
+@pytest.mark.parametrize(
+    ("workspace", "counts_group_path"),
+    [(None, "RNA"), ("workspace", "matrices/RNA")],
+)
+def test_finalize_sharded_counts_repacks_and_cleans_up(
+    monkeypatch, workspace, counts_group_path
+):
+    from scarf.storage.budget import ResourceBudget
+
+    root = _memory_group()
+    counts_group = root.create_group(counts_group_path)
+    source = counts_group.create_array(
+        "counts",
+        shape=(5, 3),
+        chunks=(2, 3),
+        dtype=np.uint32,
+        fill_value=0,
+    )
+    expected = np.arange(15, dtype=np.uint32).reshape(5, 3)
+    source[:] = expected
+    assert array_metadata_shards(source) is None
+
+    budget = ResourceBudget(memoryBytes=24, workers=1, workingCopies=1)
+    monkeypatch.setattr("scarf.storage.zarr_store.get_resource_budget", lambda: budget)
+    monkeypatch.setattr("scarf.storage.budget.get_resource_budget", lambda: budget)
+
+    result = finalize_sharded_counts(
+        root,
+        "RNA",
+        workspace=workspace,
+        profile="fast_local",
+    )
+
+    np.testing.assert_array_equal(result[:], expected)
+    assert result.chunks == (2, 1)
+    assert array_metadata_shards(result) == (2, 3)
+    refreshed_group = root[counts_group_path]
+    assert "counts__sharded_tmp" not in refreshed_group
+    assert refreshed_group.attrs["scarf:zarr_spec"] == {
+        "profile": "fast_local",
+        "chunks": [2, 1],
+        "shards": [2, 3],
+        "zarr_format": 3,
+    }
 
 
 def test_accumulate_sparse_to_shards_preserves_offsets_across_zero_runs():
