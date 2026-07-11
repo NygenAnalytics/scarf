@@ -1,4 +1,4 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -2556,6 +2556,7 @@ class DataStore(MappingDatastore):
         knn_loc: str | None = None,
         save_result: bool = False,
         return_lisi: bool = True,
+        perplexity: float = 30,
     ) -> list[tuple[str, np.ndarray]] | None:
         """Calculate Local Inverse Simpson Index (LISI) scores for cell populations.
 
@@ -2569,6 +2570,9 @@ class DataStore(MappingDatastore):
             knn_loc: Location of KNN graph if not using latest (default: None)
             save_result: Whether to save LISI scores to cell metadata (default: False)
             return_lisi: Whether to return LISI scores (default: True)
+            perplexity: Effective neighborhood size used by LISI. It is reduced
+                with a warning when the graph has fewer than three times this
+                many neighbors.
 
         Returns:
             If return_lisi is True, returns list of tuples containing:
@@ -2579,7 +2583,7 @@ class DataStore(MappingDatastore):
             If return_lisi is False, returns None
 
         Raises:
-            ValueError: If using custom KNN graph but required parameters are missing
+            ValueError: If KNN inputs, perplexity, or labels are invalid
             KeyError: If label columns not found in cell metadata
 
         Notes:
@@ -2588,12 +2592,12 @@ class DataStore(MappingDatastore):
             Higher scores indicate more mixing between different labels.
         """
 
+        label_cols = list(label_colnames)
         if from_assay is None:
             from_assay = self._load_default_assay()
 
         if use_latest_knn and knn_loc is None:
             knn_loc = self._get_latest_knn_loc(from_assay)
-            cell_key = self._get_latest_cell_key(from_assay)
             logger.info(f"Using the latest knn graph at location: {knn_loc}")
 
         else:
@@ -2602,38 +2606,42 @@ class DataStore(MappingDatastore):
             if knn_loc not in self.zw:
                 raise ValueError(f"Could not find the knn graph at location: {knn_loc}")
 
-            normed_part = knn_loc.split("/")[1]
-            _, cell_key, _ = normed_part.split("__")
             logger.info(f"Using the knn graph at location: {knn_loc}")
 
+        normed_part = knn_loc.split("/")[1]
+        _, cell_key, _ = normed_part.split("__")
         knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
 
         distances = as_zarr_array(knn_grp["distances"], name="distances")
         indices = as_zarr_array(knn_grp["indices"], name="indices")
 
         try:
-            metadata = self.cells.to_pandas_dataframe(
-                columns=list(label_colnames) + [cell_key]
-            )
+            metadata = self.cells.to_pandas_dataframe(columns=label_cols + [cell_key])
             metadata = metadata[metadata[cell_key]]
         except KeyError:
             raise KeyError(
-                f"Could not find the column(s) {label_colnames} in the cell metadata table."
+                f"Could not find the column(s) {label_cols} in the cell metadata table."
             )
 
         from ..metrics import compute_lisi
 
-        lisi_scores = compute_lisi(distances, indices, metadata, label_colnames)
+        lisi_scores = compute_lisi(
+            distances,
+            indices,
+            metadata,
+            label_cols,
+            perplexity=perplexity,
+        )
         # lisi_scores Shape -> (n_cells, n_labels)
         if save_result:
-            for col, vals in zip(label_colnames, lisi_scores.T):
+            for col, vals in zip(label_cols, lisi_scores.T):
                 col_name = f"lisi__{col}__{knn_loc.split('/')[-1]}"
                 self.cells.insert(
                     column_name=col_name, values=vals, overwrite=True, key=cell_key
                 )
 
         if return_lisi:
-            return list(zip(label_colnames, lisi_scores.T))
+            return list(zip(label_cols, lisi_scores.T))
         else:
             return None
 
@@ -2643,6 +2651,8 @@ class DataStore(MappingDatastore):
         res_label: str = "leiden_cluster",
         from_assay: str | None = None,
         knn_loc: str | None = None,
+        random_seed: int = 4444,
+        sample_size: int = 11,
     ) -> np.ndarray | None:
         """Calculate modified silhouette scores for evaluating cluster separation.
 
@@ -2651,15 +2661,18 @@ class DataStore(MappingDatastore):
 
         Args:
             use_latest_knn: Whether to use most recent KNN graph (default: True)
-            res_label: Column name containing cluster labels (default: "leiden_cluster")
+            res_label: Base or full column name containing cluster labels
+                (default: "leiden_cluster")
             from_assay: Name of assay to use if not using latest KNN (default: None)
             knn_loc: Location of KNN graph if not using latest (default: None)
+            random_seed: Seed used for cluster sampling.
+            sample_size: Maximum size of each sampled cluster group.
 
         Returns:
             numpy array of silhouette scores for each cluster, or None if computation fails
 
         Raises:
-            ValueError: If using custom KNN graph but required parameters are missing
+            ValueError: If graph, labels, sampling, or embedding data are invalid
 
         Notes:
             Scores range from -1 to 1:
@@ -2671,20 +2684,11 @@ class DataStore(MappingDatastore):
             NaN values indicate clusters that couldn't be scored due to size constraints.
         """
 
-        def compute_graph_feats(
-            knn_path: str,
-        ) -> tuple[str, str, str]:
-            k = knn_path.rsplit("/", 1)[-1].split("__")[-1]
-            dims = knn_path.rsplit("/", 2)[0].split("__")[-2]
-            feat_key_parsed = knn_path.split("/")[1].split("__")[-1]
-            return k, dims, feat_key_parsed
-
         if from_assay is None:
             from_assay = self._load_default_assay()
 
         if use_latest_knn and knn_loc is None:
             knn_loc = self._get_latest_knn_loc(from_assay)
-            k, dims, feat_key = compute_graph_feats(knn_loc)
             logger.info(
                 f"Using the latest knn graph at location: {knn_loc} for assay: {from_assay}"
             )
@@ -2694,10 +2698,9 @@ class DataStore(MappingDatastore):
                 raise ValueError("Please provide values for the KNN graph location.")
             if knn_loc not in self.zw:
                 raise ValueError(f"Could not find the knn graph at location: {knn_loc}")
-            k, dims, feat_key = compute_graph_feats(knn_loc)
             logger.info(f"Using the knn graph at location: {knn_loc}")
 
-        from ..metrics import knn_to_csr_matrix, silhouette_scoring
+        from ..metrics import silhouette_scoring
 
         normed_part = knn_loc.split("/")[1]
         _, cell_key, feat_key_parsed = normed_part.split("__")
@@ -2709,53 +2712,136 @@ class DataStore(MappingDatastore):
         )
 
         knn_grp = as_zarr_group(self.z[knn_loc], name=knn_loc)
-        graph = knn_to_csr_matrix(
-            np.asarray(as_zarr_array(knn_grp["indices"], name="indices")[:]),
-            np.asarray(as_zarr_array(knn_grp["distances"], name="distances")[:]),
-        )
-        reduction_root = knn_loc.rsplit("/", 3)[0]
-        hvg_data = np.asarray(
-            as_zarr_array(
-                as_zarr_group(self.z[reduction_root], name=reduction_root)["data"],
-                name="data",
-            )[:]
-        )
+        neighbor_indices = as_zarr_array(knn_grp["indices"], name="indices")
+        neighbor_distances = as_zarr_array(knn_grp["distances"], name="distances")
+        if ann_obj.harmonizedData is not None:
+            metric_data = ann_obj.harmonizedData
+            data_is_reduced = True
+        else:
+            if ann_obj.harmonize:
+                raise ValueError("Harmony coordinates are missing for this KNN graph")
+            metric_data = ann_obj.data
+            data_is_reduced = False
         scores = silhouette_scoring(
-            self, ann_obj, graph, hvg_data, from_assay, res_label
+            self,
+            ann_obj,
+            None,
+            metric_data,
+            from_assay,
+            res_label,
+            cell_key=cell_key,
+            random_seed=random_seed,
+            sample_size=sample_size,
+            data_is_reduced=data_is_reduced,
+            distance_metric=cast(Any, ann_obj.annMetric),
+            neighbor_indices=neighbor_indices,
+            neighbor_distances=neighbor_distances,
         )
-        return cast(NDArray[Any], scores)
+        return scores
 
-    def metric_integration(
-        self, batch_labels: list[str], metric: Literal["ari", "nmi"] = "ari"
-    ) -> float | None:
-        """Calculate integration score between different batch labels.
+    def metric_label_concordance(
+        self,
+        label_columns: Sequence[str],
+        metric: Literal["ari", "nmi"] = "ari",
+    ) -> float:
+        """Compare two metadata label partitions using ARI or NMI.
 
-        Measures how well aligned different batches are after integration by comparing
-        their cluster assignments using standard clustering metrics.
+        This measures whether two labelings of the same cells agree, for
+        example predicted clusters against imported reference annotations. It
+        does not measure batch mixing; use :meth:`metric_batch_mixing` or
+        :meth:`metric_lisi` for that.
 
         Args:
-            batch_labels: List of column names containing batch labels to compare
-            metric: Metric to use for comparison (default: "ari")
-                - "ari": Adjusted Rand Index
-                - "nmi": Normalized Mutual Information
+            label_columns: Exactly two cell metadata column names to compare.
+            metric: ``"ari"`` for the adjusted Rand index or ``"nmi"`` for
+                normalized mutual information.
 
         Returns:
-            Integration score between 0 and 1, or None if metric is not recognized
-            Higher scores indicate better alignment between batches
+            Agreement between the two partitions. ARI ranges from -1 to 1 and
+            NMI from 0 to 1, with higher values meaning stronger agreement.
 
-        Notes:
-            ARI and NMI measure the agreement between different batch labelings:
-            - Score near 1: Batches are well integrated
-            - Score near 0: Batches show poor integration
-
-            ARI is adjusted for chance and generally more stringent than NMI.
+        Raises:
+            ValueError: If the number of columns or the metric name is invalid.
         """
-        from ..metrics import integration_score
+        from ..metrics import label_concordance_score
 
-        batch_labels_vals = []
-        for batch in batch_labels:
-            vals = np.array(self.cells.fetch_all(batch))
-            batch_labels_vals.append(vals)
+        label_values = [
+            np.asarray(self.cells.fetch_all(column)) for column in label_columns
+        ]
+        return label_concordance_score(label_values, metric)
 
-        scores = integration_score(batch_labels_vals, metric)
-        return scores
+    def metric_integration(
+        self,
+        batch_labels: list[str],
+        metric: Literal["ari", "nmi"] = "ari",
+    ) -> float:
+        """Backward-compatible alias for :meth:`metric_label_concordance`.
+
+        This method compares label agreement and does not measure neighborhood
+        mixing. Use :meth:`metric_batch_mixing` to evaluate batch integration.
+        """
+        logger.warning(
+            "`metric_integration` measures label concordance. Use "
+            "`metric_label_concordance` for ARI/NMI or `metric_batch_mixing` "
+            "for neighborhood integration quality."
+        )
+        return self.metric_label_concordance(batch_labels, metric)
+
+    def metric_batch_mixing(
+        self,
+        label_colname: str,
+        use_latest_knn: bool = True,
+        from_assay: str | None = None,
+        knn_loc: str | None = None,
+        perplexity: float = 30,
+    ) -> float:
+        """Summarize batch LISI as a normalized neighborhood-mixing score.
+
+        This computes batch LISI on the current KNN graph and rescales its mean
+        against the mixing that perfectly integrated data would reach given the
+        dataset's batch sizes. Unlike raw LISI, the result is bounded in
+        ``[0, 1]``, which makes it easier to compare across graphs and datasets.
+
+        Args:
+            label_colname: Cell metadata column holding the batch assignment.
+            use_latest_knn: Whether to use the most recent KNN graph
+                (default: True).
+            from_assay: Name of assay to use if not using the latest KNN.
+            knn_loc: Location of the KNN graph if not using the latest.
+            perplexity: Effective neighborhood size passed to LISI.
+
+        Returns:
+            A value in ``[0, 1]``. Scores near 1 indicate that neighborhoods mix
+            batches as well as the global composition allows, and scores near 0
+            indicate poorly mixed batches.
+
+        Raises:
+            ValueError: If KNN inputs are invalid or the column has fewer than
+                two batches.
+        """
+        from ..metrics import lisi_batch_mixing_score
+
+        if from_assay is None:
+            from_assay = self._load_default_assay()
+        resolved_knn_loc = knn_loc
+        if use_latest_knn and resolved_knn_loc is None:
+            resolved_knn_loc = self._get_latest_knn_loc(from_assay)
+        if resolved_knn_loc is None:
+            raise ValueError("Please provide values for the KNN graph location.")
+
+        lisi_result = self.metric_lisi(
+            label_colnames=[label_colname],
+            use_latest_knn=use_latest_knn,
+            from_assay=from_assay,
+            knn_loc=resolved_knn_loc,
+            save_result=False,
+            return_lisi=True,
+            perplexity=perplexity,
+        )
+        if lisi_result is None:
+            raise RuntimeError("LISI computation did not return scores")
+
+        normed_part = resolved_knn_loc.split("/")[1]
+        _, cell_key, _ = normed_part.split("__")
+        batch_labels = self.cells.fetch(label_colname, key=cell_key)
+        return lisi_batch_mixing_score(lisi_result[0][1], batch_labels)

@@ -8,6 +8,15 @@ Short definitions of terms used across the Scarf documentation.
 **LISI (Local Inverse Simpson Index)**
 : Metric of local label mixing in the KNN graph. Higher batch LISI after correction suggests better batch mixing. Computed with `metric_lisi`.
 
+**Batch mixing score**
+: Mean batch LISI rescaled to `[0, 1]` against the mixing that perfectly integrated data would reach given the batch sizes. Scores near 1 mean well-mixed batches. Computed with `metric_batch_mixing`.
+
+**Silhouette score**
+: Graph-based measure of how separated a cluster is from its nearest neighboring cluster. Ranges from -1 to 1, with values near 1 indicating well-separated clusters. Computed with `metric_silhouette`.
+
+**Label concordance (ARI, NMI)**
+: Agreement between two labelings of the same cells, such as clusters against reference annotations. ARI ranges from -1 to 1 and NMI from 0 to 1. It reflects label agreement, not batch mixing. Computed with `metric_label_concordance`.
+
 **LSI (Latent Semantic Indexing)**
 : Linear dimension reduction used for scATAC-seq graphs, analogous to PCA for RNA.
 

@@ -66,7 +66,7 @@
 ## Integration metrics
 ```{eval-rst}
 .. automodule:: scarf.metrics
-    :members: compute_lisi, silhouette_scoring, integration_score
+    :members: compute_lisi, silhouette_scoring, label_concordance_score, lisi_batch_mixing_score, integration_score
 ```
 
 ## Merge classes

@@ -322,23 +322,37 @@ Harmony is often preferred when multiple batches need to mix without choosing a 
 (lisi_metrics)=
 ### 6) Quantifying integration quality
 
-LISI measures how well labels mix in each cell's KNN neighborhood. Run after naive, partial PCA, and Harmony graphs to compare approaches:
+The UMAP plots suggest that partial PCA and Harmony mix the two samples, but a visual read is not enough. Scarf provides several metrics that quantify integration from different angles. See the {ref}`integration methods guide <integration_guide>` for how they relate. Re-run this section after the naive, partial PCA, and Harmony graphs to compare approaches on the same footing.
+
+**LISI** measures how well a label mixes inside each cell's KNN neighborhood. Running it on `sample_id` tells us whether batches are mixed, while running it on `imported_labels` checks that cell types are still grouped. Good integration raises batch LISI while keeping cell-type LISI low. With `save_result=True` the per-cell scores are written back as `lisi__sample_id__*` columns, which you can overlay on the UMAP layouts.
 
 ```{code-cell} ipython3
 ds.metric_lisi(
     label_colnames=['sample_id', 'imported_labels'],
     save_result=True,
 )
+```
 
-ds.metric_silhouette(res_label='RNA_leiden_cluster')
+**Batch mixing** condenses batch LISI into a single number in `[0, 1]` by rescaling the mean against the mixing perfectly integrated data would reach for these batch sizes. This makes it easy to compare across graphs. Higher is better.
 
-ds.metric_integration(
-    batch_labels=['sample_id', 'imported_labels'],
+```{code-cell} ipython3
+ds.metric_batch_mixing(label_colname='sample_id')
+```
+
+**Silhouette** scores how separated each cluster is from its nearest neighboring cluster, from -1 to 1. Values near 1 mean distinct clusters. Read it alongside the batch metrics, since over-correction can mix genuinely different cell types.
+
+```{code-cell} ipython3
+ds.metric_silhouette(res_label='leiden_cluster')
+```
+
+**Label concordance** compares two labelings of the same cells with ARI or NMI. Here it checks how well the fresh Leiden clusters agree with the imported annotations. Note that this measures label agreement, not batch mixing.
+
+```{code-cell} ipython3
+ds.metric_label_concordance(
+    label_columns=['sample_id', 'imported_labels'],
     metric='ari'
 )
 ```
-
-Higher batch LISI generally indicates better batch mixing. Compare saved columns such as `lisi__sample_id__*` on UMAP layouts. Silhouette scores near 1 indicate well-separated clusters.
 
 ---
 That is all for this vignette.

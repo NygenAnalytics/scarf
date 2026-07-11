@@ -13,7 +13,7 @@ Scarf offers several integration and batch-correction approaches. This page help
 | Integrate RNA + ADT (CITE-seq) in the same cells | `integrate_assays(method='snn')` or `method='wnn'` | {ref}`WNN integration <wnn_integration>` |
 | Map query cells onto a reference atlas | `run_mapping` with optional CORAL | {ref}`data projection <data_projection>` |
 | Co-embed reference and query on one layout | `run_unified_umap` or `run_unified_tsne` | {ref}`data projection <data_projection>` |
-| Measure integration quality | `metric_lisi`, `metric_silhouette`, `metric_integration` | {ref}`LISI metrics <lisi_metrics>` |
+| Measure integration quality | `metric_lisi`, `metric_batch_mixing`, `metric_silhouette` | {ref}`LISI metrics <lisi_metrics>` |
 
 ## Harmony vs partial PCA
 
@@ -24,6 +24,17 @@ Both operate on a merged dataset in a single `DataStore`.
 **Partial PCA** (`make_graph(pca_cell_key='is_ctrl')`) trains PCA on a subset of cells (for example one control sample). Use when one batch is a trusted reference and you want a lightweight correction that down-weights batch-specific variance.
 
 After either method, quantify results with {ref}`LISI metrics <lisi_metrics>`.
+
+## Measuring integration quality
+
+After correction, quantify the result rather than relying on the UMAP alone. Scarf exposes four metrics with different purposes:
+
+- **`metric_lisi`** returns per-cell LISI for any label. Run it on the batch column to check neighborhood mixing and on the cell-type column to check that biology is preserved. Good integration raises batch LISI while keeping cell-type LISI low.
+- **`metric_batch_mixing`** condenses batch LISI into a single value in `[0, 1]` by rescaling the mean against the mixing that perfectly integrated data would reach for the given batch sizes. Use it to compare graphs and datasets on a common scale. Higher is better.
+- **`metric_silhouette`** scores how separated each cluster is from its nearest neighbor cluster, from -1 to 1. Values near 1 mean distinct clusters. Read it together with the batch metrics, since over-correction can mix genuinely distinct cell types.
+- **`metric_label_concordance`** compares two labelings with ARI or NMI, for example predicted clusters against imported annotations. It measures label agreement, not batch mixing.
+
+A useful pattern is to compute these metrics on the naive, partial PCA, and Harmony graphs, then compare. Better integration shows higher batch LISI and batch-mixing scores without collapsing cell-type separation. See the worked example in the {ref}`merging vignette <lisi_metrics>`.
 
 ## SNN vs WNN (multimodal)
 
