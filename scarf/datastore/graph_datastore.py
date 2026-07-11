@@ -6,7 +6,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -14,6 +14,8 @@ import zarr
 from loguru import logger
 from numpy.typing import NDArray
 from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.sparse.linalg import ArpackNoConvergence, svds
 
 from .._types import as_zarr_array, as_zarr_group
 from ..ann import AnnStream
@@ -32,11 +34,176 @@ from ..storage.zarr_store import (
     save_ann_index,
     zarr_root_path,
 )
-from ..utils import clean_array, show_dask_progress, tqdmbar
+from ..utils import clean_array, show_dask_progress
 from ..writers import create_zarr_dataset
 from .base_datastore import BaseDataStore
 
 _HARMONY_ANN_CONTRACT_VERSION = 1
+
+
+def _validate_source_sink_labels(
+    labels: pd.Series,
+    sources: list[Any],
+    sinks: list[Any],
+    context: str,
+) -> None:
+    overlap = sorted(set(sources) & set(sinks))
+    if overlap:
+        raise ValueError(f"Source and sink labels overlap in {context}: {overlap}")
+
+    present = set(pd.unique(labels))
+    missing_sources = [source for source in sources if source not in present]
+    missing_sinks = [sink for sink in sinks if sink not in present]
+    if missing_sources or missing_sinks:
+        raise ValueError(
+            f"Source/sink labels were not found in {context}. "
+            f"Missing sources: {missing_sources}; missing sinks: {missing_sinks}"
+        )
+
+
+def _make_source_sink_vector(
+    labels: pd.Series,
+    sources: list[Any],
+    sinks: list[Any],
+) -> np.ndarray:
+    sink_mask = labels.isin(sinks).to_numpy(dtype=bool)
+    source_mask = labels.isin(sources).to_numpy(dtype=bool)
+    labelled = sink_mask | source_mask
+    if labelled.all():
+        raise ValueError(
+            "All selected cells are labelled as sources or sinks, so the "
+            "source/sink vector cannot be balanced over unlabelled cells"
+        )
+
+    vector = np.zeros(labels.shape[0], dtype=float)
+    vector[sink_mask] = 1.0
+    vector[source_mask] = -1.0
+    vector[~labelled] = -vector.sum() / int((~labelled).sum())
+    return vector
+
+
+def _validate_source_sink_vector(
+    values: np.ndarray,
+    n_cells: int,
+    context: str,
+) -> np.ndarray:
+    try:
+        vector = np.asarray(values, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{context} must contain numeric values") from exc
+
+    if vector.ndim == 2 and vector.shape == (n_cells, 1):
+        vector = vector[:, 0]
+    elif vector.ndim != 1:
+        raise ValueError(
+            f"{context} must be one-dimensional or have shape ({n_cells}, 1)"
+        )
+
+    if vector.shape[0] != n_cells:
+        raise ValueError(
+            f"Size mismatch between {context} ({vector.shape[0]}) and graph ({n_cells})"
+        )
+    if not np.isfinite(vector).all():
+        raise ValueError(f"{context} must contain only finite values")
+
+    tolerance = 1e-10 * max(1.0, float(np.abs(vector).sum()))
+    if not np.isclose(vector.sum(), 0.0, atol=tolerance, rtol=0.0):
+        raise ValueError(f"The values in {context} must sum to zero")
+    return vector
+
+
+def _select_pseudotime_component(
+    graph: csr_matrix,
+    selected_cell_indices: np.ndarray,
+    component_policy: Literal["largest", "error"],
+) -> tuple[np.ndarray, list[int]]:
+    if component_policy not in {"largest", "error"}:
+        raise ValueError("component_policy must be either 'largest' or 'error'")
+
+    n_components, component_labels = connected_components(
+        graph, directed=False, return_labels=True
+    )
+    sizes = np.bincount(component_labels, minlength=n_components).astype(int).tolist()
+    if n_components == 1:
+        return np.ones(graph.shape[0], dtype=bool), sizes
+    if component_policy == "error":
+        raise ValueError(
+            f"The selected graph has {n_components} connected components with sizes {sizes}"
+        )
+
+    retained_component = min(
+        range(n_components),
+        key=lambda component_id: (
+            -sizes[component_id],
+            int(selected_cell_indices[component_labels == component_id].min()),
+        ),
+    )
+    return np.asarray(component_labels == retained_component, dtype=bool), sizes
+
+
+def _random_walk_laplacian_transpose(graph: csr_matrix) -> csr_matrix:
+    degree = np.asarray(graph.sum(axis=1), dtype=float).ravel()
+    if np.any(degree <= 0):
+        raise ValueError("The retained graph contains isolated cells")
+    n_cells = graph.shape[0]
+    inverse_degree = csr_matrix(
+        (1.0 / degree, (range(n_cells), range(n_cells))),
+        shape=(n_cells, n_cells),
+    )
+    identity = csr_matrix(
+        (np.ones(n_cells), (range(n_cells), range(n_cells))),
+        shape=(n_cells, n_cells),
+    )
+    # For symmetric A, I - A @ D^-1 is the transpose of PBA's I - D^-1 @ A.
+    return identity - graph.dot(inverse_degree)
+
+
+def _truncated_pba_potential(
+    laplacian_transpose: csr_matrix,
+    n_singular_vals: int,
+    random_seed: int,
+    source_sink: np.ndarray,
+) -> np.ndarray:
+    random_state = np.random.RandomState(random_seed)
+    initial_vector = random_state.rand(laplacian_transpose.shape[0])
+    logger.info("Calculating SVD of graph laplacian. This might take a while...")
+    try:
+        left_vectors, singular_values, right_vectors_t = svds(
+            laplacian_transpose,
+            k=n_singular_vals,
+            which="SM",
+            v0=initial_vector,
+        )
+    except ArpackNoConvergence as exc:
+        raise RuntimeError(
+            "Pseudotime SVD did not converge. Try a smaller n_singular_vals value"
+        ) from exc
+
+    order = np.argsort(singular_values)
+    singular_values = singular_values[order]
+    left_vectors = left_vectors[:, order]
+    right_vectors = right_vectors_t[order, :].T
+
+    rank_tolerance = (
+        max(laplacian_transpose.shape)
+        * np.finfo(singular_values.dtype).eps
+        * max(1.0, float(singular_values.max()))
+    )
+    if singular_values[0] > max(1e-8, rank_tolerance):
+        raise ValueError("The graph Laplacian does not contain the expected null mode")
+    if np.any(singular_values[1:] <= rank_tolerance):
+        raise ValueError(
+            "The graph Laplacian contains additional near-zero singular modes"
+        )
+
+    inverse_singular_values = 1.0 / singular_values[1:]
+    left_vectors = left_vectors[:, 1:]
+    right_vectors = right_vectors[:, 1:]
+    # The input is L.T, so U @ inv(S) @ V.T applies the PBA operator pinv(L).
+    return np.asarray(
+        left_vectors
+        @ (inverse_singular_values * (right_vectors.T @ source_sink).ravel())
+    )
 
 
 class _GraphBuildProgress:
@@ -2941,6 +3108,7 @@ class GraphDataStore(BaseDataStore):
         min_max_norm_ptime: bool = True,
         random_seed: int = 4444,
         label: str = "pseudotime",
+        component_policy: Literal["largest", "error"] = "largest",
     ) -> None:
         """
         Calculate differentiation potential of cells. This function is a reimplementation of population balance
@@ -2968,66 +3136,12 @@ class GraphDataStore(BaseDataStore):
                                 are in 0 to 1 range. (Default: True)
             random_seed: A random seed for svds (Default: 4444)
             label: label: Base label for pseudotime in the cell metadata column (Default value: 'pseudotime')
+            component_policy: How to handle a disconnected selected graph. ``'largest'`` scores the largest connected
+                              component and marks other selected cells as unscored. ``'error'`` raises instead.
 
         Returns:
 
         """
-
-        from scipy.sparse.linalg import svds
-
-        def inverse_degree(g: csr_matrix) -> csr_matrix:
-            d = np.ravel(g.sum(axis=1))
-            n = g.shape[0]
-            d[d != 0] = 1 / d[d != 0]
-            return csr_matrix((d, (range(n), range(n))), shape=[n, n])
-
-        def laplacian(g: csr_matrix, inv_deg: csr_matrix) -> csr_matrix:
-            n = g.shape[0]
-            identity = csr_matrix((np.ones(n), (range(n), range(n))), shape=[n, n])
-            return identity - g.dot(inv_deg)
-
-        def make_source_sink_vector(
-            c: pd.Series, source: list[Any], sink: list[Any]
-        ) -> NDArray[Any]:
-            ss = list(source) + list(sink)
-
-            r = np.zeros(c.shape[0])
-            r[c.isin(sink)] = 1
-            r[c.isin(source)] = -1
-
-            n = c.isin(ss).sum()
-            v = (0 - r.sum()) / (r.shape[0] - n)
-            r[~c.isin(ss)] = v
-            return r
-
-        def pseudo_inverse(
-            lap: csr_matrix,
-            k: int,
-            rseed: int,
-            r: NDArray[Any],
-        ) -> NDArray[Any]:
-            random_state = np.random.RandomState(rseed)
-            # noinspection PyArgumentList
-            v0 = random_state.rand(lap.shape[0])
-            # TODO: add thread management here
-            logger.info(
-                "Calculating SVD of graph laplacian. This might take a while...",
-            )
-            u, s, vt = svds(lap, k=k, which="SM", v0=v0)
-            # Because the order of singular values is not guaranteed
-            idx = np.argsort(s)
-            # Extracting the second smallest values
-            s = s[idx][1:].T
-            s = 1 / s
-            u = u[:, idx][:, 1:]
-            vt = vt[idx, :][1:, :].T
-            # Computing matmul in an iterative way to save memory
-            n = u.shape[0]
-            # TODO: Use numba for this part
-            ilap = np.zeros(n)
-            for i in tqdmbar(range(n), desc="Calculating pseudotime"):
-                ilap[i] = (vt * u[i, :] * s * r).sum()
-            return ilap
 
         from_assay, cell_key, feat_key = self._get_latest_keys(
             from_assay, cell_key, feat_key
@@ -3050,75 +3164,142 @@ class GraphDataStore(BaseDataStore):
         if cell_idx.shape[0] != cell_idx.sum():
             graph = graph[cell_idx][:, cell_idx]
 
-        if source_sink_key is None:
-            if sources is not None or sinks is not None:
-                logger.warning(
-                    "Provide `sources` and `sinks` will not be used because `source_sink_key` has not been "
-                    "provided"
-                )
-        if ss_vec is None:
-            if source_sink_key is None:
-                logger.warning(
-                    "No source/sink info or custom source sink vector provided. The results might not be "
-                    "reflect true pseudotime."
-                )
-                ss_vec = np.ones(graph.shape[0])
-            else:
-                clusts = pd.Series(
-                    self.cells.fetch(source_sink_key, key=cell_key)[cell_idx]
-                )
-                if sources is None:
-                    sources = []
-                else:
-                    if isinstance(sources, list) is False:
-                        raise ValueError(
-                            "ERROR: Parameter `sources` should be of 'list' type"
-                        )
-                if sinks is None:
-                    sinks = []
-                else:
-                    if isinstance(sinks, list) is False:
-                        raise ValueError(
-                            "ERROR: Parameter `sinks` should be of 'list' type"
-                        )
-                ss_vec = make_source_sink_vector(clusts, sources, sinks)
-        else:
-            if source_sink_key is not None:
-                logger.warning(
-                    "Sources/sinks from `source_sink_key` will not be because custom vector `ss_vec` is "
-                    "provided"
-                )
-            ss_vec = np.array(ss_vec)
-            if ss_vec.shape[0] != graph.shape[0]:
-                raise ValueError(
-                    f"ERROR: Size mismatch between `ss_vec` ({ss_vec.shape[0]}) and "
-                    f"graph ({graph.shape[0]:})"
-                )
-            if ss_vec.sum() > 1e-10:
-                raise ValueError(
-                    "ERROR: The sum of all the values in `ss_vec` should be zero. Here we test if the sum is less"
-                    " 1e-10"
-                )
-
-        ss_vec = ss_vec.reshape(-1, 1)
-
-        ptime = pseudo_inverse(
-            laplacian(graph, inverse_degree(graph)),
-            n_singular_vals,
-            random_seed,
-            ss_vec,
+        if graph.shape[0] == 0:
+            raise ValueError("No cells were selected for pseudotime scoring")
+        parent_cell_indices = self.cells.active_index(cell_key)
+        selected_cell_indices = parent_cell_indices[np.asarray(cell_idx, dtype=bool)]
+        retained_mask, component_sizes = _select_pseudotime_component(
+            graph,
+            selected_cell_indices,
+            component_policy,
         )
+        retained_graph = graph[retained_mask][:, retained_mask].tocsr()
+        if len(component_sizes) > 1:
+            logger.warning(
+                f"Selected graph components have sizes {component_sizes}. "
+                f"Scoring the largest component with {retained_graph.shape[0]} cells"
+            )
+
+        retained_n_cells = retained_graph.shape[0]
+        if not isinstance(n_singular_vals, int) or isinstance(n_singular_vals, bool):
+            raise TypeError("n_singular_vals must be an integer")
+        if n_singular_vals < 2:
+            raise ValueError("n_singular_vals must be at least 2")
+        if retained_n_cells < 4:
+            raise ValueError(
+                "The retained graph must contain at least 4 cells for pseudotime scoring"
+            )
+        effective_k = min(n_singular_vals, retained_n_cells - 2)
+        if effective_k != n_singular_vals:
+            logger.warning(
+                f"Reducing n_singular_vals from {n_singular_vals} to {effective_k} "
+                "for the retained graph size"
+            )
+
+        label_arguments_supplied = (
+            source_sink_key is not None or sources is not None or sinks is not None
+        )
+        if ss_vec is not None and label_arguments_supplied:
+            raise ValueError(
+                "Provide either ss_vec or source_sink_key with source/sink labels, not both"
+            )
+        if ss_vec is None and source_sink_key is None:
+            if sources is not None or sinks is not None:
+                raise ValueError(
+                    "source_sink_key is required when sources or sinks are provided"
+                )
+            raise ValueError("Provide source/sink labels or a custom zero-sum ss_vec")
+
+        if ss_vec is not None:
+            full_source_sink = _validate_source_sink_vector(
+                ss_vec,
+                graph.shape[0],
+                "ss_vec",
+            )
+            retained_source_sink = _validate_source_sink_vector(
+                full_source_sink[retained_mask],
+                retained_n_cells,
+                "ss_vec restricted to the retained component",
+            )
+        else:
+            if sources is not None and not isinstance(sources, list):
+                raise TypeError("sources must be a list")
+            if sinks is not None and not isinstance(sinks, list):
+                raise TypeError("sinks must be a list")
+            source_labels = [] if sources is None else sources
+            sink_labels = [] if sinks is None else sinks
+            if not source_labels and not sink_labels:
+                raise ValueError("At least one source or sink label must be provided")
+
+            selected_labels = pd.Series(
+                self.cells.fetch(cast(str, source_sink_key), key=cell_key)[cell_idx]
+            )
+            _validate_source_sink_labels(
+                selected_labels,
+                source_labels,
+                sink_labels,
+                "the selected cells",
+            )
+            retained_labels = selected_labels.iloc[
+                np.flatnonzero(retained_mask)
+            ].reset_index(drop=True)
+            _validate_source_sink_labels(
+                retained_labels,
+                source_labels,
+                sink_labels,
+                "the retained connected component",
+            )
+            retained_source_sink = _validate_source_sink_vector(
+                _make_source_sink_vector(
+                    retained_labels,
+                    source_labels,
+                    sink_labels,
+                ),
+                retained_n_cells,
+                "generated source/sink vector",
+            )
+
+        retained_ptime = _truncated_pba_potential(
+            _random_walk_laplacian_transpose(retained_graph),
+            effective_k,
+            random_seed,
+            retained_source_sink,
+        )
+        if not np.isfinite(retained_ptime).all():
+            raise ValueError("Pseudotime calculation produced non-finite values")
+        value_range = float(np.ptp(retained_ptime))
+        potential_scale = max(1.0, float(np.abs(retained_ptime).max()))
+        if value_range <= np.finfo(float).eps * potential_scale:
+            raise ValueError("Pseudotime calculation produced a constant potential")
         if min_max_norm_ptime:
-            # noinspection PyArgumentList
-            ptime = ptime - ptime.min()
-            ptime = ptime / ptime.max()
+            retained_ptime = (retained_ptime - retained_ptime.min()) / value_range
+            retained_ptime = np.clip(retained_ptime, 0.0, 1.0)
+            if not np.isfinite(retained_ptime).all():
+                raise ValueError("Pseudotime normalization produced non-finite values")
+
+        ptime = np.full(graph.shape[0], np.nan, dtype=float)
+        ptime[retained_mask] = retained_ptime
+        output_column = self._col_renamer(from_assay, subset_cell_key, label)
+        validity_column = f"{output_column}__valid"
 
         self.cells.insert(
-            self._col_renamer(from_assay, subset_cell_key, label),
+            output_column,
             ptime,
             key=subset_cell_key,
             overwrite=True,
         )
+        self.cells.insert(
+            validity_column,
+            retained_mask,
+            fill_value=False,
+            key=subset_cell_key,
+            overwrite=True,
+        )
+        if not retained_mask.all():
+            logger.warning(
+                f"Unscored cells contain NaN pseudotime. Use cell key "
+                f"'{validity_column}' for downstream analysis"
+            )
         return None
 
     def integrate_assays(

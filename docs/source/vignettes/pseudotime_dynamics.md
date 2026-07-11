@@ -73,7 +73,7 @@ ds.run_pseudotime_scoring(
 )
 ```
 
-By default, the calculated pseudotime values are saved under the cell attribute column **'RNA_pseudotime'**, where 'RNA' can be replaced by whatwever the name of the given assay is. Let's visualize these values on UMAP plot. The lighter color cells represent beginning of the pseudotime
+By default, the calculated pseudotime values are saved under the cell attribute column **'RNA_pseudotime'**, where 'RNA' can be replaced by whatwever the name of the given assay is. A companion boolean column **'RNA_pseudotime__valid'** is also written. When the selected graph is fully connected every cell is valid. If the graph splits into multiple components, only the largest one is scored (controlled by `component_policy`), the remaining cells hold `NaN`, and downstream steps expect you to pass this validity column as `cell_key`. Let's visualize these values on UMAP plot. The lighter color cells represent beginning of the pseudotime
 
 ```{code-cell} ipython3
 ds.plot_layout(
@@ -91,7 +91,7 @@ We can now identify the features that are correlated with pseudotime and hence i
 ds.run_pseudotime_marker_search(pseudotime_key='RNA_pseudotime')
 ```
 
-Once calculated, the correlation values against pseudotime are saved under the feature attribute/metadata table ('I__RNA_pseudotime__p', here). The name of of the column is according to this pattern: `<cell_key>__<pseudotime_key>__<p>`. The corresponding p-value is saved under the same column name pattern with suffix `p`
+Once calculated, the correlation values against pseudotime are saved in the feature attribute/metadata table (`I__RNA_pseudotime__r`, here). The column name follows this pattern: `<cell_key>__<pseudotime_key>__r`. The corresponding p-value is saved under the same pattern with the suffix `p` (`I__RNA_pseudotime__p`)
 
 ```{code-cell} ipython3
 ds.RNA.feats.head()
@@ -172,6 +172,8 @@ There are two primary results of `run_pseudotime_aggregation`:
 1) The  binned matrix is saved under `aggregate_<cell_key>_<feat_key>_<pseudotime_key>`
 2) Feature clusters are saved under feature attributes table
 
+Features with mean expression below `min_exp` or with no variation along the ordering are treated as invalid. They are excluded from the clustering and from the heatmap below, and they receive the unassigned cluster value (`-1`) in the feature table.
+
 ```{code-cell} ipython3
 # The binned data matrix. Here we print the shape of the matrix indicating the number of features and numner of bins respectively
 ds.RNA.z['aggregated_I_I_RNA_pseudotime/data'].shape
@@ -198,7 +200,7 @@ ds.plot_pseudotime_heatmap(
 )
 ```
 
-The heatmap above shows the gene expression dynamics as the cells progress throught the pseudotime. Here, cluster 1 captures the genes that have highest expression in early pseudotime while cluster 15 captures genes whose expression peak in the late pseudotime.
+The heatmap above shows the gene expression dynamics as the cells progress through the pseudotime. Each block of rows is one feature module. Some modules capture genes that peak early in the pseudotime while others peak later. The module numbers are assigned by the clustering step and do not follow the pseudotime order.
 
 We can visualize the expression of the above selected genes on UMAP to check whether their cluster identity corroborates their expression pattern.
 
@@ -268,44 +270,61 @@ Here we will compare the pseudotime based feature module extraction approach wit
 ds.run_marker_search(group_key='RNA_cluster')
 ```
 
-Here we extract features from pseudotime-based cluster/group 13. These genes are the ones that show high expressio in Beta cells. 
-
-```{code-cell} ipython3
-ptime_feat_clusts = ds.RNA.feats.to_pandas_dataframe(
-    columns=['names', 'pseudotime_clusters']
-)
-ptime_based_markers = ptime_feat_clusts.names[ptime_feat_clusts.pseudotime_clusters == 13]
-ptime_based_markers.head()
-```
-
-Now we extract all the marker genes for cell cluster 8, this cluster predominantly contains the Beta cells.
+First we extract the marker genes for cell cluster 8, which predominantly contains the Beta cells.
 
 ```{code-cell} ipython3
 cell_cluster_markers = ds.get_markers(
     group_key='RNA_cluster',
-    group_id='8'
+    group_id='8',
 ).feature_name
 
 cell_cluster_markers.head()
 ```
 
+Next we pick the pseudotime feature module that shares the most genes with these Beta cell markers. The module numbering is assigned by clustering and can change between runs, so we select the module in a data-driven way instead of hard-coding a cluster id.
+
 ```{code-cell} ipython3
-# let's checkout the number of Beta cell associated genes from both methods
+ptime_feat_clusts = ds.RNA.feats.to_pandas_dataframe(
+    columns=['names', 'pseudotime_clusters']
+)
+
+beta_marker_names = set(cell_cluster_markers)
+assigned = ptime_feat_clusts[ptime_feat_clusts.pseudotime_clusters != -1]
+module_overlap = assigned.groupby('pseudotime_clusters')['names'].apply(
+    lambda names: len(set(names) & beta_marker_names)
+)
+beta_module = int(module_overlap.idxmax())
+beta_module
+```
+
+The genes belonging to this Beta associated module are:
+
+```{code-cell} ipython3
+ptime_based_markers = ptime_feat_clusts.names[
+    ptime_feat_clusts.pseudotime_clusters == beta_module
+]
+ptime_based_markers.head()
+```
+
+```{code-cell} ipython3
+# Number of genes captured by each approach
 ptime_based_markers.shape, cell_cluster_markers.shape
 ```
 
 ```{code-cell} ipython3
-# let's checkout the number of common Beta cell associated genes from both methods
-len(set(cell_cluster_markers.index).intersection(ptime_based_markers.index))
+# Number of genes shared by both approaches, compared by gene name
+len(set(ptime_based_markers) & set(cell_cluster_markers))
 ```
 
 Let's visualize the cumulative expression of genes that are present only in cluster marker based approach
 
 ```{code-cell} ipython3
-temp = list(set(cell_cluster_markers.index).difference(ptime_based_markers.index))
+name_to_idx = dict(zip(ptime_feat_clusts.names, ptime_feat_clusts.index))
+cell_only = sorted((set(cell_cluster_markers) - set(ptime_based_markers)) & set(name_to_idx))
+cell_only_idx = sorted(name_to_idx[name] for name in cell_only)
 ds.cells.insert(
     column_name='Cell cluster based markers', 
-    values=ds.RNA.normed(feat_idx=sorted(temp)).mean(axis=1).compute(),
+    values=ds.RNA.normed(feat_idx=cell_only_idx).mean(axis=1).compute(),
     overwrite=True)
 
 ds.plot_layout(
@@ -318,10 +337,11 @@ ds.plot_layout(
 Let's now do this the other way and visualize the cumulative expression of genes that are present only in pseudotime-based approach
 
 ```{code-cell} ipython3
-temp = list(set(ptime_based_markers.index).difference(cell_cluster_markers.index))
+ptime_only = sorted((set(ptime_based_markers) - set(cell_cluster_markers)) & set(name_to_idx))
+ptime_only_idx = sorted(name_to_idx[name] for name in ptime_only)
 ds.cells.insert(
     column_name='Pseudotime based markers',
-    values=ds.RNA.normed(feat_idx=sorted(temp)).mean(axis=1).compute(),
+    values=ds.RNA.normed(feat_idx=ptime_only_idx).mean(axis=1).compute(),
     overwrite=True)
 
 ds.plot_layout(

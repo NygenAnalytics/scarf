@@ -213,6 +213,27 @@ class TestDataStore:
         diff = pseudotime_scoring - cell_attrs["RNA_pseudotime"].values
         assert np.all(np.abs(diff) < 0.08)
 
+    def test_run_pseudotime_scoring_current_contract(
+        self,
+        leiden_clustering,
+        datastore_ephemeral,
+    ):
+        datastore_ephemeral.run_pseudotime_scoring(
+            source_sink_key="RNA_leiden_cluster",
+            sources=[6],
+            sinks=[3],
+            n_singular_vals=10,
+            label="reliability_test",
+        )
+
+        output_key = "RNA_reliability_test"
+        validity_key = f"{output_key}__valid"
+        assert validity_key in datastore_ephemeral.cells.columns
+        values = datastore_ephemeral.cells.fetch(output_key, key=validity_key)
+        assert np.isfinite(values).all()
+        assert values.min() >= 0.0
+        assert values.max() <= 1.0
+
     def test_run_pseudotime_marker_search(self, pseudotime_markers):
         precalc_markers = pd.read_csv(
             full_path("pseudotime_markers_r_values.csv"), index_col=0
@@ -227,6 +248,8 @@ class TestDataStore:
         )
 
     def test_run_pseudotime_aggregation(self, pseudotime_aggregation, datastore):
+        from scarf.assay import PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
+
         precalc_values = np.load(full_path("aggregated_feat_idx.npy"))
         agg_group = datastore.z["RNA"]["aggregated_I_I_RNA_pseudotime"]
         test_values = agg_group["feature_indices"][:]
@@ -234,21 +257,33 @@ class TestDataStore:
             precalc_values.astype(np.int64), test_values.astype(np.int64)
         )
 
-        precalc_values = np.load(full_path("aggregated_df_top_10.npy"))
-        test_values = agg_group["data"][:10]
-        assert np.max(np.abs(precalc_values - test_values)) < 3.0
-
-        precalc_values = np.load(full_path("pseudotime_clusters.npy"))
-        test_values = datastore.RNA.feats.fetch_all("pseudotime_clusters")
-        assert len(test_values) == len(precalc_values)
-        assert len(np.unique(test_values)) == len(np.unique(precalc_values))
+        assert (
+            agg_group.attrs["schema_version"] == PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
+        )
+        assert np.isfinite(agg_group["data"][:]).all()
+        valid_features = np.asarray(agg_group["valid_features"][:], dtype=bool)
+        clusters = datastore.RNA.feats.fetch_all("pseudotime_clusters")
+        assigned = clusters[test_values[valid_features].astype(int)]
+        assert assigned.min() >= 1
+        assert assigned.max() <= 15
+        assert len(np.unique(assigned)) == 15
+        assert np.all(clusters[test_values[~valid_features].astype(int)] == -1)
 
     def test_add_grouped_assay(self, grouped_assay, datastore):
-        precalc_values = np.load(full_path("ptime_modules_group_1.npy"))
         test_values = datastore.get_cell_vals(
             from_assay="PTIME_MODULES", cell_key="I", k="group_1"
         )
-        assert np.allclose(precalc_values, test_values, rtol=0.5, atol=0.5)
+        groups = datastore.RNA.feats.fetch_all("pseudotime_clusters")
+        feature_index = np.where(groups == 1)[0]
+        expected = (
+            datastore.RNA.normed(
+                cell_idx=datastore.cells.active_index("I"),
+                feat_idx=feature_index,
+            )
+            .mean(axis=1)
+            .compute()
+        )
+        assert np.allclose(expected, test_values)
 
     def test_make_bulk(self, leiden_clustering, datastore):
         df = datastore.make_bulk(group_key="RNA_leiden_cluster")

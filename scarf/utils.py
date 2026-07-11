@@ -9,6 +9,7 @@
     - rolling_window: applies rolling window mean over a vector
 """
 
+import hashlib
 import resource
 import shutil
 import sys
@@ -50,6 +51,7 @@ __all__ = [
     "remote_column_ram_ahead",
     "process_rss_mb",
     "rss_peak_tracker",
+    "array_digest",
     "rolling_window",
 ]
 
@@ -587,6 +589,17 @@ def system_call(command: str) -> None:
     return None
 
 
+def array_digest(values: np.ndarray) -> str:
+    array = np.ascontiguousarray(values)
+    if array.dtype.hasobject:
+        raise TypeError("Cannot create a deterministic digest for object arrays")
+    digest = hashlib.blake2b(digest_size=16)
+    digest.update(array.dtype.str.encode())
+    digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+    digest.update(array.view(np.uint8).tobytes())
+    return digest.hexdigest()
+
+
 @jit(nopython=True)
 def rolling_window(a: np.ndarray, w: int) -> np.ndarray:
     """Apply a centered rolling mean with window size w along axis 0.
@@ -598,23 +611,29 @@ def rolling_window(a: np.ndarray, w: int) -> np.ndarray:
     Returns:
         Array of the same shape as a with smoothed values.
     """
+    if a.ndim != 2:
+        raise ValueError("a must be a two-dimensional array")
+    if w <= 0:
+        raise ValueError("w must be greater than zero")
+
     n, m = a.shape
-    b = np.zeros(shape=(n, m))
-    for i in range(n):
-        if i < w:
-            x = i
-            y = w - i
-        elif (n - i) < w:
-            x = w - (n - i)
-            y = n - i
-        else:
-            x = w // 2
-            y = w // 2
-        x = i - x
-        y = i + y
-        for j in range(m):
-            b[i, j] = a[x:y, j].mean()
-    return b
+    if n == 0:
+        raise ValueError("a must contain at least one row")
+    w = min(w, n)
+    left = (w - 1) // 2
+    right = w // 2
+    result = np.empty((n, m), dtype=np.float64)
+
+    for j in range(m):
+        cumulative = np.empty(n + 1, dtype=np.float64)
+        cumulative[0] = 0.0
+        for i in range(n):
+            cumulative[i + 1] = cumulative[i] + a[i, j]
+        for i in range(n):
+            start = max(0, i - left)
+            stop = min(n, i + right + 1)
+            result[i, j] = (cumulative[stop] - cumulative[start]) / (stop - start)
+    return result
 
 
 def permute_into_chunks(size: int, chunk_size: int, seed: int = 42) -> list[np.ndarray]:

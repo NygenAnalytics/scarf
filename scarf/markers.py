@@ -491,6 +491,16 @@ def find_markers_by_regression(
             - p_value: Statistical significance of correlation
     """
 
+    regressor = np.asarray(regressor, dtype=float)
+    if regressor.ndim != 1:
+        raise ValueError("regressor must be one-dimensional")
+    if not np.isfinite(regressor).all():
+        raise ValueError("regressor must contain only finite values")
+    if regressor.size < 2 or np.unique(regressor).size < 2:
+        raise ValueError("regressor must contain at least two distinct values")
+    if min_cells < 1:
+        raise ValueError("min_cells must be at least 1")
+
     res: dict[Any, tuple[float, float]] = {}
     for feature_batch in assay.iter_normed_feature_wise(
         cell_key=cell_key,
@@ -501,9 +511,15 @@ def find_markers_by_regression(
     ):
         if not isinstance(feature_batch, pd.DataFrame):
             raise TypeError("Expected normalized feature batches as DataFrames.")
+        if feature_batch.shape[0] != regressor.shape[0]:
+            raise ValueError(
+                "Regressor length does not match the number of selected cells"
+            )
         for i in feature_batch:
-            v = np.asarray(feature_batch[i].values)
-            if (v > 0).sum() > min_cells:
+            v = np.asarray(feature_batch[i].values, dtype=float)
+            if not np.isfinite(v).all():
+                raise ValueError(f"Feature {i!r} contains non-finite normalized values")
+            if (v > 0).sum() >= min_cells and np.ptp(v) > np.finfo(float).eps:
                 lin_obj = linregress(regressor, v)
                 res[i] = (float(lin_obj.rvalue), float(lin_obj.pvalue))
             else:
@@ -533,6 +549,20 @@ def knn_clustering(
         np.ndarray: 1D array of cluster assignments (integers from 1 to n_clusters)
     """
 
+    if len(d_array.shape) != 2:
+        raise ValueError("d_array must be two-dimensional")
+    n_genes = int(d_array.shape[0])
+    if n_genes < 2:
+        raise ValueError("At least two retained genes are required for clustering")
+    if not isinstance(n_neighbours, int) or isinstance(n_neighbours, bool):
+        raise TypeError("n_neighbours must be an integer")
+    if not 1 <= n_neighbours < n_genes:
+        raise ValueError(f"n_neighbours must satisfy 1 <= n_neighbours < {n_genes}")
+    if not isinstance(n_clusters, int) or isinstance(n_clusters, bool):
+        raise TypeError("n_clusters must be an integer")
+    if not 1 <= n_clusters <= n_genes:
+        raise ValueError(f"n_clusters must satisfy 1 <= n_clusters <= {n_genes}")
+
     from .ann import instantiate_knn_index, fix_knn_query
     from .utils import show_dask_progress
     from scipy.sparse import csr_matrix
@@ -550,6 +580,8 @@ def knn_clustering(
         """
 
         for i in data.stream_blocks(nthreads=t, msg="Fitting KNNs"):
+            if not np.isfinite(i).all():
+                raise ValueError("Feature profiles must contain only finite values")
             ann_idx.add_items(i)
         s, e = 0, 0
         neighbor_indices: list[np.ndarray] = []

@@ -8,11 +8,16 @@ from loguru import logger
 from numpy.typing import NDArray
 
 from .._types import ZarrMode, as_zarr_array, as_zarr_group
-from ..assay import Assay, ATACassay, RNAassay
+from ..assay import (
+    PSEUDOTIME_AGGREGATION_SCHEMA_VERSION,
+    Assay,
+    ATACassay,
+    RNAassay,
+)
 from ..chunked import ChunkedArray
 from ..feat_utils import hto_demux
 from ..markers import sort_marker_results
-from ..utils import ZARRLOC, controlled_compute, tqdmbar
+from ..utils import ZARRLOC, array_digest, controlled_compute, tqdmbar
 from ..writers import create_zarr_dataset
 from .mapping_datastore import MappingDatastore
 
@@ -91,6 +96,69 @@ def _load_marker_cluster_frame(
     df["group_id"] = group_id
     df["feature_name"] = feature_names[df.feature_index.astype("int")]
     return df[["group_id", "feature_name", *available_cols[1:]]]
+
+
+def _validated_pseudotime_regressor(
+    assay: Assay,
+    cell_key: str,
+    pseudotime_key: str,
+) -> np.ndarray:
+    try:
+        pseudotime = np.asarray(
+            assay.cells.fetch(pseudotime_key, key=cell_key),
+            dtype=float,
+        )
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"Pseudotime column '{pseudotime_key}' must be numeric"
+        ) from exc
+
+    if pseudotime.ndim != 1:
+        raise ValueError(
+            f"Pseudotime column '{pseudotime_key}' must be one-dimensional"
+        )
+    expected_size = assay.cells.active_index(cell_key).shape[0]
+    if pseudotime.shape[0] != expected_size:
+        raise ValueError(
+            f"Pseudotime column '{pseudotime_key}' has {pseudotime.shape[0]} values, "
+            f"but cell_key '{cell_key}' selects {expected_size} cells"
+        )
+    if not np.isfinite(pseudotime).all():
+        validity_key = f"{pseudotime_key}__valid"
+        if validity_key in assay.cells.columns:
+            raise ValueError(
+                f"Pseudotime column '{pseudotime_key}' contains unscored cells. "
+                f"Use cell_key='{validity_key}' for downstream analysis"
+            )
+        raise ValueError(
+            f"Pseudotime column '{pseudotime_key}' contains non-finite values"
+        )
+    if pseudotime.size < 2 or np.unique(pseudotime).size < 2:
+        raise ValueError(
+            f"Pseudotime column '{pseudotime_key}' must contain at least two distinct values"
+        )
+    return pseudotime
+
+
+def _group_assignment_digest(values: np.ndarray) -> str:
+    return array_digest(np.asarray(values).astype(str))
+
+
+def _scatter_feature_clusters(
+    n_features: int,
+    feature_indices: np.ndarray,
+    clusters: np.ndarray,
+    unassigned_value: int,
+) -> np.ndarray:
+    feature_indices = np.asarray(feature_indices, dtype=int)
+    clusters = np.asarray(clusters, dtype=int)
+    if feature_indices.shape != clusters.shape:
+        raise ValueError("Feature indices and cluster assignments are misaligned")
+    if unassigned_value in clusters:
+        raise ValueError("unassigned_value conflicts with an assigned feature cluster")
+    values = np.full(n_features, unassigned_value, dtype=int)
+    values[feature_indices] = clusters
+    return values
 
 
 class DataStore(MappingDatastore):
@@ -844,7 +912,7 @@ class DataStore(MappingDatastore):
         if feat_key is None:
             feat_key = "I"
         assay = self._get_assay(from_assay)
-        ptime = assay.cells.fetch(pseudotime_key, key=cell_key)
+        ptime = _validated_pseudotime_regressor(assay, cell_key, pseudotime_key)
         markers = find_markers_by_regression(
             assay=assay,
             cell_key=cell_key,
@@ -854,14 +922,20 @@ class DataStore(MappingDatastore):
             batch_size=gene_batch_size,
             **norm_params,
         )
+        feature_index = assay.feats.active_index(feat_key)
+        markers = markers.reindex(feature_index)
+        if markers.isna().any(axis=None):
+            raise ValueError("Pseudotime marker results are not aligned to feat_key")
         assay.feats.insert(
             f"{cell_key}__{pseudotime_key}__r",
             np.array(markers["r_value"].values),
+            key=feat_key,
             overwrite=True,
         )
         assay.feats.insert(
             f"{cell_key}__{pseudotime_key}__p",
             np.array(markers["p_value"].values),
+            key=feat_key,
             overwrite=True,
         )
 
@@ -881,7 +955,8 @@ class DataStore(MappingDatastore):
         n_clusters: int = 10,
         batch_size: int = 100,
         ann_params: dict | None = None,
-        nan_cluster_value: int | str = -1,
+        nan_cluster_value: int = -1,
+        **norm_params: Any,
     ) -> None:
         """This method performs clustering of features based on pseudotime
         ordered cells. The values from the pseudotime ordered cells are
@@ -895,13 +970,13 @@ class DataStore(MappingDatastore):
             cell_key: To run the test on specific subset of cells, provide the name of a boolean column in
                       the cell metadata table. (Default value: The cell key that was used to generate the latest graph)
             feat_key: To use only a subset of features, provide the name of a boolean column in the feature
-                      metadata/attribute table. Default value: The cell key that was used to generate the latest graph)
+                      metadata/attribute table. (Default value: 'I')
             pseudotime_key: Required parameter. This has to be a column name from cell attribute table. This
                             column contains values for pseudotime ordering of the cells.
             cluster_label: Required parameter. Name of the column under which the feature cluster identity will be
                            saved in the feature attribute table.
-            min_exp: Features with mean normalized expression than this value are dropped and hence not assigned
-                     a cluster identity (Default value: 10)
+            min_exp: Features with mean normalized expression below this value are dropped and not assigned
+                     a cluster identity. (Default value: 1e-3)
             window_size: The window for calculating rolling mean of feature values along pseudotime ordering. Larger
                          values will slow down processing but produce more smoothened. The choice of value here depends
                          on the number of cells in the analysis. Larger value will be useful to produce smooth profiles
@@ -918,6 +993,7 @@ class DataStore(MappingDatastore):
             ann_params: The parameter to forward to HNSWlib index instantiation step. (Default value: {})
             nan_cluster_value: The value to use for features that are not assigned a cluster identity.
                                (Default value: -1)
+            **norm_params: Extra keyword arguments forwarded to normalized expression calculation.
 
         Returns: None
         """
@@ -940,6 +1016,12 @@ class DataStore(MappingDatastore):
                 "of each feature will be saved under this column name. If this column already exists "
                 "then it will be overwritten."
             )
+        if not isinstance(nan_cluster_value, (int, np.integer)) or isinstance(
+            nan_cluster_value, (bool, np.bool_)
+        ):
+            raise TypeError("nan_cluster_value must be an integer")
+        nan_cluster_value = int(nan_cluster_value)
+        _validated_pseudotime_regressor(assay, cell_key, pseudotime_key)
 
         df, feat_ids = assay.save_aggregated_ordering(
             cell_key=cell_key,
@@ -951,6 +1033,7 @@ class DataStore(MappingDatastore):
             smoothen=smoothen,
             z_scale=z_scale,
             batch_size=batch_size,
+            **norm_params,
         )
         if ann_params is None:
             ann_params = {}
@@ -961,11 +1044,37 @@ class DataStore(MappingDatastore):
             n_threads=self.nthreads,
             ann_params=ann_params,
         )
-        temp = np.ones(assay.feats.N) * -1
-        temp[feat_ids] = clusts
-        assay.feats.insert(
-            cluster_label, temp.astype(int), fill_value=-1, overwrite=True
+        temp = _scatter_feature_clusters(
+            assay.feats.N,
+            feat_ids,
+            clusts,
+            nan_cluster_value,
         )
+        assay.feats.insert(
+            cluster_label,
+            temp,
+            fill_value=nan_cluster_value,
+            overwrite=True,
+        )
+
+        location = f"aggregated_{cell_key}_{feat_key}_{pseudotime_key}"
+        aggregation_group = as_zarr_group(assay.z[location], name=location)
+        cluster_digest = _group_assignment_digest(temp)
+        aggregation_group.attrs["cluster_label"] = cluster_label
+        aggregation_group.attrs["cluster_digest"] = cluster_digest
+        aggregation_group.attrs["nan_cluster_value"] = nan_cluster_value
+
+        for assay_name in self.assay_names:
+            grouped_assay = self._get_assay(assay_name)
+            if (
+                grouped_assay.attrs.get("grouped_from_assay") == assay.name
+                and grouped_assay.attrs.get("grouped_group_key") == cluster_label
+                and grouped_assay.attrs.get("grouped_group_digest") != cluster_digest
+            ):
+                logger.warning(
+                    f"Grouped assay '{assay_name}' is stale after updating "
+                    f"feature groups in '{cluster_label}'. Rerun add_grouped_assay"
+                )
         return None
 
     def get_markers(
@@ -1266,6 +1375,10 @@ class DataStore(MappingDatastore):
 
         self._load_assays(min_cells=0, custom_assay_types={assay_label: "Assay"})
         self._ini_cell_props(min_features=0, mito_pattern="", ribo_pattern="")
+        grouped_assay = self._get_assay(assay_label)
+        grouped_assay.attrs["grouped_from_assay"] = assay.name
+        grouped_assay.attrs["grouped_group_key"] = group_key
+        grouped_assay.attrs["grouped_group_digest"] = _group_assignment_digest(groups)
 
     def add_melded_assay(
         self,
@@ -2491,10 +2604,15 @@ class DataStore(MappingDatastore):
                 "ERROR: Please provide a value for parameter `pseudotime_key`"
             )
 
-        cell_ordering = assay.cells.fetch(pseudotime_key, key=cell_key)
+        cell_ordering = np.asarray(
+            assay.cells.fetch(pseudotime_key, key=cell_key),
+            dtype=float,
+        )
         # noinspection PyProtectedMember
         cell_idx, feat_idx = assay._get_cell_feat_idx(cell_key, feat_key)
-        hashes = [hash(tuple(x)) for x in (cell_idx, feat_idx, cell_ordering)]
+        hashes = [
+            array_digest(np.asarray(x)) for x in (cell_idx, feat_idx, cell_ordering)
+        ]
         location = f"aggregated_{cell_key}_{feat_key}_{pseudotime_key}"
         if location not in assay.z:
             raise KeyError(
@@ -2503,7 +2621,12 @@ class DataStore(MappingDatastore):
                 f"parameters: `cell_key`, `feat_key` and `pseudotime_key`"
             )
         agg_grp = as_zarr_group(assay.z[location], name=location)
-        if hashes != cast(list[int], agg_grp.attrs["hashes"]):
+        if agg_grp.attrs.get("schema_version") != PSEUDOTIME_AGGREGATION_SCHEMA_VERSION:
+            raise ValueError(
+                f"Aggregated data at '{location}' uses an old cache schema. "
+                "Rerun run_pseudotime_aggregation before plotting"
+            )
+        if hashes != cast(list[str], agg_grp.attrs["hashes"]):
             raise ValueError(
                 "ERROR: The values under one or more of these columns: `cell_key`, `feat_key` or/and "
                 "`pseudotime_key have been updated after running `run_pseudotime_aggregation`"
@@ -2515,9 +2638,50 @@ class DataStore(MappingDatastore):
         feature_indices = np.asarray(
             as_zarr_array(agg_grp["feature_indices"], name="feature_indices")[:]
         )
+        if "valid_features" not in agg_grp:
+            raise ValueError(
+                f"Aggregated data at '{location}' has no valid_features mask. "
+                "Rerun run_pseudotime_aggregation"
+            )
+        valid_features = np.asarray(
+            as_zarr_array(agg_grp["valid_features"], name="valid_features")[:],
+            dtype=bool,
+        )
+        if valid_features.shape[0] != feature_indices.shape[0]:
+            raise ValueError(
+                "Aggregated feature indices and validity mask are misaligned"
+            )
         da_arr = np.asarray(da[: feature_indices.shape[0]])
+        if da_arr.shape[0] != feature_indices.shape[0]:
+            raise ValueError(
+                "Aggregated feature matrix and feature indices are misaligned"
+            )
+        da_arr = da_arr[valid_features]
+        feature_indices = feature_indices[valid_features]
+        if not np.isfinite(da_arr).all():
+            raise ValueError("Aggregated feature matrix contains non-finite values")
 
-        feature_clusters = assay.feats.fetch_all(feature_cluster_key)[feature_indices]
+        all_feature_clusters = assay.feats.fetch_all(feature_cluster_key)
+        cached_cluster_label = agg_grp.attrs.get("cluster_label")
+        cached_cluster_digest = agg_grp.attrs.get("cluster_digest")
+        current_cluster_digest = _group_assignment_digest(all_feature_clusters)
+        if cached_cluster_label is None or cached_cluster_digest is None:
+            raise ValueError(
+                "Aggregated data has no completed feature-clustering provenance. "
+                "Rerun run_pseudotime_aggregation"
+            )
+        if cached_cluster_label != feature_cluster_key:
+            logger.warning(
+                f"Heatmap requested feature clusters '{feature_cluster_key}', but "
+                f"the aggregation cache was clustered as '{cached_cluster_label}'"
+            )
+        if cached_cluster_digest != current_cluster_digest:
+            logger.warning(
+                f"Feature cluster column '{feature_cluster_key}' changed after "
+                "aggregation and may be stale"
+            )
+
+        feature_clusters = all_feature_clusters[feature_indices]
         feature_labels = assay.feats.fetch_all("names")[feature_indices]
 
         idx = np.argsort(feature_clusters)

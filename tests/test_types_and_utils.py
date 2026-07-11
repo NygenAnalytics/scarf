@@ -5,6 +5,7 @@ from zarr.storage import MemoryStore
 
 from scarf._types import as_zarr_array, as_zarr_group, array_metadata_shards
 from scarf.utils import (
+    array_digest,
     clean_array,
     permute_into_chunks,
     rescale_array,
@@ -71,10 +72,42 @@ def test_set_verbosity_accepts_valid_level():
 
 
 def test_rolling_window_smoothes_along_rows():
-    data = np.arange(20, dtype=float).reshape(10, 2)
+    data = np.arange(10, dtype=float).reshape(5, 2)
     smoothed = rolling_window(data, w=3)
-    assert smoothed.shape == data.shape
-    assert np.all(np.isfinite(smoothed))
+    expected = np.array(
+        [
+            [1.0, 2.0],
+            [2.0, 3.0],
+            [4.0, 5.0],
+            [6.0, 7.0],
+            [7.0, 8.0],
+        ]
+    )
+    assert np.array_equal(smoothed, expected)
+
+
+def test_rolling_window_even_and_oversized_windows():
+    data = np.arange(5, dtype=float).reshape(-1, 1)
+
+    assert np.array_equal(rolling_window(np.array([[7.0]]), w=1), [[7.0]])
+    assert np.array_equal(
+        rolling_window(data, w=2).ravel(),
+        [0.5, 1.5, 2.5, 3.5, 4.0],
+    )
+    assert np.array_equal(
+        rolling_window(data, w=20).ravel(),
+        [1.0, 1.5, 2.0, 2.5, 3.0],
+    )
+    for window_size in (0, -1):
+        with pytest.raises(ValueError, match="greater than zero"):
+            rolling_window(data, w=window_size)
+
+
+def test_array_digest_is_deterministic_and_shape_sensitive():
+    values = np.arange(6, dtype=np.int64)
+
+    assert array_digest(values) == array_digest(values.copy())
+    assert array_digest(values) != array_digest(values.reshape(2, 3))
 
 
 def test_permute_into_chunks_preserves_all_indices():

@@ -164,7 +164,9 @@ def test_find_markers_by_regression_handles_expression_threshold():
             yield pd.DataFrame(
                 {
                     "correlated": [0.0, 1.0, 2.0, 3.0],
+                    "at_threshold": [0.0, 1.0, 2.0, 0.0],
                     "too_sparse": [0.0, 0.0, 1.0, 0.0],
+                    "constant": [1.0, 1.0, 1.0, 1.0],
                 }
             )
 
@@ -173,12 +175,14 @@ def test_find_markers_by_regression_handles_expression_threshold():
         cell_key="I",
         feat_key="I",
         regressor=np.arange(4),
-        min_cells=1,
+        min_cells=2,
     )
 
     assert result.loc["correlated", "r_value"] == pytest.approx(1.0)
     assert result.loc["correlated", "p_value"] < 1e-10
+    assert result.loc["at_threshold", "r_value"] != 0.0
     assert np.array_equal(result.loc["too_sparse"].to_numpy(), [0.0, 1.0])
+    assert np.array_equal(result.loc["constant"].to_numpy(), [0.0, 1.0])
 
 
 def test_find_markers_by_regression_rejects_non_dataframe_batches():
@@ -188,6 +192,22 @@ def test_find_markers_by_regression_rejects_non_dataframe_batches():
             yield np.ones((3, 1))
 
     with pytest.raises(TypeError, match="DataFrames"):
+        find_markers_by_regression(
+            Assay(),
+            cell_key="I",
+            feat_key="I",
+            regressor=np.arange(3),
+            min_cells=1,
+        )
+
+
+def test_find_markers_by_regression_identifies_nonfinite_feature():
+    class Assay:
+        @staticmethod
+        def iter_normed_feature_wise(**_kwargs):
+            yield pd.DataFrame({"bad_feature": [0.0, np.nan, 1.0]})
+
+    with pytest.raises(ValueError, match="bad_feature"):
         find_markers_by_regression(
             Assay(),
             cell_key="I",

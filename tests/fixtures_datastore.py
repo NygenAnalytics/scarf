@@ -185,7 +185,16 @@ def pseudotime_markers(datastore, pseudotime_scoring):
 
 @pytest.fixture(scope="session")
 def pseudotime_aggregation(datastore, pseudotime_scoring):
-    if "aggregated_I_I_RNA_pseudotime" not in datastore.z["RNA"]:
+    from scarf.assay import PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
+
+    location = "aggregated_I_I_RNA_pseudotime"
+    needs_rebuild = location not in datastore.z["RNA"]
+    if not needs_rebuild:
+        needs_rebuild = (
+            datastore.z["RNA"][location].attrs.get("schema_version")
+            != PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
+        )
+    if needs_rebuild:
         datastore.run_pseudotime_aggregation(
             pseudotime_key="RNA_pseudotime",
             cluster_label="pseudotime_clusters",
@@ -197,10 +206,9 @@ def pseudotime_aggregation(datastore, pseudotime_scoring):
 
 @pytest.fixture(scope="session")
 def grouped_assay(datastore, pseudotime_aggregation):
-    if "PTIME_MODULES" not in datastore.assay_names:
-        datastore.add_grouped_assay(
-            group_key="pseudotime_clusters", assay_label="PTIME_MODULES"
-        )
+    datastore.add_grouped_assay(
+        group_key="pseudotime_clusters", assay_label="PTIME_MODULES"
+    )
 
 
 @pytest.fixture(scope="session")

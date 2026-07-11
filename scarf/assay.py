@@ -21,9 +21,11 @@ from scipy.sparse import csr_matrix, vstack
 from ._types import as_zarr_array, as_zarr_group
 from .chunked import ChunkedArray
 from .metadata import MetaData
-from .utils import controlled_compute, logger, show_dask_progress
+from .utils import array_digest, controlled_compute, logger, show_dask_progress
 
 __all__ = ["Assay", "RNAassay", "ATACassay", "ADTassay"]
+
+PSEUDOTIME_AGGREGATION_SCHEMA_VERSION = 2
 
 type NormMethod = Callable[["Assay", ChunkedArray], ChunkedArray]
 type PercentFeatures = dict[str, str]
@@ -704,13 +706,45 @@ class Assay:
         from .utils import rolling_window
         from .writers import create_zarr_dataset
 
-        cell_ordering = self.cells.fetch(ordering_key, key=cell_key)
+        cell_ordering = np.asarray(
+            self.cells.fetch(ordering_key, key=cell_key),
+            dtype=float,
+        )
         cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
-        hashes = [hash(tuple(x)) for x in (cell_idx, feat_idx, cell_ordering)]
+        n_cells = cell_ordering.shape[0]
+        if cell_ordering.ndim != 1 or n_cells == 0:
+            raise ValueError("Cell ordering must be a non-empty one-dimensional array")
+        if not np.isfinite(cell_ordering).all():
+            raise ValueError("Cell ordering must contain only finite values")
+        if not isinstance(window_size, int) or isinstance(window_size, bool):
+            raise TypeError("window_size must be an integer")
+        if not isinstance(chunk_size, int) or isinstance(chunk_size, bool):
+            raise TypeError("chunk_size must be an integer")
+        if window_size <= 0:
+            raise ValueError("window_size must be greater than zero")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be greater than zero")
+
+        effective_window = min(window_size, n_cells)
+        effective_bins = min(chunk_size, n_cells)
+        if effective_window != window_size:
+            logger.warning(
+                f"Reducing window_size from {window_size} to {effective_window} "
+                "for the selected cell count"
+            )
+        if effective_bins != chunk_size:
+            logger.warning(
+                f"Reducing chunk_size from {chunk_size} to {effective_bins} "
+                "for the selected cell count"
+            )
+
+        hashes = [array_digest(x) for x in (cell_idx, feat_idx, cell_ordering)]
         params = {
             "min_exp": min_exp,
             "window_size": window_size,
+            "effective_window": effective_window,
             "chunk_size": chunk_size,
+            "effective_bins": effective_bins,
             "smoothen": smoothen,
             "z_scale": z_scale,
             "norm_params": norm_params,
@@ -722,6 +756,8 @@ class Assay:
             and hashes == self.z[location].attrs["hashes"]
             and "params" in self.z[location].attrs
             and params == self.z[location].attrs["params"]
+            and self.z[location].attrs.get("schema_version")
+            == PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
         ):
             logger.info(f"Using existing aggregated data from {location}")
         else:
@@ -734,9 +770,9 @@ class Assay:
                 location + "/data",
                 (batch_size,),
                 "float64",
-                (feat_idx.shape[0], chunk_size),
+                (feat_idx.shape[0], effective_bins),
             )
-            ordering_idx = np.argsort(cell_ordering)
+            ordering_idx = np.argsort(cell_ordering, kind="stable")
             stored_feat_idx: list[int] = []
             valid_feat_flags: list[bool] = []
             s = 0
@@ -749,15 +785,55 @@ class Assay:
                 **norm_params,
             ):
                 df = cast(pd.DataFrame, item)
-                valid_feat_flags.extend(list((df.mean() > min_exp).values))
                 stored_feat_idx.extend(list(df.columns))
+                ordered = df.iloc[ordering_idx].to_numpy(dtype=float)
+                if not np.isfinite(ordered).all():
+                    invalid_columns = np.asarray(df.columns)[
+                        ~np.isfinite(ordered).all(axis=0)
+                    ]
+                    raise ValueError(
+                        f"Normalized features contain non-finite values: "
+                        f"{invalid_columns.tolist()}"
+                    )
                 if smoothen:
-                    df = rolling_window(df.reindex(ordering_idx).values, window_size)
+                    ordered = rolling_window(ordered, effective_window)
+                if not np.isfinite(ordered).all():
+                    raise ValueError(
+                        "Smoothed feature profiles contain non-finite values"
+                    )
+
+                mean_expression = df.mean(axis=0).to_numpy(dtype=float)
+                standard_deviation = ordered.std(axis=0)
+                valid_features = (
+                    (mean_expression > min_exp)
+                    & np.isfinite(standard_deviation)
+                    & (standard_deviation > np.finfo(float).eps)
+                )
+                valid_feat_flags.extend(valid_features.tolist())
                 if z_scale:
-                    df = (df - df.mean(axis=0)) / df.std(axis=0)
-                df_mean = np.array(
-                    [x.mean(axis=0) for x in np.array_split(df, chunk_size)]
-                ).T
+                    processed = np.zeros_like(ordered, dtype=float)
+                    processed[:, valid_features] = (
+                        ordered[:, valid_features]
+                        - ordered[:, valid_features].mean(axis=0)
+                    ) / standard_deviation[valid_features]
+                else:
+                    processed = ordered.copy()
+                    processed[:, ~valid_features] = 0.0
+                df_mean = np.stack(
+                    [
+                        values.mean(axis=0)
+                        for values in np.array_split(
+                            processed,
+                            effective_bins,
+                            axis=0,
+                        )
+                    ],
+                    axis=1,
+                )
+                if not np.isfinite(df_mean).all():
+                    raise ValueError(
+                        "Binned feature profiles contain non-finite values"
+                    )
                 g[s : s + df_mean.shape[0]] = df_mean
                 s += df_mean.shape[0]
 
@@ -781,6 +857,9 @@ class Assay:
 
             self.z[location].attrs["hashes"] = hashes
             self.z[location].attrs["params"] = cast(Any, params)
+            self.z[location].attrs["schema_version"] = (
+                PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
+            )
 
         ret_val1 = ChunkedArray(
             as_zarr_array(self.z[location + "/data"], name=location + "/data"),
