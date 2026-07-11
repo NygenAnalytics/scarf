@@ -170,7 +170,8 @@ class BaseDataStore:
             else:
                 if len(self.assay_names) == 1:
                     assay_name = self.assay_names[0]
-                    self.zw.attrs["defaultAssay"] = assay_name
+                    if self.zarr_mode == "r+":
+                        self.zw.attrs["defaultAssay"] = assay_name
                 else:
                     raise ValueError(
                         "ERROR: You have more than one assay data. "
@@ -184,7 +185,8 @@ class BaseDataStore:
                         logger.info(
                             f"Default assay changed from {self.zw.attrs['defaultAssay']} to {assay_name}"
                         )
-                self.zw.attrs["defaultAssay"] = assay_name
+                if self.zarr_mode == "r+":
+                    self.zw.attrs["defaultAssay"] = assay_name
             else:
                 raise ValueError(
                     f"ERROR: The provided default assay name: {assay_name} was not found. "

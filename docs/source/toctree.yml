@@ -27,6 +27,8 @@ subtrees:
         title: "Merge, Harmony, and integration metrics"
       - file: vignettes/data_projection
         title: "Projection, label transfer, and unified embeddings"
+      - file: vignettes/reference_atlas_mapping
+        title: "Reusable reference atlas mapping"
   - caption: Trajectory analysis
     entries:
       - file: vignettes/pseudotime_dynamics

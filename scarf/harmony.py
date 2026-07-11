@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 
 import numpy as np
@@ -8,6 +9,21 @@ from sklearn.cluster import KMeans
 from .utils import tqdmbar, logger
 
 type ClusterFn = str | Callable[[np.ndarray, int], np.ndarray]
+
+
+@dataclass(frozen=True)
+class HarmonyResult:
+    """Converged Harmony state required for portable reference mapping."""
+
+    original: np.ndarray
+    corrected: np.ndarray
+    assignments: np.ndarray
+    centroids: np.ndarray
+    sigma: np.ndarray
+    ridge: np.ndarray
+    batch_columns: tuple[str, ...]
+    batch_levels: tuple[tuple[str, ...], ...]
+    parameters: dict[str, object]
 
 
 def run_harmony(
@@ -48,33 +64,97 @@ def run_harmony(
         Batch-corrected embedding matrix, shape (n_dims, n_cells).
     """
 
+    return fit_harmony(
+        data_mat,
+        meta_data,
+        theta=theta,
+        lamb=lamb,
+        sigma=sigma,
+        nclust=nclust,
+        tau=tau,
+        block_size=block_size,
+        max_iter_harmony=max_iter_harmony,
+        max_iter_kmeans=max_iter_kmeans,
+        epsilon_cluster=epsilon_cluster,
+        epsilon_harmony=epsilon_harmony,
+        random_state=random_state,
+        cluster_fn=cluster_fn,
+    ).corrected
+
+
+def fit_harmony(
+    data_mat: np.ndarray,
+    meta_data: pd.DataFrame,
+    theta: float | int | np.ndarray | list[float] | None = None,
+    lamb: float | int | np.ndarray | list[float] | None = None,
+    sigma: float | np.ndarray = 0.1,
+    nclust: int | None = None,
+    tau: float = 0,
+    block_size: float = 0.05,
+    max_iter_harmony: int = 50,
+    max_iter_kmeans: int = 20,
+    epsilon_cluster: float = 1e-5,
+    epsilon_harmony: float = 1e-4,
+    random_state: int = 0,
+    cluster_fn: ClusterFn = "kmeans",
+) -> HarmonyResult:
+    """Fit Harmony and return both corrected coordinates and portable state."""
+    if data_mat.ndim != 2:
+        raise ValueError("Harmony data_mat must be two-dimensional")
+    if data_mat.shape[1] != len(meta_data):
+        raise ValueError(
+            "Harmony metadata rows must match the number of embedding columns"
+        )
+    if data_mat.shape[1] < 2:
+        raise ValueError("Harmony requires at least two cells")
+    if meta_data.empty:
+        raise ValueError("Harmony requires at least one batch metadata column")
+    if meta_data.columns.duplicated().any():
+        raise ValueError("Harmony batch metadata column names must be unique")
+    if meta_data.isna().any().any():
+        raise ValueError("Harmony batch metadata cannot contain missing values")
+    if not np.all(np.isfinite(data_mat)):
+        raise ValueError("Harmony input contains non-finite values")
+
     N = data_mat.shape[1]
     if nclust is None:
-        nclust = np.min([np.round(N / 30.0), 100]).astype(int)
+        nclust = max(1, int(np.min([np.round(N / 30.0), 100])))
+    elif nclust < 1 or nclust > N:
+        raise ValueError("Harmony nclust must be between one and the cell count")
 
-    if type(sigma) is float and nclust > 1:
-        sigma = np.repeat(sigma, nclust)
+    sigma_arr = np.asarray(sigma, dtype=np.float64)
+    if sigma_arr.ndim == 0:
+        sigma_arr = np.full(nclust, float(sigma_arr.item()), dtype=np.float64)
+    elif sigma_arr.shape != (nclust,):
+        raise ValueError("Harmony sigma must be scalar or have one value per cluster")
+    if not np.all(np.isfinite(sigma_arr)) or np.any(sigma_arr <= 0):
+        raise ValueError("Harmony sigma values must be finite and positive")
 
-    phi = pd.get_dummies(meta_data).to_numpy().T
+    phi_frame = pd.get_dummies(meta_data)
+    phi = phi_frame.to_numpy().T
     phi_n = meta_data.describe().loc["unique"].to_numpy().astype(int)
 
-    if theta is None:
-        theta = np.repeat([1] * len(phi_n), phi_n)
-    elif isinstance(theta, float) or isinstance(theta, int):
-        theta = np.repeat([theta] * len(phi_n), phi_n)
-    elif len(theta) == len(phi_n):
-        theta = np.repeat([theta], phi_n)
+    def _expand_parameter(
+        values: float | int | np.ndarray | list[float] | None,
+        name: str,
+    ) -> np.ndarray:
+        if values is None:
+            return np.ones(int(np.sum(phi_n)), dtype=np.float64)
+        array = np.asarray(values, dtype=np.float64)
+        if array.ndim == 0:
+            return np.full(int(np.sum(phi_n)), float(array.item()))
+        if array.shape == (len(phi_n),):
+            return np.repeat(array, phi_n)
+        if array.shape != (int(np.sum(phi_n)),):
+            raise ValueError(f"Each Harmony batch level must have a {name}")
+        return array
 
-    assert len(theta) == np.sum(phi_n), "each batch variable must have a theta"
-
-    if lamb is None:
-        lamb = np.repeat([1] * len(phi_n), phi_n)
-    elif isinstance(lamb, float) or isinstance(lamb, int):
-        lamb = np.repeat([lamb] * len(phi_n), phi_n)
-    elif len(lamb) == len(phi_n):
-        lamb = np.repeat([lamb], phi_n)
-
-    assert len(lamb) == np.sum(phi_n), "each batch variable must have a lambda"
+    theta_arr = _expand_parameter(theta, "theta")
+    lamb_arr = _expand_parameter(lamb, "lambda")
+    if not np.all(np.isfinite(theta_arr)) or np.any(theta_arr < 0):
+        raise ValueError("Harmony theta values must be finite and non-negative")
+    if not np.all(np.isfinite(lamb_arr)) or np.any(lamb_arr < 0):
+        raise ValueError("Harmony lambda values must be finite and non-negative")
 
     # Number of items in each category.
     N_b = phi.sum(axis=1)
@@ -82,16 +162,13 @@ def run_harmony(
     Pr_b = N_b / N
 
     if tau > 0:
-        theta = theta * (1 - np.exp(-((N_b / (nclust * tau)) ** 2)))
+        theta_arr = theta_arr * (1 - np.exp(-((N_b / (nclust * tau)) ** 2)))
 
-    lamb_mat = np.diag(np.insert(lamb, 0, 0))
+    lamb_mat = np.diag(np.insert(lamb_arr, 0, 0))
 
     phi_moe = np.vstack((np.repeat(1, N), phi))
 
     np.random.seed(random_state)
-
-    sigma_arr = np.asarray(sigma)
-    theta_arr = np.asarray(theta)
 
     ho = Harmony(
         data_mat,
@@ -111,7 +188,45 @@ def run_harmony(
         cluster_fn,
     )
 
-    return ho.result()
+    batch_columns = tuple(str(column) for column in meta_data.columns)
+    batch_levels = tuple(
+        tuple(str(value) for value in pd.unique(meta_data[column]))
+        for column in meta_data.columns
+    )
+    cluster_backend = (
+        cluster_fn
+        if isinstance(cluster_fn, str)
+        else (
+            f"{getattr(cluster_fn, '__module__', type(cluster_fn).__module__)}."
+            f"{getattr(cluster_fn, '__qualname__', type(cluster_fn).__qualname__)}"
+        )
+    )
+    parameters: dict[str, object] = {
+        "nclust": int(nclust),
+        "sigma": sigma_arr.tolist(),
+        "theta": theta_arr.tolist(),
+        "lambda": lamb_arr.tolist(),
+        "tau": float(tau),
+        "blockSize": float(block_size),
+        "maxIterHarmony": int(max_iter_harmony),
+        "maxIterKmeans": int(max_iter_kmeans),
+        "epsilonCluster": float(epsilon_cluster),
+        "epsilonHarmony": float(epsilon_harmony),
+        "randomState": int(random_state),
+        "clusterBackend": cluster_backend,
+        "phiColumns": [str(column) for column in phi_frame.columns],
+    }
+    return HarmonyResult(
+        original=np.asarray(data_mat, dtype=np.float64).copy(),
+        corrected=ho.result(),
+        assignments=ho.R.copy(),
+        centroids=ho.Y.copy(),
+        sigma=sigma_arr.copy(),
+        ridge=lamb_mat.copy(),
+        batch_columns=batch_columns,
+        batch_levels=batch_levels,
+        parameters=parameters,
+    )
 
 
 class Harmony:
@@ -136,8 +251,7 @@ class Harmony:
         self.Z_corr = np.array(Z)
         self.Z_orig = np.array(Z)
 
-        self.Z_cos = self.Z_orig / self.Z_orig.max(axis=0)
-        self.Z_cos = self.Z_cos / np.linalg.norm(self.Z_cos, ord=2, axis=0)
+        self.Z_cos = _normalize_columns(self.Z_orig)
 
         self.Phi = Phi
         self.Phi_moe = Phi_moe
@@ -208,7 +322,7 @@ class Harmony:
     def init_cluster(self, cluster_fn: Callable[[np.ndarray, int], np.ndarray]) -> None:
         self.Y = cluster_fn(self.Z_cos.T, self.K).T
         # (1) Normalize
-        self.Y = self.Y / np.linalg.norm(self.Y, ord=2, axis=0)
+        self.Y = _normalize_columns(self.Y)
         # (2) Assign cluster probabilities
         self.dist_mat = 2 * (1 - np.dot(self.Y.T, self.Z_cos))
         self.R = -self.dist_mat
@@ -357,8 +471,19 @@ def moe_correct_ridge(
     for i in range(K):
         Phi_Rk = np.multiply(Phi_moe, R[i, :])
         x = np.dot(Phi_Rk, Phi_moe.T) + lamb
-        W = np.dot(np.dot(np.linalg.inv(x), Phi_Rk), Z_orig.T)
+        try:
+            W = np.linalg.solve(x, np.dot(Phi_Rk, Z_orig.T))
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("Harmony ridge system is singular") from exc
         W[0, :] = 0  # do not remove the intercept
         Z_corr -= np.dot(W.T, Phi_Rk)
-    Z_cos = Z_corr / np.linalg.norm(Z_corr, ord=2, axis=0)
+    Z_cos = _normalize_columns(Z_corr)
     return Z_cos, Z_corr, W, Phi_Rk
+
+
+def _normalize_columns(values: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(values, ord=2, axis=0)
+    normalized = np.zeros_like(values, dtype=np.float64)
+    nonzero = norms > 0
+    normalized[:, nonzero] = values[:, nonzero] / norms[nonzero]
+    return normalized

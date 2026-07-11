@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import shutil
 import tempfile
@@ -15,8 +17,9 @@ from scipy.sparse import coo_matrix, csr_matrix
 
 from .._types import as_zarr_array, as_zarr_group
 from ..ann import AnnStream
-from ..assay import Assay
+from ..assay import Assay, RNAassay
 from ..chunked import ChunkedArray
+from ..mapping_reference import MAPPING_REFERENCE_SCHEMA_VERSION, MappingReference
 from ..storage.zarr_store import (
     copy_zarr_array,
     create_or_open_staged_normed_array,
@@ -32,6 +35,8 @@ from ..storage.zarr_store import (
 from ..utils import clean_array, show_dask_progress, tqdmbar
 from ..writers import create_zarr_dataset
 from .base_datastore import BaseDataStore
+
+_HARMONY_ANN_CONTRACT_VERSION = 1
 
 
 class _GraphBuildProgress:
@@ -83,6 +88,292 @@ class GraphDataStore(BaseDataStore):
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+
+    def _mapping_reference_metadata(
+        self,
+        assay: Assay,
+        from_assay: str,
+        cell_key: str,
+        feat_key: str,
+        reduction_loc: str,
+        ann_loc: str,
+        batch_columns: list[str],
+    ) -> dict[str, Any]:
+        from ..mapping_utils import array_hash, array_store_hash
+
+        normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
+        normed_group = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+        reduction_group = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+        feature_key = f"{cell_key}__{feat_key}" if feat_key != "I" else "I"
+        feature_ids = assay.feats.fetch("ids", key=feature_key)
+        batch_values = (
+            np.column_stack(
+                [self.cells.fetch(column, key=cell_key) for column in batch_columns]
+            )
+            if batch_columns
+            else np.empty((len(self.cells.active_index(cell_key)), 0), dtype=str)
+        )
+        loadings = np.asarray(
+            as_zarr_array(reduction_group["reduction"], name="reduction")[:]
+        )
+        corrected_hash = ""
+        if "harmonizedData" in reduction_group:
+            corrected_hash = array_store_hash(
+                as_zarr_array(reduction_group["harmonizedData"], name="harmonizedData")
+            )
+        ann_group = as_zarr_group(self.zw[ann_loc], name=ann_loc)
+        ann_parts = ann_loc.rsplit("/", 1)[-1].split("__")
+        return {
+            "assay": from_assay,
+            "cellKey": cell_key,
+            "featureKey": feat_key,
+            "reductionPath": reduction_loc,
+            "annPath": ann_loc,
+            "featureHash": array_hash(feature_ids),
+            "cellHash": array_hash(self.cells.fetch("ids", key=cell_key)),
+            "batchValueHash": array_hash(batch_values),
+            "batchColumns": batch_columns,
+            "subsetHash": normed_group.attrs["subset_hash"],
+            "subsetParams": normed_group.attrs["subset_params"],
+            "loadingsHash": array_hash(loadings),
+            "correctedCoordinatesHash": corrected_hash,
+            "reductionMethod": "pca",
+            "annContract": {
+                "metric": ann_parts[1],
+                "efConstruction": int(ann_parts[2]),
+                "ef": int(ann_parts[3]),
+                "m": int(ann_parts[4]),
+                "randomState": int(ann_parts[5]),
+                "featureScaling": bool(ann_group.attrs.get("featureScaling", True)),
+            },
+        }
+
+    def _persist_mapping_reference(
+        self,
+        assay: Assay,
+        from_assay: str,
+        cell_key: str,
+        feat_key: str,
+        reduction_loc: str,
+        ann_loc: str,
+        knn_loc: str,
+        batch_columns: list[str],
+        ann_obj: AnnStream,
+    ) -> None:
+        from ..mapping_reference import persist_mapping_reference
+        from ..symphony import SymphonyReferenceModel, weighted_centroids
+
+        if ann_obj.harmonyResult is None:
+            return
+        if ann_obj.loadings is None:
+            raise RuntimeError(
+                "Cannot persist a mapping reference without PCA loadings"
+            )
+        harmony = ann_obj.harmonyResult
+        try:
+            cluster_mass, raw_centroids = weighted_centroids(
+                harmony.original.T, harmony.assignments
+            )
+            _, corrected_centroids = weighted_centroids(
+                harmony.corrected.T, harmony.assignments
+            )
+        except ValueError as exc:
+            if "empty cluster" not in str(exc):
+                raise
+            raise ValueError(
+                "Harmony produced an empty reference cluster. Rebuild with a "
+                "smaller harmony_params['nclust'] value."
+            ) from exc
+        ridge_values = np.diag(harmony.ridge)[1:]
+        correction_ridge = (
+            float(np.mean(ridge_values[ridge_values > 0]))
+            if np.any(ridge_values > 0)
+            else 1.0
+        )
+        model = SymphonyReferenceModel(
+            feature_means=ann_obj.mu,
+            feature_scales=ann_obj.sigma,
+            loadings=ann_obj.loadings,
+            centroids=harmony.centroids.T,
+            raw_centroids=raw_centroids,
+            corrected_centroids=corrected_centroids,
+            cluster_mass=cluster_mass,
+            sigma=harmony.sigma,
+            correction_ridge=correction_ridge,
+        )
+        reduction_group = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+        feature_key = f"{cell_key}__{feat_key}" if feat_key != "I" else "I"
+        feature_ids = assay.feats.fetch("ids", key=feature_key)
+        metadata = self._mapping_reference_metadata(
+            assay,
+            from_assay,
+            cell_key,
+            feat_key,
+            reduction_loc,
+            ann_loc,
+            batch_columns,
+        )
+        metadata["harmonyParameters"] = harmony.parameters
+        metadata["batchLevels"] = [list(levels) for levels in harmony.batch_levels]
+        knn_group = as_zarr_group(self.zw[knn_loc], name=knn_loc)
+        distance_quantiles, distance_values = self._reference_distance_quantiles(
+            as_zarr_array(knn_group["distances"], name="distances")
+        )
+        persist_mapping_reference(
+            reduction_group,
+            model,
+            feature_ids,
+            metadata,
+            reference_distance_quantiles=distance_quantiles,
+            reference_distance_values=distance_values,
+        )
+
+    @staticmethod
+    def _reference_distance_quantiles(
+        distances: zarr.Array,
+        max_samples: int = 100_000,
+        n_quantiles: int = 1_001,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        n_rows = int(distances.shape[0])
+        if n_rows < 1:
+            raise ValueError("Reference KNN distances are empty")
+        stride = max(int(np.ceil(n_rows / max_samples)), 1)
+        chunks = distances.chunks
+        block_size = int(chunks[0]) if chunks else min(n_rows, 10_000)
+        sampled: list[np.ndarray] = []
+        for start in range(0, n_rows, block_size):
+            stop = min(start + block_size, n_rows)
+            block = np.asarray(distances[start:stop])
+            mask = np.arange(start, stop) % stride == 0
+            sampled.append(np.asarray(block[mask, 0], dtype=np.float64))
+        values = np.concatenate(sampled)
+        quantiles = np.linspace(0.0, 1.0, min(n_quantiles, len(values)))
+        return quantiles, np.quantile(values, quantiles)
+
+    def get_mapping_reference(
+        self,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+    ) -> MappingReference:
+        """Load a validated immutable RNA/PCA Symphony-style mapping reference."""
+        from ..mapping_reference import (
+            load_mapping_reference,
+            resolve_mapping_reference_group,
+        )
+
+        from_assay, cell_key, feat_key = self._get_latest_keys(
+            from_assay, cell_key, feat_key
+        )
+        assay = self._get_assay(from_assay)
+        if not isinstance(assay, RNAassay):
+            raise TypeError("Mapping references currently support RNA assays only")
+        normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
+        if normed_loc not in self.zw:
+            raise KeyError("No normalized reference data exists for the requested keys")
+        normed_group = as_zarr_group(self.zw[normed_loc], name=normed_loc)
+        reduction_loc = cast(str, normed_group.attrs.get("latest_reduction"))
+        if not reduction_loc or reduction_loc not in self.zw:
+            raise KeyError("No reduction exists for the requested reference")
+        reduction_group = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
+        ann_loc = cast(str, reduction_group.attrs.get("latest_ann"))
+        if not ann_loc or ann_loc not in self.zw:
+            raise KeyError("No ANN index exists for the requested reference")
+        try:
+            artifact, _, is_legacy = resolve_mapping_reference_group(reduction_group)
+        except KeyError:
+            raise ValueError(
+                "This harmonized graph predates the mapping-reference artifact. "
+                "Rebuild it with build_mapping_reference."
+            ) from None
+        artifact_ann_path = artifact.attrs.get("annPath")
+        if isinstance(artifact_ann_path, str):
+            ann_loc = artifact_ann_path
+        if ann_loc not in self.zw:
+            raise ValueError(
+                "The mapping-reference ANN index is missing. Rebuild the reference."
+            )
+        ann_group = as_zarr_group(self.zw[ann_loc], name=ann_loc)
+        if not bool(ann_group.attrs.get("isHarmonized", False)):
+            raise ValueError(
+                "The requested graph is not harmonized. Build a harmonized mapping reference first."
+            )
+        batch_columns = [
+            str(column) for column in cast(list[Any], artifact.attrs["batchColumns"])
+        ]
+        expected = self._mapping_reference_metadata(
+            assay,
+            from_assay,
+            cell_key,
+            feat_key,
+            reduction_loc,
+            ann_loc,
+            batch_columns,
+        )
+        legacy_omissions = {"correctedCoordinatesHash", "annContract"}
+        for key, value in expected.items():
+            if is_legacy and key in legacy_omissions:
+                continue
+            if artifact.attrs.get(key) != value:
+                raise ValueError(
+                    f"Mapping reference is stale because {key} no longer matches. "
+                    "Rebuild it with build_mapping_reference."
+                )
+        return load_mapping_reference(
+            self, from_assay, cell_key, feat_key, reduction_loc, ann_loc
+        )
+
+    def build_mapping_reference(
+        self,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        batch_columns: list[str] | None = None,
+        **graph_kwargs: Any,
+    ) -> MappingReference:
+        """Build and return a versioned RNA/PCA Symphony-style mapping reference."""
+        if self.zarr_mode != "r+":
+            raise ValueError("Building a mapping reference requires a read-write store")
+        if batch_columns is None:
+            raise ValueError("batch_columns is required to build a mapping reference")
+        if graph_kwargs.get("feat_scaling", True) is False:
+            raise ValueError(
+                "Mapping references require feat_scaling=True because query "
+                "projection uses the stored reference mean and scale."
+            )
+        force_harmony_refit = bool(graph_kwargs)
+        if not force_harmony_refit:
+            try:
+                current = self.get_mapping_reference(from_assay, cell_key, feat_key)
+            except (KeyError, ValueError):
+                force_harmony_refit = True
+            else:
+                current_columns = [
+                    str(column)
+                    for column in cast(
+                        list[Any], current.metadata.get("batchColumns", [])
+                    )
+                ]
+                force_harmony_refit = (
+                    current_columns != batch_columns
+                    or current.metadata.get("schemaVersion")
+                    != MAPPING_REFERENCE_SCHEMA_VERSION
+                )
+        self.make_graph(
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            harmonize=True,
+            batch_columns=batch_columns,
+            _force_harmony_refit=force_harmony_refit,
+            **graph_kwargs,
+        )
+        reference = self.get_mapping_reference(from_assay, cell_key, feat_key)
+        if not bool(reference.metadata.get("complete", False)):
+            raise RuntimeError(
+                "Mapping reference build did not produce a complete artifact"
+            )
+        return reference
 
     @staticmethod
     def _choose_reduction_method(assay: Assay, reduction_method: str) -> str:
@@ -311,13 +602,14 @@ class GraphDataStore(BaseDataStore):
                 )
                 if "latest_ann" in reduction_grp.attrs:
                     ann_loc_attr = cast(str, reduction_grp.attrs["latest_ann"])
+                    ann_parts = ann_loc_attr.rsplit("/", 1)[1].split("__")
                     (
                         c_ann_metric,
                         c_ann_efc,
                         c_ann_ef,
                         c_ann_m,
                         c_rand_state,
-                    ) = ann_loc_attr.rsplit("/", 1)[1].split("__")[1:]
+                    ) = ann_parts[1:6]
                 else:
                     c_ann_metric, c_ann_efc, c_ann_ef, c_ann_m, c_rand_state = (
                         None,
@@ -397,7 +689,10 @@ class GraphDataStore(BaseDataStore):
         if ann_efc is None:
             ann_efc = min(100, max(k * 3, 50))
         ann_efc = int(ann_efc)
-        ann_loc = f"{reduction_loc}/ann__{ann_metric}__{ann_efc}__{ann_ef}__{ann_m}__{rand_state}"
+        ann_loc = (
+            f"{reduction_loc}/ann__{ann_metric}__{ann_efc}__{ann_ef}__"
+            f"{ann_m}__{rand_state}"
+        )
         knn_loc = f"{ann_loc}/knn__{k}"
 
         if n_centroids is None:
@@ -631,6 +926,7 @@ class GraphDataStore(BaseDataStore):
         cell_key: str,
         feat_key: str,
         knn_loc: str | None = None,
+        feat_scaling: bool | None = None,
     ) -> bool:
         try:
             if knn_loc is None:
@@ -652,6 +948,11 @@ class GraphDataStore(BaseDataStore):
                 return False
             if ann_loc not in self.zw:
                 return False
+            if feat_scaling is not None:
+                ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
+                cached_scaling = bool(ann_grp.attrs.get("featureScaling", True))
+                if cached_scaling != feat_scaling:
+                    return False
             reduction_loc = ann_loc.rsplit("/ann__", 1)[0]
             normed_loc = reduction_loc.rsplit("/reduction__", 1)[0]
             return self._ann_stream_recoverable(ann_loc, reduction_loc, normed_loc)
@@ -825,6 +1126,12 @@ class GraphDataStore(BaseDataStore):
             )
 
         ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
+        cached_scaling = bool(ann_grp.attrs.get("featureScaling", True))
+        if cached_scaling != feat_scaling:
+            raise ValueError(
+                f"ANN index at {ann_loc} was built with featureScaling="
+                f"{cached_scaling}, not {feat_scaling}. Rebuild the graph."
+            )
         harmonize = cast(bool, ann_grp.attrs.get("isHarmonized", False))
         harmonized_data = None
         batches = None
@@ -881,6 +1188,7 @@ class GraphDataStore(BaseDataStore):
             batches=batches,
             cache_embeddings=False,
         )
+        ann_obj.annPath = ann_loc
         if rebuilt_ann and self.zarr_mode == "r+":
             self._persist_ann_index(ann_loc, ann_obj.annIdx)
         return ann_obj
@@ -1073,6 +1381,8 @@ class GraphDataStore(BaseDataStore):
         ann_index_fetcher: Callable | None = None,
         ann_index_saver: Callable | None = None,
         local_cache: bool | str = "auto",
+        harmony_params: dict[str, Any] | None = None,
+        _force_harmony_refit: bool = False,
     ) -> AnnStream | None:
         """Creates a cell neighbourhood graph. Performs following steps in the
         process:
@@ -1169,13 +1479,12 @@ class GraphDataStore(BaseDataStore):
                              reduced dimensions. `dims` parameter is ignored when this is provided.
                              (Default value: None)
             feat_scaling: If True (default) then the feature will be z-scaled otherwise not. It is highly recommended
-                          that this is kept as True unless you know what you are doing. `feat_scaling` is internally
-                          turned off when during cross sample mapping using CORAL normalized values are being used.
-                          Read more about this in `run_mapping` method.
+                          that this is kept as True unless you know what you are doing.
             lsi_skip_first: Whether to remove the first LSI dimension when using ATAC-Seq data.
             harmonize: If True, run Harmony batch correction on the PCA embedding before
                        building the KNN graph. Requires ``batch_columns``.
             batch_columns: Cell metadata columns defining batch variables for Harmony.
+            harmony_params: Optional keyword arguments forwarded to ``fit_harmony``.
             show_elbow_plot: If True, then an elbow plot is shown when PCA is fitted to the data. Not shown when using
                             existing PCA loadings or custom loadings. (Default value: False)
             ann_index_fetcher: Optional callable to load a pre-built ANN index instead of fitting one.
@@ -1275,7 +1584,34 @@ class GraphDataStore(BaseDataStore):
         reduction_loc = (
             f"{normed_loc}/reduction__{reduction_method}__{dims}__{pca_cell_key}"
         )
-        ann_loc = f"{reduction_loc}/ann__{ann_metric}__{ann_efc}__{ann_ef}__{ann_m}__{rand_state}"
+        ann_loc = (
+            f"{reduction_loc}/ann__{ann_metric}__{ann_efc}__{ann_ef}__"
+            f"{ann_m}__{rand_state}"
+        )
+        if not feat_scaling:
+            ann_loc = f"{ann_loc}__unscaled"
+        if harmonize:
+            if batches is None:
+                raise ValueError("Harmony requires batch metadata")
+            from ..mapping_utils import array_hash
+
+            harmony_contract = {
+                "version": _HARMONY_ANN_CONTRACT_VERSION,
+                "batchColumns": batch_columns,
+                "batchValueHash": array_hash(
+                    batches.astype(str).to_numpy().reshape(-1)
+                ),
+                "parameters": harmony_params or {},
+            }
+            contract_hash = hashlib.sha256(
+                json.dumps(
+                    harmony_contract,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode()
+            ).hexdigest()[:16]
+            ann_loc = f"{ann_loc}__harmony_{contract_hash}"
         knn_loc = f"{ann_loc}/knn__{k}"
         kmeans_loc = f"{reduction_loc}/kmeans__{n_centroids}__{rand_state}"
         graph_loc = f"{knn_loc}/graph__{local_connectivity}__{bandwidth}"
@@ -1382,6 +1718,7 @@ class GraphDataStore(BaseDataStore):
                 harmonize=harmonize,
                 batch_columns=batch_columns,
                 batches=batches,
+                harmony_params=harmony_params,
                 ann_metric=ann_metric,
                 ann_efc=ann_efc,
                 ann_ef=ann_ef,
@@ -1399,6 +1736,7 @@ class GraphDataStore(BaseDataStore):
                 return_ann_object=return_ann_object,
                 show_elbow_plot=show_elbow_plot,
                 progress=progress,
+                force_harmony_refit=_force_harmony_refit,
             )
             graph_succeeded = True
             return result
@@ -1439,6 +1777,7 @@ class GraphDataStore(BaseDataStore):
         harmonize: bool,
         batch_columns: list[str] | None,
         batches: pd.DataFrame | None,
+        harmony_params: dict[str, Any] | None,
         ann_metric: str,
         ann_efc: int,
         ann_ef: int,
@@ -1456,6 +1795,7 @@ class GraphDataStore(BaseDataStore):
         return_ann_object: bool,
         show_elbow_plot: bool,
         progress: _GraphBuildProgress,
+        force_harmony_refit: bool,
     ) -> AnnStream | None:
 
         if custom_loadings is not None and data.shape[1] != custom_loadings.shape[0]:
@@ -1489,7 +1829,11 @@ class GraphDataStore(BaseDataStore):
                     )
                     loadings = None
                     del self.zw[reduction_loc]
-            if harmonize and "harmonizedData" in reduction_grp:
+            if (
+                harmonize
+                and not force_harmony_refit
+                and "harmonizedData" in reduction_grp
+            ):
                 harmonized_arr = as_zarr_array(
                     reduction_grp["harmonizedData"], name="harmonizedData"
                 )
@@ -1521,9 +1865,15 @@ class GraphDataStore(BaseDataStore):
 
         ann_idx = None
         had_cached_ann_idx = False
+        replace_ann_after_fit = False
         if ann_loc in self.zw:
             ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
             reset_ann = False
+            cached_scaling = ann_grp.attrs.get("featureScaling")
+            if cached_scaling is not None and bool(cached_scaling) != feat_scaling:
+                reset_ann = True
+            elif cached_scaling is None and feat_scaling is False:
+                reset_ann = True
             if "isHarmonized" in ann_grp.attrs:
                 if cast(bool, ann_grp.attrs["isHarmonized"]):
                     if harmonize is False:
@@ -1536,9 +1886,11 @@ class GraphDataStore(BaseDataStore):
             else:
                 if harmonize:  # Mostly for backward compatibility
                     reset_ann = True
+            if force_harmony_refit:
+                reset_ann = True
 
             if reset_ann:
-                del self.zw[ann_loc]
+                replace_ann_after_fit = True
             else:
                 temp = dims if dims > 0 else data.shape[1]
                 ann_idx = self._resolve_ann_index(
@@ -1597,9 +1949,37 @@ class GraphDataStore(BaseDataStore):
                 harmonize=harmonize,
                 harmonized_data=harmonized_data,
                 batches=batches,
+                harmony_params=harmony_params,
                 cache_embeddings=need_embeddings,
             )
+        ann_obj.annPath = ann_loc
+        if (
+            harmonize
+            and reduction_method == "pca"
+            and ann_obj.featureScaling
+            and ann_obj.harmonyResult is not None
+        ):
+            from ..symphony import weighted_centroids
 
+            try:
+                weighted_centroids(
+                    ann_obj.harmonyResult.original.T,
+                    ann_obj.harmonyResult.assignments,
+                )
+                weighted_centroids(
+                    ann_obj.harmonyResult.corrected.T,
+                    ann_obj.harmonyResult.assignments,
+                )
+            except ValueError as exc:
+                if "empty cluster" not in str(exc):
+                    raise
+                raise ValueError(
+                    "Harmony produced an empty reference cluster. Rebuild with a "
+                    "smaller harmony_params['nclust'] value."
+                ) from exc
+
+        if replace_ann_after_fit and ann_loc in self.zw:
+            del self.zw[ann_loc]
         save_loadings = reduction_loc not in self.zw
         save_harmonized = (
             harmonize and harmonized_data is None and ann_obj.harmonizedData is not None
@@ -1654,7 +2034,6 @@ class GraphDataStore(BaseDataStore):
                     ann_obj.annIdx,
                     ann_index_saver=ann_index_saver,
                 )
-
             if save_kmeans:
                 if ann_obj.kmeans is None:
                     raise RuntimeError("kmeans model missing despite fit_kmeans=True")
@@ -1724,8 +2103,31 @@ class GraphDataStore(BaseDataStore):
             reduction_grp.attrs["latest_ann"] = ann_loc
             reduction_grp.attrs["latest_kmeans"] = kmeans_loc
             ann_grp.attrs["isHarmonized"] = harmonize
+            ann_grp.attrs["featureScaling"] = feat_scaling
             ann_grp.attrs["latest_knn"] = knn_loc
             knn_grp.attrs["latest_graph"] = graph_loc
+        if (
+            harmonize
+            and reduction_method == "pca"
+            and ann_obj.harmonyResult is not None
+        ):
+            if ann_obj.featureScaling:
+                self._persist_mapping_reference(
+                    assay,
+                    from_assay,
+                    cell_key,
+                    feat_key,
+                    reduction_loc,
+                    ann_loc,
+                    knn_loc,
+                    batch_columns or [],
+                    ann_obj,
+                )
+            else:
+                logger.warning(
+                    "Skipping mapping-reference persistence because "
+                    "feat_scaling=False is incompatible with query projection."
+                )
         if return_ann_object:
             return ann_obj
         if show_elbow_plot:

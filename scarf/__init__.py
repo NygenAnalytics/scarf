@@ -39,6 +39,7 @@ from zarr.errors import UnstableSpecificationWarning
 
 from .datastore.datastore import DataStore
 from .downloader import fetch_dataset, show_available_datasets
+from .mapping_reference import MappingReference, MappingResult
 from .meld_assay import GffReader, coordinate_melding
 from .merge import AssayMerge, DatasetMerge, ZarrMerge
 from .readers import (
@@ -84,7 +85,6 @@ from .writers import (
     write_renorm_subset_to_zarr,
 )
 
-warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 
 try:
@@ -107,6 +107,8 @@ __all__ = [
     "H5adToZarr",
     "LoomReader",
     "LoomToZarr",
+    "MappingReference",
+    "MappingResult",
     "NaboH5Reader",
     "NaboH5ToZarr",
     "SparseToZarr",

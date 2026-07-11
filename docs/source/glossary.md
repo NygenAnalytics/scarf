@@ -3,7 +3,13 @@
 Short definitions of terms used across the Scarf documentation.
 
 **Harmony**
-: Batch correction method applied to PCA embeddings inside `make_graph(harmonize=True)`. Corrected coordinates are stored as `harmonizedData` in the Zarr hierarchy.
+: Batch correction method applied to PCA embeddings inside `make_graph(harmonize=True)`. Corrected coordinates are stored as `harmonizedData` in the Zarr hierarchy. A reusable mapping reference additionally preserves the converged state needed for Symphony-style query correction.
+
+**Mapping reference**
+: Content-addressed, write-once RNA/PCA artifact built with `build_mapping_reference`. It includes feature scaling, PCA loadings, Harmony cluster state, a reference-distance summary, and provenance required to map queries without moving reference cells.
+
+**Symphony-style mapping**
+: Query-to-reference mapping that projects a query into reference PCA space, assigns soft reference clusters, estimates query batch effects, and corrects only query coordinates before neighbor search. Scarf records the current fixed-assignment, scalar-ridge implementation as `symphonyStyleV1`; this name distinguishes it from a complete reimplementation of the Symphony R model.
 
 **LISI (Local Inverse Simpson Index)**
 : Metric of local label mixing in the KNN graph. Higher batch LISI after correction suggests better batch mixing. Computed with `metric_lisi`.
@@ -36,7 +42,7 @@ Short definitions of terms used across the Scarf documentation.
 : Weighted nearest neighbor merge for exactly two modalities via `integrate_assays(method='wnn')`.
 
 **CORAL**
-: Domain adaptation used in `run_mapping(run_coral=True)` to align reference and target feature distributions.
+: Experimental feature-space domain adaptation used in `run_mapping(run_coral=True)`. It is deprecated in favor of Symphony-style mapping references.
 
 **TopACeDo**
 : Manifold-preserving cell subsampling using the KNN graph (`run_topacedo_sampler`).

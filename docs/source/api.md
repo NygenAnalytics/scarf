@@ -20,6 +20,17 @@
     :members:
 ```
 
+### MappingReference
+```{eval-rst}
+.. autoclass:: scarf.mapping_reference.MappingReference
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.mapping_reference.MappingResult
+    :members:
+```
+
 ### DataStore
 ```{eval-rst}
 .. autoclass:: scarf.datastore.datastore.DataStore
@@ -61,6 +72,15 @@
 ## Harmony
 ```{eval-rst}
 .. autofunction:: scarf.harmony.run_harmony
+```
+
+```{eval-rst}
+.. autofunction:: scarf.harmony.fit_harmony
+```
+
+```{eval-rst}
+.. autoclass:: scarf.harmony.HarmonyResult
+    :members:
 ```
 
 ## Integration metrics

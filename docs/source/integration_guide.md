@@ -11,8 +11,9 @@ Scarf offers several integration and batch-correction approaches. This page help
 | Correct batch effects after merge | `make_graph(harmonize=True, batch_columns=[...])` | {ref}`Harmony batch correction <harmony_batch_correction>` |
 | Lightweight batch correction with a reference sample | `make_graph(pca_cell_key='reference_subset')` | {ref}`merging vignette <harmony_batch_correction>` |
 | Integrate RNA + ADT (CITE-seq) in the same cells | `integrate_assays(method='snn')` or `method='wnn'` | {ref}`WNN integration <wnn_integration>` |
-| Map query cells onto a reference atlas | `run_mapping` with optional CORAL | {ref}`data projection <data_projection>` |
-| Co-embed reference and query on one layout | `run_unified_umap` or `run_unified_tsne` | {ref}`data projection <data_projection>` |
+| Map query cells onto a reusable harmonized atlas | `build_mapping_reference` then `MappingReference.map_query` | {ref}`reference atlas mapping <reference_atlas_mapping>` |
+| Map query cells onto a fixed PCA reference | `run_mapping` | {ref}`data projection <data_projection>` |
+| Co-embed reference and query for exploration | `run_unified_umap` or `run_unified_tsne` | {ref}`data projection <data_projection>` |
 | Measure integration quality | `metric_lisi`, `metric_batch_mixing`, `metric_silhouette` | {ref}`LISI metrics <lisi_metrics>` |
 
 ## Harmony vs partial PCA
@@ -49,7 +50,23 @@ See {ref}`WNN integration <wnn_integration>`.
 
 **Merge** combines raw counts from multiple datasets into one Zarr store. Use when you will analyze all cells together.
 
-**Projection** (`run_mapping`) maps external cells onto an existing reference graph without merging stores. Use for label transfer, atlas mapping, or when query cells should not alter the reference embedding. CORAL can align feature distributions between reference and query.
+**Projection** (`run_mapping`) maps external cells onto an existing PCA reference graph without merging stores. Use it for one-off label transfer when the reference does not need batch correction.
+
+**Reference atlas mapping** (`build_mapping_reference` then `MappingReference.map_query`) stores a content-addressed RNA/PCA reference with Harmony state required for Symphony-style fixed-reference correction. Use it for repeated mapping into a harmonized atlas. The query never changes reference coordinates. The current numerical variant is recorded as `symphonyStyleV1`; it uses fixed pre-correction assignments and a scalar ridge term.
+
+CORAL is an experimental feature-space method and is deprecated in favor of Symphony-style mapping references.
+
+## Mapping migration notes
+
+Existing mapping calls remain accepted for one deprecation cycle:
+
+- Projection groups written before provenance schemas remain readable when their neighbor arrays are structurally valid. Scarf emits `DeprecationWarning`; rerun `run_mapping` to write full provenance.
+- A writable legacy Harmony graph without a mapping artifact is rebuilt automatically the first time `run_mapping` needs it. For a read-only store, reopen it with `zarr_mode='r+'` and call `build_mapping_reference(..., batch_columns=[...])` once.
+- `ref_mu=False` and `ref_sigma=False` no longer select query-derived statistics. They emit `DeprecationWarning` and use reference statistics. Remove these arguments.
+- `exclude_missing=True` remains an alias for `missing_feature_policy='intersection'` and retains the legacy overlap feature key temporarily. New code should use the explicit policy.
+- `run_coral=True` remains available with a deprecation warning. CORAL-corrected values are restored to reference feature scale and use the normal reference transform.
+
+Recomputed results can differ from earlier Scarf releases. Missing features now use explicit zero, intersection, error, or reference-mean policies. Label transfer uses every saved neighbor with normalized inverse-L2 weights, mapping scores use the same distance convention, and Harmony column normalization was corrected. Recalibrate downstream thresholds after rebuilding.
 
 ## Not supported
 

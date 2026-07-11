@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 
+from scarf.mapping_utils import array_hash
+
 from . import full_path
 
 
@@ -148,22 +150,31 @@ class TestDataStore:
         precalc_coords = np.load(full_path("unified_UMAP_coords.npy"))
         assert coords.shape == precalc_coords.shape
 
-    def test_get_target_classes(
-        self, run_mapping, paris_clustering, cell_attrs, datastore
-    ):
+    def test_get_target_classes(self, run_mapping, paris_clustering, datastore):
         classes = datastore.get_target_classes(
             target_name="selfmap", reference_class_group="RNA_cluster"
         )
-        assert np.array_equal(classes.values, cell_attrs["target_classes"].values)
+        assert len(classes) == len(datastore.cells.active_index("I"))
+        assert classes.notna().all()
+        assert (
+            array_hash(classes.astype(str).to_numpy())
+            == "595897c7c4b619dd367674bf66ce826e9ce2e731d59e5f05f1401bf5cc489e99"
+        )
 
-    def test_get_mapping_score(self, run_mapping, cell_attrs, datastore):
+    def test_get_mapping_score(self, run_mapping, datastore):
         scores = next(datastore.get_mapping_score(target_name="selfmap"))[1]
-        diff = scores - cell_attrs["mapping_scores"].values
-        assert np.all(diff < 1e-2)
+        assert scores.shape == (len(datastore.cells.active_index("I")),)
+        assert np.all(np.isfinite(scores))
+        assert np.any(scores > 0)
+        assert (
+            array_hash(np.round(scores, 12))
+            == "f992bd7e48c7eda529c30194dab350fd5d6fea056f76146a2705993223d97d0e"
+        )
 
-    def test_coral_mapping_score(self, run_mapping_coral, cell_attrs, datastore):
-        # TODO: add test values for coral
-        assert 1 == 1
+    def test_coral_mapping_score(self, run_mapping_coral, datastore):
+        scores = next(datastore.get_mapping_score(target_name="selfmap_coral"))[1]
+        assert np.all(np.isfinite(scores))
+        assert np.any(scores > 0)
 
     def test_repr(self, datastore):
         # TODO: Test if the expected values are printed

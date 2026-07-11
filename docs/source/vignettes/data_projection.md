@@ -71,7 +71,9 @@ ds_stim.plot_layout(
 ---
 ### 2) K-Nearest Neighbours (KNN) mapping
 
-The ``run_mapping`` method of DataStore class performs KNN mapping/projection of target cells over reference cells. Reference cells are the ones that are present in the object where `run_mapping` is being called. The `Assay` object of target cells is provided as an argument to `run_mapping`. This step will load the latest graph of the reference cells and query the Approximate Nearest Neighbour (ANN) index of the reference cells for nearest neighbours of each target cell. Since the ANN index doesn't contain any target cells, nearest neighbours of target cells will exclusively be reference cells. Under the hood, `run_mapping` method makes sure that the feature order in the target cells is same as that in the reference cells. By default, `run_mapping` will impute zero values for missing features in the target order to preserve the feature order. Here we have set `run_coral` parameter to True which activates CORAL normalization of target data. CORAL aligns the the feature distribution between reference and target cells thus removing systemic difference between reference and target cells. Read more about CORAL [here](https://arxiv.org/pdf/1612.01939.pdf). Here we use control PMBCs as reference because we invoke `run_mapping` on control PBMCs' DataStore object and provide stimulated PBMC's `RNA` assay as target.
+The ``run_mapping`` method projects target cells onto the fixed reference graph. The reference cells are in the `DataStore` where `run_mapping` is called, and the target assay is supplied as an argument. Scarf aligns target features to the ordered reference feature set, applies the scaling stored with the reference PCA, and queries the reference ANN index. Target cells are never inserted into the reference index.
+
+By default, `missing_feature_policy='zero'` fills features absent from the target with zero normalized expression. Earlier releases silently used one, so partial-overlap results can change after remapping. Use `missing_feature_policy='error'` when complete overlap is required. `missing_feature_policy='intersection'` creates an isolated, overlap-only index for a controlled comparison; it does not alter the authoritative reference graph. The deprecated `exclude_missing=True` alias also leaves its historical overlap feature key for one compatibility cycle.
 
 +++
 
@@ -85,23 +87,20 @@ The ``run_mapping`` method of DataStore class performs KNN mapping/projection of
 </div>
 
 ```{code-cell} ipython3
-# CORAL algorithm can be very slow with large number of features (> 5000).
-# Hence here it is recommended for only scRNA-Seq datasets.
-
 ds_ctrl.run_mapping(
     target_assay=ds_stim.RNA,
     target_name='stim',
     target_feat_key='hvgs_ctrl',
-    save_k=5,
-    run_coral=True
+    save_k=5
 )
 ```
 
 Key mapping parameters:
 - `save_k`: number of reference neighbors stored per target cell (default 3)
-- `run_coral`: align feature distributions between reference and target
-- `exclude_missing`: drop target features absent from reference instead of imputing zeros
-- `filter_null`: remove target cells with no valid features after alignment
+- `missing_feature_policy`: choose `zero`, `error`, or `intersection` handling for absent target features
+- `filter_null`: with `missing_feature_policy='intersection'`, removes target features with zero total counts
+- `run_coral`: deprecated experimental feature-space correction. Build a Symphony-style mapping reference for harmonized atlas mapping.
+- `ref_mu` and `ref_sigma`: deprecated compatibility flags. Reference statistics are always used.
 
 ---
 ### 3) Mapping scores
@@ -147,6 +146,17 @@ transferred_labels = ds_ctrl.get_target_classes(
 transferred_labels
 ```
 
+Use `get_target_label_evidence` to inspect neighbor-vote fraction, entropy, margin, feature coverage, and a reference distance percentile. These are diagnostic quantities, not calibrated probabilities. The distance percentile uses the reference self-neighbor distribution rather than the query distribution. The method returns `unknown` when the winning vote does not meet a chosen threshold, when top labels tie, or when a query has no directional information in reference PC space.
+
+```{code-cell} ipython3
+evidence = ds_ctrl.get_target_label_evidence(
+    target_name='stim',
+    reference_class_group='cluster_labels',
+    threshold_fraction=0.6
+)
+evidence.head()
+```
+
 We can now save these transferred labels into the stimulated cell dataset and visualize them of its UMAP.
 
 ```{code-cell} ipython3
@@ -185,7 +195,7 @@ This cross-tabulation can be presented as percentage accuracy, where the values 
 ---
 ### 5) Unified UMAPs
 
-Scarf introduces Unified UMAPs, a strategy to embed target cells onto the reference manifold. To do so, we take the results of KNN projection and spike the graph of reference cells with target cells. We can control the weight of target-reference edges also, as well as the number of edges per target to retain. We rerun UMAP on this 'unified graph' to obtain a unified embdding. Following code shows how to call `run_unified_umap` method.
+Unified UMAP adds query-reference edges and reruns UMAP on the combined graph. It is useful for exploration, but it moves the reference coordinates and can change when a different query is supplied. Do not use it as a stable atlas coordinate system.
 
 ```{code-cell} ipython3
 ds_ctrl.run_unified_umap(
@@ -204,6 +214,15 @@ ds_ctrl.plot_unified_layout(
     layout_key='unified_UMAP',
     show_target_only=False,
     ref_name='ctrl'
+)
+```
+
+For stable placement into an existing reference layout, use deterministic neighbor-weighted projection. It writes only target coordinates and leaves reference coordinates unchanged. A read-only datastore returns the coordinate array in memory instead of attempting a write.
+
+```{code-cell} ipython3
+ds_ctrl.project_mapping_layout(
+    target_name='stim',
+    reference_layout_key='RNA_UMAP'
 )
 ```
 

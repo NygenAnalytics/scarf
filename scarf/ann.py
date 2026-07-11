@@ -6,7 +6,7 @@ import pandas as pd
 from threadpoolctl import threadpool_limits
 
 from .chunked import ChunkedArray
-from .harmony import run_harmony
+from .harmony import HarmonyResult, fit_harmony
 from .utils import controlled_compute, logger, tqdmbar
 
 __all__ = ["AnnStream", "instantiate_knn_index", "fix_knn_query"]
@@ -151,6 +151,7 @@ class AnnStream:
         harmonized_data: ChunkedArray | None = None,
         batches: pd.DataFrame | None = None,
         cache_embeddings: bool = True,
+        harmony_params: dict[str, Any] | None = None,
     ) -> None:
         self.data = data
         self._embeddings: np.ndarray | None = None
@@ -168,6 +169,7 @@ class AnnStream:
         self.annEfc = ann_efc
         self.annEf = ann_ef
         self.annM = ann_m
+        self.annPath: str | None = None
         self.nthreads = nthreads
         if ann_parallel:
             self.annThreads = self.nthreads
@@ -180,7 +182,10 @@ class AnnStream:
         self.clusterLabels: np.ndarray = np.repeat(-1, self.nCells)
         self.harmonize = harmonize
         self.harmonizedData = harmonized_data
+        self.harmonyResult: HarmonyResult | None = None
         self.batches = batches
+        self.harmonyParams = dict(harmony_params or {})
+        self.featureScaling = not disable_scaling
         disable_reduction = False
         if self.dims is not None and self.dims < 1:
             disable_reduction = True
@@ -327,6 +332,25 @@ class AnnStream:
         """Z-score a block using fitted ``mu`` and ``sigma``."""
         return np.asarray((a - self.mu) / self.sigma)
 
+    def transform_query(self, a: np.ndarray) -> np.ndarray:
+        """Project query feature rows into this index's native latent space."""
+        values = np.asarray(a)
+        if values.ndim != 2:
+            raise ValueError("Query data must be a two-dimensional array")
+        if values.shape[1] != self.nFeats:
+            raise ValueError(
+                f"Query has {values.shape[1]} features but reference expects {self.nFeats}"
+            )
+        result = np.asarray(self.reducer(values))
+        expected_dims = (
+            self.dims if self.dims is not None and self.dims > 0 else self.nFeats
+        )
+        if result.ndim != 2 or result.shape[1] != expected_dims:
+            raise ValueError("Query transform did not produce the ANN index dimensions")
+        if not np.all(np.isfinite(result)):
+            raise ValueError("Query transform produced non-finite values")
+        return result
+
     def transform_ann(
         self,
         a: np.ndarray,
@@ -460,8 +484,13 @@ class AnnStream:
         )
         if self.harmonize:
             if self.harmonizedData is None:
+                if self.batches is None:
+                    raise ValueError("Harmony requires batch metadata")
+                self.harmonyResult = fit_harmony(
+                    _transform_values(), self.batches, **self.harmonyParams
+                )
                 self.harmonizedData = ChunkedArray.from_numpy(
-                    run_harmony(_transform_values(), self.batches).T,
+                    self.harmonyResult.corrected.T,
                     block_size=self.data.chunksize[0],
                     nthreads=self.nthreads,
                 )
