@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pytest
 import zarr
@@ -9,7 +11,9 @@ from scarf.knn_utils import (
     merge_graphs,
     smoothen_dists,
     weight_sort_indices,
+    wnn_integration,
 )
+from scarf.utils import logger
 from scarf.writers import create_zarr_dataset
 
 
@@ -22,6 +26,32 @@ def _simple_knn_graph(n: int, k: int = 3) -> csr_matrix:
             cols.append(neighbor)
             data.append(float(j))
     return csr_matrix((data, (rows, cols)), shape=(n, n))
+
+
+def _grouped_knn_graph(groups: list[list[int]]) -> csr_matrix:
+    n_cells = sum(len(group) for group in groups)
+    rows = []
+    cols = []
+    for group in groups:
+        for cell in group:
+            neighbors = [neighbor for neighbor in group if neighbor != cell]
+            rows.extend([cell] * len(neighbors))
+            cols.extend(neighbors)
+    return csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n_cells, n_cells))
+
+
+def _multimodal_wnn_inputs() -> tuple[csr_matrix, np.ndarray, csr_matrix, np.ndarray]:
+    g1 = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]])
+    g2 = _grouped_knn_graph([[0, 2, 4, 6], [1, 3, 5, 7]])
+    ld1 = np.array(
+        [0, 101, -97, 2, 1e6, 1e6 + 101, 1e6 - 97, 1e6 + 2],
+        dtype=np.float64,
+    ).reshape(-1, 1)
+    ld2 = np.array(
+        [0, 1e6, 101, 1e6 + 101, -97, 1e6 - 97, 2, 1e6 + 2],
+        dtype=np.float64,
+    ).reshape(-1, 1)
+    return g1, ld1, g2, ld2
 
 
 def test_calc_snn_returns_normalized_overlap():
@@ -93,3 +123,125 @@ def test_smoothen_dists_runs(tmp_path):
     smoothen_dists(graph, z_idx, z_dist, lc=1.0, bw=1.5, chunk_size=chunk_size)
     assert graph["weights"].shape[0] == graph["edges"].shape[0]
     assert graph["weights"].shape[0] > 0
+
+
+def test_wnn_integration_handles_extreme_affinities_without_runtime_warnings():
+    g1, ld1, g2, ld2 = _multimodal_wnn_inputs()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        merged = wnn_integration("RNA", g1, ld1, "ADT", g2, ld2, n_threads=1)
+
+    assert isinstance(merged, coo_matrix)
+    assert merged.shape == g1.shape
+    assert merged.nnz == g1.nnz
+    np.testing.assert_array_equal(
+        np.bincount(merged.row, minlength=g1.shape[0]),
+        np.repeat(g1.getnnz(axis=1)[0], g1.shape[0]),
+    )
+    assert np.all(np.isfinite(merged.data))
+    assert np.all(merged.data > 0)
+    assert np.all(merged.data <= 1)
+
+
+def test_wnn_integration_is_invariant_to_cell_order():
+    g1, _, g2, _ = _multimodal_wnn_inputs()
+    rng = np.random.default_rng(42)
+    ld1 = rng.normal(size=(g1.shape[0], 3))
+    ld2 = rng.normal(size=(g2.shape[0], 4))
+    expected = wnn_integration("RNA", g1, ld1, "ADT", g2, ld2, n_threads=1)
+
+    permutation = np.array([5, 0, 7, 2, 6, 1, 4, 3])
+    permuted = wnn_integration(
+        "RNA",
+        g1[permutation][:, permutation].tocsr(),
+        ld1[permutation],
+        "ADT",
+        g2[permutation][:, permutation].tocsr(),
+        ld2[permutation],
+        n_threads=1,
+    )
+    inverse = np.argsort(permutation)
+    restored = permuted.tocsr()[inverse][:, inverse]
+
+    np.testing.assert_allclose(expected.toarray(), restored.toarray())
+
+
+def test_wnn_integration_rejects_mismatched_graph_shapes():
+    g1 = _simple_knn_graph(6, k=3)
+    g2 = _simple_knn_graph(7, k=3)
+
+    with pytest.raises(ValueError, match="same shape"):
+        wnn_integration(
+            "RNA",
+            g1,
+            np.zeros((6, 2)),
+            "ADT",
+            g2,
+            np.zeros((7, 2)),
+            n_threads=1,
+        )
+
+
+def test_wnn_integration_rejects_irregular_row_degree():
+    g1 = _simple_knn_graph(6, k=3).tolil()
+    g1[0, 1] = 0
+    g1 = g1.tocsr()
+    g1.eliminate_zeros()
+    g2 = _simple_knn_graph(6, k=3)
+    embeddings = np.arange(12, dtype=np.float64).reshape(6, 2)
+
+    with pytest.raises(ValueError, match="regular row degree"):
+        wnn_integration("RNA", g1, embeddings, "ADT", g2, embeddings, n_threads=1)
+
+
+@pytest.mark.parametrize(
+    ("embedding", "match"),
+    [
+        (np.zeros((5, 2)), "one row per graph cell"),
+        (np.empty((6, 0)), "non-empty matrix"),
+        (
+            np.array(
+                [[0.0, 0.0]] * 5 + [[np.nan, 0.0]],
+                dtype=np.float64,
+            ),
+            "non-finite values",
+        ),
+    ],
+)
+def test_wnn_integration_rejects_invalid_embeddings(embedding, match):
+    graph = _simple_knn_graph(6, k=3)
+    valid_embedding = np.zeros((6, 2))
+
+    with pytest.raises(ValueError, match=match):
+        wnn_integration(
+            "RNA",
+            graph,
+            embedding,
+            "ADT",
+            graph,
+            valid_embedding,
+            n_threads=1,
+        )
+
+
+def test_wnn_integration_uses_minimum_neighbor_count_for_mismatched_graphs():
+    g1 = _simple_knn_graph(8, k=3)
+    g2 = _simple_knn_graph(8, k=2)
+    rng = np.random.default_rng(7)
+    ld1 = rng.normal(size=(8, 3))
+    ld2 = rng.normal(size=(8, 2))
+    messages = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]), level="WARNING"
+    )
+    try:
+        merged = wnn_integration("RNA", g1, ld1, "ADT", g2, ld2, n_threads=1)
+        swapped = wnn_integration("ADT", g2, ld2, "RNA", g1, ld1, n_threads=1)
+    finally:
+        logger.remove(sink)
+
+    assert any("different neighbor counts" in message for message in messages)
+    assert merged.nnz == g1.shape[0] * 2
+    assert np.all(np.isfinite(merged.data))
+    np.testing.assert_allclose(merged.toarray(), swapped.toarray())
