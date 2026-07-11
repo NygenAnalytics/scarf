@@ -48,10 +48,9 @@ def test_label_transfer_uses_every_neighbor_and_abstains_on_ties(datastore_ephem
         "manual_labels",
         reference_class_group="ids",
         threshold_fraction=0.5,
-        na_val="unknown",
     )
 
-    assert labels.tolist() == [reference_ids[0], "unknown"]
+    assert labels.tolist() == [reference_ids[0], "NA"]
 
 
 def test_mapping_score_uses_all_saved_neighbors(datastore_ephemeral):
@@ -94,7 +93,7 @@ def test_mapping_evidence_and_fixed_layout_projection(datastore_ephemeral):
     projected = datastore.z[layout_path][:]
 
     assert evidence["isUnknown"].tolist() == [False, True]
-    assert evidence["label"].tolist()[1] == "unknown"
+    assert evidence["label"].tolist()[1] == "NA"
     assert set(
         [
             "voteFraction",
@@ -255,6 +254,7 @@ def test_uninformative_projection_rows_are_forced_unknown(datastore_ephemeral):
     )
 
     assert evidence["isUnknown"].tolist() == [True, False]
+    assert evidence.loc[0, "label"] == "NA"
     classes = datastore.get_target_classes(
         "uninformative_evidence",
         reference_class_group="ids",

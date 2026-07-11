@@ -161,6 +161,7 @@ class GraphDataStore(BaseDataStore):
         ann_obj: AnnStream,
     ) -> None:
         from ..mapping_reference import persist_mapping_reference
+        from ..mapping_utils import _distance_quantile_summary
         from ..symphony import SymphonyReferenceModel, weighted_centroids
 
         if ann_obj.harmonyResult is None:
@@ -216,7 +217,7 @@ class GraphDataStore(BaseDataStore):
         metadata["harmonyParameters"] = harmony.parameters
         metadata["batchLevels"] = [list(levels) for levels in harmony.batch_levels]
         knn_group = as_zarr_group(self.zw[knn_loc], name=knn_loc)
-        distance_quantiles, distance_values = self._reference_distance_quantiles(
+        distance_quantiles, distance_values = _distance_quantile_summary(
             as_zarr_array(knn_group["distances"], name="distances")
         )
         persist_mapping_reference(
@@ -227,28 +228,6 @@ class GraphDataStore(BaseDataStore):
             reference_distance_quantiles=distance_quantiles,
             reference_distance_values=distance_values,
         )
-
-    @staticmethod
-    def _reference_distance_quantiles(
-        distances: zarr.Array,
-        max_samples: int = 100_000,
-        n_quantiles: int = 1_001,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        n_rows = int(distances.shape[0])
-        if n_rows < 1:
-            raise ValueError("Reference KNN distances are empty")
-        stride = max(int(np.ceil(n_rows / max_samples)), 1)
-        chunks = distances.chunks
-        block_size = int(chunks[0]) if chunks else min(n_rows, 10_000)
-        sampled: list[np.ndarray] = []
-        for start in range(0, n_rows, block_size):
-            stop = min(start + block_size, n_rows)
-            block = np.asarray(distances[start:stop])
-            mask = np.arange(start, stop) % stride == 0
-            sampled.append(np.asarray(block[mask, 0], dtype=np.float64))
-        values = np.concatenate(sampled)
-        quantiles = np.linspace(0.0, 1.0, min(n_quantiles, len(values)))
-        return quantiles, np.quantile(values, quantiles)
 
     def get_mapping_reference(
         self,

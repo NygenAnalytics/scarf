@@ -4,6 +4,7 @@ import pytest
 from scarf.chunked import ChunkedArray
 from scarf.mapping_utils import (
     _correlation_alignment,
+    _distance_quantile_summary,
     _order_features,
     conformal_prediction_sets,
     distance_weights,
@@ -37,6 +38,27 @@ def test_distance_weights_rejects_invalid_hnsw_distances():
         distance_weights(np.array([[-1.0, 1.0]]))
     with pytest.raises(ValueError, match="finite"):
         distance_weights(np.array([[np.nan, 1.0]]))
+
+
+def test_distance_quantile_summary_handles_vectors_and_neighbor_matrices():
+    first_neighbors = np.array([0.0, 1.0, 4.0, 9.0, 16.0])
+    neighbor_matrix = np.column_stack((first_neighbors, first_neighbors + 1))
+
+    vector_summary = _distance_quantile_summary(
+        first_neighbors,
+        max_samples=3,
+        n_quantiles=3,
+    )
+    matrix_summary = _distance_quantile_summary(
+        neighbor_matrix,
+        max_samples=3,
+        n_quantiles=3,
+    )
+
+    np.testing.assert_allclose(vector_summary[0], [0.0, 0.5, 1.0])
+    np.testing.assert_allclose(vector_summary[1], [0.0, 4.0, 16.0])
+    np.testing.assert_allclose(matrix_summary[0], vector_summary[0])
+    np.testing.assert_allclose(matrix_summary[1], vector_summary[1])
 
 
 def test_coral_rejects_one_cell_cohorts():

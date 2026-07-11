@@ -15,6 +15,7 @@ from ..ann import AnnStream
 from ..assay import Assay, RNAassay
 from ..chunked import ChunkedArray
 from ..mapping_reference import MappingReference, MappingResult
+from ..symphony import SYMPHONY_STYLE_VARIANT
 from .graph_datastore import GraphDataStore
 from ..utils import (
     tqdmbar,
@@ -325,6 +326,46 @@ class MappingDatastore(GraphDataStore):
             return int(chunks[0])
         return min(max(int(indices.shape[0]), 1), 10_000)
 
+    def _iter_projection_neighbor_rows(
+        self, store: zarr.Group
+    ) -> Generator[tuple[int, np.ndarray, np.ndarray, np.ndarray, bool], None, None]:
+        from ..mapping_utils import distance_weights
+
+        indices = as_zarr_array(store["indices"], name="indices")
+        distances = as_zarr_array(store["distances"], name="distances")
+        uninformative = (
+            as_zarr_array(store["uninformative"], name="uninformative")
+            if "uninformative" in store
+            else None
+        )
+        block_size = self._projection_block_size(indices)
+        for start in range(0, indices.shape[0], block_size):
+            stop = min(start + block_size, indices.shape[0])
+            block_indices = np.asarray(indices[start:stop])
+            block_distances = np.asarray(distances[start:stop])
+            block_weights = distance_weights(block_distances)
+            block_uninformative = (
+                np.asarray(uninformative[start:stop], dtype=bool)
+                if uninformative is not None
+                else np.zeros(stop - start, dtype=bool)
+            )
+            rows = zip(
+                block_indices,
+                block_weights,
+                block_distances,
+                block_uninformative,
+                strict=True,
+            )
+            for offset, row in enumerate(rows):
+                neighbors, weights, row_distances, force_unknown = row
+                yield (
+                    start + offset,
+                    neighbors,
+                    weights,
+                    row_distances,
+                    bool(force_unknown),
+                )
+
     def _projection_provenance(
         self,
         source_assay: Assay,
@@ -422,7 +463,7 @@ class MappingDatastore(GraphDataStore):
             "annSourcePath": ann_source_path,
             "correctionMethod": correction_method,
             "algorithmVariant": (
-                "symphonyStyleV1"
+                SYMPHONY_STYLE_VARIANT
                 if correction_method == "symphony"
                 else correction_method
             ),
@@ -437,7 +478,7 @@ class MappingDatastore(GraphDataStore):
         feature_indices: np.ndarray,
         ann_index_saver: Callable | None,
     ) -> AnnStream:
-        from ..mapping_utils import array_hash
+        from ..mapping_utils import _distance_quantile_summary, array_hash
 
         if ann_obj.method != "pca" or ann_obj.loadings is None:
             raise ValueError(
@@ -530,12 +571,9 @@ class MappingDatastore(GraphDataStore):
             )
             entry_start = entry_end
         nearest_distances = np.concatenate(sampled_distances)
-        distance_quantiles = np.linspace(
-            0.0,
-            1.0,
-            min(1_001, len(nearest_distances)),
+        distance_quantiles, distance_values = _distance_quantile_summary(
+            nearest_distances
         )
-        distance_values = np.quantile(nearest_distances, distance_quantiles)
         for name, values in (
             ("referenceDistanceQuantiles", distance_quantiles),
             ("referenceDistanceValues", distance_values),
@@ -994,7 +1032,6 @@ class MappingDatastore(GraphDataStore):
     ) -> MappingResult:
         from ..mapping_utils import align_features, array_hash
         from ..symphony import (
-            SYMPHONY_STYLE_VARIANT,
             accumulate_sufficient_statistics,
             apply_query_correction,
             initialize_sufficient_statistics,
@@ -1461,44 +1498,22 @@ class MappingDatastore(GraphDataStore):
         store = self._load_complete_projection(
             target_name, from_assay, cell_key, feat_key
         )
-        indices = as_zarr_array(store["indices"], name="indices")
-        distances = as_zarr_array(store["distances"], name="distances")
-        uninformative = (
-            as_zarr_array(store["uninformative"], name="uninformative")
-            if "uninformative" in store
-            else None
-        )
-
-        from ..mapping_utils import distance_weights
-
         preds: list[Any] = []
         prediction_indices: list[int] = []
-        block_size = self._projection_block_size(indices)
-        for start in range(0, indices.shape[0], block_size):
-            stop = min(start + block_size, indices.shape[0])
-            block_indices = np.asarray(indices[start:stop])
-            block_weights = distance_weights(np.asarray(distances[start:stop]))
-            block_uninformative = (
-                np.asarray(uninformative[start:stop], dtype=bool)
-                if uninformative is not None
-                else np.zeros(stop - start, dtype=bool)
+        for row in self._iter_projection_neighbor_rows(store):
+            n, neighbors, weights, _, force_unknown = row
+            if target_subset_set is not None and n not in target_subset_set:
+                continue
+            prediction, _, _, _, _, _ = self._label_vote_decision(
+                ref_groups,
+                neighbors,
+                weights,
+                threshold_fraction,
+                na_val,
+                force_unknown=force_unknown,
             )
-            for offset, (neighbors, weights, force_unknown) in enumerate(
-                zip(block_indices, block_weights, block_uninformative)
-            ):
-                n = start + offset
-                if target_subset_set is not None and n not in target_subset_set:
-                    continue
-                prediction, _, _, _, _, _ = self._label_vote_decision(
-                    ref_groups,
-                    neighbors,
-                    weights,
-                    threshold_fraction,
-                    na_val,
-                    force_unknown=bool(force_unknown),
-                )
-                preds.append(prediction)
-                prediction_indices.append(n)
+            preds.append(prediction)
+            prediction_indices.append(n)
         return pd.Series(preds, index=prediction_indices)
 
     def get_target_label_evidence(
@@ -1508,7 +1523,7 @@ class MappingDatastore(GraphDataStore):
         from_assay: str | None = None,
         cell_key: str | None = None,
         threshold_fraction: float = 0.5,
-        na_val: str = "unknown",
+        na_val: str = "NA",
         max_distance: float | None = None,
         calibration_nonconformity: np.ndarray | None = None,
         conformal_alpha: float = 0.1,
@@ -1530,18 +1545,11 @@ class MappingDatastore(GraphDataStore):
         store = self._load_complete_projection(
             target_name, from_assay, cell_key, feat_key
         )
-        indices = as_zarr_array(store["indices"], name="indices")
-        distances = as_zarr_array(store["distances"], name="distances")
         reference_labels = self.cells.fetch(reference_class_group, key=cell_key)
         class_labels = np.asarray(pd.unique(reference_labels), dtype=object)
         class_positions = {
             label: position for position, label in enumerate(class_labels)
         }
-        uninformative = (
-            as_zarr_array(store["uninformative"], name="uninformative")
-            if "uninformative" in store
-            else None
-        )
 
         predictions: list[Any] = []
         vote_fraction: list[float] = []
@@ -1549,51 +1557,34 @@ class MappingDatastore(GraphDataStore):
         top_two_margin: list[float] = []
         best_distances: list[float] = []
         label_scores: list[np.ndarray] = []
-        block_size = self._projection_block_size(indices)
-        for start in range(0, indices.shape[0], block_size):
-            stop = min(start + block_size, indices.shape[0])
-            block_indices = np.asarray(indices[start:stop])
-            block_distances = np.asarray(distances[start:stop])
-            from ..mapping_utils import distance_weights
-
-            block_weights = distance_weights(block_distances)
-            block_uninformative = (
-                np.asarray(uninformative[start:stop], dtype=bool)
-                if uninformative is not None
-                else np.zeros(stop - start, dtype=bool)
+        for row in self._iter_projection_neighbor_rows(store):
+            _, neighbors, weights, row_distances, force_unknown = row
+            (
+                prediction,
+                top_vote,
+                entropy,
+                margin,
+                _,
+                votes,
+            ) = self._label_vote_decision(
+                reference_labels,
+                neighbors,
+                weights,
+                threshold_fraction,
+                na_val,
+                force_unknown=force_unknown,
             )
-            for neighbors, weights, row_distances, force_unknown in zip(
-                block_indices,
-                block_weights,
-                block_distances,
-                block_uninformative,
-            ):
-                (
-                    prediction,
-                    top_vote,
-                    entropy,
-                    margin,
-                    _,
-                    votes,
-                ) = self._label_vote_decision(
-                    reference_labels,
-                    neighbors,
-                    weights,
-                    threshold_fraction,
-                    na_val,
-                    force_unknown=bool(force_unknown),
-                )
-                if max_distance is not None and row_distances[0] > max_distance:
-                    prediction = na_val
-                predictions.append(prediction)
-                vote_fraction.append(top_vote)
-                vote_entropy.append(entropy)
-                top_two_margin.append(margin)
-                best_distances.append(float(row_distances[0]))
-                score_row = np.zeros(len(class_labels), dtype=np.float64)
-                for label, score in votes.items():
-                    score_row[class_positions[label]] = score
-                label_scores.append(score_row)
+            if max_distance is not None and row_distances[0] > max_distance:
+                prediction = na_val
+            predictions.append(prediction)
+            vote_fraction.append(top_vote)
+            vote_entropy.append(entropy)
+            top_two_margin.append(margin)
+            best_distances.append(float(row_distances[0]))
+            score_row = np.zeros(len(class_labels), dtype=np.float64)
+            for label, score in votes.items():
+                score_row[class_positions[label]] = score
+            label_scores.append(score_row)
 
         best = np.asarray(best_distances)
         distance_quantiles, distance_values = self._reference_distance_summary(
@@ -1648,6 +1639,8 @@ class MappingDatastore(GraphDataStore):
         cell_key: str,
         feat_key: str,
     ) -> tuple[np.ndarray, np.ndarray]:
+        from ..mapping_utils import _distance_quantile_summary
+
         artifact_path = projection.attrs.get("mappingReferencePath")
         if isinstance(artifact_path, str) and artifact_path in self.zw:
             artifact = as_zarr_group(self.zw[artifact_path], name=artifact_path)
@@ -1705,34 +1698,7 @@ class MappingDatastore(GraphDataStore):
         knn_path = cast(str, ann.attrs["latest_knn"])
         knn = as_zarr_group(self.zw[knn_path], name=knn_path)
         reference_distances = as_zarr_array(knn["distances"], name="referenceDistances")
-        return self._distance_quantile_summary(reference_distances)
-
-    @staticmethod
-    def _distance_quantile_summary(
-        distances: Any,
-        max_samples: int = 100_000,
-        n_quantiles: int = 1_001,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        n_rows = int(distances.shape[0])
-        if n_rows < 1:
-            raise ValueError("Reference neighbor distances are empty")
-        stride = max(int(np.ceil(n_rows / max_samples)), 1)
-        chunks = getattr(distances, "chunks", None)
-        block_size = (
-            int(chunks[0])
-            if chunks is not None and len(chunks) > 0
-            else min(n_rows, 10_000)
-        )
-        sampled: list[np.ndarray] = []
-        for start in range(0, n_rows, block_size):
-            stop = min(start + block_size, n_rows)
-            block = np.asarray(distances[start:stop])
-            global_rows = np.arange(start, stop)
-            mask = global_rows % stride == 0
-            sampled.append(np.asarray(block[mask, 0], dtype=np.float64))
-        values = np.concatenate(sampled)
-        quantiles = np.linspace(0.0, 1.0, min(n_quantiles, len(values)))
-        return quantiles, np.quantile(values, quantiles)
+        return _distance_quantile_summary(reference_distances)
 
     @staticmethod
     def calibrate_label_transfer_threshold(

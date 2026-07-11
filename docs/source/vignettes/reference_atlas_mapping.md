@@ -91,7 +91,7 @@ corrected = projection['correctedLatent'][:]
 np.mean(np.abs(corrected - uncorrected))
 ```
 
-Use held-out donors to select an unknown threshold. The vote fractions below are evidence values, not calibrated probabilities. `referenceDistancePercentile` is evaluated against the reference self-neighbor distribution, so it does not change with query composition.
+Use held-out donors when selecting an abstention threshold. The example below only inspects evidence for the mapped query; its vote fractions are not calibrated probabilities. Rows that fail the threshold receive `NA` by default. `referenceDistancePercentile` is evaluated against the reference self-neighbor distribution, so it does not change with query composition.
 
 ```{code-cell} ipython3
 evidence = ds_ctrl.get_target_label_evidence(

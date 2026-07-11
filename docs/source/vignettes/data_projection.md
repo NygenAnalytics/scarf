@@ -146,7 +146,7 @@ transferred_labels = ds_ctrl.get_target_classes(
 transferred_labels
 ```
 
-Use `get_target_label_evidence` to inspect neighbor-vote fraction, entropy, margin, feature coverage, and a reference distance percentile. These are diagnostic quantities, not calibrated probabilities. The distance percentile uses the reference self-neighbor distribution rather than the query distribution. The method returns `unknown` when the winning vote does not meet a chosen threshold, when top labels tie, or when a query has no directional information in reference PC space.
+Use `get_target_label_evidence` to inspect neighbor-vote fraction, entropy, margin, feature coverage, and a reference distance percentile. These are diagnostic quantities, not calibrated probabilities. The distance percentile uses the reference self-neighbor distribution rather than the query distribution. The method returns `NA` by default when the winning vote does not meet a chosen threshold, when top labels tie, or when a query has no directional information in reference PC space.
 
 ```{code-cell} ipython3
 evidence = ds_ctrl.get_target_label_evidence(

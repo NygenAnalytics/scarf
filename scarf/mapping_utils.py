@@ -63,6 +63,43 @@ def array_store_hash(values: Any) -> str:
     return digest.hexdigest()
 
 
+def _distance_quantile_summary(
+    distances: Any,
+    max_samples: int = 100_000,
+    n_quantiles: int = 1_001,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Summarize first-neighbor distances with deterministic row sampling."""
+    shape = tuple(int(value) for value in distances.shape)
+    if len(shape) not in {1, 2}:
+        raise ValueError("Neighbor distances must be one- or two-dimensional")
+    n_rows = shape[0]
+    if n_rows < 1:
+        raise ValueError("Neighbor distances are empty")
+    if len(shape) == 2 and shape[1] < 1:
+        raise ValueError("Neighbor distances do not contain any neighbors")
+    if max_samples < 1 or n_quantiles < 1:
+        raise ValueError("Sampling and quantile counts must be positive")
+
+    stride = max(int(np.ceil(n_rows / max_samples)), 1)
+    chunks = getattr(distances, "chunks", None)
+    block_size = (
+        int(chunks[0])
+        if chunks is not None and len(chunks) > 0
+        else min(n_rows, 10_000)
+    )
+    sampled: list[np.ndarray] = []
+    for start in range(0, n_rows, block_size):
+        stop = min(start + block_size, n_rows)
+        block = np.asarray(distances[start:stop])
+        if block.ndim == 2:
+            block = block[:, 0]
+        mask = np.arange(start, stop, dtype=np.int64) % stride == 0
+        sampled.append(np.asarray(block[mask], dtype=np.float64))
+    values = np.concatenate(sampled)
+    quantiles = np.linspace(0.0, 1.0, min(n_quantiles, len(values)))
+    return quantiles, np.quantile(values, quantiles)
+
+
 def distance_weights(distances: np.ndarray) -> np.ndarray:
     """Convert HNSW squared-L2 distances into normalized inverse-L2 weights."""
     values = np.asarray(distances, dtype=np.float64)

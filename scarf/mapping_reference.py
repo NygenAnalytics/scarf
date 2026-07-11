@@ -175,6 +175,30 @@ def persist_mapping_reference(
     return f"{MAPPING_REFERENCES_GROUP}/{artifact_hash}"
 
 
+def _load_symphony_model_from_group(group: zarr.Group) -> SymphonyReferenceModel:
+    return SymphonyReferenceModel(
+        feature_means=np.asarray(
+            as_zarr_array(group["featureMeans"], name="featureMeans")[:]
+        ),
+        feature_scales=np.asarray(
+            as_zarr_array(group["featureScales"], name="featureScales")[:]
+        ),
+        loadings=np.asarray(as_zarr_array(group["loadings"], name="loadings")[:]),
+        centroids=np.asarray(as_zarr_array(group["centroids"], name="centroids")[:]),
+        raw_centroids=np.asarray(
+            as_zarr_array(group["rawCentroids"], name="rawCentroids")[:]
+        ),
+        corrected_centroids=np.asarray(
+            as_zarr_array(group["correctedCentroids"], name="correctedCentroids")[:]
+        ),
+        cluster_mass=np.asarray(
+            as_zarr_array(group["clusterMass"], name="clusterMass")[:]
+        ),
+        sigma=np.asarray(as_zarr_array(group["sigma"], name="sigma")[:]),
+        correction_ridge=_number_attribute(group, "correctionRidge"),
+    )
+
+
 def load_mapping_reference(
     datastore: Any,
     assay_name: str,
@@ -210,27 +234,7 @@ def load_mapping_reference(
         )
     if not is_legacy:
         validate_mapping_reference_artifact(group)
-    model = SymphonyReferenceModel(
-        feature_means=np.asarray(
-            as_zarr_array(group["featureMeans"], name="featureMeans")[:]
-        ),
-        feature_scales=np.asarray(
-            as_zarr_array(group["featureScales"], name="featureScales")[:]
-        ),
-        loadings=np.asarray(as_zarr_array(group["loadings"], name="loadings")[:]),
-        centroids=np.asarray(as_zarr_array(group["centroids"], name="centroids")[:]),
-        raw_centroids=np.asarray(
-            as_zarr_array(group["rawCentroids"], name="rawCentroids")[:]
-        ),
-        corrected_centroids=np.asarray(
-            as_zarr_array(group["correctedCentroids"], name="correctedCentroids")[:]
-        ),
-        cluster_mass=np.asarray(
-            as_zarr_array(group["clusterMass"], name="clusterMass")[:]
-        ),
-        sigma=np.asarray(as_zarr_array(group["sigma"], name="sigma")[:]),
-        correction_ridge=_number_attribute(group, "correctionRidge"),
-    )
+    model = _load_symphony_model_from_group(group)
     return MappingReference(
         datastore=datastore,
         assay_name=assay_name,
@@ -348,27 +352,7 @@ def mapping_reference_hash(
 
 
 def _validate_mapping_reference_hash(group: zarr.Group, expected_hash: str) -> None:
-    model = SymphonyReferenceModel(
-        feature_means=np.asarray(
-            as_zarr_array(group["featureMeans"], name="featureMeans")[:]
-        ),
-        feature_scales=np.asarray(
-            as_zarr_array(group["featureScales"], name="featureScales")[:]
-        ),
-        loadings=np.asarray(as_zarr_array(group["loadings"], name="loadings")[:]),
-        centroids=np.asarray(as_zarr_array(group["centroids"], name="centroids")[:]),
-        raw_centroids=np.asarray(
-            as_zarr_array(group["rawCentroids"], name="rawCentroids")[:]
-        ),
-        corrected_centroids=np.asarray(
-            as_zarr_array(group["correctedCentroids"], name="correctedCentroids")[:]
-        ),
-        cluster_mass=np.asarray(
-            as_zarr_array(group["clusterMass"], name="clusterMass")[:]
-        ),
-        sigma=np.asarray(as_zarr_array(group["sigma"], name="sigma")[:]),
-        correction_ridge=_number_attribute(group, "correctionRidge"),
-    )
+    model = _load_symphony_model_from_group(group)
     feature_ids = np.asarray(as_zarr_array(group["featureIds"], name="featureIds")[:])
     distance_quantiles = (
         np.asarray(
