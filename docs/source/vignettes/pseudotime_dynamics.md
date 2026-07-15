@@ -12,7 +12,7 @@ kernelspec:
   name: python3
 ---
 
-## Estimating pseudotime ordering and expression dynamics
+# Estimating pseudotime ordering and expression dynamics
 
 ```{code-cell} ipython3
 %load_ext autotime
@@ -23,7 +23,7 @@ scarf.__version__
 ```
 
 ---
-### 1) Fetch pre-analyzed data
+## 1) Fetch pre-analyzed data
 
 Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://journals.biologists.com/dev/article/146/12/dev173849/19483/) for E15.5 stage of differentiation of endocrine cells from a pool of endocrine progenitors-precursors. 
 
@@ -61,7 +61,7 @@ ds.plot_layout(
 ```
 
 ---
-### 2) Estimate pseudotime ordering
+## 2) Estimate pseudotime ordering
 
 In Scarf we use a memory efficient implementation of [PBA algorithm](https://github.com/AllonKleinLab/PBA) ([Weinreb et al. 2018, PNAS](https://www.pnas.org/content/115/10/E2467)) to estimate a pseudotime ordering of cells. The function `run_pseudotime_scoring` can be run on any Assay for which we have calculated a neighbourhood graph. The pseudotime is estimated in a supervised manner and hence, the user needs to provide the source (stem/progenitor/precursor cells) and sink (differentiated cell states) cell clusters/groups. 
 
@@ -83,7 +83,7 @@ ds.plot_layout(
 ```
 
 ---
-### 3) Identify pseudotime correlated features
+## 3) Identify pseudotime correlated features
 
 We can now identify the features that are correlated with pseudotime and hence increase or decrease along the pseudotime.`run_pseudotime_marker_search` function will calculate the correlation coefficient for each of the valid features/genes against the pseudotime. The only mandatory parameter that `run_pseudotime_marker_search` function needs is `pseudotime_key` the value of which should the cell attribute column that stores the pseudotime information
 
@@ -98,7 +98,7 @@ ds.RNA.feats.head()
 ```
 
 ---
-### 4) Visualize pseudotime correlated features
+## 4) Visualize pseudotime correlated features
 
 In this section will do deeper on how to use the pseudotime correlation values for further exploratory analysis.
 
@@ -152,7 +152,7 @@ ds.plot_layout(
 ```
 
 ---
-### 5) Identify feature modules based on pseudotime
+## 5) Identify feature modules based on pseudotime
 
 `run_pseudotime_marker_search` is excellent to find the genes are linearly correlated with the pseudotime. This function provides us informative statistical metrics to identify genes that are most strongly correlated with the pseudotime. However, with these methods we do not recover all the dynamic patterns of expression along the pseudotime. For example, there might be certain genes that express only in the middle of the trajectory or in one branch of the trajectory.
 
@@ -216,7 +216,7 @@ ds.plot_layout(
 ```
 
 ---
-### 6) Merging pseudotime-based feature modules into a new assay
+## 6) Merging pseudotime-based feature modules into a new assay
 
 The pseudotime based clusters of features can be used create a new assay. `add_grouped_assay` will take each cluster and take the mean expression of genes from that cluster and add it to a new assay. The motivation behind this approach is that we do not have to add many columns to our cell metadata table and have the mean cluster values readily available for analysis.
 
@@ -261,7 +261,7 @@ This figure complements the heatmap we generated earlier very nicely. Using this
 +++
 
 ---
-### 7) Comparing pseudotime based feature modules with cluster markers
+## 7) Comparing pseudotime based feature modules with cluster markers
 
 Here we will compare the pseudotime based feature module extraction approach with classical cluster marker approach.
 

@@ -2,8 +2,9 @@
 and features."""
 
 import re
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
 from typing import Any
-from collections.abc import Iterable
 
 import numpy as np
 import pandas as pd
@@ -16,7 +17,17 @@ from .writers import create_zarr_obj_array
 
 zarrGroup = zarr.Group
 
-__all__ = ["MetaData"]
+__all__ = ["MetaData", "MetaDataRowBlock"]
+
+
+@dataclass(frozen=True, slots=True)
+class MetaDataRowBlock:
+    """One contiguous slice of a MetaData table for blockwise scans."""
+
+    start: int
+    stop: int
+    active_global_indices: np.ndarray
+    values: dict[str, np.ndarray]
 
 
 def _all_true(bools: np.ndarray) -> np.ndarray:
@@ -266,6 +277,67 @@ class MetaData:
         """
 
         return np.asarray(self.fetch_all(column)[self.active_index(key)])
+
+    def default_block_rows(self, column: str = "I") -> int:
+        """Prefer the Zarr chunk length of ``column`` for row iteration."""
+        arr = self._get_array(column)
+        chunks = getattr(arr, "chunks", None)
+        if chunks and len(chunks) > 0 and int(chunks[0]) > 0:
+            return int(chunks[0])
+        return max(1, min(self.N, 100_000))
+
+    def iter_row_blocks(
+        self,
+        *,
+        cell_key: str = "I",
+        columns: Iterable[str] | None = None,
+        block_rows: int | None = None,
+    ) -> Iterator[MetaDataRowBlock]:
+        """Yield contiguous row blocks over this table.
+
+        Each block covers a half-open global index range ``[start, stop)``.
+        ``active_global_indices`` lists rows in that range that pass
+        ``cell_key``. Column arrays are aligned to those active indices only.
+
+        When ``block_rows`` is omitted, block size follows the Zarr chunk length
+        of ``cell_key`` (via ``default_block_rows``).
+
+        Concatenating ``active_global_indices`` across blocks equals
+        ``active_index(cell_key)``. Concatenating each column equals
+        ``fetch(column, cell_key)``.
+        """
+        self._verify_bool(cell_key)
+        if block_rows is None:
+            block_rows = self.default_block_rows(cell_key)
+        if block_rows < 1:
+            raise ValueError("block_rows must be >= 1")
+
+        if columns is None:
+            col_list: list[str] = []
+        else:
+            col_list = list(columns)
+            for col in col_list:
+                if col not in self.columns:
+                    raise KeyError(f"{col} does not exist in the metadata columns.")
+
+        key_arr = self._get_array(cell_key)
+        col_arrays = {c: self._get_array(c) for c in col_list}
+
+        for start in range(0, self.N, block_rows):
+            stop = min(start + block_rows, self.N)
+            key_slice = np.asarray(key_arr[start:stop], dtype=bool)
+            local = np.flatnonzero(key_slice)
+            active_global = (local + start).astype(np.int64, copy=False)
+            values: dict[str, np.ndarray] = {}
+            for col, arr in col_arrays.items():
+                block = np.asarray(arr[start:stop])
+                values[col] = block[local]
+            yield MetaDataRowBlock(
+                start=start,
+                stop=stop,
+                active_global_indices=active_global,
+                values=values,
+            )
 
     def _save(
         self, column_name: str, values: np.ndarray, location: str = "primary"

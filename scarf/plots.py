@@ -1,190 +1,43 @@
 """Contains the code for plotting in Scarf."""
 
+import importlib
 from collections.abc import Iterator
 from typing import Any
 
-import matplotlib as mpl  # type: ignore[import-not-found]
-import matplotlib.pyplot as plt  # type: ignore[import-not-found]
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-import seaborn as sns
+
+from .plotting._style import CUSTOM_PALETTES
 from .utils import logger
 
-plt.rcParams["svg.fonttype"] = "none"
+
+class _LazyPlotDependency:
+    def __init__(self, module_name: str):
+        self.module_name = module_name
+        self.module: Any | None = None
+
+    def _load(self) -> Any:
+        if self.module is None:
+            try:
+                self.module = importlib.import_module(self.module_name)
+            except ModuleNotFoundError as exc:
+                package = self.module_name.split(".", 1)[0]
+                raise ImportError(
+                    f"{package} is required for plotting. Install scarf[extra]."
+                ) from exc
+        return self.module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._load(), name)
 
 
-# These palettes were lifted from scanpy.plotting.palettes
-custom_palettes = {
-    10: [
-        "#1f77b4",
-        "#ff7f0e",
-        "#279e68",
-        "#d62728",
-        "#aa40fc",
-        "#8c564b",
-        "#e377c2",
-        "#7f7f7f",
-        "#b5bd61",
-        "#17becf",
-    ],
-    20: [
-        "#1f77b4",
-        "#aec7e8",
-        "#ff7f0e",
-        "#ffbb78",
-        "#2ca02c",
-        "#98df8a",
-        "#d62728",
-        "#ff9896",
-        "#9467bd",
-        "#c5b0d5",
-        "#8c564b",
-        "#c49c94",
-        "#e377c2",
-        "#f7b6d2",
-        "#7f7f7f",
-        "#c7c7c7",
-        "#bcbd22",
-        "#dbdb8d",
-        "#17becf",
-        "#9edae5",
-    ],
-    28: [
-        "#023fa5",
-        "#7d87b9",
-        "#bec1d4",
-        "#d6bcc0",
-        "#bb7784",
-        "#8e063b",
-        "#4a6fe3",
-        "#8595e1",
-        "#b5bbe3",
-        "#e6afb9",
-        "#e07b91",
-        "#d33f6a",
-        "#11c638",
-        "#8dd593",
-        "#c6dec7",
-        "#ead3c6",
-        "#f0b98d",
-        "#ef9708",
-        "#0fcfc0",
-        "#9cded6",
-        "#d5eae7",
-        "#f3e1eb",
-        "#f6c4e1",
-        "#f79cd4",
-        "#7f7f7f",
-        "#c7c7c7",
-        "#1CE6FF",
-        "#336600",
-    ],
-    102: [
-        "#FFFF00",
-        "#1CE6FF",
-        "#FF34FF",
-        "#FF4A46",
-        "#008941",
-        "#006FA6",
-        "#A30059",
-        "#FFDBE5",
-        "#7A4900",
-        "#0000A6",
-        "#63FFAC",
-        "#B79762",
-        "#004D43",
-        "#8FB0FF",
-        "#997D87",
-        "#5A0007",
-        "#809693",
-        "#6A3A4C",
-        "#1B4400",
-        "#4FC601",
-        "#3B5DFF",
-        "#4A3B53",
-        "#FF2F80",
-        "#61615A",
-        "#BA0900",
-        "#6B7900",
-        "#00C2A0",
-        "#FFAA92",
-        "#FF90C9",
-        "#B903AA",
-        "#D16100",
-        "#DDEFFF",
-        "#000035",
-        "#7B4F4B",
-        "#A1C299",
-        "#300018",
-        "#0AA6D8",
-        "#013349",
-        "#00846F",
-        "#372101",
-        "#FFB500",
-        "#C2FFED",
-        "#A079BF",
-        "#CC0744",
-        "#C0B9B2",
-        "#C2FF99",
-        "#001E09",
-        "#00489C",
-        "#6F0062",
-        "#0CBD66",
-        "#EEC3FF",
-        "#456D75",
-        "#B77B68",
-        "#7A87A1",
-        "#788D66",
-        "#885578",
-        "#FAD09F",
-        "#FF8A9A",
-        "#D157A0",
-        "#BEC459",
-        "#456648",
-        "#0086ED",
-        "#886F4C",
-        "#34362D",
-        "#B4A8BD",
-        "#00A6AA",
-        "#452C2C",
-        "#636375",
-        "#A3C8C9",
-        "#FF913F",
-        "#938A81",
-        "#575329",
-        "#00FECF",
-        "#B05B6F",
-        "#8CD0FF",
-        "#3B9700",
-        "#04F757",
-        "#C8A1A1",
-        "#1E6E00",
-        "#7900D7",
-        "#A77500",
-        "#6367A9",
-        "#A05837",
-        "#6B002C",
-        "#772600",
-        "#D790FF",
-        "#9B9700",
-        "#549E79",
-        "#FFF69F",
-        "#201625",
-        "#72418F",
-        "#BC23FF",
-        "#99ADC0",
-        "#3A2465",
-        "#922329",
-        "#5B4534",
-        "#FDE8DC",
-        "#404E55",
-        "#0089A3",
-        "#CB7E98",
-        "#A4E804",
-        "#324E72",
-    ],
-}
+mpl = _LazyPlotDependency("matplotlib")
+plt = _LazyPlotDependency("matplotlib.pyplot")
+sns = _LazyPlotDependency("seaborn")
+
+# Back-compat alias; do not mutate process-wide rcParams on import.
+custom_palettes = CUSTOM_PALETTES
 
 
 def clean_axis(ax: Any, ts: int = 11, ga: float = 0.4) -> bool:
@@ -289,16 +142,15 @@ def plot_qc(
         fig_size = (fig_width, fig_height)
     fig = plt.figure(figsize=fig_size)
     grouped = data.groupby("groups", observed=False)
-    for i in range(n_plots):
-        if data.columns[i] == "groups":
-            continue
+    metric_cols = [c for c in data.columns if c != "groups"]
+    for plot_i, metric_col in enumerate(metric_cols):
         vals_raw: dict[str, list[Any]] = {"g": [], "v": []}
         for j in sorted(data["groups"].unique()):
-            val = grouped.get_group(j)[data.columns[i]].values
+            val = grouped.get_group(j)[metric_col].values
             vals_raw["g"].extend([j for _ in range(len(val))])
             vals_raw["v"].extend(list(val))
         vals = pd.DataFrame(vals_raw)
-        ax = fig.add_subplot(n_rows, n_cols, i + 1)
+        ax = fig.add_subplot(n_rows, n_cols, plot_i + 1)
         if n_groups == 1:
             sns.violinplot(
                 y="v",
@@ -315,6 +167,7 @@ def plot_qc(
             sns.violinplot(
                 y="v",
                 x="g",
+                hue="g",
                 data=vals,
                 linewidth=1,
                 orient="v",
@@ -322,6 +175,7 @@ def plot_qc(
                 inner=None,
                 cut=0,
                 palette=cmap,
+                legend=False,
             )
         if len(vals) > max_points:
             sns.stripplot(
@@ -347,7 +201,7 @@ def plot_qc(
                 color="k",
                 alpha=0.4,
             )
-        ax.set_ylabel(data.columns[i], fontsize=label_size)
+        ax.set_ylabel(metric_col, fontsize=label_size)
         ax.set_xlabel("")
         if n_groups == 1:
             ax.set_xticks([])
@@ -421,9 +275,10 @@ def plot_elbow(
         var_exp: Percent variance explained per component.
         figsize: Figure size; width auto-scales with component count if None.
     """
-    from kneed import KneeLocator  # type: ignore[import-not-found]
+    from .plotting._deps import require_kneed
 
     x = range(len(var_exp))
+    KneeLocator = require_kneed()
     kneedle = KneeLocator(x, var_exp, S=1.0, curve="convex", direction="decreasing")
     if figsize[0] is None:
         figsize = (0.25 * len(var_exp), figsize[1])
@@ -520,16 +375,16 @@ def _scatter_fix_type(v: pd.Series, ints_as_cats: bool) -> pd.Series:
 def _scatter_fix_mask(
     v: pd.Series, mask_vals: list[Any] | None, mask_name: str
 ) -> pd.Series:
-    if mask_vals is None:
-        mask_vals = []
-    mask_vals += [np.nan]
+    # Copy so caller-provided lists are not mutated.
+    mask_list: list[Any] = list(mask_vals) if mask_vals is not None else []
+    mask_list = mask_list + [np.nan]
     iscat = False
     if v.dtype.name == "category":
         iscat = True
         v = v.astype(object)
     # There is a bug in pandas which causes failure above 1M rows
     # v[v.isin(mask_vals)] = mask_name
-    v[np.isin(v, mask_vals)] = mask_name
+    v[np.isin(v, mask_list)] = mask_name
     if iscat:
         v = v.astype("category")
     return v
@@ -557,6 +412,8 @@ def _scatter_make_colors(
             cmap = "custom"
 
     if color_key is not None:
+        # Copy so caller-provided dictionaries are not mutated.
+        color_key = dict(color_key)
         for i in uv:
             if i not in color_key:
                 raise KeyError(f"ERROR: key {i} missing in `color_key`")
@@ -702,7 +559,16 @@ def _scatter_legends(
             )
         cax.set_axis_off()
     else:
-        norm = Normalize(vmin=v.min(), vmax=v.max())
+        numeric = pd.to_numeric(v, errors="coerce")
+        finite = numeric[np.isfinite(numeric.to_numpy(dtype=np.float64))]
+        if len(finite):
+            vmin = float(finite.min())
+            vmax = float(finite.max())
+            if vmax <= vmin:
+                vmax = vmin + 1.0
+        else:
+            vmin, vmax = 0.0, 1.0
+        norm = Normalize(vmin=vmin, vmax=vmax)
         cb = ColorbarBase(cax, cmap=cmap, norm=norm, orientation="horizontal")
         if hide_title is False:
             if title is not None:
@@ -767,8 +633,11 @@ def _create_axes(
     else:
         if in_ax is None:
             _, axs = plt.subplots(1, 1, figsize=(width, height), squeeze=False)
+        elif isinstance(in_ax, np.ndarray):
+            axs = in_ax if in_ax.ndim == 2 else in_ax.reshape(1, -1)
         else:
-            axs = in_ax
+            # Bare Axes from the caller
+            axs = np.array([[in_ax]], dtype=object)
     return axs
 
 
@@ -779,10 +648,11 @@ def _iter_dataframes(
     force_ints_as_cats: bool,
 ) -> Iterator[tuple[int, pd.DataFrame]]:
     for n, df in enumerate(dfs):
+        panel = df.copy()
         vc = df.columns[2]
         v = _scatter_fix_mask(df[vc].copy(), mask_values, mask_name)
-        df[vc] = _scatter_fix_type(v, force_ints_as_cats)
-        yield n, df
+        panel[vc] = _scatter_fix_type(v, force_ints_as_cats)
+        yield n, panel
 
 
 def _handle_titles_type(titles: str | list[str] | None, n_df: int) -> list[str] | None:
@@ -878,11 +748,9 @@ def plot_scatter(
         show_fig: Show interactively when True.
         scatter_kwargs: Extra kwargs passed to ``ax.scatter`` (not ``c`` or ``s``).
     """
-    from matplotlib.colors import to_hex  # type: ignore[import-not-found]
 
     def _handle_scatter_kwargs(sk: dict[str, Any] | None) -> dict[str, Any]:
-        if sk is None:
-            sk = {}
+        sk = {} if sk is None else dict(sk)
         if "c" in sk:
             logger.warning("scatter_kwarg value `c` will be ignored")
             del sk["c"]
@@ -907,13 +775,27 @@ def plot_scatter(
             assert col_key is not None
             df["c"] = [col_key[x] for x in v]
         else:
-            if v.nunique() == 1:
+            if v.nunique(dropna=False) == 1:
                 df["c"] = [default_color for _ in v]
             else:
-                v = v.copy().fillna(0)
-                mmv = (v - v.min()) / (v.max() - v.min())
-                assert col_map is not None
-                df["c"] = [to_hex(col_map(x)) for x in mmv]
+                from matplotlib.colors import to_hex  # type: ignore[import-not-found]
+
+                v_num = pd.to_numeric(v, errors="coerce")
+                finite = np.isfinite(v_num.to_numpy(dtype=np.float64))
+                colors: list[str] = []
+                if finite.any():
+                    vmin = float(v_num[finite].min())
+                    vmax = float(v_num[finite].max())
+                    span = vmax - vmin if vmax != vmin else 1.0
+                    assert col_map is not None
+                    for val, ok in zip(v_num.to_numpy(dtype=np.float64), finite):
+                        if not ok:
+                            colors.append(to_hex(mask_color))
+                        else:
+                            colors.append(to_hex(col_map((val - vmin) / span)))
+                else:
+                    colors = [to_hex(mask_color) for _ in v]
+                df["c"] = colors
         if "s" not in df:
             df["s"] = [point_size for _ in df.index]
         scatter_kwargs = _handle_scatter_kwargs(sk=scatter_kwargs)
@@ -951,9 +833,11 @@ def plot_scatter(
         )
 
     if savename:
-        plt.savefig(savename, dpi=dpi, bbox_inches="tight")
+        fig = axs.flat[0].figure
+        with mpl.rc_context({"svg.fonttype": "none", "pdf.fonttype": 42}):
+            fig.savefig(savename, dpi=dpi, bbox_inches="tight")
     if show_fig:
-        plt.show()
+        axs.flat[0].figure.show()
         return None
     return axs
 
@@ -1034,13 +918,36 @@ def shade_scatter(
         h_pad: Height padding between subplots.
         show_fig: Show interactively when True.
     """
-    import datashader as dsh  # type: ignore[import-not-found]
-    from datashader.mpl_ext import dsshow  # type: ignore[import-not-found]
-    import datashader.transfer_functions as tf  # type: ignore[import-not-found]
     from functools import partial
 
+    from .plotting._deps import require_datashader
+
+    dsh, dsshow, tf = require_datashader()
     titles = _handle_titles_type(titles, len(dfs))
     axs = _create_axes(dfs, in_ax, figsize, figsize, w_pad, h_pad, n_columns)
+
+    # Shared continuous limits across panels so multi-panel shading is comparable.
+    # Prefer linear / percentile limits over per-panel eq_hist (Milestone C).
+    shared_vmin: float | None = None
+    shared_vmax: float | None = None
+    cont_vals: list[Any] = []
+    for n, df in _iter_dataframes(dfs, mask_values, mask_name, force_ints_as_cats):
+        v = df[df.columns[2]]
+        if v.dtype.name != "category" and v.nunique() > 1:
+            cont_vals.append(v.to_numpy(dtype=float))
+    if cont_vals:
+        import numpy as np
+
+        all_c = np.concatenate(cont_vals)
+        finite = np.isfinite(all_c)
+        if finite.any():
+            shared_vmin = float(np.nanpercentile(all_c[finite], 1))
+            shared_vmax = float(np.nanpercentile(all_c[finite], 99))
+            if shared_vmax <= shared_vmin:
+                shared_vmin = float(np.nanmin(all_c[finite]))
+                shared_vmax = float(np.nanmax(all_c[finite]))
+
+    # Rewind iterator by rebuilding from dfs
     for n, df in _iter_dataframes(dfs, mask_values, mask_name, force_ints_as_cats):
         dim1, dim2, vc = df.columns[:3]
         v = df[vc]
@@ -1049,18 +956,26 @@ def shade_scatter(
         )
         if v.dtype.name == "category":
             agg = dsh.count_cat(vc)
+            how = "eq_hist"
+            limits: dict[str, float] = {}
         else:
             if v.nunique() == 1:
                 agg = dsh.count(vc)
+                how = "eq_hist"
+                limits = {}
             else:
                 agg = dsh.mean(vc)
+                how = "linear"
+                limits = {}
+                if shared_vmin is not None and shared_vmax is not None:
+                    limits = {"vmin": shared_vmin, "vmax": shared_vmax}
 
         ax = axs[int(n / n_columns), n % n_columns]
         dsshow(
             df,
             dsh.Point(dim1, dim2),
             aggregator=agg,
-            norm="eq_hist",
+            norm=how,
             color_key=col_key,
             cmap=col_map,
             alpha_range=(min_alpha, 255),
@@ -1073,6 +988,7 @@ def shade_scatter(
             width_scale=1,
             height_scale=1,
             ax=ax,
+            **limits,
         )
 
         _scatter_label_axis(df, ax, ax_label_size, frame_offset)
@@ -1100,9 +1016,11 @@ def shade_scatter(
         )
 
     if savename:
-        plt.savefig(savename, dpi=dpi, bbox_inches="tight")
+        fig = axs.flat[0].figure
+        with mpl.rc_context({"svg.fonttype": "none", "pdf.fonttype": 42}):
+            fig.savefig(savename, dpi=dpi, bbox_inches="tight")
     if show_fig:
-        plt.show()
+        axs.flat[0].figure.show()
         return None
     return axs
 

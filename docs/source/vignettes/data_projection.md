@@ -14,7 +14,7 @@ kernelspec:
 
 (data_projection)=
 
-## Projection, label transfer, and unified embeddings
+# Projection, label transfer, and unified embeddings
 
 Scarf allows projections (aka mapping) of cells from one dataset to another. Such projection can help in  understanding how cells are related between the two datasets. Projection/mapping is a lightweight alternative to full-blown data integration which focuses on biological interpretation. In this notebook we use data from [Kang et. al.](https://www.nature.com/articles/nbt.4042). We have already preprocessed the raw count matrix to generate UMAPs and clustering of the data ([notebook here](https://github.com/parashardhapola/scarf_vignettes/blob/main/kang_et_al_processing.ipynb)). We will use two datasets from this study: control and IFN-B treated PBMCs.
 
@@ -22,11 +22,12 @@ Scarf allows projections (aka mapping) of cells from one dataset to another. Suc
 %load_ext autotime
 
 import scarf
+import scarf.plotting as splt
 scarf.__version__
 ```
 
 ---
-### 1) Fetch datasets in Zarr format
+## 1) Fetch datasets in Zarr format
 
 ```{code-cell} ipython3
 scarf.fetch_dataset(
@@ -49,10 +50,12 @@ ds_ctrl = scarf.DataStore(
     nthreads=4
 )
 
-ds_ctrl.plot_layout(
+splt.embedding(
+    ds_ctrl,
     layout_key='RNA_UMAP',
-    color_by='cluster_labels'
-)
+    color_by='cluster_labels',
+    show=False,
+).figure
 ```
 
 ```{code-cell} ipython3
@@ -62,14 +65,16 @@ ds_stim = scarf.DataStore(
     nthreads=4
 )
 
-ds_stim.plot_layout(
+splt.embedding(
+    ds_stim,
     layout_key='RNA_UMAP',
-    color_by='cluster_labels'
-)
+    color_by='cluster_labels',
+    show=False,
+).figure
 ```
 
 ---
-### 2) K-Nearest Neighbours (KNN) mapping
+## 2) K-Nearest Neighbours (KNN) mapping
 
 The ``run_mapping`` method projects target cells onto the fixed reference graph. The reference cells are in the `DataStore` where `run_mapping` is called, and the target assay is supplied as an argument. Scarf aligns target features to the ordered reference feature set, applies the scaling stored with the reference PCA, and queries the reference ANN index. Target cells are never inserted into the reference index.
 
@@ -103,7 +108,7 @@ Key mapping parameters:
 - `ref_mu` and `ref_sigma`: deprecated compatibility flags. Reference statistics are always used.
 
 ---
-### 3) Mapping scores
+## 3) Mapping scores
 
 +++
 
@@ -120,18 +125,18 @@ for g, ms in ds_ctrl.get_mapping_score(
     
     if g in ['NK', 'CD 14 Mono']:
         print (f"Target cluster {g}")
-        ds_ctrl.plot_layout(
+        splt.embedding(
+            ds_ctrl,
             layout_key='RNA_UMAP',
             color_by='cluster_labels',
-            size_vals=ms*10,
-            height=4, 
-            width=4,
-            legend_onside=False
-        )
+            point_sizes=ms * 10,
+            figsize=(4, 4),
+            show=False,
+        ).figure
 ```
 
 ---
-### 4) Label transfer
+## 4) Label transfer
 
 Using the nearest neighbours of the target cells in the reference data, we can transfer labels from reference cells to target cells based on majority voting. This means that if a target cell has 'most' of its total edge weight shared with cells from one cell type, then that cell type label is tranferred to the target cell. The default threshold for 'most' is 0.5, i.e. half of all edge weight. `get_target_classes` method returns the transferred labels for each cell from a given mapped target dataset.
 
@@ -168,10 +173,12 @@ ds_stim.cells.insert(
 ```
 
 ```{code-cell} ipython3
-ds_stim.plot_layout(
+splt.embedding(
+    ds_stim,
     layout_key='RNA_UMAP',
-    color_by='transferred_labels'
-)
+    color_by='transferred_labels',
+    show=False,
+).figure
 ```
 
 It can be quite interesting to check how the predicted/transferred labels compare to the actual labels of the target cells:
@@ -193,7 +200,7 @@ This cross-tabulation can be presented as percentage accuracy, where the values 
 ```
 
 ---
-### 5) Unified UMAPs
+## 5) Unified UMAPs
 
 Unified UMAP adds query-reference edges and reruns UMAP on the combined graph. It is useful for exploration, but it moves the reference coordinates and can change when a different query is supplied. Do not use it as a stable atlas coordinate system.
 
@@ -207,7 +214,7 @@ ds_ctrl.run_unified_umap(
 )
 ```
 
-Since the results of unified embedding contain 'foreign' cells, `plot_layout` function cannot be used to visualize all the cells. A specialized method, `plot_unified_layout` takes care of this issue. The following example shows co-embedded control (reference) and stimulated  (target) PBMCs.
+Since unified embeddings contain cells from another dataset, `scarf.plotting.embedding` cannot read the complete layout from one metadata table. The supported `plot_unified_layout` compatibility method handles this specialized case. The following example shows co-embedded control (reference) and stimulated (target) PBMCs.
 
 ```{code-cell} ipython3
 ds_ctrl.plot_unified_layout(
@@ -238,7 +245,7 @@ ds_ctrl.plot_unified_layout(
 ```
 
 ---
-### 6) Unified tSNE
+## 6) Unified tSNE
 
 Unified tSNE co-embeds reference and target cells using the same unified graph as unified UMAP:
 

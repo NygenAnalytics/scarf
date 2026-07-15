@@ -1535,21 +1535,22 @@ class DataStore(MappingDatastore):
             raise ValueError("ERROR: Please provide a value for `group_key` parameter")
         else:
             groups = self.cells.fetch_all(group_key)
-            groups_set = sorted(set(self.cells.fetch(group_key, key=cell_key)))
+            active_idx = self.cells.active_index(cell_key)
+            groups_set = sorted(set(groups[active_idx]))
         if secondary_group_key is None:
             sec_groups: NDArray[Any] = np.array([None], dtype=object)
             sec_groups_set: list[Any] = [None]
         else:
             sec_groups = self.cells.fetch_all(secondary_group_key)
-            sec_groups_set = sorted(
-                set(self.cells.fetch(secondary_group_key, key=cell_key))
-            )
+            sec_groups_set = sorted(set(sec_groups[active_idx]))
 
         assay = self._get_assay(from_assay)
 
         vals: dict[str, NDArray[Any]] = {}
         fracs: dict[str, NDArray[Any]] = {}
         all_feat_idx = np.arange(assay.feats.N)
+        active_mask = np.zeros(self.cells.N, dtype=bool)
+        active_mask[active_idx] = True
         for g in tqdmbar(groups_set):
             if g in null_vals:
                 continue
@@ -1557,9 +1558,11 @@ class DataStore(MappingDatastore):
                 if sg in secondary_null_vals:
                     continue
                 if sg is None and len(sec_groups) == 1:
-                    g_idx = np.where(groups == g)[0]
+                    g_idx = np.where((groups == g) & active_mask)[0]
                 else:
-                    g_idx = np.where((groups == g) & (sec_groups == sg))[0]
+                    g_idx = np.where((groups == g) & (sec_groups == sg) & active_mask)[
+                        0
+                    ]
                 rep_indices = make_reps(g_idx, pseudo_reps, random_seed)
                 for n, idx in enumerate(rep_indices):
                     if sg is None and len(sec_groups) == 1:
@@ -1922,6 +1925,7 @@ class DataStore(MappingDatastore):
         h_pad: float = 1,
         show_fig: bool = True,
         scatter_kwargs: dict[str, Any] | None = None,
+        use_plotting: bool = False,
     ) -> Any:
         """Create a scatter plot with a chosen layout. The method fetches the
         coordinates based from the cell metadata columns with `layout_key`
@@ -2026,15 +2030,27 @@ class DataStore(MappingDatastore):
                    Ignored if only plotting one scatterplot.
             show_fig: Whether to render the figure and display it using plt.show() (Default value: True)
             scatter_kwargs: Keyword argument to be passed to matplotlib's scatter command
+            use_plotting: If True, try ``scarf.plotting.embedding`` when the call is
+                compatible (no shading, no masks, single layout). Otherwise fall back
+                to the legacy renderer with a warning. Default False keeps legacy
+                behavior and return type.
 
         Returns:
-            None
+            None when ``show_fig`` is True. Otherwise axes (legacy) or a
+            ``PlotResult`` when ``use_plotting`` successfully bridges.
         """
 
         # TODO: add support for providing a list of subselections, from_assay and cell_keys
         # TODO: add support for different kinds of point markers
 
         from ..plots import plot_scatter, shade_scatter
+        from ..plotting._legacy import copy_plot_mutables, try_bridge_plot_layout
+
+        color_key, mask_values, scatter_kwargs = copy_plot_mutables(
+            color_key=color_key,
+            mask_values=mask_values,
+            scatter_kwargs=scatter_kwargs,
+        )
 
         if from_assay is None:
             from_assay = self._defaultAssay
@@ -2046,6 +2062,42 @@ class DataStore(MappingDatastore):
             raise ValueError(
                 "ERROR: clip_fraction cannot be larger than or equal to 0.5"
             )
+
+        handled, bridged = try_bridge_plot_layout(
+            self,
+            use_plotting=use_plotting,
+            layout_key=layout_key,
+            color_by=color_by,
+            do_shading=do_shading,
+            mask_values=mask_values,
+            subselection_key=subselection_key,
+            shuffle_df=shuffle_df,
+            legend_ondata=legend_ondata,
+            legend_onside=legend_onside,
+            force_ints_as_cats=force_ints_as_cats,
+            clip_fraction=clip_fraction,
+            ax=ax,
+            cell_key=cell_key,
+            from_assay=from_assay,
+            point_size=point_size,
+            size_vals=size_vals,
+            sort_values=sort_values,
+            cmap=cmap,
+            default_color=default_color,
+            mask_color=mask_color,
+            width=width,
+            height=height,
+            n_columns=n_columns,
+            show_fig=show_fig,
+            savename=savename,
+            save_dpi=save_dpi,
+            color_key=color_key,
+            title=title,
+            scatter_kwargs=scatter_kwargs,
+        )
+        if handled:
+            return bridged
+
         if isinstance(layout_key, list):
             layout_keys = layout_key
         else:

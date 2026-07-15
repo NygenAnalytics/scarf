@@ -236,6 +236,80 @@
 ```
 
 ## Plots
+
+### scarf.plotting
+
+```{eval-rst}
+.. automodule:: scarf.plotting
+    :members: embedding, embedding_raster, dotplot, matrixplot, composition, distribution, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, theme_context
+    :undoc-members:
+    :show-inheritance:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.PlotResult
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.FeatureRef
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.CellField
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.StudyDesign
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.NormalizationSpec
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.ColorScale
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.CategoricalScale
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.SizeScale
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.PlotProvenance
+    :members:
+```
+
+### Legacy plotting interfaces
+
+`DataStore.plot_*` and `scarf.plots` remain supported compatibility APIs and
+do not emit plotting deprecation warnings. New code should use
+`scarf.plotting` when it provides the needed plot. Individual legacy methods
+will only be deprecated after the replacement reaches exact behavioral parity.
+
+```{eval-rst}
+.. autofunction:: scarf.plotting.marker_heatmap
+```
+
+```{eval-rst}
+.. autofunction:: scarf.plotting.cluster_tree
+```
+
+```{eval-rst}
+.. autofunction:: scarf.plotting.pseudotime_heatmap
+```
+
 ```{eval-rst}
 .. autofunction:: scarf.plots.plot_graph_qc
 ```

@@ -7,6 +7,34 @@ matplotlib.use("Agg")
 import scarf.plots as plots  # noqa: E402
 
 
+def test_shade_scatter_continuous_panels_share_linear_limits():
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+
+    x = np.linspace(-1.0, 1.0, 30)
+    dfs = [
+        pd.DataFrame({"x": x, "y": x, "value": np.linspace(0.0, 1.0, 30)}),
+        pd.DataFrame({"x": x, "y": -x, "value": np.linspace(10.0, 20.0, 30)}),
+    ]
+    axes = plots.shade_scatter(
+        dfs,
+        pixels=32,
+        n_columns=2,
+        legend_ondata=False,
+        legend_onside=False,
+        show_fig=False,
+    )
+    assert axes is not None
+    artists = [
+        next(child for child in ax.get_children() if hasattr(child, "get_clim"))
+        for ax in axes.flat
+    ]
+    assert artists[0].get_clim() == pytest.approx(artists[1].get_clim())
+    assert artists[0].norm.__class__.__name__ == "Normalize"
+    plt.close(axes.flat[0].figure)
+
+
 def _assert_expected_tree_layout(
     positions: dict[str, tuple[float, float]],
 ) -> None:

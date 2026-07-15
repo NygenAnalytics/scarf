@@ -35,6 +35,8 @@ subtrees:
         title: Pseudotime dynamics
   - caption: Vignettes
     entries:
+      - file: vignettes/plotting_showcase
+        title: Publication plotting with scarf.plotting
       - file: vignettes/zarr_explanation
         title: Data organization in Scarf
       - file: vignettes/download_conversion

@@ -12,17 +12,18 @@ kernelspec:
   name: python3
 ---
 
-## Handling datasets with multiple modalities
+# Handling datasets with multiple modalities
 
 ```{code-cell} ipython3
 %load_ext autotime
 
 import scarf
+import scarf.plotting as splt
 scarf.__version__
 ```
 
 ---
-### 1) Fetch and convert data
+## 1) Fetch and convert data
 
 For this tutorial we will use CITE-Seq data from 10x genomics. This dataset contains two modalities: gene expression and surface protein abundance. Throughout this tutorial we will refer to gene expression modality as `RNA` and surface protein as `ADT`. We start by downloading the data and converting it into Zarr format:
 
@@ -64,7 +65,7 @@ writer.dump(batch_size=1000)
 ```
 
 ---
-### 2) Create a multimodal DataStore
+## 2) Create a multimodal DataStore
 
 The next step is to create a Scarf `DataStore` object. This object will be the primary way to interact with the data and all its constituent assays. The first time a Zarr file is loaded, we need to set the default assay. Here we set the 'RNA' assay as the default assay. When a Zarr file is loaded, Scarf checks if some per-cell statistics have been calculated. If not, then **nFeatures** (number of features per cell) and **nCounts** (total sum of feature counts per cell) are calculated. Scarf will also attempt to calculate the percent of mitochondrial and ribosomal content per cell.
 
@@ -99,7 +100,7 @@ ds.auto_filter_cells()
 ```
 
 ---
-### 3) Process gene expression modality
+## 3) Process gene expression modality
 
 Now we process the RNA assay to perform feature selection, create KNN graph, run UMAP reduction and clustering. These steps are same as shown in the basic workflow for scRNA-Seq data.
 
@@ -130,15 +131,16 @@ ds.run_leiden_clustering(resolution=1)
 ```
 
 ```{code-cell} ipython3
-ds.plot_layout(
+splt.embedding(
+    ds,
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
-    cmap='tab20'
-)
+    show=False,
+).figure
 ```
 
 ---
-### 4) Process protein surface abundance modality
+## 4) Process protein surface abundance modality
 
 +++
 
@@ -214,17 +216,23 @@ ds.cells.head()
 Visualizing the UMAP and clustering calcualted using `ADT` only:
 
 ```{code-cell} ipython3
-ds.plot_layout(
+splt.embedding(
+    ds,
     layout_key='ADT_UMAP',
     color_by='ADT_leiden_cluster',
-    cmap='tab20'
-)
+    show=False,
+).figure
 ```
 
 ---
-### 5) Cross modality comparison
+## 5) Cross modality comparison
 
 It is generally of interest to see how different modalities corroborate each other.
+
+The examples below intentionally use the supported `plot_layout` compatibility
+method because they combine several layout keys or CLR-normalized ADT features.
+The `scarf.plotting` API raises for assay transformations it cannot reproduce
+without changing their meaning.
 
 ```{code-cell} ipython3
 # UMAP on RNA and coloured with clusters calculated on ADT
@@ -287,7 +295,7 @@ ds.plot_layout(
 ```
 
 ---
-### 6) Integration of modalities
+## 6) Integration of modalities
 
 The KNN graphs created individually for each of the modalities can be merged together to provide an integrated mutimodal view of the data. Scarf takes the latest KNN graphs (continous form edge weight) generated for each of the user chosen modality and merges the edges from each modality. After first round of merging, Scarf performs edge pruning by penalizing those edges more that have lower number of shared nearest neighbors between the connected cells. For each cells edges are pruned until the same number of edges as in individual modalities' KNN graphs are left.
 
@@ -342,7 +350,7 @@ The UMAP and clustering calculated on the integrated graph are here saved under 
 
 ---
 (wnn_integration)=
-### 7) WNN integration
+## 7) WNN integration
 
 The default `integrate_assays` method uses shared nearest neighbors (SNN). Scarf also supports weighted nearest neighbors (WNN), which can weight modalities differently. WNN requires exactly two assays:
 
@@ -382,7 +390,7 @@ ds.plot_layout(
 SNN supports two or more assays; WNN is limited to two. Try WNN when one modality is sparse or weaker than the other.
 
 ---
-### 8) HTO demultiplexing (hashtag oligos)
+## 8) HTO demultiplexing (hashtag oligos)
 
 Multiplexed experiments with hashtag oligos (HTO) can be demultiplexed with `mark_hto_identities`. The assay should be named `HTO` (or pass `from_assay`). This CITE-seq tutorial dataset contains RNA and ADT only; below is the API pattern for multiplexed Cell Ranger output:
 

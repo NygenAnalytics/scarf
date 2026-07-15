@@ -193,7 +193,11 @@ warn_unused_ignores = false
 ignore_missing_imports = false
 
 [[tool.mypy.overrides]]
-module = "scarf.plots"
+module = [
+    "scarf.plots",
+    "scarf.plotting",
+    "scarf.plotting.*",
+]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

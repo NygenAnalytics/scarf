@@ -16,7 +16,7 @@ kernelspec:
 
 +++
 
-## Scarf's basic workflow for scRNA-Seq
+# Scarf's basic workflow for scRNA-Seq
 
 This workflow is meant to familiarize users with the Scarf API and how data is internally handled in Scarf. For a minimal pipeline see {ref}`Quick start <quickstart>`. For batch correction on merged data see {ref}`integration methods guide <integration_guide>`.
 
@@ -24,6 +24,7 @@ This workflow is meant to familiarize users with the Scarf API and how data is i
 %load_ext autotime
 
 import scarf
+import scarf.plotting as splt
 scarf.__version__
 ```
 
@@ -37,7 +38,7 @@ scarf.fetch_dataset(
 ```
 
 ---
-### 1) Format conversion
+## 1) Format conversion
 
 The first step of the analysis workflow is to convert the file into the Zarr format that is supported by Scarf. We read in the data using `CrH5Reader` (stands for cellranger H5 reader). The reader object allows quick investigation of the file before the format is converted.
 
@@ -79,7 +80,7 @@ ds = scarf.DataStore(
 ```
 
 ---
-### 2) Cell filtering
+## 2) Cell filtering
 
 We can visualize the per-cell statistics in [violin plots](https://datavizcatalogue.com/methods/violin_plot.html) before we start filtering cells out.
 
@@ -132,7 +133,7 @@ ds
 ```
 
 ---
-### 3) Feature selection
+## 3) Feature selection
 
 Similar to the cell table, Scarf also saves the feature level data that can be accessed as below:
 
@@ -170,7 +171,7 @@ As a result of running `mark_hvgs`, the feature table now has an extra column **
 ds.RNA.feats.head()
 ```
 
-### 4) Graph creation
+## 4) Graph creation
 
 Creating a neighbourhood graph of cells is the most critical step in any Scarf workflow. This step internally involves multiple substeps: 
 
@@ -193,7 +194,7 @@ ds.make_graph(
 ```
 
 ---
-### 5) Low dimensional embedding and clustering
+## 5) Low dimensional embedding and clustering
 
 Next we run UMAP on the graph calculated above. Here we will not provide which cell key or feature key to be used, because we want the UMAP to run on all the cells that were not filtered out and with the feature key used to calculate the latest graph. We can provide the parameter values for the UMAP algorithm here.
 
@@ -225,20 +226,22 @@ The UMAP results are saved in the cell metadata table as seen below in columns: 
 ds.cells.head()
 ```
 
-`plot_layout` is a versatile method to create a [scatter plot](https://datavizcatalogue.com/methods/scatterplot.html) using Scarf. Here we can plot the UMAP coordinates of all the non-filtered out cells.
+`scarf.plotting.embedding` creates a [scatter plot](https://datavizcatalogue.com/methods/scatterplot.html) from a layout stored in cell metadata. Here we plot the UMAP coordinates of cells that passed filtering.
 
 ```{code-cell} ipython3
-ds.plot_layout(layout_key='RNA_UMAP')
+splt.embedding(ds, layout_key='RNA_UMAP', show=False).figure
 ```
 
-`plot_layout` can be used to easily visualize data from any column of the cell metadata table. Next, we visualize the number of genes expressed in each cell.
+The embedding can be colored by any cell-metadata column. Next, we visualize the total counts in each cell.
 
 ```{code-cell} ipython3
-ds.plot_layout(
+splt.embedding(
+    ds,
     layout_key='RNA_UMAP',
     color_by='RNA_nCounts',
-    cmap='coolwarm'
-)
+    color_scale=splt.ColorScale(cmap='coolwarm'),
+    show=False,
+).figure
 ```
 
 There has been a lot of discussion over the choice of non-linear dimensionality reduction for single-cell data. tSNE was initially considered an excellent solution, but has gradually lost out to UMAP because the magnitude of relations between the clusters cannot easily be discerned in a tSNE plot. Scarf contains an implementation of tSNE that runs directly on the graph structure of cells. So, essentially the same data that was used to create the UMAP and clustering is used.
@@ -258,15 +261,15 @@ NOTE: The tSNE implementation is currently not supported on Windows.
 </div>
 
 ```{code-cell} ipython3
-# Here we run plot_layout under exception catching because if you are not on Linux then the `run_tsne` would have failed.
+# If run_tsne is unavailable, the tSNE columns will not exist.
 try:
-    ds.plot_layout(layout_key='RNA_tSNE')
+    splt.embedding(ds, layout_key='RNA_tSNE', show=False).figure
 except KeyError:
     print ("'RNA_tSNE1' not found in MetaData")
 ```
 
 ---
-### 6) Cell clustering
+## 6) Cell clustering
 
 +++
 
@@ -282,13 +285,15 @@ Paris is the default algorithm in Scarf due to its ability to highlight cluster 
 ds.run_leiden_clustering(resolution=0.5)
 ```
 
-We can visualize the results using the `plot_layout` method again. Here we plot both UMAP and colour cells based on their cluster identity, as obtained using Leiden clustering.
+We can visualize the results by coloring the UMAP with Leiden cluster identity.
 
 ```{code-cell} ipython3
-ds.plot_layout(
+splt.embedding(
+    ds,
     layout_key='RNA_UMAP',
-    color_by='RNA_leiden_cluster'
-)
+    color_by='RNA_leiden_cluster',
+    show=False,
+).figure
 ```
 
 The results of the clustering algorithm are saved in the cell metadata table. In this case, they have been saved under the column name **RNA_leiden_cluster**.
@@ -316,16 +321,18 @@ ds.run_clustering(n_clusters=leiden_clusters.nunique()[0])
 Visualizing Paris clusters
 
 ```{code-cell} ipython3
-ds.plot_layout(
+splt.embedding(
+    ds,
     layout_key='RNA_UMAP',
-    color_by='RNA_cluster'
-)
+    color_by='RNA_cluster',
+    show=False,
+).figure
 ```
 
 Discerning similarity between clusters can be difficult from visual inspection alone, especially for tSNE plots. `plot_cluster_tree` function plots the relationship between clusters as a binary tree. This tree is simply a condensation of the dendrogram obtained using Paris clustering.
 
 ```{code-cell} ipython3
-ds.plot_cluster_tree(cluster_key='RNA_cluster', width=1)
+splt.cluster_tree(ds, cluster_key='RNA_cluster', width=1)
 ```
 
 The tree is free form (i.e the position of clusters doesn't convey any meaning) but allows inspection of cluster similarity based on branching pattern. The sizes of clusters indicate the number of cells present in each cluster. The tree starts from the root node (black dot with no incoming edges). 
@@ -333,7 +340,7 @@ The tree is free form (i.e the position of clusters doesn't convey any meaning) 
 +++
 
 ---
-### 7) Marker gene identification
+## 7) Marker gene identification
 
 Now we can identify the genes that are differentially expressed between the clusters using the `run_marker_search` method. The method to identify the differentially expressed genes in Scarf is optimized to obtain quick results. We have not compared the sensitivity of our method to other differential expression-detecting methods. We expect specialized methods to be more sensitive and accurate to varying degrees. Our method is designed to quickly obtain key marker genes for populations from a large dataset. For each gene individually, following steps are carried out:
 
@@ -354,7 +361,8 @@ ds.run_marker_search(
 Using the `plot_marker_heatmap` method, we can also plot a heatmap with the top marker genes from each cluster. The method will calculate the mean expression value for each gene from each cluster.
 
 ```{code-cell} ipython3
-ds.plot_marker_heatmap(
+splt.marker_heatmap(
+    ds,
     group_key='RNA_cluster',
     topn=5,
     figsize=(5, 9)
@@ -376,7 +384,13 @@ df
 We can directly visualize the expression values for a gene of interest. It is usually a good idea to visually confirm the gene expression pattern across the cells at least this way.
 
 ```{code-cell} ipython3
-ds.plot_layout(layout_key='RNA_UMAP', color_by='CD14')
+splt.embedding(
+    ds,
+    layout_key='RNA_UMAP',
+    color_by='CD14',
+    sort_values=True,
+    show=False,
+).figure
 ```
 
 ---

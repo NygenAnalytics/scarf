@@ -20,6 +20,7 @@ This page runs the minimal scRNA-seq pipeline. For a full walkthrough of data ha
 
 ```{code-cell} ipython3
 import scarf
+import scarf.plotting as splt
 
 scarf.fetch_dataset('tenx_5K_pbmc_rnaseq', save_path='scarf_datasets')
 reader = scarf.CrH5Reader('scarf_datasets/tenx_5K_pbmc_rnaseq/data.h5')
@@ -39,7 +40,16 @@ ds.run_leiden_clustering(resolution=0.5)
 ```
 
 ```{code-cell} ipython3
-ds.plot_layout(layout_key='RNA_UMAP', color_by='RNA_leiden_cluster')
+result = splt.embedding(
+    ds,
+    layout_key='RNA_UMAP',
+    color_by='RNA_leiden_cluster',
+    show=False,
+)
+result.figure
 ```
+
+For publication-oriented figures (shared color scales, dotplots, composition, export),
+see {ref}`plotting with scarf.plotting <plotting_showcase>`.
 
 For batch correction on merged datasets, see {ref}`integration methods guide <integration_guide>`.

@@ -1,7 +1,7 @@
 # Scarf cloud profiling learnings (100k / 250k)
 
 Date range: 2026-07-14 to 2026-07-15  
-Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu-west-1`, secret `scarf-r2`  
+Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`  
 Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)  
 Dataset source: nested CELLxGENE samples already prepared on R2
 
@@ -32,11 +32,12 @@ Two different numbers matter:
 |---------|------:|----------:|----------:|-------------:|-------|
 | layout sweep (`baseline`, `chunk*`) | 100k | 4 | 32 GiB | ~24 GiB | Forced marker batch 50 |
 | `auto_markers_c4_m32` | 100k | 4 | 32 GiB | ~24 GiB | Auto markers; UMAP parallel off |
-| `auto_markers_c4_m32_scarf16` | 100k | 4 | 32 GiB | **16 GiB** | Budget mismatch vs `c4_m32` (Modal same, Scarf cut) |
+| `auto_markers_c4_m32_scarf16` | 100k | 4 | 32 GiB | **16 GiB** | Done; markers 219s (faster than c4_m32) |
 | `auto_markers_c4_m16` | 100k | 4 | 16 GiB | ~12 GiB | Both Modal and Scarf cut together |
 | `auto_markers_c8_m32` | 100k | 8 | 32 GiB | ~24 GiB | Speed pack (UMAP/ANN parallel) |
 | `auto_markers_c8_m32_250k` | 250k | 8 | 32 GiB | ~24 GiB | Same speed pack |
-| `auto_markers_c8_m48_500k` | 500k | 8 | 48 GiB | 36 GiB | In progress / planned |
+| `auto_markers_c8_m48_500k` | 500k | 8 | 48 GiB | 36 GiB | Done; 4339s, max peak ~10 GiB |
+| `auto_markers_c8_m64_1m` | 1M | 8 | 64 GiB | 48 GiB | In progress |
 
 Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.md` as the durable record; recreate TOMLs from these rows when needed.
 
@@ -172,7 +173,8 @@ Configs:
 ## Ops notes (Modal)
 
 - Prefer bare `Function.from_name(...).spawn` on the deployed app for `run_all_jobs`.
-- Tight `with_options` + `region=eu-west-1` + high memory often sat in queue; capacity messages mentioned 16.8 / 28.8 GiB.
+- Prefer broad Modal region `eu` over narrow `eu-west` / `eu-west-1` for capacity ([region selection](https://modal.com/docs/guide/region-selection); broad multiplier 1.5x vs narrow 1.75x).
+- Tight region + high memory often sat in queue; capacity messages mentioned 16.8 / 28.8 / 48.8 GiB under `eu-west-1`.
 - Never `modal deploy` from the agent; user deploys after code changes.
 - Use `uv` for local Python / Modal CLI.
 
@@ -185,40 +187,55 @@ Configs:
 
 For a pure markers comparison at 100k without parallel UMAP noise, use `auto_markers_c4_m32` (269s markers).
 
-## Proposed experiment: Modal 32 GiB, Scarf budget 16 GiB @ 100k
+## Budget mismatch @ 100k: Modal 32 GiB, Scarf 16 GiB (done)
 
-Yes. Isolates software budget from machine size.
+Tag `auto_markers_c4_m32_scarf16`. Matched to `c4_m32` (4 CPU, workers=4, workingCopies=4, UMAP/ANN off). Only Scarf budget cut to 16 GiB; Modal stayed 32 GiB. Store built under that budget.
 
-| Run | Modal | Scarf budget | Role |
-|-----|------:|-------------:|------|
-| `auto_markers_c4_m32` | 32 | ~24 | Reference (same CPU/parallel/workers/wc) |
-| `auto_markers_c4_m16` | 16 | ~12 | Both knobs cut (confounded) |
-| `auto_markers_c4_m32_scarf16` | 32 | **16** | Mismatch: machine rich, Scarf poor |
+| Stage | c4_m32 (~24G Scarf) | scarf16 (16G Scarf) | Δ |
+|-------|--------------------:|--------------------:|--:|
+| createStore | 107s / 3.5G | 115s / 3.3G | +9s |
+| initializeStore | 196s / 6.5G | 115s / 6.6G | −81s |
+| markHvgs | 255s / 1.1G | 226s / 1.2G | −30s |
+| makeGraph | 183s / 6.3G | 165s / 6.1G | −18s |
+| runUmap | 146s / 0.7G | 164s / 0.7G | +19s |
+| findMarkers | **269s / 4.5G** | **219s / 6.1G** | **−51s** |
+| **total** | **1215s** | **1052s** | **−163s** |
 
-Config: `profiling/layouts/100k_auto_markers_c4_m32_scarf16.toml`  
-Call id: `fc-01KXKEX6N0N44661M6ZX26NX9C`  
-Matched to `c4_m32`: 4 CPU, workers=4, workingCopies=4, UMAP/ANN parallel off. Only `scarfMemoryBudget` changes. Store is created under the 16 GiB budget so write geometry matches.
+**Reading:** Lower Scarf budget did **not** slow markers here. Markers were faster with a higher peak (6.1 vs 4.5 GiB). Contrast `c4_m16` (Modal 16 + Scarf ~12): markers 316s / 5.0G. So cutting Modal+budget together hurt markers; cutting only Scarf budget did not. Do not treat this single A/B as proof that budget is unbound; geometry/noise may dominate. Call `fc-01KXKMXS06BTJTBE7JVR5N8BWZ`.
 
-What to read when done: markers seconds/peak vs `c4_m32` (budget binding) and vs `c4_m16` (whether Modal size mattered once budget is ~16-ish).
+## Open questions
 
+1. Why scarf16 markers faster than c4_m32 despite smaller software budget?
+2. Can HVG use memory/CPU more productively (still ~1–1.4 GiB peak while taking 20%+ of wall)?
+3. Why did 8 workers slow markers vs 4 at 100k?
+4. makeGraph cgroup peak 250k→500k drop: re-measure with clean A/B before trusting.
 
-## Open questions before / during 500k
+## Scale: 500k (8 CPU / 48 GiB, region `eu`)
 
-1. Does makeGraph peak keep ~linear (~30 GiB at 500k)? If so, 32 GiB Modal may OOM; plan a higher mem ceiling from evidence, not from habit.
-2. Do marker auto batches stay budget-capped usefully as `n_cells` grows (`budgetCap ∝ 1/n_cells`)?
-3. Can HVG use memory/CPU more productively (still ~1–1.4 GiB peak while taking 20%+ of wall)?
-4. Why did 8 workers slow markers vs 4 at 100k?
-5. Modal 32 + Scarf 16 mismatch at 100k (above): does wall time follow Scarf budget when the machine is not the limit?
+Tag `auto_markers_c8_m48_500k`. Same speed-pack knobs as 100k/250k (workers=8, workingCopies=4, UMAP/ANN parallel, auto markers). Modal 48 GiB / Scarf 36 GiB. Respawned late stages onto broad region `eu` after `eu-west-1` capacity stalls.
 
-## Next / in progress: 500k
+| Stage | 100k | 250k | 500k | 250→500 time |
+|-------|-----:|-----:|-----:|-------------:|
+| createStore | 104s / 3.5G | 264s / 3.8G | 474s / 4.5G | 1.80× |
+| initializeStore | 141s / 6.4G | 320s / 6.6G | 592s / 7.0G | 1.85× |
+| markHvgs | 241s / 1.1G | 585s / 1.3G | 1095s / 1.1G | 1.87× |
+| makeGraph | 168s / 6.3G | 307s / 14.6G | 436s / 9.3G | 1.42× |
+| runUmap | 58s / 0.7G | 101s / 0.9G | 143s / 1.2G | 1.42× |
+| runLeiden | 25s / 0.7G | 51s / 1.1G | 100s / 1.4G | 1.96× |
+| findMarkers | 331s / 7.1G | 688s / 8.8G | 1473s / 10.1G | 2.14× |
+| **total** | **1095s** | **2346s** | **4339s** | **1.85×** |
+
+Cells 250k→500k is 2×; wall time 1.85× (slightly better than linear). Max peak at 500k ~10.1 GiB (markers), so 48 GiB was generous. makeGraph cgroup peak 9.3 GiB is *below* 250k's 14.6 GiB; treat that drop cautiously (cgroup vs RSS gap on 250k, restart mid-run). See discussion in chat / prefer RSS for graph sizing.
+
+Call ids: original `fc-01KXKE1ZCG0FG7KFEQ1H0QX35K` (cancelled); eu resume `fc-01KXKH7Z9V88NXFG2DJ204C8C8`.
+
+## In progress: 1M (8 CPU / 64 GiB, region `eu`)
 
 | Field | Value |
 |-------|-------|
-| Tag | `auto_markers_c8_m48_500k` |
-| Config | `profiling/layouts/500k_auto_markers_c8_m48.toml` |
-| Machine | 8 CPU / 48 GiB Modal (`49152` MiB), Scarf budget 36 GiB (75%) |
-| Same as speed pack | workers=8, workingCopies=4, UMAP/ANN parallel on, auto markers, cloud 128 MiB chunks |
-| Call id | `fc-01KXKE1ZCG0FG7KFEQ1H0QX35K` |
-| Why 48 GiB | 250k makeGraph peaked at 14.6 GiB; ~linear cell scaling suggested ~30 GiB at 500k, so 32 GiB looked risky |
-
-Compare against `auto_markers_c8_m32` (100k) and `auto_markers_c8_m32_250k` (250k) when complete. Update this section with stage table after the run finishes.
+| Tag | `auto_markers_c8_m64_1m` |
+| Config | `profiling/layouts/1m_auto_markers_c8_m64.toml` |
+| Machine | 8 CPU / 64 GiB Modal, Scarf budget 48 GiB (75%) |
+| Knobs | workers=8, workingCopies=4, UMAP/ANN parallel on, auto markers |
+| Call | see `/tmp/scarf_calib_calls.txt` key `auto_markers_c8_m64_1m` |
+| Compare to | `auto_markers_c8_m32` (100k), `_250k`, `c8_m48_500k` |
