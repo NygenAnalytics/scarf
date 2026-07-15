@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import scarf.markers as markers_module
 from scarf.assay import norm_lib_size
 from scarf.markers import (
     _batch_stats,
@@ -318,6 +319,110 @@ def test_find_markers_by_rank_slow_path_returns_groupwise_statistics():
     assert np.isfinite(group_b["p_value"]).all()
 
 
+def test_find_markers_fast_raw_path_computes_groupwise_statistics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = np.array(
+        [
+            [4.0, 0.0, 1.0, 0.0],
+            [3.0, 0.0, 1.0, 0.0],
+            [0.0, 5.0, 1.0, 2.0],
+            [0.0, 6.0, 1.0, 2.0],
+        ]
+    )
+
+    class Cells:
+        @staticmethod
+        def fetch(_group_key, _cell_key):
+            return np.array(["a", "a", "b", "b"])
+
+        @staticmethod
+        def active_index(_cell_key):
+            return np.arange(4)
+
+        @staticmethod
+        def fetch_all(_key):
+            return data.sum(axis=1)
+
+    class Feats:
+        @staticmethod
+        def active_index(_feat_key):
+            return np.arange(4)
+
+    class FakeRNA:
+        def __init__(self):
+            self.cells = Cells()
+            self.feats = Feats()
+            self.normMethod = norm_lib_size
+            self.sf = 1_000.0
+            self.name = "RNA"
+
+        def iter_raw_column_blocks(self, **_kwargs):
+            for block_index, start in enumerate(range(0, data.shape[1], 2)):
+                columns = np.arange(start, min(start + 2, data.shape[1]))
+                yield block_index, data[:, columns], columns, 0.01, "memory"
+
+    monkeypatch.setattr(markers_module, "RNAassay", FakeRNA)
+    results = find_markers_by_rank(
+        FakeRNA(),
+        group_key="cluster",
+        cell_key="I",
+        feat_key="I",
+        batch_size=2,
+        use_prenormed=False,
+        prenormed_store=None,
+        n_threads=1,
+    )
+
+    assert set(results) == {"a", "b"}
+    for frame in results.values():
+        assert len(frame) == data.shape[1]
+        assert np.isfinite(frame["p_value"]).all()
+
+
+def test_find_markers_prenormalized_path_returns_groupwise_statistics() -> None:
+    import zarr
+    from zarr.storage import MemoryStore
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    values = (
+        [4.0, 3.0, 0.0, 0.0],
+        [0.0, 0.0, 5.0, 6.0],
+        [1.0, 1.0, 1.0, 1.0],
+    )
+    for feature_index, feature_values in enumerate(values):
+        array = root.create_array(str(feature_index), shape=(4,), dtype="f8")
+        array[:] = feature_values
+
+    class Cells:
+        @staticmethod
+        def fetch(_group_key, _cell_key):
+            return np.array(["a", "a", "b", "b"])
+
+        @staticmethod
+        def active_index(_cell_key):
+            return np.arange(4)
+
+    class Assay:
+        cells = Cells()
+        z = root
+
+    results = find_markers_by_rank(
+        Assay(),
+        group_key="cluster",
+        cell_key="I",
+        feat_key="I",
+        batch_size=2,
+        use_prenormed=True,
+        prenormed_store=root,
+        n_threads=1,
+    )
+
+    assert set(results) == {"a", "b"}
+    for frame in results.values():
+        assert len(frame) == len(values)
+
+
 def test_iter_raw_feature_columns_matches_normed(datastore):
     assay = datastore.RNA
     cell_idx = assay.cells.active_index("I")
@@ -412,3 +517,35 @@ def test_compact_marker_save_roundtrip():
     assert len(loaded) == 3
     assert loaded.iloc[0]["score"] == 0.9
     assert loaded.iloc[0]["feature_name"] == "g10"
+
+
+def test_resolve_marker_gene_batch_size_respects_chunk_and_budget():
+    from scarf.markers import resolve_marker_gene_batch_size
+
+    batch = resolve_marker_gene_batch_size(
+        n_features=25_683,
+        n_cells=88_955,
+        column_chunk=948,
+        memory_bytes=24 * 1024**3,
+        working_copies=4,
+    )
+    assert batch == 948
+
+
+def test_resolve_marker_gene_batch_size_shrinks_with_more_cells():
+    from scarf.markers import resolve_marker_gene_batch_size
+
+    sizes = []
+    for n_cells in (100_000, 1_000_000, 10_000_000):
+        sizes.append(
+            resolve_marker_gene_batch_size(
+                n_features=45_525,
+                n_cells=n_cells,
+                column_chunk=10_000,
+                memory_bytes=24 * 1024**3,
+                working_copies=4,
+            )
+        )
+    assert sizes[0] > sizes[1] > sizes[2]
+    assert sizes[-1] >= 1
+    assert all(size <= 10_000 for size in sizes)

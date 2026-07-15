@@ -1,3 +1,4 @@
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any, Literal, cast
 
@@ -16,7 +17,7 @@ from ..assay import (
 )
 from ..chunked import ChunkedArray
 from ..feat_utils import hto_demux
-from ..markers import sort_marker_results
+from ..markers import resolve_marker_gene_batch_size, sort_marker_results
 from ..utils import ZARRLOC, array_digest, controlled_compute, tqdmbar
 from ..writers import create_zarr_dataset
 from .mapping_datastore import MappingDatastore
@@ -34,6 +35,14 @@ _MARKER_STAT_COLUMNS = (
     "p_value",
 )
 _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
+
+
+def _feature_column_chunk(assay: Assay, n_features: int) -> int:
+    backing = getattr(assay.rawData, "_backing", None)
+    chunks = getattr(backing, "chunks", None)
+    if chunks and len(chunks) > 1:
+        return max(1, int(chunks[1]))
+    return max(1, int(n_features))
 
 
 def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray:
@@ -741,8 +750,8 @@ class DataStore(MappingDatastore):
                         the cell metadata table. (Default value: 'I')
             feat_key: Boolean feature metadata column selecting features (default: ``'I'``).
             gene_batch_size: Number of genes loaded per batch; all selected cells are loaded for each batch.
-                             When None (default), the batch size is derived from the dimension-aware Zarr
-                             layout (memory budget and column-chunk alignment).
+                             When None (default), the batch size is the minimum of the on-disk feature chunk
+                             width and a budget-safe cap derived from the active memory budget.
             use_prenormed: If True, use prenormalized cache from ``Assay.save_normed_for_query``.
                            (Default value: False)
             prenormed_store: Custom Zarr group with prenormalized values (default: None).
@@ -769,10 +778,11 @@ class DataStore(MappingDatastore):
 
         n_features = len(assay.feats.active_index(feat_key))
         if gene_batch_size is None:
-            backing = getattr(assay.rawData, "_backing", None)
-            chunks = getattr(backing, "chunks", None)
-            col_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
-            gene_batch_size = max(1, min(col_chunk, n_features))
+            gene_batch_size = resolve_marker_gene_batch_size(
+                n_features=n_features,
+                n_cells=len(assay.cells.active_index(cell_key)),
+                column_chunk=_feature_column_chunk(assay, n_features),
+            )
 
         slot_name = f"{cell_key}__{group_key}"
         logger.debug(
@@ -806,8 +816,6 @@ class DataStore(MappingDatastore):
 
         if skip_save:
             return markers
-
-        import time
 
         from ..storage.zarr_store import is_remote_datastore
 
@@ -852,21 +860,21 @@ class DataStore(MappingDatastore):
             if len(vals) == 0:
                 return
             cluster_group = group.create_group(str(cluster_id))
+            stats = _marker_stats_matrix(vals, feature_index)
             _write_compact_marker_stats(
                 cluster_group,
-                _marker_stats_matrix(vals, feature_index),
+                stats,
             )
 
         items = list(markers.items())
         if workers <= 1:
             for item in items:
                 write_cluster(item)
-            return
+        else:
+            from concurrent.futures import ThreadPoolExecutor
 
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(write_cluster, items))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(write_cluster, items))
 
     def run_pseudotime_marker_search(
         self,

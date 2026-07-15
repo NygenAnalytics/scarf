@@ -40,6 +40,17 @@ def test_run_umap_recomputes_coordinates(datastore_ephemeral):
     assert len(umap2) == _active_cell_count(ds)
 
 
+def test_run_leiden_writes_cluster_labels(datastore_ephemeral):
+    ds = datastore_ephemeral
+    _ensure_graph(ds)
+
+    ds.run_leiden_clustering(label="ephemeral_leiden")
+
+    groups = ds.cells.fetch("RNA_ephemeral_leiden", key="I")
+    assert len(groups) == _active_cell_count(ds)
+    assert np.unique(groups).size >= 1
+
+
 def test_run_mapping_writes_projection(datastore_ephemeral):
     ds = datastore_ephemeral
     _ensure_graph(ds)

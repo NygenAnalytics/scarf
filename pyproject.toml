@@ -97,13 +97,15 @@ include-package-data = false
 version = {file = "VERSION"}
 
 [tool.setuptools.packages.find]
-exclude = ["tests*"]
+where = ["."]
+include = ["scarf*"]
+exclude = ["profiling*", "scripts*", "tests*", "docs*", "bin*"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
 addopts = "-ra -v -m 'not integration' -n auto --dist loadfile"
 markers = [
-    "integration: live network tests (OSF downloader, R2 benchmarks)",
+    "integration: live network tests",
 ]
 testpaths = [
     "tests",
@@ -146,6 +148,12 @@ generate-badge = '.'
 badge-format = "svg"
 
 [dependency-groups]
+profiling = [
+    "anndata>=0.12.18",
+    "igraph>=1.0.0",
+    "modal>=1.5.2",
+    "pydantic>=2.13.4",
+]
 dev = [
     "mypy>=2.1.0",
     "ruff>=0.15.20",
@@ -189,7 +197,7 @@ module = "scarf.plots"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "tests.*"
+module = ["profiling.*", "tests.*"]
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 disallow_untyped_calls = false

@@ -35,10 +35,18 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies (locked)
       if: matrix.resolution == 'locked'
-      run: uv sync --extra test --extra extra
+      run: uv sync --group profiling --extra test --extra extra
     - name: Install dependencies (lowest-direct)
       if: matrix.resolution == 'lowest-direct'
-      run: uv pip install --resolution lowest-direct -e ".[test,extra]"
+      run: uv pip install --resolution lowest-direct -e ".[test,extra]" --group profiling
+    - name: Lint and check formatting
+      if: matrix.resolution == 'locked' && matrix.python-version == '3.12'
+      run: |
+        uv run ruff check scarf profiling tests
+        uv run ruff format --check scarf profiling tests
+    - name: Type check
+      if: matrix.resolution == 'locked' && matrix.python-version == '3.12'
+      run: uv run mypy scarf profiling
     - name: Download test fixtures
       run: |
         if [ "${{ matrix.resolution }}" = "lowest-direct" ]; then

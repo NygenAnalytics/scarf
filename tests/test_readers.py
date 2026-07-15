@@ -2,6 +2,43 @@ import numpy as np
 import pytest
 
 
+def _write_sparse_h5ad(path, values, *, encoding_type="csr_matrix"):
+    import h5py
+    from scipy.sparse import csr_matrix
+
+    matrix = csr_matrix(values)
+    with h5py.File(path, mode="w") as h5:
+        sparse = h5.create_group("X")
+        sparse.attrs["encoding-type"] = encoding_type
+        sparse.attrs["encoding-version"] = "0.1.0"
+        sparse.attrs["shape"] = matrix.shape
+        sparse.create_dataset("data", data=matrix.data)
+        sparse.create_dataset("indices", data=matrix.indices.astype(np.int64))
+        sparse.create_dataset("indptr", data=matrix.indptr.astype(np.int64))
+
+        obs = h5.create_group("obs")
+        obs.create_dataset(
+            "_index",
+            data=np.array(
+                [f"cell_{index}".encode() for index in range(matrix.shape[0])]
+            ),
+        )
+        var = h5.create_group("var")
+        var.create_dataset(
+            "_index",
+            data=np.array(
+                [f"feature_{index}".encode() for index in range(matrix.shape[1])]
+            ),
+        )
+        var.create_dataset(
+            "feature_name",
+            data=np.array(
+                [f"gene_{index}".encode() for index in range(matrix.shape[1])]
+            ),
+        )
+        h5.create_group("obsm")
+
+
 def test_toy_crdir_assay_feats_table(toy_crdir_reader):
     assert np.all(
         toy_crdir_reader.assayFeats.columns
@@ -237,6 +274,97 @@ def test_h5ad_reader_streams_sparse_matrix(h5ad_reader):
         streamed_sum,
         matrix_data[:].sum(dtype=np.float64),
     )
+
+
+@pytest.mark.parametrize(
+    ("values", "batch_size"),
+    [
+        (
+            np.array(
+                [
+                    [1, 0, 2],
+                    [0, 0, 0],
+                    [0, 3, 0],
+                    [0, 0, 0],
+                ],
+                dtype=np.uint32,
+            ),
+            2,
+        ),
+        (
+            np.array(
+                [
+                    [1, 0, 0],
+                    [0, 2, 0],
+                    [0, 0, 0],
+                    [3, 0, 4],
+                    [0, 5, 0],
+                ],
+                dtype=np.uint32,
+            ),
+            2,
+        ),
+    ],
+)
+def test_h5ad_reader_preserves_sparse_batches(tmp_path, values, batch_size):
+    from scarf.readers import H5adReader
+
+    file_name = tmp_path / "sparse.h5ad"
+    _write_sparse_h5ad(file_name, values)
+    reader = H5adReader(str(file_name), feature_name_key="feature_name")
+    try:
+        chunks = list(reader.consume(batch_size=batch_size))
+        assert sum(chunk.shape[0] for chunk in chunks) == values.shape[0]
+        assert sum(chunk.nnz for chunk in chunks) == np.count_nonzero(values)
+        np.testing.assert_array_equal(
+            np.vstack([chunk.toarray() for chunk in chunks]),
+            values,
+        )
+    finally:
+        reader.h5.close()
+
+
+def test_h5ad_reader_rejects_csc_sparse_encoding(tmp_path):
+    from scarf.readers import H5adReader
+
+    file_name = tmp_path / "csc.h5ad"
+    _write_sparse_h5ad(
+        file_name,
+        np.eye(3, dtype=np.uint32),
+        encoding_type="csc_matrix",
+    )
+
+    with pytest.raises(ValueError, match="requires CSR encoding"):
+        H5adReader(str(file_name), feature_name_key="feature_name")
+
+
+def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
+    import zarr
+
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    values = np.array(
+        [
+            [1, 0, 2],
+            [0, 0, 0],
+            [0, 3, 0],
+            [0, 0, 0],
+        ],
+        dtype=np.uint32,
+    )
+    file_name = tmp_path / "exact_batch.h5ad"
+    zarr_path = tmp_path / "exact_batch.zarr"
+    _write_sparse_h5ad(file_name, values)
+    reader = H5adReader(str(file_name), feature_name_key="feature_name")
+    try:
+        writer = H5adToZarr(reader, zarr_loc=str(zarr_path))
+        writer.dump(batch_size=2)
+    finally:
+        reader.h5.close()
+
+    root = zarr.open_group(str(zarr_path), mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], values)
 
 
 def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):

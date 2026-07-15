@@ -695,6 +695,7 @@ class H5adReader:
             self.obsmAttrsKey: self._validate_group(self.obsmAttrsKey),
             self.matrixKey: self._validate_group(self.matrixKey),
         }
+        self._validate_sparse_matrix()
         self.nCells, self.nFeatures = (
             self._get_n(self.cellAttrsKey),
             self._get_n(self.featureAttrsKey),
@@ -704,6 +705,37 @@ class H5adReader:
         self.featNamesKey = feature_name_key
         self.catNamesKey = category_names_key
         self.matrixDtype: Any = self._get_matrix_dtype() if dtype is None else dtype
+
+    def _validate_sparse_matrix(self) -> None:
+        if self.groupCodes[self.matrixKey] != 2:
+            return
+
+        group = self.h5[self.matrixKey]
+        if not isinstance(group, h5py.Group):
+            return
+
+        required = {"data", "indices", "indptr"}
+        missing = required.difference(group.keys())
+        if missing:
+            raise ValueError(
+                f"ERROR: Sparse matrix group `{self.matrixKey}` is missing: "
+                f"{', '.join(sorted(missing))}"
+            )
+
+        encoding = group.attrs.get("encoding-type")
+        if isinstance(encoding, bytes):
+            encoding = encoding.decode("utf-8")
+        if encoding is None:
+            logger.warning(
+                f"Sparse matrix group `{self.matrixKey}` has no `encoding-type`; "
+                "assuming legacy CSR encoding"
+            )
+            return
+        if encoding != "csr_matrix":
+            raise ValueError(
+                f"ERROR: Sparse matrix encoding `{encoding}` is not supported. "
+                "H5adReader currently requires CSR encoding."
+            )
 
     def _validate_group(self, group: str) -> int:
         if group not in self.h5:
@@ -946,23 +978,28 @@ class H5adReader:
 
     def consume_group(self, batch_size: int) -> Generator[coo_matrix, None, None]:
         """Returns a generator that yield chunks of data."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+
         grp = self.h5[self.matrixKey]
-        s = 0
-        for ind_n in range(0, self.nCells, batch_size):
-            i = grp["indptr"][ind_n : ind_n + batch_size]
-            e = i[-1]
-            if s != 0:
-                idx = np.array([s] + list(i))
-                idx = idx - idx[0]
-            else:
-                idx = np.array(i)
-            n = idx.shape[0] - 1
-            nidx = np.repeat(range(n), np.diff(idx).astype("int32"))
-            yield coo_matrix(
-                (grp["data"][s:e], (nidx, grp["indices"][s:e])),
-                shape=(n, self.nFeatures),
+        for row_start in range(0, self.nCells, batch_size):
+            row_end = min(row_start + batch_size, self.nCells)
+            indptr = np.asarray(grp["indptr"][row_start : row_end + 1])
+            data_start = int(indptr[0])
+            data_end = int(indptr[-1])
+            local_indptr = indptr - data_start
+            n_rows = row_end - row_start
+            row_indices = np.repeat(
+                np.arange(n_rows),
+                np.diff(local_indptr),
             )
-            s = e
+            yield coo_matrix(
+                (
+                    grp["data"][data_start:data_end],
+                    (row_indices, grp["indices"][data_start:data_end]),
+                ),
+                shape=(n_rows, self.nFeatures),
+            )
 
     def consume(self, batch_size: int) -> Generator[coo_matrix, None, None]:
         """Returns a generator that yield chunks of data."""

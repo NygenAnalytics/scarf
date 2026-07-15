@@ -34,7 +34,8 @@ PyPI: https://pypi.org/project/scarf/
 
 import warnings
 
-from importlib.metadata import version
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from zarr.errors import UnstableSpecificationWarning
 
 from .datastore.datastore import DataStore
@@ -89,8 +90,11 @@ warnings.filterwarnings("ignore", category=UnstableSpecificationWarning)
 
 try:
     __version__ = version("scarf")
-except ImportError:
-    print("Scarf is not installed", flush=True)
+except PackageNotFoundError:
+    version_path = Path(__file__).resolve().parents[1] / "VERSION"
+    __version__ = (
+        version_path.read_text().strip() if version_path.is_file() else "unavailable"
+    )
 
 __all__ = [
     "AssayMerge",

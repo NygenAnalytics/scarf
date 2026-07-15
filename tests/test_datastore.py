@@ -400,8 +400,8 @@ class TestDataStore:
         np.testing.assert_allclose(tiled["sigmas"], legacy_sigmas, rtol=1e-5, atol=1e-6)
 
     def test_streaming_feature_stats_column_block_branch(self, datastore):
-        # Feature stats stream one feature-chunk column block at a time; results
-        # must match the full-width reductions regardless of worker count.
+        # Feature stats stream memory-bounded tiles; results must match the
+        # full-width reductions regardless of worker count / tile size.
         from scarf.storage.budget import ResourceBudget, set_resource_budget
         from scarf.utils import controlled_compute
 
@@ -421,6 +421,51 @@ class TestDataStore:
             tiled["normed_tot"], legacy_tot, rtol=1e-6, atol=1e-6
         )
         np.testing.assert_allclose(tiled["sigmas"], legacy_sigmas, rtol=1e-5, atol=1e-6)
+
+    def test_streaming_feature_stats_one_decode_per_physical_chunk(
+        self, datastore, monkeypatch
+    ):
+        import scarf.assay as assay_mod
+
+        assay = datastore.RNA
+        cell_idx, feat_idx = assay._get_cell_feat_idx("I", "I")
+        zarr_arr = assay.rawData._backing
+        row_chunk, col_chunk = zarr_arr.chunks[:2]
+        expected = len({int(i) // row_chunk for i in cell_idx}) * len(
+            {int(i) // col_chunk for i in feat_idx}
+        )
+        calls = {"n": 0}
+        original = assay_mod._read_block
+
+        def counted(zarr_arr_arg, rows, cols):
+            calls["n"] += 1
+            return original(zarr_arr_arg, rows, cols)
+
+        monkeypatch.setattr(assay_mod, "_read_block", counted)
+        assay._streaming_feature_stats(cell_idx, feat_idx)
+        assert calls["n"] == expected
+
+    def test_feature_stats_tile_shape_bounds_full_width_matrix(self):
+        from scarf.assay import _feature_stats_tile_shape
+        from scarf.storage.budget import ResourceBudget
+
+        budget = ResourceBudget(
+            memoryBytes=48 * 1024**3,
+            workers=8,
+            workingCopies=4,
+        )
+        rows, cols = _feature_stats_tile_shape(
+            22_201,
+            45_525,
+            row_chunk=11_792,
+            col_chunk=45_525,
+            budget=budget,
+        )
+        assert rows * cols * 12 <= 256 * 1024 * 1024
+        assert rows >= 1
+        assert cols >= 1
+        assert rows <= 11_792
+        assert cols <= 45_525
 
     def test_streaming_feature_stats_requires_sf(self, datastore):
         import pytest

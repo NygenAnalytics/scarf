@@ -36,5 +36,13 @@ tests/datasets/*
 !tests/datasets/markers_all_clusters.csv
 tests/.env
 tests/.env.*
-!tests/.env.example
+benchmarks/.env
+benchmarks/.env.*
+!benchmarks/.env.example
+profiling/.env
+profiling/.env.*
+!profiling/.env.example
+profiling/config.toml
+# Generated / local-only run configs (machine grids). Keep LEARNINGS.md + examples.
+profiling/layouts/
 test_data

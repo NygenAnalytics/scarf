@@ -1,0 +1,494 @@
+"""Modal entrypoints for one-shot Scarf profiling.
+
+Deploy once (you run this), then trigger jobs that keep running if your laptop
+disconnects:
+
+  modal deploy --env scarf_profiling -m profiling.modal_app
+
+  modal run --env scarf_profiling -m profiling.modal_app -- prepare-fixture --config profiling/config.toml --sizes 10000
+  modal run --env scarf_profiling -m profiling.modal_app -- prepare --config profiling/config.toml
+  modal run --env scarf_profiling -m profiling.modal_app -- run --config profiling/config.toml --size 10000 --stage createStore
+  modal run --env scarf_profiling -m profiling.modal_app -- run-all --config profiling/config.toml --sizes 10000
+
+prepare / run / run-all spawn on the deployed app and return immediately.
+run-all fans out one size pipeline per container (stages stay sequential).
+Watch progress with: modal app logs scarf-profiling --env scarf_profiling
+"""
+
+import argparse
+import os
+from pathlib import Path
+from typing import Any
+
+import modal
+
+from profiling.config import (
+    STAGE_ORDER,
+    ProfilingConfig,
+    StageName,
+    load_profiling_config,
+)
+from profiling.datasets import (
+    SOURCE_SPEC,
+    download_source,
+    prepare_fixture_datasets,
+    prepare_local_datasets,
+    sha256_file,
+)
+from profiling.modal_image import COMMON_FUNCTION_OPTIONS, app
+from profiling.modal_resources import (
+    BASE_EPHEMERAL_DISK_MB,
+    modal_function_options,
+    validate_modal_environment,
+)
+from profiling.r2 import download_file, object_exists, object_size, upload_file
+from profiling.results import result_exists, write_result
+from profiling.stages import run_stage
+
+_WORK = Path("/tmp/scarf-profiling")
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=196_608,
+    cpu=8.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def prepare_datasets(configDict: dict[str, Any]) -> dict[str, Any]:
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    work = _WORK / "prepare"
+    work.mkdir(parents=True, exist_ok=True)
+    source_path = work / "source.h5ad"
+    source_uri = config.sourceUri()
+    source_origin = "local-cache"
+    if not source_path.is_file():
+        if object_exists(source_uri):
+            download_file(source_uri, source_path)
+            source_origin = "r2-cache"
+        else:
+            download_source(
+                source_path,
+                url=SOURCE_SPEC.url,
+                expectedBytes=SOURCE_SPEC.sourceBytes,
+            )
+            upload_file(source_path, source_uri)
+            source_origin = "cellxgene+r2-upload"
+
+    uploaded: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    # Fixture uploads are tiny; real nested samples are much larger.
+    minimum_real_bytes = 5_000_000
+
+    pending_sizes: list[int] = []
+    for n_rows in config.targetSizes:
+        uri = config.datasetUri(n_rows)
+        existing = object_size(uri)
+        if existing is not None and existing >= minimum_real_bytes:
+            skipped.append(
+                {
+                    "nRows": n_rows,
+                    "uri": uri,
+                    "fileBytes": existing,
+                    "status": "skipped-existing",
+                }
+            )
+            continue
+        pending_sizes.append(n_rows)
+
+    def _upload_artifact(artifact: Any) -> None:
+        uri = config.datasetUri(artifact.targetRows)
+        upload_file(artifact.localPath, uri)
+        uploaded.append(
+            {
+                "nRows": artifact.targetRows,
+                "uri": uri,
+                "fileBytes": artifact.fileBytes,
+                "nnz": artifact.nnz,
+                "status": "uploaded",
+            }
+        )
+
+    source_sha256 = None
+    if pending_sizes:
+        prepared = prepare_local_datasets(
+            source_path,
+            work / "subsets",
+            targetRows=tuple(pending_sizes),
+            seed=config.samplingSeed,
+            spec=SOURCE_SPEC,
+            onArtifact=_upload_artifact,
+        )
+        source_sha256 = prepared.sourceSha256
+    elif source_path.is_file():
+        source_sha256 = sha256_file(source_path)
+
+    return {
+        "uploaded": uploaded,
+        "skipped": skipped,
+        "sourceSha256": source_sha256,
+        "sourceOrigin": source_origin,
+        "sourceUri": source_uri,
+    }
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=3_600,
+    memory=8_192,
+    cpu=2.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def prepare_fixture_datasets_job(
+    configDict: dict[str, Any],
+    sizes: list[int] | None = None,
+    nColumns: int = 500,
+) -> dict[str, Any]:
+    """Upload tiny synthetic H5ADs so stage jobs can be tested without Cellxgene."""
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    selected = tuple(sizes) if sizes else (10_000,)
+    for size in selected:
+        if size not in config.targetSizes:
+            raise ValueError(
+                f"fixture size {size} is not in config.targetSizes; "
+                "add it to config or choose an existing size"
+            )
+    work = _WORK / "fixture"
+    if work.exists():
+        for path in sorted(work.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+    work.mkdir(parents=True, exist_ok=True)
+    uploaded: list[dict[str, Any]] = []
+
+    def _upload_artifact(artifact: Any) -> None:
+        uri = config.datasetUri(artifact.targetRows)
+        upload_file(artifact.localPath, uri)
+        uploaded.append(
+            {
+                "nRows": artifact.targetRows,
+                "uri": uri,
+                "fileBytes": artifact.fileBytes,
+                "nnz": artifact.nnz,
+                "nColumns": artifact.nColumns,
+            }
+        )
+
+    prepare_fixture_datasets(
+        work,
+        targetRows=selected,
+        nColumns=nColumns,
+        seed=config.samplingSeed,
+        onArtifact=_upload_artifact,
+    )
+    return {"uploaded": uploaded, "kind": "fixture"}
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=65_536,
+    cpu=8.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def run_stage_job(
+    configDict: dict[str, Any],
+    nRows: int,
+    stage: StageName,
+) -> dict[str, Any]:
+    config = ProfilingConfig.model_validate(configDict)
+    resources = config.resourcesFor(stage)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+
+    work = _WORK / f"{nRows}-{stage}"
+    if work.exists():
+        for path in sorted(work.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+    work.mkdir(parents=True, exist_ok=True)
+
+    local_h5ad: Path | None = None
+    if stage == "createStore":
+        local_h5ad = work / f"{nRows}.h5ad"
+        download_file(config.datasetUri(nRows), local_h5ad)
+
+    result = run_stage(
+        stage,
+        nRows=nRows,
+        storeUri=config.storeUri(nRows),
+        workflow=config.workflow,
+        resources=resources,
+        localH5adPath=local_h5ad,
+        storageLayout=config.storageLayout,
+    )
+    write_result(config, result)
+    return result.to_json()
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=2048,
+    cpu=1.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def run_size_jobs(
+    configDict: dict[str, Any],
+    nRows: int,
+    stages: list[StageName] | None = None,
+) -> dict[str, Any]:
+    """Run stages sequentially for one size (skip if result JSON exists)."""
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    if nRows not in config.targetSizes:
+        raise ValueError(f"size {nRows} is not in config.targetSizes")
+    selected_stages = tuple(stages) if stages else STAGE_ORDER
+    parallel_sizes = max(1, len(config.targetSizes))
+    outcomes: list[dict[str, Any]] = []
+
+    for stage in selected_stages:
+        if result_exists(config, nRows, stage):
+            outcomes.append(
+                {
+                    "nRows": nRows,
+                    "stage": stage,
+                    "status": "skipped",
+                    "resultUri": config.resultUri(nRows, stage),
+                }
+            )
+            continue
+        resources = config.resourcesFor(stage)
+        options = modal_function_options(
+            config,
+            resources,
+            maxContainers=parallel_sizes,
+        )
+        result = run_stage_job.with_options(**options).remote(
+            configDict,
+            nRows,
+            stage,
+        )
+        outcomes.append(result)
+        if result.get("status") == "error":
+            return {
+                "nRows": nRows,
+                "stopped": True,
+                "failed": result,
+                "outcomes": outcomes,
+            }
+
+    return {"nRows": nRows, "stopped": False, "outcomes": outcomes}
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=2048,
+    cpu=1.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def run_all_jobs(
+    configDict: dict[str, Any],
+    sizes: list[int] | None = None,
+    stages: list[StageName] | None = None,
+) -> dict[str, Any]:
+    """Run sizes in parallel; stages within each size stay sequential."""
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    selected_sizes = tuple(sizes) if sizes else config.targetSizes
+    selected_stages = tuple(stages) if stages else STAGE_ORDER
+    for n_rows in selected_sizes:
+        if n_rows not in config.targetSizes:
+            raise ValueError(f"size {n_rows} is not in config.targetSizes")
+
+    parallel_sizes = max(1, len(selected_sizes))
+    orchestrator_options = modal_function_options(
+        config,
+        config.resourcesFor("reopenStore"),
+        maxContainers=parallel_sizes,
+    )
+    orchestrator_options["memory"] = (2048, 4096)
+    orchestrator_options["cpu"] = (1.0, 1.0)
+    orchestrator_options["timeout"] = 86_400
+
+    stage_list = list(selected_stages)
+    handles = [
+        run_size_jobs.with_options(**orchestrator_options).spawn(
+            configDict,
+            n_rows,
+            stage_list,
+        )
+        for n_rows in selected_sizes
+    ]
+    size_results = [handle.get() for handle in handles]
+    failed = [item for item in size_results if item.get("stopped")]
+    return {
+        "stopped": bool(failed),
+        "failed": failed[0] if failed else None,
+        "sizes": size_results,
+    }
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=300,
+    memory=1024,
+    cpu=1.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def smoke_check(configDict: dict[str, Any]) -> dict[str, Any]:
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    probe = f"{config.resultsUri.rstrip('/')}/smoke/ok.json"
+    from profiling.r2 import put_json
+
+    put_json(probe, {"ok": True})
+    return {"probeUri": probe, "exists": object_exists(probe)}
+
+
+def _load_config(path: str) -> ProfilingConfig:
+    config = load_profiling_config(path)
+    validate_modal_environment(config)
+    return config
+
+
+def _deployed_function(config: ProfilingConfig, name: str) -> modal.Function:
+    try:
+        return modal.Function.from_name(
+            config.modalAppName,
+            name,
+            environment_name=config.modalEnvironmentName,
+        )
+    except Exception as exc:
+        raise SystemExit(
+            f"Could not find deployed function {config.modalAppName}/{name}. "
+            "Deploy first with:\n"
+            f"  modal deploy --env {config.modalEnvironmentName} -m profiling.modal_app\n"
+            f"Original error: {exc}"
+        ) from exc
+
+
+def _print_spawned(label: str, call: Any) -> None:
+    call_id = (
+        getattr(call, "object_id", None) or getattr(call, "call_id", None) or str(call)
+    )
+    print(f"spawned {label}: {call_id}")
+    print("disconnect is safe; watch with:")
+    print("  modal app logs scarf-profiling --env scarf_profiling")
+
+
+@app.local_entrypoint()
+def main(*arg_list: str) -> None:
+    parser = argparse.ArgumentParser(prog="profiling.modal_app")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    smoke_parser = sub.add_parser("smoke")
+    smoke_parser.add_argument("--config", required=True)
+
+    prepare_parser = sub.add_parser("prepare")
+    prepare_parser.add_argument("--config", required=True)
+
+    fixture_parser = sub.add_parser("prepare-fixture")
+    fixture_parser.add_argument("--config", required=True)
+    fixture_parser.add_argument("--sizes", nargs="*", type=int, default=[10_000])
+    fixture_parser.add_argument("--n-columns", type=int, default=500)
+
+    run_parser = sub.add_parser("run")
+    run_parser.add_argument("--config", required=True)
+    run_parser.add_argument("--size", type=int, required=True)
+    run_parser.add_argument("--stage", choices=STAGE_ORDER, required=True)
+
+    all_parser = sub.add_parser("run-all")
+    all_parser.add_argument("--config", required=True)
+    all_parser.add_argument("--sizes", nargs="*", type=int, default=None)
+    all_parser.add_argument("--stages", nargs="*", choices=STAGE_ORDER, default=None)
+
+    args = parser.parse_args(list(arg_list))
+    config = _load_config(args.config)
+    payload = config.model_dump(mode="python")
+
+    if args.command == "smoke":
+        smoke_options = modal_function_options(
+            config,
+            config.resourcesFor("reopenStore"),
+        )
+        print(smoke_check.with_options(**smoke_options).remote(payload))
+        return
+
+    if args.command == "prepare":
+        prepare_options = modal_function_options(
+            config,
+            config.prepareResources,
+        )
+        call = (
+            _deployed_function(config, "prepare_datasets")
+            .with_options(**prepare_options)
+            .spawn(payload)
+        )
+        _print_spawned("prepare_datasets", call)
+        return
+
+    if args.command == "prepare-fixture":
+        sizes = list(args.sizes) if args.sizes else [10_000]
+        for size in sizes:
+            if size not in config.targetSizes:
+                raise SystemExit(f"size {size} is not in config.targetSizes")
+        fixture_options = modal_function_options(
+            config,
+            config.resourcesFor("reopenStore"),
+        )
+        call = (
+            _deployed_function(config, "prepare_fixture_datasets_job")
+            .with_options(**fixture_options)
+            .spawn(payload, sizes, args.n_columns)
+        )
+        _print_spawned("prepare_fixture_datasets_job", call)
+        return
+
+    if args.command == "run":
+        if args.size not in config.targetSizes:
+            raise SystemExit(f"size {args.size} is not in config.targetSizes")
+        if result_exists(config, args.size, args.stage):
+            print(
+                {
+                    "nRows": args.size,
+                    "stage": args.stage,
+                    "status": "skipped",
+                    "resultUri": config.resultUri(args.size, args.stage),
+                }
+            )
+            return
+        resources = config.resourcesFor(args.stage)
+        options = modal_function_options(config, resources)
+        call = (
+            _deployed_function(config, "run_stage_job")
+            .with_options(**options)
+            .spawn(payload, args.size, args.stage)
+        )
+        _print_spawned(f"run_stage_job {args.size}/{args.stage}", call)
+        return
+
+    if args.command == "run-all":
+        sizes = list(args.sizes) if args.sizes else None
+        stages = list(args.stages) if args.stages else None
+        if sizes:
+            for size in sizes:
+                if size not in config.targetSizes:
+                    raise SystemExit(f"size {size} is not in config.targetSizes")
+        coordinator_options = modal_function_options(
+            config,
+            config.resourcesFor("reopenStore"),
+        )
+        call = (
+            _deployed_function(config, "run_all_jobs")
+            .with_options(**coordinator_options)
+            .spawn(payload, sizes, stages)
+        )
+        _print_spawned("run_all_jobs", call)
+        return

@@ -17,8 +17,11 @@ StorageProfile = Literal["fast_local", "cloud"]
 type ZarrLocation = str | Store
 
 PROFILE_METADATA_CHUNK = 100_000
-# numcodecs Blosc rejects buffers larger than a signed 32-bit byte count.
-_BLOSC_MAX_BYTES = 2_147_483_647
+# numcodecs compression codecs reject buffers larger than a signed 32-bit byte count.
+_CODEC_MAX_BYTES = 2_147_483_647
+DEFAULT_CLOUD_TARGET_CHUNK_BYTES = 128 * 1024 * 1024
+DEFAULT_MIN_FEATURE_CHUNK = 500
+DEFAULT_MAX_FEATURE_CHUNK = 10_000
 
 
 def _ceil_pad(n: int, chunk: int) -> int:
@@ -77,14 +80,21 @@ def matrix_layout(
     budget: ResourceBudget | None = None,
     itemsize: int = 4,
     width: int | None = None,
+    targetChunkBytes: int | None = None,
+    minFeatureChunk: int = 1,
+    maxFeatureChunk: int | None = None,
 ) -> tuple[tuple[int, int], tuple[int, int] | None]:
     """Return ``(chunks, shards)`` from the memory-first layout rule.
 
-    Geometry is driven solely by ``memoryBytes // workingCopies`` so a single
-    chunk (or shard) band is a budget-sized read unit. When ``width`` is set
-    (normalized/derived), returns plain chunks ``(rowShard, width)`` and
-    ``shards=None``. Otherwise returns count-matrix geometry with ceil-padded
-    feature shards.
+    Geometry is driven by ``memoryBytes // workingCopies`` so a single chunk
+    (or shard) band is a budget-sized read unit, capped at the codec's maximum
+    input buffer size. When ``width`` is set (normalized/derived), returns plain
+    chunks ``(rowShard, width)`` and ``shards=None``. Otherwise returns
+    count-matrix geometry with ceil-padded feature shards.
+
+    When ``targetChunkBytes`` is set, feature-chunk width is chosen so
+    ``row_shard * feature_chunk * itemsize`` stays near that target, then
+    clamped to ``[minFeatureChunk, maxFeatureChunk]``.
     """
     budget = budget or get_resource_budget()
     n_cells = max(int(n_cells), 1)
@@ -94,14 +104,31 @@ def matrix_layout(
 
     if width is not None:
         w = max(1, int(width))
-        row_shard = max(1, min(n_cells, work // (w * itemsize)))
+        row_bytes = w * itemsize
+        if row_bytes > _CODEC_MAX_BYTES:
+            raise ValueError(
+                f"One full-width row requires {row_bytes} bytes, exceeding "
+                f"the codec limit of {_CODEC_MAX_BYTES} bytes"
+            )
+        max_chunk_bytes = min(work, _CODEC_MAX_BYTES)
+        row_shard = max(1, min(n_cells, max_chunk_bytes // row_bytes))
         chunks = (row_shard, w)
         return chunks, None
 
     row_shard = max(1, min(n_cells, work // (n_features * itemsize)))
     feature_chunk = max(1, min(n_features, work // (n_cells * itemsize)))
+    if targetChunkBytes is not None:
+        target = max(itemsize, int(targetChunkBytes))
+        feature_chunk = max(1, target // (row_shard * itemsize))
+        feature_chunk = min(n_features, feature_chunk)
+        lo = max(1, int(minFeatureChunk))
+        hi = n_features if maxFeatureChunk is None else max(1, int(maxFeatureChunk))
+        if lo > hi:
+            lo, hi = hi, lo
+        feature_chunk = max(lo, min(hi, feature_chunk))
+        feature_chunk = min(n_features, feature_chunk)
     shard_cols = _ceil_pad(n_features, feature_chunk)
-    max_shard_bytes = min(work, _BLOSC_MAX_BYTES)
+    max_shard_bytes = min(work, _CODEC_MAX_BYTES)
     row_shard, feature_chunk, shard_cols = _fit_shard_to_byte_limit(
         row_shard,
         feature_chunk,
@@ -219,6 +246,9 @@ def count_array_spec(
     *,
     remote: bool | None = None,
     budget: ResourceBudget | None = None,
+    targetChunkBytes: int | None = None,
+    minFeatureChunk: int | None = None,
+    maxFeatureChunk: int | None = None,
 ) -> ZarrArraySpec:
     """Build array spec for assay count matrices."""
     profile = profile or get_storage_profile()
@@ -227,11 +257,25 @@ def count_array_spec(
         remote = profile == "cloud"
     itemsize = int(np.dtype(dtype).itemsize)
 
+    layout_kwargs: dict[str, Any] = {}
+    resolved_target = targetChunkBytes
+    if resolved_target is None and remote:
+        resolved_target = DEFAULT_CLOUD_TARGET_CHUNK_BYTES
+    if resolved_target is not None:
+        layout_kwargs["targetChunkBytes"] = resolved_target
+        layout_kwargs["minFeatureChunk"] = (
+            DEFAULT_MIN_FEATURE_CHUNK if minFeatureChunk is None else minFeatureChunk
+        )
+        layout_kwargs["maxFeatureChunk"] = (
+            DEFAULT_MAX_FEATURE_CHUNK if maxFeatureChunk is None else maxFeatureChunk
+        )
+
     chunks, shards_raw = matrix_layout(
         nCells,
         nFeats,
         budget=budget,
         itemsize=itemsize,
+        **layout_kwargs,
     )
     assert shards_raw is not None
     # shards_raw's feature dimension is deliberately ceil-padded to a multiple

@@ -1,15 +1,29 @@
 import os
 
 import numpy as np
+import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.datastore.graph_datastore import GraphDataStore
+from scarf.datastore.graph_datastore import GraphDataStore, _GraphBuildProgress
 from scarf.storage.zarr_store import copy_zarr_array, create_or_open_staged_normed_array
 
 
 def _memory_group():
     return zarr.open_group(store=MemoryStore(), mode="w")
+
+
+def test_graph_progress_tracks_steps_and_propagates_errors() -> None:
+    progress = _GraphBuildProgress(2)
+    with progress.step("reuse graph", cached=True):
+        pass
+    with pytest.raises(RuntimeError, match="graph failed"):
+        with progress.step("build graph"):
+            raise RuntimeError("graph failed")
+    progress.finish()
+
+    assert progress._step == 2
+    assert [record[1] for record in progress._records] == ["reuse graph", "build graph"]
 
 
 def test_resolve_local_cache_plan(tmp_path):

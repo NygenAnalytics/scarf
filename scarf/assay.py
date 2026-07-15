@@ -60,6 +60,43 @@ def _read_block(
     return np.asarray(zarr_arr.get_orthogonal_selection((row_sel, col_sel)))
 
 
+def _feature_stats_tile_shape(
+    n_cells: int,
+    n_features: int,
+    *,
+    row_chunk: int,
+    col_chunk: int,
+    budget: Any | None = None,
+    target_bytes: int | None = None,
+) -> tuple[int, int]:
+    """Choose a dense stats tile that fits the active memory budget.
+
+    Full-width feature chunks (common on small matrices) would otherwise
+    materialize ``n_cells x n_features`` uint32+float64 temporaries at once.
+    """
+    from .storage.budget import ResourceBudget, get_resource_budget
+
+    if budget is None:
+        resolved = get_resource_budget()
+    elif isinstance(budget, ResourceBudget):
+        resolved = budget
+    else:
+        raise TypeError("budget must be a ResourceBudget or None")
+    work = resolved.memoryBytes // max(1, resolved.workingCopies)
+    if target_bytes is None:
+        target_bytes = min(work // 4, 256 * 1024 * 1024)
+    target_bytes = max(8 * 1024 * 1024, int(target_bytes))
+    rows = max(1, min(int(n_cells), max(1, int(row_chunk))))
+    cols = max(1, min(int(n_features), max(1, int(col_chunk))))
+    # One uint32 source band plus one float64 scaled band.
+    bytes_per_element = 12
+    while rows > 1 and rows * cols * bytes_per_element > target_bytes:
+        rows = max(1, rows // 2)
+    while cols > 1 and rows * cols * bytes_per_element > target_bytes:
+        cols = max(1, cols // 2)
+    return rows, cols
+
+
 def norm_dummy(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """A dummy normalizer. Doesn't perform any normalization. This is useful
     when the 'raw data' is already normalized.
@@ -1302,13 +1339,12 @@ class RNAassay(Assay):
     ) -> dict[str, np.ndarray]:
         """Per-feature library-size normalized stats in one streaming pass.
 
-        Reads the raw counts one feature-chunk column block at a time (across
-        all selected cells), normalizes each block in float64, and accumulates
-        per-feature nonzero count, sum, and sum of squares, so the normalized
-        Further blocks (up to ``disk_ahead``) are staged on local disk one at a time
-        while compute continues; the next block is prefetched into RAM. Values
-        match ``norm_lib_size``. Returns ``normed_tot`` (sum), ``normed_n`` (nonzero count), and
-        ``sigmas`` (population variance).
+        Decodes each physical Zarr chunk at most once for the selected cells and
+        features, normalizes dense sub-tiles in float64 in place, and accumulates
+        per-feature nonzero count, sum, and sum of squares. Remote stores may
+        prefetch the next physical chunk while compute continues. Values match
+        ``norm_lib_size``. Returns ``normed_tot`` (sum), ``normed_n`` (nonzero
+        count), and ``sigmas`` (population variance).
         """
         import time
 
@@ -1338,23 +1374,60 @@ class RNAassay(Assay):
             return {"normed_tot": s1, "normed_n": nz, "sigmas": s2}
 
         chunks = getattr(zarr_arr, "chunks", None)
-        col_block = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
-        col_block = max(1, min(col_block, n_features))
-        col_starts = list(range(0, n_features, col_block))
-        n_blocks = len(col_starts)
+        row_chunk = int(chunks[0]) if chunks and len(chunks) > 0 else n_cells
+        col_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
+        row_chunk = max(1, row_chunk)
+        col_chunk = max(1, col_chunk)
+
+        cell_pos = np.arange(n_cells, dtype=np.intp)
+        feat_pos = np.arange(n_features, dtype=np.intp)
+        cell_bins = np.asarray(cell_idx // row_chunk, dtype=np.intp)
+        feat_bins = np.asarray(feat_idx // col_chunk, dtype=np.intp)
+
+        tiles: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for row_bin in np.unique(cell_bins):
+            cell_mask = cell_bins == row_bin
+            local_cells = cell_pos[cell_mask]
+            rows = cell_idx[cell_mask]
+            for col_bin in np.unique(feat_bins):
+                feat_mask = feat_bins == col_bin
+                local_feats = feat_pos[feat_mask]
+                cols = feat_idx[feat_mask]
+                tiles.append((local_cells, rows, local_feats, cols))
+
+        n_blocks = len(tiles)
         remote = is_remote_datastore("", self.z)
+        sub_rows, sub_cols = _feature_stats_tile_shape(
+            max((len(rows) for _, rows, _, _ in tiles), default=1),
+            max((len(cols) for _, _, _, cols in tiles), default=1),
+            row_chunk=row_chunk,
+            col_chunk=col_chunk,
+        )
 
         def read_block(block_idx: int) -> np.ndarray:
-            start = col_starts[block_idx]
-            cols = feat_idx[start : start + col_block]
-            return _read_block(zarr_arr, cell_idx, cols)
+            _, rows, _, cols = tiles[block_idx]
+            return _read_block(zarr_arr, rows, cols)
 
-        def accumulate_block(raw: np.ndarray, start: int) -> None:
+        def accumulate_block(
+            raw: np.ndarray,
+            local_cells: np.ndarray,
+            local_feats: np.ndarray,
+        ) -> None:
+            height = raw.shape[0]
             width = raw.shape[1]
-            scaled = (sf * raw.astype(np.float64)) * inv_scalar[:, None]
-            nz[start : start + width] += (raw > 0).sum(axis=0)
-            s1[start : start + width] += scaled.sum(axis=0)
-            s2[start : start + width] += np.einsum("ij,ij->j", scaled, scaled)
+            for row_start in range(0, height, sub_rows):
+                row_end = min(height, row_start + sub_rows)
+                local_inv = inv_scalar[local_cells[row_start:row_end]]
+                for col_start in range(0, width, sub_cols):
+                    col_end = min(width, col_start + sub_cols)
+                    band = raw[row_start:row_end, col_start:col_end]
+                    feat_slice = local_feats[col_start:col_end]
+                    nz[feat_slice] += (band > 0).sum(axis=0)
+                    scaled = band.astype(np.float64, copy=True)
+                    scaled *= sf
+                    np.multiply(scaled, local_inv[:, None], out=scaled)
+                    s1[feat_slice] += scaled.sum(axis=0)
+                    s2[feat_slice] += np.einsum("ij,ij->j", scaled, scaled)
 
         for block_idx, raw, read_sec, source in iter_column_blocks(
             n_blocks,
@@ -1362,9 +1435,9 @@ class RNAassay(Assay):
             remote=remote,
             msg=f"({self.name}) Computing feature stats",
         ):
-            start = col_starts[block_idx]
+            local_cells, _, local_feats, _ = tiles[block_idx]
             t_compute = time.perf_counter()
-            accumulate_block(raw, start)
+            accumulate_block(raw, local_cells, local_feats)
             compute_sec = time.perf_counter() - t_compute
             logger.info(
                 f"({self.name}) feature stats block {block_idx + 1}/{n_blocks}: "

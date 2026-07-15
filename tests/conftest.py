@@ -13,6 +13,6 @@ pytest_plugins = [
 
 @pytest.fixture(scope="session", autouse=True)
 def _quiet_test_logs() -> None:
-    """Keep pytest output readable; r2_profile and other CLIs keep INFO logs."""
+    """Keep pytest output readable while standalone CLIs retain INFO logs."""
     logger.remove()
     logger.add(sys.stderr, level="ERROR")

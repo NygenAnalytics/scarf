@@ -2707,9 +2707,10 @@ class GraphDataStore(BaseDataStore):
 
         if integrated_graph is not None:
             from_assay = integrated_graph
+        membership = np.array(part.membership) + 1
         self.cells.insert(
             self._col_renamer(from_assay, cell_key, label),
-            np.array(part.membership) + 1,
+            membership,
             fill_value=-1,
             key=cell_key,
             overwrite=True,

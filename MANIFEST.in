@@ -8,6 +8,8 @@ exclude Dockerfile
 prune scarf_toolkit.egg-info
 prune docs
 prune tests
+prune profiling
+prune scripts
 prune .circleci
 prune .github
 include VERSION

@@ -10,8 +10,8 @@ from scipy.sparse import csr_matrix, coo_matrix
 import zarr
 
 from .ann import AnnStream
-from .utils import logger, tqdmbar, controlled_compute, prefetch_blocks
 from .storage.budget import worker_prefetch_depth
+from .utils import controlled_compute, logger, prefetch_blocks, tqdmbar
 from .writers import create_zarr_dataset
 
 __all__ = [

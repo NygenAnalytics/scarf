@@ -346,6 +346,26 @@ def test_normed_array_spec_plain_chunks():
     assert spec.chunks[0] >= 1
 
 
+@pytest.mark.parametrize("n_cells", [1_000_000, 2_500_000, 5_000_000, 10_000_000])
+def test_normed_array_spec_respects_codec_limit(n_cells):
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.zarr_store import _CODEC_MAX_BYTES, normed_array_spec
+
+    budget = ResourceBudget(
+        memoryBytes=112 * 1024**3,
+        workers=16,
+        workingCopies=4,
+    )
+    spec = normed_array_spec(
+        n_cells,
+        2000,
+        profile="cloud",
+        budget=budget,
+    )
+    assert spec.shards is None
+    assert spec.chunks[0] * spec.chunks[1] * 4 <= _CODEC_MAX_BYTES
+
+
 @pytest.mark.parametrize("n_feats", [500, 2000, 3000, 5000, 8192, 30_000])
 def test_normed_array_spec_creates_array(tmp_path, n_feats):
     from scarf.storage.zarr_store import (
@@ -364,7 +384,7 @@ def test_normed_array_spec_creates_array(tmp_path, n_feats):
 
 def test_memory_first_layout_worked_example():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import _BLOSC_MAX_BYTES, matrix_layout
+    from scarf.storage.zarr_store import _CODEC_MAX_BYTES, matrix_layout
 
     budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=8, workingCopies=4)
     chunks, shards = matrix_layout(1_000_000, 50_000, budget=budget, itemsize=4)
@@ -375,7 +395,7 @@ def test_memory_first_layout_worked_example():
     assert feature_chunk == work // (1_000_000 * 4)
     assert shard_cols % feature_chunk == 0
     assert shard_cols >= 50_000
-    assert row_shard * shard_cols * 4 <= _BLOSC_MAX_BYTES
+    assert row_shard * shard_cols * 4 <= _CODEC_MAX_BYTES
 
 
 def test_ceil_pad_awkward_feature_count():
@@ -418,7 +438,7 @@ def test_matrix_layout_scales_with_cells():
 
 def test_matrix_layout_shard_chunk_alignment():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import _BLOSC_MAX_BYTES, matrix_layout
+    from scarf.storage.zarr_store import _CODEC_MAX_BYTES, matrix_layout
 
     budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=4, workingCopies=4)
     chunks, shards = matrix_layout(100_000, 50_000, budget=budget, itemsize=4)
@@ -428,12 +448,12 @@ def test_matrix_layout_shard_chunk_alignment():
     assert shard_cols % col_chunk == 0
     assert shard_rows % row_chunk == 0
     assert shard_cols >= 50_000
-    assert shard_rows * shard_cols * 4 <= _BLOSC_MAX_BYTES
+    assert shard_rows * shard_cols * 4 <= _CODEC_MAX_BYTES
 
 
-def test_matrix_layout_respects_blosc_limit():
+def test_matrix_layout_respects_codec_limit():
     from scarf.storage.budget import get_resource_budget
-    from scarf.storage.zarr_store import _BLOSC_MAX_BYTES, matrix_layout
+    from scarf.storage.zarr_store import _CODEC_MAX_BYTES, matrix_layout
 
     budget = get_resource_budget()
     for n_cells, n_feats in [
@@ -445,9 +465,88 @@ def test_matrix_layout_respects_blosc_limit():
         assert shards is not None
         row_shard, shard_cols = shards
         feature_chunk = chunks[1]
-        assert row_shard * shard_cols * 4 <= _BLOSC_MAX_BYTES
+        assert row_shard * shard_cols * 4 <= _CODEC_MAX_BYTES
         assert shard_cols % feature_chunk == 0
         assert row_shard % chunks[0] == 0
+
+
+def test_matrix_layout_target_chunk_bytes_clamps_features():
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.zarr_store import matrix_layout
+
+    budget = ResourceBudget(memoryBytes=48 * 1024**3, workers=4, workingCopies=4)
+    chunks, shards = matrix_layout(
+        100_000,
+        45_525,
+        budget=budget,
+        itemsize=4,
+        targetChunkBytes=256 * 1024 * 1024,
+        minFeatureChunk=500,
+        maxFeatureChunk=10_000,
+    )
+    assert shards is not None
+    assert 500 <= chunks[1] <= 10_000
+    assert chunks[1] <= 45_525
+    assert shards[1] % chunks[1] == 0
+    assert chunks[0] * chunks[1] * 4 <= 256 * 1024 * 1024 + chunks[1] * 4
+
+
+def test_count_array_spec_passes_target_chunk_bytes():
+    from scarf.storage.budget import ResourceBudget, set_resource_budget
+    from scarf.storage.zarr_store import count_array_spec
+
+    budget = ResourceBudget(memoryBytes=24 * 1024**3, workers=4, workingCopies=4)
+    try:
+        set_resource_budget(budget)
+        capped = count_array_spec(
+            100_000,
+            45_525,
+            dtype="uint32",
+            remote=True,
+            targetChunkBytes=64 * 1024 * 1024,
+            minFeatureChunk=500,
+            maxFeatureChunk=10_000,
+        )
+        baseline = count_array_spec(100_000, 45_525, dtype="uint32", remote=True)
+    finally:
+        set_resource_budget(None)
+    assert capped.chunks[1] <= 10_000
+    assert capped.chunks[1] < baseline.chunks[1] or baseline.chunks[1] <= 10_000
+
+
+def test_count_array_spec_applies_cloud_default_target_chunk_bytes():
+    from scarf.storage.budget import ResourceBudget, set_resource_budget
+    from scarf.storage.zarr_store import (
+        DEFAULT_CLOUD_TARGET_CHUNK_BYTES,
+        count_array_spec,
+        matrix_layout,
+    )
+
+    budget = ResourceBudget(memoryBytes=24 * 1024**3, workers=4, workingCopies=4)
+    try:
+        set_resource_budget(budget)
+        cloud = count_array_spec(100_000, 45_525, dtype="uint32", remote=True)
+        local = count_array_spec(100_000, 45_525, dtype="uint32", remote=False)
+        expected, _ = matrix_layout(
+            100_000,
+            45_525,
+            budget=budget,
+            itemsize=4,
+            targetChunkBytes=DEFAULT_CLOUD_TARGET_CHUNK_BYTES,
+            minFeatureChunk=500,
+            maxFeatureChunk=10_000,
+        )
+        memory_first, _ = matrix_layout(
+            100_000,
+            45_525,
+            budget=budget,
+            itemsize=4,
+        )
+    finally:
+        set_resource_budget(None)
+    assert cloud.chunks == expected
+    assert local.chunks == memory_first
+    assert DEFAULT_CLOUD_TARGET_CHUNK_BYTES == 128 * 1024 * 1024
 
 
 def test_large_atac_count_array_accepts_sparse_writes(tmp_path):

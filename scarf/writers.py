@@ -162,6 +162,10 @@ def create_zarr_count_assay(
     feat_ids: np.ndarray | list[str],
     feat_names: np.ndarray | list[str],
     dtype: str = "uint32",
+    *,
+    targetChunkBytes: int | None = None,
+    minFeatureChunk: int | None = None,
+    maxFeatureChunk: int | None = None,
 ) -> zarr.Array:
     """Creates and returns a Zarr array with name 'counts'.
 
@@ -174,6 +178,9 @@ def create_zarr_count_assay(
         feat_ids (np.ndarray | list[str]):
         feat_names (np.ndarray | list[str]):
         dtype (str = 'uint32'):
+        targetChunkBytes: Optional cloud feature-chunk byte target.
+        minFeatureChunk: Optional lower clamp for feature-chunk width.
+        maxFeatureChunk: Optional upper clamp for feature-chunk width.
 
     Returns:
         A Zarr array.
@@ -198,6 +205,9 @@ def create_zarr_count_assay(
             n_feats,
             dtype=dtype,
             remote=get_storage_profile() == "cloud",
+            targetChunkBytes=targetChunkBytes,
+            minFeatureChunk=minFeatureChunk,
+            maxFeatureChunk=maxFeatureChunk,
         )
         return create_numeric_array(g, "counts", spec)
     return create_zarr_dataset(
@@ -424,6 +434,9 @@ class H5adToZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         working_copies: int | None = None,
+        targetChunkBytes: int | None = None,
+        minFeatureChunk: int | None = None,
+        maxFeatureChunk: int | None = None,
     ) -> None:
         # TODO: support for multiple assay. One of the `var` datasets can be used to group features in separate assays
         _apply_budget_override(mem_budget, nthreads, working_copies)
@@ -449,6 +462,9 @@ class H5adToZarr:
             feat_ids=self.h5ad.feat_ids(),
             feat_names=self.h5ad.feat_names(),
             dtype=self.h5ad.matrixDtype,
+            targetChunkBytes=targetChunkBytes,
+            minFeatureChunk=minFeatureChunk,
+            maxFeatureChunk=maxFeatureChunk,
         )
         self._ini_feature_data()
 
