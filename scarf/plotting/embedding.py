@@ -17,7 +17,23 @@ from ._contracts import (
 from ._data import fetch_normalized_feature_matrix, resolve_feature
 from ._deps import require_matplotlib
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
-from ._style import categorical_color_map, continuous_norm, theme_context
+from ._style import (
+    DEFAULT_PANEL_INCHES,
+    DEFAULT_POINT_EDGEWIDTH,
+    DEFAULT_RASTERIZE_THRESHOLD,
+    FrameStyle,
+    LegendLoc,
+    apply_figure_chrome,
+    categorical_color_map,
+    continuous_norm,
+    default_point_edgewidth,
+    default_point_size,
+    finish_embedding_axes,
+    resolve_legend_loc,
+    scatter_edgecolor,
+    square_axis_limits,
+    theme_context,
+)
 
 
 def _is_categorical(values: pd.Series, kind: str) -> bool:
@@ -143,6 +159,12 @@ def _continuous_limits(
     return vmin, vmax
 
 
+def _scatter_edges(edgecolor: str, edgewidth: float) -> tuple[str | float, float]:
+    if edgewidth <= 0:
+        return "none", 0.0
+    return edgecolor, float(edgewidth)
+
+
 def _draw_categorical(
     ax: Any,
     xx: np.ndarray,
@@ -153,25 +175,29 @@ def _draw_categorical(
     order: list[Any],
     palette: dict[Any, str],
     missing_color: str,
+    edgecolor: str,
+    edgewidth: float = DEFAULT_POINT_EDGEWIDTH,
     rasterized: bool,
 ) -> None:
     colors = [
         missing_color if pd.isna(val) or val not in palette else palette[val]
         for val in vv
     ]
+    edges, lw = _scatter_edges(edgecolor, edgewidth)
     ax.scatter(
         xx,
         yy,
         c=colors,
         s=ss,
-        linewidths=0.1,
-        edgecolors="k",
+        linewidths=lw,
+        edgecolors=edges,
         rasterized=rasterized,
     )
 
 
 def _add_categorical_legend(
     ax: Any,
+    fig: Any,
     mpl: Any,
     *,
     order: list[Any],
@@ -180,6 +206,8 @@ def _add_categorical_legend(
     missing: bool,
     missing_color: str,
     missing_label: str,
+    edgecolor: str,
+    figure_level: bool,
 ) -> None:
     handles = [
         mpl.lines.Line2D(
@@ -188,7 +216,7 @@ def _add_categorical_legend(
             marker="o",
             linestyle="",
             markerfacecolor=palette[value],
-            markeredgecolor="k",
+            markeredgecolor=edgecolor,
             markeredgewidth=0.3,
             markersize=5,
             label=str(value),
@@ -203,20 +231,68 @@ def _add_categorical_legend(
                 marker="o",
                 linestyle="",
                 markerfacecolor=missing_color,
-                markeredgecolor="k",
+                markeredgecolor=edgecolor,
                 markeredgewidth=0.3,
                 markersize=5,
                 label=missing_label,
             )
         )
-    ax.legend(
-        handles=handles,
-        title=label or None,
-        frameon=False,
-        bbox_to_anchor=(1.02, 1.0),
-        loc="upper left",
-        borderaxespad=0,
-    )
+    legend_kwargs = {
+        "handles": handles,
+        "title": label or None,
+        "frameon": False,
+        "borderaxespad": 0,
+    }
+    if figure_level:
+        # Outside legends participate in constrained layout and stay inside
+        # exact-size exports.
+        try:
+            fig.legend(
+                **legend_kwargs,
+                loc="outside right center",
+            )
+        except (TypeError, ValueError):
+            fig.legend(
+                **legend_kwargs,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+            )
+    else:
+        ax.legend(
+            **legend_kwargs,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+        )
+
+
+def _add_on_data_labels(
+    ax: Any,
+    xx: np.ndarray,
+    yy: np.ndarray,
+    vv: np.ndarray,
+    *,
+    order: list[Any],
+    theme: str,
+) -> None:
+    from matplotlib import patheffects
+
+    text_color = "#f5f5f5" if theme == "dark" else "#222222"
+    stroke = "#222222" if theme == "dark" else "#ffffff"
+    for value in order:
+        mask = np.asarray([not pd.isna(v) and v == value for v in vv], dtype=bool)
+        if not mask.any():
+            continue
+        ax.text(
+            float(np.median(xx[mask])),
+            float(np.median(yy[mask])),
+            str(value),
+            ha="center",
+            va="center",
+            fontsize=8,
+            color=text_color,
+            path_effects=[patheffects.withStroke(linewidth=2.0, foreground=stroke)],
+            zorder=5,
+        )
 
 
 def _draw_continuous(
@@ -232,6 +308,8 @@ def _draw_continuous(
     vcenter: float | None,
     missing_color: str,
     default_color: str,
+    edgecolor: str,
+    edgewidth: float = DEFAULT_POINT_EDGEWIDTH,
     label: str,
     is_uniform: bool,
     sort_values: bool,
@@ -252,6 +330,7 @@ def _draw_continuous(
     vnum = vnum[order_idx]
     ss = ss[order_idx]
     finite = finite[order_idx]
+    edges, lw = _scatter_edges(edgecolor, edgewidth)
 
     if is_uniform or len(xx) == 0:
         ax.scatter(
@@ -259,8 +338,8 @@ def _draw_continuous(
             yy,
             c=[default_color] * len(xx),
             s=ss if len(ss) else 10,
-            linewidths=0.1,
-            edgecolors="k",
+            linewidths=lw,
+            edgecolors=edges,
             rasterized=rasterized,
         )
         return
@@ -279,16 +358,27 @@ def _draw_continuous(
         yy,
         c=face,
         s=ss,
-        linewidths=0.1,
-        edgecolors="k",
+        linewidths=lw,
+        edgecolors=edges,
         rasterized=rasterized,
     )
     if add_colorbar:
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
-        cb = fig.colorbar(sm, ax=ax, shrink=0.6, fraction=0.05, pad=0.02)
-        if label:
-            cb.set_label(label)
+        # Top colorbars keep the embedding panel square and avoid colliding
+        # with neighboring y-axis labels in multi-panel figures.
+        cb = fig.colorbar(
+            sm,
+            ax=ax,
+            location="top",
+            orientation="horizontal",
+            shrink=0.8,
+            fraction=0.06,
+            pad=0.02,
+        )
+        # Axis title carries the feature name; keep colorbar ticks uncluttered.
+        _ = label
+        cb.set_label("")
 
 
 def _soft_clip(values: np.ndarray, clip_fraction: float) -> np.ndarray:
@@ -321,7 +411,7 @@ def embedding(
     cell_key: str = "I",
     from_assay: str | None = None,
     normalization: NormalizationSpec | None = None,
-    point_size: float = 10,
+    point_size: float | None = None,
     point_sizes: np.ndarray | Sequence[float] | None = None,
     sort_values: bool = False,
     color_scale: ColorScale | None = None,
@@ -334,19 +424,38 @@ def embedding(
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
     theme: str = "notebook",
+    legend_loc: LegendLoc = "auto",
+    frame: FrameStyle = "minimal",
     seed: int | None = None,
-    rasterize_threshold: int = 50_000,
+    rasterize_threshold: int = DEFAULT_RASTERIZE_THRESHOLD,
     show: bool = False,
 ) -> PlotResult:
-    """2D embedding scatter with shared per-feature color scales across facets.
+    """Scatter cells on a 2D layout (UMAP, t-SNE, and similar).
 
-    Multi-gene × condition layouts use one row per color value and one column
-    per facet by default. Color limits and categorical palettes are computed on
-    the full selected population so panels stay comparable.
+    ``color_by`` accepts a cell-metadata column, a gene name, or a list of
+    either. With several genes, Scarf draws one panel per gene. With
+    ``facet_by``, each gene becomes a row and each facet level a column.
+    Color limits for a gene are shared across facets so panels stay comparable.
 
-    Preserves useful ``DataStore.plot_layout`` behaviors:
-    - ``sort_values=True`` draws higher continuous values on top
-    - ``point_sizes`` sets per-point marker areas (e.g. mapping confidence)
+    Common choices:
+
+    - ``legend_loc``: ``"auto"`` puts a side legend when there are few
+      categories, labels on the clusters when there are many, and hides the
+      legend when there are very many. Use ``"right"``, ``"on_data"``, or
+      ``"none"`` to force a placement.
+    - ``frame``: ``"minimal"`` (default) keeps an L-shaped axes edge without
+      UMAP tick labels. ``"none"`` removes the box. ``"axes"`` keeps UMAP1 /
+      UMAP2 labels on the outer panels.
+    - ``point_size``: leave as ``None`` to size markers from the cell count.
+      Pass a number (matplotlib marker area) or ``point_sizes`` for per-cell
+      sizes such as mapping confidence.
+    - ``sort_values=True``: for continuous colors, draw high values last so
+      expressing cells sit on top of the cloud.
+    - ``theme``: ``"notebook"`` or ``"paper"`` for white figures; ``"dark"``
+      for dark notebook themes.
+
+    Returns a :class:`PlotResult`. Access ``.figure`` in notebooks, or call
+    ``.save(...)`` / ``.close()`` when you own the figure.
     """
     plt, mpl = require_matplotlib()
     if rasterize_threshold < 0:
@@ -369,10 +478,18 @@ def embedding(
         raise ValueError(f"Layout {layout_key!r} has no finite coordinates")
     if point_sizes is not None and len(point_sizes) != n:
         raise ValueError("point_sizes length must match number of selected cells")
+    resolved_point_size = (
+        float(point_size) if point_size is not None else default_point_size(n)
+    )
+    edgewidth = (
+        DEFAULT_POINT_EDGEWIDTH
+        if point_size is not None or point_sizes is not None
+        else default_point_edgewidth(n)
+    )
     size_arr = (
         np.asarray(point_sizes, dtype=np.float64)
         if point_sizes is not None
-        else np.full(n, point_size, dtype=np.float64)
+        else np.full(n, resolved_point_size, dtype=np.float64)
     )
 
     color_items = _coerce_color_items(color_by)
@@ -434,20 +551,14 @@ def embedding(
         n_columns = n_facets if facet_by is not None else min(n_colors, 4)
     n_columns = max(1, min(n_columns, len(panel_keys)))
 
-    if figsize is None and target is None:
-        nrows = int(np.ceil(len(panel_keys) / n_columns))
-        figsize = (3.6 * n_columns, 3.6 * nrows)
-
-    fig, axes, owns = normalize_axes_target(
-        target, panel_keys=panel_keys, figsize=figsize, n_columns=n_columns
-    )
-
     selected_x = x[base_mask]
     selected_y = y[base_mask]
     xpad = 0.05 * (float(selected_x.max() - selected_x.min()) or 1.0)
     ypad = 0.05 * (float(selected_y.max() - selected_y.min()) or 1.0)
     xlim = (float(selected_x.min() - xpad), float(selected_x.max() + xpad))
     ylim = (float(selected_y.min() - ypad), float(selected_y.max() + ypad))
+    xlim, ylim = square_axis_limits(xlim, ylim)
+    edgecolor = scatter_edgecolor(theme)
 
     labels = [label for _, label, _, _ in color_cache]
     label_counts = pd.Series(labels).value_counts()
@@ -499,12 +610,34 @@ def embedding(
                 else _continuous_limits(vals_sel, color_scale)
             )
 
+    legend_locs: dict[int, LegendLoc] = {
+        color_index: resolve_legend_loc(len(order), legend_loc)
+        for color_index, (order, _) in categorical_maps.items()
+    }
+    needs_side_legend = any(loc == "right" for loc in legend_locs.values())
+    if figsize is None and target is None:
+        nrows = int(np.ceil(len(panel_keys) / n_columns))
+        needs_top_cbar = any(
+            (not is_cat) and (not is_uniform)
+            for _, _, is_cat, is_uniform in color_cache
+        )
+        panel = DEFAULT_PANEL_INCHES
+        width = panel * n_columns + (1.35 if needs_side_legend else 0.25)
+        height = panel * nrows + (0.55 if needs_top_cbar else 0.2)
+        figsize = (width, height)
+
     legends: list[LegendSpec] = []
     scales_out: list[Any] = [color_scale]
     for color_index, (order, palette) in categorical_maps.items():
         label = labels[color_index]
         scales_out.append(CategoricalScale(order=tuple(order), palette=dict(palette)))
-        legends.append(LegendSpec(kind="categorical", label=label))
+        legends.append(
+            LegendSpec(
+                kind="categorical",
+                label=label,
+                extras={"legend_loc": legend_locs[color_index]},
+            )
+        )
     for color_index, (_, label, is_categorical, is_uniform) in enumerate(color_cache):
         if is_categorical or is_uniform:
             continue
@@ -525,6 +658,9 @@ def embedding(
     panel_limit_map: dict[str, tuple[float, float]] = {}
 
     with theme_context(theme):
+        fig, axes, owns = normalize_axes_target(
+            target, panel_keys=panel_keys, figsize=figsize, n_columns=n_columns
+        )
         panel_i = 0
         for color_index, (vals, label, is_cat, is_uniform) in enumerate(color_cache):
             for fac_i, fac in enumerate(facets):
@@ -564,11 +700,24 @@ def embedding(
                         order=order,
                         palette=palette,
                         missing_color=missing,
+                        edgecolor=edgecolor,
+                        edgewidth=edgewidth,
                         rasterized=rasterized,
                     )
-                    if fac_i == n_facets - 1:
+                    panel_legend = legend_locs[color_index]
+                    if panel_legend == "on_data":
+                        _add_on_data_labels(
+                            ax,
+                            xx,
+                            yy,
+                            vv,
+                            order=order,
+                            theme=theme,
+                        )
+                    elif panel_legend == "right" and fac_i == n_facets - 1:
                         _add_categorical_legend(
                             ax,
+                            fig,
                             mpl,
                             order=order,
                             palette=palette,
@@ -580,6 +729,8 @@ def embedding(
                                 if categorical_scale is not None
                                 else "NA"
                             ),
+                            edgecolor=edgecolor,
+                            figure_level=owns,
                         )
                 else:
                     vnum = pd.to_numeric(pd.Series(vv), errors="coerce").to_numpy(
@@ -609,6 +760,8 @@ def embedding(
                         vcenter=color_scale.vcenter,
                         missing_color=color_scale.missing_color,
                         default_color=default_color,
+                        edgecolor=edgecolor,
+                        edgewidth=edgewidth,
                         label=label,
                         is_uniform=is_uniform,
                         sort_values=sort_values,
@@ -619,22 +772,26 @@ def embedding(
                         mpl=mpl,
                     )
 
-                ax.set_xlim(xlim)
-                ax.set_ylim(ylim)
-                ax.set_aspect("equal", adjustable="box")
-                ax.set_xticks([])
-                ax.set_yticks([])
                 if fac is None:
                     title = label
                 else:
                     title = (
                         f"{label} | {facet_by}={fac}" if label else f"{facet_by}={fac}"
                     )
-                if title:
-                    ax.set_title(title)
-                ax.set_xlabel(f"{layout_key}1")
-                ax.set_ylabel(f"{layout_key}2")
+                col = panel_i % n_columns
+                row = panel_i // n_columns
+                nrows = int(np.ceil(len(panel_keys) / n_columns))
+                finish_embedding_axes(
+                    ax,
+                    xlim=xlim,
+                    ylim=ylim,
+                    xlabel=f"{layout_key}1" if row == nrows - 1 else "",
+                    ylabel=f"{layout_key}2" if col == 0 else "",
+                    title=title or None,
+                    frame=frame,
+                )
                 panel_i += 1
+        apply_figure_chrome(fig, theme)
 
     if color_scale.scope == "panel":
         color_limits = panel_limit_map

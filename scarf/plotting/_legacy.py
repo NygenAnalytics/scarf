@@ -89,6 +89,7 @@ def embedding_kwargs_from_plot_layout(
     figsize: tuple[float, float] | None = None,
     n_columns: int | None = None,
     color_key: dict[Any, Any] | None = None,
+    legend_loc: str = "auto",
 ) -> dict[str, Any]:
     """Map a subset of ``plot_layout`` args to ``embedding`` kwargs."""
     from ._contracts import CategoricalScale, ColorScale
@@ -112,6 +113,7 @@ def embedding_kwargs_from_plot_layout(
         "target": target,
         "figsize": figsize,
         "n_columns": n_columns,
+        "legend_loc": legend_loc,
         "show": show_fig,
     }
 
@@ -204,12 +206,14 @@ def try_bridge_plot_layout(
             )
             return False, None
 
-    if legend_ondata or legend_onside:
-        logger.info(
-            "plot_layout(use_plotting=True): on-data / side legends from the "
-            "legacy API are not drawn; scarf.plotting.embedding uses its own "
-            "colorbars and categorical styling."
-        )
+    if legend_ondata and legend_onside:
+        legend_loc = "auto"
+    elif legend_ondata:
+        legend_loc = "on_data"
+    elif legend_onside:
+        legend_loc = "right"
+    else:
+        legend_loc = "auto"
 
     from .embedding import embedding
 
@@ -255,6 +259,7 @@ def try_bridge_plot_layout(
         figsize=None if ax is not None else (width, height),
         n_columns=n_columns,
         color_key=color_key,
+        legend_loc=legend_loc,
     )
     result = embedding(store, **kwargs)
     if savename is not None:

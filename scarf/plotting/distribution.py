@@ -10,7 +10,12 @@ from ._contracts import CellField, FeatureRef, NormalizationSpec, PlotProvenance
 from ._data import fetch_normalized_feature_matrix, resolve_feature
 from ._deps import require_matplotlib, require_seaborn
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
-from ._style import theme_context
+from ._style import (
+    MAX_FIGURE_WIDTH_INCHES,
+    apply_figure_chrome,
+    capped_figsize,
+    theme_context,
+)
 
 DistKind = Literal["violin", "box", "hist", "ecdf"]
 
@@ -200,12 +205,18 @@ def distribution(
     theme: str = "notebook",
     show: bool = False,
 ) -> PlotResult:
-    """Violin, box, histogram, or ECDF for metadata columns and/or features.
+    """Compare value distributions for QC metrics or genes.
 
-    For ``violin`` / ``box``, overlay points are a deterministic subsample when
-    ``max_points`` is below the cell count. For ``ecdf``, values may be
-    subsampled the same way for display. Both cases are recorded in provenance
-    as approximate when subsampling occurs. Histograms use all cells.
+    ``keys`` may be cell-metadata columns (for example ``RNA_nCounts``) or gene
+    names. ``kind`` selects the display: ``"violin"``, ``"box"``, ``"hist"``,
+    or ``"ecdf"``. With ``group_by``, each category gets its own distribution
+    along the x-axis.
+
+    For violins and boxes, Scarf can overlay a subsample of cells as points.
+    ``max_points`` limits how many points are drawn so large datasets stay
+    responsive; the subsample is deterministic when you set ``seed``.
+    Histograms always use every selected cell. When several keys are passed,
+    panels wrap into a grid instead of growing into a very wide figure.
     """
     require_matplotlib()
     normalization = normalization or NormalizationSpec()
@@ -260,15 +271,25 @@ def distribution(
     if len(set(panel_keys)) != len(panel_keys):
         panel_keys = list(range(len(panel_keys)))
 
+    n_groups = int(pd.Series(groups).nunique())
+    n_panels = len(panel_keys)
+    # Dense category axes: keep each panel readable without billboard widths.
+    panel_width = min(MAX_FIGURE_WIDTH_INCHES, max(3.0, 0.28 * n_groups + 1.4))
     if figsize is None and target is None:
-        n_groups = int(pd.Series(groups).nunique())
-        figsize = (max(3.0, 1.2 * n_groups + 1.5) * len(panel_keys), 3.5)
+        n_columns = max(
+            1,
+            min(n_panels, int(MAX_FIGURE_WIDTH_INCHES // panel_width) or 1),
+        )
+        n_rows = int(np.ceil(n_panels / n_columns))
+        figsize = capped_figsize(panel_width * n_columns, 3.2 * n_rows)
+    else:
+        n_columns = n_panels
 
     fig, axes, owns = normalize_axes_target(
         target,
         panel_keys=panel_keys,
         figsize=figsize,
-        n_columns=len(panel_keys),
+        n_columns=n_columns,
     )
 
     rng = np.random.default_rng(seed)
@@ -314,6 +335,7 @@ def distribution(
             else:
                 ax.set_xlabel(group_by or "")
                 ax.set_ylabel(label)
+        apply_figure_chrome(fig, theme)
 
     label_counts = pd.Series([label for _, label in series_list]).value_counts()
     tables = {}

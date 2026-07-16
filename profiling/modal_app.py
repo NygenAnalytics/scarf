@@ -41,6 +41,7 @@ from profiling.modal_resources import (
     modal_function_options,
     validate_modal_environment,
 )
+from profiling.io_baseline import run_io_baseline_body
 from profiling.r2 import download_file, object_exists, object_size, upload_file
 from profiling.results import result_exists, write_result
 from profiling.stages import run_stage
@@ -186,6 +187,23 @@ def prepare_fixture_datasets_job(
         onArtifact=_upload_artifact,
     )
     return {"uploaded": uploaded, "kind": "fixture"}
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=(65_536, 65_536),
+    cpu=(8.0, 8.0),
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def io_baseline_job(
+    configDict: dict[str, Any],
+    nRows: int = 1_000_000,
+) -> dict[str, Any]:
+    """No-compute R2 stream of HVG / marker / makeGraph read patterns."""
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    return run_io_baseline_body(config, nRows=nRows)
 
 
 @app.function(
@@ -409,6 +427,10 @@ def main(*arg_list: str) -> None:
     all_parser.add_argument("--sizes", nargs="*", type=int, default=None)
     all_parser.add_argument("--stages", nargs="*", choices=STAGE_ORDER, default=None)
 
+    io_parser = sub.add_parser("io-baseline")
+    io_parser.add_argument("--config", required=True)
+    io_parser.add_argument("--size", type=int, default=1_000_000)
+
     args = parser.parse_args(list(arg_list))
     config = _load_config(args.config)
     payload = config.model_dump(mode="python")
@@ -491,4 +513,19 @@ def main(*arg_list: str) -> None:
             .spawn(payload, sizes, stages)
         )
         _print_spawned("run_all_jobs", call)
+        return
+
+    if args.command == "io-baseline":
+        resources = config.resourcesFor("markHvgs")
+        options = modal_function_options(config, resources, maxContainers=1)
+        call = (
+            _deployed_function(config, "io_baseline_job")
+            .with_options(**options)
+            .spawn(payload, args.size)
+        )
+        _print_spawned(f"io_baseline_job size={args.size}", call)
+        print(
+            "result URI (when done): "
+            f"{config.resultsUri.rstrip('/')}/io-baseline/{config.runTag}.json"
+        )
         return

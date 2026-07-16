@@ -41,7 +41,13 @@ class FeatureRef:
 
 @dataclass(frozen=True, slots=True)
 class CellField:
-    """Reference to a cell-metadata column."""
+    """Point ``color_by`` or similar arguments at a cell-metadata column.
+
+    Use this when the column name alone is ambiguous. ``kind="categorical"``
+    forces discrete colors (useful for integer cluster ids).
+    ``kind="continuous"`` forces a colorbar. ``kind="auto"`` chooses from the
+    dtype and number of unique values.
+    """
 
     key: str
     kind: CellFieldKind = "auto"
@@ -54,11 +60,12 @@ class CellField:
 
 @dataclass(frozen=True, slots=True)
 class StudyDesign:
-    """How cells relate to biological samples and conditions.
+    """Describe samples and conditions for composition and summary plots.
 
-    Supports ``sample_by`` and optional ``condition_by``. Composition pairing
-    uses ``condition_by`` with ``subject_by`` or ``pair_by``. Technical-replicate
-    collapse is deferred.
+    ``sample_by`` is the column that identifies biological samples.
+    ``condition_by`` is the experimental condition (for example treatment).
+    For paired composition plots, also set ``subject_by`` or ``pair_by`` so the
+    same donor or pair can be connected across conditions.
     """
 
     sample_by: str
@@ -91,6 +98,14 @@ class StudyDesign:
 
 @dataclass(frozen=True, slots=True)
 class NormalizationSpec:
+    """How feature values are read for gene-colored plots.
+
+    ``source="assay"`` uses the assay's current normalization settings.
+    ``source="raw"`` reads raw counts. ``transform="log1p"`` applies log1p
+    after that fetch, which is the usual choice for gene UMAPs and dotplots
+    when you want a compressed expression scale.
+    """
+
     source: NormSource = "assay"
     transform: NormTransform = "none"
 
@@ -103,6 +118,15 @@ class NormalizationSpec:
 
 @dataclass(frozen=True, slots=True)
 class ColorScale:
+    """Continuous color mapping for embeddings and summary plots.
+
+    Set ``vmin`` / ``vmax`` for fixed limits, or ``quantiles=(low, high)`` to
+    ignore extreme tails (for example ``(0.0, 0.99)`` clips the top 1%).
+    ``vcenter`` is for diverging maps such as scaled fold changes.
+    ``scope`` controls whether limits are computed per feature (default), per
+    panel, or shared across every continuous panel in the figure.
+    """
+
     cmap: str | None = None
     vmin: float | None = None
     vmax: float | None = None
@@ -131,6 +155,13 @@ class ColorScale:
 
 @dataclass(frozen=True, slots=True)
 class CategoricalScale:
+    """Category order and colors for discrete embeddings and compositions.
+
+    ``order`` sets legend and axis order. ``palette`` maps each category to a
+    color string. Categories missing from ``palette`` raise an error, so pass
+    a complete map when you customize colors.
+    """
+
     order: tuple[Any, ...] | None = None
     palette: dict[Any, str] | None = None
     missing_color: str = "#bdbdbd"

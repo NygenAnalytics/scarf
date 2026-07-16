@@ -452,18 +452,27 @@ def _scatter_cleanup(ax: Any, sw: float, sc: str, ds: tuple[str, ...]) -> None:
             spine.set_visible(False)
     ax.figure.patch.set_alpha(0)
     ax.patch.set_alpha(0)
-    ax.set_aspect("auto")
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_box_aspect(1)
     return None
 
 
 def _scatter_label_axis(df: pd.DataFrame, ax: Any, fs: float, fo: float) -> None:
+    from scarf.plotting._style import square_axis_limits
+
     x, y = df.columns[:2]
     ax.set_xlabel(x, fontsize=fs)
     ax.set_ylabel(y, fontsize=fs)
-    vmin, vmax = df[x].min(), df[x].max()
-    ax.set_xlim((vmin - abs(vmin * fo), vmax + abs(vmax * fo)))
-    vmin, vmax = df[y].min(), df[y].max()
-    ax.set_ylim((vmin - abs(vmin * fo), vmax + abs(vmax * fo)))
+    xmin, xmax = float(df[x].min()), float(df[x].max())
+    ymin, ymax = float(df[y].min()), float(df[y].max())
+    xpad = abs(xmax - xmin) * fo if xmax != xmin else abs(xmin) * fo or 1.0
+    ypad = abs(ymax - ymin) * fo if ymax != ymin else abs(ymin) * fo or 1.0
+    xlim, ylim = square_axis_limits(
+        (xmin - xpad, xmax + xpad),
+        (ymin - ypad, ymax + ypad),
+    )
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
     ax.set_xticks([])
     ax.set_yticks([])
     return None

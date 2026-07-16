@@ -496,6 +496,26 @@ def test_equal_weight_sample_aggregation_fixture():
     assert agg["mean"].iloc[0] != pytest.approx(cell_weighted)
 
 
+def test_embedding_keeps_square_panel_with_side_legend(
+    umap, leiden_clustering, datastore
+):
+    result = splt.embedding(
+        datastore,
+        layout_key="RNA_UMAP",
+        color_by="RNA_leiden_cluster",
+        show=False,
+    )
+    ax = next(iter(result.axes.values()))
+    assert ax.get_box_aspect() == pytest.approx(1.0)
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    assert (xlim[1] - xlim[0]) == pytest.approx(ylim[1] - ylim[0])
+    result.figure.canvas.draw()
+    bbox = ax.get_window_extent()
+    assert bbox.width == pytest.approx(bbox.height, rel=1e-3)
+    result.close()
+
+
 def test_embedding_dotplot_matrixplot_on_fixture(umap, leiden_clustering, datastore):
     ds = datastore
     # point_sizes and sort_values are the clever legacy behaviors to preserve
@@ -511,7 +531,7 @@ def test_embedding_dotplot_matrixplot_on_fixture(umap, leiden_clustering, datast
     )
     assert emb.owns_figure
     assert len(emb.axes) == 1
-    assert next(iter(emb.axes.values())).get_legend() is not None
+    assert emb.figure.legends or next(iter(emb.axes.values())).get_legend() is not None
     emb.close()
 
     # Gene coloring with sort_values (high expression on top)
@@ -537,7 +557,7 @@ def test_embedding_dotplot_matrixplot_on_fixture(umap, leiden_clustering, datast
     assert "mean" in dp.tables["aggregate"].columns
     assert "fraction" in dp.tables["aggregate"].columns
     assert dp.provenance.n_cells == len(ds.cells.active_index("I"))
-    assert next(iter(dp.axes.values())).get_legend() is not None
+    assert dp.figure.legends or next(iter(dp.axes.values())).get_legend() is not None
     dp.close()
 
     mp = splt.matrixplot(

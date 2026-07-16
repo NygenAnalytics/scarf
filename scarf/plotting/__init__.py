@@ -18,6 +18,7 @@ from .embedding import embedding
 from .embedding_raster import embedding_raster
 from .heatmaps import cluster_tree, marker_heatmap, pseudotime_heatmap
 from .summary import dotplot, matrixplot
+from .unified import unified_embedding
 
 __all__ = [
     "CategoricalScale",
@@ -48,4 +49,5 @@ __all__ = [
     "pseudotime_heatmap",
     "qc",
     "theme_context",
+    "unified_embedding",
 ]

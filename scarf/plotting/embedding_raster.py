@@ -8,7 +8,7 @@ from ._contracts import CellField, ColorScale, PlotProvenance
 from ._deps import require_matplotlib
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
 from ._raster import draw_raster_canvas, raster_from_metadata
-from ._style import theme_context
+from ._style import apply_figure_chrome, square_axis_limits, theme_context
 
 
 def _scarf_version() -> str:
@@ -68,11 +68,16 @@ def embedding_raster(
     seed: int = 0,
     show: bool = False,
 ) -> PlotResult:
-    """Rasterize a 2D layout from cell-metadata columns via row blocks.
+    """Draw a layout as a pixel image for large cell counts.
 
-    ``color_by`` must be a continuous cell-metadata column (not a gene).
-    Use ``CellField(key, kind="continuous")`` to explicitly treat an integer
-    measurement as continuous. Categorical blockwise raster is not supported.
+    Prefer this over :func:`embedding` when you only need a continuous
+    cell-metadata color (for example ``RNA_nCounts``) and the dataset is large
+    enough that a full scatter is slow or memory-heavy. Values are read in row
+    blocks, so full columns are not loaded at once.
+
+    ``color_by`` must be continuous metadata, not a gene. Pass
+    ``CellField(key, kind="continuous")`` when an integer column should be
+    treated as continuous. Categorical colors are not supported here.
     """
     require_matplotlib()
     color_scale = color_scale or ColorScale(cmap="viridis", quantiles=(0.01, 0.99))
@@ -139,7 +144,7 @@ def embedding_raster(
     panel_key: Hashable = color_label or layout_key
     resolved_figsize = figsize
     if resolved_figsize is None and target is None:
-        resolved_figsize = (5.0, 5.0)
+        resolved_figsize = (5.2, 5.0)
     fig, axes, owns = normalize_axes_target(
         target,
         panel_keys=[panel_key],
@@ -156,9 +161,24 @@ def embedding_raster(
         )
         ax.set_xlabel(f"{layout_key}1")
         ax.set_ylabel(f"{layout_key}2")
-        cb = fig.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
+        cb = fig.colorbar(
+            im,
+            ax=ax,
+            location="top",
+            orientation="horizontal",
+            shrink=0.8,
+            fraction=0.06,
+            pad=0.08,
+        )
         cb.set_label(color_label or "log1p cell count")
-        ax.set_aspect("equal")
+        xlim, ylim = square_axis_limits(ax.get_xlim(), ax.get_ylim())
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_box_aspect(1)
+        apply_figure_chrome(fig, theme)
 
     result = PlotResult(
         figure=fig,

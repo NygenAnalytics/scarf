@@ -19,41 +19,49 @@ def qc(
     max_points: int = 10_000,
     show_on_single_row: bool = True,
     show: bool = True,
+    theme: str = "notebook",
 ) -> Any | None:
     """Facade for ``scarf.plots.plot_qc``."""
     from ..plots import plot_qc
+    from ._style import theme_context
 
-    return plot_qc(
-        data=data,
-        color=color,
-        cmap=cmap,
-        fig_size=figsize,
-        label_size=label_size,
-        title_size=title_size,
-        sup_title=sup_title,
-        sup_title_size=sup_title_size,
-        scatter_size=scatter_size,
-        max_points=max_points,
-        show_on_single_row=show_on_single_row,
-        show_fig=show,
-    )
+    with theme_context(theme):
+        return plot_qc(
+            data=data,
+            color=color,
+            cmap=cmap,
+            fig_size=figsize,
+            label_size=label_size,
+            title_size=title_size,
+            sup_title=sup_title,
+            sup_title_size=sup_title_size,
+            scatter_size=scatter_size,
+            max_points=max_points,
+            show_on_single_row=show_on_single_row,
+            show_fig=show,
+        )
 
 
 def elbow(
     variance_explained: np.ndarray | list[float],
     figsize: tuple[float | None, float] = (None, 2),
+    theme: str = "notebook",
 ) -> None:
     """Facade for ``scarf.plots.plot_elbow``."""
     from ..plots import plot_elbow
+    from ._style import theme_context
 
-    return plot_elbow(variance_explained, figsize=figsize)
+    with theme_context(theme):
+        return plot_elbow(variance_explained, figsize=figsize)
 
 
-def graph_qc(graph: Any) -> None:
+def graph_qc(graph: Any, theme: str = "notebook") -> None:
     """Facade for ``scarf.plots.plot_graph_qc``."""
     from ..plots import plot_graph_qc
+    from ._style import theme_context
 
-    return plot_graph_qc(graph)
+    with theme_context(theme):
+        return plot_graph_qc(graph)
 
 
 def highly_variable_features(
@@ -66,17 +74,20 @@ def highly_variable_features(
     figsize: tuple[float, float] = (4.5, 4.0),
     point_sizes: tuple[float, float] = (3, 30),
     colormaps: tuple[str, str] = ("winter", "magma_r"),
+    theme: str = "notebook",
 ) -> None:
     """Plot diagnostics for highly variable feature selection."""
     from ..plots import plot_mean_var
+    from ._style import theme_context
 
-    plot_mean_var(
-        nzm=mean_nonzero,
-        fv=corrected_variance,
-        n_cells=n_cells,
-        hvg=selected,
-        ax_label_fs=label_size,
-        fig_size=figsize,
-        ss=point_sizes,
-        cmaps=colormaps,
-    )
+    with theme_context(theme):
+        plot_mean_var(
+            nzm=mean_nonzero,
+            fv=corrected_variance,
+            n_cells=n_cells,
+            hvg=selected,
+            ax_label_fs=label_size,
+            fig_size=figsize,
+            ss=point_sizes,
+            cmaps=colormaps,
+        )

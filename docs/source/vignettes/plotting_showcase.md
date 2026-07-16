@@ -16,9 +16,10 @@ kernelspec:
 
 # Plotting with scarf.plotting
 
-`scarf.plotting` is the canonical API for new figures. Import it as `splt`, keep
-`DataStore.plot_*` for existing notebooks, and opt into the new embedding path
-from `plot_layout` when you want shared scales and a `PlotResult`.
+This vignette walks through the main figure types in `scarf.plotting`. Import
+the module as `splt`. Existing notebooks can keep using `DataStore.plot_*`
+methods. Prefer `splt` for new analysis code when the plot you need is covered
+here.
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -52,79 +53,117 @@ ds = scarf.DataStore(str(zarr_path), nthreads=4, default_assay="RNA")
 
 ## Embedding
 
-Color by a metadata column or by gene names. Multi-gene panels share one color
-scale per gene when you facet.
+`splt.embedding` colors cells on a layout such as UMAP. Pass a metadata column
+or a gene name in `color_by`. The return value is a `PlotResult`; in notebooks
+you usually display `.figure`.
 
 ```{code-cell} ipython3
-emb = splt.embedding(
-    ds,
-    layout_key="RNA_UMAP",
-    color_by="clusters",
-    show=False,
-)
-emb.figure
+splt.embedding(ds, layout_key="RNA_UMAP", color_by="clusters").figure
 ```
 
+Several genes become a row of panels. `NormalizationSpec(transform="log1p")`
+compresses the expression scale. `sort_values=True` draws high-expressing cells
+last so they sit on top of the cloud.
+
 ```{code-cell} ipython3
-genes = ["Gcg", "Ins2", "Sst"]
-emb2 = splt.embedding(
+splt.embedding(
     ds,
     layout_key="RNA_UMAP",
-    color_by=genes,
+    color_by=["Gcg", "Ins2", "Sst"],
     normalization=splt.NormalizationSpec(transform="log1p"),
     sort_values=True,
-    show=False,
-)
-emb2.figure
+).figure
 ```
 
-Save a 300 DPI TIFF without cropping the figure size, with a JSON provenance
-sidecar:
+Outliers can wash out a gene UMAP. `ColorScale(quantiles=(0.0, 0.99))` sets the
+color limit from the 99th percentile instead of the absolute maximum.
 
 ```{code-cell} ipython3
-from pathlib import Path
-
-out = Path("scarf_datasets") / "plotting_showcase_embedding.tiff"
-out.parent.mkdir(parents=True, exist_ok=True)
-emb.save(out, dpi=300, exact_size=True, provenance_sidecar=True)
-assert out.exists()
-assert out.with_suffix(".tiff.json").exists()
-emb.close()
-emb2.close()
+splt.embedding(
+    ds,
+    layout_key="RNA_UMAP",
+    color_by="Gcg",
+    normalization=splt.NormalizationSpec(transform="log1p"),
+    color_scale=splt.ColorScale(cmap="viridis", quantiles=(0.0, 0.99)),
+    sort_values=True,
+).figure
 ```
 
----
-
-## Blockwise raster embedding
-
-For a large dataset, rasterize continuous cell metadata without loading complete
-columns into memory. With no `color_by`, the image shows log-transformed cell
-counts per pixel.
+For large datasets, `embedding_raster` builds a pixel image from continuous
+cell metadata without loading full columns into memory. It does not color by
+gene; use `embedding` for that.
 
 ```{code-cell} ipython3
-raster = splt.embedding_raster(
+splt.embedding_raster(
     ds,
     layout_key="RNA_UMAP",
     color_by="RNA_nCounts",
     pixels=400,
-    show=False,
-)
-raster.figure
+).figure
 ```
 
+---
+
+## Choosing a style
+
+These options apply to embeddings (and to `unified_embedding` for mapping
+layouts). Defaults aim at compact, journal-safe figures. Override them when the
+default is a poor fit for your number of clusters or for the venue.
+
+### Legends
+
+`legend_loc="auto"` (default) picks a placement from the number of categories:
+
+- few categories: side legend
+- many categories: labels drawn on the clusters
+- very many categories: no legend (label offline or subset the categories)
+
+Force a placement when you know what you want.
+
 ```{code-cell} ipython3
-raster.close()
+splt.embedding(
+    ds,
+    layout_key="RNA_UMAP",
+    color_by="clusters",
+    legend_loc="on_data",
+).figure
 ```
+
+### Frame and theme
+
+`frame="minimal"` keeps a simple L-shaped edge without UMAP axis titles.
+`frame="none"` removes the box for a Scanpy-like silhouette. `theme="paper"`
+uses smaller fonts suited to multi-panel figures; `theme="dark"` is for dark
+notebook themes.
+
+```{code-cell} ipython3
+splt.embedding(
+    ds,
+    layout_key="RNA_UMAP",
+    color_by="clusters",
+    legend_loc="on_data",
+    frame="none",
+    theme="paper",
+).figure
+```
+
+### Point size
+
+Leave `point_size=None` (the default) so marker size follows the cell count.
+Small datasets get larger points; dense clouds get smaller points and thinner
+edges so clusters do not turn into a dark smudge. Pass an explicit `point_size`
+only when you need a fixed look across figures.
 
 ---
 
 ## Dotplot and matrixplot
 
-Pass an ordered mapping to keep gene-group brackets. Use `sample_by` so each
-sample contributes equal weight to the group summary.
+A dotplot shows two summaries at once: color is mean expression in the group,
+size is the fraction of cells above the detection cutoff. Pass an ordered
+mapping if you want gene-group brackets. `sample_by` makes each sample
+contribute equal weight instead of letting large samples dominate.
 
 ```{code-cell} ipython3
-# Toy sample labels for the demo (replace with your real sample column).
 n = len(ds.cells.active_index("I"))
 ds.cells.insert(
     "demo_sample",
@@ -132,36 +171,33 @@ ds.cells.insert(
     overwrite=True,
 )
 
-dp = splt.dotplot(
+splt.dotplot(
     ds,
     features={"endocrine": ["Gcg", "Ins2", "Sst"]},
     group_by="clusters",
     sample_by="demo_sample",
-    show=False,
-)
-dp.figure
+).figure
 ```
 
+A matrixplot is a plain heatmap of mean or fraction. Gene and group order are
+left as you pass them; nothing is reclustered.
+
 ```{code-cell} ipython3
-mp = splt.matrixplot(
+splt.matrixplot(
     ds,
     features=["Gcg", "Ins2", "Sst"],
     group_by="clusters",
     value="mean",
-    show=False,
-)
-mp.figure
-mp.close()
-dp.close()
+).figure
 ```
 
 ---
 
-## Composition (including paired subjects)
+## Composition
 
-`kind='per_sample'` plots one point per sample. With subject and condition
-fields in `StudyDesign`, lines connect the same subject across conditions
-within each category.
+Use composition plots when you care about how cell types change across samples.
+`kind="per_sample"` draws one point per sample. With subject and condition
+fields, Scarf connects the same subject across conditions inside each category.
 
 ```{code-cell} ipython3
 ds.cells.insert(
@@ -175,7 +211,7 @@ ds.cells.insert(
     overwrite=True,
 )
 
-comp = splt.composition(
+splt.composition(
     ds,
     category_by="clusters",
     study_design=splt.StudyDesign(
@@ -184,85 +220,55 @@ comp = splt.composition(
         condition_by="demo_condition",
     ),
     kind="per_sample",
-    show=False,
-)
-comp.tables["per_sample"].head()
+).figure
 ```
-
-```{code-cell} ipython3
-comp.figure
-comp.close()
-```
-
----
-
-## Caller-owned axes and compatible `plot_layout`
-
-Draw into an existing axes mosaic, or opt into the new embedding renderer from
-`DataStore.plot_layout`:
-
-```{code-cell} ipython3
-import matplotlib.pyplot as plt
-
-fig, axes = plt.subplot_mosaic([["A", "B"]], figsize=(8, 3.5))
-a = splt.embedding(
-    ds,
-    layout_key="RNA_UMAP",
-    color_by="clusters",
-    target=axes["A"],
-    show=False,
-)
-b = splt.embedding(
-    ds,
-    layout_key="RNA_UMAP",
-    color_by="Gcg",
-    target=axes["B"],
-    show=False,
-)
-splt.label_panels({"A": axes["A"], "B": axes["B"]}, labels=["A", "B"])
-fig
-```
-
-```{code-cell} ipython3
-# Opt-in bridge: returns a PlotResult when the call is compatible.
-result = ds.plot_layout(
-    layout_key="RNA_UMAP",
-    color_by="clusters",
-    show_fig=False,
-    use_plotting=True,
-)
-assert isinstance(result, splt.PlotResult)
-result.close()
-a.close()
-b.close()
-plt.close(fig)
-```
-
-The legacy `scarf.plots` and `DataStore.plot_*` interfaces remain supported
-compatibility APIs without plotting deprecation warnings. Prefer
-`import scarf.plotting as splt` for new analysis code.
 
 ---
 
 ## Distributions
 
+Violins (or boxes, histograms, ECDFs) are useful for QC metrics split by
+cluster. `max_points` limits how many individual cells are overlaid as points
+so the figure stays light on large datasets. Several keys wrap into a grid
+instead of one very wide strip.
+
 ```{code-cell} ipython3
-dist = splt.distribution(
+splt.distribution(
     ds,
     keys=["RNA_nCounts", "RNA_nFeatures"],
     group_by="clusters",
     kind="violin",
     max_points=2000,
     seed=0,
-    show=False,
-)
-dist.figure
+).figure
 ```
 
+---
+
+## Saving figures
+
+`PlotResult.save` writes PNG, PDF, SVG, or TIFF. The default background is
+opaque white. Pass `transparent=True` when you want the figure to sit on a dark
+notebook theme. Call `close()` when Scarf created the figure and you are done
+with it.
+
 ```{code-cell} ipython3
-hist = splt.distribution(ds, keys="RNA_nCounts", kind="hist", bins=40, show=False)
-ecdf = splt.distribution(ds, keys="RNA_nCounts", kind="ecdf", show=False)
-hist.close()
-ecdf.close()
-dist.close()
+from pathlib import Path
+
+out = Path("scarf_datasets") / "plotting_showcase_embedding.png"
+out.parent.mkdir(parents=True, exist_ok=True)
+result = splt.embedding(
+    ds,
+    layout_key="RNA_UMAP",
+    color_by="clusters",
+    show=False,
+)
+result.save(out, dpi=200)
+assert out.exists()
+result.close()
 ```
+
+`DataStore.plot_layout(..., use_plotting=True)` can return a `PlotResult` when
+the call is compatible with `splt.embedding`. For unified reference and query
+layouts from mapping, use `splt.unified_embedding` (see the data projection
+vignette).

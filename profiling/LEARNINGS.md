@@ -1,15 +1,26 @@
-# Scarf cloud profiling learnings (100k / 250k)
+# Scarf cloud profiling learnings (100k → 1M)
 
-Date range: 2026-07-14 to 2026-07-15  
+Date range: 2026-07-14 to 2026-07-16  
 Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`  
 Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)  
 Dataset source: nested CELLxGENE samples already prepared on R2
 
-This note is the baseline for quantifying later changes (500k+, code defaults, orchestrator CPU/mem tables). Times are stage wall seconds from result JSON. Peaks are `peakCgroupBytes`.
+This note is the baseline for quantifying later changes (code defaults, orchestrator CPU/mem tables, layout ideas). Times are stage wall seconds from result JSON. Peaks are `peakCgroupBytes` unless noted.
 
 ## Objective
 
 Minimize wall time without pointless overprovisioning. Prefer using memory and CPU in ways that actually cut stage time. Do not treat `workingCopies` as a speed dial.
+
+## Agent / ops rules (mandatory)
+
+Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat local connectivity as unreliable.
+
+1. **Never drive long work with `Function.remote()` or a blocking `modal run` that waits on the result.** When the local Modal client loses its gRPC session, Modal can cancel the running input. That is what killed the 1M IO baseline mid-`markerBatches` after ~40 minutes of good progress (`TimeoutError` / `Deadline exceeded` on the client, then `Received a cancellation signal` on the container). `--detach` alone is not enough if the entrypoint still uses `.remote()`.
+2. **Prefer spawn on the deployed app**, then disconnect: `Function.from_name(...).spawn(...)` (same pattern as `run_all_jobs`). Persist results to R2 (or another durable URI) from inside the container. Poll with `FunctionCall.from_id(...).get(timeout=0)` or by reading the result object; do not hold an open await for hours.
+3. **One-off scripts must write a result JSON to R2 before returning**, and log enough that progress is recoverable from `modal app logs` alone if the client dies.
+4. **Log well for long jobs.** Flush stdout. Emit pattern/stage start, a plan line (counts, chunk sizes, block totals), progress every N blocks (wall, bytes, rate), and a done line (wall, peak RSS/cgroup, bytes). Silent multi-hour runs are unacceptable.
+5. Never `modal deploy` from the agent; user deploys. Use `uv` for local Python / Modal CLI.
+6. Prefer broad Modal region `eu` over narrow `eu-west-1` for capacity.
 
 ## Code changes already wired
 
@@ -37,7 +48,7 @@ Two different numbers matter:
 | `auto_markers_c8_m32` | 100k | 8 | 32 GiB | ~24 GiB | Speed pack (UMAP/ANN parallel) |
 | `auto_markers_c8_m32_250k` | 250k | 8 | 32 GiB | ~24 GiB | Same speed pack |
 | `auto_markers_c8_m48_500k` | 500k | 8 | 48 GiB | 36 GiB | Done; 4339s, max peak ~10 GiB |
-| `auto_markers_c8_m64_1m` | 1M | 8 | 64 GiB | 48 GiB | In progress |
+| `auto_markers_c8_m64_1m` | 1M | 8 | 64 GiB | 48 GiB | Done; 9156s, max peak 28.3 GiB (makeGraph) |
 
 Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.md` as the durable record; recreate TOMLs from these rows when needed.
 
@@ -55,7 +66,7 @@ Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.m
 2. Change one variable (size, CPU, mem, parallel flags, or code). Keep `workingCopies` and workflow seeds fixed unless the experiment is about the copy model.
 3. Compare stage seconds and peak GiB. Also report total seconds and max peak.
 4. Result URIs: `{resultsUri}/results/{runTag}/{nRows}/{stage}.json`
-5. Spawn via deployed app bare `run_all_jobs.spawn(...)` (avoids stuck `with_options` queues from local `modal run`). Stage workers still apply config resources inside the deployed orchestrator.
+5. Spawn via deployed app bare `run_all_jobs.spawn(...)` (see Agent / ops rules). Stage workers still apply config resources inside the deployed orchestrator.
 
 Useful call IDs from this campaign (`/tmp/scarf_calib_calls.txt`):
 
@@ -66,6 +77,7 @@ auto_markers_c8_m32=fc-01KXK3JTNTC44X44K3NFQRTDQ5
 auto_markers_c8_m32_250k=fc-01KXK8BRWK9P50XW0NY4FWE378
 auto_markers_c8_m48_500k=fc-01KXKE1ZCG0FG7KFEQ1H0QX35K
 auto_markers_c4_m32_scarf16=fc-01KXKEX6N0N44661M6ZX26NX9C
+auto_markers_c8_m64_1m=fc-01KXKR82TFWSJS9EP1E4P5ZXCJ
 ```
 
 ## Layout sweep @ 100k (4 CPU / 32 GiB)
@@ -172,18 +184,19 @@ Configs:
 
 ## Ops notes (Modal)
 
-- Prefer bare `Function.from_name(...).spawn` on the deployed app for `run_all_jobs`.
+- See **Agent / ops rules** above (spawn, no long `.remote()`, logging, R2 results).
 - Prefer broad Modal region `eu` over narrow `eu-west` / `eu-west-1` for capacity ([region selection](https://modal.com/docs/guide/region-selection); broad multiplier 1.5x vs narrow 1.75x).
 - Tight region + high memory often sat in queue; capacity messages mentioned 16.8 / 28.8 / 48.8 GiB under `eu-west-1`.
-- Never `modal deploy` from the agent; user deploys after code changes.
-- Use `uv` for local Python / Modal CLI.
+- Stage result JSON currently stores wall + memory peaks only (no CPU utilization). Modal dashboard has live CPU charts; CLI billing is app-day cost, not per-stage idle cores.
 
 ## Current best reference profiles
 
 | Size | Recommended reference tag | Machine | Notes |
 |------|---------------------------|---------|-------|
-| 100k | `auto_markers_c8_m32` | 8 CPU / 32 GiB | Fastest complete funnel so far (1095s) |
+| 100k | `auto_markers_c8_m32` | 8 CPU / 32 GiB | Fastest 100k funnel (1095s) |
 | 250k | `auto_markers_c8_m32_250k` | 8 CPU / 32 GiB | Same settings; 2346s, max peak 14.6 GiB |
+| 500k | `auto_markers_c8_m48_500k` | 8 CPU / 48 GiB | 4339s; Modal RAM was generous vs peaks |
+| 1M | `auto_markers_c8_m64_1m` | 8 CPU / 64 GiB | 9156s; makeGraph peak 28.3 GiB justifies 64 GiB |
 
 For a pure markers comparison at 100k without parallel UMAP noise, use `auto_markers_c4_m32` (269s markers).
 
@@ -206,9 +219,10 @@ Tag `auto_markers_c4_m32_scarf16`. Matched to `c4_m32` (4 CPU, workers=4, workin
 ## Open questions
 
 1. Why scarf16 markers faster than c4_m32 despite smaller software budget?
-2. Can HVG use memory/CPU more productively (still ~1–1.4 GiB peak while taking 20%+ of wall)?
+2. Can HVG use memory/CPU more productively (still ~1–1.4 GiB peak while taking 20%+ of wall)? Partial answer: IO baseline `hvgTiles` matched most of markHvgs wall (see below).
 3. Why did 8 workers slow markers vs 4 at 100k?
 4. makeGraph cgroup peak 250k→500k drop: re-measure with clean A/B before trusting.
+5. Feature-major secondary matrix for gene-wise stages: **tabled** until IO baseline finishes cleanly; revisit with 1M HVG/marker evidence.
 
 ## Scale: 500k (8 CPU / 48 GiB, region `eu`)
 
@@ -229,13 +243,44 @@ Cells 250k→500k is 2×; wall time 1.85× (slightly better than linear). Max pe
 
 Call ids: original `fc-01KXKE1ZCG0FG7KFEQ1H0QX35K` (cancelled); eu resume `fc-01KXKH7Z9V88NXFG2DJ204C8C8`.
 
-## In progress: 1M (8 CPU / 64 GiB, region `eu`)
+## Scale: 1M (8 CPU / 64 GiB, region `eu`)
 
-| Field | Value |
-|-------|-------|
-| Tag | `auto_markers_c8_m64_1m` |
-| Config | `profiling/layouts/1m_auto_markers_c8_m64.toml` |
-| Machine | 8 CPU / 64 GiB Modal, Scarf budget 48 GiB (75%) |
-| Knobs | workers=8, workingCopies=4, UMAP/ANN parallel on, auto markers |
-| Call | see `/tmp/scarf_calib_calls.txt` key `auto_markers_c8_m64_1m` |
-| Compare to | `auto_markers_c8_m32` (100k), `_250k`, `c8_m48_500k` |
+Tag `auto_markers_c8_m64_1m`. Same speed-pack knobs. Modal 64 GiB / Scarf 48 GiB. Call `fc-01KXKR82TFWSJS9EP1E4P5ZXCJ`.
+
+| Stage | 100k | 250k | 500k | 1M | 500k→1M time | Peak 1M |
+|-------|-----:|-----:|-----:|---:|-------------:|--------:|
+| createStore | 104s | 264s | 474s | 974s | 2.05× | 5.4G |
+| initializeStore | 141s | 320s | 592s | 1241s | 2.10× | 7.0G |
+| markHvgs | 241s | 585s | 1095s | 2546s | 2.33× | 1.1G |
+| makeGraph | 168s | 307s | 436s | 1487s | 3.41× | **28.3G** |
+| runUmap | 58s | 101s | 143s | 313s | 2.19× | 1.6G |
+| runLeiden | 25s | 51s | 100s | 185s | 1.85× | 2.3G |
+| findMarkers | 331s | 688s | 1473s | 2379s | 1.62× | 10.1G |
+| **total** | **1095s** | **2346s** | **4339s** | **9156s** | **2.11×** | **28.3G** |
+
+Cells 500k→1M is 2×; wall ~2.11×. **makeGraph is the outlier** (~3.4× time, peak 28.3 GiB cgroup / 21.0 GiB RSS): 64 GiB Modal is justified here, unlike 500k where 48 GiB was generous. HVG + markers still dominate wall (~54%). HVG peak stays ~1 GiB while taking ~28% of wall.
+
+### What `initializeStore` is
+
+First cold open after `createStore` with QC thresholds. It is not a cheap open: it streams the raw matrix to compute per-gene `nCells` / dropOuts and per-cell `nCounts` / `nFeatures` / percentMito / percentRibo, then applies min-feature filters. Later stages use `initialize=False` and skip that work (`reopenStore` ~6s at 1M). Wall scales roughly with cells; peak stays ~7 GiB (IO/reduction bound).
+
+## IO baseline (1M, same machine; partial)
+
+Goal: no-compute stream of HVG / marker / makeGraph read patterns on
+`s3://scarf-tests/scarf-profiling/stores/auto_markers_c8_m64_1m/1000000.zarr`
+at 8 CPU / 64 GiB / `eu`, to separate R2+layout cost from Scarf compute.
+
+Script: `profiling/io_baseline.py`. Must be spawned (not long `.remote()`); write result to
+`{resultsUri}/io-baseline/{runTag}.json`.
+
+| Pattern | Status | Wall | Peak RSS | Bytes read | Notes |
+|---------|--------|-----:|---------:|-----------:|-------|
+| openStore | done | 7.7s | 0.53 GiB | - | Like reopen; QC columns already present |
+| hvgTiles | done | **2347s** | 1.0 GiB | 108.4 GiB | 7912 physical tiles, chunks `(11671, 500)` |
+| markerBatches | cancelled | - | - | - | Died ~batch 12/73 after local client disconnect |
+| makeGraphRawCellBands | not run | | | | |
+| makeGraphNormedCellBands | not run | | | | |
+
+**Reading so far:** HVG-style tile IO alone (~39 min) is already close to full `markHvgs` wall (2546s) at ~1 GiB peak. That strongly supports HVG being IO/layout bound, not RAM-starved. Feature-major secondary matrix remains tabled until marker + makeGraph IO baselines complete under a spawn-safe run.
+
+Active cells after QC ~890k; auto marker batch 452; HVGs 2000.

@@ -46,6 +46,14 @@ class LegendSpec:
 
 @dataclass(slots=True)
 class PlotResult:
+    """Return value from scarf.plotting functions.
+
+    ``figure`` is the matplotlib figure. ``axes`` maps panel keys to axes.
+    ``tables`` holds any summary data used to build the plot. ``owns_figure``
+    is True when Scarf created the figure; call ``close()`` in that case when
+    you are done so notebooks do not keep many open figures.
+    """
+
     figure: Any
     axes: dict[Hashable, Any]
     tables: dict[str, pd.DataFrame]
@@ -71,7 +79,7 @@ class PlotResult:
         figure_path: str | Path | None = None,
         dpi: float | None = None,
     ) -> Path:
-        """Write a JSON sidecar describing this plot result."""
+        """Write a JSON file describing scales, legends, and cell counts."""
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         width, height = self.figure.get_size_inches()
@@ -127,6 +135,15 @@ class PlotResult:
         tiff_compression: str = "tiff_lzw",
         provenance_sidecar: bool | str | Path = False,
     ) -> Path:
+        """Write the figure to disk (PNG, PDF, SVG, TIFF, and other backends).
+
+        The default background is opaque white, which is what most journals
+        expect. Pass ``transparent=True`` if you need the figure to sit on a
+        dark notebook theme. ``exact_size=True`` keeps the inch size you set
+        when the figure was created; set it to False only when you want a tight
+        crop for display. ``provenance_sidecar=True`` writes a sibling JSON
+        file with the plot metadata.
+        """
         out = Path(path)
         if not out.suffix:
             raise ValueError("Export path must include a file extension")
@@ -150,9 +167,34 @@ class PlotResult:
         # Exact-size export must not crop; tight bbox changes physical size.
         kwargs["bbox_inches"] = None if exact_size else "tight"
         _, mpl = require_matplotlib()
-        export_rc = {"savefig.bbox": None} if exact_size else {}
-        with theme_context(self.theme), mpl.rc_context(export_rc):
-            self.figure.savefig(out, **kwargs)
+        # Honour explicit transparent=False even when the active theme prefers none.
+        export_rc: dict[str, Any] = {"savefig.bbox": None} if exact_size else {}
+        figure_face = self.figure.patch.get_facecolor()
+        figure_alpha = self.figure.patch.get_alpha()
+        axes_faces = [
+            (ax, ax.patch.get_facecolor(), ax.patch.get_alpha())
+            for ax in self.figure.axes
+        ]
+        if transparent:
+            export_rc["savefig.transparent"] = True
+            export_rc["savefig.facecolor"] = "none"
+        else:
+            export_rc["savefig.transparent"] = False
+            export_rc["savefig.facecolor"] = "white"
+            self.figure.patch.set_facecolor("white")
+            self.figure.patch.set_alpha(1.0)
+            for ax in self.figure.axes:
+                ax.patch.set_facecolor("white")
+                ax.patch.set_alpha(1.0)
+        try:
+            with theme_context(self.theme), mpl.rc_context(export_rc):
+                self.figure.savefig(out, **kwargs)
+        finally:
+            self.figure.patch.set_facecolor(figure_face)
+            self.figure.patch.set_alpha(figure_alpha)
+            for ax, face, alpha in axes_faces:
+                ax.patch.set_facecolor(face)
+                ax.patch.set_alpha(alpha)
         if provenance_sidecar:
             sidecar = (
                 out.with_suffix(out.suffix + ".json")
@@ -184,14 +226,21 @@ def normalize_axes_target(
 
     if target is None:
         if figsize is None:
-            figsize = (4.0 * len(keys), 4.0) if len(keys) > 1 else (5.0, 5.0)
+            from ._style import DEFAULT_PANEL_INCHES
+
+            panel = DEFAULT_PANEL_INCHES
+            figsize = (
+                (panel * len(keys), panel) if len(keys) > 1 else (panel + 0.4, panel)
+            )
         if len(keys) == 1:
-            fig, ax = plt.subplots(1, 1, figsize=figsize)
+            fig, ax = plt.subplots(1, 1, figsize=figsize, layout="constrained")
             return fig, {keys[0]: ax}, True
         ncols = n_columns if n_columns is not None else min(len(keys), 4)
         ncols = max(1, min(ncols, len(keys)))
         nrows = int(np.ceil(len(keys) / ncols))
-        fig, axs = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+        fig, axs = plt.subplots(
+            nrows, ncols, figsize=figsize, squeeze=False, layout="constrained"
+        )
         mapping: dict[Hashable, Any] = {}
         for i, key in enumerate(keys):
             mapping[key] = axs[i // ncols, i % ncols]

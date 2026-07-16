@@ -8,7 +8,13 @@ import pandas as pd
 from ._contracts import CategoricalScale, PlotProvenance, StudyDesign
 from ._deps import require_matplotlib
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
-from ._style import categorical_color_map, theme_context
+from ._style import (
+    apply_figure_chrome,
+    capped_figsize,
+    categorical_color_map,
+    scatter_edgecolor,
+    theme_context,
+)
 
 
 def _constant_within_sample(
@@ -60,6 +66,32 @@ def _attach_sample_meta(
         return per_sample
     meta = pd.concat(meta_parts, axis=1).reset_index()
     return per_sample.merge(meta, on="sample", how="left")
+
+
+def _sort_conditions(values: list[Any]) -> list[Any]:
+    """Order conditions for paired plots with a light before/after preference."""
+    preferred = (
+        "before",
+        "pre",
+        "baseline",
+        "control",
+        "ctrl",
+        "untreated",
+        "after",
+        "post",
+        "treated",
+        "stimulated",
+        "stim",
+    )
+
+    def key(value: Any) -> tuple[int, str]:
+        text = str(value).lower()
+        try:
+            return preferred.index(text), text
+        except ValueError:
+            return len(preferred), text
+
+    return sorted(values, key=key)
 
 
 def _draw_pair_lines(
@@ -129,16 +161,22 @@ def composition(
     theme: str = "notebook",
     show: bool = False,
 ) -> PlotResult:
-    """Cell-type / cluster composition across samples.
+    """Show how cell categories (clusters, cell types) vary across samples.
 
-    - ``kind='per_sample'``: one point per sample (requires sample_by)
-    - ``kind='stacked'``: stacked bars (by sample if sample_by set, else overall)
+    ``kind="stacked"`` draws stacked bars. With ``sample_by``, there is one bar
+    per sample; without it, one bar for the whole dataset.
+    ``kind="per_sample"`` draws one point per sample in each category (requires
+    ``sample_by`` or a :class:`StudyDesign`).
 
-    With ``condition_by`` and ``subject_by`` or ``pair_by``, paired lines connect
-    the same subject or pair across conditions within each category. Replicate
-    samples for one pair and condition are averaged for the line.
+    For paired before/after designs, pass ``condition_by`` together with
+    ``subject_by`` or ``pair_by`` (directly or via ``study_design``). Scarf
+    then connects the same subject across conditions inside each category.
+    When a subject has several samples in one condition, those proportions are
+    averaged for the connecting line.
+
+    Figure width is capped so large category lists stay page-sized.
     """
-    require_matplotlib()
+    _, mpl = require_matplotlib()
     if kind not in ("stacked", "per_sample"):
         raise ValueError("kind must be 'stacked' or 'per_sample'")
     if study_design is not None:
@@ -270,15 +308,35 @@ def composition(
     panel_key: Hashable = "composition"
     resolved_figsize = figsize
     if resolved_figsize is None and target is None:
-        resolved_figsize = (6.0, 4.0)
-    fig, axes, owns = normalize_axes_target(
-        target,
-        panel_keys=[panel_key],
-        figsize=resolved_figsize,
-    )
-    ax = axes[panel_key]
+        if kind == "per_sample" and pair_col is not None:
+            n_conditions = max(
+                2,
+                int(per_sample["condition"].nunique()) if per_sample is not None else 2,
+            )
+            resolved_figsize = capped_figsize(
+                max(5.5, 0.42 * len(cat_order) * n_conditions + 2.0),
+                3.8,
+            )
+        elif kind == "stacked" and sample_by is not None and per_sample is not None:
+            n_samples = int(per_sample["sample"].nunique())
+            resolved_figsize = capped_figsize(
+                max(4.5, 0.28 * n_samples + 1.8),
+                3.6,
+            )
+        else:
+            resolved_figsize = capped_figsize(
+                max(4.5, 0.35 * len(cat_order) + 1.8),
+                3.6,
+            )
+    edgecolor = scatter_edgecolor(theme)
 
     with theme_context(theme):
+        fig, axes, owns = normalize_axes_target(
+            target,
+            panel_keys=[panel_key],
+            figsize=resolved_figsize,
+        )
+        ax = axes[panel_key]
         if kind == "stacked":
             if sample_by is None:
                 bottom = 0.0
@@ -321,16 +379,17 @@ def composition(
                     [str(s) for s in samples_order], rotation=45, ha="right"
                 )
                 ax.set_ylabel("proportion")
-            ax.legend(frameon=False, bbox_to_anchor=(1.02, 1), loc="upper left")
+            fig.legend(
+                frameon=False,
+                loc="outside right center",
+                title=category_by,
+            )
         else:
             assert per_sample is not None
             if pair_col is not None:
                 valid_conditions = per_sample["condition"].dropna()
                 valid_conditions = valid_conditions[valid_conditions.astype(str) != ""]
-                condition_order = sorted(
-                    valid_conditions.unique(),
-                    key=lambda value: str(value),
-                )
+                condition_order = _sort_conditions(list(valid_conditions.unique()))
                 if len(condition_order) < 2:
                     raise ValueError(
                         "Paired composition requires at least two condition values"
@@ -347,26 +406,80 @@ def composition(
                     for category in cat_order
                     for condition in condition_order
                 ]
+                markers = ["o", "s", "^", "D", "v", "P"]
                 for index, (category, condition) in enumerate(plot_groups):
                     rows = per_sample[
                         (per_sample["category"] == category)
                         & (per_sample["condition"] == condition)
                     ]
                     jitter = (np.arange(len(rows)) - (len(rows) - 1) / 2) * 0.02
+                    condition_index = list(condition_order).index(condition)
                     ax.scatter(
                         np.full(len(rows), index) + jitter,
                         rows["proportion"],
                         c=palette[category],
                         s=40,
-                        edgecolors="k",
+                        marker=markers[condition_index % len(markers)],
+                        edgecolors=edgecolor,
                         linewidths=0.3,
                         zorder=2,
                     )
-                ax.set_xticks(range(len(plot_groups)))
+                # One tick per category (block center); conditions use marker shape.
+                n_conditions = len(condition_order)
+                centers = [
+                    i * n_conditions + (n_conditions - 1) / 2
+                    for i in range(len(cat_order))
+                ]
+                ax.set_xticks(centers)
                 ax.set_xticklabels(
-                    [f"{category}\n{condition}" for category, condition in plot_groups],
+                    [str(category) for category in cat_order],
                     rotation=45,
                     ha="right",
+                )
+                for boundary in range(
+                    n_conditions,
+                    len(plot_groups),
+                    n_conditions,
+                ):
+                    ax.axvline(boundary - 0.5, color="#bdbdbd", linewidth=0.6, zorder=0)
+                handles = [
+                    mpl.lines.Line2D(
+                        [],
+                        [],
+                        marker="o",
+                        linestyle="",
+                        markerfacecolor=palette[cat],
+                        markeredgecolor=edgecolor,
+                        markersize=6,
+                        label=str(cat),
+                    )
+                    for cat in cat_order
+                ]
+                condition_handles = [
+                    mpl.lines.Line2D(
+                        [],
+                        [],
+                        marker=markers[index % len(markers)],
+                        linestyle="",
+                        markerfacecolor="#9e9e9e",
+                        markeredgecolor=edgecolor,
+                        markersize=6,
+                        label=str(condition),
+                    )
+                    for index, condition in enumerate(condition_order)
+                ]
+                legend_cats = fig.legend(
+                    handles=handles,
+                    frameon=False,
+                    loc="outside right upper",
+                    title=category_by,
+                )
+                fig.add_artist(legend_cats)
+                fig.legend(
+                    handles=condition_handles,
+                    frameon=False,
+                    loc="outside right lower",
+                    title="condition",
                 )
             else:
                 for i, cat in enumerate(cat_order):
@@ -377,7 +490,7 @@ def composition(
                         sub["proportion"],
                         c=palette[cat],
                         s=40,
-                        edgecolors="k",
+                        edgecolors=edgecolor,
                         linewidths=0.3,
                         label=str(cat),
                         zorder=2,
@@ -388,8 +501,15 @@ def composition(
                     rotation=45,
                     ha="right",
                 )
+                fig.legend(
+                    frameon=False,
+                    loc="outside right center",
+                    title=category_by,
+                )
             ax.set_ylabel("proportion")
-            ax.set_ylim(-0.02, 1.02)
+            ymax = float(np.nanmax(per_sample["proportion"].to_numpy(dtype=np.float64)))
+            ax.set_ylim(-0.02, min(1.02, max(0.2, ymax * 1.15)))
+        apply_figure_chrome(fig, theme)
 
     tables = {"aggregate": aggregate}
     if per_sample is not None:

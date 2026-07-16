@@ -18,7 +18,12 @@ from ._contracts import (
 from ._data import coerce_feature_list, summarize_features_by_group
 from ._deps import require_matplotlib
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
-from ._style import continuous_norm, theme_context
+from ._style import (
+    apply_figure_chrome,
+    continuous_norm,
+    scatter_edgecolor,
+    theme_context,
+)
 
 
 def _standardize_feature(df: pd.DataFrame, value_col: str = "mean") -> pd.DataFrame:
@@ -109,7 +114,16 @@ def dotplot(
     theme: str = "notebook",
     show: bool = False,
 ) -> PlotResult:
-    """Mean expression (color) and fraction expressing (size) by group."""
+    """Dotplot of expression by group.
+
+    Color is the mean value in the group. Dot size is the fraction of cells
+    above ``expression_cutoff``. Pass ``features`` as a list of genes, or as a
+    mapping of group name to gene list when you want gene-set brackets.
+
+    With ``sample_by`` (or ``study_design.sample_by``), each sample contributes
+    equally: Scarf first summarizes within sample, then averages across samples.
+    Without it, every cell contributes equally.
+    """
     _, mpl = require_matplotlib()
     color_scale = color_scale or ColorScale(cmap="viridis")
     size_scale = size_scale or SizeScale()
@@ -148,30 +162,31 @@ def dotplot(
     resolved_figsize = figsize
     if resolved_figsize is None and target is None:
         resolved_figsize = (
-            max(4.0, 0.35 * len(group_order) + 2),
-            max(3.0, 0.3 * len(feature_order) + 1.5),
+            max(5.0, 0.45 * len(group_order) + 3.0),
+            max(4.0, 0.4 * len(feature_order) + 3.0),
         )
-    fig, axes, owns = normalize_axes_target(
-        target,
-        panel_keys=[panel_key],
-        figsize=resolved_figsize,
-    )
-    ax = axes[panel_key]
-
-    vals = plot_df["mean"].to_numpy(dtype=np.float64)
-    vmin, vmax = _color_limits(vals, color_scale)
-    norm = continuous_norm(
-        mpl,
-        vmin=vmin,
-        vmax=vmax,
-        vcenter=color_scale.vcenter,
-    )
-
-    areas = size_scale.areas(plot_df["fraction"].to_numpy(dtype=np.float64))
-    x = plot_df["group_label"].cat.codes.to_numpy()
-    y = plot_df["feature"].cat.codes.to_numpy()
-
     with theme_context(theme):
+        fig, axes, owns = normalize_axes_target(
+            target,
+            panel_keys=[panel_key],
+            figsize=resolved_figsize,
+        )
+        ax = axes[panel_key]
+
+        vals = plot_df["mean"].to_numpy(dtype=np.float64)
+        vmin, vmax = _color_limits(vals, color_scale)
+        norm = continuous_norm(
+            mpl,
+            vmin=vmin,
+            vmax=vmax,
+            vcenter=color_scale.vcenter,
+        )
+
+        areas = size_scale.areas(plot_df["fraction"].to_numpy(dtype=np.float64))
+        x = plot_df["group_label"].cat.codes.to_numpy()
+        y = plot_df["feature"].cat.codes.to_numpy()
+
+        edgecolor = scatter_edgecolor(theme)
         sc = ax.scatter(
             x,
             y,
@@ -179,7 +194,7 @@ def dotplot(
             s=areas,
             cmap=color_scale.cmap or "viridis",
             norm=norm,
-            edgecolors="k",
+            edgecolors=edgecolor,
             linewidths=0.2,
             rasterized=False,
         )
@@ -190,7 +205,9 @@ def dotplot(
         ax.set_xlim(-0.5, len(group_order) - 0.5)
         ax.set_ylim(-0.5, len(feature_order) - 0.5)
         ax.invert_yaxis()
-        cb = fig.colorbar(sc, ax=ax, shrink=0.6, pad=0.02)
+        cb = fig.colorbar(
+            sc, ax=ax, location="right", shrink=0.7, pad=0.02, fraction=0.05
+        )
         cb.set_label("mean" if standardize == "none" else "standardized mean")
         legend_values = np.array([0.25, 0.5, 0.75, 1.0])
         legend_areas = size_scale.areas(legend_values)
@@ -200,22 +217,25 @@ def dotplot(
                 [],
                 s=area,
                 facecolor="#bdbdbd",
-                edgecolor="k",
+                edgecolor=edgecolor,
                 linewidth=0.2,
             )
             for area in legend_areas
         ]
-        ax.legend(
+        # Keep fraction sizes beside the colorbar, away from x tick labels.
+        fig.legend(
             handles,
             [f"{value:g}" for value in legend_values],
             title="fraction",
             frameon=False,
-            bbox_to_anchor=(1.02, 0),
-            loc="lower left",
-            borderaxespad=0,
+            loc="outside right lower",
+            borderaxespad=0.4,
+            handletextpad=0.4,
+            labelspacing=1.1,
         )
         ax.set_xlabel(" / ".join(group_keys))
         ax.set_ylabel("feature")
+        apply_figure_chrome(fig, theme)
 
     tables = {"aggregate": aggregate}
     if per_sample is not None:
@@ -293,7 +313,14 @@ def matrixplot(
     theme: str = "notebook",
     show: bool = False,
 ) -> PlotResult:
-    """Feature-by-group matrix of mean or fraction (no forced clustering)."""
+    """Heatmap of mean expression or detection fraction by group.
+
+    Unlike a clustered marker heatmap, this does not reorder rows or columns.
+    Use it when you already know the gene and group order you want to show.
+    ``value="mean"`` colors by average expression; ``value="fraction"`` colors
+    by the share of cells above ``expression_cutoff``. ``sample_by`` has the
+    same equal-sample weighting behavior as :func:`dotplot`.
+    """
     _, mpl = require_matplotlib()
     if value not in ("mean", "fraction"):
         raise ValueError("value must be 'mean' or 'fraction'")
@@ -332,15 +359,9 @@ def matrixplot(
     resolved_figsize = figsize
     if resolved_figsize is None and target is None:
         resolved_figsize = (
-            max(4.0, 0.4 * len(group_order) + 2),
-            max(3.0, 0.35 * len(feature_order) + 1.5),
+            max(4.5, 0.45 * len(group_order) + 2.2),
+            max(3.5, 0.4 * len(feature_order) + 2.2),
         )
-    fig, axes, owns = normalize_axes_target(
-        target,
-        panel_keys=[panel_key],
-        figsize=resolved_figsize,
-    )
-    ax = axes[panel_key]
     data = mat.to_numpy(dtype=np.float64)
     vmin, vmax = _color_limits(data, color_scale)
     norm = continuous_norm(
@@ -351,6 +372,12 @@ def matrixplot(
     )
 
     with theme_context(theme):
+        fig, axes, owns = normalize_axes_target(
+            target,
+            panel_keys=[panel_key],
+            figsize=resolved_figsize,
+        )
+        ax = axes[panel_key]
         im = ax.imshow(
             data,
             aspect="auto",
@@ -362,8 +389,17 @@ def matrixplot(
         ax.set_xticklabels(group_order, rotation=45, ha="right")
         ax.set_yticks(range(len(feature_order)))
         ax.set_yticklabels(feature_order)
-        cb = fig.colorbar(im, ax=ax, shrink=0.6, pad=0.02)
+        cb = fig.colorbar(
+            im,
+            ax=ax,
+            location="top",
+            orientation="horizontal",
+            shrink=0.8,
+            fraction=0.06,
+            pad=0.04,
+        )
         cb.set_label(value)
+        apply_figure_chrome(fig, theme)
 
     tables = {"aggregate": aggregate, "matrix": mat.reset_index()}
     if per_sample is not None:

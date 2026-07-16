@@ -214,7 +214,21 @@ ds_ctrl.run_unified_umap(
 )
 ```
 
-Since unified embeddings contain cells from another dataset, `scarf.plotting.embedding` cannot read the complete layout from one metadata table. The supported `plot_unified_layout` compatibility method handles this specialized case. The following example shows co-embedded control (reference) and stimulated (target) PBMCs.
+Since unified embeddings contain cells from another dataset, `scarf.plotting.embedding`
+cannot read the complete layout from one metadata table. Prefer
+`scarf.plotting.unified_embedding`, which returns a `PlotResult` with the same
+square-panel chrome as other `scarf.plotting` figures. The legacy
+`plot_unified_layout` method remains available with its original call style.
+
+```{code-cell} ipython3
+import scarf.plotting as splt
+
+splt.unified_embedding(
+    ds_ctrl,
+    layout_key='unified_UMAP',
+    ref_name='ctrl',
+).figure
+```
 
 ```{code-cell} ipython3
 ds_ctrl.plot_unified_layout(
@@ -234,6 +248,15 @@ ds_ctrl.project_mapping_layout(
 ```
 
 We can visualize only the target cells, i.e IFN-B stimulated cells, in the unified embedding. The target cells can be colored based on their original cluster identity. Target cells of similar types are close together on the unified embedding and overlap with the cell types of the reference data
+
+```{code-cell} ipython3
+splt.unified_embedding(
+    ds_ctrl,
+    layout_key='unified_UMAP',
+    show_target_only=True,
+    target_groups=ds_stim.cells.fetch('cluster_labels'),
+).figure
+```
 
 ```{code-cell} ipython3
 ds_ctrl.plot_unified_layout(

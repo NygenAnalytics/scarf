@@ -2,7 +2,19 @@
 
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Literal
+
+# Shared Scarf figure defaults used by embedding-like plots.
+DEFAULT_POINT_SIZE = 10.0
+DEFAULT_POINT_EDGEWIDTH = 0.1
+DEFAULT_RASTERIZE_THRESHOLD = 50_000
+DEFAULT_PANEL_INCHES = 3.2
+MAX_FIGURE_WIDTH_INCHES = 7.5
+LEGEND_SIDE_MAX_CATEGORIES = 12
+LEGEND_ON_DATA_MAX_CATEGORIES = 40
+
+LegendLoc = Literal["auto", "right", "on_data", "none"]
+FrameStyle = Literal["axes", "minimal", "none"]
 
 # Lifted from scanpy.plotting.palettes (also used by legacy scarf.plots).
 CUSTOM_PALETTES: dict[int, list[str]] = {
@@ -186,6 +198,12 @@ THEMES: dict[str, dict[str, Any]] = {
         "legend.fontsize": 7,
         "axes.linewidth": 0.6,
         "lines.linewidth": 0.8,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.transparent": False,
         "svg.fonttype": "none",
         "pdf.fonttype": 42,
         "savefig.dpi": 300,
@@ -199,6 +217,12 @@ THEMES: dict[str, dict[str, Any]] = {
         "ytick.labelsize": 9,
         "legend.fontsize": 9,
         "axes.linewidth": 0.8,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.transparent": False,
         "svg.fonttype": "none",
         "pdf.fonttype": 42,
         "savefig.dpi": 150,
@@ -208,10 +232,88 @@ THEMES: dict[str, dict[str, Any]] = {
         "font.size": 9,
         "axes.spines.top": False,
         "axes.spines.right": False,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+        "savefig.facecolor": "white",
+        "savefig.transparent": False,
         "svg.fonttype": "none",
         "pdf.fonttype": 42,
     },
+    "dark": {
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "legend.fontsize": 9,
+        "axes.linewidth": 0.8,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "figure.facecolor": "none",
+        "axes.facecolor": "none",
+        "savefig.facecolor": "none",
+        "savefig.transparent": True,
+        "text.color": "#e8e8e8",
+        "axes.labelcolor": "#e8e8e8",
+        "axes.edgecolor": "#e8e8e8",
+        "xtick.color": "#e8e8e8",
+        "ytick.color": "#e8e8e8",
+        "axes.titlecolor": "#e8e8e8",
+        "svg.fonttype": "none",
+        "pdf.fonttype": 42,
+        "savefig.dpi": 150,
+        "figure.dpi": 100,
+    },
 }
+
+
+def default_point_size(n_cells: int) -> float:
+    """Marker area that stays readable from small demos to atlas-scale clouds."""
+    n = max(0, int(n_cells))
+    if n < 500:
+        return 16.0
+    if n < 2_000:
+        return 12.0
+    if n < 10_000:
+        return 8.0
+    if n < 50_000:
+        return 4.0
+    return 2.0
+
+
+def default_point_edgewidth(n_cells: int) -> float:
+    """Drop point edges once density would turn outlines into mud."""
+    n = max(0, int(n_cells))
+    if n < 2_000:
+        return 0.15
+    if n < 10_000:
+        return 0.05
+    return 0.0
+
+
+def resolve_legend_loc(n_categories: int, legend_loc: LegendLoc = "auto") -> LegendLoc:
+    """Choose a legend placement that survives many clusters."""
+    if legend_loc != "auto":
+        if legend_loc not in ("right", "on_data", "none"):
+            raise ValueError(
+                "legend_loc must be one of 'auto', 'right', 'on_data', 'none'"
+            )
+        return legend_loc
+    if n_categories <= LEGEND_SIDE_MAX_CATEGORIES:
+        return "right"
+    if n_categories <= LEGEND_ON_DATA_MAX_CATEGORIES:
+        return "on_data"
+    return "none"
+
+
+def capped_figsize(
+    width: float,
+    height: float,
+    *,
+    max_width: float = MAX_FIGURE_WIDTH_INCHES,
+) -> tuple[float, float]:
+    """Clamp figure width so atlas-scale category counts stay page-sized."""
+    return (min(float(width), float(max_width)), float(height))
 
 
 def palette_for_n(n: int) -> list[str]:
@@ -264,6 +366,83 @@ def continuous_norm(
     if not vmin < vcenter < vmax:
         raise ValueError("vcenter must be strictly between the color limits")
     return mpl.colors.TwoSlopeNorm(vmin=vmin, vcenter=vcenter, vmax=vmax)
+
+
+def square_axis_limits(
+    xlim: tuple[float, float],
+    ylim: tuple[float, float],
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Pad axis limits so the data window is square.
+
+    Keeps equal-aspect embeddings visually square after legends and colorbars
+    shrink the available axes width.
+    """
+    x0, x1 = float(xlim[0]), float(xlim[1])
+    y0, y1 = float(ylim[0]), float(ylim[1])
+    span = max(x1 - x0, y1 - y0, 1e-12)
+    cx = 0.5 * (x0 + x1)
+    cy = 0.5 * (y0 + y1)
+    half = 0.5 * span
+    return (cx - half, cx + half), (cy - half, cy + half)
+
+
+def scatter_edgecolor(theme: str = "notebook") -> str:
+    """Marker edge color that stays readable on light and dark themes."""
+    if theme == "dark":
+        return "#f0f0f0"
+    return "#333333"
+
+
+def finish_embedding_axes(
+    ax: Any,
+    *,
+    xlim: tuple[float, float],
+    ylim: tuple[float, float],
+    xlabel: str = "",
+    ylabel: str = "",
+    title: str | None = None,
+    frame: FrameStyle = "minimal",
+) -> None:
+    """Apply shared Scarf chrome to a 2D embedding axes."""
+    if frame not in ("axes", "minimal", "none"):
+        raise ValueError("frame must be one of 'axes', 'minimal', 'none'")
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_box_aspect(1)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if frame == "axes":
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+    else:
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+    if frame == "none" and hasattr(ax, "spines"):
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+    if title:
+        ax.set_title(title)
+
+
+def apply_figure_chrome(figure: Any, theme: str = "notebook") -> None:
+    """Apply Scarf figure background and spine defaults after axes creation."""
+    opaque = theme != "dark"
+    if opaque:
+        figure.patch.set_facecolor("white")
+        figure.patch.set_alpha(1.0)
+    else:
+        figure.patch.set_alpha(0)
+    hide_top_right = theme != "framed"
+    for ax in figure.axes:
+        if opaque:
+            ax.patch.set_facecolor("white")
+            ax.patch.set_alpha(1.0)
+        else:
+            ax.patch.set_alpha(0)
+        if hide_top_right and hasattr(ax, "spines"):
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
 
 
 @contextmanager

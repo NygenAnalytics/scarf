@@ -241,7 +241,7 @@
 
 ```{eval-rst}
 .. automodule:: scarf.plotting
-    :members: embedding, embedding_raster, dotplot, matrixplot, composition, distribution, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, theme_context
+    :members: embedding, embedding_raster, unified_embedding, dotplot, matrixplot, composition, distribution, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, theme_context
     :undoc-members:
     :show-inheritance:
 ```
