@@ -823,14 +823,12 @@ def test_run_marker_search_skip_save_and_errors(
     markers = {"cluster": object()}
     finder = Mock(return_value=markers)
     monkeypatch.setattr("scarf.markers.find_markers_by_rank", finder)
-    prenormed_group = store.zw.create_group("coveragePrenormed")
 
     with pytest.raises(ValueError, match="group_key"):
         store.run_marker_search(group_key=None)
 
     result = store.run_marker_search(
         group_key="ids",
-        prenormed_store="coveragePrenormed",
         skip_save=True,
     )
     assert result is markers
@@ -841,7 +839,6 @@ def test_run_marker_search_skip_save_and_errors(
     assert first_call["feat_key"] == "I"
     assert first_call["batch_size"] >= 1
     assert first_call["n_threads"] == store.nthreads
-    assert first_call["prenormed_store"].path == "coveragePrenormed"
     assert "I__ids" not in store.zw["RNA/markers"]
 
     finder.reset_mock()
@@ -850,8 +847,6 @@ def test_run_marker_search_skip_save_and_errors(
         cell_key="I",
         feat_key="I",
         gene_batch_size=2,
-        use_prenormed=True,
-        prenormed_store=prenormed_group,
         n_threads=3,
         skip_save=True,
         log_transform=False,
@@ -859,17 +854,8 @@ def test_run_marker_search_skip_save_and_errors(
     assert result is markers
     second_call = finder.call_args.kwargs
     assert second_call["batch_size"] == 2
-    assert second_call["use_prenormed"] is True
-    assert second_call["prenormed_store"] is prenormed_group
     assert second_call["n_threads"] == 3
     assert second_call["log_transform"] is False
-
-    with pytest.raises(KeyError):
-        store.run_marker_search(
-            group_key="ids",
-            prenormed_store="missing",
-            skip_save=True,
-        )
 
     finder.side_effect = RuntimeError("marker failure")
     with pytest.raises(RuntimeError, match="marker failure"):

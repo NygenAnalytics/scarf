@@ -1,20 +1,16 @@
 """Module to find biomarkers."""
 
-from collections.abc import Generator
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import numba
-from numba import jit, njit, prange, set_num_threads
+from numba import njit, prange, set_num_threads
 from scipy.stats import linregress, norm
-from scipy.stats import rankdata
-import zarr
 
-from scarf._types import as_zarr_array, as_zarr_group
 from scarf.assay import Assay, RNAassay, norm_lib_size
 from scarf.chunked import ChunkedArray
-from scarf.utils import logger, tqdmbar
+from scarf.utils import logger
 
 _MARKER_SORT_BY = ("score", "p_value")
 _MARKER_SORT_ASCENDING = (False, True)
@@ -64,22 +60,6 @@ def sort_marker_results(df: pd.DataFrame) -> pd.DataFrame:
         sort_by.append("feature_index")
         ascending.append(True)
     return frame.sort_values(by=sort_by, ascending=ascending)
-
-
-def read_prenormed_batches(
-    store: zarr.Group,
-    cell_idx: np.ndarray,
-    batch_size: int,
-    desc: str,
-) -> Generator[pd.DataFrame, None, None]:
-    batch: dict[int, np.ndarray] = {}
-    for i in tqdmbar(store.keys(), desc=desc):
-        batch[int(i)] = np.asarray(as_zarr_array(store[str(i)])[cell_idx])
-        if len(batch) == batch_size:
-            yield pd.DataFrame(batch)
-            batch = {}
-    if len(batch) > 0:
-        yield pd.DataFrame(batch)
 
 
 def mannwhitneyu_from_ranks(
@@ -286,8 +266,6 @@ def find_markers_by_rank(
     cell_key: str,
     feat_key: str,
     batch_size: int,
-    use_prenormed: bool,
-    prenormed_store: zarr.Group | None,
     n_threads: int,
     prefetch_depth: int = 1,
     **norm_params: Any,
@@ -304,8 +282,6 @@ def find_markers_by_rank(
         cell_key: Column name in cell metadata indicating which cells to use
         feat_key: Column name in feature metadata indicating which features to analyze
         batch_size: Number of features to process at once for memory efficiency
-        use_prenormed: Whether to use pre-normalized data if available
-        prenormed_store: Name of the store containing pre-normalized data
         n_threads: Number of threads to use for parallel processing
         prefetch_depth: Number of feature batches to read ahead in parallel
         **norm_params: Additional parameters to pass to normalization functions
@@ -314,52 +290,6 @@ def find_markers_by_rank(
         dict: Dictionary containing marker analysis results for each group, with statistics
               like fold changes, two-sided p-values, and effect sizes
     """
-
-    from concurrent.futures import ThreadPoolExecutor
-
-    @jit(nopython=True)
-    def calc_rank_mean(v: np.ndarray) -> np.ndarray:
-        """Calculates the mean rank of the data."""
-        r = np.ones(n_groups)
-        for x in range(n_groups):
-            r[x] = v[int_indices == x].mean()
-        return np.asarray(r / r.sum())
-
-    @jit(nopython=True)
-    def calc_frac_fc(
-        v: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Calculates the mean rank of the data."""
-        m = np.zeros(n_groups)
-        m_o = np.zeros(n_groups)
-        e = np.zeros(n_groups)
-        e_o = np.zeros(n_groups)
-        fc = np.zeros(n_groups)
-        for x in range(n_groups):
-            i = int_indices == x
-            m[x] = v[i].mean()
-            m_o[x] = v[~i].mean()
-            e[x] = v[i].nonzero()[0].shape[0] / i.sum()
-            e_o[x] = v[~i].nonzero()[0].shape[0] / (i.shape[0] - i.sum())
-            if m_o[x] == 0:
-                fc[x] = 100.100
-            else:
-                fc[x] = m[x] / (m_o[x])
-        return m, m_o, e, e_o, fc
-
-    def prenormed_mean_rank_wrapper(
-        item: tuple[int | str, np.ndarray],
-    ) -> tuple[int | str, np.ndarray]:
-        gene_idx, d = item
-        r = calc_rank_mean(rankdata(d, method="dense"))
-        m, m_o, e, e_o, fc = calc_frac_fc(d)
-        # Calculate p-values for this single feature
-        ranked_d = rankdata(d, method="average").reshape(-1, 1)
-        ranked_df = pd.DataFrame(ranked_d)
-        pvals_df = mannwhitneyu_from_ranks(ranked_df, groups, group_set)
-        p = pvals_df.iloc[:, 0].values  # Extract p-values for all groups
-        return gene_idx, np.vstack([r, m, m_o, e, e_o, fc, p])
-
     groups = assay.cells.fetch(group_key, cell_key)
     group_set = np.array(sorted(set(groups)))
     n_groups = len(group_set)
@@ -376,144 +306,89 @@ def find_markers_by_rank(
         "p_value",
     ]
     results: dict[Any, pd.DataFrame] = {}
-    if use_prenormed:
-        if prenormed_store is None:
-            if "prenormed" in assay.z:
-                prenormed_store = as_zarr_group(assay.z["prenormed"], name="prenormed")
-            else:
-                raise ValueError(
-                    "Could not find prenormed values. Run with use_prenormed=False or create pre-normed values."
-                )
+    set_num_threads(min(max(1, n_threads), numba.config.NUMBA_NUM_THREADS))
+    group_counts = pd.Series(groups).value_counts().reindex(group_set).values
+    n_total = len(groups)
 
-        prenormed_rows: dict[Any, list[list[Any]]] = {x: [] for x in group_set}
-        cell_idx = assay.cells.active_index(cell_key)
-        gene_keys = list(prenormed_store.keys())
-        n_batches = (len(gene_keys) + batch_size - 1) // batch_size
+    renormalize_subset = bool(norm_params.get("renormalize_subset", False))
+    log_transform = bool(norm_params.get("log_transform", False))
+    use_fast = (
+        assay.normMethod is norm_lib_size
+        and not renormalize_subset
+        and assay.sf is not None
+    )
 
-        def read_gene(gene_idx: int | str) -> tuple[int | str, np.ndarray]:
-            values = np.asarray(as_zarr_array(prenormed_store[str(gene_idx)])[cell_idx])
-            return gene_idx, values
-
-        def process_batches(executor: ThreadPoolExecutor | None) -> None:
-            batch_starts = range(0, len(gene_keys), batch_size)
-            for start in tqdmbar(batch_starts, desc="Finding markers", total=n_batches):
-                keys = gene_keys[start : start + batch_size]
-                if executor is None:
-                    values = [read_gene(key) for key in keys]
-                else:
-                    values = list(executor.map(read_gene, keys))
-                if executor is None:
-                    batch_results = [
-                        prenormed_mean_rank_wrapper(value) for value in values
-                    ]
-                else:
-                    batch_results = list(
-                        executor.map(prenormed_mean_rank_wrapper, values)
-                    )
-                for gene_idx, stats in batch_results:
-                    for group_id, group_stats in zip(group_set, stats.T, strict=True):
-                        prenormed_rows[group_id].append([gene_idx] + list(group_stats))
-
-        if n_threads > 1:
-            with ThreadPoolExecutor(max_workers=n_threads) as executor:
-                process_batches(executor)
-        else:
-            process_batches(None)
-        for group_id, rows in prenormed_rows.items():
-            frame = pd.DataFrame(rows, columns=out_cols)
-            cols_to_round = [col for col in frame.columns if col != "p_value"]
-            frame.loc[:, cols_to_round] = frame.loc[:, cols_to_round].round(5)
-            results[group_id] = sort_marker_results(frame)
-        return results
-    else:
-        set_num_threads(min(max(1, n_threads), numba.config.NUMBA_NUM_THREADS))
-        group_counts = pd.Series(groups).value_counts().reindex(group_set).values
-        n_total = len(groups)
-
-        renormalize_subset = bool(norm_params.get("renormalize_subset", False))
-        log_transform = bool(norm_params.get("log_transform", False))
-        use_fast = (
-            assay.normMethod is norm_lib_size
-            and not renormalize_subset
-            and assay.sf is not None
-        )
-
-        if use_fast:
-            if not isinstance(assay, RNAassay):
-                raise TypeError(
-                    "Fast raw-count marker search requires an RNAassay instance"
-                )
-            cell_idx = assay.cells.active_index(cell_key)
-            feat_idx = assay.feats.active_index(feat_key)
-            n_batches = max(1, (len(feat_idx) + batch_size - 1) // batch_size)
-            logger.debug(
-                f"Marker search (fast): {len(feat_idx)} features, {n_groups} groups, "
-                f"{n_batches} batches of {batch_size}"
+    if use_fast:
+        if not isinstance(assay, RNAassay):
+            raise TypeError(
+                "Fast raw-count marker search requires an RNAassay instance"
             )
-            scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
-            sf = assay.sf
-            if sf is None:
-                raise ValueError(
-                    "RNA library-size normalization requires a size factor"
-                )
-            scalar_col = np.asarray(scalar, dtype=np.float32).reshape(-1, 1)
-            scalar_col[scalar_col == 0] = 1
-            batch_stats: list[np.ndarray] = []
-            for (
-                _block_idx,
-                raw,
-                _cols,
-                _read_sec,
-                _source,
-            ) in assay.iter_raw_column_blocks(
-                cell_idx=cell_idx,
-                feat_idx=feat_idx,
+        cell_idx = assay.cells.active_index(cell_key)
+        feat_idx = assay.feats.active_index(feat_key)
+        n_batches = max(1, (len(feat_idx) + batch_size - 1) // batch_size)
+        logger.debug(
+            f"Marker search (fast): {len(feat_idx)} features, {n_groups} groups, "
+            f"{n_batches} batches of {batch_size}"
+        )
+        scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
+        sf = assay.sf
+        if sf is None:
+            raise ValueError("RNA library-size normalization requires a size factor")
+        scalar_col = np.asarray(scalar, dtype=np.float32).reshape(-1, 1)
+        scalar_col[scalar_col == 0] = 1
+        batch_stats: list[np.ndarray] = []
+        for (
+            _block_idx,
+            raw,
+            _cols,
+            _read_sec,
+            _source,
+        ) in assay.iter_raw_column_blocks(
+            cell_idx=cell_idx,
+            feat_idx=feat_idx,
+            batch_size=batch_size,
+            msg="Finding markers",
+        ):
+            normed = (float(sf) * raw.astype(np.float32)) / scalar_col
+            if log_transform:
+                normed = np.log1p(normed)
+            stats = _batch_stats(normed, int_indices, group_counts, n_total)
+            batch_stats.append(stats)
+        stats_matrix = np.vstack(batch_stats)
+    else:
+        batch_stats = []
+        iterator = iter(
+            assay.iter_normed_feature_wise(
+                cell_key=cell_key,
+                feat_key=feat_key,
                 batch_size=batch_size,
                 msg="Finding markers",
-            ):
-                normed = (float(sf) * raw.astype(np.float32)) / scalar_col
-                if log_transform:
-                    normed = np.log1p(normed)
-                stats = _batch_stats(normed, int_indices, group_counts, n_total)
-                batch_stats.append(stats)
-            stats_matrix = np.vstack(batch_stats)
-        else:
-            feat_index = assay.feats.active_index(feat_key)
-            batch_stats = []
-            iterator = iter(
-                assay.iter_normed_feature_wise(
-                    cell_key=cell_key,
-                    feat_key=feat_key,
-                    batch_size=batch_size,
-                    msg="Finding markers",
-                    **norm_params,
-                )
+                **norm_params,
             )
-            while True:
-                try:
-                    mat = next(iterator)
-                except StopIteration:
-                    break
-                values = mat.to_numpy() if isinstance(mat, pd.DataFrame) else mat[0]
-                stats = _batch_stats(
-                    values,
-                    int_indices,
-                    group_counts,
-                    n_total,
-                )
-                batch_stats.append(stats)
-            stats_matrix = np.vstack(batch_stats)
-        feat_index = assay.feats.active_index(feat_key)
-        pval_col = "p_value"
-        for n, i in enumerate(group_set):
-            df = pd.DataFrame(
-                stats_matrix[:, n, :], columns=out_cols[1:], index=feat_index
+        )
+        while True:
+            try:
+                mat = next(iterator)
+            except StopIteration:
+                break
+            values = mat.to_numpy() if isinstance(mat, pd.DataFrame) else mat[0]
+            stats = _batch_stats(
+                values,
+                int_indices,
+                group_counts,
+                n_total,
             )
-            cols_to_round = [col for col in df.columns if col != pval_col]
-            df.loc[:, cols_to_round] = df.loc[:, cols_to_round].round(5)
-            df["feature_index"] = df.index
-            results[i] = sort_marker_results(df)[out_cols]
-        return results
+            batch_stats.append(stats)
+        stats_matrix = np.vstack(batch_stats)
+    feat_index = assay.feats.active_index(feat_key)
+    pval_col = "p_value"
+    for n, i in enumerate(group_set):
+        df = pd.DataFrame(stats_matrix[:, n, :], columns=out_cols[1:], index=feat_index)
+        cols_to_round = [col for col in df.columns if col != pval_col]
+        df.loc[:, cols_to_round] = df.loc[:, cols_to_round].round(5)
+        df["feature_index"] = df.index
+        results[i] = sort_marker_results(df)[out_cols]
+    return results
 
 
 def find_markers_by_regression(

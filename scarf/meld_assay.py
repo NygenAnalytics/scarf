@@ -24,7 +24,7 @@ import zarr
 from .assay import Assay
 from .storage.zarr_store import accumulate_sparse_to_shards
 from .utils import logger, tqdmbar
-from .writers import create_zarr_count_assay
+from .writers import create_zarr_count_assay, finalize_writer_counts
 
 __all__ = ["GffReader", "coordinate_melding"]
 
@@ -531,4 +531,5 @@ def coordinate_melding(
         scalar_coeff=scalar_coeff,
         renormalization=renormalization,
     )
+    finalize_writer_counts(store_root, new_assay_name, workspace)
     return None

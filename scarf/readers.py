@@ -5,7 +5,6 @@
     - CrDirReader: A class to read in CellRanger (Cr) data, in the form of a directory.
     - CrReader: A class to read in CellRanger (Cr) data.
     - H5adReader: A class to read in data in the form of a H5ad file (h5 file with AnnData information).
-    - NaboH5Reader: A class to read in data in the form of a Nabo H5 file.
     - LoomReader: A class to read in data in the form of a Loom file.
 """
 
@@ -28,7 +27,6 @@ __all__ = [
     "CrDirReader",
     "CrReader",
     "H5adReader",
-    "NaboH5Reader",
     "LoomReader",
     "CSVReader",
 ]
@@ -1010,59 +1008,6 @@ class H5adReader:
         raise ValueError(
             f"ERROR: {self.matrixKey} is neither Dataset or Group type. Will not consume data"
         )
-
-
-class NaboH5Reader:
-    """A class to read in data in the form of a Nabo H5 file.
-
-    Args:
-        h5_fn: Path to H5 file.
-
-    Attributes:
-        h5: A File object from the h5py package.
-        nCells: Number of cells in dataset.
-        nFeatures: Number of features in dataset.
-    """
-
-    def __init__(self, h5_fn: str) -> None:
-        self.h5: h5py.File = h5py.File(h5_fn, mode="r")
-        self._check_integrity()
-        self.nCells = self.h5["names"]["cells"].shape[0]
-        self.nFeatures = self.h5["names"]["genes"].shape[0]
-
-    def _check_integrity(self) -> bool:
-        for i in ["cell_data", "gene_data", "names"]:
-            if i not in self.h5:
-                raise KeyError(f"ERROR: Expected group: {i} is missing in the H5 file")
-        return True
-
-    def cell_ids(self) -> list[str]:
-        """Returns a list of cell IDs."""
-        return [x.decode("UTF-8") for x in self.h5["names"]["cells"][:]]
-
-    def feat_ids(self) -> np.ndarray:
-        """Returns a list of feature IDs."""
-        return np.array([f"feature_{x}" for x in range(self.nFeatures)])
-
-    def feat_names(self) -> list[str]:
-        """Returns a list of feature names."""
-        return [
-            x.decode("UTF-8").rsplit("_", 1)[0] for x in self.h5["names"]["genes"][:]
-        ]
-
-    def consume(self, batch_size: int = 100) -> Generator[np.ndarray, None, None]:
-        """Returns a generator that yield chunks of data."""
-        batch = []
-        for i in self.h5["cell_data"]:
-            a = np.zeros(self.nFeatures).astype(int)
-            v = self.h5["cell_data"][i][:][::-1]
-            a[v["idx"]] = v["val"]
-            batch.append(a)
-            if len(batch) >= batch_size:
-                yield np.array(batch)
-                batch = []
-        if len(batch) > 0:
-            yield np.array(batch)
 
 
 class LoomReader:

@@ -1,6 +1,6 @@
 # Scarf cloud profiling learnings (100k → 1M)
 
-Date range: 2026-07-14 to 2026-07-16  
+Date range: 2026-07-14 to 2026-07-17  
 Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`  
 Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)  
 Dataset source: nested CELLxGENE samples already prepared on R2
@@ -47,8 +47,10 @@ Two different numbers matter:
 | `auto_markers_c4_m16` | 100k | 4 | 16 GiB | ~12 GiB | Both Modal and Scarf cut together |
 | `auto_markers_c8_m32` | 100k | 8 | 32 GiB | ~24 GiB | Speed pack (UMAP/ANN parallel) |
 | `auto_markers_c8_m32_250k` | 250k | 8 | 32 GiB | ~24 GiB | Same speed pack |
-| `auto_markers_c8_m48_500k` | 500k | 8 | 48 GiB | 36 GiB | Done; 4339s, max peak ~10 GiB |
+| `auto_markers_c8_m48_500k` | 500k | 8 | 48 GiB | 36 GiB | Done; 4339s; makeGraph peak 9.3G looks low vs re-run |
+| `auto_markers_c8_m32_500k` | 500k | 8 | 32 GiB | 24 GiB | Right-size re-run; 3906s, max peak **23.0 GiB** (makeGraph) |
 | `auto_markers_c8_m64_1m` | 1M | 8 | 64 GiB | 48 GiB | Done; 9156s, max peak 28.3 GiB (makeGraph) |
+| `auto_markers_c8_m64_2_5m` | 2.5M | 8 | 64 GiB | 48 GiB | In progress; createStore 1778s / 6.3G |
 
 Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.md` as the durable record; recreate TOMLs from these rows when needed.
 
@@ -78,6 +80,8 @@ auto_markers_c8_m32_250k=fc-01KXK8BRWK9P50XW0NY4FWE378
 auto_markers_c8_m48_500k=fc-01KXKE1ZCG0FG7KFEQ1H0QX35K
 auto_markers_c4_m32_scarf16=fc-01KXKEX6N0N44661M6ZX26NX9C
 auto_markers_c8_m64_1m=fc-01KXKR82TFWSJS9EP1E4P5ZXCJ
+auto_markers_c8_m64_2_5m=fc-01KXPCAS3GEFWQ19E9RMJKEFJ6
+auto_markers_c8_m32_500k=fc-01KXPCBMZGBQ02YCB9W1EKPF92
 ```
 
 ## Layout sweep @ 100k (4 CPU / 32 GiB)
@@ -195,10 +199,21 @@ Configs:
 |------|---------------------------|---------|-------|
 | 100k | `auto_markers_c8_m32` | 8 CPU / 32 GiB | Fastest 100k funnel (1095s) |
 | 250k | `auto_markers_c8_m32_250k` | 8 CPU / 32 GiB | Same settings; 2346s, max peak 14.6 GiB |
-| 500k | `auto_markers_c8_m48_500k` | 8 CPU / 48 GiB | 4339s; Modal RAM was generous vs peaks |
+| 500k | `auto_markers_c8_m32_500k` | 8 CPU / 32 GiB | Prefer over 48G run; 3906s, makeGraph peak 23 GiB |
 | 1M | `auto_markers_c8_m64_1m` | 8 CPU / 64 GiB | 9156s; makeGraph peak 28.3 GiB justifies 64 GiB |
 
 For a pure markers comparison at 100k without parallel UMAP noise, use `auto_markers_c4_m32` (269s markers).
+
+## Scale summary (wall + max peak, speed pack)
+
+| Cells | Tag | Modal | Total wall | Max peak | Stage at max peak |
+|------:|-----|------:|-----------:|---------:|-------------------|
+| 100k | `auto_markers_c8_m32` | 32 GiB | 1095s | 7.1 GiB | findMarkers |
+| 250k | `auto_markers_c8_m32_250k` | 32 GiB | 2346s | 14.6 GiB | makeGraph |
+| 500k | `auto_markers_c8_m32_500k` | 32 GiB | 3906s | **23.0 GiB** | makeGraph |
+| 1M | `auto_markers_c8_m64_1m` | 64 GiB | 9156s | **28.3 GiB** | makeGraph |
+
+Rough Modal RAM floor from peaks: 100k ≥8 GiB, 250k ≥16 GiB, 500k ≥24–32 GiB, 1M ≥32–64 GiB.
 
 ## Budget mismatch @ 100k: Modal 32 GiB, Scarf 16 GiB (done)
 
@@ -219,29 +234,32 @@ Tag `auto_markers_c4_m32_scarf16`. Matched to `c4_m32` (4 CPU, workers=4, workin
 ## Open questions
 
 1. Why scarf16 markers faster than c4_m32 despite smaller software budget?
-2. Can HVG use memory/CPU more productively (still ~1–1.4 GiB peak while taking 20%+ of wall)? Partial answer: IO baseline `hvgTiles` matched most of markHvgs wall (see below).
-3. Why did 8 workers slow markers vs 4 at 100k?
-4. makeGraph cgroup peak 250k→500k drop: re-measure with clean A/B before trusting.
-5. Feature-major secondary matrix for gene-wise stages: **tabled** until IO baseline finishes cleanly; revisit with 1M HVG/marker evidence.
+2. Why did 8 workers slow markers vs 4 at 100k?
+3. Feature-major secondary matrix for gene-wise stages: **ready to revisit**; IO baseline shows HVG/markers ~91–99% IO on row-sharded cloud Zarr.
+4. 2.5M at 64 GiB: will makeGraph OOM? (1M peaked 28 GiB)
 
-## Scale: 500k (8 CPU / 48 GiB, region `eu`)
+## Scale: 500k
 
-Tag `auto_markers_c8_m48_500k`. Same speed-pack knobs as 100k/250k (workers=8, workingCopies=4, UMAP/ANN parallel, auto markers). Modal 48 GiB / Scarf 36 GiB. Respawned late stages onto broad region `eu` after `eu-west-1` capacity stalls.
+### First run @ 48 GiB (superseded for peaks)
 
-| Stage | 100k | 250k | 500k | 250→500 time |
-|-------|-----:|-----:|-----:|-------------:|
-| createStore | 104s / 3.5G | 264s / 3.8G | 474s / 4.5G | 1.80× |
-| initializeStore | 141s / 6.4G | 320s / 6.6G | 592s / 7.0G | 1.85× |
-| markHvgs | 241s / 1.1G | 585s / 1.3G | 1095s / 1.1G | 1.87× |
-| makeGraph | 168s / 6.3G | 307s / 14.6G | 436s / 9.3G | 1.42× |
-| runUmap | 58s / 0.7G | 101s / 0.9G | 143s / 1.2G | 1.42× |
-| runLeiden | 25s / 0.7G | 51s / 1.1G | 100s / 1.4G | 1.96× |
-| findMarkers | 331s / 7.1G | 688s / 8.8G | 1473s / 10.1G | 2.14× |
-| **total** | **1095s** | **2346s** | **4339s** | **1.85×** |
+Tag `auto_markers_c8_m48_500k`. Modal 48 GiB / Scarf 36 GiB. Call resume `fc-01KXKH7Z9V88NXFG2DJ204C8C8`. Total **4339s**. Reported makeGraph peak 9.3 GiB is inconsistent with the 32 GiB re-run below; do not size machines from that 9.3 GiB figure.
 
-Cells 250k→500k is 2×; wall time 1.85× (slightly better than linear). Max peak at 500k ~10.1 GiB (markers), so 48 GiB was generous. makeGraph cgroup peak 9.3 GiB is *below* 250k's 14.6 GiB; treat that drop cautiously (cgroup vs RSS gap on 250k, restart mid-run). See discussion in chat / prefer RSS for graph sizing.
+### Right-size re-run @ 32 GiB (preferred)
 
-Call ids: original `fc-01KXKE1ZCG0FG7KFEQ1H0QX35K` (cancelled); eu resume `fc-01KXKH7Z9V88NXFG2DJ204C8C8`.
+Tag `auto_markers_c8_m32_500k`. Modal 32 GiB / Scarf 24 GiB. Call `fc-01KXPCBMZGBQ02YCB9W1EKPF92`.
+
+| Stage | 100k | 250k | 500k@32G | 250→500 time | Peak 500k@32G |
+|-------|-----:|-----:|---------:|-------------:|--------------:|
+| createStore | 104s | 264s | 402s | 1.52× | 4.4G |
+| initializeStore | 141s | 320s | 841s | 2.63× | 6.4G |
+| markHvgs | 241s | 585s | 1062s | 1.82× | 1.3G |
+| makeGraph | 168s | 307s | 585s | 1.91× | **23.0G** |
+| runUmap | 58s | 101s | 166s | 1.64× | 1.1G |
+| runLeiden | 25s | 51s | 88s | 1.73× | 1.4G |
+| findMarkers | 331s | 688s | 732s | 1.06× | 6.4G |
+| **total** | **1095s** | **2346s** | **3906s** | **1.66×** | **23.0G** |
+
+32 GiB is tight but worked (makeGraph 23 GiB peak). Faster wall than the 48 GiB run (3906 vs 4339) despite less RAM; geometry/noise and queue effects may differ. Prefer **23 GiB** as the 500k makeGraph sizing number.
 
 ## Scale: 1M (8 CPU / 64 GiB, region `eu`)
 
@@ -264,23 +282,46 @@ Cells 500k→1M is 2×; wall ~2.11×. **makeGraph is the outlier** (~3.4× time,
 
 First cold open after `createStore` with QC thresholds. It is not a cheap open: it streams the raw matrix to compute per-gene `nCells` / dropOuts and per-cell `nCounts` / `nFeatures` / percentMito / percentRibo, then applies min-feature filters. Later stages use `initialize=False` and skip that work (`reopenStore` ~6s at 1M). Wall scales roughly with cells; peak stays ~7 GiB (IO/reduction bound).
 
-## IO baseline (1M, same machine; partial)
+## IO baseline (1M, done)
 
-Goal: no-compute stream of HVG / marker / makeGraph read patterns on
+No-compute stream of HVG / marker / makeGraph read patterns on
 `s3://scarf-tests/scarf-profiling/stores/auto_markers_c8_m64_1m/1000000.zarr`
-at 8 CPU / 64 GiB / `eu`, to separate R2+layout cost from Scarf compute.
+at 8 CPU / 64 GiB / `eu`. Spawn via deployed `io_baseline_job` (not long `.remote()`).
+Result: `s3://scarf-tests/scarf-profiling/io-baseline/auto_markers_c8_m64_1m.json`.
 
-Script: `profiling/io_baseline.py`. Must be spawned (not long `.remote()`); write result to
-`{resultsUri}/io-baseline/{runTag}.json`.
+Active cells after QC ~890k; feats ~32.7k; HVGs 2000; auto marker batch 452; raw chunks `(11671, 500)`.
 
-| Pattern | Status | Wall | Peak RSS | Bytes read | Notes |
-|---------|--------|-----:|---------:|-----------:|-------|
-| openStore | done | 7.7s | 0.53 GiB | - | Like reopen; QC columns already present |
-| hvgTiles | done | **2347s** | 1.0 GiB | 108.4 GiB | 7912 physical tiles, chunks `(11671, 500)` |
-| markerBatches | cancelled | - | - | - | Died ~batch 12/73 after local client disconnect |
-| makeGraphRawCellBands | not run | | | | |
-| makeGraphNormedCellBands | not run | | | | |
+| Pattern | Wall | Peak RSS | Bytes | Notes |
+|---------|-----:|---------:|------:|-------|
+| openStore | 6s | 0.52 GiB | - | QC columns already present |
+| hvgTiles | **2510s** | 1.01 GiB | 108.4 GiB | 7912 physical tiles |
+| markerBatches | **2158s** | 6.91 GiB | 108.4 GiB | 73 gene batches |
+| makeGraphRawCellBands | 502s | 5.33 GiB | 6.6 GiB | cells × 2000 HVGs, 77 bands |
+| makeGraphNormedCellBands | **29s** | 7.81 GiB | 6.6 GiB | dense float32, 4 bands, ~234 MiB/s |
+| **total** | **5206s** | | | |
 
-**Reading so far:** HVG-style tile IO alone (~39 min) is already close to full `markHvgs` wall (2546s) at ~1 GiB peak. That strongly supports HVG being IO/layout bound, not RAM-starved. Feature-major secondary matrix remains tabled until marker + makeGraph IO baselines complete under a spawn-safe run.
+### IO vs full stage (same 1M store)
 
-Active cells after QC ~890k; auto marker batch 452; HVGs 2000.
+| Stage | Full wall | IO-only | Implied non-IO | IO share |
+|-------|----------:|--------:|---------------:|---------:|
+| markHvgs | 2546s | 2510s (hvgTiles) | ~36s | **~99%** |
+| findMarkers | 2379s | 2158s (markerBatches) | ~221s | **~91%** |
+| makeGraph | 1487s | 502s raw + 29s normed | mostly other work | not IO-dominated |
+
+**Takeaways:**
+
+1. Gene-wise stages on this row-sharded cloud layout are **R2/layout bound**. Extra Modal RAM or CPU will not fix HVG/markers.
+2. Speeding HVG/markers means cheaper column access (chunk geometry, feature-major side store, fewer cross-shard reads).
+3. makeGraph’s expensive wall/peak is **not** explained by re-reading the dense HVG-normed matrix (29s); cost is normalize/materialize, PCA/ANN/kmeans, and multi-pass work.
+4. Competing 64 GiB jobs in `eu` queue each other (IO baseline delayed 2.5M createStore for ~1h).
+
+## In progress: 2.5M (8 CPU / 64 GiB, region `eu`)
+
+| Field | Value |
+|-------|-------|
+| Tag | `auto_markers_c8_m64_2_5m` |
+| Config | `profiling/layouts/2_5m_auto_markers_c8_m64.toml` |
+| Call | `fc-01KXPCAS3GEFWQ19E9RMJKEFJ6` |
+| createStore | **1778s / 6.3G** (done) |
+| Next | initializeStore onward |
+| Risk | makeGraph may exceed 64 GiB (1M peaked 28 GiB) |

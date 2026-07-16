@@ -167,12 +167,6 @@
     :members:
 ```
 
-### Nabo H5 reader
-```{eval-rst}
-.. autoclass:: scarf.readers.NaboH5Reader
-    :members:
-```
-
 ### CSV reader
 ```{eval-rst}
 .. autoclass:: scarf.readers.CSVReader
@@ -190,12 +184,6 @@
 ### H5ad (Anndata) to Zarr
 ```{eval-rst}
 .. autoclass:: scarf.writers.H5adToZarr
-    :members:
-```
-
-### Nabo H5 to Zarr
-```{eval-rst}
-.. autoclass:: scarf.writers.NaboH5ToZarr
     :members:
 ```
 

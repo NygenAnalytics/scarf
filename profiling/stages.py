@@ -245,8 +245,6 @@ def _run_analysis(
             cell_key=workflow.cellKey,
             feat_key=workflow.markerFeatureKey,
             gene_batch_size=workflow.markerGeneBatchSize,
-            use_prenormed=False,
-            prenormed_store=None,
             n_threads=resources.workers,
             skip_save=False,
         )

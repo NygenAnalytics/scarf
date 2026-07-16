@@ -50,7 +50,6 @@ from .readers import (
     CrReader,
     H5adReader,
     LoomReader,
-    NaboH5Reader,
 )
 from .utils import (
     clean_array,
@@ -73,7 +72,6 @@ from .writers import (
     CrToZarr,
     H5adToZarr,
     LoomToZarr,
-    NaboH5ToZarr,
     SparseToZarr,
     SubsetZarr,
     create_zarr_count_assay,
@@ -113,8 +111,6 @@ __all__ = [
     "LoomToZarr",
     "MappingReference",
     "MappingResult",
-    "NaboH5Reader",
-    "NaboH5ToZarr",
     "SparseToZarr",
     "SubsetZarr",
     "ZarrMerge",

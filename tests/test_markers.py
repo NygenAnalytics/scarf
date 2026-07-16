@@ -218,29 +218,6 @@ def test_find_markers_by_regression_identifies_nonfinite_feature():
         )
 
 
-def test_find_markers_by_rank_requires_requested_prenormed_values():
-    class Cells:
-        @staticmethod
-        def fetch(_group_key, _cell_key):
-            return np.array([0, 1])
-
-    class Assay:
-        cells = Cells()
-        z = {}
-
-    with pytest.raises(ValueError, match="Could not find prenormed values"):
-        find_markers_by_rank(
-            Assay(),
-            group_key="cluster",
-            cell_key="I",
-            feat_key="I",
-            batch_size=2,
-            use_prenormed=True,
-            prenormed_store=None,
-            n_threads=1,
-        )
-
-
 def test_find_markers_by_rank_rejects_fast_path_for_non_rna_assay():
     class Cells:
         @staticmethod
@@ -260,8 +237,6 @@ def test_find_markers_by_rank_rejects_fast_path_for_non_rna_assay():
             cell_key="I",
             feat_key="I",
             batch_size=2,
-            use_prenormed=False,
-            prenormed_store=None,
             n_threads=1,
         )
 
@@ -303,8 +278,6 @@ def test_find_markers_by_rank_slow_path_returns_groupwise_statistics():
         cell_key="I",
         feat_key="I",
         batch_size=2,
-        use_prenormed=False,
-        prenormed_store=None,
         n_threads=1,
     )
     group_a = results["a"].set_index("feature_index")
@@ -369,8 +342,6 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
         cell_key="I",
         feat_key="I",
         batch_size=2,
-        use_prenormed=False,
-        prenormed_store=None,
         n_threads=1,
     )
 
@@ -378,49 +349,6 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
     for frame in results.values():
         assert len(frame) == data.shape[1]
         assert np.isfinite(frame["p_value"]).all()
-
-
-def test_find_markers_prenormalized_path_returns_groupwise_statistics() -> None:
-    import zarr
-    from zarr.storage import MemoryStore
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    values = (
-        [4.0, 3.0, 0.0, 0.0],
-        [0.0, 0.0, 5.0, 6.0],
-        [1.0, 1.0, 1.0, 1.0],
-    )
-    for feature_index, feature_values in enumerate(values):
-        array = root.create_array(str(feature_index), shape=(4,), dtype="f8")
-        array[:] = feature_values
-
-    class Cells:
-        @staticmethod
-        def fetch(_group_key, _cell_key):
-            return np.array(["a", "a", "b", "b"])
-
-        @staticmethod
-        def active_index(_cell_key):
-            return np.arange(4)
-
-    class Assay:
-        cells = Cells()
-        z = root
-
-    results = find_markers_by_rank(
-        Assay(),
-        group_key="cluster",
-        cell_key="I",
-        feat_key="I",
-        batch_size=2,
-        use_prenormed=True,
-        prenormed_store=root,
-        n_threads=1,
-    )
-
-    assert set(results) == {"a", "b"}
-    for frame in results.values():
-        assert len(frame) == len(values)
 
 
 def test_iter_raw_feature_columns_matches_normed(datastore):
@@ -450,34 +378,6 @@ def test_iter_raw_feature_columns_matches_normed(datastore):
     assert np.array_equal(np.concatenate(cols), feat_idx)
     assert fast.shape == streamed.shape
     assert np.allclose(fast, streamed, rtol=1e-4, atol=1e-4)
-
-
-def test_read_prenormed_batches_yields_expected_chunks():
-    import zarr
-    from zarr.storage import MemoryStore
-
-    from scarf.markers import read_prenormed_batches
-
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    n_cells = 12
-    for batch_id in range(5):
-        arr = root.create_array(str(batch_id), shape=(n_cells,), dtype="f8")
-        arr[:] = float(batch_id)
-
-    cell_idx = np.arange(n_cells)
-    batches = list(
-        read_prenormed_batches(root, cell_idx, batch_size=2, desc="test batches")
-    )
-
-    assert len(batches) == 3
-    assert batches[0].shape == (n_cells, 2)
-    assert batches[1].shape == (n_cells, 2)
-    assert batches[2].shape == (n_cells, 1)
-    first_chunk = batches[0].iloc[:, 0]
-    last_chunk = batches[2].iloc[:, 0]
-    assert first_chunk.nunique() == 1
-    assert last_chunk.nunique() == 1
-    assert set(first_chunk.unique()).issubset({0.0, 1.0, 2.0, 3.0, 4.0})
 
 
 def test_compact_marker_save_roundtrip():

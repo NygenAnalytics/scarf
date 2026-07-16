@@ -129,35 +129,52 @@ def _progress(
 def _stream_hvg_tiles(
     assay: Any, cellIdx: np.ndarray, featIdx: np.ndarray
 ) -> dict[str, Any]:
-    """Physical row×col chunk tiles, same layout walk as HVG feature stats."""
-    zarr_arr = assay.rawData._backing
-    chunks = getattr(zarr_arr, "chunks", None)
-    row_chunk = int(chunks[0]) if chunks and len(chunks) > 0 else len(cellIdx)
-    col_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else len(featIdx)
-    row_chunk = max(1, row_chunk)
-    col_chunk = max(1, col_chunk)
+    """Physical chunk tiles, same layout walk as HVG feature stats."""
+    use_counts_t = getattr(assay, "rawDataT", None) is not None
+    if use_counts_t:
+        zarr_arr = assay.rawDataT
+        chunks = getattr(zarr_arr, "chunks", None)
+        feat_chunk = int(chunks[0]) if chunks and len(chunks) > 0 else len(featIdx)
+        cell_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else len(cellIdx)
+    else:
+        zarr_arr = assay.rawData._backing
+        chunks = getattr(zarr_arr, "chunks", None)
+        cell_chunk = int(chunks[0]) if chunks and len(chunks) > 0 else len(cellIdx)
+        feat_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else len(featIdx)
+    cell_chunk = max(1, cell_chunk)
+    feat_chunk = max(1, feat_chunk)
 
-    cell_bins = np.asarray(cellIdx // row_chunk, dtype=np.intp)
-    feat_bins = np.asarray(featIdx // col_chunk, dtype=np.intp)
+    cell_bins = np.asarray(cellIdx // cell_chunk, dtype=np.intp)
+    feat_bins = np.asarray(featIdx // feat_chunk, dtype=np.intp)
     tiles: list[tuple[np.ndarray, np.ndarray]] = []
-    for row_bin in np.unique(cell_bins):
-        rows = cellIdx[cell_bins == row_bin]
-        for col_bin in np.unique(feat_bins):
-            cols = featIdx[feat_bins == col_bin]
-            tiles.append((rows, cols))
+    if use_counts_t:
+        for feat_bin in np.unique(feat_bins):
+            cols = featIdx[feat_bins == feat_bin]
+            for cell_bin in np.unique(cell_bins):
+                rows = cellIdx[cell_bins == cell_bin]
+                tiles.append((rows, cols))
+    else:
+        for cell_bin in np.unique(cell_bins):
+            rows = cellIdx[cell_bins == cell_bin]
+            for feat_bin in np.unique(feat_bins):
+                cols = featIdx[feat_bins == feat_bin]
+                tiles.append((rows, cols))
 
     n_blocks = len(tiles)
     _log(
         f"[plan] hvgTiles cells={len(cellIdx)} feats={len(featIdx)} "
-        f"chunks=({row_chunk},{col_chunk}) tiles={n_blocks}"
+        f"chunks=({cell_chunk},{feat_chunk}) tiles={n_blocks} "
+        f"source={'countsT' if use_counts_t else 'counts'}"
     )
-    remote = is_remote_datastore("", assay.z)
+    remote = is_remote_datastore(None, assay.z)
     bytes_read = 0
     chunks_read = 0
     t0 = time.perf_counter()
 
     def read_block(block_idx: int) -> np.ndarray:
         rows, cols = tiles[block_idx]
+        if use_counts_t:
+            return _read_block(zarr_arr, cols, rows).T
         return _read_block(zarr_arr, rows, cols)
 
     for block_idx, raw, read_sec, source in iter_column_blocks(
@@ -180,10 +197,11 @@ def _stream_hvg_tiles(
     return {
         "nCells": int(len(cellIdx)),
         "nFeatures": int(len(featIdx)),
-        "rowChunk": row_chunk,
-        "colChunk": col_chunk,
+        "rowChunk": cell_chunk,
+        "colChunk": feat_chunk,
         "nBlocks": chunks_read,
         "bytesRead": bytes_read,
+        "arraySource": "countsT" if use_counts_t else "counts",
     }
 
 
@@ -194,10 +212,13 @@ def _stream_marker_batches(
     batchSize: int,
 ) -> dict[str, Any]:
     """All cells × gene batches, same path as marker search."""
+    array_source = (
+        "countsT" if getattr(assay, "rawDataT", None) is not None else "counts"
+    )
     n_blocks = int(np.ceil(len(featIdx) / max(1, batchSize)))
     _log(
         f"[plan] markerBatches cells={len(cellIdx)} feats={len(featIdx)} "
-        f"geneBatchSize={batchSize} batches={n_blocks}"
+        f"geneBatchSize={batchSize} batches={n_blocks} source={array_source}"
     )
     bytes_read = 0
     done = 0
@@ -225,6 +246,7 @@ def _stream_marker_batches(
         "geneBatchSize": int(batchSize),
         "nBlocks": done,
         "bytesRead": bytes_read,
+        "arraySource": array_source,
     }
 
 

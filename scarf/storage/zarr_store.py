@@ -547,9 +547,9 @@ def is_local_zarr_path(location: ZarrLocation) -> bool:
     return isinstance(location, str) and not is_remote_zarr_location(location)
 
 
-def is_remote_datastore(zarr_loc: ZarrLocation, group: zarr.Group) -> bool:
+def is_remote_datastore(zarr_loc: ZarrLocation | None, group: zarr.Group) -> bool:
     """Return True when the datastore primary store is a remote/object backend."""
-    if isinstance(zarr_loc, str):
+    if isinstance(zarr_loc, str) and zarr_loc:
         return is_remote_zarr_location(zarr_loc)
     if zarr_root_path(group) is not None:
         return False
@@ -808,6 +808,78 @@ def repack_to_sharded(
         shard_rows=shardRows,
     )
     return dstArray
+
+
+def write_counts_t(counts: zarr.Array, group: zarr.Group) -> zarr.Array | None:
+    """Write feature-major ``countsT`` next to a finalized ``counts`` array.
+
+    ``countsT`` has shape ``(nFeatures, nCells)``. Returns ``None`` for Zarr v2
+    stores, which keep the ``counts``-only layout.
+    """
+    from ..utils import logger, tqdmbar
+
+    if _group_zarr_format(group) < 3:
+        return None
+
+    n_cells = int(counts.shape[0])
+    n_feats = int(counts.shape[1])
+    itemsize = max(1, int(np.dtype(counts.dtype).itemsize))
+    source_row_chunk = max(1, int(counts.chunks[0]))
+    feature_chunk = max(1, min(n_feats, int(counts.chunks[1])))
+
+    bytes_per_row_band = feature_chunk * source_row_chunk * itemsize
+    if bytes_per_row_band >= DEFAULT_CLOUD_TARGET_CHUNK_BYTES:
+        cell_chunk = source_row_chunk
+    else:
+        cell_chunk = (
+            DEFAULT_CLOUD_TARGET_CHUNK_BYTES // bytes_per_row_band
+        ) * source_row_chunk
+    cell_chunk = max(source_row_chunk, min(n_cells, cell_chunk))
+    while (
+        cell_chunk > source_row_chunk
+        and feature_chunk * cell_chunk * itemsize > _CODEC_MAX_BYTES
+    ):
+        cell_chunk -= source_row_chunk
+    cell_chunk = max(1, min(n_cells, cell_chunk))
+
+    if "countsT" in group:
+        del group["countsT"]
+    counts_t = create_numeric_array(
+        group,
+        "countsT",
+        ZarrArraySpec(
+            shape=(n_feats, n_cells),
+            chunks=(feature_chunk, cell_chunk),
+            dtype=counts.dtype,
+            shards=None,
+            compressors=get_compressors(get_storage_profile()),
+            fillValue=0,
+            overwrite=True,
+        ),
+    )
+    counts_t.attrs["complete"] = False
+    logger.info(
+        f"Writing countsT shape=({n_feats}, {n_cells}) "
+        f"chunks=({feature_chunk}, {cell_chunk})"
+    )
+
+    feat_starts = list(range(0, n_feats, feature_chunk))
+    cell_starts = list(range(0, n_cells, cell_chunk))
+    total_tiles = max(1, len(feat_starts) * len(cell_starts))
+    with tqdmbar(
+        total=total_tiles,
+        desc="Writing countsT",
+    ) as progress:
+        for feat_start in feat_starts:
+            feat_end = min(feat_start + feature_chunk, n_feats)
+            for cell_start in cell_starts:
+                cell_end = min(cell_start + cell_chunk, n_cells)
+                block = np.asarray(counts[cell_start:cell_end, feat_start:feat_end])
+                counts_t[feat_start:feat_end, cell_start:cell_end] = block.T
+                progress.update(1)
+
+    counts_t.attrs["complete"] = True
+    return counts_t
 
 
 def finalize_sharded_counts(

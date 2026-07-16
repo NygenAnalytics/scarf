@@ -38,6 +38,14 @@ _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
 
 
 def _feature_column_chunk(assay: Assay, n_features: int) -> int:
+    # Only RNA marker/HVG fast paths read countsT; other assays keep cell-major
+    # batch sizing even when a durable countsT array is present.
+    if isinstance(assay, RNAassay):
+        counts_t = getattr(assay, "rawDataT", None)
+        if counts_t is not None:
+            chunks = getattr(counts_t, "chunks", None)
+            if chunks and len(chunks) > 0:
+                return max(1, int(chunks[0]))
     backing = getattr(assay.rawData, "_backing", None)
     chunks = getattr(backing, "chunks", None)
     if chunks and len(chunks) > 1:
@@ -731,8 +739,6 @@ class DataStore(MappingDatastore):
         cell_key: str | None = None,
         feat_key: str | None = None,
         gene_batch_size: int | None = None,
-        use_prenormed: bool = False,
-        prenormed_store: zarr.Group | str | None = None,
         n_threads: int | None = None,
         skip_save: bool = False,
         **norm_params: Any,
@@ -752,10 +758,7 @@ class DataStore(MappingDatastore):
             gene_batch_size: Number of genes loaded per batch; all selected cells are loaded for each batch.
                              When None (default), the batch size is the minimum of the on-disk feature chunk
                              width and a budget-safe cap derived from the active memory budget.
-            use_prenormed: If True, use prenormalized cache from ``Assay.save_normed_for_query``.
-                           (Default value: False)
-            prenormed_store: Custom Zarr group with prenormalized values (default: None).
-            n_threads: Threads for marker search when ``use_prenormed`` is True.
+            n_threads: Threads for marker search.
             skip_save: If True, return results without writing to Zarr.
             **norm_params: Extra keyword arguments forwarded to ``normed``.
 
@@ -794,22 +797,12 @@ class DataStore(MappingDatastore):
             assay_grp.create_group("markers")
         markers_grp = as_zarr_group(assay_grp["markers"], name="markers")
 
-        prenormed_group: zarr.Group | None
-        if isinstance(prenormed_store, str):
-            prenormed_group = as_zarr_group(
-                self.zw[prenormed_store], name=prenormed_store
-            )
-        else:
-            prenormed_group = prenormed_store
-
         markers = find_markers_by_rank(
             assay=assay,
             group_key=group_key,
             cell_key=cell_key,
             feat_key=feat_key,
             batch_size=gene_batch_size,
-            use_prenormed=use_prenormed,
-            prenormed_store=prenormed_group,
             n_threads=n_threads,
             **norm_params,
         )
@@ -1331,7 +1324,7 @@ class DataStore(MappingDatastore):
 
         from ..storage.zarr_store import write_dense_in_shard_rows
 
-        from ..writers import create_zarr_count_assay
+        from ..writers import create_zarr_count_assay, finalize_writer_counts
 
         if assay_label is None:
             raise ValueError(
@@ -1380,6 +1373,7 @@ class DataStore(MappingDatastore):
             lambda start, end: matrix[start:end, :],
             msg="Writing grouped assay",
         )
+        finalize_writer_counts(self.zw, assay_label, self.workspace)
 
         self._load_assays(min_cells=0, custom_assay_types={assay_label: "Assay"})
         self._ini_cell_props(min_features=0, mito_pattern="", ribo_pattern="")

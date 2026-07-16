@@ -78,6 +78,9 @@ def test_is_remote_datastore():
     local_root = _memory_group()
     assert is_remote_datastore("/tmp/foo.zarr", local_root) is False
     assert is_remote_datastore("s3://bucket/path", local_root) is True
+    # Missing/empty location must inspect the group store, not treat "" as local.
+    assert is_remote_datastore("", local_root) is False
+    assert is_remote_datastore(None, local_root) is False
 
 
 def test_copy_zarr_array_round_trip(tmp_path):

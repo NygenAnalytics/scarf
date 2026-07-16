@@ -211,21 +211,47 @@ class Assay:
         self.cells = cell_data
         self.nthreads = nthreads
         if workspace is None:
+            counts_path = f"{name}/counts"
+            counts_t_path = f"{name}/countsT"
+            matrix_group = as_zarr_group(z[name], name=name)
             self.rawData = ChunkedArray(
-                as_zarr_array(z[f"{name}/counts"], name=f"{name}/counts"),
+                as_zarr_array(z[counts_path], name=counts_path),
                 nthreads=nthreads,
             )
             self.feats = MetaData(z[f"{name}/featureData"])  # type: ignore
-            self.z = as_zarr_group(z[self.name], name=self.name)
+            self.z = matrix_group
         else:
+            counts_path = f"matrices/{name}/counts"
+            counts_t_path = f"matrices/{name}/countsT"
+            matrix_group = as_zarr_group(z[f"matrices/{name}"], name=f"matrices/{name}")
             self.rawData = ChunkedArray(
-                as_zarr_array(
-                    z[f"matrices/{name}/counts"], name=f"matrices/{name}/counts"
-                ),
+                as_zarr_array(z[counts_path], name=counts_path),
                 nthreads=nthreads,
             )
             self.feats = MetaData(z[f"{workspace}/{name}/featureData"])  # type: ignore
             self.z = as_zarr_group(z[f"{workspace}/{name}"], name=f"{workspace}/{name}")
+        self.rawDataT: zarr.Array | None = None
+        if "countsT" in matrix_group:
+            try:
+                counts_t = as_zarr_array(matrix_group["countsT"], name=counts_t_path)
+            except TypeError:
+                logger.warning(
+                    f"({self.name}) Ignoring countsT at {counts_t_path}: "
+                    "expected a Zarr array"
+                )
+            else:
+                expected_shape = (self.rawData.shape[1], self.rawData.shape[0])
+                if (
+                    counts_t.attrs.get("complete") is True
+                    and tuple(counts_t.shape) == expected_shape
+                    and np.dtype(counts_t.dtype) == np.dtype(self.rawData.dtype)
+                ):
+                    self.rawDataT = counts_t
+                else:
+                    logger.warning(
+                        f"({self.name}) Ignoring countsT at {counts_t_path}: "
+                        "incomplete or mismatched with counts"
+                    )
         self.attrs = self.z.attrs
         if "percentFeatures" not in self.attrs:
             self.attrs["percentFeatures"] = {}
@@ -667,47 +693,6 @@ class Assay:
                     controlled_compute(data[:, chunk], self.nthreads).T,
                     feat_idx[chunk],
                 )
-
-    def save_normed_for_query(
-        self, feat_key: str | None, batch_size: int, overwrite: bool = True
-    ) -> None:
-        """This methods dumps normalized values for features (as marked by
-        `feat_key`) onto disk  in the 'prenormed' slot under the assay's own
-        slot.
-
-        Args:
-            feat_key: Name of the key (column) from feature attribute table. The data will be fetched
-                      for only those features that have a True value in this column. If None then all the features are
-                      used
-            batch_size: Number of genes to be loaded in the memory at a time.
-            overwrite: If True (default value), then will overwrite the existing 'prenormed' slot in the
-                       assay hierarchy
-
-        Returns:
-            None
-        """
-        from concurrent.futures import ThreadPoolExecutor
-
-        from .writers import create_zarr_obj_array
-
-        def write_wrapper(idx: str, v: np.ndarray) -> None:
-            create_zarr_obj_array(g, idx, v, np.float64, True, False)
-            return None
-
-        if "prenormed" in self.z and overwrite is False:
-            return None
-
-        g = self.z.create_group("prenormed", overwrite=True)
-        for mat, inds in self.iter_normed_feature_wise(
-            None, feat_key, batch_size, "Saving features", False
-        ):
-            write_args = ((inds[i], mat[i]) for i in range(len(inds)))  # type: ignore
-            if self.nthreads > 1:
-                with ThreadPoolExecutor(max_workers=self.nthreads) as ex:
-                    list(ex.map(lambda args: write_wrapper(*args), write_args))
-            else:
-                for args in write_args:
-                    write_wrapper(*args)
 
     def save_aggregated_ordering(
         self,
@@ -1179,7 +1164,6 @@ class RNAassay(Assay):
         from .storage.zarr_store import is_remote_datastore
         from .utils import iter_column_blocks
 
-        zarr_arr = cast(zarr.Array, self.rawData._backing)
         cell_idx = np.asarray(cell_idx)
         feat_idx = np.asarray(feat_idx)
         batch_size = max(1, batch_size)
@@ -1193,10 +1177,20 @@ class RNAassay(Assay):
                 f"{n_blocks} batches (width {batch_size})"
             )
 
-        def read_block(block_idx: int) -> np.ndarray:
-            return _read_block(zarr_arr, cell_idx, batches[block_idx])
+        use_counts_t = self.rawDataT is not None
+        if use_counts_t:
+            zarr_arr = cast(zarr.Array, self.rawDataT)
 
-        remote = is_remote_datastore("", self.z)
+            def read_block(block_idx: int) -> np.ndarray:
+                return _read_block(zarr_arr, batches[block_idx], cell_idx).T
+
+        else:
+            zarr_arr = cast(zarr.Array, self.rawData._backing)
+
+            def read_block(block_idx: int) -> np.ndarray:
+                return _read_block(zarr_arr, cell_idx, batches[block_idx])
+
+        remote = is_remote_datastore(None, self.z)
         for block_idx, raw, read_sec, source in iter_column_blocks(
             n_blocks,
             read_block,
@@ -1351,7 +1345,6 @@ class RNAassay(Assay):
         from .storage.zarr_store import is_remote_datastore
         from .utils import iter_column_blocks, process_rss_mb
 
-        zarr_arr = cast(zarr.Array, self.rawData._backing)
         cell_idx = np.asarray(cell_idx)
         feat_idx = np.asarray(feat_idx)
         if self.normMethod is norm_lib_size and self.sf is None:
@@ -1373,39 +1366,60 @@ class RNAassay(Assay):
         if n_cells == 0 or n_features == 0:
             return {"normed_tot": s1, "normed_n": nz, "sigmas": s2}
 
-        chunks = getattr(zarr_arr, "chunks", None)
-        row_chunk = int(chunks[0]) if chunks and len(chunks) > 0 else n_cells
-        col_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
-        row_chunk = max(1, row_chunk)
-        col_chunk = max(1, col_chunk)
+        use_counts_t = self.rawDataT is not None
+        if use_counts_t:
+            zarr_arr = cast(zarr.Array, self.rawDataT)
+            chunks = getattr(zarr_arr, "chunks", None)
+            feat_chunk = int(chunks[0]) if chunks and len(chunks) > 0 else n_features
+            cell_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else n_cells
+        else:
+            zarr_arr = cast(zarr.Array, self.rawData._backing)
+            chunks = getattr(zarr_arr, "chunks", None)
+            cell_chunk = int(chunks[0]) if chunks and len(chunks) > 0 else n_cells
+            feat_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
+        cell_chunk = max(1, cell_chunk)
+        feat_chunk = max(1, feat_chunk)
 
         cell_pos = np.arange(n_cells, dtype=np.intp)
         feat_pos = np.arange(n_features, dtype=np.intp)
-        cell_bins = np.asarray(cell_idx // row_chunk, dtype=np.intp)
-        feat_bins = np.asarray(feat_idx // col_chunk, dtype=np.intp)
+        cell_bins = np.asarray(cell_idx // cell_chunk, dtype=np.intp)
+        feat_bins = np.asarray(feat_idx // feat_chunk, dtype=np.intp)
 
         tiles: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-        for row_bin in np.unique(cell_bins):
-            cell_mask = cell_bins == row_bin
-            local_cells = cell_pos[cell_mask]
-            rows = cell_idx[cell_mask]
-            for col_bin in np.unique(feat_bins):
-                feat_mask = feat_bins == col_bin
+        if use_counts_t:
+            for feat_bin in np.unique(feat_bins):
+                feat_mask = feat_bins == feat_bin
                 local_feats = feat_pos[feat_mask]
                 cols = feat_idx[feat_mask]
-                tiles.append((local_cells, rows, local_feats, cols))
+                for cell_bin in np.unique(cell_bins):
+                    cell_mask = cell_bins == cell_bin
+                    local_cells = cell_pos[cell_mask]
+                    rows = cell_idx[cell_mask]
+                    tiles.append((local_cells, rows, local_feats, cols))
+        else:
+            for cell_bin in np.unique(cell_bins):
+                cell_mask = cell_bins == cell_bin
+                local_cells = cell_pos[cell_mask]
+                rows = cell_idx[cell_mask]
+                for feat_bin in np.unique(feat_bins):
+                    feat_mask = feat_bins == feat_bin
+                    local_feats = feat_pos[feat_mask]
+                    cols = feat_idx[feat_mask]
+                    tiles.append((local_cells, rows, local_feats, cols))
 
         n_blocks = len(tiles)
-        remote = is_remote_datastore("", self.z)
+        remote = is_remote_datastore(None, self.z)
         sub_rows, sub_cols = _feature_stats_tile_shape(
             max((len(rows) for _, rows, _, _ in tiles), default=1),
             max((len(cols) for _, _, _, cols in tiles), default=1),
-            row_chunk=row_chunk,
-            col_chunk=col_chunk,
+            row_chunk=cell_chunk,
+            col_chunk=feat_chunk,
         )
 
         def read_block(block_idx: int) -> np.ndarray:
             _, rows, _, cols = tiles[block_idx]
+            if use_counts_t:
+                return _read_block(zarr_arr, cols, rows).T
             return _read_block(zarr_arr, rows, cols)
 
         def accumulate_block(

@@ -118,12 +118,11 @@ def write_doublet_target_zarr(
     Returns:
         The root Zarr group of the written store.
     """
-    from .storage.zarr_store import write_dense_in_shard_rows
+    from .storage.zarr_store import finalize_sharded_counts, write_dense_in_shard_rows
     from .utils import load_zarr
     from .writers import (
         create_cell_data,
         create_zarr_count_assay,
-        finalize_writer_counts,
         load_count_store,
     )
 
@@ -147,6 +146,6 @@ def write_doublet_target_zarr(
         lambda s, e: sim_counts[s:e].toarray().astype(dtype),
         msg="Writing simulated doublets",
     )
-    finalize_writer_counts(z, assay_name, None)
+    finalize_sharded_counts(z, assay_name, None)
     logger.debug(f"Wrote {n_sim} simulated doublets to {zarr_loc}")
     return z

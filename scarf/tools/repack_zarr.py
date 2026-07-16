@@ -31,13 +31,15 @@ def _copy_group(
             _copy_group(node, new_group, profile)
             continue
         chunks = normalize_chunks(node.chunks, node.shape)
-        dst.create_array(
+        dst_array = dst.create_array(
             key,
             data=np.asarray(node[...]),
             chunks=chunks,
             compressors=get_compressors(profile, zarrFormat=3),
             overwrite=True,
         )
+        for attr_key, attr_val in node.attrs.items():
+            dst_array.attrs[attr_key] = attr_val
 
 
 def repack_store(

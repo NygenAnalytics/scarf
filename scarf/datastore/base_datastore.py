@@ -5,7 +5,7 @@ from typing import Any, cast
 
 from loguru import logger
 
-from .._types import ZarrMode, as_zarr_array, as_zarr_group
+from .._types import ZarrMode, as_zarr_group
 from ..assay import RNAassay, ATACassay, ADTassay, Assay
 from ..metadata import MetaData
 from ..utils import show_dask_progress, controlled_compute, load_zarr, ZARRLOC
@@ -466,8 +466,6 @@ class BaseDataStore:
         cell_key: str,
         k: str,
         clip_fraction: float = 0,
-        use_precached: bool = True,
-        cache_key: str = "prenormed",
     ) -> np.ndarray:
         """Fetches data from the Zarr file.
 
@@ -479,8 +477,6 @@ class BaseDataStore:
             cell_key: Boolean column in cell metadata selecting cells (default: ``'I'``).
             k: Cell metadata column name or feature name whose values are fetched.
             clip_fraction: Fraction (0-1) for soft percentile clipping of numeric values.
-            use_precached: Use values from the ``prenormed`` slot when available.
-            cache_key: Zarr group name for precached feature values (default: ``'prenormed'``).
 
         Returns:
             The requested values
@@ -496,33 +492,9 @@ class BaseDataStore:
                     logger.warning(
                         f"Plotting mean of {len(feat_idx)} features because {k} is not unique."
                     )
-            vals = None
-            if use_precached and cache_key in assay.z:
-                g = as_zarr_group(assay.z[cache_key], name=cache_key)
-                vals = np.zeros(assay.cells.N)
-                n_feats = 0
-                for i in feat_idx:
-                    feat_key = str(i)
-                    if feat_key in g:
-                        feat_vals = np.asarray(
-                            as_zarr_array(g[feat_key], name=feat_key)[:],
-                            dtype=np.float64,
-                        )
-                        vals += feat_vals
-                        n_feats += 1
-                if n_feats == 0:
-                    logger.debug(f"Could not find prenormed values for feat: {k}")
-                    vals = None
-                elif n_feats > 1:
-                    vals = vals / n_feats
-                else:
-                    pass
-                if vals is not None:
-                    vals = vals[cell_idx]
-            if vals is None:
-                vals = controlled_compute(
-                    assay.normed(cell_idx, feat_idx).mean(axis=1), self.nthreads
-                ).astype(np.float64)
+            vals = controlled_compute(
+                assay.normed(cell_idx, feat_idx).mean(axis=1), self.nthreads
+            ).astype(np.float64)
         else:
             vals = self.cells.fetch(k, key=cell_key)
         if clip_fraction < 0 or clip_fraction > 1:
