@@ -1,14 +1,19 @@
 from pathlib import Path
 
-from profiling.config import STAGE_ORDER, WorkflowParameters, load_profiling_config
+from profiling.config import (
+    STAGE_ORDER,
+    StorageLayout,
+    WorkflowParameters,
+    load_profiling_config,
+)
 from profiling.results import result_exists
 from profiling.stages import StageRunResult
 
+_EXAMPLE_CONFIG = Path(__file__).parents[1] / "profiling" / "config.example.toml"
+
 
 def test_example_config_loads():
-    config = load_profiling_config(
-        Path(__file__).parents[1] / "profiling" / "config.example.toml"
-    )
+    config = load_profiling_config(_EXAMPLE_CONFIG)
     assert config.modalEnvironmentName == "scarf_profiling"
     assert set(config.stageResources) == set(STAGE_ORDER)
     assert config.datasetUri(10_000).endswith("/10000.h5ad")
@@ -18,8 +23,12 @@ def test_example_config_loads():
 
 
 def test_run_tag_isolates_store_and_result_uris():
-    config = load_profiling_config(
-        Path(__file__).parents[1] / "profiling" / "layouts" / "100k_chunk256m.toml"
+    # layouts/ is gitignored, so derive runTag settings from the committed example.
+    config = load_profiling_config(_EXAMPLE_CONFIG).model_copy(
+        update={
+            "runTag": "chunk256m",
+            "storageLayout": StorageLayout(targetChunkBytes=256 * 1024 * 1024),
+        }
     )
     assert config.runTag == "chunk256m"
     assert config.storageLayout.targetChunkBytes == 256 * 1024 * 1024
@@ -36,9 +45,7 @@ def test_marker_group_key_matches_leiden_column():
 
 
 def test_result_exists_skips_when_object_present(monkeypatch):
-    config = load_profiling_config(
-        Path(__file__).parents[1] / "profiling" / "config.example.toml"
-    )
+    config = load_profiling_config(_EXAMPLE_CONFIG)
     monkeypatch.setattr(
         "profiling.results.object_exists",
         lambda uri: uri.endswith("/results/10000/createStore.json"),
