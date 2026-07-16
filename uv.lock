@@ -3147,7 +3147,7 @@ requires-dist = [
     { name = "numba", specifier = ">=0.60" },
     { name = "numcodecs", specifier = ">=0.16" },
     { name = "numpy", specifier = ">=2" },
-    { name = "obstore" },
+    { name = "obstore", specifier = ">=0.5.1" },
     { name = "packaging" },
     { name = "pandas", specifier = ">=2.2.2" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0" },
