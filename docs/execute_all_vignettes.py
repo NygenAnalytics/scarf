@@ -1,6 +1,4 @@
-"""Execute all myst-nb vignettes in parallel and merge into docs/.jupyter_cache."""
-
-from __future__ import annotations
+"""Execute all myst-nb documentation pages and merge into docs/.jupyter_cache."""
 
 import argparse
 import os
@@ -10,16 +8,22 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from docs.execute_vignette import configure_doc_execution_env
-
 DOCS_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = DOCS_ROOT.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from docs.execute_vignette import configure_doc_execution_env  # noqa: E402
+
 PARALLEL_CACHE = DOCS_ROOT / ".jupyter_cache" / "_parallel"
 EXECUTE_SCRIPT = DOCS_ROOT / "execute_vignette.py"
 
 
-def _run_vignette_subprocess(name: str) -> Path:
-    """Run one vignette in a fresh Python process so memory is fully released."""
-    cache_path = PARALLEL_CACHE / name
+def _run_page_subprocess(name: str) -> Path:
+    """Run one page in a fresh Python process so memory is fully released."""
+    # Parallel cache dirs cannot contain path separators.
+    safe_name = name.replace("/", "__")
+    cache_path = PARALLEL_CACHE / safe_name
     if cache_path.exists():
         shutil.rmtree(cache_path)
 
@@ -62,21 +66,21 @@ def main() -> None:
         type=int,
         default=1,
         help=(
-            "Number of vignettes to run concurrently (default: 1). "
-            "Each vignette runs in its own Python process."
+            "Number of pages to run concurrently (default: 1). "
+            "Each page runs in its own Python process."
         ),
     )
     parser.add_argument(
-        "vignettes",
+        "pages",
         nargs="*",
-        help="Vignette names without .md extension (default: all)",
+        help="Page names without .md extension (default: all executable pages)",
     )
     args = parser.parse_args()
     if args.jobs < 1:
         raise SystemExit("--jobs must be >= 1")
     if args.jobs > 1:
         print(
-            "WARNING: Each vignette can use several GB. Prefer -j 1 on WSL.",
+            "WARNING: Each page can use several GB. Prefer -j 1 on WSL.",
             flush=True,
         )
 
@@ -89,17 +93,17 @@ def main() -> None:
         prune_stale_cache,
     )
 
-    names = args.vignettes or list_executable_docs()
+    names = args.pages or list_executable_docs()
     if not names:
-        raise SystemExit("No vignettes found")
+        raise SystemExit("No executable documentation pages found")
 
-    print(f"Executing {len(names)} vignettes with {args.jobs} workers", flush=True)
+    print(f"Executing {len(names)} pages with {args.jobs} workers", flush=True)
     PARALLEL_CACHE.mkdir(parents=True, exist_ok=True)
 
     failures: list[tuple[str, str]] = []
     completed_caches: list[Path] = []
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futures = {pool.submit(_run_vignette_subprocess, name): name for name in names}
+        futures = {pool.submit(_run_page_subprocess, name): name for name in names}
         for future in as_completed(futures):
             name = futures[future]
             try:
@@ -126,13 +130,13 @@ def main() -> None:
         print(f"Pruned {len(pruned)} stale cache entries", flush=True)
 
     if failures:
-        print("\nFailed vignettes:", flush=True)
+        print("\nFailed pages:", flush=True)
         for name, msg in failures:
             print(f"  - {name}: {msg}", flush=True)
         raise SystemExit(1)
 
     print(
-        f"All {len(names)} vignettes executed and merged into docs/.jupyter_cache",
+        f"All {len(names)} pages executed and merged into docs/.jupyter_cache",
         flush=True,
     )
 

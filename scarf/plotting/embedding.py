@@ -31,6 +31,7 @@ from ._style import (
     finish_embedding_axes,
     resolve_legend_loc,
     scatter_edgecolor,
+    sort_categories,
     square_axis_limits,
     theme_context,
 )
@@ -529,7 +530,7 @@ def embedding(
         if facet_order is not None:
             facets = list(facet_order)
         else:
-            facets = sorted(pd.unique(facet_values), key=lambda v: (pd.isna(v), str(v)))
+            facets = sort_categories(list(pd.unique(facet_values)))
     else:
         facet_values = None
         facets = [None]
@@ -596,7 +597,7 @@ def embedding(
                         + ", ".join(map(str, unlisted[:10]))
                     )
             else:
-                order = sorted(observed, key=lambda v: str(v))
+                order = sort_categories(observed)
             palette = categorical_color_map(
                 order,
                 palette=categorical_scale.palette if categorical_scale else None,

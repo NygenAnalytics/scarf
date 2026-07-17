@@ -1,85 +1,99 @@
 ---
-description: Memory-efficient single-cell RNA-seq, ATAC-seq, and CITE-seq analysis with Harmony, WNN, and Zarr-backed workflows.
+description: Memory-efficient single-cell RNA-seq, ATAC-seq, and CITE-seq analysis with neighbourhood graphs and Zarr-backed stores.
 ---
 
 [![PyPI][pypi]][pypiLink] [![Docs][docs]][docsLink] [![Github Stars][stars]][github]
 
-# Overview of Scarf
+# About Scarf
 
-{ref}`Jump to installation <installation>` | {ref}`Quick start <quickstart>` | [Source code on Github]
+{ref}`Installation <installation>` · {ref}`Quick start <quickstart>` · {doc}`scarf_and_scanpy` · [Source code on Github]
 
-## What is Scarf
+## Introduction
 
-Scarf is a Python package that performs memory-efficient analysis of **single-cell genomics data**.
-Using an efficient data chunking process (built on [Zarr]) Scarf manages to perform the core
-steps of single-cell genomics data analysis with very low memory consumption. Scarf's core step
-is to efficiently generate a neighbourhood graph (KNN graph) of cells. This graph forms the basis for
-downstream steps of the analysis thus maximizing concordance between those steps.
+Scarf is a Python package for memory-efficient analysis of single-cell genomics data.
+It stores count matrices and intermediate results in [Zarr]-backed stores and builds a
+neighbourhood graph (KNN graph) of cells that downstream steps reuse. The same graph
+feeds embeddings, clustering, mapping, and multimodal integration, which keeps those
+steps concordant.
+
+Scarf supports scRNA-seq, scATAC-seq, and CITE-seq workflows on local machines without
+loading the full matrix into memory.
 
 :::{image} _static/overview.svg
 :width: 75%
 :align: center
+:alt: Overview of Scarf analysis stages from counts through neighbourhood graph to embeddings and clustering
 :::
 
-:::{admonition} Scarf is published!
-The article describing Scarf is published in [Nature Communications](https://doi.org/10.1038/s41467-022-32097-3).
+:::{admonition} Citation
+The methods paper is published in [Nature Communications](https://doi.org/10.1038/s41467-022-32097-3).
 :::
 
-## What does Scarf offer
+## What this documentation covers
 
-- Analyze atlas scale scRNA-Seq datasets on your laptop (up to 4 million cells tested)
-- Perform analysis of scATAC-Seq datasets (datasets with up to 700K cells and 1M peaks tested)
-- Parallel implementations of UMAP and tSNE (SG-tSNE) for quick cell embedding
-- Perform hierarchical clustering that gives interpretable cluster relationships
-- Sub-sample highly representative cells using state-of-the-art TopACeDo method
-- **Harmony** batch correction and **partial PCA** for merged datasets ({ref}`merging vignette <harmony_batch_correction>`)
-- **WNN and SNN** multimodal integration for CITE-seq ({ref}`multimodal vignette <wnn_integration>`)
-- **LISI** and related metrics to quantify integration quality ({ref}`LISI metrics <lisi_metrics>`)
-- Project cells across datasets with label transfer and unified embeddings ({ref}`projection vignette <data_projection>`)
-- Zarr v3 storage with cloud and local profiles ({ref}`data organization <data_organization>`)
+- Installing Scarf and running a minimal scRNA-seq pipeline
+- End-to-end tutorials for scRNA-seq, scATAC-seq, and CITE-seq
+- Quality control, feature selection, neighbourhood graphs, embeddings, and clustering
+- Marker genes, annotation, and subsetting with cell keys
+- Merging batches, Harmony, partial PCA, and integration metrics
+- Mapping query cells to a reference and transferring labels
+- Multimodal SNN/WNN integration
+- Large-scale analysis with downsampling and Zarr storage notes
+- Plotting with `scarf.plotting` and the API reference
 
-See the {ref}`integration methods guide <integration_guide>` for help choosing between batch correction and integration approaches.
+## What this documentation does not cover
 
-## Why use Scarf
+- Raw FASTQ processing or alignment (use Cell Ranger, STARsolo, alevin-fry, or similar)
+- Methods Scarf does not ship, including scVI, Scanorama, RNA velocity, and full DE
+  pipelines with multiple-testing correction. Export a subset (for example with
+  `to_anndata` / `to_h5ad`) and continue in Scanpy or another tool when you need those methods.
 
-The following flowchart can help one decide which tool to choose with respect to the size of the data.
-This flowchart assumes that you do not have access or simply do not want to use a system with large RAM
-capacity. Only a few popular tools have been mentioned here, this is not an exhaustive list.
+## Who should read this
 
-:::{margin} **Useful references**
-[Chen et. al.] benchmarked many scATAC-Seq tools for their scalability
+Biologists and bioinformaticians analyzing single-cell count matrices. Prior experience
+with Scanpy or Seurat helps but is not required. If you already use Scanpy and want a
+lower-memory path for large data, start with {doc}`scarf_and_scanpy`.
 
-[Luecken et. al.] benchmarked scalability of various data integration tools
-:::
+## Structure of the documentation
 
-For large datasets on limited RAM, Scarf's chunked Zarr backend and graph-first workflow often remain practical when in-memory tools do not. See {ref}`FAQ <faq>` for comparisons with Scanpy.
+1. **Get started**: installation, quick start, and Scarf compared with Scanpy
+2. **Introductory tutorials**: canonical scRNA-seq, scATAC-seq, CITE-seq, import/export, plotting
+3. **Data integration and mapping**: method choice, merge/Harmony, metrics, label transfer, reference atlases
+4. **Other analyses**: QC depth, cell cycle, pseudotime, imputation, downsampling
+5. **Reference**: API, glossary, FAQ, citation
+6. **Developers**: contributing and internals
 
-### Example usage scenarios
-- You have generated a knockdown model of some stem cells and want to see which lineages are
-  affected as a result of this perturbation. So you perform scRNA-Seq of this perturbed stem cell
-  derived populations. You download an atlas-scale data available for this tissue system but the
-  data is too large and can't be analyzed on your laptop. Using Scarf you can quickly generate a
-  UMAP of the atlas scale data and visualize all the author annotated clusters. Now you can project
-  your perturbed population over this map to check how the heterogeneity has been affected due the
-  perturbation.
+## Prerequisites
 
-- There is an atlas-scale (say more than 500K cells) dataset available for some embryonic
-  tissue. You want to redo the cell trajectory analysis with a new and promising tool that just came
-  out on Bioarxiv. However, the dataset is too large to be analyzed on your laptop. Using Scarf, you
-  can perform clustering on the data on your laptop and run Scarf's cell downsampling algorithm to
-  select the most representative cells from the clusters of your interest. You can then use this
-  downsampled data and run the trajectory analysis on it.
+- Python 3.12 or newer
+- Basic familiarity with NumPy and pandas
+- A count matrix (for example Cell Ranger H5 or H5AD)
 
-## When not to use Scarf
+## Citation
 
-Scarf prioritizes memory efficiency over breadth of third-party integrations. Methods such as Scanorama, scVI, or rich trajectory toolkits are not built in. For small datasets where speed matters most, Scanpy may be faster. Scarf works best as a complement for atlas-scale or multi-dataset workflows on modest hardware.
+Dhapola, P., Rodhe, J., Olofzon, R. et al. Scarf enables a highly memory-efficient
+analysis of large-scale single-cell genomics data. Nat Commun 13, 4616 (2022).
+https://doi.org/10.1038/s41467-022-32097-3
 
-## Scarf development: the future
+## Contributing and feedback
 
-The core team is constantly working to improve Scarf's functionality, add new features and to
-make the code more robust (aka testing). We aim to extend Scarf to more single-cell
-methodologies by including normalization and dimension reduction strategies best suited to
-those methods.
+Report bugs and request features on [GitHub issues]. See {doc}`developers/contributing`
+for how to build and execute documentation pages locally.
+
+## Start here
+
+1. {ref}`Install Scarf <installation>`
+2. Run the {ref}`Quick start <quickstart>`
+3. Read {doc}`scarf_and_scanpy` if you know Scanpy or Seurat
+4. Work through {doc}`tutorials/scrna_seq`
+
+Capability links:
+
+- One scRNA-seq dataset: {doc}`tutorials/scrna_seq`
+- Merge batches: {doc}`tutorials/data_integration`
+- CITE-seq: {doc}`tutorials/cite_seq`
+- Map to a reference: {doc}`tutorials/reference_atlas`
+- Downsample large data: {doc}`tutorials/downsampling`
 
 [pypi]: https://img.shields.io/pypi/v/scarf.svg
 [pypiLink]: https://pypi.org/project/scarf
@@ -88,6 +102,5 @@ those methods.
 [stars]: https://img.shields.io/github/stars/parashardhapola/scarf?style=social
 [github]: https://github.com/parashardhapola/scarf
 [Source code on Github]: https://github.com/parashardhapola/scarf
-[Zarr]: http://zarr.readthedocs.io
-[Chen et. al.]: https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1854-5
-[Luecken et. al.]: https://www.biorxiv.org/content/10.1101/2020.05.22.111161v2.full
+[Zarr]: https://zarr.readthedocs.io
+[GitHub issues]: https://github.com/parashardhapola/scarf/issues

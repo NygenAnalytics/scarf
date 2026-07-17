@@ -158,6 +158,28 @@ def test_embedding_raster_density_and_foreign_target(umap, datastore):
     plt.close(fig)
 
 
+def test_embedding_raster_image_fills_square_axes(umap, datastore):
+    result = splt.embedding_raster(
+        datastore,
+        layout_key="RNA_UMAP",
+        color_by="RNA_nCounts",
+        pixels=48,
+        show=False,
+    )
+    ax = next(iter(result.axes.values()))
+    images = ax.get_images()
+    assert len(images) == 1
+    extent = images[0].get_extent()
+    xlim = ax.get_xlim()
+    ylim = ax.get_ylim()
+    assert extent[0] == pytest.approx(xlim[0])
+    assert extent[1] == pytest.approx(xlim[1])
+    assert extent[2] == pytest.approx(ylim[0])
+    assert extent[3] == pytest.approx(ylim[1])
+    assert (xlim[1] - xlim[0]) == pytest.approx(ylim[1] - ylim[0])
+    result.close()
+
+
 def test_raster_validates_quantiles():
     from scarf.plotting._raster import raster_from_metadata
 

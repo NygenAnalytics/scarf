@@ -1,0 +1,45 @@
+name: Docs
+
+on:
+  push:
+    branches:
+      - master
+      - development
+    paths:
+      - "docs/**"
+      - "scarf/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".readthedocs.yml"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches:
+      - master
+      - development
+    paths:
+      - "docs/**"
+      - "scarf/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".readthedocs.yml"
+      - ".github/workflows/docs.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      HNSWLIB_NO_NATIVE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libfftw3-dev libmetis-dev
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install documentation dependencies
+        run: uv sync --extra docs --extra extra
+      - name: Sphinx HTML build (nitpicky, warnings as errors)
+        run: uv run sphinx-build -b html -n -W docs/source docs/build/html

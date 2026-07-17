@@ -47,6 +47,7 @@ def modal_function_options(
     )
     # ephemeral_disk is fixed on @app.function; with_options does not accept it.
     _ = resolve_ephemeral_disk_mb(resources.ephemeralDiskMb)
+    # Do not pass cloud=; pinning aws (or any provider) shrinks Modal capacity.
     return {
         "cpu": (resources.modalCpuRequest, resources.modalCpuLimit),
         "memory": (resources.modalMemoryRequestMb, resources.modalMemoryLimitMb),
@@ -56,6 +57,5 @@ def modal_function_options(
         "max_containers": maxContainers,
         "buffer_containers": 0,
         "timeout": resources.timeoutSeconds,
-        "cloud": config.modalCloud,
         "region": config.modalRegion,
     }

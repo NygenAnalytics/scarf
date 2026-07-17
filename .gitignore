@@ -26,7 +26,12 @@ docs/source/vignettes/*.mtx
 docs/build/
 docs/_build/
 docs/jupyter_execute
+# Downloaded/converted notebook datasets (path depends on CWD during execute)
 docs/source/scarf_datasets/
+docs/source/tutorials/scarf_datasets/
+docs/**/scarf_datasets/
+*.zarr/
+**/*.zarr/
 .coverage
 coverage.xml
 htmlcov/

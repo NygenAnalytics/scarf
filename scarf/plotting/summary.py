@@ -163,7 +163,7 @@ def dotplot(
     if resolved_figsize is None and target is None:
         resolved_figsize = (
             max(5.0, 0.45 * len(group_order) + 3.0),
-            max(4.0, 0.4 * len(feature_order) + 3.0),
+            max(4.2, 0.4 * len(feature_order) + 3.2),
         )
     with theme_context(theme):
         fig, axes, owns = normalize_axes_target(
@@ -358,9 +358,10 @@ def matrixplot(
     panel_key: Hashable = "matrixplot"
     resolved_figsize = figsize
     if resolved_figsize is None and target is None:
+        # Extra height keeps rotated group labels from clipping.
         resolved_figsize = (
             max(4.5, 0.45 * len(group_order) + 2.2),
-            max(3.5, 0.4 * len(feature_order) + 2.2),
+            max(4.2, 0.45 * len(feature_order) + 2.8),
         )
     data = mat.to_numpy(dtype=np.float64)
     vmin, vmax = _color_limits(data, color_scale)

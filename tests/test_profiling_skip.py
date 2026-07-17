@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from profiling.config import (
-    STAGE_ORDER,
+    CORE_STAGE_ORDER,
     StorageLayout,
     WorkflowParameters,
     load_profiling_config,
@@ -15,7 +15,8 @@ _EXAMPLE_CONFIG = Path(__file__).parents[1] / "profiling" / "config.example.toml
 def test_example_config_loads():
     config = load_profiling_config(_EXAMPLE_CONFIG)
     assert config.modalEnvironmentName == "scarf_profiling"
-    assert set(config.stageResources) == set(STAGE_ORDER)
+    assert set(config.stageResources) == set(CORE_STAGE_ORDER)
+    assert config.effectiveStages == CORE_STAGE_ORDER
     assert config.datasetUri(10_000).endswith("/10000.h5ad")
     assert config.resultUri(10_000, "createStore").endswith(
         "/results/10000/createStore.json"

@@ -3,7 +3,6 @@
 modalEnvironmentName = "scarf_profiling"
 modalAppName = "scarf-profiling"
 modalSecretName = "replace-with-modal-secret"
-modalCloud = "aws"
 modalRegion = "eu"
 r2EndpointUrl = "https://replace-with-account-id.r2.cloudflarestorage.com"
 datasetPrefixUri = "s3://example-bucket/scarf-profiling/datasets"

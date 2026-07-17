@@ -23,7 +23,7 @@ from typing import Any
 import modal
 
 from profiling.config import (
-    STAGE_ORDER,
+    FULL_STAGE_ORDER,
     ProfilingConfig,
     StageName,
     load_profiling_config,
@@ -235,6 +235,10 @@ def run_stage_job(
     if stage == "createStore":
         local_h5ad = work / f"{nRows}.h5ad"
         download_file(config.datasetUri(nRows), local_h5ad)
+    elif stage == "prepareMappingQuery":
+        query_rows = config.workflow.mappingQueryRows
+        local_h5ad = work / f"{query_rows}.h5ad"
+        download_file(config.datasetUri(query_rows), local_h5ad)
 
     result = run_stage(
         stage,
@@ -244,6 +248,8 @@ def run_stage_job(
         resources=resources,
         localH5adPath=local_h5ad,
         storageLayout=config.storageLayout,
+        queryStoreUri=config.queryStoreUri(nRows),
+        workDir=work,
     )
     write_result(config, result)
     return result.to_json()
@@ -266,7 +272,7 @@ def run_size_jobs(
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     if nRows not in config.targetSizes:
         raise ValueError(f"size {nRows} is not in config.targetSizes")
-    selected_stages = tuple(stages) if stages else STAGE_ORDER
+    selected_stages = tuple(stages) if stages else config.effectiveStages
     parallel_sizes = max(1, len(config.targetSizes))
     outcomes: list[dict[str, Any]] = []
 
@@ -320,7 +326,7 @@ def run_all_jobs(
     config = ProfilingConfig.model_validate(configDict)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     selected_sizes = tuple(sizes) if sizes else config.targetSizes
-    selected_stages = tuple(stages) if stages else STAGE_ORDER
+    selected_stages = tuple(stages) if stages else config.effectiveStages
     for n_rows in selected_sizes:
         if n_rows not in config.targetSizes:
             raise ValueError(f"size {n_rows} is not in config.targetSizes")
@@ -420,12 +426,14 @@ def main(*arg_list: str) -> None:
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--config", required=True)
     run_parser.add_argument("--size", type=int, required=True)
-    run_parser.add_argument("--stage", choices=STAGE_ORDER, required=True)
+    run_parser.add_argument("--stage", choices=FULL_STAGE_ORDER, required=True)
 
     all_parser = sub.add_parser("run-all")
     all_parser.add_argument("--config", required=True)
     all_parser.add_argument("--sizes", nargs="*", type=int, default=None)
-    all_parser.add_argument("--stages", nargs="*", choices=STAGE_ORDER, default=None)
+    all_parser.add_argument(
+        "--stages", nargs="*", choices=FULL_STAGE_ORDER, default=None
+    )
 
     io_parser = sub.add_parser("io-baseline")
     io_parser.add_argument("--config", required=True)

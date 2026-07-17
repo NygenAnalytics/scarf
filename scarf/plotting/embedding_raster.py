@@ -1,5 +1,6 @@
 """Blockwise raster embedding for large cell counts."""
 
+from dataclasses import replace
 from typing import Any, Hashable
 
 import numpy as np
@@ -127,8 +128,6 @@ def embedding_raster(
         seed=seed,
     )
     if color_scale.vmin is not None or color_scale.vmax is not None:
-        from dataclasses import replace
-
         canvas = replace(
             canvas,
             vmin=(
@@ -152,13 +151,29 @@ def embedding_raster(
     )
     ax = axes[panel_key]
     with theme_context(theme):
+        # Square the data window first, then draw into that extent so the
+        # image fills the axes (no floating grey rectangle in empty margins).
+        xlim, ylim = square_axis_limits(
+            (canvas.extent[0], canvas.extent[1]),
+            (canvas.extent[2], canvas.extent[3]),
+        )
+        squared = replace(
+            canvas,
+            extent=(xlim[0], xlim[1], ylim[0], ylim[1]),
+        )
         im = draw_raster_canvas(
             ax,
-            canvas,
+            squared,
             cmap=color_scale.cmap or "viridis",
             missing_color=missing_color,
             vcenter=color_scale.vcenter,
         )
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_box_aspect(1)
+        ax.set_xticks([])
+        ax.set_yticks([])
         ax.set_xlabel(f"{layout_key}1")
         ax.set_ylabel(f"{layout_key}2")
         cb = fig.colorbar(
@@ -171,13 +186,6 @@ def embedding_raster(
             pad=0.08,
         )
         cb.set_label(color_label or "log1p cell count")
-        xlim, ylim = square_axis_limits(ax.get_xlim(), ax.get_ylim())
-        ax.set_xlim(xlim)
-        ax.set_ylim(ylim)
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_box_aspect(1)
         apply_figure_chrome(fig, theme)
 
     result = PlotResult(

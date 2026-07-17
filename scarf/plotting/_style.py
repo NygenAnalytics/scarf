@@ -1,6 +1,7 @@
 """Themes and categorical palettes for scarf.plotting."""
 
-from collections.abc import Iterator, Mapping
+import re
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any, Literal
 
@@ -314,6 +315,47 @@ def capped_figsize(
 ) -> tuple[float, float]:
     """Clamp figure width so atlas-scale category counts stay page-sized."""
     return (min(float(width), float(max_width)), float(height))
+
+
+def _category_sort_key(value: Any) -> tuple[Any, ...]:
+    """Sort key: numbers in numeric order, then natural string order."""
+    import math
+
+    import numpy as np
+    import pandas as pd
+
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return (2, ())
+    try:
+        if pd.isna(value):
+            return (2, ())
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, (bool, np.bool_)):
+        return (1, (str(bool(value)).lower(),))
+    if isinstance(value, (int, np.integer)):
+        return (0, (float(value),))
+    if isinstance(value, (float, np.floating)) and math.isfinite(float(value)):
+        return (0, (float(value),))
+
+    text = str(value)
+    try:
+        return (0, (float(text),))
+    except ValueError:
+        pass
+
+    tokens = tuple(
+        int(part) if part.isdigit() else part.casefold()
+        for part in re.split(r"(\d+)", text)
+        if part != ""
+    )
+    return (1, tokens)
+
+
+def sort_categories(values: Sequence[Any]) -> list[Any]:
+    """Order categories with numeric ids before natural strings (1, 2, 10)."""
+    return sorted(values, key=_category_sort_key)
 
 
 def palette_for_n(n: int) -> list[str]:

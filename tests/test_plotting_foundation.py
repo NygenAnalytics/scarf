@@ -1121,6 +1121,9 @@ def test_distribution_violin(umap, leiden_clustering, datastore):
     assert "RNA_nCounts" in result.tables
     assert result.provenance.extras["approximate"] is True
     assert "subsampled_display" in result.provenance.notes
+    ax = next(iter(result.axes.values()))
+    rotations = {tick.get_rotation() for tick in ax.get_xticklabels()}
+    assert 45 in rotations or any(abs(r - 45) < 1e-6 for r in rotations)
     result.close()
 
     gene = str(ds.RNA.feats.fetch_all("names")[0])

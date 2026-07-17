@@ -14,6 +14,7 @@ from ._style import (
     MAX_FIGURE_WIDTH_INCHES,
     apply_figure_chrome,
     capped_figsize,
+    sort_categories,
     theme_context,
 )
 
@@ -79,7 +80,11 @@ def _draw_violin_or_box(
     max_points: int,
     point_size: float,
     rng: np.random.Generator,
+    order: list[Any] | None = None,
 ) -> bool:
+    plot_kw: dict[str, Any] = {}
+    if order is not None:
+        plot_kw["order"] = order
     if kind == "violin":
         sns.violinplot(
             data=df,
@@ -90,9 +95,10 @@ def _draw_violin_or_box(
             inner=None,
             cut=0,
             linewidth=1,
+            **plot_kw,
         )
     else:
-        sns.boxplot(data=df, x="group", y="value", ax=ax, color=color)
+        sns.boxplot(data=df, x="group", y="value", ax=ax, color=color, **plot_kw)
 
     subsampled = False
     if max_points > 0 and len(df) > 0:
@@ -106,6 +112,7 @@ def _draw_violin_or_box(
             size=point_size,
             jitter=0.35,
             alpha=0.4,
+            **plot_kw,
         )
     return subsampled
 
@@ -273,15 +280,17 @@ def distribution(
 
     n_groups = int(pd.Series(groups).nunique())
     n_panels = len(panel_keys)
-    # Dense category axes: keep each panel readable without billboard widths.
-    panel_width = min(MAX_FIGURE_WIDTH_INCHES, max(3.0, 0.28 * n_groups + 1.4))
+    group_order = sort_categories(list(pd.unique(groups)))
+    # Width scales with category count so rotated labels stay readable; wrap
+    # to extra rows before exceeding the page width.
+    panel_width = min(MAX_FIGURE_WIDTH_INCHES, max(3.6, 0.55 * n_groups + 1.8))
     if figsize is None and target is None:
         n_columns = max(
             1,
             min(n_panels, int(MAX_FIGURE_WIDTH_INCHES // panel_width) or 1),
         )
         n_rows = int(np.ceil(n_panels / n_columns))
-        figsize = capped_figsize(panel_width * n_columns, 3.2 * n_rows)
+        figsize = capped_figsize(panel_width * n_columns, 4.0 * n_rows)
     else:
         n_columns = n_panels
 
@@ -309,10 +318,15 @@ def distribution(
                     max_points=max_points,
                     point_size=point_size,
                     rng=rng,
+                    order=None if group_by is None else group_order,
                 )
                 any_subsampled = any_subsampled or subsampled
                 if group_by is None:
                     ax.set_xticks([])
+                else:
+                    ax.tick_params(axis="x", labelrotation=45)
+                    for tick in ax.get_xticklabels():
+                        tick.set_ha("right")
             elif kind == "hist":
                 _draw_hist(ax, df, color=color, bins=bins, group_by=group_by)
             else:

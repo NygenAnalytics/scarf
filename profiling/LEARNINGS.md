@@ -1,15 +1,17 @@
-# Scarf cloud profiling learnings (100k → 1M)
+# Scarf cloud profiling learnings (100k → 2.5M, countsT)
 
 Date range: 2026-07-14 to 2026-07-17  
 Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`  
 Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)  
 Dataset source: nested CELLxGENE samples already prepared on R2
 
-This note is the baseline for quantifying later changes (code defaults, orchestrator CPU/mem tables, layout ideas). Times are stage wall seconds from result JSON. Peaks are `peakCgroupBytes` unless noted.
+This note is the baseline for quantifying later changes (code defaults, orchestrator CPU/mem tables, layout ideas). Times are stage wall seconds from result JSON. Peaks are `peakRssBytes` / `peakCgroupBytes` as reported (RSS unless noted).
 
 ## Objective
 
 Minimize wall time without pointless overprovisioning. Prefer using memory and CPU in ways that actually cut stage time. Do not treat `workingCopies` as a speed dial.
+
+**Default layout going forward: feature-major `countsT` (Zarr v3).** Row-major tags remain as historical controls. New funnel profiles should use countsT stores.
 
 ## Agent / ops rules (mandatory)
 
@@ -21,6 +23,7 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 4. **Log well for long jobs.** Flush stdout. Emit pattern/stage start, a plan line (counts, chunk sizes, block totals), progress every N blocks (wall, bytes, rate), and a done line (wall, peak RSS/cgroup, bytes). Silent multi-hour runs are unacceptable.
 5. Never `modal deploy` from the agent; user deploys. Use `uv` for local Python / Modal CLI.
 6. Prefer broad Modal region `eu` over narrow `eu-west-1` for capacity.
+7. Do **not** set Modal `cloud=` (e.g. aws). Provider pinning shrinks the pool; leave cloud unset so Modal can schedule any provider.
 
 ## Code changes already wired
 
@@ -45,12 +48,14 @@ Two different numbers matter:
 | `auto_markers_c4_m32` | 100k | 4 | 32 GiB | ~24 GiB | Auto markers; UMAP parallel off |
 | `auto_markers_c4_m32_scarf16` | 100k | 4 | 32 GiB | **16 GiB** | Done; markers 219s (faster than c4_m32) |
 | `auto_markers_c4_m16` | 100k | 4 | 16 GiB | ~12 GiB | Both Modal and Scarf cut together |
-| `auto_markers_c8_m32` | 100k | 8 | 32 GiB | ~24 GiB | Speed pack (UMAP/ANN parallel) |
+| `auto_markers_c8_m32` | 100k | 8 | 32 GiB | ~24 GiB | Row-major speed pack (UMAP/ANN parallel) |
 | `auto_markers_c8_m32_250k` | 250k | 8 | 32 GiB | ~24 GiB | Same speed pack |
 | `auto_markers_c8_m48_500k` | 500k | 8 | 48 GiB | 36 GiB | Done; 4339s; makeGraph peak 9.3G looks low vs re-run |
-| `auto_markers_c8_m32_500k` | 500k | 8 | 32 GiB | 24 GiB | Right-size re-run; 3906s, max peak **23.0 GiB** (makeGraph) |
-| `auto_markers_c8_m64_1m` | 1M | 8 | 64 GiB | 48 GiB | Done; 9156s, max peak 28.3 GiB (makeGraph) |
-| `auto_markers_c8_m64_2_5m` | 2.5M | 8 | 64 GiB | 48 GiB | In progress; createStore 1778s / 6.3G |
+| `auto_markers_c8_m32_500k` | 500k | 8 | 32 GiB | 24 GiB | Row-major right-size; 3906s, max peak **23.0 GiB** (makeGraph) |
+| `auto_markers_c8_m64_1m` | 1M | 8 | 64 GiB | 48 GiB | Row-major; 9156s, max peak 28.3 GiB (makeGraph) |
+| `auto_markers_c8_m64_2_5m` | 2.5M | 8 | 64 GiB | 48 GiB | Row-major; **15292s**, makeGraph peak 24.5 GiB |
+| `counts_t_c8_m32_100k` | 100k | 8 | 32 GiB | ~24 GiB | Feature-major `countsT`; **881s** (vs 1095s row-major) |
+| `counts_t_c8_m32_500k` | 500k | 8 | 32 GiB | 24 GiB | Feature-major `countsT`; **2825s** (vs 3906s row-major) |
 
 Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.md` as the durable record; recreate TOMLs from these rows when needed.
 
@@ -64,7 +69,7 @@ Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.m
 
 ## How to quantify a future change
 
-1. Pick a fixed reference run tag (see tables below). Prefer `auto_markers_c8_m32` for 100k and `auto_markers_c8_m32_250k` for 250k.
+1. Pick a fixed reference run tag (see tables below). Prefer `counts_t_c8_m32_100k` / `counts_t_c8_m32_500k` when comparing gene-wise IO. Use `auto_markers_c8_m32*` for row-major baselines.
 2. Change one variable (size, CPU, mem, parallel flags, or code). Keep `workingCopies` and workflow seeds fixed unless the experiment is about the copy model.
 3. Compare stage seconds and peak GiB. Also report total seconds and max peak.
 4. Result URIs: `{resultsUri}/results/{runTag}/{nRows}/{stage}.json`
@@ -80,8 +85,10 @@ auto_markers_c8_m32_250k=fc-01KXK8BRWK9P50XW0NY4FWE378
 auto_markers_c8_m48_500k=fc-01KXKE1ZCG0FG7KFEQ1H0QX35K
 auto_markers_c4_m32_scarf16=fc-01KXKEX6N0N44661M6ZX26NX9C
 auto_markers_c8_m64_1m=fc-01KXKR82TFWSJS9EP1E4P5ZXCJ
-auto_markers_c8_m64_2_5m=fc-01KXPCAS3GEFWQ19E9RMJKEFJ6
+auto_markers_c8_m64_2_5m=fc-01KXPPVXKA34Z0KK7MCJ41990T
 auto_markers_c8_m32_500k=fc-01KXPCBMZGBQ02YCB9W1EKPF92
+counts_t_c8_m32_100k=fc-01KXPPVDDF9A5J8599QM7ZW65Q
+counts_t_c8_m32_500k=fc-01KXPR232W53HQXN4QPPNAD8D6
 ```
 
 ## Layout sweep @ 100k (4 CPU / 32 GiB)
@@ -185,6 +192,7 @@ Configs:
 | Cutting Modal RAM for its own sake | No for speed | 16G markers slower |
 | Raising `workers` for markers | Not shown; can hurt | 4→8 workers, markers +62s |
 | Tuning `workingCopies` for speed | Do not | It is a copy-count model, not a perf knob |
+| Feature-major `countsT` (Zarr v3) | **Yes** for HVG/markers | 100k/500k A/B below; createStore pays write cost |
 
 ## Ops notes (Modal)
 
@@ -197,23 +205,27 @@ Configs:
 
 | Size | Recommended reference tag | Machine | Notes |
 |------|---------------------------|---------|-------|
-| 100k | `auto_markers_c8_m32` | 8 CPU / 32 GiB | Fastest 100k funnel (1095s) |
-| 250k | `auto_markers_c8_m32_250k` | 8 CPU / 32 GiB | Same settings; 2346s, max peak 14.6 GiB |
-| 500k | `auto_markers_c8_m32_500k` | 8 CPU / 32 GiB | Prefer over 48G run; 3906s, makeGraph peak 23 GiB |
-| 1M | `auto_markers_c8_m64_1m` | 8 CPU / 64 GiB | 9156s; makeGraph peak 28.3 GiB justifies 64 GiB |
+| 100k | `counts_t_c8_m32_100k` | 8 CPU / 32 GiB | Fastest measured funnel (**881s**); row-major control `auto_markers_c8_m32` (1095s) |
+| 250k | `auto_markers_c8_m32_250k` | 8 CPU / 32 GiB | Row-major only so far; 2346s, max peak 14.6 GiB |
+| 500k | `counts_t_c8_m32_500k` | 8 CPU / 32 GiB | Fastest measured (**2825s**); row-major control `auto_markers_c8_m32_500k` (3906s) |
+| 1M | `auto_markers_c8_m64_1m` | 8 CPU / 64 GiB | Row-major 9156s; countsT not measured yet (estimate ~1.3h below) |
+| 2.5M | `auto_markers_c8_m64_2_5m` | 8 CPU / 64 GiB | Row-major **15292s**; makeGraph peak 24.5 GiB |
 
 For a pure markers comparison at 100k without parallel UMAP noise, use `auto_markers_c4_m32` (269s markers).
 
 ## Scale summary (wall + max peak, speed pack)
 
-| Cells | Tag | Modal | Total wall | Max peak | Stage at max peak |
-|------:|-----|------:|-----------:|---------:|-------------------|
-| 100k | `auto_markers_c8_m32` | 32 GiB | 1095s | 7.1 GiB | findMarkers |
-| 250k | `auto_markers_c8_m32_250k` | 32 GiB | 2346s | 14.6 GiB | makeGraph |
-| 500k | `auto_markers_c8_m32_500k` | 32 GiB | 3906s | **23.0 GiB** | makeGraph |
-| 1M | `auto_markers_c8_m64_1m` | 64 GiB | 9156s | **28.3 GiB** | makeGraph |
+| Cells | Tag | Layout | Modal | Total wall | Max peak | Stage at max peak |
+|------:|-----|--------|------:|-----------:|---------:|-------------------|
+| 100k | `auto_markers_c8_m32` | row | 32 GiB | 1095s | 7.1 GiB | findMarkers |
+| 100k | `counts_t_c8_m32_100k` | **countsT** | 32 GiB | **881s** | 6.7 GiB | initializeStore |
+| 250k | `auto_markers_c8_m32_250k` | row | 32 GiB | 2346s | 14.6 GiB | makeGraph |
+| 500k | `auto_markers_c8_m32_500k` | row | 32 GiB | 3906s | **23.0 GiB** | makeGraph |
+| 500k | `counts_t_c8_m32_500k` | **countsT** | 32 GiB | **2825s** | 16.6 GiB | makeGraph |
+| 1M | `auto_markers_c8_m64_1m` | row | 64 GiB | 9156s | **28.3 GiB** | makeGraph |
+| 2.5M | `auto_markers_c8_m64_2_5m` | row | 64 GiB | **15292s** | 24.5 GiB | makeGraph |
 
-Rough Modal RAM floor from peaks: 100k ≥8 GiB, 250k ≥16 GiB, 500k ≥24–32 GiB, 1M ≥32–64 GiB.
+Rough Modal RAM floor from peaks: 100k ≥8 GiB, 250k ≥16 GiB, 500k ≥24–32 GiB, 1M–2.5M ≥32–64 GiB.
 
 ## Budget mismatch @ 100k: Modal 32 GiB, Scarf 16 GiB (done)
 
@@ -235,8 +247,8 @@ Tag `auto_markers_c4_m32_scarf16`. Matched to `c4_m32` (4 CPU, workers=4, workin
 
 1. Why scarf16 markers faster than c4_m32 despite smaller software budget?
 2. Why did 8 workers slow markers vs 4 at 100k?
-3. Feature-major secondary matrix for gene-wise stages: **ready to revisit**; IO baseline shows HVG/markers ~91–99% IO on row-sharded cloud Zarr.
-4. 2.5M at 64 GiB: will makeGraph OOM? (1M peaked 28 GiB)
+3. countsT at 1M / 2.5M: confirm createStore write cost vs gene-wise savings (estimates below; not measured).
+4. Can createStore / finalize overlap or stream `countsT` write to cut the growing createStore share?
 
 ## Scale: 500k
 
@@ -311,17 +323,138 @@ Active cells after QC ~890k; feats ~32.7k; HVGs 2000; auto marker batch 452; raw
 **Takeaways:**
 
 1. Gene-wise stages on this row-sharded cloud layout are **R2/layout bound**. Extra Modal RAM or CPU will not fix HVG/markers.
-2. Speeding HVG/markers means cheaper column access (chunk geometry, feature-major side store, fewer cross-shard reads).
+2. Speeding HVG/markers means cheaper column access. Feature-major `countsT` delivered that (see A/B): HVG/markers cut to ~25–40% of row-major time at 100k/500k.
 3. makeGraph’s expensive wall/peak is **not** explained by re-reading the dense HVG-normed matrix (29s); cost is normalize/materialize, PCA/ANN/kmeans, and multi-pass work.
-4. Competing 64 GiB jobs in `eu` queue each other (IO baseline delayed 2.5M createStore for ~1h).
+4. Competing large-RAM jobs in `eu` queue each other (IO baseline delayed 2.5M; countsT 500k sat ~1.5h before createStore started).
 
-## In progress: 2.5M (8 CPU / 64 GiB, region `eu`)
+## Scale: 2.5M row-major (8 CPU / 64 GiB, region `eu`)
+
+Tag `auto_markers_c8_m64_2_5m`. Same speed-pack knobs as 1M. Call `fc-01KXPPVXKA34Z0KK7MCJ41990T` (after redeploy without `cloud=` pin).
+
+| Stage | Seconds | Peak GiB |
+|-------|--------:|---------:|
+| createStore | 1778 | 6.3 |
+| initializeStore | 9 | 0.6 |
+| reopenStore | 10 | 0.6 |
+| filterCells | 20 | 0.6 |
+| markHvgs | **3019** | 2.1 |
+| makeGraph | **3042** | **24.5** |
+| runUmap | 742 | 3.2 |
+| runLeiden | 681 | 5.2 |
+| findMarkers | **5990** | 13.3 |
+| **total** | **15292** (~4.2h) | **24.5** |
+
+**Reading:** makeGraph fit comfortably in 64 GiB (24.5G peak, vs 28.3G at 1M). Gene-wise stages dominate: HVG + markers = 9009s (~59% of wall). Markers alone are 5990s with slow R2 block reads. initializeStore was cheap here because QC columns already existed on the store from the earlier createStore attempt.
+
+## Feature-major `countsT` A/B (done)
+
+Zarr v3 secondary matrix written on finalize (`write_counts_t` / `finalize_writer_counts`). RNA HVG/markers use `assay.rawDataT` when present. Same speed pack as row-major controls (8 CPU / 32 GiB, parallel UMAP/ANN, auto markers, cloud 128 MiB chunks). Fresh stores so createStore pays for `countsT` write.
+
+| Stage | 100k row | 100k countsT | 500k row | 500k countsT |
+|-------|---------:|-------------:|---------:|-------------:|
+| createStore | 104s | **260s** | 402s | **1042s** |
+| initializeStore | 141s | 166s | 841s | 418s |
+| markHvgs | 241s | **82s** | 1062s | **261s** |
+| makeGraph | 168s | 164s | 585s | 539s |
+| runUmap | 58s | 57s | 166s | 159s |
+| runLeiden | 25s | 24s | 88s | 94s |
+| findMarkers | 331s | **102s** | 732s | **293s** |
+| **total** | **1095s** | **881s** | **3906s** | **2825s** |
+
+Calls: `fc-01KXPPVDDF9A5J8599QM7ZW65Q` (100k), `fc-01KXPR232W53HQXN4QPPNAD8D6` (500k).
+
+**Learnings:**
+
+1. **Gene-wise stages are transformed.** HVG ~34% / ~25% of row-major time at 100k / 500k. Markers ~31% / ~40% of row-major time.
+2. **Net funnel wins despite slower createStore.** 100k: −214s (−20%). 500k: −1081s (−28%). createStore roughly 2.5× slower (countsT write), but HVG+markers savings more than pay for it.
+3. **Gene-wise share of total drops** from ~52% (row 100k HVG+markers) to ~21% (countsT 100k). createStore becomes a larger fraction (~37% at countsT 500k).
+4. makeGraph / UMAP / Leiden are essentially unchanged (layout-independent).
+
+## Scaling estimates: 50k → 5M under countsT
+
+Fit from the two measured countsT totals (100k, 500k) only:
+
+\[
+T \approx 0.211 \cdot N^{0.724}
+\]
+
+Cells ×5 (100k→500k) gave wall ×3.21 (sublinear). Stage-wise power laws were fit the same way and summed for the table below. **These are extrapolations**, not measurements. Caveats:
+
+- Only two measured sizes; exponent is underdetermined.
+- createStore (incl. countsT write) has the steepest measured exponent (~0.86) and already ~37% of 500k wall; if write cost stays high, large-N totals may exceed this fit.
+- makeGraph RAM still grows with cells (16.6G at countsT 500k; 24–28G row-major at 1M–2.5M). Estimates assume capacity is available (32 GiB below ~500k, 64 GiB above).
+- Cross-check: row-major 2.5M measured **15292s**; countsT stage-sum estimate at 2.5M is **~9500s** (~38% faster if the fit holds).
+
+| Cells | Est. wall (s) | Est. hours | createStore | markHvgs | makeGraph | findMarkers | Status |
+|------:|--------------:|-----------:|------------:|---------:|----------:|------------:|--------|
+| 50k | 545 | 0.15 | 143 | 50 | 98 | 65 | estimate |
+| 100k | **881** | **0.24** | 260 | 82 | 164 | 102 | **measured** |
+| 250k | 1697 | 0.47 | 573 | 159 | 323 | 186 | estimate |
+| 500k | **2825** | **0.78** | 1042 | 261 | 539 | 293 | **measured** |
+| 1M | 4741 | 1.32 | 1895 | 430 | 900 | 462 | estimate |
+| 2.5M | 9499 | 2.64 | 4176 | 831 | 1771 | 842 | estimate (row-major measured 15292s) |
+| 5M | 16176 | 4.49 | 7593 | 1368 | 2957 | 1326 | estimate |
+
+Total-only power law (same two points) is close: 50k ~533s, 1M ~4666s, 2.5M ~9059s, 5M ~14962s.
+
+**Practical read:** with countsT, a full funnel looks like ~15 min at 50k, ~25 min at 100k, ~45 min at 250k, ~50 min at 500k, ~1.3 h at 1M, ~2.5–3 h at 2.5M, ~4–4.5 h at 5M, if createStore write scaling does not worsen and Modal capacity is available. Next measurement that would tighten the curve: countsT at 1M.
+
+## Peak RAM sizing (Modal cgroup)
+
+countsT does **not** change makeGraph RAM much. Size machines from **makeGraph `peakCgroupBytes`** (Modal OOM signal); RSS is often lower.
+
+### Measured peaks (countsT speed pack)
+
+| Cells | Max peak | Stage | makeGraph RSS / cgroup | Markers |
+|------:|----------|-------|------------------------|--------:|
+| 100k | 6.7G | initializeStore | 5.2 / 5.3G | 4.4G |
+| 500k | 16.6G RSS | makeGraph | 16.6 / **24.5G** | 7.8G |
+
+Row-major makeGraph cgroup for larger sizes: 1M **28.3G**, 2.5M **32.6G**. Growth from 500k→2.5M is shallow (~N^0.18).
+
+### Suggested Modal RAM (countsT funnel, ~20% headroom)
+
+| Cells | Peak driver | Est. need | Recommend |
+|------:|-------------|----------:|----------:|
+| 50k | init ~7G | ~7G | 16 GiB |
+| 100k | init 6.7G | 6.7G | 16–32 GiB |
+| 250k | makeGraph ~13G | ~13G | 16–32 GiB |
+| 500k | makeGraph 24.5G cgroup | 24.5G | **32 GiB** |
+| 1M | makeGraph 28.3G | ~28G | 48–64 GiB |
+| 2.5M | makeGraph 32.6G | ~33G | 48–64 GiB |
+| 5M | makeGraph ~37G (extrap.) | ~37G | 48–64 GiB |
+
+Wall-time and RAM scale differently: gene-wise wall shrinks with countsT; makeGraph RAM stays the sizing constraint above ~250k.
+
+## Non-core extras @ 250k (countsT, planned / in flight)
+
+Tag `counts_t_extras_c8_m32_250k`. Config `profiling/layouts/250k_counts_t_extras_c8_m32.toml`. Same speed pack (8 CPU / 32 GiB) plus optional stages after the core funnel. Mapping query is nested **25k** on R2; `prepareMappingQuery` is timed separately; `runMapping` measures projection only (store opens in `inputSetupSeconds`).
+
+| Stage | Purpose |
+|-------|---------|
+| core funnel | createStore…findMarkers on countsT 250k |
+| `getImputed` | MAGIC operator + 25 genes (`cache_operator=True`) |
+| `runClustering` | Paris, 20 clusters |
+| `runPseudotime` | PBA using Leiden first/last cluster as source/sink |
+| `prepareMappingQuery` | Build 25k query Zarr (prep cost) |
+| `runMapping` | Project 25k onto 250k reference (mapping cost only) |
+| `makeGraphHarmony` | Synthetic 4 batches + `make_graph(harmonize=True)` |
+| `subsetZarr` | Export active cells to local Zarr |
+| `toH5ad` | Export assay to local H5AD |
+
+Spawned: `fc-01KXQYNZG3X6NZ5K8J08XNNR3G`
+
+```bash
+uv run --group profiling modal run --env scarf_profiling -m profiling.modal_app -- \
+  run-all --config profiling/layouts/250k_counts_t_extras_c8_m32.toml
+```
+
+## In progress: 5M countsT core (8 CPU / 64 GiB)
 
 | Field | Value |
 |-------|-------|
-| Tag | `auto_markers_c8_m64_2_5m` |
-| Config | `profiling/layouts/2_5m_auto_markers_c8_m64.toml` |
-| Call | `fc-01KXPCAS3GEFWQ19E9RMJKEFJ6` |
-| createStore | **1778s / 6.3G** (done) |
-| Next | initializeStore onward |
-| Risk | makeGraph may exceed 64 GiB (1M peaked 28 GiB) |
+| Tag | `counts_t_c8_m64_5m` |
+| Config | `profiling/layouts/5m_counts_t_c8_m64.toml` |
+| Call | `fc-01KXQYP5HX3P0PHD6YWDAFSRXA` |
+| Stages | core only (9); countsT via Zarr v3 finalize |
+| RAM note | makeGraph cgroup est ~37G; 64 GiB box |

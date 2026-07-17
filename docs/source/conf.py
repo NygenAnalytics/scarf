@@ -6,7 +6,7 @@ import matplotlib
 sys.path.insert(0, os.path.abspath("../.."))
 
 project = "Scarf"
-copyright = "2020-2024, Parashar Dhapola"
+copyright = "2020-2026, Parashar Dhapola"
 author = "Parashar Dhapola"
 
 extensions = [
@@ -30,6 +30,9 @@ exclude_patterns = [
     ".DS_Store",
     "**.ipynb_checkpoints",
     "vignettes/dev",
+    "tutorials/dev",
+    "scarf_datasets",
+    "**/scarf_datasets",
 ]
 pygments_style = "sphinx"
 language = "en"
@@ -43,7 +46,7 @@ myst_enable_extensions = [
 
 html_theme = "sphinx_book_theme"
 html_favicon = "favicon.ico"
-html_logo = "logo.png"
+html_logo = "_static/nygen-wordmark-black.png"
 html_title = "Scarf documentation"
 html_baseurl = "https://scarf.readthedocs.io/en/latest/"
 html_theme_options = {
@@ -72,3 +75,34 @@ nb_execution_cache_path = os.path.join(
 nb_execution_timeout = 600
 
 matplotlib.use("agg")
+
+# Suppress noisy autodoc type cross-refs until intersphinx inventories are complete (P7).
+nitpick_ignore = [
+    ("py:class", "numpy.ndarray"),
+    ("py:class", "numpy.dtype"),
+    ("py:class", "pandas.core.frame.DataFrame"),
+    ("py:class", "pandas.core.series.Series"),
+    ("py:class", "scipy.sparse._csr.csr_matrix"),
+    ("py:class", "scipy.sparse._coo.coo_matrix"),
+    ("py:class", "zarr.abc.store.Store"),
+    ("py:class", "zarr.core.group.Group"),
+    ("py:class", "zarr.core.array.Array"),
+    ("py:class", "pathlib.Path"),
+    ("py:class", "collections.abc.Callable"),
+    ("py:class", "collections.abc.Iterable"),
+    ("py:class", "collections.abc.Iterator"),
+    ("py:class", "collections.abc.Sequence"),
+    ("py:class", "collections.abc.Generator"),
+    ("py:class", "scarf.chunked.ChunkedArray"),
+    ("py:class", "scarf.ann.AnnStream"),
+    ("py:class", "scarf.merge.DummyAssay"),
+    ("py:class", "scarf.readers.CrReader"),
+    ("py:class", "scarf.plotting._figure.LegendSpec"),
+    ("py:class", "scarf.metadata.MetaDataRowBlock"),
+    ("py:class", "scarf.datastore.mapping_datastore.MappingDatastore"),
+    ("py:obj", "numpy.typing.DTypeLike"),
+    ("py:data", "typing.Any"),
+    ("py:data", "typing.Literal"),
+    ("py:data", "typing.Optional"),
+    ("py:data", "Ellipsis"),
+]

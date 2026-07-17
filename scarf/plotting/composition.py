@@ -13,6 +13,7 @@ from ._style import (
     capped_figsize,
     categorical_color_map,
     scatter_edgecolor,
+    sort_categories,
     theme_context,
 )
 
@@ -212,7 +213,7 @@ def composition(
                 + ", ".join(map(str, unlisted[:10]))
             )
     else:
-        cat_order = sorted(observed_categories, key=lambda value: str(value))
+        cat_order = sort_categories(observed_categories)
 
     pair_col: str | None = None
     n_pair_lines = 0

@@ -1,65 +1,78 @@
 # Scarf
 
-Out-of-core, graph-first workflows for million-cell RNA-seq and CITE-seq.
+Single-cell analysis that stays on disk.
+
+Scarf runs scRNA-seq and CITE-seq neighbourhood-graph workflows on [Zarr](https://zarr.readthedocs.io)
+stores, locally or on S3-compatible object storage. Counts, graphs, and embeddings persist
+as you go, so atlas-scale analysis does not require loading the full matrix into memory.
+
+If you already use [Scanpy](https://scanpy.readthedocs.io): Scarf covers the core path
+(QC → HVGs → graph → UMAP/Leiden → markers → mapping) with a lower memory ceiling and
+native remote stores. Export with `to_anndata` / `to_h5ad` when you need the wider
+Scanpy ecosystem. Stage mapping: [Scarf and Scanpy](https://scarf.readthedocs.io/en/latest/scarf_and_scanpy.html).
 
 [![PyPI](https://img.shields.io/pypi/v/scarf.svg)](https://pypi.org/project/scarf)
 [![Docs](https://readthedocs.org/projects/scarf/badge/?version=latest)](https://scarf.readthedocs.io)
 [![Tests](https://github.com/parashardhapola/scarf/actions/workflows/pytest.yml/badge.svg)](https://github.com/parashardhapola/scarf/actions/workflows/pytest.yml)
 [![Coverage](https://codecov.io/gh/parashardhapola/scarf/branch/master/graph/badge.svg?token=ZvJXuYq3pd)](https://codecov.io/gh/parashardhapola/scarf)
-[![Downloads](https://pepy.tech/badge/scarf)](https://pepy.tech/project/scarf)
 
-## Installation
+## Install
 
-Requires Python 3.12+.
+Python 3.12+.
 
 ```bash
-pip install scarf[extra]
+uv pip install "scarf[extra]"
 ```
-
-## Features
-
-- Analyze atlas-scale scRNA-seq on modest hardware (tested up to 4M cells)
-- CITE-seq multimodal analysis with WNN and SNN integration
-- Zarr-backed chunking for low memory use
-- Parallel UMAP and SG-tSNE embeddings
-- Harmony batch correction and partial PCA for merged datasets
-- Cell projection and label transfer across datasets
-- TopACeDo subsampling for representative cell selection
-- Hierarchical clustering with interpretable dendrograms
 
 ## Quick start
 
-Convert a Cell Ranger `filtered_feature_bc_matrix.h5` to Zarr, then run a minimal scRNA-seq workflow:
-
 ```python
 import scarf
+import scarf.plotting as splt
 
 reader = scarf.CrH5Reader("filtered_feature_bc_matrix.h5")
 scarf.CrToZarr(reader, zarr_loc="data.zarr").dump(batch_size=1000)
 
 ds = scarf.DataStore("data.zarr", nthreads=4, min_features_per_cell=10)
-ds.filter_cells(attrs=["RNA_nCounts", "RNA_nFeatures"], highs=[15000, 4000], lows=[1000, 500])
-
+ds.filter_cells(
+    attrs=["RNA_nCounts", "RNA_nFeatures"],
+    highs=[15000, 4000],
+    lows=[1000, 500],
+)
 ds.mark_hvgs(min_cells=20, top_n=500)
 ds.make_graph(feat_key="hvgs", k=11, dims=15, n_centroids=100)
 ds.run_umap(n_epochs=250, spread=5, min_dist=1, parallel=True)
 ds.run_leiden_clustering(resolution=0.5)
 
-ds.plot_layout(layout_key="RNA_UMAP", color_by="RNA_leiden_cluster")
+splt.embedding(
+    ds, layout_key="RNA_UMAP", color_by="RNA_leiden_cluster", show=False
+).figure
 ```
 
-## Documentation
+Same path with more explanation: [docs quick start](https://scarf.readthedocs.io/en/latest/quickstart.html).
 
-- [Installation guide](https://scarf.readthedocs.io/en/latest/install.html)
-- [scRNA-seq tutorial](https://scarf.readthedocs.io/en/latest/vignettes/basic_tutorial_scRNAseq.html)
-- [CITE-seq tutorial](https://scarf.readthedocs.io/en/latest/vignettes/multiple_modalities.html)
-- [Integration guide](https://scarf.readthedocs.io/en/latest/integration_guide.html)
-- [Full API](https://scarf.readthedocs.io/en/latest/api.html)
+## What Scarf is good at
+
+- **Remote-first Zarr**: analyze stores on S3 without a local full copy
+- **Large matrices on modest RAM**: measured through 2.5M cells in 64 GiB (~4 h end-to-end on object storage); details in [`profiling/LEARNINGS.md`](profiling/LEARNINGS.md)
+- **Graph-centric workflows**: UMAP, Leiden/Paris, Harmony, WNN/SNN, mapping, TopACeDo subsampling
+- **Persistent results**: intermediates live in the store, not only in an in-memory object
+
+## Docs
+
+Start here: [Installation](https://scarf.readthedocs.io/en/latest/installation.html) ·
+[Quick start](https://scarf.readthedocs.io/en/latest/quickstart.html) ·
+[Scarf and Scanpy](https://scarf.readthedocs.io/en/latest/scarf_and_scanpy.html) ·
+[scRNA-seq](https://scarf.readthedocs.io/en/latest/tutorials/scrna_seq.html) ·
+[API](https://scarf.readthedocs.io/en/latest/reference/api.html)
+
+Also: [CITE-seq](https://scarf.readthedocs.io/en/latest/tutorials/cite_seq.html),
+[integration](https://scarf.readthedocs.io/en/latest/tutorials/choosing_integration_methods.html).
 
 ## Citation
 
-If you use Scarf in your research, please cite [Dhapola et al., Nature Communications (2022)](https://doi.org/10.1038/s41467-022-32097-3).
+[Dhapola et al., Nature Communications (2022)](https://doi.org/10.1038/s41467-022-32097-3)
 
 ## Support
 
-Open an [issue on GitHub](https://github.com/parashardhapola/scarf/issues) if you run into problems.
+[GitHub issues](https://github.com/parashardhapola/scarf/issues)

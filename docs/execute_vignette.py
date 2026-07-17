@@ -1,6 +1,4 @@
-"""Execute myst-nb vignettes into docs/.jupyter_cache."""
-
-from __future__ import annotations
+"""Execute myst-nb documentation pages into docs/.jupyter_cache."""
 
 import os
 import shutil
@@ -13,8 +11,18 @@ from myst_nb.core.execute import create_client
 from myst_nb.core.read import create_nb_reader
 
 DOCS_ROOT = Path(__file__).resolve().parent
+SOURCE_DIR = DOCS_ROOT / "source"
 DEFAULT_CACHE = DOCS_ROOT / ".jupyter_cache"
-VIGNETTES_DIR = DOCS_ROOT / "source" / "vignettes"
+DEFAULT_PAGE = "scrna_seq"
+
+# Non-executable prose trees (still under source/) are skipped.
+_SKIP_DIR_NAMES = {
+    "_static",
+    "_templates",
+    "_build",
+    "scarf_datasets",
+    "dev",
+}
 
 os.environ.setdefault("IPYTHONDIR", str(DOCS_ROOT / ".ipython"))
 
@@ -49,24 +57,89 @@ class _Logger:
         pass
 
 
-def resolve_doc_path(name: str) -> Path:
-    if name == "quickstart":
-        path = DOCS_ROOT / "source" / "quickstart.md"
-    else:
-        path = VIGNETTES_DIR / f"{name}.md"
-    if not path.exists():
-        raise FileNotFoundError(f"Executable doc not found: {path}")
-    return path
+def _is_executable_myst(path: Path) -> bool:
+    """Return True when the markdown file is a myst-nb notebook source."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    # Require notebook frontmatter or a real MyST code-cell fence, not prose mentions.
+    if "kernelspec:" in text:
+        return True
+    return "```{code-cell}" in text or "```{code-cell} " in text
+
+
+def iter_executable_paths() -> list[Path]:
+    """Discover executable MyST pages under docs/source recursively."""
+    paths: list[Path] = []
+    for path in sorted(SOURCE_DIR.rglob("*.md")):
+        if any(part in _SKIP_DIR_NAMES for part in path.parts):
+            continue
+        if not _is_executable_myst(path):
+            continue
+        paths.append(path)
+    return paths
+
+
+def _page_aliases(path: Path) -> list[str]:
+    """Names that resolve to this page: stem and source-relative path without suffix."""
+    rel = path.relative_to(SOURCE_DIR)
+    aliases = [path.stem, rel.as_posix().removesuffix(".md")]
+    # Deduplicate while preserving order.
+    seen: set[str] = set()
+    out: list[str] = []
+    for alias in aliases:
+        if alias not in seen:
+            seen.add(alias)
+            out.append(alias)
+    return out
 
 
 def list_executable_docs() -> list[str]:
-    names = ["quickstart"]
-    names.extend(sorted(p.stem for p in VIGNETTES_DIR.glob("*.md")))
+    """Return unique page stems (and conflict-safe relative paths) for CLI use."""
+    stem_counts: dict[str, int] = {}
+    paths = iter_executable_paths()
+    for path in paths:
+        stem_counts[path.stem] = stem_counts.get(path.stem, 0) + 1
+
+    names: list[str] = []
+    for path in paths:
+        if stem_counts[path.stem] == 1:
+            names.append(path.stem)
+        else:
+            names.append(path.relative_to(SOURCE_DIR).as_posix().removesuffix(".md"))
     return names
 
 
 def list_vignettes() -> list[str]:
+    """Backward-compatible alias for list_executable_docs."""
     return list_executable_docs()
+
+
+def resolve_doc_path(name: str) -> Path:
+    """Resolve a page name or source-relative path to an executable .md file."""
+    cleaned = name.removesuffix(".md").lstrip("./")
+    candidates = [
+        SOURCE_DIR / f"{cleaned}.md",
+        SOURCE_DIR / "tutorials" / f"{cleaned}.md",
+        SOURCE_DIR / "vignettes" / f"{cleaned}.md",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and _is_executable_myst(candidate):
+            return candidate
+
+    matches = [
+        path
+        for path in iter_executable_paths()
+        if cleaned in _page_aliases(path) or path.stem == Path(cleaned).stem
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        opts = ", ".join(
+            p.relative_to(SOURCE_DIR).as_posix().removesuffix(".md") for p in matches
+        )
+        raise FileNotFoundError(
+            f"Ambiguous executable doc {name!r}; use one of: {opts}"
+        )
+    raise FileNotFoundError(f"Executable doc not found: {name}")
 
 
 def prune_stale_cache(cache_path: Path = DEFAULT_CACHE) -> list[str]:
@@ -186,7 +259,7 @@ def _stale_failure_traceback(cache_path: Path, uri: str) -> str | None:
         db.close()
 
 
-def execute_vignette(
+def execute_page(
     name: str,
     *,
     cache_path: Path | None = None,
@@ -203,7 +276,7 @@ def execute_vignette(
         _invalidate_cache_entry(cache_path, uri)
     elif (traceback := _stale_failure_traceback(cache_path, uri)) is not None:
         raise RuntimeError(
-            f"Vignette {name!r} has a cached execution error; re-run with --force:\n"
+            f"Page {name!r} has a cached execution error; re-run with --force:\n"
             f"{traceback}"
         )
 
@@ -220,7 +293,7 @@ def execute_vignette(
     content = path.read_text(encoding="utf-8")
     nb_reader = create_nb_reader(str(path), md_config, nb_config, content)
     if nb_reader is None:
-        raise ValueError(f"Not a myst-nb vignette: {path}")
+        raise ValueError(f"Not a myst-nb page: {path}")
 
     notebook = nb_reader.read(content)
     logger = _Logger()
@@ -231,12 +304,26 @@ def execute_vignette(
         metadata = client.exec_metadata or {}
 
     if _cached_notebook_hash(cache_path, uri) is None:
-        raise RuntimeError(
-            f"Vignette {name!r} finished without writing a cached notebook"
-        )
+        raise RuntimeError(f"Page {name!r} finished without writing a cached notebook")
 
     print(f"[{name}] finished", flush=True)
     return {"name": name, "metadata": metadata}
+
+
+def execute_vignette(
+    name: str,
+    *,
+    cache_path: Path | None = None,
+    execution_in_temp: bool = False,
+    force: bool = False,
+) -> dict:
+    """Backward-compatible alias for execute_page."""
+    return execute_page(
+        name,
+        cache_path=cache_path,
+        execution_in_temp=execution_in_temp,
+        force=force,
+    )
 
 
 def merge_caches(source_dirs: list[Path], target_dir: Path = DEFAULT_CACHE) -> None:
@@ -303,10 +390,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "vignette",
+        "page",
         nargs="?",
-        default="basic_tutorial_scRNAseq",
-        help="Vignette name without .md extension",
+        default=DEFAULT_PAGE,
+        help="Page stem or source-relative path without .md (default: scrna_seq)",
     )
     parser.add_argument(
         "--cache-path",
@@ -319,9 +406,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Re-execute even when a cached notebook exists",
     )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List executable page names and exit",
+    )
     cli = parser.parse_args()
-    execute_vignette(
-        cli.vignette,
+    if cli.list:
+        for name in list_executable_docs():
+            print(name)
+        raise SystemExit(0)
+    execute_page(
+        cli.page,
         cache_path=cli.cache_path,
         execution_in_temp=True,
         force=cli.force,

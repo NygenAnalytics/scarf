@@ -73,6 +73,7 @@ def test_density_and_legend_helpers():
         default_point_edgewidth,
         default_point_size,
         resolve_legend_loc,
+        sort_categories,
     )
 
     assert default_point_size(100) > default_point_size(20_000)
@@ -83,6 +84,15 @@ def test_density_and_legend_helpers():
     assert resolve_legend_loc(80) == "none"
     assert resolve_legend_loc(20, "right") == "right"
     assert capped_figsize(20.0, 4.0)[0] == pytest.approx(7.5)
+    assert sort_categories([1, 10, 2, "B", "A10", "A2"]) == [
+        1,
+        2,
+        10,
+        "A2",
+        "A10",
+        "B",
+    ]
+    assert sort_categories(["10", "2", "1"]) == ["1", "2", "10"]
 
 
 def test_embedding_on_data_legend(umap, leiden_clustering, datastore):
