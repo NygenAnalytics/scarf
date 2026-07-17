@@ -4,6 +4,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf._types import as_zarr_array, as_zarr_group, array_metadata_shards
+import scarf.utils as utils_module
 from scarf.utils import (
     array_digest,
     clean_array,
@@ -11,6 +12,7 @@ from scarf.utils import (
     rescale_array,
     rolling_window,
     set_verbosity,
+    tqdmbar,
 )
 
 
@@ -69,6 +71,58 @@ def test_set_verbosity_rejects_invalid_level():
 def test_set_verbosity_accepts_valid_level():
     set_verbosity("ERROR")
     set_verbosity("INFO")
+
+
+def test_tqdmbar_enabled_for_tty_or_notebook(monkeypatch):
+    import tqdm
+    import tqdm.auto as tqdm_auto
+
+    captured: dict[str, bool] = {}
+
+    class FakeTqdm:
+        def __init__(self, *args, **kwargs):
+            captured["disable"] = bool(kwargs.get("disable"))
+
+        def __iter__(self):
+            return iter(())
+
+    monkeypatch.setattr(utils_module, "get_log_level", lambda: 20)
+    monkeypatch.setattr(utils_module, "stdout_is_interactive", lambda: False)
+    monkeypatch.setattr(utils_module, "is_notebook", lambda: True)
+    monkeypatch.setattr(tqdm, "tqdm_notebook", FakeTqdm)
+    list(tqdmbar(range(1), desc="test"))
+    assert captured["disable"] is False
+
+    monkeypatch.setattr(utils_module, "is_notebook", lambda: False)
+    monkeypatch.setattr(utils_module, "stdout_is_interactive", lambda: True)
+    monkeypatch.setattr(tqdm_auto, "tqdm", FakeTqdm)
+    list(tqdmbar(range(1), desc="test"))
+    assert captured["disable"] is False
+
+
+def test_tqdmbar_disabled_when_redirected_or_quiet(monkeypatch):
+    import tqdm.auto as tqdm_auto
+
+    captured: dict[str, bool] = {}
+
+    class FakeTqdm:
+        def __init__(self, *args, **kwargs):
+            captured["disable"] = bool(kwargs.get("disable"))
+
+        def __iter__(self):
+            return iter(())
+
+    monkeypatch.setattr(tqdm_auto, "tqdm", FakeTqdm)
+    monkeypatch.setattr(utils_module, "is_notebook", lambda: False)
+    monkeypatch.setattr(utils_module, "stdout_is_interactive", lambda: False)
+    monkeypatch.setattr(utils_module, "get_log_level", lambda: 20)
+    list(tqdmbar(range(1), desc="test"))
+    assert captured["disable"] is True
+
+    monkeypatch.setattr(utils_module, "stdout_is_interactive", lambda: True)
+    monkeypatch.setattr(utils_module, "get_log_level", lambda: 30)
+    list(tqdmbar(range(1), desc="test"))
+    assert captured["disable"] is True
 
 
 def test_rolling_window_smoothes_along_rows():

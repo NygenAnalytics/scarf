@@ -113,7 +113,7 @@ def tqdmbar(*args: Any, **kwargs: Any) -> Any:
         if i in params:
             del params[i]
     if "disable" not in kwargs and "disable" not in params:
-        if get_log_level() <= 20 and stdout_is_interactive():
+        if get_log_level() <= 20 and (stdout_is_interactive() or is_notebook()):
             params["disable"] = False
         else:
             params["disable"] = True

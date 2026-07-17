@@ -4,9 +4,13 @@ import pytest
 
 import scarf.markers as markers_module
 from scarf.assay import norm_lib_size
+from scipy.stats import linregress
+
 from scarf.markers import (
     _batch_stats,
     _marker_stats_batch,
+    _regression_batch_results,
+    _regression_r_batch,
     find_markers_by_rank,
     find_markers_by_regression,
     mannwhitneyu_from_ranks,
@@ -184,6 +188,77 @@ def test_find_markers_by_regression_handles_expression_threshold():
     assert result.loc["at_threshold", "r_value"] != 0.0
     assert np.array_equal(result.loc["too_sparse"].to_numpy(), [0.0, 1.0])
     assert np.array_equal(result.loc["constant"].to_numpy(), [0.0, 1.0])
+
+
+def test_regression_r_batch_matches_py_func():
+    rng = np.random.default_rng(0)
+    data = rng.poisson(0.8, size=(40, 8)).astype(np.float64)
+    regressor = np.linspace(0.0, 1.0, 40)
+    x_centered = regressor - regressor.mean()
+    ssxm = float(np.dot(x_centered, x_centered) / regressor.size)
+    kwargs = (
+        np.ascontiguousarray(data),
+        np.ascontiguousarray(x_centered),
+        ssxm,
+        2,
+        float(np.finfo(float).eps),
+    )
+    compiled = _regression_r_batch(*kwargs)
+    python = _regression_r_batch.py_func(*kwargs)
+    np.testing.assert_allclose(compiled[0], python[0])
+    np.testing.assert_array_equal(compiled[1], python[1])
+
+
+def test_regression_batch_matches_linregress():
+    rng = np.random.default_rng(1)
+    n_cells = 50
+    regressor = np.linspace(-1.0, 2.0, n_cells)
+    data = np.column_stack(
+        [
+            2.0 * regressor + 0.1,
+            -1.5 * regressor,
+            rng.poisson(0.5, size=n_cells).astype(float),
+            np.zeros(n_cells),
+            np.where(np.arange(n_cells) < 3, 1.0, 0.0),
+        ]
+    )
+    x_centered = regressor - regressor.mean()
+    ssxm = float(np.dot(x_centered, x_centered) / n_cells)
+    labels = np.array(["pos", "neg", "sparseish", "constant", "too_sparse"])
+    r_vals, p_vals = _regression_batch_results(
+        np.ascontiguousarray(data),
+        np.ascontiguousarray(x_centered),
+        ssxm,
+        regressor,
+        min_cells=5,
+        feature_labels=labels,
+    )
+    for i, label in enumerate(labels):
+        v = data[:, i]
+        if (v > 0).sum() >= 5 and np.ptp(v) > np.finfo(float).eps:
+            ref = linregress(regressor, v)
+            assert r_vals[i] == pytest.approx(ref.rvalue, rel=1e-10, abs=1e-12)
+            assert p_vals[i] == pytest.approx(ref.pvalue, rel=1e-8, abs=1e-12)
+        else:
+            assert r_vals[i] == 0.0
+            assert p_vals[i] == 1.0
+
+
+def test_find_markers_by_regression_two_cell_fallback():
+    class Assay:
+        @staticmethod
+        def iter_normed_feature_wise(**_kwargs):
+            yield pd.DataFrame({"a": [0.0, 1.0], "b": [1.0, 1.0]})
+
+    result = find_markers_by_regression(
+        Assay(),
+        cell_key="I",
+        feat_key="I",
+        regressor=np.array([0.0, 1.0]),
+        min_cells=1,
+    )
+    assert result.loc["a", "r_value"] == pytest.approx(1.0)
+    assert np.array_equal(result.loc["b"].to_numpy(), [0.0, 1.0])
 
 
 def test_find_markers_by_regression_rejects_non_dataframe_batches():

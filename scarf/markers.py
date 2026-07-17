@@ -6,9 +6,9 @@ import numpy as np
 import pandas as pd
 import numba
 from numba import njit, prange, set_num_threads
-from scipy.stats import linregress, norm
+from scipy.stats import linregress, norm, t as student_t
 
-from scarf.assay import Assay, RNAassay, norm_lib_size
+from scarf.assay import Assay, RNAassay, lib_size_feature_stream_eligible
 from scarf.chunked import ChunkedArray
 from scarf.utils import logger
 
@@ -16,6 +16,11 @@ _MARKER_SORT_BY = ("score", "p_value")
 _MARKER_SORT_ASCENDING = (False, True)
 # Dense marker batches keep raw + float32 normed + prefetch slack.
 _MARKER_BYTES_PER_CELL_FEATURE = 32
+_LINREGRESS_TINY = 1.0e-20
+# Per-feature status codes for _regression_r_batch.
+_REG_OK = 0
+_REG_SENTINEL = 1
+_REG_NONFINITE = 2
 
 
 def resolve_marker_gene_batch_size(
@@ -312,10 +317,8 @@ def find_markers_by_rank(
 
     renormalize_subset = bool(norm_params.get("renormalize_subset", False))
     log_transform = bool(norm_params.get("log_transform", False))
-    use_fast = (
-        assay.normMethod is norm_lib_size
-        and not renormalize_subset
-        and assay.sf is not None
+    use_fast = lib_size_feature_stream_eligible(
+        assay, renormalize_subset=renormalize_subset
     )
 
     if use_fast:
@@ -391,6 +394,122 @@ def find_markers_by_rank(
     return results
 
 
+@njit(parallel=True, cache=True)
+def _regression_r_batch(
+    data: np.ndarray,
+    x_centered: np.ndarray,
+    ssxm: float,
+    min_cells: int,
+    eps: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pearson r per feature column; status is OK / SENTINEL / NONFINITE."""
+    n_cells = data.shape[0]
+    n_genes = data.shape[1]
+    r_out = np.empty(n_genes, dtype=np.float64)
+    status = np.empty(n_genes, dtype=np.int8)
+    inv_n = 1.0 / n_cells
+    for g in prange(n_genes):
+        v = data[:, g]
+        finite = True
+        nz = 0
+        vmin = v[0]
+        vmax = v[0]
+        y_sum = 0.0
+        for c in range(n_cells):
+            val = v[c]
+            if not np.isfinite(val):
+                finite = False
+                break
+            y_sum += val
+            if val > 0.0:
+                nz += 1
+            if val < vmin:
+                vmin = val
+            if val > vmax:
+                vmax = val
+        if not finite:
+            r_out[g] = 0.0
+            status[g] = _REG_NONFINITE
+            continue
+        if nz < min_cells or (vmax - vmin) <= eps:
+            r_out[g] = 0.0
+            status[g] = _REG_SENTINEL
+            continue
+        y_mean = y_sum * inv_n
+        ssym = 0.0
+        ssxym = 0.0
+        for c in range(n_cells):
+            yd = v[c] - y_mean
+            ssym += yd * yd
+            ssxym += x_centered[c] * yd
+        ssym *= inv_n
+        ssxym *= inv_n
+        if ssxm == 0.0 or ssym == 0.0:
+            r_out[g] = 0.0
+            status[g] = _REG_SENTINEL
+            continue
+        r = ssxym / np.sqrt(ssxm * ssym)
+        if r > 1.0:
+            r = 1.0
+        elif r < -1.0:
+            r = -1.0
+        r_out[g] = r
+        status[g] = _REG_OK
+    return r_out, status
+
+
+def _regression_p_values(r: np.ndarray, n_cells: int) -> np.ndarray:
+    """Two-sided Student-t p-values matching scipy.stats.linregress."""
+    df = float(n_cells - 2)
+    denom = (1.0 - r + _LINREGRESS_TINY) * (1.0 + r + _LINREGRESS_TINY)
+    t_stat = r * np.sqrt(df / denom)
+    return 2.0 * student_t.sf(np.abs(t_stat), df)
+
+
+def _regression_batch_results(
+    data: np.ndarray,
+    x_centered: np.ndarray,
+    ssxm: float,
+    regressor: np.ndarray,
+    min_cells: int,
+    feature_labels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute r and p for one feature batch; raise on non-finite columns."""
+    n_cells = data.shape[0]
+    eps = float(np.finfo(float).eps)
+    if n_cells == 2:
+        r_vals = np.empty(data.shape[1], dtype=np.float64)
+        p_vals = np.empty(data.shape[1], dtype=np.float64)
+        for g in range(data.shape[1]):
+            v = data[:, g]
+            if not np.isfinite(v).all():
+                raise ValueError(
+                    f"Feature {feature_labels[g]!r} contains non-finite "
+                    "normalized values"
+                )
+            if (v > 0).sum() >= min_cells and np.ptp(v) > eps:
+                lin_obj = linregress(regressor, v)
+                r_vals[g] = float(lin_obj.rvalue)
+                p_vals[g] = float(lin_obj.pvalue)
+            else:
+                r_vals[g] = 0.0
+                p_vals[g] = 1.0
+        return r_vals, p_vals
+
+    r_vals, status = _regression_r_batch(data, x_centered, ssxm, int(min_cells), eps)
+    bad = np.flatnonzero(status == _REG_NONFINITE)
+    if bad.size:
+        raise ValueError(
+            f"Feature {feature_labels[bad[0]]!r} contains non-finite normalized values"
+        )
+    p_vals = np.ones(data.shape[1], dtype=np.float64)
+    ok = status == _REG_OK
+    if np.any(ok):
+        p_vals[ok] = _regression_p_values(r_vals[ok], n_cells)
+    r_vals = np.where(ok, r_vals, 0.0)
+    return r_vals, p_vals
+
+
 def find_markers_by_regression(
     assay: Assay,
     cell_key: str,
@@ -417,7 +536,7 @@ def find_markers_by_regression(
             - p_value: Statistical significance of correlation
     """
 
-    regressor = np.asarray(regressor, dtype=float)
+    regressor = np.asarray(regressor, dtype=np.float64)
     if regressor.ndim != 1:
         raise ValueError("regressor must be one-dimensional")
     if not np.isfinite(regressor).all():
@@ -427,7 +546,14 @@ def find_markers_by_regression(
     if min_cells < 1:
         raise ValueError("min_cells must be at least 1")
 
-    res: dict[Any, tuple[float, float]] = {}
+    n_threads = getattr(assay, "nthreads", 1)
+    set_num_threads(min(max(1, int(n_threads)), numba.config.NUMBA_NUM_THREADS))
+    x_centered = regressor - regressor.mean()
+    ssxm = float(np.dot(x_centered, x_centered) / regressor.shape[0])
+
+    labels: list[Any] = []
+    r_parts: list[np.ndarray] = []
+    p_parts: list[np.ndarray] = []
     for feature_batch in assay.iter_normed_feature_wise(
         cell_key=cell_key,
         feat_key=feat_key,
@@ -441,17 +567,29 @@ def find_markers_by_regression(
             raise ValueError(
                 "Regressor length does not match the number of selected cells"
             )
-        for i in feature_batch:
-            v = np.asarray(feature_batch[i].values, dtype=float)
-            if not np.isfinite(v).all():
-                raise ValueError(f"Feature {i!r} contains non-finite normalized values")
-            if (v > 0).sum() >= min_cells and np.ptp(v) > np.finfo(float).eps:
-                lin_obj = linregress(regressor, v)
-                res[i] = (float(lin_obj.rvalue), float(lin_obj.pvalue))
-            else:
-                res[i] = (0.0, 1.0)
-    res = pd.DataFrame(res, index=["r_value", "p_value"]).T
-    return res
+        data = np.ascontiguousarray(feature_batch.to_numpy(dtype=np.float64))
+        feat_labels = np.asarray(feature_batch.columns)
+        r_vals, p_vals = _regression_batch_results(
+            data,
+            x_centered,
+            ssxm,
+            regressor,
+            min_cells,
+            feat_labels,
+        )
+        labels.extend(feat_labels.tolist())
+        r_parts.append(r_vals)
+        p_parts.append(p_vals)
+
+    if not labels:
+        return pd.DataFrame(columns=["r_value", "p_value"])
+    return pd.DataFrame(
+        {
+            "r_value": np.concatenate(r_parts),
+            "p_value": np.concatenate(p_parts),
+        },
+        index=labels,
+    )
 
 
 def knn_clustering(
@@ -505,12 +643,14 @@ def knn_clustering(
             scipy.sparse.csr_matrix: Sparse adjacency matrix representing the KNN graph
         """
 
+        logger.info("Pseudotime modules: fitting feature KNN")
         for i in data.stream_blocks(nthreads=t, msg="Fitting KNNs"):
             if not np.isfinite(i).all():
                 raise ValueError("Feature profiles must contain only finite values")
             ann_idx.add_items(i)
         s, e = 0, 0
         neighbor_indices: list[np.ndarray] = []
+        logger.info("Pseudotime modules: querying feature KNN")
         for i in data.stream_blocks(nthreads=t, msg="Identifying feature KNNs"):
             e += i.shape[0]
             inds, d = ann_idx.knn_query(i, k=k + 1)
@@ -544,7 +684,7 @@ def knn_clustering(
         import sknetwork as skn
 
         paris = skn.hierarchy.Paris(reorder=False)
-        logger.info("Performing clustering, this might take a while...")
+        logger.info("Pseudotime modules: clustering modules")
         dendrogram = paris.fit_transform(mat)
         return np.asarray(skn.hierarchy.cut_straight(dendrogram, n_clusters=nc))
 

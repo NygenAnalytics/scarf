@@ -124,6 +124,19 @@ def norm_lib_size(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
     return assay.sf * counts / assay.scalar.reshape(-1, 1)
 
 
+def lib_size_feature_stream_eligible(
+    assay: "Assay",
+    *,
+    renormalize_subset: bool = False,
+) -> bool:
+    """True when column-wise lib-size streaming matches ``normed`` semantics."""
+    return (
+        assay.normMethod is norm_lib_size
+        and not renormalize_subset
+        and getattr(assay, "sf", None) is not None
+    )
+
+
 def norm_lib_size_log(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """Performs library size normalization and then transforms the values into
     log scale.
@@ -1022,6 +1035,63 @@ class RNAassay(Assay):
             self.sf = 1000
             self.attrs["size_factor"] = self.sf
         self.scalar: np.ndarray | None = None
+
+    def iter_normed_feature_wise(
+        self,
+        cell_key: str | None,
+        feat_key: str | None,
+        batch_size: int,
+        msg: str | None,
+        as_dataframe: bool = True,
+        **norm_params: Any,
+    ) -> Generator[pd.DataFrame | tuple[np.ndarray, np.ndarray], None, None]:
+        renormalize_subset = bool(norm_params.get("renormalize_subset", False))
+        if not lib_size_feature_stream_eligible(
+            self, renormalize_subset=renormalize_subset
+        ):
+            yield from Assay.iter_normed_feature_wise(
+                self,
+                cell_key,
+                feat_key,
+                batch_size,
+                msg,
+                as_dataframe=as_dataframe,
+                **norm_params,
+            )
+            return
+
+        if cell_key is None:
+            cell_idx = np.array(list(range(self.cells.N)))
+        else:
+            cell_idx = self.cells.active_index(cell_key)
+
+        if feat_key is None:
+            feat_idx = np.array(list(range(self.feats.N)))
+        else:
+            feat_idx = self.feats.active_index(feat_key)
+
+        if msg is None:
+            msg = ""
+
+        sf = self.sf
+        if sf is None:
+            raise ValueError("RNA library-size normalization requires a size factor")
+        scalar = self.cells.fetch_all(self.name + "_nCounts")[cell_idx]
+        log_transform = bool(norm_params.get("log_transform", False))
+        for mat, cols in self.iter_raw_feature_columns(
+            cell_idx=cell_idx,
+            feat_idx=feat_idx,
+            batch_size=batch_size,
+            scalar=scalar,
+            sf=float(sf),
+            log_transform=log_transform,
+            msg=msg,
+        ):
+            mat64 = np.asarray(mat, dtype=np.float64)
+            if as_dataframe:
+                yield pd.DataFrame(mat64, columns=cols)
+            else:
+                yield mat64.T, cols
 
     def save_normalized_data(
         self,

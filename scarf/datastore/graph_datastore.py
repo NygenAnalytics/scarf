@@ -166,7 +166,11 @@ def _truncated_pba_potential(
 ) -> np.ndarray:
     random_state = np.random.RandomState(random_seed)
     initial_vector = random_state.rand(laplacian_transpose.shape[0])
-    logger.info("Calculating SVD of graph laplacian. This might take a while...")
+    logger.info(
+        f"Pseudotime scoring: calculating SVD "
+        f"(shape={laplacian_transpose.shape}, nnz={laplacian_transpose.nnz}, "
+        f"k={n_singular_vals})"
+    )
     try:
         left_vectors, singular_values, right_vectors_t = svds(
             laplacian_transpose,
@@ -3155,6 +3159,10 @@ class GraphDataStore(BaseDataStore):
             if cell_idx.sum() != self.cells.fetch_all(subset_cell_key).sum():
                 raise ValueError("subset_cell_key is not a complete subset of cell_key")
 
+        logger.info(
+            f"Pseudotime scoring: loading graph "
+            f"({from_assay}, cell_key={cell_key}, feat_key={feat_key})"
+        )
         graph = self.load_graph(
             from_assay=from_assay,
             cell_key=cell_key,
@@ -3260,8 +3268,10 @@ class GraphDataStore(BaseDataStore):
                 "generated source/sink vector",
             )
 
+        logger.info("Pseudotime scoring: constructing Laplacian")
+        laplacian_transpose = _random_walk_laplacian_transpose(retained_graph)
         retained_ptime = _truncated_pba_potential(
-            _random_walk_laplacian_transpose(retained_graph),
+            laplacian_transpose,
             effective_k,
             random_seed,
             retained_source_sink,
@@ -3283,6 +3293,7 @@ class GraphDataStore(BaseDataStore):
         output_column = self._col_renamer(from_assay, subset_cell_key, label)
         validity_column = f"{output_column}__valid"
 
+        logger.info("Pseudotime scoring: saving pseudotime")
         self.cells.insert(
             output_column,
             ptime,

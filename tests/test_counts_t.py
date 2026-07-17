@@ -1,13 +1,14 @@
 import numpy as np
+import pandas as pd
 import pytest
 import zarr
 from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
-from scarf.assay import Assay, RNAassay
+from scarf.assay import Assay, RNAassay, lib_size_feature_stream_eligible, norm_dummy
 from scarf.datastore.datastore import _feature_column_chunk
 from scarf.doublet_utils import write_doublet_target_zarr
-from scarf.markers import find_markers_by_rank
+from scarf.markers import find_markers_by_rank, find_markers_by_regression
 from scarf.meld_assay import coordinate_melding
 from scarf.metadata import MetaData
 from scarf.storage.zarr_store import write_counts_t
@@ -248,6 +249,191 @@ def test_marker_results_match_with_and_without_counts_t():
             rtol=1e-10,
             equal_nan=True,
         )
+
+
+def _small_rna_with_ptime(values: np.ndarray) -> tuple[zarr.Group, MetaData]:
+    root = _memory_root()
+    _write_small_assay(root, workspace=None, values=values)
+    cells = MetaData(root["cellData"])
+    cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
+    cells.insert("ptime", np.linspace(0.0, 1.0, values.shape[0]), overwrite=True)
+    return root, cells
+
+
+def test_iter_normed_feature_wise_matches_with_and_without_counts_t():
+    values = np.array(
+        [
+            [4, 0, 1, 2],
+            [3, 0, 1, 0],
+            [0, 5, 1, 2],
+            [0, 6, 1, 2],
+        ],
+        dtype=np.uint32,
+    )
+    root, cells = _small_rna_with_ptime(values)
+
+    with_t = RNAassay(
+        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
+    )
+    with_t.sf = 1000.0
+    assert with_t.rawDataT is not None
+    frames_with = list(
+        with_t.iter_normed_feature_wise("I", "I", 2, "normed feats", log_transform=True)
+    )
+
+    root["RNA/countsT"].attrs["complete"] = False
+    without_t = RNAassay(
+        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
+    )
+    without_t.sf = 1000.0
+    assert without_t.rawDataT is None
+    frames_without = list(
+        without_t.iter_normed_feature_wise(
+            "I", "I", 2, "normed feats", log_transform=True
+        )
+    )
+
+    mat_with = pd.concat(frames_with, axis=1)
+    mat_without = pd.concat(frames_without, axis=1)
+    assert list(mat_with.columns) == list(mat_without.columns)
+    np.testing.assert_allclose(
+        mat_with.to_numpy(dtype=np.float64),
+        mat_without.to_numpy(dtype=np.float64),
+        rtol=1e-10,
+    )
+
+
+def test_regression_and_aggregation_match_with_and_without_counts_t():
+    values = np.array(
+        [
+            [4, 0, 1, 2],
+            [3, 0, 1, 0],
+            [0, 5, 1, 2],
+            [0, 6, 1, 2],
+        ],
+        dtype=np.uint32,
+    )
+    root, cells = _small_rna_with_ptime(values)
+    ptime = cells.fetch("ptime", key="I")
+
+    with_t = RNAassay(
+        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
+    )
+    with_t.sf = 1000.0
+    assert with_t.rawDataT is not None
+    regression_with = find_markers_by_regression(
+        with_t,
+        cell_key="I",
+        feat_key="I",
+        regressor=ptime,
+        min_cells=1,
+        batch_size=2,
+    )
+    agg_with, feats_with = with_t.save_aggregated_ordering(
+        cell_key="I",
+        feat_key="I",
+        ordering_key="ptime",
+        min_exp=0.0,
+        smoothen=False,
+        z_scale=False,
+        window_size=2,
+        chunk_size=2,
+        batch_size=2,
+    )
+    agg_with_vals = np.asarray(agg_with.compute())
+    location = "aggregated_I_I_ptime"
+    del root["RNA"][location]
+
+    root["RNA/countsT"].attrs["complete"] = False
+    without_t = RNAassay(
+        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
+    )
+    without_t.sf = 1000.0
+    assert without_t.rawDataT is None
+    regression_without = find_markers_by_regression(
+        without_t,
+        cell_key="I",
+        feat_key="I",
+        regressor=ptime,
+        min_cells=1,
+        batch_size=2,
+    )
+    agg_without, feats_without = without_t.save_aggregated_ordering(
+        cell_key="I",
+        feat_key="I",
+        ordering_key="ptime",
+        min_exp=0.0,
+        smoothen=False,
+        z_scale=False,
+        window_size=2,
+        chunk_size=2,
+        batch_size=2,
+    )
+
+    np.testing.assert_allclose(
+        regression_with.sort_index().to_numpy(dtype=np.float64),
+        regression_without.sort_index().to_numpy(dtype=np.float64),
+        rtol=1e-10,
+        equal_nan=True,
+    )
+    np.testing.assert_array_equal(feats_with, feats_without)
+    np.testing.assert_allclose(
+        agg_with_vals,
+        np.asarray(agg_without.compute()),
+        rtol=1e-10,
+    )
+
+
+def test_iter_normed_feature_wise_uses_slow_path_when_ineligible(monkeypatch):
+    values = np.array(
+        [
+            [4, 0, 1, 2],
+            [3, 0, 1, 0],
+            [0, 5, 1, 2],
+            [0, 6, 1, 2],
+        ],
+        dtype=np.uint32,
+    )
+    root, cells = _small_rna_with_ptime(values)
+    assay = RNAassay(
+        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
+    )
+    assay.sf = 1000.0
+    assert lib_size_feature_stream_eligible(assay) is True
+    assert lib_size_feature_stream_eligible(assay, renormalize_subset=True) is False
+
+    calls = {"raw": 0, "base": 0}
+    orig_raw = RNAassay.iter_raw_feature_columns
+    orig_base = Assay.iter_normed_feature_wise
+
+    def spy_raw(self, *args, **kwargs):
+        calls["raw"] += 1
+        yield from orig_raw(self, *args, **kwargs)
+
+    def spy_base(self, *args, **kwargs):
+        calls["base"] += 1
+        yield from orig_base(self, *args, **kwargs)
+
+    monkeypatch.setattr(RNAassay, "iter_raw_feature_columns", spy_raw)
+    monkeypatch.setattr(Assay, "iter_normed_feature_wise", spy_base)
+
+    list(assay.iter_normed_feature_wise("I", "I", 2, None))
+    assert calls["raw"] >= 1
+    assert calls["base"] == 0
+
+    calls["raw"] = 0
+    calls["base"] = 0
+    list(assay.iter_normed_feature_wise("I", "I", 2, None, renormalize_subset=True))
+    assert calls["raw"] == 0
+    assert calls["base"] >= 1
+
+    calls["raw"] = 0
+    calls["base"] = 0
+    assay.normMethod = norm_dummy
+    assert lib_size_feature_stream_eligible(assay) is False
+    list(assay.iter_normed_feature_wise("I", "I", 2, None))
+    assert calls["raw"] == 0
+    assert calls["base"] >= 1
 
 
 def test_coordinate_melding_builds_counts_t():

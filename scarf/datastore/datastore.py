@@ -38,8 +38,8 @@ _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
 
 
 def _feature_column_chunk(assay: Assay, n_features: int) -> int:
-    # Only RNA marker/HVG fast paths read countsT; other assays keep cell-major
-    # batch sizing even when a durable countsT array is present.
+    # RNA feature-column streams (markers, HVG, pseudotime) prefer countsT
+    # when present; other assays keep cell-major batch sizing.
     if isinstance(assay, RNAassay):
         counts_t = getattr(assay, "rawDataT", None)
         if counts_t is not None:
@@ -914,6 +914,12 @@ class DataStore(MappingDatastore):
             feat_key = "I"
         assay = self._get_assay(from_assay)
         ptime = _validated_pseudotime_regressor(assay, cell_key, pseudotime_key)
+        n_cells = len(assay.cells.active_index(cell_key))
+        n_feats = len(assay.feats.active_index(feat_key))
+        logger.info(
+            f"Pseudotime markers: correlating features "
+            f"(cells={n_cells}, features={n_feats}, batch_size={gene_batch_size})"
+        )
         markers = find_markers_by_regression(
             assay=assay,
             cell_key=cell_key,
@@ -927,6 +933,7 @@ class DataStore(MappingDatastore):
         markers = markers.reindex(feature_index)
         if markers.isna().any(axis=None):
             raise ValueError("Pseudotime marker results are not aligned to feat_key")
+        logger.info("Pseudotime markers: saving marker scores")
         assay.feats.insert(
             f"{cell_key}__{pseudotime_key}__r",
             np.array(markers["r_value"].values),
@@ -1024,6 +1031,7 @@ class DataStore(MappingDatastore):
         nan_cluster_value = int(nan_cluster_value)
         _validated_pseudotime_regressor(assay, cell_key, pseudotime_key)
 
+        logger.info("Pseudotime modules: aggregating feature profiles")
         df, feat_ids = assay.save_aggregated_ordering(
             cell_key=cell_key,
             feat_key=feat_key,
@@ -1051,6 +1059,7 @@ class DataStore(MappingDatastore):
             clusts,
             nan_cluster_value,
         )
+        logger.info("Pseudotime modules: saving module labels")
         assay.feats.insert(
             cluster_label,
             temp,

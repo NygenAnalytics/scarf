@@ -131,6 +131,33 @@ def test_truncated_pba_operator_matches_dense_svd_reference():
     assert np.allclose(actual, expected, rtol=1e-6, atol=1e-8)
 
 
+def test_truncated_pba_logs_svd_stage_start():
+    from loguru import logger
+
+    adjacency = np.zeros((6, 6), dtype=float)
+    for index in range(5):
+        adjacency[index, index + 1] = 1.0
+        adjacency[index + 1, index] = 1.0
+    laplacian_transpose = _random_walk_laplacian_transpose(csr_matrix(adjacency))
+    source_sink = np.array([-1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="INFO",
+    )
+    try:
+        _truncated_pba_potential(laplacian_transpose, 3, 7, source_sink)
+    finally:
+        logger.remove(sink)
+
+    assert any(
+        "Pseudotime scoring: calculating SVD" in msg
+        and "k=3" in msg
+        and "shape=(6, 6)" in msg
+        for msg in messages
+    )
+
+
 def test_dense_pba_reference_orders_a_path_from_source_to_sink():
     adjacency = np.zeros((7, 7), dtype=float)
     for index in range(6):
