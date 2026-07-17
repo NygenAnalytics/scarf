@@ -60,10 +60,6 @@ subtrees:
         title: Imputation
       - file: tutorials/pseudobulk_and_differential_expression
         title: Pseudobulk and differential expression
-  - caption: Examples
-    entries:
-      - file: tutorials/mnist
-        title: Exploring MNIST
   - caption: Reference
     entries:
       - file: reference/api
