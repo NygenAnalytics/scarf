@@ -38,6 +38,8 @@ from pathlib import Path
 import scarf
 import scarf.plotting as splt
 
+scarf.set_verbosity('WARNING')
+
 dataset = "bastidas-ponce_4K_pancreas-d15_rnaseq"
 scarf.fetch_dataset(
     dataset_name=dataset,

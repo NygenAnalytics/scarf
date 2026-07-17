@@ -170,6 +170,15 @@ extra-build-variables = { hnswlib = { HNSWLIB_NO_NATIVE = "1" } }
 [tool.uv.extra-build-dependencies]
 pcst-fast = ["pybind11>=2.11"]
 
+[tool.ruff]
+exclude = [
+    ".git",
+    ".venv",
+    "docs/.jupyter_cache",
+    "docs/build",
+    "docs/source/tutorials/scarf_datasets",
+]
+
 [tool.mypy]
 strict = false
 

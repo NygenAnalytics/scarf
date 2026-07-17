@@ -21,6 +21,8 @@ This tutorial merges datasets from different Zarr files, corrects batch effects 
 ```{code-cell} ipython3
 import scarf
 import scarf.plotting as splt
+
+scarf.set_verbosity('WARNING')
 scarf.__version__
 ```
 

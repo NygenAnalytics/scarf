@@ -22,7 +22,11 @@ Scarf implements a Symphony-style fixed-reference correction. The `symphonyStyle
 ```{code-cell} ipython3
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 import scarf
+import scarf.plotting as splt
+
+scarf.set_verbosity('WARNING')
 
 scarf.fetch_dataset(
     dataset_name='kang_15K_pbmc_rnaseq',
@@ -37,6 +41,26 @@ scarf.fetch_dataset(
 
 ds_ctrl = scarf.DataStore('scarf_datasets/kang_15K_pbmc_rnaseq/data.zarr')
 ds_stim = scarf.DataStore('scarf_datasets/kang_14K_ifnb-pbmc_rnaseq/data.zarr')
+```
+
+Reference and query UMAPs before mapping:
+
+```{code-cell} ipython3
+splt.embedding(
+    ds_ctrl,
+    layout_key='RNA_UMAP',
+    color_by='cluster_labels',
+    show=False,
+).figure
+```
+
+```{code-cell} ipython3
+splt.embedding(
+    ds_stim,
+    layout_key='RNA_UMAP',
+    color_by='cluster_labels',
+    show=False,
+).figure
 ```
 
 The reference must already have a selected RNA feature set. For a production atlas, `reference_batch` should contain known technical batches. This compact example uses one recorded control batch to demonstrate the artifact API.
@@ -88,7 +112,38 @@ dict(projection.attrs)
 
 uncorrected = projection['uncorrectedLatent'][:]
 corrected = projection['correctedLatent'][:]
-np.mean(np.abs(corrected - uncorrected))
+shift = np.linalg.norm(corrected - uncorrected, axis=1)
+
+fig, ax = plt.subplots(figsize=(4.5, 3.2))
+ax.hist(shift, bins=40, color='#1f4e79', edgecolor='white')
+ax.set_xlabel(r'$\|corrected - uncorrected\|$')
+ax.set_ylabel('Query cells')
+ax.set_title('Symphony correction magnitude (stimulated query)')
+fig
+```
+
+Transfer reference labels onto the query and compare them to the published stimulated labels on the query UMAP.
+
+```{code-cell} ipython3
+transferred = ds_ctrl.get_target_classes(
+    target_name='stim_symphony',
+    reference_class_group='cluster_labels',
+)
+ds_stim.cells.insert('symphony_labels', transferred.values, overwrite=True)
+
+splt.embedding(
+    ds_stim,
+    layout_key='RNA_UMAP',
+    color_by='symphony_labels',
+    show=False,
+).figure
+```
+
+```{code-cell} ipython3
+pd.crosstab(
+    ds_stim.cells.fetch('cluster_labels'),
+    ds_stim.cells.fetch('symphony_labels'),
+)
 ```
 
 Use held-out donors when selecting an abstention threshold. The example below only inspects evidence for the mapped query; its vote fractions are not calibrated probabilities. Rows that fail the threshold receive `NA` by default. `referenceDistancePercentile` is evaluated against the reference self-neighbor distribution, so it does not change with query composition.
@@ -100,6 +155,17 @@ evidence = ds_ctrl.get_target_label_evidence(
     threshold_fraction=0.6
 )
 evidence.head()
+```
+
+```{code-cell} ipython3
+fig, ax = plt.subplots(figsize=(4.5, 3.2))
+ax.hist(evidence['voteFraction'].dropna(), bins=30, color='#1f4e79', edgecolor='white')
+ax.axvline(0.6, color='#c45c26', linestyle='--', label='threshold 0.6')
+ax.set_xlabel('Vote fraction')
+ax.set_ylabel('Query cells')
+ax.set_title('Label-transfer vote fractions')
+ax.legend(frameon=False)
+fig
 ```
 
 Split-conformal prediction sets are optional and require calibration examples that are exchangeable with future queries.
@@ -129,4 +195,18 @@ control_result = reference.map_query(
     )
 )
 control_result
+```
+
+```{code-cell} ipython3
+ctrl_proj = ds_ctrl.z['RNA']['projections']['control_symphony']
+ctrl_unc = ctrl_proj['uncorrectedLatent'][:]
+ctrl_cor = ctrl_proj['correctedLatent'][:]
+ctrl_shift = np.linalg.norm(ctrl_cor - ctrl_unc, axis=1)
+
+fig, ax = plt.subplots(figsize=(4.5, 3.2))
+ax.hist(ctrl_shift, bins=40, color='#5b7c99', edgecolor='white')
+ax.set_xlabel(r'$\|corrected - uncorrected\|$')
+ax.set_ylabel('Reference cells (self-map)')
+ax.set_title('Correction should stay near zero on control')
+fig
 ```

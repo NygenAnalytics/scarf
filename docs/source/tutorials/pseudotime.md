@@ -18,6 +18,8 @@ kernelspec:
 import scarf
 import scarf.plotting as splt
 
+scarf.set_verbosity('WARNING')
+
 scarf.__version__
 ```
 

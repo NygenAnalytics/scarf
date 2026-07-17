@@ -31,24 +31,18 @@ counts or metadata to interoperable formats.
 
 ```{code-cell} ipython3
 import scarf
+
+scarf.set_verbosity('WARNING')
 scarf.__version__
 ```
 
 ### 1. Fetch datasets from the catalog
 
-Scarf stores many single-cell datasets online on [OSF](https://osf.io/zeupv/). Herein datasets are stored in many different formats including MTX, 10x HDF5 and H5ad(anndata). These files can readily be downloaded using Scarf's `fetch_dataset` command.
+Scarf hosts example datasets on [OSF](https://osf.io/zeupv/) in formats such as MTX, 10x HDF5, and H5AD. Download any catalog entry with `fetch_dataset`. Call `scarf.show_available_datasets()` locally for the full list (it prints every name).
 
-+++
+**Naming format**: `<author>_<number of cells>_<cell/tissue type or species>_<single-cell method>`
 
-To check which datasets are available to download, use the `show_available_datasets` function:
-
-```{code-cell} ipython3
-scarf.show_available_datasets()
-```
-
-**Naming format**: Datasets are named using this rule: \<author\>\_\<number of cells\>\_\<cell/tissue type or species\>\_\<single-cell method>
-
-Now using any of these dataset names we can download the dataset of our choice:
+Examples used below:
 
 ```{code-cell} ipython3
 # This dataset is in Cellranger (10x) HDF5 format.

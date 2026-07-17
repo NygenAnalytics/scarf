@@ -40,6 +40,9 @@ to `make_bulk`.
 
 ```{code-cell} ipython3
 import scarf
+import scarf.plotting as splt
+
+scarf.set_verbosity('WARNING')
 
 scarf.fetch_dataset(
     'kang_15K_pbmc_rnaseq',
@@ -61,6 +64,18 @@ if 'RNA_leiden_cluster' not in ds.cells.columns:
     ds.run_leiden_clustering(resolution=0.5)
 ```
 
+The catalog Kang store already includes a UMAP. Leiden groups used for `make_bulk` below may
+differ from the published `cluster_labels` column.
+
+```{code-cell} ipython3
+splt.embedding(
+    ds,
+    layout_key='RNA_UMAP',
+    color_by='RNA_leiden_cluster',
+    show=False,
+).figure
+```
+
 ## Guided steps
 
 ### 1. Inspect marker ranks separately from DE
@@ -74,6 +89,15 @@ markers = ds.get_markers(
     min_frac_exp=-1,
 )
 markers.head()
+```
+
+```{code-cell} ipython3
+splt.marker_heatmap(
+    ds,
+    group_key='RNA_leiden_cluster',
+    topn=3,
+    figsize=(5, 7),
+)
 ```
 
 ```{note}

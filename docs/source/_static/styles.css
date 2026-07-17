@@ -26,19 +26,26 @@ p {
 .dataframe {
     font-size: 0.8em !important;
 }
-@media (min-width: 768px) {
-	div.navbar-brand-box a.navbar-brand img {
-		max-height: 25vh !important;
-	}
-}
-div.navbar-brand-box a.navbar-brand img {
-    display: block;
-    height: auto;
-    width: auto;
-    max-height: 30vh !important;
-    max-width: 100%;
-    margin: 0 auto;
-}
+
+/* Square Scarf mark: keep the sidebar brand compact. */
 .navbar-brand-box {
     padding-top: unset !important;
+}
+div.navbar-brand-box a.navbar-brand img,
+.bd-sidebar .navbar-brand img,
+.navbar-brand img.logo__image {
+    display: block;
+    width: auto;
+    height: auto;
+    max-height: 3.25rem !important;
+    max-width: 3.25rem !important;
+    margin: 0.5rem auto;
+}
+@media (min-width: 768px) {
+    div.navbar-brand-box a.navbar-brand img,
+    .bd-sidebar .navbar-brand img,
+    .navbar-brand img.logo__image {
+        max-height: 3.5rem !important;
+        max-width: 3.5rem !important;
+    }
 }

@@ -46,7 +46,7 @@ myst_enable_extensions = [
 
 html_theme = "sphinx_book_theme"
 html_favicon = "favicon.ico"
-html_logo = "_static/nygen-wordmark-black.png"
+html_logo = "_static/scarf-logo-black.png"
 html_title = "Scarf documentation"
 html_baseurl = "https://scarf.readthedocs.io/en/latest/"
 html_theme_options = {
@@ -59,6 +59,10 @@ html_theme_options = {
     "use_fullscreen_button": True,
     "navigation_with_keys": False,
     "toc_title": "Sections",
+    "logo": {
+        "image_light": "_static/scarf-logo-black.png",
+        "image_dark": "_static/scarf-logo-white.png",
+    },
 }
 html_static_path = ["_static"]
 html_css_files = ["styles.css"]

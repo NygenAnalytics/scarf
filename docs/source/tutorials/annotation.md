@@ -36,9 +36,11 @@ plot known markers, assign labels, and recluster a subset with a custom cell key
 Use the same 5K PBMC Zarr store. Rebuild a short analysis path so this page runs alone.
 
 ```{code-cell} ipython3
+import numpy as np
 import scarf
 import scarf.plotting as splt
-import numpy as np
+
+scarf.set_verbosity('WARNING')
 
 scarf.fetch_dataset(
     'tenx_5K_pbmc_rnaseq',

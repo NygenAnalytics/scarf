@@ -136,12 +136,17 @@ def _pseudotime_sources_sinks(
 ) -> tuple[list[Any], list[Any]]:
     group_key = workflow.resolvedMarkerGroupKey
     labels = np.asarray(store.cells.fetch(group_key, key=workflow.cellKey))
-    uniq = sorted({str(x) for x in labels.tolist()})
-    if len(uniq) < 2:
+    # Keep native label values (Leiden membership is int). Prefer the two
+    # largest clusters so both usually sit in the retained graph component.
+    values, counts = np.unique(labels, return_counts=True)
+    if values.size < 2:
         raise ValueError(
-            f"Need >=2 clusters in {group_key} for pseudotime; found {uniq}"
+            f"Need >=2 clusters in {group_key} for pseudotime; found {values.tolist()}"
         )
-    return [uniq[0]], [uniq[-1]]
+    order = np.argsort(-counts)
+    source = values[order[0]].item()
+    sink = values[order[1]].item()
+    return [source], [sink]
 
 
 def run_stage(

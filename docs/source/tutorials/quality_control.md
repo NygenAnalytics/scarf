@@ -38,6 +38,8 @@ page when you need more control.
 import scarf
 import scarf.plotting as splt
 
+scarf.set_verbosity('WARNING')
+
 scarf.fetch_dataset(
     'tenx_5K_pbmc_rnaseq',
     save_path='scarf_datasets',

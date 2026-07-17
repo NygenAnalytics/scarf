@@ -32,6 +32,8 @@ result to create a smaller Zarr store for workflows that do not need every cell.
 ```{code-cell} ipython3
 import scarf
 import scarf.plotting as splt
+
+scarf.set_verbosity('WARNING')
 scarf.__version__
 ```
 

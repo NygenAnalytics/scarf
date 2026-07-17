@@ -29,6 +29,9 @@ After merging batches and building a graph ({doc}`data_integration`), quantify m
 
 ```{code-cell} ipython3
 import scarf
+import scarf.plotting as splt
+
+scarf.set_verbosity('WARNING')
 
 scarf.fetch_dataset('kang_15K_pbmc_rnaseq', save_path='scarf_datasets', as_zarr=True)
 scarf.fetch_dataset('kang_14K_ifnb-pbmc_rnaseq', save_path='scarf_datasets', as_zarr=True)
@@ -60,6 +63,28 @@ ds.cells.insert(
 ds.mark_hvgs(min_cells=20, top_n=500)
 ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
 ds.run_leiden_clustering(resolution=0.5)
+ds.run_umap(n_epochs=100, parallel=True)
+```
+
+The naive merge (no batch correction) often separates by sample on UMAP. The metrics below
+quantify that pattern.
+
+```{code-cell} ipython3
+splt.embedding(
+    ds,
+    layout_key='RNA_UMAP',
+    color_by='sample_id',
+    show=False,
+).figure
+```
+
+```{code-cell} ipython3
+splt.embedding(
+    ds,
+    layout_key='RNA_UMAP',
+    color_by='imported_labels',
+    show=False,
+).figure
 ```
 
 ## LISI

@@ -33,6 +33,8 @@ This chapter processes each assay, then combines their cell graphs with SNN or W
 ```{code-cell} ipython3
 import scarf
 import scarf.plotting as splt
+
+scarf.set_verbosity('WARNING')
 scarf.__version__
 ```
 
