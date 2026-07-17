@@ -59,7 +59,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
     show=False,
-).figure
+).figure;
 ```
 
 ```{code-cell} ipython3
@@ -74,7 +74,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
     show=False,
-).figure
+).figure;
 ```
 
 ---
@@ -136,7 +136,7 @@ for g, ms in ds_ctrl.get_mapping_score(
             point_sizes=ms * 10,
             figsize=(4, 4),
             show=False,
-        ).figure
+        ).figure;
 ```
 
 ---
@@ -182,7 +182,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='transferred_labels',
     show=False,
-).figure
+).figure;
 ```
 
 It can be quite interesting to check how the predicted/transferred labels compare to the actual labels of the target cells:
@@ -231,7 +231,7 @@ splt.unified_embedding(
     ds_ctrl,
     layout_key='unified_UMAP',
     ref_name='ctrl',
-).figure
+).figure;
 ```
 
 ```{code-cell} ipython3
@@ -259,7 +259,7 @@ splt.unified_embedding(
     layout_key='unified_UMAP',
     show_target_only=True,
     target_groups=ds_stim.cells.fetch('cluster_labels'),
-).figure
+).figure;
 ```
 
 ```{code-cell} ipython3

@@ -77,7 +77,7 @@ ds.run_umap(
     use_density_map=True,
     label='densMAP',
 )
-splt.embedding(ds, layout_key='RNA_densMAP', show=False).figure
+splt.embedding(ds, layout_key='RNA_densMAP', show=False).figure;
 ```
 
 ### 2. Run tSNE
@@ -95,7 +95,7 @@ ds.run_tsne(
     max_iter=500,
     parallel=True,
 )
-splt.embedding(ds, layout_key='RNA_tSNE', show=False).figure
+splt.embedding(ds, layout_key='RNA_tSNE', show=False).figure;
 ```
 
 ### 3. Run Paris clustering and inspect the tree
@@ -116,7 +116,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cluster',
     show=False,
-).figure
+).figure;
 ```
 
 ```{code-cell} ipython3

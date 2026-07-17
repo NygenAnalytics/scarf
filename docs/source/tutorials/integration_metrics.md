@@ -75,7 +75,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='sample_id',
     show=False,
-).figure
+).figure;
 ```
 
 ```{code-cell} ipython3
@@ -84,7 +84,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='imported_labels',
     show=False,
-).figure
+).figure;
 ```
 
 ## LISI

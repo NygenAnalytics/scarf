@@ -124,7 +124,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by=score_col,
     show=False,
-).figure
+).figure;
 ```
 
 Filter on the score yourself when you choose a cutoff for your data:

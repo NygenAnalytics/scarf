@@ -188,7 +188,7 @@ ds.cells.head()
 ```
 
 ```{code-cell} ipython3
-splt.embedding(ds, layout_key='RNA_UMAP', show=False).figure
+splt.embedding(ds, layout_key='RNA_UMAP', show=False).figure;
 ```
 
 ```{code-cell} ipython3
@@ -198,7 +198,7 @@ splt.embedding(
     color_by='RNA_nCounts',
     color_scale=splt.ColorScale(cmap='coolwarm'),
     show=False,
-).figure
+).figure;
 ```
 
 Alternatives (densMAP, tSNE, Paris trees) are covered in
@@ -219,7 +219,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
     show=False,
-).figure
+).figure;
 ```
 
 ```{code-cell} ipython3
@@ -270,7 +270,7 @@ splt.embedding(
     color_by='CD14',
     sort_values=True,
     show=False,
-).figure
+).figure;
 ```
 
 Annotation from markers, known gene panels, and subclustering is covered in

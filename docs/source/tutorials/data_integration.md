@@ -199,7 +199,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='sample_id',
     legend_loc='right',
-).figure
+).figure;
 ```
 
 Visualization of cluster labels in the 2D UMAP space:
@@ -210,7 +210,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='imported_labels',
     legend_loc='right',
-).figure
+).figure;
 ```
 
 ---
@@ -264,7 +264,7 @@ splt.embedding(
     layout_key='RNA_pUMAP',
     color_by='sample_id',
     legend_loc='right',
-).figure
+).figure;
 ```
 
 Visualization of cluster labels in the new UMAP space shows that the cells from the same cell-type do not split into separate clusters like they did before.
@@ -275,7 +275,7 @@ splt.embedding(
     layout_key='RNA_pUMAP',
     color_by='imported_labels',
     legend_loc='right',
-).figure
+).figure;
 ```
 
 ---
@@ -310,14 +310,14 @@ splt.embedding(
     layout_key='RNA_hUMAP',
     color_by='sample_id',
     legend_loc='right',
-).figure
+).figure;
 
 splt.embedding(
     ds,
     layout_key='RNA_hUMAP',
     color_by='imported_labels',
     legend_loc='right',
-).figure
+).figure;
 ```
 
 Harmony is often preferred when multiple batches need to mix without choosing a single reference sample. Partial PCA (section 4) is lighter when one sample defines the embedding.

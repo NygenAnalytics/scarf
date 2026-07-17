@@ -66,11 +66,11 @@ ds.run_umap(n_epochs=150, parallel=True)
 ```{code-cell} ipython3
 imputed_cd4 = ds.get_imputed(feature_name='CD4', t=2)
 ds.cells.insert('CD4_imputed', imputed_cd4, overwrite=True)
-splt.embedding(ds, layout_key='RNA_UMAP', color_by='CD4', show=False).figure
+splt.embedding(ds, layout_key='RNA_UMAP', color_by='CD4', show=False).figure;
 ```
 
 ```{code-cell} ipython3
-splt.embedding(ds, layout_key='RNA_UMAP', color_by='CD4_imputed', show=False).figure
+splt.embedding(ds, layout_key='RNA_UMAP', color_by='CD4_imputed', show=False).figure;
 ```
 
 The `t` parameter controls diffusion depth. Higher values smooth more. The diffusion operator

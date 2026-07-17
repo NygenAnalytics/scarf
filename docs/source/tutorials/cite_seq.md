@@ -123,7 +123,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
     show=False,
-).figure
+).figure;
 ```
 
 ### 4. Process the ADT assay
@@ -207,7 +207,7 @@ splt.embedding(
     layout_key='ADT_UMAP',
     color_by='ADT_leiden_cluster',
     show=False,
-).figure
+).figure;
 ```
 
 ### 5. Compare modalities
@@ -323,7 +323,7 @@ splt.embedding(
     ],
     legend_loc='on_data',
     n_columns=3,
-).figure
+).figure;
 ```
 
 ```{code-cell} ipython3
@@ -364,13 +364,13 @@ splt.embedding(
     layout_key='RNA+ADT_UMAP',
     color_by='RNA+ADT_wnn_leiden_cluster',
     legend_loc='on_data',
-).figure
+).figure;
 splt.embedding(
     ds,
     layout_key='RNA+ADT_wnn_UMAP',
     color_by='RNA+ADT_wnn_leiden_cluster',
     legend_loc='on_data',
-).figure
+).figure;
 ```
 
 SNN supports two or more assays; WNN is limited to two. Try WNN when one modality is sparse or weaker than the other.

@@ -56,7 +56,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by=['RNA_cluster', 'clusters'],
     legend_loc='on_data',
-).figure
+).figure;
 ```
 
 ---
@@ -79,7 +79,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_pseudotime',
-).figure
+).figure;
 ```
 
 ---
@@ -131,7 +131,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by=['Spp1', 'Dbi', 'Sparc'],
     sort_values=True,
-).figure
+).figure;
 ```
 
 Genes with a positive correlation increase in expression as pseudotime progresses.
@@ -146,7 +146,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by=['Aplp1', 'Gnas', 'Cpe'],
     sort_values=True,
-).figure
+).figure;
 ```
 
 ---
@@ -210,7 +210,7 @@ splt.embedding(
     color_by=genes_to_label,
     n_columns=5,
     sort_values=True,
-).figure
+).figure;
 ```
 
 ---
@@ -249,7 +249,7 @@ splt.embedding(
     color_by=[f"group_{i}" for i in range(1, n_clusters + 1)],
     n_columns=5,
     color_scale=splt.ColorScale(cmap='coolwarm'),
-).figure
+).figure;
 ```
 
 This figure complements the heatmap we generated earlier very nicely. Using this approach we have clearly found **gene modules** that are restricted in expression to certain portion of the pseudotime and differentiation trajectory
@@ -328,7 +328,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='Cell cluster based markers',
     color_scale=splt.ColorScale(cmap='coolwarm'),
-).figure
+).figure;
 ```
 
 Let's now do this the other way and visualize the cumulative expression of genes that are present only in pseudotime-based approach
@@ -346,7 +346,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='Pseudotime based markers',
     color_scale=splt.ColorScale(cmap='coolwarm'),
-).figure
+).figure;
 ```
 
 The pseudotime-based approach clearly captures a lot of signal that would be otherwise missed by simply taking a cell cluster marker based approach. 

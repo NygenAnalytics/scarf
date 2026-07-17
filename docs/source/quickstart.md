@@ -62,7 +62,7 @@ result = splt.embedding(
     color_by='RNA_leiden_cluster',
     show=False,
 )
-result.figure
+result.figure;
 ```
 
 ## What was saved
