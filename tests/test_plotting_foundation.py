@@ -1106,6 +1106,24 @@ def test_embedding_clip_and_subset(umap, datastore):
     result.close()
 
 
+def test_embedding_groups_filters_categories(umap, leiden_clustering, datastore):
+    ds = datastore
+    labels = list(pd.unique(ds.cells.fetch("RNA_leiden_cluster")))
+    assert len(labels) >= 2
+    keep = labels[:2]
+    result = splt.embedding(
+        ds,
+        layout_key="RNA_UMAP",
+        color_by="RNA_leiden_cluster",
+        groups=keep,
+        show=False,
+    )
+    assert result.provenance.extras["groups"] == list(keep)
+    cat_scale = next(s for s in result.scales if isinstance(s, splt.CategoricalScale))
+    assert list(cat_scale.order) == list(keep)
+    result.close()
+
+
 def test_distribution_violin(umap, leiden_clustering, datastore):
     ds = datastore
     result = splt.distribution(
@@ -1124,12 +1142,46 @@ def test_distribution_violin(umap, leiden_clustering, datastore):
     ax = next(iter(result.axes.values()))
     rotations = {tick.get_rotation() for tick in ax.get_xticklabels()}
     assert 45 in rotations or any(abs(r - 45) < 1e-6 for r in rotations)
+    # Grouped violins should not be a single steelblue fill.
+    face_colors = {
+        tuple(np.round(c.get_facecolor()[0][:3], 3))
+        for c in ax.collections
+        if hasattr(c, "get_facecolor") and len(c.get_facecolor())
+    }
+    assert len(face_colors) >= 2
     result.close()
 
     gene = str(ds.RNA.feats.fetch_all("names")[0])
     result2 = splt.distribution(ds, keys=gene, kind="box", max_points=100, show=False)
     assert len(result2.axes) == 1
     result2.close()
+
+
+def test_distribution_subset_and_groups(umap, leiden_clustering, datastore):
+    ds = datastore
+    active_n = len(ds.cells.active_index("I"))
+    keep = np.zeros(active_n, dtype=bool)
+    keep[: max(20, active_n // 2)] = True
+    ds.cells.insert("dist_keep", keep, overwrite=True)
+    labels = list(pd.unique(ds.cells.fetch("RNA_leiden_cluster")))
+    keep_groups = labels[:2]
+    result = splt.distribution(
+        ds,
+        keys="RNA_nCounts",
+        group_by="RNA_leiden_cluster",
+        groups=keep_groups,
+        subset_by="dist_keep",
+        kind="box",
+        max_points=0,
+        show=False,
+    )
+    assert result.provenance.extras["subset_by"] == "dist_keep"
+    assert result.provenance.extras["groups"] == list(keep_groups)
+    table_groups = set(result.tables["RNA_nCounts"]["group"].unique())
+    assert table_groups == set(keep_groups)
+    assert result.provenance.n_cells == len(result.tables["RNA_nCounts"])
+    assert result.provenance.n_cells < active_n
+    result.close()
 
 
 def test_distribution_hist_and_ecdf(umap, leiden_clustering, datastore):

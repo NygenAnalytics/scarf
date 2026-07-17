@@ -65,6 +65,7 @@ def raster_from_metadata(
     y_key: str,
     color_key: str | None = None,
     cell_key: str = "I",
+    subset_by: str | None = None,
     pixels: int = 400,
     block_rows: int | None = None,
     quantiles: tuple[float, float] | None = (0.01, 0.99),
@@ -84,7 +85,13 @@ def raster_from_metadata(
         q0, q1 = quantiles
         if not (0.0 <= q0 < q1 <= 1.0):
             raise ValueError("quantiles must satisfy 0 <= low < high <= 1")
-    cols = [x_key, y_key] + ([color_key] if color_key is not None else [])
+    cols = [x_key, y_key]
+    if color_key is not None:
+        cols.append(color_key)
+    if subset_by is not None:
+        if subset_by not in cells.columns:
+            raise KeyError(f"subset_by {subset_by!r} not found in cell metadata")
+        cols.append(subset_by)
     rng = np.random.default_rng(seed)
 
     # --- Pass 1: bounds + color scale ---
@@ -106,6 +113,13 @@ def raster_from_metadata(
         x = np.asarray(block.values[x_key], dtype=np.float64)
         y = np.asarray(block.values[y_key], dtype=np.float64)
         finite = np.isfinite(x) & np.isfinite(y)
+        if subset_by is not None:
+            sub = np.asarray(block.values[subset_by])
+            if sub.dtype != bool:
+                raise TypeError(
+                    f"subset_by {subset_by!r} must be boolean; got {sub.dtype}"
+                )
+            finite &= sub
         if not finite.any():
             continue
         n_cells += int(finite.sum())
@@ -181,6 +195,13 @@ def raster_from_metadata(
         x = np.asarray(block.values[x_key], dtype=np.float64)
         y = np.asarray(block.values[y_key], dtype=np.float64)
         finite = np.isfinite(x) & np.isfinite(y)
+        if subset_by is not None:
+            sub = np.asarray(block.values[subset_by])
+            if sub.dtype != bool:
+                raise TypeError(
+                    f"subset_by {subset_by!r} must be boolean; got {sub.dtype}"
+                )
+            finite &= sub
         if not finite.any():
             continue
         x = x[finite]
@@ -229,7 +250,7 @@ def draw_raster_canvas(
     canvas: RasterCanvas,
     *,
     cmap: str = "viridis",
-    missing_color: str = "#f0f0f0",
+    missing_color: str = "white",
     vcenter: float | None = None,
 ) -> Any:
     """Draw a ``RasterCanvas`` onto a matplotlib axes; return the mappable."""
@@ -256,4 +277,5 @@ def draw_raster_canvas(
         aspect="equal",
         interpolation="nearest",
     )
+    ax.set_facecolor(missing_color)
     return im

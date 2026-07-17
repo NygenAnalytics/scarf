@@ -39,6 +39,7 @@ from profiling.modal_image import COMMON_FUNCTION_OPTIONS, app
 from profiling.modal_resources import (
     BASE_EPHEMERAL_DISK_MB,
     modal_function_options,
+    orchestrator_function_options,
     validate_modal_environment,
 )
 from profiling.io_baseline import run_io_baseline_body
@@ -332,14 +333,10 @@ def run_all_jobs(
             raise ValueError(f"size {n_rows} is not in config.targetSizes")
 
     parallel_sizes = max(1, len(selected_sizes))
-    orchestrator_options = modal_function_options(
+    orchestrator_options = orchestrator_function_options(
         config,
-        config.resourcesFor("reopenStore"),
         maxContainers=parallel_sizes,
     )
-    orchestrator_options["memory"] = (2048, 4096)
-    orchestrator_options["cpu"] = (1.0, 1.0)
-    orchestrator_options["timeout"] = 86_400
 
     stage_list = list(selected_stages)
     handles = [
@@ -511,10 +508,7 @@ def main(*arg_list: str) -> None:
             for size in sizes:
                 if size not in config.targetSizes:
                     raise SystemExit(f"size {size} is not in config.targetSizes")
-        coordinator_options = modal_function_options(
-            config,
-            config.resourcesFor("reopenStore"),
-        )
+        coordinator_options = orchestrator_function_options(config)
         call = (
             _deployed_function(config, "run_all_jobs")
             .with_options(**coordinator_options)

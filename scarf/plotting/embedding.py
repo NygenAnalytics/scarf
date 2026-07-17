@@ -14,7 +14,11 @@ from ._contracts import (
     NormalizationSpec,
     PlotProvenance,
 )
-from ._data import fetch_normalized_feature_matrix, resolve_feature
+from ._data import (
+    fetch_normalized_feature_matrix,
+    resolve_cell_selection,
+    resolve_feature,
+)
 from ._deps import require_matplotlib
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
 from ._style import (
@@ -421,6 +425,7 @@ def embedding(
     missing_color: str = "#bdbdbd",
     clip_fraction: float = 0.0,
     subset_by: str | None = None,
+    groups: Sequence[Any] | None = None,
     n_columns: int | None = None,
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
@@ -440,6 +445,10 @@ def embedding(
 
     Common choices:
 
+    - ``subset_by``: keep cells marked ``True`` in a boolean metadata column.
+    - ``groups``: keep only these categories. Applies to ``facet_by`` when set,
+      otherwise to the first categorical ``color_by`` column. Also sets legend
+      order when ``categorical_scale.order`` is omitted.
     - ``legend_loc``: ``"auto"`` puts a side legend when there are few
       categories, labels on the clusters when there are many, and hides the
       legend when there are very many. Use ``"right"``, ``"on_data"``, or
@@ -513,26 +522,47 @@ def embedding(
                 )
         color_cache = clipped
 
-    # Optional boolean cell subselection (legacy plot_layout behavior)
-    base_mask = finite_coordinates.copy()
-    if subset_by is not None:
-        sub = np.asarray(store.cells.fetch(subset_by, key=cell_key))
-        if sub.dtype != bool:
-            raise TypeError(f"subset_by {subset_by!r} must be boolean; got {sub.dtype}")
-        if len(sub) != n:
-            raise ValueError("subset_by length must match selected cells")
-        base_mask &= sub
-    if not base_mask.any():
-        raise ValueError("No cells remain after applying layout/subset filters")
-
+    subset_vals = (
+        np.asarray(store.cells.fetch(subset_by, key=cell_key))
+        if subset_by is not None
+        else None
+    )
+    facet_values: np.ndarray | None = None
+    groups_category: np.ndarray | None = None
     if facet_by is not None:
         facet_values = np.asarray(store.cells.fetch(facet_by, key=cell_key))
-        if facet_order is not None:
+        if groups is not None:
+            groups_category = facet_values
+    elif groups is not None:
+        cat_columns = [
+            vals
+            for vals, _, is_cat, is_uniform in color_cache
+            if is_cat and not is_uniform
+        ]
+        if not cat_columns:
+            raise ValueError(
+                "groups requires a categorical color_by column, or facet_by"
+            )
+        groups_category = np.asarray(cat_columns[0])
+
+    selection_mask, group_order = resolve_cell_selection(
+        n,
+        subset=subset_vals,
+        subset_name=subset_by,
+        category_values=groups_category,
+        groups=groups,
+    )
+    base_mask = finite_coordinates & selection_mask
+
+    if facet_by is not None:
+        assert facet_values is not None
+        if groups is not None and group_order is not None:
+            facets = list(group_order)
+        elif facet_order is not None:
             facets = list(facet_order)
         else:
-            facets = sort_categories(list(pd.unique(facet_values)))
+            facets = sort_categories(list(pd.unique(facet_values[base_mask])))
     else:
-        facet_values = None
         facets = [None]
 
     # Stable panel keys: (color_label, facet) when faceting, else color_label
@@ -596,6 +626,13 @@ def embedding(
                         "categorical_scale.order is missing observed values: "
                         + ", ".join(map(str, unlisted[:10]))
                     )
+            elif (
+                groups is not None
+                and group_order is not None
+                and facet_by is None
+                and groups_category is not None
+            ):
+                order = [g for g in group_order if g in set(observed)]
             else:
                 order = sort_categories(observed)
             palette = categorical_color_map(
@@ -839,6 +876,7 @@ def embedding(
                 "panel_keys": [str(k) for k in panel_keys],
                 "clip_fraction": clip_fraction,
                 "subset_by": subset_by,
+                "groups": None if groups is None else list(groups),
                 "input_n_cells": n,
                 "invalid_coordinate_cells": int((~finite_coordinates).sum()),
                 "rasterize_threshold": rasterize_threshold,

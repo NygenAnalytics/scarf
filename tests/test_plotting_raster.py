@@ -281,6 +281,62 @@ def test_raster_all_missing_color_has_finite_default_limits():
     assert np.isnan(canvas.image).all()
 
 
+def test_raster_missing_pixels_default_white():
+    from scarf.plotting._raster import RasterCanvas, draw_raster_canvas
+
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    canvas = RasterCanvas(
+        image=np.full((8, 8), np.nan, dtype=np.float64),
+        counts=np.zeros((8, 8), dtype=np.int64),
+        extent=(0.0, 1.0, 0.0, 1.0),
+        vmin=0.0,
+        vmax=1.0,
+        n_cells=0,
+        n_blocks=0,
+    )
+    fig, ax = plt.subplots()
+    im = draw_raster_canvas(ax, canvas)
+    bad = np.asarray(im.cmap.get_bad())
+    # RGBA for the bad/missing color should be opaque white.
+    np.testing.assert_allclose(bad[:3], [1.0, 1.0, 1.0], atol=1e-5)
+    face = np.asarray(matplotlib.colors.to_rgba(ax.get_facecolor()))
+    np.testing.assert_allclose(face[:3], [1.0, 1.0, 1.0], atol=1e-5)
+    plt.close(fig)
+
+
+def test_raster_subset_by_reduces_cells():
+    from scarf.plotting._raster import raster_from_metadata
+
+    n = 20
+    keep = np.zeros(n, dtype=bool)
+    keep[:5] = True
+    cells = _GuardedMeta(
+        {
+            "I": np.ones(n, dtype=bool),
+            "x": np.linspace(0, 1, n),
+            "y": np.linspace(0, 1, n),
+            "value": np.arange(n, dtype=float),
+            "keep": keep,
+        }
+    )
+    full = raster_from_metadata(
+        cells, x_key="x", y_key="y", color_key="value", pixels=16
+    )
+    subset = raster_from_metadata(
+        cells,
+        x_key="x",
+        y_key="y",
+        color_key="value",
+        subset_by="keep",
+        pixels=16,
+    )
+    assert subset.n_cells == 5
+    assert subset.n_cells < full.n_cells
+
+
 def test_specialized_facades_are_callable():
     assert callable(splt.qc)
     assert callable(splt.elbow)

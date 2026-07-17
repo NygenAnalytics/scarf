@@ -59,3 +59,25 @@ def modal_function_options(
         "timeout": resources.timeoutSeconds,
         "region": config.modalRegion,
     }
+
+
+def orchestrator_function_options(
+    config: ProfilingConfig,
+    *,
+    maxContainers: int = 1,
+) -> dict[str, Any]:
+    """Tiny options for run_all_jobs / run_size_jobs coordinators.
+
+    These only spawn/wait; they must not request stage RAM (32–64 GiB) or they
+    compete with the real stage workers for scarce high-memory capacity.
+    """
+    # Borrow secrets/region/env from a stage resource block, then shrink compute.
+    options = modal_function_options(
+        config,
+        config.resourcesFor("reopenStore"),
+        maxContainers=maxContainers,
+    )
+    options["memory"] = (2048, 4096)
+    options["cpu"] = (1.0, 1.0)
+    options["timeout"] = 86_400
+    return options

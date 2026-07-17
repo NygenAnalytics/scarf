@@ -15,6 +15,7 @@ from ._contracts import (
     Standardize,
     StudyDesign,
 )
+from ._style import sort_categories
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,58 @@ def coerce_feature_list(
                 out.append((str(group), item))
         return out
     return [(None, item) for item in features]
+
+
+def resolve_cell_selection(
+    n: int,
+    *,
+    subset: np.ndarray | None = None,
+    subset_name: str | None = None,
+    category_values: np.ndarray | None = None,
+    groups: Sequence[Any] | None = None,
+) -> tuple[np.ndarray, list[Any] | None]:
+    """Build a boolean mask from ``subset`` and optional category ``groups``.
+
+    ``subset`` must be boolean and length ``n`` when provided. ``groups`` keeps
+    only those categories from ``category_values`` and defines their order.
+    When ``groups`` is omitted, category order is natural via
+    :func:`sort_categories` over observed values (or ``None`` if no categories).
+    """
+    mask = np.ones(n, dtype=bool)
+    if subset is not None:
+        sub = np.asarray(subset)
+        if sub.dtype != bool:
+            label = subset_name or "subset_by"
+            raise TypeError(f"{label!r} must be boolean; got {sub.dtype}")
+        if len(sub) != n:
+            raise ValueError("subset_by length must match selected cells")
+        mask &= sub
+
+    group_order: list[Any] | None = None
+    if category_values is not None:
+        cats = np.asarray(category_values)
+        if len(cats) != n:
+            raise ValueError("category values length must match selected cells")
+        present = set(pd.unique(cats).tolist())
+        if groups is not None:
+            group_order = list(groups)
+            if not group_order:
+                raise ValueError("groups must be non-empty when provided")
+            missing = [g for g in group_order if g not in present]
+            if missing:
+                raise ValueError(
+                    "groups contains labels not present in the data: "
+                    + ", ".join(map(str, missing[:10]))
+                )
+            mask &= np.isin(cats, group_order)
+        elif mask.any():
+            group_order = sort_categories(list(pd.unique(cats[mask])))
+        else:
+            group_order = []
+
+    if not mask.any():
+        raise ValueError("No cells remain after applying subset/groups filters")
+    return mask, group_order
 
 
 def assert_assay_supported_for_plotting(assay: Any) -> None:

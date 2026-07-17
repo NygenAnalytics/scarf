@@ -24,6 +24,7 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 5. Never `modal deploy` from the agent; user deploys. Use `uv` for local Python / Modal CLI.
 6. Prefer broad Modal region `eu` over narrow `eu-west-1` for capacity.
 7. Do **not** set Modal `cloud=` (e.g. aws). Provider pinning shrinks the pool; leave cloud unset so Modal can schedule any provider.
+8. Coordinators (`run_all_jobs` / `run_size_jobs`) must use tiny resources (~2–4 GiB / 1 CPU) via `orchestrator_function_options`. Never spawn them with stage RAM (32–64 GiB); that competes with real stage workers for scarce high-memory capacity.
 
 ## Code changes already wired
 

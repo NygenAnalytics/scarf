@@ -94,8 +94,8 @@ splt.embedding(
 ```
 
 For large datasets, `embedding_raster` builds a pixel image from continuous
-cell metadata without loading full columns into memory. It does not color by
-gene; use `embedding` for that.
+cell metadata without loading full columns into memory. Empty pixels are white
+by default. It does not color by gene; use `embedding` for that.
 
 ```{code-cell} ipython3
 splt.embedding_raster(
@@ -231,16 +231,20 @@ splt.composition(
 
 ### 5. Plot distributions
 
-Violins (or boxes, histograms, ECDFs) are useful for QC metrics split by
-cluster. `max_points` limits how many individual cells are overlaid as points
-so the figure stays light on large datasets. Several keys wrap into a grid
-instead of one very wide strip.
+Violins (or boxes, histograms, ECDFs) are useful for QC metrics or genes split
+by cluster. Groups are colored distinctly. `max_points` limits how many
+individual cells are overlaid as points (`0` turns points off). Use the same
+selection knobs as embeddings: `subset_by` for a boolean cell column and
+`groups` to keep and order categories from `group_by`. Several gene keys share
+a y-axis scale and wrap into a grid.
 
 ```{code-cell} ipython3
+cluster_ids = sorted(set(ds.cells.fetch("clusters")), key=str)[:6]
 splt.distribution(
     ds,
     keys=["RNA_nCounts", "RNA_nFeatures"],
     group_by="clusters",
+    groups=cluster_ids,
     kind="violin",
     max_points=2000,
     seed=0,

@@ -62,7 +62,8 @@ def embedding_raster(
     pixels: int = 400,
     block_rows: int | None = None,
     color_scale: ColorScale | None = None,
-    missing_color: str = "#f0f0f0",
+    missing_color: str = "white",
+    subset_by: str | None = None,
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
     theme: str = "notebook",
@@ -79,6 +80,9 @@ def embedding_raster(
     ``color_by`` must be continuous metadata, not a gene. Pass
     ``CellField(key, kind="continuous")`` when an integer column should be
     treated as continuous. Categorical colors are not supported here.
+    Empty pixels use a white background by default (override with
+    ``missing_color``). Pass ``subset_by`` to keep cells marked ``True`` in a
+    boolean cell-metadata column.
     """
     require_matplotlib()
     color_scale = color_scale or ColorScale(cmap="viridis", quantiles=(0.01, 0.99))
@@ -115,6 +119,9 @@ def embedding_raster(
             "embedding() for categorical cell metadata"
         )
 
+    if subset_by is not None and subset_by not in store.cells.columns:
+        raise KeyError(f"subset_by {subset_by!r} not found in cell metadata")
+
     quantiles = color_scale.quantiles
     canvas = raster_from_metadata(
         store.cells,
@@ -122,6 +129,7 @@ def embedding_raster(
         y_key=y_key,
         color_key=color_key,
         cell_key=cell_key,
+        subset_by=subset_by,
         pixels=pixels,
         block_rows=block_rows,
         quantiles=quantiles,
@@ -222,6 +230,8 @@ def embedding_raster(
                 "vmax": canvas.vmax,
                 "color_by": color_key,
                 "color_mode": "continuous" if color_key is not None else "density",
+                "subset_by": subset_by,
+                "missing_color": missing_color,
             },
         ),
         owns_figure=owns,
