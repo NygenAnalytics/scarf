@@ -27,6 +27,7 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 8. Coordinators (`run_all_jobs` / `run_size_jobs`) must use tiny resources (~2–4 GiB / 1 CPU) via `orchestrator_function_options` with `retries=0`. Never spawn them with stage RAM (32–64 GiB); that competes with real stage workers for scarce high-memory capacity.
 9. Stage workers use Modal `Retries(max_retries=3)` via `modal_function_options`. `run_size_jobs` also re-spawns a stage up to 3 times if the call dies without an R2 result (covers `InternalFailure: Server has lost track of input`).
 10. Right-size Modal RAM per stage from measured peaks. Do not put Leiden/UMAP/HVG on a 64 GiB queue when peaks are ~5–8 GiB; that worsens scheduling and lost-input risk. Keep 64 GiB for createStore / makeGraph at large N when peaks justify it.
+11. When polling spawned calls, treat call-graph `FAILURE` / `INIT_FAILURE` / `TERMINATED` / `TIMEOUT` as terminal. Modal can raise an empty `TimeoutError` from `get(timeout=…)` on failed inputs; spinning on that alone leaves orchestrators stuck until the stage deadline.
 
 ## Code changes already wired
 
