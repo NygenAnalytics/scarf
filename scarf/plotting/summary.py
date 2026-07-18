@@ -112,7 +112,7 @@ def dotplot(
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
     theme: str = "notebook",
-    show: bool = False,
+    show: bool = True,
 ) -> PlotResult:
     """Dotplot of expression by group.
 
@@ -311,7 +311,7 @@ def matrixplot(
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
     theme: str = "notebook",
-    show: bool = False,
+    show: bool = True,
 ) -> PlotResult:
     """Heatmap of mean expression or detection fraction by group.
 

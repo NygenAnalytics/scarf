@@ -9,6 +9,13 @@ MIN_EPHEMERAL_DISK_MB = 524_288
 MAX_EPHEMERAL_DISK_MB = 3_145_728
 BASE_EPHEMERAL_DISK_MB = MIN_EPHEMERAL_DISK_MB
 
+# Stage workers: retry after runner loss / InternalFailure. Orchestrators stay at 0.
+STAGE_JOB_RETRIES = modal.Retries(
+    max_retries=3,
+    backoff_coefficient=2.0,
+    initial_delay=5.0,
+)
+
 
 def resolve_ephemeral_disk_mb(requestedMb: int) -> int:
     if requestedMb > MAX_EPHEMERAL_DISK_MB:
@@ -37,6 +44,7 @@ def modal_function_options(
     resources: StageResources | PrepareResources,
     *,
     maxContainers: int = 1,
+    retries: int | modal.Retries = STAGE_JOB_RETRIES,
 ) -> dict[str, Any]:
     if maxContainers <= 0:
         raise ValueError("maxContainers must be positive")
@@ -53,7 +61,7 @@ def modal_function_options(
         "memory": (resources.modalMemoryRequestMb, resources.modalMemoryLimitMb),
         "env": {"R2_ENDPOINT": config.r2EndpointUrl},
         "secrets": [secret],
-        "retries": 0,
+        "retries": retries,
         "max_containers": maxContainers,
         "buffer_containers": 0,
         "timeout": resources.timeoutSeconds,
@@ -76,6 +84,7 @@ def orchestrator_function_options(
         config,
         config.resourcesFor("reopenStore"),
         maxContainers=maxContainers,
+        retries=0,
     )
     options["memory"] = (2048, 4096)
     options["cpu"] = (1.0, 1.0)

@@ -122,7 +122,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
-).show();
+)
 ```
 
 ### 4. Process the ADT assay
@@ -205,29 +205,25 @@ splt.embedding(
     ds,
     layout_key='ADT_UMAP',
     color_by='ADT_leiden_cluster',
-).show();
+)
 ```
 
 ### 5. Compare modalities
 
 It is generally of interest to see how different modalities corroborate each other.
 
-The examples below intentionally use the supported `plot_layout` compatibility
-method because they combine several layout keys or CLR-normalized ADT features.
-The `scarf.plotting` API raises for assay transformations it cannot reproduce
-without changing their meaning.
+`splt.embedding` can compare several layouts in one figure and uses the selected
+assay's native normalization for feature values.
 
 ```{code-cell} ipython3
 # UMAP on RNA and coloured with clusters calculated on ADT
-ds.plot_layout(
+splt.embedding(
+    ds,
     layout_key=['RNA_UMAP', 'ADT_UMAP'],
     color_by=['ADT_leiden_cluster', 'RNA_leiden_cluster'],
-    cmap='tab20',
-    width=4,
-    height=4, 
     n_columns=2,
     point_size=5,
-    legend_onside=False
+    legend_loc='on_data',
 )
 ```
 
@@ -252,28 +248,26 @@ There are possibly many interesting strategies to analyze this further. One simp
 Individual ADT expression can be visualized in both UMAPs easily.
 
 ```{code-cell} ipython3
-ds.plot_layout(
+splt.embedding(
+    ds,
     layout_key=['RNA_UMAP', 'ADT_UMAP'],
     color_by='CD16_TotalSeqB',
     from_assay='ADT',
-    width=4,
-    height=4,
     n_columns=2,
-    point_size=5
+    point_size=5,
 )
 ```
 
 We can also query gene expression and visualize it on both RNA and ADT UMAPs. Here we query gene FCGR3A which codes for CD16:
 
 ```{code-cell} ipython3
-ds.plot_layout(
+splt.embedding(
+    ds,
     layout_key=['RNA_UMAP', 'ADT_UMAP'],
     color_by='FCGR3A',
     from_assay='RNA',
-    width=4,
-    height=4,
     n_columns=2,
-    point_size=5
+    point_size=5,
 )
 ```
 
@@ -321,7 +315,7 @@ splt.embedding(
     ],
     legend_loc='on_data',
     n_columns=3,
-).show();
+)
 ```
 
 ```{code-cell} ipython3
@@ -362,13 +356,13 @@ splt.embedding(
     layout_key='RNA+ADT_UMAP',
     color_by='RNA+ADT_wnn_leiden_cluster',
     legend_loc='on_data',
-).show();
+)
 splt.embedding(
     ds,
     layout_key='RNA+ADT_wnn_UMAP',
     color_by='RNA+ADT_wnn_leiden_cluster',
     legend_loc='on_data',
-).show();
+)
 ```
 
 SNN supports two or more assays; WNN is limited to two. Try WNN when one modality is sparse or weaker than the other.

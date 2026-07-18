@@ -40,18 +40,30 @@ def _scarf_version() -> str:
         return "unknown"
 
 
+def _cell_index(store: Any, cell_key: str | None) -> np.ndarray:
+    if cell_key is None:
+        return np.arange(store.cells.N, dtype=np.int64)
+    return np.asarray(store.cells.active_index(cell_key))
+
+
+def _fetch_cell_column(store: Any, column: str, cell_key: str | None) -> np.ndarray:
+    if cell_key is None:
+        return np.asarray(store.cells.fetch_all(column))
+    return np.asarray(store.cells.fetch(column, key=cell_key))
+
+
 def _fetch_series(
     store: Any,
     key: str | CellField | FeatureRef,
     *,
-    cell_key: str,
+    cell_key: str | None,
     from_assay: str | None,
     normalization: NormalizationSpec,
 ) -> tuple[np.ndarray, str, bool]:
     """Return (values, label, is_feature)."""
     if isinstance(key, CellField):
         return (
-            np.asarray(store.cells.fetch(key.key, key=cell_key)),
+            _fetch_cell_column(store, key.key, cell_key),
             key.label or key.key,
             False,
         )
@@ -59,7 +71,7 @@ def _fetch_series(
         isinstance(key, str) and key not in store.cells.columns
     ):
         resolved = resolve_feature(store, key, from_assay=from_assay)
-        cell_idx = store.cells.active_index(cell_key)
+        cell_idx = _cell_index(store, cell_key)
         mat = fetch_normalized_feature_matrix(
             store,
             [resolved],
@@ -67,7 +79,7 @@ def _fetch_series(
             normalization=normalization,
         )
         return mat[:, 0], resolved.label, True
-    return np.asarray(store.cells.fetch(str(key), key=cell_key)), str(key), False
+    return _fetch_cell_column(store, str(key), cell_key), str(key), False
 
 
 def _subsample_frame(
@@ -266,7 +278,7 @@ def distribution(
     group_by: str | None = None,
     groups: Sequence[Any] | None = None,
     subset_by: str | None = None,
-    cell_key: str = "I",
+    cell_key: str | None = "I",
     from_assay: str | None = None,
     normalization: NormalizationSpec | None = None,
     categorical_scale: CategoricalScale | None = None,
@@ -278,8 +290,9 @@ def distribution(
     color: str = "steelblue",
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
+    title: str | None = None,
     theme: str = "notebook",
-    show: bool = False,
+    show: bool = True,
 ) -> PlotResult:
     """Compare value distributions for QC metrics or genes.
 
@@ -290,6 +303,8 @@ def distribution(
 
     Cell selection (same knobs as embeddings):
 
+    - ``cell_key``: boolean metadata column selecting cells (default ``"I"``).
+      Pass ``None`` to include every cell, including those marked inactive.
     - ``subset_by``: boolean metadata column; keep ``True`` cells
     - ``groups``: keep / order these ``group_by`` categories
 
@@ -344,14 +359,14 @@ def distribution(
     ]
     n = len(series_list[0][0])
     if group_by is not None:
-        groups_arr = np.asarray(store.cells.fetch(group_by, key=cell_key))
+        groups_arr = _fetch_cell_column(store, group_by, cell_key)
         if len(groups_arr) != n:
             raise ValueError("group_by length does not match selected cells")
     else:
         groups_arr = np.zeros(n, dtype=int)
 
     subset_vals = (
-        np.asarray(store.cells.fetch(subset_by, key=cell_key))
+        _fetch_cell_column(store, subset_by, cell_key)
         if subset_by is not None
         else None
     )
@@ -476,6 +491,8 @@ def distribution(
                 for ax in axes.values():
                     ax.set_ylim(ymin - pad, ymax + pad)
 
+        if title is not None:
+            fig.suptitle(title)
         apply_figure_chrome(fig, theme)
 
     label_counts = pd.Series([label for _, label, _ in series_list]).value_counts()
@@ -507,6 +524,7 @@ def distribution(
                 "groups": None if groups is None else list(groups),
                 "subset_by": subset_by,
                 "bins": bins if kind == "hist" else None,
+                "title": title,
                 "approximate": any_subsampled,
                 "normalization": {
                     "source": normalization.source,

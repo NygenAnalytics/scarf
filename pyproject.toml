@@ -203,7 +203,6 @@ ignore_missing_imports = false
 
 [[tool.mypy.overrides]]
 module = [
-    "scarf.plots",
     "scarf.plotting",
     "scarf.plotting.*",
 ]

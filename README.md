@@ -45,8 +45,10 @@ ds.run_umap(n_epochs=250, spread=5, min_dist=1, parallel=True)
 ds.run_leiden_clustering(resolution=0.5)
 
 splt.embedding(
-    ds, layout_key="RNA_UMAP", color_by="RNA_leiden_cluster", show=False
-).figure
+    ds,
+    layout_key="RNA_UMAP",
+    color_by="RNA_leiden_cluster",
+)
 ```
 
 Same path with more explanation: [docs quick start](https://scarf.readthedocs.io/en/latest/quickstart.html).

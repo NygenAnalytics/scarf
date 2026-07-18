@@ -18,6 +18,7 @@ the Scanpy material.
 ## Stage mapping
 
 Approximate mapping of common steps. Rows marked approximate are not one-to-one.
+For plotting calls, `splt` means `import scarf.plotting as splt`.
 
 | Stage | Scanpy | Scarf |
 |---|---|---|
@@ -30,7 +31,7 @@ Approximate mapping of common steps. Rows marked approximate are not one-to-one.
 | UMAP | `sc.tl.umap` | `run_umap` |
 | Clustering | `sc.tl.leiden` | `run_leiden_clustering` (also Paris hierarchical clustering) |
 | Markers | `sc.tl.rank_genes_groups` | `run_marker_search` / `get_markers` (Mann-Whitney U scores and p-values; no FDR correction) |
-| Plotting | `sc.pl.*` | `scarf.plotting` (`embedding`, `dotplot`, …); some `DataStore.plot_*` helpers remain |
+| Plotting | `sc.pl.*` | `splt.embedding`, `splt.dotplot`, and other `scarf.plotting` functions |
 | Export | write H5AD | `to_anndata`, `scarf.to_h5ad`, MTX helpers |
 
 ## Scarf-specific mechanics
@@ -82,7 +83,7 @@ need for the next tool.
 2. Inspect QC columns (`RNA_nCounts`, `RNA_nFeatures`, …) before filtering.
 3. Call `mark_hvgs`, then `make_graph` (normalization and PCA happen here).
 4. Run `run_umap` and `run_leiden_clustering` on the graph.
-5. Use `scarf.plotting.embedding` for UMAP figures.
+5. Use `splt.embedding` for UMAP figures.
 6. Export with `to_anndata` when you need a Scanpy-only method.
 
 ## If you know Seurat

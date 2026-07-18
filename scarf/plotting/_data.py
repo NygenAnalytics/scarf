@@ -110,18 +110,6 @@ def resolve_cell_selection(
     return mask, group_order
 
 
-def assert_assay_supported_for_plotting(assay: Any) -> None:
-    """Reject assay transformations that the plotting adapter cannot reproduce."""
-    from ..assay import ADTassay, ATACassay
-
-    if isinstance(assay, (ADTassay, ATACassay)):
-        raise NotImplementedError(
-            f"Plotting feature values from {type(assay).__name__} is not "
-            "supported yet. Use RNA-like assays for now, or color by a "
-            "cell-metadata column."
-        )
-
-
 def resolve_feature(
     store: Any,
     feature: str | FeatureRef,
@@ -185,8 +173,7 @@ def fetch_normalized_feature_matrix(
     cell_idx: np.ndarray,
     normalization: NormalizationSpec | None = None,
 ) -> np.ndarray:
-    """Return normalized values without mutating assay normalization state."""
-    from ..assay import norm_dummy, norm_lib_size, norm_lib_size_log
+    """Return assay-native or raw feature values in requested feature order."""
     from ..utils import controlled_compute
 
     normalization = normalization or NormalizationSpec()
@@ -200,41 +187,21 @@ def fetch_normalized_feature_matrix(
 
     for assay_name, slots in assay_slots.items():
         assay = store._get_assay(assay_name)
-        if normalization.source != "raw":
-            assert_assay_supported_for_plotting(assay)
         physical_indices = np.unique(
             np.concatenate(
                 [np.asarray(resolved[slot].indices, dtype=np.int64) for slot in slots]
             )
         )
-        counts = controlled_compute(
-            assay.rawData[:, physical_indices][cell_idx, :],
-            store.nthreads,
-        ).astype(np.float64)
-        if counts.ndim == 1:
-            counts = counts.reshape(-1, 1)
-
         if normalization.source == "raw":
-            normalized = counts
-        elif assay.normMethod is norm_dummy:
-            normalized = counts
-        elif assay.normMethod in (norm_lib_size, norm_lib_size_log):
-            if assay.sf is None:
-                raise ValueError(
-                    f"Assay {assay_name!r} requires a size factor for "
-                    "library-size normalization"
-                )
-            scalar = np.asarray(
-                assay.cells.fetch_all(f"{assay.name}_nCounts")[cell_idx],
-                dtype=np.float64,
-            ).copy()
-            scalar[scalar == 0] = 1.0
-            normalized = float(assay.sf) * counts / scalar[:, None]
+            values = assay.rawData[:, physical_indices][cell_idx, :]
         else:
-            raise NotImplementedError(
-                f"Plotting does not yet support normalization method "
-                f"{assay.normMethod.__name__!r} for assay {assay_name!r}"
+            values = assay.normed(
+                cell_idx=cell_idx,
+                feat_idx=physical_indices,
             )
+        normalized = controlled_compute(values, store.nthreads).astype(np.float64)
+        if normalized.ndim == 1:
+            normalized = normalized.reshape(-1, 1)
         if normalization.transform == "log1p":
             normalized = np.log1p(normalized)
 

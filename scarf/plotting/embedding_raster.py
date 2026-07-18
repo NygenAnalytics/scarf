@@ -68,7 +68,7 @@ def embedding_raster(
     figsize: tuple[float, float] | None = None,
     theme: str = "notebook",
     seed: int = 0,
-    show: bool = False,
+    show: bool = True,
 ) -> PlotResult:
     """Draw a layout as a pixel image for large cell counts.
 

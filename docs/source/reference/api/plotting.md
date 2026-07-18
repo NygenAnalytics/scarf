@@ -1,7 +1,10 @@
 # Plotting
 
-Prefer `scarf.plotting` for new code. `DataStore.plot_*` and `scarf.plots` remain available
-compatibility helpers.
+`scarf.plotting` is Scarf's plotting API. Import it as `splt` and call functions such as
+`splt.embedding(...)`, `splt.dotplot(...)`, and `splt.cluster_tree(...)`.
+
+Plot functions return a `PlotResult` and render by default with `show=True`. Pass
+`show=False` before accessing, saving, or reusing an owned figure.
 
 ```{eval-rst}
 .. automodule:: scarf.plotting
@@ -53,8 +56,4 @@ compatibility helpers.
 ```{eval-rst}
 .. autoclass:: scarf.plotting.PlotProvenance
     :members:
-```
-
-```{eval-rst}
-.. autofunction:: scarf.plots.plot_graph_qc
 ```

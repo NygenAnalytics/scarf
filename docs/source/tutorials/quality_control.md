@@ -70,7 +70,7 @@ splt.distribution(
     keys=qc_cols,
     kind='violin',
     max_points=2000,
-).show();
+)
 ```
 
 ## 2) Manual thresholds
@@ -91,7 +91,7 @@ splt.distribution(
     kind='violin',
     max_points=2000,
     color='coral',
-).show();
+)
 ```
 
 ## 3) Automatic thresholds
@@ -128,7 +128,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by=score_col,
-).show();
+)
 ```
 
 Filter on the score yourself when you choose a cutoff for your data:

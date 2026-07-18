@@ -81,6 +81,249 @@ def _coerce_color_items(
     return list(color_by)
 
 
+def _coerce_layout_items(layout_key: str | Sequence[str]) -> list[str]:
+    if isinstance(layout_key, str):
+        return [layout_key]
+    layouts = list(layout_key)
+    if not layouts:
+        raise ValueError("layout_key must contain at least one layout")
+    if any(not isinstance(layout, str) for layout in layouts):
+        raise TypeError("Every layout_key entry must be a string")
+    if len(set(layouts)) != len(layouts):
+        raise ValueError("layout_key entries must be unique")
+    return layouts
+
+
+def _color_labels(
+    store: Any,
+    color_items: Sequence[str | FeatureRef | CellField | None],
+    *,
+    from_assay: str | None,
+) -> list[str]:
+    labels: list[str] = []
+    for item in color_items:
+        if item is None:
+            labels.append("cells")
+        elif isinstance(item, CellField):
+            labels.append(item.label or item.key)
+        elif isinstance(item, str) and item in store.cells.columns:
+            labels.append(item)
+        else:
+            labels.append(resolve_feature(store, item, from_assay=from_assay).label)
+    return labels
+
+
+def _embedding_panel_keys(
+    labels: Sequence[str],
+    facets: Sequence[Any],
+) -> list[Hashable]:
+    panel_keys: list[Hashable] = []
+    for label in labels:
+        for facet in facets:
+            panel_keys.append(label if facet is None else (label, facet))
+    if len(set(panel_keys)) != len(panel_keys):
+        return [(index, key) for index, key in enumerate(panel_keys)]
+    return panel_keys
+
+
+def _layout_panel_key(layout: str, panel_key: Hashable) -> Hashable:
+    if isinstance(panel_key, tuple):
+        return (layout, *panel_key)
+    return (layout, panel_key)
+
+
+def _multi_layout_facets(
+    store: Any,
+    *,
+    facet_by: str | None,
+    facet_order: Sequence[Any] | None,
+    groups: Sequence[Any] | None,
+    subset_by: str | None,
+    cell_key: str,
+) -> list[Any]:
+    if facet_by is None:
+        return [None]
+    if groups is not None:
+        return list(groups)
+    if facet_order is not None:
+        return list(facet_order)
+
+    values = np.asarray(store.cells.fetch(facet_by, key=cell_key))
+    subset = (
+        np.asarray(store.cells.fetch(subset_by, key=cell_key))
+        if subset_by is not None
+        else None
+    )
+    selection, _ = resolve_cell_selection(
+        len(values),
+        subset=subset,
+        subset_name=subset_by,
+    )
+    return sort_categories(list(pd.unique(values[selection])))
+
+
+def _embedding_multiple_layouts(
+    store: Any,
+    *,
+    layout_keys: Sequence[str],
+    color_by: str
+    | FeatureRef
+    | CellField
+    | Sequence[str | FeatureRef | CellField]
+    | None,
+    facet_by: str | None,
+    facet_order: Sequence[Any] | None,
+    cell_key: str,
+    from_assay: str | None,
+    normalization: NormalizationSpec | None,
+    groups: Sequence[Any] | None,
+    subset_by: str | None,
+    n_columns: int | None,
+    target: Any | None,
+    figsize: tuple[float, float] | None,
+    theme: str,
+    show: bool,
+    child_kwargs: dict[str, Any],
+) -> PlotResult:
+    color_items = _coerce_color_items(color_by)
+    if not color_items:
+        raise ValueError("color_by must contain at least one item")
+    labels = _color_labels(store, color_items, from_assay=from_assay)
+    facets = _multi_layout_facets(
+        store,
+        facet_by=facet_by,
+        facet_order=facet_order,
+        groups=groups,
+        subset_by=subset_by,
+        cell_key=cell_key,
+    )
+    child_panel_keys = _embedding_panel_keys(labels, facets)
+    panel_keys = [
+        _layout_panel_key(layout, panel_key)
+        for layout in layout_keys
+        for panel_key in child_panel_keys
+    ]
+    resolved_columns = n_columns if n_columns is not None else len(child_panel_keys)
+    resolved_columns = max(1, min(resolved_columns, len(panel_keys)))
+    if figsize is None and target is None:
+        nrows = int(np.ceil(len(panel_keys) / resolved_columns))
+        figsize = (
+            DEFAULT_PANEL_INCHES * resolved_columns + 0.4,
+            DEFAULT_PANEL_INCHES * nrows + 0.2,
+        )
+
+    with theme_context(theme):
+        figure, axes, owns = normalize_axes_target(
+            target,
+            panel_keys=panel_keys,
+            figsize=figsize,
+            n_columns=resolved_columns,
+        )
+
+    children: list[tuple[str, PlotResult]] = []
+    for layout in layout_keys:
+        child_target = {
+            panel_key: axes[_layout_panel_key(layout, panel_key)]
+            for panel_key in child_panel_keys
+        }
+        child = embedding(
+            store,
+            layout_key=layout,
+            color_by=color_by,
+            facet_by=facet_by,
+            facet_order=facets if facet_by is not None else facet_order,
+            cell_key=cell_key,
+            from_assay=from_assay,
+            normalization=normalization,
+            groups=groups,
+            subset_by=subset_by,
+            n_columns=len(child_panel_keys),
+            target=child_target,
+            figsize=None,
+            theme=theme,
+            show=False,
+            **child_kwargs,
+        )
+        children.append((layout, child))
+
+    tables: dict[str, pd.DataFrame] = {}
+    legends: list[LegendSpec] = []
+    scales: list[Any] = []
+    for layout, child in children:
+        tables.update({f"{layout}:{key}": value for key, value in child.tables.items()})
+        legends.extend(child.legends)
+        scales.extend(child.scales)
+
+    provenances = {layout: child.provenance for layout, child in children}
+    first_provenance = children[0][1].provenance
+    assays = sorted(
+        {
+            assay
+            for provenance in provenances.values()
+            for assay in provenance.extras.get("assays", [])
+        }
+    )
+    assay_values = {
+        provenance.assay
+        for provenance in provenances.values()
+        if provenance.assay is not None
+    }
+    extras = dict(first_provenance.extras)
+    extras.update(
+        {
+            "layouts": list(layout_keys),
+            "n_layouts": len(layout_keys),
+            "panel_keys": [str(key) for key in panel_keys],
+            "layout_provenance": provenances,
+            "color_limits_by_layout": {
+                layout: provenance.extras.get("color_limits")
+                for layout, provenance in provenances.items()
+            },
+            "invalid_coordinate_cells": {
+                layout: provenance.extras.get("invalid_coordinate_cells", 0)
+                for layout, provenance in provenances.items()
+            },
+            "assays": assays,
+        }
+    )
+    notes = tuple(
+        dict.fromkeys(
+            (
+                "embedding",
+                "materialized",
+                "multi_layout",
+                *(
+                    note
+                    for provenance in provenances.values()
+                    for note in provenance.notes
+                    if note not in ("embedding", "materialized")
+                ),
+            )
+        )
+    )
+    result = PlotResult(
+        figure=figure,
+        axes=axes,
+        tables=tables,
+        legends=tuple(legends),
+        scales=tuple(scales),
+        provenance=PlotProvenance(
+            scarf_version=first_provenance.scarf_version,
+            assay=next(iter(assay_values)) if len(assay_values) == 1 else None,
+            cell_key=cell_key,
+            n_cells=max(provenance.n_cells for provenance in provenances.values()),
+            renderer=first_provenance.renderer,
+            notes=notes,
+            extras=extras,
+        ),
+        owns_figure=owns,
+        theme=theme,
+    )
+    if show:
+        result.show()
+    return result
+
+
 def _prefetch_colors(
     store: Any,
     color_items: Sequence[str | FeatureRef | CellField | None],
@@ -405,7 +648,7 @@ def _soft_clip(values: np.ndarray, clip_fraction: float) -> np.ndarray:
 def embedding(
     store: Any,
     *,
-    layout_key: str,
+    layout_key: str | Sequence[str],
     color_by: str
     | FeatureRef
     | CellField
@@ -434,14 +677,16 @@ def embedding(
     frame: FrameStyle = "minimal",
     seed: int | None = None,
     rasterize_threshold: int = DEFAULT_RASTERIZE_THRESHOLD,
-    show: bool = False,
+    show: bool = True,
 ) -> PlotResult:
-    """Scatter cells on a 2D layout (UMAP, t-SNE, and similar).
+    """Scatter cells on one or more 2D layouts (UMAP, t-SNE, and similar).
 
     ``color_by`` accepts a cell-metadata column, a gene name, or a list of
     either. With several genes, Scarf draws one panel per gene. With
     ``facet_by``, each gene becomes a row and each facet level a column.
     Color limits for a gene are shared across facets so panels stay comparable.
+    Multiple ``layout_key`` values produce the cartesian product of layouts and
+    colors in one figure.
 
     Common choices:
 
@@ -467,6 +712,41 @@ def embedding(
     Returns a :class:`PlotResult`. Access ``.figure`` in notebooks, or call
     ``.save(...)`` / ``.close()`` when you own the figure.
     """
+    layout_keys = _coerce_layout_items(layout_key)
+    if len(layout_keys) > 1:
+        return _embedding_multiple_layouts(
+            store,
+            layout_keys=layout_keys,
+            color_by=color_by,
+            facet_by=facet_by,
+            facet_order=facet_order,
+            cell_key=cell_key,
+            from_assay=from_assay,
+            normalization=normalization,
+            groups=groups,
+            subset_by=subset_by,
+            n_columns=n_columns,
+            target=target,
+            figsize=figsize,
+            theme=theme,
+            show=show,
+            child_kwargs={
+                "point_size": point_size,
+                "point_sizes": point_sizes,
+                "sort_values": sort_values,
+                "color_scale": color_scale,
+                "categorical_scale": categorical_scale,
+                "default_color": default_color,
+                "missing_color": missing_color,
+                "clip_fraction": clip_fraction,
+                "legend_loc": legend_loc,
+                "frame": frame,
+                "seed": seed,
+                "rasterize_threshold": rasterize_threshold,
+            },
+        )
+    layout_key = layout_keys[0]
+
     plt, mpl = require_matplotlib()
     if rasterize_threshold < 0:
         raise ValueError("rasterize_threshold must be >= 0")
@@ -565,16 +845,8 @@ def embedding(
     else:
         facets = [None]
 
-    # Stable panel keys: (color_label, facet) when faceting, else color_label
-    panel_keys: list[Hashable] = []
-    for _, label, _, _ in color_cache:
-        for fac in facets:
-            if fac is None:
-                panel_keys.append(label)
-            else:
-                panel_keys.append((label, fac))
-    if len(set(panel_keys)) != len(panel_keys):
-        panel_keys = [(i, k) for i, k in enumerate(panel_keys)]
+    labels = [label for _, label, _, _ in color_cache]
+    panel_keys = _embedding_panel_keys(labels, facets)
 
     n_colors = len(color_cache)
     n_facets = len(facets)
@@ -591,7 +863,6 @@ def embedding(
     xlim, ylim = square_axis_limits(xlim, ylim)
     edgecolor = scatter_edgecolor(theme)
 
-    labels = [label for _, label, _, _ in color_cache]
     label_counts = pd.Series(labels).value_counts()
 
     def display_key(index: int, label: str) -> str:

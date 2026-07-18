@@ -58,7 +58,7 @@ splt.embedding(
     ds_ctrl,
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
-).show();
+)
 ```
 
 ```{code-cell} ipython3
@@ -72,7 +72,7 @@ splt.embedding(
     ds_stim,
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
-).show();
+)
 ```
 
 ---
@@ -133,7 +133,7 @@ for g, ms in ds_ctrl.get_mapping_score(
             color_by='cluster_labels',
             point_sizes=ms * 10,
             figsize=(4, 4),
-        ).show();
+        )
 ```
 
 ---
@@ -178,7 +178,7 @@ splt.embedding(
     ds_stim,
     layout_key='RNA_UMAP',
     color_by='transferred_labels',
-).show();
+)
 ```
 
 It can be quite interesting to check how the predicted/transferred labels compare to the actual labels of the target cells:
@@ -214,27 +214,15 @@ ds_ctrl.run_unified_umap(
 )
 ```
 
-Since unified embeddings contain cells from another dataset, `scarf.plotting.embedding`
-cannot read the complete layout from one metadata table. Prefer
-`scarf.plotting.unified_embedding`, which returns a `PlotResult` with the same
-square-panel chrome as other `scarf.plotting` figures. The legacy
-`plot_unified_layout` method remains available with its original call style.
+Since unified embeddings contain cells from another dataset, use
+`splt.unified_embedding`. Use `splt.embedding` for regular layouts stored in cell
+metadata.
 
 ```{code-cell} ipython3
-import scarf.plotting as splt
-
 splt.unified_embedding(
     ds_ctrl,
     layout_key='unified_UMAP',
     ref_name='ctrl',
-).show();
-```
-
-```{code-cell} ipython3
-ds_ctrl.plot_unified_layout(
-    layout_key='unified_UMAP',
-    show_target_only=False,
-    ref_name='ctrl'
 )
 ```
 
@@ -255,15 +243,7 @@ splt.unified_embedding(
     layout_key='unified_UMAP',
     show_target_only=True,
     target_groups=ds_stim.cells.fetch('cluster_labels'),
-).show();
-```
-
-```{code-cell} ipython3
-ds_ctrl.plot_unified_layout(
-    layout_key='unified_UMAP',
-    show_target_only=True, 
-    legend_ondata=True,
-    target_groups=ds_stim.cells.fetch('cluster_labels')
+    legend_loc='on_data',
 )
 ```
 
@@ -281,10 +261,10 @@ ds_ctrl.run_unified_tsne(
     max_iter=500
 )
 
-ds_ctrl.plot_unified_layout(
+splt.unified_embedding(
+    ds_ctrl,
     layout_key='unified_tSNE',
-    show_target_only=False,
-    ref_name='ctrl'
+    ref_name='ctrl',
 )
 ```
 

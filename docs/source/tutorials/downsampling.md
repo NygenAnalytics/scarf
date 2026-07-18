@@ -61,7 +61,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_cluster',
-).show();
+)
 ```
 
 ---
@@ -88,7 +88,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cluster',
     subset_by='RNA_sketched',
-).show();
+)
 ```
 
 It may also be interesting to visualize the cells that were marked as `seed cells` used when PCST was run. These cells are marked under the column `RNA_sketch_seeds`.
@@ -99,7 +99,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cluster',
     subset_by='RNA_sketch_seeds',
-).show();
+)
 ```
 
 ---
@@ -114,7 +114,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_cell_density',
-).show();
+)
 ```
 
 The downsampling algorithm also identifies regions of the graph where cells form tightly connected groups by calculating mean shared nearest neighbours of each cell's neighbours. The tightly connected regions get a sampling award. These values can be accessed from under the cell metadata column `RNA_snn_value`.
@@ -124,7 +124,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_snn_value',
-).show();
+)
 ```
 
 ---

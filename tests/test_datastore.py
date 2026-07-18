@@ -1,6 +1,13 @@
+from importlib import import_module, util
+
 import numpy as np
 import pandas as pd
+import pytest
 
+import scarf
+import scarf.plotting as splt
+from scarf.datastore.datastore import DataStore
+from scarf.datastore.mapping_datastore import MappingDatastore
 from scarf.mapping_utils import array_hash
 from scarf.results import (
     PseudotimeAggregationResult,
@@ -52,8 +59,65 @@ class TestDataStore:
             )
             is None
         )
-        # show_qc_plots=True
-        #  howto test plots?
+
+    def test_auto_filter_cells_uses_modern_distribution(
+        self, datastore_ephemeral, monkeypatch
+    ):
+        calls = []
+        active_before = int(datastore_ephemeral.cells.fetch_all("I").sum())
+
+        def record_distribution(store, *, keys, cell_key=None, **kwargs):
+            if cell_key is None:
+                n_cells = store.cells.N
+            else:
+                n_cells = len(store.cells.active_index(cell_key))
+            calls.append(
+                {
+                    "keys": list(keys),
+                    "cell_key": cell_key,
+                    "n_cells": n_cells,
+                    "active_i": int(store.cells.fetch_all("I").sum()),
+                    **kwargs,
+                }
+            )
+
+        monkeypatch.setattr(splt, "distribution", record_distribution)
+        datastore_ephemeral.auto_filter_cells(
+            attrs=["RNA_nCounts", "RNA_nFeatures"],
+            show_qc_plots=True,
+        )
+
+        assert [call["title"] for call in calls] == [
+            "Pre-filtering distribution",
+            "Post-filtering distribution",
+        ]
+        assert [call["color"] for call in calls] == ["steelblue", "coral"]
+        assert [call["cell_key"] for call in calls] == [None, "I"]
+        assert all(call["keys"] == ["RNA_nCounts", "RNA_nFeatures"] for call in calls)
+        assert all(call["show"] is True for call in calls)
+        # Filtering happens before both plots; pre includes filtered-out cells.
+        assert calls[0]["active_i"] < active_before
+        assert calls[0]["n_cells"] == datastore_ephemeral.cells.N
+        assert calls[1]["n_cells"] == calls[1]["active_i"]
+        assert calls[0]["n_cells"] >= calls[1]["n_cells"]
+
+    def test_auto_filter_cells_skips_qc_when_no_attrs(
+        self, datastore_ephemeral, monkeypatch
+    ):
+        monkeypatch.setattr(
+            splt,
+            "distribution",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("distribution should not be called")
+            ),
+        )
+        assert (
+            datastore_ephemeral.auto_filter_cells(
+                attrs=["missing_a", "missing_b"],
+                show_qc_plots=True,
+            )
+            is None
+        )
 
     def test_filter_cells(self, datastore_ephemeral):
         assert (
@@ -352,34 +416,70 @@ class TestDataStore:
     def test_run_topacedo_sampler(self, cell_attrs, topacedo_sampler):
         assert np.all(topacedo_sampler == cell_attrs["RNA_sketched"])
 
-    def test_plot_cells_dists(self, datastore):
-        datastore.plot_cells_dists(show_fig=False)
-
-    def test_plot_layout(self, umap, paris_clustering, datastore):
-        datastore.plot_layout(
-            layout_key="RNA_UMAP", color_by="RNA_cluster", show_fig=False
+    def test_plot_distributions(self, datastore):
+        result = splt.distribution(
+            datastore,
+            keys=["RNA_nCounts", "RNA_nFeatures"],
+            show=False,
         )
+        assert isinstance(result, splt.PlotResult)
+        assert set(result.tables) == {"RNA_nCounts", "RNA_nFeatures"}
+        result.close()
 
-    def test_plot_layout_shade(self, umap, paris_clustering, datastore):
-        axs = datastore.plot_layout(
+    def test_plot_embedding(self, umap, paris_clustering, datastore):
+        result = splt.embedding(
+            datastore,
             layout_key="RNA_UMAP",
             color_by="RNA_cluster",
-            show_fig=False,
-            do_shading=True,
-            shade_npixels=64,
+            show=False,
         )
-        assert axs is not None
+        assert isinstance(result, splt.PlotResult)
+        assert result.provenance.notes[:2] == ("embedding", "materialized")
+        result.close()
 
-    def test_plot_cluster_tree(self, datastore):
-        datastore.plot_cluster_tree(cluster_key="RNA_cluster", show_fig=False)
+    def test_plot_embedding_raster(self, umap, datastore):
+        result = splt.embedding_raster(
+            datastore,
+            layout_key="RNA_UMAP",
+            color_by="RNA_nCounts",
+            pixels=64,
+            show=False,
+        )
+        assert isinstance(result, splt.PlotResult)
+        assert result.provenance.renderer == "matplotlib-raster"
+        result.close()
+
+    def test_plot_cluster_tree(self, paris_clustering, datastore):
+        result = splt.cluster_tree(
+            datastore,
+            cluster_key="RNA_cluster",
+            show=False,
+        )
+        assert isinstance(result, splt.PlotResult)
+        assert "cluster_summary" in result.tables
+        result.close()
 
     def test_plot_marker_heatmap(self, marker_search, datastore):
-        datastore.plot_marker_heatmap(group_key="RNA_cluster", show_fig=False)
+        result = splt.marker_heatmap(
+            datastore,
+            group_key="RNA_cluster",
+            show=False,
+        )
+        assert isinstance(result, splt.PlotResult)
+        assert "matrix" in result.tables
+        result.close()
 
-    def test_plot_unified_layout(self, run_unified_umap, datastore):
-        datastore.plot_unified_layout(layout_key="unified_UMAP", show_fig=False)
+    def test_plot_unified_embedding(self, run_unified_umap, datastore):
+        result = splt.unified_embedding(
+            datastore,
+            layout_key="unified_UMAP",
+            show=False,
+        )
+        assert isinstance(result, splt.PlotResult)
+        assert "cells" in result.tables
+        result.close()
 
-    def test_plot_unified_layout_target_groups(
+    def test_plot_unified_embedding_target_groups(
         self, run_unified_umap, paris_clustering, datastore
     ):
         from scarf._types import as_zarr_array, as_zarr_group
@@ -391,23 +491,53 @@ class TestDataStore:
         layout = as_zarr_array(projections["unified_UMAP"], name="unified_UMAP")
         n_target_cells = int(layout.attrs["n_cells"][1])
         target_groups = paris_clustering[:n_target_cells]
-        datastore.plot_unified_layout(
+        result = splt.unified_embedding(
+            datastore,
             layout_key="unified_UMAP",
             show_target_only=True,
-            legend_ondata=True,
+            legend_loc="on_data",
             target_groups=target_groups,
-            show_fig=False,
+            show=False,
         )
+        assert result.provenance.n_cells == n_target_cells
+        assert set(result.tables["cells"]["group"]) == set(target_groups)
+        result.close()
 
     def test_plot_pseudotime_heatmap(self, pseudotime_aggregation, datastore):
-        datastore.plot_pseudotime_heatmap(
+        result = splt.pseudotime_heatmap(
+            datastore,
             cell_key="I",
             feat_key="I",
             feature_cluster_key="pseudotime_clusters",
             pseudotime_key="RNA_pseudotime",
             show_features=["Wsb1", "Rest"],
-            show_fig=False,
+            show=False,
         )
+        assert isinstance(result, splt.PlotResult)
+        assert "pseudotime_bins" in result.tables
+        result.close()
+
+    def test_legacy_plotting_apis_are_absent(self):
+        removed_datastore_methods = (
+            "plot_cells_dists",
+            "plot_layout",
+            "plot_marker_heatmap",
+            "plot_cluster_tree",
+            "plot_pseudotime_heatmap",
+            "plot_unified_layout",
+        )
+        for method_name in removed_datastore_methods:
+            assert not hasattr(DataStore, method_name)
+        assert not hasattr(MappingDatastore, "plot_unified_layout")
+
+        assert not hasattr(scarf, "plots")
+        assert not hasattr(splt, "_legacy")
+        for module_name in ("scarf.plots", "scarf.plotting._legacy"):
+            assert util.find_spec(module_name) is None
+            with pytest.raises(
+                ModuleNotFoundError, match=module_name.replace(".", r"\.")
+            ):
+                import_module(module_name)
 
     def test_mark_hvgs_with_atac_assay(self, atac_datastore):
         import pytest

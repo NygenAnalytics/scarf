@@ -16,8 +16,7 @@ kernelspec:
 
 # Plotting
 
-`scarf.plotting` provides the main figure types for Scarf analysis. Import the module as `splt`
-and use it for new plotting code.
+`scarf.plotting` provides the plotting API for Scarf analysis. Import the module as `splt`.
 
 ## Prerequisites
 
@@ -58,11 +57,11 @@ ds = scarf.DataStore(
 ### 1. Plot embeddings
 
 `splt.embedding` colors cells on a layout such as UMAP. Pass a metadata column
-or a gene name in `color_by`. The return value is a `PlotResult`; call
-`.show()` to render it in the current notebook cell.
+or a gene name in `color_by`. Plot functions render in the current notebook
+cell by default.
 
 ```{code-cell} ipython3
-splt.embedding(ds, layout_key="RNA_UMAP", color_by="clusters").show();
+splt.embedding(ds, layout_key="RNA_UMAP", color_by="clusters");
 ```
 
 Several genes become a row of panels. `NormalizationSpec(transform="log1p")`
@@ -76,7 +75,7 @@ splt.embedding(
     color_by=["Gcg", "Ins2", "Sst"],
     normalization=splt.NormalizationSpec(transform="log1p"),
     sort_values=True,
-).show();
+);
 ```
 
 Outliers can wash out a gene UMAP. `ColorScale(quantiles=(0.0, 0.99))` sets the
@@ -90,7 +89,7 @@ splt.embedding(
     normalization=splt.NormalizationSpec(transform="log1p"),
     color_scale=splt.ColorScale(cmap="viridis", quantiles=(0.0, 0.99)),
     sort_values=True,
-).show();
+);
 ```
 
 For large datasets, `embedding_raster` builds a pixel image from continuous
@@ -103,7 +102,7 @@ splt.embedding_raster(
     layout_key="RNA_UMAP",
     color_by="RNA_nCounts",
     pixels=400,
-).show();
+);
 ```
 
 ---
@@ -130,7 +129,7 @@ splt.embedding(
     layout_key="RNA_UMAP",
     color_by="clusters",
     legend_loc="on_data",
-).show();
+);
 ```
 
 ### Frame and theme
@@ -148,7 +147,7 @@ splt.embedding(
     legend_loc="on_data",
     frame="none",
     theme="paper",
-).show();
+);
 ```
 
 ### Point size
@@ -180,7 +179,7 @@ splt.dotplot(
     features={"endocrine": ["Gcg", "Ins2", "Sst"]},
     group_by="clusters",
     sample_by="demo_sample",
-).show();
+);
 ```
 
 A matrixplot is a plain heatmap of mean or fraction. Gene and group order are
@@ -192,7 +191,7 @@ splt.matrixplot(
     features=["Gcg", "Ins2", "Sst"],
     group_by="clusters",
     value="mean",
-).show();
+);
 ```
 
 ---
@@ -224,7 +223,7 @@ splt.composition(
         condition_by="demo_condition",
     ),
     kind="per_sample",
-).show();
+);
 ```
 
 ---
@@ -248,17 +247,19 @@ splt.distribution(
     kind="violin",
     max_points=2000,
     seed=0,
-).show();
+);
 ```
 
 ---
 
 ### 6. Save figures
 
-`PlotResult.save` writes PNG, PDF, SVG, or TIFF. The default background is
-opaque white. Pass `transparent=True` when you want the figure to sit on a dark
-notebook theme. Call `close()` when Scarf created the figure and you are done
-with it.
+Plot functions return a `PlotResult`. With the default `show=True`, a
+Scarf-owned figure is rendered and then closed. Pass `show=False` when you need
+to inspect or reuse `result.figure`, or save the figure. `PlotResult.save`
+writes PNG, PDF, SVG, or TIFF. The default background is opaque white. Pass
+`transparent=True` when you want the figure to sit on a dark notebook theme,
+and call `close()` when you are done with an owned figure.
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -277,11 +278,8 @@ result.close()
 ```
 
 ```{note}
-Prefer `scarf.plotting` for new figures. `DataStore.plot_layout` and other
-`DataStore.plot_*` helpers remain available compatibility APIs. Some older
-tutorials still call them where behavior matches. For unified reference and
-query layouts from mapping, use `splt.unified_embedding` (see
-{doc}`mapping_and_label_transfer`).
+For unified reference and query layouts from mapping, use
+`splt.unified_embedding` (see {doc}`mapping_and_label_transfer`).
 ```
 
 ## Common mistakes

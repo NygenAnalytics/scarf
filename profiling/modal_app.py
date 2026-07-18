@@ -45,6 +45,13 @@ from profiling.modal_resources import (
 from profiling.io_baseline import run_io_baseline_body
 from profiling.r2 import download_file, object_exists, object_size, upload_file
 from profiling.results import result_exists, write_result
+from profiling.spawn_wait import (
+    DEFAULT_GRACE_SECONDS,
+    DEFAULT_STAGE_SPAWN_ATTEMPTS,
+    await_function_call,
+    await_many_function_calls,
+    await_stage_result,
+)
 from profiling.stages import run_stage
 
 _WORK = Path("/tmp/scarf-profiling")
@@ -294,11 +301,59 @@ def run_size_jobs(
             resources,
             maxContainers=parallel_sizes,
         )
-        result = run_stage_job.with_options(**options).remote(
-            configDict,
-            nRows,
-            stage,
-        )
+        deadline_seconds = float(resources.timeoutSeconds) + DEFAULT_GRACE_SECONDS
+        result: dict[str, Any] | None = None
+        last_error: BaseException | None = None
+        for attempt in range(1, DEFAULT_STAGE_SPAWN_ATTEMPTS + 1):
+            if result_exists(config, nRows, stage):
+                result = {
+                    "nRows": nRows,
+                    "stage": stage,
+                    "status": "ok",
+                    "resultUri": config.resultUri(nRows, stage),
+                    "recoveredFromR2": True,
+                    "spawnAttempt": attempt,
+                }
+                break
+            call = run_stage_job.with_options(**options).spawn(
+                configDict,
+                nRows,
+                stage,
+            )
+            try:
+                result = await_stage_result(
+                    config,
+                    nRows,
+                    stage,
+                    call,
+                    deadlineSeconds=deadline_seconds,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 - Modal surfaces many failure types
+                last_error = exc
+                if result_exists(config, nRows, stage):
+                    result = {
+                        "nRows": nRows,
+                        "stage": stage,
+                        "status": "ok",
+                        "resultUri": config.resultUri(nRows, stage),
+                        "recoveredFromR2": True,
+                        "spawnAttempt": attempt,
+                        "callError": str(exc),
+                    }
+                    break
+                if attempt >= DEFAULT_STAGE_SPAWN_ATTEMPTS:
+                    raise
+                print(
+                    f"stage {stage} spawn attempt {attempt}/"
+                    f"{DEFAULT_STAGE_SPAWN_ATTEMPTS} failed ({exc}); retrying",
+                    flush=True,
+                )
+        if result is None:
+            raise RuntimeError(
+                f"stage {stage} produced no result"
+                + (f" after error: {last_error}" if last_error else "")
+            )
         outcomes.append(result)
         if result.get("status") == "error":
             return {
@@ -347,7 +402,10 @@ def run_all_jobs(
         )
         for n_rows in selected_sizes
     ]
-    size_results = [handle.get() for handle in handles]
+    size_results = await_many_function_calls(
+        handles,
+        deadlineSeconds=86_400.0,
+    )
     failed = [item for item in size_results if item.get("stopped")]
     return {
         "stopped": bool(failed),
@@ -441,11 +499,13 @@ def main(*arg_list: str) -> None:
     payload = config.model_dump(mode="python")
 
     if args.command == "smoke":
-        smoke_options = modal_function_options(
-            config,
-            config.resourcesFor("reopenStore"),
+        smoke_options = orchestrator_function_options(config)
+        call = (
+            _deployed_function(config, "smoke_check")
+            .with_options(**smoke_options)
+            .spawn(payload)
         )
-        print(smoke_check.with_options(**smoke_options).remote(payload))
+        print(await_function_call(call, deadlineSeconds=300.0))
         return
 
     if args.command == "prepare":

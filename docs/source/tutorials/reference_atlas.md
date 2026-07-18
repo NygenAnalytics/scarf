@@ -50,7 +50,7 @@ splt.embedding(
     ds_ctrl,
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
-).show();
+)
 ```
 
 ```{code-cell} ipython3
@@ -58,7 +58,7 @@ splt.embedding(
     ds_stim,
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
-).show();
+)
 ```
 
 The reference must already have a selected RNA feature set. For a production atlas, `reference_batch` should contain known technical batches. This compact example uses one recorded control batch to demonstrate the artifact API.
@@ -136,7 +136,7 @@ splt.embedding(
     ds_stim,
     layout_key='RNA_UMAP',
     color_by='symphony_labels',
-).show();
+)
 ```
 
 ```{code-cell} ipython3

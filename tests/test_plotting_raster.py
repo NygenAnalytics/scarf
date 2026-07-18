@@ -337,7 +337,7 @@ def test_raster_subset_by_reduces_cells():
     assert subset.n_cells < full.n_cells
 
 
-def test_specialized_facades_are_callable():
+def test_specialized_plotting_exports_are_callable():
     assert callable(splt.qc)
     assert callable(splt.elbow)
     assert callable(splt.graph_qc)

@@ -5,8 +5,27 @@ Notes for developers updating older Scarf workflows or documentation.
 
 ## Plotting
 
-Prefer `scarf.plotting` (`embedding`, `marker_heatmap`, `cluster_tree`, …).
-`DataStore.plot_*` and `scarf.plots` remain available compatibility helpers.
+The plotting API is a clean break from earlier releases. Older plotting entry points have
+been removed, so existing plotting calls must be rewritten. Import `scarf.plotting` as `splt`
+and call its functions directly:
+
+`scarf.plots` and the `DataStore.plot_*` plotting methods no longer exist. Use
+`splt.embedding`, `splt.distribution`, `splt.marker_heatmap`, `splt.cluster_tree`,
+`splt.pseudotime_heatmap`, and `splt.unified_embedding` instead.
+
+```python
+import scarf.plotting as splt
+
+splt.embedding(ds, layout_key="RNA_UMAP", color_by="clusters")
+```
+
+Plot functions render by default with `show=True`. Pass `show=False` when the returned
+`PlotResult` must remain available for figure access or saving.
+
+`mark_hvgs(..., show_plot=True, **plot_kwargs)` now forwards keyword arguments to
+`splt.highly_variable_features`. Rename older mean-variance plot kwargs as follows:
+`ax_label_fs` to `label_size`, `fig_size` to `figsize`, `ss` to `point_sizes`, and
+`cmaps` to `colormaps`.
 
 ## Merge APIs
 

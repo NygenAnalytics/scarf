@@ -1782,7 +1782,9 @@ class RNAassay(Assay):
                        the non-zero mean (means from cells where the gene had a non-zero value) on the x-axis. The
                        genes are colored in two gradients which indicate the number of cells where the gene was
                        expressed. The colors are yellow to dark red for HVGs, and blue to green for non-HVGs.
-            **plot_kwargs: Keyword arguments for matplotlib.pyplot.scatter function
+            **plot_kwargs: Keyword arguments for ``scarf.plotting.highly_variable_features``
+                           (for example ``figsize``, ``label_size``, ``point_sizes``,
+                           ``colormaps``).
         """
 
         def col_renamer(x: str) -> str:
@@ -1850,13 +1852,20 @@ class RNAassay(Assay):
         self.feats.insert(hvg_key_name, hvgs, fill_value=False, overwrite=True)
 
         if show_plot:
-            from .plots import plot_mean_var
+            from .plotting import highly_variable_features
 
             nzm, vf, nc = [
                 self.feats.fetch(x)
                 for x in [col_renamer("nz_mean"), col_renamer(c_var_col), "nCells"]
             ]
-            plot_mean_var(nzm, vf, nc, self.feats.fetch(hvg_key_name), **plot_kwargs)
+            highly_variable_features(
+                mean_nonzero=nzm,
+                corrected_variance=vf,
+                n_cells=nc,
+                selected=self.feats.fetch(hvg_key_name),
+                show=True,
+                **plot_kwargs,
+            )
 
         return None
 

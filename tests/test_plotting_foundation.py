@@ -1,6 +1,5 @@
-"""Compatibility snapshots and basic scarf.plotting tests."""
+"""Foundation and integration tests for scarf.plotting."""
 
-import inspect
 import subprocess
 import sys
 from pathlib import Path
@@ -13,18 +12,45 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import scarf.plots as plots
 import scarf.plotting as splt
-from scarf.datastore.datastore import DataStore
-from scarf.datastore.mapping_datastore import MappingDatastore
 
 
 def test_import_plotting_exports():
-    assert callable(splt.embedding)
-    assert callable(splt.dotplot)
-    assert callable(splt.matrixplot)
-    assert callable(splt.composition)
-    assert splt.FeatureRef is not None
+    function_names = (
+        "cluster_tree",
+        "collect_legends",
+        "composition",
+        "distribution",
+        "dotplot",
+        "elbow",
+        "embedding",
+        "embedding_raster",
+        "graph_qc",
+        "highly_variable_features",
+        "label_panels",
+        "marker_heatmap",
+        "matrixplot",
+        "pseudotime_heatmap",
+        "qc",
+        "theme_context",
+        "unified_embedding",
+    )
+    result_names = (
+        "CategoricalScale",
+        "CellField",
+        "ColorScale",
+        "FeatureRef",
+        "LegendSpec",
+        "NormalizationSpec",
+        "PlotProvenance",
+        "PlotResult",
+        "SizeScale",
+        "StudyDesign",
+    )
+
+    assert all(name in splt.__all__ for name in (*function_names, *result_names))
+    assert all(callable(getattr(splt, name)) for name in function_names)
+    assert all(getattr(splt, name) is not None for name in result_names)
 
 
 def test_plotting_modules_import_without_optional_dependencies():
@@ -40,17 +66,18 @@ def block_plotting_dependencies(name, *args, **kwargs):
     return original_import(name, *args, **kwargs)
 
 builtins.__import__ = block_plotting_dependencies
-import scarf
-import scarf.plots
-import scarf.plotting
+import scarf.plotting as plotting
 try:
-    scarf.plots.plot_elbow([1.0, 0.5])
+    plotting.elbow([1.0, 0.5], show=False)
 except ImportError as exc:
     assert "scarf[extra]" in str(exc)
 else:
     raise AssertionError("plot use should require optional dependencies")
 try:
-    scarf.plots.plot_qc(pd.DataFrame({"groups": ["a"], "value": [1.0]}))
+    plotting.qc(
+        pd.DataFrame({"groups": ["a"], "value": [1.0]}),
+        show=False,
+    )
 except ImportError as exc:
     assert "scarf[extra]" in str(exc)
 else:
@@ -64,376 +91,6 @@ else:
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-
-
-def test_plots_no_longer_sets_global_svg_fonttype_on_import():
-    # Import already happened; ensure the module does not require the old global default.
-    # Regression: plots.py must not assign plt.rcParams at import time.
-    import scarf.plots as p
-
-    src = inspect.getsource(p)
-    assert 'plt.rcParams["svg.fonttype"]' not in src
-    assert "CUSTOM_PALETTES" in src or "custom_palettes" in src
-
-
-def test_legacy_signature_snapshots():
-    expected = {
-        plots.plot_scatter: (
-            "dfs",
-            "in_ax",
-            "width",
-            "height",
-            "default_color",
-            "color_map",
-            "color_key",
-            "mask_values",
-            "mask_name",
-            "mask_color",
-            "point_size",
-            "ax_label_size",
-            "frame_offset",
-            "spine_width",
-            "spine_color",
-            "displayed_sides",
-            "legend_ondata",
-            "legend_onside",
-            "legend_size",
-            "legends_per_col",
-            "titles",
-            "title_size",
-            "hide_title",
-            "cbar_shrink",
-            "marker_scale",
-            "lspacing",
-            "cspacing",
-            "savename",
-            "dpi",
-            "force_ints_as_cats",
-            "n_columns",
-            "w_pad",
-            "h_pad",
-            "show_fig",
-            "scatter_kwargs",
-        ),
-        plots.shade_scatter: (
-            "dfs",
-            "in_ax",
-            "figsize",
-            "pixels",
-            "spread_px",
-            "spread_threshold",
-            "min_alpha",
-            "color_map",
-            "color_key",
-            "mask_values",
-            "mask_name",
-            "mask_color",
-            "ax_label_size",
-            "frame_offset",
-            "spine_width",
-            "spine_color",
-            "displayed_sides",
-            "legend_ondata",
-            "legend_onside",
-            "legend_size",
-            "legends_per_col",
-            "titles",
-            "title_size",
-            "hide_title",
-            "cbar_shrink",
-            "marker_scale",
-            "lspacing",
-            "cspacing",
-            "savename",
-            "dpi",
-            "force_ints_as_cats",
-            "n_columns",
-            "w_pad",
-            "h_pad",
-            "show_fig",
-        ),
-        plots.plot_qc: (
-            "data",
-            "color",
-            "cmap",
-            "fig_size",
-            "label_size",
-            "title_size",
-            "sup_title",
-            "sup_title_size",
-            "scatter_size",
-            "max_points",
-            "show_on_single_row",
-            "show_fig",
-        ),
-        DataStore.plot_layout: (
-            "self",
-            "from_assay",
-            "cell_key",
-            "layout_key",
-            "color_by",
-            "subselection_key",
-            "size_vals",
-            "clip_fraction",
-            "width",
-            "height",
-            "default_color",
-            "cmap",
-            "color_key",
-            "mask_values",
-            "mask_name",
-            "mask_color",
-            "point_size",
-            "do_shading",
-            "shade_npixels",
-            "shade_min_alpha",
-            "spread_pixels",
-            "spread_threshold",
-            "ax_label_size",
-            "frame_offset",
-            "spine_width",
-            "spine_color",
-            "displayed_sides",
-            "legend_ondata",
-            "legend_onside",
-            "legend_size",
-            "legends_per_col",
-            "title",
-            "title_size",
-            "hide_title",
-            "cbar_shrink",
-            "marker_scale",
-            "lspacing",
-            "cspacing",
-            "shuffle_df",
-            "sort_values",
-            "savename",
-            "save_dpi",
-            "ax",
-            "force_ints_as_cats",
-            "n_columns",
-            "w_pad",
-            "h_pad",
-            "show_fig",
-            "scatter_kwargs",
-            "use_plotting",
-        ),
-        MappingDatastore.plot_unified_layout: (
-            "self",
-            "from_assay",
-            "layout_key",
-            "show_target_only",
-            "ref_name",
-            "target_groups",
-            "width",
-            "height",
-            "cmap",
-            "color_key",
-            "mask_color",
-            "point_size",
-            "ax_label_size",
-            "frame_offset",
-            "spine_width",
-            "spine_color",
-            "displayed_sides",
-            "legend_ondata",
-            "legend_onside",
-            "legend_size",
-            "legends_per_col",
-            "title",
-            "title_size",
-            "hide_title",
-            "cbar_shrink",
-            "marker_scale",
-            "lspacing",
-            "cspacing",
-            "savename",
-            "save_dpi",
-            "ax",
-            "force_ints_as_cats",
-            "n_columns",
-            "w_pad",
-            "h_pad",
-            "scatter_kwargs",
-            "shuffle_zorder",
-            "show_fig",
-        ),
-        DataStore.plot_cells_dists: (
-            "self",
-            "from_assay",
-            "cols",
-            "cell_key",
-            "group_key",
-            "color",
-            "cmap",
-            "fig_size",
-            "label_size",
-            "title_size",
-            "sup_title",
-            "sup_title_size",
-            "scatter_size",
-            "max_points",
-            "show_on_single_row",
-            "show_fig",
-        ),
-        DataStore.plot_marker_heatmap: (
-            "self",
-            "from_assay",
-            "group_key",
-            "cell_key",
-            "topn",
-            "log_transform",
-            "vmin",
-            "vmax",
-            "savename",
-            "save_dpi",
-            "show_fig",
-            "heatmap_kwargs",
-        ),
-        DataStore.plot_cluster_tree: (
-            "self",
-            "from_assay",
-            "cell_key",
-            "feat_key",
-            "cluster_key",
-            "fill_by_value",
-            "force_ints_as_cats",
-            "width",
-            "lvr_factor",
-            "vert_gap",
-            "min_node_size",
-            "node_size_multiplier",
-            "node_power",
-            "root_size",
-            "non_leaf_size",
-            "show_labels",
-            "fontsize",
-            "root_color",
-            "non_leaf_color",
-            "cmap",
-            "color_key",
-            "edgecolors",
-            "edgewidth",
-            "alpha",
-            "figsize",
-            "ax",
-            "show_fig",
-            "savename",
-            "save_dpi",
-        ),
-        DataStore.plot_pseudotime_heatmap: (
-            "self",
-            "from_assay",
-            "cell_key",
-            "feat_key",
-            "feature_cluster_key",
-            "pseudotime_key",
-            "show_features",
-            "width",
-            "height",
-            "vmin",
-            "vmax",
-            "heatmap_cmap",
-            "pseudotime_cmap",
-            "clusterbar_cmap",
-            "tick_fontsize",
-            "axis_fontsize",
-            "feature_label_fontsize",
-            "savename",
-            "save_dpi",
-            "show_fig",
-        ),
-    }
-    for function, parameter_names in expected.items():
-        assert tuple(inspect.signature(function).parameters) == parameter_names
-
-
-def test_color_key_not_mutated():
-    df = pd.DataFrame({"x": [0.0, 1.0], "y": [0.0, 1.0], "g": ["a", "b"]})
-    color_key = {"a": "#111111", "b": "#222222"}
-    original = dict(color_key)
-    plots.plot_scatter(
-        [df],
-        color_key=color_key,
-        force_ints_as_cats=True,
-        show_fig=False,
-        legend_ondata=False,
-        legend_onside=False,
-    )
-    assert color_key == original
-
-
-def test_mask_values_list_not_mutated():
-    df = pd.DataFrame(
-        {"x": [0.0, 1.0, 2.0], "y": [0.0, 1.0, 2.0], "g": ["a", "b", "c"]}
-    )
-    mask_values = ["c"]
-    original = list(mask_values)
-    plots.plot_scatter(
-        [df],
-        mask_values=mask_values,
-        show_fig=False,
-        legend_ondata=False,
-        legend_onside=False,
-    )
-    assert mask_values == original
-
-
-def test_legacy_scatter_does_not_mutate_dataframes():
-    df = pd.DataFrame(
-        {
-            "x": [0.0, 1.0, 2.0],
-            "y": [0.0, 1.0, 2.0],
-            "group": [1, 2, 1],
-        }
-    )
-    original = df.copy(deep=True)
-    scatter_kwargs = {"c": "red", "s": 5}
-    original_kwargs = dict(scatter_kwargs)
-    plots.plot_scatter(
-        [df],
-        force_ints_as_cats=True,
-        show_fig=False,
-        legend_ondata=False,
-        legend_onside=False,
-        scatter_kwargs=scatter_kwargs,
-    )
-    pd.testing.assert_frame_equal(df, original)
-    assert scatter_kwargs == original_kwargs
-
-
-def test_bare_axes_accepted_by_plot_scatter():
-    fig, ax = matplotlib.pyplot.subplots()
-    df = pd.DataFrame({"x": [0.0, 1.0], "y": [0.0, 1.0], "g": [0.1, 0.9]})
-    out = plots.plot_scatter([df], in_ax=ax, show_fig=False, legend_onside=False)
-    assert out is not None
-    matplotlib.pyplot.close(fig)
-
-
-def test_continuous_nan_not_filled_as_zero():
-    df = pd.DataFrame(
-        {"x": [0.0, 1.0, 2.0], "y": [0.0, 1.0, 2.0], "v": [0.0, np.nan, 1.0]}
-    )
-    out = plots.plot_scatter(
-        [df], show_fig=False, legend_onside=False, mask_color="#ff00ff"
-    )
-    assert out is not None
-    matplotlib.pyplot.close("all")
-
-
-def test_plot_qc_with_groups_first_column():
-    data = pd.DataFrame(
-        {
-            "groups": ["a", "a", "b", "b"],
-            "nCounts": [10.0, 12.0, 20.0, 22.0],
-            "nFeatures": [5.0, 6.0, 8.0, 9.0],
-        }
-    )
-    fig = plots.plot_qc(data, show_fig=False)
-    assert fig is not None
-    # Two metric panels
-    assert len(fig.axes) >= 2
-    matplotlib.pyplot.close(fig)
 
 
 def test_study_design_allows_pairing_rejects_tech_rep():
@@ -518,7 +175,7 @@ def test_embedding_keeps_square_panel_with_side_legend(
 
 def test_embedding_dotplot_matrixplot_on_fixture(umap, leiden_clustering, datastore):
     ds = datastore
-    # point_sizes and sort_values are the clever legacy behaviors to preserve
+    # Point sizes and sort order are part of the native embedding contract.
     n = len(ds.cells.fetch("I", key="I"))
     sizes = np.linspace(5, 40, n)
     emb = splt.embedding(
@@ -790,23 +447,159 @@ def test_composition_and_export(umap, leiden_clustering, datastore, tmp_path):
     stacked.close()
 
 
-def test_feature_plotting_uses_pure_normalization_adapter(umap, datastore, monkeypatch):
+def test_feature_plotting_uses_assay_normalization_adapter(
+    umap, datastore, monkeypatch
+):
     ds = datastore
     assay = ds.RNA
-    prev_method = assay.normMethod
-    prev_scalar = getattr(assay, "scalar", None)
     gene = str(assay.feats.fetch_all("names")[0])
+    native_normed = assay.normed
+    calls = []
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("plotting must not call stateful assay.normed()")
+    def tracked_normed(*args, **kwargs):
+        calls.append(kwargs)
+        return native_normed(*args, **kwargs)
 
-    monkeypatch.setattr(assay, "normed", fail_if_called)
+    monkeypatch.setattr(assay, "normed", tracked_normed)
     result = splt.embedding(
-        ds, layout_key="RNA_UMAP", color_by=gene, sort_values=True, show=False
+        ds,
+        layout_key="RNA_UMAP",
+        color_by=gene,
+        normalization=splt.NormalizationSpec(transform="log1p"),
+        sort_values=True,
+        show=False,
     )
     result.close()
-    assert assay.normMethod is prev_method
-    assert getattr(assay, "scalar", None) is prev_scalar
+    assert len(calls) == 1
+    assert set(calls[0]) == {"cell_idx", "feat_idx"}
+
+
+def _assert_plotting_fetch_matches_assay_normed(
+    datastore, assay_name, requested_indices, cell_idx
+):
+    from scarf.plotting._data import (
+        fetch_normalized_feature_matrix,
+        resolve_feature,
+    )
+    from scarf.utils import controlled_compute
+
+    assay = datastore._get_assay(assay_name)
+    resolved = [
+        resolve_feature(
+            datastore,
+            splt.FeatureRef(value=index, assay=assay_name, by="index"),
+        )
+        for index in requested_indices
+    ]
+    physical_indices = np.unique(np.asarray(requested_indices, dtype=np.int64))
+    expected = controlled_compute(
+        assay.normed(cell_idx=cell_idx, feat_idx=physical_indices),
+        datastore.nthreads,
+    ).astype(np.float64)
+    local_order = np.searchsorted(
+        physical_indices, np.asarray(requested_indices, dtype=np.int64)
+    )
+    expected = expected[:, local_order]
+    fetched = fetch_normalized_feature_matrix(
+        datastore,
+        resolved,
+        cell_idx,
+        normalization=splt.NormalizationSpec(source="assay"),
+    )
+    logged = fetch_normalized_feature_matrix(
+        datastore,
+        resolved,
+        cell_idx,
+        normalization=splt.NormalizationSpec(source="assay", transform="log1p"),
+    )
+    np.testing.assert_allclose(fetched, expected)
+    np.testing.assert_allclose(logged, np.log1p(expected))
+
+
+def test_plotting_fetch_matches_rna_normed(datastore):
+    cell_idx = datastore.cells.active_index("I")[:32]
+    _assert_plotting_fetch_matches_assay_normed(
+        datastore,
+        "RNA",
+        [1, 0],
+        cell_idx,
+    )
+
+
+def test_plotting_fetch_matches_adt_normed(toy_crdir_ds):
+    cell_idx = np.arange(toy_crdir_ds.cells.N, dtype=np.int64)
+    _assert_plotting_fetch_matches_assay_normed(
+        toy_crdir_ds,
+        "ADT",
+        [1, 0],
+        cell_idx,
+    )
+
+
+def test_plotting_fetch_matches_atac_normed(atac_datastore):
+    cell_idx = atac_datastore.cells.active_index("I")[:32]
+    _assert_plotting_fetch_matches_assay_normed(
+        atac_datastore,
+        "ATAC",
+        [1, 0],
+        cell_idx,
+    )
+
+
+def test_plotting_fetch_preserves_assay_groups_order_and_reduction(toy_crdir_ds):
+    from dataclasses import replace
+
+    from scarf.plotting._data import (
+        fetch_normalized_feature_matrix,
+        resolve_feature,
+    )
+    from scarf.utils import controlled_compute
+
+    cell_idx = np.arange(toy_crdir_ds.cells.N, dtype=np.int64)
+    rna = [
+        resolve_feature(
+            toy_crdir_ds,
+            splt.FeatureRef(value=index, assay="RNA", by="index"),
+        )
+        for index in (0, 1)
+    ]
+    adt = [
+        resolve_feature(
+            toy_crdir_ds,
+            splt.FeatureRef(value=index, assay="ADT", by="index"),
+        )
+        for index in (0, 1)
+    ]
+    rna_sum = replace(
+        rna[0],
+        indices=(0, 1),
+        ids=rna[0].ids + rna[1].ids,
+        names=rna[0].names + rna[1].names,
+        reduction="sum",
+    )
+    fetched = fetch_normalized_feature_matrix(
+        toy_crdir_ds,
+        [adt[1], rna_sum, adt[0]],
+        cell_idx,
+    )
+    rna_native = controlled_compute(
+        toy_crdir_ds.RNA.normed(
+            cell_idx=cell_idx,
+            feat_idx=np.asarray([0, 1], dtype=np.int64),
+        ),
+        toy_crdir_ds.nthreads,
+    )
+    adt_native = controlled_compute(
+        toy_crdir_ds.ADT.normed(
+            cell_idx=cell_idx,
+            feat_idx=np.asarray([0, 1], dtype=np.int64),
+        ),
+        toy_crdir_ds.nthreads,
+    )
+    expected = np.column_stack(
+        (adt_native[:, 1], rna_native.sum(axis=1), adt_native[:, 0])
+    )
+    np.testing.assert_allclose(fetched, expected)
 
 
 def test_normalization_spec_supports_raw_and_log1p(datastore):
@@ -836,6 +629,12 @@ def test_normalization_spec_supports_raw_and_log1p(datastore):
         cell_idx,
         normalization=splt.NormalizationSpec(),
     )
+    raw_logged = fetch_normalized_feature_matrix(
+        datastore,
+        resolved,
+        cell_idx,
+        normalization=splt.NormalizationSpec(source="raw", transform="log1p"),
+    )
     logged = fetch_normalized_feature_matrix(
         datastore,
         resolved,
@@ -843,6 +642,7 @@ def test_normalization_spec_supports_raw_and_log1p(datastore):
         normalization=splt.NormalizationSpec(transform="log1p"),
     )
     assert np.array_equal(raw, expected_raw)
+    assert np.allclose(raw_logged, np.log1p(raw))
     assert np.allclose(logged, np.log1p(normalized))
 
 
@@ -894,6 +694,167 @@ def test_multi_gene_by_condition_embedding(umap, datastore):
     result.close()
 
 
+def _add_secondary_embedding(datastore):
+    x = np.asarray(datastore.cells.fetch_all("RNA_UMAP1"), dtype=np.float64)
+    y = np.asarray(datastore.cells.fetch_all("RNA_UMAP2"), dtype=np.float64)
+    datastore.cells.insert(
+        "plot_secondary_embedding1",
+        -y,
+        overwrite=True,
+    )
+    datastore.cells.insert(
+        "plot_secondary_embedding2",
+        x,
+        overwrite=True,
+    )
+
+
+def _add_synthetic_embeddings(datastore, assay_name):
+    coordinates = np.linspace(-1.0, 1.0, datastore.cells.N)
+    layouts = [
+        f"plot_{assay_name.lower()}_native_a",
+        f"plot_{assay_name.lower()}_native_b",
+    ]
+    datastore.cells.insert(f"{layouts[0]}1", coordinates, overwrite=True)
+    datastore.cells.insert(f"{layouts[0]}2", coordinates**2, overwrite=True)
+    datastore.cells.insert(f"{layouts[1]}1", -coordinates, overwrite=True)
+    datastore.cells.insert(f"{layouts[1]}2", coordinates[::-1], overwrite=True)
+    return layouts
+
+
+def test_multi_layout_multi_color_embedding(umap, datastore):
+    _add_secondary_embedding(datastore)
+    layouts = ["RNA_UMAP", "plot_secondary_embedding"]
+    colors = ["RNA_nCounts", "RNA_nFeatures"]
+    expected_keys = [(layout, color) for layout in layouts for color in colors]
+
+    result = splt.embedding(
+        datastore,
+        layout_key=layouts,
+        color_by=colors,
+        show=False,
+    )
+
+    assert result.owns_figure is True
+    assert list(result.axes) == expected_keys
+    assert result.provenance.extras["layouts"] == layouts
+    assert result.provenance.extras["n_layouts"] == 2
+    assert set(result.provenance.extras["layout_provenance"]) == set(layouts)
+    assert "multi_layout" in result.provenance.notes
+    assert len(result.legends) == 4
+    assert len(result.scales) == 2
+    result.close()
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "assay_name"),
+    [
+        pytest.param("datastore", "RNA", id="rna"),
+        pytest.param("toy_crdir_ds", "ADT", id="adt"),
+        pytest.param("atac_datastore", "ATAC", id="atac"),
+    ],
+)
+def test_multi_layout_embedding_uses_native_feature_values(
+    request,
+    fixture_name,
+    assay_name,
+):
+    from scarf.utils import controlled_compute
+
+    datastore = request.getfixturevalue(fixture_name)
+    layouts = _add_synthetic_embeddings(datastore, assay_name)
+    label = f"{assay_name} native feature"
+    feature = splt.FeatureRef(
+        value=0,
+        assay=assay_name,
+        by="index",
+        label=label,
+    )
+    result = splt.embedding(
+        datastore,
+        layout_key=layouts,
+        color_by=feature,
+        show=False,
+    )
+
+    assay = datastore._get_assay(assay_name)
+    cell_index = datastore.cells.active_index("I")
+    native_values = controlled_compute(
+        assay.normed(
+            cell_idx=cell_index,
+            feat_idx=np.asarray([0], dtype=np.int64),
+        ),
+        datastore.nthreads,
+    ).reshape(-1)
+    expected_limits = (float(native_values.min()), float(native_values.max()))
+    if expected_limits[1] <= expected_limits[0]:
+        expected_limits = (expected_limits[0], expected_limits[0] + 1.0)
+
+    assert list(result.axes) == [(layout, label) for layout in layouts]
+    assert result.provenance.assay == assay_name
+    assert result.provenance.extras["assays"] == [assay_name]
+    for layout in layouts:
+        limits = result.provenance.extras["color_limits_by_layout"][layout]
+        assert limits[label] == pytest.approx(expected_limits)
+    result.close()
+
+
+def test_multi_layout_embedding_accepts_matching_target_axes(umap, datastore):
+    import matplotlib.pyplot as plt
+
+    _add_secondary_embedding(datastore)
+    layouts = ["RNA_UMAP", "plot_secondary_embedding"]
+    colors = ["RNA_nCounts", "RNA_nFeatures"]
+    panel_keys = [(layout, color) for layout in layouts for color in colors]
+    figure, target_axes = plt.subplots(2, 2)
+    target = dict(zip(panel_keys, target_axes.ravel(), strict=True))
+
+    result = splt.embedding(
+        datastore,
+        layout_key=layouts,
+        color_by=colors,
+        target=target,
+        show=False,
+    )
+
+    assert result.owns_figure is False
+    assert result.figure is figure
+    assert result.axes == target
+    result.close()
+    assert plt.fignum_exists(figure.number)
+    plt.close(figure)
+
+
+def test_embedding_show_default_suppression_and_later_show(
+    umap,
+    datastore,
+    monkeypatch,
+):
+    shown = []
+
+    def track_show(result):
+        shown.append(result)
+
+    monkeypatch.setattr(splt.PlotResult, "show", track_show)
+    default_result = splt.embedding(
+        datastore,
+        layout_key="RNA_UMAP",
+        color_by="RNA_nCounts",
+    )
+    suppressed_result = splt.embedding(
+        datastore,
+        layout_key="RNA_UMAP",
+        color_by="RNA_nCounts",
+        show=False,
+    )
+
+    assert shown == [default_result]
+    suppressed_result.show()
+    assert shown == [default_result, suppressed_result]
+    default_result.close()
+    suppressed_result.close()
+
+
 def test_resolve_feature_by_index(datastore):
     from scarf.plotting._data import resolve_feature
 
@@ -931,116 +892,6 @@ def test_label_panels_and_collect_legends(umap, datastore):
     a.close()
     b.close()
     plt.close(fig)
-
-
-def test_legacy_mutable_copy_helper():
-    from scarf.plotting._legacy import copy_plot_mutables
-
-    color_key = {"a": "#000"}
-    mask_values = ["x"]
-    sk = {"lw": 0.2}
-    ck2, mv2, sk2 = copy_plot_mutables(
-        color_key=color_key, mask_values=mask_values, scatter_kwargs=sk
-    )
-    assert ck2 is not color_key and ck2 == color_key
-    assert mv2 is not mask_values and mv2 == mask_values
-    ck2["b"] = "#fff"
-    mv2.append("y")
-    assert "b" not in color_key
-    assert mask_values == ["x"]
-
-
-def test_plot_layout_bridge_still_blocked_by_default():
-    from scarf.plotting._legacy import plot_layout_bridge_blockers
-
-    blockers = plot_layout_bridge_blockers(
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
-        do_shading=False,
-        mask_values=None,
-        subset_by=None,
-        shuffle_df=False,
-        legend_ondata=True,
-        legend_onside=True,
-        force_ints_as_cats=True,
-        clip_fraction=0.01,
-        ax=None,
-        use_plotting=False,
-    )
-    assert blockers == ("bridge_not_enabled",)
-
-    ok = plot_layout_bridge_blockers(
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
-        do_shading=False,
-        mask_values=None,
-        subset_by=None,
-        shuffle_df=False,
-        legend_ondata=True,
-        legend_onside=True,
-        force_ints_as_cats=True,
-        clip_fraction=0.01,
-        ax=None,
-        use_plotting=True,
-    )
-    assert ok == ()
-
-    shaded = plot_layout_bridge_blockers(
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
-        do_shading=True,
-        mask_values=None,
-        subset_by=None,
-        shuffle_df=False,
-        legend_ondata=False,
-        legend_onside=False,
-        force_ints_as_cats=False,
-        clip_fraction=0.0,
-        ax=None,
-        use_plotting=True,
-    )
-    assert "do_shading" in shaded
-
-
-def test_plot_layout_use_plotting_bridge(umap, leiden_clustering, datastore):
-    result = datastore.plot_layout(
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
-        show_fig=False,
-        use_plotting=True,
-    )
-    assert isinstance(result, splt.PlotResult)
-    assert "embedding" in result.provenance.notes
-    result.close()
-
-    categories = sorted(pd.unique(datastore.cells.fetch("RNA_leiden_cluster")))
-    palette = {
-        value: f"#{((index + 1) * 123457) % 0xFFFFFF:06x}"
-        for index, value in enumerate(categories)
-    }
-    colored = datastore.plot_layout(
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
-        color_key=palette,
-        show_fig=False,
-        use_plotting=True,
-    )
-    assert isinstance(colored, splt.PlotResult)
-    categorical_scales = [
-        scale for scale in colored.scales if isinstance(scale, splt.CategoricalScale)
-    ]
-    assert categorical_scales[0].palette == palette
-    colored.close()
-
-    legacy = datastore.plot_layout(
-        layout_key="RNA_UMAP",
-        color_by="RNA_leiden_cluster",
-        title="Custom title",
-        show_fig=False,
-        use_plotting=True,
-    )
-    assert not isinstance(legacy, splt.PlotResult)
-    matplotlib.pyplot.close("all")
 
 
 def test_paired_composition_draws_subject_lines(umap, leiden_clustering, datastore):
@@ -1155,6 +1006,20 @@ def test_distribution_violin(umap, leiden_clustering, datastore):
     result2 = splt.distribution(ds, keys=gene, kind="box", max_points=100, show=False)
     assert len(result2.axes) == 1
     result2.close()
+
+
+def test_distribution_cell_key_none_includes_all_cells(datastore):
+    result = splt.distribution(
+        datastore,
+        keys="RNA_nCounts",
+        cell_key=None,
+        max_points=0,
+        show=False,
+    )
+    assert result.provenance.cell_key is None
+    assert result.provenance.n_cells == datastore.cells.N
+    assert len(result.tables["RNA_nCounts"]) == datastore.cells.N
+    result.close()
 
 
 def test_distribution_subset_and_groups(umap, leiden_clustering, datastore):

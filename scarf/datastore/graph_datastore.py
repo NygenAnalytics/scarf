@@ -2282,14 +2282,14 @@ class GraphDataStore(BaseDataStore):
         if return_ann_object:
             return ann_obj
         if show_elbow_plot:
-            from ..plots import plot_elbow
+            from ..plotting import elbow
 
             try:
                 var_exp = 100 * ann_obj._pca.explained_variance_ratio_
             except AttributeError:
                 logger.warning("PCA was not fitted so not showing an Elbow plot")
             else:
-                plot_elbow(var_exp)
+                elbow(variance_explained=var_exp, show=True)
         return None
 
     def load_graph(
@@ -3368,8 +3368,8 @@ class GraphDataStore(BaseDataStore):
                 )
             if ao.loadings is None:
                 logger.warning(
-                    f"No dimension reduction was user for {assay_name} data. "
-                    f"Memory consumption will be high."
+                    f"No dimension reduction was used for {assay_name} data. "
+                    f"Memory consumption may be high."
                 )
                 return g, ao.data.compute()
             return g, ao.data.dot(ao.loadings).compute()

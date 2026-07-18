@@ -101,7 +101,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='CD14',
     sort_values=True,
-).show();
+)
 ```
 
 ```{code-cell} ipython3
@@ -110,7 +110,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='MS4A1',
     sort_values=True,
-).show();
+)
 ```
 
 ```{code-cell} ipython3
@@ -119,7 +119,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='CD3D',
     sort_values=True,
-).show();
+)
 ```
 
 ## 3) Assign labels
@@ -156,7 +156,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='cell_type',
-).show();
+)
 ```
 
 ## 4) Subset and recluster
@@ -201,7 +201,7 @@ splt.embedding(
     layout_key='RNA_focus_cells_UMAP',
     color_by='RNA_focus_cells_leiden_cluster',
     cell_key='focus_cells',
-).show();
+)
 ```
 
 ## Common mistakes and limitations

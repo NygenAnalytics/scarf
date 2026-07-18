@@ -17,7 +17,7 @@ LEGEND_ON_DATA_MAX_CATEGORIES = 40
 LegendLoc = Literal["auto", "right", "on_data", "none"]
 FrameStyle = Literal["axes", "minimal", "none"]
 
-# Lifted from scanpy.plotting.palettes (also used by legacy scarf.plots).
+# Lifted from scanpy.plotting.palettes.
 CUSTOM_PALETTES: dict[int, list[str]] = {
     10: [
         "#1f77b4",

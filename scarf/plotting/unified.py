@@ -133,7 +133,7 @@ def unified_embedding(
     seed: int | None = None,
     rasterize_threshold: int = DEFAULT_RASTERIZE_THRESHOLD,
     target: Any | None = None,
-    show: bool = False,
+    show: bool = True,
 ) -> PlotResult:
     """Plot reference and query cells on a unified projection.
 

@@ -41,15 +41,20 @@ Enable density-preserving UMAP with `run_umap(use_density_map=True)`. Useful whe
 
 ## Which clustering should we use, Paris or Leiden?
 
-The Leiden clustering method is faster than Paris, especially when it comes to large scale
-datasets. On small datasets that we have tested, Leiden clustering results seem to be more
-concordant with UMAP clustering. Paris, however, clearly shows relationship between clusters
-using the `plot_cluster_tree` method of the DataStore class. Due to low computational
-requirements of both the methods we suggest that you run both the clustering methods and
-visualize them together using `plot_cluster_tree` like this::
+Leiden is faster than Paris, especially for large datasets. On small datasets we have tested,
+Leiden results are often more concordant with UMAP clusters. Paris provides a hierarchy that
+can show relationships between clusters. Both methods have low computational requirements, so
+you can run both and view the Paris hierarchy with Leiden labels:
 
-    ds.plot_cluster_tree(cluster_key='RNA_cluster',
-                         fill_by_value='RNA_leiden_cluster')
+```python
+import scarf.plotting as splt
+
+splt.cluster_tree(
+    ds,
+    cluster_key="RNA_cluster",
+    fill_by_value="RNA_leiden_cluster",
+)
+```
 
 ## How do I create a count matrix for my single-cell data?
 

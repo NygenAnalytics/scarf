@@ -17,14 +17,16 @@ Minimize wall time without pointless overprovisioning. Prefer using memory and C
 
 Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat local connectivity as unreliable.
 
-1. **Never drive long work with `Function.remote()` or a blocking `modal run` that waits on the result.** When the local Modal client loses its gRPC session, Modal can cancel the running input. That is what killed the 1M IO baseline mid-`markerBatches` after ~40 minutes of good progress (`TimeoutError` / `Deadline exceeded` on the client, then `Received a cancellation signal` on the container). `--detach` alone is not enough if the entrypoint still uses `.remote()`.
-2. **Prefer spawn on the deployed app**, then disconnect: `Function.from_name(...).spawn(...)` (same pattern as `run_all_jobs`). Persist results to R2 (or another durable URI) from inside the container. Poll with `FunctionCall.from_id(...).get(timeout=0)` or by reading the result object; do not hold an open await for hours.
+1. **Never use `Function.remote()` in profiling.** Local entrypoints and in-app orchestrators must `.spawn(...)` only. Waiting is via short `FunctionCall.get(timeout=…)` polls and/or durable R2 result JSON (`profiling/spawn_wait.py`). A long `.remote()` or a blocking `modal run` that waits on the result can cancel the input when the client gRPC session dies (this killed the 1M IO baseline mid-`markerBatches`).
+2. **Prefer spawn on the deployed app**, then disconnect: `Function.from_name(...).spawn(...)`. Persist results to R2 from inside the container. Laptop clients print the call id and exit; orchestrators poll R2 / short `get()` so their own heartbeats stay alive.
 3. **One-off scripts must write a result JSON to R2 before returning**, and log enough that progress is recoverable from `modal app logs` alone if the client dies.
 4. **Log well for long jobs.** Flush stdout. Emit pattern/stage start, a plan line (counts, chunk sizes, block totals), progress every N blocks (wall, bytes, rate), and a done line (wall, peak RSS/cgroup, bytes). Silent multi-hour runs are unacceptable.
 5. Never `modal deploy` from the agent; user deploys. Use `uv` for local Python / Modal CLI.
 6. Prefer broad Modal region `eu` over narrow `eu-west-1` for capacity.
 7. Do **not** set Modal `cloud=` (e.g. aws). Provider pinning shrinks the pool; leave cloud unset so Modal can schedule any provider.
-8. Coordinators (`run_all_jobs` / `run_size_jobs`) must use tiny resources (~2–4 GiB / 1 CPU) via `orchestrator_function_options`. Never spawn them with stage RAM (32–64 GiB); that competes with real stage workers for scarce high-memory capacity.
+8. Coordinators (`run_all_jobs` / `run_size_jobs`) must use tiny resources (~2–4 GiB / 1 CPU) via `orchestrator_function_options` with `retries=0`. Never spawn them with stage RAM (32–64 GiB); that competes with real stage workers for scarce high-memory capacity.
+9. Stage workers use Modal `Retries(max_retries=3)` via `modal_function_options`. `run_size_jobs` also re-spawns a stage up to 3 times if the call dies without an R2 result (covers `InternalFailure: Server has lost track of input`).
+10. Right-size Modal RAM per stage from measured peaks. Do not put Leiden/UMAP/HVG on a 64 GiB queue when peaks are ~5–8 GiB; that worsens scheduling and lost-input risk. Keep 64 GiB for createStore / makeGraph at large N when peaks justify it.
 
 ## Code changes already wired
 
@@ -450,12 +452,24 @@ uv run --group profiling modal run --env scarf_profiling -m profiling.modal_app 
   run-all --config profiling/layouts/250k_counts_t_extras_c8_m32.toml
 ```
 
-## In progress: 5M countsT core (8 CPU / 64 GiB)
+## In progress: 5M countsT core (right-sized RAM)
 
 | Field | Value |
 |-------|-------|
-| Tag | `counts_t_c8_m64_5m` |
+| Tag | `counts_t_c8_m64_5m` (unchanged so prior stage JSONs skip) |
 | Config | `profiling/layouts/5m_counts_t_c8_m64.toml` |
-| Call | `fc-01KXQYP5HX3P0PHD6YWDAFSRXA` |
 | Stages | core only (9); countsT via Zarr v3 finalize |
-| RAM note | makeGraph cgroup est ~37G; 64 GiB box |
+| Done so far | createStore 11508s / 7.4G; init/reopen/filter ~12/7/31s; markHvgs 3809s / 8.0G; makeGraph 6296s / **33.0G cgroup**; runUmap 1036s / 5.5G |
+| Missing | `runLeiden`, `findMarkers` (calls lost: heartbeat timeout / InternalFailure while queued on 64 GiB) |
+| Right-size | createStore + makeGraph **64 GiB**; markHvgs/UMAP/Leiden **16 GiB**; findMarkers **32 GiB**; init/reopen/filter **8 GiB** |
+| Ops fix | orchestrators spawn stage workers (no `.remote()`); stage retries on; re-spawn without R2 result |
+
+After redeploy, resume with only missing stages, e.g.:
+
+```
+modal run --env scarf_profiling -m profiling.modal_app -- run-all \
+  --config profiling/layouts/5m_counts_t_c8_m64.toml \
+  --sizes 5000000 --stages runLeiden findMarkers
+```
+
+Or single-stage `run` for Leiden then markers.

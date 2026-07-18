@@ -106,7 +106,7 @@ splt.distribution(
     keys=qc_cols,
     kind='violin',
     max_points=2000,
-).show();
+)
 ```
 
 ```{code-cell} ipython3
@@ -129,7 +129,7 @@ splt.distribution(
     kind='violin',
     max_points=2000,
     color='coral',
-).show();
+)
 ds.cells.head()
 ```
 
@@ -194,7 +194,7 @@ ds.cells.head()
 ```
 
 ```{code-cell} ipython3
-splt.embedding(ds, layout_key='RNA_UMAP').show();
+splt.embedding(ds, layout_key='RNA_UMAP')
 ```
 
 ```{code-cell} ipython3
@@ -203,7 +203,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_nCounts',
     color_scale=splt.ColorScale(cmap='coolwarm'),
-).show();
+)
 ```
 
 Alternatives (densMAP, tSNE, Paris trees) are covered in
@@ -223,7 +223,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
-).show();
+)
 ```
 
 ```{code-cell} ipython3
@@ -273,7 +273,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='CD14',
     sort_values=True,
-).show();
+)
 ```
 
 Annotation from markers, known gene panels, and subclustering is covered in

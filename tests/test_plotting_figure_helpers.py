@@ -1,7 +1,8 @@
 """Figure ownership and composition helper tests."""
 
+import warnings
+
 import matplotlib
-import numpy as np
 import pytest
 
 matplotlib.use("Agg")
@@ -9,56 +10,135 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import scarf.plotting as splt
-from scarf.plotting._figure import PlotResult, as_2d_axes_array, normalize_axes_target
+from scarf.plotting._figure import PlotResult, normalize_axes_target
 
 
-def test_plot_result_show_displays_once_and_closes_owned_inline_figure(monkeypatch):
+def _plot_result(*, owns_figure: bool = True) -> PlotResult:
     fig, ax = plt.subplots()
     ax.plot([0, 1])
-    displayed = []
-    monkeypatch.setattr(
-        matplotlib,
-        "get_backend",
-        lambda: "module://matplotlib_inline.backend_inline",
-    )
-    monkeypatch.setattr("IPython.display.display", displayed.append)
-    result = PlotResult(
+    return PlotResult(
         figure=fig,
         axes={"main": ax},
         tables={},
         legends=(),
         scales=(),
         provenance=splt.PlotProvenance(scarf_version="test"),
-        owns_figure=True,
+        owns_figure=owns_figure,
     )
 
-    result.show()
 
-    assert displayed == [fig]
-    assert not plt.fignum_exists(fig.number)
-
-
-def test_plot_result_show_displays_under_agg_when_ipython_active(monkeypatch):
-    fig, ax = plt.subplots()
-    ax.plot([0, 1])
+def test_plot_result_show_uses_ipython_display_under_agg(monkeypatch):
+    result = _plot_result()
     displayed = []
-    monkeypatch.setattr(matplotlib, "get_backend", lambda: "Agg")
+    show_calls = []
+    assert result.figure.canvas.required_interactive_framework is None
     monkeypatch.setattr("IPython.get_ipython", lambda: object())
     monkeypatch.setattr("IPython.display.display", displayed.append)
-    result = PlotResult(
-        figure=fig,
-        axes={"main": ax},
-        tables={},
-        legends=(),
-        scales=(),
-        provenance=splt.PlotProvenance(scarf_version="test"),
-        owns_figure=True,
+    monkeypatch.setattr(plt, "show", lambda: show_calls.append(True))
+
+    result.show()
+
+    assert displayed == [result.figure]
+    assert show_calls == []
+    assert not plt.fignum_exists(result.figure.number)
+    assert "rendered=True" in repr(result)
+
+
+def test_plot_result_show_delegates_for_interactive_gui_canvas(monkeypatch):
+    result = _plot_result()
+    displayed = []
+    show_calls = []
+    monkeypatch.setattr("IPython.get_ipython", lambda: None)
+    monkeypatch.setattr("IPython.display.display", displayed.append)
+    monkeypatch.setattr(plt, "show", lambda: show_calls.append(True))
+    monkeypatch.setattr(
+        result.figure.canvas,
+        "required_interactive_framework",
+        "qt",
+        raising=False,
     )
 
     result.show()
 
-    assert displayed == [fig]
-    assert not plt.fignum_exists(fig.number)
+    assert displayed == []
+    assert show_calls == [True]
+    assert not plt.fignum_exists(result.figure.number)
+    assert "rendered=True" in repr(result)
+
+
+def test_plot_result_show_is_warning_free_noop_for_headless_agg(monkeypatch):
+    result = _plot_result(owns_figure=False)
+    monkeypatch.setattr("IPython.get_ipython", lambda: None)
+    monkeypatch.setattr(
+        plt,
+        "show",
+        lambda: pytest.fail("headless Agg must not call plt.show()"),
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        result.show()
+
+    assert plt.fignum_exists(result.figure.number)
+    assert "rendered=False" in repr(result)
+    plt.close(result.figure)
+
+
+def test_plot_result_show_closes_owned_figure_and_retains_metadata(monkeypatch):
+    result = _plot_result()
+    figure = result.figure
+    axes = result.axes
+    tables = result.tables
+    legends = result.legends
+    scales = result.scales
+    provenance = result.provenance
+    monkeypatch.setattr("IPython.get_ipython", lambda: object())
+    monkeypatch.setattr("IPython.display.display", lambda _: None)
+
+    result.show()
+
+    assert not plt.fignum_exists(figure.number)
+    assert result.figure is figure
+    assert result.axes is axes
+    assert result.tables is tables
+    assert result.legends is legends
+    assert result.scales is scales
+    assert result.provenance is provenance
+
+    caller_owned = _plot_result(owns_figure=False)
+    caller_owned.close()
+    assert plt.fignum_exists(caller_owned.figure.number)
+    plt.close(caller_owned.figure)
+
+
+def test_plot_result_repr_is_compact_and_never_renders(monkeypatch):
+    result = _plot_result()
+    displayed = []
+    show_calls = []
+    monkeypatch.setattr("IPython.get_ipython", lambda: object())
+    monkeypatch.setattr("IPython.display.display", displayed.append)
+    monkeypatch.setattr(plt, "show", lambda: show_calls.append(True))
+
+    unrendered = repr(result)
+
+    assert unrendered == (
+        "PlotResult(axes=1, tables=0, legends=0, scales=0, "
+        "owns_figure=True, rendered=False)"
+    )
+    assert displayed == []
+    assert show_calls == []
+    assert plt.fignum_exists(result.figure.number)
+
+    result.show()
+    rendered = repr(result)
+
+    assert rendered == (
+        "PlotResult(axes=1, tables=0, legends=0, scales=0, "
+        "owns_figure=True, rendered=True)"
+    )
+    assert "figure=<" not in rendered
+    assert displayed == [result.figure]
+    assert show_calls == []
 
 
 def test_normalize_axes_target_accepts_mappings_and_sequences():
@@ -106,9 +186,7 @@ def test_normalize_axes_target_rejects_invalid_ownership():
     plt.close(fig_b)
 
 
-def test_panel_labels_legend_collection_and_axes_normalization(
-    umap, leiden_clustering, datastore
-):
+def test_panel_labels_and_legend_collection(umap, leiden_clustering, datastore):
     first = splt.embedding(
         datastore,
         layout_key="RNA_UMAP",
@@ -129,9 +207,5 @@ def test_panel_labels_legend_collection_and_axes_normalization(
 
     legends = splt.collect_legends(first.figure, [first, second])
     assert legends == first.legends + second.legends
-    assert as_2d_axes_array(axes[0]).shape == (1, 1)
-    assert as_2d_axes_array(np.asarray(axes)).shape == (1, 1)
-    with pytest.raises(ValueError, match="in_ax is None"):
-        as_2d_axes_array(None)
     first.close()
     second.close()

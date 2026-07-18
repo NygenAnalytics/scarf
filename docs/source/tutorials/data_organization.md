@@ -86,7 +86,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
-).show();
+)
 ```
 
 ## Guided steps

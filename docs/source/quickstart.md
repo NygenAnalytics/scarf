@@ -56,12 +56,11 @@ ds.run_leiden_clustering(resolution=0.5)
 ## Plot the embedding
 
 ```{code-cell} ipython3
-result = splt.embedding(
+splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
 )
-result.show();
 ```
 
 ## What was saved

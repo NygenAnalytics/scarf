@@ -50,8 +50,8 @@ class PlotResult:
 
     ``figure`` is the matplotlib figure. ``axes`` maps panel keys to axes.
     ``tables`` holds any summary data used to build the plot. ``owns_figure``
-    is True when Scarf created the figure; call ``close()`` in that case when
-    you are done so notebooks do not keep many open figures.
+    is True when Scarf created the figure. ``show()`` and ``close()`` release
+    owned figures without discarding the result metadata.
     """
 
     figure: Any
@@ -62,10 +62,10 @@ class PlotResult:
     provenance: PlotProvenance
     owns_figure: bool
     theme: str = "notebook"
+    _rendered: bool = field(default=False, init=False, repr=False, compare=False)
 
     def show(self) -> None:
-        plt, mpl = require_matplotlib()
-        backend = str(mpl.get_backend()).lower()
+        plt, _ = require_matplotlib()
         in_ipython = False
         try:
             from IPython import get_ipython
@@ -73,16 +73,38 @@ class PlotResult:
             in_ipython = get_ipython() is not None
         except ImportError:
             pass
-        # myst-nb / docs kernels often use Agg under the hood; prefer explicit
-        # IPython display so figures land in notebook outputs.
-        if in_ipython or "inline" in backend:
-            from IPython.display import display
+        try:
+            if in_ipython:
+                from IPython.display import display
 
-            display(self.figure)  # type: ignore[no-untyped-call]
+                display(self.figure)  # type: ignore[no-untyped-call]
+                self._rendered = True
+                return
+            if (
+                getattr(
+                    self.figure.canvas,
+                    "required_interactive_framework",
+                    None,
+                )
+                is not None
+            ):
+                plt.show()
+                self._rendered = True
+        finally:
             if self.owns_figure:
                 plt.close(self.figure)
-            return
-        plt.show()
+
+    def __repr__(self) -> str:
+        return (
+            "PlotResult("
+            f"axes={len(self.axes)}, "
+            f"tables={len(self.tables)}, "
+            f"legends={len(self.legends)}, "
+            f"scales={len(self.scales)}, "
+            f"owns_figure={self.owns_figure}, "
+            f"rendered={self._rendered}"
+            ")"
+        )
 
     def close(self) -> None:
         if not self.owns_figure:

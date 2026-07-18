@@ -160,7 +160,7 @@ def composition(
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
     theme: str = "notebook",
-    show: bool = False,
+    show: bool = True,
 ) -> PlotResult:
     """Show how cell categories (clusters, cell types) vary across samples.
 
