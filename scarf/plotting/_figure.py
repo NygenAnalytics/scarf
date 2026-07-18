@@ -68,7 +68,7 @@ class PlotResult:
         if "inline" in str(mpl.get_backend()).lower():
             from IPython.display import display
 
-            display(self.figure)
+            display(self.figure)  # type: ignore[no-untyped-call]
             if self.owns_figure:
                 plt.close(self.figure)
             return

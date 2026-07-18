@@ -1,6 +1,6 @@
 """Module to find biomarkers."""
 
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -463,7 +463,7 @@ def _regression_p_values(r: np.ndarray, n_cells: int) -> np.ndarray:
     df = float(n_cells - 2)
     denom = (1.0 - r + _LINREGRESS_TINY) * (1.0 + r + _LINREGRESS_TINY)
     t_stat = r * np.sqrt(df / denom)
-    return 2.0 * student_t.sf(np.abs(t_stat), df)
+    return cast(np.ndarray, 2.0 * student_t.sf(np.abs(t_stat), df))
 
 
 def _regression_batch_results(
