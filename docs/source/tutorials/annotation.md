@@ -67,8 +67,10 @@ ds.run_marker_search(group_key='RNA_leiden_cluster', gene_batch_size=100)
 
 ## 1) Marker tables
 
-`get_markers` returns genes ranked for one cluster. Columns include scores, expression
-fractions, fold change, and Mann-Whitney `p_value`. These are not FDR-corrected DE results.
+`get_markers` returns genes ranked by marker score. Pass a `group_id` for one cluster, or
+`group_id=None` for every cluster in one long table with a `group_id` column. Columns include
+scores, expression fractions, fold change, and Mann-Whitney `p_value`. These are not
+FDR-corrected DE results.
 
 ```{code-cell} ipython3
 markers = ds.get_markers(
@@ -99,8 +101,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='CD14',
     sort_values=True,
-    show=False,
-).figure;
+).show();
 ```
 
 ```{code-cell} ipython3
@@ -109,8 +110,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='MS4A1',
     sort_values=True,
-    show=False,
-).figure;
+).show();
 ```
 
 ```{code-cell} ipython3
@@ -119,8 +119,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='CD3D',
     sort_values=True,
-    show=False,
-).figure;
+).show();
 ```
 
 ## 3) Assign labels
@@ -136,29 +135,20 @@ unique = sorted(
     key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
 )
 
-def best_cluster_for_gene(gene: str) -> str | None:
-    best_cid, best_score = None, -1.0
-    for cid in unique:
-        table = ds.get_markers(
-            group_key='RNA_leiden_cluster',
-            group_id=cid,
-            min_score=-1,
-            min_frac_exp=-1,
-        )
-        name_col = 'feature_name' if 'feature_name' in table.columns else 'names'
-        hit = table[table[name_col].astype(str) == gene]
-        if hit.empty:
-            continue
-        score = float(hit['score'].iloc[0]) if 'score' in hit.columns else 0.0
-        if score > best_score:
-            best_cid, best_score = cid, score
-    return best_cid
+markers = ds.get_markers(
+    group_key='RNA_leiden_cluster',
+    group_id=None,
+    min_score=-1,
+    min_frac_exp=-1,
+)
 
 label_map = {c: f'Cluster {c}' for c in unique}
 for gene, name in [('CD14', 'Monocytes'), ('MS4A1', 'B cells'), ('CD3D', 'T cells')]:
-    cid = best_cluster_for_gene(gene)
-    if cid is not None:
-        label_map[cid] = name
+    hit = markers[markers['feature_name'].astype(str) == gene]
+    if hit.empty:
+        continue
+    cid = str(hit.sort_values('score', ascending=False).iloc[0]['group_id'])
+    label_map[cid] = name
 
 labels = np.array([label_map[str(c)] for c in cluster_ids], dtype=object)
 ds.cells.insert(column_name='cell_type', values=labels, overwrite=True)
@@ -166,7 +156,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='cell_type',
-).figure;
+).show();
 ```
 
 ## 4) Subset and recluster
@@ -211,8 +201,7 @@ splt.embedding(
     layout_key='RNA_focus_cells_UMAP',
     color_by='RNA_focus_cells_leiden_cluster',
     cell_key='focus_cells',
-    show=False,
-).figure;
+).show();
 ```
 
 ## Common mistakes and limitations

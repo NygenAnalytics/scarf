@@ -60,9 +60,8 @@ result = splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
-    show=False,
 )
-result.figure;
+result.show();
 ```
 
 ## What was saved

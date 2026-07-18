@@ -51,6 +51,11 @@ from .readers import (
     H5adReader,
     LoomReader,
 )
+from .results import (
+    PseudotimeAggregationResult,
+    PseudotimeMarkerResult,
+    PseudotimeScoreResult,
+)
 from .utils import (
     clean_array,
     controlled_compute,
@@ -111,6 +116,9 @@ __all__ = [
     "LoomToZarr",
     "MappingReference",
     "MappingResult",
+    "PseudotimeAggregationResult",
+    "PseudotimeMarkerResult",
+    "PseudotimeScoreResult",
     "SparseToZarr",
     "SubsetZarr",
     "ZarrMerge",

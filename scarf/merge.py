@@ -94,6 +94,7 @@ class AssayMerge:
                            are set as True as in the 'I' column. To keep the filtering information set the value for
                            this parameter to False. (Default value: True)
         seed: Seed for randomization of rows in the assays.
+        source_column: Optional cell-metadata column populated from each entry in ``names``.
 
     Attributes:
         assays: List of assay objects to be merged. For example, [ds1.RNA, ds2.RNA].
@@ -123,6 +124,7 @@ class AssayMerge:
         reset_cell_filter: bool = True,
         seed: int | None = 42,
         storage_options: dict[str, Any] | None = None,
+        source_column: str | None = None,
         _row_plan: _RowPlan | None = None,
         _row_chunk_sizes: list[int] | None = None,
     ) -> None:
@@ -153,7 +155,7 @@ class AssayMerge:
                     "All assays from a datastore must contain the same number of cells"
                 )
         self.mergedCells: pd.DataFrame = self._merge_cell_table(
-            reset_cell_filter, prepend_text
+            reset_cell_filter, prepend_text, source_column
         )
         self.nCells: int = self.mergedCells.shape[0]
         self.featCollection: list[dict[str, str]] = self._get_feat_ids(assays)
@@ -322,13 +324,17 @@ class AssayMerge:
         return new_cells
 
     def _merge_cell_table(
-        self, reset: bool, prepend_text: str | None = None
+        self,
+        reset: bool,
+        prepend_text: str | None = None,
+        source_column: str | None = None,
     ) -> pd.DataFrame:
         """Merges the cell metadata table for each sample.
 
         Args:
             reset: whether to remove filtering information
             prepend_text: string to add as prefix for each cell column
+            source_column: optional column populated with each source name
 
         Returns:
         """
@@ -338,6 +344,14 @@ class AssayMerge:
             )
         if prepend_text == "":
             prepend_text = None
+        if source_column is not None and (
+            not isinstance(source_column, str)
+            or not source_column.strip()
+            or source_column in {"ids", "I", "names"}
+        ):
+            raise ValueError(
+                "source_column must be a non-empty string that is not ids, I, or names"
+            )
         ret_val = []
         for assay, name in zip(self.assays, self.names):
             a = assay.cells.to_pandas_dataframe(assay.cells.columns)
@@ -346,6 +360,12 @@ class AssayMerge:
                 if i not in ["ids", "I", "names"] and prepend_text is not None:
                     a[f"{prepend_text}_{i}"] = assay.cells.fetch_all(i)
                     a = a.drop(columns=[i])
+            if source_column is not None:
+                if source_column in a.columns:
+                    raise ValueError(
+                        f"source_column {source_column!r} conflicts with merged metadata"
+                    )
+                a[source_column] = np.repeat(name, len(a))
             if reset:
                 a["I"] = np.ones(len(a["ids"])).astype(bool)
             ret_val.append(a)
@@ -778,6 +798,7 @@ class DatasetMerge:
                            are set as True as in the 'I' column. To keep the filtering information set the value for
                            this parameter to False. (Default value: True)
         seed: Seed for randomization of rows in the assays.
+        source_column: Optional cell-metadata column populated from each entry in ``names``.
 
     Example:
         >>> # Assuming ds1, ds2 and ds3 are DataStore objects
@@ -807,6 +828,7 @@ class DatasetMerge:
         reset_cell_filter: bool = True,
         seed: int | None = 42,
         storage_options: dict[str, Any] | None = None,
+        source_column: str | None = None,
     ) -> None:
         self.datasets = datasets
         self.names = names
@@ -820,6 +842,7 @@ class DatasetMerge:
         self.reset_cell_filter = reset_cell_filter
         self.seed = seed
         self.storage_options = storage_options
+        self.source_column = source_column
         self.unique_assays = self.get_unique_assays()
         self.n_unique_assays = len(self.unique_assays)
         self.merge_generators = self.create_merge_generators()
@@ -871,6 +894,7 @@ class DatasetMerge:
                 reset_cell_filter=self.reset_cell_filter,
                 seed=self.seed,
                 storage_options=self.storage_options,
+                source_column=self.source_column,
                 _row_plan=shared_row_plan,
                 _row_chunk_sizes=row_chunk_sizes,
             )

@@ -9,8 +9,8 @@
                 method for feature selection.
 """
 
-from collections.abc import Callable, Generator
-from typing import Any, cast
+from collections.abc import Callable, Generator, Sequence
+from typing import Any, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -919,6 +919,64 @@ class Assay:
             ret_val2 = ret_val2[valid_feats]
 
         return ret_val1, ret_val2
+
+    def mean_features(
+        self,
+        feature_names: Sequence[str],
+        cell_key: str = "I",
+        *,
+        missing: Literal["error", "skip"] = "error",
+    ) -> np.ndarray:
+        """Per-cell mean normalized expression over named features.
+
+        Returns one value per active cell under ``cell_key``. Does not write
+        cell metadata. Distinct from ``score_features``, which subtracts a
+        control-gene background.
+        """
+        if missing not in ("error", "skip"):
+            raise ValueError("missing must be 'error' or 'skip'")
+        if not feature_names:
+            raise ValueError("feature_names must be non-empty")
+
+        requested = [str(name) for name in feature_names]
+        if len(set(name.upper() for name in requested)) != len(requested):
+            raise ValueError("feature_names contains duplicate names")
+
+        name_to_indices: dict[str, list[int]] = {}
+        for index, name in enumerate(self.feats.fetch_all("names")):
+            key = str(name).upper()
+            name_to_indices.setdefault(key, []).append(index)
+
+        feature_idx: list[int] = []
+        missing_names: list[str] = []
+        for name in requested:
+            matches = name_to_indices.get(name.upper(), [])
+            if not matches:
+                missing_names.append(name)
+                continue
+            if len(matches) > 1:
+                raise ValueError(f"Feature name {name!r} matches multiple features")
+            feature_idx.append(matches[0])
+
+        if missing_names:
+            if missing == "error":
+                raise ValueError("Features not found: " + ", ".join(missing_names))
+            if not feature_idx:
+                raise ValueError("No requested features were found")
+
+        cell_idx, _ = self._get_cell_feat_idx(cell_key, "I")
+        feat_idx = np.asarray(feature_idx, dtype=int)
+        if isinstance(self, RNAassay) and self.normMethod is norm_lib_size:
+            means = self._mean_normed_feature_groups(
+                cell_idx,
+                {"target": feat_idx},
+            )
+            return np.asarray(means["target"])
+        return np.asarray(
+            self.normed(cell_idx=cell_idx, feat_idx=np.sort(feat_idx))
+            .mean(axis=1)
+            .compute()
+        )
 
     def score_features(
         self,

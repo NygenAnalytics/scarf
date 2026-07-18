@@ -9,7 +9,33 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import scarf.plotting as splt
-from scarf.plotting._figure import as_2d_axes_array, normalize_axes_target
+from scarf.plotting._figure import PlotResult, as_2d_axes_array, normalize_axes_target
+
+
+def test_plot_result_show_displays_once_and_closes_owned_inline_figure(monkeypatch):
+    fig, ax = plt.subplots()
+    ax.plot([0, 1])
+    displayed = []
+    monkeypatch.setattr(
+        matplotlib,
+        "get_backend",
+        lambda: "module://matplotlib_inline.backend_inline",
+    )
+    monkeypatch.setattr("IPython.display.display", displayed.append)
+    result = PlotResult(
+        figure=fig,
+        axes={"main": ax},
+        tables={},
+        legends=(),
+        scales=(),
+        provenance=splt.PlotProvenance(scarf_version="test"),
+        owns_figure=True,
+    )
+
+    result.show()
+
+    assert displayed == [fig]
+    assert not plt.fignum_exists(fig.number)
 
 
 def test_normalize_axes_target_accepts_mappings_and_sequences():

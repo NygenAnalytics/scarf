@@ -2,6 +2,10 @@ import numpy as np
 import pandas as pd
 
 from scarf.mapping_utils import array_hash
+from scarf.results import (
+    PseudotimeAggregationResult,
+    PseudotimeScoreResult,
+)
 
 from . import full_path
 
@@ -136,6 +140,16 @@ class TestDataStore:
             p_diff = (markers.p_value - precalc_markers.p_value).values
             assert np.all(np.abs(p_diff) < 1e-3), "p_values differ from reference"
 
+    def test_get_markers_all_groups(self, marker_search, paris_clustering, datastore):
+        all_markers = datastore.get_markers(group_key="RNA_cluster", group_id=None)
+        assert "group_id" in all_markers.columns
+        groups = set(datastore.cells.fetch("RNA_cluster", key="I"))
+        assert set(all_markers["group_id"]).issubset(groups)
+        one = datastore.get_markers(group_key="RNA_cluster", group_id=1)
+        from_all = all_markers[all_markers["group_id"] == 1].reset_index(drop=True)
+        assert len(from_all) == len(one)
+        assert from_all["feature_name"].equals(one["feature_name"])
+
     def test_export_markers_to_csv(
         self, marker_search, paris_clustering, datastore, tmp_path
     ):
@@ -185,11 +199,34 @@ class TestDataStore:
         values = datastore.get_imputed(feature_name="CD4")
         assert values.shape == datastore.cells.fetch("I").shape
 
+    def test_mean_features(self, datastore):
+        import pytest
+
+        names = list(datastore.RNA.feats.fetch("names", key="I")[:3])
+        values = datastore.RNA.mean_features(names)
+        active = datastore.cells.active_index("I")
+        feat_idx = datastore.RNA.feats.get_index_by(names, "names", None)
+        expected = (
+            datastore.RNA.normed(cell_idx=active, feat_idx=np.sort(feat_idx))
+            .mean(axis=1)
+            .compute()
+        )
+        assert values.shape == (len(active),)
+        np.testing.assert_allclose(values, expected)
+        with pytest.raises(ValueError, match="not found"):
+            datastore.RNA.mean_features(["__missing_feature__"])
+        skipped = datastore.RNA.mean_features(
+            [names[0], "__missing_feature__"],
+            missing="skip",
+        )
+        assert skipped.shape == (len(active),)
+
     def test_run_doublet_detection(self, make_graph, paris_clustering, datastore):
-        datastore.run_doublet_detection(
+        score_col = datastore.run_doublet_detection(
             cluster_key="RNA_cluster", simulation_ratio=0.5, random_seed=1
         )
         col = "RNA_doublet_score"
+        assert score_col == col
         assert col in datastore.cells.columns
         scores = datastore.cells.fetch(col)
         n_active = datastore.cells.active_index("I").shape[0]
@@ -218,7 +255,7 @@ class TestDataStore:
         leiden_clustering,
         datastore_ephemeral,
     ):
-        datastore_ephemeral.run_pseudotime_scoring(
+        result = datastore_ephemeral.run_pseudotime_scoring(
             source_sink_key="RNA_leiden_cluster",
             sources=[6],
             sinks=[3],
@@ -228,6 +265,11 @@ class TestDataStore:
 
         output_key = "RNA_reliability_test"
         validity_key = f"{output_key}__valid"
+        assert isinstance(result, PseudotimeScoreResult)
+        assert result.pseudotime_key == output_key
+        assert result.validity_key == validity_key
+        assert result.values.shape == result.valid.shape
+        np.testing.assert_array_equal(result.valid, np.ones_like(result.valid))
         assert validity_key in datastore_ephemeral.cells.columns
         values = datastore_ephemeral.cells.fetch(output_key, key=validity_key)
         assert np.isfinite(values).all()
@@ -253,6 +295,10 @@ class TestDataStore:
         precalc_values = np.load(full_path("aggregated_feat_idx.npy"))
         agg_group = datastore.z["RNA"]["aggregated_I_I_RNA_pseudotime"]
         test_values = agg_group["feature_indices"][:]
+        assert isinstance(pseudotime_aggregation, PseudotimeAggregationResult)
+        assert pseudotime_aggregation.storage_path == (
+            "RNA/aggregated_I_I_RNA_pseudotime"
+        )
         assert np.array_equal(
             precalc_values.astype(np.int64), test_values.astype(np.int64)
         )
@@ -262,11 +308,20 @@ class TestDataStore:
         )
         assert np.isfinite(agg_group["data"][:]).all()
         valid_features = np.asarray(agg_group["valid_features"][:], dtype=bool)
+        np.testing.assert_array_equal(
+            pseudotime_aggregation.feature_indices,
+            test_values[valid_features],
+        )
+        assert pseudotime_aggregation.data.shape[0] == valid_features.sum()
         clusters = datastore.RNA.feats.fetch_all("pseudotime_clusters")
         assigned = clusters[test_values[valid_features].astype(int)]
         assert assigned.min() >= 1
         assert assigned.max() <= 15
         assert len(np.unique(assigned)) == 15
+        np.testing.assert_array_equal(
+            pseudotime_aggregation.feature_clusters,
+            assigned,
+        )
         assert np.all(clusters[test_values[~valid_features].astype(int)] == -1)
 
     def test_add_grouped_assay(self, grouped_assay, datastore):

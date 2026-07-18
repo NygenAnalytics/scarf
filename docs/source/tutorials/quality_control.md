@@ -65,9 +65,12 @@ qc_cols = [
     )
     if c in ds.cells.columns
 ]
-qc_df = ds.cells.to_pandas_dataframe(qc_cols)
-qc_df['groups'] = 0
-splt.qc(qc_df)
+splt.distribution(
+    ds,
+    keys=qc_cols,
+    kind='violin',
+    max_points=2000,
+).show();
 ```
 
 ## 2) Manual thresholds
@@ -82,10 +85,13 @@ ds.filter_cells(
     lows=[1000, 500, 0],
     reset_previous=True,
 )
-qc_df = ds.cells.to_pandas_dataframe(qc_cols)
-qc_df['groups'] = 0
-qc_df = qc_df.reindex(ds.cells.active_index('I'))
-splt.qc(qc_df, color='coral')
+splt.distribution(
+    ds,
+    keys=qc_cols,
+    kind='violin',
+    max_points=2000,
+    color='coral',
+).show();
 ```
 
 ## 3) Automatic thresholds
@@ -113,18 +119,16 @@ remove cells automatically. It requires an existing cluster column.
 ds.mark_hvgs(min_cells=20, top_n=500)
 ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
 ds.run_leiden_clustering(resolution=0.5)
-ds.run_doublet_detection(cluster_key='RNA_leiden_cluster')
+score_col = ds.run_doublet_detection(cluster_key='RNA_leiden_cluster')
 ds.run_umap(n_epochs=100, spread=5, min_dist=1, parallel=True)
 ```
 
 ```{code-cell} ipython3
-score_col = [c for c in ds.cells.columns if c.endswith('doublet_score')][0]
 splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by=score_col,
-    show=False,
-).figure;
+).show();
 ```
 
 Filter on the score yourself when you choose a cutoff for your data:

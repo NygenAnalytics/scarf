@@ -64,6 +64,14 @@ class PlotResult:
     theme: str = "notebook"
 
     def show(self) -> None:
+        plt, mpl = require_matplotlib()
+        if "inline" in str(mpl.get_backend()).lower():
+            from IPython.display import display
+
+            display(self.figure)
+            if self.owns_figure:
+                plt.close(self.figure)
+            return
         self.figure.show()
 
     def close(self) -> None:

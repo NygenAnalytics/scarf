@@ -146,6 +146,103 @@ def test_assay_merge_maps_features_and_preserves_row_order(
     assert counts_array.fill_value == 0
 
 
+def test_assay_merge_keeps_source_metadata_aligned_after_permutation(
+    tmp_path,
+    tiny_merge_budget,
+):
+    left = _MergeAssay(
+        "RNA",
+        [[1], [2], [3]],
+        ["l0", "l1", "l2"],
+        ["gene"],
+        ["Gene"],
+        block_size=1,
+    )
+    right = _MergeAssay(
+        "RNA",
+        [[4], [5]],
+        ["r0", "r1"],
+        ["gene"],
+        ["Gene"],
+        block_size=1,
+    )
+    left.cells = _MergeMeta(
+        ids=["l0", "l1", "l2"],
+        names=["l0", "l1", "l2"],
+        I=[True, False, True],
+        cluster_labels=[10, 11, 12],
+    )
+    right.cells = _MergeMeta(
+        ids=["r0", "r1"],
+        names=["r0", "r1"],
+        I=[False, True],
+        cluster_labels=[20, 21],
+    )
+
+    fn = str(tmp_path / "aligned_metadata.zarr")
+    AssayMerge(
+        zarr_path=fn,
+        assays=[left, right],
+        names=["left", "right"],
+        merge_assay_name="RNA",
+        prepend_text="orig",
+        reset_cell_filter=False,
+        source_column="sample_id",
+        seed=7,
+    ).dump()
+
+    root = zarr.open_group(fn, mode="r")
+    ids = np.asarray(root["cellData/ids"][:]).astype(str)
+    sources = np.asarray(root["cellData/sample_id"][:]).astype(str)
+    clusters = np.asarray(root["cellData/orig_cluster_labels"][:])
+    valid = np.asarray(root["cellData/I"][:], dtype=bool)
+    observed = {
+        cell_id: (source, int(cluster), bool(is_valid))
+        for cell_id, source, cluster, is_valid in zip(
+            ids,
+            sources,
+            clusters,
+            valid,
+            strict=True,
+        )
+    }
+
+    assert observed == {
+        "left__l0": ("left", 10, True),
+        "left__l1": ("left", 11, False),
+        "left__l2": ("left", 12, True),
+        "right__r0": ("right", 20, False),
+        "right__r1": ("right", 21, True),
+    }
+
+
+def test_assay_merge_rejects_source_column_conflict(tmp_path):
+    assay = _MergeAssay(
+        "RNA",
+        [[1], [2]],
+        ["c0", "c1"],
+        ["gene"],
+        ["Gene"],
+        block_size=1,
+    )
+    assay.cells = _MergeMeta(
+        ids=["c0", "c1"],
+        names=["c0", "c1"],
+        I=[True, True],
+        sample_id=["existing", "existing"],
+    )
+
+    with pytest.raises(ValueError, match="conflicts with merged metadata"):
+        AssayMerge(
+            zarr_path=str(tmp_path / "source_conflict.zarr"),
+            assays=[assay],
+            names=["sample"],
+            merge_assay_name="RNA",
+            prepend_text="",
+            source_column="sample_id",
+        )
+
+
 def test_assay_merge_preserves_order_when_prefetch_finishes_out_of_order(
     monkeypatch,
     tmp_path,
@@ -453,6 +550,7 @@ def test_dataset_merge_cells(datastore, tmp_path):
         datasets=[datastore, datastore],
         names=["self1", "self2"],
         prepend_text="orig",
+        source_column="sample_id",
         overwrite=True,
     )
     writer.dump()
@@ -465,6 +563,10 @@ def test_dataset_merge_cells(datastore, tmp_path):
     df = ds.cells.to_pandas_dataframe(ds.cells.columns)
     df_diff = df[df["orig_RNA_nCounts"] != df["RNA_nCounts"]]
     assert len(df_diff) == 0
+    assert df["sample_id"].value_counts().to_dict() == {
+        "self1": datastore.cells.N,
+        "self2": datastore.cells.N,
+    }
 
 
 def test_assay_merge_rejects_duplicate_sample_names(datastore, tmp_path):

@@ -23,6 +23,7 @@ from scarf.datastore.graph_datastore import (
     _validate_source_sink_vector,
 )
 from scarf.markers import knn_clustering
+from scarf.results import PseudotimeMarkerResult
 
 
 def test_source_sink_vector_supports_one_sided_supervision():
@@ -205,9 +206,15 @@ class _FakeFeatures:
         assert overwrite
         self.insertions.append((column_name, values, key))
 
+    @staticmethod
+    def fetch_all(key: str) -> np.ndarray:
+        assert key == "names"
+        return np.array(["zero", "one", "two", "three"])
+
 
 class _MarkerAssay:
     def __init__(self):
+        self.name = "RNA"
         self.cells = _FakeCells(np.array([0.0, 1.0, 2.0, 3.0]))
         self.feats = _FakeFeatures()
 
@@ -232,7 +239,7 @@ class _MarkerStore:
 def test_marker_search_writes_strict_feature_subset_with_subset_key():
     store = _MarkerStore()
 
-    DataStore.run_pseudotime_marker_search(
+    result = DataStore.run_pseudotime_marker_search(
         store,
         from_assay="RNA",
         cell_key="I",
@@ -246,6 +253,11 @@ def test_marker_search_writes_strict_feature_subset_with_subset_key():
         "subset",
     ]
     assert all(item[1].shape == (2,) for item in store.assay.feats.insertions)
+    assert isinstance(result, PseudotimeMarkerResult)
+    assert result.correlation_key == "I__ptime__r"
+    assert result.p_value_key == "I__ptime__p"
+    assert result.table["feature_index"].tolist() == [1, 3]
+    assert result.table["feature_name"].tolist() == ["one", "three"]
 
 
 def test_regressor_validation_points_to_component_validity_key():

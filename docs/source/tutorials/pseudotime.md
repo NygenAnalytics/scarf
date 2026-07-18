@@ -56,65 +56,59 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by=['RNA_cluster', 'clusters'],
     legend_loc='on_data',
-).figure;
+).show();
 ```
 
 ---
 ## 2) Estimate pseudotime ordering
 
-In Scarf we use a memory efficient implementation of [PBA algorithm](https://github.com/AllonKleinLab/PBA) ([Weinreb et al. 2018, PNAS](https://www.pnas.org/content/115/10/E2467)) to estimate a pseudotime ordering of cells. The function `run_pseudotime_scoring` can be run on any Assay for which we have calculated a neighbourhood graph. The pseudotime is estimated in a supervised manner and hence, the user needs to provide the source (stem/progenitor/precursor cells) and sink (differentiated cell states) cell clusters/groups. 
+Scarf uses a memory-efficient implementation of the [PBA algorithm](https://github.com/AllonKleinLab/PBA) ([Weinreb et al. 2018, PNAS](https://www.pnas.org/content/115/10/E2467)) to estimate a pseudotime ordering. `run_pseudotime_scoring` works with any assay that has a neighborhood graph. The method is supervised, so provide source groups such as progenitor cells and sink groups such as differentiated cell states.
 
 ```{code-cell} ipython3
-ds.run_pseudotime_scoring(
+pseudotime = ds.run_pseudotime_scoring(
     source_sink_key="RNA_cluster",    # Column that contains cluster information 
     sources=[1],                      # Source clusters
     sinks=[3],                        # Sink clusters
 )
 ```
 
-By default, the calculated pseudotime values are saved under the cell attribute column **'RNA_pseudotime'**, where 'RNA' can be replaced by whatever the name of the given assay is. A companion boolean column **'RNA_pseudotime__valid'** is also written. When the selected graph is fully connected every cell is valid. If the graph splits into multiple components, only the largest one is scored (controlled by `component_policy`), the remaining cells hold `NaN`, and downstream steps expect you to pass this validity column as `cell_key`. Let's visualize these values on UMAP plot. The lighter color cells represent beginning of the pseudotime
+By default, the calculated values are saved under **'RNA_pseudotime'**, where 'RNA' is replaced by the assay name. A companion boolean column **'RNA_pseudotime__valid'** is also written. The returned result exposes both names as `pseudotime_key` and `validity_key`. When the selected graph is fully connected, every cell is valid. If the graph has multiple components, only the largest one is scored by default. The remaining cells hold `NaN`, and downstream steps should use the validity column as `cell_key`. The UMAP below shows progression from 0 to 1.
 
 ```{code-cell} ipython3
 splt.embedding(
     ds,
     layout_key='RNA_UMAP',
-    color_by='RNA_pseudotime',
-).figure;
+    color_by=pseudotime.pseudotime_key,
+).show();
 ```
 
 ---
 ## 3) Identify pseudotime correlated features
 
-We can now identify the features that are correlated with pseudotime and hence increase or decrease along the pseudotime.`run_pseudotime_marker_search` function will calculate the correlation coefficient for each of the valid features/genes against the pseudotime. The only mandatory parameter that `run_pseudotime_marker_search` function needs is `pseudotime_key` the value of which should the cell attribute column that stores the pseudotime information
+`run_pseudotime_marker_search` calculates a correlation coefficient and p-value for each selected feature against the pseudotime ordering.
 
 ```{code-cell} ipython3
-ds.run_pseudotime_marker_search(pseudotime_key='RNA_pseudotime')
+markers = ds.run_pseudotime_marker_search(
+    cell_key=pseudotime.validity_key,
+    pseudotime_key=pseudotime.pseudotime_key,
+)
 ```
 
-Once calculated, the correlation values against pseudotime are saved in the feature attribute/metadata table (`I__RNA_pseudotime__r`, here). The column name follows this pattern: `<cell_key>__<pseudotime_key>__r`. The corresponding p-value is saved under the same pattern with the suffix `p` (`I__RNA_pseudotime__p`)
+The correlations and p-values are saved in feature metadata. Their generated column names are available as `markers.correlation_key` and `markers.p_value_key`. The same values, feature indices, and feature names are returned in `markers.table`.
 
 ```{code-cell} ipython3
-ds.RNA.feats.head()
+markers.table.head()
 ```
 
 ---
 ## 4) Visualize pseudotime correlated features
 
-In this section will do deeper on how to use the pseudotime correlation values for further exploratory analysis.
+This section uses the returned correlations for exploratory analysis.
 
-The first step is to export the values in a convenient dataframe format. we can use the `to_pandas_dataframe` methods of the feature attribute table to export the dataframe containing only the columns of choice
+The returned table can be used directly for sorting and filtering.
 
 ```{code-cell} ipython3
-corr_genes_df = ds.RNA.feats.to_pandas_dataframe(
-    columns=[
-        'names',
-        'I__RNA_pseudotime__p',
-        'I__RNA_pseudotime__r'
-    ],
-    key='I')
-
-# Rename the columns to be shorter
-corr_genes_df.columns = ['names', 'p_value', 'r_value']
+corr_genes_df = markers.table
 ```
 
 Genes with a negative correlation decrease in expression as pseudotime progresses.
@@ -131,7 +125,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by=['Spp1', 'Dbi', 'Sparc'],
     sort_values=True,
-).figure;
+).show();
 ```
 
 Genes with a positive correlation increase in expression as pseudotime progresses.
@@ -146,19 +140,20 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by=['Aplp1', 'Gnas', 'Cpe'],
     sort_values=True,
-).figure;
+).show();
 ```
 
 ---
 ## 5) Identify feature modules based on pseudotime
 
-`run_pseudotime_marker_search` is excellent to find the genes are linearly correlated with the pseudotime. This function provides us informative statistical metrics to identify genes that are most strongly correlated with the pseudotime. However, with these methods we do not recover all the dynamic patterns of expression along the pseudotime. For example, there might be certain genes that express only in the middle of the trajectory or in one branch of the trajectory.
+`run_pseudotime_marker_search` identifies features with a linear relationship to pseudotime. It does not capture every dynamic pattern. Some genes, for example, may peak only in the middle of a trajectory or along one branch.
 
-`run_pseudotime_aggregation` performs two task: 1) It arranges cells along the pseudotime and creates a smoothened, scaled and binned matrix of data 2) Clustering (KNN+Paris) is performed on this matrix to identify the groups of features/genes that have similar expression patterns along the pseudotime.
+`run_pseudotime_aggregation` orders cells by pseudotime and creates a smoothed, scaled, binned expression matrix. It then applies KNN and Paris clustering to identify features with similar expression patterns.
 
 ```{code-cell} ipython3
-ds.run_pseudotime_aggregation(
-    pseudotime_key='RNA_pseudotime',
+modules = ds.run_pseudotime_aggregation(
+    cell_key=pseudotime.validity_key,
+    pseudotime_key=pseudotime.pseudotime_key,
     cluster_label='pseudotime_clusters',
     n_clusters = 15,
     window_size=200,
@@ -166,20 +161,18 @@ ds.run_pseudotime_aggregation(
 )
 ```
 
-There are two primary results of `run_pseudotime_aggregation`: 
-1) The  binned matrix is saved under `aggregate_<cell_key>_<feat_key>_<pseudotime_key>`
-2) Feature clusters are saved under feature attributes table
+The returned result contains the lazy binned matrix in `modules.data`, the aligned physical feature indices, and their cluster assignments. It also exposes the saved feature column as `modules.cluster_key` and the Zarr location as `modules.storage_path`.
 
 Features with mean expression below `min_exp` or with no variation along the ordering are treated as invalid. They are excluded from the clustering and from the heatmap below, and they receive the unassigned cluster value (`-1`) in the feature table.
 
 ```{code-cell} ipython3
-# The binned data matrix. Here we print the shape of the matrix indicating the number of features and number of bins respectively
-ds.RNA.z['aggregated_I_I_RNA_pseudotime/data'].shape
+# Number of retained features and pseudotime bins
+modules.data.shape
 ```
 
 ```{code-cell} ipython3
-# Fetching pseudotime based cluster identity of features
-ds.RNA.feats.fetch('pseudotime_clusters')
+# Cluster assignment for each retained feature
+modules.feature_clusters
 ```
 
 `splt.pseudotime_heatmap` visualizes the binned matrix along with the feature clusters
@@ -191,10 +184,10 @@ genes_to_label = ['S100b', 'Nrarp', 'Atoh8', 'Grin2c', 'Slc35d3',
 
 splt.pseudotime_heatmap(
     ds,
-    cell_key='I',
-    feat_key='I',
-    feature_cluster_key='pseudotime_clusters',
-    pseudotime_key='RNA_pseudotime',
+    cell_key=modules.cell_key,
+    feat_key=modules.feature_key,
+    feature_cluster_key=modules.cluster_key,
+    pseudotime_key=modules.pseudotime_key,
     show_features=genes_to_label,
 )
 ```
@@ -210,7 +203,7 @@ splt.embedding(
     color_by=genes_to_label,
     n_columns=5,
     sort_values=True,
-).figure;
+).show();
 ```
 
 ---
@@ -222,7 +215,7 @@ Taking mean cluster values is a powerful approach that allows use to explore cum
 
 ```{code-cell} ipython3
 ds.add_grouped_assay(
-    group_key='pseudotime_clusters',
+    group_key=modules.cluster_key,
     assay_label='PTIME_MODULES'
 )
 ```
@@ -249,7 +242,7 @@ splt.embedding(
     color_by=[f"group_{i}" for i in range(1, n_clusters + 1)],
     n_columns=5,
     color_scale=splt.ColorScale(cmap='coolwarm'),
-).figure;
+).show();
 ```
 
 This figure complements the heatmap we generated earlier very nicely. Using this approach we have clearly found **gene modules** that are restricted in expression to certain portion of the pseudotime and differentiation trajectory
@@ -315,38 +308,42 @@ len(set(ptime_based_markers) & set(cell_cluster_markers))
 Let's visualize the cumulative expression of genes that are present only in cluster marker based approach
 
 ```{code-cell} ipython3
-name_to_idx = dict(zip(ptime_feat_clusts.names, ptime_feat_clusts.index))
-cell_only = sorted((set(cell_cluster_markers) - set(ptime_based_markers)) & set(name_to_idx))
-cell_only_idx = sorted(name_to_idx[name] for name in cell_only)
+available_names = set(ptime_feat_clusts.names)
+cell_only = sorted(
+    (set(cell_cluster_markers) - set(ptime_based_markers)) & available_names
+)
 ds.cells.insert(
-    column_name='Cell cluster based markers', 
-    values=ds.RNA.normed(feat_idx=cell_only_idx).mean(axis=1).compute(),
-    overwrite=True)
+    column_name='Cell cluster based markers',
+    values=ds.RNA.mean_features(cell_only),
+    overwrite=True,
+)
 
 splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='Cell cluster based markers',
     color_scale=splt.ColorScale(cmap='coolwarm'),
-).figure;
+).show();
 ```
 
 Let's now do this the other way and visualize the cumulative expression of genes that are present only in pseudotime-based approach
 
 ```{code-cell} ipython3
-ptime_only = sorted((set(ptime_based_markers) - set(cell_cluster_markers)) & set(name_to_idx))
-ptime_only_idx = sorted(name_to_idx[name] for name in ptime_only)
+ptime_only = sorted(
+    (set(ptime_based_markers) - set(cell_cluster_markers)) & available_names
+)
 ds.cells.insert(
     column_name='Pseudotime based markers',
-    values=ds.RNA.normed(feat_idx=ptime_only_idx).mean(axis=1).compute(),
-    overwrite=True)
+    values=ds.RNA.mean_features(ptime_only),
+    overwrite=True,
+)
 
 splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='Pseudotime based markers',
     color_scale=splt.ColorScale(cmap='coolwarm'),
-).figure;
+).show();
 ```
 
 The pseudotime-based approach clearly captures a lot of signal that would be otherwise missed by simply taking a cell cluster marker based approach. 

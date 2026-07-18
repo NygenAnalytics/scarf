@@ -50,8 +50,7 @@ splt.embedding(
     ds_ctrl,
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
-    show=False,
-).figure;
+).show();
 ```
 
 ```{code-cell} ipython3
@@ -59,8 +58,7 @@ splt.embedding(
     ds_stim,
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
-    show=False,
-).figure;
+).show();
 ```
 
 The reference must already have a selected RNA feature set. For a production atlas, `reference_batch` should contain known technical batches. This compact example uses one recorded control batch to demonstrate the artifact API.
@@ -107,12 +105,15 @@ result
 Inspect stored provenance, feature coverage, and the uncorrected and corrected latent coordinates. The two coordinate arrays support diagnostics; nearest neighbors are calculated from the corrected coordinates.
 
 ```{code-cell} ipython3
-projection = ds_ctrl.z['RNA']['projections']['stim_symphony']
-dict(projection.attrs)
+mapped = ds_ctrl.get_mapping_result('stim_symphony', load_arrays=True)
+mapped.diagnostics
+```
 
-uncorrected = projection['uncorrectedLatent'][:]
-corrected = projection['correctedLatent'][:]
-shift = np.linalg.norm(corrected - uncorrected, axis=1)
+```{code-cell} ipython3
+shift = np.linalg.norm(
+    mapped.corrected_latent - mapped.uncorrected_latent,
+    axis=1,
+)
 
 fig, ax = plt.subplots(figsize=(4.5, 3.2))
 ax.hist(shift, bins=40, color='#1f4e79', edgecolor='white')
@@ -135,8 +136,7 @@ splt.embedding(
     ds_stim,
     layout_key='RNA_UMAP',
     color_by='symphony_labels',
-    show=False,
-).figure;
+).show();
 ```
 
 ```{code-cell} ipython3
@@ -168,17 +168,8 @@ ax.legend(frameon=False)
 fig
 ```
 
-Split-conformal prediction sets are optional and require calibration examples that are exchangeable with future queries.
-
-```{code-cell} ipython3
-calibrated = ds_ctrl.get_target_label_evidence(
-    target_name='stim_symphony',
-    reference_class_group='cluster_labels',
-    calibration_nonconformity=np.array([0.08, 0.12, 0.2, 0.25]),
-    conformal_alpha=0.1
-)
-calibrated[['label', 'predictionSet']].head()
-```
+Split-conformal prediction sets are optional. They need calibration examples that are
+exchangeable with future queries; this tutorial does not demonstrate that path.
 
 Opening the reference read-only returns arrays in memory by default. Large queries can supply a writable Zarr group through `result_store` so neighbors and latent coordinates remain out of core.
 
@@ -198,10 +189,14 @@ control_result
 ```
 
 ```{code-cell} ipython3
-ctrl_proj = ds_ctrl.z['RNA']['projections']['control_symphony']
-ctrl_unc = ctrl_proj['uncorrectedLatent'][:]
-ctrl_cor = ctrl_proj['correctedLatent'][:]
-ctrl_shift = np.linalg.norm(ctrl_cor - ctrl_unc, axis=1)
+control_mapped = ds_ctrl.get_mapping_result(
+    'control_symphony',
+    load_arrays=True,
+)
+ctrl_shift = np.linalg.norm(
+    control_mapped.corrected_latent - control_mapped.uncorrected_latent,
+    axis=1,
+)
 
 fig, ax = plt.subplots(figsize=(4.5, 3.2))
 ax.hist(ctrl_shift, bins=40, color='#5b7c99', edgecolor='white')

@@ -67,6 +67,11 @@ def test_run_mapping_writes_projection(datastore_ephemeral):
     assert ds.z["RNA"]["projections"]["freshmap"]["indices"].shape[
         0
     ] == _active_cell_count(ds)
+    loaded = ds.get_mapping_result("freshmap", load_arrays=True)
+    assert loaded.indices is not None
+    assert loaded.distances is not None
+    assert loaded.corrected_latent is None
+    assert loaded.uncorrected_latent is None
 
 
 def test_run_mapping_supports_all_features_key(datastore_ephemeral):
@@ -203,6 +208,20 @@ def test_build_and_reload_symphony_mapping_reference(datastore_ephemeral, tmp_pa
     assert isinstance(projection.attrs["queryBatchHash"], str)
     original_indices = projection["indices"][:].copy()
     original_corrected = projection["correctedLatent"][:].copy()
+
+    meta = ds.get_mapping_result("symphony_self")
+    assert meta.n_cells == result.n_cells
+    assert meta.correction_method == "symphony"
+    assert meta.projection_path == "RNA/projections/symphony_self"
+    assert meta.indices is None
+    assert meta.corrected_latent is None
+    assert "featureCoverage" in meta.diagnostics
+
+    loaded_result = ds.get_mapping_result("symphony_self", load_arrays=True)
+    np.testing.assert_array_equal(loaded_result.indices, original_indices)
+    np.testing.assert_allclose(loaded_result.corrected_latent, original_corrected)
+    assert loaded_result.uncorrected_latent is not None
+    assert loaded_result.uncorrected_latent.shape == original_corrected.shape
     np.testing.assert_array_equal(reduction["harmonizedData"][:], reference_coordinates)
     np.testing.assert_array_equal(reduction["reduction"][:], reference_loadings)
     assert dict(reference_ann.attrs) == reference_ann_metadata

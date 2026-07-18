@@ -101,9 +101,12 @@ qc_cols = [
     )
     if c in ds.cells.columns
 ]
-qc_df = ds.cells.to_pandas_dataframe(qc_cols)
-qc_df['groups'] = 0
-splt.qc(qc_df)
+splt.distribution(
+    ds,
+    keys=qc_cols,
+    kind='violin',
+    max_points=2000,
+).show();
 ```
 
 ```{code-cell} ipython3
@@ -120,10 +123,13 @@ Filtered cells are marked inactive in the boolean cell key `I`, not deleted. Mos
 ```
 
 ```{code-cell} ipython3
-qc_df = ds.cells.to_pandas_dataframe(qc_cols)
-qc_df['groups'] = 0
-qc_df = qc_df.reindex(ds.cells.active_index('I'))
-splt.qc(qc_df, color='coral')
+splt.distribution(
+    ds,
+    keys=qc_cols,
+    kind='violin',
+    max_points=2000,
+    color='coral',
+).show();
 ds.cells.head()
 ```
 
@@ -188,7 +194,7 @@ ds.cells.head()
 ```
 
 ```{code-cell} ipython3
-splt.embedding(ds, layout_key='RNA_UMAP', show=False).figure;
+splt.embedding(ds, layout_key='RNA_UMAP').show();
 ```
 
 ```{code-cell} ipython3
@@ -197,8 +203,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_nCounts',
     color_scale=splt.ColorScale(cmap='coolwarm'),
-    show=False,
-).figure;
+).show();
 ```
 
 Alternatives (densMAP, tSNE, Paris trees) are covered in
@@ -218,8 +223,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
-    show=False,
-).figure;
+).show();
 ```
 
 ```{code-cell} ipython3
@@ -269,8 +273,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='CD14',
     sort_values=True,
-    show=False,
-).figure;
+).show();
 ```
 
 Annotation from markers, known gene panels, and subclustering is covered in

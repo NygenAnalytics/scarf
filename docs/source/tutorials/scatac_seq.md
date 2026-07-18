@@ -150,7 +150,7 @@ splt.embedding(
     ds,
     layout_key='ATAC_UMAP',
     color_by='ATAC_leiden_cluster',
-).figure;
+).show();
 ```
 
 Those familiar with PBMC datasets might already be able to identify different cell types in the UMAP plot.
@@ -225,7 +225,7 @@ splt.embedding(
     clip_fraction=0.01,
     n_columns=3,
     sort_values=True,
-).figure;
+).show();
 ```
 
 The same melding approach maps any coordinate bed file onto peaks, including motif or enhancer annotations via `GffReader` and `coordinate_melding`. For cross-dataset integration using GeneScores, see {ref}`integration methods guide <integration_guide>` and {ref}`data projection <data_projection>`.

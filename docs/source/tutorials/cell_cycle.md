@@ -67,7 +67,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='clusters',
-).figure;
+).show();
 ```
 
 ---
@@ -101,7 +101,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='RNA_cell_cycle_phase',
-).figure;
+).show();
 ```
 
 We can clearly see that cycling group of cells in the 'ductal' group. You can provide your own custom color mappings like below:
@@ -118,7 +118,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cell_cycle_phase',
     categorical_scale=splt.CategoricalScale(palette=color_key),
-).figure;
+).show();
 ```
 
 ---
@@ -131,7 +131,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by=['RNA_S_score', 'RNA_G2M_score'],
-).figure;
+).show();
 ```
 
 ---
@@ -144,7 +144,7 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='S_score',
-).figure;
+).show();
 ```
 
 Unsurprisingly, these scores look very similar to those obtained through Scarf. Let's quantify the concordance below

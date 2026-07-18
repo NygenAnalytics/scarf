@@ -22,6 +22,7 @@ from ..ann import AnnStream
 from ..assay import Assay, RNAassay
 from ..chunked import ChunkedArray
 from ..mapping_reference import MAPPING_REFERENCE_SCHEMA_VERSION, MappingReference
+from ..results import PseudotimeScoreResult
 from ..storage.zarr_store import (
     copy_zarr_array,
     create_or_open_staged_normed_array,
@@ -3114,7 +3115,7 @@ class GraphDataStore(BaseDataStore):
         random_seed: int = 4444,
         label: str = "pseudotime",
         component_policy: Literal["largest", "error"] = "largest",
-    ) -> None:
+    ) -> PseudotimeScoreResult:
         """
         Calculate differentiation potential of cells. This function is a reimplementation of population balance
         analysis (PBA) approach published in Weinreb et al. 2017, PNAS. This function computes the random walk
@@ -3145,7 +3146,7 @@ class GraphDataStore(BaseDataStore):
                               component and marks other selected cells as unscored. ``'error'`` raises instead.
 
         Returns:
-
+            Pseudotime values, validity mask, and their saved metadata keys.
         """
 
         from_assay, cell_key, feat_key = self._get_latest_keys(
@@ -3312,7 +3313,16 @@ class GraphDataStore(BaseDataStore):
                 f"Unscored cells contain NaN pseudotime. Use cell key "
                 f"'{validity_column}' for downstream analysis"
             )
-        return None
+        return PseudotimeScoreResult(
+            pseudotime_key=output_column,
+            validity_key=validity_column,
+            assay=from_assay,
+            graph_cell_key=cell_key,
+            result_cell_key=subset_cell_key,
+            feature_key=feat_key,
+            values=ptime,
+            valid=retained_mask,
+        )
 
     def integrate_assays(
         self,

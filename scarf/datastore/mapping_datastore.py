@@ -1362,6 +1362,67 @@ class MappingDatastore(GraphDataStore):
             votes,
         )
 
+    def get_mapping_result(
+        self,
+        target_name: str,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        *,
+        load_arrays: bool = False,
+    ) -> MappingResult:
+        """Load a persisted mapping projection as a ``MappingResult``.
+
+        By default only metadata is returned and array fields are ``None``.
+        Set ``load_arrays=True`` to materialize neighbor and latent arrays that
+        exist on the projection.
+        """
+        from_assay, cell_key, feat_key = self._get_latest_keys(
+            from_assay, cell_key, feat_key
+        )
+        store = self._load_complete_projection(
+            target_name, from_assay, cell_key, feat_key
+        )
+        projection_path = f"{from_assay}/projections/{target_name}"
+        indices = as_zarr_array(store["indices"], name="indices")
+        n_cells = int(indices.shape[0])
+        correction_method = str(store.attrs.get("correctionMethod", "none"))
+        diagnostics: dict[str, float | str] = {}
+        for key in ("featureCoverage", "queryBatchCount", "algorithmVariant"):
+            if key in store.attrs:
+                value = store.attrs[key]
+                if isinstance(value, (bool, np.bool_)):
+                    continue
+                if isinstance(value, (int, float, np.integer, np.floating, str)):
+                    diagnostics[key] = value if isinstance(value, str) else float(value)
+
+        if not load_arrays:
+            return MappingResult(
+                projection_path=projection_path,
+                n_cells=n_cells,
+                correction_method=correction_method,
+                diagnostics=diagnostics,
+            )
+
+        def _optional_array(name: str) -> np.ndarray | None:
+            if name not in store:
+                return None
+            return np.asarray(as_zarr_array(store[name], name=name)[:])
+
+        return MappingResult(
+            projection_path=projection_path,
+            n_cells=n_cells,
+            correction_method=correction_method,
+            diagnostics=diagnostics,
+            indices=np.asarray(indices[:]),
+            distances=np.asarray(
+                as_zarr_array(store["distances"], name="distances")[:]
+            ),
+            uncorrected_latent=_optional_array("uncorrectedLatent"),
+            corrected_latent=_optional_array("correctedLatent"),
+            uninformative=_optional_array("uninformative"),
+        )
+
     def get_mapping_score(
         self,
         target_name: str,

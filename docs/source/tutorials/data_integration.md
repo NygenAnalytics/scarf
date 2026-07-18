@@ -76,7 +76,10 @@ scarf.AssayMerge(
     assays=[ds_ctrl.RNA, ds_stim.RNA],
     names=['ctrl', 'stim'],
     merge_assay_name='RNA',
-    overwrite=True
+    prepend_text='orig',
+    reset_cell_filter=False,
+    source_column='sample_id',
+    overwrite=True,
 ).dump()
 ```
 
@@ -89,51 +92,16 @@ ds = scarf.DataStore(
 )
 ```
 
-So now we print the merged datastore. The merging removed all the precalculated data. Even the information on which cells were filtered out is lost in the process. This is done deliberately, to allow users to start fresh with the merged dataset.
+The merge removes calculated graphs and embeddings. It keeps each input cell filter because `reset_cell_filter=False`, stores the input metadata with the `orig_` prefix, and writes the corresponding entry from `names` to `sample_id`. Counts and cell metadata receive the same row permutation, so these columns remain aligned.
 
 ```{code-cell} ipython3
 ds
 ```
 
-If we have a look at the cell attributes table, we can clearly see the that the sample identity is shown in the `ids` column, prepended to the barcode.
+The cell table now contains `sample_id`, the aligned `orig_cluster_labels`, and the preserved `I` filter. The source name is also prepended to each barcode in `ids`.
 
 ```{code-cell} ipython3
 ds.cells.head()
-```
-
-It can be a good idea to keep track of the cells from different samples, we can fetch out the dataset id from cell-barcodes and add them separately in a new column (this step might get automated in the future).
-
-```{code-cell} ipython3
-ds.cells.insert(
-    column_name='sample_id',
-    values=[x.split('__')[0] for x in ds.cells.fetch_all('ids')],
-    overwrite=True
-)
-```
-
-Rather than performing a fresh round of annotation, we will also import the cluster labels from the unmerged datasets. This help us at later steps to evaluate our results.
-
-```{code-cell} ipython3
-ctrl_labels = list(ds_ctrl.cells.fetch_all('cluster_labels'))
-stim_labels = list(ds_stim.cells.fetch_all('cluster_labels'))
-
-ds.cells.insert(
-    column_name='imported_labels',
-    values=ctrl_labels + stim_labels,
-    overwrite=True
-)
-```
-
-As well as re-using annotations, we import the information about which cells where kept and which ones where filtered out.
-
-```{code-cell} ipython3
-ctrl_valid_cells = list(ds_ctrl.cells.fetch_all('I'))
-stim_valid_cells = list(ds_stim.cells.fetch_all('I'))
-
-ds.cells.update_key(
-    values=ctrl_valid_cells + stim_valid_cells,
-    key='I'
-)
 ```
 
 Now we can check the number of cells from each of the samples:
@@ -199,7 +167,7 @@ splt.embedding(
     layout_key='RNA_UMAP',
     color_by='sample_id',
     legend_loc='right',
-).figure;
+).show();
 ```
 
 Visualization of cluster labels in the 2D UMAP space:
@@ -208,9 +176,9 @@ Visualization of cluster labels in the 2D UMAP space:
 splt.embedding(
     ds,
     layout_key='RNA_UMAP',
-    color_by='imported_labels',
+    color_by='orig_cluster_labels',
     legend_loc='right',
-).figure;
+).show();
 ```
 
 ---
@@ -264,7 +232,7 @@ splt.embedding(
     layout_key='RNA_pUMAP',
     color_by='sample_id',
     legend_loc='right',
-).figure;
+).show();
 ```
 
 Visualization of cluster labels in the new UMAP space shows that the cells from the same cell-type do not split into separate clusters like they did before.
@@ -273,9 +241,9 @@ Visualization of cluster labels in the new UMAP space shows that the cells from 
 splt.embedding(
     ds,
     layout_key='RNA_pUMAP',
-    color_by='imported_labels',
+    color_by='orig_cluster_labels',
     legend_loc='right',
-).figure;
+).show();
 ```
 
 ---
@@ -310,14 +278,14 @@ splt.embedding(
     layout_key='RNA_hUMAP',
     color_by='sample_id',
     legend_loc='right',
-).figure;
+).show();
 
 splt.embedding(
     ds,
     layout_key='RNA_hUMAP',
-    color_by='imported_labels',
+    color_by='orig_cluster_labels',
     legend_loc='right',
-).figure;
+).show();
 ```
 
 Harmony is often preferred when multiple batches need to mix without choosing a single reference sample. Partial PCA (section 4) is lighter when one sample defines the embedding.
@@ -327,13 +295,13 @@ Harmony is often preferred when multiple batches need to mix without choosing a 
 
 The UMAP plots suggest that partial PCA and Harmony mix the two samples, but a visual read is not enough. Scarf provides several metrics that quantify integration from different angles. See {doc}`integration_metrics` and the {ref}`integration methods guide <integration_guide>`. Re-run this section after the naive, partial PCA, and Harmony graphs to compare approaches on the same footing.
 
-**LISI** measures how well a label mixes inside each cell's KNN neighborhood. Running it on `sample_id` tells us whether batches are mixed, while running it on `imported_labels` checks that cell types are still grouped. Good integration raises batch LISI while keeping cell-type LISI low. With `save_result=True` the per-cell scores are written back as `lisi__sample_id__*` columns, which you can overlay on the UMAP layouts.
+**LISI** measures how well a label mixes inside each cell's KNN neighborhood. Running it on `sample_id` tells us whether batches are mixed, while running it on `orig_cluster_labels` checks that cell types are still grouped. Good integration raises batch LISI while keeping cell-type LISI low. With `save_result=True` the per-cell scores are written back as `lisi__sample_id__*` columns, which you can overlay on the UMAP layouts.
 
 Default `perplexity=30` needs a graph with at least about `3 * perplexity` neighbors. This tutorial builds graphs with `k=21`, so the default fits. If you use a smaller `k` (for example `k=11` in {doc}`integration_metrics`), Scarf lowers perplexity automatically and warns; scores remain valid for that smaller neighborhood.
 
 ```{code-cell} ipython3
 ds.metric_lisi(
-    label_colnames=['sample_id', 'imported_labels'],
+    label_colnames=['sample_id', 'orig_cluster_labels'],
     save_result=True,
 )
 ```
@@ -354,7 +322,7 @@ ds.metric_silhouette(res_label='leiden_cluster')
 
 ```{code-cell} ipython3
 ds.metric_label_concordance(
-    label_columns=['RNA_leiden_cluster', 'imported_labels'],
+    label_columns=['RNA_leiden_cluster', 'orig_cluster_labels'],
     metric='ari'
 )
 ```

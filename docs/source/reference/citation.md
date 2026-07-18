@@ -18,3 +18,9 @@ https://doi.org/10.1038/s41467-022-32097-3
   doi     = {10.1038/s41467-022-32097-3}
 }
 ```
+
+## Maintenance
+
+Scarf is open source. Development and maintenance are led by
+[Nygen](https://nygen.io). [ScarfWeb](https://www.nygen.io/products/scarfweb) is a separate
+hosted interface that uses Scarf; it is not required to run the library locally.

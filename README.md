@@ -76,3 +76,7 @@ Also: [CITE-seq](https://scarf.readthedocs.io/en/latest/tutorials/cite_seq.html)
 ## Support
 
 [GitHub issues](https://github.com/parashardhapola/scarf/issues)
+
+Scarf is open source and maintained by [Nygen](https://nygen.io). Nygen's hosted product,
+[ScarfWeb](https://www.nygen.io/products/scarfweb), is built on Scarf; it is optional and not
+required to use this library.

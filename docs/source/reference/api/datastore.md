@@ -11,6 +11,19 @@ are extending Scarf.
     :show-inheritance:
 ```
 
+## Analysis results
+
+```{eval-rst}
+.. autoclass:: scarf.PseudotimeScoreResult
+    :members:
+
+.. autoclass:: scarf.PseudotimeMarkerResult
+    :members:
+
+.. autoclass:: scarf.PseudotimeAggregationResult
+    :members:
+```
+
 ## Inheritance appendix
 
 These classes exist for implementation structure. Analysts should not need to construct them

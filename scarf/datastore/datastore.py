@@ -18,6 +18,7 @@ from ..assay import (
 from ..chunked import ChunkedArray
 from ..feat_utils import hto_demux
 from ..markers import resolve_marker_gene_batch_size, sort_marker_results
+from ..results import PseudotimeAggregationResult, PseudotimeMarkerResult
 from ..utils import ZARRLOC, array_digest, controlled_compute, tqdmbar
 from ..writers import create_zarr_dataset
 from .mapping_datastore import MappingDatastore
@@ -434,7 +435,7 @@ class DataStore(MappingDatastore):
         label: str = "doublet_score",
         batch_size: int = 1000,
         random_seed: int = 4444,
-    ) -> None:
+    ) -> str:
         """Flag potential doublets by simulating and mapping synthetic doublets.
 
         Synthetic doublets are simulated by summing the raw counts of pairs of
@@ -478,7 +479,7 @@ class DataStore(MappingDatastore):
             random_seed: Seed for reproducible sampling. (Default value: 4444)
 
         Returns:
-            None
+            Name of the cell-metadata column containing the final scores.
         """
         import shutil
         import tempfile
@@ -536,6 +537,7 @@ class DataStore(MappingDatastore):
         temp_dir = tempfile.mkdtemp(prefix="scarf_doublet_")
         target_name = f"_doublet_sim_{from_assay}"
         target_feat_key = f"{feat_key}_doublet"
+        final_col: str | None = None
         try:
             write_doublet_target_zarr(
                 zarr_loc=temp_dir,
@@ -602,6 +604,9 @@ class DataStore(MappingDatastore):
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Could not remove temporary projection group: {e}")
             shutil.rmtree(temp_dir, ignore_errors=True)
+        if final_col is None:
+            raise RuntimeError("Doublet score column was not created")
+        return final_col
 
     def mark_hvgs(
         self,
@@ -878,7 +883,7 @@ class DataStore(MappingDatastore):
         min_cells: int = 10,
         gene_batch_size: int = 50,
         **norm_params: Any,
-    ) -> None:
+    ) -> PseudotimeMarkerResult:
         """Identify genes that a correlated with a given pseudotime ordering of
         cells. The results are saved in feature attribute tables. For example,
         the r value can be found under, 'I__RNA_pseudotime__r' and the
@@ -897,7 +902,8 @@ class DataStore(MappingDatastore):
             gene_batch_size: Number of genes to be loaded in memory at a time. (Default value: 50).
             **norm_params: Extra keyword arguments forwarded to ``normed``.
 
-        Returns: None
+        Returns:
+            Correlation table and the feature-metadata keys where it was saved.
         """
 
         from ..markers import find_markers_by_regression
@@ -934,17 +940,35 @@ class DataStore(MappingDatastore):
         if markers.isna().any(axis=None):
             raise ValueError("Pseudotime marker results are not aligned to feat_key")
         logger.info("Pseudotime markers: saving marker scores")
+        correlation_key = f"{cell_key}__{pseudotime_key}__r"
+        p_value_key = f"{cell_key}__{pseudotime_key}__p"
         assay.feats.insert(
-            f"{cell_key}__{pseudotime_key}__r",
+            correlation_key,
             np.array(markers["r_value"].values),
             key=feat_key,
             overwrite=True,
         )
         assay.feats.insert(
-            f"{cell_key}__{pseudotime_key}__p",
+            p_value_key,
             np.array(markers["p_value"].values),
             key=feat_key,
             overwrite=True,
+        )
+        table = markers.rename_axis("feature_index").reset_index()
+        feature_names = np.asarray(assay.feats.fetch_all("names"), dtype=object)
+        table.insert(
+            1,
+            "feature_name",
+            feature_names[table["feature_index"].to_numpy(dtype=np.int64)],
+        )
+        return PseudotimeMarkerResult(
+            table=table,
+            correlation_key=correlation_key,
+            p_value_key=p_value_key,
+            assay=assay.name,
+            cell_key=cell_key,
+            feature_key=feat_key,
+            pseudotime_key=pseudotime_key,
         )
 
     def run_pseudotime_aggregation(
@@ -965,7 +989,7 @@ class DataStore(MappingDatastore):
         ann_params: dict | None = None,
         nan_cluster_value: int = -1,
         **norm_params: Any,
-    ) -> None:
+    ) -> PseudotimeAggregationResult:
         """This method performs clustering of features based on pseudotime
         ordered cells. The values from the pseudotime ordered cells are
         smoothened, scaled and binned. The resulting binned matrix is used to
@@ -1003,7 +1027,8 @@ class DataStore(MappingDatastore):
                                (Default value: -1)
             **norm_params: Extra keyword arguments forwarded to normalized expression calculation.
 
-        Returns: None
+        Returns:
+            Lazy aggregated matrix with its aligned feature indices and clusters.
         """
         from ..markers import knn_clustering
 
@@ -1085,7 +1110,17 @@ class DataStore(MappingDatastore):
                     f"Grouped assay '{assay_name}' is stale after updating "
                     f"feature groups in '{cluster_label}'. Rerun add_grouped_assay"
                 )
-        return None
+        return PseudotimeAggregationResult(
+            data=df,
+            feature_indices=np.asarray(feat_ids),
+            feature_clusters=np.asarray(clusts),
+            cluster_key=cluster_label,
+            storage_path=str(aggregation_group.path),
+            assay=assay.name,
+            cell_key=cell_key,
+            feature_key=feat_key,
+            pseudotime_key=pseudotime_key,
+        )
 
     def get_markers(
         self,
@@ -1096,10 +1131,12 @@ class DataStore(MappingDatastore):
         min_score: float = 0.25,
         min_frac_exp: float = 0.2,
     ) -> pd.DataFrame:
-        """Returns a table of markers features obtained through
-        `run_marker_search` for a given group.
+        """Return marker features from `run_marker_search`.
 
-        The table contains names of marker features and feature ids are used as table index.
+        When ``group_id`` is ``None`` (default), markers for every group under
+        ``group_key`` are returned in one long table with a ``group_id`` column.
+        Pass a specific ``group_id`` to return markers for that group only.
+        For a wide export of marker names only, use ``export_markers_to_csv``.
 
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
@@ -1108,8 +1145,7 @@ class DataStore(MappingDatastore):
             group_key: Required parameter. This has to be a column name from cell metadata table.
                        Usually this would be a column denoting cell clusters. Please use the same value as used
                        when ran `run_marker_search`
-            group_id: This is one of the value in `group_key` column of cell metadata.
-                      Results are returned for this group
+            group_id: One value from the ``group_key`` column, or ``None`` for all groups.
             min_score: This value dictates how specific the feature value has to be in a group before it is
                        considered a marker for that group. The value has to be greater than 0 but less than or equal to
                        1 (Default value: 0.25)
@@ -1117,7 +1153,7 @@ class DataStore(MappingDatastore):
                           considered a marker for that group.
 
         Returns:
-            Pandas dataframe
+            Pandas dataframe with marker statistics. All-group results include a ``group_id`` column.
         """
 
         if cell_key is None:

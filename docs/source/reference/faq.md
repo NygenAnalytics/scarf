@@ -6,6 +6,14 @@
 
 See {doc}`citation`.
 
+## Who maintains Scarf? Is ScarfWeb required?
+
+Scarf is open source and maintained by [Nygen](https://nygen.io).
+[ScarfWeb](https://www.nygen.io/products/scarfweb) is Nygen's hosted, browser-based product
+built on Scarf. You can install and run this library without ScarfWeb. Bug reports and
+feature requests for the Python package belong on
+[GitHub issues](https://github.com/parashardhapola/scarf/issues).
+
 ## How does Scarf compare to Scanpy?
 
 See {doc}`../scarf_and_scanpy` for a stage-by-stage mapping, round-trip notes, and a short

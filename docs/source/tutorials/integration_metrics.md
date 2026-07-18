@@ -45,26 +45,20 @@ scarf.AssayMerge(
     assays=[ds_ctrl.RNA, ds_stim.RNA],
     names=['ctrl', 'stim'],
     merge_assay_name='RNA',
+    prepend_text='orig',
+    reset_cell_filter=False,
+    source_column='sample_id',
     overwrite=True,
 ).dump()
 
 ds = scarf.DataStore(merged, nthreads=4)
-ds.cells.insert(
-    column_name='sample_id',
-    values=[x.split('__')[0] for x in ds.cells.fetch_all('ids')],
-    overwrite=True,
-)
-ds.cells.insert(
-    column_name='imported_labels',
-    values=list(ds_ctrl.cells.fetch_all('cluster_labels'))
-    + list(ds_stim.cells.fetch_all('cluster_labels')),
-    overwrite=True,
-)
 ds.mark_hvgs(min_cells=20, top_n=500)
 ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
 ds.run_leiden_clustering(resolution=0.5)
 ds.run_umap(n_epochs=100, parallel=True)
 ```
+
+`source_column` records the source dataset, while `prepend_text='orig'` keeps the input labels as `orig_cluster_labels`. `reset_cell_filter=False` also preserves each input `I` filter. These columns stay aligned with the permuted count rows.
 
 The naive merge (no batch correction) often separates by sample on UMAP. The metrics below
 quantify that pattern.
@@ -74,17 +68,15 @@ splt.embedding(
     ds,
     layout_key='RNA_UMAP',
     color_by='sample_id',
-    show=False,
-).figure;
+).show();
 ```
 
 ```{code-cell} ipython3
 splt.embedding(
     ds,
     layout_key='RNA_UMAP',
-    color_by='imported_labels',
-    show=False,
-).figure;
+    color_by='orig_cluster_labels',
+).show();
 ```
 
 ## LISI
@@ -114,12 +106,12 @@ ds.metric_silhouette(res_label='leiden_cluster')
 
 ```{code-cell} ipython3
 ds.metric_label_concordance(
-    label_columns=['RNA_leiden_cluster', 'imported_labels']
+    label_columns=['RNA_leiden_cluster', 'orig_cluster_labels']
 )
 ```
 
 On this naive merged graph (no batch correction), batch LISI and batch mixing are usually
-low, and Leiden vs `imported_labels` concordance can also be low when clusters split by
+low, and Leiden vs `orig_cluster_labels` concordance can also be low when clusters split by
 sample. Compare the same metrics after partial PCA or Harmony in {doc}`data_integration`.
 
 See {ref}`integration methods guide <integration_guide>` for how these scores relate to

@@ -58,11 +58,11 @@ ds = scarf.DataStore(
 ### 1. Plot embeddings
 
 `splt.embedding` colors cells on a layout such as UMAP. Pass a metadata column
-or a gene name in `color_by`. The return value is a `PlotResult`; in notebooks
-you usually display `.figure`.
+or a gene name in `color_by`. The return value is a `PlotResult`; call
+`.show()` to render it in the current notebook cell.
 
 ```{code-cell} ipython3
-splt.embedding(ds, layout_key="RNA_UMAP", color_by="clusters").figure;
+splt.embedding(ds, layout_key="RNA_UMAP", color_by="clusters").show();
 ```
 
 Several genes become a row of panels. `NormalizationSpec(transform="log1p")`
@@ -76,7 +76,7 @@ splt.embedding(
     color_by=["Gcg", "Ins2", "Sst"],
     normalization=splt.NormalizationSpec(transform="log1p"),
     sort_values=True,
-).figure;
+).show();
 ```
 
 Outliers can wash out a gene UMAP. `ColorScale(quantiles=(0.0, 0.99))` sets the
@@ -90,7 +90,7 @@ splt.embedding(
     normalization=splt.NormalizationSpec(transform="log1p"),
     color_scale=splt.ColorScale(cmap="viridis", quantiles=(0.0, 0.99)),
     sort_values=True,
-).figure;
+).show();
 ```
 
 For large datasets, `embedding_raster` builds a pixel image from continuous
@@ -103,7 +103,7 @@ splt.embedding_raster(
     layout_key="RNA_UMAP",
     color_by="RNA_nCounts",
     pixels=400,
-).figure;
+).show();
 ```
 
 ---
@@ -130,7 +130,7 @@ splt.embedding(
     layout_key="RNA_UMAP",
     color_by="clusters",
     legend_loc="on_data",
-).figure;
+).show();
 ```
 
 ### Frame and theme
@@ -148,7 +148,7 @@ splt.embedding(
     legend_loc="on_data",
     frame="none",
     theme="paper",
-).figure;
+).show();
 ```
 
 ### Point size
@@ -180,7 +180,7 @@ splt.dotplot(
     features={"endocrine": ["Gcg", "Ins2", "Sst"]},
     group_by="clusters",
     sample_by="demo_sample",
-).figure;
+).show();
 ```
 
 A matrixplot is a plain heatmap of mean or fraction. Gene and group order are
@@ -192,7 +192,7 @@ splt.matrixplot(
     features=["Gcg", "Ins2", "Sst"],
     group_by="clusters",
     value="mean",
-).figure;
+).show();
 ```
 
 ---
@@ -224,7 +224,7 @@ splt.composition(
         condition_by="demo_condition",
     ),
     kind="per_sample",
-).figure;
+).show();
 ```
 
 ---
@@ -248,7 +248,7 @@ splt.distribution(
     kind="violin",
     max_points=2000,
     seed=0,
-).figure;
+).show();
 ```
 
 ---
