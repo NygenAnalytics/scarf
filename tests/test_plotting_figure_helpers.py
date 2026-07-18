@@ -38,6 +38,29 @@ def test_plot_result_show_displays_once_and_closes_owned_inline_figure(monkeypat
     assert not plt.fignum_exists(fig.number)
 
 
+def test_plot_result_show_displays_under_agg_when_ipython_active(monkeypatch):
+    fig, ax = plt.subplots()
+    ax.plot([0, 1])
+    displayed = []
+    monkeypatch.setattr(matplotlib, "get_backend", lambda: "Agg")
+    monkeypatch.setattr("IPython.get_ipython", lambda: object())
+    monkeypatch.setattr("IPython.display.display", displayed.append)
+    result = PlotResult(
+        figure=fig,
+        axes={"main": ax},
+        tables={},
+        legends=(),
+        scales=(),
+        provenance=splt.PlotProvenance(scarf_version="test"),
+        owns_figure=True,
+    )
+
+    result.show()
+
+    assert displayed == [fig]
+    assert not plt.fignum_exists(fig.number)
+
+
 def test_normalize_axes_target_accepts_mappings_and_sequences():
     fig, axes = plt.subplots(1, 2)
     _, mapped, owns = normalize_axes_target(

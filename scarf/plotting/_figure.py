@@ -65,14 +65,24 @@ class PlotResult:
 
     def show(self) -> None:
         plt, mpl = require_matplotlib()
-        if "inline" in str(mpl.get_backend()).lower():
+        backend = str(mpl.get_backend()).lower()
+        in_ipython = False
+        try:
+            from IPython import get_ipython
+
+            in_ipython = get_ipython() is not None
+        except ImportError:
+            pass
+        # myst-nb / docs kernels often use Agg under the hood; prefer explicit
+        # IPython display so figures land in notebook outputs.
+        if in_ipython or "inline" in backend:
             from IPython.display import display
 
             display(self.figure)  # type: ignore[no-untyped-call]
             if self.owns_figure:
                 plt.close(self.figure)
             return
-        self.figure.show()
+        plt.show()
 
     def close(self) -> None:
         if not self.owns_figure:

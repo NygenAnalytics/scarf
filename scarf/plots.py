@@ -846,7 +846,7 @@ def plot_scatter(
         with mpl.rc_context({"svg.fonttype": "none", "pdf.fonttype": 42}):
             fig.savefig(savename, dpi=dpi, bbox_inches="tight")
     if show_fig:
-        axs.flat[0].figure.show()
+        plt.show()
         return None
     return axs
 
@@ -1029,7 +1029,7 @@ def shade_scatter(
         with mpl.rc_context({"svg.fonttype": "none", "pdf.fonttype": 42}):
             fig.savefig(savename, dpi=dpi, bbox_inches="tight")
     if show_fig:
-        axs.flat[0].figure.show()
+        plt.show()
         return None
     return axs
 
