@@ -70,7 +70,7 @@ class PlotResult:
         try:
             from IPython import get_ipython
 
-            in_ipython = get_ipython() is not None
+            in_ipython = get_ipython() is not None  # type: ignore[no-untyped-call]
         except ImportError:
             pass
         try:

@@ -1,6 +1,7 @@
 """Native heatmap and cluster-tree plotting."""
 
 import math
+from collections.abc import Hashable
 from importlib.metadata import version
 from typing import Any, cast
 
@@ -248,7 +249,7 @@ def marker_heatmap(
             )
         apply_figure_chrome(cluster_grid.fig, theme)
 
-    axes = {
+    axes: dict[Hashable, Any] = {
         "heatmap": cluster_grid.ax_heatmap,
         "row_dendrogram": cluster_grid.ax_row_dendrogram,
         "column_dendrogram": cluster_grid.ax_col_dendrogram,
@@ -1007,7 +1008,7 @@ def pseudotime_heatmap(
         )
         apply_figure_chrome(fig, theme)
 
-    axes = {
+    axes: dict[Hashable, Any] = {
         "heatmap": heatmap_ax,
         "feature_clusters": cluster_ax,
         "colorbar": colorbar_ax,
