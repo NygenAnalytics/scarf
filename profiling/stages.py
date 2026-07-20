@@ -45,7 +45,9 @@ def _open_datastore(
     arguments: dict[str, Any] = {
         "nthreads": resources.workers,
         "zarr_mode": "r+",
-        "zarrProfile": "cloud" if storeUri.startswith("s3://") else None,
+        "zarrProfile": (
+            "cloud" if storeUri.startswith("s3://") else "fast_local"
+        ),
         "storage_options": options,
         "mem_budget": resources.scarfMemoryBudget,
         "working_copies": resources.workingCopies,

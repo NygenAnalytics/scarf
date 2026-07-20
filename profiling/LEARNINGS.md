@@ -1,6 +1,6 @@
 # Scarf cloud profiling learnings (100k → 2.5M, countsT)
 
-Date range: 2026-07-14 to 2026-07-17  
+Date range: 2026-07-14 to 2026-07-20  
 Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`  
 Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)  
 Dataset source: nested CELLxGENE samples already prepared on R2
@@ -28,6 +28,7 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 9. Stage workers use Modal `Retries(max_retries=3)` via `modal_function_options`. `run_size_jobs` also re-spawns a stage up to 3 times if the call dies without an R2 result (covers `InternalFailure: Server has lost track of input`).
 10. Right-size Modal RAM per stage from measured peaks. Do not put Leiden/UMAP/HVG on a 64 GiB queue when peaks are ~5–8 GiB; that worsens scheduling and lost-input risk. Keep 64 GiB for createStore / makeGraph at large N when peaks justify it.
 11. When polling spawned calls, treat call-graph `FAILURE` / `INIT_FAILURE` / `TERMINATED` / `TIMEOUT` as terminal. Modal can raise an empty `TimeoutError` from `get(timeout=…)` on failed inputs; spinning on that alone leaves orchestrators stuck until the stage deadline.
+12. Local-vs-remote store A/B: use `run-local` / `run_local_funnel_job` (one container, H5AD + Zarr on ephemeral disk, `fast_local`). Per-stage `run` / `run-all` always write the store to R2. Compare tags like `local_ephemeral_c8_m32_100k` vs `counts_t_c8_m32_100k_reorg`.
 
 ## Code changes already wired
 
@@ -59,6 +60,8 @@ Two different numbers matter:
 | `auto_markers_c8_m64_1m` | 1M | 8 | 64 GiB | 48 GiB | Row-major; 9156s, max peak 28.3 GiB (makeGraph) |
 | `auto_markers_c8_m64_2_5m` | 2.5M | 8 | 64 GiB | 48 GiB | Row-major; **15292s**, makeGraph peak 24.5 GiB |
 | `counts_t_c8_m32_100k` | 100k | 8 | 32 GiB | ~24 GiB | Feature-major `countsT`; **881s** (vs 1095s row-major) |
+| `counts_t_c8_m32_100k_reorg` | 100k | 8 | 32 GiB | ~24 GiB | Post-reorg R2 control; **735s** (same knobs, fresh store) |
+| `local_ephemeral_c8_m32_100k` | 100k | 8 | 32 GiB | ~24 GiB | Same knobs; Zarr on Modal `/tmp` (`fast_local`); **421s** |
 | `counts_t_c8_m32_500k` | 500k | 8 | 32 GiB | 24 GiB | Feature-major `countsT`; **2825s** (vs 3906s row-major) |
 
 Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.md` as the durable record; recreate TOMLs from these rows when needed.
@@ -373,6 +376,33 @@ Calls: `fc-01KXPPVDDF9A5J8599QM7ZW65Q` (100k), `fc-01KXPR232W53HQXN4QPPNAD8D6` (
 2. **Net funnel wins despite slower createStore.** 100k: −214s (−20%). 500k: −1081s (−28%). createStore roughly 2.5× slower (countsT write), but HVG+markers savings more than pay for it.
 3. **Gene-wise share of total drops** from ~52% (row 100k HVG+markers) to ~21% (countsT 100k). createStore becomes a larger fraction (~37% at countsT 500k).
 4. makeGraph / UMAP / Leiden are essentially unchanged (layout-independent).
+
+## Local ephemeral vs R2 store (100k, done)
+
+Same knobs as the countsT speed pack (8 CPU / 32 GiB, parallel UMAP/ANN, auto markers). Control is the post-reorg R2 funnel (`counts_t_c8_m32_100k_reorg`, **735s**). Local run uses `run_local_funnel_job`: one Modal container, H5AD downloaded once from R2, Zarr written under `/tmp` with `fast_local` profile; stage result JSONs still land on R2 under tag `local_ephemeral_c8_m32_100k`. Call `fc-01KY0AQ54YCV6D210FG6KKWHH0`.
+
+| Stage | Local `/tmp` | R2 reorg | Local / R2 | Local RSS | R2 RSS |
+|-------|-------------:|---------:|-----------:|----------:|-------:|
+| createStore | 130 | 230 | 0.56× | 4.8G | 3.4G |
+| initializeStore | 52 | 99 | 0.53× | 7.9G | 6.4G |
+| reopenStore | 0.1 | 6.0 | 0.02× | 0.8G | 0.5G |
+| filterCells | 0.3 | 17 | 0.02× | 0.8G | 0.5G |
+| markHvgs | 21 | 69 | 0.30× | 2.5G | 1.1G |
+| makeGraph | 99 | 173 | 0.57× | 10.6G | 6.4G |
+| runUmap | 25 | 42 | 0.59× | 1.3G | 0.8G |
+| runLeiden | 13 | 24 | 0.52× | 1.5G | 0.7G |
+| findMarkers | 82 | 74 | **1.10×** | 10.4G | 4.1G |
+| **total** | **421** | **735** | **0.57×** | | |
+
+Original pre-reorg R2 countsT total was **881s**; reorg alone cut that to 735s (−17%). Local then cut another −43% vs reorg.
+
+**Learnings:**
+
+1. **At 100k, store IO is still a large fraction of R2 wall.** Putting the Zarr on ephemeral disk nearly halves the funnel (735 → 421s). The biggest relative wins are cheap metadata/open stages (`reopenStore`, `filterCells`) and gene-wise HVG (0.30×), which matches earlier IO-baseline evidence that R2 block latency dominates gene-wise work.
+2. **createStore / initialize / makeGraph / UMAP / Leiden all improve ~1.7–2× locally.** That is not "compute disappeared"; it is less waiting on remote reads/writes around the same algorithms. Local peaks are higher (makeGraph 10.6G vs 6.4G RSS): more of the working set stays hot in page cache instead of streaming from R2.
+3. **findMarkers is the exception (~same or slightly slower locally).** Markers are already much less R2-bound after countsT; once gene-column access is fast, wall is closer to CPU/math. Small +7s is within noise / cache / batching differences, not a local regression signal.
+4. **Do not treat 421s as the cloud product number.** Production Scarf-on-R2 remains the R2 figures (735s post-reorg). Local ephemeral is the ceiling for "how fast is this funnel when storage is free," useful for sizing how much further remote IO work can buy.
+5. **Ops caveat:** local requires one long-lived container (`run-local`). Per-stage spawn cannot keep a `/tmp` store across workers. H5AD download time is outside stage timers (same as remote createStore).
 
 ## Scaling estimates: 50k → 5M under countsT
 

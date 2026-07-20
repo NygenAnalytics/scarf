@@ -10,8 +10,9 @@ disconnects:
   modal run --env scarf_profiling -m profiling.modal_app -- run --config profiling/config.toml --size 10000 --stage createStore
   modal run --env scarf_profiling -m profiling.modal_app -- run-all --config profiling/config.toml --sizes 10000
 
-prepare / run / run-all spawn on the deployed app and return immediately.
-run-all fans out one size pipeline per container (stages stay sequential).
+prepare / run / run-all / run-local spawn on the deployed app and return immediately.
+run-all fans out one size pipeline per container (stages stay sequential on R2).
+run-local runs the full funnel in one container on ephemeral-disk Zarr (fast_local).
 Watch progress with: modal app logs scarf-profiling --env scarf_profiling
 """
 
@@ -266,6 +267,111 @@ def run_stage_job(
 @app.function(
     **COMMON_FUNCTION_OPTIONS,
     timeout=86_400,
+    memory=32_768,
+    cpu=8.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def run_local_funnel_job(
+    configDict: dict[str, Any],
+    nRows: int,
+    stages: list[StageName] | None = None,
+) -> dict[str, Any]:
+    """Full funnel in one container: H5AD + Zarr on ephemeral disk (fast_local).
+
+    Downloads the prepared H5AD from R2 once, writes the store under /tmp, runs
+    stages in-process, and still persists each stage result JSON to R2.
+    """
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    os.environ["SCARF_ZARR_PROFILE"] = "fast_local"
+    if nRows not in config.targetSizes:
+        raise ValueError(f"size {nRows} is not in config.targetSizes")
+    selected_stages = tuple(stages) if stages else config.effectiveStages
+
+    work = _WORK / f"local-{config.runTag or 'untagged'}-{nRows}"
+    if work.exists():
+        for path in sorted(work.rglob("*"), reverse=True):
+            if path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                path.rmdir()
+    work.mkdir(parents=True, exist_ok=True)
+
+    local_h5ad = work / f"{nRows}.h5ad"
+    local_store = work / f"{nRows}.zarr"
+    store_uri = str(local_store)
+
+    if "createStore" in selected_stages and not result_exists(
+        config, nRows, "createStore"
+    ):
+        print(f"downloading dataset to {local_h5ad}", flush=True)
+        download_file(config.datasetUri(nRows), local_h5ad)
+
+    outcomes: list[dict[str, Any]] = []
+    for stage in selected_stages:
+        if result_exists(config, nRows, stage):
+            outcomes.append(
+                {
+                    "nRows": nRows,
+                    "stage": stage,
+                    "status": "skipped",
+                    "resultUri": config.resultUri(nRows, stage),
+                    "storeBackend": "local",
+                }
+            )
+            continue
+        if stage == "createStore" and not local_h5ad.is_file():
+            raise FileNotFoundError(
+                f"createStore needs {local_h5ad}; download failed or was skipped"
+            )
+        if stage != "createStore" and not local_store.exists():
+            raise FileNotFoundError(
+                f"stage {stage} needs local store at {local_store}; "
+                "include createStore or pre-seed the ephemeral workdir"
+            )
+        resources = config.resourcesFor(stage)
+        print(f"local funnel stage start: {stage}", flush=True)
+        result = run_stage(
+            stage,
+            nRows=nRows,
+            storeUri=store_uri,
+            workflow=config.workflow,
+            resources=resources,
+            localH5adPath=local_h5ad if stage == "createStore" else None,
+            storageLayout=config.storageLayout,
+            workDir=work / stage,
+        )
+        write_result(config, result)
+        payload = result.to_json()
+        payload["storeBackend"] = "local"
+        outcomes.append(payload)
+        print(
+            f"local funnel stage done: {stage} status={result.status} "
+            f"seconds={result.seconds}",
+            flush=True,
+        )
+        if result.status == "error":
+            return {
+                "nRows": nRows,
+                "stopped": True,
+                "storeBackend": "local",
+                "storeUri": store_uri,
+                "failed": payload,
+                "outcomes": outcomes,
+            }
+
+    return {
+        "nRows": nRows,
+        "stopped": False,
+        "storeBackend": "local",
+        "storeUri": store_uri,
+        "outcomes": outcomes,
+    }
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
     memory=2048,
     cpu=1.0,
     ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
@@ -490,6 +596,19 @@ def main(*arg_list: str) -> None:
         "--stages", nargs="*", choices=FULL_STAGE_ORDER, default=None
     )
 
+    local_parser = sub.add_parser(
+        "run-local",
+        help=(
+            "One-container funnel on ephemeral-disk Zarr (fast_local); "
+            "H5AD downloaded once from R2; stage results still written to R2"
+        ),
+    )
+    local_parser.add_argument("--config", required=True)
+    local_parser.add_argument("--size", type=int, required=True)
+    local_parser.add_argument(
+        "--stages", nargs="*", choices=FULL_STAGE_ORDER, default=None
+    )
+
     io_parser = sub.add_parser("io-baseline")
     io_parser.add_argument("--config", required=True)
     io_parser.add_argument("--size", type=int, default=1_000_000)
@@ -575,6 +694,29 @@ def main(*arg_list: str) -> None:
             .spawn(payload, sizes, stages)
         )
         _print_spawned("run_all_jobs", call)
+        return
+
+    if args.command == "run-local":
+        if args.size not in config.targetSizes:
+            raise SystemExit(f"size {args.size} is not in config.targetSizes")
+        stages = list(args.stages) if args.stages else None
+        selected = tuple(stages) if stages else config.effectiveStages
+        # Size the single container to the hungriest stage in the funnel.
+        peak = max(
+            (config.resourcesFor(stage) for stage in selected),
+            key=lambda item: (
+                item.modalMemoryLimitMb,
+                item.modalCpuLimit,
+                item.timeoutSeconds,
+            ),
+        )
+        options = modal_function_options(config, peak, maxContainers=1)
+        call = (
+            _deployed_function(config, "run_local_funnel_job")
+            .with_options(**options)
+            .spawn(payload, args.size, stages)
+        )
+        _print_spawned(f"run_local_funnel_job {args.size}", call)
         return
 
     if args.command == "io-baseline":
