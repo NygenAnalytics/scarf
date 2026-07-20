@@ -27,7 +27,19 @@ partial PCA
   PCA trained on a subset of cells via `pca_cell_key`. A lightweight batch-correction option when one sample is the reference.
 
 LISI
-  Local Inverse Simpson Index. Metric of local label mixing in the KNN graph. Computed with `metric_lisi`.
+  Local Inverse Simpson Index. Per-cell measure of local label mixing in the KNN graph. Computed with `metric_lisi`.
+
+iLISI
+  Integration LISI. Median batch LISI scaled so higher values indicate better batch mixing. Computed with `metric_ilisi`.
+
+cLISI
+  Cell-type LISI. Median label LISI inverted and scaled so higher values indicate better biological-label conservation. Computed with `metric_clisi`.
+
+proportion-aware batch mixing
+  Scarf summary that rescales mean batch LISI against the observed global batch proportions. Computed with `metric_proportional_batch_mixing`.
+
+graph connectivity
+  Mean fraction of cells from each label retained in its largest connected component on Scarf's symmetrized graph. Computed with `metric_graph_connectivity`.
 
 batch correction
   Adjusting embeddings or graphs so technical sample batches mix while biological structure is preserved.

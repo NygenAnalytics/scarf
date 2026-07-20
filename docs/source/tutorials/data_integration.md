@@ -326,16 +326,38 @@ ds.metric_lisi(
 )
 ```
 
-**Batch mixing** condenses batch LISI into a single number in `[0, 1]` by rescaling the mean against the mixing perfectly integrated data would reach for these batch sizes. This makes it easy to compare across graphs. Higher is better.
+**iLISI** summarizes batch mixing with the median and scIB scaling. **cLISI** summarizes
+preservation of the imported cell labels. Both are higher when the corresponding objective
+is better.
 
 ```{code-cell} ipython3
-ds.metric_batch_mixing(label_colname='sample_id', perplexity=7)
+ds.metric_ilisi(batch_colname='sample_id', perplexity=7)
 ```
 
-**Silhouette** scores how separated each cluster is from its nearest neighboring cluster, from -1 to 1. Values near 1 mean distinct clusters. Read it alongside the batch metrics, since over-correction can mix genuinely different cell types.
+```{code-cell} ipython3
+ds.metric_clisi(label_colname='orig_cluster_labels', perplexity=7)
+```
+
+Scarf's proportion-aware summary instead uses mean batch LISI and the observed batch sizes.
+It complements iLISI when batches are imbalanced.
 
 ```{code-cell} ipython3
-ds.metric_silhouette(res_label='leiden_cluster')
+ds.metric_proportional_batch_mixing(label_colname='sample_id', perplexity=7)
+```
+
+**Graph connectivity** reports how much of each imported cell label remains in its largest
+connected component.
+
+```{code-cell} ipython3
+ds.metric_graph_connectivity(label_colname='orig_cluster_labels')
+```
+
+**Graph silhouette** scores how separated each cluster is from its nearest neighboring
+cluster, from -1 to 1. Values near 1 mean distinct clusters. Read it alongside the batch
+metrics, since over-correction can mix genuinely different cell types.
+
+```{code-cell} ipython3
+ds.metric_graph_silhouette(res_label='leiden_cluster')
 ```
 
 **Label concordance** compares two labelings of the same cells with ARI or NMI. Here it checks how well the fresh Leiden clusters agree with the imported annotations. Note that this measures label agreement, not batch mixing.

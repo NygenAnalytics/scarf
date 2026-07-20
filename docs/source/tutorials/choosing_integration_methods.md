@@ -26,7 +26,7 @@ the right one. For worked examples, follow the linked tutorials.
 | Map query cells onto a reusable harmonized atlas | `build_mapping_reference` then `MappingReference.map_query` | {ref}`reference atlas mapping <reference_atlas_mapping>` |
 | Map query cells onto a fixed PCA reference | `run_mapping` | {ref}`data projection <data_projection>` |
 | Co-embed reference and query for exploration | `run_unified_umap` or `run_unified_tsne` | {ref}`data projection <data_projection>` |
-| Measure integration quality | `metric_lisi`, `metric_batch_mixing`, `metric_silhouette` | {ref}`LISI metrics <lisi_metrics>` |
+| Measure integration quality | `metric_ilisi`, `metric_clisi`, `metric_graph_connectivity` | {ref}`LISI metrics <lisi_metrics>` |
 
 ## Harmony vs partial PCA
 
@@ -43,8 +43,11 @@ After either method, quantify results with {ref}`LISI metrics <lisi_metrics>`.
 After correction, quantify the result rather than relying on the UMAP alone:
 
 - **`metric_lisi`** returns per-cell LISI for any label. Run it on the batch column to check neighborhood mixing and on the cell-type column to check that biology is preserved.
-- **`metric_batch_mixing`** condenses batch LISI into a single value in `[0, 1]`. Higher is better.
-- **`metric_silhouette`** scores how separated each cluster is from its nearest neighbor cluster.
+- **`metric_ilisi`** summarizes batch mixing with scIB median scaling.
+- **`metric_clisi`** summarizes biological-label conservation with scIB scaling.
+- **`metric_proportional_batch_mixing`** uses mean LISI and adjusts for observed batch sizes.
+- **`metric_graph_connectivity`** measures whether cells with each biological label remain connected.
+- **`metric_graph_silhouette`** scores how separated each cluster is from its nearest neighbor cluster.
 - **`metric_label_concordance`** compares two labelings with ARI or NMI. It measures label agreement, not batch mixing.
 
 A useful pattern is to compute these metrics on the naive, partial PCA, and Harmony graphs, then compare. See {doc}`integration_metrics`.

@@ -1,14 +1,20 @@
 import numpy as np
 import pandas as pd
 import pytest
+import zarr
 from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
+from zarr.storage import MemoryStore
 
 from scarf.metrics import (
     calculate_knn_cluster_similarity,
     calculate_top_k_neighbor_distances,
     calculate_weighted_cluster_similarity,
+    clisi_knn,
     compute_lisi,
     compute_simpson,
+    graph_connectivity,
+    ilisi_knn,
     integration_score,
     knn_to_csr_matrix,
     label_concordance_score,
@@ -16,6 +22,20 @@ from scarf.metrics import (
     silhouette_scoring,
 )
 from scarf.metrics.lisi import _effective_perplexity, _neighbor_probabilities
+
+
+def _uniform_self_free_knn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    indices = np.array(
+        [
+            [1, 2, 3],
+            [0, 2, 3],
+            [0, 1, 3],
+            [0, 1, 2],
+        ]
+    )
+    distances = np.ones_like(indices, dtype=np.float64)
+    labels = np.array([0, 0, 1, 1])
+    return distances, indices, labels
 
 
 def test_compute_lisi_uses_all_stored_neighbors():
@@ -148,6 +168,165 @@ def test_compute_lisi_rejects_invalid_neighbor_distances():
 
     with pytest.raises(ValueError, match="finite, non-negative"):
         compute_lisi(distances, indices, metadata, ["batch"], perplexity=1)
+
+
+def test_ilisi_and_clisi_match_analytic_self_free_values():
+    distances, indices, labels = _uniform_self_free_knn()
+
+    assert ilisi_knn(distances, indices, labels) == pytest.approx(0.8)
+    assert clisi_knn(distances, indices, labels) == pytest.approx(0.2)
+    assert ilisi_knn(
+        distances,
+        indices,
+        labels,
+        perplexity=1,
+        scale=False,
+    ) == pytest.approx(1.8)
+
+
+def test_lisi_summary_default_perplexity_matches_floor_k_over_three():
+    distances, indices, labels = _uniform_self_free_knn()
+
+    assert ilisi_knn(distances, indices, labels) == pytest.approx(
+        ilisi_knn(distances, indices, labels, perplexity=1)
+    )
+    assert clisi_knn(distances, indices, labels) == pytest.approx(
+        clisi_knn(distances, indices, labels, perplexity=1)
+    )
+
+
+@pytest.mark.parametrize("metric", [ilisi_knn, clisi_knn])
+def test_lisi_summary_validates_categories_and_alignment(metric):
+    distances, indices, labels = _uniform_self_free_knn()
+
+    with pytest.raises(ValueError, match="at least two categories"):
+        metric(distances, indices, np.zeros(len(labels)), perplexity=1)
+    with pytest.raises(ValueError, match="missing values"):
+        metric(distances, indices, np.array([0, 0, 1, np.nan]), perplexity=1)
+    with pytest.raises(ValueError, match="number of cells"):
+        metric(distances, indices, labels[:-1], perplexity=1)
+    with pytest.raises(ValueError, match="at least two categories"):
+        metric(
+            np.empty((0, 3)),
+            np.empty((0, 3), dtype=np.int64),
+            np.array([]),
+            perplexity=1,
+        )
+
+
+def test_lisi_summaries_match_chunked_zarr_inputs():
+    distances, indices, labels = _uniform_self_free_knn()
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    z_distances = root.create_array(
+        "distances",
+        data=distances,
+        chunks=(2, 3),
+    )
+    z_indices = root.create_array(
+        "indices",
+        data=indices,
+        chunks=(2, 3),
+    )
+
+    assert ilisi_knn(z_distances, z_indices, labels) == pytest.approx(
+        ilisi_knn(distances, indices, labels)
+    )
+    assert clisi_knn(z_distances, z_indices, labels) == pytest.approx(
+        clisi_knn(distances, indices, labels)
+    )
+
+
+def test_proportional_batch_mixing_differs_from_ilisi_for_imbalanced_batches():
+    labels = np.array([0] * 8 + [1] * 2)
+    indices = np.array(
+        [[1, 8, 9]] + [[0, 8, 9] for _ in range(7)] + [[0, 1, 9], [0, 1, 8]]
+    )
+    distances = np.ones_like(indices, dtype=np.float64)
+    metadata = pd.DataFrame({"batch": labels})
+    per_cell = compute_lisi(
+        distances,
+        indices,
+        metadata,
+        ["batch"],
+        perplexity=1,
+    )[:, 0]
+
+    assert lisi_batch_mixing_score(per_cell, labels) == pytest.approx(1)
+    assert ilisi_knn(distances, indices, labels, perplexity=1) == pytest.approx(0.8)
+
+
+def _materialized_graph_connectivity(
+    edges: np.ndarray,
+    labels: np.ndarray,
+) -> float:
+    n_cells = len(labels)
+    graph = csr_matrix(
+        (
+            np.ones(len(edges)),
+            (edges[:, 0], edges[:, 1]),
+        ),
+        shape=(n_cells, n_cells),
+    )
+    symmetric = graph + graph.T - graph.multiply(graph.T)
+    scores = []
+    for label in np.unique(labels):
+        mask = labels == label
+        subgraph = symmetric[mask][:, mask]
+        n_components, component_labels = connected_components(
+            subgraph,
+            directed=False,
+        )
+        sizes = np.bincount(component_labels, minlength=n_components)
+        scores.append(sizes.max() / sizes.sum())
+    return float(np.mean(scores))
+
+
+def test_graph_connectivity_matches_materialized_symmetric_reference():
+    labels = np.array(["a", "a", "a", "b", "b", "c"])
+    edges = np.array([[0, 1], [1, 0], [3, 4]], dtype=np.int64)
+
+    expected = _materialized_graph_connectivity(edges, labels)
+
+    assert expected == pytest.approx((2 / 3 + 1 + 1) / 3)
+    assert graph_connectivity(edges, labels, batch_rows=1) == pytest.approx(expected)
+    assert graph_connectivity(
+        np.empty((0, 2), dtype=np.int64),
+        np.array(["isolated", "isolated", "isolated"]),
+    ) == pytest.approx(1 / 3)
+
+
+def test_graph_connectivity_matches_chunked_zarr_and_chunk_sizes():
+    labels = np.array([0, 0, 0, 1, 1])
+    edges = np.array(
+        [[0, 1], [1, 0], [1, 2], [3, 4], [4, 3]],
+        dtype=np.uint64,
+    )
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    z_edges = root.create_array("edges", data=edges, chunks=(2, 2))
+    expected = graph_connectivity(edges, labels, batch_rows=len(edges))
+
+    assert graph_connectivity(edges, labels, batch_rows=1) == pytest.approx(expected)
+    assert graph_connectivity(z_edges, labels, batch_rows=3) == pytest.approx(expected)
+
+
+def test_graph_connectivity_validates_inputs():
+    labels = np.array([0, 0])
+
+    with pytest.raises(TypeError, match="integers"):
+        graph_connectivity(np.array([[0.0, 1.0]]), labels)
+    with pytest.raises(IndexError, match="outside"):
+        graph_connectivity(np.array([[0, 2]]), labels)
+    with pytest.raises(ValueError, match="shape"):
+        graph_connectivity(np.array([0, 1]), labels)
+    with pytest.raises(ValueError, match="greater than zero"):
+        graph_connectivity(np.array([[0, 1]]), labels, batch_rows=0)
+    with pytest.raises(ValueError, match="at least one cell"):
+        graph_connectivity(np.empty((0, 2), dtype=np.int64), np.array([]))
+    with pytest.raises(ValueError, match="missing values"):
+        graph_connectivity(
+            np.array([[0, 1]]),
+            np.array([0, np.nan]),
+        )
 
 
 def test_metric_lisi_single_category_is_one(datastore, make_graph):
@@ -290,8 +469,8 @@ def test_top_k_distances_reject_unsupported_metric():
 
 
 def test_metric_silhouette(datastore, make_graph, leiden_clustering):
-    scores = datastore.metric_silhouette(random_seed=42)
-    scores_from_full_label = datastore.metric_silhouette(
+    scores = datastore.metric_graph_silhouette(random_seed=42)
+    scores_from_full_label = datastore.metric_graph_silhouette(
         res_label="RNA_leiden_cluster",
         random_seed=42,
     )
@@ -409,8 +588,40 @@ def test_metric_label_concordance(datastore, make_graph, leiden_clustering):
     )
     with pytest.warns(DeprecationWarning, match="metric_integration"):
         assert datastore.metric_integration(["labels1", "labels2"]) == pytest.approx(1)
-    mixing_score = datastore.metric_batch_mixing("labels1")
+    mixing_score = datastore.metric_proportional_batch_mixing("labels1")
     assert 0 <= mixing_score <= 1
+
+
+def test_datastore_scib_metrics(datastore, make_graph, leiden_clustering):
+    label_colname = "RNA_leiden_cluster"
+
+    ilisi = datastore.metric_ilisi(label_colname)
+    clisi = datastore.metric_clisi(label_colname)
+    latest_connectivity = datastore.metric_graph_connectivity(
+        label_colname,
+        from_assay="RNA",
+        cell_key="I",
+        feat_key="hvgs",
+    )
+    graph_loc = datastore._get_latest_graph_loc(
+        from_assay="RNA",
+        cell_key="I",
+        feat_key="hvgs",
+    )
+    explicit_connectivity = datastore.metric_graph_connectivity(
+        label_colname,
+        graph_loc=graph_loc,
+    )
+
+    assert 0 <= ilisi <= 1
+    assert 0 <= clisi <= 1
+    assert 0 <= latest_connectivity <= 1
+    assert explicit_connectivity == pytest.approx(latest_connectivity)
+    with pytest.raises(ValueError, match="cell-key provenance"):
+        datastore.metric_graph_connectivity(
+            label_colname,
+            graph_loc=f"{datastore._integratedGraphsLoc}/test",
+        )
 
 
 def test_silhouette_scoring_missing_cluster_labels(datastore):

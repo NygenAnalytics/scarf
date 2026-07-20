@@ -209,6 +209,81 @@ def test_metric_integration_uses_standard_deprecation_warning():
     assert caught[0].filename == __file__
 
 
+def test_metric_batch_mixing_uses_standard_deprecation_warning():
+    class Store:
+        @staticmethod
+        def metric_proportional_batch_mixing(
+            label_colname,
+            use_latest_knn,
+            from_assay,
+            knn_loc,
+            perplexity,
+        ):
+            assert (
+                label_colname,
+                use_latest_knn,
+                from_assay,
+                knn_loc,
+                perplexity,
+            ) == ("batch", False, "RNA", "knn", 7)
+            return 0.5
+
+    with pytest.warns(DeprecationWarning, match="Scarf 2.0") as caught:
+        result = scarf.DataStore.metric_batch_mixing(
+            Store(),
+            "batch",
+            False,
+            "RNA",
+            "knn",
+            7,
+        )
+
+    assert result == 0.5
+    assert caught[0].filename == __file__
+    assert inspect.signature(scarf.DataStore.metric_batch_mixing) == inspect.signature(
+        scarf.DataStore.metric_proportional_batch_mixing
+    )
+
+
+def test_metric_silhouette_uses_standard_deprecation_warning():
+    class Store:
+        @staticmethod
+        def metric_graph_silhouette(
+            use_latest_knn,
+            res_label,
+            from_assay,
+            knn_loc,
+            random_seed,
+            sample_size,
+        ):
+            assert (
+                use_latest_knn,
+                res_label,
+                from_assay,
+                knn_loc,
+                random_seed,
+                sample_size,
+            ) == (False, "clusters", "RNA", "knn", 42, 5)
+            return np.array([0.25])
+
+    with pytest.warns(DeprecationWarning, match="Scarf 2.0") as caught:
+        result = scarf.DataStore.metric_silhouette(
+            Store(),
+            False,
+            "clusters",
+            "RNA",
+            "knn",
+            42,
+            5,
+        )
+
+    assert np.array_equal(result, np.array([0.25]))
+    assert caught[0].filename == __file__
+    assert inspect.signature(scarf.DataStore.metric_silhouette) == inspect.signature(
+        scarf.DataStore.metric_graph_silhouette
+    )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

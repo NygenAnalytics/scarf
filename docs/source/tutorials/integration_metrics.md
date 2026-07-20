@@ -82,6 +82,7 @@ splt.embedding(
 ## LISI
 
 `metric_lisi` takes one or more cell-metadata label columns (batches, clusters, and similar).
+It returns raw per-cell LISI values without reducing them to one benchmark score.
 Default `perplexity=30` expects roughly `3 * perplexity` graph neighbors. This page builds
 the graph with `k=11`, so Scarf reduces perplexity automatically and prints a warning. Scores
 still describe mixing inside that smaller neighborhood. Raise `k` or lower `perplexity=` if
@@ -92,16 +93,40 @@ lisi = ds.metric_lisi(label_colnames=['sample_id'])
 lisi
 ```
 
-## Batch mixing summary
+## iLISI and cLISI
+
+`metric_ilisi` summarizes batch mixing with the median and scIB scaling. Higher is better.
+`metric_clisi` applies the complementary scaling to a biological label. Higher cLISI means
+that neighborhoods preserve those labels. Their default perplexity is `floor(k / 3)`.
+Both scores depend on graph `k`. The scIB benchmark convention compares neighborhoods with
+15, 50, or 90 neighbors, so use the same `k` when comparing Scarf results to a benchmark.
 
 ```{code-cell} ipython3
-ds.metric_batch_mixing(label_colname='sample_id')
+ds.metric_ilisi(batch_colname='sample_id')
 ```
 
-## Silhouette and label concordance
+```{code-cell} ipython3
+ds.metric_clisi(label_colname='orig_cluster_labels')
+```
+
+Scarf also provides a proportion-aware batch summary. It uses the mean LISI and the global
+batch proportions, so it is intentionally different from iLISI.
 
 ```{code-cell} ipython3
-ds.metric_silhouette(res_label='leiden_cluster')
+ds.metric_proportional_batch_mixing(label_colname='sample_id')
+```
+
+## Graph connectivity, silhouette, and label concordance
+
+Graph connectivity measures the fraction of each biological label retained in its largest
+connected component on Scarf's symmetrized graph.
+
+```{code-cell} ipython3
+ds.metric_graph_connectivity(label_colname='orig_cluster_labels')
+```
+
+```{code-cell} ipython3
+ds.metric_graph_silhouette(res_label='leiden_cluster')
 ```
 
 ```{code-cell} ipython3
@@ -110,9 +135,9 @@ ds.metric_label_concordance(
 )
 ```
 
-On this naive merged graph (no batch correction), batch LISI and batch mixing are usually
-low, and Leiden vs `orig_cluster_labels` concordance can also be low when clusters split by
-sample. Compare the same metrics after partial PCA or Harmony in {doc}`data_integration`.
+On this naive merged graph (no batch correction), batch LISI and iLISI are usually low.
+Leiden vs `orig_cluster_labels` concordance can also be low when clusters split by sample.
+Compare the same metrics after partial PCA or Harmony in {doc}`data_integration`.
 
 See {ref}`integration methods guide <integration_guide>` for how these scores relate to
 method choice.

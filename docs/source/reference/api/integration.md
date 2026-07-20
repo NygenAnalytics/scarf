@@ -22,11 +22,19 @@ implementations.
 
 ```{eval-rst}
 .. automodule:: scarf.metrics
-    :members: compute_lisi, silhouette_scoring, label_concordance_score, lisi_batch_mixing_score, integration_score
+    :members: compute_lisi, ilisi_knn, clisi_knn, graph_connectivity, silhouette_scoring, label_concordance_score, lisi_batch_mixing_score, integration_score
     :imported-members:
 ```
 
-See also `DataStore.metric_lisi`, `metric_silhouette`, `metric_label_concordance`,
-and `metric_batch_mixing` on {doc}`datastore`. `metric_integration` is a
-deprecated compatibility name for `metric_label_concordance` and may be
-removed in Scarf 2.0.
+See also `DataStore.metric_lisi`, `metric_ilisi`, `metric_clisi`,
+`metric_proportional_batch_mixing`, `metric_graph_connectivity`,
+`metric_graph_silhouette`, and `metric_label_concordance` on {doc}`datastore`.
+
+Scarf's iLISI and cLISI use the scIB median and scaling definitions over
+Scarf's self-free persisted KNN arrays. Graph connectivity follows the
+original scIB symmetrized-graph definition. YosefLab `scib-metrics` currently
+uses directed strong components for graph connectivity, so those values need
+not match. See Luecken et al. 2022, doi: 10.1038/s41592-021-01336-8.
+
+`metric_integration`, `metric_batch_mixing`, and `metric_silhouette` are
+deprecated compatibility names and may be removed in Scarf 2.0.

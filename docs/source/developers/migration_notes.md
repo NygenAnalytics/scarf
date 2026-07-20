@@ -55,9 +55,17 @@ Recomputed results can differ from earlier Scarf releases. Recalibrate downstrea
 ## Metric names
 
 `DataStore.metric_integration` measures label concordance. It now emits
-`DeprecationWarning`; use `metric_label_concordance` for ARI or NMI and
-`metric_batch_mixing` for neighborhood integration quality. The deprecated
-method remains available through Scarf 1.x and may be removed in 2.0.
+`DeprecationWarning`; use `metric_label_concordance` for ARI or NMI.
+
+`DataStore.metric_batch_mixing` is now a deprecated name for
+`metric_proportional_batch_mixing`, Scarf's mean LISI summary adjusted for
+global batch proportions. Use `metric_ilisi` for the scIB median-scaled batch
+metric. These two summaries are intentionally different.
+
+`DataStore.metric_silhouette` is now a deprecated name for
+`metric_graph_silhouette`, which makes its sampled graph-guided implementation
+explicit. The deprecated methods remain available through Scarf 1.x and may be
+removed in 2.0.
 
 The function name `scarf.metrics.integration_score` remains a supported 1.x
 compatibility name for `label_concordance_score`.

@@ -55,9 +55,14 @@ _METHODS = {
         "mark_hvgs",
         "mark_prevalent_peaks",
         "metric_batch_mixing",
+        "metric_clisi",
+        "metric_graph_connectivity",
+        "metric_graph_silhouette",
+        "metric_ilisi",
         "metric_integration",
         "metric_label_concordance",
         "metric_lisi",
+        "metric_proportional_batch_mixing",
         "metric_silhouette",
         "run_cell_cycle_scoring",
         "run_doublet_detection",
@@ -74,7 +79,7 @@ _SIGNATURE_DIGESTS = {
     BaseDataStore: "ed2e08a687942d2339c1ab09bf1eac3af20c290319cf527b8662fb937a401cd2",
     GraphDataStore: "09b597c4ec33150204ddc99fc75a508ba2debf586f45a35051e5eff94abefae2",
     MappingDatastore: "a1e2fe91d8430b54a2a67f42c537a8a5e189691f81e2fddc8a959e1fd87fb3a9",
-    DataStore: "41668a075e28f8382a84f2f72bfea1eb50acb0a02d3f1b376d5e3367dda9a447",
+    DataStore: "a0f2ab91f02cf4268673541c70f00d7141cbc4920bb78b97bf87ccfb331374cc",
 }
 
 

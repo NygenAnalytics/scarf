@@ -3,6 +3,7 @@ Methods and classes for evaluation
 """
 
 from ._types import MatrixData, NeighborMetric, ZarrArray
+from .connectivity import graph_connectivity
 from .concordance import integration_score, label_concordance_score
 from .graph import (
     calculate_knn_cluster_similarity,
@@ -10,7 +11,13 @@ from .graph import (
     calculate_weighted_cluster_similarity,
     knn_to_csr_matrix,
 )
-from .lisi import compute_lisi, compute_simpson, lisi_batch_mixing_score
+from .lisi import (
+    clisi_knn,
+    compute_lisi,
+    compute_simpson,
+    ilisi_knn,
+    lisi_batch_mixing_score,
+)
 from .silhouette import process_cluster, silhouette_scoring
 
 __all__ = [
@@ -20,8 +27,11 @@ __all__ = [
     "calculate_knn_cluster_similarity",
     "calculate_top_k_neighbor_distances",
     "calculate_weighted_cluster_similarity",
+    "clisi_knn",
     "compute_lisi",
     "compute_simpson",
+    "graph_connectivity",
+    "ilisi_knn",
     "integration_score",
     "knn_to_csr_matrix",
     "label_concordance_score",

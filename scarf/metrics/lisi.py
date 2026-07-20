@@ -191,6 +191,114 @@ def compute_lisi(
     return lisi_df
 
 
+def _lisi_knn_summary(
+    distances: np.ndarray | ZarrArray,
+    indices: np.ndarray | ZarrArray,
+    labels: Sequence[object] | np.ndarray,
+    perplexity: float | None,
+    scale: bool,
+    *,
+    invert: bool,
+    label_name: str,
+) -> float:
+    if distances.ndim != 2 or indices.ndim != 2:
+        raise ValueError("KNN distances and indices must be two-dimensional")
+    if distances.shape != indices.shape:
+        raise ValueError("KNN distances and indices must have matching shapes")
+
+    n_cells, n_neighbors = distances.shape
+    if n_neighbors < 3:
+        raise ValueError("LISI requires at least three neighbors per cell")
+
+    categorical = pd.Categorical(labels)
+    if len(categorical) != n_cells:
+        raise ValueError(f"{label_name} labels must match the number of cells")
+    if np.any(categorical.codes < 0):
+        raise ValueError(f"{label_name} labels must not contain missing values")
+
+    n_categories = int(np.unique(categorical.codes).size)
+    if n_categories < 2:
+        raise ValueError(f"{label_name} LISI requires at least two categories")
+
+    resolved_perplexity = (
+        float(np.floor(n_neighbors / 3)) if perplexity is None else perplexity
+    )
+    metadata = pd.DataFrame({"labels": categorical})
+    per_cell = compute_lisi(
+        distances,
+        indices,
+        metadata,
+        ["labels"],
+        perplexity=resolved_perplexity,
+    )[:, 0]
+    summary = float(np.nanmedian(per_cell))
+    if not scale:
+        return summary
+    if invert:
+        return float((n_categories - summary) / (n_categories - 1))
+    return float((summary - 1) / (n_categories - 1))
+
+
+def ilisi_knn(
+    distances: np.ndarray | ZarrArray,
+    indices: np.ndarray | ZarrArray,
+    batch_labels: Sequence[object] | np.ndarray,
+    perplexity: float | None = None,
+    scale: bool = True,
+) -> float:
+    """Compute the median integration LISI score from a self-free KNN graph.
+
+    When scaled, higher values indicate better batch mixing. This follows the
+    iLISI aggregation and scaling used by scIB.
+
+    The KNN arrays must exclude each cell from its own neighbor row. Scarf's
+    persisted KNN graphs satisfy this requirement. Self-including KNN arrays
+    produce a different statistic and are not adjusted automatically.
+
+    References:
+        Luecken et al. 2022 doi: 10.1038/s41592-021-01336-8
+    """
+    return _lisi_knn_summary(
+        distances,
+        indices,
+        batch_labels,
+        perplexity,
+        scale,
+        invert=False,
+        label_name="Batch",
+    )
+
+
+def clisi_knn(
+    distances: np.ndarray | ZarrArray,
+    indices: np.ndarray | ZarrArray,
+    cell_labels: Sequence[object] | np.ndarray,
+    perplexity: float | None = None,
+    scale: bool = True,
+) -> float:
+    """Compute the median cell-type LISI score from a self-free KNN graph.
+
+    When scaled, higher values indicate better conservation of cell labels.
+    This follows the cLISI aggregation and scaling used by scIB.
+
+    The KNN arrays must exclude each cell from its own neighbor row. Scarf's
+    persisted KNN graphs satisfy this requirement. Self-including KNN arrays
+    produce a different statistic and are not adjusted automatically.
+
+    References:
+        Luecken et al. 2022 doi: 10.1038/s41592-021-01336-8
+    """
+    return _lisi_knn_summary(
+        distances,
+        indices,
+        cell_labels,
+        perplexity,
+        scale,
+        invert=True,
+        label_name="Cell",
+    )
+
+
 def compute_simpson(
     distances: np.ndarray,
     indices: np.ndarray,

@@ -290,6 +290,36 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             "coalesced_location": coalesced_loc,
         }
 
+    def _load_metric_knn(
+        self,
+        use_latest_knn: bool,
+        from_assay: str | None,
+        knn_loc: str | None,
+    ) -> tuple[str, str, str, zarr.Array, zarr.Array]:
+        if from_assay is None:
+            from_assay = self._load_default_assay()
+
+        if use_latest_knn and knn_loc is None:
+            resolved_knn_loc = self._get_latest_knn_loc(from_assay)
+            logger.info(f"Using the latest knn graph at location: {resolved_knn_loc}")
+        else:
+            if knn_loc is None:
+                raise ValueError("Please provide values for the KNN graph location.")
+            if knn_loc not in self.zw:
+                raise ValueError(f"Could not find the knn graph at location: {knn_loc}")
+            resolved_knn_loc = knn_loc
+            logger.info(f"Using the knn graph at location: {resolved_knn_loc}")
+
+        normed_part = resolved_knn_loc.split("/")[1]
+        _, cell_key, _ = normed_part.split("__")
+        knn_grp = as_zarr_group(
+            self.zw[resolved_knn_loc],
+            name=resolved_knn_loc,
+        )
+        distances = as_zarr_array(knn_grp["distances"], name="distances")
+        indices = as_zarr_array(knn_grp["indices"], name="indices")
+        return from_assay, resolved_knn_loc, cell_key, distances, indices
+
     def metric_lisi(
         self,
         label_colnames: Iterable[str],
@@ -387,7 +417,180 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         else:
             return None
 
-    def metric_silhouette(
+    def metric_ilisi(
+        self,
+        batch_colname: str,
+        use_latest_knn: bool = True,
+        from_assay: str | None = None,
+        knn_loc: str | None = None,
+        perplexity: float | None = None,
+        scale: bool = True,
+    ) -> float:
+        """Compute scIB integration LISI on a persisted KNN graph.
+
+        Args:
+            batch_colname: Cell metadata column containing batch labels.
+            use_latest_knn: Use the latest KNN graph when ``knn_loc`` is not
+                provided.
+            from_assay: Assay used to resolve the latest KNN graph.
+            knn_loc: Explicit persisted KNN location.
+            perplexity: Effective neighborhood size. ``None`` uses
+                ``floor(k / 3)``.
+            scale: Scale the median LISI by the number of observed batches.
+
+        Returns:
+            Median iLISI, scaled so higher values indicate better batch mixing
+            when ``scale`` is true.
+
+        Notes:
+            Scarf persisted KNN graphs exclude self-neighbors, as required by
+            this metric.
+        """
+        from ...metrics import ilisi_knn
+
+        _, _, cell_key, distances, indices = self._load_metric_knn(
+            use_latest_knn,
+            from_assay,
+            knn_loc,
+        )
+        batch_labels = self.cells.fetch(batch_colname, key=cell_key)
+        return ilisi_knn(
+            distances,
+            indices,
+            batch_labels,
+            perplexity=perplexity,
+            scale=scale,
+        )
+
+    def metric_clisi(
+        self,
+        label_colname: str,
+        use_latest_knn: bool = True,
+        from_assay: str | None = None,
+        knn_loc: str | None = None,
+        perplexity: float | None = None,
+        scale: bool = True,
+    ) -> float:
+        """Compute scIB cell-type LISI on a persisted KNN graph.
+
+        Args:
+            label_colname: Cell metadata column containing biological labels.
+            use_latest_knn: Use the latest KNN graph when ``knn_loc`` is not
+                provided.
+            from_assay: Assay used to resolve the latest KNN graph.
+            knn_loc: Explicit persisted KNN location.
+            perplexity: Effective neighborhood size. ``None`` uses
+                ``floor(k / 3)``.
+            scale: Invert and scale the median LISI by the number of observed
+                labels.
+
+        Returns:
+            Median cLISI, scaled so higher values indicate better label
+            conservation when ``scale`` is true.
+
+        Notes:
+            Scarf persisted KNN graphs exclude self-neighbors, as required by
+            this metric.
+        """
+        from ...metrics import clisi_knn
+
+        _, _, cell_key, distances, indices = self._load_metric_knn(
+            use_latest_knn,
+            from_assay,
+            knn_loc,
+        )
+        cell_labels = self.cells.fetch(label_colname, key=cell_key)
+        return clisi_knn(
+            distances,
+            indices,
+            cell_labels,
+            perplexity=perplexity,
+            scale=scale,
+        )
+
+    def metric_graph_connectivity(
+        self,
+        label_colname: str,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        graph_loc: str | None = None,
+    ) -> float:
+        """Score label connectivity on a persisted, symmetrized assay graph.
+
+        Args:
+            label_colname: Cell metadata column containing biological labels.
+            from_assay: Assay used to resolve the latest graph.
+            cell_key: Cell-selection key used to resolve the latest graph.
+            feat_key: Feature-selection key used to resolve the latest graph.
+            graph_loc: Explicit persisted standard-assay graph location.
+
+        Returns:
+            Mean fraction of cells retained in the largest connected component
+            for each label.
+
+        Notes:
+            Persisted directed edges are treated as undirected. This follows
+            the original scIB symmetrized-graph definition and intentionally
+            differs from the directed strong-component calculation currently
+            used by YosefLab ``scib-metrics``. Integrated graph locations are
+            rejected because they do not preserve safe cell-key provenance.
+        """
+        from ...metrics import graph_connectivity
+
+        if graph_loc is None:
+            from_assay, cell_key, feat_key = self._get_latest_keys(
+                from_assay,
+                cell_key,
+                feat_key,
+            )
+            graph_loc = self._get_latest_graph_loc(
+                from_assay,
+                cell_key,
+                feat_key,
+            )
+        else:
+            if graph_loc.startswith(self._integratedGraphsLoc):
+                raise ValueError(
+                    "Integrated graph connectivity is unavailable because the "
+                    "graph does not record its cell-key provenance"
+                )
+            if graph_loc not in self.zw:
+                raise ValueError(f"Could not find the graph at location: {graph_loc}")
+
+            path_parts = graph_loc.split("/")
+            if len(path_parts) < 2:
+                raise ValueError(
+                    f"Could not determine graph provenance from location: {graph_loc}"
+                )
+            normed_parts = path_parts[1].split("__")
+            if len(normed_parts) != 3 or normed_parts[0] != "normed":
+                raise ValueError(
+                    f"Could not determine graph provenance from location: {graph_loc}"
+                )
+
+            path_assay = path_parts[0]
+            _, path_cell_key, path_feat_key = normed_parts
+            if from_assay is not None and from_assay != path_assay:
+                raise ValueError("from_assay does not match the graph location")
+            if cell_key is not None and cell_key != path_cell_key:
+                raise ValueError("cell_key does not match the graph location")
+            if feat_key is not None and feat_key != path_feat_key:
+                raise ValueError("feat_key does not match the graph location")
+            from_assay = path_assay
+            cell_key = path_cell_key
+            feat_key = path_feat_key
+
+        n_cells, _ = self._get_graph_ncells_k(graph_loc)
+        labels = self.cells.fetch(label_colname, key=cell_key)
+        if len(labels) != n_cells:
+            raise ValueError("Graph labels must match the number of cells in the graph")
+
+        graph_grp = as_zarr_group(self.zw[graph_loc], name=graph_loc)
+        edges = as_zarr_array(graph_grp["edges"], name="edges")
+        return graph_connectivity(edges, labels)
+
+    def metric_graph_silhouette(
         self,
         use_latest_knn: bool = True,
         res_label: str = "leiden_cluster",
@@ -481,6 +684,31 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         )
         return scores
 
+    def metric_silhouette(
+        self,
+        use_latest_knn: bool = True,
+        res_label: str = "leiden_cluster",
+        from_assay: str | None = None,
+        knn_loc: str | None = None,
+        random_seed: int = 4444,
+        sample_size: int = 11,
+    ) -> np.ndarray | None:
+        """Deprecated alias for :meth:`metric_graph_silhouette`."""
+        warnings.warn(
+            "metric_silhouette is deprecated and will be removed in Scarf 2.0. "
+            "Use metric_graph_silhouette instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.metric_graph_silhouette(
+            use_latest_knn=use_latest_knn,
+            res_label=res_label,
+            from_assay=from_assay,
+            knn_loc=knn_loc,
+            random_seed=random_seed,
+            sample_size=sample_size,
+        )
+
     def metric_label_concordance(
         self,
         label_columns: Sequence[str],
@@ -490,8 +718,9 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
         This measures whether two labelings of the same cells agree, for
         example predicted clusters against imported reference annotations. It
-        does not measure batch mixing; use :meth:`metric_batch_mixing` or
-        :meth:`metric_lisi` for that.
+        does not measure batch mixing; use :meth:`metric_ilisi`,
+        :meth:`metric_proportional_batch_mixing`, or :meth:`metric_lisi`
+        for that.
 
         Args:
             label_columns: Exactly two cell metadata column names to compare.
@@ -520,18 +749,20 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         """Backward-compatible alias for :meth:`metric_label_concordance`.
 
         This method compares label agreement and does not measure neighborhood
-        mixing. Use :meth:`metric_batch_mixing` to evaluate batch integration.
+        mixing. Use :meth:`metric_ilisi` or
+        :meth:`metric_proportional_batch_mixing` to evaluate batch integration.
         """
         warnings.warn(
             "metric_integration is deprecated and will be removed in Scarf 2.0. "
-            "Use metric_label_concordance for ARI/NMI or metric_batch_mixing "
-            "for neighborhood integration quality.",
+            "Use metric_label_concordance for ARI/NMI, metric_ilisi for scIB "
+            "iLISI, or metric_proportional_batch_mixing for Scarf's "
+            "proportion-aware batch mixing score.",
             DeprecationWarning,
             stacklevel=2,
         )
         return self.metric_label_concordance(batch_labels, metric)
 
-    def metric_batch_mixing(
+    def metric_proportional_batch_mixing(
         self,
         label_colname: str,
         use_latest_knn: bool = True,
@@ -589,3 +820,26 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         _, cell_key, _ = normed_part.split("__")
         batch_labels = self.cells.fetch(label_colname, key=cell_key)
         return lisi_batch_mixing_score(lisi_result[0][1], batch_labels)
+
+    def metric_batch_mixing(
+        self,
+        label_colname: str,
+        use_latest_knn: bool = True,
+        from_assay: str | None = None,
+        knn_loc: str | None = None,
+        perplexity: float = 30,
+    ) -> float:
+        """Deprecated alias for :meth:`metric_proportional_batch_mixing`."""
+        warnings.warn(
+            "metric_batch_mixing is deprecated and will be removed in Scarf 2.0. "
+            "Use metric_proportional_batch_mixing instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.metric_proportional_batch_mixing(
+            label_colname=label_colname,
+            use_latest_knn=use_latest_knn,
+            from_assay=from_assay,
+            knn_loc=knn_loc,
+            perplexity=perplexity,
+        )

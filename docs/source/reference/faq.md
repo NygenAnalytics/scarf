@@ -29,7 +29,9 @@ Both merge modality-specific KNN graphs with `integrate_assays`. SNN (default) s
 
 ## How do I compute LISI in Scarf?
 
-Use `metric_lisi` on the latest KNN graph after integration. See {ref}`LISI metrics <lisi_metrics>`.
+Use `metric_lisi` for raw per-cell LISI values. Use `metric_ilisi` for a
+single scIB-scaled batch-mixing score and `metric_clisi` for a scIB-scaled
+biological-label conservation score. See {ref}`LISI metrics <lisi_metrics>`.
 
 ## Should I use tSNE or UMAP?
 
