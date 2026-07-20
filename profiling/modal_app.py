@@ -275,6 +275,7 @@ def run_stage_job(
 def probe_leiden_job(
     configDict: dict[str, Any],
     nRows: int,
+    backend: str = "igraph",
 ) -> dict[str, Any]:
     """Diagnose 5M Leiden: flushed probes before/during graph load and clustering.
 
@@ -282,6 +283,9 @@ def probe_leiden_job(
       WORKER_START -> open_datastore -> load_graph -> leiden_membership steps
     If WORKER_START never appears: Modal never ran our code.
     If probes stop mid-leiden: scale/algorithm issue.
+
+    Default backend is ``igraph`` (native community_leiden). Pass ``leidenalg``
+    to reproduce the historical path that hung in find_partition at ~4.6M cells.
     """
     import sys
 
@@ -290,7 +294,14 @@ def probe_leiden_job(
         sys.stdout.flush()
 
     _probe("WORKER_START")
+    if backend not in ("leidenalg", "igraph"):
+        raise ValueError(f"backend must be leidenalg or igraph, got {backend!r}")
     config = ProfilingConfig.model_validate(configDict)
+    config = config.model_copy(
+        update={
+            "workflow": config.workflow.model_copy(update={"leidenBackend": backend})
+        }
+    )
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     if nRows not in config.targetSizes:
         raise ValueError(f"size {nRows} is not in config.targetSizes")
@@ -301,6 +312,7 @@ def probe_leiden_job(
             "stage": "runLeiden",
             "status": "skipped",
             "resultUri": config.resultUri(nRows, "runLeiden"),
+            "backend": backend,
         }
 
     resources = config.resourcesFor("runLeiden")
@@ -313,10 +325,10 @@ def probe_leiden_job(
             "scarfMemoryBudget": heavy.scarfMemoryBudget,
         }
     )
-    work = _WORK / f"probe-leiden-{nRows}"
+    work = _WORK / f"probe-leiden-{nRows}-{backend}"
     work.mkdir(parents=True, exist_ok=True)
     store_uri = config.storeUri(nRows)
-    _probe(f"store={store_uri} memMb={resources.modalMemoryLimitMb}")
+    _probe(f"store={store_uri} memMb={resources.modalMemoryLimitMb} backend={backend}")
     _probe("ENTER run_stage(runLeiden)")
     result = run_stage(
         "runLeiden",
@@ -329,10 +341,12 @@ def probe_leiden_job(
     )
     write_result(config, result)
     _probe(
-        f"DONE status={result.status} seconds={result.seconds} error={result.error!r}"
+        f"DONE status={result.status} seconds={result.seconds} "
+        f"error={result.error!r} backend={backend}"
     )
     payload = result.to_json()
     payload["probe"] = True
+    payload["backend"] = backend
     return payload
 
 
@@ -690,6 +704,12 @@ def main(*arg_list: str) -> None:
     )
     probe_parser.add_argument("--config", required=True)
     probe_parser.add_argument("--size", type=int, required=True)
+    probe_parser.add_argument(
+        "--backend",
+        choices=("igraph", "leidenalg"),
+        default="igraph",
+        help="Leiden implementation (default: igraph native community_leiden)",
+    )
 
     io_parser = sub.add_parser("io-baseline")
     io_parser.add_argument("--config", required=True)
@@ -814,10 +834,10 @@ def main(*arg_list: str) -> None:
         call = (
             _deployed_function(config, "probe_leiden_job")
             .with_options(**options)
-            .spawn(payload, args.size)
+            .spawn(payload, args.size, args.backend)
         )
-        _print_spawned(f"probe_leiden_job {args.size}", call)
-        print("Watch for [probe_leiden] WORKER_START in app logs.")
+        _print_spawned(f"probe_leiden_job {args.size} backend={args.backend}", call)
+        print("Watch for [probe_leiden] WORKER_START and [leiden] backend=... in logs.")
         return
 
     if args.command == "io-baseline":

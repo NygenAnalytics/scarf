@@ -131,6 +131,79 @@ def _impute_feature_names(store: DataStore, workflow: WorkflowParameters) -> lis
     return candidates[: workflow.imputeGeneCount]
 
 
+def _run_native_igraph_leiden(
+    store: DataStore,
+    workflow: WorkflowParameters,
+) -> None:
+    """Profiling-only native igraph Leiden backend.
+
+    The historical implementation constructs an undirected multigraph with one
+    unit edge per nonzero entry, then runs RBConfigurationVertexPartition.
+    ``Adjacency(mode="plus")`` preserves that graph while avoiding a Python
+    list of tens of millions of edge tuples. Native modularity Leiden is the
+    matching igraph objective at the same resolution.
+    """
+    import random
+
+    import igraph
+
+    print("[igraph_leiden] ENTER load_graph", flush=True)
+    graph = store.load_graph(
+        from_assay=workflow.assayName,
+        cell_key=workflow.cellKey,
+        feat_key=workflow.hvgKey,
+        symmetric=False,
+        upper_only=False,
+    )
+    print(
+        f"[igraph_leiden] graph loaded shape={graph.shape} nnz={graph.nnz}; "
+        "building binary sparse adjacency",
+        flush=True,
+    )
+
+    binary = graph.copy()
+    binary.eliminate_zeros()
+    binary.data = np.ones(binary.nnz, dtype=np.int8)
+    igraph_graph = igraph.Graph.Adjacency(
+        binary,
+        mode="plus",
+        loops="once",
+    )
+    print(
+        f"[igraph_leiden] igraph built vertices={igraph_graph.vcount()} "
+        f"edges={igraph_graph.ecount()}; ENTER community_leiden",
+        flush=True,
+    )
+    del binary
+    del graph
+
+    rng = random.Random(workflow.leidenSeed)
+    igraph.set_random_number_generator(rng)
+    try:
+        clustering = igraph_graph.community_leiden(
+            objective_function="modularity",
+            weights=None,
+            resolution=workflow.leidenResolution,
+            n_iterations=2,
+        )
+    finally:
+        igraph.set_random_number_generator(random)
+
+    membership = np.asarray(clustering.membership, dtype=np.int64) + 1
+    print(
+        f"[igraph_leiden] community_leiden DONE "
+        f"clusters={int(membership.max()) if membership.size else 0}",
+        flush=True,
+    )
+    store.cells.insert(
+        workflow.resolvedMarkerGroupKey,
+        membership,
+        fill_value=-1,
+        key=workflow.cellKey,
+        overwrite=True,
+    )
+
+
 def _pseudotime_sources_sinks(
     store: DataStore, workflow: WorkflowParameters
 ) -> tuple[list[Any], list[Any]]:
@@ -343,17 +416,21 @@ def _run_analysis(
     if stage == "runLeiden":
         print(
             "[runLeiden] ENTER run_leiden_clustering "
-            f"resolution={workflow.leidenResolution} seed={workflow.leidenSeed}",
+            f"resolution={workflow.leidenResolution} seed={workflow.leidenSeed} "
+            f"backend={workflow.leidenBackend}",
             flush=True,
         )
-        store.run_leiden_clustering(
-            from_assay=workflow.assayName,
-            cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
-            resolution=workflow.leidenResolution,
-            label=workflow.leidenLabel,
-            random_seed=workflow.leidenSeed,
-        )
+        if workflow.leidenBackend == "igraph":
+            _run_native_igraph_leiden(store, workflow)
+        else:
+            store.run_leiden_clustering(
+                from_assay=workflow.assayName,
+                cell_key=workflow.cellKey,
+                feat_key=workflow.hvgKey,
+                resolution=workflow.leidenResolution,
+                label=workflow.leidenLabel,
+                random_seed=workflow.leidenSeed,
+            )
         print("[runLeiden] DONE run_leiden_clustering", flush=True)
         return
     if stage == "findMarkers":

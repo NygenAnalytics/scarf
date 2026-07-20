@@ -55,11 +55,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 raise KeyError(
                     f"ERROR: An integrated graph with label: {integrated_graph} does not exist"
                 )
-        print(
-            "[run_leiden_clustering] ENTER load_graph "
-            f"assay={from_assay} cell_key={cell_key} feat_key={feat_key}",
-            flush=True,
-        )
         graph = self.load_graph(
             from_assay=from_assay,
             cell_key=cell_key,
@@ -68,19 +63,9 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             upper_only=graph_upper_only,
             graph_loc=graph_loc,
         )
-        print(
-            f"[run_leiden_clustering] load_graph DONE shape={graph.shape} "
-            f"nnz={graph.nnz}; ENTER leiden_membership",
-            flush=True,
-        )
         if integrated_graph is not None:
             from_assay = integrated_graph
         membership = leiden_membership(graph, resolution, random_seed)
-        print(
-            f"[run_leiden_clustering] leiden_membership DONE "
-            f"n_labels={membership.size}",
-            flush=True,
-        )
         self.cells.insert(
             self._col_renamer(from_assay, cell_key, label),
             membership,
