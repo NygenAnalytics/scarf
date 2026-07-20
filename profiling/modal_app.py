@@ -267,6 +267,78 @@ def run_stage_job(
 @app.function(
     **COMMON_FUNCTION_OPTIONS,
     timeout=86_400,
+    # Fixed 64 GiB, no region pin on the function itself (broader capacity).
+    memory=65_536,
+    cpu=8.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def probe_leiden_job(
+    configDict: dict[str, Any],
+    nRows: int,
+) -> dict[str, Any]:
+    """Diagnose 5M Leiden: flushed probes before/during graph load and clustering.
+
+    Reads:
+      WORKER_START -> open_datastore -> load_graph -> leiden_membership steps
+    If WORKER_START never appears: Modal never ran our code.
+    If probes stop mid-leiden: scale/algorithm issue.
+    """
+    import sys
+
+    def _probe(msg: str) -> None:
+        print(f"[probe_leiden] {msg}", flush=True)
+        sys.stdout.flush()
+
+    _probe("WORKER_START")
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    if nRows not in config.targetSizes:
+        raise ValueError(f"size {nRows} is not in config.targetSizes")
+    if result_exists(config, nRows, "runLeiden"):
+        _probe("result already exists; skipping")
+        return {
+            "nRows": nRows,
+            "stage": "runLeiden",
+            "status": "skipped",
+            "resultUri": config.resultUri(nRows, "runLeiden"),
+        }
+
+    resources = config.resourcesFor("runLeiden")
+    # Prefer makeGraph RAM class for headroom while loading the 5M graph.
+    heavy = config.resourcesFor("makeGraph")
+    resources = resources.model_copy(
+        update={
+            "modalMemoryRequestMb": heavy.modalMemoryRequestMb,
+            "modalMemoryLimitMb": heavy.modalMemoryLimitMb,
+            "scarfMemoryBudget": heavy.scarfMemoryBudget,
+        }
+    )
+    work = _WORK / f"probe-leiden-{nRows}"
+    work.mkdir(parents=True, exist_ok=True)
+    store_uri = config.storeUri(nRows)
+    _probe(f"store={store_uri} memMb={resources.modalMemoryLimitMb}")
+    _probe("ENTER run_stage(runLeiden)")
+    result = run_stage(
+        "runLeiden",
+        nRows=nRows,
+        storeUri=store_uri,
+        workflow=config.workflow,
+        resources=resources,
+        storageLayout=config.storageLayout,
+        workDir=work,
+    )
+    write_result(config, result)
+    _probe(
+        f"DONE status={result.status} seconds={result.seconds} error={result.error!r}"
+    )
+    payload = result.to_json()
+    payload["probe"] = True
+    return payload
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
     memory=32_768,
     cpu=8.0,
     ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
@@ -609,6 +681,16 @@ def main(*arg_list: str) -> None:
         "--stages", nargs="*", choices=FULL_STAGE_ORDER, default=None
     )
 
+    probe_parser = sub.add_parser(
+        "probe-leiden",
+        help=(
+            "Diagnose Leiden on an existing store with flushed step probes "
+            "(WORKER_START / load_graph / leiden_membership)"
+        ),
+    )
+    probe_parser.add_argument("--config", required=True)
+    probe_parser.add_argument("--size", type=int, required=True)
+
     io_parser = sub.add_parser("io-baseline")
     io_parser.add_argument("--config", required=True)
     io_parser.add_argument("--size", type=int, default=1_000_000)
@@ -717,6 +799,25 @@ def main(*arg_list: str) -> None:
             .spawn(payload, args.size, stages)
         )
         _print_spawned(f"run_local_funnel_job {args.size}", call)
+        return
+
+    if args.command == "probe-leiden":
+        if args.size not in config.targetSizes:
+            raise SystemExit(f"size {args.size} is not in config.targetSizes")
+        # Secrets/env only; keep function memory (64 GiB) and do not pin region.
+        options = modal_function_options(
+            config,
+            config.resourcesFor("makeGraph"),
+            maxContainers=1,
+        )
+        options.pop("region", None)
+        call = (
+            _deployed_function(config, "probe_leiden_job")
+            .with_options(**options)
+            .spawn(payload, args.size)
+        )
+        _print_spawned(f"probe_leiden_job {args.size}", call)
+        print("Watch for [probe_leiden] WORKER_START in app logs.")
         return
 
     if args.command == "io-baseline":

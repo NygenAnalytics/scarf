@@ -236,8 +236,17 @@ def run_stage(
                 del ref
             else:
                 with timer.operation():
+                    print(
+                        f"[run_stage] ENTER open_datastore stage={stage} "
+                        f"store={storeUri}",
+                        flush=True,
+                    )
                     store = _open_datastore(
                         storeUri, workflow, resources, initialize=False
+                    )
+                    print(
+                        f"[run_stage] datastore open; ENTER analysis stage={stage}",
+                        flush=True,
                     )
                     _run_analysis(
                         stage,
@@ -246,6 +255,7 @@ def run_stage(
                         resources,
                         workDir=workDir,
                     )
+                    print(f"[run_stage] analysis DONE stage={stage}", flush=True)
                     del store
         except Exception as exc:
             status = "error"
@@ -331,6 +341,11 @@ def _run_analysis(
         )
         return
     if stage == "runLeiden":
+        print(
+            "[runLeiden] ENTER run_leiden_clustering "
+            f"resolution={workflow.leidenResolution} seed={workflow.leidenSeed}",
+            flush=True,
+        )
         store.run_leiden_clustering(
             from_assay=workflow.assayName,
             cell_key=workflow.cellKey,
@@ -339,6 +354,7 @@ def _run_analysis(
             label=workflow.leidenLabel,
             random_seed=workflow.leidenSeed,
         )
+        print("[runLeiden] DONE run_leiden_clustering", flush=True)
         return
     if stage == "findMarkers":
         store.run_marker_search(

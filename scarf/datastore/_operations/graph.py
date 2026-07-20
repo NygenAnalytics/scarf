@@ -1249,7 +1249,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         Returns:
 
         """
-        logger.debug(f"Loading graph from location: {graph_loc}")
+        logger.info(f"Loading graph from location: {graph_loc}")
+        print(f"[load_graph] ENTER loc={graph_loc}", flush=True)
         store = as_zarr_group(self.zw[graph_loc], name=graph_loc)
         n_cells, k = self._get_graph_ncells_k(graph_loc)
         # TODO: can we have a progress bar for graph loading. Append to coo matrix?
@@ -1263,18 +1264,25 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             indexer = np.tile([True] * use_k + [False] * (k - use_k), n_cells)
         else:
             indexer = None
+        print(
+            f"[load_graph] reading weights/edges n_cells={n_cells} k={k} use_k={use_k}",
+            flush=True,
+        )
         w = np.asarray(as_zarr_array(store["weights"], name="weights")[:])
         e = np.asarray(as_zarr_array(store["edges"], name="edges")[:])
         if indexer is not None:
             w, e = w[indexer], e[indexer]
+        print(
+            f"[load_graph] arrays loaded weights={w.nbytes}B edges={e.nbytes}B; "
+            f"building {sparse_format}",
+            flush=True,
+        )
         if sparse_format == "csr":
-            return n_cells, csr_matrix(
-                (w, (e[:, 0], e[:, 1])), shape=(n_cells, n_cells)
-            )
+            matrix = csr_matrix((w, (e[:, 0], e[:, 1])), shape=(n_cells, n_cells))
         else:
-            return n_cells, coo_matrix(
-                (w, (e[:, 0], e[:, 1])), shape=(n_cells, n_cells)
-            )
+            matrix = coo_matrix((w, (e[:, 0], e[:, 1])), shape=(n_cells, n_cells))
+        print(f"[load_graph] DONE nnz={matrix.nnz}", flush=True)
+        return n_cells, matrix
 
     @staticmethod
     def _resolve_local_cache_plan(
