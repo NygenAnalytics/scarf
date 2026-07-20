@@ -302,9 +302,13 @@ the PCA reduction group as `harmonizedData` with `isHarmonized=True`.
 Metadata changes, graph caches, and marker results are written to the Zarr store. Exported
 marker tables go to the path passed to `csv_filename`.
 
+WAGGR and AUCell results are stored below `<assay>/enrichment/<label>`. See
+{doc}`gene_set_enrichment` for the scoring and loading APIs.
+
 ## Next steps
 
 - {doc}`import_and_export`
+- {doc}`gene_set_enrichment`
 - {doc}`plotting`
 - {doc}`dimensionality_reduction_and_clustering`
 - {doc}`../developers/zarr_internals`

@@ -50,6 +50,7 @@ _METHODS = {
         "export_markers_to_csv",
         "filter_cells",
         "get_assay",
+        "get_enrichment",
         "get_markers",
         "make_bulk",
         "mark_hto_identities",
@@ -65,11 +66,13 @@ _METHODS = {
         "metric_lisi",
         "metric_proportional_batch_mixing",
         "metric_silhouette",
+        "run_aucell",
         "run_cell_cycle_scoring",
         "run_doublet_detection",
         "run_marker_search",
         "run_pseudotime_aggregation",
         "run_pseudotime_marker_search",
+        "run_waggr",
         "show_zarr_tree",
         "smart_label",
         "to_anndata",
@@ -80,7 +83,7 @@ _SIGNATURE_DIGESTS = {
     BaseDataStore: "ed2e08a687942d2339c1ab09bf1eac3af20c290319cf527b8662fb937a401cd2",
     GraphDataStore: "0f6098aa5ab1e926da212aa882dc90ab07fc632a302a45eb79ce353b5e228d59",
     MappingDatastore: "a1e2fe91d8430b54a2a67f42c537a8a5e189691f81e2fddc8a959e1fd87fb3a9",
-    DataStore: "a0f2ab91f02cf4268673541c70f00d7141cbc4920bb78b97bf87ccfb331374cc",
+    DataStore: "5bb9c3410c65c4a99885df4ed9843cd9003c672304e597bc392227aa39ecb47e",
 }
 
 
@@ -368,6 +371,9 @@ def test_feature_selection_and_pseudotime_methods_have_domain_owners():
     )
 
     assert "mark_hvgs" in _FeatureOperationsMixin.__dict__
+    assert "get_enrichment" in _FeatureOperationsMixin.__dict__
+    assert "run_aucell" in _FeatureOperationsMixin.__dict__
+    assert "run_waggr" in _FeatureOperationsMixin.__dict__
     assert "mark_hvgs" not in _QualityControlOperationsMixin.__dict__
     assert "run_fate_mapping" in _TrajectoryOperationsMixin.__dict__
     assert "run_fate_mapping" not in _TrajectoryFeatureOperationsMixin.__dict__

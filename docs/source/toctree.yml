@@ -52,6 +52,8 @@ subtrees:
         title: Dimensionality reduction and clustering
       - file: tutorials/annotation
         title: Annotation
+      - file: tutorials/gene_set_enrichment
+        title: Gene-set enrichment
       - file: tutorials/pseudotime
         title: Pseudotime
       - file: tutorials/fate_mapping

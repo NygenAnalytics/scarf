@@ -522,6 +522,7 @@ def test_features_facades_defer_nested_implementations():
             """
 import sys
 
+import scarf
 import scarf.features as features
 
 assert "scarf.features.variability" not in sys.modules
@@ -529,6 +530,23 @@ assert "scarf.features.genomic.gff" not in sys.modules
 assert "scarf.features.genomic.melding" not in sys.modules
 assert "scarf.features.markers.batching" not in sys.modules
 assert "scarf.features.markers.search" not in sys.modules
+assert "scarf.features.enrichment" not in sys.modules
+assert "scarf.features.enrichment.net" not in sys.modules
+assert "scarf.features.enrichment.results" not in sys.modules
+assert "scarf.features.enrichment.aucell" not in sys.modules
+assert "scarf.features.enrichment.waggr" not in sys.modules
+
+_ = scarf.read_gmt
+assert "scarf.features.enrichment.net" in sys.modules
+assert "scarf.features.enrichment.results" not in sys.modules
+assert "scarf.features.enrichment.aucell" not in sys.modules
+assert "scarf.features.enrichment.waggr" not in sys.modules
+assert features.read_gmt is scarf.read_gmt
+
+_ = features.EnrichmentResult
+assert "scarf.features.enrichment.results" in sys.modules
+assert "scarf.features.enrichment.aucell" not in sys.modules
+assert "scarf.features.enrichment.waggr" not in sys.modules
 
 _ = features.resolve_marker_gene_batch_size
 assert "scarf.features.markers.batching" in sys.modules

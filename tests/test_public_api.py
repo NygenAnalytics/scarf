@@ -15,6 +15,7 @@ _EXPECTED_EXPORTS = {
     "CrToZarr": "scarf.writers",
     "DataStore": "scarf.datastore.datastore",
     "DatasetMerge": "scarf.merge",
+    "EnrichmentResult": "scarf.features.enrichment.results",
     "FateMappingResult": "scarf.trajectory.results",
     "GffReader": "scarf.features.genomic.gff",
     "H5adReader": "scarf.readers",
@@ -42,6 +43,7 @@ _EXPECTED_EXPORTS = {
     "logger": "scarf.utils",
     "permute_into_chunks": "scarf.utils",
     "prefetch_blocks": "scarf.utils",
+    "read_gmt": "scarf.features.enrichment.net",
     "rescale_array": "scarf.utils",
     "rolling_window": "scarf.utils",
     "set_verbosity": "scarf.utils",
@@ -242,6 +244,11 @@ def test_domain_packages_export_canonical_objects():
         ("scarf.embeddings", "run_harmony"): "scarf.embeddings.harmony",
         ("scarf.features", "binned_sampling"): "scarf.features.scoring",
         ("scarf.features", "fit_lowess"): "scarf.features.variability",
+        (
+            "scarf.features",
+            "EnrichmentResult",
+        ): "scarf.features.enrichment.results",
+        ("scarf.features", "read_gmt"): "scarf.features.enrichment.net",
         (
             "scarf.features",
             "select_highly_variable_features",

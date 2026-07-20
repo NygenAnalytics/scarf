@@ -95,6 +95,7 @@ nitpick_ignore = [
     ("py:class", "zarr.core.group.Group"),
     ("py:class", "zarr.core.array.Array"),
     ("py:class", "pathlib.Path"),
+    ("py:class", "os.PathLike"),
     ("py:class", "collections.abc.Callable"),
     ("py:class", "collections.abc.Iterable"),
     ("py:class", "collections.abc.Iterator"),

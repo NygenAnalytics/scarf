@@ -1,0 +1,210 @@
+---
+jupytext:
+  text_representation:
+    extension: .md
+    format_name: myst
+    format_version: 0.13
+    jupytext_version: 1.14.1
+kernelspec:
+  display_name: Python 3 (ipykernel)
+  language: python
+  name: python3
+---
+
+(gene_set_enrichment)=
+
+# Gene-set enrichment
+
+Score pathway or cell-state signatures per cell with WAGGR or AUCell. Both methods stream
+RNA counts from the Zarr store and persist their score matrices for later use.
+
+## Prerequisites
+
+- Scarf installed with the `extra` optional dependencies
+- An RNA assay with feature names that match the identifiers in your gene sets
+- A basic understanding of cell metadata and embeddings
+
+## What you will learn
+
+- Read gene sets from GMT and inspect feature overlap
+- Score weighted signatures with WAGGR
+- Score rank-based signatures with AUCell
+- Load selected score columns without materializing the full result
+
+## Dataset
+
+This page uses the 5K PBMC dataset from {doc}`scrna_seq`. The setup below is standalone.
+
+```{code-cell} ipython3
+from pathlib import Path
+
+import scarf
+import scarf.plotting as splt
+
+scarf.set_verbosity('WARNING')
+
+scarf.fetch_dataset(
+    'tenx_5K_pbmc_rnaseq',
+    save_path='scarf_datasets',
+    as_zarr=True,
+)
+ds = scarf.DataStore(
+    'scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr',
+    nthreads=4,
+    min_features_per_cell=10,
+)
+ds.filter_cells(
+    attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
+    highs=[15000, 4000, 15],
+    lows=[1000, 500, 0],
+    reset_previous=True,
+)
+
+if 'RNA_UMAP1' not in ds.cells.columns:
+    ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
+    ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
+    ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
+```
+
+## 1) Read and inspect gene sets
+
+GMT stores one source per line. The first field is the source name, the second is a
+description, and the remaining fields are target genes. `read_gmt` returns one
+source-target row per gene.
+
+```{code-cell} ipython3
+gmt_path = Path('scarf_datasets/pbmc_signatures.gmt')
+gmt_path.write_text(
+    'T_cell\tna\tCD3D\tCD3E\tTRAC\tLTB\tIL7R\n'
+    'B_cell\tna\tMS4A1\tCD79A\tCD37\tCD74\tHLA-DRA\n'
+    'Myeloid\tna\tLST1\tS100A8\tS100A9\tCTSS\tFCER1G\n',
+    encoding='utf-8',
+)
+gene_sets = scarf.read_gmt(gmt_path)
+gene_sets
+```
+
+Targets are matched to active RNA feature names without case sensitivity. `tmin` is applied
+after matching, so a source is retained only when enough of its targets are present. Missing
+targets do not need to be removed from the input table first.
+
+```{code-cell} ipython3
+available = {str(name).upper() for name in ds.RNA.feats.fetch('names')}
+(
+    gene_sets.assign(
+        matched=gene_sets['target'].str.upper().isin(available),
+    )
+    .groupby('source')['matched']
+    .agg(['sum', 'count'])
+)
+```
+
+## 2) Score weighted signatures with WAGGR
+
+WAGGR applies edge weights to library-size-normalized expression. `wmean` divides each
+weighted sum by the sum of absolute weights, while `wsum` leaves the weighted sum
+unscaled. Signed weights are supported.
+
+```{code-cell} ipython3
+weighted_sets = gene_sets.assign(weight=1.0)
+weighted_sets.loc[
+    weighted_sets['target'].isin(['S100A8', 'S100A9']),
+    'weight',
+] = 1.5
+
+waggr = ds.run_waggr(
+    weighted_sets,
+    label='pbmc_waggr',
+    mode='wmean',
+    tmin=3,
+    overwrite=True,
+)
+waggr.source_names, waggr.data.shape
+```
+
+WAGGR uses Scarf's default RNA library-size normalization. Set `log_transform=True` to
+apply `log1p` before aggregation.
+
+## 3) Score rank recovery with AUCell
+
+AUCell ranks the selected RNA features within each cell and measures how early a source's
+targets are recovered. Scores range from zero to one. Network weights are ignored.
+
+`feat_key` defines the ranking universe. Here the default `I` feature key ranks all active
+features. `n_up=500` evaluates recovery within the top 500 ranks.
+
+```{code-cell} ipython3
+aucell = ds.run_aucell(
+    gene_sets,
+    label='pbmc_aucell',
+    tmin=3,
+    n_up=500,
+    tie_seed=0,
+    overwrite=True,
+)
+aucell.source_names, aucell.data.shape
+```
+
+The same `tie_seed` gives a deterministic global ordering for equal expression values.
+Changing `n_up`, `tie_seed`, the feature selection, or the network creates a different
+execution.
+
+## 4) Load selected sources and visualize a score
+
+`get_enrichment` returns a lazy result. Selecting sources first avoids loading unrelated
+columns.
+
+```{code-cell} ipython3
+myeloid = ds.get_enrichment(
+    'pbmc_aucell',
+    sources=['Myeloid'],
+)
+myeloid_scores = myeloid.data.compute().ravel()
+
+ds.cells.insert(
+    'Myeloid_AUCell',
+    myeloid_scores,
+    key=myeloid.cell_key,
+    overwrite=True,
+)
+splt.embedding(
+    ds,
+    layout_key='RNA_UMAP',
+    color_by='Myeloid_AUCell',
+    sort_values=True,
+)
+```
+
+## Choosing a method
+
+- Use WAGGR when edge weights or signed targets carry useful information and expression
+  magnitude should affect the score.
+- Use AUCell when relative within-cell ranks are preferable to expression magnitude.
+- Treat both outputs as activity scores, not p-values. Scores from different feature
+  universes or AUCell `n_up` values are not directly interchangeable.
+
+## Common mistakes and limitations
+
+- Using identifiers that do not match the assay feature names
+- Setting `tmin` above the number of targets that remain after feature matching
+- Passing an HVG key to AUCell without intending to restrict its ranking universe
+- Comparing WAGGR runs that use different normalization or log-transform settings
+- Reusing a label for different inputs without `overwrite=True`
+- Editing the count matrix outside Scarf after a result has been cached
+
+## Saved results
+
+Results are stored below `<assay>/enrichment/<label>`. Repeating an identical call returns
+the cached result. `overwrite=True` keeps the previous complete result available until its
+replacement has finished writing.
+
+```{code-cell} ipython3
+ds.get_enrichment('pbmc_waggr').storage_path
+```
+
+## Next steps
+
+- {doc}`annotation`
+- {doc}`cell_cycle`
+- {doc}`data_organization`
+- {doc}`../reference/api/datastore`

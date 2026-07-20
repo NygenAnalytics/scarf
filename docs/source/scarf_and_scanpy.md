@@ -31,6 +31,7 @@ For plotting calls, `splt` means `import scarf.plotting as splt`.
 | UMAP | `sc.tl.umap` | `run_umap` |
 | Clustering | `sc.tl.leiden` | `run_leiden_clustering` (also Paris hierarchical clustering) |
 | Markers | `sc.tl.rank_genes_groups` | `run_marker_search` / `get_markers` (Mann-Whitney U scores and p-values; no FDR correction) |
+| Gene-set activity | `decoupler` or `sc.tl.score_genes` | `run_waggr` / `run_aucell` |
 | Plotting | `sc.pl.*` | `splt.embedding`, `splt.dotplot`, and other `scarf.plotting` functions |
 | Export | write H5AD | `to_anndata`, `scarf.to_h5ad`, MTX helpers |
 
@@ -102,4 +103,5 @@ need for the next tool.
 
 - {ref}`Quick start <quickstart>`
 - {doc}`tutorials/scrna_seq`
+- {doc}`tutorials/gene_set_enrichment`
 - {doc}`tutorials/import_and_export`

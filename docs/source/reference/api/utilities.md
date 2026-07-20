@@ -19,3 +19,7 @@
 ```{eval-rst}
 .. autofunction:: scarf.controlled_compute
 ```
+
+```{eval-rst}
+.. autofunction:: scarf.read_gmt
+```

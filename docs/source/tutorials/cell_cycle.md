@@ -186,6 +186,7 @@ Scarf stores `RNA_cell_cycle_phase`, `RNA_S_score`, and `RNA_G2M_score` in cell 
 
 ## Next steps
 
+- {doc}`gene_set_enrichment`
 - {doc}`plotting`
 - {doc}`annotation`
 - {doc}`data_organization`

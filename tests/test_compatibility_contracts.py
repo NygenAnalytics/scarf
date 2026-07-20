@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import scarf
+import scarf.features as feature_algorithms
 import scarf.mapping as mapping
 import scarf.trajectory as trajectory
 from scarf.merge import ZarrMerge
@@ -28,6 +29,18 @@ _EXPECTED_TRAJECTORY_EXPORTS = (
 )
 
 _EXPECTED_RESULT_FIELDS = {
+    feature_algorithms.EnrichmentResult: (
+        "data",
+        "source_names",
+        "source_sizes",
+        "cell_index",
+        "label",
+        "storage_path",
+        "assay",
+        "cell_key",
+        "feature_key",
+        "method",
+    ),
     mapping.MappingResult: (
         "projection_path",
         "n_cells",
@@ -86,6 +99,7 @@ _EXPECTED_RESULT_FIELDS = {
 
 
 def test_result_facades_and_constructor_fields_are_stable():
+    assert scarf.EnrichmentResult is feature_algorithms.EnrichmentResult
     assert scarf.MappingResult is mapping.MappingResult
     assert tuple(trajectory.__all__) == _EXPECTED_TRAJECTORY_EXPORTS
     for name in (
@@ -114,6 +128,18 @@ def test_result_facades_and_constructor_fields_are_stable():
 
 def test_result_records_reject_attribute_assignment():
     records = (
+        feature_algorithms.EnrichmentResult(
+            SimpleNamespace(shape=(2, 1)),
+            np.array(["set"]),
+            np.array([2]),
+            np.array([0, 1]),
+            "label",
+            "RNA/enrichment/label",
+            "RNA",
+            "I",
+            "I",
+            "waggr",
+        ),
         mapping.MappingResult("projection", 2, "none", {}),
         trajectory.FateMappingResult(
             ("fate_A", "fate_B"),

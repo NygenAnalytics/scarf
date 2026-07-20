@@ -45,6 +45,10 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .datastore.datastore import DataStore as DataStore
+    from .features.enrichment import (
+        EnrichmentResult as EnrichmentResult,
+        read_gmt as read_gmt,
+    )
     from .readers.datasets import (
         fetch_dataset as fetch_dataset,
         show_available_datasets as show_available_datasets,
@@ -129,6 +133,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "CrToZarr": (".writers", "CrToZarr"),
     "DataStore": (".datastore.datastore", "DataStore"),
     "DatasetMerge": (".merge", "DatasetMerge"),
+    "EnrichmentResult": (".features.enrichment", "EnrichmentResult"),
     "FateMappingResult": (".trajectory.results", "FateMappingResult"),
     "GffReader": (".features.genomic.gff", "GffReader"),
     "H5adReader": (".readers", "H5adReader"),
@@ -165,6 +170,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "logger": (".utils", "logger"),
     "permute_into_chunks": (".utils", "permute_into_chunks"),
     "prefetch_blocks": (".utils", "prefetch_blocks"),
+    "read_gmt": (".features.enrichment", "read_gmt"),
     "rescale_array": (".utils", "rescale_array"),
     "rolling_window": (".utils", "rolling_window"),
     "set_verbosity": (".utils", "set_verbosity"),

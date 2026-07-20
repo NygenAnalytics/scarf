@@ -24,6 +24,9 @@ are extending Scarf.
 
 .. autoclass:: scarf.PseudotimeAggregationResult
     :members:
+
+.. autoclass:: scarf.EnrichmentResult
+    :members:
 ```
 
 ## Inheritance appendix

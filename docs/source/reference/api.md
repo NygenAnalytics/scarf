@@ -4,6 +4,7 @@
 Public Scarf surfaces for analysts:
 
 - `DataStore` and its documented methods
+- `EnrichmentResult` and `read_gmt` for gene-set scoring
 - Readers and writers that create or export Zarr stores
 - `scarf.plotting`
 - Documented integration metrics (`DataStore.metric_*`; `scarf.metrics` holds the underlying functions)

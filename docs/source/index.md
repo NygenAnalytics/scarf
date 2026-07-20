@@ -34,7 +34,7 @@ The methods paper is published in [Nature Communications](https://doi.org/10.103
 - Installing Scarf and running a minimal scRNA-seq pipeline
 - End-to-end tutorials for scRNA-seq, scATAC-seq, and CITE-seq
 - Quality control, feature selection, neighbourhood graphs, embeddings, and clustering
-- Marker genes, annotation, and subsetting with cell keys
+- Marker genes, gene-set enrichment, annotation, and subsetting with cell keys
 - Merging batches, Harmony, partial PCA, and integration metrics
 - Mapping query cells to a reference and transferring labels
 - Multimodal SNN/WNN integration
@@ -59,7 +59,7 @@ lower-memory path for large data, start with {doc}`scarf_and_scanpy`.
 1. **Get started**: installation, quick start, and Scarf compared with Scanpy
 2. **Introductory tutorials**: canonical scRNA-seq, scATAC-seq, CITE-seq, import/export, plotting
 3. **Data integration and mapping**: method choice, merge/Harmony, metrics, label transfer, reference atlases
-4. **Other analyses**: QC depth, cell cycle, pseudotime, imputation, downsampling
+4. **Other analyses**: QC depth, gene-set enrichment, cell cycle, pseudotime, imputation, downsampling
 5. **Reference**: API, glossary, FAQ, citation
 6. **Developers**: contributing and internals
 
@@ -92,6 +92,7 @@ Capability links:
 - One scRNA-seq dataset: {doc}`tutorials/scrna_seq`
 - Merge batches: {doc}`tutorials/data_integration`
 - CITE-seq: {doc}`tutorials/cite_seq`
+- Score gene sets: {doc}`tutorials/gene_set_enrichment`
 - Map to a reference: {doc}`tutorials/reference_atlas`
 - Downsample large data: {doc}`tutorials/downsampling`
 

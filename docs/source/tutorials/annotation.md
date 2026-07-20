@@ -226,6 +226,7 @@ splt.embedding(
 
 ## Next steps
 
+- {doc}`gene_set_enrichment`
 - {doc}`pseudobulk_and_differential_expression`
 - {doc}`mapping_and_label_transfer`
 - {doc}`plotting`

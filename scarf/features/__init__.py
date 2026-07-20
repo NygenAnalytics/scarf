@@ -2,6 +2,10 @@ from importlib import import_module as _import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from .enrichment import (
+        EnrichmentResult as EnrichmentResult,
+        read_gmt as read_gmt,
+    )
     from .genomic import (
         GffReader as GffReader,
         binary_search as binary_search,
@@ -25,6 +29,7 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "EnrichmentResult",
     "GffReader",
     "binary_search",
     "binned_sampling",
@@ -37,12 +42,14 @@ __all__ = [
     "get_feature_mappings",
     "get_ranges",
     "mannwhitneyu_from_ranks",
+    "read_gmt",
     "resolve_marker_gene_batch_size",
     "select_highly_variable_features",
     "sort_marker_results",
 ]
 
 _LAZY_EXPORTS = {
+    "EnrichmentResult": (".enrichment", "EnrichmentResult"),
     "GffReader": (".genomic", "GffReader"),
     "binary_search": (".genomic", "binary_search"),
     "binned_sampling": (".scoring", "binned_sampling"),
@@ -55,6 +62,7 @@ _LAZY_EXPORTS = {
     "get_feature_mappings": (".genomic", "get_feature_mappings"),
     "get_ranges": (".genomic", "get_ranges"),
     "mannwhitneyu_from_ranks": (".markers", "mannwhitneyu_from_ranks"),
+    "read_gmt": (".enrichment", "read_gmt"),
     "resolve_marker_gene_batch_size": (
         ".markers",
         "resolve_marker_gene_batch_size",

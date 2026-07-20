@@ -307,5 +307,6 @@ Annotation from markers, known gene panels, and subclustering is covered in
 
 - {doc}`quality_control`
 - {doc}`annotation`
+- {doc}`gene_set_enrichment`
 - {doc}`plotting`
 - {doc}`data_integration`
