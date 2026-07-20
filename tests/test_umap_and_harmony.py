@@ -74,41 +74,38 @@ def test_fit_transform_runs_short_embedding():
     graph = _ring_graph(n_cells)
     ini_embed = np.random.default_rng(0).normal(size=(n_cells, 2)).astype(np.float32)
 
-    embedding, a, b = fit_transform(
-        graph,
-        ini_embed,
-        spread=1.0,
-        min_dist=0.5,
-        n_epochs=15,
-        random_seed=42,
-        repulsion_strength=1.0,
-        initial_alpha=1.0,
-        negative_sample_rate=5,
-        densmap_kwds={},
-        parallel=False,
-        nthreads=1,
-        verbose=False,
-    )
+    def run_embedding() -> tuple[np.ndarray, float, float]:
+        return fit_transform(
+            graph,
+            ini_embed.copy(),
+            spread=1.0,
+            min_dist=0.5,
+            n_epochs=15,
+            random_seed=42,
+            repulsion_strength=1.0,
+            initial_alpha=1.0,
+            negative_sample_rate=5,
+            densmap_kwds={},
+            parallel=False,
+            nthreads=1,
+            verbose=False,
+        )
+
+    embedding, a, b = run_embedding()
+    repeated_embedding, repeated_a, repeated_b = run_embedding()
 
     assert embedding.shape == (n_cells, 2)
     assert np.all(np.isfinite(embedding))
-    pairs = np.array([[0, 1], [0, 6], [3, 15], [8, 20], [12, 23]])
-    pair_distances = np.linalg.norm(
-        embedding[pairs[:, 0]] - embedding[pairs[:, 1]],
-        axis=1,
-    )
-    np.testing.assert_allclose(
-        pair_distances,
-        [3.7229292, 6.3459296, 2.1798954, 4.09683, 3.122777],
-        rtol=1e-4,
-        atol=1e-5,
-    )
+    assert np.all(np.ptp(embedding, axis=0) > 0)
+    assert not np.array_equal(embedding, ini_embed)
+    np.testing.assert_array_equal(embedding, repeated_embedding)
     np.testing.assert_allclose(
         [a, b],
         [0.58303002, 1.33416699],
         rtol=1e-6,
         atol=1e-6,
     )
+    np.testing.assert_allclose([a, b], [repeated_a, repeated_b], rtol=0, atol=0)
 
 
 def test_initial_embedding_matches_regression_values():

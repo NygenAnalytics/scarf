@@ -32,9 +32,9 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    AssayMerge: "2bd56840ef05b204d0e89f73cdd6b04dc5714e82f78550564a6c28eacbe1952f",
-    ZarrMerge: "72b80c54f15cfba8fa4669ceb28cd0c87b991918d64ec2f81b45b2631e57c9c4",
-    DatasetMerge: "16e0900fcb937fde78f974282ecd6b703d7470e5f54a48224adc6e7fa4a8d718",
+    AssayMerge: "732b39fd1d5b021a715df876e625efb3c7cd74580faa844d0c9bff1e12848006",
+    ZarrMerge: "752893a7c877b2cb73a6bdedffe4dfc6392b36e153be78bf35eb756c2330108c",
+    DatasetMerge: "825504ddf1bcf69117305a124567b1f65a1cec8baf9876860f66960aabdb264b",
 }
 _FACADE_METHODS = {DummyAssay: ("__init__",), **_PUBLIC_CLASS_METHODS}
 

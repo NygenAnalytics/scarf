@@ -1,5 +1,8 @@
+import inspect
+
 import numpy as np
 from scipy.io import mmread
+from scipy.sparse import csr_matrix
 
 
 def test_export_knn_to_mtx(datastore, make_graph, tmp_path):
@@ -16,7 +19,10 @@ def test_export_knn_to_mtx(datastore, make_graph, tmp_path):
     ret_val = export_knn_to_mtx(fn, graph)
     assert ret_val is None
 
-    actual = mmread(fn, spmatrix=True).tocsr()
+    read_options = (
+        {"spmatrix": True} if "spmatrix" in inspect.signature(mmread).parameters else {}
+    )
+    actual = csr_matrix(mmread(fn, **read_options))
     expected = graph.tocsr(copy=True)
     actual.sort_indices()
     expected.sort_indices()
