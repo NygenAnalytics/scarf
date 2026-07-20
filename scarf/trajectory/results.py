@@ -1,9 +1,40 @@
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from ..matrix import ChunkedArray
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class FateMappingResult:
+    """Saved fate probabilities aligned to cells selected by result_cell_key."""
+
+    fate_keys: tuple[str, ...]
+    validity_key: str
+    sink_labels: tuple[Any, ...]
+    assay: str
+    graph_cell_key: str
+    result_cell_key: str
+    feature_key: str
+    pseudotime_key: str
+    sink_key: str
+    values: np.ndarray = field(repr=False)
+    valid: np.ndarray = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if self.values.ndim != 2:
+            raise ValueError("Fate probabilities must be two-dimensional")
+        if self.valid.ndim != 1:
+            raise ValueError("Fate validity must be one-dimensional")
+        if self.values.shape[0] != self.valid.shape[0]:
+            raise ValueError("Fate probabilities and validity rows must align")
+        n_sinks = self.values.shape[1]
+        if n_sinks != len(self.fate_keys) or n_sinks != len(self.sink_labels):
+            raise ValueError(
+                "Fate probability columns, keys, and sink labels must align"
+            )
 
 
 @dataclass(frozen=True, slots=True, eq=False)

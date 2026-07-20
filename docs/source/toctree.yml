@@ -54,6 +54,8 @@ subtrees:
         title: Annotation
       - file: tutorials/pseudotime
         title: Pseudotime
+      - file: tutorials/fate_mapping
+        title: Multi-sink fate mapping
       - file: tutorials/cell_cycle
         title: Cell cycle
       - file: tutorials/imputation

@@ -67,6 +67,7 @@ if TYPE_CHECKING:
         LoomReader as LoomReader,
     )
     from .trajectory.results import (
+        FateMappingResult as FateMappingResult,
         PseudotimeAggregationResult as PseudotimeAggregationResult,
         PseudotimeMarkerResult as PseudotimeMarkerResult,
         PseudotimeScoreResult as PseudotimeScoreResult,
@@ -128,6 +129,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "CrToZarr": (".writers", "CrToZarr"),
     "DataStore": (".datastore.datastore", "DataStore"),
     "DatasetMerge": (".merge", "DatasetMerge"),
+    "FateMappingResult": (".trajectory.results", "FateMappingResult"),
     "GffReader": (".features.genomic.gff", "GffReader"),
     "H5adReader": (".readers", "H5adReader"),
     "H5adToZarr": (".writers", "H5adToZarr"),

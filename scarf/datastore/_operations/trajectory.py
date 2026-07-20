@@ -11,6 +11,10 @@ from ...trajectory.feature_dynamics import (
     scatter_feature_clusters as _scatter_feature_clusters_impl,
     validate_pseudotime_regressor,
 )
+from ...trajectory.fate import (
+    compute_fate_probabilities as _compute_fate_probabilities_impl,
+    make_sink_tokens as _make_sink_tokens_impl,
+)
 from ...trajectory.pseudotime import (
     make_source_sink_vector as _make_source_sink_vector_impl,
     random_walk_laplacian_transpose as _random_walk_laplacian_transpose_impl,
@@ -20,6 +24,7 @@ from ...trajectory.pseudotime import (
     validate_source_sink_vector as _validate_source_sink_vector_impl,
 )
 from ...trajectory.results import (
+    FateMappingResult,
     PseudotimeAggregationResult,
     PseudotimeMarkerResult,
     PseudotimeScoreResult,
@@ -378,6 +383,139 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             feature_key=feat_key,
             values=ptime,
             valid=retained_mask,
+        )
+
+    def run_fate_mapping(
+        self,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        subset_cell_key: str | None = None,
+        feat_key: str | None = None,
+        pseudotime_key: str | None = None,
+        sink_key: str | None = None,
+        sinks: list[Any] | None = None,
+        beta: float = 10.0,
+        solver_tol: float = 1e-6,
+        max_iterations: int = 1000,
+        label: str = "fate",
+    ) -> FateMappingResult:
+        """Compute cell fate probabilities toward user-provided sink groups.
+
+        Args:
+            from_assay: Assay whose neighborhood graph should be used.
+            cell_key: Cell key used to create the neighborhood graph.
+            subset_cell_key: Cell key restricting the graph for this calculation.
+                             Use the pseudotime validity key when unscored cells
+                             contain non-finite pseudotime.
+            feat_key: Feature key used to create the neighborhood graph.
+            pseudotime_key: Numeric cell metadata column containing pseudotime.
+            sink_key: Cell metadata column containing the sink labels.
+            sinks: Ordered sink labels. Every matching selected cell becomes a
+                   fate boundary.
+            beta: Strength of the penalty applied to backward graph edges.
+            solver_tol: Relative tolerance used by the GMRES solver.
+            max_iterations: Maximum number of GMRES inner iterations per sink.
+                            GMRES restart is fixed at 20.
+            label: Base label used for saved fate probability columns.
+
+        Returns:
+            Fate probabilities, validity mask, sink labels, and saved metadata keys.
+        """
+        if pseudotime_key is None:
+            raise ValueError("pseudotime_key must be provided")
+        if sink_key is None:
+            raise ValueError("sink_key must be provided")
+        if sinks is None:
+            raise ValueError("sinks must be provided")
+        if not isinstance(sinks, list):
+            raise TypeError("sinks must be a list")
+        if not sinks:
+            raise ValueError("At least one sink label must be provided")
+        if not isinstance(label, str):
+            raise TypeError("label must be a string")
+        if not label:
+            raise ValueError("label must not be empty")
+
+        from_assay, cell_key, feat_key = self._get_latest_keys(
+            from_assay,
+            cell_key,
+            feat_key,
+        )
+        if subset_cell_key is None:
+            subset_cell_key = cell_key
+        cell_idx = np.asarray(self.cells.fetch(subset_cell_key, key=cell_key))
+        if cell_idx.ndim != 1 or cell_idx.dtype.kind != "b":
+            raise TypeError("subset_cell_key must select cells with boolean values")
+        if int(cell_idx.sum()) != int(self.cells.fetch_all(subset_cell_key).sum()):
+            raise ValueError("subset_cell_key is not a complete subset of cell_key")
+        if not cell_idx.any():
+            raise ValueError("No cells were selected for fate mapping")
+
+        assay = self._get_assay(from_assay)
+        pseudotime = _validate_assay_pseudotime(
+            assay,
+            subset_cell_key,
+            pseudotime_key,
+        )
+        sink_values = np.asarray(assay.cells.fetch(sink_key, key=subset_cell_key))
+
+        logger.info(
+            f"Fate mapping: loading graph "
+            f"({from_assay}, cell_key={cell_key}, feat_key={feat_key})"
+        )
+        graph = self.load_graph(
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            symmetric=True,
+            upper_only=False,
+        )
+        if cell_idx.shape[0] != int(cell_idx.sum()):
+            graph = graph[cell_idx][:, cell_idx].tocsr()
+
+        probabilities, valid, sink_labels = _compute_fate_probabilities_impl(
+            graph,
+            pseudotime,
+            sink_values,
+            sinks,
+            beta=beta,
+            solver_tol=solver_tol,
+            max_iterations=max_iterations,
+            _copy_graph=False,
+        )
+        output_base = self._col_renamer(from_assay, subset_cell_key, label)
+        fate_keys = tuple(
+            f"{output_base}_{token}" for token in _make_sink_tokens_impl(sink_labels)
+        )
+        validity_key = f"{output_base}__valid"
+
+        logger.info("Fate mapping: saving probabilities")
+        for index, fate_key in enumerate(fate_keys):
+            self.cells.insert(
+                fate_key,
+                probabilities[:, index],
+                key=subset_cell_key,
+                overwrite=True,
+            )
+        self.cells.insert(
+            validity_key,
+            valid,
+            fill_value=False,
+            key=subset_cell_key,
+            overwrite=True,
+        )
+        return FateMappingResult(
+            fate_keys=fate_keys,
+            validity_key=validity_key,
+            sink_labels=sink_labels,
+            assay=from_assay,
+            graph_cell_key=cell_key,
+            result_cell_key=subset_cell_key,
+            feature_key=feat_key,
+            pseudotime_key=pseudotime_key,
+            sink_key=sink_key,
+            values=probabilities,
+            valid=valid,
         )
 
 

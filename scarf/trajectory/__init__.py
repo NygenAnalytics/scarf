@@ -16,12 +16,14 @@ if TYPE_CHECKING:
         validate_source_sink_vector as validate_source_sink_vector,
     )
     from .results import (
+        FateMappingResult as FateMappingResult,
         PseudotimeAggregationResult as PseudotimeAggregationResult,
         PseudotimeMarkerResult as PseudotimeMarkerResult,
         PseudotimeScoreResult as PseudotimeScoreResult,
     )
 
 __all__ = [
+    "FateMappingResult",
     "PseudotimeAggregationResult",
     "PseudotimeMarkerResult",
     "PseudotimeScoreResult",
@@ -72,6 +74,10 @@ _LAZY_EXPORTS = {
     "validate_pseudotime_regressor": (
         ".feature_dynamics",
         "validate_pseudotime_regressor",
+    ),
+    "FateMappingResult": (
+        ".results",
+        "FateMappingResult",
     ),
     "PseudotimeAggregationResult": (
         ".results",

@@ -22,6 +22,7 @@ _METHODS = {
         "load_graph",
         "make_graph",
         "run_clustering",
+        "run_fate_mapping",
         "run_leiden_clustering",
         "run_pseudotime_scoring",
         "run_topacedo_sampler",
@@ -77,7 +78,7 @@ _METHODS = {
 
 _SIGNATURE_DIGESTS = {
     BaseDataStore: "ed2e08a687942d2339c1ab09bf1eac3af20c290319cf527b8662fb937a401cd2",
-    GraphDataStore: "09b597c4ec33150204ddc99fc75a508ba2debf586f45a35051e5eff94abefae2",
+    GraphDataStore: "0f6098aa5ab1e926da212aa882dc90ab07fc632a302a45eb79ce353b5e228d59",
     MappingDatastore: "a1e2fe91d8430b54a2a67f42c537a8a5e189691f81e2fddc8a959e1fd87fb3a9",
     DataStore: "a0f2ab91f02cf4268673541c70f00d7141cbc4920bb78b97bf87ccfb331374cc",
 }
@@ -363,10 +364,13 @@ def test_feature_selection_and_pseudotime_methods_have_domain_owners():
     )
     from scarf.datastore._operations.trajectory import (
         _TrajectoryFeatureOperationsMixin,
+        _TrajectoryOperationsMixin,
     )
 
     assert "mark_hvgs" in _FeatureOperationsMixin.__dict__
     assert "mark_hvgs" not in _QualityControlOperationsMixin.__dict__
+    assert "run_fate_mapping" in _TrajectoryOperationsMixin.__dict__
+    assert "run_fate_mapping" not in _TrajectoryFeatureOperationsMixin.__dict__
     assert "run_pseudotime_marker_search" in (
         _TrajectoryFeatureOperationsMixin.__dict__
     )

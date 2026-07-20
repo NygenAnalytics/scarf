@@ -13,6 +13,9 @@ are extending Scarf.
 ## Analysis results
 
 ```{eval-rst}
+.. autoclass:: scarf.FateMappingResult
+    :members:
+
 .. autoclass:: scarf.PseudotimeScoreResult
     :members:
 

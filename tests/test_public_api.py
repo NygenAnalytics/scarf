@@ -15,6 +15,7 @@ _EXPECTED_EXPORTS = {
     "CrToZarr": "scarf.writers",
     "DataStore": "scarf.datastore.datastore",
     "DatasetMerge": "scarf.merge",
+    "FateMappingResult": "scarf.trajectory.results",
     "GffReader": "scarf.features.genomic.gff",
     "H5adReader": "scarf.readers",
     "H5adToZarr": "scarf.writers",

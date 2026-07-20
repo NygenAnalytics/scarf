@@ -12,6 +12,7 @@ from scarf.merge import ZarrMerge
 
 
 _EXPECTED_TRAJECTORY_EXPORTS = (
+    "FateMappingResult",
     "PseudotimeAggregationResult",
     "PseudotimeMarkerResult",
     "PseudotimeScoreResult",
@@ -37,6 +38,19 @@ _EXPECTED_RESULT_FIELDS = {
         "uncorrected_latent",
         "corrected_latent",
         "uninformative",
+    ),
+    trajectory.FateMappingResult: (
+        "fate_keys",
+        "validity_key",
+        "sink_labels",
+        "assay",
+        "graph_cell_key",
+        "result_cell_key",
+        "feature_key",
+        "pseudotime_key",
+        "sink_key",
+        "values",
+        "valid",
     ),
     trajectory.PseudotimeScoreResult: (
         "pseudotime_key",
@@ -75,6 +89,7 @@ def test_result_facades_and_constructor_fields_are_stable():
     assert scarf.MappingResult is mapping.MappingResult
     assert tuple(trajectory.__all__) == _EXPECTED_TRAJECTORY_EXPORTS
     for name in (
+        "FateMappingResult",
         "PseudotimeAggregationResult",
         "PseudotimeMarkerResult",
         "PseudotimeScoreResult",
@@ -100,6 +115,19 @@ def test_result_facades_and_constructor_fields_are_stable():
 def test_result_records_reject_attribute_assignment():
     records = (
         mapping.MappingResult("projection", 2, "none", {}),
+        trajectory.FateMappingResult(
+            ("fate_A", "fate_B"),
+            "fate__valid",
+            ("A", "B"),
+            "RNA",
+            "I",
+            "I",
+            "hvgs",
+            "pseudotime",
+            "clusters",
+            np.array([[0.25, 0.75], [1.0, 0.0]]),
+            np.array([True, True]),
+        ),
         trajectory.PseudotimeScoreResult(
             "pseudotime",
             "valid",
@@ -146,6 +174,21 @@ def test_result_records_reject_attribute_assignment():
 
 
 def test_pseudotime_result_shape_validation_is_stable():
+    with pytest.raises(ValueError, match="rows must align"):
+        trajectory.FateMappingResult(
+            ("fate_A", "fate_B"),
+            "fate__valid",
+            ("A", "B"),
+            "RNA",
+            "I",
+            "I",
+            "hvgs",
+            "pseudotime",
+            "clusters",
+            np.array([[0.25, 0.75], [1.0, 0.0]]),
+            np.array([True]),
+        )
+
     with pytest.raises(ValueError, match="same shape"):
         trajectory.PseudotimeScoreResult(
             "pseudotime",
