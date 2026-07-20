@@ -1,14 +1,15 @@
 import numpy as np
 import pytest
 
-from scarf.chunked import ChunkedArray
-from scarf.mapping_utils import (
-    _correlation_alignment,
+from scarf.matrix import ChunkedArray
+from scarf.mapping.confidence import (
     _distance_quantile_summary,
-    _order_features,
     conformal_prediction_sets,
     distance_weights,
 )
+from scarf.mapping.coral import _correlation_alignment
+from scarf.mapping.features import _order_features
+from scarf.mapping.hashing import array_hash, array_store_hash
 
 
 class _Features:
@@ -23,6 +24,28 @@ class _Features:
 class _Assay:
     def __init__(self, ids: list[str]) -> None:
         self.feats = _Features(ids)
+
+
+def test_mapping_array_hashes_match_golden_values():
+    numeric = np.array([[1.5, -2.0], [0.0, 4.25]], dtype=np.float64)
+    identifiers = np.array(["gene_a", "gene_b"], dtype="<U6")
+
+    assert (
+        array_hash(numeric)
+        == "ab342d324ef6a1e409055ac301654f1472817f569ab4c0df2c10464bad546a49"
+    )
+    assert (
+        array_store_hash(numeric)
+        == "ab342d324ef6a1e409055ac301654f1472817f569ab4c0df2c10464bad546a49"
+    )
+    assert (
+        array_hash(identifiers)
+        == "7b628da091bfd6a5c5f8c6dd644c3fefc482779799a9e51018f9f0c290215ad2"
+    )
+    assert (
+        array_store_hash(identifiers)
+        == "7b628da091bfd6a5c5f8c6dd644c3fefc482779799a9e51018f9f0c290215ad2"
+    )
 
 
 def test_distance_weights_uses_all_neighbors_and_handles_zero_distance():

@@ -3,8 +3,12 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf._types import as_zarr_array, as_zarr_group, array_metadata_shards
-import scarf.utils as utils_module
+from scarf.storage.types import (
+    array_metadata_shards,
+    as_zarr_array,
+    as_zarr_group,
+)
+import scarf.utils.progress as progress_module
 from scarf.utils import (
     array_digest,
     clean_array,
@@ -86,15 +90,15 @@ def test_tqdmbar_enabled_for_tty_or_notebook(monkeypatch):
         def __iter__(self):
             return iter(())
 
-    monkeypatch.setattr(utils_module, "get_log_level", lambda: 20)
-    monkeypatch.setattr(utils_module, "stdout_is_interactive", lambda: False)
-    monkeypatch.setattr(utils_module, "is_notebook", lambda: True)
+    monkeypatch.setattr(progress_module, "get_log_level", lambda: 20)
+    monkeypatch.setattr(progress_module, "stdout_is_interactive", lambda: False)
+    monkeypatch.setattr(progress_module, "is_notebook", lambda: True)
     monkeypatch.setattr(tqdm, "tqdm_notebook", FakeTqdm)
     list(tqdmbar(range(1), desc="test"))
     assert captured["disable"] is False
 
-    monkeypatch.setattr(utils_module, "is_notebook", lambda: False)
-    monkeypatch.setattr(utils_module, "stdout_is_interactive", lambda: True)
+    monkeypatch.setattr(progress_module, "is_notebook", lambda: False)
+    monkeypatch.setattr(progress_module, "stdout_is_interactive", lambda: True)
     monkeypatch.setattr(tqdm_auto, "tqdm", FakeTqdm)
     list(tqdmbar(range(1), desc="test"))
     assert captured["disable"] is False
@@ -113,14 +117,14 @@ def test_tqdmbar_disabled_when_redirected_or_quiet(monkeypatch):
             return iter(())
 
     monkeypatch.setattr(tqdm_auto, "tqdm", FakeTqdm)
-    monkeypatch.setattr(utils_module, "is_notebook", lambda: False)
-    monkeypatch.setattr(utils_module, "stdout_is_interactive", lambda: False)
-    monkeypatch.setattr(utils_module, "get_log_level", lambda: 20)
+    monkeypatch.setattr(progress_module, "is_notebook", lambda: False)
+    monkeypatch.setattr(progress_module, "stdout_is_interactive", lambda: False)
+    monkeypatch.setattr(progress_module, "get_log_level", lambda: 20)
     list(tqdmbar(range(1), desc="test"))
     assert captured["disable"] is True
 
-    monkeypatch.setattr(utils_module, "stdout_is_interactive", lambda: True)
-    monkeypatch.setattr(utils_module, "get_log_level", lambda: 30)
+    monkeypatch.setattr(progress_module, "stdout_is_interactive", lambda: True)
+    monkeypatch.setattr(progress_module, "get_log_level", lambda: 30)
     list(tqdmbar(range(1), desc="test"))
     assert captured["disable"] is True
 

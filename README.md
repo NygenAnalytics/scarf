@@ -2,14 +2,16 @@
 
 Single-cell analysis that stays on disk.
 
-Scarf runs scRNA-seq and CITE-seq neighbourhood-graph workflows on [Zarr](https://zarr.readthedocs.io)
-stores, locally or on S3-compatible object storage. Counts, graphs, and embeddings persist
-as you go, so atlas-scale analysis does not require loading the full matrix into memory.
+Scarf runs scRNA-seq, scATAC-seq, and CITE-seq neighbourhood-graph workflows on
+[Zarr](https://zarr.readthedocs.io) stores, locally or on S3-compatible object storage.
+Counts, graphs, and embeddings persist as you go, so atlas-scale analysis does not require
+loading the full matrix into memory.
 
 If you already use [Scanpy](https://scanpy.readthedocs.io): Scarf covers the core path
 (QC → HVGs → graph → UMAP/Leiden → markers → mapping) with a lower memory ceiling and
 native remote stores. Export with `to_anndata` / `to_h5ad` when you need the wider
-Scanpy ecosystem. Stage mapping: [Scarf and Scanpy](https://scarf.readthedocs.io/en/latest/scarf_and_scanpy.html).
+Scanpy ecosystem. See [Scarf and Scanpy](https://scarf.readthedocs.io/en/latest/scarf_and_scanpy.html)
+for a stage-by-stage comparison.
 
 [![PyPI](https://img.shields.io/pypi/v/scarf.svg)](https://pypi.org/project/scarf)
 [![Docs](https://readthedocs.org/projects/scarf/badge/?version=latest)](https://scarf.readthedocs.io)

@@ -3,6 +3,11 @@
 ## Readers
 
 ```{eval-rst}
+.. autoclass:: scarf.readers.CrReader
+    :members:
+```
+
+```{eval-rst}
 .. autoclass:: scarf.readers.CrH5Reader
     :members:
 ```
@@ -71,7 +76,30 @@
 .. autofunction:: scarf.writers.dask_to_zarr
 ```
 
+```{eval-rst}
+.. autofunction:: scarf.writers.create_zarr_dataset
+```
+
+```{eval-rst}
+.. autofunction:: scarf.writers.create_zarr_obj_array
+```
+
+```{eval-rst}
+.. autofunction:: scarf.writers.create_zarr_count_assay
+```
+
+```{eval-rst}
+.. autofunction:: scarf.writers.subset_assay_zarr
+```
+
+```{eval-rst}
+.. autofunction:: scarf.writers.write_renorm_subset_to_zarr
+```
+
 ## Merge
+
+Use `AssayMerge` for new code. `ZarrMerge` is a deprecated compatibility
+subclass retained through Scarf 1.x.
 
 ```{eval-rst}
 .. autoclass:: scarf.merge.AssayMerge

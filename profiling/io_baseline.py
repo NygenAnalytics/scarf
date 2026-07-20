@@ -21,12 +21,12 @@ from profiling.config import ProfilingConfig, StageResources
 from profiling.metrics import ResourceSampler
 from profiling.r2 import put_json, storage_options
 from scarf import DataStore
-from scarf._types import as_zarr_array
+from scarf.storage.types import as_zarr_array
 from scarf.assay import _read_block
-from scarf.datastore.datastore import _feature_column_chunk
-from scarf.markers import resolve_marker_gene_batch_size
+from scarf.datastore._operations.features import _feature_column_chunk
+from scarf.features.markers import resolve_marker_gene_batch_size
 from scarf.storage.budget import resolve_budget, set_resource_budget
-from scarf.storage.zarr_store import is_remote_datastore
+from scarf.storage.stores import is_remote_datastore
 from scarf.utils import iter_column_blocks
 
 _CONFIG_PATH = "profiling/layouts/1m_auto_markers_c8_m64.toml"

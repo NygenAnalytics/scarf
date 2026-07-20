@@ -52,7 +52,7 @@ scarf.AssayMerge(
 ).dump()
 
 ds = scarf.DataStore(merged, nthreads=4)
-ds.mark_hvgs(min_cells=20, top_n=500)
+ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
 ds.run_leiden_clustering(resolution=0.5)
 ds.run_umap(n_epochs=100, parallel=True)

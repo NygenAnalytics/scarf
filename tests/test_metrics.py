@@ -4,18 +4,18 @@ import pytest
 from scipy.sparse import csr_matrix
 
 from scarf.metrics import (
-    _effective_perplexity,
-    _neighbor_probabilities,
     calculate_knn_cluster_similarity,
     calculate_top_k_neighbor_distances,
     calculate_weighted_cluster_similarity,
     compute_lisi,
+    compute_simpson,
     integration_score,
     knn_to_csr_matrix,
     label_concordance_score,
     lisi_batch_mixing_score,
     silhouette_scoring,
 )
+from scarf.metrics.lisi import _effective_perplexity, _neighbor_probabilities
 
 
 def test_compute_lisi_uses_all_stored_neighbors():
@@ -124,6 +124,22 @@ def test_neighbor_probabilities_calibrate_diffuse_and_concentrated_rows():
     assert np.allclose(calibrated_perplexity, 2.0, rtol=1e-7)
 
 
+def test_compute_simpson_with_uniform_neighbor_weights():
+    distances = np.ones((3, 2), dtype=np.float64)
+    indices = np.array(
+        [
+            [0, 1],
+            [1, 2],
+            [2, 3],
+        ]
+    )
+    labels = pd.Categorical([0, 0, 1, 1])
+
+    simpson = compute_simpson(distances, indices, labels, perplexity=1)
+
+    assert np.allclose(simpson, 5 / 9)
+
+
 def test_compute_lisi_rejects_invalid_neighbor_distances():
     metadata = pd.DataFrame({"batch": [0, 0, 1, 1]})
     indices = np.tile(np.array([0, 1, 2]), (4, 1))
@@ -149,6 +165,24 @@ def test_metric_lisi_single_category_is_one(datastore, make_graph):
 
     assert lisi is not None
     assert np.allclose(lisi[0][1], 1)
+
+
+def test_knn_without_affinities_preserves_distances():
+    indices = np.array([[1, 2], [0, 2], [0, 1]])
+    distances = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+
+    graph = knn_to_csr_matrix(indices, distances)
+
+    assert np.array_equal(
+        graph.toarray(),
+        np.array(
+            [
+                [0.0, 1.0, 2.0],
+                [3.0, 0.0, 4.0],
+                [5.0, 6.0, 0.0],
+            ]
+        ),
+    )
 
 
 def test_knn_affinities_decrease_with_distance():
@@ -329,6 +363,20 @@ def test_label_concordance_identical_partitions(metric):
     assert integration_score([labels, labels], metric) == pytest.approx(1)
 
 
+@pytest.mark.parametrize(
+    ("metric", "expected"),
+    [
+        ("ari", 0.125),
+        ("nmi", 0.18872187554086706),
+    ],
+)
+def test_label_concordance_partial_agreement(metric, expected):
+    first = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    second = np.array([0, 0, 0, 1, 1, 1, 1, 0])
+
+    assert label_concordance_score([first, second], metric) == pytest.approx(expected)
+
+
 def test_label_concordance_requires_exactly_two_partitions():
     with pytest.raises(ValueError, match="Exactly two"):
         label_concordance_score([np.array([0, 1])])
@@ -359,7 +407,8 @@ def test_metric_label_concordance(datastore, make_graph, leiden_clustering):
     assert datastore.metric_label_concordance(["labels1", "labels2"]) == pytest.approx(
         1
     )
-    assert datastore.metric_integration(["labels1", "labels2"]) == pytest.approx(1)
+    with pytest.warns(DeprecationWarning, match="metric_integration"):
+        assert datastore.metric_integration(["labels1", "labels2"]) == pytest.approx(1)
     mixing_score = datastore.metric_batch_mixing("labels1")
     assert 0 <= mixing_score <= 1
 

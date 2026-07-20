@@ -9,6 +9,7 @@ Plot functions return a `PlotResult` and render by default with `show=True`. Pas
 ```{eval-rst}
 .. automodule:: scarf.plotting
     :members: embedding, embedding_raster, unified_embedding, dotplot, matrixplot, composition, distribution, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap
+    :imported-members:
     :undoc-members:
     :show-inheritance:
 ```
@@ -56,4 +57,20 @@ Plot functions return a `PlotResult` and render by default with `show=True`. Pas
 ```{eval-rst}
 .. autoclass:: scarf.plotting.PlotProvenance
     :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.FeatureSummary
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.LegendSpec
+    :members:
+```
+
+```{eval-rst}
+.. py:data:: THEMES
+
+    Registry of built-in plotting theme definitions.
 ```

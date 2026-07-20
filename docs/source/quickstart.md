@@ -47,7 +47,7 @@ ds.filter_cells(attrs=['RNA_nCounts', 'RNA_nFeatures'], highs=[15000, 4000], low
 KNN graph that UMAP and Leiden reuse.
 
 ```{code-cell} ipython3
-ds.mark_hvgs(min_cells=20, top_n=500)
+ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
 ds.run_umap(n_epochs=250, spread=5, min_dist=1, parallel=True)
 ds.run_leiden_clustering(resolution=0.5)

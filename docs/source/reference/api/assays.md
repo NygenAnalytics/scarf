@@ -21,6 +21,10 @@
 ```
 
 ```{eval-rst}
+.. autofunction:: scarf.assay.norm_dummy
+```
+
+```{eval-rst}
 .. autoclass:: scarf.metadata.MetaData
     :members:
 ```
@@ -28,10 +32,10 @@
 ## ATAC coordinate melding
 
 ```{eval-rst}
-.. autoclass:: scarf.meld_assay.GffReader
+.. autoclass:: scarf.GffReader
     :members:
 ```
 
 ```{eval-rst}
-.. autofunction:: scarf.meld_assay.coordinate_melding
+.. autofunction:: scarf.coordinate_melding
 ```

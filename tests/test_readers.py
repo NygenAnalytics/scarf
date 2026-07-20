@@ -39,6 +39,57 @@ def _write_sparse_h5ad(path, values, *, encoding_type="csr_matrix"):
         h5.create_group("obsm")
 
 
+def _write_cr_h5(path, values, *, legacy=False):
+    import h5py
+    from scipy.sparse import csr_matrix
+
+    matrix = csr_matrix(values)
+    with h5py.File(path, mode="w") as h5:
+        group = h5.create_group("genome" if legacy else "matrix")
+        group.create_dataset("data", data=matrix.data)
+        group.create_dataset("indices", data=matrix.indices.astype(np.int64))
+        group.create_dataset("indptr", data=matrix.indptr.astype(np.int64))
+        group.create_dataset(
+            "barcodes",
+            data=np.array(
+                [f"cell_{index}".encode() for index in range(values.shape[0])]
+            ),
+        )
+        if legacy:
+            group.create_dataset(
+                "genes",
+                data=np.array(
+                    [f"feature_{index}".encode() for index in range(values.shape[1])]
+                ),
+            )
+            group.create_dataset(
+                "gene_names",
+                data=np.array(
+                    [f"gene_{index}".encode() for index in range(values.shape[1])]
+                ),
+            )
+        else:
+            features = group.create_group("features")
+            features.create_dataset(
+                "id",
+                data=np.array(
+                    [f"feature_{index}".encode() for index in range(values.shape[1])]
+                ),
+            )
+            features.create_dataset(
+                "name",
+                data=np.array(
+                    [f"gene_{index}".encode() for index in range(values.shape[1])]
+                ),
+            )
+            features.create_dataset(
+                "feature_type",
+                data=np.array(
+                    ["Gene Expression".encode() for _ in range(values.shape[1])]
+                ),
+            )
+
+
 def test_toy_crdir_assay_feats_table(toy_crdir_reader):
     assert np.all(
         toy_crdir_reader.assayFeats.columns
@@ -244,6 +295,52 @@ def test_crh5reader_filters_background_barcodes(crh5_reader):
         reader.close()
 
 
+def test_crh5reader_preserves_filtered_values_dtype_and_batching(tmp_path):
+    from scarf.readers import CrH5Reader
+
+    values = np.array(
+        [
+            [1, 0, 2],
+            [0, 0, 0],
+            [3, 4, 0],
+            [0, 5, 6],
+        ],
+        dtype=np.uint16,
+    )
+    path = tmp_path / "modern.h5"
+    _write_cr_h5(path, values)
+    reader = CrH5Reader(str(path), is_filtered=False, filtering_cutoff=0)
+    try:
+        chunks = list(reader.consume(batch_size=2))
+        observed = np.concatenate([chunk.toarray() for chunk in chunks])
+        np.testing.assert_array_equal(reader.validBarcodeIdx, [0, 2, 3])
+        np.testing.assert_array_equal(observed, values[[0, 2, 3]])
+        assert [chunk.shape[0] for chunk in chunks] == [2, 1]
+        assert all(chunk.dtype == values.dtype for chunk in chunks)
+    finally:
+        reader.close()
+    assert not reader.h5obj.id.valid
+
+
+def test_crh5reader_preserves_legacy_layout_values(tmp_path):
+    from scarf.readers import CrH5Reader
+
+    values = np.array([[1, 0], [0, 2], [3, 4]], dtype=np.uint32)
+    path = tmp_path / "legacy.h5"
+    _write_cr_h5(path, values, legacy=True)
+    reader = CrH5Reader(str(path))
+    try:
+        observed = np.concatenate(
+            [chunk.toarray() for chunk in reader.consume(batch_size=2)]
+        )
+        np.testing.assert_array_equal(observed, values)
+        assert reader.feature_ids() == ["feature_0", "feature_1"]
+        assert reader.feature_names() == ["gene_0", "gene_1"]
+        assert reader.feature_types() == ["Gene Expression", "Gene Expression"]
+    finally:
+        reader.close()
+
+
 def test_crdir_reader(crdir_reader):
     assert crdir_reader.nCells == 892
     assert crdir_reader.nFeatures == 36601  # Does not contain 10 ADTs
@@ -365,6 +462,8 @@ def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
 
     root = zarr.open_group(str(zarr_path), mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
+    np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):
@@ -524,3 +623,35 @@ def test_loom_reader_streams_metadata_and_counts(loom_reader):
         (98, loom_reader.nFeatures),
     ]
     assert sum(chunk.nnz for chunk in chunks) > 0
+
+
+def test_csv_reader_preserves_batches_skipped_columns_and_cell_metadata(tmp_path):
+    from scarf.readers import CSVReader
+
+    path = tmp_path / "counts.csv"
+    path.write_text("g1,g2,batch,drop\n1,2,a,10\n3,4,b,20\n5,6,c,30\n")
+    reader = CSVReader(
+        str(path),
+        skip_cols=["drop"],
+        cell_data_cols=["batch"],
+        batch_size=2,
+    )
+
+    assert reader.nCells == 3
+    assert reader.nFeatures == 2
+    np.testing.assert_array_equal(reader.cell_ids(), ["cell_0", "cell_1", "cell_2"])
+    np.testing.assert_array_equal(reader.feature_ids(), ["g1", "g2"])
+    batches = list(reader.consume())
+    np.testing.assert_array_equal(batches[0][0], [[1, 2], [3, 4]])
+    np.testing.assert_array_equal(batches[0][1], [["a"], ["b"]])
+    np.testing.assert_array_equal(batches[1][0], [[5, 6]])
+    np.testing.assert_array_equal(batches[1][1], [["c"]])
+
+
+def test_csv_reader_rejects_features_along_rows(tmp_path):
+    from scarf.readers import CSVReader
+
+    path = tmp_path / "counts.csv"
+    path.write_text("g1,g2\n1,2\n")
+    with pytest.raises(NotImplementedError, match="cells are along the rows"):
+        CSVReader(str(path), rows_are_cells=False)

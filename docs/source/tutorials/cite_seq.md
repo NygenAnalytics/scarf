@@ -350,11 +350,13 @@ ds.run_leiden_clustering(
 )
 ```
 
+Compare each integration method on its matching layout and cluster labels:
+
 ```{code-cell} ipython3
 splt.embedding(
     ds,
     layout_key='RNA+ADT_UMAP',
-    color_by='RNA+ADT_wnn_leiden_cluster',
+    color_by='RNA+ADT_leiden_cluster',
     legend_loc='on_data',
 )
 splt.embedding(

@@ -17,6 +17,8 @@ jobs:
         python-version: "3.14"
     - name: Build a binary wheel and a source tarball
       run: uv build
+    - name: Smoke-test wheel
+      run: uv run --no-project python tests/smoke_wheel.py dist/*.whl
     - name: Store the distribution packages
       uses: actions/upload-artifact@v4
       with:

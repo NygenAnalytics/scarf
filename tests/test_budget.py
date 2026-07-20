@@ -136,7 +136,7 @@ def test_working_copies_from_env(monkeypatch):
 
 
 def test_layout_geometry_independent_of_workers():
-    from scarf.storage.zarr_store import matrix_layout
+    from scarf.storage.layout import matrix_layout
 
     one = ResourceBudget(memoryBytes=8 * 1024**3, workers=1, workingCopies=4)
     eight = ResourceBudget(memoryBytes=8 * 1024**3, workers=8, workingCopies=4)

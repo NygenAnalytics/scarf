@@ -1,21 +1,21 @@
 # Utilities and datasets
 
 ```{eval-rst}
-.. autofunction:: scarf.downloader.fetch_dataset
+.. autofunction:: scarf.fetch_dataset
 ```
 
 ```{eval-rst}
-.. autofunction:: scarf.downloader.show_available_datasets
+.. autofunction:: scarf.show_available_datasets
 ```
 
 ```{eval-rst}
-.. autofunction:: scarf.utils.set_verbosity
+.. autofunction:: scarf.set_verbosity
 ```
 
 ```{eval-rst}
-.. autofunction:: scarf.utils.load_zarr
+.. autofunction:: scarf.load_zarr
 ```
 
 ```{eval-rst}
-.. autofunction:: scarf.utils.controlled_compute
+.. autofunction:: scarf.controlled_compute
 ```

@@ -361,15 +361,3 @@ def collect_legends(
     out = tuple(legends)
     figure._scarf_legends = out  # type: ignore[attr-defined]
     return out
-
-
-def as_2d_axes_array(in_ax: Any, n_columns: int = 1) -> np.ndarray:
-    """Normalize legacy in_ax inputs to a 2D object array (rows, cols)."""
-    if in_ax is None:
-        raise ValueError("in_ax is None")
-    if isinstance(in_ax, np.ndarray):
-        if in_ax.ndim == 2:
-            return in_ax
-        if in_ax.ndim == 1:
-            return in_ax.reshape(1, -1)
-    return np.array([[in_ax]], dtype=object)

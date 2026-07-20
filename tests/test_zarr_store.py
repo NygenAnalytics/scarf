@@ -5,24 +5,30 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.storage.zarr_store import (
-    accumulate_sparse_to_shards,
+from scarf.storage.arrays import create_numeric_array
+from scarf.storage.copy import (
     copy_zarr_array,
     copy_zarr_group_tree,
-    create_numeric_array,
-    finalize_sharded_counts,
+    open_or_create_staged_normed_array,
+)
+from scarf.storage.layout import normed_array_spec
+from scarf.storage.profiles import (
     get_storage_profile,
     is_local_zarr_path,
-    is_remote_datastore,
     is_remote_zarr_location,
-    make_store,
-    normed_array_spec,
-    open_or_create_staged_normed_array,
-    open_store,
     set_storage_profile,
+)
+from scarf.storage.sharding import (
+    accumulate_sparse_to_shards,
+    finalize_sharded_counts,
     write_dense_from_row_batches,
 )
-from scarf._types import array_metadata_shards
+from scarf.storage.stores import (
+    is_remote_datastore,
+    make_store,
+    open_store,
+)
+from scarf.storage.types import array_metadata_shards
 from scarf.utils import load_zarr
 
 
@@ -56,9 +62,9 @@ def test_load_zarr_forwards_storage_options_to_make_store(monkeypatch):
         captured["read_only"] = read_only
         return MemoryStore()
 
-    monkeypatch.setattr("scarf.storage.zarr_store.make_store", fake_make_store)
+    monkeypatch.setattr("scarf.storage.stores.make_store", fake_make_store)
     monkeypatch.setattr(
-        "scarf.storage.zarr_store.configure_zarr_io_for_profile", lambda: None
+        "scarf.storage.stores.configure_zarr_io_for_profile", lambda: None
     )
     monkeypatch.setattr("zarr.open_group", lambda **kwargs: object())
     load_zarr(
@@ -164,8 +170,7 @@ def test_finalize_sharded_counts_repacks_and_cleans_up(
     assert array_metadata_shards(source) is None
 
     budget = ResourceBudget(memoryBytes=24, workers=1, workingCopies=1)
-    monkeypatch.setattr("scarf.storage.zarr_store.get_resource_budget", lambda: budget)
-    monkeypatch.setattr("scarf.storage.budget.get_resource_budget", lambda: budget)
+    monkeypatch.setattr("scarf.storage.layout.get_resource_budget", lambda: budget)
 
     result = finalize_sharded_counts(
         root,
@@ -338,7 +343,8 @@ def test_explicit_profile_not_overridden_by_remote(monkeypatch):
 
 def test_normed_array_spec_plain_chunks():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import normed_array_spec, set_storage_profile
+    from scarf.storage.layout import normed_array_spec
+    from scarf.storage.profiles import set_storage_profile
 
     set_storage_profile("cloud")
     budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=4, workingCopies=4)
@@ -352,7 +358,7 @@ def test_normed_array_spec_plain_chunks():
 @pytest.mark.parametrize("n_cells", [1_000_000, 2_500_000, 5_000_000, 10_000_000])
 def test_normed_array_spec_respects_codec_limit(n_cells):
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import _CODEC_MAX_BYTES, normed_array_spec
+    from scarf.storage.layout import _CODEC_MAX_BYTES, normed_array_spec
 
     budget = ResourceBudget(
         memoryBytes=112 * 1024**3,
@@ -371,11 +377,9 @@ def test_normed_array_spec_respects_codec_limit(n_cells):
 
 @pytest.mark.parametrize("n_feats", [500, 2000, 3000, 5000, 8192, 30_000])
 def test_normed_array_spec_creates_array(tmp_path, n_feats):
-    from scarf.storage.zarr_store import (
-        create_numeric_array,
-        normed_array_spec,
-        set_storage_profile,
-    )
+    from scarf.storage.arrays import create_numeric_array
+    from scarf.storage.layout import normed_array_spec
+    from scarf.storage.profiles import set_storage_profile
 
     set_storage_profile("cloud")
     spec = normed_array_spec(1_000_000, n_feats)
@@ -387,7 +391,7 @@ def test_normed_array_spec_creates_array(tmp_path, n_feats):
 
 def test_memory_first_layout_worked_example():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import _CODEC_MAX_BYTES, matrix_layout
+    from scarf.storage.layout import _CODEC_MAX_BYTES, matrix_layout
 
     budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=8, workingCopies=4)
     chunks, shards = matrix_layout(1_000_000, 50_000, budget=budget, itemsize=4)
@@ -403,7 +407,7 @@ def test_memory_first_layout_worked_example():
 
 def test_ceil_pad_awkward_feature_count():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import matrix_layout
+    from scarf.storage.layout import matrix_layout
 
     budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=1, workingCopies=4)
     chunks, shards = matrix_layout(1_000_000, 36_601, budget=budget, itemsize=4)
@@ -417,7 +421,7 @@ def test_ceil_pad_awkward_feature_count():
 
 def test_float64_halves_row_shard():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import matrix_layout
+    from scarf.storage.layout import matrix_layout
 
     budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=1, workingCopies=4)
     u32, _ = matrix_layout(100_000, 20_000, budget=budget, itemsize=4)
@@ -427,7 +431,7 @@ def test_float64_halves_row_shard():
 
 def test_matrix_layout_scales_with_cells():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import matrix_layout
+    from scarf.storage.layout import matrix_layout
 
     budget = ResourceBudget(memoryBytes=64 * 1024**3, workers=2, workingCopies=4)
     small_chunks, small_shards = matrix_layout(1_000, 2_000, budget=budget, itemsize=4)
@@ -441,7 +445,7 @@ def test_matrix_layout_scales_with_cells():
 
 def test_matrix_layout_shard_chunk_alignment():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import _CODEC_MAX_BYTES, matrix_layout
+    from scarf.storage.layout import _CODEC_MAX_BYTES, matrix_layout
 
     budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=4, workingCopies=4)
     chunks, shards = matrix_layout(100_000, 50_000, budget=budget, itemsize=4)
@@ -456,7 +460,7 @@ def test_matrix_layout_shard_chunk_alignment():
 
 def test_matrix_layout_respects_codec_limit():
     from scarf.storage.budget import get_resource_budget
-    from scarf.storage.zarr_store import _CODEC_MAX_BYTES, matrix_layout
+    from scarf.storage.layout import _CODEC_MAX_BYTES, matrix_layout
 
     budget = get_resource_budget()
     for n_cells, n_feats in [
@@ -475,7 +479,7 @@ def test_matrix_layout_respects_codec_limit():
 
 def test_matrix_layout_target_chunk_bytes_clamps_features():
     from scarf.storage.budget import ResourceBudget
-    from scarf.storage.zarr_store import matrix_layout
+    from scarf.storage.layout import matrix_layout
 
     budget = ResourceBudget(memoryBytes=48 * 1024**3, workers=4, workingCopies=4)
     chunks, shards = matrix_layout(
@@ -496,7 +500,7 @@ def test_matrix_layout_target_chunk_bytes_clamps_features():
 
 def test_count_array_spec_passes_target_chunk_bytes():
     from scarf.storage.budget import ResourceBudget, set_resource_budget
-    from scarf.storage.zarr_store import count_array_spec
+    from scarf.storage.layout import count_array_spec
 
     budget = ResourceBudget(memoryBytes=24 * 1024**3, workers=4, workingCopies=4)
     try:
@@ -519,7 +523,7 @@ def test_count_array_spec_passes_target_chunk_bytes():
 
 def test_count_array_spec_applies_cloud_default_target_chunk_bytes():
     from scarf.storage.budget import ResourceBudget, set_resource_budget
-    from scarf.storage.zarr_store import (
+    from scarf.storage.layout import (
         DEFAULT_CLOUD_TARGET_CHUNK_BYTES,
         count_array_spec,
         matrix_layout,
@@ -555,7 +559,8 @@ def test_count_array_spec_applies_cloud_default_target_chunk_bytes():
 def test_large_atac_count_array_accepts_sparse_writes(tmp_path):
     import numpy as np
 
-    from scarf.storage.zarr_store import count_array_spec, create_numeric_array
+    from scarf.storage.arrays import create_numeric_array
+    from scarf.storage.layout import count_array_spec
 
     n_cells, n_feats = 10_000, 89_796
     spec = count_array_spec(n_cells, n_feats, dtype="uint32")
@@ -567,7 +572,8 @@ def test_large_atac_count_array_accepts_sparse_writes(tmp_path):
 
 
 def test_v2_group_skips_shards(tmp_path):
-    from scarf.storage.zarr_store import count_array_spec, create_numeric_array
+    from scarf.storage.arrays import create_numeric_array
+    from scarf.storage.layout import count_array_spec
 
     root = zarr.open_group(str(tmp_path / "v2.zarr"), mode="w", zarr_format=2)
     spec = count_array_spec(100, 50, dtype="uint32")
@@ -578,7 +584,7 @@ def test_v2_group_skips_shards(tmp_path):
 def test_ann_index_round_trip(tmp_path):
     import hnswlib
 
-    from scarf.storage.zarr_store import (
+    from scarf.storage.ann_index import (
         has_ann_index,
         load_ann_index,
         save_ann_index,

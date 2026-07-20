@@ -58,7 +58,7 @@ ds.filter_cells(
     lows=[1000, 500, 0],
     reset_previous=True,
 )
-ds.mark_hvgs(min_cells=20, top_n=500)
+ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
 ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
 ds.run_leiden_clustering(resolution=0.5)
@@ -173,7 +173,12 @@ subset = np.array([str(c) == focus for c in ds.cells.fetch_all('RNA_leiden_clust
 active = ds.cells.fetch_all('I').astype(bool)
 ds.cells.insert('focus_cells', active & subset, overwrite=True)
 # Feature keys are resolved as <cell_key>__<feat_key>. Recompute HVGs for the subset.
-ds.mark_hvgs(cell_key='focus_cells', min_cells=10, top_n=500)
+ds.mark_hvgs(
+    cell_key='focus_cells',
+    min_cells=10,
+    top_n=500,
+    show_plot=False,
+)
 
 ds.make_graph(
     cell_key='focus_cells',

@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from scarf.mapping_utils import array_hash
+from scarf.mapping.hashing import array_hash
 from scarf.writers import create_zarr_dataset
 
 
@@ -137,6 +137,24 @@ def test_label_threshold_boundary_and_subset_index(datastore_ephemeral):
     )
     assert evidence["label"].tolist() == ["winner", "runner_up"]
     np.testing.assert_allclose(evidence["voteFraction"], [0.75, 0.75])
+
+
+def test_schema_v1_projection_warns_on_read(datastore_ephemeral):
+    datastore = datastore_ephemeral
+    _projection_store(
+        datastore,
+        "legacy_schema_projection",
+        np.array([[0, 1]], dtype=np.uint64),
+        np.array([[1.0, 1.0]]),
+    )
+
+    with pytest.warns(DeprecationWarning, match="legacy projection schema"):
+        result = datastore.get_target_classes(
+            "legacy_schema_projection",
+            reference_class_group="ids",
+        )
+
+    assert len(result) == 1
 
 
 def test_schema_less_projection_remains_readable(datastore_ephemeral):

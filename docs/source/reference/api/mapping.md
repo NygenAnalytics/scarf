@@ -1,12 +1,12 @@
 # Mapping
 
 ```{eval-rst}
-.. autoclass:: scarf.mapping_reference.MappingReference
+.. autoclass:: scarf.MappingReference
     :members:
 ```
 
 ```{eval-rst}
-.. autoclass:: scarf.mapping_reference.MappingResult
+.. autoclass:: scarf.MappingResult
     :members:
 ```
 

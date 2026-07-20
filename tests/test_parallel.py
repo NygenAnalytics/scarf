@@ -6,14 +6,14 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.chunked import ChunkedArray
-from scarf.parallel import in_shard_context, map_shards, stream_shards
+from scarf.matrix import ChunkedArray
 from scarf.storage.budget import (
     READ_AHEAD,
     ResourceBudget,
     set_resource_budget,
     shard_parallelism,
 )
+from scarf.storage.parallel import in_shard_context, map_shards, stream_shards
 
 
 @pytest.fixture

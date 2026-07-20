@@ -9,21 +9,21 @@ from scarf.assay import (
     PSEUDOTIME_AGGREGATION_SCHEMA_VERSION,
     Assay,
 )
-from scarf.datastore.datastore import (
-    DataStore,
-    _scatter_feature_clusters,
-    _validated_pseudotime_regressor,
+from scarf.trajectory.feature_dynamics import knn_clustering
+from scarf.datastore.datastore import DataStore
+from scarf.trajectory.feature_dynamics import (
+    scatter_feature_clusters as _scatter_feature_clusters,
+    validate_pseudotime_regressor as _validated_pseudotime_regressor,
 )
-from scarf.datastore.graph_datastore import (
-    _make_source_sink_vector,
-    _random_walk_laplacian_transpose,
-    _select_pseudotime_component,
-    _truncated_pba_potential,
-    _validate_source_sink_labels,
-    _validate_source_sink_vector,
+from scarf.trajectory.pseudotime import (
+    make_source_sink_vector as _make_source_sink_vector,
+    random_walk_laplacian_transpose as _random_walk_laplacian_transpose,
+    select_pseudotime_component as _select_pseudotime_component,
+    truncated_pba_potential as _truncated_pba_potential,
+    validate_source_sink_labels as _validate_source_sink_labels,
+    validate_source_sink_vector as _validate_source_sink_vector,
 )
-from scarf.markers import knn_clustering
-from scarf.results import PseudotimeMarkerResult
+from scarf.trajectory.results import PseudotimeMarkerResult
 
 
 def test_source_sink_vector_supports_one_sided_supervision():
@@ -261,19 +261,14 @@ def test_marker_search_writes_strict_feature_subset_with_subset_key():
 
 
 def test_regressor_validation_points_to_component_validity_key():
-    assay = type(
-        "FakeAssay",
-        (),
-        {
-            "cells": _FakeCells(
-                np.array([0.0, np.nan]),
-                ["ptime", "ptime__valid"],
-            )
-        },
-    )()
-
     with pytest.raises(ValueError, match="ptime__valid"):
-        _validated_pseudotime_regressor(assay, "I", "ptime")
+        _validated_pseudotime_regressor(
+            np.array([0.0, np.nan]),
+            2,
+            "ptime",
+            "I",
+            has_validity_column=True,
+        )
 
 
 class _AggregationCells:

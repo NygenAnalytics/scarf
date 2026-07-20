@@ -1,11 +1,54 @@
 """Tests for scarf.plotting.unified_embedding."""
 
 import matplotlib
+import numpy as np
 import pytest
+import zarr
+from zarr.storage import MemoryStore
 
 matplotlib.use("Agg")
 
 import scarf.plotting as splt
+from scarf.datastore.mapping_datastore import MappingDatastore
+from scarf.plotting.unified import _load_unified_layout
+
+
+def _memory_layout_store(
+    attrs: dict[str, object],
+) -> MappingDatastore:
+    store = MappingDatastore.__new__(MappingDatastore)
+    store.z = zarr.open_group(store=MemoryStore(), mode="w")
+    store.workspace = None
+    store._defaultAssay = "RNA"
+    projections = store.z.create_group("RNA/projections")
+    layout = projections.create_array("layout", data=np.zeros((3, 2)))
+    layout.attrs.update(attrs)
+    return store
+
+
+def test_unified_layout_requires_datastore_adapter():
+    with pytest.raises(TypeError, match="does not provide unified layout data"):
+        _load_unified_layout(object(), layout_key="layout", from_assay="RNA")
+
+
+@pytest.mark.parametrize(
+    ("attrs", "message"),
+    [
+        ({}, "missing n_cells/target_names"),
+        (
+            {"n_cells": [1, 1], "target_names": ["target"]},
+            "n_cells does not match",
+        ),
+        (
+            {"n_cells": [2, 1], "target_names": []},
+            "target_names length",
+        ),
+    ],
+)
+def test_unified_layout_adapter_validates_persisted_metadata(attrs, message):
+    store = _memory_layout_store(attrs)
+    with pytest.raises(ValueError, match=message):
+        store._load_unified_layout_data("layout", "RNA")
 
 
 def test_unified_embedding_matches_projection_rows(run_unified_umap, datastore):

@@ -52,7 +52,7 @@ scarf.fetch_dataset(
 ```{code-cell} ipython3
 ds = scarf.DataStore('scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr')
 
-ds.mark_hvgs(min_cells=20, top_n=500)
+ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ds.make_graph(feat_key='hvgs', k=11, dims=15)
 ds.run_clustering(n_clusters=15)
 ds.run_umap(n_epochs=250, parallel=True)
@@ -69,15 +69,22 @@ splt.embedding(
 
 +++
 
-UMAP, clustering and marker identification together allow a good understanding of cellular diversity. However, one can still choose from a plethora of other analysis on the data. For example, identification of cell differentiation trajectories. One of the major challenges to run these analysis could be the size of the data. Scarf performs a topology conserving downsampling of the data based on the cell neighbourhood graph. This downsampling aims to maximize the heterogeneity while sampling cells from the data.
+UMAP, clustering, and marker identification describe cellular diversity, but some downstream
+analyses remain expensive on every cell. Scarf can select a topology-preserving subset from
+the cell-neighborhood graph while retaining heterogeneous regions.
 
-Here we run the TopACeDo downsampling algorithm that leverages Scarf's KNN graph to perform a manifold preserving subsampling of cells. The subsampler can be invoked directly from Scarf's DataStore object.
+TopACeDo uses Scarf's KNN graph to perform manifold-preserving subsampling. Invoke it from
+the `DataStore`:
 
 ```{code-cell} ipython3
 ds.run_topacedo_sampler(
     cluster_key='RNA_cluster',
     max_sampling_rate=0.1
 )
+if 'RNA_sketched' not in ds.cells.columns:
+    raise RuntimeError(
+        "TopACeDo did not create RNA_sketched. Verify that topacedo is installed."
+    )
 ```
 
 As a result of subsampling the subsampled cells are marked True under the cell metadata column `RNA_sketched`. We can visualize these cells with `splt.embedding` and `subset_by`
@@ -132,7 +139,8 @@ splt.embedding(
 
 +++
 
-TopACeDo only marks the cells the representative that for downsampling. To create a new subsampled datasets, `SubsetZarr` writer class must be used. This will create a new Zarr file containing only the subset of cells.
+TopACeDo marks representative cells but leaves the source store unchanged. Use `SubsetZarr`
+to create a new Zarr store containing only the selected cells.
 
 ```{code-cell} ipython3
 writer = scarf.SubsetZarr(

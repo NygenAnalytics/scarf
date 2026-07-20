@@ -20,7 +20,7 @@ class PostInstallCommand(install):
                 os.remove(target)
             with open(source, "rb") as src, open(target, "wb") as dst:
                 dst.write(src.read())
-            os.chmod(target, 0o655)
+            os.chmod(target, 0o755)
 
 
 setup(cmdclass={"install": PostInstallCommand})

@@ -4,14 +4,15 @@ import numpy as np
 import pytest
 import zarr
 
-from scarf.mapping_reference import (
+from scarf.mapping.artifact import (
     LATEST_MAPPING_REFERENCE_ATTRIBUTE,
     MAPPING_REFERENCE_GROUP,
     MAPPING_REFERENCES_GROUP,
     load_mapping_reference,
+    mapping_reference_hash,
     persist_mapping_reference,
 )
-from scarf.symphony import SymphonyReferenceModel
+from scarf.mapping.models import SymphonyReferenceModel
 
 
 def _model() -> SymphonyReferenceModel:
@@ -25,6 +26,36 @@ def _model() -> SymphonyReferenceModel:
         cluster_mass=np.array([5.0, 4.0]),
         sigma=np.array([0.1, 0.2]),
         correction_ridge=1.0,
+    )
+
+
+def test_mapping_reference_hash_is_stable():
+    metadata = {
+        "assay": "RNA",
+        "cellKey": "I",
+        "featureKey": "hvgs",
+        "reductionPath": "RNA/reduction",
+        "annPath": "RNA/reduction/ann",
+        "featureHash": "features",
+        "cellHash": "cells",
+        "batchValueHash": "batches",
+        "batchColumns": ["batch"],
+        "subsetHash": 1,
+        "subsetParams": {"log_transform": True},
+        "loadingsHash": "loadings",
+        "reductionMethod": "pca",
+        "algorithmVariant": "symphonyStyleV1",
+    }
+
+    assert (
+        mapping_reference_hash(
+            _model(),
+            np.array(["gene_a", "gene_b"]),
+            metadata,
+            np.array([0.0, 1.0]),
+            np.array([0.1, 2.0]),
+        )
+        == "026a8e3ad0f570ff52d12575669dcbf8584f5146cf70456fb7ae3d878e66de79"
     )
 
 

@@ -5,8 +5,13 @@ from scipy.sparse import coo_matrix
 
 pytest.importorskip("umap")
 
-from scarf.harmony import run_harmony
-from scarf.umap import calc_dens_map_params, fit_transform, fuzzy_simplicial_set
+from scarf.embeddings.initialization import initial_embedding
+from scarf.embeddings.umap import (
+    calc_dens_map_params,
+    fit_transform,
+    fuzzy_simplicial_set,
+)
+from scarf.embeddings.harmony import run_harmony
 
 
 def _ring_graph(n: int) -> coo_matrix:
@@ -23,23 +28,45 @@ def _ring_graph(n: int) -> coo_matrix:
 
 def test_calc_dens_map_params():
     graph = _ring_graph(8)
-    dists = np.full((8, 8), 2.0, dtype=np.float32)
+    dists = np.full((8, 8), 3.0, dtype=np.float32)
     np.fill_diagonal(dists, 0.0)
     for i in range(8):
-        dists[i, (i + 1) % 8] = 1.0
-        dists[i, (i - 1) % 8] = 1.0
+        for j in (i - 1, i + 1):
+            neighbor = j % 8
+            dists[i, neighbor] = (
+                1.0 + ((min(i, neighbor) * 3 + max(i, neighbor)) % 5) / 5.0
+            )
     mu_sum, r_term = calc_dens_map_params(graph, dists)
-    assert mu_sum.shape == (8,)
-    assert r_term.shape == (8,)
-    assert np.all(np.isfinite(mu_sum))
-    assert np.all(np.isfinite(mu_sum[mu_sum > 0]))
+    np.testing.assert_array_equal(mu_sum, np.full(8, 4.0, dtype=np.float32))
+    np.testing.assert_allclose(
+        r_term,
+        [
+            -0.1043465,
+            -1.270655,
+            0.6717964,
+            1.7731321,
+            0.89659786,
+            -0.10434671,
+            -1.270655,
+            -0.59152323,
+        ],
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_fuzzy_simplicial_set_produces_coo_graph():
     graph = coo_matrix(([1.0, 0.6], ([0, 1], [1, 2])), shape=(4, 4))
     merged = fuzzy_simplicial_set(graph, 1.0)
-    assert merged.shape == (4, 4)
-    assert merged.nnz > 0
+    np.testing.assert_array_equal(
+        merged.toarray(),
+        [
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.6, 0.0],
+            [0.0, 0.6, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+    )
 
 
 def test_fit_transform_runs_short_embedding():
@@ -65,8 +92,50 @@ def test_fit_transform_runs_short_embedding():
 
     assert embedding.shape == (n_cells, 2)
     assert np.all(np.isfinite(embedding))
-    assert a > 0
-    assert b > 0
+    pairs = np.array([[0, 1], [0, 6], [3, 15], [8, 20], [12, 23]])
+    pair_distances = np.linalg.norm(
+        embedding[pairs[:, 0]] - embedding[pairs[:, 1]],
+        axis=1,
+    )
+    np.testing.assert_allclose(
+        pair_distances,
+        [3.7229292, 6.3459296, 2.1798954, 4.09683, 3.122777],
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        [a, b],
+        [0.58303002, 1.33416699],
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_initial_embedding_matches_regression_values():
+    centers = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 1.0],
+            [0.0, 3.0, 2.0],
+            [2.0, 3.0, 4.0],
+        ]
+    )
+    labels = np.array([2, 0, 3, 1, 2])
+
+    actual = initial_embedding(centers, labels, 2)
+
+    np.testing.assert_allclose(
+        actual,
+        [
+            [1.0399364, -1.3556585],
+            [-2.435071, -0.58934784],
+            [2.4441376, 0.7173242],
+            [-1.3938057, 1.3570011],
+            [1.0399364, -1.3556585],
+        ],
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_run_harmony_corrects_batch_structure():

@@ -3,7 +3,7 @@ import pytest
 from scipy.cluster.hierarchy import linkage
 from scipy.spatial.distance import pdist
 
-from scarf.dendrogram import BalancedCut, CoalesceTree, make_digraph
+from scarf.clustering.hierarchy import BalancedCut, CoalesceTree, make_digraph
 
 
 def test_make_digraph_builds_expected_node_count():

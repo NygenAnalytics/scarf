@@ -3,13 +3,15 @@ from importlib import import_module, util
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.spatial import procrustes
+from sklearn.metrics import adjusted_rand_score
 
 import scarf
 import scarf.plotting as splt
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.mapping_datastore import MappingDatastore
-from scarf.mapping_utils import array_hash
-from scarf.results import (
+from scarf.mapping.hashing import array_hash
+from scarf.trajectory.results import (
     PseudotimeAggregationResult,
     PseudotimeScoreResult,
 )
@@ -139,12 +141,12 @@ class TestDataStore:
     def test_graph_distances(self, make_graph, datastore):
         a = np.load(full_path("knn_distances.npy"))
         b = datastore.z[make_graph]["distances"][:]
-        assert np.all((a - b) < 1e-3)
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-3)
 
     def test_graph_weights(self, make_graph, datastore):
         a = np.load(full_path("knn_weights.npy"))
         b = datastore.z[make_graph]["graph__1.0__1.5"]["weights"][:]
-        assert np.all((a - b) < 1e-5)
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-5)
 
     def test_atac_graph_indices(self, make_atac_graph, atac_datastore):
         a = np.load(full_path("atac_knn_indices.npy"))
@@ -166,8 +168,9 @@ class TestDataStore:
 
     def test_leiden_values(self, leiden_clustering, cell_attrs):
         assert len(set(leiden_clustering)) == 10
-        # Disabled the following test because failing on CI
-        # assert np.array_equal(leiden_clustering, cell_attrs['RNA_leiden_cluster'].values)
+        expected = cell_attrs["RNA_leiden_cluster"].values
+        agreement = adjusted_rand_score(expected, leiden_clustering)
+        assert agreement == pytest.approx(0.8850162225, abs=1e-6)
 
     def test_paris_values(self, paris_clustering, cell_attrs):
         assert np.array_equal(paris_clustering, cell_attrs["RNA_cluster"].values)
@@ -185,8 +188,8 @@ class TestDataStore:
     def test_umap_values(self, umap, cell_attrs):
         precalc_umap = cell_attrs[["RNA_UMAP1", "RNA_UMAP2"]].values
         assert umap.shape == precalc_umap.shape
-        # Disabled the following test because failing on CI
-        # assert np.all((umap - precalc_umap) < 0.1)
+        _, _, disparity = procrustes(precalc_umap, umap)
+        assert disparity < 0.2
 
     def test_get_markers(self, marker_search, paris_clustering, datastore):
         precalc_markers = pd.read_csv(full_path("markers_cluster1.csv"), index_col=0)
@@ -194,8 +197,12 @@ class TestDataStore:
 
         # Check feature names and scores (always required)
         assert markers.feature_name.equals(precalc_markers.feature_name)
-        diff = (markers.score - precalc_markers.score).values
-        assert np.all(diff < 1e-3)
+        np.testing.assert_allclose(
+            markers.score.values,
+            precalc_markers.score.values,
+            rtol=0,
+            atol=1e-3,
+        )
 
         # Check p_values only if they exist in reference data (backward compatible)
         if "p_value" in precalc_markers.columns:
@@ -482,7 +489,7 @@ class TestDataStore:
     def test_plot_unified_embedding_target_groups(
         self, run_unified_umap, paris_clustering, datastore
     ):
-        from scarf._types import as_zarr_array, as_zarr_group
+        from scarf.storage.types import as_zarr_array, as_zarr_group
 
         projections = as_zarr_group(
             as_zarr_group(datastore.zw["RNA"], name="RNA")["projections"],

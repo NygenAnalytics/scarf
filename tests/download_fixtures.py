@@ -137,7 +137,7 @@ def download_optional_h5ad() -> None:
     if local_h5ad.is_file():
         return
 
-    from scarf.downloader import fetch_dataset
+    from scarf.readers.datasets import fetch_dataset
 
     fetch_dataset(sample, save_path=str(datasets_dir()))
 

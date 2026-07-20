@@ -5,9 +5,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from scarf.harmony import fit_harmony
-from scarf.symphony import (
-    SymphonyReferenceModel,
+from scarf.embeddings.harmony import fit_harmony
+from scarf.mapping.models import SymphonyReferenceModel
+from scarf.mapping.symphony import (
     accumulate_sufficient_statistics,
     apply_query_correction,
     initialize_sufficient_statistics,

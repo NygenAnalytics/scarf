@@ -231,7 +231,7 @@ def test_embedding_dotplot_matrixplot_on_fixture(umap, leiden_clustering, datast
 def test_feature_ref_duplicate_raises(datastore):
     # Looking up by a nonsense name
     with pytest.raises(KeyError):
-        splt.FeatureRef  # noqa: B018 — ensure import path
+        splt.FeatureRef  # noqa: B018 - ensure import path
         from scarf.plotting._data import resolve_feature
 
         resolve_feature(datastore, "___not_a_real_feature___")

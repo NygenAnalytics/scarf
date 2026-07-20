@@ -2,19 +2,20 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import scarf.markers as markers_module
+import scarf.features.markers.search as marker_search_module
 from scarf.assay import norm_lib_size
 from scipy.stats import linregress
 
-from scarf.markers import (
-    _batch_stats,
-    _marker_stats_batch,
-    _regression_batch_results,
-    _regression_r_batch,
+from scarf.features.markers import (
     find_markers_by_rank,
     find_markers_by_regression,
     mannwhitneyu_from_ranks,
     sort_marker_results,
+)
+from scarf.features.markers.rank import _batch_stats, _marker_stats_batch
+from scarf.features.markers.regression import (
+    _regression_batch_results,
+    _regression_r_batch,
 )
 from scarf.utils import controlled_compute
 
@@ -410,7 +411,7 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
                 columns = np.arange(start, min(start + 2, data.shape[1]))
                 yield block_index, data[:, columns], columns, 0.01, "memory"
 
-    monkeypatch.setattr(markers_module, "RNAassay", FakeRNA)
+    monkeypatch.setattr(marker_search_module, "RNAassay", FakeRNA)
     results = find_markers_by_rank(
         FakeRNA(),
         group_key="cluster",
@@ -459,7 +460,8 @@ def test_compact_marker_save_roundtrip():
     import zarr
     from zarr.storage import MemoryStore
 
-    from scarf.datastore.datastore import DataStore, _load_marker_cluster_frame
+    from scarf.datastore._operations.features import _load_marker_cluster_frame
+    from scarf.datastore.datastore import DataStore
 
     index = np.array([10, 5, 7], dtype=np.int32)
     source = pd.DataFrame(
@@ -495,7 +497,7 @@ def test_compact_marker_save_roundtrip():
 
 
 def test_resolve_marker_gene_batch_size_respects_chunk_and_budget():
-    from scarf.markers import resolve_marker_gene_batch_size
+    from scarf.features.markers import resolve_marker_gene_batch_size
 
     batch = resolve_marker_gene_batch_size(
         n_features=25_683,
@@ -508,7 +510,7 @@ def test_resolve_marker_gene_batch_size_respects_chunk_and_budget():
 
 
 def test_resolve_marker_gene_batch_size_shrinks_with_more_cells():
-    from scarf.markers import resolve_marker_gene_batch_size
+    from scarf.features.markers import resolve_marker_gene_batch_size
 
     sizes = []
     for n_cells in (100_000, 1_000_000, 10_000_000):

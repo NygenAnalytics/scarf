@@ -99,14 +99,13 @@ splt.distribution(
 `auto_filter_cells` models each QC column as a normal distribution from its median and
 standard deviation, then takes density points at `min_p` and `max_p` (defaults 0.01 and
 0.99). Default columns are nCounts, nFeatures, percentMito, and percentRibo when present.
+Like repeated `filter_cells` calls, it intersects its result with the current `I` column and
+does not reactivate cells. The call below intentionally refines the manual filter from the
+previous section. Use a fresh store or reset `I` before the call when comparing it as an
+alternative filtering strategy.
 
 ```{code-cell} ipython3
-ds_auto = scarf.DataStore(
-    'scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr',
-    nthreads=4,
-    min_features_per_cell=10,
-)
-ds_auto.auto_filter_cells(show_qc_plots=True)
+ds.auto_filter_cells(show_qc_plots=True)
 ```
 
 ## 4) Doublet scores
@@ -116,7 +115,7 @@ graph, and writes a per-cell score (default base label `doublet_score`). It does
 remove cells automatically. It requires an existing cluster column.
 
 ```{code-cell} ipython3
-ds.mark_hvgs(min_cells=20, top_n=500)
+ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
 ds.run_leiden_clustering(resolution=0.5)
 score_col = ds.run_doublet_detection(cluster_key='RNA_leiden_cluster')

@@ -1,6 +1,6 @@
 import numpy as np
 
-from scarf.ann import fix_knn_query
+from scarf.neighbors.index import fix_knn_query
 
 
 def test_fix_knn_query_removes_leading_self_matches():

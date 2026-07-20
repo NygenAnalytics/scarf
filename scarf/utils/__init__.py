@@ -1,0 +1,112 @@
+from importlib import import_module as _import_module
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .arrays import (
+        array_digest as array_digest,
+        clean_array as clean_array,
+        permute_into_chunks as permute_into_chunks,
+        rescale_array as rescale_array,
+        rolling_window as rolling_window,
+    )
+    from .compute import (
+        controlled_compute as controlled_compute,
+        show_dask_progress as show_dask_progress,
+    )
+    from .logging import (
+        get_log_level as get_log_level,
+        logger as logger,
+        set_verbosity as set_verbosity,
+    )
+    from .prefetch import (
+        ColumnBlockPipeline as ColumnBlockPipeline,
+        iter_column_blocks as iter_column_blocks,
+        prefetch_blocks as prefetch_blocks,
+        remote_column_disk_ahead as remote_column_disk_ahead,
+        remote_column_ram_ahead as remote_column_ram_ahead,
+    )
+    from .process import (
+        process_rss_mb as process_rss_mb,
+        rss_peak_tracker as rss_peak_tracker,
+        system_call as system_call,
+    )
+    from .progress import (
+        tqdm_params as tqdm_params,
+        tqdmbar as tqdmbar,
+    )
+    from ..storage.stores import (
+        ZARRLOC as ZARRLOC,
+        load_zarr as load_zarr,
+    )
+
+__all__ = [
+    "logger",
+    "tqdmbar",
+    "tqdm_params",
+    "set_verbosity",
+    "get_log_level",
+    "system_call",
+    "rescale_array",
+    "clean_array",
+    "load_zarr",
+    "permute_into_chunks",
+    "show_dask_progress",
+    "controlled_compute",
+    "prefetch_blocks",
+    "ColumnBlockPipeline",
+    "iter_column_blocks",
+    "remote_column_disk_ahead",
+    "remote_column_ram_ahead",
+    "process_rss_mb",
+    "rss_peak_tracker",
+    "array_digest",
+    "rolling_window",
+]
+
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "logger": (".logging", "logger"),
+    "tqdmbar": (".progress", "tqdmbar"),
+    "tqdm_params": (".progress", "tqdm_params"),
+    "set_verbosity": (".logging", "set_verbosity"),
+    "get_log_level": (".logging", "get_log_level"),
+    "system_call": (".process", "system_call"),
+    "rescale_array": (".arrays", "rescale_array"),
+    "clean_array": (".arrays", "clean_array"),
+    "load_zarr": ("..storage.stores", "load_zarr"),
+    "permute_into_chunks": (".arrays", "permute_into_chunks"),
+    "show_dask_progress": (".compute", "show_dask_progress"),
+    "controlled_compute": (".compute", "controlled_compute"),
+    "prefetch_blocks": (".prefetch", "prefetch_blocks"),
+    "ColumnBlockPipeline": (".prefetch", "ColumnBlockPipeline"),
+    "iter_column_blocks": (".prefetch", "iter_column_blocks"),
+    "remote_column_disk_ahead": (".prefetch", "remote_column_disk_ahead"),
+    "remote_column_ram_ahead": (".prefetch", "remote_column_ram_ahead"),
+    "process_rss_mb": (".process", "process_rss_mb"),
+    "rss_peak_tracker": (".process", "rss_peak_tracker"),
+    "array_digest": (".arrays", "array_digest"),
+    "rolling_window": (".arrays", "rolling_window"),
+    "ZARRLOC": ("..storage.stores", "ZARRLOC"),
+    "stdout_is_interactive": (".logging", "stdout_is_interactive"),
+    "is_notebook": (".progress", "is_notebook"),
+    "REMOTE_COLUMN_DISK_AHEAD": (".prefetch", "REMOTE_COLUMN_DISK_AHEAD"),
+}
+
+for _export_name in _LAZY_EXPORTS:
+    globals().pop(_export_name, None)
+del _export_name
+
+
+def __getattr__(name: str) -> Any:
+    export = _LAZY_EXPORTS.get(name)
+    if export is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute_name = export
+    value = getattr(_import_module(module_name, __name__), attribute_name)
+    if name in __all__ and hasattr(value, "__module__"):
+        value.__module__ = __name__
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()).union(_LAZY_EXPORTS))

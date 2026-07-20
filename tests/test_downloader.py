@@ -9,7 +9,7 @@ from . import full_path, remove
 
 @pytest.fixture
 def mock_osf_downloader(monkeypatch):
-    from scarf import downloader
+    from scarf.readers import datasets as downloader
 
     class FakeOSFdownloader:
         projectId = "zeupv"
@@ -39,7 +39,7 @@ def test_downloader(mock_osf_downloader):
 
 
 def test_osf_downloader_initializes_and_lists_sorted(monkeypatch, capsys):
-    from scarf.downloader import OSFdownloader
+    from scarf.readers.datasets import OSFdownloader
 
     datasets = {
         "zeta": ("zeta-id", "figshare"),
@@ -69,7 +69,7 @@ def test_osf_downloader_initializes_and_lists_sorted(monkeypatch, capsys):
 def test_osf_downloader_builds_api_urls(monkeypatch):
     import requests
 
-    from scarf.downloader import OSFdownloader
+    from scarf.readers.datasets import OSFdownloader
 
     requested_urls = []
 
@@ -94,7 +94,7 @@ def test_osf_downloader_builds_api_urls(monkeypatch):
 
 
 def test_osf_downloader_retries_and_paginates(monkeypatch):
-    from scarf.downloader import OSFdownloader
+    from scarf.readers.datasets import OSFdownloader
 
     client = object.__new__(OSFdownloader)
     responses = iter(
@@ -116,7 +116,7 @@ def test_osf_downloader_retries_and_paginates(monkeypatch):
         return response
 
     monkeypatch.setattr(client, "get_json", fake_get_json)
-    monkeypatch.setattr("scarf.downloader.time.sleep", sleeps.append)
+    monkeypatch.setattr("scarf.readers.datasets.time.sleep", sleeps.append)
 
     assert client.get_all_pages("osfstorage", "folder") == [
         {"id": "first"},
@@ -132,7 +132,7 @@ def test_osf_downloader_retries_and_paginates(monkeypatch):
 
 
 def test_osf_downloader_discovers_datasets_and_files(monkeypatch):
-    from scarf.downloader import OSFdownloader
+    from scarf.readers.datasets import OSFdownloader
 
     client = object.__new__(OSFdownloader)
     client.projectId = "project-id"
@@ -186,7 +186,7 @@ def test_osf_downloader_discovers_datasets_and_files(monkeypatch):
 def test_osf_downloader_populates_sources(monkeypatch):
     import requests
 
-    from scarf.downloader import OSFdownloader
+    from scarf.readers.datasets import OSFdownloader
 
     client = object.__new__(OSFdownloader)
     client.sourceFile = "sources-id"
@@ -225,7 +225,7 @@ def test_osf_downloader_populates_sources(monkeypatch):
 
 
 def test_osf_downloader_source_retries_are_bounded(monkeypatch):
-    from scarf.downloader import OSFdownloader
+    from scarf.readers.datasets import OSFdownloader
 
     client = object.__new__(OSFdownloader)
     client.sourceFile = "sources-id"
@@ -237,7 +237,7 @@ def test_osf_downloader_source_retries_are_bounded(monkeypatch):
         return {}
 
     monkeypatch.setattr(client, "_get_files_for_node", missing_sources)
-    monkeypatch.setattr("scarf.downloader.time.sleep", sleeps.append)
+    monkeypatch.setattr("scarf.readers.datasets.time.sleep", sleeps.append)
 
     with pytest.raises(KeyError, match="after 5 attempts"):
         client._populate_sources()
@@ -246,7 +246,7 @@ def test_osf_downloader_source_retries_are_bounded(monkeypatch):
 
 
 def test_show_available_datasets(mock_osf_downloader):
-    from scarf.downloader import show_available_datasets
+    from scarf.readers.datasets import show_available_datasets
 
     show_available_datasets()
 
@@ -258,7 +258,7 @@ def test_fetch_dataset(bastidas_ponce_data):
 
 
 def test_downloader_as_zarr(mock_osf_downloader, monkeypatch, tmp_path):
-    from scarf import downloader
+    from scarf.readers import datasets as downloader
 
     downloaded = []
 
@@ -278,7 +278,7 @@ def test_downloader_as_zarr(mock_osf_downloader, monkeypatch, tmp_path):
 
 
 def test_fetch_dataset_downloads_each_non_zarr_file(monkeypatch, tmp_path):
-    from scarf import downloader
+    from scarf.readers import datasets as downloader
 
     class MultiFileDownloader:
         def get_dataset_file_ids(self, dataset_name):
@@ -318,7 +318,7 @@ def test_fetch_dataset_downloads_each_non_zarr_file(monkeypatch, tmp_path):
 def test_handle_download_streams_nonempty_chunks(monkeypatch, tmp_path):
     import requests
 
-    from scarf import downloader
+    from scarf.readers import datasets as downloader
 
     calls = []
     progress = {}
@@ -366,7 +366,7 @@ def test_handle_download_streams_nonempty_chunks(monkeypatch, tmp_path):
 def test_handle_download_extracts_tar_archive(monkeypatch, tmp_path):
     import requests
 
-    from scarf import downloader
+    from scarf.readers import datasets as downloader
 
     archive = io.BytesIO()
     payload = b"archive contents"
@@ -406,7 +406,7 @@ def test_handle_download_extracts_tar_archive(monkeypatch, tmp_path):
 def test_handle_download_propagates_request_errors(monkeypatch, tmp_path):
     import requests
 
-    from scarf import downloader
+    from scarf.readers import datasets as downloader
 
     class HeadResponse:
         headers = {}
@@ -429,14 +429,14 @@ def test_handle_download_propagates_request_errors(monkeypatch, tmp_path):
 
 
 def test_fetch_dataset_unknown_name_raises(mock_osf_downloader):
-    from scarf.downloader import fetch_dataset
+    from scarf.readers.datasets import fetch_dataset
 
     with pytest.raises(KeyError):
         fetch_dataset("this_dataset_does_not_exist", save_path=".")
 
 
 def test_fetch_dataset_as_zarr_missing_file(mock_osf_downloader, tmp_path):
-    from scarf.downloader import fetch_dataset
+    from scarf.readers.datasets import fetch_dataset
 
     fetch_dataset("dataset_0", as_zarr=True, save_path=str(tmp_path))
     assert not any(tmp_path.iterdir())
@@ -444,7 +444,7 @@ def test_fetch_dataset_as_zarr_missing_file(mock_osf_downloader, tmp_path):
 
 @pytest.mark.integration
 def test_downloader_live_osf():
-    from scarf.downloader import OSFdownloader
+    from scarf.readers.datasets import OSFdownloader
 
     osfd = OSFdownloader("zeupv")
     assert len(osfd.datasets) > 15
@@ -452,7 +452,7 @@ def test_downloader_live_osf():
 
 @pytest.mark.integration
 def test_fetch_dataset_live():
-    from scarf.downloader import fetch_dataset
+    from scarf.readers.datasets import fetch_dataset
 
     sample = "tenx_5K_pbmc_rnaseq"
     fetch_dataset(sample, as_zarr=True, save_path=full_path(None))

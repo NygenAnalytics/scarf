@@ -56,7 +56,7 @@ ds = scarf.DataStore(
 
 ```{code-cell} ipython3
 ds.filter_cells(attrs=['RNA_nCounts'], highs=[15000], lows=[1000], reset_previous=True)
-ds.mark_hvgs(min_cells=20, top_n=500)
+ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ds.make_graph(feat_key='hvgs', k=11, dims=15)
 ds.run_umap(n_epochs=150, parallel=True)
 ```

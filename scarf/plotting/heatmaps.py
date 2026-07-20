@@ -8,10 +8,13 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
-from .._types import as_zarr_array, as_zarr_group
-from ..assay import PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
-from ..chunked import ChunkedArray
-from ..utils import array_digest, controlled_compute, logger, tqdmbar
+from ..storage.types import as_zarr_array, as_zarr_group
+from ..matrix import ChunkedArray
+from ..storage.schema import PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
+from ..utils.arrays import array_digest
+from ..utils.compute import controlled_compute
+from ..utils.logging import logger
+from ..utils.progress import tqdmbar
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib, require_seaborn
 from ._figure import LegendSpec, PlotResult, normalize_axes_target

@@ -6,12 +6,12 @@ from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.assay import Assay, RNAassay, lib_size_feature_stream_eligible, norm_dummy
-from scarf.datastore.datastore import _feature_column_chunk
-from scarf.doublet_utils import write_doublet_target_zarr
-from scarf.markers import find_markers_by_rank, find_markers_by_regression
-from scarf.meld_assay import coordinate_melding
+from scarf.datastore._operations.features import _feature_column_chunk
+from scarf.features.genomic.melding import coordinate_melding
+from scarf.features.markers import find_markers_by_rank, find_markers_by_regression
 from scarf.metadata import MetaData
-from scarf.storage.zarr_store import write_counts_t
+from scarf.quality_control.doublets import write_doublet_target_zarr
+from scarf.storage.sharding import write_counts_t
 from scarf.writers import (
     create_cell_data,
     create_zarr_count_assay,

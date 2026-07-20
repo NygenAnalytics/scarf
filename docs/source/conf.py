@@ -21,6 +21,9 @@ extensions = [
     "sphinx_tabs.tabs",
     "myst_nb",
 ]
+autodoc_type_aliases = {
+    "DataStore": "scarf.datastore.datastore.DataStore",
+}
 
 templates_path = ["_templates"]
 master_doc = "index"
@@ -97,8 +100,8 @@ nitpick_ignore = [
     ("py:class", "collections.abc.Iterator"),
     ("py:class", "collections.abc.Sequence"),
     ("py:class", "collections.abc.Generator"),
-    ("py:class", "scarf.chunked.ChunkedArray"),
-    ("py:class", "scarf.ann.AnnStream"),
+    ("py:class", "scarf.matrix.ChunkedArray"),
+    ("py:class", "scarf.neighbors.stream.AnnStream"),
     ("py:class", "scarf.merge.DummyAssay"),
     ("py:class", "scarf.readers.CrReader"),
     ("py:class", "scarf.plotting._figure.LegendSpec"),

@@ -11,7 +11,7 @@ from scarf.storage.budget import (
     set_resource_budget,
     worker_prefetch_depth,
 )
-from scarf.storage.zarr_store import set_storage_profile
+from scarf.storage.profiles import set_storage_profile
 from scarf.utils import (
     ColumnBlockPipeline,
     iter_column_blocks,

@@ -4,17 +4,22 @@ import numpy as np
 import pytest
 import zarr
 from scipy.sparse import coo_matrix, csr_matrix
+from sklearn.metrics import adjusted_rand_score
 from zarr.storage import MemoryStore
 
-from scarf.knn_utils import (
+from scarf.clustering.leiden import leiden_membership
+from scarf.neighbors.graph_store import (
     _patch_null_weights,
-    calc_snn,
-    merge_graphs,
     self_query_knn,
     smoothen_dists,
-    weight_sort_indices,
-    wnn_integration,
 )
+from scarf.neighbors.graph import (
+    calc_snn,
+    merge_graphs,
+    weight_sort_indices,
+)
+from scarf.neighbors.diffusion import diffusion_operator
+from scarf.neighbors.integration import wnn_integration
 from scarf.utils import logger
 from scarf.writers import create_zarr_dataset
 
@@ -40,6 +45,37 @@ def _grouped_knn_graph(groups: list[list[int]]) -> csr_matrix:
             rows.extend([cell] * len(neighbors))
             cols.extend(neighbors)
     return csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n_cells, n_cells))
+
+
+def test_leiden_membership_preserves_disconnected_partitions():
+    graph = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]])
+
+    actual = leiden_membership(graph, resolution=1.0, random_seed=4444)
+
+    assert adjusted_rand_score([1, 1, 1, 1, 2, 2, 2, 2], actual) == pytest.approx(1.0)
+
+
+def test_diffusion_operator_matches_powered_row_normalization():
+    graph = csr_matrix(
+        [
+            [0.0, 2.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [0.0, 3.0, 0.0],
+        ]
+    )
+
+    actual = diffusion_operator(graph, power=2)
+
+    np.testing.assert_allclose(
+        actual.toarray(),
+        [
+            [0.5, 0.0, 0.5],
+            [0.0, 1.0, 0.0],
+            [0.5, 0.0, 0.5],
+        ],
+        rtol=0,
+        atol=1e-12,
+    )
 
 
 def _multimodal_wnn_inputs() -> tuple[csr_matrix, np.ndarray, csr_matrix, np.ndarray]:

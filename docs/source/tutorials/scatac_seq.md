@@ -43,7 +43,9 @@ scarf.__version__
 
 ### 1. Fetch and convert data
 
-We will use 10x Genomics's singel-cell ATAC-Seq data from peripheral blood mononuclear cells. Like single-cell RNA-Seq, Scarf only needs a count matrix to start the analysis of scATAC-Seq data. We can use `fetch_dataset` to download the data in 10x's HDF5 format.
+We will use 10x Genomics single-cell ATAC-seq data from peripheral blood mononuclear
+cells. Like single-cell RNA-seq, Scarf only needs a count matrix to start the analysis.
+Use `fetch_dataset` to download the data in 10x HDF5 format.
 
 ```{code-cell} ipython3
 scarf.fetch_dataset(
@@ -74,7 +76,10 @@ writer.dump(batch_size=1000)
 
 +++
 
-We load the Zarr file on using `DataStore` class. The obtained `DataStore` object will be our single point on interaction for rest of this analysis. When loaded, Scarf will automatically calculate the number of cells where each peak is present and number of peaks that are accessible in cell (nFeatures). Scarf will also calculate the total number of fragments/cut sites within each cell.
+Load the Zarr store with `DataStore`, which is the main interface for the rest of the
+analysis. On first load, Scarf calculates the number of cells in which each peak is present,
+the number of accessible peaks per cell (`nFeatures`), and the total fragments or cut sites
+per cell.
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(
@@ -83,7 +88,9 @@ ds = scarf.DataStore(
 )
 ```
 
-We will use `auto_filter_cells` method which automatically remove outliers from the data. To identify outliers we generate a normal distribution using sample mean and variance. Using this normal distribution Scarf estimates the values with probability less 0.01 (default value) on both ends of the distribution and flags them for removal.
+`auto_filter_cells` models each selected QC column with a normal distribution centered on its
+median and using its standard deviation. The default 0.01 and 0.99 quantiles define the lower
+and upper bounds. Cells outside those bounds are marked inactive in `I`; they are not deleted.
 
 ```{code-cell} ipython3
 ds.auto_filter_cells()
@@ -91,7 +98,9 @@ ds.auto_filter_cells()
 
 ### 3. Select features
 
-For scATAC-Seq data, the features are ranked by their [TF-IDF](https://en.wikipedia.org/wiki/Tf-idf) normalized values, summed across all cells. The top n features are marked as `prevalent_peaks` and are used for downstream steps. Here we used top 25000 peaks, which makes for more than quarter of all the peaks which inline with the what has been suggested in other scATAC-Seq analysis protocols.
+For scATAC-seq data, features are ranked by TF-IDF-normalized values summed across cells.
+The top features are marked as `prevalent_peaks` for downstream steps. Here we retain 25,000
+peaks, slightly more than one quarter of the available peaks.
 
 ```{code-cell} ipython3
 ds.mark_prevalent_peaks(top_n=25000)

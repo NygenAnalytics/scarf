@@ -90,6 +90,8 @@ subtrees:
     entries:
       - file: developers/contributing
         title: Contributing
+      - file: developers/architecture
+        title: Architecture
       - file: developers/zarr_internals
         title: Zarr internals
       - file: developers/migration_notes

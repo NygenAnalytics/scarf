@@ -54,7 +54,7 @@ ds.filter_cells(
     lows=[1000, 500, 0],
     reset_previous=True,
 )
-ds.mark_hvgs(min_cells=20, top_n=500)
+ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
 ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
 ds.run_leiden_clustering(resolution=0.5)
@@ -102,7 +102,7 @@ splt.embedding(ds, layout_key='RNA_tSNE')
 
 Paris builds a hierarchical dendrogram that can be cut to a chosen number of clusters.
 `run_clustering` is the Paris entrypoint. Cluster relationships can be drawn with
-`scarf.plotting.cluster_tree`.
+`splt.cluster_tree`.
 
 ```{code-cell} ipython3
 n_clusters = int(

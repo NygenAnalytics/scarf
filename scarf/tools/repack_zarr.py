@@ -6,15 +6,10 @@ from pathlib import Path
 import numpy as np
 import zarr
 
-from scarf.storage.zarr_store import (
-    StorageProfile,
-    array_info,
-    finalize_sharded_counts,
-    get_compressors,
-    get_storage_profile,
-    normalize_chunks,
-    open_store,
-)
+from scarf.storage.layout import array_info, get_compressors, normalize_chunks
+from scarf.storage.profiles import StorageProfile, get_storage_profile
+from scarf.storage.sharding import finalize_sharded_counts
+from scarf.storage.stores import open_store
 
 
 def _copy_group(

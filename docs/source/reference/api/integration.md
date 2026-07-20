@@ -6,15 +6,15 @@ implementations.
 ## Harmony
 
 ```{eval-rst}
-.. autofunction:: scarf.harmony.run_harmony
+.. autofunction:: scarf.embeddings.run_harmony
 ```
 
 ```{eval-rst}
-.. autofunction:: scarf.harmony.fit_harmony
+.. autofunction:: scarf.embeddings.fit_harmony
 ```
 
 ```{eval-rst}
-.. autoclass:: scarf.harmony.HarmonyResult
+.. autoclass:: scarf.embeddings.HarmonyResult
     :members:
 ```
 
@@ -23,7 +23,10 @@ implementations.
 ```{eval-rst}
 .. automodule:: scarf.metrics
     :members: compute_lisi, silhouette_scoring, label_concordance_score, lisi_batch_mixing_score, integration_score
+    :imported-members:
 ```
 
 See also `DataStore.metric_lisi`, `metric_silhouette`, `metric_label_concordance`,
-`metric_batch_mixing`, and `metric_integration` on {doc}`datastore`.
+and `metric_batch_mixing` on {doc}`datastore`. `metric_integration` is a
+deprecated compatibility name for `metric_label_concordance` and may be
+removed in Scarf 2.0.

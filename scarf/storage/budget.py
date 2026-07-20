@@ -162,6 +162,10 @@ def set_resource_budget(budget: ResourceBudget | None) -> None:
     _cachedDefault = None
 
 
+def _get_resource_budget_override() -> ResourceBudget | None:
+    return _activeBudget
+
+
 def get_resource_budget() -> ResourceBudget:
     """Return the active budget, lazily resolving (and caching) a default."""
     global _cachedDefault

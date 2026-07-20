@@ -4,14 +4,14 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.chunked import ChunkedArray
-from scarf.meld_assay import (
-    GffReader,
+from scarf.matrix import ChunkedArray
+from scarf.features.genomic.gff import GffReader
+from scarf.features.genomic.intervals import (
     binary_search,
     create_bed_from_coord_ids,
-    create_counts_mat,
     get_feature_mappings,
 )
+from scarf.features.genomic.melding import create_counts_mat
 from scarf.writers import create_zarr_dataset
 
 

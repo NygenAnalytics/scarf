@@ -451,7 +451,7 @@ def test_latest_knn_and_ann_stream_cache_paths(
     legacy_path = tmp_path / "ann_idx"
     legacy_path.write_bytes(b"index")
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.legacy_ann_index_path",
+        "scarf.datastore._operations.graph.legacy_ann_index_path",
         lambda *_: str(legacy_path),
     )
     assert (
@@ -462,7 +462,7 @@ def test_latest_knn_and_ann_stream_cache_paths(
     )
 
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.legacy_ann_index_path",
+        "scarf.datastore._operations.graph.legacy_ann_index_path",
         lambda *_: None,
     )
     assert (
@@ -483,9 +483,9 @@ def test_ann_index_resolution_and_persistence_paths(
     ann_group.create_array("ann_idx_bytes", data=np.array([1, 2, 3], dtype=np.uint8))
     stored_index = object()
     load_stored = Mock(return_value=stored_index)
-    monkeypatch.setattr("scarf.datastore.graph_datastore.load_ann_index", load_stored)
+    monkeypatch.setattr("scarf.datastore._operations.graph.load_ann_index", load_stored)
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.legacy_ann_index_path",
+        "scarf.datastore._operations.graph.legacy_ann_index_path",
         lambda *_: None,
     )
 
@@ -505,7 +505,7 @@ def test_ann_index_resolution_and_persistence_paths(
         )
     )
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.load_ann_index_from_path",
+        "scarf.datastore._operations.graph.load_ann_index_from_path",
         load_path,
     )
 
@@ -531,9 +531,9 @@ def test_ann_index_resolution_and_persistence_paths(
     )
 
     save_index = Mock()
-    monkeypatch.setattr("scarf.datastore.graph_datastore.save_ann_index", save_index)
+    monkeypatch.setattr("scarf.datastore._operations.graph.save_ann_index", save_index)
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.legacy_ann_index_path",
+        "scarf.datastore._operations.graph.legacy_ann_index_path",
         lambda *_: str(legacy_path),
     )
     assert store._resolve_ann_index(ann_loc, "l2", 3) is legacy_index
@@ -631,7 +631,7 @@ def test_normalized_cache_validation_paths(
     )
 
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.zarr.open_group",
+        "scarf.datastore._operations.graph.zarr.open_group",
         Mock(side_effect=RuntimeError("broken cache")),
     )
     assert (
@@ -650,7 +650,7 @@ def test_partial_normalization_statistics_cache_paths(
     data.mean.return_value = np.array([2.0, 4.0])
     data.std.return_value = np.array([1.5, 2.5])
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.show_dask_progress",
+        "scarf.datastore._operations.graph.show_dask_progress",
         lambda values, *_: values,
     )
 
@@ -689,7 +689,7 @@ def test_remote_cache_plan_auto_and_invalid(
 ) -> None:
     store = _memory_graph_store()
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.is_remote_datastore",
+        "scarf.datastore._operations.graph.is_remote_datastore",
         lambda *_: True,
     )
 
@@ -822,7 +822,7 @@ def test_run_marker_search_skip_save_and_errors(
     monkeypatch.setattr(store, "_get_latest_feat_key", lambda _: "I")
     markers = {"cluster": object()}
     finder = Mock(return_value=markers)
-    monkeypatch.setattr("scarf.markers.find_markers_by_rank", finder)
+    monkeypatch.setattr("scarf.features.markers.find_markers_by_rank", finder)
 
     with pytest.raises(ValueError, match="group_key"):
         store.run_marker_search(group_key=None)
@@ -941,7 +941,7 @@ def test_run_tsne_orchestration_and_error_paths(
     monkeypatch.setattr(store, "_get_latest_keys", latest_keys)
     monkeypatch.setattr(store, "load_graph", load_graph)
     monkeypatch.setattr(store, "_get_ini_embed", get_initial)
-    monkeypatch.setattr("scarf.knn_utils.run_sgtsne", runner)
+    monkeypatch.setattr("scarf.embeddings.sgtsne.run_sgtsne", runner)
 
     store.run_tsne(
         symmetric_graph=True,

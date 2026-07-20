@@ -71,6 +71,11 @@ jobs:
             --cov-report=xml \
             --cov-report=term
         fi
+    - name: Build and smoke-test wheel
+      if: matrix.resolution == 'locked' && matrix.python-version == '3.14'
+      run: |
+        uv build
+        uv run --no-project python tests/smoke_wheel.py dist/*.whl
     - name: Upload coverage to Codecov
       if: matrix.resolution == 'locked' && matrix.python-version == '3.14'
       uses: codecov/codecov-action@v3

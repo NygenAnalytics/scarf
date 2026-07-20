@@ -101,7 +101,10 @@ def test_save_normalized_data_without_renorm_still_uses_normed(
         return write_renorm_subset_to_zarr(*args, **kwargs)
 
     monkeypatch.setattr(RNAassay, "normed", fake_normed)
-    monkeypatch.setattr("scarf.writers.write_renorm_subset_to_zarr", fake_fused)
+    monkeypatch.setattr(
+        "scarf.storage.materialize.write_renorm_subset_to_zarr",
+        fake_fused,
+    )
     monkeypatch.setattr(
         rna,
         "_get_cell_feat_idx",
@@ -130,7 +133,10 @@ def test_save_normalized_data_renorm_cache_hit(toy_crdir_ds, monkeypatch):
         called["fused"] += 1
         return orig_fused(*args, **kwargs)
 
-    monkeypatch.setattr("scarf.writers.write_renorm_subset_to_zarr", counting_fused)
+    monkeypatch.setattr(
+        "scarf.storage.materialize.write_renorm_subset_to_zarr",
+        counting_fused,
+    )
     monkeypatch.setattr(
         rna,
         "_get_cell_feat_idx",

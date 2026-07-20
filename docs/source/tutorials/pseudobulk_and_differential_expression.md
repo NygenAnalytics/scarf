@@ -59,7 +59,7 @@ ds
 ```{code-cell} ipython3
 # Ensure a clustering column exists for aggregation demos.
 if 'RNA_leiden_cluster' not in ds.cells.columns:
-    ds.mark_hvgs(min_cells=20, top_n=500)
+    ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
     ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
     ds.run_leiden_clustering(resolution=0.5)
 ```

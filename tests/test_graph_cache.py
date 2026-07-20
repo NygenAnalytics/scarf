@@ -5,8 +5,9 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.datastore.graph_datastore import GraphDataStore, _GraphBuildProgress
-from scarf.storage.zarr_store import copy_zarr_array, create_or_open_staged_normed_array
+from scarf.datastore._operations.graph import _GraphBuildProgress
+from scarf.datastore.graph_datastore import GraphDataStore
+from scarf.storage.copy import copy_zarr_array, create_or_open_staged_normed_array
 
 
 def _memory_group():
@@ -67,7 +68,7 @@ def test_stage_normed_data_skips_repeat_copy(toy_crdir_ds, tmp_path, monkeypatch
         return orig_copy(*args, **kwargs)
 
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.copy_zarr_array", counting_copy
+        "scarf.datastore._operations.graph.copy_zarr_array", counting_copy
     )
     store = GraphDataStore.__new__(GraphDataStore)
     store.nthreads = rna.nthreads
@@ -99,7 +100,7 @@ def test_stage_normed_data_recopies_when_subset_params_change(
         return orig_copy(*args, **kwargs)
 
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.copy_zarr_array", counting_copy
+        "scarf.datastore._operations.graph.copy_zarr_array", counting_copy
     )
     store = GraphDataStore.__new__(GraphDataStore)
     store.nthreads = rna.nthreads
@@ -156,7 +157,7 @@ def test_mirror_write_lets_staging_skip_copy(toy_crdir_ds, tmp_path, monkeypatch
         return orig_copy(*args, **kwargs)
 
     monkeypatch.setattr(
-        "scarf.datastore.graph_datastore.copy_zarr_array", counting_copy
+        "scarf.datastore._operations.graph.copy_zarr_array", counting_copy
     )
     staged = store._stage_normed_data(remote, subset_hash, subset_params, cache_base)
     assert calls["n"] == 0

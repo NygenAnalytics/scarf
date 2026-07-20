@@ -3,12 +3,12 @@ import zarr
 from collections.abc import Iterable
 from typing import Any, cast
 
-from loguru import logger
-
-from .._types import ZarrMode, as_zarr_group
+from ..storage.types import ZarrMode, as_zarr_group
 from ..assay import RNAassay, ATACassay, ADTassay, Assay
 from ..metadata import MetaData
-from ..utils import show_dask_progress, controlled_compute, load_zarr, ZARRLOC
+from ..storage.stores import ZARRLOC, load_zarr
+from ..utils.compute import controlled_compute, show_dask_progress
+from ..utils.logging import logger
 
 
 def sanitize_hierarchy(z: zarr.Group, assay_name: str, workspace: str | None) -> bool:
@@ -117,6 +117,7 @@ class BaseDataStore:
 
     @property
     def zw(self) -> zarr.Group:
+        """Return the active root or workspace Zarr group."""
         if self.workspace is None:
             ret_val: zarr.Group = self.z
         else:

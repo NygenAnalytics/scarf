@@ -1,0 +1,164 @@
+import re
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+from ..utils.logging import logger
+
+__all__ = ["fit_lowess", "select_highly_variable_features"]
+
+
+def fit_lowess(
+    a: np.ndarray,
+    b: np.ndarray,
+    n_bins: int,
+    lowess_frac: float,
+) -> np.ndarray:
+    """Fit a LOWESS curve and return corrected variance estimates."""
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+
+    stats = pd.DataFrame({"a": a, "b": b}).apply(np.log)
+    bin_edges = np.histogram(stats.a, bins=n_bins)[1]
+    bin_edges[-1] += 0.1
+    bin_idx: list[list[Any]] = []
+    for index in range(n_bins):
+        idx = pd.Series(
+            (stats.a >= bin_edges[index]) & (stats.a < bin_edges[index + 1])
+        )
+        if sum(idx) > 0:
+            bin_idx.append(list(idx[idx].index))
+    bin_vals: list[list[float]] = []
+    for idx in bin_idx:
+        temp_stat = stats.reindex(idx)
+        temp_gene = temp_stat.idxmin().b
+        bin_vals.append([temp_stat.b[temp_gene], temp_stat.a[temp_gene]])
+    bin_array = np.array(bin_vals).T
+    bin_cor_fac = lowess(
+        bin_array[0],
+        bin_array[1],
+        return_sorted=False,
+        frac=lowess_frac,
+        it=100,
+    ).T
+    fixed_var: dict[Any, float] = {}
+    for correction, indices in zip(bin_cor_fac, bin_idx):
+        for idx in indices:
+            fixed_var[idx] = np.e ** (stats.b[idx] - correction)
+    return np.array([fixed_var[index] for index in range(len(a))])
+
+
+def _bounded(
+    values: np.ndarray,
+    lower: float,
+    upper: float,
+    *,
+    keep_bounds: bool,
+) -> np.ndarray:
+    if keep_bounds:
+        return (values >= lower) & (values <= upper)
+    return (values > lower) & (values < upper)
+
+
+def _linear_threshold(value: float, unbounded_value: float) -> float:
+    if value == unbounded_value:
+        return value
+    return float(2**value)
+
+
+def select_highly_variable_features(
+    corrected_variance: np.ndarray,
+    normalized_cell_counts: np.ndarray,
+    mean_nonzero: np.ndarray,
+    active_features: np.ndarray,
+    feature_names: np.ndarray,
+    *,
+    min_cells: int,
+    max_cells: int | float,
+    top_n: int,
+    min_var: float,
+    max_var: float,
+    min_mean: float,
+    max_mean: float,
+    blacklist: str,
+    keep_bounds: bool,
+) -> np.ndarray:
+    """Select highly variable features from precomputed feature statistics."""
+    corrected_variance = np.asarray(corrected_variance)
+    normalized_cell_counts = np.asarray(normalized_cell_counts)
+    mean_nonzero = np.asarray(mean_nonzero)
+    active_features = np.asarray(active_features, dtype=bool)
+    feature_names = np.asarray(feature_names)
+    size = corrected_variance.shape[0]
+    if any(
+        values.shape != (size,)
+        for values in (
+            normalized_cell_counts,
+            mean_nonzero,
+            active_features,
+            feature_names,
+        )
+    ):
+        raise ValueError("HVG inputs must be one-dimensional arrays of equal length")
+
+    min_var = _linear_threshold(min_var, -np.inf)
+    max_var = _linear_threshold(max_var, np.inf)
+    min_mean = _linear_threshold(min_mean, -np.inf)
+    max_mean = _linear_threshold(max_mean, np.inf)
+
+    if blacklist:
+        pattern = re.compile(blacklist.upper())
+        allowed = np.fromiter(
+            (pattern.match(str(name).upper()) is None for name in feature_names),
+            dtype=bool,
+            count=size,
+        )
+    else:
+        allowed = np.ones(size, dtype=bool)
+
+    candidates = (
+        _bounded(
+            normalized_cell_counts,
+            min_cells,
+            max_cells,
+            keep_bounds=keep_bounds,
+        )
+        & _bounded(mean_nonzero, min_mean, max_mean, keep_bounds=keep_bounds)
+        & active_features
+        & allowed
+    )
+    if min_var == -np.inf:
+        if top_n < 1:
+            raise ValueError(
+                "ERROR: Please provide a value greater than 0 for `top_n` parameter"
+            )
+        n_valid_features = int(candidates.sum())
+        if n_valid_features == 0:
+            raise ValueError(
+                "No features passed HVG candidate filters "
+                f"(min_cells={min_cells}, max_cells={max_cells}, "
+                f"min_mean={min_mean}, max_mean={max_mean})."
+            )
+        if top_n >= n_valid_features:
+            logger.warning(
+                f"WARNING: Number of valid features are less then value "
+                f"of parameter `top_n`: {top_n}. Resetting `top_n` to "
+                f"{n_valid_features - 1}"
+            )
+            top_n = n_valid_features - 1
+        min_var = (
+            pd.Series(corrected_variance)[candidates]
+            .sort_values(ascending=False)
+            .values[top_n]
+        )
+
+    return np.asarray(
+        candidates
+        & _bounded(
+            corrected_variance,
+            min_var,
+            max_var,
+            keep_bounds=keep_bounds,
+        ),
+        dtype=bool,
+    )

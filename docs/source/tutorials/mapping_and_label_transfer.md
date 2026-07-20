@@ -114,10 +114,15 @@ Key mapping parameters:
 
 +++
 
-We can use `mapping scores` to perform cross-dataset cluster similarity inspection. `mapping scores` are scores assigned to each reference cell based on how frequently it was identified as one of the nearest neighbour of the target cells. ``get_mapping_score`` method allows generating these scores. We use an optional parameter of `get_mapping_score`, `target_groups`. `target_groups` takes grouping information for target cells such that mapping scores are calculated for one group at a time. Here we provide the cluster information of stimulated cells as group information and mapping scores will be obtained for each target cluster independently. The UMAPs below show how much mapping score each control cell received upon mapping from cells from one of the IFN-B stimulated cell clusters.
+Mapping scores support cross-dataset cluster similarity inspection. By default,
+`get_mapping_score` accumulates distance-derived neighbor weights for each reference cell and
+normalizes them by the number of mapped target cells and saved neighbors. Frequently selected,
+nearby reference cells therefore receive higher scores. `target_groups` calculates a separate
+score for each target group. Here the stimulated-cell clusters are used as groups, and the
+UMAPs show where selected target clusters map onto the control reference.
 
 ```{code-cell} ipython3
-# Here we will generate plots for IFB-B stimulated cells from NK  and CD14 monocyte clusters.
+# Generate plots for IFN-B stimulated cells from NK and CD14 monocyte clusters.
 
 for g, ms in ds_ctrl.get_mapping_score(
     target_name='stim',
@@ -163,7 +168,8 @@ evidence = ds_ctrl.get_target_label_evidence(
 evidence.head()
 ```
 
-We can now save these transferred labels into the stimulated cell dataset and visualize them of its UMAP.
+We can now save these transferred labels in the stimulated-cell dataset and visualize them on
+its UMAP.
 
 ```{code-cell} ipython3
 ds_stim.cells.insert(
@@ -193,10 +199,24 @@ df = pd.crosstab(
 df
 ```
 
-This cross-tabulation can be presented as percentage accuracy, where the values indicate the percentage of the transferred values that were correct.
+The column-normalized table below shows the composition of each transferred label. Each column
+sums to 100, and a diagonal entry is the precision for that predicted label. It is not an
+overall accuracy score.
 
 ```{code-cell} ipython3
 (100 * df / df.sum(axis=0)).round(1)
+```
+
+Overall label accuracy is the fraction of target cells whose transferred label matches the
+stored target label:
+
+```{code-cell} ipython3
+round(
+    100 * (
+        ds_stim.cells.fetch('cluster_labels') == transferred_labels.to_numpy()
+    ).mean(),
+    1,
+)
 ```
 
 ---

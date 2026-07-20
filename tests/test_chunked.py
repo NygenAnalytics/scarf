@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import zarr
 
-from scarf.chunked import ChunkedArray
+from scarf.matrix import ChunkedArray
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def backed_pair(tmp_path):
 class TestChunkedArrayParity:
     def test_shape_and_blocks(self, backed_pair):
         ca, dense = backed_pair
-        from scarf.storage.zarr_store import array_shard_rows
+        from scarf.storage.layout import array_shard_rows
 
         assert ca.shape == dense.shape
         stream_rows = array_shard_rows(ca._backing)

@@ -6,14 +6,14 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.chunked import ChunkedArray
+from scarf.matrix import ChunkedArray
 from scarf.merge import AssayMerge
 from scarf.storage.budget import (
     ResourceBudget,
     get_resource_budget,
     set_resource_budget,
 )
-from scarf.storage.zarr_store import count_array_spec
+from scarf.storage.layout import count_array_spec
 
 
 class _MergeMeta:
@@ -123,6 +123,8 @@ def test_assay_merge_maps_features_and_preserves_row_order(
     root = zarr.open_group(fn, mode="r")
     counts_array = root["RNA/counts"]
     counts = np.asarray(counts_array[:])
+    np.testing.assert_array_equal(root["RNA/countsT"][:], counts.T)
+    assert root["RNA/countsT"].attrs["complete"] is True
     merged_cell_ids = np.asarray(root["cellData/ids"][:]).astype(str)
     merged_feature_ids = np.asarray(root["RNA/featureData/ids"][:]).astype(str)
 
@@ -602,6 +604,8 @@ def test_assay_merge_rejects_existing_workspace_assay(
     counts = root["matrices/RNA/counts"]
     assert counts.shape[0] == 2 * datastore.cells.N
     assert int(counts[...].sum()) == 2 * rna_raw_total
+    np.testing.assert_array_equal(root["matrices/RNA/countsT"][:], counts[:].T)
+    assert root["matrices/RNA/countsT"].attrs["complete"] is True
 
     with pytest.raises(ValueError, match="already contains RNA assay"):
         AssayMerge(

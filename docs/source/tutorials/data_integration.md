@@ -184,9 +184,15 @@ splt.embedding(
 ---
 ## 4) Partial PCA training to reduce batch effects
 
-The plots above clearly show that the cells from the two samples are distinct on the UMAP space and have not integrated. This clearly indicates a treatment-specific or simply a batch effect between the cells from the two samples. Another interesting pattern in the UMAP plot above is the 'mirror effect', i.e. the equivalent clusters from the two samples look like mirror images. This is often seen in the datasets where the heterogenity/cell population composition is not strongly affected by the treatment.
+The plots above show that cells from the two source datasets are separated. These datasets
+also represent different treatment conditions, so source, treatment, and any technical effects
+are confounded. This example demonstrates the correction APIs, but it cannot determine which
+part of the separation is technical rather than a true interferon response.
 
-We will now attempt to integrate the cells from the two samples so that we obtain same cell types that do not form separate clusters. One can do this by training the PCA on cells from only one of the samples. Training PCA on cells from only one of the samples will diminish the contribution of genes differentially expressed between the two samples.
+Partial PCA trains the basis on a trusted reference subset. Variation absent from that subset
+contributes less to the resulting graph, including both technical variation and real
+condition-specific biology. Do not use the corrected coordinates as input for condition-level
+differential expression.
 
 +++
 
@@ -251,6 +257,12 @@ splt.embedding(
 
 Harmony runs inside `make_graph` on the PCA embedding before KNN construction. Pass `harmonize=True` and the batch column name:
 
+```{warning}
+Here `sample_id` distinguishes control from stimulated cells as well as the source dataset.
+Harmony can therefore remove genuine treatment signal. In a real study, use technical batch
+columns that are not perfectly confounded with the biological comparison.
+```
+
 ```{code-cell} ipython3
 ds.make_graph(
     feat_key='hvgs',
@@ -293,23 +305,31 @@ Harmony is often preferred when multiple batches need to mix without choosing a 
 ---
 ## 6) Quantifying integration quality
 
-The UMAP plots suggest that partial PCA and Harmony mix the two samples, but a visual read is not enough. Scarf provides several metrics that quantify integration from different angles. See {doc}`integration_metrics` and the {ref}`integration methods guide <integration_guide>`. Re-run this section after the naive, partial PCA, and Harmony graphs to compare approaches on the same footing.
+The UMAP plots suggest that partial PCA and Harmony mix the two samples, but a visual read is
+not enough. Scarf provides several metrics that quantify integration from different angles.
+The code below evaluates the latest graph, which is the Harmony graph at this point. To compare
+the naive, partial PCA, and Harmony results, calculate and retain these metrics immediately
+after building each graph. See {doc}`integration_metrics` and the
+{ref}`integration methods guide <integration_guide>`.
 
 **LISI** measures how well a label mixes inside each cell's KNN neighborhood. Running it on `sample_id` tells us whether batches are mixed, while running it on `orig_cluster_labels` checks that cell types are still grouped. Good integration raises batch LISI while keeping cell-type LISI low. With `save_result=True` the per-cell scores are written back as `lisi__sample_id__*` columns, which you can overlay on the UMAP layouts.
 
-Default `perplexity=30` needs a graph with at least about `3 * perplexity` neighbors. This tutorial builds graphs with `k=21`, so the default fits. If you use a smaller `k` (for example `k=11` in {doc}`integration_metrics`), Scarf lowers perplexity automatically and warns; scores remain valid for that smaller neighborhood.
+Default `perplexity=30` needs at least 90 neighbors. This tutorial uses `k=21`, so the call
+sets `perplexity=7` explicitly to match the available neighborhood. Raise `k` when you need a
+larger LISI neighborhood.
 
 ```{code-cell} ipython3
 ds.metric_lisi(
     label_colnames=['sample_id', 'orig_cluster_labels'],
     save_result=True,
+    perplexity=7,
 )
 ```
 
 **Batch mixing** condenses batch LISI into a single number in `[0, 1]` by rescaling the mean against the mixing perfectly integrated data would reach for these batch sizes. This makes it easy to compare across graphs. Higher is better.
 
 ```{code-cell} ipython3
-ds.metric_batch_mixing(label_colname='sample_id')
+ds.metric_batch_mixing(label_colname='sample_id', perplexity=7)
 ```
 
 **Silhouette** scores how separated each cluster is from its nearest neighboring cluster, from -1 to 1. Values near 1 mean distinct clusters. Read it alongside the batch metrics, since over-correction can mix genuinely different cell types.

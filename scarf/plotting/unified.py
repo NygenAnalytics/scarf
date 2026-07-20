@@ -2,12 +2,11 @@
 
 from collections.abc import Sequence
 from importlib.metadata import version
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 
-from .._types import as_zarr_array, as_zarr_group
 from ._contracts import CategoricalScale, PlotProvenance
 from ._deps import require_matplotlib
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
@@ -43,43 +42,13 @@ def _load_unified_layout(
     layout_key: str,
     from_assay: str | None,
 ) -> tuple[np.ndarray, np.ndarray, int, list[int], list[str]]:
-    assay = from_assay or getattr(store, "_defaultAssay", None)
-    if assay is None:
-        raise ValueError("from_assay is required when the store has no default assay")
-    try:
-        projections = as_zarr_group(
-            as_zarr_group(store.zw[assay], name=assay)["projections"],
-            name="projections",
-        )
-        layout = as_zarr_array(projections[layout_key], name=layout_key)
-    except Exception as exc:
-        raise KeyError(
-            f"Unified layout {layout_key!r} not found under assay {assay!r}. "
-            "Run run_unified_umap or run_unified_tsne first."
-        ) from exc
-    coords = np.asarray(layout[:], dtype=np.float64)
-    if coords.ndim != 2 or coords.shape[1] < 2:
-        raise ValueError(f"Unified layout {layout_key!r} must be an (n, 2) array")
-    attrs = dict(layout.attrs)
-    raw_n_cells = attrs.get("n_cells")
-    raw_target_names = attrs.get("target_names")
-    if not isinstance(raw_n_cells, (list, tuple)) or not isinstance(
-        raw_target_names, (list, tuple)
-    ):
-        raise ValueError(
-            f"Unified layout {layout_key!r} is missing n_cells/target_names attributes"
-        )
-    n_cells = [int(value) for value in raw_n_cells]
-    target_names = [str(name) for name in raw_target_names]
-    if not n_cells or sum(n_cells) != coords.shape[0]:
-        raise ValueError(
-            f"Unified layout {layout_key!r} n_cells does not match coordinate rows"
-        )
-    if len(target_names) != len(n_cells) - 1:
-        raise ValueError(
-            f"Unified layout {layout_key!r} target_names length must match target blocks"
-        )
-    return coords[:, 0], coords[:, 1], n_cells[0], n_cells[1:], target_names
+    loader = getattr(store, "_load_unified_layout_data", None)
+    if not callable(loader):
+        raise TypeError("store does not provide unified layout data")
+    return cast(
+        tuple[np.ndarray, np.ndarray, int, list[int], list[str]],
+        loader(layout_key=layout_key, from_assay=from_assay),
+    )
 
 
 def _build_unified_groups(

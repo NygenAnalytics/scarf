@@ -174,7 +174,7 @@ def fetch_normalized_feature_matrix(
     normalization: NormalizationSpec | None = None,
 ) -> np.ndarray:
     """Return assay-native or raw feature values in requested feature order."""
-    from ..utils import controlled_compute
+    from ..utils.compute import controlled_compute
 
     normalization = normalization or NormalizationSpec()
     if not resolved:

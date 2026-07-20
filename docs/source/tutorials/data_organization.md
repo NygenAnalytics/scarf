@@ -35,11 +35,6 @@ Low-level layout details for contributors live in {doc}`../developers/zarr_inter
 `DataStore` is the main entry point. Each assay owns feature metadata, normalization, and
 feature selection. Cell-level columns are shared across assays.
 
-```{image} ../_static/scarf_organization.png
-:alt: Scarf DataStore, assays, and metadata
-:width: 800px
-```
-
 ```{code-cell} ipython3
 import scarf
 import scarf.plotting as splt
@@ -67,7 +62,7 @@ ds = scarf.DataStore(
 )
 
 if 'RNA_leiden_cluster' not in ds.cells.columns:
-    ds.mark_hvgs(min_cells=20, top_n=500)
+    ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
     ds.make_graph(feat_key='hvgs', k=11, dims=15)
     ds.run_leiden_clustering(resolution=0.5)
 if 'RNA_UMAP1' not in ds.cells.columns:
@@ -128,7 +123,7 @@ ds.show_zarr_tree(start='RNA/featureData', depth=1)
 
 ### 2. Inspect cell and feature attributes
 
-Cell and feature tables are `Metadata` objects (`ds.cells`, `ds.RNA.feats`), not pandas
+Cell and feature tables are `MetaData` objects (`ds.cells`, `ds.RNA.feats`), not pandas
 DataFrames. Use `head` for a quick look, `to_pandas_dataframe` to export selected columns, and
 `fetch` / `fetch_all` for single columns.
 
@@ -158,7 +153,7 @@ cluster_labels.shape, ds.cells.fetch_all('RNA_leiden_cluster').shape
 Re-inserting an existing column requires `overwrite=True`.
 
 ```{code-cell} ipython3
-is_cluster_1 = cluster_labels == 1
+is_cluster_1 = cluster_labels.astype(str) == '1'
 ds.cells.insert(column_name='is_cluster_1', values=is_cluster_1, overwrite=True)
 ```
 
@@ -171,7 +166,8 @@ ds.cells.insert(
 )
 ```
 
-See the `Metadata` API for delete and update helpers. Useful query helpers:
+See the `MetaData` API in {doc}`../reference/api/assays` for delete and update helpers.
+Useful query helpers:
 
 ```python
 idx = ds.cells.get_index_by(['3'], 'RNA_leiden_cluster')
@@ -277,7 +273,7 @@ ds.export_markers_to_csv(
 
 ### 6. Zarr v3, memory, and remote stores
 
-Scarf 0.33+ writes new datasets as Zarr v3. Existing v2 stores remain readable. Count matrices
+Current Scarf versions write new datasets as Zarr v3. Existing v2 stores remain readable. Count matrices
 from the writers use sharded arrays (default profile `fast_local`). Set the profile with
 `SCARF_ZARR_PROFILE` (`fast_local` or `cloud`) or `zarrProfile=` when opening a `DataStore`.
 
@@ -298,7 +294,7 @@ the PCA reduction group as `harmonizedData` with `isHarmonized=True`.
 ## Common mistakes
 
 - Expecting filtered cells to be deleted instead of marked `False` in `I`
-- Treating `Metadata` as an in-memory pandas DataFrame
+- Treating `MetaData` as an in-memory pandas DataFrame
 - Using `fetch` when values for inactive cells are also required (`fetch_all`)
 
 ## Saved results

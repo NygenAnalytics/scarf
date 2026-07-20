@@ -8,7 +8,6 @@ are extending Scarf.
 .. autoclass:: scarf.datastore.datastore.DataStore
     :members:
     :inherited-members:
-    :show-inheritance:
 ```
 
 ## Analysis results
@@ -38,11 +37,13 @@ directly.
 ```{eval-rst}
 .. autoclass:: scarf.datastore.graph_datastore.GraphDataStore
     :members:
+    :inherited-members:
     :no-index:
 ```
 
 ```{eval-rst}
 .. autoclass:: scarf.datastore.mapping_datastore.MappingDatastore
     :members:
+    :inherited-members:
     :no-index:
 ```

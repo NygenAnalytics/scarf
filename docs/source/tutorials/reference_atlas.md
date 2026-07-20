@@ -63,6 +63,13 @@ splt.embedding(
 
 The reference must already have a selected RNA feature set. For a production atlas, `reference_batch` should contain known technical batches. This compact example uses one recorded control batch to demonstrate the artifact API.
 
+```{warning}
+The control and stimulated dataset labels below are used only to exercise the query-batch API.
+They are confounded with biological condition, so this example must not be interpreted as
+condition-preserving batch correction. Production references should use donor, preparation,
+or sequencing batches represented across the biological comparison.
+```
+
 ```{code-cell} ipython3
 ds_ctrl.cells.insert(
     'reference_batch',

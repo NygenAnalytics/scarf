@@ -5,7 +5,8 @@
 If you would like to add a new feature, fix a bug or make some improvements please
 follow this [guideline]. Usually when planning to add a new feature it is a good
 idea to introduce the proposed feature and discuss it on the [discussion page].
-The code is written using [black] style. Please make sure you blacken any edited files.
+The project uses [Ruff] for formatting and linting. Before opening a pull request, run
+`uv run ruff format .` and `uv run ruff check .`.
 
 ## Testing locally
 
@@ -98,7 +99,7 @@ Here we acknowledge some of them (at least those with pretty logos).
 
 [guideline]: https://www.dataschool.io/how-to-contribute-on-github
 [discussion page]: https://github.com/parashardhapola/scarf/discussions
-[black]: https://black.readthedocs.io/en/stable
+[Ruff]: https://docs.astral.sh/ruff/
 [Sphinx]: https://www.sphinx-doc.org
 [MyST]: https://myst-parser.readthedocs.io/en/latest/index.html
 [myst_nb]: https://myst-nb.readthedocs.io/

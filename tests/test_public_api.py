@@ -1,0 +1,411 @@
+import json
+import subprocess
+import sys
+from importlib import import_module
+from typing import cast
+
+
+_EXPECTED_EXPORTS = {
+    "AssayMerge": "scarf.merge",
+    "CSVReader": "scarf.readers",
+    "CSVtoZarr": "scarf.writers",
+    "CrDirReader": "scarf.readers",
+    "CrH5Reader": "scarf.readers",
+    "CrReader": "scarf.readers",
+    "CrToZarr": "scarf.writers",
+    "DataStore": "scarf.datastore.datastore",
+    "DatasetMerge": "scarf.merge",
+    "GffReader": "scarf.features.genomic.gff",
+    "H5adReader": "scarf.readers",
+    "H5adToZarr": "scarf.writers",
+    "LoomReader": "scarf.readers",
+    "LoomToZarr": "scarf.writers",
+    "MappingReference": "scarf.mapping.reference",
+    "MappingResult": "scarf.mapping.models",
+    "PseudotimeAggregationResult": "scarf.trajectory.results",
+    "PseudotimeMarkerResult": "scarf.trajectory.results",
+    "PseudotimeScoreResult": "scarf.trajectory.results",
+    "SparseToZarr": "scarf.writers",
+    "SubsetZarr": "scarf.writers",
+    "ZarrMerge": "scarf.merge",
+    "clean_array": "scarf.utils",
+    "controlled_compute": "scarf.utils",
+    "coordinate_melding": "scarf.features.genomic.melding",
+    "create_zarr_count_assay": "scarf.writers",
+    "create_zarr_dataset": "scarf.writers",
+    "create_zarr_obj_array": "scarf.writers",
+    "dask_to_zarr": "scarf.writers",
+    "fetch_dataset": "scarf.readers.datasets",
+    "get_log_level": "scarf.utils",
+    "load_zarr": "scarf.utils",
+    "logger": "scarf.utils",
+    "permute_into_chunks": "scarf.utils",
+    "prefetch_blocks": "scarf.utils",
+    "rescale_array": "scarf.utils",
+    "rolling_window": "scarf.utils",
+    "set_verbosity": "scarf.utils",
+    "show_available_datasets": "scarf.readers.datasets",
+    "show_dask_progress": "scarf.utils",
+    "subset_assay_zarr": "scarf.writers",
+    "system_call": "scarf.utils",
+    "to_h5ad": "scarf.writers",
+    "to_mtx": "scarf.writers",
+    "tqdmbar": "scarf.utils",
+    "tqdm_params": "scarf.utils",
+    "write_renorm_subset_to_zarr": "scarf.writers",
+}
+
+_EXPECTED_MODULE_ATTRIBUTES = {
+    "assay": "scarf.assay",
+    "datastore": "scarf.datastore",
+    "embeddings": "scarf.embeddings",
+    "features": "scarf.features",
+    "mapping": "scarf.mapping",
+    "matrix": "scarf.matrix",
+    "merge": "scarf.merge",
+    "metadata": "scarf.metadata",
+    "metrics": "scarf.metrics",
+    "quality_control": "scarf.quality_control",
+    "readers": "scarf.readers",
+    "storage": "scarf.storage",
+    "utils": "scarf.utils",
+    "writers": "scarf.writers",
+}
+
+_EXPECTED_UTILS_EXPORTS = [
+    "logger",
+    "tqdmbar",
+    "tqdm_params",
+    "set_verbosity",
+    "get_log_level",
+    "system_call",
+    "rescale_array",
+    "clean_array",
+    "load_zarr",
+    "permute_into_chunks",
+    "show_dask_progress",
+    "controlled_compute",
+    "prefetch_blocks",
+    "ColumnBlockPipeline",
+    "iter_column_blocks",
+    "remote_column_disk_ahead",
+    "remote_column_ram_ahead",
+    "process_rss_mb",
+    "rss_peak_tracker",
+    "array_digest",
+    "rolling_window",
+]
+
+_EXPECTED_PLOTTING_EXPORTS = (
+    "CategoricalScale",
+    "CellField",
+    "ColorScale",
+    "FeatureRef",
+    "FeatureSummary",
+    "LegendSpec",
+    "NormalizationSpec",
+    "PlotProvenance",
+    "PlotResult",
+    "SizeScale",
+    "StudyDesign",
+    "THEMES",
+    "cluster_tree",
+    "collect_legends",
+    "composition",
+    "distribution",
+    "dotplot",
+    "elbow",
+    "embedding",
+    "embedding_raster",
+    "graph_qc",
+    "highly_variable_features",
+    "label_panels",
+    "marker_heatmap",
+    "matrixplot",
+    "pseudotime_heatmap",
+    "qc",
+    "theme_context",
+    "unified_embedding",
+)
+
+
+def _run_probe(source: str) -> dict[str, object]:
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return cast(dict[str, object], json.loads(result.stdout))
+
+
+def test_bare_import_is_lazy():
+    lazy_names = [*_EXPECTED_EXPORTS, *_EXPECTED_MODULE_ATTRIBUTES]
+    result = _run_probe(
+        f"""
+import json
+import sys
+import scarf
+
+heavy_modules = {{
+    "dask",
+    "h5py",
+    "hnswlib",
+    "matplotlib",
+    "numba",
+    "numpy",
+    "pandas",
+    "scipy",
+    "sklearn",
+    "zarr",
+}}
+lazy_names = {lazy_names!r}
+print(json.dumps({{
+    "boundLazyNames": sorted(name for name in lazy_names if name in vars(scarf)),
+    "heavyModules": sorted(heavy_modules.intersection(sys.modules)),
+    "plotsInDir": "plots" in dir(scarf),
+    "plottingInDir": "plotting" in dir(scarf),
+    "scarfModules": sorted(
+        name for name in sys.modules
+        if name == "scarf" or name.startswith("scarf.")
+    ),
+    "versionIsSet": isinstance(scarf.__version__, str) and bool(scarf.__version__),
+}}))
+"""
+    )
+
+    assert result == {
+        "boundLazyNames": [],
+        "heavyModules": [],
+        "plotsInDir": False,
+        "plottingInDir": False,
+        "scarfModules": ["scarf"],
+        "versionIsSet": True,
+    }
+
+
+def test_utils_package_is_lazy():
+    result = _run_probe(
+        f"""
+import json
+import sys
+import scarf.utils as utils
+
+exports = {_EXPECTED_UTILS_EXPORTS!r}
+print(json.dumps({{
+    "advertised": sorted(name for name in exports if name in dir(utils)),
+    "bound": sorted(name for name in exports if name in vars(utils)),
+    "exports": utils.__all__,
+    "heavyModules": sorted({{"numba", "numpy", "scipy", "zarr"}}.intersection(sys.modules)),
+}}))
+"""
+    )
+
+    assert result == {
+        "advertised": sorted(_EXPECTED_UTILS_EXPORTS),
+        "bound": [],
+        "exports": _EXPECTED_UTILS_EXPORTS,
+        "heavyModules": [],
+    }
+
+
+def test_utils_surface_preserves_module_metadata():
+    utils = import_module("scarf.utils")
+
+    assert utils.__all__ == _EXPECTED_UTILS_EXPORTS
+    for name in _EXPECTED_UTILS_EXPORTS:
+        value = getattr(utils, name)
+        if callable(value):
+            assert value.__module__ == "scarf.utils"
+
+
+def test_public_exports_match_canonical_objects():
+    import scarf
+
+    assert scarf.__all__ == list(_EXPECTED_EXPORTS)
+    assert isinstance(scarf.__version__, str)
+    assert scarf.__version__
+    assert set(_EXPECTED_EXPORTS).issubset(dir(scarf))
+
+    for name, module_name in _EXPECTED_EXPORTS.items():
+        canonical = getattr(import_module(module_name), name)
+        exported = getattr(scarf, name)
+        assert exported is canonical
+        assert vars(scarf)[name] is canonical
+        if callable(exported):
+            assert exported.__module__ == module_name
+
+
+def test_domain_packages_export_canonical_objects():
+    exports = {
+        ("scarf.embeddings", "run_harmony"): "scarf.embeddings.harmony",
+        ("scarf.features", "binned_sampling"): "scarf.features.scoring",
+        ("scarf.features", "fit_lowess"): "scarf.features.variability",
+        (
+            "scarf.features",
+            "select_highly_variable_features",
+        ): "scarf.features.variability",
+        ("scarf.features", "GffReader"): "scarf.features.genomic.gff",
+        ("scarf.features", "coordinate_melding"): "scarf.features.genomic.melding",
+        ("scarf.mapping", "MappingReference"): "scarf.mapping.reference",
+        ("scarf.mapping", "MappingResult"): "scarf.mapping.models",
+        (
+            "scarf.features",
+            "find_markers_by_rank",
+        ): "scarf.features.markers.search",
+        (
+            "scarf.features",
+            "resolve_marker_gene_batch_size",
+        ): "scarf.features.markers.batching",
+        ("scarf.matrix", "ChunkedArray"): "scarf.matrix.chunked",
+        ("scarf.metrics", "compute_lisi"): "scarf.metrics.lisi",
+        ("scarf.metrics", "silhouette_scoring"): "scarf.metrics.silhouette",
+        (
+            "scarf.quality_control",
+            "assign_cell_cycle_phase",
+        ): "scarf.quality_control.cell_cycle",
+        (
+            "scarf.quality_control",
+            "simulate_doublet_pairs",
+        ): "scarf.quality_control.doublets",
+        (
+            "scarf.quality_control",
+            "s_phase_genes",
+        ): "scarf.quality_control.cell_cycle_genes",
+    }
+
+    for (package_name, symbol), module_name in exports.items():
+        package = import_module(package_name)
+        canonical = import_module(module_name)
+        assert getattr(package, symbol) is getattr(canonical, symbol)
+
+
+def test_star_import_matches_all():
+    result = _run_probe(
+        """
+import json
+
+namespace = {}
+exec("from scarf import *", namespace)
+bound = sorted(name for name in namespace if not name.startswith("__"))
+print(json.dumps({"bound": bound}))
+"""
+    )
+
+    assert result["bound"] == sorted(_EXPECTED_EXPORTS)
+
+
+def test_de_facto_module_attributes_resolve_lazily():
+    result = _run_probe(
+        f"""
+import importlib
+import json
+import scarf
+
+module_names = {_EXPECTED_MODULE_ATTRIBUTES!r}
+before = sorted(name for name in module_names if name in vars(scarf))
+advertised = sorted(name for name in module_names if name in dir(scarf))
+identical = {{
+    name: getattr(scarf, name) is importlib.import_module(module_name)
+    for name, module_name in module_names.items()
+}}
+cached = sorted(name for name in module_names if name in vars(scarf))
+print(json.dumps({{
+    "advertised": advertised,
+    "before": before,
+    "cached": cached,
+    "identical": identical,
+}}))
+"""
+    )
+
+    expected_names = sorted(_EXPECTED_MODULE_ATTRIBUTES)
+    assert result["advertised"] == expected_names
+    assert result["before"] == []
+    assert result["cached"] == expected_names
+    assert result["identical"] == dict.fromkeys(_EXPECTED_MODULE_ATTRIBUTES, True)
+
+
+def test_lazy_facades_clear_cached_exports_on_reload():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib
+
+cases = (
+    ("scarf", "MappingResult"),
+    ("scarf.features", "fit_lowess"),
+    ("scarf.readers", "CSVReader"),
+    ("scarf.writers", "CSVtoZarr"),
+    ("scarf.merge", "DatasetMerge"),
+    ("scarf.utils", "clean_array"),
+    ("scarf.neighbors", "diffusion_operator"),
+    ("scarf.clustering", "balanced_cut"),
+    ("scarf.embeddings", "initial_embedding"),
+    ("scarf.trajectory", "PseudotimeScoreResult"),
+)
+
+for module_name, export_name in cases:
+    module = importlib.import_module(module_name)
+    original = getattr(module, export_name)
+    setattr(module, export_name, object())
+    importlib.reload(module)
+    assert export_name not in vars(module), (module_name, export_name)
+    assert getattr(module, export_name) is original, (module_name, export_name)
+""",
+        ],
+        check=True,
+    )
+
+
+def test_zarr_warning_filter_does_not_make_import_eager():
+    result = _run_probe(
+        """
+import json
+import sys
+import warnings
+
+import scarf
+
+zarr_was_loaded = "zarr" in sys.modules
+
+import numpy as np
+import zarr
+from zarr.storage import MemoryStore
+
+with warnings.catch_warnings(record=True) as caught:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    root.create_array("text", data=np.asarray(["a", "bb"]))
+
+print(json.dumps({
+    "unstableWarnings": [
+        type(item.message).__name__
+        for item in caught
+        if type(item.message).__name__ == "UnstableSpecificationWarning"
+    ],
+    "zarrWasLoaded": zarr_was_loaded,
+}))
+"""
+    )
+
+    assert result == {"unstableWarnings": [], "zarrWasLoaded": False}
+
+
+def test_modern_plotting_surface_matches_baseline():
+    plotting = import_module("scarf.plotting")
+
+    assert tuple(plotting.__all__) == _EXPECTED_PLOTTING_EXPORTS
+    for name in _EXPECTED_PLOTTING_EXPORTS:
+        assert hasattr(plotting, name)
+
+
+def test_legacy_plotting_surface_remains_absent():
+    from importlib.util import find_spec
+
+    from scarf import DataStore
+
+    assert not [name for name in dir(DataStore) if name.startswith("plot_")]
+    assert find_spec("scarf.plots") is None
+    assert find_spec("scarf.plotting._legacy") is None

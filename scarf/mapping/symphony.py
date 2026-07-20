@@ -1,0 +1,158 @@
+"""Portable numerical primitives for Symphony-style reference mapping."""
+
+from typing import cast
+
+import numpy as np
+
+from .models import QueryCorrection, SymphonyReferenceModel
+
+SYMPHONY_STYLE_VARIANT = "symphonyStyleV1"
+
+
+def project_pca(values: np.ndarray, model: SymphonyReferenceModel) -> np.ndarray:
+    """Project normalized expression onto immutable reference PCA loadings."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != model.n_features:
+        raise ValueError(
+            f"Expected query matrix with {model.n_features} features, got {values.shape}"
+        )
+    projected = ((values - model.feature_means) / model.feature_scales) @ model.loadings
+    if not np.all(np.isfinite(projected)):
+        raise ValueError("PCA projection produced non-finite values")
+    return cast(np.ndarray, projected)
+
+
+def soft_cluster_assignments(
+    coordinates: np.ndarray, model: SymphonyReferenceModel
+) -> np.ndarray:
+    """Calculate cosine-kernel soft assignments to reference centroids."""
+    values = np.asarray(coordinates, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != model.n_dims:
+        raise ValueError("Query coordinates have incompatible dimensions")
+    query_unit = _normalize_rows(values)
+    centroids_unit = _normalize_rows(model.centroids)
+    distances = 2.0 * (1.0 - query_unit @ centroids_unit.T)
+    logits = -distances / model.sigma[np.newaxis, :]
+    logits -= logits.max(axis=1, keepdims=True)
+    assignments = np.exp(logits)
+    assignments /= assignments.sum(axis=1, keepdims=True)
+    if not np.all(np.isfinite(assignments)):
+        raise ValueError("Soft cluster assignments contain non-finite values")
+    return cast(np.ndarray, assignments)
+
+
+def zero_norm_rows(coordinates: np.ndarray) -> np.ndarray:
+    """Return rows without directional information in reference PC space."""
+    values = np.asarray(coordinates, dtype=np.float64)
+    if values.ndim != 2:
+        raise ValueError("Query coordinates must be two-dimensional")
+    return cast(np.ndarray, np.linalg.norm(values, axis=1) == 0)
+
+
+def initialize_sufficient_statistics(
+    n_batches: int, model: SymphonyReferenceModel
+) -> tuple[np.ndarray, np.ndarray]:
+    if n_batches < 1:
+        raise ValueError("At least one query batch is required")
+    return (
+        np.zeros((n_batches, model.n_clusters), dtype=np.float64),
+        np.zeros((n_batches, model.n_clusters, model.n_dims), dtype=np.float64),
+    )
+
+
+def accumulate_sufficient_statistics(
+    counts: np.ndarray,
+    sums: np.ndarray,
+    coordinates: np.ndarray,
+    assignments: np.ndarray,
+    batch_codes: np.ndarray,
+) -> None:
+    """Accumulate per-query-batch, per-cluster weighted coordinate sums."""
+    if coordinates.shape[0] != len(batch_codes) or assignments.shape[0] != len(
+        batch_codes
+    ):
+        raise ValueError("Query batch codes must match coordinate rows")
+    if assignments.shape[1] != counts.shape[1]:
+        raise ValueError("Assignment count does not match reference clusters")
+    if np.any(batch_codes < 0) or np.any(batch_codes >= counts.shape[0]):
+        raise ValueError("Query batch codes are out of range")
+
+    for batch_code in np.unique(batch_codes):
+        batch_mask = batch_codes == batch_code
+        batch_assignments = assignments[batch_mask]
+        counts[batch_code] += batch_assignments.sum(axis=0)
+        sums[batch_code] += batch_assignments.T @ coordinates[batch_mask]
+
+
+def solve_query_correction(
+    counts: np.ndarray,
+    sums: np.ndarray,
+    model: SymphonyReferenceModel,
+) -> QueryCorrection:
+    """Fit cluster-aware batch offsets against reference raw centroids."""
+    if counts.ndim != 2 or counts.shape[1] != model.n_clusters:
+        raise ValueError("Query count statistics have incompatible dimensions")
+    if sums.shape != (counts.shape[0], model.n_clusters, model.n_dims):
+        raise ValueError("Query sum statistics have incompatible dimensions")
+    expected = counts[:, :, np.newaxis] * model.raw_centroids[np.newaxis, :, :]
+    median_mass = max(float(np.median(model.cluster_mass)), 1.0)
+    reference_regularization = model.correction_ridge * model.cluster_mass / median_mass
+    denominator = (
+        counts[:, :, np.newaxis] + reference_regularization[np.newaxis, :, np.newaxis]
+    )
+    offsets = np.divide(
+        sums - expected,
+        denominator,
+        out=np.zeros_like(sums),
+        where=denominator > 0,
+    )
+    return QueryCorrection(batch_offsets=offsets, batch_counts=counts.copy())
+
+
+def apply_query_correction(
+    coordinates: np.ndarray,
+    assignments: np.ndarray,
+    batch_codes: np.ndarray,
+    model: SymphonyReferenceModel,
+    correction: QueryCorrection,
+) -> np.ndarray:
+    """Map query PCA coordinates into the fixed corrected reference space."""
+    if coordinates.shape[0] != assignments.shape[0] or coordinates.shape[0] != len(
+        batch_codes
+    ):
+        raise ValueError("Query coordinate, assignment, and batch rows must agree")
+    if assignments.shape[1] != model.n_clusters:
+        raise ValueError("Query assignments have incompatible cluster count")
+    if correction.batch_offsets.shape[1:] != (model.n_clusters, model.n_dims):
+        raise ValueError("Query correction has incompatible reference dimensions")
+    query_offsets = np.einsum(
+        "nk,nkd->nd", assignments, correction.batch_offsets[batch_codes]
+    )
+    reference_shift = assignments @ (model.raw_centroids - model.corrected_centroids)
+    corrected = coordinates - query_offsets - reference_shift
+    if not np.all(np.isfinite(corrected)):
+        raise ValueError("Query correction produced non-finite coordinates")
+    return cast(np.ndarray, corrected)
+
+
+def weighted_centroids(
+    coordinates: np.ndarray, assignments: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return soft cluster masses and centroids for reference compression."""
+    values = np.asarray(coordinates, dtype=np.float64)
+    weights = np.asarray(assignments, dtype=np.float64)
+    if values.ndim != 2 or weights.ndim != 2 or values.shape[0] != weights.shape[1]:
+        raise ValueError("Coordinate and assignment dimensions do not agree")
+    mass = weights.sum(axis=1)
+    if np.any(mass <= 0):
+        raise ValueError("Reference assignments include an empty cluster")
+    centroids = (weights @ values / mass[:, np.newaxis]).astype(np.float64)
+    return mass, centroids
+
+
+def _normalize_rows(values: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(values, axis=1, keepdims=True)
+    normalized = np.zeros_like(values, dtype=np.float64)
+    nonzero = norms[:, 0] > 0
+    normalized[nonzero] = values[nonzero] / norms[nonzero]
+    return normalized

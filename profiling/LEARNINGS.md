@@ -34,7 +34,7 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 | Change | Location | Effect |
 |--------|----------|--------|
 | Cloud default `targetChunkBytes` = 128 MiB when remote and unset | `scarf/storage/zarr_store.py` (`DEFAULT_CLOUD_TARGET_CHUNK_BYTES`) | Matches layout-sweep winner |
-| Auto marker batch when `gene_batch_size is None` | `scarf/markers.py` `resolve_marker_gene_batch_size` | `min(col_chunk, n_features, budgetCap)` with `budgetCap = (memoryBytes // workingCopies) // (n_cells * 32)` |
+| Auto marker batch when `gene_batch_size is None` | `scarf/features/markers/batching.py` `resolve_marker_gene_batch_size` | `min(col_chunk, n_features, budgetCap)` with `budgetCap = (memoryBytes // workingCopies) // (n_cells * 32)` |
 | Optional profiling override | `profiling` `markerGeneBatchSize` | Layout sweep forced `50`; later runs leave unset for auto |
 
 ## Machine sizes used (Modal hard limit vs Scarf budget)

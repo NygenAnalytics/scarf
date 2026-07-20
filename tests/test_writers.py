@@ -51,6 +51,52 @@ def test_crtozarr_fromdir(crdir_reader, tmp_path):
     writer.dump()
 
 
+def test_crtozarr_preserves_exact_counts_metadata_and_transpose():
+    import pandas as pd
+    from scipy.sparse import coo_matrix
+
+    values = np.array(
+        [[1, 0, 2], [0, 3, 0], [4, 5, 6]],
+        dtype=np.uint16,
+    )
+
+    class ExactReader:
+        nCells = values.shape[0]
+        assayFeats = pd.DataFrame(
+            {"RNA": ["Gene Expression", 0, values.shape[1], values.shape[1]]},
+            index=["type", "start", "end", "nFeatures"],
+        )
+
+        def cell_names(self):
+            return ["c1", "c2", "c3"]
+
+        def feature_ids(self, assay_name):
+            return ["f1", "f2", "f3"]
+
+        def feature_names(self, assay_name):
+            return ["g1", "g2", "g3"]
+
+        def consume(self, batch_size, lines_in_mem):
+            for start in range(0, self.nCells, batch_size):
+                yield coo_matrix(values[start : start + batch_size])
+
+    store = MemoryStore()
+    writer = CrToZarr(
+        ExactReader(),
+        zarr_loc=store,
+        dtype="uint16",
+        chunk_size=(2, 2),
+    )
+    writer.dump(batch_size=2)
+
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], values)
+    np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
+    assert root["RNA/countsT"].attrs["complete"] is True
+    np.testing.assert_array_equal(root["cellData/ids"][:], ["c1", "c2", "c3"])
+    np.testing.assert_array_equal(root["RNA/featureData/ids"][:], ["f1", "f2", "f3"])
+
+
 def test_h5adtozarr(h5ad_reader, tmp_path):
     from scarf.writers import H5adToZarr
 
@@ -65,6 +111,35 @@ def test_loomtozarr(loom_reader, tmp_path):
     fn = str(tmp_path / "sympathetic.zarr")
     writer = LoomToZarr(loom_reader, zarr_loc=fn)
     writer.dump()
+
+
+def test_loomtozarr_preserves_exact_counts_and_transpose(tmp_path):
+    import h5py
+
+    from scarf.readers import LoomReader
+    from scarf.writers import LoomToZarr
+
+    values = np.array([[1, 0], [0, 2], [3, 4]], dtype=np.uint16)
+    path = tmp_path / "exact.loom"
+    with h5py.File(path, mode="w") as handle:
+        handle.create_dataset("matrix", data=values.T)
+        cells = handle.create_group("col_attrs")
+        cells.create_dataset("obs_names", data=np.array([b"c1", b"c2", b"c3"]))
+        features = handle.create_group("row_attrs")
+        features.create_dataset("var_names", data=np.array([b"g1", b"g2"]))
+
+    reader = LoomReader(str(path))
+    store = MemoryStore()
+    try:
+        writer = LoomToZarr(reader, zarr_loc=store, chunk_size=(2, 2))
+        writer.dump(batch_size=2)
+    finally:
+        reader.h5.close()
+
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], values)
+    np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_sparsetozarr(tmp_path):
@@ -87,6 +162,10 @@ def test_sparsetozarr(tmp_path):
         feature_ids=[f"feat_{x}" for x in range(10)],
     )
     writer.dump()
+    root = zarr.open_group(fn, mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], mat.toarray())
+    np.testing.assert_array_equal(root["RNA/countsT"][:], mat.toarray().T)
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_sparsetozarr_sharded_layout(tmp_path):
@@ -154,6 +233,8 @@ def test_csv_to_zarr_round_trip(tmp_path):
         dtype=np.uint16,
     )
     np.testing.assert_array_equal(root["RNA/counts"][:], expected)
+    np.testing.assert_array_equal(root["RNA/countsT"][:], expected.T)
+    assert root["RNA/countsT"].attrs["complete"] is True
     np.testing.assert_array_equal(
         root["RNA/featureData/ids"][:],
         np.array(["geneA", "geneB", "geneC"]),
@@ -400,3 +481,57 @@ def test_crtozarr_forwards_storage_options(monkeypatch):
         storage_options={"access_key_id": "id"},
     )
     assert captured["storage_options"] == {"access_key_id": "id"}
+
+
+def test_h5adtozarr_forwards_storage_resources_and_chunk_controls(monkeypatch):
+    from scarf.writers import H5adToZarr
+
+    captured = {}
+
+    def fake_load_zarr(zarr_loc, mode, storage_options=None):
+        captured["store"] = (zarr_loc, mode, storage_options)
+        return zarr.open_group(store=MemoryStore(), mode="w")
+
+    def fake_budget(mem_budget, nthreads, working_copies):
+        captured["budget"] = (mem_budget, nthreads, working_copies)
+
+    def fake_create_count(**kwargs):
+        captured["count"] = kwargs
+
+    monkeypatch.setattr("scarf.writers.load_zarr", fake_load_zarr)
+    monkeypatch.setattr("scarf.writers._apply_budget_override", fake_budget)
+    monkeypatch.setattr("scarf.writers.create_zarr_count_assay", fake_create_count)
+    monkeypatch.setattr(H5adToZarr, "_ini_cell_data", lambda self: None)
+    monkeypatch.setattr(H5adToZarr, "_ini_feature_data", lambda self: None)
+
+    class FakeH5ad:
+        nCells = 1
+        matrixDtype = np.dtype("uint16")
+
+        def feat_ids(self):
+            return np.array(["f1"])
+
+        def feat_names(self):
+            return np.array(["g1"])
+
+    H5adToZarr(
+        FakeH5ad(),
+        zarr_loc="s3://bucket/out.zarr",
+        storage_options={"access_key_id": "id"},
+        mem_budget="2G",
+        nthreads=3,
+        working_copies=2,
+        targetChunkBytes=4096,
+        minFeatureChunk=16,
+        maxFeatureChunk=128,
+    )
+
+    assert captured["store"] == (
+        "s3://bucket/out.zarr",
+        "w",
+        {"access_key_id": "id"},
+    )
+    assert captured["budget"] == ("2G", 3, 2)
+    assert captured["count"]["targetChunkBytes"] == 4096
+    assert captured["count"]["minFeatureChunk"] == 16
+    assert captured["count"]["maxFeatureChunk"] == 128

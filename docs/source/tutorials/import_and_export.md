@@ -110,16 +110,17 @@ writer = scarf.CrToZarr(
 writer.dump()
 ```
 
-#### From Anndata H5ad file format
+#### From AnnData H5AD file format
 
 ```{code-cell} ipython3
- # Note: H5adReader takes the path to the .h5ad file directly
+# H5adReader takes the path to the .h5ad file directly.
+# In this catalog file, the feature index contains the gene names.
 reader = scarf.H5adReader(
-    'scarf_datasets/bastidas-ponce_4K_pancreas-d15_rnaseq/data.h5ad', 
-    cell_ids_key = 'index',               # Where Cell/barcode ids are saved under 'obs' slot
-    feature_ids_key = 'index',            # Where gene ids are saved under 'var' slot
-    feature_name_key = 'gene_short_name'  # Where gene names are saved under 'var' slot
-)  
+    'scarf_datasets/bastidas-ponce_4K_pancreas-d15_rnaseq/data.h5ad',
+    cell_ids_key='index',
+    feature_ids_key='index',
+    feature_name_key='index',
+)
 
 # change value of `zarr_loc` to your choice of filename and path
 writer = scarf.H5adToZarr(
@@ -152,8 +153,10 @@ scarf.writers.to_mtx(
 
 #### To H5ad format
 
-`to_h5ad` exports the count matrix and selected cell metadata columns. For a richer AnnData
-object including embeddings, use `DataStore.to_anndata` (see {doc}`downsampling`).
+`to_h5ad` exports the count matrix and metadata, and writes UMAP or tSNE coordinate pairs to
+AnnData `obsm` by default. `DataStore.to_anndata` returns an in-memory AnnData object with
+counts, cell and feature metadata, and optional assay layers. It currently leaves layout
+coordinates as ordinary `obs` columns rather than populating `obsm` (see {doc}`downsampling`).
 
 ```{code-cell} ipython3
 ds = scarf.DataStore('scarf_datasets/differentiating_pancreatic_cells.zarr')
