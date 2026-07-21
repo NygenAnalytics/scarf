@@ -108,6 +108,9 @@ ds.plots.distribution(
 )
 ```
 
+Each violin is one QC metric before filtering; set thresholds from the tails of these
+distributions.
+
 ```{code-cell} ipython3
 ds.filter_cells(
     attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
@@ -131,10 +134,12 @@ ds.plots.distribution(
 ds.cells.head()
 ```
 
+After filtering, the same metrics are restricted to active cells (`I=True`).
+
 ## 3) Feature selection
 
 Library-size normalization for RNA assays uses a scalar factor (`ds.RNA.sf`, default 1000).
-Because we filtered cells with `RNA_nCounts` at least 1000, that default is safe here.
+Because cells with `RNA_nCounts` below 1000 were filtered out, that default is safe here.
 
 ```{code-cell} ipython3
 ds.RNA.sf
@@ -150,7 +155,8 @@ ds.mark_hvgs(
     top_n=500,
     min_mean=-3,
     max_mean=2,
-    max_var=6
+    max_var=6,
+    show_plot=True,
 )
 ds.RNA.feats.head()
 ```
@@ -195,6 +201,8 @@ ds.cells.head()
 ds.plots.embedding(layout_key='RNA_UMAP')
 ```
 
+Cells are placed by neighbourhood-graph proximity on the UMAP.
+
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
@@ -202,6 +210,8 @@ ds.plots.embedding(
     color_scale=splt.ColorScale(cmap='coolwarm'),
 )
 ```
+
+Library size varies across the embedding; check whether high-count cells dominate one region.
 
 Alternatives (densMAP, tSNE, Paris trees) are covered in
 {doc}`dimensionality_reduction_and_clustering`.
@@ -221,6 +231,8 @@ ds.plots.embedding(
     color_by='RNA_leiden_cluster',
 )
 ```
+
+Each colour is a Leiden partition on the same UMAP coordinates.
 
 ```{code-cell} ipython3
 leiden_clusters = ds.cells.to_pandas_dataframe(
@@ -252,6 +264,8 @@ ds.plots.marker_heatmap(
 )
 ```
 
+Rows are top marker genes per cluster; stronger scores mark more cluster-specific genes.
+
 ```{code-cell} ipython3
 df = ds.get_markers(
     group_key='RNA_leiden_cluster',
@@ -265,10 +279,14 @@ df.head()
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='CD14',
+    color_by=['CD14', 'MS4A1', 'CD3D'],
+    n_columns=3,
     sort_values=True,
 )
 ```
+
+CD14, MS4A1, and CD3D mark monocyte-, B-, and T-cell-like regions when those lineages
+are present.
 
 Annotation from markers, known gene panels, and subclustering is covered in
 {doc}`annotation`.
@@ -295,6 +313,7 @@ Annotation from markers, known gene panels, and subclustering is covered in
 
 - [Single-cell best practices: quality control](https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html)
 - [Single-cell best practices: clustering](https://www.sc-best-practices.org/cellular_structure/clustering.html)
+- [Scanpy clustering tutorial](https://scanpy.readthedocs.io/en/stable/tutorials/basics/clustering.html)
 - Scarf paper: https://doi.org/10.1038/s41467-022-32097-3
 
 ## Next steps

@@ -23,9 +23,8 @@ result to create a smaller Zarr store for workflows that do not need every cell.
 
 ## What you will learn
 
-- Cluster cells, then select representatives with TopACeDo
-- Select representative cells with `run_topacedo_sampler`
-- Export the selected cells to a new Zarr store
+- Select topology-preserving representatives with `run_topacedo_sampler`
+- Export selected cells to a new Zarr store with `SubsetZarr`
 
 ## Dataset
 
@@ -33,7 +32,6 @@ result to create a smaller Zarr store for workflows that do not need every cell.
 import scarf
 
 scarf.set_verbosity('WARNING')
-scarf.__version__
 ```
 
 ## Guided steps
@@ -62,17 +60,15 @@ ds.plots.embedding(
 )
 ```
 
+Paris clusters on the full UMAP before downsampling.
+
 ---
 ### 2. Run the TopACeDo downsampler
 
 +++
 
-UMAP, clustering, and marker identification describe cellular diversity, but some downstream
-analyses remain expensive on every cell. Scarf can select a topology-preserving subset from
-the cell-neighborhood graph while retaining heterogeneous regions.
-
-TopACeDo uses Scarf's KNN graph to perform manifold-preserving subsampling. Invoke it from
-the `DataStore`:
+Some downstream steps remain expensive on every cell. TopACeDo selects a topology-preserving
+subset from Scarf's KNN graph while keeping heterogeneous regions.
 
 ```{code-cell} ipython3
 ds.run_topacedo_sampler(
@@ -85,7 +81,7 @@ if 'RNA_sketched' not in ds.cells.columns:
     )
 ```
 
-As a result of subsampling the subsampled cells are marked True under the cell metadata column `RNA_sketched`. We can visualize these cells with `ds.plots.embedding` and `subset_by`.
+Selected cells are marked `True` under `RNA_sketched`. Plot them with `subset_by`:
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -95,7 +91,9 @@ ds.plots.embedding(
 )
 ```
 
-It may also be interesting to visualize the cells that were marked as `seed cells` used when PCST was run. These cells are marked under the column `RNA_sketch_seeds`.
+The subset should still cover the main clusters on the UMAP.
+
+Seed cells used for PCST are marked under `RNA_sketch_seeds`:
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -105,12 +103,15 @@ ds.plots.embedding(
 )
 ```
 
+Seed cells are a smaller set used to initialize the sampler.
+
 ---
 ### 3. Inspect downsampling parameters
 
 +++
 
-To identify the seed cells, the subsampling algorithm calculates cell densities based on neighbourhood degrees. Regions of higher cell density get a sampling penalty. The neighbourhood degree of individual cells are stored under the column `RNA_cell_density`.
+To place seed cells, the sampler estimates density from neighbourhood degree. Dense regions
+get a sampling penalty. Per-cell values are stored in `RNA_cell_density`.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -119,7 +120,10 @@ ds.plots.embedding(
 )
 ```
 
-The downsampling algorithm also identifies regions of the graph where cells form tightly connected groups by calculating mean shared nearest neighbours of each cell's neighbours. The tightly connected regions get a sampling award. These values can be accessed from under the cell metadata column `RNA_snn_value`.
+Higher `RNA_cell_density` marks denser graph neighbourhoods.
+
+The sampler also scores tight connectivity via mean shared nearest neighbours of each cell's
+neighbours. Tight regions get a sampling reward. Values are stored in `RNA_snn_value`.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -127,6 +131,8 @@ ds.plots.embedding(
     color_by='RNA_snn_value',
 )
 ```
+
+Higher `RNA_snn_value` marks more tightly connected neighbourhoods.
 
 ---
 ### 4. Export downsampled data
@@ -146,7 +152,7 @@ writer = scarf.SubsetZarr(
 writer.dump()
 ```
 
-The downsampled dataset can be loaded as a new DataStore
+Open the downsampled store as a new `DataStore`:
 
 ```{code-cell} ipython3
 ds2 = scarf.DataStore('scarf_datasets/tenx_5K_pbmc_rnaseq/subset.zarr')
@@ -156,8 +162,8 @@ ds2 = scarf.DataStore('scarf_datasets/tenx_5K_pbmc_rnaseq/subset.zarr')
 ds2
 ```
 
-It is expected the downsampled dataset will be small enough to fit in memory. Here it is exported
-to AnnData for downstream analysis in the [scverse](https://scverse.org/) ecosystem.
+When the subset fits in memory, export to AnnData for tools in the
+[scverse](https://scverse.org/) ecosystem:
 
 ```{code-cell} ipython3
 adata = ds2.to_anndata()
@@ -178,8 +184,13 @@ adata
 TopACeDo writes `RNA_sketched`, `RNA_sketch_seeds`, `RNA_cell_density`, and `RNA_snn_value` to
 cell metadata. `SubsetZarr` writes the selected cells to `subset.zarr`.
 
+## Further reading
+
+- [TopACeDo](https://github.com/parashardhapola/topacedo)
+- [Seurat sketch-based analysis](https://satijalab.org/seurat/articles/seurat5_sketch_analysis) (analogous practice for large datasets; not equivalent to TopACeDo)
+
 ## Next steps
 
-- {doc}`pseudotime`
 - {doc}`import_and_export`
+- {doc}`data_organization`
 - {doc}`plotting`

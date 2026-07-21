@@ -39,31 +39,25 @@ feature selection. Cell-level columns are shared across assays.
 import scarf
 
 scarf.set_verbosity('WARNING')
-scarf.__version__
 ```
 
-This page uses the multimodal CITE-seq store also used in {doc}`cite_seq`. It
-runs a short RNA graph and clustering pass so every execution starts from the
-downloaded fixture and creates the columns inspected below.
+This page opens the pre-analyzed Bastidas-Ponce pancreas store also used in
+{doc}`plotting` and {doc}`cell_cycle`. The store already includes HVGs, a
+neighbourhood graph, UMAP coordinates, and cluster labels, so no graph or
+clustering bootstrap is required here.
 
 ```{code-cell} ipython3
 scarf.cytebase.connect("scarf_docs").download_dataset(
-    name='tenx_8K_pbmc_citeseq',
+    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
     destination='scarf_datasets',
-    zarr=True
+    zarr=True,
 )
 
 ds = scarf.DataStore(
-    'scarf_datasets/tenx_8K_pbmc_citeseq/data.zarr',
+    'scarf_datasets/bastidas-ponce_4K_pancreas-d15_rnaseq/data.zarr',
     default_assay='RNA',
     nthreads=4,
 )
-
-ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-ds.make_graph(feat_key='hvgs', k=11, dims=15)
-ds.run_leiden_clustering(resolution=0.5)
-ds.run_umap(n_epochs=100, parallel=False, random_seed=4444)
-ds.run_marker_search(group_key='RNA_leiden_cluster', gene_batch_size=100)
 
 ds
 ```
@@ -71,9 +65,11 @@ ds
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_leiden_cluster',
+    color_by='clusters',
 )
 ```
+
+Cluster labels already live in cell metadata; the embedding only reads those columns.
 
 ## Guided steps
 
@@ -81,8 +77,8 @@ ds.plots.embedding(
 
 Scarf uses [Zarr](https://zarr.readthedocs.io/en/stable/) for chunked on-disk arrays. The store
 is a directory tree: counts, cell and feature attributes, and cached intermediates live under
-named groups. Benefits relative to a single HDF5 file include parallel reads and writes, fast
-compression codecs, and automatic persistence of intermediate results.
+named groups. Relative to a single HDF5 file, the layout supports parallel reads and writes,
+fast compression codecs, and automatic persistence of intermediate results.
 
 `show_zarr_tree` prints the hierarchy. With `depth=1` you see the top-level assays and
 `cellData`.
@@ -128,7 +124,7 @@ ds.RNA.feats.head()
 
 ```{code-cell} ipython3
 ds.cells.to_pandas_dataframe(
-    columns=['ids', 'RNA_nCounts', 'RNA_nFeatures', 'RNA_leiden_cluster']
+    columns=['ids', 'RNA_nCounts', 'RNA_nFeatures', 'clusters']
 ).set_index('ids')
 ```
 
@@ -136,24 +132,25 @@ ds.cells.to_pandas_dataframe(
 row in the store.
 
 ```{code-cell} ipython3
-cluster_labels = ds.cells.fetch('RNA_leiden_cluster')
-cluster_labels.shape, ds.cells.fetch_all('RNA_leiden_cluster').shape
+cluster_labels = ds.cells.fetch('clusters')
+cluster_labels.shape, ds.cells.fetch_all('clusters').shape
 ```
 
 `insert` writes a new column and aligns values to the active subset unless you override `key`.
 Re-inserting an existing column requires `overwrite=True`.
 
 ```{code-cell} ipython3
-is_cluster_1 = cluster_labels.astype(str) == '1'
-ds.cells.insert(column_name='is_cluster_1', values=is_cluster_1, overwrite=True)
+first_cluster = str(cluster_labels[0])
+is_first_cluster = cluster_labels.astype(str) == first_cluster
+ds.cells.insert(column_name='is_first_cluster', values=is_first_cluster, overwrite=True)
 ```
 
 ```{code-cell} ipython3
 :tags: [raises-exception]
 
 ds.cells.insert(
-    column_name='is_cluster_1',
-    values=is_cluster_1,
+    column_name='is_first_cluster',
+    values=is_first_cluster,
 )
 ```
 
@@ -161,7 +158,7 @@ See the `MetaData` API in {doc}`../reference/api/assays` for delete and update h
 Useful query helpers:
 
 ```python
-idx = ds.cells.get_index_by(['3'], 'RNA_leiden_cluster')
+idx = ds.cells.get_index_by(['3'], 'clusters')
 keep = ds.cells.sift('RNA_nCounts', min_v=1000, max_v=15000)
 ```
 
@@ -182,25 +179,13 @@ disk by default.
 ds.RNA.normed()
 ```
 
-Override normalization by assigning `normMethod`. Reassign it each time you open the store if
-you use a custom function. `scarf.assay.norm_dummy` disables normalization for pre-normalized
-inputs.
+Override normalization by assigning `normMethod`. Reassign a custom function each time you
+open the store. `scarf.assay.norm_dummy` disables normalization for pre-normalized inputs.
 
 ```{code-cell} ipython3
 import inspect
 
 print(inspect.getsource(ds.RNA.normMethod))
-```
-
-```{code-cell} ipython3
-def my_cool_normalization_method(assay, counts):
-    import numpy as np
-
-    lib_size = counts.sum(axis=1).reshape(-1, 1)
-    return np.log2(counts / lib_size)
-
-ds.RNA.normMethod = my_cool_normalization_method
-ds.RNA.normMethod = scarf.assay.norm_dummy
 ```
 
 ### 4. Graph caching
@@ -235,37 +220,22 @@ ds.load_graph(
 
 ### 5. Marker features
 
-`run_marker_search` writes markers under `{assay}/markers/{cell_key}__{group_key}`. Fetch one
-group with `get_markers`, or export all groups with `export_markers_to_csv`.
+`run_marker_search` writes markers under `{assay}/markers/{cell_key}__{group_key}`.
+Fetch one group with `get_markers`, or export all groups with `export_markers_to_csv`.
 
 ```{code-cell} ipython3
+if 'RNA/markers' not in ds.z:
+    ds.run_marker_search(group_key='clusters', gene_batch_size=100)
 ds.show_zarr_tree(start='RNA/markers', depth=2)
 ```
 
 ```{code-cell} ipython3
 ds.get_markers(
-    group_key='RNA_leiden_cluster',
-    group_id='1',
+    group_key='clusters',
+    group_id=ds.cells.fetch('clusters')[0],
     min_score=0.1,
     min_frac_exp=0.1,
 ).head()
-```
-
-```{code-cell} ipython3
-ds.plots.marker_heatmap(
-    group_key='RNA_leiden_cluster',
-    topn=3,
-    figsize=(5, 7),
-)
-```
-
-```{code-cell} ipython3
-ds.export_markers_to_csv(
-    group_key='RNA_leiden_cluster',
-    csv_filename='scarf_datasets/data_organization_markers.csv',
-    min_score=0.2,
-    min_frac_exp=0.1,
-)
 ```
 
 ### 6. Zarr v3, memory, and remote stores
@@ -296,16 +266,12 @@ the PCA reduction group as `harmonizedData` with `isHarmonized=True`.
 
 ## Saved results
 
-Metadata changes, graph caches, and marker results are written to the Zarr store. Exported
-marker tables go to the path passed to `csv_filename`.
-
-WAGGR and AUCell results are stored below `<assay>/enrichment/<label>`. See
-{doc}`gene_set_enrichment` for the scoring and loading APIs.
+Metadata changes and graph caches are written to the Zarr store. Marker tables appear under
+`{assay}/markers/...` after `run_marker_search`. WAGGR and AUCell results are stored below
+`<assay>/enrichment/<label>`; see {doc}`gene_set_enrichment` for the scoring APIs.
 
 ## Next steps
 
 - {doc}`import_and_export`
-- {doc}`gene_set_enrichment`
-- {doc}`plotting`
-- {doc}`dimensionality_reduction_and_clustering`
+- {doc}`../reference/api`
 - {doc}`../developers/zarr_internals`

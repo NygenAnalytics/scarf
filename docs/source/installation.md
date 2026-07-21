@@ -45,7 +45,7 @@ New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
     -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
 ```
 
-See the [Microsoft long-path documentation](https://docs.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation?tabs=powershell).
+See the [Microsoft long-path documentation](https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation).
 ````
 
 ## Optional: conda environment

@@ -1,19 +1,24 @@
 (scarf_and_scanpy)=
-# Scarf and Scanpy
+# Coming from Scanpy or Seurat
 
-Scarf and [Scanpy](https://scanpy.readthedocs.io/) both support core scRNA-seq analysis.
-They differ in data model, memory behaviour, and which methods they ship. This page maps
-stages between the two tools and notes when to use each. A short Seurat subsection follows
-the Scanpy material.
+If you already analyze single-cell data with [Scanpy](https://scanpy.readthedocs.io/) or
+Seurat, this page translates what you know onto Scarf's API so you can get productive
+quickly. It is a migration guide, not a comparison. Scarf covers the core scRNA-seq path
+and reads and writes AnnData, so the two fit together in one workflow. A short Seurat
+subsection follows the Scanpy material.
 
-## What each tool is built for
+## What changes when you switch
 
 | | Scarf | Scanpy |
 |---|---|---|
 | Primary object | `DataStore` over a Zarr store | `AnnData` in memory (or backed modes) |
-| Design focus | Lower-memory neighbourhood-graph workflows | Broad method catalog and ecosystem |
+| Where data lives | On disk or object storage, read in place | In memory on the `AnnData` object |
 | Modalities in-package | scRNA-seq, scATAC-seq, CITE-seq | scRNA-seq; spatial and other modalities via the wider scverse stack |
 | Results persistence | Written into the Zarr store as you run steps | Held on the `AnnData` object (save explicitly) |
+
+The main adjustment is that Scarf keeps counts and results on a store rather than in a
+single in-memory object, and it reuses one neighbourhood graph across embedding,
+clustering, and mapping. The stage mapping below covers the rest.
 
 ## Stage mapping
 
@@ -43,19 +48,16 @@ standalone after `import scarf.plotting as splt`.
 - **Graph-centric pipeline**: embeddings, clustering, mapping, and multimodal integration reuse the neighbourhood graph from `make_graph`.
 - **On-disk by default**: intermediate matrices and embeddings live under the Zarr hierarchy.
 
-## When to use Scarf, Scanpy, or both
+## Using Scarf and Scanpy together
 
-Use **Scarf** when memory is limited, when you want built-in Harmony / WNN / mapping / TopACeDo
-downsampling, or when you prefer results that persist in Zarr as you work.
+Scarf reads and writes AnnData, so you can move between the two in one project. A common
+pattern is to run graph-heavy or large-scale steps in Scarf, then export a subset for a
+method that lives in the wider scverse ecosystem (for example scVI, CellRank, or Squidpy).
 
-Use **Scanpy** when you need the wider ecosystem (for example scVI, CellRank, Squidpy) or when
-the dataset is small enough that in-memory AnnData is simplest.
-
-Use **both** when Scarf handles large-scale UMAP and clustering, then you export a subset with
-`to_anndata` / `to_h5ad` for methods Scarf does not include.
-
-Do not treat runtime or memory numbers on this page as benchmarks. Relative behaviour depends
-on dataset size, hardware, and parameters.
+Some methods are not part of Scarf, including scVI, Scanorama, RNA velocity, and full
+differential-expression pipelines with multiple-testing correction. When you need one of
+these, export the assay and cell metadata with `to_anndata` / `to_h5ad` and continue in
+the other tool.
 
 ## H5AD and AnnData round-trip
 
@@ -99,6 +101,12 @@ need for the next tool.
 | Harmony integration | `make_graph(..., harmonize=True, batch_columns=...)` |
 | WNN | `integrate_assays(..., method="wnn")` |
 | Sketching / representative cells | TopACeDo via the downsampling tutorial |
+
+## Further reading
+
+- [Scanpy documentation](https://scanpy.readthedocs.io/en/stable/)
+- [Seurat PBMC clustering vignette](https://satijalab.org/seurat/articles/pbmc3k_tutorial)
+- [Seurat integration introduction](https://satijalab.org/seurat/articles/integration_introduction)
 
 ## Next steps
 

@@ -23,8 +23,9 @@ counts or metadata to interoperable formats.
 
 ## What you will learn
 
-- Download datasets from Scarf's catalog
-- Convert 10x HDF5, MTX, and H5AD inputs to Zarr
+- Download datasets from the `scarf_docs` Cytebase catalog
+- Convert 10x HDF5, MTX, H5AD, CSV, and sparse inputs to Zarr
+- Merge full DataStores with `DatasetMerge`
 - Export an assay to MTX or H5AD
 
 ## Guided steps
@@ -33,7 +34,6 @@ counts or metadata to interoperable formats.
 import scarf
 
 scarf.set_verbosity('WARNING')
-scarf.__version__
 ```
 
 ### 1. Download datasets from Cytebase
@@ -57,7 +57,8 @@ datasets.download_dataset(
 )
 ```
 
-The above dataset gets saved under the directory `scarf_datasets` in our current working directory. You can modify the `destination` parameter to save data in a location of your choice. The dataset above was downloaded in 10x's HDF5 format. Let us download a few more datasets that are in different file formats.
+The download lands under `scarf_datasets` in the current working directory unless
+`destination` is changed. The file above is 10x HDF5. Download a few more formats:
 
 ```{code-cell} ipython3
 # This dataset is in MTX format along with barcodes and features TSV files.
@@ -77,7 +78,8 @@ datasets.download_dataset(
 
 ### 2. Convert data to a Scarf Zarr store
 
-Scarf stores data as dense, compressed chunks in Zarr file format. `scarf.readers` and `scarf.writers` modules contain classes that allow reading many different file formats and convert them to Zarr. There are often complementary reader and writer classes. Let's explore them below.
+Scarf stores data as dense, compressed chunks in Zarr. `scarf.readers` and `scarf.writers`
+provide complementary classes that convert common count formats into that layout.
 
 +++
 
@@ -174,23 +176,136 @@ scarf.writers.to_h5ad(
 )
 ```
 
-### 4. Use CSV, sparse, and Dask writers
+### 4. Convert a CSV matrix to Zarr
 
-`CSVReader` and `CSVtoZarr` import dense CSV count matrices. `SparseToZarr` accepts a SciPy sparse matrix. `dask_to_zarr` writes from a Dask array when lazy out-of-core conversion is needed.
+`CSVReader` and `CSVtoZarr` import dense CSV count matrices. The toy matrix below is
+synthesized in-notebook so the conversion does not depend on a catalog file. Rows are cells
+and columns are features; `cell_data_cols` moves selected columns into cell metadata.
+
+```{code-cell} ipython3
+from pathlib import Path
+import shutil
+
+import numpy as np
+from scipy.sparse import csr_matrix
+
+csv_dir = Path('scarf_datasets')
+csv_dir.mkdir(parents=True, exist_ok=True)
+csv_path = csv_dir / 'toy_counts.csv'
+csv_path.write_text(
+    'quality,geneA,geneB,geneC\n'
+    '10,1,0,2\n'
+    '20,0,3,0\n'
+    '30,4,5,6\n'
+    '40,7,0,8\n'
+    '50,9,10,0\n',
+    encoding='utf-8',
+)
+
+csv_zarr = csv_dir / 'toy_csv.zarr'
+if csv_zarr.exists():
+    shutil.rmtree(csv_zarr)
+
+reader = scarf.CSVReader(
+    str(csv_path),
+    cell_data_cols=['quality'],
+)
+writer = scarf.CSVtoZarr(
+    reader,
+    zarr_loc=str(csv_zarr),
+    assay_name='RNA',
+    dtype=np.dtype('uint16'),
+)
+writer.dump()
+ds_csv = scarf.DataStore(str(csv_zarr))
+ds_csv
+```
+
+### 5. Convert a sparse matrix to Zarr
+
+`SparseToZarr` accepts a SciPy CSR matrix with matching cell and feature IDs.
+
+```{code-cell} ipython3
+mat = csr_matrix(
+    (
+        [1, 10, 15, 10, 20, 2, 3, 1, 5],
+        ([0, 0, 0, 1, 1, 1, 2, 2, 2], [1, 3, 8, 2, 3, 1, 2, 8, 9]),
+    ),
+    shape=(3, 10),
+)
+sparse_zarr = Path('scarf_datasets/toy_sparse.zarr')
+if sparse_zarr.exists():
+    shutil.rmtree(sparse_zarr)
+sparse_writer = scarf.SparseToZarr(
+    mat,
+    zarr_loc=str(sparse_zarr),
+    cell_ids=[f'cell_{i}' for i in range(mat.shape[0])],
+    feature_ids=[f'feat_{i}' for i in range(mat.shape[1])],
+    assay_name='RNA',
+)
+sparse_writer.dump()
+ds_sparse = scarf.DataStore(str(sparse_zarr))
+ds_sparse
+```
+
+### 6. Merge full DataStores with DatasetMerge
 
 `DatasetMerge` merges multiple full DataStores (all assays per dataset) into one Zarr file.
-For single-assay merges see `AssayMerge` in {doc}`data_integration`.
+The example below merges two tiny stores created with `SparseToZarr`. For single-assay merges
+of larger studies see `AssayMerge` in {doc}`data_integration`.
 
-## Common mistakes
+```{code-cell} ipython3
+for name, values in [
+    ('toy_merge_a.zarr', [1, 2, 3, 4, 5, 6]),
+    ('toy_merge_b.zarr', [7, 8, 9, 10, 11, 12]),
+]:
+    path = Path('scarf_datasets') / name
+    if path.exists():
+        shutil.rmtree(path)
+    m = csr_matrix(np.asarray(values, dtype=np.uint16).reshape(3, 2))
+    scarf.SparseToZarr(
+        m,
+        zarr_loc=str(path),
+        cell_ids=[f'{path.stem}_{i}' for i in range(3)],
+        feature_ids=['g1', 'g2'],
+        assay_name='RNA',
+    ).dump()
+
+ds_a = scarf.DataStore('scarf_datasets/toy_merge_a.zarr')
+ds_b = scarf.DataStore('scarf_datasets/toy_merge_b.zarr')
+merger = scarf.DatasetMerge(
+    datasets=[ds_a, ds_b],
+    zarr_path='scarf_datasets/toy_merged.zarr',
+    names=['a', 'b'],
+    source_column='sample_id',
+    overwrite=True,
+)
+merger.dump()
+ds_merged = scarf.DataStore('scarf_datasets/toy_merged.zarr')
+ds_merged.cells.head()
+```
+
+`dask_to_zarr` writes from a Dask array when lazy out-of-core conversion is needed. Loom
+import uses `LoomReader` / `LoomToZarr` with the same dump pattern as the readers above; this
+page does not execute a Loom example.
+
+## Common mistakes and limitations
 
 - Fetching a prepared Zarr store when the aim is to demonstrate source-format conversion
 - Reusing an existing Zarr output path without confirming that it can be overwritten
 - Exporting normalized values when a downstream method requires raw counts
+- Using `DatasetMerge` when you only need one assay from each store (`AssayMerge` is enough)
 
 ## Saved results
 
 Conversion writes a Zarr directory at `zarr_loc`. Export commands write the requested MTX or
-H5AD file at the supplied destination.
+H5AD file at the supplied destination. `DatasetMerge` writes the merged store at `zarr_path`.
+
+## Further reading
+
+- [AnnData / H5AD](https://anndata.readthedocs.io/)
+- [Loom](https://loompy.org/)
+- [scverse](https://scverse.org/)
 
 ## Next steps
 

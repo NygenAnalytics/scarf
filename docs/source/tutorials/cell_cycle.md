@@ -35,16 +35,16 @@ import scarf
 import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
-scarf.__version__
 ```
 
 ## Guided steps
 
 ### 1. Fetch pre-analyzed data
 
-Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://journals.biologists.com/dev/article/146/12/dev173849/19483/) for E15.5 stage of differentiation of endocrine cells from a pool of endocrine progenitors-precursors. 
+Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://journals.biologists.com/dev/article/146/12/dev173849/19483/) for E15.5 stage of differentiation of endocrine cells from a pool of endocrine progenitors-precursors.
 
-We have stored this data on Scarf's online repository for quick access. We processed the data to identify the highly variable genes (top 2000) and create a neighbourhood graph of cells. A UMAP embedding was calculated for the cells. 
+The prepared Zarr store is available from the `scarf_docs` Cytebase catalog. It already
+includes the top 2000 highly variable genes, a neighbourhood graph, and a UMAP embedding. 
 
 ```{code-cell} ipython3
 scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -102,7 +102,7 @@ ds.plots.embedding(
 )
 ```
 
-We can clearly see that cycling group of cells in the 'ductal' group. You can provide your own custom color mappings like below:
+Cycling cells are concentrated in the ductal group. Custom colors can be supplied like this:
 
 ```{code-cell} ipython3
 color_key = {
@@ -117,6 +117,23 @@ ds.plots.embedding(
     categorical_scale=splt.CategoricalScale(palette=color_key),
 )
 ```
+
+Phase composition per cluster shows which groups are enriched for S or G2M relative to G1:
+
+```{code-cell} ipython3
+ds.plots.composition(
+    category_by='RNA_cell_cycle_phase',
+    sample_by='clusters',
+    kind='stacked',
+    categorical_scale=splt.CategoricalScale(
+        palette=color_key,
+        order=['G1', 'S', 'G2M'],
+    ),
+)
+```
+
+Stacked bars are cluster-wise phase fractions among active cells; ductal-associated
+clusters should show a higher S/G2M share if the embedding pattern above holds.
 
 ---
 ### 4. Visualize phase-specific scores
@@ -142,7 +159,7 @@ ds.plots.embedding(
 )
 ```
 
-Unsurprisingly, these scores look very similar to those obtained through Scarf. Let's quantify the concordance below
+The Scanpy scores look similar to Scarf's. Quantify the concordance:
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -169,7 +186,7 @@ High correlation coefficients indicate a large degree of concordance between the
 
 +++
 
-## Common mistakes
+## Common mistakes and limitations
 
 - Applying a human or mouse gene set to data with incompatible feature names
 - Interpreting a phase score as evidence of cell proliferation without checking the underlying genes
@@ -178,6 +195,10 @@ High correlation coefficients indicate a large degree of concordance between the
 ## Saved results
 
 Scarf stores `RNA_cell_cycle_phase`, `RNA_S_score`, and `RNA_G2M_score` in cell metadata.
+
+## Further reading
+
+- [Scanpy `score_genes_cell_cycle`](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.score_genes_cell_cycle.html)
 
 ## Next steps
 

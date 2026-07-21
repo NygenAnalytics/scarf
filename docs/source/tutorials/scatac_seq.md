@@ -35,7 +35,6 @@ clustering accessible chromatin profiles. See {doc}`scrna_seq` for the RNA workf
 import scarf
 
 scarf.set_verbosity('WARNING')
-scarf.__version__
 ```
 
 ## Guided steps
@@ -87,12 +86,27 @@ ds = scarf.DataStore(
 )
 ```
 
+Inspect fragment and peak-count distributions before filtering. Thresholds are
+dataset-specific.
+
+```{code-cell} ipython3
+qc_cols = [
+    c for c in ('ATAC_nCounts', 'ATAC_nFeatures')
+    if c in ds.cells.columns
+]
+ds.plots.distribution(
+    keys=qc_cols,
+    kind='violin',
+    max_points=2000,
+)
+```
+
 `auto_filter_cells` models each selected QC column with a normal distribution centered on its
 median and using its standard deviation. The default 0.01 and 0.99 quantiles define the lower
 and upper bounds. Cells outside those bounds are marked inactive in `I`; they are not deleted.
 
 ```{code-cell} ipython3
-ds.auto_filter_cells()
+ds.auto_filter_cells(show_qc_plots=True)
 ```
 
 ### 3. Select features
@@ -128,7 +142,8 @@ ds.make_graph(
 ### 5. Run UMAP and clustering
 
 
-Non-linear dimension reduction using UMAP and tSNE are performed in the same way as for scRNA-Seq data. Because, in Scarf the core UMAP step are run directly on the neighbourhood graph, the scATAC-Seq data is handled similar to any other data.
+UMAP and tSNE use the same neighbourhood-graph path as scRNA-seq, so the ATAC workflow
+looks the same after the graph is built.
 
 ```{code-cell} ipython3
 ds.run_umap(
@@ -139,19 +154,21 @@ ds.run_umap(
 )
 ```
 
-Same goes for clustering as well. The leiden clustering acts on the neighbourhood graph directly.
+Leiden clustering also acts on the neighbourhood graph directly.
 
 ```{code-cell} ipython3
 ds.run_leiden_clustering(resolution=0.6)
 ```
 
-Results from both UMAP and Leiden clustering are stored in cell attribute table. Here, because the UMAP and leiden clustering columns have 'ATAC' prefixes because they were executed on the default 'ATAC' assay. You can also see that the cells that were filtered out (marked by 'False' value in column 'I') have NaN value for UMAP axes and -1 for clustering
+UMAP and Leiden results are stored in the cell attribute table with an `ATAC` prefix because
+they were run on the default ATAC assay. Filtered cells (`I` is False) have NaN UMAP
+coordinates and cluster id `-1`.
 
 ```{code-cell} ipython3
 ds.cells.head()
 ```
 
-We can visualize the UMAP embedding and the clusters of cells on the embedding
+Plot the UMAP embedding colored by Leiden clusters:
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -160,30 +177,17 @@ ds.plots.embedding(
 )
 ```
 
-Coloring by an ATAC peak uses the assay's native TF-IDF normalization:
-
-```{code-cell} ipython3
-peak = str(ds.ATAC.feats.fetch_all('ids')[0])
-ds.plots.embedding(
-    layout_key='ATAC_UMAP',
-    from_assay='ATAC',
-    color_by=peak,
-    sort_values=True,
-)
-```
-
-Those familiar with PBMC datasets might already be able to identify different cell types in the UMAP plot.
-
-+++
+Individual peak IDs are rarely interpretable on their own. The next section maps peaks to
+gene scores so known marker genes can be plotted on this UMAP.
 
 ### 6. Calculate gene scores
 
-The features in snATAC-Seq in form of peak coordinates are hard to interpret by themselves.
-Hence, distilling the open chromatin regions in terms of accessible genes can help in identification of cell types.
-`GeneScores` are simply the summation of all the peak fragments that are present within gene bodies and their corresponding promoter region.
-Since, marker genes are often better understood than the non-coding regions the `GeneScores` can be used to annotate cell types.
+Gene scores summarize accessible chromatin by summing peak fragments that overlap gene
+bodies and their promoter regions. Marker genes are often easier to use for cell-type
+annotation than individual peaks.
 
-In Scarf, the users can provide a BED file containing gene annotations. This BED should have no header, should be tab separated and must have the columns in following order:
+Provide a BED file of gene annotations. The file should have no header, be tab-separated, and
+use this column order:
 1) chromosome identifier
 2) start coordinate
 3) end coordinate 
@@ -193,7 +197,9 @@ In Scarf, the users can provide a BED file containing gene annotations. This BED
 
 The start/end coordinate can extend through transcription start site (TSS) to include a portion of promoter.
 
-For convenience we have generated such BED files for human and mouse assemblies using the annotation information from GENCODE project. We downloaded the GFF3 format primary chromosome annotations and used Scarf's `GffReader` to convert the files into BED and add promoter offset of 2KB. Download these BED files by passing `annotations` to `download_dataset`.
+Prepared human and mouse BED files from GENCODE annotations are available in the
+`scarf_docs` Cytebase catalog (GFF3 primary-chromosome annotations converted with Scarf's
+`GffReader`, plus a 2 kb promoter offset). Download them with `annotations`:
 
 ```{code-cell} ipython3
 scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -204,15 +210,19 @@ scarf.cytebase.connect("scarf_docs").download_dataset(
 
 ----
 
-Now we have the annotations and are ready to calculate the 'GeneScores'. The `add_melded_assay` is the `DataStore` method that will be used for this purpose. The `add_melded_assay` method is actually designed to map any arbitrary genomic coordinate information (not just gene annotations) to the ATAC peaks. Here, we use the term 'melding' for the process wherein for a given loci the values from all the overlapping peaks are merged/melded into that feature. The peaks values are TF-IDF normalized before melding.
+`add_melded_assay` maps genomic coordinates onto ATAC peaks. For a given locus, values from
+all overlapping peaks are melded into one feature. Peak values are TF-IDF normalized before
+melding. The same method can meld motif or enhancer annotations, not only gene bodies.
 
-Now we explain the parameters that are usually passed to the `add_melded_assay`.
-- `from_assay`: Name of the assay to be acted on. You can generally skip if you have only one assay. We use this parameter here only for demonstration puspose
-- `external_bed_fn`: This is the annotation file. Here we pass the annotation for human GRCh37/hg19 assembly based GENCODE v38 annotations.
+Common parameters:
+- `from_assay`: Assay to act on. Optional when only one assay is present; shown here for clarity.
+- `external_bed_fn`: Annotation BED. Here, human GRCh37/hg19 GENCODE v38 gene bodies.
 - `peaks_col`: Column in `ds.ATAC.feats` with peak coordinates in `chr:start-end` format.
-- `renormalization`: By overriding the default value of True to False here, we turned off 'renormalization' step. The renormalization step makes sure that all the feature values for each cells in the melded assay sum up to the same value. Here we turned this off because we will have 'GeneScores' as an 'RNAassay' which uses library size normalization that has the same effect as 'renormalization'.
-- `assay_label`: The label/name of the melded/output assay. Because we are using gene bodies as our input, 'GeneScores' is sensible choice.
-- `assay_type`: Here we set the type of assay as 'RNA' which means that the new melded assay will be treated as if it was an scRNA-Seq assay. Alternatively, we could have set it as a generic 'Assay'
+- `renormalization`: Set to False here. Renormalization would force each cell's melded feature
+  values to the same sum; GeneScores is created as an `RNAassay`, which already applies
+  library-size normalization.
+- `assay_label`: Name of the output assay (`GeneScores`).
+- `assay_type`: `'RNA'` treats the melded assay like scRNA-seq. Use `'Assay'` for a generic assay.
 
 ```{code-cell} ipython3
 ds.add_melded_assay(
@@ -233,13 +243,15 @@ their calculated scores.
 
 ---
 
-We can now print out the DataStore and see that the 'GeneScores' assay has indeed been added. The 'add_melded_assay' also printed a useful bit of information that almost half of features(genes bodies) did not overlap with even a single peak. The melded assay anyway contains all the genes but sets these 'empty' genes as invalid.
+Print the DataStore to confirm that `GeneScores` was added. `add_melded_assay` also reports
+how many gene bodies did not overlap any peak; those genes remain in the assay but are marked
+invalid.
 
 ```{code-cell} ipython3
 ds
 ```
 
-Let's now visualize some 'GeneScores' for some of the known marker genes for PBMCs on the UMAP plot calculated on the ATAC assay
+Plot GeneScores for known PBMC marker genes on the ATAC UMAP:
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -256,7 +268,7 @@ The same melding approach maps any coordinate bed file onto peaks, including mot
 
 +++
 
-## Common mistakes
+## Common mistakes and limitations
 
 - Requesting `zarr=True` for `tenx_10K_pbmc-v1_atacseq`, which has no prepared Zarr store
 - Using RNA normalization or PCA assumptions for ATAC data
@@ -266,6 +278,10 @@ The same melding approach maps any coordinate bed file onto peaks, including mot
 
 The converted Zarr store retains the ATAC counts, cell metadata, graph, UMAP coordinates, Leiden
 labels, and the optional `GeneScores` assay.
+
+## Further reading
+
+- [Cell Ranger ATAC](https://www.10xgenomics.com/support/software/cell-ranger-atac/latest)
 
 ## Next steps
 

@@ -18,17 +18,30 @@ kernelspec:
 
 This tutorial merges datasets from different Zarr files, corrects batch effects with partial PCA or Harmony, and quantifies integration with LISI and related metrics. See also the {ref}`integration methods guide <integration_guide>`. Metrics details are in {doc}`integration_metrics`.
 
+## Prerequisites
+
+- Scarf installed with the `extra` optional dependencies
+- Two or more Zarr stores with a shared RNA feature space
+
+## What you will learn
+
+- Merge assays from separate Zarr files with `AssayMerge`
+- Compare a naive joint analysis with partial PCA and Harmony
+- Quantify mixing and label preservation with LISI and related metrics
+
+## Dataset
+
 ```{code-cell} ipython3
 import scarf
 
 scarf.set_verbosity('WARNING')
-scarf.__version__
 ```
 
 ---
 ## 1) Fetch datasets in Zarr format
 
-Here we use the same datasets as in {ref}`mapping and label transfer <data_projection>`. We download the files in Zarr format.
+Use the same Kang PBMC datasets as in {ref}`mapping and label transfer <data_projection>`.
+Download the prepared Zarr stores from the `scarf_docs` Cytebase catalog.
 
 ```{code-cell} ipython3
 scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -203,7 +216,8 @@ ds.cells.insert(
 )
 ```
 
-The next step is to perform the partial PCA training. PCA is trained during the graph creation step. We will now use `pca_cell_key` parameter and set it to `is_ctrl` so that only 'ctrl' cells are used for PCA training.
+PCA is trained during graph creation. Pass `pca_cell_key='is_ctrl'` so only control cells
+define the PCA basis.
 
 ```{code-cell} ipython3
 ds.make_graph(
@@ -237,7 +251,8 @@ ds.plots.embedding(
 )
 ```
 
-Visualization of cluster labels in the new UMAP space shows that the cells from the same cell-type do not split into separate clusters like they did before.
+Cluster labels on the new UMAP often mix more by cell type than before, but treatment and
+batch remain confounded, so improved mixing is not proof that biology was preserved.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -362,5 +377,26 @@ ds.metric_label_concordance(
 )
 ```
 
----
-See {doc}`integration_metrics` for more metric detail and {doc}`choosing_integration_methods` for method choice.
+## Common mistakes and limitations
+
+- Treating sample identity as a technical batch when it is confounded with treatment
+- Using corrected embeddings as input for condition-level differential expression
+- Judging integration from UMAP alone without batch and label metrics
+- Comparing LISI scores across graphs built with different `k` or perplexity
+
+## Saved results
+
+The merged Zarr store holds aligned counts and metadata. Each graph rebuild writes its own
+UMAP/Leiden columns (`RNA_UMAP`, `RNA_pUMAP`, `RNA_hUMAP`, and so on). With
+`save_result=True`, per-cell LISI scores are stored as `lisi__*` columns.
+
+## Further reading
+
+- Korsunsky et al. 2019, Harmony: https://doi.org/10.1038/s41592-019-0619-0
+
+## Next steps
+
+- {doc}`integration_metrics`
+- {doc}`choosing_integration_methods`
+- {doc}`mapping_and_label_transfer`
+- {doc}`reference_atlas`

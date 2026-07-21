@@ -89,33 +89,23 @@ ds.plots.marker_heatmap(
 )
 ```
 
+Rows are top markers per cluster; use them with known lineage genes, not as FDR DE.
+
 ## 2) Known markers on the embedding
 
-Visually confirm panel genes before assigning labels.
+Confirm panel genes on the UMAP before assigning labels.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='CD14',
+    color_by=['CD14', 'MS4A1', 'CD3D'],
+    n_columns=3,
     sort_values=True,
 )
 ```
 
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='MS4A1',
-    sort_values=True,
-)
-```
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='CD3D',
-    sort_values=True,
-)
-```
+CD14, MS4A1, and CD3D mark monocyte-, B-, and T-cell-like regions when those lineages
+are present.
 
 ## 3) Assign labels
 
@@ -153,7 +143,30 @@ ds.plots.embedding(
 )
 ```
 
-## 4) Subset and recluster
+Assigned labels replace numeric cluster IDs where the panel genes ranked highest.
+
+## 4) Relabel clusters with `smart_label`
+
+`smart_label` renames values in one categorical column from the most frequent overlap with
+another column. Here Leiden cluster IDs are rewritten from the `cell_type` labels just
+assigned. Shared base labels get letter suffixes when more than one Leiden cluster maps to
+the same type.
+
+```{code-cell} ipython3
+ds.smart_label(
+    to_relabel='RNA_leiden_cluster',
+    base_label='cell_type',
+    new_col_name='leiden_by_type',
+)
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by='leiden_by_type',
+)
+```
+
+`leiden_by_type` is a convenience labeling of clusters, not an automated ontology annotation.
+
+## 5) Subset and recluster
 
 Create a boolean cell key for one population, then recompute the graph with that key.
 
@@ -202,6 +215,8 @@ ds.plots.embedding(
 )
 ```
 
+The subset UMAP and Leiden labels apply only to cells marked in `focus_cells`.
+
 ## Common mistakes and limitations
 
 - Treating cluster IDs as biologically stable across resolutions
@@ -213,9 +228,14 @@ ds.plots.embedding(
 | Kind | Keys |
 |---|---|
 | Markers | from `run_marker_search` / `get_markers` |
-| Labels | user columns such as `cell_type` |
+| Labels | user columns such as `cell_type`, `leiden_by_type` |
 | Subset key | e.g. `focus_cells` |
 | Subcluster results | e.g. `RNA_focus_cells_UMAP*`, `RNA_focus_cells_leiden_cluster` |
+
+## Further reading
+
+- [Single-cell best practices: cell-type annotation](https://www.sc-best-practices.org/cellular_structure/annotation.html)
+- Scarf does not ship automated ontology annotators; labels here are assigned from markers and known genes
 
 ## Next steps
 

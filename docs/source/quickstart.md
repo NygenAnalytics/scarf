@@ -16,8 +16,8 @@ kernelspec:
 
 # Quick start
 
-This page runs a minimal scRNA-seq pipeline on a 5K PBMC dataset. For the full walkthrough,
-see {doc}`tutorials/scrna_seq`. If you know Scanpy, skim {doc}`scarf_and_scanpy` first.
+This page runs a minimal scRNA-seq pipeline on a 5K PBMC dataset. For the full workflow,
+see {doc}`tutorials/scrna_seq`. If you know Scanpy, see {doc}`scarf_and_scanpy` first.
 
 ## Load counts into Zarr
 
@@ -34,9 +34,15 @@ scarf.CrToZarr(reader, zarr_loc='scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr').
 ## Open the store and filter cells
 
 `filter_cells` marks cells inactive (cell key `I`) rather than deleting them from the store.
+QC thresholds are dataset-specific; set them from the distributions for the store you open.
 
 ```{code-cell} ipython3
 ds = scarf.DataStore('scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr', nthreads=4, min_features_per_cell=10)
+ds.plots.distribution(
+    keys=['RNA_nCounts', 'RNA_nFeatures'],
+    kind='violin',
+    max_points=2000,
+)
 ds.filter_cells(attrs=['RNA_nCounts', 'RNA_nFeatures'], highs=[15000, 4000], lows=[1000, 500])
 ```
 
@@ -61,6 +67,8 @@ ds.plots.embedding(
 )
 ```
 
+Each colour is a Leiden cluster on the UMAP built from the neighbourhood graph.
+
 ## What was saved
 
 Typical columns and keys written by this pipeline:
@@ -70,8 +78,14 @@ Typical columns and keys written by this pipeline:
 - Embedding: `RNA_UMAP1`, `RNA_UMAP2`
 - Clusters: `RNA_leiden_cluster`
 
+## Further reading
+
+- [Single-cell best practices: quality control](https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html)
+- [Single-cell best practices: clustering](https://www.sc-best-practices.org/cellular_structure/clustering.html)
+- [Scanpy clustering tutorial](https://scanpy.readthedocs.io/en/stable/tutorials/basics/clustering.html)
+
 ## Next steps
 
 - Full scRNA-seq chapter: {doc}`tutorials/scrna_seq`
+- Scanpy and Seurat mapping: {doc}`scarf_and_scanpy`
 - Publication plotting with `ds.plots`: {ref}`plotting showcase <plotting_showcase>`
-- Batch correction: {ref}`integration methods guide <integration_guide>`

@@ -148,30 +148,60 @@ The same `tie_seed` gives a deterministic global ordering for equal expression v
 Changing `n_up`, `tie_seed`, the feature selection, or the network creates a different
 execution.
 
-## 4) Load selected sources and visualize a score
+## 4) Load selected sources and visualize scores
 
 `get_enrichment` returns a lazy result. Selecting sources first avoids loading unrelated
-columns.
+columns. The values below are activity scores, not p-values.
 
 ```{code-cell} ipython3
-myeloid = ds.get_enrichment(
-    'pbmc_aucell',
-    sources=['Myeloid'],
-)
-myeloid_scores = myeloid.data.compute().ravel()
+aucell_cols = []
+for source in ['T_cell', 'B_cell', 'Myeloid']:
+    result = ds.get_enrichment('pbmc_aucell', sources=[source])
+    col = f'{source}_AUCell'
+    ds.cells.insert(
+        col,
+        result.data.compute().ravel(),
+        key=result.cell_key,
+        overwrite=True,
+    )
+    aucell_cols.append(col)
 
+present = [c for c in aucell_cols if c in ds.cells.columns]
+if present:
+    ds.plots.embedding(
+        layout_key='RNA_UMAP',
+        color_by=present,
+        n_columns=3,
+        sort_values=True,
+    )
+```
+
+AUCell scores highlight lineage-consistent regions: T-cell, B-cell, and Myeloid scores
+peak in separate parts of the UMAP when those populations are present.
+
+```{code-cell} ipython3
+waggr_myeloid = ds.get_enrichment('pbmc_waggr', sources=['Myeloid'])
 ds.cells.insert(
-    'Myeloid_AUCell',
-    myeloid_scores,
-    key=myeloid.cell_key,
+    'Myeloid_WAGGR',
+    waggr_myeloid.data.compute().ravel(),
+    key=waggr_myeloid.cell_key,
     overwrite=True,
 )
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='Myeloid_AUCell',
-    sort_values=True,
-)
+
+compare = [
+    c for c in ['Myeloid_WAGGR', 'Myeloid_AUCell'] if c in ds.cells.columns
+]
+if len(compare) == 2:
+    ds.plots.embedding(
+        layout_key='RNA_UMAP',
+        color_by=compare,
+        n_columns=2,
+        sort_values=True,
+    )
 ```
+
+WAGGR and AUCell both mark myeloid-like cells here, but the score scales differ because
+one aggregates weighted expression and the other measures within-cell rank recovery.
 
 ## Choosing a method
 
@@ -199,6 +229,11 @@ replacement has finished writing.
 ```{code-cell} ipython3
 ds.get_enrichment('pbmc_waggr').storage_path
 ```
+
+## Further reading
+
+- Aibar et al. 2017, SCENIC / AUCell: https://doi.org/10.1038/nmeth.4463
+- [Bioconductor AUCell vignette](https://bioconductor.org/packages/release/bioc/vignettes/AUCell/inst/doc/AUCell.html)
 
 ## Next steps
 

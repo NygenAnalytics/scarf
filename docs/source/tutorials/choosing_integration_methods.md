@@ -1,8 +1,8 @@
 (integration_guide)=
 # Choosing integration methods
 
-Scarf offers several integration and batch-correction approaches. This page helps you choose
-the right one. For worked examples, follow the linked tutorials.
+Scarf includes several integration and batch-correction approaches. This page maps goals to
+APIs. For worked examples, follow the linked tutorials.
 
 ## Prerequisites
 
@@ -57,7 +57,7 @@ A useful pattern is to compute these metrics on the naive, partial PCA, and Harm
 Both merge per-modality KNN graphs from the same cells:
 
 - **SNN** (default): shared-nearest-neighbor graph merge. Supports two or more assays.
-- **WNN**: weighted nearest neighbors (Hao et al., Cell 2022). Exactly two assays only.
+- **WNN**: weighted nearest neighbors (Hao et al., Cell 2021). Exactly two assays only.
 
 See {ref}`WNN integration <wnn_integration>`.
 
@@ -76,6 +76,13 @@ Developer migration notes for older mapping calls live in {doc}`../developers/mi
 ## Not supported
 
 Scarf does not include Scanorama, BBKNN, scVI, ComBat, or other external integration packages. Export subsets with `to_anndata` or `SubsetZarr` if you need those tools.
+
+## Further reading
+
+- Korsunsky et al. 2019, Harmony: https://doi.org/10.1038/s41592-019-0619-0
+- Hao et al. 2021, weighted nearest neighbor analysis: https://doi.org/10.1016/j.cell.2021.04.048
+- [Seurat WNN vignette](https://satijalab.org/seurat/articles/weighted_nearest_neighbor_analysis)
+- Kang et al. 2021, Symphony: https://doi.org/10.1038/s41467-021-25957-x
 
 ## Related pages
 

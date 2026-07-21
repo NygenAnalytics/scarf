@@ -19,14 +19,26 @@ kernelspec:
 Scarf can project (map) cells from one dataset onto another. Mapping is a lighter alternative
 to merging both matrices into one batch-corrected object. This notebook uses data from
 [Kang et al.](https://www.nature.com/articles/nbt.4042): control and IFN-B treated PBMCs.
-The Scarf catalog already ships both samples as Zarr stores with UMAP and cluster labels.
-For a reusable harmonized atlas workflow, see {doc}`reference_atlas`.
+Prepared Zarr stores with UMAP and cluster labels are available from the `scarf_docs`
+Cytebase catalog. For a reusable harmonized atlas workflow, see {doc}`reference_atlas`.
+
+## Prerequisites
+
+- Scarf installed with the `extra` optional dependencies
+- A reference `DataStore` with a neighbourhood graph and a target assay to map
+
+## What you will learn
+
+- Map query cells onto a fixed reference graph
+- Transfer categorical labels and inspect vote evidence
+- Build unified embeddings and project into a stable reference layout
+
+## Dataset
 
 ```{code-cell} ipython3
 import scarf
 
 scarf.set_verbosity('WARNING')
-scarf.__version__
 ```
 
 ---
@@ -182,7 +194,7 @@ ds_stim.plots.embedding(
 )
 ```
 
-It can be quite interesting to check how the predicted/transferred labels compare to the actual labels of the target cells:
+Compare transferred labels to the stored target labels:
 
 ```{code-cell} ipython3
 import pandas as pd
@@ -213,6 +225,35 @@ round(
     1,
 )
 ```
+
+### Calibrate a vote-fraction threshold
+
+`calibrate_label_transfer_threshold` chooses a vote-fraction cutoff from held-out correctness
+labels so that a target fraction of correct cells remain above the cutoff. Here the stored
+stimulated `cluster_labels` stand in for held-out truth. Prefer donor-level held-out splits
+in real atlases rather than labels from the query being mapped.
+
+```{code-cell} ipython3
+import numpy as np
+
+evidence_for_cal = ds_ctrl.get_target_label_evidence(
+    target_name='stim',
+    reference_class_group='cluster_labels',
+    threshold_fraction=0.0,
+)
+correct = (
+    ds_stim.cells.fetch('cluster_labels') == transferred_labels.to_numpy()
+)
+calibration = ds_ctrl.calibrate_label_transfer_threshold(
+    vote_fractions=evidence_for_cal['voteFraction'].to_numpy(dtype=float),
+    correct=np.asarray(correct, dtype=bool),
+    target_coverage=0.9,
+)
+calibration
+```
+
+The returned `voteThreshold` is a cutoff on `voteFraction`, not a calibrated probability.
+`validationCoverage` and `validationAccuracy` summarize the held-out set at that cutoff.
 
 ---
 ## 5) Unified UMAPs
@@ -249,7 +290,9 @@ ds_ctrl.project_mapping_layout(
 )
 ```
 
-We can visualize only the target cells, i.e IFN-B stimulated cells, in the unified embedding. The target cells can be colored based on their original cluster identity. Target cells of similar types are close together on the unified embedding and overlap with the cell types of the reference data
+Show only the IFN-B stimulated target cells in the unified embedding, colored by their
+original cluster identity. Similar types often sit near each other and near matching
+reference populations, but unified UMAP is exploratory and not a fixed atlas layout.
 
 ```{code-cell} ipython3
 ds_ctrl.plots.unified_embedding(
@@ -261,9 +304,11 @@ ds_ctrl.plots.unified_embedding(
 ```
 
 ---
-## 6) Unified tSNE
+## 6) Unified tSNE (optional)
 
-Unified tSNE co-embeds reference and target cells using the same unified graph as unified UMAP:
+Unified tSNE co-embeds reference and target cells on the same unified graph. Prefer
+`project_mapping_layout` when you need stable coordinates; use unified embeddings only for
+exploration.
 
 ```{code-cell} ipython3
 ds_ctrl.run_unified_tsne(
@@ -280,5 +325,27 @@ ds_ctrl.plots.unified_embedding(
 )
 ```
 
----
-For building a reusable mapping reference from a harmonized atlas, see {doc}`reference_atlas`.
+## Common mistakes and limitations
+
+- Mapping before the reference has a neighbourhood graph and PCA loadings
+- Treating transferred labels as ground truth without checking vote evidence
+- Using unified UMAP as a stable atlas coordinate system
+- Ignoring `missing_feature_policy` when reference and query gene sets differ
+
+## Saved results
+
+`run_mapping` stores neighbor relations under the chosen `target_name`. Transferred labels
+and evidence live in query cell metadata after `insert`. Unified layouts are written under
+keys such as `unified_UMAP`; `project_mapping_layout` writes target coordinates only.
+
+## Further reading
+
+- Kang et al. 2018, IFN-stimulated PBMCs used in this chapter: https://doi.org/10.1038/nbt.4042
+- Kang Nature Biotechnology article page: https://www.nature.com/articles/nbt.4042
+
+## Next steps
+
+- {doc}`reference_atlas`
+- {doc}`data_integration`
+- {doc}`plotting`
+- {doc}`choosing_integration_methods`

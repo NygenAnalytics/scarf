@@ -22,7 +22,7 @@ Use `get_imputed` after building a neighbourhood graph.
 ## Prerequisites
 
 - Scarf installed with the `extra` optional dependencies
-- A graph built from a suitable cell and feature subset
+- This page downloads a PBMC store and builds the neighbourhood graph before imputation
 
 ## What you will learn
 
@@ -65,23 +65,22 @@ ds.run_umap(n_epochs=150, parallel=True)
 ```{code-cell} ipython3
 imputed_cd4 = ds.get_imputed(feature_name='CD4', t=2)
 ds.cells.insert('CD4_imputed', imputed_cd4, overwrite=True)
-ds.plots.embedding(layout_key='RNA_UMAP', color_by='CD4')
-```
-
-```{code-cell} ipython3
-ds.plots.embedding(layout_key='RNA_UMAP', color_by='CD4_imputed')
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by=['CD4', 'CD4_imputed'],
+    n_columns=2,
+    sort_values=True,
+)
 ```
 
 The `t` parameter controls diffusion depth. Higher values smooth more. The diffusion operator
 is cached under the graph location in the Zarr store.
 
-Use imputation when you need a smoother view of a sparse marker for visualization or for
-ranking cells along a continuum. Do not use imputed values as input counts for differential
-expression or for claiming that a gene was detected in a cell. A quick check is to compare
-the raw and imputed UMAPs above: the imputed panel should retain the same high-expression
-regions while filling gaps inside those neighborhoods.
+Raw CD4 is sparse; the imputed panel should keep the same high-expression neighborhoods
+while filling gaps inside them. Do not use imputed values as input counts for differential
+expression or as evidence that a gene was detected in a cell.
 
-## Common mistakes
+## Common mistakes and limitations
 
 - Imputing values before building the matching graph
 - Treating imputed expression as a replacement for observed counts
@@ -91,6 +90,10 @@ regions while filling gaps inside those neighborhoods.
 
 The diffusion operator is cached with the graph. The `CD4_imputed` column is saved in cell
 metadata after `insert`.
+
+## Further reading
+
+- van Dijk et al. 2018, MAGIC (algorithmic ancestry for graph diffusion imputation; not feature parity with Scarf): https://doi.org/10.1016/j.cell.2018.05.061
 
 ## Next steps
 

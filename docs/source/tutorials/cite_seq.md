@@ -1,5 +1,5 @@
 ---
-description: CITE-seq multimodal analysis with SNN and WNN integration for RNA and ADT.
+description: CITE-seq multimodal analysis with independent RNA and ADT processing.
 jupytext:
   text_representation:
     extension: .md
@@ -15,7 +15,8 @@ kernelspec:
 # CITE-seq analysis
 
 CITE-seq combines RNA counts with antibody-derived tags (ADT) measured in the same cells.
-This chapter processes each assay, then combines their cell graphs with SNN or WNN integration.
+This chapter processes each assay and compares modality-specific embeddings and clusters.
+For SNN and WNN graph integration, continue with {doc}`cite_seq_integration`.
 
 ## Prerequisites
 
@@ -26,7 +27,7 @@ This chapter processes each assay, then combines their cell graphs with SNN or W
 
 - Analyze RNA and ADT assays independently
 - Compare modality-specific embeddings and clusters
-- Integrate assay graphs with SNN and WNN
+- Continue to SNN and WNN integration in {doc}`cite_seq_integration`
 
 ## Dataset
 
@@ -34,7 +35,6 @@ This chapter processes each assay, then combines their cell graphs with SNN or W
 import scarf
 
 scarf.set_verbosity('WARNING')
-scarf.__version__
 ```
 
 ## Guided steps
@@ -127,7 +127,8 @@ ds.plots.embedding(
 
 +++
 
-We will now perform similar steps as RNA for the ADT data. Since ADT panels are often custom designed, we will not perform any feature selection step. This particular data contains some control antibodies which we should filter out before downstream analysis. 
+Repeat the RNA-style steps for ADT. ADT panels are often custom, so skip feature
+selection here. Filter out control antibodies before downstream analysis. 
 
 ```{code-cell} ipython3
 ds.ADT.feats.head(n=ds.ADT.feats.N)
@@ -207,7 +208,7 @@ ds.plots.embedding(
 
 ### 5. Compare modalities
 
-It is generally of interest to see how different modalities corroborate each other.
+Compare how the two modalities agree.
 
 `ds.plots.embedding` can compare several layouts in one figure and uses the selected
 assay's native normalization for feature values.
@@ -265,114 +266,20 @@ ds.plots.embedding(
 )
 ```
 
-### 6. Integrate assays with SNN
+## Common mistakes and limitations
 
-The KNN graphs created individually for each of the modalities can be merged together to provide an integrated mutimodal view of the data. Scarf takes the latest KNN graphs (continous form edge weight) generated for each of the user chosen modality and merges the edges from each modality. After first round of merging, Scarf performs edge pruning by penalizing those edges more that have lower number of shared nearest neighbors between the connected cells. For each cells edges are pruned until the same number of edges as in individual modalities' KNN graphs are left.
-
-Here we will integrate the *RNA* and *ADT* assays and run UMAP and leiden clustering on the integrated graph.
-
-```{code-cell} ipython3
-ds.integrate_assays(
-    assays=['RNA', 'ADT'],
-    label='RNA+ADT',
-    method='snn',
-)
-```
-
-`integrated_graph` parameter in `run_umap` and `run_leiden_clustering` allows running these steps on the integrated graph.
-
-```{code-cell} ipython3
-ds.run_umap(
-    integrated_graph='RNA+ADT',
-    n_epochs=500,
-    spread=5,
-    min_dist=0.5,
-    parallel=True
-)
-
-ds.run_leiden_clustering(
-    integrated_graph='RNA+ADT',
-    resolution=1.75
-)
-```
-
-Lets visualize the UMAPs created using the integrated manifolds from the two modalities. Here we label the cells based on their modality specific cluster identity as well as integrated manifold cluster identity
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA+ADT_UMAP',
-    color_by=[
-        'RNA_leiden_cluster',
-        'ADT_leiden_cluster',
-        'RNA+ADT_leiden_cluster',
-    ],
-    legend_loc='on_data',
-    n_columns=3,
-)
-```
-
-```{code-cell} ipython3
-ds.cells.columns
-```
-
-The UMAP and clustering calculated on the integrated graph are here saved under cell attribute table with prefix *RNA+ADT*
-
-(wnn_integration)=
-### 7. Integrate assays with WNN
-
-The default `integrate_assays` method uses shared nearest neighbors (SNN). Scarf also supports weighted nearest neighbors (WNN), which can weight modalities differently. WNN requires exactly two assays:
-
-```{code-cell} ipython3
-ds.integrate_assays(
-    assays=['RNA', 'ADT'],
-    label='RNA+ADT_wnn',
-    method='wnn'
-)
-
-ds.run_umap(
-    integrated_graph='RNA+ADT_wnn',
-    n_epochs=500,
-    spread=5,
-    min_dist=0.5,
-    parallel=True
-)
-
-ds.run_leiden_clustering(
-    integrated_graph='RNA+ADT_wnn',
-    resolution=1.75
-)
-```
-
-Compare each integration method on its matching layout and cluster labels:
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA+ADT_UMAP',
-    color_by='RNA+ADT_leiden_cluster',
-    legend_loc='on_data',
-)
-ds.plots.embedding(
-    layout_key='RNA+ADT_wnn_UMAP',
-    color_by='RNA+ADT_wnn_leiden_cluster',
-    legend_loc='on_data',
-)
-```
-
-SNN supports two or more assays; WNN is limited to two. Try WNN when one modality is sparse or weaker than the other.
-
-## Common mistakes
-
-- Building assay graphs from different cell subsets before integration
-- Using WNN with anything other than two assays
+- Building assay graphs from different cell subsets before comparing modalities
 - Treating RNA and ADT clusters as interchangeable without examining cross-modality agreement
 
 ## Saved results
 
-Each assay stores its own graph, UMAP, and cluster columns. SNN and WNN graphs are stored under
-their `label` values and generate corresponding UMAP and Leiden columns.
+Each assay stores its own graph, UMAP, and cluster columns under assay-specific prefixes such as
+`RNA_` and `ADT_`.
 
 ## Next steps
 
+- {doc}`cite_seq_integration`
+- {doc}`multimodal_integration`
 - {doc}`choosing_integration_methods`
 - {doc}`plotting`
 - {doc}`data_organization`

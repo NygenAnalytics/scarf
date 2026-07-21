@@ -16,8 +16,9 @@ neighbourhood graph (KNN graph) of cells that downstream steps reuse. The same g
 feeds embeddings, clustering, mapping, and multimodal integration, which keeps those
 steps concordant.
 
-Scarf supports scRNA-seq, scATAC-seq, and CITE-seq workflows on local machines without
-loading the full matrix into memory.
+Scarf supports scRNA-seq, scATAC-seq, and CITE-seq workflows on a laptop or a single
+server, reading data from local disk or object storage, without loading the full matrix
+into memory.
 
 :::{image} _static/overview.svg
 :width: 75%
@@ -28,6 +29,44 @@ loading the full matrix into memory.
 :::{admonition} Citation
 The methods paper is published in [Nature Communications](https://doi.org/10.1038/s41467-022-32097-3).
 :::
+
+## Why Scarf
+
+Most single-cell tools load the whole count matrix into memory and hold every
+intermediate result there too. That is fine until the dataset outgrows the machine.
+Scarf takes a different route: counts and results live in a [Zarr] store on disk or
+object storage, and the analysis is built around one neighbourhood graph that every
+later step reuses. Four things follow from that design.
+
+**Large datasets run on modest hardware.** The full pipeline (QC, HVGs, graph, UMAP,
+Leiden, markers) has been measured end to end through 2.5 million cells inside 64 GiB of
+RAM. The memory ceiling is set by graph construction and barely moves as datasets grow,
+so a single 64 GiB machine covers the range from a hundred thousand to ten million cells.
+
+| Cells | Peak RAM | End-to-end wall time |
+|---|---|---|
+| 100k | ~7 GiB | ~15 min |
+| 500k | ~25 GiB | ~45 min |
+| 1M | ~28 GiB | ~1.5 h |
+| 2.5M | ~33 GiB | ~2.5 h |
+| 5M | ~33 GiB | ~4.5 h |
+| 10M | ~37 GiB | ~7 h |
+
+Times are on 8 CPU cores. Runs through 2.5M cells are measured; 5M and 10M are projected
+from the same curve. Actual numbers depend on hardware, storage, and parameters.
+
+**It is remote-first.** A Zarr store can live on S3-compatible object storage, and Scarf
+reads and writes it in place. You can analyze a dataset that never lands on your local
+disk as a full copy, which is what makes shared-storage and cloud workflows practical.
+
+**One graph keeps results concordant.** `make_graph` builds a single KNN graph, and
+embeddings, clustering, mapping, and multimodal integration all read from it. Your UMAP,
+your clusters, and your transferred labels see the same neighbourhood structure rather
+than three separately parameterized versions of it.
+
+**Results persist as you work.** Every step writes back into the store, so you can stop,
+inspect intermediate outputs, and resume later without recomputing. Filtering marks cells
+inactive instead of deleting them, so quality-control choices stay reversible.
 
 ## What this documentation covers
 
@@ -57,11 +96,13 @@ lower-memory path for large data, start with {doc}`scarf_and_scanpy`.
 ## Structure of the documentation
 
 1. **Get started**: installation, quick start, and Scarf compared with Scanpy
-2. **Introductory tutorials**: canonical scRNA-seq, scATAC-seq, CITE-seq, import/export, plotting
-3. **Data integration and mapping**: method choice, merge/Harmony, metrics, label transfer, reference atlases
-4. **Other analyses**: QC depth, gene-set enrichment, cell cycle, pseudotime, imputation, downsampling
-5. **Reference**: API, glossary, FAQ, citation
-6. **Developers**: contributing and internals
+2. **Core workflows**: end-to-end scRNA-seq, scATAC-seq, and CITE-seq analysis
+3. **Analysis essentials**: quality control, dimensionality reduction, clustering, annotation, and plotting
+4. **Data management and scaling**: import/export, Zarr organization, and cell downsampling
+5. **Integration and mapping**: method choice, merge/Harmony, metrics, label transfer, and reference atlases
+6. **Specialized analyses**: gene-set enrichment, cell cycle, imputation, pseudobulk export, and trajectories
+7. **Reference and support**: API, FAQ, glossary, citation, and community links
+8. **Developers**: contributing and internals
 
 ## Prerequisites
 
@@ -92,8 +133,11 @@ Capability links:
 - One scRNA-seq dataset: {doc}`tutorials/scrna_seq`
 - Merge batches: {doc}`tutorials/data_integration`
 - CITE-seq: {doc}`tutorials/cite_seq`
+- CITE-seq SNN/WNN integration: {doc}`tutorials/cite_seq_integration`
 - Score gene sets: {doc}`tutorials/gene_set_enrichment`
-- Map to a reference: {doc}`tutorials/reference_atlas`
+- Map query cells to a reference: {doc}`tutorials/mapping_and_label_transfer`
+- Build a reusable reference atlas: {doc}`tutorials/reference_atlas`
+- Pseudotime modules: {doc}`tutorials/pseudotime_modules`
 - Downsample large data: {doc}`tutorials/downsampling`
 
 [pypi]: https://img.shields.io/pypi/v/scarf.svg

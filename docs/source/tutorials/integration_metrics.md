@@ -25,6 +25,12 @@ After merging batches and building a graph ({doc}`data_integration`), quantify m
 - A merged multi-sample `DataStore` with a neighbourhood graph
 - A batch/sample column and optionally paired label columns for concordance
 
+## What you will learn
+
+- Compute per-cell LISI and summary iLISI/cLISI scores
+- Score graph connectivity, silhouette, and label concordance
+- Read naive-merge metrics as a baseline before batch correction
+
 ## Dataset
 
 ```{code-cell} ipython3
@@ -138,6 +144,18 @@ Compare the same metrics after partial PCA or Harmony in {doc}`data_integration`
 
 See {ref}`integration methods guide <integration_guide>` for how these scores relate to
 method choice.
+
+## Common mistakes and limitations
+
+- Comparing LISI scores across graphs built with different `k` or perplexity
+- Reading high batch mixing as proof that biology was preserved
+- Using label concordance as a batch-mixing metric
+- Scoring only the latest graph when you meant to compare several correction methods
+
+## Saved results
+
+Metric helpers return summary values in memory. With `save_result=True` on `metric_lisi`,
+per-cell scores are written as `lisi__*` columns in cell metadata.
 
 ## Next steps
 

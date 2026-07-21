@@ -66,10 +66,10 @@ be used if your data was generated using 10x's kit.
 [STARsolo]: https://github.com/alexdobin/STAR/blob/master/docs/STARsolo.md
 [alevin-fry]: https://alevin-fry.readthedocs.io/en/stable/
 [kallisto|bustools]: https://www.kallistobus.tools/
-[Cell Ranger]: https://support.10xgenomics.com/single-cell-gene-expression/software/pipelines/latest/what-is-cell-ranger
+[Cell Ranger]: https://www.10xgenomics.com/support/software/cell-ranger/latest
 [Yan et al]: https://genomebiology.biomedcentral.com/articles/10.1186/s13059-020-1929-3
 [Cusanovich et al]: https://www.cell.com/cell/fulltext/S0092-8674(18)30855-9
-[Cell Ranger ATAC]: https://support.10xgenomics.com/single-cell-atac/software/pipelines/latest/what-is-cell-ranger-atac
+[Cell Ranger ATAC]: https://www.10xgenomics.com/support/software/cell-ranger-atac/latest
 
 ## Can I use Scarf from R?
 

@@ -1,6 +1,6 @@
-# Scarf cloud profiling learnings (100k → 2.5M, countsT)
+# Scarf cloud profiling learnings (100k → 5M, countsT)
 
-Date range: 2026-07-14 to 2026-07-20  
+Date range: 2026-07-14 to 2026-07-21  
 Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`  
 Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)  
 Dataset source: nested CELLxGENE samples already prepared on R2
@@ -29,6 +29,7 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 10. Right-size Modal RAM per stage from measured peaks. Do not put Leiden/UMAP/HVG on a 64 GiB queue when peaks are ~5–8 GiB; that worsens scheduling and lost-input risk. Keep 64 GiB for createStore / makeGraph at large N when peaks justify it.
 11. When polling spawned calls, treat call-graph `FAILURE` / `INIT_FAILURE` / `TERMINATED` / `TIMEOUT` as terminal. Modal can raise an empty `TimeoutError` from `get(timeout=…)` on failed inputs; spinning on that alone leaves orchestrators stuck until the stage deadline.
 12. Local-vs-remote store A/B: use `run-local` / `run_local_funnel_job` (one container, H5AD + Zarr on ephemeral disk, `fast_local`). Per-stage `run` / `run-all` always write the store to R2. Compare tags like `local_ephemeral_c8_m32_100k` vs `counts_t_c8_m32_100k_reorg`.
+13. **Run Leiden in a child process for large N.** Modal's runner heartbeat (~900s) is not configurable. Historical `leidenalg` holds the GIL in native code, so the parent stops heartbeating and the runner dies. Profiling isolates `runLeiden` in `profiling/leiden_worker.py` with a parent that logs every 30s and warns at 1800s without killing the child. Do not try to "raise the heartbeat threshold"; keep the child-process path.
 
 ## Code changes already wired
 
@@ -37,6 +38,7 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 | Cloud default `targetChunkBytes` = 128 MiB when remote and unset | `scarf/storage/zarr_store.py` (`DEFAULT_CLOUD_TARGET_CHUNK_BYTES`) | Matches layout-sweep winner |
 | Auto marker batch when `gene_batch_size is None` | `scarf/features/markers/batching.py` `resolve_marker_gene_batch_size` | `min(col_chunk, n_features, budgetCap)` with `budgetCap = (memoryBytes // workingCopies) // (n_cells * 32)` |
 | Optional profiling override | `profiling` `markerGeneBatchSize` | Layout sweep forced `50`; later runs leave unset for auto |
+| Leiden child-process isolation | `profiling/stages.py`, `profiling/leiden_worker.py` | Parent keeps Modal heartbeats alive during long `leidenalg` GIL holds |
 
 ## Machine sizes used (Modal hard limit vs Scarf budget)
 
@@ -63,6 +65,7 @@ Two different numbers matter:
 | `counts_t_c8_m32_100k_reorg` | 100k | 8 | 32 GiB | ~24 GiB | Post-reorg R2 control; **735s** (same knobs, fresh store) |
 | `local_ephemeral_c8_m32_100k` | 100k | 8 | 32 GiB | ~24 GiB | Same knobs; Zarr on Modal `/tmp` (`fast_local`); **421s** |
 | `counts_t_c8_m32_500k` | 500k | 8 | 32 GiB | 24 GiB | Feature-major `countsT`; **2825s** (vs 3906s row-major) |
+| `counts_t_c8_m64_5m` | 5M | 8 (Leiden 2) | right-sized 8–64 GiB | ~75% of Modal | countsT core; **29465s (~8.2 h)**; max peak **33.0 GiB** (makeGraph cgroup) |
 
 Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.md` as the durable record; recreate TOMLs from these rows when needed.
 
@@ -96,6 +99,8 @@ auto_markers_c8_m64_2_5m=fc-01KXPPVXKA34Z0KK7MCJ41990T
 auto_markers_c8_m32_500k=fc-01KXPCBMZGBQ02YCB9W1EKPF92
 counts_t_c8_m32_100k=fc-01KXPPVDDF9A5J8599QM7ZW65Q
 counts_t_c8_m32_500k=fc-01KXPR232W53HQXN4QPPNAD8D6
+counts_t_c8_m64_5m_leiden=fc-01KY2DMQ331ZVJ8YCBN634BTJS
+counts_t_c8_m64_5m_markers=fc-01KY2JQDPFWK689ZSV5QYK9H5E
 ```
 
 ## Layout sweep @ 100k (4 CPU / 32 GiB)
@@ -404,34 +409,19 @@ Original pre-reorg R2 countsT total was **881s**; reorg alone cut that to 735s (
 4. **Do not treat 421s as the cloud product number.** Production Scarf-on-R2 remains the R2 figures (735s post-reorg). Local ephemeral is the ceiling for "how fast is this funnel when storage is free," useful for sizing how much further remote IO work can buy.
 5. **Ops caveat:** local requires one long-lived container (`run-local`). Per-stage spawn cannot keep a `/tmp` store across workers. H5AD download time is outside stage timers (same as remote createStore).
 
-## Scaling estimates: 50k → 5M under countsT
+## Scaling: countsT 100k / 500k / 5M
 
-Fit from the two measured countsT totals (100k, 500k) only:
+Early fit from only 100k and 500k totals (`T ≈ 0.211 · N^0.724`) projected **~4.5 h** at 5M. Measured 5M was **~8.2 h**. The two-point fit under-predicted large-N wall, especially gene-wise stages and createStore write.
 
-\[
-T \approx 0.211 \cdot N^{0.724}
-\]
-
-Cells ×5 (100k→500k) gave wall ×3.21 (sublinear). Stage-wise power laws were fit the same way and summed for the table below. **These are extrapolations**, not measurements. Caveats:
-
-- Only two measured sizes; exponent is underdetermined.
-- createStore (incl. countsT write) has the steepest measured exponent (~0.86) and already ~37% of 500k wall; if write cost stays high, large-N totals may exceed this fit.
-- makeGraph RAM still grows with cells (16.6G at countsT 500k; 24–28G row-major at 1M–2.5M). Estimates assume capacity is available (32 GiB below ~500k, 64 GiB above).
-- Cross-check: row-major 2.5M measured **15292s**; countsT stage-sum estimate at 2.5M is **~9500s** (~38% faster if the fit holds).
-
-| Cells | Est. wall (s) | Est. hours | createStore | markHvgs | makeGraph | findMarkers | Status |
-|------:|--------------:|-----------:|------------:|---------:|----------:|------------:|--------|
-| 50k | 545 | 0.15 | 143 | 50 | 98 | 65 | estimate |
+| Cells | Wall (s) | Hours | createStore | markHvgs | makeGraph | findMarkers | Status |
+|------:|---------:|------:|------------:|---------:|----------:|------------:|--------|
 | 100k | **881** | **0.24** | 260 | 82 | 164 | 102 | **measured** |
-| 250k | 1697 | 0.47 | 573 | 159 | 323 | 186 | estimate |
 | 500k | **2825** | **0.78** | 1042 | 261 | 539 | 293 | **measured** |
-| 1M | 4741 | 1.32 | 1895 | 430 | 900 | 462 | estimate |
-| 2.5M | 9499 | 2.64 | 4176 | 831 | 1771 | 842 | estimate (row-major measured 15292s) |
-| 5M | 16176 | 4.49 | 7593 | 1368 | 2957 | 1326 | estimate |
+| 5M | **29465** | **8.18** | 11508 | 3809 | 6296 | 5215 | **measured** |
 
-Total-only power law (same two points) is close: 50k ~533s, 1M ~4666s, 2.5M ~9059s, 5M ~14962s.
+500k → 5M is cells ×10 and wall ×10.4 (near-linear overall). Stage ratios vs the old 5M estimate: createStore ×1.5, makeGraph ×2.1, HVG ×2.8, markers ×3.9.
 
-**Practical read:** with countsT, a full funnel looks like ~15 min at 50k, ~25 min at 100k, ~45 min at 250k, ~50 min at 500k, ~1.3 h at 1M, ~2.5–3 h at 2.5M, ~4–4.5 h at 5M, if createStore write scaling does not worsen and Modal capacity is available. Next measurement that would tighten the curve: countsT at 1M.
+**Practical read:** countsT still wins vs row-major at small/mid N, but do not trust the old 100k/500k power law past 1M. Prefer measured 5M as the large-N anchor. 10M planning should start from ~15 h compute (rough ×2 from 5M) plus 64 GiB scheduling/preemption risk.
 
 ## Peak RAM sizing (Modal cgroup)
 
@@ -439,12 +429,13 @@ countsT does **not** change makeGraph RAM much. Size machines from **makeGraph `
 
 ### Measured peaks (countsT speed pack)
 
-| Cells | Max peak | Stage | makeGraph RSS / cgroup | Markers |
-|------:|----------|-------|------------------------|--------:|
-| 100k | 6.7G | initializeStore | 5.2 / 5.3G | 4.4G |
-| 500k | 16.6G RSS | makeGraph | 16.6 / **24.5G** | 7.8G |
+| Cells | Max peak | Stage | makeGraph RSS / cgroup | Markers | Leiden |
+|------:|----------|-------|------------------------|--------:|-------:|
+| 100k | 6.7G | initializeStore | 5.2 / 5.3G | 4.4G | 0.7G |
+| 500k | 16.6G RSS | makeGraph | 16.6 / **24.5G** | 7.8G | 1.5G |
+| 5M | **33.0G** | makeGraph | 26.5 / **33.0G** | 7.9G | **13.0G** |
 
-Row-major makeGraph cgroup for larger sizes: 1M **28.3G**, 2.5M **32.6G**. Growth from 500k→2.5M is shallow (~N^0.18).
+Row-major makeGraph cgroup for mid sizes: 1M **28.3G**, 2.5M **32.6G**. 5M countsT makeGraph cgroup matches that band (~33G), not the old ~37G extrapolate.
 
 ### Suggested Modal RAM (countsT funnel, ~20% headroom)
 
@@ -456,9 +447,9 @@ Row-major makeGraph cgroup for larger sizes: 1M **28.3G**, 2.5M **32.6G**. Growt
 | 500k | makeGraph 24.5G cgroup | 24.5G | **32 GiB** |
 | 1M | makeGraph 28.3G | ~28G | 48–64 GiB |
 | 2.5M | makeGraph 32.6G | ~33G | 48–64 GiB |
-| 5M | makeGraph ~37G (extrap.) | ~37G | 48–64 GiB |
+| 5M | makeGraph **33.0G** | 33G | **64 GiB** createStore/makeGraph; Leiden ≥16–32 GiB |
 
-Wall-time and RAM scale differently: gene-wise wall shrinks with countsT; makeGraph RAM stays the sizing constraint above ~250k.
+Wall-time and RAM scale differently: gene-wise wall shrinks with countsT at small N; at 5M, createStore + makeGraph + markers dominate wall, and makeGraph still sets the RAM floor.
 
 ## Non-core extras @ 250k (countsT, planned / in flight)
 
@@ -483,24 +474,29 @@ uv run --group profiling modal run --env scarf_profiling -m profiling.modal_app 
   run-all --config profiling/layouts/250k_counts_t_extras_c8_m32.toml
 ```
 
-## In progress: 5M countsT core (right-sized RAM)
+## Scale: 5M countsT core (done)
 
-| Field | Value |
-|-------|-------|
-| Tag | `counts_t_c8_m64_5m` (unchanged so prior stage JSONs skip) |
-| Config | `profiling/layouts/5m_counts_t_c8_m64.toml` |
-| Stages | core only (9); countsT via Zarr v3 finalize |
-| Done so far | createStore 11508s / 7.4G; init/reopen/filter ~12/7/31s; markHvgs 3809s / 8.0G; makeGraph 6296s / **33.0G cgroup**; runUmap 1036s / 5.5G |
-| Missing | `runLeiden`, `findMarkers` (calls lost: heartbeat timeout / InternalFailure while queued on 64 GiB) |
-| Right-size | createStore + makeGraph **64 GiB**; markHvgs/UMAP/Leiden **16 GiB**; findMarkers **32 GiB**; init/reopen/filter **8 GiB** |
-| Ops fix | orchestrators spawn stage workers (no `.remote()`); stage retries on; re-spawn without R2 result |
+Tag `counts_t_c8_m64_5m`. Config `profiling/layouts/5m_counts_t_c8_m64.toml`. Core stages only; countsT via Zarr v3 finalize. Right-sized Modal RAM (64 GiB createStore/makeGraph; smaller elsewhere). Leiden finished after child-process isolation (`probe_leiden` `fc-01KY2DMQ331ZVJ8YCBN634BTJS`); markers `fc-01KY2JQDPFWK689ZSV5QYK9H5E`.
 
-After redeploy, resume with only missing stages, e.g.:
+| Stage | Seconds | Peak GiB (RSS / cgroup) |
+|-------|--------:|------------------------:|
+| createStore | 11508 | 7.4 / 7.3 |
+| initializeStore | 12 | 0.6 / 0.6 |
+| reopenStore | 7 | 0.6 / 0.6 |
+| filterCells | 31 | 0.6 / 0.6 |
+| markHvgs | 3809 | 8.0 / 7.9 |
+| makeGraph | 6296 | 26.5 / **33.0** |
+| runUmap | 1036 | 5.5 / 5.5 |
+| runLeiden | 1550 | **13.0** / 12.7 |
+| findMarkers | 5215 | 7.9 / 7.8 |
+| **total** | **29465 (~8.2 h)** | **33.0** |
 
-```
-modal run --env scarf_profiling -m profiling.modal_app -- run-all \
-  --config profiling/layouts/5m_counts_t_c8_m64.toml \
-  --sizes 5000000 --stages runLeiden findMarkers
-```
+Share of wall: createStore 39%, makeGraph 21%, markers 18%, HVG 13%, Leiden 5%, UMAP 4%.
 
-Or single-stage `run` for Leiden then markers.
+### Leiden at 5M (ops lesson)
+
+In-process `leidenalg` / native igraph both hit Modal **runner heartbeat timeout (~900s)** while holding the GIL on ~4.61M active cells / ~50.7M edges (~11 edges/cell, normal for k=11). Graph shape was not pathological. Scaling through 2.5M was smooth (Leiden 681s row-major); naive 5M extrapolate was ~20–25 min, and the successful child-process run took **1550s (~26 min)** at **13 GiB** RSS. Fix: keep historical `leidenalg` semantics, run it in `profiling.leiden_worker`, parent logs every 30s. Native igraph backend was removed from profiling.
+
+### Markers at 5M
+
+`findMarkers` **5215s (~87 min)**, peak ~7.9 GiB, 58 clusters. That is between the optimistic countsT 100k/500k extrapolate (~22 min) and row-major 1M→2.5M power-law (~4 h). countsT still helps, but large-N marker wall is no longer near the small-N curve.

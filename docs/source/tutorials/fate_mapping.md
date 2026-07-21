@@ -19,6 +19,19 @@ ordering with a probability for each user-provided terminal state. This notebook
 uses pancreatic endocrine differentiation to estimate Alpha, Beta, and Delta
 fates without CellRank or Scanpy.
 
+## Prerequisites
+
+- Scarf installed with the `extra` optional dependencies
+- An RNA assay with a neighbourhood graph and cluster annotations for sources and sinks
+
+## What you will learn
+
+- Define progenitor and terminal groups for multi-sink PBA
+- Estimate a shared pseudotime across branches
+- Compute absorption probabilities for each terminal fate
+
+## Dataset
+
 ```{code-cell} ipython3
 from pathlib import Path
 
@@ -28,13 +41,12 @@ import pandas as pd
 import scarf
 
 scarf.set_verbosity('WARNING')
-scarf.__version__
 ```
 
 ## 1. Load the preprocessed dataset
 
-The dataset contains a KNN graph, UMAP coordinates, Scarf clusters, and the
-published cell-type annotations.
+The prepared Zarr store from the `scarf_docs` Cytebase catalog contains a KNN graph,
+UMAP coordinates, Scarf clusters, and the published cell-type annotations.
 
 ```{code-cell} ipython3
 dataset_root = Path('./scarf_datasets')
@@ -204,5 +216,26 @@ The fate columns separate that direction into terminal outcomes and quantify
 ambiguous intermediate cells. Sink identities remain supervised: this method
 does not discover terminal states automatically and does not use RNA velocity.
 
-For pseudotime-associated genes and expression modules, continue with
-{doc}`pseudotime`.
+## Common mistakes and limitations
+
+- Choosing sink clusters that mix several terminal annotations
+- Interpreting fate probabilities as lineage commitment without experimental support
+- Ignoring the pseudotime validity key when the graph has multiple components
+- Expecting the method to find terminal states on its own
+
+## Saved results
+
+Pseudotime and validity columns are written to cell metadata. Fate probabilities are stored
+under the keys returned in `fate.fate_keys`, with a matching validity column.
+
+## Further reading
+
+- Weinreb et al. 2018, population balance analysis (PBA): https://doi.org/10.1073/pnas.1714723115
+- [PBA reference implementation](https://github.com/AllonKleinLab/PBA)
+
+## Next steps
+
+- {doc}`pseudotime`
+- {doc}`pseudotime_modules`
+- {doc}`annotation`
+- {doc}`plotting`

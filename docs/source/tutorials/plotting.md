@@ -1,5 +1,5 @@
 ---
-description: Publication-oriented figures through the DataStore plotting namespace.
+description: Figures through the DataStore plotting namespace.
 jupytext:
   text_representation:
     extension: .md
@@ -29,7 +29,7 @@ such as color and normalization scales.
 
 - Draw embedding, dotplot, matrixplot, composition, and distribution figures
 - Control legends, themes, and point size
-- Save publication-ready figures
+- Save figures to PNG, PDF, SVG, or TIFF
 
 ## Dataset
 
@@ -109,28 +109,16 @@ ds.plots.embedding_raster(
 ### 2. Choose a style
 
 These options apply to embeddings (and to `unified_embedding` for mapping
-layouts). Defaults aim at compact, journal-safe figures. Override them when the
-default is a poor fit for your number of clusters or for the venue.
+layouts). Defaults aim at compact figures. Override them when the default is a
+poor fit for your number of clusters or for the venue.
 
-### Legends
+### Legends, frame, and theme
 
 `legend_loc="auto"` (default) picks a placement from the number of categories:
 
 - few categories: side legend
 - many categories: labels drawn on the clusters
 - very many categories: no legend (label offline or subset the categories)
-
-Force a placement when you know what you want.
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by="clusters",
-    legend_loc="on_data",
-);
-```
-
-### Frame and theme
 
 `frame="minimal"` keeps a simple L-shaped edge without UMAP axis titles.
 `frame="none"` removes the box for a Scanpy-like silhouette. `theme="paper"`
@@ -162,6 +150,9 @@ A dotplot shows two summaries at once: color is mean expression in the group,
 size is the fraction of cells above the detection cutoff. Pass an ordered
 mapping if you want gene-group brackets. `sample_by` makes each sample
 contribute equal weight instead of letting large samples dominate.
+
+The `demo_sample` column below is synthetic demo metadata for equal sample
+weighting in this showcase. It is not an experimental sample annotation.
 
 ```{code-cell} ipython3
 n = len(ds.cells.active_index("I"))
@@ -196,6 +187,9 @@ ds.plots.matrixplot(
 Use composition plots when you care about how cell types change across samples.
 `kind="per_sample"` draws one point per sample. With subject and condition
 fields, Scarf connects the same subject across conditions inside each category.
+
+The `demo_subject` and `demo_condition` columns below are synthetic demo
+metadata for this showcase. They are not experimental sample annotations.
 
 ```{code-cell} ipython3
 ds.cells.insert(
@@ -255,8 +249,6 @@ writes PNG, PDF, SVG, or TIFF. The default background is opaque white. Pass
 and call `close()` when you are done with an owned figure.
 
 ```{code-cell} ipython3
-from pathlib import Path
-
 out = Path("scarf_datasets") / "plotting_showcase_embedding.png"
 out.parent.mkdir(parents=True, exist_ok=True)
 result = ds.plots.embedding(
@@ -274,7 +266,21 @@ For unified reference and query layouts from mapping, use
 `ds.plots.unified_embedding` (see {doc}`mapping_and_label_transfer`).
 ```
 
-## Common mistakes
+### 7. Diagnostic plots used in workflow pages
+
+Workflow chapters call a few standalone diagnostics:
+
+- `DataStore.make_graph(..., show_elbow_plot=True)` plots PCA explained variance
+- `scarf.plotting.graph_qc(graph)` plots degree and edge-weight distributions for a
+  sparse graph from `load_graph`
+- `mark_hvgs(..., show_plot=True)` or `scarf.plotting.highly_variable_features` shows the
+  mean-variance relationship used for HVG selection
+
+See {doc}`dimensionality_reduction_and_clustering` and {doc}`scrna_seq` for executable
+examples. Keep diagnostic plots next to the analysis step that produces the values they
+inspect.
+
+## Common mistakes and limitations
 
 - Passing a layout key or metadata column that is not present in the store
 - Using a continuous color scale for categorical labels

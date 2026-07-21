@@ -71,18 +71,25 @@ ds.plots.distribution(
 )
 ```
 
+Each violin shows the distribution of one QC metric before filtering; use the tails to set
+dataset-specific cutoffs.
+
 ## 2) Manual thresholds
 
 Thresholds are dataset-specific. The values below match the PBMC example in
 {doc}`scrna_seq`. Filtered cells are marked inactive in cell key `I`.
 
 ```{code-cell} ipython3
+n_before = int(ds.cells.fetch_all('I').sum())
 ds.filter_cells(
     attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
     highs=[15000, 4000, 15],
     lows=[1000, 500, 0],
     reset_previous=True,
 )
+n_after = int(ds.cells.fetch_all('I').sum())
+print(f'Active cells before filter: {n_before}')
+print(f'Active cells after filter: {n_after}')
 ds.plots.distribution(
     keys=qc_cols,
     kind='violin',
@@ -91,7 +98,26 @@ ds.plots.distribution(
 )
 ```
 
-## 3) Automatic thresholds
+After filtering, the same metrics are restricted to active cells (`I=True`).
+
+## 3) Custom percent-feature columns
+
+`add_percent_feature` stores the fraction of counts from features matching a regular
+expression. Built-in mito and ribo columns use this mechanism. The example below adds a
+hemoglobin-gene fraction when those gene names are present.
+
+```{code-cell} ipython3
+ds.RNA.add_percent_feature(feat_pattern='^HB[AB]', name='RNA_percentHB')
+if 'RNA_percentHB' in ds.cells.columns:
+    print(
+        ds.cells.to_pandas_dataframe(['RNA_percentHB'], key='I')['RNA_percentHB']
+        .describe()
+    )
+else:
+    print('No features matched ^HB[AB] in this store')
+```
+
+## 4) Automatic thresholds
 
 `auto_filter_cells` models each QC column as a normal distribution from its median and
 standard deviation, then takes density points at `min_p` and `max_p` (defaults 0.01 and
@@ -105,7 +131,9 @@ alternative filtering strategy.
 ds.auto_filter_cells(show_qc_plots=True)
 ```
 
-## 4) Doublet scores
+The plots show fitted density bounds on each QC column used for the automatic cutoffs.
+
+## 5) Doublet scores
 
 `run_doublet_detection` simulates doublets, maps them onto the existing neighbourhood
 graph, and writes a per-cell score (default base label `doublet_score`). It does not
@@ -126,7 +154,8 @@ ds.plots.embedding(
 )
 ```
 
-Filter on the score yourself when you choose a cutoff for your data:
+Higher doublet scores mark cells that map near simulated doublets. Inspect the score
+distribution before applying a cutoff:
 
 ```{code-cell} ipython3
 ds.cells.to_pandas_dataframe(columns=[score_col], key='I').describe()
@@ -146,8 +175,13 @@ ds.cells.to_pandas_dataframe(columns=[score_col], key='I').describe()
 | Active cells | `I` |
 | Doublets | `*doublet_score` (assay-prefixed) |
 
+## Further reading
+
+- [Single-cell best practices: quality control](https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html)
+- [Scanpy clustering tutorial](https://scanpy.readthedocs.io/en/stable/tutorials/basics/clustering.html)
+
 ## Next steps
 
-- {doc}`scrna_seq`
+- {doc}`dimensionality_reduction_and_clustering`
 - {doc}`annotation`
 - {doc}`data_organization`

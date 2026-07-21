@@ -16,10 +16,11 @@ kernelspec:
 
 # Pseudobulk and differential expression
 
-`make_bulk` aggregates cells into bulk-like profiles. It is not a full differential-expression
-suite. `run_marker_search` returns Mann-Whitney `p_value` columns without multiple-testing
-correction. Export aggregate counts for condition-level differential expression in an external
-tool.
+Scarf stops at aggregation and export. Use `make_bulk` to build bulk-like count profiles, then
+export those counts (with sample-level metadata) for condition-level differential expression in
+an external tool such as edgeR or DESeq2. `run_marker_search` is separate: it returns
+Mann-Whitney `p_value` columns without multiple-testing correction and is for cluster
+interpretation, not FDR-controlled DE.
 
 ## Prerequisites
 
@@ -28,9 +29,9 @@ tool.
 
 ## What you will learn
 
-- Aggregate raw counts with `make_bulk`
-- Inspect marker statistics separately from differential expression
-- Export pseudobulk counts for an external analysis
+- Export aggregate counts from `make_bulk` for external DE
+- Keep marker statistics separate from condition-level DE
+- Build optional pseudo-replicates within groups
 
 ## Dataset
 
@@ -73,6 +74,8 @@ ds.plots.embedding(
 )
 ```
 
+Leiden clusters on the catalog UMAP; these labels are the grouping key for `make_bulk` below.
+
 ## Guided steps
 
 ### 1. Inspect marker ranks separately from DE
@@ -95,6 +98,8 @@ ds.plots.marker_heatmap(
     figsize=(5, 7),
 )
 ```
+
+Rows are top markers per cluster for interpretation only, not exported DE results.
 
 ```{note}
 Use marker tables for cluster interpretation. Do not treat uncorrected `p_value` columns as
@@ -131,9 +136,10 @@ bulk.to_csv('scarf_datasets/kang_pseudobulk_counts.csv')
 ```
 
 Use the exported count matrix and sample-level metadata with a method appropriate to the study
-design, such as edgeR or DESeq2. For a true multi-sample design, merge donors or conditions
-first ({doc}`data_integration`), aggregate with a sample-aware `group_key` (for example
-sample nested with cell type), and keep biological replicates in the exported metadata.
+design, such as edgeR or DESeq2. Scarf stops at aggregation and export; it does not run those
+models. For a true multi-sample design, merge donors or conditions first
+({doc}`data_integration`), aggregate with a sample-aware `group_key` (for example sample
+nested with cell type), and keep biological replicates in the exported metadata.
 
 ## Common mistakes
 
@@ -146,6 +152,10 @@ sample nested with cell type), and keep biological replicates in the exported me
 `make_bulk` returns a pandas DataFrame. The example exports it to
 `scarf_datasets/kang_pseudobulk_counts.csv`. Marker-search results are stored under the assay's
 `markers` group in the Zarr store.
+
+## Further reading
+
+- [Single-cell best practices: differential gene expression](https://www.sc-best-practices.org/conditions/differential_gene_expression.html)
 
 ## Next steps
 

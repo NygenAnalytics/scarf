@@ -7,8 +7,8 @@ subtrees:
       - file: quickstart
         title: Quick start
       - file: scarf_and_scanpy
-        title: Scarf and Scanpy
-  - caption: Introductory tutorials
+        title: Scarf for Scanpy and Seurat users
+  - caption: Core workflows
     entries:
       - file: tutorials/scrna_seq
         title: scRNA-seq analysis
@@ -16,35 +16,12 @@ subtrees:
         title: scATAC-seq analysis
       - file: tutorials/cite_seq
         title: CITE-seq analysis
-      - file: tutorials/import_and_export
-        title: Import and export
-      - file: tutorials/plotting
-        title: Plotting
-  - caption: Multimodal
-    entries:
-      - file: tutorials/multimodal_integration
-        title: Multimodal integration
-  - caption: Data integration
-    entries:
-      - file: tutorials/choosing_integration_methods
-        title: Choosing integration methods
-      - file: tutorials/data_integration
-        title: Merge, Harmony, and partial PCA
-      - file: tutorials/integration_metrics
-        title: Integration metrics
-  - caption: Mapping and annotation
-    entries:
-      - file: tutorials/mapping_and_label_transfer
-        title: Mapping and label transfer
-      - file: tutorials/reference_atlas
-        title: Reference atlas mapping
-  - caption: Large-scale analysis
-    entries:
-      - file: tutorials/downsampling
-        title: Cell downsampling
-      - file: tutorials/data_organization
-        title: Data organization
-  - caption: Other analyses
+        entries:
+          - file: tutorials/multimodal_integration
+            title: Multimodal integration overview
+          - file: tutorials/cite_seq_integration
+            title: SNN and WNN integration
+  - caption: Analysis essentials
     entries:
       - file: tutorials/quality_control
         title: Quality control
@@ -52,44 +29,77 @@ subtrees:
         title: Dimensionality reduction and clustering
       - file: tutorials/annotation
         title: Annotation
+      - file: tutorials/plotting
+        title: Plotting
+  - caption: Data management and scaling
+    entries:
+      - file: tutorials/import_and_export
+        title: Import and export
+      - file: tutorials/data_organization
+        title: Data organization
+      - file: tutorials/downsampling
+        title: Cell downsampling
+  - caption: Integration and mapping
+    entries:
+      - file: tutorials/choosing_integration_methods
+        title: Choosing integration methods
+        entries:
+          - file: tutorials/data_integration
+            title: Merge, Harmony, and partial PCA
+          - file: tutorials/integration_metrics
+            title: Integration metrics
+          - file: tutorials/mapping_and_label_transfer
+            title: Mapping, label transfer, and unified embeddings
+          - file: tutorials/reference_atlas
+            title: Build and map a reference atlas
+  - caption: Specialized analyses
+    entries:
       - file: tutorials/gene_set_enrichment
         title: Gene-set enrichment
-      - file: tutorials/pseudotime
-        title: Pseudotime
-      - file: tutorials/fate_mapping
-        title: Multi-sink fate mapping
       - file: tutorials/cell_cycle
         title: Cell cycle
       - file: tutorials/imputation
         title: Imputation
       - file: tutorials/pseudobulk_and_differential_expression
-        title: Pseudobulk and differential expression
-  - caption: Reference
+        title: Pseudobulk export for differential expression
+      - file: tutorials/pseudotime
+        title: Pseudotime and expression dynamics
+        entries:
+          - file: tutorials/pseudotime_modules
+            title: Pseudotime modules
+          - file: tutorials/fate_mapping
+            title: Multi-sink fate mapping
+  - caption: Reference and support
     entries:
       - file: reference/api
-        title: API
-      - file: reference/api/datastore
-        title: DataStore
-      - file: reference/api/import_export
-        title: Import and export API
-      - file: reference/api/assays
-        title: Assays and metadata
-      - file: reference/api/integration
-        title: Integration and metrics API
-      - file: reference/api/mapping
-        title: Mapping API
-      - file: reference/api/plotting
-        title: Plotting API
-      - file: reference/api/utilities
-        title: Cytebase and utilities
-      - file: reference/glossary
-        title: Glossary
+        title: API reference
+        entries:
+          - file: reference/api/datastore
+            title: DataStore
+          - file: reference/api/import_export
+            title: Import and export
+          - file: reference/api/assays
+            title: Assays and metadata
+          - file: reference/api/integration
+            title: Integration and metrics
+          - file: reference/api/mapping
+            title: Mapping
+          - file: reference/api/plotting
+            title: Plotting
+          - file: reference/api/utilities
+            title: Dataset catalog and utilities
       - file: reference/faq
         title: FAQ
+      - file: reference/glossary
+        title: Glossary
       - file: reference/citation
         title: Citation
       - file: reference/license
         title: License
+      - url: https://github.com/parashardhapola/scarf/discussions
+        title: Ask a question
+      - url: https://github.com/parashardhapola/scarf/issues
+        title: Report a bug
   - caption: Developers
     entries:
       - file: developers/contributing
@@ -100,11 +110,3 @@ subtrees:
         title: Zarr internals
       - file: developers/migration_notes
         title: Migration notes
-  - caption: Useful links
-    entries:
-      - url: https://www.nature.com/articles/s41467-022-32097-3
-        title: Scarf paper in Nature Communications
-      - url: https://github.com/parashardhapola/scarf/discussions
-        title: Discussion page
-      - url: https://github.com/parashardhapola/scarf/issues
-        title: Report a bug
