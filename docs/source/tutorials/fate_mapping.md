@@ -44,10 +44,10 @@ dataset_path = (
     / 'data.zarr'
 )
 if not dataset_path.exists():
-    scarf.fetch_dataset(
-        dataset_name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-        save_path=str(dataset_root),
-        as_zarr=True,
+    scarf.cytebase.connect("scarf_docs").download_dataset(
+        name='bastidas-ponce_4K_pancreas-d15_rnaseq',
+        destination=str(dataset_root),
+        zarr=True,
     )
 ```
 

@@ -32,8 +32,8 @@ import scarf
 
 scarf.set_verbosity('WARNING')
 
-scarf.fetch_dataset('kang_15K_pbmc_rnaseq', save_path='scarf_datasets', as_zarr=True)
-scarf.fetch_dataset('kang_14K_ifnb-pbmc_rnaseq', save_path='scarf_datasets', as_zarr=True)
+scarf.cytebase.connect("scarf_docs").download_dataset('kang_15K_pbmc_rnaseq', destination='scarf_datasets', zarr=True)
+scarf.cytebase.connect("scarf_docs").download_dataset('kang_14K_ifnb-pbmc_rnaseq', destination='scarf_datasets', zarr=True)
 
 ds_ctrl = scarf.DataStore('scarf_datasets/kang_15K_pbmc_rnaseq/data.zarr', nthreads=4)
 ds_stim = scarf.DataStore('scarf_datasets/kang_14K_ifnb-pbmc_rnaseq/data.zarr', nthreads=4)

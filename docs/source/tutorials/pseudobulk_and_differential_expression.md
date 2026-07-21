@@ -43,10 +43,10 @@ import scarf
 
 scarf.set_verbosity('WARNING')
 
-scarf.fetch_dataset(
+scarf.cytebase.connect("scarf_docs").download_dataset(
     'kang_15K_pbmc_rnaseq',
-    save_path='scarf_datasets',
-    as_zarr=True,
+    destination='scarf_datasets',
+    zarr=True,
 )
 ds = scarf.DataStore(
     'scarf_datasets/kang_15K_pbmc_rnaseq/data.zarr',

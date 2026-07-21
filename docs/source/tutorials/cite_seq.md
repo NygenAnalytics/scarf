@@ -45,10 +45,10 @@ This dataset contains gene expression and surface protein abundance. The prepare
 contains these assays as `RNA` and `ADT`.
 
 ```{code-cell} ipython3
-scarf.fetch_dataset(
+scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_8K_pbmc_citeseq',
-    save_path='scarf_datasets',
-    as_zarr=True,
+    destination='scarf_datasets',
+    zarr=True,
 )
 ```
 

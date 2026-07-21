@@ -79,7 +79,7 @@ Suggested chapter outline:
 7. Summary of saved results
 8. Next steps
 
-Fact-check before merging: method names and defaults against `scarf/`, dataset IDs against `fetch_dataset`, metadata keys against executed output, and no claims for methods Scarf does not ship.
+Fact-check before merging: method names and defaults against `scarf/`, dataset IDs against the `scarf_docs` Cytebase repository, metadata keys against executed output, and no claims for methods Scarf does not ship.
 
 The documentation uses [Sphinx], the [MyST] parser, and [myst_nb] for notebook execution.
 Sphinx reads the committed cache via `nb_execution_mode = "cache"` in `docs/source/conf.py`.

@@ -78,9 +78,9 @@ imports internal helpers directly should use these focused paths:
 - `scarf.parallel` was removed. Use `scarf.storage.parallel`.
 - `scarf._types` was removed. Use `scarf.storage.types`.
 - `scarf.chunked.ChunkedArray` moved to `scarf.matrix.ChunkedArray`.
-- `scarf.downloader` was removed. Continue to use the top-level
-  `scarf.fetch_dataset` and `scarf.show_available_datasets` functions. Dataset
-  retrieval internals now live in `scarf.readers.datasets`.
+- `scarf.downloader`, `scarf.fetch_dataset`, and
+  `scarf.show_available_datasets` were removed. Use
+  `scarf.cytebase.connect("scarf_docs")` to list and download example datasets.
 - `scarf.storage.zarr_store` was removed. Use the focused storage modules:
   - Profiles and location detection: `scarf.storage.profiles`
   - Store opening and root helpers: `scarf.storage.stores`

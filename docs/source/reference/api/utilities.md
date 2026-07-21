@@ -1,11 +1,16 @@
-# Utilities and datasets
+# Cytebase and utilities
 
 ```{eval-rst}
-.. autofunction:: scarf.fetch_dataset
+.. autofunction:: scarf.cytebase.list_repositories
 ```
 
 ```{eval-rst}
-.. autofunction:: scarf.show_available_datasets
+.. autofunction:: scarf.cytebase.connect
+```
+
+```{eval-rst}
+.. autoclass:: scarf.cytebase.Repository
+   :members:
 ```
 
 ```{eval-rst}

@@ -31,16 +31,16 @@ scarf.__version__
 Here we use the same datasets as in {ref}`mapping and label transfer <data_projection>`. We download the files in Zarr format.
 
 ```{code-cell} ipython3
-scarf.fetch_dataset(
-    dataset_name='kang_15K_pbmc_rnaseq',
-    save_path='scarf_datasets',
-    as_zarr=True
+scarf.cytebase.connect("scarf_docs").download_dataset(
+    name='kang_15K_pbmc_rnaseq',
+    destination='scarf_datasets',
+    zarr=True
 )
 
-scarf.fetch_dataset(
-    dataset_name='kang_14K_ifnb-pbmc_rnaseq', 
-    save_path='scarf_datasets',
-    as_zarr=True
+scarf.cytebase.connect("scarf_docs").download_dataset(
+    name='kang_14K_ifnb-pbmc_rnaseq',
+    destination='scarf_datasets',
+    zarr=True
 )
 ```
 

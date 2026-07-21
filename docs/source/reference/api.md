@@ -23,6 +23,6 @@ Inheritance helpers (`BaseDataStore`, `GraphDataStore`, `MappingDatastore`) are 
 | Integration and metrics | {doc}`api/integration` |
 | Mapping | {doc}`api/mapping` |
 | Plotting | {doc}`api/plotting` |
-| Utilities and datasets | {doc}`api/utilities` |
+| Cytebase and utilities | {doc}`api/utilities` |
 
 Stage names match {doc}`../scarf_and_scanpy` and {doc}`../tutorials/scrna_seq`.

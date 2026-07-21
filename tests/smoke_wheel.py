@@ -49,6 +49,7 @@ _RETIRED_MODULES = {
     "scarf/plotting/_legacy.py",
     "scarf/plotting/_legacy/__init__.py",
     "scarf/readers.py",
+    "scarf/readers/datasets.py",
     "scarf/results.py",
     "scarf/storage/zarr_store.py",
     "scarf/trajectory/aggregation.py",
@@ -72,6 +73,7 @@ import importlib.util
 from pathlib import Path
 
 import scarf
+import scarf.cytebase
 import scarf.embeddings.harmony
 import scarf.features.genomic
 import scarf.features.markers
@@ -84,6 +86,7 @@ import scarf.writers
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.datastore.mapping_datastore import MappingDatastore
+from scarf.cytebase import Repository, connect, list_repositories
 from scarf.embeddings.harmony import Harmony, HarmonyResult, fit_harmony, run_harmony
 from scarf.features import (
     GffReader,
@@ -103,7 +106,6 @@ from scarf.readers import (
     H5adReader,
     LoomReader,
 )
-from scarf.readers.datasets import fetch_dataset, show_available_datasets
 from scarf.trajectory.feature_dynamics import knn_clustering
 from scarf.writers import (
     CSVtoZarr,
@@ -140,8 +142,9 @@ for merge_class in (AssayMerge, DatasetMerge, DummyAssay, ZarrMerge):
     assert merge_class.__module__ == "scarf.merge"
 assert scarf.CrH5Reader is scarf.readers.CrH5Reader
 assert scarf.CrToZarr is scarf.writers.CrToZarr
-assert scarf.fetch_dataset is fetch_dataset
-assert scarf.show_available_datasets is show_available_datasets
+assert scarf.cytebase.Repository is Repository
+assert scarf.cytebase.connect is connect
+assert scarf.cytebase.list_repositories is list_repositories
 assert scarf.GffReader is GffReader
 assert scarf.coordinate_melding is coordinate_melding
 for feature_function in (

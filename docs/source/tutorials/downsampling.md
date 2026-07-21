@@ -41,10 +41,10 @@ scarf.__version__
 ### 1. Fetch prepared data
 
 ```{code-cell} ipython3
-scarf.fetch_dataset(
-    dataset_name='tenx_5K_pbmc_rnaseq',
-    as_zarr=True,
-    save_path='scarf_datasets'
+scarf.cytebase.connect("scarf_docs").download_dataset(
+    name='tenx_5K_pbmc_rnaseq',
+    zarr=True,
+    destination='scarf_datasets'
 )
 ```
 

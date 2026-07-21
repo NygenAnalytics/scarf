@@ -36,9 +36,14 @@ scarf.set_verbosity('WARNING')
 scarf.__version__
 ```
 
-### 1. Fetch datasets from the catalog
+### 1. Download datasets from Cytebase
 
-Scarf hosts example datasets on [OSF](https://osf.io/zeupv/) in formats such as MTX, 10x HDF5, and H5AD. Download any catalog entry with `fetch_dataset`. Call `scarf.show_available_datasets()` locally for the full list (it prints every name).
+Scarf hosts example datasets in the public [Cytebase bucket](https://huggingface.co/buckets/Nygen/cytebase) in formats such as MTX, 10x HDF5, and H5AD. Connect to the `scarf_docs` repository to list or download them:
+
+```{code-cell} ipython3
+datasets = scarf.cytebase.connect("scarf_docs")
+datasets.list_datasets()
+```
 
 **Naming format**: `<author>_<number of cells>_<cell/tissue type or species>_<single-cell method>`
 
@@ -46,27 +51,27 @@ Examples used below:
 
 ```{code-cell} ipython3
 # This dataset is in Cellranger (10x) HDF5 format.
-scarf.fetch_dataset(
-    dataset_name='tenx_10K_pbmc-v1_atacseq',
-    save_path='./scarf_datasets'
+datasets.download_dataset(
+    name='tenx_10K_pbmc-v1_atacseq',
+    destination='./scarf_datasets'
 )
 ```
 
-The above dataset gets saved under the directory `scarf_datasets` in our current working directory. You can modify `save_path` parameter to save data in location of your choice. The dataset above was downloaded in 10x's HDF5 format. Let us download a few more datasets that are in different file formats.
+The above dataset gets saved under the directory `scarf_datasets` in our current working directory. You can modify the `destination` parameter to save data in a location of your choice. The dataset above was downloaded in 10x's HDF5 format. Let us download a few more datasets that are in different file formats.
 
 ```{code-cell} ipython3
 # This dataset is in MTX format along with barcodes and features TSV files.
-scarf.fetch_dataset(
-    dataset_name='xin_1K_pancreas_rnaseq',
-    save_path='./scarf_datasets'
+datasets.download_dataset(
+    name='xin_1K_pancreas_rnaseq',
+    destination='./scarf_datasets'
 )
 ```
 
 ```{code-cell} ipython3
 # This dataset is in H5ad (anndata) format.
-scarf.fetch_dataset(
-    dataset_name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    save_path='./scarf_datasets'
+datasets.download_dataset(
+    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
+    destination='./scarf_datasets'
 )
 ```
 

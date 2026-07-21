@@ -47,10 +47,10 @@ runs a short RNA graph and clustering pass so every execution starts from the
 downloaded fixture and creates the columns inspected below.
 
 ```{code-cell} ipython3
-scarf.fetch_dataset(
-    dataset_name='tenx_8K_pbmc_citeseq',
-    save_path='scarf_datasets',
-    as_zarr=True
+scarf.cytebase.connect("scarf_docs").download_dataset(
+    name='tenx_8K_pbmc_citeseq',
+    destination='scarf_datasets',
+    zarr=True
 )
 
 ds = scarf.DataStore(

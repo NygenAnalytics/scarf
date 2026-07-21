@@ -37,7 +37,6 @@ _EXPECTED_EXPORTS = {
     "create_zarr_dataset": "scarf.writers",
     "create_zarr_obj_array": "scarf.writers",
     "dask_to_zarr": "scarf.writers",
-    "fetch_dataset": "scarf.readers.datasets",
     "get_log_level": "scarf.utils",
     "load_zarr": "scarf.utils",
     "logger": "scarf.utils",
@@ -47,7 +46,6 @@ _EXPECTED_EXPORTS = {
     "rescale_array": "scarf.utils",
     "rolling_window": "scarf.utils",
     "set_verbosity": "scarf.utils",
-    "show_available_datasets": "scarf.readers.datasets",
     "show_dask_progress": "scarf.utils",
     "subset_assay_zarr": "scarf.writers",
     "system_call": "scarf.utils",
@@ -60,6 +58,7 @@ _EXPECTED_EXPORTS = {
 
 _EXPECTED_MODULE_ATTRIBUTES = {
     "assay": "scarf.assay",
+    "cytebase": "scarf.cytebase",
     "datastore": "scarf.datastore",
     "embeddings": "scarf.embeddings",
     "features": "scarf.features",
@@ -370,6 +369,16 @@ print(json.dumps({{
     assert result["before"] == []
     assert result["cached"] == expected_names
     assert result["identical"] == dict.fromkeys(_EXPECTED_MODULE_ATTRIBUTES, True)
+
+
+def test_legacy_dataset_download_api_is_absent():
+    from importlib.util import find_spec
+
+    import scarf
+
+    assert not hasattr(scarf, "fetch_dataset")
+    assert not hasattr(scarf, "show_available_datasets")
+    assert find_spec("scarf.readers.datasets") is None
 
 
 def test_lazy_facades_clear_cached_exports_on_reload():

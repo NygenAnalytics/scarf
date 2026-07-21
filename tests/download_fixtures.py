@@ -137,9 +137,12 @@ def download_optional_h5ad() -> None:
     if local_h5ad.is_file():
         return
 
-    from scarf.readers.datasets import fetch_dataset
+    from scarf import cytebase
 
-    fetch_dataset(sample, save_path=str(datasets_dir()))
+    cytebase.connect("scarf_docs").download_dataset(
+        sample,
+        destination=datasets_dir(),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -152,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--with-h5ad",
         action="store_true",
-        help="Also fetch bastidas-ponce h5ad from OSF (requires network).",
+        help="Also download the bastidas-ponce h5ad from Cytebase.",
     )
     args = parser.parse_args(argv)
 

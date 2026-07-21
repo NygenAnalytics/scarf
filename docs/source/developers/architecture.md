@@ -87,7 +87,8 @@ may use a narrow, named `storage` adapter.
 
 ### Import and export
 
-- `readers/` retrieves example datasets and parses supported input formats.
+- `cytebase` lists, downloads, and opens public datasets.
+- `readers/` parses supported input formats.
 - `writers/` materializes Scarf stores and exports supported formats.
 - `merge/` combines assays and datasets without importing `DataStore` during
   normal module loading.

@@ -13,4 +13,4 @@
 `Matplotlib <https://matplotlib.org>`_,
 `seaborn <https://seaborn.pydata.org>`_,
 `Jupyter <https://jupyter.org>`_, and
-`OSF <https://osf.io>`_
+`Hugging Face <https://huggingface.co>`_

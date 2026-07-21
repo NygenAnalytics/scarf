@@ -44,12 +44,12 @@ scarf.__version__
 
 We will use 10x Genomics single-cell ATAC-seq data from peripheral blood mononuclear
 cells. Like single-cell RNA-seq, Scarf only needs a count matrix to start the analysis.
-Use `fetch_dataset` to download the data in 10x HDF5 format.
+Use the `scarf_docs` Cytebase client to download the data in 10x HDF5 format.
 
 ```{code-cell} ipython3
-scarf.fetch_dataset(
-    dataset_name='tenx_10K_pbmc-v1_atacseq',
-    save_path='scarf_datasets'
+scarf.cytebase.connect("scarf_docs").download_dataset(
+    name='tenx_10K_pbmc-v1_atacseq',
+    destination='scarf_datasets'
 )
 ```
 
@@ -193,12 +193,12 @@ In Scarf, the users can provide a BED file containing gene annotations. This BED
 
 The start/end coordinate can extend through transcription start site (TSS) to include a portion of promoter.
 
-For convenience we have generated such BED files for human and mouse assemblies using the annotation information from GENCODE project. We downloaded the GFF3 format primary chromosome annotations and used Scarf's `GffReader` to convert the files into BED and add promoter offset of 2KB. These BED files containing gene annotations can be downloaded using `fetch_dataset` command and passing 'annotations' parameter.
+For convenience we have generated such BED files for human and mouse assemblies using the annotation information from GENCODE project. We downloaded the GFF3 format primary chromosome annotations and used Scarf's `GffReader` to convert the files into BED and add promoter offset of 2KB. Download these BED files by passing `annotations` to `download_dataset`.
 
 ```{code-cell} ipython3
-scarf.fetch_dataset(
-    dataset_name='annotations', 
-    save_path='scarf_datasets'
+scarf.cytebase.connect("scarf_docs").download_dataset(
+    name='annotations',
+    destination='scarf_datasets'
 )
 ```
 
@@ -258,7 +258,7 @@ The same melding approach maps any coordinate bed file onto peaks, including mot
 
 ## Common mistakes
 
-- Requesting `as_zarr=True` for `tenx_10K_pbmc-v1_atacseq`, which has no prepared Zarr store
+- Requesting `zarr=True` for `tenx_10K_pbmc-v1_atacseq`, which has no prepared Zarr store
 - Using RNA normalization or PCA assumptions for ATAC data
 - Omitting `lsi_skip_first=True` without checking whether depth dominates the first LSI component
 

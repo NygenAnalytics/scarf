@@ -81,7 +81,7 @@ subtrees:
       - file: reference/api/plotting
         title: Plotting API
       - file: reference/api/utilities
-        title: Utilities and datasets
+        title: Cytebase and utilities
       - file: reference/glossary
         title: Glossary
       - file: reference/faq

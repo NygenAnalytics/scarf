@@ -42,10 +42,10 @@ import scarf.plotting as splt
 scarf.set_verbosity('WARNING')
 
 dataset = "bastidas-ponce_4K_pancreas-d15_rnaseq"
-scarf.fetch_dataset(
-    dataset_name=dataset,
-    save_path="scarf_datasets",
-    as_zarr=True,
+scarf.cytebase.connect("scarf_docs").download_dataset(
+    name=dataset,
+    destination="scarf_datasets",
+    zarr=True,
 )
 ds = scarf.DataStore(
     str(Path("scarf_datasets") / dataset / "data.zarr"),

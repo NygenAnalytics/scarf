@@ -37,8 +37,8 @@ minimal pipeline see {ref}`Quick start <quickstart>`. For Scanpy equivalents see
 
 ## Dataset
 
-`tenx_5K_pbmc_rnaseq` is a public 10x Genomics PBMC dataset distributed through Scarf's
-`fetch_dataset` catalog.
+`tenx_5K_pbmc_rnaseq` is a public 10x Genomics PBMC dataset distributed through the
+`scarf_docs` Cytebase repository.
 
 ```{code-cell} ipython3
 import scarf
@@ -46,9 +46,9 @@ import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
-scarf.fetch_dataset(
+scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',
-    save_path='scarf_datasets'
+    destination='scarf_datasets'
 )
 ```
 

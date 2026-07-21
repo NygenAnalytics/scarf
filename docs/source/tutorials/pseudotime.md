@@ -31,10 +31,10 @@ Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://jour
 We have stored this data on Scarf's online repository for quick access. We processed the data to identify the highly variable genes (top 2000) and create a neighbourhood graph of cells. A UMAP embedding was calculated for the cells. 
 
 ```{code-cell} ipython3
-scarf.fetch_dataset(
-    dataset_name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    save_path='./scarf_datasets',
-    as_zarr=True,
+scarf.cytebase.connect("scarf_docs").download_dataset(
+    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
+    destination='./scarf_datasets',
+    zarr=True,
 )
 ```
 

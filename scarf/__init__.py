@@ -16,10 +16,11 @@ Exports:
 --------
 
 - Modules
+    - cytebase: Browse and download public datasets from Cytebase.
     - datastore: Contains the primary interface to interact with data (i.e. DataStore) and its superclasses.
     - embeddings: Dimension reduction, Harmony correction, and cell embeddings.
     - matrix: Lazy blockwise matrix operations over NumPy and Zarr arrays.
-    - readers: Dataset retrieval and classes for reading supported data formats.
+    - readers: Classes for reading supported data formats.
     - writers: Methods and classes for writing data to disk.
     - features: Variability, marker, scoring, and genomic feature algorithms.
     - mapping: Reference mapping, alignment, and confidence algorithms.
@@ -44,14 +45,11 @@ from pathlib import Path as _Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from . import cytebase as cytebase
     from .datastore.datastore import DataStore as DataStore
     from .features.enrichment import (
         EnrichmentResult as EnrichmentResult,
         read_gmt as read_gmt,
-    )
-    from .readers.datasets import (
-        fetch_dataset as fetch_dataset,
-        show_available_datasets as show_available_datasets,
     )
     from .mapping.models import MappingResult as MappingResult
     from .mapping.reference import MappingReference as MappingReference
@@ -164,7 +162,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "create_zarr_dataset": (".writers", "create_zarr_dataset"),
     "create_zarr_obj_array": (".writers", "create_zarr_obj_array"),
     "dask_to_zarr": (".writers", "dask_to_zarr"),
-    "fetch_dataset": (".readers.datasets", "fetch_dataset"),
     "get_log_level": (".utils", "get_log_level"),
     "load_zarr": (".utils", "load_zarr"),
     "logger": (".utils", "logger"),
@@ -174,7 +171,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "rescale_array": (".utils", "rescale_array"),
     "rolling_window": (".utils", "rolling_window"),
     "set_verbosity": (".utils", "set_verbosity"),
-    "show_available_datasets": (".readers.datasets", "show_available_datasets"),
     "show_dask_progress": (".utils", "show_dask_progress"),
     "subset_assay_zarr": (".writers", "subset_assay_zarr"),
     "system_call": (".utils", "system_call"),
@@ -191,6 +187,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 _LAZY_MODULES = frozenset(
     {
         "assay",
+        "cytebase",
         "datastore",
         "embeddings",
         "features",
