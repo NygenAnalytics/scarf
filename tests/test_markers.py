@@ -526,3 +526,43 @@ def test_resolve_marker_gene_batch_size_shrinks_with_more_cells():
     assert sizes[0] > sizes[1] > sizes[2]
     assert sizes[-1] >= 1
     assert all(size <= 10_000 for size in sizes)
+
+
+def test_explicit_marker_gene_batch_size_bypasses_resolver(
+    datastore_ephemeral,
+    monkeypatch,
+):
+    groups = np.arange(datastore_ephemeral.cells.N) % 2
+    datastore_ephemeral.cells.insert("batch_contract_groups", groups, overwrite=True)
+    captured = {}
+    expected = {"group": pd.DataFrame()}
+
+    def fail_resolver(**_kwargs):
+        raise AssertionError("automatic batch resolver must not run")
+
+    def capture_marker_search(**kwargs):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.features.resolve_marker_gene_batch_size",
+        fail_resolver,
+    )
+    monkeypatch.setattr(
+        "scarf.features.markers.find_markers_by_rank",
+        capture_marker_search,
+    )
+    monkeypatch.setattr(
+        datastore_ephemeral,
+        "_get_latest_keys",
+        lambda from_assay, cell_key, feat_key: ("RNA", "I", "I"),
+    )
+
+    result = datastore_ephemeral.run_marker_search(
+        group_key="batch_contract_groups",
+        gene_batch_size=100,
+        skip_save=True,
+    )
+
+    assert result is expected
+    assert captured["batch_size"] == 100

@@ -798,11 +798,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             feat_key = self._get_latest_feat_key(from_assay)
         return from_assay, cell_key, feat_key
 
-    def _get_latest_graph_loc(
+    def get_latest_graph_loc(
         self, from_assay: str, cell_key: str, feat_key: str
     ) -> str:
-        """Convenience function to identify location of the latest graph in the
-        Zarr hierarchy.
+        """Return the location of the latest graph in the Zarr hierarchy.
 
         Args:
             from_assay: Name of the assay.
@@ -821,6 +820,12 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         knn_loc = cast(str, ann_grp.attrs["latest_knn"])
         knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
         return cast(str, knn_grp.attrs["latest_graph"])
+
+    def _get_latest_graph_loc(
+        self, from_assay: str, cell_key: str, feat_key: str
+    ) -> str:
+        """Compatibility alias for :meth:`get_latest_graph_loc`."""
+        return self.get_latest_graph_loc(from_assay, cell_key, feat_key)
 
     def _get_latest_knn_loc(self, from_assay: str | None = None) -> str:
         """Convenience function to identify location of the latest KNN graph in

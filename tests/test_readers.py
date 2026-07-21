@@ -93,12 +93,17 @@ def _write_cr_h5(path, values, *, legacy=False):
 def test_toy_crdir_assay_feats_table(toy_crdir_reader):
     assert np.all(
         toy_crdir_reader.assayFeats.columns
-        == np.array(["RNA", "ADT", "RNA", "HTO", "RNA"])
+        == np.array(["RNA", "ADT", "RNA", "HTO", "RNA", "ADT"])
     )
     assert np.all(
         toy_crdir_reader.assayFeats.values[1:]
-        == [[0, 1, 3, 5, 6], [1, 3, 5, 6, 7], [1, 2, 2, 1, 1]]
+        == [
+            [0, 1, 3, 5, 6, 7],
+            [1, 3, 5, 6, 7, 8],
+            [1, 2, 2, 1, 1, 1],
+        ]
     )
+    assert toy_crdir_reader.assayFeats.loc["nFeatures"].sum() == 8
 
 
 def test_toy_crdir_reader_cells_feats(toy_crdir_reader):
@@ -129,7 +134,7 @@ def test_toy_crdir_reader_cells_feats(toy_crdir_reader):
 
 def test_toy_crdir_reader_assay_subsets(toy_crdir_reader):
     assert toy_crdir_reader.feature_names("RNA") == ["g1", "g2", "g3", "g4"]
-    assert toy_crdir_reader.feature_ids("ADT") == ["a1", "a2"]
+    assert toy_crdir_reader.feature_ids("ADT") == ["a1", "a2", "a3"]
     assert toy_crdir_reader.feature_names("HTO") == ["h1"]
 
     with pytest.raises(ValueError, match="Assay ID missing is not valid"):

@@ -6,6 +6,8 @@ import sys
 
 import h5py
 import numpy as np
+import pytest
+import zarr
 
 import scarf.readers as readers_module
 from scarf.readers import (
@@ -24,6 +26,7 @@ _PUBLIC_CLASS_METHODS = {
         "__init__",
         "consume",
         "rename_assays",
+        "reclassify_features",
         "feature_ids",
         "feature_names",
         "feature_types",
@@ -73,7 +76,7 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    CrReader: "016c1b61d01f8809606e469fadd4614c8dd026ddc098a18ca8cec54653da5254",
+    CrReader: "cfeac7ccf7bc316f1db1d9e177d6556b37a0169b3cbb2800a92e561b75f4fc4a",
     CrH5Reader: "053373f2af2f2fc74a3e00cde9b067c5818aba92c09da3a9ac2e129566ca87b9",
     CrDirReader: "51884c2390ad90fba1cdbd71808fc4dd98de548bd901e810c9caba6dbb9cf49a",
     H5adReader: "952244c6ef7048f599958bcf3b0e853f2934c7ed141736484b5b4bb776966967",
@@ -92,6 +95,20 @@ def _write_minimal_cellranger_directory(path) -> None:
     (path / "barcodes.tsv").write_text("c1\n")
     (path / "matrix.mtx").write_text(
         "%%MatrixMarket matrix coordinate integer general\n2 1 1\n1 1 1\n"
+    )
+
+
+def _write_mixed_cellranger_directory(path) -> None:
+    (path / "features.tsv").write_text(
+        "f1\tg1\tGene Expression\n"
+        "f2\th1\tAntibody Capture\n"
+        "f3\tg2\tGene Expression\n"
+        "f4\th2\tAntibody Capture\n"
+        "f5\ta1\tAntibody Capture\n"
+    )
+    (path / "barcodes.tsv").write_text("c1\n")
+    (path / "matrix.mtx").write_text(
+        "%%MatrixMarket matrix coordinate integer general\n5 1 3\n2 1 2\n4 1 4\n5 1 5\n"
     )
 
 
@@ -229,6 +246,78 @@ def test_read_file_facade_remains_patchable_by_cellranger_reader(
     assert reader.feature_names() == ["g1", "g2"]
     assert any(filename.endswith("features.tsv") for filename in calls)
     assert any(filename.endswith("barcodes.tsv") for filename in calls)
+
+
+def test_crreader_reclassifies_noncontiguous_features_atomically(tmp_path):
+    _write_mixed_cellranger_directory(tmp_path)
+    reader = CrDirReader(str(tmp_path))
+
+    reader.reclassify_features([1, 3], "HTO")
+
+    assert reader.feature_types() == [
+        "Gene Expression",
+        "HTO",
+        "Gene Expression",
+        "HTO",
+        "Antibody Capture",
+    ]
+    assert list(reader.assayFeats.columns) == ["RNA", "HTO", "RNA", "HTO", "ADT"]
+    assert reader.feature_names("HTO") == ["h1", "h2"]
+    assert reader.feature_names("ADT") == ["a1"]
+
+    before = reader.assayFeats.copy()
+    reader.reclassify_features([1, 3], "HTO")
+    assert reader.assayFeats.equals(before)
+
+    with pytest.raises(ValueError, match="conflicting"):
+        reader.reclassify_features([1], "RNA", require_previous=None)
+    assert reader.feature_types()[1] == "HTO"
+
+
+def test_crreader_reclassification_validates_before_mutation(tmp_path):
+    _write_mixed_cellranger_directory(tmp_path)
+    reader = CrDirReader(str(tmp_path))
+    original_types = reader.feature_types()
+    original_table = reader.assayFeats.copy()
+
+    with pytest.raises(ValueError, match="currently have type"):
+        reader.reclassify_features([1, 2], "HTO")
+    with pytest.raises(ValueError, match="unique"):
+        reader.reclassify_features([1, 1], "HTO")
+    with pytest.raises(IndexError, match="out-of-range"):
+        reader.reclassify_features([5], "HTO")
+
+    assert reader.feature_types() == original_types
+    assert reader.assayFeats.equals(original_table)
+
+
+def test_crreader_reclassification_locks_when_writer_captures_schema(tmp_path):
+    from scarf.writers import CrToZarr
+
+    source = tmp_path / "source"
+    source.mkdir()
+    _write_mixed_cellranger_directory(source)
+    reader = CrDirReader(str(source))
+    reader.reclassify_features([1, 3], "HTO")
+
+    destination = tmp_path / "out.zarr"
+    writer = CrToZarr(reader, str(destination))
+    writer.dump()
+    root = zarr.open_group(str(destination), mode="r")
+
+    assert set(root.group_keys()) >= {"RNA", "HTO", "ADT"}
+    np.testing.assert_array_equal(
+        np.asarray(root["HTO/featureData/ids"][:]).astype(str),
+        ["f2", "f4"],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(root["ADT/featureData/ids"][:]).astype(str),
+        ["f5"],
+    )
+    np.testing.assert_array_equal(root["HTO/counts"][:], [[2, 4]])
+    np.testing.assert_array_equal(root["ADT/counts"][:], [[5]])
+    with pytest.raises(RuntimeError, match="captures the schema"):
+        reader.reclassify_features([4], "HTO")
 
 
 def test_loom_reader_preserves_cell_feature_orientation(tmp_path):

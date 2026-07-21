@@ -1,4 +1,4 @@
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from typing import Any, cast
 
 import numpy as np
@@ -27,6 +27,30 @@ def _read_facade_block(
     from . import _read_block
 
     return _read_block(zarr_arr, row_idx, col_idx)
+
+
+def _as_feature_indexes(
+    values: Sequence[int],
+    *,
+    n_features: int,
+    name: str,
+    require_unique: bool,
+) -> np.ndarray:
+    if isinstance(values, str):
+        raise TypeError(f"{name} must be a sequence of integer feature indexes")
+    indexes = np.asarray(values)
+    if indexes.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional")
+    if indexes.size == 0:
+        return np.empty(0, dtype=np.int64)
+    if not np.issubdtype(indexes.dtype, np.integer):
+        raise TypeError(f"{name} must contain only integer feature indexes")
+    indexes = indexes.astype(np.int64, copy=False)
+    if np.any(indexes < 0) or np.any(indexes >= n_features):
+        raise IndexError(f"{name} contains an out-of-range feature index")
+    if require_unique and np.unique(indexes).size != indexes.size:
+        raise ValueError(f"{name} contains duplicate feature indexes")
+    return indexes
 
 
 class RNAassay(Assay):
@@ -658,6 +682,53 @@ class RNAassay(Assay):
         self.feats.unmount_location(identifier)
         return None
 
+    def get_feature_stats(
+        self,
+        cell_key: str,
+        columns: Sequence[str] | None = None,
+        *,
+        feat_key: str = "I",
+    ) -> dict[str, np.ndarray]:
+        """Return cached feature statistics aligned to ``feat_key``.
+
+        This method only reads an existing, valid summary-statistics group. It
+        does not calculate statistics or delete a stale cache.
+        """
+        requested: tuple[str, ...]
+        if columns is None:
+            requested = ("nz_mean", "c_var__200__0.1", "normed_n")
+        elif isinstance(columns, str):
+            raise TypeError("columns must be a sequence of column names, not a string")
+        else:
+            requested = tuple(columns)
+        if not all(isinstance(column, str) for column in requested):
+            raise TypeError("columns must contain only strings")
+
+        cell_idx, all_feat_idx = self._get_cell_feat_idx(cell_key, "I")
+        _, stats_loc = self._get_summary_stats_loc(cell_key)
+        if not self._validate_stats_loc(
+            stats_loc,
+            cell_idx,
+            all_feat_idx,
+            delete_on_fail=False,
+        ):
+            raise KeyError(
+                f"Summary statistics have not been calculated for cell key: {cell_key}"
+            )
+
+        stats_group = as_zarr_group(self.z[stats_loc], name=stats_loc)
+        feat_idx = self.feats.active_index(feat_key)
+        values: dict[str, np.ndarray] = {}
+        for column in requested:
+            if column not in stats_group:
+                raise KeyError(
+                    f"Feature statistic {column!r} is not available for cell key "
+                    f"{cell_key!r}"
+                )
+            array = as_zarr_array(stats_group[column], name=f"{stats_loc}/{column}")
+            values[column] = np.asarray(array[:])[feat_idx]
+        return values
+
     def set_summary_stats(
         self, cell_key: str | None = None, n_bins: int = 200, lowess_frac: float = 0.1
     ) -> tuple[str, str]:
@@ -702,6 +773,73 @@ class RNAassay(Assay):
             self.feats.insert(c_var_col, c_var, overwrite=True, location=identifier)
 
         return identifier, c_var_col
+
+    def set_hvgs(
+        self,
+        cell_key: str,
+        *,
+        mask: np.ndarray | None = None,
+        feature_indexes: Sequence[int] | None = None,
+        hvg_key_name: str = "hvgs",
+        n_bins: int = 200,
+        lowess_frac: float = 0.1,
+        blacklist: str | None = None,
+        blacklist_exclusions: str | None = None,
+        blacklist_indexes: Sequence[int] | None = None,
+    ) -> str:
+        """Install a supplied HVG selection and ensure its summary statistics."""
+        if (mask is None) == (feature_indexes is None):
+            raise ValueError("Provide exactly one of mask or feature_indexes")
+
+        if mask is not None:
+            if not isinstance(mask, np.ndarray):
+                raise TypeError("mask must be a NumPy array")
+            if mask.shape != (self.feats.N,):
+                raise ValueError(f"mask must have shape ({self.feats.N},)")
+            if mask.dtype != bool:
+                raise TypeError("mask must have boolean dtype")
+            selected = mask.copy()
+        else:
+            assert feature_indexes is not None
+            indexes = _as_feature_indexes(
+                feature_indexes,
+                n_features=self.feats.N,
+                name="feature_indexes",
+                require_unique=True,
+            )
+            selected = self.feats.index_to_bool(indexes)
+
+        if not selected.any():
+            raise ValueError("HVG selection must contain at least one feature")
+
+        blocked = np.empty(0, dtype=np.int64)
+        if blacklist_indexes is not None:
+            blocked = _as_feature_indexes(
+                blacklist_indexes,
+                n_features=self.feats.N,
+                name="blacklist_indexes",
+                require_unique=False,
+            )
+        elif blacklist is not None:
+            blocked_names = (
+                set() if blacklist == "" else set(self.feats.grep(blacklist))
+            )
+            if blacklist_exclusions is None or blacklist_exclusions == "":
+                excluded_names: set[str] = set()
+            else:
+                excluded_names = set(self.feats.grep(blacklist_exclusions))
+            blocked = self.feats.get_index_by(
+                sorted(blocked_names - excluded_names),
+                "names",
+            ).astype(np.int64, copy=False)
+        elif blacklist_exclusions not in (None, ""):
+            raise ValueError("blacklist_exclusions requires blacklist")
+
+        self.set_summary_stats(cell_key, n_bins, lowess_frac)
+        selected[blocked] = False
+        column_name = f"{cell_key}__{hvg_key_name}"
+        self.feats.insert(column_name, selected, fill_value=False, overwrite=True)
+        return column_name
 
     # maybe we should return plot here? If one wants to modify it. /raz
     def mark_hvgs(

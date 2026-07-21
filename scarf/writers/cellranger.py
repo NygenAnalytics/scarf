@@ -52,6 +52,9 @@ class CrToZarr:
 
         _apply_budget_override(mem_budget, nthreads, working_copies)
         self.cr = cr
+        mark_schema_captured = getattr(self.cr, "_mark_schema_captured", None)
+        if callable(mark_schema_captured):
+            mark_schema_captured()
         self.chunkSizes = chunk_size
         self.workspace = workspace
         self.storage_options = storage_options
@@ -62,7 +65,7 @@ class CrToZarr:
             ids=np.array(self.cr.cell_names()),
             names=np.array(self.cr.cell_names()),
         )
-        for assay_name in self.cr.assayFeats.columns:
+        for assay_name in dict.fromkeys(self.cr.assayFeats.columns):
             create_zarr_count_assay(
                 z=self.z,
                 assay_name=assay_name,

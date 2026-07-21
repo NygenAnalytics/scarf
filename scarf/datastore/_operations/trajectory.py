@@ -68,6 +68,77 @@ def _validate_assay_pseudotime(
 
 
 class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
+    def get_diffusion_operator(
+        self,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        t: int = 2,
+        *,
+        cache_operator: bool = True,
+    ) -> coo_matrix:
+        """Load or calculate the sparse MAGIC diffusion operator."""
+        from ...neighbors.diffusion import diffusion_operator
+
+        from_assay, cell_key, feat_key = self._get_latest_keys(
+            from_assay,
+            cell_key,
+            feat_key,
+        )
+        graph_loc = self.get_latest_graph_loc(from_assay, cell_key, feat_key)
+        magic_loc = f"{graph_loc}/magic_{t}"
+        cached = (
+            self._cachedMagicOperator
+            if self._cachedMagicOperatorLoc == magic_loc
+            else None
+        )
+        if magic_loc in self.zw:
+            if cached is not None:
+                diff_op = cast(coo_matrix, cached)
+            else:
+                logger.info("Using existing MAGIC diffusion operator")
+                n_cells, _ = self._get_graph_ncells_k(graph_loc)
+                store = as_zarr_group(self.zw[magic_loc], name=magic_loc)
+                diff_op = coo_matrix(
+                    (
+                        np.asarray(as_zarr_array(store["data"], name="data")[:]),
+                        (
+                            np.asarray(as_zarr_array(store["row"], name="row")[:]),
+                            np.asarray(as_zarr_array(store["col"], name="col")[:]),
+                        ),
+                    ),
+                    shape=(n_cells, n_cells),
+                )
+        else:
+            graph = self.load_graph(
+                from_assay=from_assay,
+                cell_key=cell_key,
+                feat_key=feat_key,
+                symmetric=True,
+                upper_only=False,
+            )
+            diff_op = diffusion_operator(graph, t)
+            shape = diff_op.data.shape
+            store = self.zw.create_group(magic_loc, overwrite=True)
+            for name, dtype in zip(
+                ("row", "col", "data"),
+                ("uint32", "uint32", "float32"),
+                strict=True,
+            ):
+                array = create_zarr_dataset(store, name, (1000000,), dtype, shape)
+                array[:] = getattr(diff_op, name)
+            as_zarr_group(self.zw[graph_loc], name=graph_loc).attrs["latest_magic"] = (
+                magic_loc
+            )
+
+        if cache_operator:
+            self._cachedMagicOperator = diff_op
+            self._cachedMagicOperatorLoc = magic_loc  # type: ignore[assignment]
+        else:
+            self._cachedMagicOperator = None
+            self._cachedMagicOperatorLoc = None
+        return diff_op
+
     def get_imputed(
         self,
         from_assay: str | None = None,
@@ -96,8 +167,6 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
         """
 
-        from ...neighbors.diffusion import diffusion_operator
-
         from_assay, cell_key, feat_key = self._get_latest_keys(
             from_assay, cell_key, feat_key
         )
@@ -109,55 +178,13 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         data = self.get_cell_vals(
             from_assay=from_assay, cell_key=cell_key, k=feature_name
         )
-
-        graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
-        magic_loc = f"{graph_loc}/magic_{t}"
-        if magic_loc in self.zw:
-            logger.info("Using existing MAGIC diffusion operator")
-            if self._cachedMagicOperatorLoc == magic_loc:
-                diff_op = cast(coo_matrix, self._cachedMagicOperator)
-            else:
-                n_cells, _ = self._get_graph_ncells_k(graph_loc)
-                store = as_zarr_group(self.zw[magic_loc], name=magic_loc)
-                diff_op = coo_matrix(
-                    (
-                        np.asarray(as_zarr_array(store["data"], name="data")[:]),
-                        (
-                            np.asarray(as_zarr_array(store["row"], name="row")[:]),
-                            np.asarray(as_zarr_array(store["col"], name="col")[:]),
-                        ),
-                    ),
-                    shape=(n_cells, n_cells),
-                )
-                if cache_operator:
-                    self._cachedMagicOperator = diff_op
-                    self._cachedMagicOperatorLoc = magic_loc  # type: ignore[assignment]
-                else:
-                    self._cachedMagicOperator = None
-                    self._cachedMagicOperatorLoc = None
-        else:
-            graph = self.load_graph(
-                from_assay=from_assay,
-                cell_key=cell_key,
-                feat_key=feat_key,
-                symmetric=True,
-                upper_only=False,
-            )
-            diff_op = diffusion_operator(graph, t)
-            shape = diff_op.data.shape
-            store = self.zw.create_group(magic_loc, overwrite=True)
-            for i, j in zip(["row", "col", "data"], ["uint32", "uint32", "float32"]):
-                zg = create_zarr_dataset(store, i, (1000000,), j, shape)
-                zg[:] = getattr(diff_op, i)
-            as_zarr_group(self.zw[graph_loc], name=graph_loc).attrs["latest_magic"] = (
-                magic_loc
-            )
-            if cache_operator:
-                self._cachedMagicOperator = diff_op
-                self._cachedMagicOperatorLoc = magic_loc  # type: ignore[assignment]
-            else:
-                self._cachedMagicOperator = None
-                self._cachedMagicOperatorLoc = None
+        diff_op = self.get_diffusion_operator(
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            t=t,
+            cache_operator=cache_operator,
+        )
         return cast(np.ndarray, diff_op.dot(data))
 
     def run_pseudotime_scoring(

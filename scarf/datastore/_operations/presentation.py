@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import zarr
+from scipy.sparse import csr_matrix, vstack
 
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...storage.arrays import create_zarr_dataset
@@ -22,6 +23,10 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         from_assay: str | None = None,
         cell_key: str | None = None,
         layers: dict[str, str] | None = None,
+        *,
+        matrix: Literal["raw", "normed"] = "raw",
+        feature_indexes: Sequence[int] | None = None,
+        feature_names: Sequence[str] | None = None,
     ) -> Any:
         """Return an assay as an in-memory AnnData object.
 
@@ -34,6 +39,9 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             cell_key: Name of column from cell metadata that has boolean values. This is used to subset cells
             layers: A mapping of layer names to assay names. Ex. {'spliced': 'RNA', 'unspliced': 'URNA'}. The raw data
                     from the assays will be stored as sparse arrays in the corresponding layer in anndata.
+            matrix: Whether ``X`` contains raw counts or normalized values.
+            feature_indexes: Global feature rows to export, in the requested order.
+            feature_names: Feature names to export, in the requested order.
 
         Returns:
             An AnnData object, or ``None`` when ``anndata`` is unavailable.
@@ -51,16 +59,115 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         if cell_key is None:
             cell_key = "I"
         assay = self._get_assay(from_assay)
+        if matrix not in ("raw", "normed"):
+            raise ValueError("matrix must be either 'raw' or 'normed'")
+        if feature_indexes is not None and feature_names is not None:
+            raise ValueError("feature_indexes and feature_names are mutually exclusive")
+
+        if feature_indexes is not None:
+            if isinstance(feature_indexes, str):
+                raise TypeError(
+                    "feature_indexes must be a sequence of integer feature indexes"
+                )
+            feat_idx = np.asarray(feature_indexes)
+            if feat_idx.ndim != 1:
+                raise ValueError("feature_indexes must be one-dimensional")
+            if feat_idx.size == 0:
+                feat_idx = np.empty(0, dtype=np.int64)
+            elif not np.issubdtype(feat_idx.dtype, np.integer):
+                raise TypeError("feature_indexes must contain only integers")
+            else:
+                feat_idx = feat_idx.astype(np.int64, copy=False)
+            if np.unique(feat_idx).size != feat_idx.size:
+                raise ValueError("feature_indexes must contain unique indexes")
+            if np.any(feat_idx < 0) or np.any(feat_idx >= assay.feats.N):
+                raise IndexError("feature_indexes contains an out-of-range index")
+        elif feature_names is not None:
+            if isinstance(feature_names, str):
+                raise TypeError(
+                    "feature_names must be a sequence of feature names, not a string"
+                )
+            requested_names = list(feature_names)
+            if not all(isinstance(name, str) for name in requested_names):
+                raise TypeError("feature_names must contain only strings")
+            if len(set(requested_names)) != len(requested_names):
+                raise ValueError("feature_names must contain unique names")
+            name_positions: dict[str, list[int]] = {}
+            for index, name in enumerate(assay.feats.fetch_all("names").astype(str)):
+                name_positions.setdefault(name, []).append(index)
+            missing = [name for name in requested_names if name not in name_positions]
+            if missing:
+                raise KeyError("Feature names not found: " + ", ".join(missing))
+            ambiguous = [
+                name for name in requested_names if len(name_positions[name]) != 1
+            ]
+            if ambiguous:
+                raise ValueError(
+                    "Feature names are not unique in the assay: " + ", ".join(ambiguous)
+                )
+            feat_idx = np.asarray(
+                [name_positions[name][0] for name in requested_names],
+                dtype=np.int64,
+            )
+        else:
+            feat_idx = np.arange(assay.feats.N, dtype=np.int64)
+
+        cell_idx = self.cells.active_index(cell_key)
         df = self.cells.to_pandas_dataframe(self.cells.columns, key=cell_key)
         obs = df.reset_index(drop=True).set_index("ids")
-        df = assay.feats.to_pandas_dataframe(assay.feats.columns)
+        df = assay.feats.to_pandas_dataframe(assay.feats.columns).iloc[feat_idx]
         var = df.rename(columns={"ids": "gene_ids"}).set_index("gene_ids")
-        adata = AnnData(assay.to_raw_sparse(cell_key), obs=obs, var=var)
+        if matrix == "raw":
+            x = assay.to_raw_sparse(cell_key)[:, feat_idx].tocsr()
+        else:
+            normed = assay.normed(cell_idx=cell_idx, feat_idx=feat_idx)
+            blocks = [csr_matrix(block) for block in normed.stream_blocks()]
+            x = (
+                vstack(blocks, format="csr")
+                if blocks
+                else csr_matrix((len(cell_idx), len(feat_idx)))
+            )
+        adata = AnnData(x, obs=obs, var=var)
         if layers is not None:
-            for layer, assay_name in layers.items():
-                adata.layers[layer] = self._get_assay(assay_name).to_raw_sparse(
-                    cell_key
+            selected_ids = assay.feats.fetch_all("ids").astype(str)[feat_idx]
+            if np.unique(selected_ids).size != selected_ids.size:
+                raise ValueError(
+                    "Selected feature IDs must be unique when exporting layers"
                 )
+            for layer, assay_name in layers.items():
+                layer_assay = self._get_assay(assay_name)
+                layer_matrix = layer_assay.to_raw_sparse(cell_key)
+                layer_id_positions: dict[str, list[int]] = {}
+                for index, feature_id in enumerate(
+                    layer_assay.feats.fetch_all("ids").astype(str)
+                ):
+                    layer_id_positions.setdefault(feature_id, []).append(index)
+                missing_ids = [
+                    feature_id
+                    for feature_id in selected_ids
+                    if feature_id not in layer_id_positions
+                ]
+                ambiguous_ids = [
+                    feature_id
+                    for feature_id in selected_ids
+                    if len(layer_id_positions.get(feature_id, ())) > 1
+                ]
+                if missing_ids or ambiguous_ids:
+                    details = []
+                    if missing_ids:
+                        details.append("missing: " + ", ".join(missing_ids))
+                    if ambiguous_ids:
+                        details.append("ambiguous: " + ", ".join(ambiguous_ids))
+                    raise ValueError(
+                        f"Layer {layer!r} cannot align selected feature IDs ("
+                        + "; ".join(details)
+                        + ")"
+                    )
+                layer_feat_idx = np.asarray(
+                    [layer_id_positions[feature_id][0] for feature_id in selected_ids],
+                    dtype=np.int64,
+                )
+                adata.layers[layer] = layer_matrix[:, layer_feat_idx].tocsr()
         return adata
 
     def show_zarr_tree(self, start: str = "/", depth: int = 2) -> None:

@@ -1,3 +1,5 @@
+import numpy as np
+import pytest
 import zarr
 
 from scarf.tools.repack_zarr import repack_store
@@ -19,6 +21,11 @@ def test_repack_store_round_trip(toy_crdir_writer, tmp_path):
         assert "counts" in dst_assay
         assert src_assay["counts"].shape == dst_assay["counts"].shape
         assert (src_assay["counts"][...] == dst_assay["counts"][...]).all()
+        assert dst_assay["countsT"].attrs["complete"] is True
+        np.testing.assert_array_equal(
+            dst_assay["countsT"][:],
+            np.asarray(dst_assay["counts"][:]).T,
+        )
 
 
 def test_repack_store_without_sharding(toy_crdir_writer, tmp_path):
@@ -32,3 +39,144 @@ def test_repack_store_without_sharding(toy_crdir_writer, tmp_path):
     dst = zarr.open_group(str(output), mode="r")
     assert "RNA" in dst
     assert "counts" in dst["RNA"]
+
+
+def test_repack_v2_without_counts_t_builds_complete_transpose(tmp_path):
+    source = tmp_path / "source_v2.zarr"
+    output = tmp_path / "output_v3.zarr"
+    root = zarr.open_group(str(source), mode="w", zarr_format=2)
+    assay = root.create_group("RNA")
+    assay.attrs["is_assay"] = True
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    assay.create_array("counts", data=values, chunks=(2, 2))
+
+    repack_store(str(source), str(output), shard_counts=True)
+
+    result = zarr.open_group(str(output), mode="r")
+    assert result.metadata.zarr_format == 3
+    assert result["RNA/countsT"].attrs["complete"] is True
+    np.testing.assert_array_equal(result["RNA/counts"][:], values)
+    np.testing.assert_array_equal(result["RNA/countsT"][:], values.T)
+
+
+def test_repack_rebuilds_incorrect_source_counts_t(tmp_path):
+    source = tmp_path / "source_wrong.zarr"
+    output = tmp_path / "output_fixed.zarr"
+    root = zarr.open_group(str(source), mode="w")
+    assay = root.create_group("RNA")
+    assay.attrs["is_assay"] = True
+    values = np.arange(15, dtype=np.uint32).reshape(5, 3)
+    assay.create_array("counts", data=values, chunks=(2, 3))
+    stale = assay.create_array(
+        "countsT",
+        data=np.zeros((3, 5), dtype=np.uint32),
+    )
+    stale.attrs["complete"] = True
+
+    repack_store(str(source), str(output), shard_counts=True)
+
+    result = zarr.open_group(str(output), mode="r")
+    np.testing.assert_array_equal(result["RNA/countsT"][:], values.T)
+    assert result["RNA/countsT"].attrs["complete"] is True
+
+
+def test_repack_finalizes_workspace_counts_with_requested_profile(
+    tmp_path,
+    monkeypatch,
+):
+    import scarf.tools.repack_zarr as repack_module
+
+    source = tmp_path / "source_workspace.zarr"
+    output = tmp_path / "output_workspace.zarr"
+    root = zarr.open_group(str(source), mode="w")
+    metadata = root.create_group("workspace/RNA")
+    metadata.attrs["is_assay"] = True
+    counts_group = root.create_group("matrices/RNA")
+    values = np.arange(8, dtype=np.uint32).reshape(4, 2)
+    counts_group.create_array("counts", data=values, chunks=(2, 2))
+
+    calls = []
+    original = repack_module.finalize_counts
+
+    def tracked_finalize(store, assay_name, workspace=None, profile=None):
+        calls.append((assay_name, workspace, profile))
+        return original(
+            store,
+            assay_name,
+            workspace=workspace,
+            profile=profile,
+        )
+
+    monkeypatch.setattr(repack_module, "finalize_counts", tracked_finalize)
+    repack_store(
+        str(source),
+        str(output),
+        profile="cloud",
+        shard_counts=True,
+    )
+
+    result = zarr.open_group(str(output), mode="r")
+    assert calls == [("RNA", "workspace", "cloud")]
+    np.testing.assert_array_equal(result["matrices/RNA/countsT"][:], values.T)
+    assert result["matrices/RNA/countsT"].attrs["complete"] is True
+
+
+def test_repack_rejects_source_destination_alias_before_overwrite(tmp_path):
+    source = tmp_path / "source.zarr"
+    root = zarr.open_group(str(source), mode="w")
+    root.create_array("sentinel", data=np.array([1, 2, 3]))
+    equivalent_path = source / ".." / source.name
+
+    with pytest.raises(ValueError, match="different stores"):
+        repack_store(str(source), str(equivalent_path))
+
+    reopened = zarr.open_group(str(source), mode="r")
+    np.testing.assert_array_equal(reopened["sentinel"][:], [1, 2, 3])
+
+
+@pytest.mark.parametrize("destination_relation", ["child", "parent"])
+def test_repack_rejects_overlapping_local_paths_before_overwrite(
+    tmp_path,
+    destination_relation,
+):
+    if destination_relation == "child":
+        source = tmp_path / "source.zarr"
+        output = source / "nested.zarr"
+    else:
+        output = tmp_path / "container.zarr"
+        source = output / "source.zarr"
+
+    root = zarr.open_group(str(source), mode="w")
+    root.create_array("sentinel", data=np.array([1, 2, 3]))
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        repack_store(str(source), str(output))
+
+    reopened = zarr.open_group(str(source), mode="r")
+    np.testing.assert_array_equal(reopened["sentinel"][:], [1, 2, 3])
+
+
+@pytest.mark.parametrize(
+    ("source", "output"),
+    [
+        ("s3://bucket/source.zarr", "s3://bucket/source.zarr/nested.zarr"),
+        ("s3://bucket/container.zarr/source.zarr", "s3://bucket/container.zarr"),
+    ],
+)
+def test_repack_rejects_overlapping_uri_paths_before_open(
+    source,
+    output,
+    monkeypatch,
+):
+    import scarf.tools.repack_zarr as repack_module
+
+    monkeypatch.setattr(
+        repack_module,
+        "open_store",
+        lambda *_args, **_kwargs: pytest.fail(
+            "overlap must be rejected before opening either store"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        repack_store(source, output)

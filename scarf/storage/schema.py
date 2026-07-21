@@ -8,7 +8,7 @@ from .arrays import (
     create_zarr_obj_array,
 )
 from .layout import _group_zarr_format, count_array_spec
-from .profiles import get_storage_profile
+from .profiles import StorageProfile, get_storage_profile
 from .sharding import finalize_sharded_counts, write_counts_t
 
 PSEUDOTIME_AGGREGATION_SCHEMA_VERSION = 2
@@ -82,8 +82,14 @@ def finalize_counts(
     store: zarr.Group,
     assay_name: str,
     workspace: str | None = None,
+    profile: StorageProfile | None = None,
 ) -> zarr.Array:
-    counts = finalize_sharded_counts(store, assay_name, workspace)
+    counts = finalize_sharded_counts(
+        store,
+        assay_name,
+        workspace,
+        profile=profile,
+    )
     if workspace is None:
         group = as_zarr_group(store[assay_name], name=assay_name)
     else:
@@ -91,7 +97,7 @@ def finalize_counts(
             store[f"matrices/{assay_name}"],
             name=f"matrices/{assay_name}",
         )
-    write_counts_t(counts, group)
+    write_counts_t(counts, group, profile=profile)
     return counts
 
 

@@ -6,7 +6,7 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 import zarr
-from scipy.sparse import csr_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.assay import ATACassay
@@ -721,11 +721,15 @@ def test_get_imputed_creates_loads_and_reuses_operator() -> None:
     )
     store._get_latest_keys = Mock(return_value=("RNA", "I", "I"))
     store.get_cell_vals = Mock(return_value=values)
-    store._get_latest_graph_loc = Mock(return_value=graph_loc)
+    store.get_latest_graph_loc = Mock(return_value=graph_loc)
     store.load_graph = Mock(return_value=graph)
 
     with pytest.raises(ValueError, match="name for the feature"):
         store.get_imputed(feature_name=None)
+    store.get_cell_vals.assert_not_called()
+
+    operator = store.get_diffusion_operator(t=1)
+    assert isinstance(operator, coo_matrix)
     store.get_cell_vals.assert_not_called()
 
     first = store.get_imputed(feature_name="gene", t=1)
@@ -767,6 +771,32 @@ def test_get_imputed_creates_loads_and_reuses_operator() -> None:
     assert store.load_graph.call_count == 2
     assert store._cachedMagicOperator is None
     assert store._cachedMagicOperatorLoc is None
+
+
+def test_get_diffusion_operator_discards_stale_in_memory_cache() -> None:
+    store = _memory_graph_store()
+    graph_loc = _add_test_graph(store)
+    first_graph = csr_matrix(
+        np.array(
+            [
+                [0.0, 1.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+            ]
+        )
+    )
+    replacement_graph = csr_matrix(np.eye(3))
+    store._get_latest_keys = Mock(return_value=("RNA", "I", "I"))
+    store.get_latest_graph_loc = Mock(return_value=graph_loc)
+    store.load_graph = Mock(side_effect=[first_graph, replacement_graph])
+
+    first = store.get_diffusion_operator(t=1)
+    del store.zw[f"{graph_loc}/magic_1"]
+    replacement = store.get_diffusion_operator(t=1)
+
+    assert store.load_graph.call_count == 2
+    assert replacement is not first
+    np.testing.assert_allclose(replacement.toarray(), np.eye(3))
 
 
 def test_filter_cells_open_bounds_reset_and_boundaries(

@@ -27,6 +27,30 @@ def test_graph_progress_tracks_steps_and_propagates_errors() -> None:
     assert [record[1] for record in progress._records] == ["reuse graph", "build graph"]
 
 
+def test_get_latest_graph_loc_is_public_with_private_compatibility_alias():
+    root = _memory_group()
+    normed = root.create_group("RNA/normed__I__hvgs")
+    reduction = root.create_group("RNA/reduction")
+    ann = root.create_group("RNA/ann")
+    knn = root.create_group("RNA/knn")
+    graph = root.create_group("RNA/knn/graph")
+    normed.attrs["latest_reduction"] = reduction.path
+    reduction.attrs["latest_ann"] = ann.path
+    ann.attrs["latest_knn"] = knn.path
+    knn.attrs["latest_graph"] = graph.path
+
+    store = GraphDataStore.__new__(GraphDataStore)
+    store.z = root
+    store.workspace = None
+
+    assert store.get_latest_graph_loc("RNA", "I", "hvgs") == graph.path
+    assert store._get_latest_graph_loc("RNA", "I", "hvgs") == graph.path
+
+    del knn.attrs["latest_graph"]
+    with pytest.raises(KeyError):
+        store.get_latest_graph_loc("RNA", "I", "hvgs")
+
+
 def test_resolve_local_cache_plan(tmp_path):
     local_root = _memory_group()
     enabled, base, remove = GraphDataStore._resolve_local_cache_plan(

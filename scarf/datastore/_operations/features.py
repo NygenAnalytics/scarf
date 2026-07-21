@@ -589,6 +589,39 @@ def _load_enrichment_result(
 
 
 class _FeatureOperationsMixin(_FeatureOperationsBase):
+    def set_hvgs(
+        self,
+        *,
+        from_assay: str | None = None,
+        cell_key: str,
+        mask: np.ndarray | None = None,
+        feature_indexes: Sequence[int] | None = None,
+        hvg_key_name: str = "hvgs",
+        n_bins: int = 200,
+        lowess_frac: float = 0.1,
+        blacklist: str | None = None,
+        blacklist_exclusions: str | None = None,
+        blacklist_indexes: Sequence[int] | None = None,
+    ) -> str:
+        """Install a supplied HVG selection on an RNA assay."""
+        assay = self._get_assay(from_assay)
+        if not isinstance(assay, RNAassay):
+            raise TypeError(
+                "set_hvgs can only be applied to an RNAassay; "
+                f"received {type(assay).__name__}"
+            )
+        return assay.set_hvgs(
+            cell_key,
+            mask=mask,
+            feature_indexes=feature_indexes,
+            hvg_key_name=hvg_key_name,
+            n_bins=n_bins,
+            lowess_frac=lowess_frac,
+            blacklist=blacklist,
+            blacklist_exclusions=blacklist_exclusions,
+            blacklist_indexes=blacklist_indexes,
+        )
+
     def mark_hvgs(
         self,
         from_assay: str | None = None,

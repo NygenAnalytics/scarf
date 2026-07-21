@@ -141,8 +141,8 @@ Private implementation paths and other incidental module globals may change.
 - `scarf.feat_utils.binned_sampling` moved to `scarf.features.scoring.binned_sampling`.
 - `scarf.feat_utils.hto_demux` moved to `scarf.quality_control.hto.hto_demux`.
 - `scarf.doublet_utils` functions moved to `scarf.quality_control.doublets`.
-- `scarf.bio_data` cell-cycle references moved to
-  `scarf.quality_control.cell_cycle_genes`.
+- `scarf.bio_data` cell-cycle references moved to the public
+  `scarf.quality_control` package.
 - `scarf.meld_assay.GffReader` moved to
   `scarf.features.genomic.gff.GffReader`.
 - BED and interval helpers from `scarf.meld_assay` moved to

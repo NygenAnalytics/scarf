@@ -24,7 +24,7 @@ class TestToyDataStore:
         assert np.all(
             toy_crdir_ds.RNA.feats.fetch_all("ids") == ["g1", "g2", "g3", "g4"]
         )
-        assert np.all(toy_crdir_ds.ADT.feats.fetch_all("ids") == ["a1", "a2"])
+        assert np.all(toy_crdir_ds.ADT.feats.fetch_all("ids") == ["a1", "a2", "a3"])
         assert np.all(toy_crdir_ds.HTO.feats.fetch_all("ids") == ["h1"])
         assert np.all(toy_crdir_ds.cells.fetch_all("ids") == ["b1", "b2", "b3"])
 
@@ -34,7 +34,8 @@ class TestToyDataStore:
             == [[5, 0, 0, 2], [3, 3, 0, 7], [3, 3, 0, 7]]
         )
         assert np.all(
-            toy_crdir_ds.ADT.rawData.compute() == [[30, 40], [30, 50], [0, 50]]
+            toy_crdir_ds.ADT.rawData.compute()
+            == [[30, 40, 30], [30, 50, 20], [0, 50, 20]]
         )
         assert np.all(toy_crdir_ds.HTO.rawData.compute() == [[200], [100], [100]])
 

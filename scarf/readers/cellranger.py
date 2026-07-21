@@ -1,7 +1,7 @@
 import math
 import os
 from abc import ABC, abstractmethod
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from typing import Any
 
 import h5py
@@ -37,6 +37,8 @@ class CrReader(ABC):
             "ADT": "ADT",
             "HTO": "HTO",
         }
+        self._featureTypeOverrides: dict[int, str] = {}
+        self._schemaCaptured = False
         self.grpNames: dict[str, Any] = grp_names
         self.nFeatures: int = len(self.feature_names())
         self.nCells: int = len(self.cell_names())
@@ -84,31 +86,120 @@ class CrReader(ABC):
                 "ERROR: assay feats is 3D. Something went really wrong. Create a github issue"
             )
 
-    def _make_feat_table(self) -> pd.DataFrame:
-        s = self.feature_types()
-        span: list[tuple] = []
-        last = s[0]
-        last_n: int = 0
-        for n, i in enumerate(s[1:], 1):
-            if i != last:
-                span.append((last, last_n, n))
-                last_n = n
-            elif n == len(s) - 1:
-                span.append((last, last_n, n + 1))
-            last = i
+    @staticmethod
+    def _make_feat_table_from_types(feature_types: Sequence[str]) -> pd.DataFrame:
+        if not feature_types:
+            raise ValueError("Cannot build an assay table without features")
+        span: list[tuple[str, int, int]] = []
+        last = feature_types[0]
+        start = 0
+        for index, feature_type in enumerate(feature_types[1:], 1):
+            if feature_type != last:
+                span.append((last, start, index))
+                start = index
+            last = feature_type
+        span.append((last, start, len(feature_types)))
         df = pd.DataFrame(span, columns=["type", "start", "end"])
         df.index = ["ASSAY%s" % str(x + 1) for x in df.index]
         df["nFeatures"] = df.end - df.start
         return df.T
 
-    def _auto_rename_assay_names(self) -> None:
+    def _make_feat_table(self) -> pd.DataFrame:
+        return self._make_feat_table_from_types(self.feature_types())
+
+    def _auto_named_feat_table(self, assay_feats: pd.DataFrame) -> pd.DataFrame:
+        assay_feats = assay_feats.copy()
         new_names = []
-        for k, v in self.assayFeats.T["type"].to_dict().items():
-            if v in self.autoNames:
-                new_names.append(self.autoNames[v])
+        for key, value in assay_feats.T["type"].to_dict().items():
+            if value in self.autoNames:
+                new_names.append(self.autoNames[value])
             else:
-                new_names.append(k)
-        self.assayFeats.columns = new_names
+                new_names.append(key)
+        assay_feats.columns = new_names
+        return assay_feats
+
+    def _auto_rename_assay_names(self) -> None:
+        self.assayFeats = self._auto_named_feat_table(self.assayFeats)
+
+    def _mark_schema_captured(self) -> None:
+        self._schemaCaptured = True
+
+    def reclassify_features(
+        self,
+        indexes: Sequence[int],
+        feature_type: str,
+        *,
+        require_previous: str | None = "Antibody Capture",
+    ) -> None:
+        """Reclassify global feature rows before a writer captures the schema."""
+        if self._schemaCaptured:
+            raise RuntimeError(
+                "Features cannot be reclassified after a writer captures the schema"
+            )
+        if not isinstance(feature_type, str) or feature_type == "":
+            raise ValueError("feature_type must be a non-empty string")
+        if isinstance(indexes, str):
+            raise TypeError("indexes must be a sequence of integer feature indexes")
+        index_array = np.asarray(indexes)
+        if index_array.ndim != 1:
+            raise ValueError("indexes must be one-dimensional")
+        if index_array.size == 0:
+            raise ValueError("indexes must contain at least one feature index")
+        if not np.issubdtype(index_array.dtype, np.integer):
+            raise TypeError("indexes must contain only integers")
+        index_array = index_array.astype(np.int64, copy=False)
+        if np.unique(index_array).size != index_array.size:
+            raise ValueError("indexes must contain unique feature indexes")
+        if np.any(index_array < 0) or np.any(index_array >= self.nFeatures):
+            raise IndexError("indexes contains an out-of-range feature index")
+
+        conflicting = [
+            int(index)
+            for index in index_array
+            if index in self._featureTypeOverrides
+            and self._featureTypeOverrides[int(index)] != feature_type
+        ]
+        if conflicting:
+            raise ValueError(
+                "Features already have a conflicting reclassification: "
+                + ", ".join(map(str, conflicting))
+            )
+
+        current_types = self.feature_types()
+        pending = np.asarray(
+            [
+                index
+                for index in index_array
+                if current_types[int(index)] != feature_type
+            ],
+            dtype=np.int64,
+        )
+        if pending.size == 0:
+            return None
+        if require_previous is not None:
+            invalid = [
+                int(index)
+                for index in pending
+                if current_types[int(index)] != require_previous
+            ]
+            if invalid:
+                raise ValueError(
+                    f"Features must currently have type {require_previous!r}: "
+                    + ", ".join(map(str, invalid))
+                )
+
+        updated_types = list(current_types)
+        updated_overrides = dict(self._featureTypeOverrides)
+        for index in pending:
+            updated_types[int(index)] = feature_type
+            updated_overrides[int(index)] = feature_type
+        updated_table = self._auto_named_feat_table(
+            self._make_feat_table_from_types(updated_types)
+        )
+
+        self._featureTypeOverrides = updated_overrides
+        self.assayFeats = updated_table
+        return None
 
     def rename_assays(self, name_map: dict[str, str]) -> None:
         """Renames specified assays in the Reader.
@@ -148,9 +239,17 @@ class CrReader(ABC):
         if self.grpNames["feature_types"] is not None:
             ret_val = self._read_dataset("feature_types")
             if ret_val is not None:
-                return ret_val
-        default_name = list(self.autoNames.keys())[0]
-        return [default_name for _ in range(self.nFeatures)]
+                feature_types = list(ret_val)
+            else:
+                feature_types = []
+        else:
+            feature_types = []
+        if not feature_types:
+            default_name = list(self.autoNames.keys())[0]
+            feature_types = [default_name for _ in range(self.nFeatures)]
+        for index, feature_type in self._featureTypeOverrides.items():
+            feature_types[index] = feature_type
+        return feature_types
 
     def cell_names(self) -> list[str]:
         """Returns a list of names of the cells in the dataset."""

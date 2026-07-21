@@ -217,6 +217,8 @@ def repack_to_sharded(
 def write_counts_t(
     counts: zarr.Array,
     group: zarr.Group,
+    *,
+    profile: StorageProfile | None = None,
 ) -> zarr.Array | None:
     """Write feature-major ``countsT`` beside a finalized count matrix."""
     from ..utils.logging import logger
@@ -256,7 +258,7 @@ def write_counts_t(
             chunks=(feature_chunk, cell_chunk),
             dtype=counts.dtype,
             shards=None,
-            compressors=get_compressors(get_storage_profile()),
+            compressors=get_compressors(profile or get_storage_profile()),
             fillValue=0,
             overwrite=True,
         ),

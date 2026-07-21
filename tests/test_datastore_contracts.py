@@ -16,6 +16,8 @@ _METHODS = {
     GraphDataStore: (
         "__init__",
         "build_mapping_reference",
+        "get_diffusion_operator",
+        "get_latest_graph_loc",
         "get_imputed",
         "get_mapping_reference",
         "integrate_assays",
@@ -73,6 +75,7 @@ _METHODS = {
         "run_pseudotime_aggregation",
         "run_pseudotime_marker_search",
         "run_waggr",
+        "set_hvgs",
         "show_zarr_tree",
         "smart_label",
         "to_anndata",
@@ -81,9 +84,9 @@ _METHODS = {
 
 _SIGNATURE_DIGESTS = {
     BaseDataStore: "ed2e08a687942d2339c1ab09bf1eac3af20c290319cf527b8662fb937a401cd2",
-    GraphDataStore: "0f6098aa5ab1e926da212aa882dc90ab07fc632a302a45eb79ce353b5e228d59",
+    GraphDataStore: "21e3d138c50917e6e62d9ba965e19f6c0aae0fa1bca4db357b61302c3d67a40d",
     MappingDatastore: "a1e2fe91d8430b54a2a67f42c537a8a5e189691f81e2fddc8a959e1fd87fb3a9",
-    DataStore: "5bb9c3410c65c4a99885df4ed9843cd9003c672304e597bc392227aa39ecb47e",
+    DataStore: "a28b6252b2c709912a83e93807882e526c28ef8186c8a60412ed51adfa769191",
 }
 
 
