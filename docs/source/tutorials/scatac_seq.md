@@ -33,7 +33,6 @@ clustering accessible chromatin profiles. See {doc}`scrna_seq` for the RNA workf
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 scarf.__version__
@@ -155,8 +154,7 @@ ds.cells.head()
 We can visualize the UMAP embedding and the clusters of cells on the embedding
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='ATAC_UMAP',
     color_by='ATAC_leiden_cluster',
 )
@@ -166,8 +164,7 @@ Coloring by an ATAC peak uses the assay's native TF-IDF normalization:
 
 ```{code-cell} ipython3
 peak = str(ds.ATAC.feats.fetch_all('ids')[0])
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='ATAC_UMAP',
     from_assay='ATAC',
     color_by=peak,
@@ -228,6 +225,12 @@ ds.add_melded_assay(
 )
 ```
 
+```{note}
+It is expected that some annotation features do not overlap any peak. They
+remain in `GeneScores` but are marked invalid, while overlapping genes retain
+their calculated scores.
+```
+
 ---
 
 We can now print out the DataStore and see that the 'GeneScores' assay has indeed been added. The 'add_melded_assay' also printed a useful bit of information that almost half of features(genes bodies) did not overlap with even a single peak. The melded assay anyway contains all the genes but sets these 'empty' genes as invalid.
@@ -239,8 +242,7 @@ ds
 Let's now visualize some 'GeneScores' for some of the known marker genes for PBMCs on the UMAP plot calculated on the ATAC assay
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='ATAC_UMAP',
     from_assay='GeneScores',
     color_by=['CD3D', 'MS4A1', 'LEF1', 'NKG7', 'TREM1', 'LYZ'],

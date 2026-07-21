@@ -116,6 +116,17 @@ def test_datastore_property_contracts_are_stable():
         assert inspect.getattr_static(DataStore, name) is descriptor
 
 
+def test_datastore_plot_namespace_contract_is_stable():
+    descriptor = inspect.getattr_static(DataStore, "plots")
+
+    assert isinstance(descriptor, property)
+    assert descriptor.fget is not None
+    assert list(inspect.signature(descriptor.fget).parameters) == ["self"]
+    assert "plots" in DataStore.__dict__
+    for cls in (BaseDataStore, GraphDataStore, MappingDatastore):
+        assert not hasattr(cls, "plots")
+
+
 def test_datastore_static_method_contracts_are_stable():
     static_methods = {
         GraphDataStore: (

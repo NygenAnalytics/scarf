@@ -12,6 +12,17 @@ from .profiles import get_storage_profile
 from .sharding import finalize_sharded_counts, write_counts_t
 
 PSEUDOTIME_AGGREGATION_SCHEMA_VERSION = 2
+RESERVED_ASSAY_NAMES = frozenset({"plots"})
+
+
+def validate_assay_name(assay_name: str) -> None:
+    """Reject assay names reserved by the datastore API."""
+    if assay_name in RESERVED_ASSAY_NAMES:
+        raise ValueError(
+            f"Assay name {assay_name!r} is reserved for DataStore.plots. "
+            "Choose another name, or rename the assay in the Zarr store before "
+            "opening it with Scarf."
+        )
 
 
 def create_zarr_count_assay(
@@ -28,6 +39,7 @@ def create_zarr_count_assay(
     minFeatureChunk: int | None = None,
     maxFeatureChunk: int | None = None,
 ) -> zarr.Array:
+    validate_assay_name(assay_name)
     if workspace is None:
         group = z.create_group(assay_name, overwrite=True)
     else:

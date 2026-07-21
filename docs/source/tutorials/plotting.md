@@ -1,5 +1,5 @@
 ---
-description: Publication-oriented figures with scarf.plotting (embedding, dotplot, composition, export).
+description: Publication-oriented figures through the DataStore plotting namespace.
 jupytext:
   text_representation:
     extension: .md
@@ -16,7 +16,9 @@ kernelspec:
 
 # Plotting
 
-`scarf.plotting` provides the plotting API for Scarf analysis. Import the module as `splt`.
+Use `ds.plots` for plots backed by a `DataStore`. The same store-first functions
+remain available from `scarf.plotting`, which also provides reusable contracts
+such as color and normalization scales.
 
 ## Prerequisites
 
@@ -56,12 +58,12 @@ ds = scarf.DataStore(
 
 ### 1. Plot embeddings
 
-`splt.embedding` colors cells on a layout such as UMAP. Pass a metadata column
+`ds.plots.embedding` colors cells on a layout such as UMAP. Pass a metadata column
 or a gene name in `color_by`. Plot functions render in the current notebook
 cell by default.
 
 ```{code-cell} ipython3
-splt.embedding(ds, layout_key="RNA_UMAP", color_by="clusters");
+ds.plots.embedding(layout_key="RNA_UMAP", color_by="clusters");
 ```
 
 Several genes become a row of panels. `NormalizationSpec(transform="log1p")`
@@ -69,8 +71,7 @@ compresses the expression scale. `sort_values=True` draws high-expressing cells
 last so they sit on top of the cloud.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by=["Gcg", "Ins2", "Sst"],
     normalization=splt.NormalizationSpec(transform="log1p"),
@@ -82,8 +83,7 @@ Outliers can wash out a gene UMAP. `ColorScale(quantiles=(0.0, 0.99))` sets the
 color limit from the 99th percentile instead of the absolute maximum.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by="Gcg",
     normalization=splt.NormalizationSpec(transform="log1p"),
@@ -92,13 +92,12 @@ splt.embedding(
 );
 ```
 
-For large datasets, `embedding_raster` builds a pixel image from continuous
+For large datasets, `ds.plots.embedding_raster` builds a pixel image from continuous
 cell metadata without loading full columns into memory. Empty pixels are white
-by default. It does not color by gene; use `embedding` for that.
+by default. It does not color by gene; use `ds.plots.embedding` for that.
 
 ```{code-cell} ipython3
-splt.embedding_raster(
-    ds,
+ds.plots.embedding_raster(
     layout_key="RNA_UMAP",
     color_by="RNA_nCounts",
     pixels=400,
@@ -124,8 +123,7 @@ default is a poor fit for your number of clusters or for the venue.
 Force a placement when you know what you want.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by="clusters",
     legend_loc="on_data",
@@ -140,8 +138,7 @@ uses smaller fonts suited to multi-panel figures; `theme="dark"` is for dark
 notebook themes.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by="clusters",
     legend_loc="on_data",
@@ -174,8 +171,7 @@ ds.cells.insert(
     overwrite=True,
 )
 
-splt.dotplot(
-    ds,
+ds.plots.dotplot(
     features={"endocrine": ["Gcg", "Ins2", "Sst"]},
     group_by="clusters",
     sample_by="demo_sample",
@@ -186,8 +182,7 @@ A matrixplot is a plain heatmap of mean or fraction. Gene and group order are
 left as you pass them; nothing is reclustered.
 
 ```{code-cell} ipython3
-splt.matrixplot(
-    ds,
+ds.plots.matrixplot(
     features=["Gcg", "Ins2", "Sst"],
     group_by="clusters",
     value="mean",
@@ -214,8 +209,7 @@ ds.cells.insert(
     overwrite=True,
 )
 
-splt.composition(
-    ds,
+ds.plots.composition(
     category_by="clusters",
     study_design=splt.StudyDesign(
         sample_by="demo_sample",
@@ -239,8 +233,7 @@ a y-axis scale and wrap into a grid.
 
 ```{code-cell} ipython3
 cluster_ids = sorted(set(ds.cells.fetch("clusters")), key=str)[:6]
-splt.distribution(
-    ds,
+ds.plots.distribution(
     keys=["RNA_nCounts", "RNA_nFeatures"],
     group_by="clusters",
     groups=cluster_ids,
@@ -266,8 +259,7 @@ from pathlib import Path
 
 out = Path("scarf_datasets") / "plotting_showcase_embedding.png"
 out.parent.mkdir(parents=True, exist_ok=True)
-result = splt.embedding(
-    ds,
+result = ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by="clusters",
     show=False,
@@ -279,7 +271,7 @@ result.close()
 
 ```{note}
 For unified reference and query layouts from mapping, use
-`splt.unified_embedding` (see {doc}`mapping_and_label_transfer`).
+`ds.plots.unified_embedding` (see {doc}`mapping_and_label_transfer`).
 ```
 
 ## Common mistakes

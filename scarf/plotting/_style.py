@@ -3,7 +3,9 @@
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any, Literal
+from typing import Any
+
+from ._contracts import FrameStyle, LegendLoc
 
 # Shared Scarf figure defaults used by embedding-like plots.
 DEFAULT_POINT_SIZE = 10.0
@@ -13,9 +15,6 @@ DEFAULT_PANEL_INCHES = 3.2
 MAX_FIGURE_WIDTH_INCHES = 7.5
 LEGEND_SIDE_MAX_CATEGORIES = 12
 LEGEND_ON_DATA_MAX_CATEGORIES = 40
-
-LegendLoc = Literal["auto", "right", "on_data", "none"]
-FrameStyle = Literal["axes", "minimal", "none"]
 
 # Lifted from scanpy.plotting.palettes.
 CUSTOM_PALETTES: dict[int, list[str]] = {

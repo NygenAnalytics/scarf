@@ -1,4 +1,4 @@
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from ..storage.types import ZarrMode
 from ..assay import Assay
@@ -8,6 +8,9 @@ from ._operations.presentation import _PresentationOperationsMixin
 from ._operations.quality_control import _QualityControlOperationsMixin
 from ._operations.trajectory import _TrajectoryFeatureOperationsMixin
 from .mapping_datastore import MappingDatastore
+
+if TYPE_CHECKING:
+    from .plot_accessor import DataStorePlotAccessor
 
 __all__ = ["DataStore"]
 
@@ -24,7 +27,8 @@ class DataStore(
 
     DataStore is the primary interface for filtering cells, selecting features,
     building graphs, mapping datasets, finding markers, aggregating cells, and
-    exporting data. Plotting is provided separately through `scarf.plotting`.
+    exporting data. Store-backed plots are available through `DataStore.plots`;
+    the same functions remain available through `scarf.plotting`.
 
     Args:
         zarr_loc: Path to Zarr file created using one of writer functions of Scarf.
@@ -101,6 +105,13 @@ class DataStore(
             synchronizer=synchronizer,
             storage_options=storage_options,
         )
+
+    @property
+    def plots(self) -> "DataStorePlotAccessor":
+        """Return store-bound equivalents of store-first plotting functions."""
+        from .plot_accessor import DataStorePlotAccessor
+
+        return DataStorePlotAccessor(self)
 
     def get_assay(self, assay_name: str) -> Assay:
         """Returns the assay object for the given assay name.

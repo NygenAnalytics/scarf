@@ -32,7 +32,6 @@ This chapter processes each assay, then combines their cell graphs with SNN or W
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 scarf.__version__
@@ -118,8 +117,7 @@ ds.run_leiden_clustering(resolution=1)
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
 )
@@ -201,8 +199,7 @@ ds.cells.head()
 Visualizing the UMAP and clustering calculated using `ADT` only:
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='ADT_UMAP',
     color_by='ADT_leiden_cluster',
 )
@@ -212,13 +209,12 @@ splt.embedding(
 
 It is generally of interest to see how different modalities corroborate each other.
 
-`splt.embedding` can compare several layouts in one figure and uses the selected
+`ds.plots.embedding` can compare several layouts in one figure and uses the selected
 assay's native normalization for feature values.
 
 ```{code-cell} ipython3
 # UMAP on RNA and coloured with clusters calculated on ADT
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key=['RNA_UMAP', 'ADT_UMAP'],
     color_by=['ADT_leiden_cluster', 'RNA_leiden_cluster'],
     n_columns=2,
@@ -248,8 +244,7 @@ There are possibly many interesting strategies to analyze this further. One simp
 Individual ADT expression can be visualized in both UMAPs easily.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key=['RNA_UMAP', 'ADT_UMAP'],
     color_by='CD16_TotalSeqB',
     from_assay='ADT',
@@ -261,8 +256,7 @@ splt.embedding(
 We can also query gene expression and visualize it on both RNA and ADT UMAPs. Here we query gene FCGR3A which codes for CD16:
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key=['RNA_UMAP', 'ADT_UMAP'],
     color_by='FCGR3A',
     from_assay='RNA',
@@ -305,8 +299,7 @@ ds.run_leiden_clustering(
 Lets visualize the UMAPs created using the integrated manifolds from the two modalities. Here we label the cells based on their modality specific cluster identity as well as integrated manifold cluster identity
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA+ADT_UMAP',
     color_by=[
         'RNA_leiden_cluster',
@@ -353,14 +346,12 @@ ds.run_leiden_clustering(
 Compare each integration method on its matching layout and cluster labels:
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA+ADT_UMAP',
     color_by='RNA+ADT_leiden_cluster',
     legend_loc='on_data',
 )
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA+ADT_wnn_UMAP',
     color_by='RNA+ADT_wnn_leiden_cluster',
     legend_loc='on_data',

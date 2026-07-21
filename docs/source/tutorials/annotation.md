@@ -38,7 +38,6 @@ Use the same 5K PBMC Zarr store. Rebuild a short analysis path so this page runs
 ```{code-cell} ipython3
 import numpy as np
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
@@ -83,8 +82,7 @@ markers.head(10)
 ```
 
 ```{code-cell} ipython3
-splt.marker_heatmap(
-    ds,
+ds.plots.marker_heatmap(
     group_key='RNA_leiden_cluster',
     topn=5,
     figsize=(5, 9),
@@ -96,8 +94,7 @@ splt.marker_heatmap(
 Visually confirm panel genes before assigning labels.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='CD14',
     sort_values=True,
@@ -105,8 +102,7 @@ splt.embedding(
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='MS4A1',
     sort_values=True,
@@ -114,8 +110,7 @@ splt.embedding(
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='CD3D',
     sort_values=True,
@@ -152,8 +147,7 @@ for gene, name in [('CD14', 'Monocytes'), ('MS4A1', 'B cells'), ('CD3D', 'T cell
 
 labels = np.array([label_map[str(c)] for c in cluster_ids], dtype=object)
 ds.cells.insert(column_name='cell_type', values=labels, overwrite=True)
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='cell_type',
 )
@@ -201,8 +195,7 @@ ds.run_leiden_clustering(
     label='leiden_cluster',
 )
 # With cell_key != 'I', columns are RNA_<cell_key>_<label>
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_focus_cells_UMAP',
     color_by='RNA_focus_cells_leiden_cluster',
     cell_key='focus_cells',

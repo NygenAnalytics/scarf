@@ -37,16 +37,14 @@ feature selection. Cell-level columns are shared across assays.
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 scarf.__version__
 ```
 
-This page uses the multimodal CITE-seq store also used in {doc}`cite_seq`. Fresh catalog
-downloads need a short RNA graph and clustering pass so the examples below have columns to
-inspect. If you already ran the CITE-seq chapter in the same working directory, that work is
-reused.
+This page uses the multimodal CITE-seq store also used in {doc}`cite_seq`. It
+runs a short RNA graph and clustering pass so every execution starts from the
+downloaded fixture and creates the columns inspected below.
 
 ```{code-cell} ipython3
 scarf.fetch_dataset(
@@ -61,24 +59,17 @@ ds = scarf.DataStore(
     nthreads=4,
 )
 
-if 'RNA_leiden_cluster' not in ds.cells.columns:
-    ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-    ds.make_graph(feat_key='hvgs', k=11, dims=15)
-    ds.run_leiden_clustering(resolution=0.5)
-if 'RNA_UMAP1' not in ds.cells.columns:
-    ds.run_umap(n_epochs=100, parallel=True)
-
-marker_slot = 'I__RNA_leiden_cluster'
-rna_markers = ds.z['RNA']['markers'] if 'markers' in ds.z['RNA'] else None
-if rna_markers is None or marker_slot not in rna_markers:
-    ds.run_marker_search(group_key='RNA_leiden_cluster', gene_batch_size=100)
+ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
+ds.make_graph(feat_key='hvgs', k=11, dims=15)
+ds.run_leiden_clustering(resolution=0.5)
+ds.run_umap(n_epochs=100, parallel=False, random_seed=4444)
+ds.run_marker_search(group_key='RNA_leiden_cluster', gene_batch_size=100)
 
 ds
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
 )
@@ -218,7 +209,14 @@ ds.RNA.normMethod = scarf.assay.norm_dummy
 PCA and ANN artefacts are kept so Scarf can skip recomputation when parameters match.
 
 ```{code-cell} ipython3
-ds.show_zarr_tree(start='RNA/normed__I__hvgs')
+import warnings
+
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        'ignore',
+        message='Object at ann_idx is not recognized as a component of a Zarr hierarchy.',
+    )
+    ds.show_zarr_tree(start='RNA/normed__I__hvgs')
 ```
 
 `load_graph` returns the latest graph for the given assay, cell key, and feature key as a
@@ -254,8 +252,7 @@ ds.get_markers(
 ```
 
 ```{code-cell} ipython3
-splt.marker_heatmap(
-    ds,
+ds.plots.marker_heatmap(
     group_key='RNA_leiden_cluster',
     topn=3,
     figsize=(5, 7),
@@ -265,7 +262,7 @@ splt.marker_heatmap(
 ```{code-cell} ipython3
 ds.export_markers_to_csv(
     group_key='RNA_leiden_cluster',
-    csv_filename='test.csv',
+    csv_filename='scarf_datasets/data_organization_markers.csv',
     min_score=0.2,
     min_frac_exp=0.1,
 )

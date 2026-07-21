@@ -12,6 +12,9 @@ CellFieldKind = Literal["auto", "categorical", "continuous"]
 NormSource = Literal["assay", "raw"]
 NormTransform = Literal["none", "log1p"]
 Standardize = Literal["none", "feature"]
+LegendLoc = Literal["auto", "right", "on_data", "none"]
+FrameStyle = Literal["axes", "minimal", "none"]
+DistKind = Literal["violin", "box", "hist", "ecdf"]
 
 
 @dataclass(frozen=True, slots=True)

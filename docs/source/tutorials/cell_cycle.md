@@ -63,8 +63,7 @@ ds = scarf.DataStore(
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='clusters',
 )
@@ -97,8 +96,7 @@ By default the cell cycle phase information in stored under cell attribute table
 We can color the UMAP plot based on these values.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cell_cycle_phase',
 )
@@ -113,8 +111,7 @@ color_key = {
     'G2M': 'green',
 }
 
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cell_cycle_phase',
     categorical_scale=splt.CategoricalScale(palette=color_key),
@@ -127,8 +124,7 @@ splt.embedding(
 The individual and S and G2M scores for each cell are stored under columns `RNA_S_score` and `RNA_G2M_score`. We can visualize the distribution of these scores on the UMAP plots
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=['RNA_S_score', 'RNA_G2M_score'],
 )
@@ -140,8 +136,7 @@ splt.embedding(
 The dataset we downloaded, already had cell cycle scores calculated using Scanpy. For example, the S phase scores are stored under the column `S_score`. We can plot these scores on the UMAP.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='S_score',
 )

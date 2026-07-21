@@ -39,7 +39,6 @@ This page uses the 5K PBMC dataset from {doc}`scrna_seq`. The setup below is sta
 from pathlib import Path
 
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
@@ -167,8 +166,7 @@ ds.cells.insert(
     key=myeloid.cell_key,
     overwrite=True,
 )
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='Myeloid_AUCell',
     sort_values=True,

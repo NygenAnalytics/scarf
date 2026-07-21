@@ -434,8 +434,7 @@ class TestDataStore:
         result.close()
 
     def test_plot_embedding(self, umap, paris_clustering, datastore):
-        result = splt.embedding(
-            datastore,
+        result = datastore.plots.embedding(
             layout_key="RNA_UMAP",
             color_by="RNA_cluster",
             show=False,

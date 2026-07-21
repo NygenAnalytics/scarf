@@ -34,7 +34,6 @@ graph-based tSNE, Paris hierarchical clustering, and cluster trees.
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
@@ -77,7 +76,7 @@ ds.run_umap(
     use_density_map=True,
     label='densMAP',
 )
-splt.embedding(ds, layout_key='RNA_densMAP')
+ds.plots.embedding(layout_key='RNA_densMAP')
 ```
 
 ### 2. Run tSNE
@@ -93,16 +92,15 @@ ds.run_tsne(
     box_h=1,
     early_iter=250,
     max_iter=500,
-    parallel=True,
 )
-splt.embedding(ds, layout_key='RNA_tSNE')
+ds.plots.embedding(layout_key='RNA_tSNE')
 ```
 
 ### 3. Run Paris clustering and inspect the tree
 
 Paris builds a hierarchical dendrogram that can be cut to a chosen number of clusters.
 `run_clustering` is the Paris entrypoint. Cluster relationships can be drawn with
-`splt.cluster_tree`.
+`ds.plots.cluster_tree`.
 
 ```{code-cell} ipython3
 n_clusters = int(
@@ -111,15 +109,14 @@ n_clusters = int(
     )['RNA_leiden_cluster'].nunique()
 )
 ds.run_clustering(n_clusters=n_clusters)
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cluster',
 )
 ```
 
 ```{code-cell} ipython3
-splt.cluster_tree(ds, cluster_key='RNA_cluster', width=1)
+ds.plots.cluster_tree(cluster_key='RNA_cluster', width=1)
 ```
 
 ## Common mistakes

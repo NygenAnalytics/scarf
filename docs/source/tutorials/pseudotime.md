@@ -51,8 +51,7 @@ ds
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=['RNA_cluster', 'clusters'],
     legend_loc='on_data',
@@ -75,8 +74,7 @@ pseudotime = ds.run_pseudotime_scoring(
 By default, the calculated values are saved under **'RNA_pseudotime'**, where 'RNA' is replaced by the assay name. A companion boolean column **'RNA_pseudotime__valid'** is also written. The returned result exposes both names as `pseudotime_key` and `validity_key`. When the selected graph is fully connected, every cell is valid. If the graph has multiple components, only the largest one is scored by default. The remaining cells hold `NaN`, and downstream steps should use the validity column as `cell_key`. The UMAP below shows progression from 0 to 1.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=pseudotime.pseudotime_key,
 )
@@ -120,8 +118,7 @@ corr_genes_df.sort_values('r_value')[:15]
 Let's visualize the expression of some of these genes on the UMAP plot
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=['Spp1', 'Dbi', 'Sparc'],
     sort_values=True,
@@ -135,8 +132,7 @@ corr_genes_df.sort_values('r_value', ascending=False)[:10]
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=['Aplp1', 'Gnas', 'Cpe'],
     sort_values=True,
@@ -175,15 +171,14 @@ modules.data.shape
 modules.feature_clusters
 ```
 
-`splt.pseudotime_heatmap` visualizes the binned matrix along with the feature clusters
+`ds.plots.pseudotime_heatmap` visualizes the binned matrix along with the feature clusters.
 
 ```{code-cell} ipython3
 # Highlighting some marker genes
 genes_to_label = ['S100b', 'Nrarp', 'Atoh8', 'Grin2c', 'Slc35d3',
                   'Sst', 'Mnx1', 'Ins2', 'Gm11837', 'Irx1']
 
-splt.pseudotime_heatmap(
-    ds,
+ds.plots.pseudotime_heatmap(
     cell_key=modules.cell_key,
     feat_key=modules.feature_key,
     feature_cluster_key=modules.cluster_key,
@@ -197,8 +192,7 @@ The heatmap above shows the gene expression dynamics as the cells progress throu
 We can visualize the expression of the above selected genes on UMAP to check whether their cluster identity corroborates their expression pattern.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=genes_to_label,
     n_columns=5,
@@ -235,8 +229,7 @@ We can visualize these cluster mean values directly on the UMAP like this:
 
 ```{code-cell} ipython3
 n_clusters = 15
-splt.embedding(
-    ds,
+ds.plots.embedding(
     from_assay='PTIME_MODULES',
     layout_key='RNA_UMAP',
     color_by=[f"group_{i}" for i in range(1, n_clusters + 1)],
@@ -318,8 +311,7 @@ ds.cells.insert(
     overwrite=True,
 )
 
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='Cell cluster based markers',
     color_scale=splt.ColorScale(cmap='coolwarm'),
@@ -338,8 +330,7 @@ ds.cells.insert(
     overwrite=True,
 )
 
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='Pseudotime based markers',
     color_scale=splt.ColorScale(cmap='coolwarm'),

@@ -2,6 +2,9 @@
 
 `scarf.plotting` is Scarf's plotting API. Import it as `splt` and call functions such as
 `splt.embedding(...)`, `splt.dotplot(...)`, and `splt.cluster_tree(...)`.
+For functions whose first argument is a datastore, `ds.plots.embedding(...)`
+and related accessor methods provide the same behavior with that argument
+already bound. Array and DataFrame diagnostics remain standalone.
 
 Plot functions return a `PlotResult` and render by default with `show=True`. Pass
 `show=False` before accessing, saving, or reusing an owned figure.

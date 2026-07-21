@@ -10,6 +10,17 @@ are extending Scarf.
     :inherited-members:
 ```
 
+## Store-bound plotting
+
+`DataStore.plots` binds the datastore argument for canonical store-first
+functions in `scarf.plotting`. Array and DataFrame diagnostics such as
+`elbow`, `qc`, `graph_qc`, and `highly_variable_features` remain standalone.
+
+```{eval-rst}
+.. autoclass:: scarf.datastore.plot_accessor.DataStorePlotAccessor
+    :members:
+```
+
 ## Analysis results
 
 ```{eval-rst}

@@ -301,6 +301,59 @@ def test_plotting_does_not_import_datastore():
     assert _upward_imports("plotting", {"datastore"}) == set()
 
 
+def test_datastore_plot_namespace_defers_plotting_imports():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+
+from scarf.datastore.datastore import DataStore
+
+optional = ("matplotlib", "seaborn", "datashader")
+assert not any(
+    name == prefix or name.startswith(f"{prefix}.")
+    for name in sys.modules
+    for prefix in ("scarf.plotting", *optional)
+)
+
+store = object.__new__(DataStore)
+accessor = store.plots
+
+assert type(accessor).__module__ == "scarf.datastore.plot_accessor"
+concrete_modules = {
+    "scarf.plotting.composition",
+    "scarf.plotting.diagnostics",
+    "scarf.plotting.distribution",
+    "scarf.plotting.embedding",
+    "scarf.plotting.embedding_raster",
+    "scarf.plotting.heatmaps",
+    "scarf.plotting.summary",
+    "scarf.plotting.unified",
+}
+assert concrete_modules.isdisjoint(sys.modules)
+assert not any(
+    name == prefix or name.startswith(f"{prefix}.")
+    for name in sys.modules
+    for prefix in optional
+)
+
+import scarf.plotting as plotting
+
+_ = plotting.embedding
+assert "scarf.plotting.embedding" in sys.modules
+assert not any(
+    name == prefix or name.startswith(f"{prefix}.")
+    for name in sys.modules
+    for prefix in optional
+)
+""",
+        ],
+        check=True,
+    )
+
+
 def test_unified_plotting_uses_datastore_layout_adapter():
     path = _SCARF_ROOT / "plotting" / "unified.py"
     source = path.read_text()

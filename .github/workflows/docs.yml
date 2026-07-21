@@ -40,6 +40,10 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install documentation dependencies
-        run: uv sync --extra docs --extra extra
+        run: uv sync --extra docs --extra test --extra extra
+      - name: Documentation cache tests
+        run: uv run pytest -n 0 tests/test_docs_cache.py
+      - name: Validate committed notebook cache
+        run: uv run python docs/execute_all_vignettes.py --validate
       - name: Sphinx HTML build (nitpicky, warnings as errors)
         run: uv run sphinx-build -b html -n -W docs/source docs/build/html

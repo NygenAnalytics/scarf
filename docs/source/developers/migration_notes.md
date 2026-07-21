@@ -6,17 +6,17 @@ Notes for developers updating older Scarf workflows or documentation. See
 
 ## Plotting
 
-The plotting API is a clean break from earlier releases. Older plotting entry points have
-been removed, so existing plotting calls must be rewritten. Import `scarf.plotting` as `splt`
-and call its functions directly:
-
-`scarf.plots` and the `DataStore.plot_*` plotting methods no longer exist. Use
-`splt.embedding`, `splt.distribution`, `splt.marker_heatmap`, `splt.cluster_tree`,
-`splt.pseudotime_heatmap`, and `splt.unified_embedding` instead.
+The plotting API is a clean break from earlier releases. The old `scarf.plots`
+module and flat `DataStore.plot_*` methods no longer exist. Store-backed plots
+are available through `ds.plots`, while the same canonical functions remain
+available from `scarf.plotting`.
 
 ```python
 import scarf.plotting as splt
 
+ds.plots.embedding(layout_key="RNA_UMAP", color_by="clusters")
+
+# Equivalent standalone call
 splt.embedding(ds, layout_key="RNA_UMAP", color_by="clusters")
 ```
 

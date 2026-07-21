@@ -6,6 +6,7 @@ from typing import Any, cast
 from ..storage.types import ZarrMode, as_zarr_group
 from ..assay import RNAassay, ATACassay, ADTassay, Assay
 from ..metadata import MetaData
+from ..storage.schema import validate_assay_name
 from ..storage.stores import ZARRLOC, load_zarr
 from ..utils.compute import controlled_compute, show_dask_progress
 from ..utils.logging import logger
@@ -103,6 +104,7 @@ class BaseDataStore:
         )
         self.workspace = workspace
         self.nthreads = nthreads
+        _ = self.assay_names
         # The order is critical here:
         self.cells = self._load_cells()
         self._defaultAssay = self._load_default_assay(default_assay)
@@ -149,6 +151,7 @@ class BaseDataStore:
         assays = []
         for i in self.zw.group_keys():
             if "is_assay" in self.zw[i].attrs.keys():
+                validate_assay_name(i)
                 sanitize_hierarchy(self.z, i, self.workspace)
                 assays.append(i)
         return assays

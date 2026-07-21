@@ -26,7 +26,6 @@ import numpy as np
 import pandas as pd
 
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 scarf.__version__
@@ -61,8 +60,7 @@ ds = scarf.DataStore(
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=['clusters', 'RNA_cluster'],
     legend_loc='on_data',
@@ -114,8 +112,7 @@ pseudotime = ds.run_pseudotime_scoring(
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=pseudotime.pseudotime_key,
     subset_by=pseudotime.validity_key,
@@ -149,8 +146,7 @@ pd.Series(
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=list(fate.fate_keys),
     subset_by=fate.validity_key,

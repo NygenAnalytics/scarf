@@ -40,7 +40,6 @@ to `make_bulk`.
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
@@ -68,8 +67,7 @@ The catalog Kang store already includes a UMAP. Leiden groups used for `make_bul
 differ from the published `cluster_labels` column.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
 )
@@ -91,8 +89,7 @@ markers.head()
 ```
 
 ```{code-cell} ipython3
-splt.marker_heatmap(
-    ds,
+ds.plots.marker_heatmap(
     group_key='RNA_leiden_cluster',
     topn=3,
     figsize=(5, 7),

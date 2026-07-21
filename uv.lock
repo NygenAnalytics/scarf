@@ -3084,6 +3084,7 @@ dependencies = [
 docs = [
     { name = "jedi" },
     { name = "jinja2" },
+    { name = "jupyter-cache" },
     { name = "myst-nb" },
     { name = "myst-parser" },
     { name = "nbclient" },
@@ -3136,6 +3137,7 @@ requires-dist = [
     { name = "ipywidgets", marker = "extra == 'extra'", specifier = ">=8" },
     { name = "jedi", marker = "extra == 'docs'" },
     { name = "jinja2", marker = "extra == 'docs'" },
+    { name = "jupyter-cache", marker = "extra == 'docs'", specifier = ">=1.0.1" },
     { name = "kneed", marker = "extra == 'extra'", specifier = ">=0.8" },
     { name = "leidenalg", specifier = ">=0.12" },
     { name = "loguru", specifier = ">=0.7" },

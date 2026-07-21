@@ -29,26 +29,35 @@ without re-running notebooks on every build.
 After editing a tutorial or quickstart page:
 
     uv sync --extra docs --extra extra
-    cd docs && make execute-docs
+    cd docs && make execute-page PAGE=scrna_seq
 
-This runs all executable pages (default `-j 1`), updates `docs/.jupyter_cache/`, and prunes stale
-cache entries for deleted or moved source files. Commit both the edited `.md` files and `docs/.jupyter_cache/`.
+The page runs in an isolated cache. The runner preserves matching outputs for all other current
+sources, validates a complete candidate, and then publishes it through a recoverable
+backup-and-rename sequence. If execution, import, validation, or publication fails, the committed
+cache remains unchanged.
+
+Use `make execute-docs` to force every executable page. The default is one worker because each
+page can use several GB of memory. A failed run retains successful staged pages. Resume it
+explicitly with `make resume-docs`; staged outputs are reused only while their source hash and
+execution fingerprint still match.
+
+Commit both the edited `.md` files and `docs/.jupyter_cache/`.
 
 ### Other doc commands
 
-Run one page only:
+Validate the committed cache without changing it:
 
-    cd docs && make execute-page PAGE=scrna_seq
+    cd docs && make validate-cache
 
-Build HTML locally without re-executing notebooks:
+Build HTML locally after cache validation:
 
     cd docs && make html
 
-Remove orphaned cache entries only:
+Rebuild the cache from outputs that still match current sources:
 
     cd docs && make prune-stale-cache
 
-Full sequential re-execution via Sphinx (slower fallback):
+Force every page and run a strict Sphinx build:
 
     cd docs && make execute-notebooks-all
 
@@ -56,7 +65,7 @@ Full sequential re-execution via Sphinx (slower fallback):
 
 1. Add `docs/source/tutorials/your_tutorial.md` with MyST `{code-cell}` blocks (or convert from Jupyter with [Jupytext]).
 2. Register it in `docs/source/toctree.yml`.
-3. Run `cd docs && make execute-page PAGE=your_tutorial` (or `make execute-docs`).
+3. Run `cd docs && make execute-page PAGE=your_tutorial`.
 4. Commit the `.md` file and `docs/.jupyter_cache/`.
 
 Suggested chapter outline:

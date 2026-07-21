@@ -49,10 +49,7 @@ can show relationships between clusters. Both methods have low computational req
 you can run both and view the Paris hierarchy with Leiden labels:
 
 ```python
-import scarf.plotting as splt
-
-splt.cluster_tree(
-    ds,
+ds.plots.cluster_tree(
     cluster_key="RNA_cluster",
     fill_by_value="RNA_leiden_cluster",
 )

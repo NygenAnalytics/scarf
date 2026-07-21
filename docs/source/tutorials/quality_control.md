@@ -36,7 +36,6 @@ page when you need more control.
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
@@ -65,8 +64,7 @@ qc_cols = [
     )
     if c in ds.cells.columns
 ]
-splt.distribution(
-    ds,
+ds.plots.distribution(
     keys=qc_cols,
     kind='violin',
     max_points=2000,
@@ -85,8 +83,7 @@ ds.filter_cells(
     lows=[1000, 500, 0],
     reset_previous=True,
 )
-splt.distribution(
-    ds,
+ds.plots.distribution(
     keys=qc_cols,
     kind='violin',
     max_points=2000,
@@ -123,8 +120,7 @@ ds.run_umap(n_epochs=100, spread=5, min_dist=1, parallel=True)
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=score_col,
 )

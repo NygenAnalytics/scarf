@@ -101,8 +101,7 @@ qc_cols = [
     )
     if c in ds.cells.columns
 ]
-splt.distribution(
-    ds,
+ds.plots.distribution(
     keys=qc_cols,
     kind='violin',
     max_points=2000,
@@ -123,8 +122,7 @@ Filtered cells are marked inactive in the boolean cell key `I`, not deleted. Mos
 ```
 
 ```{code-cell} ipython3
-splt.distribution(
-    ds,
+ds.plots.distribution(
     keys=qc_cols,
     kind='violin',
     max_points=2000,
@@ -194,12 +192,11 @@ ds.cells.head()
 ```
 
 ```{code-cell} ipython3
-splt.embedding(ds, layout_key='RNA_UMAP')
+ds.plots.embedding(layout_key='RNA_UMAP')
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_nCounts',
     color_scale=splt.ColorScale(cmap='coolwarm'),
@@ -219,8 +216,7 @@ ds.run_leiden_clustering(resolution=0.5)
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
 )
@@ -249,8 +245,7 @@ ds.run_marker_search(
 ```
 
 ```{code-cell} ipython3
-splt.marker_heatmap(
-    ds,
+ds.plots.marker_heatmap(
     group_key='RNA_leiden_cluster',
     topn=5,
     figsize=(5, 9)
@@ -268,8 +263,7 @@ df.head()
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='CD14',
     sort_values=True,

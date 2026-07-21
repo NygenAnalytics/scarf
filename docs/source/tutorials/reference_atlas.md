@@ -24,7 +24,6 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
@@ -46,16 +45,14 @@ ds_stim = scarf.DataStore('scarf_datasets/kang_14K_ifnb-pbmc_rnaseq/data.zarr')
 Reference and query UMAPs before mapping:
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds_ctrl,
+ds_ctrl.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
 )
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds_stim,
+ds_stim.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
 )
@@ -139,8 +136,7 @@ transferred = ds_ctrl.get_target_classes(
 )
 ds_stim.cells.insert('symphony_labels', transferred.values, overwrite=True)
 
-splt.embedding(
-    ds_stim,
+ds_stim.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='symphony_labels',
 )

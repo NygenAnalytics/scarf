@@ -134,18 +134,22 @@ datastore method.
 established plotting result types, accept documented data contracts, and use
 narrow adapters instead of adding storage-path knowledge.
 
+`DataStore.plots` is a thin, store-bound accessor over the canonical
+store-first functions in `scarf.plotting`. The accessor imports concrete plot
+implementations only when a method is called, so this convenience namespace
+does not reverse the dependency from plotting to datastore.
+
 ## Public facade policy
 
 The lazy facades in `scarf`, `features`, `readers`, `writers`, `merge`, `utils`,
-`neighbors`, `clustering`, `embeddings`, and `trajectory` are architectural
-boundaries, not temporary deprecation shims. Their documented 1.x exports
-preserve stable import paths and defer optional or expensive implementations
-until an export is accessed.
+`neighbors`, `clustering`, `embeddings`, `trajectory`, and `plotting` are
+architectural boundaries, not temporary deprecation shims. Their documented
+1.x exports preserve stable import paths and defer optional or expensive
+implementations until an export is accessed.
 
-The `assay`, `mapping`, `matrix`, `metadata`, `metrics`, `plotting`, and
-`quality_control` package initializers are eager domain facades. API reference
-pages and public contract tests define which of their exports carry
-compatibility guarantees.
+The `assay`, `mapping`, `matrix`, `metadata`, `metrics`, and `quality_control`
+package initializers are eager domain facades. API reference pages and public
+contract tests define which of their exports carry compatibility guarantees.
 
 Reloading a lazy facade clears cached exports before resolving them again.
 This keeps reload behavior deterministic for tests and interactive work.
@@ -204,6 +208,8 @@ Accepted:
 - `metadata` remains a root data-model package because assays and datastore
   orchestration both depend on it.
 - Unified plotting uses a datastore adapter instead of reading Zarr paths.
+- Store-backed plotting is available through the lazy `DataStore.plots`
+  accessor without moving implementation ownership out of `plotting`.
 - Old flat compatibility modules remain deleted.
 
 Deferred to a later structural phase:

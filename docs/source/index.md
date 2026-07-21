@@ -39,7 +39,7 @@ The methods paper is published in [Nature Communications](https://doi.org/10.103
 - Mapping query cells to a reference and transferring labels
 - Multimodal SNN/WNN integration
 - Large-scale analysis with downsampling and Zarr storage notes
-- Plotting with `scarf.plotting` and the API reference
+- Plotting through `ds.plots` or `scarf.plotting`, with the API reference
 
 ## What this documentation does not cover
 

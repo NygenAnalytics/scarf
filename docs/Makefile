@@ -13,36 +13,44 @@ SPHINXPROJ    = Scarf
 help:
 	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
-.PHONY: help Makefile execute-docs execute-page execute-vignette execute-vignettes prune-stale-cache html execute-notebooks-all nitpick
+.PHONY: help Makefile execute-docs execute-page execute-vignette execute-vignettes resume-docs validate-cache prune-stale-cache html execute-notebooks-all nitpick
 
 # Execute one doc page locally and update docs/.jupyter_cache.
 # Usage: make execute-page PAGE=scrna_seq
 # Alias: make execute-vignette VIGNETTE=scrna_seq (legacy)
 execute-page:
-	@uv run python execute_vignette.py $(or $(PAGE),$(VIGNETTE),scrna_seq)
+	@uv run python execute_all_vignettes.py $(or $(PAGE),$(VIGNETTE),scrna_seq) -j $(or $(JOBS),1)
 
 execute-vignette: execute-page
 
-# Execute all executable MyST pages; merge into docs/.jupyter_cache.
+# Force all executable MyST pages and publish a validated cache.
 execute-vignettes execute-docs:
-	@set -o pipefail; uv run python execute_all_vignettes.py -j $(or $(JOBS),1)
+	@uv run python execute_all_vignettes.py --full -j $(or $(JOBS),1)
 
-# Remove cache entries whose source .md files were deleted or moved.
+# Resume the last failed run when source and execution fingerprints still match.
+resume-docs:
+	@uv run python execute_all_vignettes.py --resume -j $(or $(JOBS),1)
+
+# Validate the committed cache without changing it.
+validate-cache:
+	@uv run python execute_all_vignettes.py --validate
+
+# Rebuild the cache from outputs matching current sources only.
 prune-stale-cache:
-	@uv run python -c "from docs.execute_vignette import prune_stale_cache; removed = prune_stale_cache(); print(f'Pruned {len(removed)} entries')"
+	@uv run python execute_all_vignettes.py --prune
 
 # Build HTML locally (uses committed docs/.jupyter_cache; does not re-execute).
-html:
+html: validate-cache
 	@$(SPHINXBUILD) -b html "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS) $(O)
 
 # Nitpicky HTML build used by docs CI (missing refs/toctree fail the build).
-nitpick:
-	@$(SPHINXBUILD) -b html -n "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS) $(O)
+nitpick: validate-cache
+	@$(SPHINXBUILD) -b html -n -W "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS) $(O)
 
-# Wipe cache and rebuild HTML (sequential re-execution via Sphinx; slower than execute-docs).
+# Force all notebooks through the validated runner, then build strictly.
 execute-notebooks-all:
-	@rm -rf .jupyter_cache
-	@$(SPHINXBUILD) -b html "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS) $(O)
+	@uv run python execute_all_vignettes.py --full -j $(or $(JOBS),1)
+	@$(SPHINXBUILD) -b html -n -W "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS) $(O)
 
 # Catch-all target: route all unknown targets to Sphinx using the new
 # "make mode" option.  $(O) is meant as a shortcut for $(SPHINXOPTS).

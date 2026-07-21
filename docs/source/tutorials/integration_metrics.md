@@ -29,7 +29,6 @@ After merging batches and building a graph ({doc}`data_integration`), quantify m
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
@@ -64,16 +63,14 @@ The naive merge (no batch correction) often separates by sample on UMAP. The met
 quantify that pattern.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='sample_id',
 )
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='orig_cluster_labels',
 )

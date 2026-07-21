@@ -85,6 +85,7 @@ docs = [
     "sphinx-tabs",
     "topacedo",
     "nbclient",
+    "jupyter-cache>=1.0.1",
 ]
 
 [project.urls]

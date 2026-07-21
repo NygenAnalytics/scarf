@@ -20,7 +20,6 @@ This tutorial merges datasets from different Zarr files, corrects batch effects 
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 scarf.__version__
@@ -162,8 +161,7 @@ ds.cells.head()
 Visualization of cells from the two samples in the 2D UMAP space:
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='sample_id',
     legend_loc='right',
@@ -173,8 +171,7 @@ splt.embedding(
 Visualization of cluster labels in the 2D UMAP space:
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='orig_cluster_labels',
     legend_loc='right',
@@ -233,8 +230,7 @@ ds.run_umap(
 Visualize the new UMAP
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_pUMAP',
     color_by='sample_id',
     legend_loc='right',
@@ -244,8 +240,7 @@ splt.embedding(
 Visualization of cluster labels in the new UMAP space shows that the cells from the same cell-type do not split into separate clusters like they did before.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_pUMAP',
     color_by='orig_cluster_labels',
     legend_loc='right',
@@ -285,15 +280,13 @@ ds.run_leiden_clustering(resolution=1.0)
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_hUMAP',
     color_by='sample_id',
     legend_loc='right',
 )
 
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_hUMAP',
     color_by='orig_cluster_labels',
     legend_loc='right',

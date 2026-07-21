@@ -212,6 +212,41 @@ print(json.dumps({{
     }
 
 
+def test_plotting_package_is_lazy():
+    result = _run_probe(
+        f"""
+import json
+import sys
+import scarf.plotting as plotting
+
+exports = {_EXPECTED_PLOTTING_EXPORTS!r}
+concrete = (
+    "scarf.plotting.composition",
+    "scarf.plotting.diagnostics",
+    "scarf.plotting.distribution",
+    "scarf.plotting.embedding",
+    "scarf.plotting.embedding_raster",
+    "scarf.plotting.heatmaps",
+    "scarf.plotting.summary",
+    "scarf.plotting.unified",
+)
+print(json.dumps({{
+    "advertised": sorted(name for name in exports if name in dir(plotting)),
+    "bound": sorted(name for name in exports if name in vars(plotting)),
+    "concreteModules": sorted(set(concrete).intersection(sys.modules)),
+    "exports": plotting.__all__,
+}}))
+"""
+    )
+
+    assert result == {
+        "advertised": sorted(_EXPECTED_PLOTTING_EXPORTS),
+        "bound": [],
+        "concreteModules": [],
+        "exports": list(_EXPECTED_PLOTTING_EXPORTS),
+    }
+
+
 def test_utils_surface_preserves_module_metadata():
     utils = import_module("scarf.utils")
 
@@ -356,6 +391,7 @@ cases = (
     ("scarf.clustering", "balanced_cut"),
     ("scarf.embeddings", "initial_embedding"),
     ("scarf.trajectory", "PseudotimeScoreResult"),
+    ("scarf.plotting", "embedding"),
 )
 
 for module_name, export_name in cases:
@@ -412,11 +448,22 @@ def test_modern_plotting_surface_matches_baseline():
         assert hasattr(plotting, name)
 
 
+def test_plotting_submodule_import_does_not_clobber_function_export():
+    plotting = import_module("scarf.plotting")
+    canonical_module = import_module("scarf.plotting.embedding")
+
+    assert plotting.embedding is canonical_module.embedding
+
+
 def test_legacy_plotting_surface_remains_absent():
     from importlib.util import find_spec
 
     from scarf import DataStore
+    from scarf.datastore.plot_accessor import DataStorePlotAccessor
 
+    assert hasattr(DataStore, "plots")
+    assert DataStorePlotAccessor.__module__ == "scarf.datastore.plot_accessor"
+    assert not hasattr(import_module("scarf"), "DataStorePlotAccessor")
     assert not [name for name in dir(DataStore) if name.startswith("plot_")]
     assert find_spec("scarf.plots") is None
     assert find_spec("scarf.plotting._legacy") is None

@@ -24,7 +24,6 @@ For a reusable harmonized atlas workflow, see {doc}`reference_atlas`.
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 scarf.__version__
@@ -54,8 +53,7 @@ ds_ctrl = scarf.DataStore(
     nthreads=4
 )
 
-splt.embedding(
-    ds_ctrl,
+ds_ctrl.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
 )
@@ -68,8 +66,7 @@ ds_stim = scarf.DataStore(
     nthreads=4
 )
 
-splt.embedding(
-    ds_stim,
+ds_stim.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='cluster_labels',
 )
@@ -132,8 +129,7 @@ for g, ms in ds_ctrl.get_mapping_score(
     
     if g in ['NK', 'CD 14 Mono']:
         print (f"Target cluster {g}")
-        splt.embedding(
-            ds_ctrl,
+        ds_ctrl.plots.embedding(
             layout_key='RNA_UMAP',
             color_by='cluster_labels',
             point_sizes=ms * 10,
@@ -180,8 +176,7 @@ ds_stim.cells.insert(
 ```
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds_stim,
+ds_stim.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='transferred_labels',
 )
@@ -235,12 +230,11 @@ ds_ctrl.run_unified_umap(
 ```
 
 Since unified embeddings contain cells from another dataset, use
-`splt.unified_embedding`. Use `splt.embedding` for regular layouts stored in cell
-metadata.
+`ds_ctrl.plots.unified_embedding`. Use `ds_ctrl.plots.embedding` for regular layouts
+stored in cell metadata.
 
 ```{code-cell} ipython3
-splt.unified_embedding(
-    ds_ctrl,
+ds_ctrl.plots.unified_embedding(
     layout_key='unified_UMAP',
     ref_name='ctrl',
 )
@@ -258,8 +252,7 @@ ds_ctrl.project_mapping_layout(
 We can visualize only the target cells, i.e IFN-B stimulated cells, in the unified embedding. The target cells can be colored based on their original cluster identity. Target cells of similar types are close together on the unified embedding and overlap with the cell types of the reference data
 
 ```{code-cell} ipython3
-splt.unified_embedding(
-    ds_ctrl,
+ds_ctrl.plots.unified_embedding(
     layout_key='unified_UMAP',
     show_target_only=True,
     target_groups=ds_stim.cells.fetch('cluster_labels'),
@@ -281,8 +274,7 @@ ds_ctrl.run_unified_tsne(
     max_iter=500
 )
 
-splt.unified_embedding(
-    ds_ctrl,
+ds_ctrl.plots.unified_embedding(
     layout_key='unified_tSNE',
     ref_name='ctrl',
 )

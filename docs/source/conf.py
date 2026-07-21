@@ -23,6 +23,7 @@ extensions = [
 ]
 autodoc_type_aliases = {
     "DataStore": "scarf.datastore.datastore.DataStore",
+    "DataStorePlotAccessor": "scarf.datastore.plot_accessor.DataStorePlotAccessor",
 }
 
 templates_path = ["_templates"]
@@ -75,6 +76,7 @@ htmlhelp_basename = "Scarf Documentation"
 man_pages = [(master_doc, "scarf", "Scarf Documentation", [author], 1)]
 
 nb_execution_allow_errors = False
+nb_execution_raise_on_error = True
 nb_execution_mode = "cache"
 nb_execution_cache_path = os.path.join(
     os.path.dirname(__file__), "..", ".jupyter_cache"

@@ -30,7 +30,6 @@ uv pip install "scarf[extra]"
 
 ```python
 import scarf
-import scarf.plotting as splt
 
 reader = scarf.CrH5Reader("filtered_feature_bc_matrix.h5")
 scarf.CrToZarr(reader, zarr_loc="data.zarr").dump(batch_size=1000)
@@ -46,12 +45,14 @@ ds.make_graph(feat_key="hvgs", k=11, dims=15, n_centroids=100)
 ds.run_umap(n_epochs=250, spread=5, min_dist=1, parallel=True)
 ds.run_leiden_clustering(resolution=0.5)
 
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by="RNA_leiden_cluster",
 )
 ```
+
+After `import scarf.plotting as splt`, the equivalent standalone call is
+`splt.embedding(ds, layout_key="RNA_UMAP", color_by="RNA_leiden_cluster")`.
 
 Same path with more explanation: [docs quick start](https://scarf.readthedocs.io/en/latest/quickstart.html).
 

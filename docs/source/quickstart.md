@@ -23,7 +23,6 @@ see {doc}`tutorials/scrna_seq`. If you know Scanpy, skim {doc}`scarf_and_scanpy`
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
@@ -56,8 +55,7 @@ ds.run_leiden_clustering(resolution=0.5)
 ## Plot the embedding
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_leiden_cluster',
 )
@@ -75,5 +73,5 @@ Typical columns and keys written by this pipeline:
 ## Next steps
 
 - Full scRNA-seq chapter: {doc}`tutorials/scrna_seq`
-- Publication plotting: {ref}`plotting with scarf.plotting <plotting_showcase>`
+- Publication plotting with `ds.plots`: {ref}`plotting showcase <plotting_showcase>`
 - Batch correction: {ref}`integration methods guide <integration_guide>`

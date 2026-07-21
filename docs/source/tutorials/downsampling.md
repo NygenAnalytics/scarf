@@ -31,7 +31,6 @@ result to create a smaller Zarr store for workflows that do not need every cell.
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 scarf.__version__
@@ -57,8 +56,7 @@ ds.make_graph(feat_key='hvgs', k=11, dims=15)
 ds.run_clustering(n_clusters=15)
 ds.run_umap(n_epochs=250, parallel=True)
 
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cluster',
 )
@@ -87,11 +85,10 @@ if 'RNA_sketched' not in ds.cells.columns:
     )
 ```
 
-As a result of subsampling the subsampled cells are marked True under the cell metadata column `RNA_sketched`. We can visualize these cells with `splt.embedding` and `subset_by`
+As a result of subsampling the subsampled cells are marked True under the cell metadata column `RNA_sketched`. We can visualize these cells with `ds.plots.embedding` and `subset_by`.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cluster',
     subset_by='RNA_sketched',
@@ -101,8 +98,7 @@ splt.embedding(
 It may also be interesting to visualize the cells that were marked as `seed cells` used when PCST was run. These cells are marked under the column `RNA_sketch_seeds`.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cluster',
     subset_by='RNA_sketch_seeds',
@@ -117,8 +113,7 @@ splt.embedding(
 To identify the seed cells, the subsampling algorithm calculates cell densities based on neighbourhood degrees. Regions of higher cell density get a sampling penalty. The neighbourhood degree of individual cells are stored under the column `RNA_cell_density`.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_cell_density',
 )
@@ -127,8 +122,7 @@ splt.embedding(
 The downsampling algorithm also identifies regions of the graph where cells form tightly connected groups by calculating mean shared nearest neighbours of each cell's neighbours. The tightly connected regions get a sampling award. These values can be accessed from under the cell metadata column `RNA_snn_value`.
 
 ```{code-cell} ipython3
-splt.embedding(
-    ds,
+ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_snn_value',
 )

@@ -9,6 +9,7 @@ import pandas as pd
 from ._contracts import (
     CategoricalScale,
     CellField,
+    DistKind,
     FeatureRef,
     NormalizationSpec,
     PlotProvenance,
@@ -27,8 +28,6 @@ from ._style import (
     categorical_color_map,
     theme_context,
 )
-
-DistKind = Literal["violin", "box", "hist", "ecdf"]
 
 
 def _scarf_version() -> str:
