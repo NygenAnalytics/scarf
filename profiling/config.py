@@ -88,8 +88,6 @@ class WorkflowParameters(BaseModel):
     leidenResolution: float = 1.0
     leidenSeed: int = 4444
     leidenLabel: str = "leiden_cluster"
-    # leidenalg = RBConfiguration via leidenalg+igraph; igraph = native community_leiden
-    leidenBackend: Literal["leidenalg", "igraph"] = "leidenalg"
     markerFeatureKey: str = "I"
     markerGeneBatchSize: int | None = None
     graphLocalCache: bool | str = "auto"

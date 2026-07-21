@@ -21,6 +21,9 @@ def test_example_config_loads():
     assert config.resultUri(10_000, "createStore").endswith(
         "/results/10000/createStore.json"
     )
+    leiden = config.resourcesFor("runLeiden")
+    assert leiden.modalMemoryLimitMb == 32_768
+    assert leiden.modalCpuLimit == 2.0
 
 
 def test_run_tag_isolates_store_and_result_uris():

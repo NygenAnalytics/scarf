@@ -267,26 +267,15 @@ def run_stage_job(
 @app.function(
     **COMMON_FUNCTION_OPTIONS,
     timeout=86_400,
-    # Fixed 64 GiB, no region pin on the function itself (broader capacity).
-    memory=65_536,
-    cpu=8.0,
+    memory=32_768,
+    cpu=2.0,
     ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
 )
 def probe_leiden_job(
     configDict: dict[str, Any],
     nRows: int,
-    backend: str = "igraph",
 ) -> dict[str, Any]:
-    """Diagnose 5M Leiden: flushed probes before/during graph load and clustering.
-
-    Reads:
-      WORKER_START -> open_datastore -> load_graph -> leiden_membership steps
-    If WORKER_START never appears: Modal never ran our code.
-    If probes stop mid-leiden: scale/algorithm issue.
-
-    Default backend is ``igraph`` (native community_leiden). Pass ``leidenalg``
-    to reproduce the historical path that hung in find_partition at ~4.6M cells.
-    """
+    """Run historical Leiden with flushed worker and parent-process probes."""
     import sys
 
     def _probe(msg: str) -> None:
@@ -294,14 +283,7 @@ def probe_leiden_job(
         sys.stdout.flush()
 
     _probe("WORKER_START")
-    if backend not in ("leidenalg", "igraph"):
-        raise ValueError(f"backend must be leidenalg or igraph, got {backend!r}")
     config = ProfilingConfig.model_validate(configDict)
-    config = config.model_copy(
-        update={
-            "workflow": config.workflow.model_copy(update={"leidenBackend": backend})
-        }
-    )
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     if nRows not in config.targetSizes:
         raise ValueError(f"size {nRows} is not in config.targetSizes")
@@ -312,23 +294,13 @@ def probe_leiden_job(
             "stage": "runLeiden",
             "status": "skipped",
             "resultUri": config.resultUri(nRows, "runLeiden"),
-            "backend": backend,
         }
 
     resources = config.resourcesFor("runLeiden")
-    # Prefer makeGraph RAM class for headroom while loading the 5M graph.
-    heavy = config.resourcesFor("makeGraph")
-    resources = resources.model_copy(
-        update={
-            "modalMemoryRequestMb": heavy.modalMemoryRequestMb,
-            "modalMemoryLimitMb": heavy.modalMemoryLimitMb,
-            "scarfMemoryBudget": heavy.scarfMemoryBudget,
-        }
-    )
-    work = _WORK / f"probe-leiden-{nRows}-{backend}"
+    work = _WORK / f"probe-leiden-{nRows}"
     work.mkdir(parents=True, exist_ok=True)
     store_uri = config.storeUri(nRows)
-    _probe(f"store={store_uri} memMb={resources.modalMemoryLimitMb} backend={backend}")
+    _probe(f"store={store_uri} memMb={resources.modalMemoryLimitMb}")
     _probe("ENTER run_stage(runLeiden)")
     result = run_stage(
         "runLeiden",
@@ -341,12 +313,10 @@ def probe_leiden_job(
     )
     write_result(config, result)
     _probe(
-        f"DONE status={result.status} seconds={result.seconds} "
-        f"error={result.error!r} backend={backend}"
+        f"DONE status={result.status} seconds={result.seconds} error={result.error!r}"
     )
     payload = result.to_json()
     payload["probe"] = True
-    payload["backend"] = backend
     return payload
 
 
@@ -697,19 +667,10 @@ def main(*arg_list: str) -> None:
 
     probe_parser = sub.add_parser(
         "probe-leiden",
-        help=(
-            "Diagnose Leiden on an existing store with flushed step probes "
-            "(WORKER_START / load_graph / leiden_membership)"
-        ),
+        help="Run historical Leiden in a monitored child process",
     )
     probe_parser.add_argument("--config", required=True)
     probe_parser.add_argument("--size", type=int, required=True)
-    probe_parser.add_argument(
-        "--backend",
-        choices=("igraph", "leidenalg"),
-        default="igraph",
-        help="Leiden implementation (default: igraph native community_leiden)",
-    )
 
     io_parser = sub.add_parser("io-baseline")
     io_parser.add_argument("--config", required=True)
@@ -824,20 +785,20 @@ def main(*arg_list: str) -> None:
     if args.command == "probe-leiden":
         if args.size not in config.targetSizes:
             raise SystemExit(f"size {args.size} is not in config.targetSizes")
-        # Secrets/env only; keep function memory (64 GiB) and do not pin region.
+        # Use the runLeiden resource block and do not narrow Modal capacity.
         options = modal_function_options(
             config,
-            config.resourcesFor("makeGraph"),
+            config.resourcesFor("runLeiden"),
             maxContainers=1,
         )
         options.pop("region", None)
         call = (
             _deployed_function(config, "probe_leiden_job")
             .with_options(**options)
-            .spawn(payload, args.size, args.backend)
+            .spawn(payload, args.size)
         )
-        _print_spawned(f"probe_leiden_job {args.size} backend={args.backend}", call)
-        print("Watch for [probe_leiden] WORKER_START and [leiden] backend=... in logs.")
+        _print_spawned(f"probe_leiden_job {args.size}", call)
+        print("Watch for parent and child runLeiden progress in logs.")
         return
 
     if args.command == "io-baseline":

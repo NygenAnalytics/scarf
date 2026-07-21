@@ -1,3 +1,8 @@
+import json
+import subprocess
+import sys
+import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -14,6 +19,10 @@ from profiling.config import (
 )
 from profiling.metrics import ResourceMeasurement, ResourceSampler, StageTimer
 from profiling.r2 import storage_options
+
+LEIDEN_MONITOR_INTERVAL_SECONDS = 30.0
+LEIDEN_WARNING_SECONDS = 1_800.0
+LEIDEN_STOP_GRACE_SECONDS = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,77 +140,113 @@ def _impute_feature_names(store: DataStore, workflow: WorkflowParameters) -> lis
     return candidates[: workflow.imputeGeneCount]
 
 
-def _run_native_igraph_leiden(
-    store: DataStore,
-    workflow: WorkflowParameters,
-) -> None:
-    """Profiling-only native igraph Leiden backend.
+def _monitor_leiden_process(
+    process: subprocess.Popen[bytes],
+    *,
+    warningSeconds: float = LEIDEN_WARNING_SECONDS,
+    pollSeconds: float = LEIDEN_MONITOR_INTERVAL_SECONDS,
+) -> int:
+    if warningSeconds <= 0:
+        raise ValueError("warningSeconds must be positive")
+    if pollSeconds <= 0:
+        raise ValueError("pollSeconds must be positive")
 
-    The historical implementation constructs an undirected multigraph with one
-    unit edge per nonzero entry, then runs RBConfigurationVertexPartition.
-    ``Adjacency(mode="plus")`` preserves that graph while avoiding a Python
-    list of tens of millions of edge tuples. Native modularity Leiden is the
-    matching igraph objective at the same resolution.
-    """
-    import random
+    started = time.monotonic()
+    warned = False
+    while True:
+        try:
+            return process.wait(timeout=pollSeconds)
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - started
+            print(
+                f"[runLeiden] child still running pid={process.pid} "
+                f"elapsedSeconds={elapsed:.0f}",
+                flush=True,
+            )
+            if not warned and elapsed >= warningSeconds:
+                print(
+                    f"[runLeiden] WARNING child exceeded "
+                    f"{warningSeconds:.0f}s; continuing",
+                    flush=True,
+                )
+                warned = True
 
-    import igraph
 
-    print("[igraph_leiden] ENTER load_graph", flush=True)
-    graph = store.load_graph(
-        from_assay=workflow.assayName,
-        cell_key=workflow.cellKey,
-        feat_key=workflow.hvgKey,
-        symmetric=False,
-        upper_only=False,
-    )
-    print(
-        f"[igraph_leiden] graph loaded shape={graph.shape} nnz={graph.nnz}; "
-        "building binary sparse adjacency",
-        flush=True,
-    )
-
-    binary = graph.copy()
-    binary.eliminate_zeros()
-    binary.data = np.ones(binary.nnz, dtype=np.int8)
-    igraph_graph = igraph.Graph.Adjacency(
-        binary,
-        mode="plus",
-        loops="once",
-    )
-    print(
-        f"[igraph_leiden] igraph built vertices={igraph_graph.vcount()} "
-        f"edges={igraph_graph.ecount()}; ENTER community_leiden",
-        flush=True,
-    )
-    del binary
-    del graph
-
-    rng = random.Random(workflow.leidenSeed)
-    igraph.set_random_number_generator(rng)
+def _stop_leiden_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
     try:
-        clustering = igraph_graph.community_leiden(
-            objective_function="modularity",
-            weights=None,
-            resolution=workflow.leidenResolution,
-            n_iterations=2,
-        )
-    finally:
-        igraph.set_random_number_generator(random)
+        process.wait(timeout=LEIDEN_STOP_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
-    membership = np.asarray(clustering.membership, dtype=np.int64) + 1
+
+def _read_leiden_worker_status(statusPath: Path) -> dict[str, Any] | None:
+    if not statusPath.is_file():
+        return None
+    payload = json.loads(statusPath.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("Leiden worker status must be a JSON object")
+    return payload
+
+
+def _run_leiden_in_subprocess(
+    *,
+    storeUri: str,
+    workflow: WorkflowParameters,
+    resources: StageResources,
+    workDir: Path | None,
+) -> None:
+    worker_dir = (
+        workDir
+        if workDir is not None
+        else Path(tempfile.mkdtemp(prefix="scarf-leiden-"))
+    )
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    request_path = worker_dir / "request.json"
+    status_path = worker_dir / "status.json"
+    status_path.unlink(missing_ok=True)
+    request_path.write_text(
+        json.dumps(
+            {
+                "storeUri": storeUri,
+                "workflow": workflow.model_dump(mode="json"),
+                "resources": resources.model_dump(mode="json"),
+                "statusPath": str(status_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    command = [
+        sys.executable,
+        "-m",
+        "profiling.leiden_worker",
+        "--request",
+        str(request_path),
+    ]
+    process = subprocess.Popen(command)
     print(
-        f"[igraph_leiden] community_leiden DONE "
-        f"clusters={int(membership.max()) if membership.size else 0}",
+        f"[runLeiden] child started pid={process.pid} backend=leidenalg "
+        f"warningSeconds={LEIDEN_WARNING_SECONDS:.0f}",
         flush=True,
     )
-    store.cells.insert(
-        workflow.resolvedMarkerGroupKey,
-        membership,
-        fill_value=-1,
-        key=workflow.cellKey,
-        overwrite=True,
-    )
+    try:
+        return_code = _monitor_leiden_process(process)
+    except BaseException:
+        _stop_leiden_process(process)
+        raise
+
+    status = _read_leiden_worker_status(status_path)
+    if return_code != 0:
+        detail = status.get("error") if status is not None else None
+        suffix = f": {detail}" if isinstance(detail, str) else ""
+        raise RuntimeError(f"Leiden worker exited with code {return_code}{suffix}")
+    if status is None or status.get("status") != "ok":
+        raise RuntimeError("Leiden worker exited without a successful status")
+    print(f"[runLeiden] child completed pid={process.pid}", flush=True)
 
 
 def _pseudotime_sources_sinks(
@@ -307,6 +352,14 @@ def run_stage(
                     )
                 del query
                 del ref
+            elif stage == "runLeiden":
+                with timer.operation():
+                    _run_leiden_in_subprocess(
+                        storeUri=storeUri,
+                        workflow=workflow,
+                        resources=resources,
+                        workDir=workDir,
+                    )
             else:
                 with timer.operation():
                     print(
@@ -414,25 +467,7 @@ def _run_analysis(
         )
         return
     if stage == "runLeiden":
-        print(
-            "[runLeiden] ENTER run_leiden_clustering "
-            f"resolution={workflow.leidenResolution} seed={workflow.leidenSeed} "
-            f"backend={workflow.leidenBackend}",
-            flush=True,
-        )
-        if workflow.leidenBackend == "igraph":
-            _run_native_igraph_leiden(store, workflow)
-        else:
-            store.run_leiden_clustering(
-                from_assay=workflow.assayName,
-                cell_key=workflow.cellKey,
-                feat_key=workflow.hvgKey,
-                resolution=workflow.leidenResolution,
-                label=workflow.leidenLabel,
-                random_seed=workflow.leidenSeed,
-            )
-        print("[runLeiden] DONE run_leiden_clustering", flush=True)
-        return
+        raise AssertionError("runLeiden must execute in its child process")
     if stage == "findMarkers":
         store.run_marker_search(
             from_assay=workflow.assayName,

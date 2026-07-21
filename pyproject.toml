@@ -151,7 +151,6 @@ badge-format = "svg"
 [dependency-groups]
 profiling = [
     "anndata>=0.12.18",
-    "igraph>=1.0.0",
     "modal>=1.5.2",
     "pydantic>=2.13.4",
 ]

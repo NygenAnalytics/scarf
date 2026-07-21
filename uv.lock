@@ -3121,7 +3121,6 @@ dev = [
 ]
 profiling = [
     { name = "anndata" },
-    { name = "igraph" },
     { name = "modal" },
     { name = "pydantic" },
 ]
@@ -3185,7 +3184,6 @@ dev = [
 ]
 profiling = [
     { name = "anndata", specifier = ">=0.12.18" },
-    { name = "igraph", specifier = ">=1.0.0" },
     { name = "modal", specifier = ">=1.5.2" },
     { name = "pydantic", specifier = ">=2.13.4" },
 ]

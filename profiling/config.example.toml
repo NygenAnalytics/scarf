@@ -150,13 +150,13 @@ timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
 [stageResources.runLeiden]
-modalMemoryRequestMb = 65536
-modalMemoryLimitMb = 73728
-modalCpuRequest = 8.0
-modalCpuLimit = 8.0
-scarfMemoryBudget = 51539607552
-workers = 8
-workingCopies = 4
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 2.0
+modalCpuLimit = 2.0
+scarfMemoryBudget = 25769803776
+workers = 2
+workingCopies = 2
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
