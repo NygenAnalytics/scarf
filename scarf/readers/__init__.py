@@ -17,14 +17,16 @@ from ._text import read_file as read_file
 if TYPE_CHECKING:
     from .cellranger import CrDirReader, CrH5Reader, CrReader
     from .csv import CSVReader
-    from .h5ad import H5adReader
+    from .h5ad import H5adInspectResult, H5adReader, inspect_h5ad
     from .loom import LoomReader
 
 __all__ = [
     "CrH5Reader",
     "CrDirReader",
     "CrReader",
+    "H5adInspectResult",
     "H5adReader",
+    "inspect_h5ad",
     "LoomReader",
     "CSVReader",
 ]
@@ -34,7 +36,9 @@ _LAZY_EXPORTS = {
     "CrH5Reader": "cellranger",
     "CrReader": "cellranger",
     "CSVReader": "csv",
+    "H5adInspectResult": "h5ad",
     "H5adReader": "h5ad",
+    "inspect_h5ad": "h5ad",
     "LoomReader": "loom",
 }
 
@@ -43,10 +47,12 @@ for _export_name in _LAZY_EXPORTS:
 del _export_name
 
 
-def _normalize_class_metadata(reader_class: type[Any]) -> None:
-    reader_class.__module__ = __name__
-    for descriptor in reader_class.__dict__.values():
-        if isinstance(descriptor, staticmethod):
+def _normalize_export_metadata(value: Any) -> None:
+    value.__module__ = __name__
+    if not isinstance(value, type):
+        return
+    for descriptor in value.__dict__.values():
+        if isinstance(descriptor, classmethod | staticmethod):
             descriptor.__func__.__module__ = __name__
         elif callable(descriptor) and hasattr(descriptor, "__module__"):
             descriptor.__module__ = __name__
@@ -61,9 +67,9 @@ def __getattr__(name: str) -> Any:
     for export_name, export_module in _LAZY_EXPORTS.items():
         if export_module != module_name:
             continue
-        reader_class = getattr(module, export_name)
-        _normalize_class_metadata(reader_class)
-        globals()[export_name] = reader_class
+        value = getattr(module, export_name)
+        _normalize_export_metadata(value)
+        globals()[export_name] = value
     return globals()[name]
 
 

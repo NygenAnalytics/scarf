@@ -65,8 +65,10 @@ if TYPE_CHECKING:
         CrDirReader as CrDirReader,
         CrH5Reader as CrH5Reader,
         CrReader as CrReader,
+        H5adInspectResult as H5adInspectResult,
         H5adReader as H5adReader,
         LoomReader as LoomReader,
+        inspect_h5ad as inspect_h5ad,
     )
     from .trajectory.results import (
         FateMappingResult as FateMappingResult,
@@ -134,6 +136,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "EnrichmentResult": (".features.enrichment", "EnrichmentResult"),
     "FateMappingResult": (".trajectory.results", "FateMappingResult"),
     "GffReader": (".features.genomic.gff", "GffReader"),
+    "H5adInspectResult": (".readers", "H5adInspectResult"),
     "H5adReader": (".readers", "H5adReader"),
     "H5adToZarr": (".writers", "H5adToZarr"),
     "LoomReader": (".readers", "LoomReader"),
@@ -163,6 +166,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "create_zarr_obj_array": (".writers", "create_zarr_obj_array"),
     "dask_to_zarr": (".writers", "dask_to_zarr"),
     "get_log_level": (".utils", "get_log_level"),
+    "inspect_h5ad": (".readers", "inspect_h5ad"),
     "load_zarr": (".utils", "load_zarr"),
     "logger": (".utils", "logger"),
     "permute_into_chunks": (".utils", "permute_into_chunks"),

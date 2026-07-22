@@ -15,6 +15,7 @@ from scarf.readers import (
     CrDirReader,
     CrH5Reader,
     CrReader,
+    H5adInspectResult,
     H5adReader,
     LoomReader,
 )
@@ -49,11 +50,14 @@ _PUBLIC_CLASS_METHODS = {
     ),
     H5adReader: (
         "__init__",
+        "from_inspect",
         "cell_ids",
         "feat_ids",
         "feat_names",
         "get_cell_columns",
         "get_feat_columns",
+        "feature_types",
+        "assay_feature_slices",
         "consume_dataset",
         "consume_group",
         "consume",
@@ -79,12 +83,12 @@ _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     CrReader: "cfeac7ccf7bc316f1db1d9e177d6556b37a0169b3cbb2800a92e561b75f4fc4a",
     CrH5Reader: "053373f2af2f2fc74a3e00cde9b067c5818aba92c09da3a9ac2e129566ca87b9",
     CrDirReader: "51884c2390ad90fba1cdbd71808fc4dd98de548bd901e810c9caba6dbb9cf49a",
-    H5adReader: "952244c6ef7048f599958bcf3b0e853f2934c7ed141736484b5b4bb776966967",
+    H5adReader: "aa4d19ec019beed92009edfd8b65a0a36fc6dbd66b19a887632862d770c4a3da",
     LoomReader: "85c3ff965cb94a4fa201915b9d43890081e1f26e931327fcda6531bee4c3782a",
     CSVReader: "8aa6c17c876afb62765584fc7ff64d2838c66ef53095da10d7198ca60ab83851",
 }
 _MODULE_SIGNATURE_DIGEST = (
-    "f0889415a5820081a464e6dd0c65580fb42e47c40b44d1a85cb507ca10388186"
+    "d0ea3ab7abdc2416a0059a564d7aec9683c1a6dfcd8acf3108995e9f38e38b15"
 )
 
 
@@ -117,7 +121,9 @@ def test_readers_facade_surface_is_stable():
         "CrH5Reader",
         "CrDirReader",
         "CrReader",
+        "H5adInspectResult",
         "H5adReader",
+        "inspect_h5ad",
         "LoomReader",
         "CSVReader",
     ]
@@ -126,9 +132,11 @@ def test_readers_facade_surface_is_stable():
         "CrDirReader",
         "CrH5Reader",
         "CrReader",
+        "H5adInspectResult",
         "H5adReader",
         "LoomReader",
         "get_file_handle",
+        "inspect_h5ad",
         "read_file",
     }
     assert expected.issubset(vars(readers_module))
@@ -172,7 +180,8 @@ def test_reader_class_and_method_signatures_are_stable():
 
 def test_reader_module_function_signatures_are_stable():
     methods = {
-        name: getattr(readers_module, name) for name in ("get_file_handle", "read_file")
+        name: getattr(readers_module, name)
+        for name in ("get_file_handle", "inspect_h5ad", "read_file")
     }
     assert signature_digest(methods) == _MODULE_SIGNATURE_DIGEST
 
@@ -182,10 +191,16 @@ def test_reader_public_metadata_remains_on_facade():
         assert cls.__module__ == "scarf.readers"
         for name in names:
             descriptor = inspect.getattr_static(cls, name)
-            assert descriptor.__module__ == "scarf.readers"
-            assert descriptor.__qualname__.startswith(f"{cls.__name__}.")
+            method = (
+                descriptor.__func__
+                if isinstance(descriptor, classmethod | staticmethod)
+                else descriptor
+            )
+            assert method.__module__ == "scarf.readers"
+            assert method.__qualname__.startswith(f"{cls.__name__}.")
 
-    for name in ("get_file_handle", "read_file"):
+    assert H5adInspectResult.__module__ == "scarf.readers"
+    for name in ("get_file_handle", "inspect_h5ad", "read_file"):
         assert getattr(readers_module, name).__module__ == "scarf.readers"
 
 

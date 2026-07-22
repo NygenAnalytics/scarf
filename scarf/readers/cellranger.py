@@ -12,6 +12,11 @@ from scipy.sparse import coo_matrix
 
 from ..utils.logging import logger
 from ..utils.progress import tqdmbar
+from ._assay_names import (
+    AUTO_ASSAY_NAMES,
+    auto_name_feat_table,
+    make_feat_table_from_types,
+)
 
 
 class CrReader(ABC):
@@ -29,14 +34,7 @@ class CrReader(ABC):
     """
 
     def __init__(self, grp_names: dict[str, Any]) -> None:
-        self.autoNames: dict[str, str] = {
-            "Gene Expression": "RNA",
-            "Peaks": "ATAC",
-            "Antibody Capture": "ADT",
-            "RNA": "RNA",
-            "ADT": "ADT",
-            "HTO": "HTO",
-        }
+        self.autoNames = dict(AUTO_ASSAY_NAMES)
         self._featureTypeOverrides: dict[int, str] = {}
         self._schemaCaptured = False
         self.grpNames: dict[str, Any] = grp_names
@@ -88,35 +86,13 @@ class CrReader(ABC):
 
     @staticmethod
     def _make_feat_table_from_types(feature_types: Sequence[str]) -> pd.DataFrame:
-        if not feature_types:
-            raise ValueError("Cannot build an assay table without features")
-        span: list[tuple[str, int, int]] = []
-        last = feature_types[0]
-        start = 0
-        for index, feature_type in enumerate(feature_types[1:], 1):
-            if feature_type != last:
-                span.append((last, start, index))
-                start = index
-            last = feature_type
-        span.append((last, start, len(feature_types)))
-        df = pd.DataFrame(span, columns=["type", "start", "end"])
-        df.index = ["ASSAY%s" % str(x + 1) for x in df.index]
-        df["nFeatures"] = df.end - df.start
-        return df.T
+        return make_feat_table_from_types(feature_types)
 
     def _make_feat_table(self) -> pd.DataFrame:
         return self._make_feat_table_from_types(self.feature_types())
 
     def _auto_named_feat_table(self, assay_feats: pd.DataFrame) -> pd.DataFrame:
-        assay_feats = assay_feats.copy()
-        new_names = []
-        for key, value in assay_feats.T["type"].to_dict().items():
-            if value in self.autoNames:
-                new_names.append(self.autoNames[value])
-            else:
-                new_names.append(key)
-        assay_feats.columns = new_names
-        return assay_feats
+        return auto_name_feat_table(assay_feats, self.autoNames)
 
     def _auto_rename_assay_names(self) -> None:
         self.assayFeats = self._auto_named_feat_table(self.assayFeats)

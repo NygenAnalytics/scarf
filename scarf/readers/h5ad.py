@@ -1,12 +1,23 @@
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import h5py
 import numpy as np
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csc_matrix, csr_matrix
 
 from ..utils.logging import logger
 from ..utils.progress import tqdmbar
+from ._assay_names import auto_name_feat_table, make_feat_table_from_types
+from ._h5ad_inspect import H5adInspectResult, inspect_h5ad as inspect_h5ad
+
+
+@dataclass(frozen=True)
+class _H5adAssayFeatures:
+    ranges: tuple[tuple[int, int], ...]
+    featureIndexes: np.ndarray
+    featureIds: np.ndarray
+    featureNames: np.ndarray
 
 
 class H5adReader:
@@ -68,7 +79,8 @@ class H5adReader:
             self.obsmAttrsKey: self._validate_group(self.obsmAttrsKey),
             self.matrixKey: self._validate_group(self.matrixKey),
         }
-        self._validate_sparse_matrix()
+        self.matrixOrientation = self._validate_sparse_matrix()
+        self._convertedCsr: csr_matrix | None = None
         self.nCells, self.nFeatures = (
             self._get_n(self.cellAttrsKey),
             self._get_n(self.featureAttrsKey),
@@ -79,13 +91,23 @@ class H5adReader:
         self.catNamesKey = category_names_key
         self.matrixDtype: Any = self._get_matrix_dtype() if dtype is None else dtype
 
-    def _validate_sparse_matrix(self) -> None:
+    @classmethod
+    def from_inspect(
+        cls,
+        inspection: H5adInspectResult,
+        **overrides: Any,
+    ) -> "H5adReader":
+        reader_kwargs = inspection.to_reader_kwargs()
+        reader_kwargs.update(overrides)
+        return cls(**reader_kwargs)
+
+    def _validate_sparse_matrix(self) -> str:
         if self.groupCodes[self.matrixKey] != 2:
-            return
+            return "dense"
 
         group = self.h5[self.matrixKey]
         if not isinstance(group, h5py.Group):
-            return
+            return "dense"
 
         required = {"data", "indices", "indptr"}
         missing = required.difference(group.keys())
@@ -96,19 +118,25 @@ class H5adReader:
             )
 
         encoding = group.attrs.get("encoding-type")
-        if isinstance(encoding, bytes):
-            encoding = encoding.decode("utf-8")
+        if encoding is None:
+            encoding = group.attrs.get("h5sparse_format")
         if encoding is None:
             logger.warning(
-                f"Sparse matrix group `{self.matrixKey}` has no `encoding-type`; "
+                f"Sparse matrix group `{self.matrixKey}` has no sparse encoding; "
                 "assuming legacy CSR encoding"
             )
-            return
-        if encoding != "csr_matrix":
-            raise ValueError(
-                f"ERROR: Sparse matrix encoding `{encoding}` is not supported. "
-                "H5adReader currently requires CSR encoding."
-            )
+            return "csr"
+        if isinstance(encoding, bytes | np.bytes_):
+            encoding = encoding.decode("utf-8")
+        normalized = str(encoding).lower()
+        if normalized in {"csr", "csr_matrix"}:
+            return "csr"
+        if normalized in {"csc", "csc_matrix"}:
+            return "csc"
+        raise ValueError(
+            f"ERROR: Sparse matrix encoding `{encoding}` is not supported. "
+            "H5adReader supports CSR and CSC encoding."
+        )
 
     def _validate_group(self, group: str) -> int:
         if group not in self.h5:
@@ -156,6 +184,30 @@ class H5adReader:
                 f"ERROR: {self.matrixKey} is neither Dataset or Group type. Will not consume data"
             )
 
+    def _matrix_shape(self) -> tuple[int, int]:
+        matrix = self.h5[self.matrixKey]
+        if isinstance(matrix, h5py.Dataset):
+            return int(matrix.shape[0]), int(matrix.shape[1])
+
+        shape: Any = matrix.attrs.get("shape")
+        if shape is None:
+            shape = matrix.attrs.get("h5sparse_shape")
+        if shape is None and "shape" in matrix:
+            shape_node = matrix["shape"]
+            if isinstance(shape_node, h5py.Dataset):
+                shape = shape_node[:]
+        if shape is not None:
+            values = np.asarray(shape).reshape(-1)
+            if values.size == 2:
+                return int(values[0]), int(values[1])
+
+        compressed_axis = int(matrix["indptr"].shape[0] - 1)
+        indices = matrix["indices"]
+        observed_axis = int(np.max(indices[:])) + 1 if indices.shape[0] else 0
+        if self.matrixOrientation == "csr":
+            return compressed_axis, observed_axis
+        return observed_axis, compressed_axis
+
     def _check_exists(self, group: str, key: str) -> bool:
         if group in self.groupCodes:
             group_code = self.groupCodes[group]
@@ -180,19 +232,19 @@ class H5adReader:
 
     def _get_n(self, group: str) -> int:
         if self.groupCodes[group] == 0:
-            if self._check_exists(self.matrixKey, "shape"):
-                return int(self.h5[self.matrixKey]["shape"][0])
-            else:
-                raise KeyError(
-                    f"ERROR: `{group}` not found and `shape` key is missing in the {self.matrixKey} group. "
-                    f"Aborting read process."
-                )
+            matrix_shape = self._matrix_shape()
+            return matrix_shape[0 if group == self.cellAttrsKey else 1]
         elif self.groupCodes[group] == 1:
             return int(self.h5[group].shape[0])
         else:
             for i in self.h5[group].keys():
                 if isinstance(self.h5[group][i], h5py.Dataset):
                     return int(self.h5[group][i].shape[0])
+                if (
+                    isinstance(self.h5[group][i], h5py.Group)
+                    and "codes" in self.h5[group][i]
+                ):
+                    return int(self.h5[group][i]["codes"].shape[0])
             raise KeyError(
                 f"ERROR: `{group}` key doesn't contain any child node of Dataset type."
                 f"Aborting because unexpected H5ad format."
@@ -201,10 +253,10 @@ class H5adReader:
     def cell_ids(self) -> np.ndarray:
         """Returns a list of cell IDs."""
         if self._check_exists(self.cellAttrsKey, self.cellIdsKey):
-            if self.groupCodes[self.cellAttrsKey] == 1:
-                return np.asarray(self.h5[self.cellAttrsKey][self.cellIdsKey])
-            else:
-                return np.asarray(self.h5[self.cellAttrsKey][self.cellIdsKey][:])
+            values = self.h5[self.cellAttrsKey][self.cellIdsKey]
+            return self._replace_category_values(
+                values, self.cellIdsKey, self.cellAttrsKey
+            ).astype(object)
         logger.warning(f"Could not find cells ids key: {self.cellIdsKey} in `obs`.")
         return np.array([f"cell_{x}" for x in range(self.nCells)])
 
@@ -212,10 +264,10 @@ class H5adReader:
     def feat_ids(self) -> np.ndarray:
         """Returns a list of feature IDs."""
         if self._check_exists(self.featureAttrsKey, self.featIdsKey):
-            if self.groupCodes[self.featureAttrsKey] == 1:
-                return np.asarray(self.h5[self.featureAttrsKey][self.featIdsKey])
-            else:
-                return np.asarray(self.h5[self.featureAttrsKey][self.featIdsKey][:])
+            values = self.h5[self.featureAttrsKey][self.featIdsKey]
+            return self._replace_category_values(
+                values, self.featIdsKey, self.featureAttrsKey
+            ).astype(object)
         logger.warning(
             f"Could not find feature ids key: {self.featIdsKey} in {self.featureAttrsKey}."
         )
@@ -242,17 +294,13 @@ class H5adReader:
             if "codes" in v and "categories" in v:
                 codes = v["codes"][:]
                 categories = v["categories"][:]
-                try:
-                    return np.array([categories[x] for x in codes])
-                except (IndexError, TypeError):
-                    logger.warning(f"Failed to decode categorical data for {key}")
-                    return np.array([f"feature_{x}" for x in range(len(codes))])
-            else:
-                # It's a Group but doesn't have the expected structure, try to read it as dataset
-                logger.warning(
-                    f"{key} is a Group but missing 'codes' or 'categories', attempting to extract data"
-                )
-                return np.asarray(v[:])
+                valid = (codes >= 0) & (codes < len(categories))
+                decoded = np.empty(codes.shape, dtype=object)
+                decoded[valid] = categories[codes[valid]]
+                decoded[~valid] = None
+                return decoded
+            logger.warning(f"{key} is a Group but is not a categorical column")
+            return np.array([], dtype=object)
 
         # if v is a Dataset
         if isinstance(v, h5py.Dataset):
@@ -263,19 +311,26 @@ class H5adReader:
                 cat_g = self.h5[group][self.catNamesKey]
                 if isinstance(cat_g, h5py.Group):
                     if key in cat_g:
-                        c = cat_g[key][:]
-                        try:
-                            return np.array([c[x] for x in v])
-                        except (IndexError, TypeError):
-                            return v
+                        return self._decode_legacy_categories(v, cat_g[key][:])
         if "uns" in self.h5:
             if key + "_categories" in self.h5["uns"]:
-                c = self.h5["uns"][key + "_categories"][:]
-                try:
-                    return np.array([c[x] for x in v])
-                except (IndexError, TypeError):
-                    return v
+                categories = self.h5["uns"][key + "_categories"][:]
+                return self._decode_legacy_categories(v, categories)
         return np.asarray(v)
+
+    @staticmethod
+    def _decode_legacy_categories(
+        codes: np.ndarray, categories: np.ndarray
+    ) -> np.ndarray:
+        values = np.asarray(codes)
+        if not np.issubdtype(values.dtype, np.integer):
+            return values
+        try:
+            # Negative codes mark missing values in legacy AnnData categoricals;
+            # they must decode to None rather than wrap to the final category.
+            return np.array([None if code < 0 else categories[code] for code in values])
+        except (IndexError, TypeError):
+            return values
 
     def _get_col_data(
         self, group: str, ignore_keys: list[str]
@@ -294,10 +349,16 @@ class H5adReader:
             ):
                 if i in ignore_keys:
                     continue
-                if isinstance(self.h5[group][i], h5py.Dataset):
+                values = self.h5[group][i]
+                if isinstance(values, h5py.Dataset | h5py.Group):
+                    if isinstance(values, h5py.Group) and not {
+                        "codes",
+                        "categories",
+                    }.issubset(values.keys()):
+                        continue
                     yield (
                         i,
-                        self._replace_category_values(self.h5[group][i][:], i, group),
+                        self._replace_category_values(values, i, group),
                     )
 
     def _get_obsm_data(
@@ -336,6 +397,67 @@ class H5adReader:
         ):
             yield i, j
 
+    def feature_types(self, key: str) -> list[str]:
+        """Return decoded feature types from a var column."""
+        if not self._check_exists(self.featureAttrsKey, key):
+            raise KeyError(
+                f"Feature type key `{key}` was not found in {self.featureAttrsKey}"
+            )
+        values = self._replace_category_values(
+            self.h5[self.featureAttrsKey][key],
+            key,
+            self.featureAttrsKey,
+        )
+        if values.ndim != 1 or len(values) != self.nFeatures:
+            raise ValueError(
+                f"Feature type key `{key}` has {len(values)} values; "
+                f"expected {self.nFeatures}"
+            )
+        return [
+            value.decode("utf-8")
+            if isinstance(value, bytes | np.bytes_)
+            else str(value)
+            for value in values
+        ]
+
+    def assay_feature_slices(
+        self,
+        key: str,
+        name_map: Mapping[str, str] | None = None,
+    ) -> dict[str, _H5adAssayFeatures]:
+        """Resolve feature ranges and metadata for each assay."""
+        assay_table = auto_name_feat_table(
+            make_feat_table_from_types(self.feature_types(key)),
+            name_map,
+        )
+        feature_ids = self.feat_ids()
+        feature_names = self.feat_names()
+        assays: dict[str, _H5adAssayFeatures] = {}
+        for assay_name in dict.fromkeys(assay_table.columns):
+            selected = assay_table[assay_name]
+            ranges: tuple[tuple[int, int], ...]
+            if selected.ndim == 1:
+                ranges = ((int(selected.loc["start"]), int(selected.loc["end"])),)
+            else:
+                ranges = tuple(
+                    (int(start), int(end))
+                    for start, end in zip(
+                        selected.loc["start"],
+                        selected.loc["end"],
+                        strict=True,
+                    )
+                )
+            indexes = np.concatenate(
+                [np.arange(start, end, dtype=np.int64) for start, end in ranges]
+            )
+            assays[str(assay_name)] = _H5adAssayFeatures(
+                ranges=ranges,
+                featureIndexes=indexes,
+                featureIds=feature_ids[indexes],
+                featureNames=feature_names[indexes],
+            )
+        return assays
+
     # noinspection DuplicatedCode
     def consume_dataset(
         self, batch_size: int = 1000
@@ -353,6 +475,10 @@ class H5adReader:
         """Returns a generator that yield chunks of data."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+
+        if self.matrixOrientation == "csc":
+            yield from self._consume_converted_csr(batch_size)
+            return
 
         grp = self.h5[self.matrixKey]
         for row_start in range(0, self.nCells, batch_size):
@@ -373,6 +499,29 @@ class H5adReader:
                 ),
                 shape=(n_rows, self.nFeatures),
             )
+
+    def _consume_converted_csr(
+        self,
+        batch_size: int,
+    ) -> Generator[coo_matrix, None, None]:
+        """Convert the complete CSC matrix once before yielding row batches."""
+        if self._convertedCsr is None:
+            group = self.h5[self.matrixKey]
+            if not isinstance(group, h5py.Group):
+                raise TypeError("CSC matrix slot must be an HDF5 group")
+            converted = csc_matrix(
+                (
+                    np.asarray(group["data"][:]),
+                    np.asarray(group["indices"][:]),
+                    np.asarray(group["indptr"][:]),
+                ),
+                shape=(self.nCells, self.nFeatures),
+            ).tocsr()
+            self._convertedCsr = converted.astype(self.matrixDtype, copy=False)
+
+        for row_start in range(0, self.nCells, batch_size):
+            row_end = min(row_start + batch_size, self.nCells)
+            yield self._convertedCsr[row_start:row_end].tocoo(copy=False)
 
     def consume(self, batch_size: int) -> Generator[coo_matrix, None, None]:
         """Returns a generator that yield chunks of data."""

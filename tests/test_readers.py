@@ -2,19 +2,31 @@ import numpy as np
 import pytest
 
 
+def _write_sparse_group(parent, key, values, *, encoding_type="csr_matrix"):
+    from scipy.sparse import csc_matrix, csr_matrix
+
+    matrix_type = csc_matrix if encoding_type in {"csc", "csc_matrix"} else csr_matrix
+    matrix = matrix_type(values)
+    sparse = parent.create_group(key)
+    sparse.attrs["encoding-type"] = encoding_type
+    sparse.attrs["encoding-version"] = "0.1.0"
+    sparse.attrs["shape"] = matrix.shape
+    sparse.create_dataset("data", data=matrix.data)
+    sparse.create_dataset("indices", data=matrix.indices.astype(np.int64))
+    sparse.create_dataset("indptr", data=matrix.indptr.astype(np.int64))
+    return matrix
+
+
 def _write_sparse_h5ad(path, values, *, encoding_type="csr_matrix"):
     import h5py
-    from scipy.sparse import csr_matrix
 
-    matrix = csr_matrix(values)
     with h5py.File(path, mode="w") as h5:
-        sparse = h5.create_group("X")
-        sparse.attrs["encoding-type"] = encoding_type
-        sparse.attrs["encoding-version"] = "0.1.0"
-        sparse.attrs["shape"] = matrix.shape
-        sparse.create_dataset("data", data=matrix.data)
-        sparse.create_dataset("indices", data=matrix.indices.astype(np.int64))
-        sparse.create_dataset("indptr", data=matrix.indptr.astype(np.int64))
+        matrix = _write_sparse_group(
+            h5,
+            "X",
+            values,
+            encoding_type=encoding_type,
+        )
 
         obs = h5.create_group("obs")
         obs.create_dataset(
@@ -356,6 +368,163 @@ def test_h5ad_reader(h5ad_reader):
     assert h5ad_reader.nFeatures == 27998 == len(h5ad_reader.feat_names())
 
 
+def test_inspect_h5ad_resolves_fixture_and_builds_reader(bastidas_ponce_data):
+    from scarf.readers import H5adReader, inspect_h5ad
+
+    inspection = inspect_h5ad(bastidas_ponce_data)
+
+    assert inspection.matrixKey == "X"
+    assert inspection.matrixEncoding == "csr"
+    assert inspection.matrixCandidates == ("X", "layers/spliced", "layers/unspliced")
+    assert inspection.featureAttrsKey == "var"
+    assert inspection.cellIdsKey == "index"
+    assert inspection.featureIdsKey == "index"
+    assert inspection.layers == ("spliced", "unspliced")
+    assert inspection.nCells == 3696
+    assert inspection.nFeatures == 27998
+
+    reader = H5adReader.from_inspect(inspection)
+    try:
+        assert reader.matrixKey == inspection.matrixKey
+        assert reader.cellIdsKey == inspection.cellIdsKey
+        assert reader.featIdsKey == inspection.featureIdsKey
+        assert reader.nCells == inspection.nCells
+        assert reader.nFeatures == inspection.nFeatures
+    finally:
+        reader.h5.close()
+
+
+def test_inspect_h5ad_prefers_dimension_matched_raw_counts(tmp_path):
+    import h5py
+
+    from scarf.readers import H5adReader, inspect_h5ad
+
+    file_name = tmp_path / "discovery.h5ad"
+    with h5py.File(file_name, mode="w") as h5:
+        _write_sparse_group(
+            h5,
+            "X",
+            np.array([[0.1, 0.0], [0.0, 1.5]], dtype=np.float32),
+        )
+        _write_sparse_group(
+            h5,
+            "raw/X",
+            np.array([[1, 0, 3], [0, 2, 0]], dtype=np.uint16),
+        )
+        layers = h5.create_group("layers")
+        layers.create_dataset(
+            "scaled",
+            data=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32),
+        )
+
+        obs = h5.create_group("obs")
+        obs.create_dataset("barcode", data=np.array([b"cell-a", b"cell-b"]))
+        obs.create_dataset("batch", data=np.array([0, 1], dtype=np.int8))
+        categories = obs.create_group("categories")
+        categories.create_dataset("batch", data=np.array([b"A", b"B"]))
+
+        var = h5.create_group("var")
+        var.create_dataset("gene_ids", data=np.array([b"v1", b"v2"]))
+
+        raw_var = h5.create_group("raw/var")
+        raw_var.create_dataset(
+            "gene_ids",
+            data=np.array([b"ENSG00000000001", b"ENSG00000000002", b"AB-1"]),
+        )
+        raw_var.create_dataset(
+            "gene_symbol",
+            data=np.array([b"GENE1", b"GENE2", b"CD3"]),
+        )
+        raw_var.create_dataset(
+            "feature_types",
+            data=np.array(
+                [b"Gene Expression", b"Gene Expression", b"Antibody Capture"]
+            ),
+        )
+        uns = h5.create_group("uns")
+        uns.create_dataset("title", data=np.bytes_("Discovery fixture"))
+        uns.create_dataset("citation", data=np.bytes_("Synthetic citation"))
+
+    inspection = inspect_h5ad(str(file_name))
+
+    assert inspection.matrixKey == "raw/X"
+    assert inspection.matrixCandidates == ("raw/X", "layers/scaled", "X")
+    assert inspection.featureAttrsKey == "raw/var"
+    assert inspection.cellIdsKey == "barcode"
+    assert inspection.featureIdsKey == "gene_ids"
+    assert inspection.featureNameKey == "gene_symbol"
+    assert inspection.categoryNamesKey == "categories"
+    assert inspection.assaySplitKey == "feature_types"
+    assert inspection.suggestedAssays == {"RNA": 2, "ADT": 1}
+    assert inspection.layers == ("scaled",)
+    assert inspection.title == "Discovery fixture"
+    assert inspection.description == "Synthetic citation"
+    assert inspection.to_reader_kwargs()["feature_ids_key"] == "gene_ids"
+
+    reader = H5adReader.from_inspect(inspection)
+    try:
+        np.testing.assert_array_equal(
+            reader.feat_ids(),
+            [b"ENSG00000000001", b"ENSG00000000002", b"AB-1"],
+        )
+        np.testing.assert_array_equal(
+            reader.feat_names(),
+            [b"GENE1", b"GENE2", b"CD3"],
+        )
+        np.testing.assert_array_equal(
+            np.vstack([chunk.toarray() for chunk in reader.consume(1)]),
+            [[1, 0, 3], [0, 2, 0]],
+        )
+        np.testing.assert_array_equal(
+            dict(reader.get_cell_columns())["batch"],
+            [b"A", b"B"],
+        )
+    finally:
+        reader.h5.close()
+
+    overridden = H5adReader.from_inspect(
+        inspection,
+        feature_name_key="gene_ids",
+    )
+    try:
+        assert overridden.featNamesKey == "gene_ids"
+    finally:
+        overridden.h5.close()
+
+
+def test_inspect_h5ad_falls_back_from_mismatched_raw_var(tmp_path):
+    import h5py
+
+    from scarf.readers import inspect_h5ad
+
+    file_name = tmp_path / "mismatched_raw_var.h5ad"
+    with h5py.File(file_name, mode="w") as h5:
+        _write_sparse_group(
+            h5,
+            "X",
+            np.array([[1, 0], [0, 2]], dtype=np.uint16),
+        )
+        obs = h5.create_group("obs")
+        obs.create_dataset("barcode", data=np.array([b"c1", b"c2"]))
+        var = h5.create_group("var")
+        var.create_dataset(
+            "opaque_long",
+            data=np.array([b"ENSG00000000001", b"ENSG00000000002"]),
+        )
+        var.create_dataset("opaque_short", data=np.array([b"G1", b"G2"]))
+        raw_var = h5.create_group("raw/var")
+        raw_var.create_dataset(
+            "gene_ids",
+            data=np.array([b"raw1", b"raw2", b"raw3"]),
+        )
+
+    inspection = inspect_h5ad(str(file_name))
+
+    assert inspection.featureAttrsKey == "var"
+    assert inspection.featureIdsKey == "opaque_long"
+    assert inspection.featureNameKey == "opaque_short"
+
+
 def test_h5ad_reader_streams_sparse_matrix(h5ad_reader):
     streamed_rows = 0
     streamed_nnz = 0
@@ -426,18 +595,55 @@ def test_h5ad_reader_preserves_sparse_batches(tmp_path, values, batch_size):
         reader.h5.close()
 
 
-def test_h5ad_reader_rejects_csc_sparse_encoding(tmp_path):
+def test_h5ad_reader_converts_csc_sparse_encoding(tmp_path):
+    import h5py
+    import zarr
+
     from scarf.readers import H5adReader
+    from scarf.readers import inspect_h5ad
+    from scarf.writers import H5adToZarr
 
     file_name = tmp_path / "csc.h5ad"
+    zarr_path = tmp_path / "csc.zarr"
+    values = np.array(
+        [
+            [1, 0, 2],
+            [0, 3, 0],
+            [4, 0, 5],
+            [0, 6, 0],
+        ],
+        dtype=np.uint16,
+    )
     _write_sparse_h5ad(
         file_name,
-        np.eye(3, dtype=np.uint32),
+        values,
         encoding_type="csc_matrix",
     )
+    with h5py.File(file_name, mode="r+") as h5:
+        shape = h5["X"].attrs["shape"]
+        del h5["X"].attrs["encoding-type"]
+        del h5["X"].attrs["shape"]
+        h5["X"].attrs["h5sparse_format"] = "csc"
+        h5["X"].attrs["h5sparse_shape"] = shape
 
-    with pytest.raises(ValueError, match="requires CSR encoding"):
-        H5adReader(str(file_name), feature_name_key="feature_name")
+    inspection = inspect_h5ad(str(file_name))
+    assert inspection.matrixEncoding == "csc"
+
+    reader = H5adReader.from_inspect(inspection)
+    try:
+        chunks = list(reader.consume(batch_size=2))
+        np.testing.assert_array_equal(
+            np.vstack([chunk.toarray() for chunk in chunks]),
+            values,
+        )
+        writer = H5adToZarr(reader, zarr_loc=str(zarr_path))
+        writer.dump(batch_size=2)
+    finally:
+        reader.h5.close()
+
+    root = zarr.open_group(str(zarr_path), mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], values)
+    np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
 
 
 def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
@@ -500,9 +706,11 @@ def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):
     feature_columns = dict(h5ad_reader.get_feat_columns())
     assert feature_columns.keys() == {"highly_variable_genes"}
     assert feature_columns["highly_variable_genes"].shape == (h5ad_reader.nFeatures,)
+    # Legacy codes here are {-1, 0, 1} against categories [False, True]; the
+    # -1 sentinel decodes to missing rather than wrapping to the last category.
     np.testing.assert_array_equal(
         feature_columns["highly_variable_genes"][:3],
-        np.array([b"False", b"True", b"True"]),
+        np.array([b"False", None, None], dtype=object),
     )
     np.testing.assert_array_equal(
         h5ad_reader._replace_category_values(
@@ -518,7 +726,7 @@ def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):
 def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
     import h5py
 
-    from scarf.readers import H5adReader
+    from scarf.readers import H5adReader, inspect_h5ad
 
     file_name = tmp_path / "dense.h5ad"
     with h5py.File(file_name, mode="w") as h5:
@@ -531,6 +739,9 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
         obs.create_dataset("batch", data=np.array([0, 1, 0], dtype=np.int8))
         obs_categories = obs.create_group("__categories")
         obs_categories.create_dataset("batch", data=np.array([b"A", b"B"]))
+        state = obs.create_group("state")
+        state.create_dataset("codes", data=np.array([0, 1, 0], dtype=np.int8))
+        state.create_dataset("categories", data=np.array([b"cycling", b"resting"]))
 
         var = h5.create_group("var")
         var.create_dataset("_index", data=np.array([b"f1", b"f2"]))
@@ -541,6 +752,12 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
             data=np.array([b"Gene A", b"Gene B"]),
         )
         var.create_dataset("chromosome", data=np.array([b"1", b"2"]))
+        feature_type = var.create_group("feature_type")
+        feature_type.create_dataset("codes", data=np.array([0, 1], dtype=np.int8))
+        feature_type.create_dataset(
+            "categories",
+            data=np.array([b"Gene Expression", b"Antibody Capture"]),
+        )
 
         obsm = h5.create_group("obsm")
         obsm.create_dataset(
@@ -552,6 +769,10 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
             data=np.array([[1, 2], [3, 4]], dtype=np.float32),
         )
 
+    inspection = inspect_h5ad(str(file_name))
+    assert inspection.matrixKey == "X"
+    assert inspection.matrixEncoding == "dense"
+
     reader = H5adReader(str(file_name))
     try:
         assert reader.groupCodes == {"obs": 2, "var": 2, "obsm": 2, "X": 1}
@@ -560,13 +781,25 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
         np.testing.assert_array_equal(reader.feat_names(), [b"Gene B", b"Gene A"])
 
         cell_columns = dict(reader.get_cell_columns())
-        assert cell_columns.keys() == {"batch", "X_embed1", "X_embed2"}
+        assert cell_columns.keys() == {"batch", "state", "X_embed1", "X_embed2"}
         np.testing.assert_array_equal(cell_columns["batch"], [b"A", b"B", b"A"])
+        np.testing.assert_array_equal(
+            cell_columns["state"],
+            [b"cycling", b"resting", b"cycling"],
+        )
         np.testing.assert_array_equal(cell_columns["X_embed2"], [2, 4, 6])
 
         feature_columns = dict(reader.get_feat_columns())
-        assert feature_columns.keys() == {"chromosome"}
+        assert feature_columns.keys() == {"chromosome", "feature_type"}
         np.testing.assert_array_equal(feature_columns["chromosome"], [b"1", b"2"])
+        np.testing.assert_array_equal(
+            feature_columns["feature_type"],
+            [b"Gene Expression", b"Antibody Capture"],
+        )
+        assert reader.feature_types("feature_type") == [
+            "Gene Expression",
+            "Antibody Capture",
+        ]
 
         chunks = [chunk.toarray() for chunk in reader.consume(batch_size=2)]
         assert len(chunks) == 2

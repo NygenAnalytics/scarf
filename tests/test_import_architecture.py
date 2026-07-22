@@ -759,7 +759,11 @@ def test_reader_implementations_are_runtime_isolated():
 
         allowed_reader_imports: set[str] = set()
         if path.name == "cellranger.py":
-            allowed_reader_imports.add("readers.read_file")
+            allowed_reader_imports.update({"readers._assay_names", "readers.read_file"})
+        elif path.name == "h5ad.py":
+            allowed_reader_imports.update(
+                {"readers._assay_names", "readers._h5ad_inspect"}
+            )
         assert not {
             module_name
             for module_name in runtime_imports

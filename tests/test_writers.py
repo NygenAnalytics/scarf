@@ -105,6 +105,104 @@ def test_h5adtozarr(h5ad_reader, tmp_path):
     writer.dump()
 
 
+def test_h5adtozarr_splits_noncontiguous_feature_types():
+    import tempfile
+    from pathlib import Path
+
+    import h5py
+    from scipy.sparse import csr_matrix
+
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    values = np.array(
+        [
+            [1, 2, 0, 3],
+            [4, 0, 5, 0],
+            [0, 6, 7, 8],
+        ],
+        dtype=np.uint16,
+    )
+    matrix = csr_matrix(values)
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "multi.h5ad"
+        with h5py.File(path, mode="w") as h5:
+            sparse = h5.create_group("X")
+            sparse.attrs["encoding-type"] = "csr_matrix"
+            sparse.attrs["shape"] = matrix.shape
+            sparse.create_dataset("data", data=matrix.data)
+            sparse.create_dataset("indices", data=matrix.indices)
+            sparse.create_dataset("indptr", data=matrix.indptr)
+
+            obs = h5.create_group("obs")
+            obs.create_dataset("_index", data=np.array([b"c1", b"c2", b"c3"]))
+            obs.create_dataset("batch", data=np.array([b"A", b"A", b"B"]))
+
+            var = h5.create_group("var")
+            var.create_dataset(
+                "_index",
+                data=np.array([b"f1", b"a1", b"f2", b"a2"]),
+            )
+            var.create_dataset(
+                "feature_name",
+                data=np.array([b"g1", b"p1", b"g2", b"p2"]),
+            )
+            var.create_dataset(
+                "feature_types",
+                data=np.array(
+                    [
+                        b"Gene Expression",
+                        b"Antibody Capture",
+                        b"Gene Expression",
+                        b"Antibody Capture",
+                    ]
+                ),
+            )
+            var.create_dataset(
+                "chromosome",
+                data=np.array([b"1", b"na", b"2", b"na"]),
+            )
+
+        reader = H5adReader(str(path), feature_name_key="feature_name")
+        store = MemoryStore()
+        try:
+            assert tuple(
+                reader.assay_feature_slices(
+                    "feature_types",
+                    {"Antibody Capture": "HTO"},
+                )
+            ) == ("RNA", "HTO")
+            writer = H5adToZarr(
+                reader,
+                zarr_loc=store,
+                assay_name="ignored",
+                assay_split_key="feature_types",
+                chunk_size=(2, 2),
+            )
+            writer.dump(batch_size=2)
+        finally:
+            reader.h5.close()
+
+    root = zarr.open_group(store=store, mode="r")
+    assert set(root.group_keys()) == {"cellData", "RNA", "ADT"}
+    np.testing.assert_array_equal(root["RNA/counts"][:], values[:, [0, 2]])
+    np.testing.assert_array_equal(root["ADT/counts"][:], values[:, [1, 3]])
+    np.testing.assert_array_equal(root["RNA/countsT"][:], values[:, [0, 2]].T)
+    np.testing.assert_array_equal(root["ADT/countsT"][:], values[:, [1, 3]].T)
+    np.testing.assert_array_equal(root["cellData/batch"][:], ["A", "A", "B"])
+    np.testing.assert_array_equal(root["RNA/featureData/ids"][:], ["f1", "f2"])
+    np.testing.assert_array_equal(root["ADT/featureData/ids"][:], ["a1", "a2"])
+    np.testing.assert_array_equal(
+        root["RNA/featureData/chromosome"][:],
+        ["1", "2"],
+    )
+    np.testing.assert_array_equal(
+        root["ADT/featureData/feature_types"][:],
+        ["Antibody Capture", "Antibody Capture"],
+    )
+
+
 def test_loomtozarr(loom_reader, tmp_path):
     from scarf.writers import LoomToZarr
 
