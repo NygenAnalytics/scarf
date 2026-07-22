@@ -1,5 +1,5 @@
 import re
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -8,14 +8,122 @@ from ..utils.logging import logger
 
 __all__ = ["fit_lowess", "select_highly_variable_features"]
 
+_ADAPTIVE_MIN_BIN_SIZE = 25
+_ADAPTIVE_ANCHOR_QUANTILE = 0.1
+
+
+def _fit_lowess_adaptive(
+    a: np.ndarray,
+    b: np.ndarray,
+    n_bins: int,
+    lowess_frac: float,
+) -> np.ndarray:
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+
+    means = np.asarray(a, dtype=float)
+    variances = np.asarray(b, dtype=float)
+    if means.ndim != 1 or variances.ndim != 1 or means.shape != variances.shape:
+        raise ValueError("LOWESS inputs must be one-dimensional arrays of equal length")
+    if isinstance(n_bins, (bool, np.bool_)) or not isinstance(
+        n_bins,
+        (int, np.integer),
+    ):
+        raise TypeError("n_bins must be an integer")
+    if n_bins < 1:
+        raise ValueError("n_bins must be greater than 0")
+    if isinstance(lowess_frac, (bool, np.bool_)) or not isinstance(
+        lowess_frac,
+        (int, float, np.integer, np.floating),
+    ):
+        raise TypeError("lowess_frac must be numeric")
+    if not np.isfinite(lowess_frac) or not 0 <= lowess_frac <= 1:
+        raise ValueError("lowess_frac must be between 0 and 1")
+
+    corrected = np.zeros(means.shape, dtype=float)
+    valid = np.isfinite(means) & np.isfinite(variances) & (means > 0) & (variances > 0)
+    if not valid.any():
+        return corrected
+
+    log_means = np.log(means[valid])
+    log_variances = np.log(variances[valid])
+    order = np.argsort(log_means, kind="stable")
+    sorted_means = log_means[order]
+    sorted_variances = log_variances[order]
+
+    bin_slices: list[slice] = []
+    bins_left = max(1, min(n_bins, len(order) // _ADAPTIVE_MIN_BIN_SIZE))
+    start = 0
+    while start < len(order):
+        remaining = len(order) - start
+        if bins_left == 1:
+            end = len(order)
+        else:
+            target_size = (remaining + bins_left - 1) // bins_left
+            end = start + target_size
+        while end < len(order) and sorted_means[end] == sorted_means[end - 1]:
+            end += 1
+        bins_after = min(
+            bins_left - 1,
+            (len(order) - end) // _ADAPTIVE_MIN_BIN_SIZE,
+        )
+        if bins_after == 0:
+            end = len(order)
+        bin_slices.append(slice(start, end))
+        start = end
+        bins_left = bins_after
+
+    anchor_means = np.fromiter(
+        (np.median(sorted_means[indices]) for indices in bin_slices),
+        dtype=float,
+        count=len(bin_slices),
+    )
+    anchor_variances = np.fromiter(
+        (
+            np.quantile(
+                sorted_variances[indices],
+                _ADAPTIVE_ANCHOR_QUANTILE,
+            )
+            for indices in bin_slices
+        ),
+        dtype=float,
+        count=len(bin_slices),
+    )
+
+    if len(anchor_means) == 1:
+        correction = np.full(log_means.shape, anchor_variances[0], dtype=float)
+    else:
+        fitted = np.asarray(
+            lowess(
+                anchor_variances,
+                anchor_means,
+                return_sorted=False,
+                frac=lowess_frac,
+                it=100,
+            ),
+            dtype=float,
+        )
+        if fitted.shape != anchor_means.shape or not np.all(np.isfinite(fitted)):
+            raise ValueError("LOWESS returned invalid adaptive trend values")
+        correction = np.interp(log_means, anchor_means, fitted)
+
+    corrected[valid] = np.exp(log_variances - correction)
+    return corrected
+
 
 def fit_lowess(
     a: np.ndarray,
     b: np.ndarray,
     n_bins: int,
     lowess_frac: float,
+    *,
+    bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
 ) -> np.ndarray:
     """Fit a LOWESS curve and return corrected variance estimates."""
+    if bin_strategy == "adaptive":
+        return _fit_lowess_adaptive(a, b, n_bins, lowess_frac)
+    if bin_strategy != "fixed":
+        raise ValueError("bin_strategy must be either 'fixed' or 'adaptive'")
+
     from statsmodels.nonparametric.smoothers_lowess import lowess
 
     stats = pd.DataFrame({"a": a, "b": b}).apply(np.log)

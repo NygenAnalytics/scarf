@@ -110,7 +110,7 @@ def auto_filter_cells(datastore):
 @pytest.fixture(scope="session")
 def mark_hvgs(auto_filter_cells, datastore):
     if not _has_graph(datastore):
-        datastore.mark_hvgs(top_n=100, show_plot=False)
+        datastore.mark_hvgs(top_n=100, show_plot=False, bin_strategy="fixed")
 
 
 @pytest.fixture(scope="session")

@@ -10,7 +10,7 @@ def _ensure_graph(datastore) -> None:
         datastore._get_latest_graph_loc("RNA", "I", "hvgs")
     except KeyError:
         datastore.auto_filter_cells(show_qc_plots=False)
-        datastore.mark_hvgs(top_n=100, show_plot=False)
+        datastore.mark_hvgs(top_n=100, show_plot=False, bin_strategy="fixed")
         datastore.make_graph(feat_key="hvgs")
 
 

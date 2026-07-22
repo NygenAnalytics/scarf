@@ -599,6 +599,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         hvg_key_name: str = "hvgs",
         n_bins: int = 200,
         lowess_frac: float = 0.1,
+        bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
         blacklist: str | None = None,
         blacklist_exclusions: str | None = None,
         blacklist_indexes: Sequence[int] | None = None,
@@ -617,6 +618,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             hvg_key_name=hvg_key_name,
             n_bins=n_bins,
             lowess_frac=lowess_frac,
+            bin_strategy=bin_strategy,
             blacklist=blacklist,
             blacklist_exclusions=blacklist_exclusions,
             blacklist_indexes=blacklist_indexes,
@@ -639,6 +641,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         show_plot: bool = True,
         hvg_key_name: str = "hvgs",
         max_cells: float | None = None,
+        bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
         **plot_kwargs: Any,
     ) -> None:
         """Identify and mark genes as highly variable genes (HVGs). This is a
@@ -668,6 +671,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             lowess_frac: Between 0 and 1. The fraction of the data used when estimating the fit between mean and
                          variance. This is same as `frac` in statsmodels.nonparametric.smoothers_lowess.lowess
                          (Default: 0.1)
+            bin_strategy: Strategy used to construct bins and variance anchors. (Default: 'adaptive')
             blacklist: This is a regular expression (regex) string that can be used to exclude genes from being marked
                        as HVGs. By default, we exclude mitochondrial, ribosomal, some cell-cycle related, histone and
                        HLA genes. (Default: '^MT- | ^RPS | ^RPL | ^MRPS | ^MRPL | ^CCN | ^HLA- | ^H2- | ^HIST' )
@@ -711,6 +715,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             max_mean=max_mean,
             n_bins=n_bins,
             lowess_frac=lowess_frac,
+            bin_strategy=bin_strategy,
             blacklist=blacklist,
             hvg_key_name=hvg_key_name,
             keep_bounds=keep_bounds,

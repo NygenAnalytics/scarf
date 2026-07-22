@@ -1,5 +1,5 @@
 from collections.abc import Generator, Sequence
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -51,6 +51,34 @@ def _as_feature_indexes(
     if require_unique and np.unique(indexes).size != indexes.size:
         raise ValueError(f"{name} contains duplicate feature indexes")
     return indexes
+
+
+def _corrected_variance_column(
+    n_bins: int,
+    lowess_frac: float,
+    bin_strategy: Literal["fixed", "adaptive"],
+) -> str:
+    if bin_strategy not in ("fixed", "adaptive"):
+        raise ValueError("bin_strategy must be either 'fixed' or 'adaptive'")
+    if bin_strategy == "adaptive":
+        if isinstance(n_bins, (bool, np.bool_)) or not isinstance(
+            n_bins,
+            (int, np.integer),
+        ):
+            raise TypeError("n_bins must be an integer")
+        if n_bins < 1:
+            raise ValueError("n_bins must be greater than 0")
+        if isinstance(lowess_frac, (bool, np.bool_)) or not isinstance(
+            lowess_frac,
+            (int, float, np.integer, np.floating),
+        ):
+            raise TypeError("lowess_frac must be numeric")
+        if not np.isfinite(lowess_frac) or not 0 <= lowess_frac <= 1:
+            raise ValueError("lowess_frac must be between 0 and 1")
+        return f"c_var__adaptive__{n_bins}__{lowess_frac}"
+    if not 0 <= lowess_frac <= 1:
+        raise ValueError("lowess_frac must be between 0 and 1")
+    return f"c_var__{n_bins}__{lowess_frac}"
 
 
 class RNAassay(Assay):
@@ -692,16 +720,19 @@ class RNAassay(Assay):
         """Return cached feature statistics aligned to ``feat_key``.
 
         This method only reads an existing, valid summary-statistics group. It
-        does not calculate statistics or delete a stale cache.
+        does not calculate statistics or delete a stale cache. Default reads
+        prefer adaptive corrected variance and fall back to legacy fixed caches.
         """
-        requested: tuple[str, ...]
+        requested: tuple[str, ...] | None
         if columns is None:
-            requested = ("nz_mean", "c_var__200__0.1", "normed_n")
+            requested = None
         elif isinstance(columns, str):
             raise TypeError("columns must be a sequence of column names, not a string")
         else:
             requested = tuple(columns)
-        if not all(isinstance(column, str) for column in requested):
+        if requested is not None and not all(
+            isinstance(column, str) for column in requested
+        ):
             raise TypeError("columns must contain only strings")
 
         cell_idx, all_feat_idx = self._get_cell_feat_idx(cell_key, "I")
@@ -717,6 +748,15 @@ class RNAassay(Assay):
             )
 
         stats_group = as_zarr_group(self.z[stats_loc], name=stats_loc)
+        if requested is None:
+            adaptive = _corrected_variance_column(200, 0.1, "adaptive")
+            fixed = _corrected_variance_column(200, 0.1, "fixed")
+            c_var_col = (
+                adaptive
+                if adaptive in stats_group or fixed not in stats_group
+                else fixed
+            )
+            requested = ("nz_mean", c_var_col, "normed_n")
         feat_idx = self.feats.active_index(feat_key)
         values: dict[str, np.ndarray] = {}
         for column in requested:
@@ -730,7 +770,12 @@ class RNAassay(Assay):
         return values
 
     def set_summary_stats(
-        self, cell_key: str | None = None, n_bins: int = 200, lowess_frac: float = 0.1
+        self,
+        cell_key: str | None = None,
+        n_bins: int = 200,
+        lowess_frac: float = 0.1,
+        *,
+        bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
     ) -> tuple[str, str]:
         """Calculates summary statistics for the features of the assay using only cells that are marked True by the 'cell_key' parameter.
 
@@ -739,6 +784,7 @@ class RNAassay(Assay):
             n_bins: Number of bins to divide the data into.
             lowess_frac: Between 0 and 1. The fraction of the data used when estimating the fit between mean and
                          variance. This is same as `frac` in statsmodels.nonparametric.smoothers_lowess.lowess
+            bin_strategy: Strategy used to construct bins and variance anchors.
 
         Returns:
             A tuple of two strings.
@@ -752,13 +798,13 @@ class RNAassay(Assay):
         if cell_key is None:
             cell_key = "I"
 
-        # check lowess_frac is between 0 and 1
-        if not 0 <= lowess_frac <= 1:
-            raise ValueError("lowess_frac must be between 0 and 1")
-
+        c_var_col = _corrected_variance_column(
+            n_bins,
+            lowess_frac,
+            bin_strategy,
+        )
         self.set_feature_stats(cell_key)
         identifier = self._load_stats_loc(cell_key)
-        c_var_col = f"c_var__{n_bins}__{lowess_frac}"
         if col_renamer(c_var_col) in self.feats.columns:
             logger.info("Using existing corrected dispersion values")
         else:
@@ -767,8 +813,18 @@ class RNAassay(Assay):
                 i = col_renamer(i)
                 if i not in self.feats.columns:
                     raise KeyError(f"ERROR: {i} not found in feature metadata")
-            c_var = self.feats.remove_trend(
-                col_renamer("avg"), col_renamer("sigmas"), n_bins, lowess_frac
+            from ..features.variability import fit_lowess
+
+            mean = self.feats.fetch(col_renamer("avg")).astype(float)
+            variance = self.feats.fetch(col_renamer("sigmas")).astype(float)
+            positive = mean > 0
+            c_var = np.zeros(mean.shape, dtype=float)
+            c_var[positive] = fit_lowess(
+                mean[positive],
+                variance[positive],
+                n_bins,
+                lowess_frac,
+                bin_strategy=bin_strategy,
             )
             self.feats.insert(c_var_col, c_var, overwrite=True, location=identifier)
 
@@ -783,6 +839,7 @@ class RNAassay(Assay):
         hvg_key_name: str = "hvgs",
         n_bins: int = 200,
         lowess_frac: float = 0.1,
+        bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
         blacklist: str | None = None,
         blacklist_exclusions: str | None = None,
         blacklist_indexes: Sequence[int] | None = None,
@@ -835,7 +892,12 @@ class RNAassay(Assay):
         elif blacklist_exclusions not in (None, ""):
             raise ValueError("blacklist_exclusions requires blacklist")
 
-        self.set_summary_stats(cell_key, n_bins, lowess_frac)
+        self.set_summary_stats(
+            cell_key,
+            n_bins,
+            lowess_frac,
+            bin_strategy=bin_strategy,
+        )
         selected[blocked] = False
         column_name = f"{cell_key}__{hvg_key_name}"
         self.feats.insert(column_name, selected, fill_value=False, overwrite=True)
@@ -858,14 +920,15 @@ class RNAassay(Assay):
         keep_bounds: bool,
         show_plot: bool,
         max_cells: int | float,
+        bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
         **plot_kwargs: Any,
     ) -> None:
         """Identifies highly variable genes in the dataset.
 
         The parameters govern the min/max variance (corrected) and mean expression threshold for calling genes highly
         variable. The variance is corrected by first dividing genes into bins based on their mean expression values.
-        Genes with minimum variance is selected from each bin and a Lowess curve is fitted to
-        the mean-variance trend of these genes. mark_hvgs will by default run on the default assay.
+        The fixed strategy fits a Lowess curve through minimum-variance genes, while the adaptive strategy uses balanced
+        bins and robust variance anchors. mark_hvgs will by default run on the default assay.
         See `scarf.features.fit_lowess` for further details.
 
         *Modifies the feats table*: adds a column named `<cell_key>__hvgs` to the feature table,
@@ -892,6 +955,7 @@ class RNAassay(Assay):
             n_bins: Number of bins into which the mean expression is binned.
             lowess_frac: Between 0 and 1. The fraction of the data used when estimating the fit between mean and
                          variance. This is same as `frac` in statsmodels.nonparametric.smoothers_lowess.lowess
+            bin_strategy: Strategy used to construct bins and variance anchors.
             blacklist: A regular expression string pattern. Gene names matching to this pattern will be excluded from
                        the final highly variable genes list
             hvg_key_name: The label for highly variable genes. This label will be used to mark the HVGs in the
@@ -910,7 +974,12 @@ class RNAassay(Assay):
             return f"{identifier}_{x}"
 
         logger.info("Calculating summary statistics")
-        identifier, c_var_col = self.set_summary_stats(cell_key, n_bins, lowess_frac)
+        identifier, c_var_col = self.set_summary_stats(
+            cell_key,
+            n_bins,
+            lowess_frac,
+            bin_strategy=bin_strategy,
+        )
         logger.info("Calculating HVGs")
 
         from ..features.variability import select_highly_variable_features

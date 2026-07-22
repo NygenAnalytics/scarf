@@ -558,6 +558,54 @@ class TestDataStore:
         with patch.object(datastore.RNA, "mark_hvgs") as mock:
             datastore.mark_hvgs(show_plot=False, top_n=10)
         assert mock.call_args.kwargs["max_cells"] == np.inf
+        assert mock.call_args.kwargs["bin_strategy"] == "adaptive"
+
+        with patch.object(datastore.RNA, "mark_hvgs") as mock:
+            datastore.mark_hvgs(
+                show_plot=False,
+                top_n=10,
+                bin_strategy="adaptive",
+            )
+        assert mock.call_args.kwargs["bin_strategy"] == "adaptive"
+
+    def test_adaptive_hvg_stats_reuse_single_matrix_pass(
+        self,
+        auto_filter_cells,
+        datastore,
+        monkeypatch,
+    ):
+        import scarf.features.variability as variability
+
+        assay = datastore.RNA
+        identifier, fixed_column = assay.set_summary_stats(
+            "I",
+            bin_strategy="fixed",
+        )
+
+        def fail_matrix_pass(*args, **kwargs):
+            pytest.fail("adaptive correction must reuse cached feature statistics")
+
+        def fail_metadata_trend(*args, **kwargs):
+            pytest.fail("HVG correction must not route through metadata")
+
+        monkeypatch.setattr(assay, "_streaming_feature_stats", fail_matrix_pass)
+        monkeypatch.setattr(assay.feats, "remove_trend", fail_metadata_trend)
+        adaptive_identifier, adaptive_column = assay.set_summary_stats("I")
+
+        assert adaptive_identifier == identifier
+        assert fixed_column == "c_var__200__0.1"
+        assert adaptive_column == "c_var__adaptive__200__0.1"
+        assert f"{identifier}_{fixed_column}" in assay.feats.columns
+        assert f"{identifier}_{adaptive_column}" in assay.feats.columns
+
+        def fail_correction(*args, **kwargs):
+            pytest.fail("cached adaptive correction must be reused")
+
+        monkeypatch.setattr(variability, "fit_lowess", fail_correction)
+        assert assay.set_summary_stats("I") == (
+            identifier,
+            adaptive_column,
+        )
 
     def test_mark_prevalent_peaks_with_rna_assay(self, datastore):
         import pytest

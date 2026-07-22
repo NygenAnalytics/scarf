@@ -11,7 +11,7 @@ def _active_cell_count(datastore) -> int:
 def _ensure_graph(datastore):
     if not _has_graph(datastore):
         datastore.auto_filter_cells(show_qc_plots=False)
-        datastore.mark_hvgs(top_n=100, show_plot=False)
+        datastore.mark_hvgs(top_n=100, show_plot=False, bin_strategy="fixed")
         datastore.make_graph(feat_key="hvgs")
 
 

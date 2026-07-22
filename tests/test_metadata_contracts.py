@@ -115,6 +115,30 @@ def test_metadata_rows_and_queries_match_table_contract():
     assert table.head(2)["score"].tolist() == [0.5, 2.0]
 
 
+def test_metadata_remove_trend_preserves_fixed_strategy():
+    from scarf.features.variability import fit_lowess
+
+    rng = np.random.default_rng(5)
+    means = rng.uniform(0.5, 20.0, 80)
+    variances = np.clip(means**1.5 + rng.normal(0, 0.05, len(means)), 0.1, None)
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    group.create_array("I", data=np.ones(len(means), dtype=bool))
+    group.create_array("means", data=means)
+    group.create_array("variances", data=variances)
+    table = metadata.MetaData(group)
+
+    observed = table.remove_trend("means", "variances", n_bins=8, lowess_frac=0.6)
+    expected = fit_lowess(
+        means,
+        variances,
+        n_bins=8,
+        lowess_frac=0.6,
+        bin_strategy="fixed",
+    )
+
+    np.testing.assert_array_equal(observed, expected)
+
+
 def test_metadata_row_blocks_remain_pickle_resolvable():
     block = metadata.MetaDataRowBlock(
         start=0,

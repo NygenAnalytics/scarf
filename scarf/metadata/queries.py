@@ -122,6 +122,7 @@ def remove_trend(
         y_values[positive],
         n_bins,
         lowess_frac,
+        bin_strategy="fixed",
     )
     residuals = np.repeat(fill_value, len(x_values)).astype(float)
     residuals[positive] = trend

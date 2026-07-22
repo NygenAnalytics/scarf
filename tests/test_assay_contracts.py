@@ -61,7 +61,7 @@ _PUBLIC_CLASS_METHODS = {
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     Assay: "ec3721b2cc5d31858beb1652cc3ea20050dc675c70328b444bfb2cbb535038bc",
-    RNAassay: "6626dd172a0d0e2548d8bcb6f8703e6b78caa9631671f63126dc1bba9d7ee276",
+    RNAassay: "5af40e0f5579c8ef6dff03b41eaec1a1ea184b653bc7c66c8ecb1e5b5d51a60a",
     ATACassay: "491bb1c63ad83fa5d9634200c5b3778a3018e39abdd3ae87208eb3e85659633c",
     ADTassay: "a1ff1bebdd8fcd3f30a1b64a42dbf2931f6b8031ddce75abcf362750eb4e9c34",
 }
@@ -228,7 +228,18 @@ def test_assay_read_block_facade_remains_patchable(monkeypatch):
     np.testing.assert_array_equal(blocks[0][1], expected)
 
 
-def test_get_feature_stats_reads_cached_columns_in_feature_key_order():
+@pytest.mark.parametrize(
+    ("include_adaptive", "expected_column", "expected_variance"),
+    [
+        (False, "c_var__200__0.1", np.array([40.0, 20.0])),
+        (True, "c_var__adaptive__200__0.1", np.array([400.0, 200.0])),
+    ],
+)
+def test_get_feature_stats_reads_cached_columns_in_feature_key_order(
+    include_adaptive,
+    expected_column,
+    expected_variance,
+):
     root = zarr.open_group(store=MemoryStore(), mode="w")
     stats = root.create_group("summary_stats_I")
     stats.create_array("nz_mean", data=np.array([1.0, 2.0, 3.0, 4.0]))
@@ -236,6 +247,11 @@ def test_get_feature_stats_reads_cached_columns_in_feature_key_order():
         "c_var__200__0.1",
         data=np.array([10.0, 20.0, 30.0, 40.0]),
     )
+    if include_adaptive:
+        stats.create_array(
+            "c_var__adaptive__200__0.1",
+            data=np.array([100.0, 200.0, 300.0, 400.0]),
+        )
     stats.create_array("normed_n", data=np.array([5.0, 6.0, 7.0, 8.0]))
 
     rna = RNAassay.__new__(RNAassay)
@@ -256,12 +272,9 @@ def test_get_feature_stats_reads_cached_columns_in_feature_key_order():
     rna._validate_stats_loc = validate
     values = rna.get_feature_stats("I", feat_key="selected")
 
-    assert list(values) == ["nz_mean", "c_var__200__0.1", "normed_n"]
+    assert list(values) == ["nz_mean", expected_column, "normed_n"]
     np.testing.assert_array_equal(values["nz_mean"], np.array([4.0, 2.0]))
-    np.testing.assert_array_equal(
-        values["c_var__200__0.1"],
-        np.array([40.0, 20.0]),
-    )
+    np.testing.assert_array_equal(values[expected_column], expected_variance)
     np.testing.assert_array_equal(values["normed_n"], np.array([8.0, 6.0]))
     assert validation_calls[0][3] is False
 

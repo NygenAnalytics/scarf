@@ -1,4 +1,5 @@
 from types import MethodType
+from typing import Literal
 
 import numpy as np
 import pytest
@@ -12,7 +13,7 @@ from scarf.metadata import MetaData
 
 def _rna_with_feature_names(
     names: list[str],
-) -> tuple[RNAassay, list[tuple[str, int, float]]]:
+) -> tuple[RNAassay, list[tuple[str, int, float, str]]]:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     feature_data = root.create_group("featureData")
     feature_data.create_array("I", data=np.ones(len(names), dtype=bool))
@@ -25,16 +26,19 @@ def _rna_with_feature_names(
     assay = RNAassay.__new__(RNAassay)
     assay.z = root
     assay.feats = MetaData(feature_data)
-    calls: list[tuple[str, int, float]] = []
+    calls: list[tuple[str, int, float, str]] = []
 
     def set_summary_stats(
         self: RNAassay,
         cell_key: str,
         n_bins: int,
         lowess_frac: float,
+        *,
+        bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
     ) -> tuple[str, str]:
-        calls.append((cell_key, n_bins, lowess_frac))
-        return f"stats_{cell_key}", f"c_var__{n_bins}__{lowess_frac}"
+        calls.append((cell_key, n_bins, lowess_frac, bin_strategy))
+        strategy = "" if bin_strategy == "fixed" else "adaptive__"
+        return f"stats_{cell_key}", f"c_var__{strategy}{n_bins}__{lowess_frac}"
 
     assay.set_summary_stats = MethodType(set_summary_stats, assay)
     return assay, calls
@@ -55,7 +59,7 @@ def test_set_hvgs_installs_mask_and_applies_regex_exclusions():
         assay.feats.fetch_all(column),
         np.array([False, True, True, True]),
     )
-    assert calls == [("selected_cells", 200, 0.1)]
+    assert calls == [("selected_cells", 200, 0.1, "adaptive")]
 
 
 def test_set_hvgs_accepts_global_indexes_and_prefers_blacklist_indexes():
@@ -67,6 +71,7 @@ def test_set_hvgs_accepts_global_indexes_and_prefers_blacklist_indexes():
         hvg_key_name="custom",
         n_bins=50,
         lowess_frac=0.2,
+        bin_strategy="adaptive",
         blacklist="^KEEP",
         blacklist_indexes=[1],
     )
@@ -76,7 +81,7 @@ def test_set_hvgs_accepts_global_indexes_and_prefers_blacklist_indexes():
         assay.feats.fetch_all(column),
         np.array([True, False, False, True]),
     )
-    assert calls == [("I", 50, 0.2)]
+    assert calls == [("I", 50, 0.2, "adaptive")]
 
 
 @pytest.mark.parametrize(
@@ -113,6 +118,24 @@ def test_set_hvgs_validates_selection_before_computing_stats(kwargs, error):
     assert calls == []
 
 
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        ({"n_bins": True}, TypeError),
+        ({"lowess_frac": np.nan}, ValueError),
+        ({"bin_strategy": "unknown"}, ValueError),
+    ],
+)
+def test_set_summary_stats_validates_before_computing_feature_stats(kwargs, error):
+    assay = RNAassay.__new__(RNAassay)
+    assay.set_feature_stats = lambda cell_key: pytest.fail(
+        "invalid correction parameters must not trigger feature statistics"
+    )
+
+    with pytest.raises(error):
+        assay.set_summary_stats("I", **kwargs)
+
+
 def test_datastore_set_hvgs_delegates_and_rejects_non_rna_assays():
     assay = RNAassay.__new__(RNAassay)
     delegated = []
@@ -130,12 +153,14 @@ def test_datastore_set_hvgs_delegates_and_rejects_non_rna_assays():
         cell_key="selected",
         feature_indexes=[2],
         blacklist_indexes=[1],
+        bin_strategy="adaptive",
     )
 
     assert result == "selected__hvgs"
     assert delegated[0][0] == "selected"
     assert delegated[0][1]["feature_indexes"] == [2]
     assert delegated[0][1]["blacklist_indexes"] == [1]
+    assert delegated[0][1]["bin_strategy"] == "adaptive"
 
     adt = ADTassay.__new__(ADTassay)
     store._get_assay = lambda from_assay: adt
