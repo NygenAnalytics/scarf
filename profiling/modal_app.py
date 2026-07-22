@@ -53,7 +53,7 @@ from profiling.spawn_wait import (
     await_many_function_calls,
     await_stage_result,
 )
-from profiling.stages import run_stage
+from profiling.stages import repair_counts_t, run_stage
 
 _WORK = Path("/tmp/scarf-profiling")
 
@@ -262,6 +262,45 @@ def run_stage_job(
     )
     write_result(config, result)
     return result.to_json()
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=65_536,
+    cpu=8.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def repair_counts_t_job(
+    configDict: dict[str, Any],
+    nRows: int,
+) -> dict[str, Any]:
+    """Rewrite incomplete ``countsT`` for an existing store (no createStore)."""
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    if nRows not in config.targetSizes:
+        raise ValueError(f"size {nRows} is not in config.targetSizes")
+    resources = config.resourcesFor("createStore")
+    store_uri = config.storeUri(nRows)
+    print(
+        f"[repair_counts_t] store={store_uri} memMb={resources.modalMemoryLimitMb}",
+        flush=True,
+    )
+    result = repair_counts_t(
+        storeUri=store_uri,
+        assayName=config.workflow.assayName,
+        resources=resources,
+    )
+    print(
+        f"[repair_counts_t] DONE status={result['status']} "
+        f"seconds={result['seconds']} complete={result['complete']}",
+        flush=True,
+    )
+    return {
+        "runTag": config.runTag,
+        "nRows": nRows,
+        **result,
+    }
 
 
 @app.function(
@@ -644,12 +683,22 @@ def main(*arg_list: str) -> None:
     run_parser.add_argument("--config", required=True)
     run_parser.add_argument("--size", type=int, required=True)
     run_parser.add_argument("--stage", choices=FULL_STAGE_ORDER, required=True)
+    run_parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="Spawn from this modal run app (no deploy). Prefer --detach.",
+    )
 
     all_parser = sub.add_parser("run-all")
     all_parser.add_argument("--config", required=True)
     all_parser.add_argument("--sizes", nargs="*", type=int, default=None)
     all_parser.add_argument(
         "--stages", nargs="*", choices=FULL_STAGE_ORDER, default=None
+    )
+    all_parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="Spawn from this modal run app (no deploy). Prefer --detach.",
     )
 
     local_parser = sub.add_parser(
@@ -671,6 +720,17 @@ def main(*arg_list: str) -> None:
     )
     probe_parser.add_argument("--config", required=True)
     probe_parser.add_argument("--size", type=int, required=True)
+
+    repair_parser = sub.add_parser(
+        "repair-counts-t",
+        help=(
+            "Rewrite countsT for an existing store and mark complete=True. "
+            "Use: modal run --detach --env scarf_profiling -m profiling.modal_app "
+            "-- repair-counts-t --config ... --size ..."
+        ),
+    )
+    repair_parser.add_argument("--config", required=True)
+    repair_parser.add_argument("--size", type=int, required=True)
 
     io_parser = sub.add_parser("io-baseline")
     io_parser.add_argument("--config", required=True)
@@ -735,11 +795,12 @@ def main(*arg_list: str) -> None:
             return
         resources = config.resourcesFor(args.stage)
         options = modal_function_options(config, resources)
-        call = (
-            _deployed_function(config, "run_stage_job")
-            .with_options(**options)
-            .spawn(payload, args.size, args.stage)
+        target = (
+            run_stage_job
+            if args.ephemeral
+            else _deployed_function(config, "run_stage_job")
         )
+        call = target.with_options(**options).spawn(payload, args.size, args.stage)
         _print_spawned(f"run_stage_job {args.size}/{args.stage}", call)
         return
 
@@ -751,11 +812,12 @@ def main(*arg_list: str) -> None:
                 if size not in config.targetSizes:
                     raise SystemExit(f"size {size} is not in config.targetSizes")
         coordinator_options = orchestrator_function_options(config)
-        call = (
-            _deployed_function(config, "run_all_jobs")
-            .with_options(**coordinator_options)
-            .spawn(payload, sizes, stages)
+        target = (
+            run_all_jobs
+            if args.ephemeral
+            else _deployed_function(config, "run_all_jobs")
         )
+        call = target.with_options(**coordinator_options).spawn(payload, sizes, stages)
         _print_spawned("run_all_jobs", call)
         return
 
@@ -799,6 +861,22 @@ def main(*arg_list: str) -> None:
         )
         _print_spawned(f"probe_leiden_job {args.size}", call)
         print("Watch for parent and child runLeiden progress in logs.")
+        return
+
+    if args.command == "repair-counts-t":
+        if args.size not in config.targetSizes:
+            raise SystemExit(f"size {args.size} is not in config.targetSizes")
+        # retries=0: overlapping rewrites leave complete=False again.
+        options = modal_function_options(
+            config,
+            config.resourcesFor("createStore"),
+            maxContainers=1,
+            retries=0,
+        )
+        # Ephemeral under `modal run` (prefer --detach). No deploy required.
+        call = repair_counts_t_job.with_options(**options).spawn(payload, args.size)
+        _print_spawned(f"repair_counts_t_job {args.size}", call)
+        print("Prefer: modal run --detach ... so the rewrite survives disconnect.")
         return
 
     if args.command == "io-baseline":

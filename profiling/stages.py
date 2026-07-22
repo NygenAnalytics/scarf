@@ -9,6 +9,11 @@ from typing import Any
 
 import numpy as np
 from scarf import DataStore, H5adReader, H5adToZarr, SubsetZarr
+from scarf.storage.budget import resolve_budget, set_resource_budget
+from scarf.storage.profiles import set_storage_profile
+from scarf.storage.sharding import write_counts_t
+from scarf.storage.stores import open_store
+from scarf.storage.types import as_zarr_array, as_zarr_group
 from scarf.writers import to_h5ad
 
 from profiling.config import (
@@ -140,9 +145,10 @@ def _impute_feature_names(store: DataStore, workflow: WorkflowParameters) -> lis
     return candidates[: workflow.imputeGeneCount]
 
 
-def _monitor_leiden_process(
+def _monitor_child_process(
     process: subprocess.Popen[bytes],
     *,
+    stageLabel: str,
     warningSeconds: float = LEIDEN_WARNING_SECONDS,
     pollSeconds: float = LEIDEN_MONITOR_INTERVAL_SECONDS,
 ) -> int:
@@ -159,20 +165,34 @@ def _monitor_leiden_process(
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - started
             print(
-                f"[runLeiden] child still running pid={process.pid} "
+                f"[{stageLabel}] child still running pid={process.pid} "
                 f"elapsedSeconds={elapsed:.0f}",
                 flush=True,
             )
             if not warned and elapsed >= warningSeconds:
                 print(
-                    f"[runLeiden] WARNING child exceeded "
+                    f"[{stageLabel}] WARNING child exceeded "
                     f"{warningSeconds:.0f}s; continuing",
                     flush=True,
                 )
                 warned = True
 
 
-def _stop_leiden_process(process: subprocess.Popen[bytes]) -> None:
+def _monitor_leiden_process(
+    process: subprocess.Popen[bytes],
+    *,
+    warningSeconds: float = LEIDEN_WARNING_SECONDS,
+    pollSeconds: float = LEIDEN_MONITOR_INTERVAL_SECONDS,
+) -> int:
+    return _monitor_child_process(
+        process,
+        stageLabel="runLeiden",
+        warningSeconds=warningSeconds,
+        pollSeconds=pollSeconds,
+    )
+
+
+def _stop_child_process(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
     process.terminate()
@@ -183,26 +203,35 @@ def _stop_leiden_process(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
-def _read_leiden_worker_status(statusPath: Path) -> dict[str, Any] | None:
+def _stop_leiden_process(process: subprocess.Popen[bytes]) -> None:
+    _stop_child_process(process)
+
+
+def _read_worker_status(statusPath: Path, *, workerName: str) -> dict[str, Any] | None:
     if not statusPath.is_file():
         return None
     payload = json.loads(statusPath.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise RuntimeError("Leiden worker status must be a JSON object")
+        raise RuntimeError(f"{workerName} status must be a JSON object")
     return payload
 
 
-def _run_leiden_in_subprocess(
+def _read_leiden_worker_status(statusPath: Path) -> dict[str, Any] | None:
+    return _read_worker_status(statusPath, workerName="Leiden worker")
+
+
+def _run_worker_in_subprocess(
     *,
+    stageLabel: str,
+    workerModule: str,
     storeUri: str,
     workflow: WorkflowParameters,
     resources: StageResources,
     workDir: Path | None,
+    workDirPrefix: str,
 ) -> None:
     worker_dir = (
-        workDir
-        if workDir is not None
-        else Path(tempfile.mkdtemp(prefix="scarf-leiden-"))
+        workDir if workDir is not None else Path(tempfile.mkdtemp(prefix=workDirPrefix))
     )
     worker_dir.mkdir(parents=True, exist_ok=True)
     request_path = worker_dir / "request.json"
@@ -223,30 +252,68 @@ def _run_leiden_in_subprocess(
     command = [
         sys.executable,
         "-m",
-        "profiling.leiden_worker",
+        workerModule,
         "--request",
         str(request_path),
     ]
     process = subprocess.Popen(command)
     print(
-        f"[runLeiden] child started pid={process.pid} backend=leidenalg "
+        f"[{stageLabel}] child started pid={process.pid} module={workerModule} "
         f"warningSeconds={LEIDEN_WARNING_SECONDS:.0f}",
         flush=True,
     )
     try:
-        return_code = _monitor_leiden_process(process)
+        return_code = _monitor_child_process(process, stageLabel=stageLabel)
     except BaseException:
-        _stop_leiden_process(process)
+        _stop_child_process(process)
         raise
 
-    status = _read_leiden_worker_status(status_path)
+    status = _read_worker_status(status_path, workerName=f"{stageLabel} worker")
     if return_code != 0:
         detail = status.get("error") if status is not None else None
         suffix = f": {detail}" if isinstance(detail, str) else ""
-        raise RuntimeError(f"Leiden worker exited with code {return_code}{suffix}")
+        raise RuntimeError(
+            f"{stageLabel} worker exited with code {return_code}{suffix}"
+        )
     if status is None or status.get("status") != "ok":
-        raise RuntimeError("Leiden worker exited without a successful status")
-    print(f"[runLeiden] child completed pid={process.pid}", flush=True)
+        raise RuntimeError(f"{stageLabel} worker exited without a successful status")
+    print(f"[{stageLabel}] child completed pid={process.pid}", flush=True)
+
+
+def _run_leiden_in_subprocess(
+    *,
+    storeUri: str,
+    workflow: WorkflowParameters,
+    resources: StageResources,
+    workDir: Path | None,
+) -> None:
+    _run_worker_in_subprocess(
+        stageLabel="runLeiden",
+        workerModule="profiling.leiden_worker",
+        storeUri=storeUri,
+        workflow=workflow,
+        resources=resources,
+        workDir=workDir,
+        workDirPrefix="scarf-leiden-",
+    )
+
+
+def _run_paris_in_subprocess(
+    *,
+    storeUri: str,
+    workflow: WorkflowParameters,
+    resources: StageResources,
+    workDir: Path | None,
+) -> None:
+    _run_worker_in_subprocess(
+        stageLabel="runClustering",
+        workerModule="profiling.paris_worker",
+        storeUri=storeUri,
+        workflow=workflow,
+        resources=resources,
+        workDir=workDir,
+        workDirPrefix="scarf-paris-",
+    )
 
 
 def _pseudotime_sources_sinks(
@@ -355,6 +422,14 @@ def run_stage(
             elif stage == "runLeiden":
                 with timer.operation():
                     _run_leiden_in_subprocess(
+                        storeUri=storeUri,
+                        workflow=workflow,
+                        resources=resources,
+                        workDir=workDir,
+                    )
+            elif stage == "runClustering":
+                with timer.operation():
+                    _run_paris_in_subprocess(
                         storeUri=storeUri,
                         workflow=workflow,
                         resources=resources,
@@ -491,14 +566,7 @@ def _run_analysis(
             )
         return
     if stage == "runClustering":
-        store.run_clustering(
-            from_assay=workflow.assayName,
-            cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
-            n_clusters=workflow.parisNClusters,
-            label=workflow.parisLabel,
-        )
-        return
+        raise AssertionError("runClustering must execute in its child process")
     if stage == "runPseudotime":
         sources, sinks = _pseudotime_sources_sinks(store, workflow)
         store.run_pseudotime_scoring(
@@ -555,3 +623,95 @@ def _run_analysis(
         )
         return
     raise ValueError(f"No analysis operation for {stage}")
+
+
+def repair_counts_t(
+    *,
+    storeUri: str,
+    assayName: str,
+    resources: StageResources,
+    nCheckTiles: int = 3,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Rewrite feature-major ``countsT`` and only then mark it complete."""
+    set_storage_profile("cloud" if storeUri.startswith("s3://") else "fast_local")
+    set_resource_budget(
+        resolve_budget(
+            memory=resources.scarfMemoryBudget,
+            workers=resources.workers,
+            working_copies=resources.workingCopies,
+        )
+    )
+    root = open_store(
+        storeUri,
+        mode="r+",
+        storage_options=storage_options(storeUri),
+    )
+    group = as_zarr_group(root[assayName], name=assayName)
+    counts = as_zarr_array(group["counts"], name=f"{assayName}/counts")
+    before_complete = None
+    if "countsT" in group:
+        before_complete = group["countsT"].attrs.get("complete")
+
+    started = time.perf_counter()
+    counts_t = write_counts_t(counts, group)
+    seconds = time.perf_counter() - started
+    if counts_t is None:
+        raise RuntimeError(
+            f"write_counts_t skipped for {assayName} (Zarr format < 3); "
+            "cannot repair countsT"
+        )
+    if counts_t.attrs.get("complete") is not True:
+        raise RuntimeError(
+            f"countsT rewrite finished without complete=True at {storeUri}"
+        )
+
+    expected_shape = (int(counts.shape[1]), int(counts.shape[0]))
+    if tuple(counts_t.shape) != expected_shape:
+        raise RuntimeError(
+            f"countsT shape {tuple(counts_t.shape)} != expected {expected_shape}"
+        )
+    if np.dtype(counts_t.dtype) != np.dtype(counts.dtype):
+        raise RuntimeError(
+            f"countsT dtype {counts_t.dtype} != counts dtype {counts.dtype}"
+        )
+
+    rng = np.random.default_rng(seed)
+    feat_chunk = max(1, int(counts_t.chunks[0]))
+    cell_chunk = max(1, int(counts_t.chunks[1]))
+    n_feats, n_cells = counts_t.shape
+    checks: list[dict[str, Any]] = []
+    for _ in range(max(0, nCheckTiles)):
+        feat_start = int(rng.integers(0, n_feats))
+        feat_start = (feat_start // feat_chunk) * feat_chunk
+        cell_start = int(rng.integers(0, n_cells))
+        cell_start = (cell_start // cell_chunk) * cell_chunk
+        feat_end = min(feat_start + feat_chunk, n_feats)
+        cell_end = min(cell_start + cell_chunk, n_cells)
+        got = np.asarray(counts_t[feat_start:feat_end, cell_start:cell_end])
+        expect = np.asarray(counts[cell_start:cell_end, feat_start:feat_end]).T
+        if got.shape != expect.shape or not np.array_equal(got, expect):
+            raise RuntimeError(
+                "countsT tile mismatch after rewrite "
+                f"feat=[{feat_start}:{feat_end}] cell=[{cell_start}:{cell_end}]"
+            )
+        checks.append(
+            {
+                "featStart": feat_start,
+                "featEnd": feat_end,
+                "cellStart": cell_start,
+                "cellEnd": cell_end,
+            }
+        )
+
+    return {
+        "storeUri": storeUri,
+        "assayName": assayName,
+        "status": "ok",
+        "seconds": seconds,
+        "beforeComplete": before_complete,
+        "complete": True,
+        "shape": list(counts_t.shape),
+        "dtype": str(counts_t.dtype),
+        "checkedTiles": checks,
+    }

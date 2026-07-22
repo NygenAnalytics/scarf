@@ -99,6 +99,11 @@ class WorkflowParameters(BaseModel):
     imputeDiffusionT: int = 2
     parisNClusters: int = 20
     parisLabel: str = "paris_cluster"
+    # When True, cut the Paris dendrogram with BalancedCut. min/max default to
+    # the observed Leiden cluster sizes on the same cell key (see paris worker).
+    parisBalancedCut: bool = False
+    parisMinSize: int | None = None
+    parisMaxSize: int | None = None
     pseudotimeLabel: str = "pseudotime"
     mappingQueryRows: int = 25_000
     mappingTargetName: str = "query25k"
@@ -126,6 +131,16 @@ class WorkflowParameters(BaseModel):
             raise ValueError("imputeDiffusionT must be positive")
         if self.parisNClusters <= 1:
             raise ValueError("parisNClusters must be > 1")
+        if self.parisMinSize is not None and self.parisMinSize < 1:
+            raise ValueError("parisMinSize must be >= 1")
+        if self.parisMaxSize is not None and self.parisMaxSize < 1:
+            raise ValueError("parisMaxSize must be >= 1")
+        if (
+            self.parisMinSize is not None
+            and self.parisMaxSize is not None
+            and self.parisMinSize > self.parisMaxSize
+        ):
+            raise ValueError("parisMinSize must be <= parisMaxSize")
         if self.mappingQueryRows <= 0:
             raise ValueError("mappingQueryRows must be positive")
         if self.mappingSaveK <= 0 or self.mappingBatchSize <= 0:
@@ -308,7 +323,9 @@ def _normalize_raw_config(raw: dict[str, Any]) -> dict[str, Any]:
     payload = dict(raw)
     fixed = payload.pop("fixedResources", None)
     if fixed is not None and "stageResources" not in payload:
-        payload["stageResources"] = fixed
+        stages = payload.get("stages")
+        selected = tuple(stages) if stages is not None else CORE_STAGE_ORDER
+        payload["stageResources"] = {stage: fixed for stage in selected}
     payload.pop("sourceProvenance", None)
     payload.pop("capacityCases", None)
     payload.pop("blockSeeds", None)

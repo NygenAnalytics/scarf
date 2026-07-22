@@ -1,6 +1,6 @@
-# Scarf cloud profiling learnings (100k → 5M, countsT)
+# Scarf cloud profiling learnings (50k → 5M, countsT + Paris)
 
-Date range: 2026-07-14 to 2026-07-21  
+Date range: 2026-07-14 to 2026-07-22  
 Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`  
 Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)  
 Dataset source: nested CELLxGENE samples already prepared on R2
@@ -29,7 +29,8 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 10. Right-size Modal RAM per stage from measured peaks. Do not put Leiden/UMAP/HVG on a 64 GiB queue when peaks are ~5–8 GiB; that worsens scheduling and lost-input risk. Keep 64 GiB for createStore / makeGraph at large N when peaks justify it.
 11. When polling spawned calls, treat call-graph `FAILURE` / `INIT_FAILURE` / `TERMINATED` / `TIMEOUT` as terminal. Modal can raise an empty `TimeoutError` from `get(timeout=…)` on failed inputs; spinning on that alone leaves orchestrators stuck until the stage deadline.
 12. Local-vs-remote store A/B: use `run-local` / `run_local_funnel_job` (one container, H5AD + Zarr on ephemeral disk, `fast_local`). Per-stage `run` / `run-all` always write the store to R2. Compare tags like `local_ephemeral_c8_m32_100k` vs `counts_t_c8_m32_100k_reorg`.
-13. **Run Leiden in a child process for large N.** Modal's runner heartbeat (~900s) is not configurable. Historical `leidenalg` holds the GIL in native code, so the parent stops heartbeating and the runner dies. Profiling isolates `runLeiden` in `profiling/leiden_worker.py` with a parent that logs every 30s and warns at 1800s without killing the child. Do not try to "raise the heartbeat threshold"; keep the child-process path.
+13. **Run Leiden and Paris in a child process for large N.** Modal's runner heartbeat (~900s) is not configurable. Historical `leidenalg` and sknetwork Paris both hold the GIL in native code, so the parent stops heartbeating and the runner dies. Profiling isolates `runLeiden` in `profiling/leiden_worker.py` and `runClustering` (Paris) in `profiling/paris_worker.py`, with a parent that logs every 30s and warns at 1800s without killing the child. Do not try to raise the heartbeat threshold; keep the child-process path.
+14. **`countsT` durability:** `complete=False` until every tile is written. A full-shaped array with `complete=False` is untrusted (interrupted or overlapping writers). Do not flip the attr; re-run `write_counts_t`. Overlapping createStore retries on the same store can leave this state. Use `retries=0` for repair-only rewrites.
 
 ## Code changes already wired
 
@@ -39,6 +40,9 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 | Auto marker batch when `gene_batch_size is None` | `scarf/features/markers/batching.py` `resolve_marker_gene_batch_size` | `min(col_chunk, n_features, budgetCap)` with `budgetCap = (memoryBytes // workingCopies) // (n_cells * 32)` |
 | Optional profiling override | `profiling` `markerGeneBatchSize` | Layout sweep forced `50`; later runs leave unset for auto |
 | Leiden child-process isolation | `profiling/stages.py`, `profiling/leiden_worker.py` | Parent keeps Modal heartbeats alive during long `leidenalg` GIL holds |
+| Paris child-process isolation | `profiling/stages.py`, `profiling/paris_worker.py` | Same heartbeat pattern; balanced cut min/max from Leiden cluster sizes |
+| `fixedResources` expands per stage | `profiling/config.py` `_normalize_raw_config` | One resource block applies to every selected stage |
+| `--ephemeral` spawn | `profiling/modal_app.py` `run` / `run-all` | Spawn from `modal run` app without deploy; prefer `--detach` |
 
 ## Machine sizes used (Modal hard limit vs Scarf budget)
 
@@ -66,6 +70,8 @@ Two different numbers matter:
 | `local_ephemeral_c8_m32_100k` | 100k | 8 | 32 GiB | ~24 GiB | Same knobs; Zarr on Modal `/tmp` (`fast_local`); **421s** |
 | `counts_t_c8_m32_500k` | 500k | 8 | 32 GiB | 24 GiB | Feature-major `countsT`; **2825s** (vs 3906s row-major) |
 | `counts_t_c8_m64_5m` | 5M | 8 (Leiden 2) | right-sized 8–64 GiB | ~75% of Modal | countsT core; **29465s (~8.2 h)**; max peak **33.0 GiB** (makeGraph cgroup) |
+| `core_paris_c2_m16_50k` | 50k | 2 | 16 GiB | 12 GiB | Full core + Paris; **693s**; max peak **6.5 GiB** (initializeStore) |
+| Paris-only (`paris_c2_m16_*`) | 100k–5M | 2 | 16 GiB | 12 GiB | Reused existing stores; balanced cut from Leiden sizes; see Paris section |
 
 Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.md` as the durable record; recreate TOMLs from these rows when needed.
 
@@ -101,6 +107,13 @@ counts_t_c8_m32_100k=fc-01KXPPVDDF9A5J8599QM7ZW65Q
 counts_t_c8_m32_500k=fc-01KXPR232W53HQXN4QPPNAD8D6
 counts_t_c8_m64_5m_leiden=fc-01KY2DMQ331ZVJ8YCBN634BTJS
 counts_t_c8_m64_5m_markers=fc-01KY2JQDPFWK689ZSV5QYK9H5E
+core_paris_c2_m16_50k=fc-01KY4TJ4J4CAXQQ0T6PG5PTTAQ
+paris_100k=fc-01KY4TJQ76E8K4AHKRJJF4DVKH
+paris_250k=fc-01KY4TKA0690V7767RG5K10RYA
+paris_500k=fc-01KY4TKXM62KND6Y54H3FYYZDW
+paris_1m=fc-01KY4TMFKCCG7YP0D7QZ31AW6B
+paris_2_5m=fc-01KY4TN2DECFKJHZ57GP48DV8H
+paris_5m=fc-01KY4TNN5D4QTFHAY9DDYKRHJE
 ```
 
 ## Layout sweep @ 100k (4 CPU / 32 GiB)
@@ -217,11 +230,13 @@ Configs:
 
 | Size | Recommended reference tag | Machine | Notes |
 |------|---------------------------|---------|-------|
-| 100k | `counts_t_c8_m32_100k` | 8 CPU / 32 GiB | Fastest measured funnel (**881s**); row-major control `auto_markers_c8_m32` (1095s) |
-| 250k | `auto_markers_c8_m32_250k` | 8 CPU / 32 GiB | Row-major only so far; 2346s, max peak 14.6 GiB |
-| 500k | `counts_t_c8_m32_500k` | 8 CPU / 32 GiB | Fastest measured (**2825s**); row-major control `auto_markers_c8_m32_500k` (3906s) |
-| 1M | `auto_markers_c8_m64_1m` | 8 CPU / 64 GiB | Row-major 9156s; countsT not measured yet (estimate ~1.3h below) |
-| 2.5M | `auto_markers_c8_m64_2_5m` | 8 CPU / 64 GiB | Row-major **15292s**; makeGraph peak 24.5 GiB |
+| 50k | `core_paris_c2_m16_50k` | 2 CPU / 16 GiB | Full core + Paris; **693s**; max peak 6.5 GiB |
+| 100k | `counts_t_c8_m32_100k` | 8 CPU / 32 GiB | Fastest measured funnel (**881s**); row-major control `auto_markers_c8_m32` (1095s); Paris 42s |
+| 250k | `auto_markers_c8_m32_250k` | 8 CPU / 32 GiB | Row-major only so far; 2346s, max peak 14.6 GiB; Paris 68s |
+| 500k | `counts_t_c8_m32_500k` | 8 CPU / 32 GiB | Fastest measured (**2825s**); row-major control `auto_markers_c8_m32_500k` (3906s); Paris 140s |
+| 1M | `auto_markers_c8_m64_1m` | 8 CPU / 64 GiB | Row-major 9156s; countsT not measured yet; Paris 274s |
+| 2.5M | `auto_markers_c8_m64_2_5m` | 8 CPU / 64 GiB | Row-major **15292s**; makeGraph peak 24.5 GiB; Paris 1408s |
+| 5M | `counts_t_c8_m64_5m` | right-sized 8–64 GiB | countsT core **29465s**; Paris 4492s / 14.8 GiB RSS |
 
 For a pure markers comparison at 100k without parallel UMAP noise, use `auto_markers_c4_m32` (269s markers).
 
@@ -447,9 +462,65 @@ Row-major makeGraph cgroup for mid sizes: 1M **28.3G**, 2.5M **32.6G**. 5M count
 | 500k | makeGraph 24.5G cgroup | 24.5G | **32 GiB** |
 | 1M | makeGraph 28.3G | ~28G | 48–64 GiB |
 | 2.5M | makeGraph 32.6G | ~33G | 48–64 GiB |
-| 5M | makeGraph **33.0G** | 33G | **64 GiB** createStore/makeGraph; Leiden ≥16–32 GiB |
+| 5M | makeGraph **33.0G** | 33G | **64 GiB** createStore/makeGraph; Leiden ≥16–32 GiB; Paris ≥16 GiB |
 
 Wall-time and RAM scale differently: gene-wise wall shrinks with countsT at small N; at 5M, createStore + makeGraph + markers dominate wall, and makeGraph still sets the RAM floor.
+
+## Paris clustering (balanced cut, 2026-07-22)
+
+Paris needs a finished neighbourhood graph + Leiden labels. Knobs: `parisBalancedCut=true`, `min_size` / `max_size` = observed Leiden cluster sizes on that store, label `paris_cluster`, Modal **2 CPU / 16 GiB**, child-process worker. Layouts: `profiling/layouts/50k_core_paris_c2_m16.toml` (full funnel) and `profiling/layouts/paris_c2_m16_{100k,250k,500k,1m,2_5m,5m}.toml` (Paris-only on existing tags).
+
+Leiden size stats used for balanced cut (active cells under `I`):
+
+| Store tag | Cells (active) | Leiden clusters | min size | max size |
+|-----------|---------------:|----------------:|---------:|---------:|
+| `core_paris_c2_m16_50k` | 44428 | 38 | 136 | 4593 |
+| `counts_t_c8_m32_100k` | 88955 | 40 | 27 | 8500 |
+| `auto_markers_c8_m32_250k` | 222443 | 43 | 20 | 19302 |
+| `counts_t_c8_m32_500k` | 444909 | 53 | 63 | 33025 |
+| `auto_markers_c8_m64_1m` | 889974 | 52 | 111 | 86697 |
+| `auto_markers_c8_m64_2_5m` | 2377327 | 53 | 455 | 192883 |
+| `counts_t_c8_m64_5m` | 4605638 | 58 | 283 | 319408 |
+
+### Paris wall + peaks
+
+| Cells | Store tag | Seconds | Peak RSS | Peak cgroup | vs Leiden (same store, prior run) |
+|------:|-----------|--------:|---------:|------------:|-----------------------------------|
+| 50k | `core_paris_c2_m16_50k` | **25** | 1.09 | 0.76 | Leiden 25s / 1.07G RSS |
+| 100k | `counts_t_c8_m32_100k` | **42** | 1.21 | 0.88 | Leiden ~24s (R2 reorg) |
+| 250k | `auto_markers_c8_m32_250k` | **68** | 1.59 | 1.26 | Leiden 51s |
+| 500k | `counts_t_c8_m32_500k` | **140** | 2.24 | 1.89 | Leiden ~1.5G peak band |
+| 1M | `auto_markers_c8_m64_1m` | **274** | 3.53 | 3.19 | Leiden 185s / 2.3G |
+| 2.5M | `auto_markers_c8_m64_2_5m` | **1408** | 8.01 | 7.64 | Leiden 681s row-major |
+| 5M | `counts_t_c8_m64_5m` | **4492 (~75 min)** | **14.77** | 14.39 | Leiden 1550s / 13.0G |
+
+**Learnings:**
+
+1. **16 GiB is enough for Paris through 5M** on these graphs. 5M peaked at 14.8 GiB RSS (tight vs 16 GiB Modal; little headroom).
+2. **Paris is slower than Leiden at large N**, and the gap widens: ~1× at 50k, ~1.5× at 1M, ~2× at 2.5M, ~2.9× at 5M (4492s vs 1550s).
+3. **Paris RAM grows with cells** (roughly with graph size), unlike gene-wise stages that stay flatter after countsT. Size Paris like a graph algorithm, not like markers.
+4. **Child-process isolation is required** for the same Modal heartbeat reason as Leiden; in-process Paris at 5M would be a multi-hour GIL hold.
+5. Prefer reusing existing stores for Paris-only A/B; do not rebuild the funnel unless the graph is missing.
+
+### 50k full core + Paris @ 2 CPU / 16 GiB (done)
+
+Tag `core_paris_c2_m16_50k`. Fresh store. Call `fc-01KY4TJ4J4CAXQQ0T6PG5PTTAQ`.
+
+| Stage | Seconds | Peak GiB (RSS / cgroup) |
+|-------|--------:|------------------------:|
+| createStore | 141 | 3.4 / 3.4 |
+| initializeStore | 90 | **6.5 / 6.4** |
+| reopenStore | 8 | 0.5 / 0.5 |
+| filterCells | 18 | 0.5 / 0.5 |
+| markHvgs | 45 | 1.1 / 1.1 |
+| makeGraph | 166 | 4.4 / 4.9 |
+| runUmap | 65 | 0.7 / 0.7 |
+| runLeiden | 25 | 1.1 / 0.7 |
+| findMarkers | 109 | 2.0 / 1.9 |
+| runClustering | 25 | 1.1 / 0.8 |
+| **total** | **693** | **6.5** |
+
+**Reading:** 2 CPU / 16 GiB is comfortable for 50k end-to-end. Peak driver is `initializeStore`, not makeGraph. Paris and Leiden are both ~25s at this size.
 
 ## Non-core extras @ 250k (countsT, planned / in flight)
 
