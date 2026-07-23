@@ -107,6 +107,7 @@ nitpick_ignore = [
     ("py:class", "scarf.neighbors.stream.AnnStream"),
     ("py:class", "scarf.merge.DummyAssay"),
     ("py:class", "scarf.readers.CrReader"),
+    ("py:class", "scarf.readers.h5ad._H5adAssayFeatures"),
     ("py:class", "scarf.plotting._figure.LegendSpec"),
     ("py:class", "scarf.metadata.MetaDataRowBlock"),
     ("py:class", "scarf.datastore.mapping_datastore.MappingDatastore"),
