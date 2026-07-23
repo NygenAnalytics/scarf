@@ -59,6 +59,8 @@ ds = scarf.DataStore(
     nthreads=4, 
     default_assay='RNA'
 )
+if 'RNA_paris_cluster' not in ds.cells.columns:
+    ds.run_paris_clustering(n_clusters=10)
 ```
 
 ```{code-cell} ipython3
@@ -68,7 +70,7 @@ ds
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by=['RNA_cluster', 'clusters'],
+    color_by=['RNA_paris_cluster', 'clusters'],
     legend_loc='on_data',
 )
 ```
@@ -80,7 +82,7 @@ Scarf uses a memory-efficient implementation of the [PBA algorithm](https://gith
 
 ```{code-cell} ipython3
 pseudotime = ds.run_pseudotime_scoring(
-    source_sink_key="RNA_cluster",    # Column that contains cluster information 
+    source_sink_key="RNA_paris_cluster",  # Column that contains cluster information
     sources=[1],                      # Source clusters
     sinks=[3],                        # Sink clusters
 )

@@ -3169,7 +3169,6 @@ dependencies = [
     { name = "packaging" },
     { name = "pandas" },
     { name = "scikit-learn" },
-    { name = "scikit-network" },
     { name = "scipy" },
     { name = "setuptools" },
     { name = "sgtsnepi" },
@@ -3210,6 +3209,7 @@ test = [
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
+    { name = "scikit-network" },
     { name = "topacedo" },
 ]
 
@@ -3255,7 +3255,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=4" },
     { name = "pytest-xdist", marker = "extra == 'test'", specifier = ">=3" },
     { name = "scikit-learn", specifier = ">=1.5" },
-    { name = "scikit-network", specifier = ">=0.33.1" },
+    { name = "scikit-network", marker = "extra == 'test'", specifier = ">=0.33.1" },
     { name = "scipy", specifier = ">=1.13,!=1.17.0" },
     { name = "seaborn", marker = "extra == 'extra'", specifier = ">=0.13" },
     { name = "setuptools", specifier = ">=61" },

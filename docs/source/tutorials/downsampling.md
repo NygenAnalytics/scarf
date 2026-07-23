@@ -51,12 +51,12 @@ ds = scarf.DataStore('scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr')
 
 ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ds.make_graph(feat_key='hvgs', k=11, dims=15)
-ds.run_clustering(n_clusters=15)
+ds.run_paris_clustering(n_clusters=15)
 ds.run_umap(n_epochs=250, parallel=True)
 
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_cluster',
+    color_by='RNA_paris_cluster',
 )
 ```
 
@@ -72,7 +72,7 @@ subset from Scarf's KNN graph while keeping heterogeneous regions.
 
 ```{code-cell} ipython3
 ds.run_topacedo_sampler(
-    cluster_key='RNA_cluster',
+    cluster_key='RNA_paris_cluster',
     max_sampling_rate=0.1
 )
 if 'RNA_sketched' not in ds.cells.columns:
@@ -86,7 +86,7 @@ Selected cells are marked `True` under `RNA_sketched`. Plot them with `subset_by
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_cluster',
+    color_by='RNA_paris_cluster',
     subset_by='RNA_sketched',
 )
 ```
@@ -98,7 +98,7 @@ Seed cells used for PCST are marked under `RNA_sketch_seeds`:
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_cluster',
+    color_by='RNA_paris_cluster',
     subset_by='RNA_sketch_seeds',
 )
 ```

@@ -42,7 +42,6 @@ dependencies = [
     "packaging",
     "pandas>=2.2.2",
     "scikit-learn>=1.5",
-    "scikit-network>=0.33.1",
     "scipy>=1.13,!=1.17.0",
     "setuptools>=61",
     "statsmodels>=0.14.2",
@@ -71,6 +70,7 @@ test = [
     "pytest-xdist>=3",
     "topacedo>=0.2.10",
     "anndata>=0.12",
+    "scikit-network>=0.33.1",
 ]
 docs = [
     "jinja2",

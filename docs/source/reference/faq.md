@@ -50,7 +50,7 @@ you can run both and view the Paris hierarchy with Leiden labels:
 
 ```python
 ds.plots.cluster_tree(
-    cluster_key="RNA_cluster",
+    cluster_key="RNA_paris_cluster",
     fill_by_value="RNA_leiden_cluster",
 )
 ```

@@ -28,7 +28,7 @@ graph-based tSNE, Paris hierarchical clustering, and cluster trees.
 
 - Build a graph with normalization, PCA, and KNN search
 - Compare UMAP, densMAP, and tSNE from that graph
-- Inspect Leiden groups with a Paris cluster tree
+- Inspect Paris groups with a Paris cluster tree
 
 ## Dataset
 
@@ -147,27 +147,25 @@ layout geometry, not a second clustering.
 
 ### 4. Run Paris clustering and inspect the tree
 
-Paris builds a hierarchical dendrogram that can be cut to a chosen number of clusters.
-`run_clustering` is the Paris entrypoint. Cluster relationships can be drawn with
-`ds.plots.cluster_tree`.
+Paris builds a hierarchical dendrogram. `run_paris_clustering` selects a
+branch-adaptive cut by default, or accepts an integer cluster count for a fixed cut.
+The automatic cut keeps persistent branches only when splitting them also adds
+topological structure beyond a degree-preserving null model. Its minimum cluster size
+defaults to the graph's `k + 1` and can be set with `min_cluster_size`.
+Cluster relationships can be drawn with `ds.plots.cluster_tree`.
 
 ```{code-cell} ipython3
-n_clusters = int(
-    ds.cells.to_pandas_dataframe(
-        columns=['RNA_leiden_cluster'], key='I'
-    )['RNA_leiden_cluster'].nunique()
-)
-ds.run_clustering(n_clusters=n_clusters)
+paris = ds.run_paris_clustering()
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_cluster',
+    color_by=paris.label_key,
 )
 ```
 
-Paris labels (`RNA_cluster`) need not match Leiden IDs one-to-one.
+Paris labels (`RNA_paris_cluster`) need not match Leiden IDs one-to-one.
 
 ```{code-cell} ipython3
-ds.plots.cluster_tree(cluster_key='RNA_cluster', width=1)
+ds.plots.cluster_tree(cluster_key='RNA_paris_cluster', width=1)
 ```
 
 Internal nodes are successive merges of Paris clusters; nearby leaves share a longer
@@ -183,7 +181,7 @@ common branch and are more closely related in the hierarchical cut.
 
 UMAP, densMAP, and tSNE coordinates are written to `RNA_UMAP*`, `RNA_densMAP*`, and
 `RNA_tSNE*`. Leiden labels are stored in `RNA_leiden_cluster`; Paris labels are stored in
-`RNA_cluster`, and its dendrogram is saved with the graph.
+`RNA_paris_cluster`, and its hierarchy is saved with the graph.
 
 ## Further reading
 

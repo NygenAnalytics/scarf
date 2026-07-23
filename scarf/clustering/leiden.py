@@ -15,7 +15,7 @@ def leiden_membership(
             "ERROR: 'leidenalg' package is not installed. Please find the "
             "installation instructions here: "
             "https://github.com/vtraag/leidenalg#installation. Also, consider "
-            "running Paris instead of Leiden clustering using `run_clustering` method"
+            "running Paris with the `run_paris_clustering` method"
         )
     import igraph
 

@@ -4,26 +4,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
 from profiling.config import StageResources, WorkflowParameters
 from profiling.stages import _open_datastore
 
 
 def _write_status(statusPath: Path, payload: dict[str, Any]) -> None:
     statusPath.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def _leiden_cluster_sizes(
-    store: Any,
-    workflow: WorkflowParameters,
-) -> tuple[int, int, int]:
-    group_key = workflow.resolvedMarkerGroupKey
-    labels = np.asarray(store.cells.fetch(group_key, key=workflow.cellKey))
-    _values, counts = np.unique(labels, return_counts=True)
-    if counts.size == 0:
-        raise ValueError(f"No Leiden labels found in {group_key}")
-    return int(counts.min()), int(counts.max()), int(counts.size)
 
 
 def run_paris_worker(requestPath: Path) -> None:
@@ -49,32 +35,18 @@ def run_paris_worker(requestPath: Path) -> None:
             "cell_key": workflow.cellKey,
             "feat_key": workflow.hvgKey,
             "label": workflow.parisLabel,
+            "n_clusters": workflow.parisNClusters,
         }
-        if workflow.parisBalancedCut:
-            min_size, max_size, n_clusters = _leiden_cluster_sizes(store, workflow)
-            if workflow.parisMinSize is not None:
-                min_size = workflow.parisMinSize
-            if workflow.parisMaxSize is not None:
-                max_size = workflow.parisMaxSize
-            print(
-                f"[paris_worker] balanced_cut from Leiden "
-                f"nClusters={n_clusters} minSize={min_size} maxSize={max_size}",
-                flush=True,
-            )
-            arguments.update(
-                balanced_cut=True,
-                min_size=min_size,
-                max_size=max_size,
-            )
-        else:
-            arguments["n_clusters"] = workflow.parisNClusters
-            print(
-                f"[paris_worker] straight_cut nClusters={workflow.parisNClusters}",
-                flush=True,
-            )
+        if workflow.parisMinClusterSize is not None:
+            arguments["min_cluster_size"] = workflow.parisMinClusterSize
+        print(
+            f"[paris_worker] cut nClusters={workflow.parisNClusters} "
+            f"minClusterSize={workflow.parisMinClusterSize}",
+            flush=True,
+        )
 
-        print("[paris_worker] datastore open; ENTER run_clustering", flush=True)
-        store.run_clustering(**arguments)
+        print("[paris_worker] datastore open; ENTER run_paris_clustering", flush=True)
+        store.run_paris_clustering(**arguments)
         del store
     except BaseException as exc:
         error = f"{type(exc).__name__}: {exc}"
@@ -83,7 +55,7 @@ def run_paris_worker(requestPath: Path) -> None:
         raise
 
     _write_status(status_path, {"status": "ok", "error": None})
-    print("[paris_worker] DONE run_clustering", flush=True)
+    print("[paris_worker] DONE run_paris_clustering", flush=True)
 
 
 def main(argv: Sequence[str] | None = None) -> None:

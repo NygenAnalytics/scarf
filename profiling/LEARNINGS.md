@@ -1,8 +1,8 @@
-# Scarf cloud profiling learnings (50k → 5M, countsT + Paris)
+# Scarf cloud profiling learnings (50k → 10M, countsT + Paris)
 
-Date range: 2026-07-14 to 2026-07-22  
-Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`  
-Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)  
+Date range: 2026-07-14 to 2026-07-23
+Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`
+Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)
 Dataset source: nested CELLxGENE samples already prepared on R2
 
 This note is the baseline for quantifying later changes (code defaults, orchestrator CPU/mem tables, layout ideas). Times are stage wall seconds from result JSON. Peaks are `peakRssBytes` / `peakCgroupBytes` as reported (RSS unless noted).
@@ -29,7 +29,7 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 10. Right-size Modal RAM per stage from measured peaks. Do not put Leiden/UMAP/HVG on a 64 GiB queue when peaks are ~5–8 GiB; that worsens scheduling and lost-input risk. Keep 64 GiB for createStore / makeGraph at large N when peaks justify it.
 11. When polling spawned calls, treat call-graph `FAILURE` / `INIT_FAILURE` / `TERMINATED` / `TIMEOUT` as terminal. Modal can raise an empty `TimeoutError` from `get(timeout=…)` on failed inputs; spinning on that alone leaves orchestrators stuck until the stage deadline.
 12. Local-vs-remote store A/B: use `run-local` / `run_local_funnel_job` (one container, H5AD + Zarr on ephemeral disk, `fast_local`). Per-stage `run` / `run-all` always write the store to R2. Compare tags like `local_ephemeral_c8_m32_100k` vs `counts_t_c8_m32_100k_reorg`.
-13. **Run Leiden and Paris in a child process for large N.** Modal's runner heartbeat (~900s) is not configurable. Historical `leidenalg` and sknetwork Paris both hold the GIL in native code, so the parent stops heartbeating and the runner dies. Profiling isolates `runLeiden` in `profiling/leiden_worker.py` and `runClustering` (Paris) in `profiling/paris_worker.py`, with a parent that logs every 30s and warns at 1800s without killing the child. Do not try to raise the heartbeat threshold; keep the child-process path.
+13. **Run Leiden and Paris in a child process for large N.** Modal's runner heartbeat (~900s) is not configurable. Historical `leidenalg` and the former scikit-network Paris path could block the parent heartbeat during long native calls. Paris now uses Scarf's native Numba implementation, but profiling keeps both stages isolated so the parent can report progress and failures consistently. `profiling/leiden_worker.py` and `profiling/paris_worker.py` log every 30s and warn at 1800s without killing the child. Do not try to raise the heartbeat threshold; keep the child-process path.
 14. **`countsT` durability:** `complete=False` until every tile is written. A full-shaped array with `complete=False` is untrusted (interrupted or overlapping writers). Do not flip the attr; re-run `write_counts_t`. Overlapping createStore retries on the same store can leave this state. Use `retries=0` for repair-only rewrites.
 
 ## Code changes already wired
@@ -40,7 +40,8 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 | Auto marker batch when `gene_batch_size is None` | `scarf/features/markers/batching.py` `resolve_marker_gene_batch_size` | `min(col_chunk, n_features, budgetCap)` with `budgetCap = (memoryBytes // workingCopies) // (n_cells * 32)` |
 | Optional profiling override | `profiling` `markerGeneBatchSize` | Layout sweep forced `50`; later runs leave unset for auto |
 | Leiden child-process isolation | `profiling/stages.py`, `profiling/leiden_worker.py` | Parent keeps Modal heartbeats alive during long `leidenalg` GIL holds |
-| Paris child-process isolation | `profiling/stages.py`, `profiling/paris_worker.py` | Same heartbeat pattern; balanced cut min/max from Leiden cluster sizes |
+| Paris child-process isolation | `profiling/stages.py`, `profiling/paris_worker.py` | Same heartbeat pattern; fixed or adaptive Paris cut |
+| Guarded adaptive Paris profiling | `profiling/paris_profile.py`, `profiling/paris_quality_gate.py` | Measures the same persistence plus modularity cut shipped by `run_paris_clustering` |
 | `fixedResources` expands per stage | `profiling/config.py` `_normalize_raw_config` | One resource block applies to every selected stage |
 | `--ephemeral` spawn | `profiling/modal_app.py` `run` / `run-all` | Spawn from `modal run` app without deploy; prefer `--detach` |
 
@@ -70,8 +71,9 @@ Two different numbers matter:
 | `local_ephemeral_c8_m32_100k` | 100k | 8 | 32 GiB | ~24 GiB | Same knobs; Zarr on Modal `/tmp` (`fast_local`); **421s** |
 | `counts_t_c8_m32_500k` | 500k | 8 | 32 GiB | 24 GiB | Feature-major `countsT`; **2825s** (vs 3906s row-major) |
 | `counts_t_c8_m64_5m` | 5M | 8 (Leiden 2) | right-sized 8–64 GiB | ~75% of Modal | countsT core; **29465s (~8.2 h)**; max peak **33.0 GiB** (makeGraph cgroup) |
+| `counts_t_c8_m64_10m` | 10M | 8 (Leiden 2) | right-sized 16–64 GiB | ~75% of Modal | countsT core; corrected wall **~22.8 h**; HVG JSON under-timed |
 | `core_paris_c2_m16_50k` | 50k | 2 | 16 GiB | 12 GiB | Full core + Paris; **693s**; max peak **6.5 GiB** (initializeStore) |
-| Paris-only (`paris_c2_m16_*`) | 100k–5M | 2 | 16 GiB | 12 GiB | Reused existing stores; balanced cut from Leiden sizes; see Paris section |
+| Paris-only (`paris_c2_m16_*`) | 100k–5M | 2 | 16 GiB | 12 GiB | Legacy balanced-cut runs retained as a historical baseline |
 
 Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.md` as the durable record; recreate TOMLs from these rows when needed.
 
@@ -107,6 +109,7 @@ counts_t_c8_m32_100k=fc-01KXPPVDDF9A5J8599QM7ZW65Q
 counts_t_c8_m32_500k=fc-01KXPR232W53HQXN4QPPNAD8D6
 counts_t_c8_m64_5m_leiden=fc-01KY2DMQ331ZVJ8YCBN634BTJS
 counts_t_c8_m64_5m_markers=fc-01KY2JQDPFWK689ZSV5QYK9H5E
+counts_t_c8_m64_10m_resume=fc-01KY5TK4AH8MK0GAPDBJ374547
 core_paris_c2_m16_50k=fc-01KY4TJ4J4CAXQQ0T6PG5PTTAQ
 paris_100k=fc-01KY4TJQ76E8K4AHKRJJF4DVKH
 paris_250k=fc-01KY4TKA0690V7767RG5K10RYA
@@ -237,6 +240,7 @@ Configs:
 | 1M | `auto_markers_c8_m64_1m` | 8 CPU / 64 GiB | Row-major 9156s; countsT not measured yet; Paris 274s |
 | 2.5M | `auto_markers_c8_m64_2_5m` | 8 CPU / 64 GiB | Row-major **15292s**; makeGraph peak 24.5 GiB; Paris 1408s |
 | 5M | `counts_t_c8_m64_5m` | right-sized 8–64 GiB | countsT core **29465s**; Paris 4492s / 14.8 GiB RSS |
+| 10M | `counts_t_c8_m64_10m` | right-sized 16–64 GiB | countsT core done; HVG JSON **under-timed** (see 10M section) |
 
 For a pure markers comparison at 100k without parallel UMAP noise, use `auto_markers_c4_m32` (269s markers).
 
@@ -424,7 +428,7 @@ Original pre-reorg R2 countsT total was **881s**; reorg alone cut that to 735s (
 4. **Do not treat 421s as the cloud product number.** Production Scarf-on-R2 remains the R2 figures (735s post-reorg). Local ephemeral is the ceiling for "how fast is this funnel when storage is free," useful for sizing how much further remote IO work can buy.
 5. **Ops caveat:** local requires one long-lived container (`run-local`). Per-stage spawn cannot keep a `/tmp` store across workers. H5AD download time is outside stage timers (same as remote createStore).
 
-## Scaling: countsT 100k / 500k / 5M
+## Scaling: countsT 100k / 500k / 5M / 10M
 
 Early fit from only 100k and 500k totals (`T ≈ 0.211 · N^0.724`) projected **~4.5 h** at 5M. Measured 5M was **~8.2 h**. The two-point fit under-predicted large-N wall, especially gene-wise stages and createStore write.
 
@@ -433,10 +437,13 @@ Early fit from only 100k and 500k totals (`T ≈ 0.211 · N^0.724`) projected **
 | 100k | **881** | **0.24** | 260 | 82 | 164 | 102 | **measured** |
 | 500k | **2825** | **0.78** | 1042 | 261 | 539 | 293 | **measured** |
 | 5M | **29465** | **8.18** | 11508 | 3809 | 6296 | 5215 | **measured** |
+| 10M | **~82k*** | **~22.8*** | 22130 | **~16k*** | 10576 | 16404 | **measured*** |
 
-500k → 5M is cells ×10 and wall ×10.4 (near-linear overall). Stage ratios vs the old 5M estimate: createStore ×1.5, makeGraph ×2.1, HVG ×2.8, markers ×3.9.
+\*10M JSON stage sum is **65871s (~18.3 h)** if you trust `markHvgs.json` (21.8s). That HVG number is a **cache hit** and must not be used for scaling. Use the corrected HVG estimate below; adjusted funnel wall is then **~22.8 h**.
 
-**Practical read:** countsT still wins vs row-major at small/mid N, but do not trust the old 100k/500k power law past 1M. Prefer measured 5M as the large-N anchor. 10M planning should start from ~15 h compute (rough ×2 from 5M) plus 64 GiB scheduling/preemption risk.
+500k → 5M is cells ×10 and wall ×10.4 (near-linear overall). 5M → 10M (corrected) is cells ×2 and wall ×~2.8 vs 5M.
+
+**Practical read:** countsT still wins vs row-major at small/mid N, but do not trust the old 100k/500k power law past 1M. Prefer measured 5M / corrected 10M as large-N anchors.
 
 ## Peak RAM sizing (Modal cgroup)
 
@@ -449,8 +456,9 @@ countsT does **not** change makeGraph RAM much. Size machines from **makeGraph `
 | 100k | 6.7G | initializeStore | 5.2 / 5.3G | 4.4G | 0.7G |
 | 500k | 16.6G RSS | makeGraph | 16.6 / **24.5G** | 7.8G | 1.5G |
 | 5M | **33.0G** | makeGraph | 26.5 / **33.0G** | 7.9G | **13.0G** |
+| 10M | **36.2G** | makeGraph | 30.0 / **36.2G** | 15.2G | **24.5G** |
 
-Row-major makeGraph cgroup for mid sizes: 1M **28.3G**, 2.5M **32.6G**. 5M countsT makeGraph cgroup matches that band (~33G), not the old ~37G extrapolate.
+Row-major makeGraph cgroup for mid sizes: 1M **28.3G**, 2.5M **32.6G**. 5M/10M countsT makeGraph cgroup stays in the ~33–36G band.
 
 ### Suggested Modal RAM (countsT funnel, ~20% headroom)
 
@@ -463,12 +471,31 @@ Row-major makeGraph cgroup for mid sizes: 1M **28.3G**, 2.5M **32.6G**. 5M count
 | 1M | makeGraph 28.3G | ~28G | 48–64 GiB |
 | 2.5M | makeGraph 32.6G | ~33G | 48–64 GiB |
 | 5M | makeGraph **33.0G** | 33G | **64 GiB** createStore/makeGraph; Leiden ≥16–32 GiB; Paris ≥16 GiB |
+| 10M | makeGraph **36.2G** | 36G | **64 GiB** makeGraph; Leiden ≥32 GiB; HVG ≥16–32 GiB (stream ~14G) |
 
-Wall-time and RAM scale differently: gene-wise wall shrinks with countsT at small N; at 5M, createStore + makeGraph + markers dominate wall, and makeGraph still sets the RAM floor.
+Wall-time and RAM scale differently: gene-wise wall shrinks with countsT at small N; at 5M+, createStore + makeGraph + markers dominate wall, and makeGraph still sets the RAM floor.
 
-## Paris clustering (balanced cut, 2026-07-22)
+## Native guarded Paris local profile (2026-07-23)
 
-Paris needs a finished neighbourhood graph + Leiden labels. Knobs: `parisBalancedCut=true`, `min_size` / `max_size` = observed Leiden cluster sizes on that store, label `paris_cluster`, Modal **2 CPU / 16 GiB**, child-process worker. Layouts: `profiling/layouts/50k_core_paris_c2_m16.toml` (full funnel) and `profiling/layouts/paris_c2_m16_{100k,250k,500k,1m,2_5m,5m}.toml` (Paris-only on existing tags).
+Synthetic directed 15-neighbor graphs, 8 threads, Python 3.14:
+
+| Cells | Fit | Modularity guard | Guarded cut total | Estimated peak | Fit incremental RSS |
+|------:|----:|-----------------:|------------------:|---------------:|--------------------:|
+| 100k | 1.82s | 1.57s | 1.71s | 0.18 GiB | 0.15 GiB |
+| 500k | 25.33s | 8.39s | 9.10s | 0.90 GiB | 0.71 GiB |
+
+The guard adds a linear topology pass but remains below fit time at both sizes.
+The RSS sampler covers fitting; the estimate covers fitting and guarded-cut
+paths. These local synthetic measurements are not directly comparable to the
+older cloud store timings below.
+
+## Legacy Paris balanced-cut profile (2026-07-22)
+
+These measurements predate the native Paris hierarchy and adaptive cut. The
+balanced-cut settings below are no longer accepted by the profiling worker.
+Current runs use `parisNClusters="auto"` with optional
+`parisMinClusterSize`, or an integer `parisNClusters` for a fixed cut. The
+older results remain useful only as a runtime and memory baseline.
 
 Leiden size stats used for balanced cut (active cells under `I`):
 
@@ -499,7 +526,7 @@ Leiden size stats used for balanced cut (active cells under `I`):
 1. **16 GiB is enough for Paris through 5M** on these graphs. 5M peaked at 14.8 GiB RSS (tight vs 16 GiB Modal; little headroom).
 2. **Paris is slower than Leiden at large N**, and the gap widens: ~1× at 50k, ~1.5× at 1M, ~2× at 2.5M, ~2.9× at 5M (4492s vs 1550s).
 3. **Paris RAM grows with cells** (roughly with graph size), unlike gene-wise stages that stay flatter after countsT. Size Paris like a graph algorithm, not like markers.
-4. **Child-process isolation is required** for the same Modal heartbeat reason as Leiden; in-process Paris at 5M would be a multi-hour GIL hold.
+4. **Keep child-process isolation for long Paris runs** so the parent can report heartbeats, progress, and failures independently of the native implementation.
 5. Prefer reusing existing stores for Paris-only A/B; do not rebuild the funnel unless the graph is missing.
 
 ### 50k full core + Paris @ 2 CPU / 16 GiB (done)
@@ -571,3 +598,88 @@ In-process `leidenalg` / native igraph both hit Modal **runner heartbeat timeout
 ### Markers at 5M
 
 `findMarkers` **5215s (~87 min)**, peak ~7.9 GiB, 58 clusters. That is between the optimistic countsT 100k/500k extrapolate (~22 min) and row-major 1M→2.5M power-law (~4 h). countsT still helps, but large-N marker wall is no longer near the small-N curve.
+
+## Scale: 10M countsT core (done; HVG caveat)
+
+Tag `counts_t_c8_m64_10m`. Config `profiling/layouts/10m_counts_t_c8_m64.toml`. Resume orchestrator `fc-01KY5TK4AH8MK0GAPDBJ374547` after createStore/initializeStore. `countsT` repaired earlier (`complete=True`, ~4.2 h rewrite).
+
+| Stage | Seconds (result JSON) | Peak GiB (RSS / cgroup) | Notes |
+|-------|----------------------:|------------------------:|-------|
+| createStore | 22130 | 7.7 / 7.7 | includes countsT write |
+| initializeStore | 9551 | 7.4 / 7.3 | cell QC + `nCells`/`dropOuts` |
+| reopenStore | 12 | 0.8 / 0.8 | |
+| filterCells | 43 | 0.8 / 0.8 | |
+| markHvgs | **21.8 (do not use)** | 0.7 / 0.7 | **under-timed; see below** |
+| makeGraph | 10576 | 30.0 / **36.2** | |
+| runUmap | 3817 | 10.2 / 10.1 | |
+| runLeiden | 3316 | **24.5** / 24.1 | child-process path |
+| findMarkers | 16404 | 15.2 / 14.9 | |
+| **JSON total** | **65871 (~18.3 h)** | **36.2** | treats HVG as 22s |
+| **Corrected total** | **~82k (~22.8 h)** | **36.2** | HVG ≈ **~16k s (~4.5 h)** |
+
+### markHvgs at 10M (under-timing)
+
+`markHvgs.json` reports **21.8s / ~0.7 GiB**. That is a **feature-stats cache hit**, not a full HVG compute.
+
+What actually happened:
+
+1. `initializeStore` does **not** mark HVGs. It only builds cell QC and per-feature `nCells`/`dropOuts`.
+2. Real HVG cost is `set_feature_stats` (library-size-normalized mean/variance stream). Logs showed `feature stats block N/15824` at ~14 GiB RSS while `markHvgs` was still pending.
+3. That first pass wrote `summary_stats_I` to the store, then the stage attempt failed to leave a durable result (preempt/retry).
+4. The successful attempt reused the cache (`Using cached feature stats`), ran only dispersion fit + top-2000 selection, and wrote the 21.8s JSON.
+
+**Accounting for LEARNINGS / scaling:** use an estimated full HVG wall of **~4.5 h (~16000s)** from the mid-pass progress (~44% of blocks after ~2 h wall). Peak for sizing: **~14 GiB**, not 0.7 GiB. Do **not** put 21.8s in scale plots or 5M→10M ratios.
+
+Corrected funnel wall ≈ JSON total − 22 + 16000 ≈ **~22.8 h**.
+
+### Other 10M notes
+
+- makeGraph cgroup **36.2 GiB** under 64 GiB Modal: comfortable vs 5M’s 33.0 GiB.
+- Leiden **3316s (~55 min)** / **24.5 GiB** RSS (about 2.1× 5M Leiden time, ~1.9× RSS).
+- Markers **16404s (~4.6 h)** / 15.2 GiB (about 3.1× 5M marker wall).
+- 16 GiB was tight for the real HVG stream (~14 GiB); prefer 32 GiB for 10M `markHvgs` if remeasuring.
+
+## Landscape context (how to talk about scale)
+
+This campaign does **not** claim Scarf is uniquely able to touch multi-million-cell data. Several mature stacks reach large N under different assumptions. The useful claim is narrower and measured:
+
+**Scarf completed a full core funnel (createStore through findMarkers) at ~10M cells on CPU Modal with peak ~36 GiB, store on cloud R2 Zarr.** That combination (CPU, ~64 GiB class host, remote object store, full graph + markers on all cells) is uncommon in public writeups.
+
+### What other stacks optimize for
+
+| Stack | Strength at large N | Typical resource model | Notes for comparison |
+|-------|---------------------|------------------------|----------------------|
+| Scanpy (in-memory) | Proven ~1.3M demos | Often **~100+ GiB** host RAM for classic 1.3M workflows | Out-of-core / Dask / lazy Zarr paths exist for larger atlas work |
+| Scanpy + Dask / lazy AnnData | Atlas-scale PCA and chunked pipelines | Multi-worker or chunked CPU/GPU | Scales via distributed or out-of-core design |
+| rapids-singlecell | Very fast 1M on one GPU; 11M+ with multi-GPU | **GPU VRAM** (managed memory can spill to host) | Different hardware class than this Modal CPU campaign |
+| ScaleSC and similar GPU pipelines | Reported ~10–20M-class runs | Large single-GPU or multi-GPU | Same: GPU-first, not 64 GiB CPU |
+| BPCells (+ Seurat v5) | Excellent disk-backed norm / HVG / PCA; census-scale PCA on modest RAM | Local disk bitpacking; streaming C++ | Strong RAM story for matrix algebra; see below for end-to-end shape |
+
+Sources consulted while drafting this note: Scanpy 1.3M usage notes and memory discussions; NVIDIA RAPIDS-singlecell blogs/papers; ScaleSC (Bioinformatics Advances); BPCells benchmarks and manuscript; Seurat v5 BPCells and sketch vignettes.
+
+### BPCells / Seurat v5 (closest RAM peer)
+
+BPCells is a strong reference for **low-RAM, disk-backed** RNA/ATAC matrix work. Public benchmarks show normalize + PCA and even **44M-cell census PCA** within laptop/server RAM envelopes that Scanpy in-memory cannot match.
+
+For **end-to-end** Seurat analysis at millions of cells, the documented product path is often:
+
+1. Keep the full matrix on disk with BPCells.
+2. **Sketch** a representative subset into memory (commonly on the order of tens of thousands of cells).
+3. Run neighbors / clustering / UMAP on the sketch.
+4. **Project** labels and embeddings back to the full dataset.
+
+That is a deliberate, well-supported design for interactive large-N work. It is not the same job as running graph construction, Leiden/UMAP, and markers on **every** cell under a fixed CPU memory cap.
+
+Community issues also show integration friction that is normal for a fast-moving stack: Seurat steps that historically materialized on-disk layers into `dgCMatrix` (2^31 nnz limits), marker/logFC differences while BPCells marker paths matured, slower full-object plotting unless using the sketch assay, and some Seurat options (for example regress-out during `ScaleData`) that need BPCells-native helpers. Fixes and workarounds exist; the point for Scarf is only that "BPCells PCA at atlas scale" and "full-N cloud funnel at 10M / 64 GiB CPU" answer different questions.
+
+### Positioning for Scarf (use this wording)
+
+Prefer:
+
+> Scarf can run an end-to-end analysis funnel at multi-million cell scale on modest CPU memory against cloud Zarr, with measured wall time and peaks through 10M.
+
+Avoid:
+
+> Scarf is the only / most scalable single-cell package.
+
+Market pull for that narrower job is real (atlas-sized studies, shared CPU nodes, cloud object storage) alongside GPU-first and sketch/disk-backed R workflows that serve other needs well.

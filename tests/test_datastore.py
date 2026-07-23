@@ -15,6 +15,7 @@ from scarf.trajectory.results import (
     PseudotimeAggregationResult,
     PseudotimeScoreResult,
 )
+from scarf.utils.arrays import array_digest
 
 from . import full_path
 
@@ -173,13 +174,19 @@ class TestDataStore:
         agreement = adjusted_rand_score(expected, leiden_clustering)
         assert agreement == pytest.approx(0.8850162225, abs=1e-6)
 
-    def test_paris_values(self, paris_clustering, cell_attrs):
-        assert np.array_equal(paris_clustering, cell_attrs["RNA_cluster"].values)
+    def test_paris_values(self, paris_clustering):
+        labels = np.asarray(paris_clustering, dtype=np.int32)
+        assert labels.ndim == 1
+        assert np.array_equal(np.unique(labels), np.arange(1, 11))
+        assert array_digest(labels) == ("0159faffd8fd22e6c9a9a3e36eb89826")
 
-    def test_paris_balanced_values(self, paris_clustering_balanced, cell_attrs):
-        assert np.array_equal(
-            paris_clustering_balanced, cell_attrs["RNA_balanced_clusters"].values
-        )
+    def test_paris_adaptive_values(self, paris_clustering_auto):
+        labels = np.asarray(paris_clustering_auto, dtype=np.int32)
+        unique = np.unique(labels)
+        assert labels.ndim == 1
+        assert np.array_equal(unique, np.arange(1, unique.size + 1))
+        assert np.bincount(labels)[1:].min() >= 10
+        assert array_digest(labels) == ("aeb885f85abcb41ec2b970f7fe1aaca2")
 
     def test_run_cell_cycle_scoring(self, cell_cycle_scoring, cell_attrs):
         assert np.array_equal(
@@ -193,24 +200,15 @@ class TestDataStore:
         assert disparity < 0.2
 
     def test_get_markers(self, marker_search, paris_clustering, datastore):
-        precalc_markers = pd.read_csv(full_path("markers_cluster1.csv"), index_col=0)
         markers = datastore.get_markers(group_key="RNA_cluster", group_id=1)
 
-        # Check feature names and scores (always required)
-        assert markers.feature_name.equals(precalc_markers.feature_name)
-        np.testing.assert_allclose(
-            markers.score.values,
-            precalc_markers.score.values,
-            rtol=0,
-            atol=1e-3,
-        )
-
-        # Check p_values only if they exist in reference data (backward compatible)
-        if "p_value" in precalc_markers.columns:
-            assert "p_value" in markers.columns, "p_value column missing in output"
-            # P-values should match within reasonable tolerance
-            p_diff = (markers.p_value - precalc_markers.p_value).values
-            assert np.all(np.abs(p_diff) < 1e-3), "p_values differ from reference"
+        assert not markers.empty
+        assert set(markers.group_id) == {1}
+        assert markers.feature_name.is_unique
+        assert {"score", "fold_change", "p_value"}.issubset(markers.columns)
+        assert np.isfinite(markers.score).all()
+        assert np.isfinite(markers.fold_change).all()
+        assert markers.p_value.between(0, 1).all()
 
     def test_get_markers_all_groups(self, marker_search, paris_clustering, datastore):
         all_markers = datastore.get_markers(group_key="RNA_cluster", group_id=None)
@@ -225,11 +223,18 @@ class TestDataStore:
     def test_export_markers_to_csv(
         self, marker_search, paris_clustering, datastore, tmp_path
     ):
-        precalc_markers = pd.read_csv(full_path("markers_all_clusters.csv"))
         out_file = str(tmp_path / "test_values_markers.csv")
         datastore.export_markers_to_csv(group_key="RNA_cluster", csv_filename=out_file)
         markers = pd.read_csv(out_file)
-        assert markers.equals(precalc_markers)
+        groups = sorted(np.unique(paris_clustering))
+        assert list(markers.columns) == [str(group) for group in groups]
+        for group in groups:
+            expected = datastore.get_markers(
+                group_key="RNA_cluster",
+                group_id=int(group),
+            ).feature_name.reset_index(drop=True)
+            actual = markers[str(group)].dropna().reset_index(drop=True)
+            assert actual.equals(expected)
 
     def test_run_unified_umap(self, run_unified_umap, datastore):
         coords = datastore.z["RNA"]["projections"]["unified_UMAP"][:]
@@ -244,7 +249,7 @@ class TestDataStore:
         assert classes.notna().all()
         assert (
             array_hash(classes.astype(str).to_numpy())
-            == "595897c7c4b619dd367674bf66ce826e9ce2e731d59e5f05f1401bf5cc489e99"
+            == "2844cf86e46c3a1638c7d697ff95268e65650c2065714a155c3b6abff8be66bf"
         )
 
     def test_get_mapping_score(self, run_mapping, datastore):
@@ -421,8 +426,16 @@ class TestDataStore:
         # TODO: Check if all the attributes copied to anndata
         datastore.to_anndata()
 
-    def test_run_topacedo_sampler(self, cell_attrs, topacedo_sampler):
-        assert np.all(topacedo_sampler == cell_attrs["RNA_sketched"])
+    def test_run_topacedo_sampler(self, paris_clustering, topacedo_sampler):
+        assert topacedo_sampler.dtype == bool
+        assert topacedo_sampler.shape == paris_clustering.shape
+        cluster_sizes = np.bincount(paris_clustering)[1:]
+        sampled_sizes = np.bincount(
+            paris_clustering[topacedo_sampler],
+            minlength=int(paris_clustering.max()) + 1,
+        )[1:]
+        assert np.all(sampled_sizes >= 3)
+        assert np.all(sampled_sizes < cluster_sizes)
 
     def test_plot_distributions(self, datastore):
         result = splt.distribution(

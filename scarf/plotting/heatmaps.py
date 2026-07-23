@@ -472,6 +472,7 @@ def cluster_tree(
     from_assay: str | None = None,
     cell_key: str | None = None,
     feat_key: str | None = None,
+    integrated_graph: str | None = None,
     cluster_key: str | None = None,
     fill_by_value: str | None = None,
     force_ints_as_cats: bool = True,
@@ -504,6 +505,7 @@ def cluster_tree(
         from_assay=from_assay,
         cell_key=cell_key,
         feat_key=feat_key,
+        integrated_graph=integrated_graph,
         cluster_key=cluster_key,
         fill_by_value=fill_by_value,
     )

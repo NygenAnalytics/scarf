@@ -213,6 +213,43 @@ print(json.dumps({{
     }
 
 
+def test_clustering_package_is_lazy():
+    exports = [
+        "BalancedCut",
+        "CoalesceTree",
+        "ParisClusterDiagnostic",
+        "ParisClusteringResult",
+        "adaptive_cut",
+        "balanced_cut",
+        "leiden_membership",
+        "make_digraph",
+        "paris_dendrogram",
+        "straight_cut",
+    ]
+    result = _run_probe(
+        f"""
+import json
+import sys
+import scarf.clustering as clustering
+
+exports = {exports!r}
+print(json.dumps({{
+    "advertised": sorted(name for name in exports if name in dir(clustering)),
+    "bound": sorted(name for name in exports if name in vars(clustering)),
+    "exports": clustering.__all__,
+    "heavyModules": sorted({{"numba", "numpy", "scipy"}}.intersection(sys.modules)),
+}}))
+"""
+    )
+
+    assert result == {
+        "advertised": sorted(exports),
+        "bound": [],
+        "exports": exports,
+        "heavyModules": [],
+    }
+
+
 def test_plotting_package_is_lazy():
     result = _run_probe(
         f"""
@@ -277,6 +314,15 @@ def test_public_exports_match_canonical_objects():
 
 def test_domain_packages_export_canonical_objects():
     exports = {
+        (
+            "scarf.clustering",
+            "ParisClusterDiagnostic",
+        ): "scarf.clustering.paris_multiscale",
+        (
+            "scarf.clustering",
+            "ParisClusteringResult",
+        ): "scarf.clustering.paris_multiscale",
+        ("scarf.clustering", "adaptive_cut"): "scarf.clustering.paris_multiscale",
         ("scarf.embeddings", "run_harmony"): "scarf.embeddings.harmony",
         ("scarf.features", "binned_sampling"): "scarf.features.scoring",
         ("scarf.features", "fit_lowess"): "scarf.features.variability",

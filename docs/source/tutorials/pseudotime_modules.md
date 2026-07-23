@@ -53,13 +53,15 @@ ds = scarf.DataStore(
     nthreads=4,
     default_assay='RNA',
 )
+if 'RNA_paris_cluster' not in ds.cells.columns:
+    ds.run_paris_clustering(n_clusters=10)
 
 pseudotime_key = 'RNA_pseudotime'
 validity_key = 'RNA_pseudotime__valid'
 
 if pseudotime_key not in ds.cells.columns:
     pseudotime = ds.run_pseudotime_scoring(
-        source_sink_key='RNA_cluster',
+        source_sink_key='RNA_paris_cluster',
         sources=[1],
         sinks=[3],
     )
@@ -176,14 +178,14 @@ Compare the pseudotime-based feature modules with classical cluster markers.
 
 ```{code-cell} ipython3
 # Running marker search
-ds.run_marker_search(group_key='RNA_cluster')
+ds.run_marker_search(group_key='RNA_paris_cluster')
 ```
 
 First we extract the marker genes for cell cluster 8, which predominantly contains the Beta cells.
 
 ```{code-cell} ipython3
 cell_cluster_markers = ds.get_markers(
-    group_key='RNA_cluster',
+    group_key='RNA_paris_cluster',
     group_id='8',
 ).feature_name
 

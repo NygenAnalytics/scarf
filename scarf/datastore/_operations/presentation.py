@@ -283,12 +283,15 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         from_assay: str | None = None,
         cell_key: str | None = None,
         feat_key: str | None = None,
+        integrated_graph: str | None = None,
         cluster_key: str | None = None,
         fill_by_value: str | None = None,
     ) -> dict[str, Any]:
         from networkx import DiGraph, to_pandas_edgelist
 
-        from ...clustering.hierarchy import CoalesceTree, make_digraph
+        from ...clustering.cluster_tree import CoalesceTree, make_digraph
+        from ...utils.arrays import array_digest
+        from .paris_persistence import resolve_compatibility_dendrogram
 
         from_assay, cell_key, feat_key = self._get_latest_keys(
             from_assay, cell_key, feat_key
@@ -299,12 +302,43 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             )
 
         clusters = np.asarray(self.cells.fetch(cluster_key, key=cell_key))
-        graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
-        graph_grp = as_zarr_group(self.zw[graph_loc], name=graph_loc)
-        dendrogram_loc = cast(str, graph_grp.attrs["latest_dendrogram"])
-        coalesced_loc = dendrogram_loc + f"_coalesced_{len(set(clusters))}"
-
+        if integrated_graph is None:
+            graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
+        else:
+            graph_loc = f"{self._integratedGraphsLoc}/{integrated_graph}"
+            if graph_loc not in self.zw:
+                raise KeyError(
+                    f"An integrated graph with label {integrated_graph!r} does not exist"
+                )
+        dendrogram_loc, generation_id = resolve_compatibility_dendrogram(
+            self.zw,
+            graph_loc,
+            final_label_key=cluster_key,
+        )
+        if clusters.dtype.hasobject:
+            hashed_clusters = pd.util.hash_pandas_object(
+                pd.Series(clusters),
+                index=False,
+                categorize=True,
+            ).to_numpy(dtype=np.uint64)
+            cluster_digest = array_digest(hashed_clusters)
+        else:
+            cluster_digest = array_digest(clusters)
+        coalesced_loc = f"{dendrogram_loc}_coalesced_{cluster_digest}"
+        cache_hit = False
         if coalesced_loc in self.zw:
+            coalesced_group = as_zarr_group(
+                self.zw[coalesced_loc],
+                name=coalesced_loc,
+            )
+            cache_hit = (
+                coalesced_group.attrs.get("complete") is True
+                and coalesced_group.attrs.get("cluster_digest") == cluster_digest
+                and coalesced_group.attrs.get("hierarchy_generation_id")
+                == (generation_id or "legacy")
+            )
+
+        if cache_hit:
             subgraph = DiGraph()
             subgraph.add_edges_from(
                 np.asarray(
@@ -327,7 +361,11 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                 )[:]
             )
             cluster_labels = {str(value): value for value in set(clusters)}
-            for node_data, partition_id in zip(nodelist, partition_ids):
+            for node_data, partition_id in zip(
+                nodelist,
+                partition_ids,
+                strict=True,
+            ):
                 node = int(node_data[0])
                 subgraph.nodes[node]["nleaves"] = int(node_data[1])
                 partition_text = str(partition_id)
@@ -341,9 +379,18 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             )
             subgraph = CoalesceTree(make_digraph(dendrogram), clusters)
             edge_list = to_pandas_edgelist(subgraph).values
+            coalesced_group = self.zw.create_group(coalesced_loc, overwrite=True)
+            coalesced_group.attrs.update(
+                {
+                    "complete": False,
+                    "cluster_digest": cluster_digest,
+                    "hierarchy_generation_id": generation_id or "legacy",
+                    "cluster_key": cluster_key,
+                }
+            )
             store = create_zarr_dataset(
-                self.zw,
-                f"{coalesced_loc}/edgelist",
+                coalesced_group,
+                "edgelist",
                 (100000,),
                 "u8",
                 edge_list.shape,
@@ -360,8 +407,8 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
             node_list_arr = np.asarray(node_list)
             store = create_zarr_dataset(
-                self.zw,
-                f"{coalesced_loc}/nodelist",
+                coalesced_group,
+                "nodelist",
                 (100000,),
                 node_list_arr.dtype,
                 node_list_arr.shape,
@@ -369,13 +416,14 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             store[:] = node_list_arr
 
             store = create_zarr_dataset(
-                self.zw,
-                f"{coalesced_loc}/partition_id",
+                coalesced_group,
+                "partition_id",
                 (100000,),
                 str,
                 (len(partition_id_list),),
             )
             store[:] = partition_id_list
+            coalesced_group.attrs["complete"] = True
 
         color_values = (
             self.get_cell_vals(
@@ -393,6 +441,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             "from_assay": from_assay,
             "cell_key": cell_key,
             "feat_key": feat_key,
+            "integrated_graph": integrated_graph,
             "cluster_key": cluster_key,
             "coalesced_location": coalesced_loc,
         }

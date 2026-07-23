@@ -142,12 +142,20 @@ def knn_clustering(
     n_genes = int(d_array.shape[0])
     if n_genes < 2:
         raise ValueError("At least two retained genes are required for clustering")
-    if not isinstance(n_neighbours, int) or isinstance(n_neighbours, bool):
+    if isinstance(n_neighbours, (bool, np.bool_)) or not isinstance(
+        n_neighbours,
+        (int, np.integer),
+    ):
         raise TypeError("n_neighbours must be an integer")
+    n_neighbours = int(n_neighbours)
     if not 1 <= n_neighbours < n_genes:
         raise ValueError(f"n_neighbours must satisfy 1 <= n_neighbours < {n_genes}")
-    if not isinstance(n_clusters, int) or isinstance(n_clusters, bool):
+    if isinstance(n_clusters, (bool, np.bool_)) or not isinstance(
+        n_clusters,
+        (int, np.integer),
+    ):
         raise TypeError("n_clusters must be an integer")
+    n_clusters = int(n_clusters)
     if not 1 <= n_clusters <= n_genes:
         raise ValueError(f"n_clusters must satisfy 1 <= n_clusters <= {n_genes}")
 
@@ -195,16 +203,19 @@ def knn_clustering(
         )
 
     def make_clusters(matrix: "csr_matrix", n_cluster: int) -> np.ndarray:
-        import sknetwork as skn
+        from ..clustering.paris import (
+            fit_paris_hierarchy,
+            hierarchy_to_dendrogram,
+            straight_cut,
+        )
 
         logger.info("Pseudotime modules: clustering modules")
-        dendrogram = skn.hierarchy.Paris(reorder=False).fit_transform(matrix)
-        return np.asarray(
-            skn.hierarchy.cut_straight(
-                dendrogram,
-                n_clusters=n_cluster,
-            )
+        hierarchy = fit_paris_hierarchy(
+            matrix,
+            n_threads=n_threads,
         )
+        dendrogram = hierarchy_to_dendrogram(hierarchy)
+        return straight_cut(dendrogram, n_cluster)
 
     def fix_cluster_order(
         data: "scarf.matrix.ChunkedArray",

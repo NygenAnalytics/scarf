@@ -69,12 +69,14 @@ ds = scarf.DataStore(
     nthreads=4,
     default_assay='RNA',
 )
+if 'RNA_paris_cluster' not in ds.cells.columns:
+    ds.run_paris_clustering(n_clusters=10)
 ```
 
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by=['clusters', 'RNA_cluster'],
+    color_by=['clusters', 'RNA_paris_cluster'],
     legend_loc='on_data',
 )
 ```
@@ -87,14 +89,14 @@ number of cells with that published annotation.
 
 ```{code-cell} ipython3
 annotations = ds.cells.to_pandas_dataframe(
-    columns=['RNA_cluster', 'clusters'],
+    columns=['RNA_paris_cluster', 'clusters'],
     key='I',
 )
 terminal_cell_types = ['Alpha', 'Beta', 'Delta']
 terminal_clusters = {
     cell_type: annotations.loc[
         annotations['clusters'] == cell_type,
-        'RNA_cluster',
+        'RNA_paris_cluster',
     ].value_counts().idxmax()
     for cell_type in terminal_cell_types
 }
@@ -116,7 +118,7 @@ as sinks so the ordering covers the branches analyzed below.
 
 ```{code-cell} ipython3
 pseudotime = ds.run_pseudotime_scoring(
-    source_sink_key='RNA_cluster',
+    source_sink_key='RNA_paris_cluster',
     sources=source_clusters,
     sinks=sink_clusters,
     label='fate_pseudotime',

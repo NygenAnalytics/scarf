@@ -26,6 +26,7 @@ _METHODS = {
         "run_clustering",
         "run_fate_mapping",
         "run_leiden_clustering",
+        "run_paris_clustering",
         "run_pseudotime_scoring",
         "run_topacedo_sampler",
         "run_tsne",
@@ -84,7 +85,7 @@ _METHODS = {
 
 _SIGNATURE_DIGESTS = {
     BaseDataStore: "ed2e08a687942d2339c1ab09bf1eac3af20c290319cf527b8662fb937a401cd2",
-    GraphDataStore: "21e3d138c50917e6e62d9ba965e19f6c0aae0fa1bca4db357b61302c3d67a40d",
+    GraphDataStore: "39fc316f71c5029298c40c1d93ded6af62ff64b2d5de999191559d2c29c709ae",
     MappingDatastore: "a1e2fe91d8430b54a2a67f42c537a8a5e189691f81e2fddc8a959e1fd87fb3a9",
     DataStore: "e61d06c48bdd945a5d913de6275b9fff6d1e949154f7934f690fae3156685e0b",
 }

@@ -133,17 +133,19 @@ def leiden_clustering(make_graph, datastore):
 @pytest.fixture(scope="session")
 def paris_clustering(make_graph, datastore):
     if not _cell_has(datastore, "RNA_cluster"):
-        datastore.run_clustering(n_clusters=10)
+        datastore.run_paris_clustering(n_clusters=10, label="cluster")
     yield datastore.cells.fetch("RNA_cluster")
 
 
 @pytest.fixture(scope="session")
-def paris_clustering_balanced(make_graph, datastore):
-    if not _cell_has(datastore, "RNA_balanced_clusters"):
-        datastore.run_clustering(
-            balanced_cut=True, max_size=100, min_size=10, label="balanced_clusters"
+def paris_clustering_auto(make_graph, datastore):
+    if not _cell_has(datastore, "RNA_adaptive_clusters"):
+        datastore.run_paris_clustering(
+            n_clusters="auto",
+            min_cluster_size=10,
+            label="adaptive_clusters",
         )
-    yield datastore.cells.fetch("RNA_balanced_clusters")
+    yield datastore.cells.fetch("RNA_adaptive_clusters")
 
 
 @pytest.fixture(scope="session")

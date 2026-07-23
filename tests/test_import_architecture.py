@@ -498,7 +498,9 @@ def test_compatibility_only_modules_are_removed():
         _SCARF_ROOT / "metrics.py",
         _SCARF_ROOT / "neighbors" / "persistence.py",
         _SCARF_ROOT / "features" / "lowess.py",
+        _SCARF_ROOT / "clustering" / "_paris_mdl.py",
         _SCARF_ROOT / "clustering" / "feature_graph.py",
+        _SCARF_ROOT / "clustering" / "hierarchy.py",
         _SCARF_ROOT / "parallel.py",
         _SCARF_ROOT / "results.py",
         _SCARF_ROOT / "storage" / "zarr_store.py",
@@ -520,7 +522,9 @@ def test_retired_root_import_paths_do_not_resolve():
         "scarf.genomics",
         "scarf.knn_utils",
         "scarf.markers",
+        "scarf.clustering._paris_mdl",
         "scarf.clustering.feature_graph",
+        "scarf.clustering.hierarchy",
         "scarf.features.lowess",
         "scarf.trajectory.aggregation",
     ):
@@ -942,15 +946,19 @@ def test_datastore_operation_mixins_are_runtime_isolated():
         "datastore.graph_datastore",
         "datastore.mapping_datastore",
     }
+    allowed_operation_helpers = {
+        "datastore._operations.paris_persistence",
+    }
     for path in operations_root.glob("*.py"):
         runtime_imports = _runtime_import_modules(path)
         assert runtime_imports.isdisjoint(facade_modules)
-        assert not {
+        operation_imports = {
             module_name
             for module_name in runtime_imports
             if module_name == "datastore._operations"
             or module_name.startswith("datastore._operations.")
         }
+        assert operation_imports.issubset(allowed_operation_helpers)
 
     mixins = (
         _EmbeddingOperationsMixin,

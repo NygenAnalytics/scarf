@@ -374,9 +374,11 @@ def test_knn_clustering_rejects_infeasible_parameters():
     with pytest.raises(ValueError, match="At least two"):
         knn_clustering(_ShapeOnlyArray((1, 3)), 1, 1, 1)
     with pytest.raises(ValueError, match="n_neighbours"):
-        knn_clustering(_ShapeOnlyArray((3, 3)), 3, 2, 1)
+        knn_clustering(_ShapeOnlyArray((3, 3)), np.int64(3), np.int32(2), 1)
     with pytest.raises(ValueError, match="n_clusters"):
-        knn_clustering(_ShapeOnlyArray((3, 3)), 1, 4, 1)
+        knn_clustering(_ShapeOnlyArray((3, 3)), np.int32(1), np.int64(4), 1)
+    with pytest.raises(TypeError, match="n_clusters"):
+        knn_clustering(_ShapeOnlyArray((3, 3)), 1, np.bool_(True), 1)
 
 
 def test_feature_cluster_scatter_honors_custom_unassigned_value():

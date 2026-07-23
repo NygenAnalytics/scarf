@@ -2,12 +2,17 @@ from importlib import import_module as _import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .hierarchy import (
-        BalancedCut as BalancedCut,
+    from .balanced_cut import BalancedCut as BalancedCut
+    from .cluster_tree import (
         CoalesceTree as CoalesceTree,
         make_digraph as make_digraph,
     )
     from .leiden import leiden_membership as leiden_membership
+    from .paris_multiscale import (
+        ParisClusterDiagnostic as ParisClusterDiagnostic,
+        ParisClusteringResult as ParisClusteringResult,
+        adaptive_cut as adaptive_cut,
+    )
     from .paris import (
         balanced_cut as balanced_cut,
         paris_dendrogram as paris_dendrogram,
@@ -17,6 +22,9 @@ if TYPE_CHECKING:
 __all__ = [
     "BalancedCut",
     "CoalesceTree",
+    "ParisClusterDiagnostic",
+    "ParisClusteringResult",
+    "adaptive_cut",
     "balanced_cut",
     "leiden_membership",
     "make_digraph",
@@ -25,11 +33,14 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
-    "BalancedCut": (".hierarchy", "BalancedCut"),
-    "CoalesceTree": (".hierarchy", "CoalesceTree"),
+    "BalancedCut": (".balanced_cut", "BalancedCut"),
+    "CoalesceTree": (".cluster_tree", "CoalesceTree"),
+    "ParisClusterDiagnostic": (".paris_multiscale", "ParisClusterDiagnostic"),
+    "ParisClusteringResult": (".paris_multiscale", "ParisClusteringResult"),
+    "adaptive_cut": (".paris_multiscale", "adaptive_cut"),
     "balanced_cut": (".paris", "balanced_cut"),
     "leiden_membership": (".leiden", "leiden_membership"),
-    "make_digraph": (".hierarchy", "make_digraph"),
+    "make_digraph": (".cluster_tree", "make_digraph"),
     "paris_dendrogram": (".paris", "paris_dendrogram"),
     "straight_cut": (".paris", "straight_cut"),
 }

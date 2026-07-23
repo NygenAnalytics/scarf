@@ -38,6 +38,12 @@ functions in `scarf.plotting`. Array and DataFrame diagnostics such as
 
 .. autoclass:: scarf.EnrichmentResult
     :members:
+
+.. autoclass:: scarf.clustering.ParisClusteringResult
+    :members:
+
+.. autoclass:: scarf.clustering.ParisClusterDiagnostic
+    :members:
 ```
 
 ## Inheritance appendix

@@ -1,7 +1,6 @@
 import json
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 from profiling import paris_worker
@@ -23,20 +22,12 @@ def _resources() -> StageResources:
     )
 
 
-class _Cells:
-    def fetch(self, name: str, key: str = "I") -> np.ndarray:
-        assert name == "RNA_leiden_cluster"
-        assert key == "I"
-        return np.array([0, 0, 0, 1, 1, 2, 2, 2, 2], dtype=np.int32)
-
-
 class _Store:
     def __init__(self, *, error: Exception | None = None) -> None:
         self.error = error
-        self.cells = _Cells()
         self.arguments: dict[str, object] | None = None
 
-    def run_clustering(self, **arguments: object) -> None:
+    def run_paris_clustering(self, **arguments: object) -> None:
         self.arguments = arguments
         if self.error is not None:
             raise self.error
@@ -63,7 +54,7 @@ def _request(
     return request_path, status_path
 
 
-def test_worker_balanced_cut_uses_leiden_sizes(
+def test_worker_auto_cut_uses_minimum_cluster_size(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -83,7 +74,10 @@ def test_worker_balanced_cut_uses_leiden_sizes(
     monkeypatch.setattr(paris_worker, "_open_datastore", fake_open)
     request_path, status_path = _request(
         tmp_path,
-        workflow=WorkflowParameters(parisBalancedCut=True),
+        workflow=WorkflowParameters(
+            parisNClusters="auto",
+            parisMinClusterSize=7,
+        ),
     )
 
     paris_worker.run_paris_worker(request_path)
@@ -93,9 +87,8 @@ def test_worker_balanced_cut_uses_leiden_sizes(
         "cell_key": "I",
         "feat_key": "hvgs",
         "label": "paris_cluster",
-        "balanced_cut": True,
-        "min_size": 2,
-        "max_size": 4,
+        "n_clusters": "auto",
+        "min_cluster_size": 7,
     }
     assert json.loads(status_path.read_text(encoding="utf-8")) == {
         "status": "ok",
@@ -115,7 +108,7 @@ def test_worker_straight_cut_uses_n_clusters(
     )
     request_path, status_path = _request(
         tmp_path,
-        workflow=WorkflowParameters(parisBalancedCut=False, parisNClusters=12),
+        workflow=WorkflowParameters(parisNClusters=12),
     )
 
     paris_worker.run_paris_worker(request_path)
@@ -156,7 +149,7 @@ def test_parent_starts_paris_worker_module(
 
     _run_paris_in_subprocess(
         storeUri="s3://bucket/store.zarr",
-        workflow=WorkflowParameters(parisBalancedCut=True),
+        workflow=WorkflowParameters(),
         resources=_resources(),
         workDir=tmp_path,
     )
@@ -183,7 +176,7 @@ def test_run_stage_routes_paris_to_child(
         "runClustering",
         nRows=5_000_000,
         storeUri="s3://bucket/store.zarr",
-        workflow=WorkflowParameters(parisBalancedCut=True),
+        workflow=WorkflowParameters(),
         resources=_resources(),
         workDir=tmp_path,
         sampleIntervalSeconds=0.01,

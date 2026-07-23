@@ -48,7 +48,9 @@ mapping reference
   Content-addressed RNA/PCA artifact from `build_mapping_reference` used for Symphony-style query mapping.
 
 Paris clustering
-  Hierarchical graph clustering in Scarf (`run_clustering`). Supports cluster trees.
+  Hierarchical graph clustering in Scarf (`run_paris_clustering`). Supports
+  fixed cuts and branch-adaptive cuts guarded by configuration-null modularity,
+  plus cluster-tree visualization.
 
 Leiden clustering
   Graph community detection via `run_leiden_clustering`.

@@ -39,6 +39,32 @@ through Scarf 1.x and may be removed in 2.0.
 Filtering still marks cells inactive via boolean cell keys (default `I`) rather than
 deleting rows. Custom keys remain the supported way to subset for reclustering and mapping.
 
+## Paris clustering
+
+Use `run_paris_clustering` for Paris clustering. Its default
+`n_clusters="auto"` selects a branch-adaptive cut and writes
+`RNA_paris_cluster` for the default RNA assay. The automatic cut combines
+branch persistence with a configuration-null modularity guard over unweighted
+graph topology, so a candidate split must add structure beyond the
+degree-preserving null model. Its
+`min_cluster_size` defaults to the graph's `k + 1`; pass it explicitly when a
+workflow needs a stable lower bound. Pass an integer `n_clusters` to request a
+fixed cut. `run_clustering` remains a deprecated forwarding method until the
+next major release, and the DataStore balanced-cut mode has been removed. The
+deprecated method keeps its legacy signature, so call `run_paris_clustering`
+directly to set `min_cluster_size`.
+
+Paris now fits the additive graph `A + A.T`. The first Paris call on an older
+store rebuilds its hierarchy and emits a warning. Fixed and adaptive labels can
+therefore differ from labels created by earlier releases, even when an integer
+cluster count is unchanged.
+
+The adaptive cache schema is now version 3. Cached automatic labels from an
+older schema are ignored and recomputed on first use; fixed cuts and the stored
+hierarchy are unaffected. `scikit-network` is no longer a runtime dependency.
+It remains in Scarf's test dependencies for reference comparisons, so
+applications that import it directly must declare it themselves.
+
 ## Mapping calls
 
 The following compatibility paths remain accepted through Scarf 1.x and may be
@@ -208,8 +234,9 @@ focused paths:
 - `scarf.knn_utils.self_query_knn` and `smoothen_dists` moved to
   `scarf.neighbors.graph_store`; `scarf.knn_utils` was removed.
 - `scarf.umap` implementations moved to `scarf.embeddings.umap`.
-- `scarf.dendrogram` implementations moved to
-  `scarf.clustering.hierarchy`.
+- `scarf.dendrogram.BalancedCut` moved to
+  `scarf.clustering.balanced_cut`. Cluster-tree helpers moved to
+  `scarf.clustering.cluster_tree`.
 - Pseudotime feature-profile clustering moved to
   `scarf.trajectory.feature_dynamics.knn_clustering`.
 - `scarf.results` classes moved to `scarf.trajectory.results`.

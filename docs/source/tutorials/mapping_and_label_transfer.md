@@ -154,7 +154,7 @@ for g, ms in ds_ctrl.get_mapping_score(
 
 Using the nearest neighbours of the target cells in the reference data, we can transfer labels from reference cells to target cells based on majority voting. This means that if a target cell has 'most' of its total edge weight shared with cells from one cell type, then that cell type label is transferred to the target cell. The default threshold for 'most' is 0.5, i.e. half of all edge weight. `get_target_classes` method returns the transferred labels for each cell from a given mapped target dataset.
 
-The `reference_class_group` parameter decides which labels to transfer. This can be any column from the cell attribute table that has categorical values, generally users would use `RNA_leiden_cluster` or `RNA_cluster` but they can also use other labels. Here, for example, we use the custom labels stored under `cluster_labels` column.
+The `reference_class_group` parameter decides which labels to transfer. This can be any column from the cell attribute table that has categorical values, generally users would use `RNA_leiden_cluster` or `RNA_paris_cluster` but they can also use other labels. Here, for example, we use the custom labels stored under `cluster_labels` column.
 
 ```{code-cell} ipython3
 transferred_labels = ds_ctrl.get_target_classes(
