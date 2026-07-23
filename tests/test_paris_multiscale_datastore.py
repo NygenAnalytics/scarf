@@ -14,7 +14,6 @@ from scarf.clustering.paris import fit_paris_hierarchy
 from scarf.datastore._operations.clustering import _ClusteringOperationsMixin
 from scarf.datastore._operations.presentation import _PresentationOperationsMixin
 from scarf.datastore._operations.paris_persistence import (
-    ADAPTIVE_SCHEMA_VERSION,
     LATEST_PARIS_GENERATION,
     adaptive_config_digest,
     estimate_cached_paris_peak_bytes,
@@ -113,7 +112,7 @@ class _Store(_ClusteringOperationsMixin, _PresentationOperationsMixin):
     ) -> tuple[str, str, str]:
         return from_assay or "RNA", cell_key or "I", feat_key or "hvgs"
 
-    def _get_latest_graph_loc(
+    def get_latest_graph_loc(
         self,
         from_assay: str,
         cell_key: str,
@@ -124,6 +123,49 @@ class _Store(_ClusteringOperationsMixin, _PresentationOperationsMixin):
         if self.raise_on_latest_graph:
             raise AssertionError("standard graph lookup was not expected")
         return "RNA/graph"
+
+    def _get_latest_graph_loc(
+        self,
+        from_assay: str,
+        cell_key: str,
+        feat_key: str,
+    ) -> str:
+        return self.get_latest_graph_loc(from_assay, cell_key, feat_key)
+
+    def _lookup_stored_graph(
+        self,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        graph_loc: str | None = None,
+    ):
+        from scarf.graph.paths import AssayGraphPaths, StoredAssayGraph
+
+        if graph_loc is not None:
+            path = graph_loc
+        else:
+            path = self.get_latest_graph_loc(
+                from_assay or "RNA",
+                cell_key or "I",
+                feat_key or "hvgs",
+            )
+        return StoredAssayGraph(
+            paths=AssayGraphPaths(
+                normalized_group_path="RNA/normed__I__hvgs",
+                reduction_group_path="RNA/normed__I__hvgs/reduction__pca__10__I",
+                neighbor_index_group_path=(
+                    "RNA/normed__I__hvgs/reduction__pca__10__I/ann__l2__50__50__16__1"
+                ),
+                nearest_neighbors_group_path=(
+                    "RNA/normed__I__hvgs/reduction__pca__10__I/"
+                    "ann__l2__50__50__16__1/knn__11"
+                ),
+                cell_graph_group_path=path,
+            ),
+            from_assay=from_assay or "RNA",
+            cell_key=cell_key or "I",
+            feat_key=feat_key or "hvgs",
+        )
 
     def _get_graph_ncells_k(self, graph_loc: str) -> tuple[int, int]:
         attrs = self.zw[graph_loc].attrs
@@ -291,7 +333,7 @@ def test_auto_cut_defaults_minimum_cluster_size_to_graph_k_plus_one() -> None:
     assert result.min_cluster_size == 4
 
 
-def test_stale_adaptive_cache_schema_is_recomputed() -> None:
+def test_incomplete_adaptive_cache_is_recomputed() -> None:
     store = _Store(_block_graph())
     first = store.run_paris_clustering(min_cluster_size=2)
     generation_id = first.hierarchy_generation_id
@@ -315,7 +357,7 @@ def test_stale_adaptive_cache_schema_is_recomputed() -> None:
         )
         is not None
     )
-    config.attrs["schema_version"] = ADAPTIVE_SCHEMA_VERSION - 1
+    del config["selected_nodes"]
     assert (
         load_adaptive_result(
             store.zw,
@@ -330,7 +372,8 @@ def test_stale_adaptive_cache_schema_is_recomputed() -> None:
     second = store.run_paris_clustering(min_cluster_size=2)
 
     assert np.array_equal(second.labels, first.labels)
-    assert store.zw[location].attrs["schema_version"] == ADAPTIVE_SCHEMA_VERSION
+    assert "selected_nodes" in store.zw[location]
+    assert "schema_version" not in store.zw[location].attrs
     assert store.load_graph_calls == 2
 
 
@@ -343,7 +386,7 @@ def test_force_recalculation_retains_only_referenced_generations() -> None:
         force_recalc=True,
     )
     assert first.hierarchy_generation_id != second.hierarchy_generation_id
-    hierarchy_group = store.zw["RNA/graph/paris_hierarchy/v2"]
+    hierarchy_group = store.zw["RNA/graph/paris_hierarchy"]
     assert set(hierarchy_group.group_keys()) == {
         first.hierarchy_generation_id,
         second.hierarchy_generation_id,
@@ -355,6 +398,23 @@ def test_force_recalculation_retains_only_referenced_generations() -> None:
     assert "RNA/graph/adaptive_clustering/second" in store.zw
 
 
+def test_stale_generation_pointer_recomputes_without_crashing() -> None:
+    store = _Store(_block_graph())
+    first = store.run_paris_clustering(n_clusters=2)
+    # Simulate an old paris_hierarchy/v2 pointer whose target no longer exists
+    # at the current root: the hierarchy must be recomputed, not raise KeyError.
+    store.zw["RNA/graph"].attrs[LATEST_PARIS_GENERATION] = "missing-generation"
+    assert generation_location("RNA/graph", "missing-generation") not in store.zw
+
+    second = store.run_paris_clustering(n_clusters=2)
+
+    # Re-fetch the group so the pointer read is not from a stale attrs cache.
+    new_generation = str(store.zw["RNA/graph"].attrs[LATEST_PARIS_GENERATION])
+    assert new_generation != "missing-generation"
+    assert generation_location("RNA/graph", new_generation) in store.zw
+    assert np.array_equal(second.labels, first.labels)
+
+
 def test_adaptive_cache_collection_prunes_only_unusable_configurations() -> None:
     store = _Store(_block_graph())
     result = store.run_paris_clustering(min_cluster_size=2)
@@ -363,29 +423,26 @@ def test_adaptive_cache_collection_prunes_only_unusable_configurations() -> None
     label_location = "RNA/graph/adaptive_clustering/paris_cluster"
     reusable_digest = adaptive_config_digest(generation_id, 2)
 
-    stale_digest = adaptive_config_digest(generation_id, 3)
+    mismatched_digest = adaptive_config_digest(generation_id, 3)
     incomplete_digest = adaptive_config_digest(generation_id, 4)
     orphan_digest = adaptive_config_digest("missing-generation", 2)
-    for digest, config_generation, min_size, schema, complete in (
+    for digest, config_generation, min_size, complete in (
         (
-            stale_digest,
+            mismatched_digest,
             generation_id,
             3,
-            ADAPTIVE_SCHEMA_VERSION - 1,
             True,
         ),
         (
             incomplete_digest,
             generation_id,
             4,
-            ADAPTIVE_SCHEMA_VERSION,
             False,
         ),
         (
             orphan_digest,
             "missing-generation",
             2,
-            ADAPTIVE_SCHEMA_VERSION,
             True,
         ),
     ):
@@ -393,7 +450,6 @@ def test_adaptive_cache_collection_prunes_only_unusable_configurations() -> None
         config.attrs.update(
             {
                 "complete": complete,
-                "schema_version": schema,
                 "hierarchy_generation_id": config_generation,
                 "min_cluster_size": min_size,
                 "final_label_key": "RNA_paris_cluster",
@@ -403,7 +459,7 @@ def test_adaptive_cache_collection_prunes_only_unusable_configurations() -> None
     store.run_paris_clustering(n_clusters=2)
 
     assert f"{label_location}/{reusable_digest}" in store.zw
-    assert f"{label_location}/{stale_digest}" not in store.zw
+    assert f"{label_location}/{mismatched_digest}" not in store.zw
     assert f"{label_location}/{incomplete_digest}" not in store.zw
     assert f"{label_location}/{orphan_digest}" not in store.zw
     assert "active_digest" not in store.zw[label_location].attrs
@@ -608,7 +664,7 @@ def test_interrupted_replacement_keeps_previous_generation_authoritative(
         *_args: object,
         **_kwargs: object,
     ) -> tuple[str, str]:
-        location = f"{graph_loc}/paris_hierarchy/v2/incomplete"
+        location = f"{graph_loc}/paris_hierarchy/incomplete"
         group = root.create_group(location, overwrite=True)
         group.attrs["complete"] = False
         raise OSError("simulated interrupted write")

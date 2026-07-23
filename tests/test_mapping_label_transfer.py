@@ -25,7 +25,6 @@ def _projection_store(datastore, name: str, indices: np.ndarray, distances: np.n
     zi[:] = indices
     zd[:] = distances
     store.attrs["complete"] = True
-    store.attrs["schemaVersion"] = 1
     store.attrs["assay"] = "RNA"
     store.attrs["cellKey"] = "I"
     store.attrs["featureKey"] = "hvgs"
@@ -139,38 +138,19 @@ def test_label_threshold_boundary_and_subset_index(datastore_ephemeral):
     np.testing.assert_allclose(evidence["voteFraction"], [0.75, 0.75])
 
 
-def test_schema_v1_projection_warns_on_read(datastore_ephemeral):
-    datastore = datastore_ephemeral
-    _projection_store(
-        datastore,
-        "legacy_schema_projection",
-        np.array([[0, 1]], dtype=np.uint64),
-        np.array([[1.0, 1.0]]),
-    )
-
-    with pytest.warns(DeprecationWarning, match="legacy projection schema"):
-        result = datastore.get_target_classes(
-            "legacy_schema_projection",
-            reference_class_group="ids",
-        )
-
-    assert len(result) == 1
-
-
-def test_schema_less_projection_remains_readable(datastore_ephemeral):
+def test_master_projection_without_provenance_warns_on_read(datastore_ephemeral):
     datastore = datastore_ephemeral
     store = _projection_store(
         datastore,
-        "legacy_projection",
+        "master_projection",
         np.array([[0, 1]], dtype=np.uint64),
         np.array([[1.0, 1.0]]),
     )
-    del store.attrs["schemaVersion"]
     del store.attrs["complete"]
 
     with pytest.warns(DeprecationWarning, match="predates"):
         result = datastore.get_target_classes(
-            "legacy_projection",
+            "master_projection",
             reference_class_group="ids",
         )
 
@@ -178,12 +158,12 @@ def test_schema_less_projection_remains_readable(datastore_ephemeral):
     store.attrs["complete"] = False
     with pytest.raises(ValueError, match="incomplete"):
         datastore.get_target_classes(
-            "legacy_projection",
+            "master_projection",
             reference_class_group="ids",
         )
 
 
-def test_incomplete_versioned_projection_is_rejected(datastore_ephemeral):
+def test_incomplete_projection_is_rejected(datastore_ephemeral):
     datastore = datastore_ephemeral
     store = _projection_store(
         datastore,
@@ -322,3 +302,42 @@ def test_reference_distance_percentile_is_query_composition_invariant(
         single.loc[0, "referenceDistancePercentile"]
         == composed.loc[0, "referenceDistancePercentile"]
     )
+
+
+def test_legacy_projection_without_provenance_marker_warns(datastore_ephemeral):
+    datastore = datastore_ephemeral
+    _projection_store(
+        datastore,
+        "legacy_projection",
+        np.array([[0, 1]], dtype=np.uint64),
+        np.array([[0.0, 1.0]]),
+    )
+
+    with pytest.warns(DeprecationWarning, match="predates projection provenance"):
+        datastore.get_target_classes(
+            "legacy_projection",
+            reference_class_group="ids",
+            threshold_fraction=0.5,
+        )
+
+
+def test_partial_provenance_projection_is_rejected_not_downgraded(datastore_ephemeral):
+    # A projection that carries the provenance marker but is missing the rest of
+    # the provenance metadata is a corrupt current write, not a legacy store, so
+    # it must raise rather than silently fall back to the legacy read path.
+    datastore = datastore_ephemeral
+    store = _projection_store(
+        datastore,
+        "partial_provenance",
+        np.array([[0, 1]], dtype=np.uint64),
+        np.array([[0.0, 1.0]]),
+    )
+    marker = create_zarr_dataset(store, "referenceFeatureIndices", (1,), "u8", (1,))
+    marker[:] = [0]
+
+    with pytest.raises(ValueError, match="incomplete provenance metadata"):
+        datastore.get_target_classes(
+            "partial_provenance",
+            reference_class_group="ids",
+            threshold_fraction=0.5,
+        )

@@ -5,10 +5,7 @@ import zarr
 from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
-from scarf.assay import (
-    PSEUDOTIME_AGGREGATION_SCHEMA_VERSION,
-    Assay,
-)
+from scarf.assay import Assay
 from scarf.trajectory.feature_dynamics import knn_clustering
 from scarf.datastore.datastore import DataStore
 from scarf.trajectory.feature_dynamics import (
@@ -333,11 +330,11 @@ def test_aggregation_orders_without_smoothing_and_filters_constant_profiles():
     group = assay.z["aggregated_I_I_ptime"]
     assert np.array_equal(group["valid_features"][:], [True, False])
     assert np.isfinite(group["data"][:]).all()
-    assert group.attrs["schema_version"] == PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
+    assert "schema_version" not in group.attrs
     assert all(isinstance(value, str) for value in group.attrs["hashes"])
 
 
-def test_old_aggregation_schema_is_rebuilt():
+def test_incomplete_aggregation_cache_is_rebuilt():
     expression = np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [4.0, 5.0]])
     assay = _AggregationAssay(expression, np.arange(4, dtype=float))
     kwargs = {
@@ -353,16 +350,14 @@ def test_old_aggregation_schema_is_rebuilt():
 
     Assay.save_aggregated_ordering(assay, **kwargs)
     group = assay.z["aggregated_I_I_ptime"]
-    group.attrs["schema_version"] = 1
+    del group["valid_features"]
     group["data"][:] = 999.0
 
     aggregated, _ = Assay.save_aggregated_ordering(assay, **kwargs)
 
     assert not np.all(aggregated.compute() == 999.0)
-    assert (
-        assay.z["aggregated_I_I_ptime"].attrs["schema_version"]
-        == PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
-    )
+    assert "valid_features" in assay.z["aggregated_I_I_ptime"]
+    assert "schema_version" not in assay.z["aggregated_I_I_ptime"].attrs
 
 
 class _ShapeOnlyArray:

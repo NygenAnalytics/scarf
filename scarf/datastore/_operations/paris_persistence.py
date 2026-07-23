@@ -19,12 +19,38 @@ from ...storage.arrays import create_zarr_dataset
 from ...storage.budget import ResourceBudget, get_resource_budget
 from ...storage.types import as_zarr_array, as_zarr_group
 
-PARIS_SCHEMA_VERSION = 2
-PARIS_HIERARCHY_ROOT = "paris_hierarchy/v2"
+PARIS_HIERARCHY_ROOT = "paris_hierarchy"
 LATEST_PARIS_GENERATION = "latest_paris_generation"
-# Version 3 adds the configuration-null modularity split guard to the auto cut,
-# so any adaptive labels cached before it must be recomputed.
-ADAPTIVE_SCHEMA_VERSION = 3
+_PARIS_HIERARCHY_ARRAYS = (
+    "children",
+    "heights",
+    "sizes",
+    "component_roots",
+    "synthetic_joins",
+)
+_PARIS_PLATEAU_ARRAYS = (
+    "representatives",
+    "heights",
+    "sizes",
+    "parent_events",
+    "child_offsets",
+    "child_refs",
+    "min_leaves",
+    "component_roots",
+)
+_ADAPTIVE_RESULT_ARRAYS = (
+    "selected_nodes",
+    "parent_events",
+    "components",
+    "sizes",
+    "resolution_lower",
+    "resolution_upper",
+    "persistence",
+    "margins",
+    "forced",
+    "blocking_child_counts",
+    "folded_cell_counts",
+)
 _MEMORY_HEADROOM = 1.35
 _CACHED_FIXED_TRANSIENT_BYTES_PER_CELL = 128
 _CACHED_ADAPTIVE_TRANSIENT_BYTES_PER_CELL = 96
@@ -292,7 +318,6 @@ def write_hierarchy_generation(
     generation.attrs.update(
         {
             "complete": False,
-            "schema_version": PARIS_SCHEMA_VERSION,
             "n_leaves": hierarchy.n_leaves,
             "total_weight": hierarchy.total_weight,
         }
@@ -340,9 +365,18 @@ def load_hierarchy_generation(
     generation = as_zarr_group(root[location], name=location)
     if generation.attrs.get("complete") is not True:
         raise ValueError(f"Paris hierarchy generation {generation_id!r} is incomplete")
-    if generation.attrs.get("schema_version") != PARIS_SCHEMA_VERSION:
+    missing = [name for name in _PARIS_HIERARCHY_ARRAYS if name not in generation]
+    if missing or "plateau" not in generation:
         raise ValueError(
-            f"Unsupported Paris hierarchy schema at {location!r}; recompute it"
+            f"Paris hierarchy generation {generation_id!r} is missing required arrays"
+        )
+    plateau_group = as_zarr_group(generation["plateau"], name=f"{location}/plateau")
+    missing_plateau = [
+        name for name in _PARIS_PLATEAU_ARRAYS if name not in plateau_group
+    ]
+    if missing_plateau:
+        raise ValueError(
+            f"Paris hierarchy generation {generation_id!r} is missing plateau arrays"
         )
     n_leaves = cast(int, generation.attrs["n_leaves"])
     hierarchy = ParisHierarchy(
@@ -357,7 +391,6 @@ def load_hierarchy_generation(
         n_leaves=n_leaves,
         total_weight=cast(float, generation.attrs["total_weight"]),
     )
-    plateau_group = as_zarr_group(generation["plateau"], name=f"{location}/plateau")
     plateau_forest = PlateauForest(
         representatives=_read_array(plateau_group, "representatives"),
         heights=_read_array(plateau_group, "heights"),
@@ -426,7 +459,12 @@ def resolve_compatibility_dendrogram(
         )
     )
     generation_id = label_generation or latest_generation
-    if generation_id is not None:
+    # A stale generation pointer (for example an old paris_hierarchy/v2 layout)
+    # must fall through to the legacy alias or dendrogram rather than crash.
+    if (
+        generation_id is not None
+        and generation_location(graph_loc, generation_id) in root
+    ):
         location = generation_location(graph_loc, generation_id)
         dendrogram_loc = f"{location}/dendrogram"
         generation = as_zarr_group(root[location], name=location)
@@ -477,7 +515,6 @@ def adaptive_config_digest(generation_id: str, min_cluster_size: int) -> str:
         {
             "hierarchy_generation_id": generation_id,
             "min_cluster_size": min_cluster_size,
-            "schema_version": ADAPTIVE_SCHEMA_VERSION,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -509,7 +546,6 @@ def persist_adaptive_result(
     config.attrs.update(
         {
             "complete": False,
-            "schema_version": ADAPTIVE_SCHEMA_VERSION,
             "hierarchy_generation_id": generation_id,
             "min_cluster_size": result.min_cluster_size,
             "final_label_key": final_label_key,
@@ -602,7 +638,7 @@ def load_adaptive_result(
     config = as_zarr_group(root[location], name=location)
     if config.attrs.get("complete") is not True:
         return None
-    if config.attrs.get("schema_version") != ADAPTIVE_SCHEMA_VERSION:
+    if any(name not in config for name in _ADAPTIVE_RESULT_ARRAYS):
         return None
 
     selected_nodes = _read_array(config, "selected_nodes")
@@ -724,10 +760,9 @@ def _reusable_adaptive_generation(
     digest: str,
     available_generations: set[str],
 ) -> str | None:
-    if (
-        config.attrs.get("complete") is not True
-        or config.attrs.get("schema_version") != ADAPTIVE_SCHEMA_VERSION
-    ):
+    if config.attrs.get("complete") is not True:
+        return None
+    if any(name not in config for name in _ADAPTIVE_RESULT_ARRAYS):
         return None
     generation_value = config.attrs.get("hierarchy_generation_id")
     min_cluster_size = config.attrs.get("min_cluster_size")

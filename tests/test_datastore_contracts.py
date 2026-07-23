@@ -15,9 +15,11 @@ _METHODS = {
     ),
     GraphDataStore: (
         "__init__",
+        "_get_latest_graph_loc",
         "build_mapping_reference",
         "get_diffusion_operator",
         "get_latest_graph_loc",
+        "get_normalized_group_path",
         "get_imputed",
         "get_mapping_reference",
         "integrate_assays",
@@ -85,7 +87,7 @@ _METHODS = {
 
 _SIGNATURE_DIGESTS = {
     BaseDataStore: "ed2e08a687942d2339c1ab09bf1eac3af20c290319cf527b8662fb937a401cd2",
-    GraphDataStore: "39fc316f71c5029298c40c1d93ded6af62ff64b2d5de999191559d2c29c709ae",
+    GraphDataStore: "05074067772f41c5e7ab852974545917c91168dacccf18fb53a086b135195d95",
     MappingDatastore: "a1e2fe91d8430b54a2a67f42c537a8a5e189691f81e2fddc8a959e1fd87fb3a9",
     DataStore: "e61d06c48bdd945a5d913de6275b9fff6d1e949154f7934f690fae3156685e0b",
 }
@@ -109,6 +111,11 @@ def test_datastore_public_class_chain_is_stable():
     assert MappingDatastore.__module__ == "scarf.datastore.mapping_datastore"
     assert GraphDataStore.__module__ == "scarf.datastore.graph_datastore"
     assert BaseDataStore.__module__ == "scarf.datastore.base_datastore"
+
+
+def test_stored_graph_lookup_remains_internal():
+    assert not hasattr(GraphDataStore, "lookup_stored_graph")
+    assert hasattr(GraphDataStore, "_lookup_stored_graph")
 
 
 def test_datastore_property_contracts_are_stable():
@@ -156,8 +163,9 @@ def test_datastore_static_method_contracts_are_stable():
             for name in names
         )
 
-    assert MappingDatastore._PROJECTION_SCHEMA_VERSION == 2
-    assert MappingDatastore._LEGACY_PROJECTION_SCHEMA_VERSIONS == {1}
+    assert hasattr(MappingDatastore, "_projection_has_provenance")
+    assert not hasattr(MappingDatastore, "_PROJECTION_SCHEMA_VERSION")
+    assert not hasattr(MappingDatastore, "_LEGACY_PROJECTION_SCHEMA_VERSIONS")
 
 
 def test_graph_datastore_private_mixin_order_is_stable():

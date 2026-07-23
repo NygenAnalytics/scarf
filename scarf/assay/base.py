@@ -10,9 +10,6 @@ from scipy.sparse import csr_matrix, vstack
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
-from ..storage.schema import (
-    PSEUDOTIME_AGGREGATION_SCHEMA_VERSION as PSEUDOTIME_AGGREGATION_SCHEMA_VERSION,
-)
 from ..utils.arrays import array_digest
 from ..utils.compute import controlled_compute, show_dask_progress
 from ..utils.logging import logger
@@ -287,19 +284,19 @@ class Assay:
         return cell_idx, feat_idx
 
     @staticmethod
-    def _create_subset_hash(cell_idx: np.ndarray, feat_idx: np.ndarray) -> int:
-        """Takes two index list and hashes them individually and then computes
-        hash of the resulting tuple of two hashes. The objective of this
-        function is to generate a unique state identifier for the cell and
-        feature indices.
+    def _create_subset_hash(cell_idx: np.ndarray, feat_idx: np.ndarray) -> str:
+        """Return a stable content digest for ordered cell and feature selections.
 
-        Args:
-            cell_idx: Cell row indices
-            feat_idx: Feature row indices
-
-        Returns: Returns the final hash
+        The digest is persisted as a normalized-data cache key, so it must be
+        deterministic across processes and Python runtimes.
         """
-        return hash(tuple([hash(tuple(cell_idx)), hash(tuple(feat_idx))]))
+        cells = np.ascontiguousarray(np.asarray(cell_idx), dtype=np.int64)
+        feats = np.ascontiguousarray(np.asarray(feat_idx), dtype=np.int64)
+        # Prefix the cell count so the cell/feature boundary is encoded. Without
+        # it, concatenation alone lets different splits (e.g. cells=[0,1],
+        # feats=[2,3] versus cells=[0,1,2], feats=[3]) collide to one digest.
+        boundary = np.array([cells.shape[0]], dtype=np.int64)
+        return array_digest(np.concatenate([boundary, cells, feats]))
 
     @staticmethod
     def _get_summary_stats_loc(cell_key: str) -> tuple[str, str]:
@@ -375,7 +372,7 @@ class Assay:
     @staticmethod
     def _finalize_staged_mirror(
         mirror: zarr.Array | None,
-        subset_hash: int,
+        subset_hash: str,
         subset_params: dict[str, Any],
     ) -> None:
         """Mark a mirrored staging array complete so staging reuses it as-is."""
@@ -620,15 +617,31 @@ class Assay:
             "norm_params": norm_params,
         }
         location = f"aggregated_{cell_key}_{feat_key}_{ordering_key}"
-        if (
-            location in self.z
-            and "hashes" in self.z[location].attrs
-            and hashes == self.z[location].attrs["hashes"]
-            and "params" in self.z[location].attrs
-            and params == self.z[location].attrs["params"]
-            and self.z[location].attrs.get("schema_version")
-            == PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
-        ):
+
+        def _cached_aggregation_valid() -> bool:
+            if location not in self.z:
+                return False
+            group = as_zarr_group(self.z[location], name=location)
+            attrs = group.attrs
+            if attrs.get("hashes") != hashes or attrs.get("params") != params:
+                return False
+            if not all(
+                name in group for name in ("data", "feature_indices", "valid_features")
+            ):
+                return False
+            data_arr = as_zarr_array(group["data"], name="data")
+            feat_arr = as_zarr_array(group["feature_indices"], name="feature_indices")
+            valid_arr = as_zarr_array(group["valid_features"], name="valid_features")
+            if data_arr.ndim != 2 or data_arr.shape[1] != effective_bins:
+                return False
+            if (
+                feat_arr.shape[0] != data_arr.shape[0]
+                or valid_arr.shape[0] != data_arr.shape[0]
+            ):
+                return False
+            return True
+
+        if _cached_aggregation_valid():
             logger.info(f"Using existing aggregated data from {location}")
         else:
             if location in self.z:
@@ -690,9 +703,6 @@ class Assay:
 
             self.z[location].attrs["hashes"] = hashes
             self.z[location].attrs["params"] = cast(Any, params)
-            self.z[location].attrs["schema_version"] = (
-                PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
-            )
 
         ret_val1 = ChunkedArray(
             as_zarr_array(self.z[location + "/data"], name=location + "/data"),

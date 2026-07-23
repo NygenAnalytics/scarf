@@ -10,7 +10,6 @@ from .layout import _group_zarr_format, get_compressors
 from .profiles import StorageProfile, get_storage_profile
 
 ANN_INDEX_ARRAY = "ann_idx_bytes"
-ANN_INDEX_FORMAT = "zarr-uint8-v1"
 ANN_INDEX_CHUNK_BYTES = 8 * 1024 * 1024
 
 
@@ -57,7 +56,6 @@ def save_ann_index(
         ),
     )
     array[:] = data
-    group.attrs["annIndexFormat"] = ANN_INDEX_FORMAT
     array.attrs["byteLength"] = int(data.shape[0])
 
 

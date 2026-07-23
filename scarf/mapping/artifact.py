@@ -15,10 +15,20 @@ from .models import SymphonyReferenceModel
 from .reference import MappingReference
 from .symphony import SYMPHONY_STYLE_VARIANT
 
-MAPPING_REFERENCE_SCHEMA_VERSION = 2
 MAPPING_REFERENCE_GROUP = "mappingReference"
 MAPPING_REFERENCES_GROUP = "mappingReferences"
 LATEST_MAPPING_REFERENCE_ATTRIBUTE = "latestMappingReference"
+_MAPPING_REFERENCE_ARRAYS = (
+    "featureIds",
+    "featureMeans",
+    "featureScales",
+    "loadings",
+    "centroids",
+    "rawCentroids",
+    "correctedCentroids",
+    "clusterMass",
+    "sigma",
+)
 
 
 def persist_mapping_reference(
@@ -73,7 +83,6 @@ def persist_mapping_reference(
             return f"{MAPPING_REFERENCES_GROUP}/{artifact_hash}"
         del references[artifact_hash]
     group = references.create_group(artifact_hash)
-    group.attrs["schemaVersion"] = MAPPING_REFERENCE_SCHEMA_VERSION
     group.attrs["complete"] = False
     group.attrs["artifactHash"] = artifact_hash
     for key, value in metadata.items():
@@ -133,6 +142,20 @@ def _load_symphony_model_from_group(group: zarr.Group) -> SymphonyReferenceModel
     )
 
 
+def _validate_mapping_reference_arrays(group: zarr.Group) -> None:
+    missing = [name for name in _MAPPING_REFERENCE_ARRAYS if name not in group]
+    if missing:
+        raise ValueError(
+            "Mapping reference is missing required arrays: "
+            + ", ".join(missing)
+            + ". Rebuild the harmonized reference."
+        )
+    if "correctionRidge" not in group.attrs:
+        raise ValueError(
+            "Mapping reference is missing correctionRidge. Rebuild the reference."
+        )
+
+
 def load_mapping_reference(
     datastore: Any,
     assay_name: str,
@@ -150,23 +173,15 @@ def load_mapping_reference(
         raise ValueError(
             "Mapping reference is incomplete. Rebuild the harmonized reference."
         )
-    schema_version = group.attrs.get("schemaVersion")
     if is_legacy:
-        if schema_version != 1:
-            raise ValueError(
-                "Legacy mapping reference schema is incompatible. Rebuild the reference."
-            )
         warnings.warn(
             "This mapping reference uses the legacy overwrite-in-place layout. "
             "Rebuild it to create a content-addressed artifact.",
             DeprecationWarning,
             stacklevel=3,
         )
-    elif schema_version != MAPPING_REFERENCE_SCHEMA_VERSION:
-        raise ValueError(
-            "Mapping reference schema is incompatible. Rebuild the harmonized reference."
-        )
-    if not is_legacy:
+        _validate_mapping_reference_arrays(group)
+    else:
         validate_mapping_reference_artifact(group)
     model = _load_symphony_model_from_group(group)
     return MappingReference(
@@ -211,10 +226,7 @@ def validate_mapping_reference_artifact(group: zarr.Group) -> None:
         raise ValueError(
             "Mapping reference is incomplete. Rebuild the harmonized reference."
         )
-    if group.attrs.get("schemaVersion") != MAPPING_REFERENCE_SCHEMA_VERSION:
-        raise ValueError(
-            "Mapping reference schema is incompatible. Rebuild the harmonized reference."
-        )
+    _validate_mapping_reference_arrays(group)
     artifact_hash = group.attrs.get("artifactHash")
     if not isinstance(artifact_hash, str):
         raise ValueError("Mapping reference is missing its artifact hash.")

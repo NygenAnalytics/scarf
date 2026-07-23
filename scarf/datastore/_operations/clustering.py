@@ -3,6 +3,8 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import numpy as np
 import pandas as pd
 
+from ...graph.encoded_paths import make_integrated_graph_path
+from ...graph.paths import StoredAssayGraph
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...utils.logging import logger
 
@@ -53,23 +55,36 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         budget = get_resource_budget()
         if generation_value is not None and not force_recalc:
             generation_id = str(generation_value)
-            preflight_cached_paris_cut(
-                self.zw,
-                graph_loc,
-                generation_id,
-                cut_mode,
-                budget,
-            )
-            hierarchy, plateau_forest = load_hierarchy_generation(
-                self.zw,
-                graph_loc,
-                generation_id,
-            )
-            logger.info(
-                f"Using Paris hierarchy generation "
-                f"{generation_location(graph_loc, generation_id)}"
-            )
-            return generation_id, hierarchy, plateau_forest, True, None, None
+            location = generation_location(graph_loc, generation_id)
+            if location in self.zw:
+                # Budget errors from the cached-cut preflight must propagate;
+                # only absent or invalid generations fall through to recompute.
+                preflight_cached_paris_cut(
+                    self.zw,
+                    graph_loc,
+                    generation_id,
+                    cut_mode,
+                    budget,
+                )
+                try:
+                    hierarchy, plateau_forest = load_hierarchy_generation(
+                        self.zw,
+                        graph_loc,
+                        generation_id,
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        f"Cached Paris hierarchy generation {generation_id!r} is "
+                        f"invalid ({exc}); recomputing."
+                    )
+                else:
+                    logger.info(f"Using Paris hierarchy generation {location}")
+                    return generation_id, hierarchy, plateau_forest, True, None, None
+            else:
+                logger.warning(
+                    f"Cached Paris hierarchy generation {generation_id!r} was not "
+                    f"found at {location}; recomputing."
+                )
 
         legacy_dendrogram = f"{graph_loc}/dendrogram"
         if generation_value is None and (
@@ -155,7 +170,9 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         )
         graph_loc = None
         if integrated_graph is not None:
-            graph_loc = f"{self._integratedGraphsLoc}/{integrated_graph}"
+            graph_loc = make_integrated_graph_path(
+                self._integratedGraphsLoc, integrated_graph
+            )
             if graph_loc not in self.zw:
                 raise KeyError(
                     f"ERROR: An integrated graph with label: {integrated_graph} does not exist"
@@ -229,7 +246,9 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             raise ValueError("min_cluster_size is only valid when n_clusters='auto'")
 
         if integrated_graph is not None:
-            graph_loc = f"{self._integratedGraphsLoc}/{integrated_graph}"
+            graph_loc = make_integrated_graph_path(
+                self._integratedGraphsLoc, integrated_graph
+            )
             if graph_loc not in self.zw:
                 raise KeyError(
                     f"An integrated graph with label {integrated_graph!r} does not exist"
@@ -243,11 +262,10 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             feat_key,
         )
         if graph_loc is None:
-            graph_loc = self._get_latest_graph_loc(
-                from_assay,
-                cell_key,
-                feat_key,
-            )
+            stored = self._lookup_stored_graph(from_assay, cell_key, feat_key)
+            if not isinstance(stored, StoredAssayGraph):
+                raise TypeError("Paris clustering requires an assay graph")
+            graph_loc = stored.paths.cell_graph_group_path
 
         n_cells, effective_k = self._get_graph_ncells_k(graph_loc)
         active_cell_count = int(np.count_nonzero(self.cells.fetch_all(cell_key)))
@@ -543,10 +561,15 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             raise ValueError("ERROR: Please provide a value for cluster key")
         clusters = pd.Series(self.cells.fetch(cluster_key, key=cell_key))
         if integrated_graph is None:
-            graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
+            stored = self._lookup_stored_graph(from_assay, cell_key, feat_key)
+            if not isinstance(stored, StoredAssayGraph):
+                raise TypeError("TopACeDo sampling requires an assay graph")
+            graph_loc = stored.paths.cell_graph_group_path
             output_assay = from_assay
         else:
-            graph_loc = f"{self._integratedGraphsLoc}/{integrated_graph}"
+            graph_loc = make_integrated_graph_path(
+                self._integratedGraphsLoc, integrated_graph
+            )
             if graph_loc not in self.zw:
                 raise KeyError(
                     f"An integrated graph with label {integrated_graph!r} does not exist"

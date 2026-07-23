@@ -24,7 +24,6 @@ else:
     _FeatureOperationsBase = object
 
 
-_MARKER_LAYOUT_V2 = "compact_v2"
 _MARKER_STAT_COLUMNS = (
     "score",
     "mean",
@@ -35,8 +34,7 @@ _MARKER_STAT_COLUMNS = (
     "p_value",
 )
 _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
-_ENRICHMENT_LAYOUT = "cells_by_sources_v1"
-_ENRICHMENT_SCHEMA_VERSION = 1
+_ENRICHMENT_LAYOUT = "cells_by_sources"
 _ENRICHMENT_ACTIVE_SLOT = "_active_slot"
 _ENRICHMENT_RUN_PREFIX = "_run_"
 
@@ -97,7 +95,7 @@ def _load_marker_cluster_frame(
     group_id: Any,
 ) -> pd.DataFrame:
     out_cols = list(_MARKER_OUT_COLUMNS)
-    if slot_group.attrs.get("layout") == _MARKER_LAYOUT_V2 and "stats" in cluster_group:
+    if "feature_index" in slot_group and "stats" in cluster_group:
         feature_index = np.asarray(
             as_zarr_array(slot_group["feature_index"], name="feature_index")[:]
         )
@@ -381,15 +379,6 @@ def _load_enrichment_result(
     slot = _resolve_enrichment_slot(label_group, label=label)
     if slot.attrs.get("complete") is not True:
         raise ValueError(f"Enrichment slot {label!r} is incomplete")
-    if slot.attrs.get("layout") != _ENRICHMENT_LAYOUT:
-        raise ValueError(f"Enrichment slot {label!r} has an unknown layout")
-    schema_version = slot.attrs.get("schema_version")
-    if (
-        isinstance(schema_version, bool)
-        or not isinstance(schema_version, (int, np.integer))
-        or int(schema_version) != _ENRICHMENT_SCHEMA_VERSION
-    ):
-        raise ValueError(f"Enrichment slot {label!r} has an unsupported schema")
     method = str(slot.attrs.get("method", ""))
     if method not in {"waggr", "aucell"}:
         raise ValueError(f"Enrichment slot {label!r} has an unknown method")
@@ -823,7 +812,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "method": "waggr",
                 "network_digest": network.network_digest,
                 "normalization": "norm_lib_size",
-                "schema_version": _ENRICHMENT_SCHEMA_VERSION,
                 "size_factor": size_factor,
                 "tmin": tmin,
                 "waggr_mode": mode,
@@ -842,7 +830,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             "method": "waggr",
             "network_digest": network.network_digest,
             "normalization": "norm_lib_size",
-            "schema_version": _ENRICHMENT_SCHEMA_VERSION,
             "size_factor": size_factor,
             "tmin": tmin,
             "waggr_mode": mode,
@@ -995,7 +982,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "method": "aucell",
                 "n_up": resolved_n_up,
                 "network_digest": network.network_digest,
-                "schema_version": _ENRICHMENT_SCHEMA_VERSION,
                 "tie_seed": tie_seed,
                 "tmin": tmin,
             }
@@ -1012,7 +998,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             "method": "aucell",
             "n_up": resolved_n_up,
             "network_digest": network.network_digest,
-            "schema_version": _ENRICHMENT_SCHEMA_VERSION,
             "tie_seed": tie_seed,
             "tmin": tmin,
         }
@@ -1194,7 +1179,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         logger.info(
             f"Saved marker results to {assay.name}/markers/{slot_name} "
             f"in {time.perf_counter() - t_save:.1f}s "
-            f"({len(markers)} clusters, layout={_MARKER_LAYOUT_V2})"
+            f"({len(markers)} clusters)"
         )
         return None
 
@@ -1208,7 +1193,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         from ...storage.arrays import create_metadata_column
 
         feature_index = _shared_marker_feature_index(markers)
-        group.attrs["layout"] = _MARKER_LAYOUT_V2
         group.attrs["statColumns"] = list(_MARKER_STAT_COLUMNS)
         create_metadata_column(
             group,

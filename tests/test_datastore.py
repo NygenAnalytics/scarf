@@ -367,8 +367,6 @@ class TestDataStore:
         )
 
     def test_run_pseudotime_aggregation(self, pseudotime_aggregation, datastore):
-        from scarf.assay import PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
-
         precalc_values = np.load(full_path("aggregated_feat_idx.npy"))
         agg_group = datastore.z["RNA"]["aggregated_I_I_RNA_pseudotime"]
         test_values = agg_group["feature_indices"][:]
@@ -380,9 +378,10 @@ class TestDataStore:
             precalc_values.astype(np.int64), test_values.astype(np.int64)
         )
 
-        assert (
-            agg_group.attrs["schema_version"] == PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
-        )
+        assert "schema_version" not in agg_group.attrs
+        assert "hashes" in agg_group.attrs
+        assert "params" in agg_group.attrs
+        assert "valid_features" in agg_group
         assert np.isfinite(agg_group["data"][:]).all()
         valid_features = np.asarray(agg_group["valid_features"][:], dtype=bool)
         np.testing.assert_array_equal(

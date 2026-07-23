@@ -196,7 +196,6 @@ class SizeScale:
 @dataclass(frozen=True, slots=True)
 class PlotProvenance:
     scarf_version: str
-    schema_version: str = "1"
     assay: str | None = None
     cell_key: str | None = None
     n_cells: int = 0

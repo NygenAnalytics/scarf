@@ -291,7 +291,7 @@ def _stream_makegraph_normed_cell_bands(
     assay = store.get_assay(assayName)
     cell_key = assay.attrs.get("latest_cell_key", "I")
     feat_key = assay.attrs["latest_feat_key"]
-    loc = f"{assayName}/normed__{cell_key}__{feat_key}/data"
+    loc = f"{store.get_normalized_group_path(assayName, cell_key, feat_key)}/data"
     arr = as_zarr_array(store.zw[loc], name="data")
     n_rows, n_cols = int(arr.shape[0]), int(arr.shape[1])
     chunks = getattr(arr, "chunks", None)

@@ -1,4 +1,5 @@
 import os
+from dataclasses import fields
 
 import numpy as np
 import pytest
@@ -7,6 +8,7 @@ from zarr.storage import MemoryStore
 
 from scarf.datastore._operations.graph import _GraphBuildProgress
 from scarf.datastore.graph_datastore import GraphDataStore
+from scarf.graph.build import _GraphBuildOutcome
 from scarf.storage.copy import copy_zarr_array, create_or_open_staged_normed_array
 
 
@@ -27,13 +29,23 @@ def test_graph_progress_tracks_steps_and_propagates_errors() -> None:
     assert [record[1] for record in progress._records] == ["reuse graph", "build graph"]
 
 
+def test_graph_build_outcome_carries_finalize_state() -> None:
+    assert tuple(field.name for field in fields(_GraphBuildOutcome)) == (
+        "plan",
+        "ann_stream",
+        "cell_graph_group_path",
+        "fresh_batch_correction",
+    )
+    assert not hasattr(GraphDataStore, "_set_graph_params")
+
+
 def test_get_latest_graph_loc_is_public_with_private_compatibility_alias():
     root = _memory_group()
     normed = root.create_group("RNA/normed__I__hvgs")
-    reduction = root.create_group("RNA/reduction")
-    ann = root.create_group("RNA/ann")
-    knn = root.create_group("RNA/knn")
-    graph = root.create_group("RNA/knn/graph")
+    reduction = root.create_group(f"{normed.path}/reduction__pca__10__I")
+    ann = root.create_group(f"{reduction.path}/ann__l2__50__50__16__1")
+    knn = root.create_group(f"{ann.path}/knn__11")
+    graph = root.create_group(f"{knn.path}/graph__1.0__1.5")
     normed.attrs["latest_reduction"] = reduction.path
     reduction.attrs["latest_ann"] = ann.path
     ann.attrs["latest_knn"] = knn.path
@@ -43,6 +55,7 @@ def test_get_latest_graph_loc_is_public_with_private_compatibility_alias():
     store.z = root
     store.workspace = None
 
+    assert store.get_normalized_group_path("RNA", "I", "hvgs") == "RNA/normed__I__hvgs"
     assert store.get_latest_graph_loc("RNA", "I", "hvgs") == graph.path
     assert store._get_latest_graph_loc("RNA", "I", "hvgs") == graph.path
 

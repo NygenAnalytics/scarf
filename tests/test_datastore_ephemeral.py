@@ -158,8 +158,13 @@ def test_run_unified_umap_after_mapping(datastore_ephemeral):
 
 
 def test_build_and_reload_symphony_mapping_reference(datastore_ephemeral, tmp_path):
+    import hashlib
+    import json
+
     import numpy as np
     import pandas as pd
+
+    from scarf.mapping.hashing import array_hash
 
     ds = datastore_ephemeral
     _ensure_graph(ds)
@@ -180,6 +185,27 @@ def test_build_and_reload_symphony_mapping_reference(datastore_ephemeral, tmp_pa
     reference_loadings = reduction["reduction"][:].copy()
     reference_ann = ds.z[reduction.attrs["latest_ann"]]
     reference_ann_metadata = dict(reference_ann.attrs)
+    harmony_contract = {
+        "batchColumns": ["mapping_batch"],
+        "batchValueHash": array_hash(
+            pd.DataFrame({"mapping_batch": active_batches.astype(object)})
+            .astype(str)
+            .to_numpy()
+            .reshape(-1)
+        ),
+        "parameters": {"nclust": 5},
+    }
+    expected_contract_hash = hashlib.sha256(
+        json.dumps(
+            harmony_contract,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode()
+    ).hexdigest()[:16]
+    assert str(reduction.attrs["latest_ann"]).endswith(
+        f"__harmony_{expected_contract_hash}"
+    )
     loaded = ds.get_mapping_reference(feat_key="hvgs")
     with pytest.raises(ValueError, match="matches the reference path"):
         loaded.map_query(
@@ -411,7 +437,6 @@ def test_cached_harmony_can_rebuild_missing_mapping_artifact(datastore_ephemeral
             "correctedCoordinatesHash",
         }:
             legacy.attrs[key] = value
-    legacy.attrs["schemaVersion"] = 1
     for name in (
         "featureIds",
         "featureMeans",
@@ -429,7 +454,8 @@ def test_cached_harmony_can_rebuild_missing_mapping_artifact(datastore_ephemeral
 
     with pytest.warns(DeprecationWarning, match="legacy"):
         legacy_reference = ds.get_mapping_reference(feat_key="hvgs")
-    assert legacy_reference.metadata["schemaVersion"] == 1
+    assert legacy_reference.artifact_path.endswith("mappingReference")
+    assert "artifactHash" not in legacy_reference.metadata
     del reduction["mappingReference"]
 
     from scarf.datastore.datastore import DataStore

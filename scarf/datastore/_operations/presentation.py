@@ -7,6 +7,11 @@ import pandas as pd
 import zarr
 from scipy.sparse import csr_matrix, vstack
 
+from ...graph.encoded_paths import (
+    is_integrated_graph_path,
+    parse_assay_graph_paths,
+    parse_assay_keys_from_nearest_neighbors_path,
+)
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...storage.arrays import create_zarr_dataset
 from ...utils.logging import logger
@@ -207,7 +212,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         Returns:
             None
         """
-        loc = self._get_latest_graph_loc(
+        loc = self.get_latest_graph_loc(
             from_assay=from_assay, cell_key=cell_key, feat_key=feat_key
         )
         n_cells, k = self._get_graph_ncells_k(graph_loc=loc)
@@ -303,7 +308,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
         clusters = np.asarray(self.cells.fetch(cluster_key, key=cell_key))
         if integrated_graph is None:
-            graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
+            graph_loc = self.get_latest_graph_loc(from_assay, cell_key, feat_key)
         else:
             graph_loc = f"{self._integratedGraphsLoc}/{integrated_graph}"
             if graph_loc not in self.zw:
@@ -466,8 +471,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             resolved_knn_loc = knn_loc
             logger.info(f"Using the knn graph at location: {resolved_knn_loc}")
 
-        normed_part = resolved_knn_loc.split("/")[1]
-        _, cell_key, _ = normed_part.split("__")
+        _, cell_key, _ = parse_assay_keys_from_nearest_neighbors_path(resolved_knn_loc)
         knn_grp = as_zarr_group(
             self.zw[resolved_knn_loc],
             name=resolved_knn_loc,
@@ -536,8 +540,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
             logger.info(f"Using the knn graph at location: {knn_loc}")
 
-        normed_part = knn_loc.split("/")[1]
-        _, cell_key, _ = normed_part.split("__")
+        _, cell_key, _ = parse_assay_keys_from_nearest_neighbors_path(knn_loc)
         knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
 
         distances = as_zarr_array(knn_grp["distances"], name="distances")
@@ -700,13 +703,13 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                 cell_key,
                 feat_key,
             )
-            graph_loc = self._get_latest_graph_loc(
+            graph_loc = self.get_latest_graph_loc(
                 from_assay,
                 cell_key,
                 feat_key,
             )
         else:
-            if graph_loc.startswith(self._integratedGraphsLoc):
+            if is_integrated_graph_path(graph_loc, self._integratedGraphsLoc):
                 raise ValueError(
                     "Integrated graph connectivity is unavailable because the "
                     "graph does not record its cell-key provenance"
@@ -714,19 +717,16 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             if graph_loc not in self.zw:
                 raise ValueError(f"Could not find the graph at location: {graph_loc}")
 
-            path_parts = graph_loc.split("/")
-            if len(path_parts) < 2:
+            try:
+                stored_graph = parse_assay_graph_paths(graph_loc)
+            except ValueError as exc:
                 raise ValueError(
                     f"Could not determine graph provenance from location: {graph_loc}"
-                )
-            normed_parts = path_parts[1].split("__")
-            if len(normed_parts) != 3 or normed_parts[0] != "normed":
-                raise ValueError(
-                    f"Could not determine graph provenance from location: {graph_loc}"
-                )
+                ) from exc
 
-            path_assay = path_parts[0]
-            _, path_cell_key, path_feat_key = normed_parts
+            path_assay = stored_graph.from_assay
+            path_cell_key = stored_graph.cell_key
+            path_feat_key = stored_graph.feat_key
             if from_assay is not None and from_assay != path_assay:
                 raise ValueError("from_assay does not match the graph location")
             if cell_key is not None and cell_key != path_cell_key:
@@ -803,8 +803,9 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
         from ...metrics import silhouette_scoring
 
-        normed_part = knn_loc.split("/")[1]
-        _, cell_key, feat_key_parsed = normed_part.split("__")
+        _, cell_key, feat_key_parsed = parse_assay_keys_from_nearest_neighbors_path(
+            knn_loc
+        )
         ann_obj = self._load_ann_stream(
             from_assay=from_assay,
             cell_key=cell_key,
@@ -972,8 +973,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         if lisi_result is None:
             raise RuntimeError("LISI computation did not return scores")
 
-        normed_part = resolved_knn_loc.split("/")[1]
-        _, cell_key, _ = normed_part.split("__")
+        _, cell_key, _ = parse_assay_keys_from_nearest_neighbors_path(resolved_knn_loc)
         batch_labels = self.cells.fetch(label_colname, key=cell_key)
         return lisi_batch_mixing_score(lisi_result[0][1], batch_labels)
 

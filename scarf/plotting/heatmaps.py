@@ -10,7 +10,6 @@ import pandas as pd
 
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..matrix import ChunkedArray
-from ..storage.schema import PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
 from ..utils.arrays import array_digest
 from ..utils.compute import controlled_compute
 from ..utils.logging import logger
@@ -24,8 +23,6 @@ from ._style import (
     sort_categories,
     theme_context,
 )
-
-_MARKER_LAYOUT_V2 = "compact_v2"
 
 
 def _scarf_version() -> str:
@@ -66,10 +63,7 @@ def _prepare_marker_heatmap(
 
     feature_indices: list[int] = []
     marker_rows: list[dict[str, Any]] = []
-    if (
-        marker_slot.attrs.get("layout") == _MARKER_LAYOUT_V2
-        and "feature_index" in marker_slot
-    ):
+    if "feature_index" in marker_slot:
         shared_index = np.asarray(
             as_zarr_array(marker_slot["feature_index"], name="feature_index")[:]
         )
@@ -795,11 +789,13 @@ def _prepare_pseudotime_heatmap(
         )
     aggregation_group = as_zarr_group(assay.z[location], name=location)
     if (
-        aggregation_group.attrs.get("schema_version")
-        != PSEUDOTIME_AGGREGATION_SCHEMA_VERSION
+        "hashes" not in aggregation_group.attrs
+        or "data" not in aggregation_group
+        or "feature_indices" not in aggregation_group
+        or "valid_features" not in aggregation_group
     ):
         raise ValueError(
-            f"Aggregated data at '{location}' uses an old cache schema. "
+            f"Aggregated data at '{location}' is incomplete. "
             "Rerun run_pseudotime_aggregation before plotting"
         )
     if hashes != cast(list[str], aggregation_group.attrs["hashes"]):

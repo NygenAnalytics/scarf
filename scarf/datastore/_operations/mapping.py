@@ -9,6 +9,15 @@ import zarr
 from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 
+from ...graph.encoded_paths import (
+    lookup_latest_neighbor_index_group_path,
+    lookup_latest_nearest_neighbors_group_path,
+    lookup_latest_reduction_group_path,
+    make_normalized_group_path,
+    make_normalized_leaf_name,
+    parse_neighbor_index_group_path,
+    reduction_group_path_from_neighbor_index,
+)
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...assay import Assay, RNAassay
 from ...matrix import ChunkedArray
@@ -28,8 +37,21 @@ else:
 
 
 class _MappingOperationsMixin(_MappingOperationsBase):
-    _PROJECTION_SCHEMA_VERSION = 2
-    _LEGACY_PROJECTION_SCHEMA_VERSIONS = {1}
+    _PROJECTION_PROVENANCE_ATTRS = frozenset(
+        {
+            "assay",
+            "cellKey",
+            "featureKey",
+            "saveK",
+            "referenceCellHash",
+            "referenceFeatureHash",
+            "referencePath",
+            "reductionPath",
+            "annPath",
+            "referenceSubsetHash",
+            "reductionHash",
+        }
+    )
 
     @staticmethod
     def _validate_projection_arrays(store: zarr.Group, target_name: str) -> None:
@@ -52,6 +74,14 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 f"Projection {target_name!r} does not contain any neighbors."
             )
 
+    def _projection_has_provenance(self, store: zarr.Group) -> bool:
+        attrs = store.attrs
+        if not bool(attrs.get("complete", False)):
+            return False
+        if not self._PROJECTION_PROVENANCE_ATTRS.issubset(attrs):
+            return False
+        return "referenceFeatureIndices" in store
+
     def _load_complete_projection(
         self,
         target_name: str,
@@ -69,10 +99,19 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         store = as_zarr_group(self.zw[store_loc], name=store_loc)
         attrs = store.attrs
         self._validate_projection_arrays(store, target_name)
-        if "schemaVersion" not in attrs:
-            if "complete" in attrs and not bool(attrs["complete"]):
+        if "complete" in attrs and not bool(attrs["complete"]):
+            raise ValueError(
+                f"Projection {target_name!r} is incomplete. Run run_mapping again."
+            )
+        if not self._projection_has_provenance(store):
+            # ``referenceFeatureIndices`` is the provenance-era marker; genuine
+            # legacy projections lack it entirely. A projection that carries the
+            # marker but is missing required provenance is a partial or corrupt
+            # current write and must not silently downgrade to the legacy path.
+            if "referenceFeatureIndices" in store:
                 raise ValueError(
-                    f"Projection {target_name!r} is incomplete. Run run_mapping again."
+                    f"Projection {target_name!r} has incomplete provenance metadata. "
+                    "Re-run run_mapping to rebuild it."
                 )
             warnings.warn(
                 f"Projection {target_name!r} predates projection provenance. "
@@ -81,22 +120,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 stacklevel=3,
             )
             return store
-        if not bool(attrs.get("complete", False)):
-            raise ValueError(
-                f"Projection {target_name!r} is incomplete. Run run_mapping again."
-            )
-        schema_version = attrs.get("schemaVersion")
-        if schema_version in self._LEGACY_PROJECTION_SCHEMA_VERSIONS:
-            warnings.warn(
-                f"Projection {target_name!r} uses legacy projection schema "
-                f"{schema_version}. Re-run run_mapping to upgrade its provenance.",
-                DeprecationWarning,
-                stacklevel=3,
-            )
-        elif schema_version != self._PROJECTION_SCHEMA_VERSION:
-            raise ValueError(
-                f"Projection {target_name!r} uses an incompatible schema. Run run_mapping again."
-            )
         if attrs.get("assay") != from_assay or attrs.get("cellKey") != cell_key:
             raise ValueError(
                 f"Projection {target_name!r} does not match the selected reference assay or cells."
@@ -112,8 +135,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise ValueError(
                 f"Projection {target_name!r} was built from a different reference cell set."
             )
-        if schema_version == self._PROJECTION_SCHEMA_VERSION:
-            self._validate_projection_provenance(store, target_name)
+        self._validate_projection_provenance(store, target_name)
         return store
 
     def _validate_projection_provenance(
@@ -191,11 +213,28 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise ValueError(
                 f"Projection {target_name!r} references a changed ANN coordinate space."
             )
-        ann_parts = ann_path.rsplit("/", 1)[-1].split("__")
-        if len(ann_parts) < 6:
+        settings_ann_path = ann_path
+        if "__intersection_" in ann_path:
+            source_ann_path = ann.attrs.get("sourceAnnPath")
+            if not isinstance(source_ann_path, str) or not source_ann_path:
+                raise ValueError(
+                    f"Projection {target_name!r} has invalid intersection ANN provenance."
+                )
+            settings_ann_path = source_ann_path
+        try:
+            (
+                path_ann_metric,
+                path_ann_efc,
+                path_ann_ef,
+                path_ann_m,
+                path_ann_random_state,
+                _,
+                _,
+            ) = parse_neighbor_index_group_path(settings_ann_path)
+        except ValueError as exc:
             raise ValueError(
                 f"Projection {target_name!r} has an invalid ANN provenance path."
-            )
+            ) from exc
         stored_ann_values = (
             attrs.get("annEfc"),
             attrs.get("annEf"),
@@ -210,11 +249,11 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             tuple[int | float, ...], stored_ann_values
         )
         if (
-            attrs.get("annMetric") != ann_parts[1]
-            or int(ann_efc) != int(ann_parts[2])
-            or int(ann_ef) != int(ann_parts[3])
-            or int(ann_m) != int(ann_parts[4])
-            or int(ann_random_state) != int(ann_parts[5])
+            attrs.get("annMetric") != path_ann_metric
+            or int(ann_efc) != path_ann_efc
+            or int(ann_ef) != path_ann_ef
+            or int(ann_m) != path_ann_m
+            or int(ann_random_state) != path_ann_random_state
         ):
             raise ValueError(
                 f"Projection {target_name!r} references incompatible ANN settings."
@@ -309,8 +348,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
     ) -> None:
         if not self._same_assay_store(source_assay, target_assay):
             return
-        source_path = f"normed__{source_cell_key}__{source_feat_key}"
-        target_path = f"normed__{target_cell_key}__{target_feat_key}"
+        source_path = make_normalized_leaf_name(source_cell_key, source_feat_key)
+        target_path = make_normalized_leaf_name(target_cell_key, target_feat_key)
         if source_path == target_path:
             raise ValueError(
                 "The mapping target normalization path matches the reference path. "
@@ -392,19 +431,37 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 np.isin(reference_features, target_feature_ids).sum()
                 / len(reference_features)
             )
-        reference_path = f"{source_assay_name}/normed__{cell_key}__{feat_key}"
+        reference_path = make_normalized_group_path(
+            source_assay_name, cell_key, feat_key
+        )
         reduction_path: str | None = None
         ann_path = self._ann_stream_path(ann_obj)
         if ann_path is not None:
-            reduction_path = ann_path.rsplit("/ann__", 1)[0]
+            reduction_source_path = ann_path
+            if "__intersection_" in ann_path and ann_path in self.zw:
+                intersection_group = as_zarr_group(self.zw[ann_path], name=ann_path)
+                stored_source_path = intersection_group.attrs.get("sourceAnnPath")
+                if isinstance(stored_source_path, str):
+                    reduction_source_path = stored_source_path
+            reduction_path = reduction_group_path_from_neighbor_index(
+                reduction_source_path
+            )
         if reference_path in self.zw:
-            normed = as_zarr_group(self.zw[reference_path], name=reference_path)
             if reduction_path is None:
-                reduction_path = cast(str | None, normed.attrs.get("latest_reduction"))
+                try:
+                    reduction_path = lookup_latest_reduction_group_path(
+                        self.zw, reference_path
+                    )
+                except KeyError:
+                    reduction_path = None
             if reduction_path is not None and reduction_path in self.zw:
-                reduction = as_zarr_group(self.zw[reduction_path], name=reduction_path)
                 if ann_path is None:
-                    ann_path = cast(str | None, reduction.attrs.get("latest_ann"))
+                    try:
+                        ann_path = lookup_latest_neighbor_index_group_path(
+                            self.zw, reduction_path
+                        )
+                    except KeyError:
+                        ann_path = None
         reduction_hash = ""
         reference_subset_hash: int | str = ""
         ann_feature_scaling = ann_obj.featureScaling
@@ -427,7 +484,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     )
                 )
         return {
-            "schemaVersion": self._PROJECTION_SCHEMA_VERSION,
             "complete": False,
             "assay": source_assay_name,
             "targetName": target_name,
@@ -710,15 +766,22 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             target_feat_key,
         )
 
-        normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
+        normed_loc = make_normalized_group_path(from_assay, cell_key, feat_key)
         if normed_loc in self.zw:
-            normed_group = as_zarr_group(self.zw[normed_loc], name=normed_loc)
-            reduction_loc = cast(str | None, normed_group.attrs.get("latest_reduction"))
+            try:
+                reduction_loc = lookup_latest_reduction_group_path(self.zw, normed_loc)
+            except KeyError:
+                reduction_loc = None
             if reduction_loc is not None and reduction_loc in self.zw:
                 reduction_group = as_zarr_group(
                     self.zw[reduction_loc], name=reduction_loc
                 )
-                ann_loc = cast(str | None, reduction_group.attrs.get("latest_ann"))
+                try:
+                    ann_loc = lookup_latest_neighbor_index_group_path(
+                        self.zw, reduction_loc
+                    )
+                except KeyError:
+                    ann_loc = None
                 if ann_loc is not None and ann_loc in self.zw:
                     ann_group = as_zarr_group(self.zw[ann_loc], name=ann_loc)
                     if bool(ann_group.attrs.get("isHarmonized", False)):
@@ -838,28 +901,27 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
         else:
             previous_ann_path: str | None = None
-            reference_normed_path = f"{from_assay}/normed__{cell_key}__{ann_feat_key}"
+            reference_normed_path = make_normalized_group_path(
+                from_assay, cell_key, ann_feat_key
+            )
             reference_reduction_path: str | None = None
             if reference_normed_path in self.zw:
-                reference_normed_group = as_zarr_group(
-                    self.zw[reference_normed_path], name=reference_normed_path
-                )
-                reference_reduction_path = cast(
-                    str | None,
-                    reference_normed_group.attrs.get("latest_reduction"),
-                )
+                try:
+                    reference_reduction_path = lookup_latest_reduction_group_path(
+                        self.zw, reference_normed_path
+                    )
+                except KeyError:
+                    reference_reduction_path = None
                 if (
                     reference_reduction_path is not None
                     and reference_reduction_path in self.zw
                 ):
-                    reference_reduction_group = as_zarr_group(
-                        self.zw[reference_reduction_path],
-                        name=reference_reduction_path,
-                    )
-                    previous_ann_path = cast(
-                        str | None,
-                        reference_reduction_group.attrs.get("latest_ann"),
-                    )
+                    try:
+                        previous_ann_path = lookup_latest_neighbor_index_group_path(
+                            self.zw, reference_reduction_path
+                        )
+                    except KeyError:
+                        previous_ann_path = None
             ann_obj = self.make_graph(
                 from_assay=from_assay,
                 cell_key=cell_key,
@@ -929,10 +991,12 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         if save_k > ann_obj.k:
             logger.warning(f"`save_k` was decreased to {ann_obj.k}")
             save_k = ann_obj.k
+        target_normed_path = make_normalized_leaf_name(target_cell_key, target_feat_key)
+        target_data_path = f"{target_normed_path}/data"
         target_data = ChunkedArray(
             as_zarr_array(
-                target_assay.z[f"normed__{target_cell_key}__{target_feat_key}/data"],
-                name=f"normed__{target_cell_key}__{target_feat_key}/data",
+                target_assay.z[target_data_path],
+                name=target_data_path,
             ),
             nthreads=self.nthreads,
         )
@@ -948,10 +1012,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
             target_data = ChunkedArray(
                 as_zarr_array(
-                    target_assay.z[
-                        f"normed__{target_cell_key}__{target_feat_key}/data_coral"
-                    ],
-                    name=(f"normed__{target_cell_key}__{target_feat_key}/data_coral"),
+                    target_assay.z[f"{target_normed_path}/data_coral"],
+                    name=f"{target_normed_path}/data_coral",
                 ),
                 nthreads=self.nthreads,
             )
@@ -959,7 +1021,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             source_assay.z.create_group("projections")
         projections = as_zarr_group(source_assay.z["projections"], name="projections")
         store = projections.create_group(target_name, overwrite=True)
-        store.attrs["schemaVersion"] = self._PROJECTION_SCHEMA_VERSION
         store.attrs["complete"] = False
         nc = target_assay.cells.active_index(target_cell_key).shape[0]
         nk = save_k
@@ -1100,10 +1161,12 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise ValueError(
                 "Reference feature identifiers no longer match the immutable artifact"
             )
+        target_normed_path = make_normalized_leaf_name(target_cell_key, target_feat_key)
+        target_data_path = f"{target_normed_path}/data"
         target_data = ChunkedArray(
             as_zarr_array(
-                target_assay.z[f"normed__{target_cell_key}__{target_feat_key}/data"],
-                name=f"normed__{target_cell_key}__{target_feat_key}/data",
+                target_assay.z[target_data_path],
+                name=target_data_path,
             ),
             nthreads=self.nthreads,
         )
@@ -1152,7 +1215,12 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 "The mapping reference ANN was built without feature scaling "
                 "and cannot use reference-scaled query projection."
             )
-        reference_knn_path = cast(str, reference_ann_group.attrs.get("latest_knn"))
+        try:
+            reference_knn_path = lookup_latest_nearest_neighbors_group_path(
+                self.zw, reference.ann_path
+            )
+        except KeyError:
+            reference_knn_path = ""
         if not reference_knn_path or reference_knn_path not in self.zw:
             raise ValueError(
                 "The mapping reference KNN metadata is missing. Rebuild the reference."
@@ -1190,7 +1258,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 projection_path = f"{reference.assay_name}/projections/{target_name}"
             else:
                 projection_path = getattr(store, "path", "")
-            store.attrs["schemaVersion"] = self._PROJECTION_SCHEMA_VERSION
             store.attrs["complete"] = False
             for key, value in self._projection_provenance(
                 source_assay,
@@ -1737,11 +1804,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 cell_key = stored_cell_key
             if isinstance(stored_feature_key, str):
                 feat_key = stored_feature_key
-            normed_path = f"{from_assay}/normed__{cell_key}__{feat_key}"
-            normed = as_zarr_group(self.zw[normed_path], name=normed_path)
-            reduction_path = cast(str, normed.attrs["latest_reduction"])
-            reduction = as_zarr_group(self.zw[reduction_path], name=reduction_path)
-            ann_path = cast(str, reduction.attrs["latest_ann"])
+            normed_path = make_normalized_group_path(from_assay, cell_key, feat_key)
+            reduction_path = lookup_latest_reduction_group_path(self.zw, normed_path)
+            ann_path = lookup_latest_neighbor_index_group_path(self.zw, reduction_path)
         ann = as_zarr_group(self.zw[ann_path], name=ann_path)
         if "referenceDistanceQuantiles" in ann and "referenceDistanceValues" in ann:
             return (
@@ -1758,7 +1823,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     )[:]
                 ),
             )
-        knn_path = cast(str, ann.attrs["latest_knn"])
+        knn_path = lookup_latest_nearest_neighbors_group_path(self.zw, ann_path)
         knn = as_zarr_group(self.zw[knn_path], name=knn_path)
         reference_distances = as_zarr_array(knn["distances"], name="referenceDistances")
         return _distance_quantile_summary(reference_distances)
@@ -1840,7 +1905,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         if persist_layout:
             layout.attrs["complete"] = True
             layout.attrs["referenceLayoutKey"] = reference_layout_key
-            layout.attrs["projectionSchemaVersion"] = self._PROJECTION_SCHEMA_VERSION
             return f"{from_assay}/projections/{target_name}/{label}"
         return np.asarray(layout)
 
@@ -1877,7 +1941,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             cell_key = self._get_latest_cell_key(from_assay)
         if feat_key is None:
             feat_key = self._get_latest_feat_key(from_assay)
-        graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
+        graph_loc = self.get_latest_graph_loc(from_assay, cell_key, feat_key)
         graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
         edges = np.asarray(as_zarr_array(graph_group["edges"], name="edges")[:])
         weights = np.asarray(as_zarr_array(graph_group["weights"], name="weights")[:])

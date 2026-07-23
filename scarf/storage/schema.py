@@ -11,7 +11,6 @@ from .layout import _group_zarr_format, count_array_spec
 from .profiles import StorageProfile, get_storage_profile
 from .sharding import finalize_sharded_counts, write_counts_t
 
-PSEUDOTIME_AGGREGATION_SCHEMA_VERSION = 2
 RESERVED_ASSAY_NAMES = frozenset({"plots"})
 
 

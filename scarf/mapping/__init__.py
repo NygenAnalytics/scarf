@@ -1,7 +1,6 @@
 from .artifact import (
     LATEST_MAPPING_REFERENCE_ATTRIBUTE,
     MAPPING_REFERENCE_GROUP,
-    MAPPING_REFERENCE_SCHEMA_VERSION,
     MAPPING_REFERENCES_GROUP,
     load_mapping_reference,
     mapping_reference_hash,
@@ -30,7 +29,6 @@ from .symphony import (
 __all__ = [
     "LATEST_MAPPING_REFERENCE_ATTRIBUTE",
     "MAPPING_REFERENCE_GROUP",
-    "MAPPING_REFERENCE_SCHEMA_VERSION",
     "MAPPING_REFERENCES_GROUP",
     "MappingReference",
     "MappingResult",

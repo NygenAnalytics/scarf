@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 
+from ..graph.encoded_paths import make_normalized_leaf_name
 from ..matrix import ChunkedArray
 from ..utils.compute import show_dask_progress
 from ..utils.logging import logger
@@ -126,10 +127,11 @@ def coral(
         nthreads,
     )
     data = standardized * td + tm
+    normed_loc = make_normalized_leaf_name(cell_key, feat_key)
     dask_to_zarr(
         data,
         assay.z,
-        f"normed__{cell_key}__{feat_key}/data_coral",
+        f"{normed_loc}/data_coral",
         data.chunksize,
         nthreads,
         msg="Writing out coral corrected data",

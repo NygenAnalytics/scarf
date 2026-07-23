@@ -489,8 +489,9 @@ def test_compact_marker_save_roundtrip():
         feature_names,
         group_id=1,
     )
-    assert slot.attrs["layout"] == "compact_v2"
-    assert list(slot.group_keys()) == ["1", "feature_index"] or "feature_index" in slot
+    assert "layout" not in slot.attrs
+    assert "feature_index" in slot
+    assert "stats" in slot["1"]
     assert len(loaded) == 3
     assert loaded.iloc[0]["score"] == 0.9
     assert loaded.iloc[0]["feature_name"] == "g10"

@@ -1,8 +1,13 @@
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.sparse import csr_matrix
 
+from ...graph.encoded_paths import (
+    lookup_latest_kmeans_path,
+    make_integrated_graph_path,
+)
+from ...graph.paths import StoredAssayGraph
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...utils.logging import logger
 
@@ -32,11 +37,11 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         """
         from ...embeddings.initialization import initial_embedding
 
-        normed_loc = f"{from_assay}/normed__{cell_key}__{feat_key}"
-        normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
-        reduction_loc = cast(str, normed_grp.attrs["latest_reduction"])
-        reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
-        kmeans_loc = cast(str, reduction_grp.attrs["latest_kmeans"])
+        # Initial embedding only needs the reduction and k-means groups, not an
+        # ANN index, KNN graph, or built cell graph.
+        kmeans_loc = lookup_latest_kmeans_path(self.zw, from_assay, cell_key, feat_key)
+        if kmeans_loc is None:
+            raise KeyError("No k-means initialization group found for assay graph")
         kmeans_grp = as_zarr_group(self.zw[kmeans_loc], name=kmeans_loc)
         cluster_centers = np.asarray(
             as_zarr_array(
@@ -246,7 +251,9 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         )
         graph_loc = None
         if integrated_graph is not None:
-            graph_loc = f"{self._integratedGraphsLoc}/{integrated_graph}"
+            graph_loc = make_integrated_graph_path(
+                self._integratedGraphsLoc, integrated_graph
+            )
             if graph_loc not in self.zw:
                 raise KeyError(
                     f"ERROR: An integrated graph with label: {integrated_graph} does not exist"
@@ -273,8 +280,11 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 logger.warning(
                     "DensMap is not available for integrated graphs. Will run without UMAP without DensMap"
                 )
-            graph_loc = self._get_latest_graph_loc(from_assay, cell_key, feat_key)
-            knn_loc = graph_loc.rsplit("/", 1)[0]
+            stored = self._lookup_stored_graph(from_assay, cell_key, feat_key)
+            if not isinstance(stored, StoredAssayGraph):
+                raise TypeError("DensMAP requires an assay graph")
+            graph_loc = stored.paths.cell_graph_group_path
+            knn_loc = stored.paths.nearest_neighbors_group_path
             logger.trace(f"Loading KNN dists and indices from {knn_loc}")
             knn_group = as_zarr_group(self.zw[knn_loc], name=knn_loc)
             dists = np.asarray(

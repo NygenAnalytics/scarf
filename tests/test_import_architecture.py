@@ -8,7 +8,6 @@ from pathlib import Path
 _SCARF_ROOT = Path(__file__).resolve().parents[1] / "scarf"
 _MOVED_SYMBOLS = {
     "datastore.datastore": {
-        "_MARKER_LAYOUT_V2",
         "_MARKER_OUT_COLUMNS",
         "_MARKER_STAT_COLUMNS",
         "_feature_column_chunk",
@@ -973,3 +972,77 @@ def test_datastore_operation_mixins_are_runtime_isolated():
     )
     assert all("__init__" not in mixin.__dict__ for mixin in mixins)
     assert all(mixin.__bases__ == (object,) for mixin in mixins)
+
+
+def test_assay_graph_path_grammar_is_centralized():
+    encoded_paths = _SCARF_ROOT / "graph" / "encoded_paths.py"
+    path_markers = ("normed__", "reduction__", "ann__", "knn__", "graph__")
+    pointer_names = {
+        "latest_reduction",
+        "latest_ann",
+        "latest_knn",
+        "latest_graph",
+        "latest_kmeans",
+    }
+    violations: list[tuple[str, int, str]] = []
+
+    for path in _SCARF_ROOT.rglob("*.py"):
+        if path == encoded_paths:
+            continue
+        tree = ast.parse(path.read_text(), filename=str(path))
+        docstring_constants = {
+            id(owner.body[0].value)
+            for owner in ast.walk(tree)
+            if isinstance(
+                owner,
+                ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef,
+            )
+            and owner.body
+            and isinstance(owner.body[0], ast.Expr)
+            and isinstance(owner.body[0].value, ast.Constant)
+            and isinstance(owner.body[0].value.value, str)
+        }
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in docstring_constants
+                and any(marker in node.value for marker in path_markers)
+            ):
+                violations.append(
+                    (
+                        path.relative_to(_SCARF_ROOT).as_posix(),
+                        node.lineno,
+                        "path construction",
+                    )
+                )
+            elif (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.ctx, ast.Load)
+                and isinstance(node.slice, ast.Constant)
+                and node.slice.value in pointer_names
+            ):
+                violations.append(
+                    (
+                        path.relative_to(_SCARF_ROOT).as_posix(),
+                        node.lineno,
+                        "latest pointer read",
+                    )
+                )
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value in pointer_names
+            ):
+                violations.append(
+                    (
+                        path.relative_to(_SCARF_ROOT).as_posix(),
+                        node.lineno,
+                        "latest pointer read",
+                    )
+                )
+
+    assert violations == []

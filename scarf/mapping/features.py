@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import pandas as pd
 
+from ..graph.encoded_paths import make_normalized_leaf_name
 from ..utils.compute import controlled_compute
 from ..utils.logging import logger
 
@@ -141,7 +142,7 @@ def align_features(
             )
         if not np.all(np.isfinite(missing_feature_values)):
             raise ValueError("missing_feature_values must be finite")
-    normed_loc = f"normed__{source_cell_key}__{source_feat_key}"
+    normed_loc = make_normalized_leaf_name(source_cell_key, source_feat_key)
     norm_params = cast(
         dict[str, Any], source_assay.z[normed_loc].attrs["subset_params"]
     )
@@ -152,7 +153,7 @@ def align_features(
         sorted_t_idx,
         **norm_params,
     )
-    normed_loc = f"normed__{target_cell_key}__{target_feat_key}"
+    normed_loc = make_normalized_leaf_name(target_cell_key, target_feat_key)
     og = create_zarr_dataset(
         target_assay.z,
         f"{normed_loc}/data",

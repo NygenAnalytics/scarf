@@ -85,7 +85,6 @@ def test_assay_facade_surface_is_stable():
         "ATACassay",
         "Assay",
         "NormMethod",
-        "PSEUDOTIME_AGGREGATION_SCHEMA_VERSION",
         "PercentFeatures",
         "RNAassay",
         "_feature_stats_tile_shape",

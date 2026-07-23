@@ -11,9 +11,6 @@
 
 from .adt import ADTassay as ADTassay
 from .atac import ATACassay as ATACassay
-from .base import (
-    PSEUDOTIME_AGGREGATION_SCHEMA_VERSION as PSEUDOTIME_AGGREGATION_SCHEMA_VERSION,
-)
 from .base import Assay as Assay
 from .base import PercentFeatures as PercentFeatures
 from .normalization import NormMethod as NormMethod

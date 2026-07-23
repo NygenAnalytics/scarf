@@ -12,6 +12,7 @@ from zarr.storage import MemoryStore
 from scarf.assay import ATACassay
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.graph_datastore import GraphDataStore
+from scarf.graph.build import ResolvedGraphParameters
 
 
 class _MemoryGraphStore(GraphDataStore):
@@ -229,32 +230,38 @@ def test_load_graph_latest_location_formats_and_errors() -> None:
         )
 
 
-def test_set_graph_params_defaults_and_reduction_validation(
+def test_resolve_graph_parameters_defaults_and_reduction_validation(
     isolated_toy_datastore: DataStore,
 ) -> None:
     store = isolated_toy_datastore
 
-    params = store._set_graph_params(
+    params = store._resolve_graph_parameters(
         from_assay="RNA",
         cell_key="I",
         feat_key="coverageFresh",
         reduction_method="AUTO",
     )
-    assert params == (
-        True,
-        True,
-        "pca",
-        11,
-        "I",
-        "l2",
-        50,
-        50,
-        48,
-        4466,
-        11,
-        1000,
-        1.0,
-        1.5,
+    assert params == ResolvedGraphParameters(
+        log_transform=True,
+        renormalize_subset=True,
+        reduction_method="pca",
+        dims=11,
+        pca_cell_key="I",
+        ann_metric="l2",
+        ann_efc=50,
+        ann_ef=50,
+        ann_m=48,
+        rand_state=4466,
+        k=11,
+        n_centroids=1000,
+        local_connectivity=1.0,
+        bandwidth=1.5,
+        feat_scaling=True,
+        lsi_skip_first=True,
+        harmonize=False,
+        batch_columns=None,
+        harmony_params=None,
+        harmony_contract_hash=None,
     )
 
     assert store._choose_reduction_method(store.RNA, "PCA") == "pca"
@@ -266,7 +273,7 @@ def test_set_graph_params_defaults_and_reduction_validation(
         store._choose_reduction_method(store.RNA, "invalid")
 
     with pytest.raises(ValueError, match="does not exist"):
-        store._set_graph_params(
+        store._resolve_graph_parameters(
             from_assay="RNA",
             cell_key="I",
             feat_key="coverageFresh",
@@ -275,7 +282,7 @@ def test_set_graph_params_defaults_and_reduction_validation(
         )
 
     with pytest.raises(TypeError, match="should be `bool`"):
-        store._set_graph_params(
+        store._resolve_graph_parameters(
             from_assay="RNA",
             cell_key="I",
             feat_key="coverageFresh",
@@ -284,13 +291,23 @@ def test_set_graph_params_defaults_and_reduction_validation(
         )
 
 
-def test_set_graph_params_reuses_cached_hierarchy(
+@pytest.mark.parametrize(
+    "ann_suffix",
+    [
+        "",
+        "__unscaled",
+        "__harmony_deadbeef",
+        "__unscaled__harmony_deadbeef",
+    ],
+)
+def test_resolve_graph_parameters_reuses_cached_hierarchy(
     isolated_toy_datastore: DataStore,
+    ann_suffix: str,
 ) -> None:
     store = isolated_toy_datastore
     normed_loc = "RNA/normed__I__coverageCached"
     reduction_loc = f"{normed_loc}/reduction__pca__7__I"
-    ann_loc = f"{reduction_loc}/ann__cosine__70__60__32__123"
+    ann_loc = f"{reduction_loc}/ann__cosine__70__60__32__123{ann_suffix}"
     knn_loc = f"{ann_loc}/knn__5"
     kmeans_loc = f"{reduction_loc}/kmeans__9__123"
     graph_loc = f"{knn_loc}/graph__2.0__3.0"
@@ -311,59 +328,71 @@ def test_set_graph_params_reuses_cached_hierarchy(
     ann_group.attrs["latest_knn"] = knn_loc
     knn_group.attrs["latest_graph"] = graph_loc
 
-    params = store._set_graph_params(
+    params = store._resolve_graph_parameters(
         from_assay="RNA",
         cell_key="I",
         feat_key="coverageCached",
         reduction_method="pca",
     )
 
-    assert params == (
-        False,
-        False,
-        "pca",
-        7,
-        "I",
-        "cosine",
-        70,
-        60,
-        32,
-        123,
-        5,
-        9,
-        2.0,
-        3.0,
+    assert params == ResolvedGraphParameters(
+        log_transform=False,
+        renormalize_subset=False,
+        reduction_method="pca",
+        dims=7,
+        pca_cell_key="I",
+        ann_metric="cosine",
+        ann_efc=70,
+        ann_ef=60,
+        ann_m=32,
+        rand_state=123,
+        k=5,
+        n_centroids=9,
+        local_connectivity=2.0,
+        bandwidth=3.0,
+        feat_scaling=True,
+        lsi_skip_first=True,
+        harmonize=False,
+        batch_columns=None,
+        harmony_params=None,
+        harmony_contract_hash=None,
     )
 
 
-def test_set_graph_params_uses_missing_metadata_fallbacks(
+def test_resolve_graph_parameters_uses_missing_metadata_fallbacks(
     isolated_toy_datastore: DataStore,
 ) -> None:
     store = isolated_toy_datastore
     empty_normed_loc = "RNA/normed__I__coverageEmpty"
     store.zw.create_group(empty_normed_loc)
 
-    defaults = store._set_graph_params(
+    defaults = store._resolve_graph_parameters(
         from_assay="RNA",
         cell_key="I",
         feat_key="coverageEmpty",
         reduction_method="pca",
     )
-    assert defaults == (
-        True,
-        True,
-        "pca",
-        11,
-        "I",
-        "l2",
-        50,
-        50,
-        48,
-        4466,
-        11,
-        1000,
-        1.0,
-        1.5,
+    assert defaults == ResolvedGraphParameters(
+        log_transform=True,
+        renormalize_subset=True,
+        reduction_method="pca",
+        dims=11,
+        pca_cell_key="I",
+        ann_metric="l2",
+        ann_efc=50,
+        ann_ef=50,
+        ann_m=48,
+        rand_state=4466,
+        k=11,
+        n_centroids=1000,
+        local_connectivity=1.0,
+        bandwidth=1.5,
+        feat_scaling=True,
+        lsi_skip_first=True,
+        harmonize=False,
+        batch_columns=None,
+        harmony_params=None,
+        harmony_contract_hash=None,
     )
 
     normed_loc = "RNA/normed__I__coveragePartial"
@@ -379,27 +408,33 @@ def test_set_graph_params_uses_missing_metadata_fallbacks(
     store.zw.create_group(reduction_loc)
     store.zw.create_group(knn_loc)
 
-    fallbacks = store._set_graph_params(
+    fallbacks = store._resolve_graph_parameters(
         from_assay="RNA",
         cell_key="I",
         feat_key="coveragePartial",
         reduction_method="pca",
     )
-    assert fallbacks == (
-        True,
-        True,
-        "pca",
-        6,
-        "I",
-        "l2",
-        50,
-        50,
-        48,
-        4466,
-        11,
-        1000,
-        1.0,
-        1.5,
+    assert fallbacks == ResolvedGraphParameters(
+        log_transform=True,
+        renormalize_subset=True,
+        reduction_method="pca",
+        dims=6,
+        pca_cell_key="I",
+        ann_metric="l2",
+        ann_efc=50,
+        ann_ef=50,
+        ann_m=48,
+        rand_state=4466,
+        k=11,
+        n_centroids=1000,
+        local_connectivity=1.0,
+        bandwidth=1.5,
+        feat_scaling=True,
+        lsi_skip_first=True,
+        harmonize=False,
+        batch_columns=None,
+        harmony_params=None,
+        harmony_contract_hash=None,
     )
 
 
@@ -537,7 +572,8 @@ def test_ann_index_resolution_and_persistence_paths(
         lambda *_: str(legacy_path),
     )
     assert store._resolve_ann_index(ann_loc, "l2", 3) is legacy_index
-    save_index.assert_called_once_with(ann_group, legacy_index)
+    save_index.assert_not_called()
+    assert "ann_idx_bytes" not in ann_group
 
     custom_saver = Mock()
     custom_only_loc = "custom/ann"
@@ -559,6 +595,117 @@ def test_ann_index_resolution_and_persistence_paths(
     store._persist_ann_index(read_only_loc, object())
     assert read_only_loc in store.zw
     assert save_index.call_count == calls_before
+
+
+def test_corrupt_zarr_ann_does_not_fall_back_to_legacy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    ann_loc = "RNA/normed/reduction/ann__l2__50__50__48__1"
+    ann_group = store.zw.create_group(ann_loc)
+    ann_group.create_array("ann_idx_bytes", data=np.array([1, 2, 3], dtype=np.uint8))
+    legacy_path = tmp_path / "ann_idx"
+    legacy_path.write_bytes(b"legacy")
+    load_legacy = Mock()
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.load_ann_index",
+        Mock(side_effect=RuntimeError("corrupt Zarr ANN bytes")),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.load_ann_index_from_path",
+        load_legacy,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.legacy_ann_index_path",
+        lambda *_: str(legacy_path),
+    )
+
+    with pytest.raises(RuntimeError, match="corrupt Zarr ANN bytes"):
+        store._resolve_ann_index(ann_loc, "l2", 3)
+    load_legacy.assert_not_called()
+
+
+def test_custom_ann_fetcher_precedes_and_falls_back_to_zarr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    ann_loc = "RNA/normed/reduction/ann__l2__50__50__48__1"
+    ann_group = store.zw.create_group(ann_loc)
+    ann_group.create_array("ann_idx_bytes", data=np.array([1, 2, 3], dtype=np.uint8))
+    custom_path = tmp_path / "custom.idx"
+    custom_path.write_bytes(b"custom")
+    custom_index = object()
+    zarr_index = object()
+    load_path = Mock(return_value=custom_index)
+    load_zarr = Mock(return_value=zarr_index)
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.load_ann_index_from_path",
+        load_path,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.load_ann_index",
+        load_zarr,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.legacy_ann_index_path",
+        lambda *_: None,
+    )
+
+    assert (
+        store._resolve_ann_index(
+            ann_loc,
+            "l2",
+            3,
+            ann_index_fetcher=lambda _: str(custom_path),
+        )
+        is custom_index
+    )
+    load_path.assert_called_once_with(str(custom_path), "l2", 3)
+    load_zarr.assert_not_called()
+
+    failing_fetcher = Mock(side_effect=RuntimeError("fetch failed"))
+    assert (
+        store._resolve_ann_index(
+            ann_loc,
+            "l2",
+            3,
+            ann_index_fetcher=failing_fetcher,
+        )
+        is zarr_index
+    )
+    load_zarr.assert_called_once_with(ann_group, "l2", 3)
+
+
+def test_legacy_ann_load_does_not_create_zarr_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hnswlib
+
+    store = _memory_graph_store()
+    ann_loc = "RNA/normed/reduction/ann__l2__50__50__48__1"
+    ann_group = store.zw.create_group(ann_loc)
+    before_attrs = dict(ann_group.attrs)
+    data = np.random.default_rng(9).random((20, 3), dtype=np.float32)
+    source = hnswlib.Index(space="l2", dim=3)
+    source.init_index(max_elements=len(data), ef_construction=50, M=16)
+    source.add_items(data)
+    legacy_path = tmp_path / "ann_idx"
+    source.save_index(str(legacy_path))
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.legacy_ann_index_path",
+        lambda *_: str(legacy_path),
+    )
+
+    loaded = store._resolve_ann_index(ann_loc, "l2", 3)
+    expected_indices, expected_distances = source.knn_query(data[:3], k=4)
+    actual_indices, actual_distances = loaded.knn_query(data[:3], k=4)
+    np.testing.assert_array_equal(actual_indices, expected_indices)
+    np.testing.assert_allclose(actual_distances, expected_distances)
+    assert "ann_idx_bytes" not in ann_group
+    assert dict(ann_group.attrs) == before_attrs
 
 
 def test_normalized_cache_validation_paths(
@@ -897,24 +1044,30 @@ def test_make_graph_harmony_input_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = isolated_toy_datastore
-    graph_params = (
-        True,
-        True,
-        "pca",
-        2,
-        "I",
-        "l2",
-        50,
-        50,
-        48,
-        1,
-        2,
-        2,
-        1.0,
-        1.5,
+    graph_params = ResolvedGraphParameters(
+        log_transform=True,
+        renormalize_subset=True,
+        reduction_method="pca",
+        dims=2,
+        pca_cell_key="I",
+        ann_metric="l2",
+        ann_efc=50,
+        ann_ef=50,
+        ann_m=48,
+        rand_state=1,
+        k=2,
+        n_centroids=2,
+        local_connectivity=1.0,
+        bandwidth=1.5,
+        feat_scaling=True,
+        lsi_skip_first=True,
+        harmonize=True,
+        batch_columns=None,
+        harmony_params=None,
+        harmony_contract_hash=None,
     )
-    set_params = Mock(return_value=graph_params)
-    monkeypatch.setattr(store, "_set_graph_params", set_params)
+    resolve_parameters = Mock(return_value=graph_params)
+    monkeypatch.setattr(store, "_resolve_graph_parameters", resolve_parameters)
 
     with pytest.raises(ValueError, match="no batches provided"):
         store.make_graph(
@@ -934,7 +1087,7 @@ def test_make_graph_harmony_input_validation(
             batch_columns="ids",
         )
 
-    assert set_params.call_count == 2
+    assert resolve_parameters.call_count == 2
 
 
 def test_run_tsne_orchestration_and_error_paths(

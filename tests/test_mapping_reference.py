@@ -135,7 +135,6 @@ def test_legacy_mapping_reference_remains_readable(tmp_path):
     root = zarr.open_group(str(tmp_path / "legacy_reference.zarr"), mode="w")
     reduction = root.create_group("RNA/reduction")
     legacy = reduction.create_group(MAPPING_REFERENCE_GROUP)
-    legacy.attrs["schemaVersion"] = 1
     legacy.attrs["complete"] = True
     legacy.attrs["correctionRidge"] = 1.0
     legacy.attrs["batchColumns"] = ["batch"]
@@ -164,6 +163,7 @@ def test_legacy_mapping_reference_remains_readable(tmp_path):
         )
 
     assert reference.artifact_path.endswith(MAPPING_REFERENCE_GROUP)
+    assert "schemaVersion" not in reference.metadata
 
 
 def test_incomplete_content_addressed_reference_is_rejected(tmp_path):

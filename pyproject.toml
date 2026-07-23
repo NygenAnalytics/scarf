@@ -104,7 +104,7 @@ exclude = ["profiling*", "scripts*", "tests*", "docs*", "bin*"]
 
 [tool.pytest.ini_options]
 minversion = "6.0"
-addopts = "-ra -v -m 'not integration' -n auto --dist loadfile"
+addopts = "-ra -v -n auto --dist loadfile"
 markers = [
     "integration: live network tests",
 ]
