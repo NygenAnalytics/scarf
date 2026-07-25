@@ -210,6 +210,23 @@ def test_artifact_ids_are_random_storage_addresses() -> None:
     assert parse_artifact_path(artifact_path(datastore_ref)) == datastore_ref
 
 
+def test_artifact_ref_repr_truncates_the_artifact_id() -> None:
+    assay_ref = _ref(artifact_id="ab" * 32)
+    datastore_ref = ArtifactRef(
+        scope="datastore",
+        kind="integrated_graph",
+        artifact_id="cd" * 32,
+    )
+
+    assert repr(assay_ref) == (
+        "ArtifactRef(assay='RNA', kind='normalized', artifact_id='abababababab...')"
+    )
+    assert repr(datastore_ref) == (
+        "ArtifactRef(datastore, kind='integrated_graph', artifact_id='cdcdcdcdcdcd...')"
+    )
+    assert assay_ref.to_dict()["artifact_id"] == "ab" * 32
+
+
 def test_artifact_ref_rejects_malformed_values() -> None:
     with pytest.raises(ValueError, match="require an assay"):
         ArtifactRef(scope="assay", kind="normalized", artifact_id="a" * 64)

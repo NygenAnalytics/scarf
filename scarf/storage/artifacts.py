@@ -94,6 +94,13 @@ class ArtifactRef:
         elif self.assay is not None:
             raise ValueError("datastore-scoped artifact references cannot set assay")
 
+    def __repr__(self) -> str:
+        location = f"assay={self.assay!r}" if self.assay is not None else "datastore"
+        return (
+            f"ArtifactRef({location}, kind={self.kind!r}, "
+            f"artifact_id='{self.artifact_id[:12]}...')"
+        )
+
     def to_dict(self) -> dict[str, str]:
         value = {
             "type": "artifact",

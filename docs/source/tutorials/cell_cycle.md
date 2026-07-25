@@ -47,17 +47,15 @@ The prepared Zarr store is available from the `scarf_docs` Cytebase catalog. It 
 includes the top 2000 highly variable genes, a neighbourhood graph, and a UMAP embedding. 
 
 ```{code-cell} ipython3
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    destination='./scarf_datasets',
+    destination='scarf_datasets',
     zarr=True,
 )
-```
 
-```{code-cell} ipython3
 ds = scarf.DataStore(
-    f"scarf_datasets/bastidas-ponce_4K_pancreas-d15_rnaseq/data.zarr",
-    nthreads=4, 
+    f'{dataset}/data.zarr',
+    nthreads=4,
     default_assay='RNA'
 )
 ```

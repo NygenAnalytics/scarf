@@ -29,14 +29,14 @@ import scarf
 
 scarf.set_verbosity('WARNING')
 
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',
     destination='scarf_datasets',
 )
-reader = scarf.CrH5Reader('scarf_datasets/tenx_5K_pbmc_rnaseq/data.h5')
+reader = scarf.CrH5Reader(f'{dataset}/data.h5')
 scarf.CrToZarr(
     reader,
-    zarr_loc='scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr',
+    zarr_loc=f'{dataset}/data.zarr',
 ).dump(batch_size=1000)
 ```
 
@@ -45,9 +45,12 @@ scarf.CrToZarr(
 QC thresholds are dataset-specific. Inspect distributions before choosing
 cutoffs. Filtering marks cells inactive (cell key `I`) rather than deleting them.
 
+Opening the store prints a message that the smallest cell count is below the RNA
+size factor of 1000. The filter thresholds set below remove those cells.
+
 ```{code-cell} ipython3
 ds = scarf.DataStore(
-    'scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr',
+    f'{dataset}/data.zarr',
     nthreads=4,
     min_features_per_cell=10,
 )
@@ -87,7 +90,7 @@ artifacts = ds.pipeline.run(
         'min_dist': 1,
         'parallel': True,
     },
-    leiden={0.5: {}},
+    leiden={0.5: {'label': 'leiden_cluster'}},
     paris=False,
     doublet_scoring=False,
     markers=False,
@@ -95,12 +98,19 @@ artifacts = ds.pipeline.run(
 list(artifacts)
 ```
 
+```{note}
+By default the pipeline names each Leiden column after its resolution, giving
+`RNA_leiden_0.5`. The `label` above renames it to `RNA_leiden_cluster`, which is what
+`run_leiden_clustering` writes and what the rest of the documentation uses. The key in the
+returned dictionary stays resolution-based (`leiden_0.5`) either way.
+```
+
 ## Plot the embedding
 
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_leiden_0.5',
+    color_by='RNA_leiden_cluster',
 )
 ```
 
@@ -111,9 +121,12 @@ Each colour is a Leiden cluster on the UMAP built from the neighbourhood graph.
 List assay artifacts and inspect one result from the pipeline return value:
 
 ```{code-cell} ipython3
-ds.list_artifacts()
+print('Artifact kinds:', sorted({ref.kind for ref in ds.list_artifacts()}))
+
 status = ds.inspect_artifact(artifacts['connectivity_map'])
-status.complete, status.operation, status.parameters
+print('Graph complete:', status.complete)
+print('Graph operation:', status.operation)
+print('Graph parameters:', status.parameters)
 ```
 
 Typical columns written by this configured run:
@@ -121,7 +134,7 @@ Typical columns written by this configured run:
 - Cell QC: `RNA_nCounts`, `RNA_nFeatures` (and mito/ribo fractions when patterns match)
 - Active cells: boolean key `I`
 - Embedding: `RNA_UMAP1`, `RNA_UMAP2`
-- Clusters: `RNA_leiden_0.5`
+- Clusters: `RNA_leiden_cluster`
 
 For provenance concepts, see {doc}`concepts/provenance`. For atomic control of
 the graph chain, see {doc}`tutorials/atomic_graph_operations`.

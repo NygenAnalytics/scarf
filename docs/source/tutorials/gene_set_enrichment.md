@@ -42,13 +42,13 @@ import scarf
 
 scarf.set_verbosity('WARNING')
 
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',
     destination='scarf_datasets',
     zarr=True,
 )
 ds = scarf.DataStore(
-    'scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr',
+    f'{dataset}/data.zarr',
     nthreads=4,
     min_features_per_cell=10,
 )
@@ -61,12 +61,12 @@ ds.filter_cells(
 
 if 'RNA_UMAP1' not in ds.cells.columns:
     ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-    normalized = ds.run_normalization(feat_key='hvgs')
-    pca = ds.run_pca(normalized, dims=15)
-    ds.build_embedding_initialization(pca)
-    ann = ds.build_ann_index(pca)
-    neighbors = ds.query_neighbors(ann, k=11)
-    ds.build_connectivity_map(neighbors)
+    ds.run_normalization(feat_key='hvgs')
+    ds.run_pca(dims=15)
+    ds.build_embedding_initialization()
+    ds.build_ann_index()
+    ds.query_neighbors(k=11)
+    ds.build_connectivity_map()
     ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
 ```
 

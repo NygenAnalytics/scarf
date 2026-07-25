@@ -16,19 +16,21 @@ kernelspec:
 
 # Atomic graph operations
 
-Use the atomic chain when you need explicit refs, branching (for example
-Harmony), or partial recomputation. For a default RNA analysis, prefer
-{ref}`Quick start <quickstart>` and `ds.pipeline.run`. Concepts live in
-{doc}`../concepts/graph_and_state`.
+{doc}`scrna_seq` runs the graph steps one after another and lets each step pick up
+the previous result from the store. That is enough for a single linear analysis.
+This page covers the same steps while capturing the reference each one returns,
+which is what you need to branch the chain, recompute part of it, or insert
+Harmony. Concepts live in {doc}`../concepts/graph_and_state`.
 
 ## Prerequisites
 
 - Scarf installed with the `extra` optional dependencies
 - Familiarity with cell key `I` and HVG feature keys
+- The linear graph walkthrough in {doc}`scrna_seq`
 
 ## What you will learn
 
-- Run normalization → PCA → ANN → neighbors → connectivity as separate calls
+- Capture the `ArtifactRef` each graph step returns and pass it to the next step
 - Publish `AssayState` for downstream UMAP and clustering
 - Map former `make_graph` arguments onto atomic methods
 
@@ -39,13 +41,13 @@ import scarf
 
 scarf.set_verbosity('WARNING')
 
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',
     destination='scarf_datasets',
     zarr=True,
 )
 ds = scarf.DataStore(
-    'scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr',
+    f'{dataset}/data.zarr',
     nthreads=4,
     min_features_per_cell=10,
 )
@@ -61,7 +63,9 @@ if 'I__hvgs' not in ds.RNA.feats.columns:
 
 ## Atomic chain
 
-Each call returns an `ArtifactRef`. Defaults publish into `AssayState`.
+Each call returns an `ArtifactRef` that names the artifact it wrote. Passing that
+reference to the next call states the input explicitly instead of relying on
+whatever the store currently has selected. Defaults still publish into `AssayState`.
 
 ```{code-cell} ipython3
 normalized = ds.run_normalization(feat_key='hvgs')
@@ -112,6 +116,14 @@ table below in new code.
 | `local_cache` | Same name on atomic methods (`"auto"`, `True`, `False`, or a path) |
 | `update_keys=True` | `update_state=True` on atomic methods |
 | `return_ann_object=True` | Load ANN from the `ann_index` artifact when needed |
+
+```{warning}
+`make_graph` derived the ANN search breadth from `k` as `min(100, max(k * 3, 50))`, while
+`build_ann_index` uses a fixed default of 50 for `ann_efc` and `ann_ef`. For any `k` above
+16 the two produce slightly different approximate neighbours, so a migrated call can give
+marginally different edge weights and clusters. Pass the derived values explicitly when you
+need to reproduce an older graph exactly.
+```
 
 Identity parameters (for example `dims`, `k`) decide artifact reuse.
 Execution-only options (for example `local_cache`, `batch_size`) do not. See

@@ -37,13 +37,13 @@ import scarf
 
 scarf.set_verbosity('WARNING')
 
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',
     destination='scarf_datasets',
     zarr=True,
 )
 ds = scarf.DataStore(
-    'scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr',
+    f'{dataset}/data.zarr',
     nthreads=4,
     min_features_per_cell=10,
 )
@@ -82,11 +82,11 @@ Normalization, PCA, and ANN refs stay the same object.
 neighbors_k15 = ds.query_neighbors(ann, k=15, update_state=False)
 graph_k15 = ds.build_connectivity_map(neighbors_k15, update_state=False)
 
-assert ds.run_normalization(feat_key='hvgs', update_state=False) == normalized
-assert ds.run_pca(normalized, dims=15, update_state=False) == pca
-assert ds.build_ann_index(pca, update_state=False) == ann
-assert neighbors_k15 != neighbors_k11
-assert graph_k15 != graph_k11
+print('normalization reused:', ds.run_normalization(feat_key='hvgs', update_state=False) == normalized)
+print('PCA reused:', ds.run_pca(normalized, dims=15, update_state=False) == pca)
+print('ANN index reused:', ds.build_ann_index(pca, update_state=False) == ann)
+print('neighbors recomputed:', neighbors_k15 != neighbors_k11)
+print('graph recomputed:', graph_k15 != graph_k11)
 ```
 
 ## Vary `dims`: invalidate downstream
@@ -100,11 +100,11 @@ ann_dims20 = ds.build_ann_index(pca_dims20, update_state=False)
 neighbors_dims20 = ds.query_neighbors(ann_dims20, k=11, update_state=False)
 graph_dims20 = ds.build_connectivity_map(neighbors_dims20, update_state=False)
 
-assert pca_dims20 != pca
-assert ann_dims20 != ann
-assert neighbors_dims20 != neighbors_k11
-assert graph_dims20 != graph_k11
-assert ds.run_normalization(feat_key='hvgs', update_state=False) == normalized
+print('PCA recomputed:', pca_dims20 != pca)
+print('ANN index recomputed:', ann_dims20 != ann)
+print('neighbors recomputed:', neighbors_dims20 != neighbors_k11)
+print('graph recomputed:', graph_dims20 != graph_k11)
+print('normalization reused:', ds.run_normalization(feat_key='hvgs', update_state=False) == normalized)
 ```
 
 ## Force recompute
@@ -118,9 +118,10 @@ forced = ds.run_normalization(
     update_state=False,
     invalidate_cache=True,
 )
-assert forced != normalized
 status = ds.inspect_artifact(forced)
-status.complete, status.operation
+print('new artifact:', forced != normalized)
+print('complete:', status.complete)
+print('operation:', status.operation)
 ```
 
 ## Walk inputs

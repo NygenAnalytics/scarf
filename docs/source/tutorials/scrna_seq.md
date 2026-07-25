@@ -48,9 +48,9 @@ import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',
-    destination='scarf_datasets'
+    destination='scarf_datasets',
 )
 ```
 
@@ -63,14 +63,14 @@ A Zarr "file" is a directory hierarchy on disk, not a single HDF5-style file.
 ```
 
 ```{code-cell} ipython3
-reader = scarf.CrH5Reader('scarf_datasets/tenx_5K_pbmc_rnaseq/data.h5')
+reader = scarf.CrH5Reader(f'{dataset}/data.h5')
 reader.nCells, reader.nFeatures
 ```
 
 ```{code-cell} ipython3
 writer = scarf.CrToZarr(
     reader,
-    zarr_loc='scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr',
+    zarr_loc=f'{dataset}/data.zarr',
     chunk_size=(2000, 1000)
 )
 writer.dump(batch_size=1000)
@@ -81,9 +81,13 @@ and `RNA_nFeatures`, and mito/ribo fractions when gene-name patterns match.
 `min_features_per_cell` marks cells inactive when they have fewer non-zero features
 than the threshold. Feature filtering uses `min_cells_per_feature` (default 20).
 
+Opening this store prints a message that the smallest cell count is below the RNA size
+factor of 1000. It refers to normalization, which is covered in step 3, and the QC filter
+in step 2 removes those cells.
+
 ```{code-cell} ipython3
 ds = scarf.DataStore(
-    'scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr',
+    f'{dataset}/data.zarr',
     nthreads=4,
     min_features_per_cell=10
 )
@@ -114,11 +118,15 @@ Each violin is one QC metric before filtering; set thresholds from the tails of 
 distributions.
 
 ```{code-cell} ipython3
+n_before = int(ds.cells.fetch_all('I').sum())
 ds.filter_cells(
     attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
     highs=[15000, 4000, 15],
     lows=[1000, 500, 0]
 )
+n_after = int(ds.cells.fetch_all('I').sum())
+print(f'Active cells before filter: {n_before}')
+print(f'Active cells after filter: {n_after}')
 ```
 
 ```{note}
@@ -133,7 +141,6 @@ ds.plots.distribution(
     max_points=2000,
     color='coral',
 )
-ds.cells.head()
 ```
 
 After filtering, the same metrics are restricted to active cells (`I=True`).
@@ -160,14 +167,18 @@ ds.mark_hvgs(
     max_var=6,
     show_plot=True,
 )
-ds.RNA.feats.head()
+print('Selected genes:', int(ds.RNA.feats.fetch_all('I__hvgs').sum()))
+ds.RNA.feats.to_pandas_dataframe(
+    ['names', 'nCells', 'I__hvgs']
+).head()
 ```
 
 ## 4) Neighbourhood graph
 
-Build the graph as separate provenance-backed steps. For a shorter default path, see
-{ref}`Quick start <quickstart>` (`ds.pipeline.run`) or
-{doc}`atomic_graph_operations`.
+Cells are linked into a k-nearest-neighbour graph in five steps: normalize the selected
+genes, reduce them with PCA, index the reduced coordinates, query each cell's neighbours,
+and turn those neighbours into a weighted graph. Every step reads the previous result from
+the store, so run them in this order.
 
 Important parameters:
 
@@ -176,12 +187,25 @@ Important parameters:
 - `k`: neighbours per cell
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(feat_key='hvgs')
-pca = ds.run_pca(normalized, dims=15)
-ds.build_embedding_initialization(pca)
-ann = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann, k=11)
-ds.build_connectivity_map(neighbors)
+ds.run_normalization(feat_key='hvgs')
+ds.run_pca(dims=15)
+ds.build_embedding_initialization()
+ds.build_ann_index()
+ds.query_neighbors(k=11)
+ds.build_connectivity_map()
+
+ds.load_graph()
+```
+
+`load_graph` returns the result as a sparse cell-by-cell matrix, which is a quick way to
+confirm the graph covers the active cells.
+
+```{seealso}
+Each step also returns a reference to the artifact it wrote. Capturing those references
+lets you branch the chain, for example to compare two values of `k` or to insert Harmony
+batch correction between PCA and the neighbour index. That style is covered in
+{doc}`atomic_graph_operations`. To run the whole recipe in one call, see
+{ref}`Quick start <quickstart>`.
 ```
 
 
@@ -196,7 +220,10 @@ ds.run_umap(
     min_dist=1,
     parallel=True
 )
-ds.cells.head()
+ds.cells.to_pandas_dataframe(
+    columns=['RNA_UMAP1', 'RNA_UMAP2'],
+    key='I'
+).head()
 ```
 
 ```{code-cell} ipython3
@@ -225,7 +252,14 @@ Leiden clustering runs on the same neighbourhood graph. Cluster labels are saved
 
 ```{code-cell} ipython3
 ds.run_leiden_clustering(resolution=0.5)
+ds.cells.to_pandas_dataframe(
+    columns=['RNA_leiden_cluster'],
+    key='I'
+)['RNA_leiden_cluster'].value_counts().sort_index()
 ```
+
+Cluster sizes are worth a look before plotting: a resolution that is too high splits one
+cell type into several small clusters.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -235,14 +269,6 @@ ds.plots.embedding(
 ```
 
 Each colour is a Leiden partition on the same UMAP coordinates.
-
-```{code-cell} ipython3
-leiden_clusters = ds.cells.to_pandas_dataframe(
-    columns=['RNA_leiden_cluster'],
-    key='I'
-)
-leiden_clusters.head()
-```
 
 ## 7) Marker genes
 

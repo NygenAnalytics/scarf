@@ -60,7 +60,8 @@ readable straight away:
 
 ```{code-cell} ipython3
 state = ds.get_assay_state('RNA')
-(state.reduction is not None, state.connectivity_map is not None)
+print('Reduction published:', state.reduction is not None)
+print('Graph published:', state.connectivity_map is not None)
 ```
 
 ## Open your own remote store
@@ -123,12 +124,12 @@ Against object storage, set `local_cache` so those passes hit local disk:
 | `"/path/to/scratch"` | Persistent scratch keyed by artifact ID |
 
 ```python
-normalized = ds.run_normalization(feat_key="hvgs", local_cache=True)
-pca = ds.run_pca(normalized, dims=15, local_cache=True)
-ds.build_embedding_initialization(pca)
-ann = ds.build_ann_index(pca, local_cache=True)
-neighbors = ds.query_neighbors(ann, k=11, local_cache=True)
-graph = ds.build_connectivity_map(neighbors)
+ds.run_normalization(feat_key="hvgs", local_cache=True)
+ds.run_pca(dims=15, local_cache=True)
+ds.build_embedding_initialization()
+ds.build_ann_index(local_cache=True)
+ds.query_neighbors(k=11, local_cache=True)
+ds.build_connectivity_map()
 ```
 
 `local_cache` is an execution option. It does not change artifact identity, so

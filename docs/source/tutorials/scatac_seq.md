@@ -46,7 +46,7 @@ cells. Like single-cell RNA-seq, Scarf only needs a count matrix to start the an
 Use the `scarf_docs` Cytebase client to download the data in 10x HDF5 format.
 
 ```{code-cell} ipython3
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name='tenx_10K_pbmc-v1_atacseq',
     destination='scarf_datasets'
 )
@@ -55,16 +55,14 @@ scarf.cytebase.connect("scarf_docs").download_dataset(
 The `CrH5Reader` class provides access to the HDF5 file. We can load the file and quickly check the number of features, and also verify that Scarf identified the assay as an ATAC assay. 
 
 ```{code-cell} ipython3
-reader = scarf.CrH5Reader(
-    'scarf_datasets/tenx_10K_pbmc-v1_atacseq/data.h5'
-)
+reader = scarf.CrH5Reader(f'{dataset}/data.h5')
 reader.assayFeats
 ```
 
 ```{code-cell} ipython3
 writer = scarf.CrToZarr(
     reader,
-    zarr_loc=f'scarf_datasets/tenx_10K_pbmc-v1_atacseq/data.zarr',
+    zarr_loc=f'{dataset}/data.zarr',
     chunk_size=(1000, 2000)
 )
 writer.dump(batch_size=1000)
@@ -81,7 +79,7 @@ per cell.
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(
-    'scarf_datasets/tenx_10K_pbmc-v1_atacseq/data.zarr', 
+    f'{dataset}/data.zarr',
     nthreads=4
 )
 ```
@@ -134,13 +132,18 @@ LSI reduction of scATAC-Seq is known to capture the sequencing depth of cells in
 first LSI dimension. `run_lsi` skips that component by default (`skip_first=True`).
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(feat_key='prevalent_peaks')
-lsi = ds.run_lsi(normalized, dims=50, skip_first=True)
-ds.build_embedding_initialization(lsi)
-ann = ds.build_ann_index(lsi)
-neighbors = ds.query_neighbors(ann, k=21)
-ds.build_connectivity_map(neighbors)
+ds.run_normalization(feat_key='prevalent_peaks')
+ds.run_lsi(dims=50, skip_first=True)
+ds.build_embedding_initialization()
+ds.build_ann_index()
+ds.query_neighbors(k=21)
+ds.build_connectivity_map()
+
+ds.load_graph()
 ```
+
+`load_graph` returns the graph as a sparse cell-by-cell matrix, which confirms it covers the
+active cells.
 
 
 ### 5. Run UMAP and clustering
@@ -169,7 +172,9 @@ they were run on the default ATAC assay. Filtered cells (`I` is False) have NaN 
 coordinates and cluster id `-1`.
 
 ```{code-cell} ipython3
-ds.cells.head()
+ds.cells.to_pandas_dataframe(
+    ['ATAC_UMAP1', 'ATAC_UMAP2', 'ATAC_leiden_cluster']
+).head()
 ```
 
 Plot the UMAP embedding colored by Leiden clusters:
@@ -206,7 +211,7 @@ Prepared human and mouse BED files from GENCODE annotations are available in the
 `GffReader`, plus a 2 kb promoter offset). Download them with `annotations`:
 
 ```{code-cell} ipython3
-scarf.cytebase.connect("scarf_docs").download_dataset(
+annotations = scarf.cytebase.connect("scarf_docs").download_dataset(
     name='annotations',
     destination='scarf_datasets'
 )
@@ -231,7 +236,7 @@ Common parameters:
 ```{code-cell} ipython3
 ds.add_melded_assay(
     from_assay='ATAC',
-    external_bed_fn='scarf_datasets/annotations/human_GRCh37_gencode_v38_gene_body.bed.gz',
+    external_bed_fn=f'{annotations}/human_GRCh37_gencode_v38_gene_body.bed.gz',
     peaks_col='ids',
     renormalization=False,
     assay_label='GeneScores',
@@ -276,7 +281,7 @@ The same melding approach maps any coordinate bed file onto peaks, including mot
 
 - Requesting `zarr=True` for `tenx_10K_pbmc-v1_atacseq`, which has no prepared Zarr store
 - Using RNA normalization or PCA assumptions for ATAC data
-- Omitting `lsi_skip_first=True` without checking whether depth dominates the first LSI component
+- Setting `skip_first=False` on `run_lsi` without checking whether sequencing depth dominates the first LSI component
 
 ## Saved results
 

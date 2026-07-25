@@ -141,10 +141,10 @@ Capability links:
 - One scRNA-seq dataset: {doc}`tutorials/scrna_seq`
 - Merge batches: {doc}`tutorials/data_integration`
 - CITE-seq: {doc}`tutorials/cite_seq`
-- CITE-seq SNN/WNN integration: {doc}`tutorials/cite_seq_integration`
+- CITE-seq SNN/WNN integration: {ref}`multimodal integration <multimodal_integration>`
 - Score gene sets: {doc}`tutorials/gene_set_enrichment`
 - Map query cells to a reference: {doc}`tutorials/mapping_and_label_transfer`
-- Build a reusable reference atlas: {doc}`tutorials/reference_atlas`
+- Build a reusable reference atlas: {ref}`reference atlas mapping <reference_atlas_mapping>`
 - Pseudotime modules: {doc}`tutorials/pseudotime_modules`
 - Downsample large data: {doc}`tutorials/downsampling`
 

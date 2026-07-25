@@ -106,6 +106,16 @@ class PlotResult:
             ")"
         )
 
+    def _ipython_display_(self) -> None:
+        # show() already displayed the figure, so echoing the summary repr
+        # underneath it only adds noise. Results that were never displayed keep
+        # their plain-text repr.
+        if self._rendered:
+            return
+        from IPython.display import display
+
+        display({"text/plain": repr(self)}, raw=True)
+
     def close(self) -> None:
         if not self.owns_figure:
             return

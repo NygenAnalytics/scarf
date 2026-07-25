@@ -1,5 +1,5 @@
 ---
-description: CITE-seq multimodal analysis with independent RNA and ADT processing.
+description: CITE-seq analysis in Scarf covering per-assay processing and multimodal graph integration.
 jupytext:
   text_representation:
     extension: .md
@@ -14,81 +14,75 @@ kernelspec:
 
 # CITE-seq analysis
 
-CITE-seq combines RNA counts with antibody-derived tags (ADT) measured in the same cells.
-This chapter processes each assay and compares modality-specific embeddings and clusters.
-For SNN and WNN graph integration, continue with {doc}`cite_seq_integration`.
+CITE-seq measures RNA counts and antibody-derived tags (ADT) in the same cells. Scarf keeps
+both as separate assays in one store, so each modality is processed with its own
+normalization and graph, and the two can then be compared or merged.
+
+This chapter processes RNA and ADT independently, compares what each modality sees, and
+merges the two graphs with SNN and WNN.
 
 ## Prerequisites
 
 - Scarf installed with the `extra` optional dependencies
-- Python 3.12 or newer
+- The single-assay workflow in {doc}`scrna_seq`
 
 ## What you will learn
 
-- Analyze RNA and ADT assays independently
-- Compare modality-specific embeddings and clusters
-- Continue to SNN and WNN integration in {doc}`cite_seq_integration`
+- Open a store holding two assays and filter cells on the default assay
+- Drop control antibodies from an ADT panel
+- Build an ADT graph without dimension reduction
+- Compare RNA and ADT clusters against each other
+- Merge both graphs with shared nearest neighbors (SNN) and weighted nearest neighbors (WNN)
 
 ## Dataset
+
+`tenx_8K_pbmc_citeseq` is distributed as a prepared Zarr store with the assays already named
+`RNA` and `ADT`.
 
 ```{code-cell} ipython3
 import scarf
 
 scarf.set_verbosity('WARNING')
-```
 
-## Guided steps
-
-### 1. Fetch the prepared data
-
-This dataset contains gene expression and surface protein abundance. The prepared Zarr store
-contains these assays as `RNA` and `ADT`.
-
-```{code-cell} ipython3
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_8K_pbmc_citeseq',
     destination='scarf_datasets',
     zarr=True,
 )
 ```
 
-### 2. Create a multimodal DataStore
+## 1) Open the multimodal store
 
-The next step is to create a Scarf `DataStore` object. This object will be the primary way to interact with the data and all its constituent assays. The first time a Zarr file is loaded, we need to set the default assay. Here we set the 'RNA' assay as the default assay. When a Zarr file is loaded, Scarf checks if some per-cell statistics have been calculated. If not, then **nFeatures** (number of features per cell) and **nCounts** (total sum of feature counts per cell) are calculated. Scarf will also attempt to calculate the percent of mitochondrial and ribosomal content per cell.
+`default_assay` decides which assay unqualified calls act on. Cell filtering and QC always
+run on the default assay, so set it to `RNA` here.
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(
-    'scarf_datasets/tenx_8K_pbmc_citeseq/data.zarr',
+    f'{dataset}/data.zarr',
     default_assay='RNA',
     nthreads=4
 )
-```
-
-We can print out the DataStore object to get an overview of all the assays stored.
-
-```{code-cell} ipython3
 ds
 ```
 
-Feature attribute tables for each of the assays can be accessed like this:
-
-```{code-cell} ipython3
-ds.RNA.feats.head()
-```
-
-```{code-cell} ipython3
-ds.ADT.feats.head()
-```
-
-Cell filtering is performed based on the default assay. Here we use the `auto_filter_cells` method of the `DataStore` to filter low quality cells.
+The summary lists both assays with their own feature counts, and the cell count reads as
+active followed by total in brackets. This prepared store already carries a cell selection
+and previously computed columns, which is why the two numbers differ before any filtering
+happens here. Cell metadata is shared across assays: one row per cell, whichever assay wrote
+the column.
 
 ```{code-cell} ipython3
 ds.auto_filter_cells()
 ```
 
-### 3. Process the RNA assay
+`auto_filter_cells` models each RNA QC column as a normal distribution, takes its 1st and
+99th percentiles as bounds, and marks outliers inactive in cell key `I`. The two figures are
+the QC distributions before and after that filter. Because the key is shared, the ADT assay
+analyzes the same cells.
 
-Now we process the RNA assay to perform feature selection, create KNN graph, run UMAP reduction and clustering. These steps are same as shown in the basic workflow for scRNA-Seq data.
+## 2) Process the RNA assay
+
+These are the steps from {doc}`scrna_seq`, so the narrative here is brief.
 
 ```{code-cell} ipython3
 ds.mark_hvgs(
@@ -96,15 +90,16 @@ ds.mark_hvgs(
     top_n=1000,
     min_mean=-3,
     max_mean=2,
-    max_var=6
+    max_var=6,
+    show_plot=False,
 )
 
-normalized = ds.run_normalization(feat_key='hvgs')
-pca = ds.run_pca(normalized, dims=15)
-ds.build_embedding_initialization(pca)
-ann = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann, k=21)
-ds.build_connectivity_map(neighbors)
+ds.run_normalization(feat_key='hvgs')
+ds.run_pca(dims=15)
+ds.build_embedding_initialization()
+ds.build_ann_index()
+ds.query_neighbors(k=21)
+ds.build_connectivity_map()
 
 ds.run_umap(
     n_epochs=250,
@@ -112,10 +107,14 @@ ds.run_umap(
     min_dist=1,
     parallel=True
 )
-
 ds.run_leiden_clustering(resolution=1)
+ds.load_graph()
 ```
 
+```{note}
+Both assays are given `k=21` here. `integrate_assays` later merges the two graphs, and
+matching `k` keeps one modality from contributing far more edges than the other.
+```
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -124,59 +123,62 @@ ds.plots.embedding(
 )
 ```
 
-### 4. Process the ADT assay
+## 3) Process the ADT assay
 
-+++
+ADT panels hold tens of antibodies rather than thousands of genes, which changes two things:
+there is no feature selection step, and control antibodies have to be removed by hand.
 
-Repeat the RNA-style steps for ADT. ADT panels are often custom, so skip feature
-selection here. Filter out control antibodies before downstream analysis. 
+Scarf recognizes an assay named `ADT` as an `ADTassay`, which normalizes with a centred log
+ratio rather than the library-size scaling used for RNA.
 
 ```{code-cell} ipython3
-ds.ADT.feats.head(n=ds.ADT.feats.N)
+ds.ADT.normMethod.__name__
 ```
 
-We can manually filter out the control antibodies by updating **I** to be False for those features. To do so we first extract the names of all the ADT features like below:
+Controls in this panel carry `control` in their name. Other panels use other conventions, so
+inspect the names before choosing a pattern.
 
 ```{code-cell} ipython3
-adt_names = ds.ADT.feats.to_pandas_dataframe(['names'])['names']
-adt_names
+adt_panel = ds.ADT.feats.to_pandas_dataframe(['names'])
+adt_panel['is_control'] = adt_panel['names'].str.contains('control')
+adt_panel
 ```
 
-The ADT features with 'control' in name are designated as control antibodies. You can have your own selection criteria here. The aim here is to create a boolean array that has `True` value for features to be removed.
+`update_key` takes a boolean array and marks features `False` as inactive, so pass the
+inverse of the control flag.
 
 ```{code-cell} ipython3
-is_control = adt_names.str.contains('control').values
-is_control
-```
-
-Now we update `I` to remove the control features. `update_key` method takes a boolean array and disables the features that have `False` value. So we invert the above created array (using `~`) before providing it to `update_key`. The second parameter for `update_key` denotes which feature table boolean column to modify, `I` in this case.
-
-```{code-cell} ipython3
-ds.ADT.feats.update_key(~is_control, 'I')
-ds.ADT.feats.head(n=ds.ADT.feats.N)
-```
-
-Assays named ADT are automatically created as objects of the `ADTassay` class, which uses CLR (centred log ratio) normalization as the default normalization method.
-
-```{code-cell} ipython3
-print (ds.ADT)
-print (ds.ADT.normMethod.__name__)
-```
-
-Now we are ready to create a KNN graph of cells using only ADT data. Here we will use all the features (except those that were filtered out) and that is why we use `I` as value for `feat_key`. It is important to note the value for `from_assay` parameter which has now been set to `ADT`. If no value is provided for `from_assay` then it is automatically set to the default assay. By setting `dims` to 0 we disable dimension reduction. Prefer the deprecated `make_graph` facade for that special case until a dedicated atomic helper exists.
-
-```{code-cell} ipython3
-ds.make_graph(
-    from_assay='ADT',
-    feat_key='I', 
-    k=21,
-    dims=0,
-    n_centroids=100
+ds.ADT.feats.update_key(~adt_panel['is_control'].values, 'I')
+print(
+    f"Active ADT features: {int(ds.ADT.feats.fetch_all('I').sum())}"
+    f" of {len(adt_panel)}"
 )
 ```
 
+Now build the ADT graph. Two arguments differ from the RNA chain:
 
-UMAP and clustering can be run on ADT assay by simply setting `from_assay` parameter value to 'ADT':
+- `from_assay='ADT'` targets the non-default assay on every step
+- `feat_key='I'` uses every active antibody, since there is no feature selection column
+- `dims=0` turns off dimension reduction, so neighbours are found on the normalized
+  antibody values directly
+
+```{code-cell} ipython3
+ds.run_normalization(from_assay='ADT', feat_key='I')
+ds.run_pca(from_assay='ADT', dims=0)
+ds.build_embedding_initialization(from_assay='ADT', n_centroids=100)
+ds.build_ann_index(from_assay='ADT')
+ds.query_neighbors(from_assay='ADT', k=21)
+ds.build_connectivity_map(from_assay='ADT')
+ds.load_graph(from_assay='ADT')
+```
+
+```{note}
+A PCA of 15 components over a panel of roughly 20 antibodies would discard little and cost
+an extra fit, which is why `dims=0` is the sensible default for ADT. For RNA, where
+thousands of genes are in play, reduction is what makes the neighbour search tractable.
+```
+
+UMAP and clustering take the same `from_assay` argument and write assay-prefixed columns.
 
 ```{code-cell} ipython3
 ds.run_umap(
@@ -186,20 +188,12 @@ ds.run_umap(
     min_dist=1,
     parallel=True
 )
-
 ds.run_leiden_clustering(
     from_assay='ADT',
     resolution=1
 )
+sorted(c for c in ds.cells.columns if c.startswith('ADT_'))
 ```
-
-If we now check the cell attribute table, we will find the UMAP coordinates and clusters calculated using `ADT` assay:
-
-```{code-cell} ipython3
-ds.cells.head()
-```
-
-Visualizing the UMAP and clustering calculated using `ADT` only:
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -208,15 +202,12 @@ ds.plots.embedding(
 )
 ```
 
-### 5. Compare modalities
+## 4) Compare the two modalities
 
-Compare how the two modalities agree.
-
-`ds.plots.embedding` can compare several layouts in one figure and uses the selected
-assay's native normalization for feature values.
+Each modality now has its own embedding and its own clusters over the same cells. Plotting
+one modality's clusters on the other's layout shows where they agree.
 
 ```{code-cell} ipython3
-# UMAP on RNA and coloured with clusters calculated on ADT
 ds.plots.embedding(
     layout_key=['RNA_UMAP', 'ADT_UMAP'],
     color_by=['ADT_leiden_cluster', 'RNA_leiden_cluster'],
@@ -226,25 +217,29 @@ ds.plots.embedding(
 )
 ```
 
-We can quantify the overlap of cells between RNA and ADT clusters. The following table has ADT clusters on columns and RNA clusters on rows. This table shows a cross tabulation of cells across the clustering from the two modalities.
+A cross tabulation counts cells shared by each pair of clusters, with RNA clusters on rows
+and ADT clusters on columns.
 
 ```{code-cell} ipython3
 import pandas as pd
 
-df = pd.crosstab(
+overlap = pd.crosstab(
     ds.cells.fetch('RNA_leiden_cluster'),
     ds.cells.fetch('ADT_leiden_cluster')
 )
-df
+overlap
 ```
 
-There are possibly many interesting strategies to analyze this further. One simple way to summarize the above table can be quantify the transcriptomics 'purity' of ADT clusters:
+One way to summarize that table is to ask, for each ADT cluster, what share of its cells
+fall in a single RNA cluster. Values near 100 mean the ADT cluster maps onto one
+transcriptional population.
 
 ```{code-cell} ipython3
-(100 * df.max()/df.sum()).sort_values(ascending=False)
+(100 * overlap.max() / overlap.sum()).round(1).sort_values(ascending=False)
 ```
 
-Individual ADT expression can be visualized in both UMAPs easily.
+Individual antibodies and their coding genes can be placed on either layout. CD16 protein
+and its gene `FCGR3A` are a useful pair to check.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -256,8 +251,6 @@ ds.plots.embedding(
 )
 ```
 
-We can also query gene expression and visualize it on both RNA and ADT UMAPs. Here we query gene FCGR3A which codes for CD16:
-
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key=['RNA_UMAP', 'ADT_UMAP'],
@@ -268,20 +261,135 @@ ds.plots.embedding(
 )
 ```
 
+Protein signal is usually smoother than the matching transcript, which is one reason to
+combine the modalities rather than pick one.
+
+(multimodal_integration)=
+
+## 5) Merge the graphs with SNN
+
+Comparing clusters is descriptive. Integration goes further and produces a single graph, so
+one embedding and one set of clusters describe both modalities.
+
+`integrate_assays` takes the latest graph of each named assay, merges their edges, then
+prunes by shared nearest neighbors until each cell keeps about as many edges as it had in
+the per-assay graphs.
+
+```{code-cell} ipython3
+ds.integrate_assays(
+    assays=['RNA', 'ADT'],
+    label='RNA+ADT',
+    method='snn',
+)
+```
+
+The merged graph is stored under its `label`. Downstream steps reach it through
+`integrated_graph` instead of `from_assay`, and write columns using the same label as prefix.
+
+```{code-cell} ipython3
+ds.run_umap(
+    integrated_graph='RNA+ADT',
+    n_epochs=500,
+    spread=5,
+    min_dist=0.5,
+    parallel=True
+)
+ds.run_leiden_clustering(
+    integrated_graph='RNA+ADT',
+    resolution=1.75
+)
+sorted(c for c in ds.cells.columns if c.startswith('RNA+ADT'))
+```
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key='RNA+ADT_UMAP',
+    color_by=[
+        'RNA_leiden_cluster',
+        'ADT_leiden_cluster',
+        'RNA+ADT_leiden_cluster',
+    ],
+    legend_loc='on_data',
+    n_columns=3,
+)
+```
+
+The first two panels show where each modality alone would split these cells; the third shows
+the partition the merged graph supports.
+
+(wnn_integration)=
+
+## 6) Merge the graphs with WNN
+
+SNN treats both modalities equally and accepts two or more assays. Weighted nearest
+neighbors instead learns a per-cell weight for each modality, so cells whose identity is
+better resolved by protein lean on the ADT graph and the rest lean on RNA. WNN takes exactly
+two assays.
+
+```{code-cell} ipython3
+ds.integrate_assays(
+    assays=['RNA', 'ADT'],
+    label='RNA+ADT_wnn',
+    method='wnn'
+)
+ds.run_umap(
+    integrated_graph='RNA+ADT_wnn',
+    n_epochs=500,
+    spread=5,
+    min_dist=0.5,
+    parallel=True
+)
+ds.run_leiden_clustering(
+    integrated_graph='RNA+ADT_wnn',
+    resolution=1.75
+)
+```
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key=['RNA+ADT_UMAP', 'RNA+ADT_wnn_UMAP'],
+    color_by=['RNA+ADT_leiden_cluster', 'RNA+ADT_wnn_leiden_cluster'],
+    n_columns=2,
+    legend_loc='on_data',
+)
+```
+
+Reach for WNN when one modality is noticeably sparser or noisier than the other, and for SNN
+when the modalities are comparable or when more than two are involved.
+
+## HTO demultiplexing
+
+`DataStore.mark_hto_identities` assigns hashtag identities when an HTO assay is present
+(default assay name `HTO`). No public HTO dataset is in the Scarf catalog yet, so this page
+cannot demonstrate it; see {doc}`../reference/api/datastore` for the signature.
+
 ## Common mistakes and limitations
 
-- Building assay graphs from different cell subsets before comparing modalities
-- Treating RNA and ADT clusters as interchangeable without examining cross-modality agreement
+- Filtering cells on one assay and then comparing modalities built from different cell sets
+- Integrating per-assay graphs built with different `k`
+- Leaving control antibodies active in the ADT panel
+- Using WNN with anything other than two assays
+- Reading RNA and ADT clusters as interchangeable labels for the same populations
 
-## Saved results
+## Summary of saved results
 
-Each assay stores its own graph, UMAP, and cluster columns under assay-specific prefixes such as
-`RNA_` and `ADT_`.
+| Kind | Keys / location |
+|---|---|
+| RNA embedding and clusters | `RNA_UMAP1`, `RNA_UMAP2`, `RNA_leiden_cluster` |
+| ADT embedding and clusters | `ADT_UMAP1`, `ADT_UMAP2`, `ADT_leiden_cluster` |
+| Active ADT antibodies | feature key `I` in `ds.ADT.feats` |
+| SNN integration | `RNA+ADT_UMAP1/2`, `RNA+ADT_leiden_cluster` |
+| WNN integration | `RNA+ADT_wnn_UMAP1/2`, `RNA+ADT_wnn_leiden_cluster` |
+
+## Further reading
+
+- Stoeckius et al. 2017, CITE-seq: https://doi.org/10.1038/nmeth.4380
+- Hao et al. 2021, weighted nearest neighbor analysis: https://doi.org/10.1016/j.cell.2021.04.048
+- [Seurat WNN vignette](https://satijalab.org/seurat/articles/weighted_nearest_neighbor_analysis)
 
 ## Next steps
 
-- {doc}`cite_seq_integration`
 - {doc}`plotting`
+- {doc}`annotation`
 - {doc}`data_organization`
 - {doc}`data_integration`
-

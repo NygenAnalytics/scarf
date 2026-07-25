@@ -44,13 +44,13 @@ import scarf
 
 scarf.set_verbosity('WARNING')
 
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'kang_15K_pbmc_rnaseq',
     destination='scarf_datasets',
     zarr=True,
 )
 ds = scarf.DataStore(
-    'scarf_datasets/kang_15K_pbmc_rnaseq/data.zarr',
+    f'{dataset}/data.zarr',
     nthreads=4,
 )
 ds
@@ -60,12 +60,12 @@ ds
 # Ensure a clustering column exists for aggregation demos.
 if 'RNA_leiden_cluster' not in ds.cells.columns:
     ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-    normalized = ds.run_normalization(feat_key='hvgs')
-    pca = ds.run_pca(normalized, dims=15)
-    ds.build_embedding_initialization(pca)
-    ann = ds.build_ann_index(pca)
-    neighbors = ds.query_neighbors(ann, k=11)
-    ds.build_connectivity_map(neighbors)
+    ds.run_normalization(feat_key='hvgs')
+    ds.run_pca(dims=15)
+    ds.build_embedding_initialization()
+    ds.build_ann_index()
+    ds.query_neighbors(k=11)
+    ds.build_connectivity_map()
     ds.run_leiden_clustering(resolution=0.5)
 ```
 
@@ -94,7 +94,7 @@ markers = ds.get_markers(
     min_score=-1,
     min_frac_exp=-1,
 )
-markers.head()
+markers[['feature_name', 'score', 'frac_exp', 'p_value']].head()
 ```
 
 ```{code-cell} ipython3
@@ -138,7 +138,9 @@ bulk_reps.shape
 ### 3. Export counts for external DE
 
 ```{code-cell} ipython3
-bulk.to_csv('scarf_datasets/kang_pseudobulk_counts.csv')
+export_path = 'scarf_datasets/kang_pseudobulk_counts.csv'
+bulk.to_csv(export_path)
+print(f'Wrote {bulk.shape[0]} features x {bulk.shape[1]} groups to {export_path}')
 ```
 
 Use the exported count matrix and sample-level metadata with a method appropriate to the study

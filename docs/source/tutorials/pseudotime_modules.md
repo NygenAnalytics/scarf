@@ -37,37 +37,36 @@ is standalone: it downloads the store, opens a `DataStore`, and runs pseudotime 
 when needed.
 
 ```{code-cell} ipython3
+import pandas as pd
+
 import scarf
 import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    destination='./scarf_datasets',
+    destination='scarf_datasets',
     zarr=True,
 )
 
 ds = scarf.DataStore(
-    'scarf_datasets/bastidas-ponce_4K_pancreas-d15_rnaseq/data.zarr',
+    f'{dataset}/data.zarr',
     nthreads=4,
     default_assay='RNA',
 )
-if 'RNA_paris_cluster' not in ds.cells.columns:
-    ds.run_paris_clustering(n_clusters=10)
 
-pseudotime_key = 'RNA_pseudotime'
-validity_key = 'RNA_pseudotime__valid'
-
-if pseudotime_key not in ds.cells.columns:
-    pseudotime = ds.run_pseudotime_scoring(
-        source_sink_key='RNA_paris_cluster',
-        sources=[1],
-        sinks=[3],
-    )
-    pseudotime_key = pseudotime.pseudotime_key
-    validity_key = pseudotime.validity_key
+pseudotime = ds.run_pseudotime_scoring(
+    source_sink_key='clusters',
+    sources=['Ductal'],
+    sinks=['Alpha', 'Beta', 'Delta'],
+)
+pseudotime_key = pseudotime.pseudotime_key
+validity_key = pseudotime.validity_key
 ```
+
+The sources and sinks come from the published `clusters` annotation, the same choice made in
+{doc}`pseudotime`.
 
 ## Guided steps
 
@@ -97,9 +96,11 @@ Features with mean expression below `min_exp` or with no variation along the ord
 modules.data.shape
 ```
 
+`modules.feature_clusters` holds one cluster assignment per retained feature. Counting them
+shows how the genes are distributed across modules.
+
 ```{code-cell} ipython3
-# Cluster assignment for each retained feature
-modules.feature_clusters
+pd.Series(modules.feature_clusters).value_counts().sort_index()
 ```
 
 `ds.plots.pseudotime_heatmap` visualizes the binned matrix along with the feature clusters.
@@ -154,8 +155,9 @@ ds.add_grouped_assay(
 )
 ```
 
+The new assay has one feature per module.
+
 ```{code-cell} ipython3
-# DataStore summary showing `PTIME_MODULES` assay with 15 features (number of pseudotime based feature clusters)
 ds
 ```
 
@@ -168,11 +170,11 @@ ds.PTIME_MODULES.feats.head()
 We can visualize these cluster mean values directly on the UMAP like this:
 
 ```{code-cell} ipython3
-n_clusters = 15
+module_features = ds.PTIME_MODULES.feats.fetch_all('names').tolist()
 ds.plots.embedding(
     from_assay='PTIME_MODULES',
     layout_key='RNA_UMAP',
-    color_by=[f"group_{i}" for i in range(1, n_clusters + 1)],
+    color_by=module_features,
     n_columns=5,
     color_scale=splt.ColorScale(cmap='coolwarm'),
 )
@@ -186,16 +188,16 @@ pseudotime and differentiation trajectory.
 Compare the pseudotime-based feature modules with classical cluster markers.
 
 ```{code-cell} ipython3
-# Running marker search
-ds.run_marker_search(group_key='RNA_paris_cluster')
+ds.run_marker_search(group_key='clusters')
 ```
 
-First we extract the marker genes for cell cluster 8, which predominantly contains the Beta cells.
+The Beta cells are one endpoint of this trajectory, so their markers are a natural
+comparison for the modules that rise late in pseudotime.
 
 ```{code-cell} ipython3
 cell_cluster_markers = ds.get_markers(
-    group_key='RNA_paris_cluster',
-    group_id='8',
+    group_key='clusters',
+    group_id='Beta',
 ).feature_name
 
 cell_cluster_markers.head()

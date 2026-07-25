@@ -141,6 +141,34 @@ def test_plot_result_repr_is_compact_and_never_renders(monkeypatch):
     assert show_calls == []
 
 
+def test_rendered_plot_result_publishes_no_extra_notebook_output(monkeypatch):
+    from IPython.core.formatters import DisplayFormatter
+
+    result = _plot_result()
+    monkeypatch.setattr("IPython.get_ipython", lambda: object())
+    monkeypatch.setattr("IPython.display.display", lambda _: None)
+    result.show()
+
+    data, metadata = DisplayFormatter().format(result)
+
+    # An empty format bundle makes the IPython display hook publish nothing, so
+    # the already-displayed figure stays the only output of the cell.
+    assert data == {}
+    assert metadata == {}
+
+
+def test_unrendered_plot_result_still_displays_its_summary(monkeypatch):
+    published = []
+    monkeypatch.setattr("IPython.display.display", lambda *a, **k: published.append(a))
+    result = _plot_result()
+
+    result._ipython_display_()
+
+    assert published == [({"text/plain": repr(result)},)]
+    assert "rendered=False" in published[0][0]["text/plain"]
+    plt.close(result.figure)
+
+
 def test_normalize_axes_target_accepts_mappings_and_sequences():
     fig, axes = plt.subplots(1, 2)
     _, mapped, owns = normalize_axes_target(

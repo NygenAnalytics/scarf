@@ -28,8 +28,8 @@ partial PCA or Harmony, and quantifies integration with LISI and related metrics
 |---|---|
 | Merge two scRNA-seq batches in one object | `AssayMerge`, then this page |
 | Correct batch effects after merge | Atomic Harmony (`run_harmony`) or partial PCA (`pca_cell_key`) |
-| Integrate RNA + ADT in the same cells | {doc}`cite_seq_integration` (SNN / WNN) |
-| Map query cells onto a reference | {doc}`mapping_and_label_transfer` or {doc}`reference_atlas` |
+| Integrate RNA + ADT in the same cells | {ref}`CITE-seq SNN / WNN <multimodal_integration>` |
+| Map query cells onto a reference | {doc}`mapping_and_label_transfer` |
 | Measure integration quality | `metric_*` helpers in the final section below |
 
 Scarf does not ship Scanorama, BBKNN, scVI, ComBat, or other external integrators.
@@ -63,13 +63,13 @@ Use the same Kang PBMC datasets as in {ref}`mapping and label transfer <data_pro
 Download the prepared Zarr stores from the `scarf_docs` Cytebase catalog.
 
 ```{code-cell} ipython3
-scarf.cytebase.connect("scarf_docs").download_dataset(
+repository = scarf.cytebase.connect("scarf_docs")
+ctrl_path = repository.download_dataset(
     name='kang_15K_pbmc_rnaseq',
     destination='scarf_datasets',
     zarr=True
 )
-
-scarf.cytebase.connect("scarf_docs").download_dataset(
+stim_path = repository.download_dataset(
     name='kang_14K_ifnb-pbmc_rnaseq',
     destination='scarf_datasets',
     zarr=True
@@ -79,19 +79,13 @@ scarf.cytebase.connect("scarf_docs").download_dataset(
 The Zarr files need to be loaded as a DataStore before they can be merged:
 
 ```{code-cell} ipython3
-ds_ctrl = scarf.DataStore(
-    'scarf_datasets/kang_15K_pbmc_rnaseq/data.zarr/',
-    nthreads=4
-)
+ds_ctrl = scarf.DataStore(f'{ctrl_path}/data.zarr', nthreads=4)
 
 ds_ctrl
 ```
 
 ```{code-cell} ipython3
-ds_stim = scarf.DataStore(
-    'scarf_datasets/kang_14K_ifnb-pbmc_rnaseq/data.zarr',
-    nthreads=4
-)
+ds_stim = scarf.DataStore(f'{stim_path}/data.zarr', nthreads=4)
 
 ds_stim
 ```
@@ -132,7 +126,9 @@ ds
 The cell table now contains `sample_id`, the aligned `orig_cluster_labels`, and the preserved `I` filter. The source name is also prepended to each barcode in `ids`.
 
 ```{code-cell} ipython3
-ds.cells.head()
+ds.cells.to_pandas_dataframe(
+    ['ids', 'sample_id', 'orig_cluster_labels', 'I']
+).head()
 ```
 
 Now we can check the number of cells from each of the samples:
@@ -164,8 +160,8 @@ ds.mark_hvgs(
 )
 ```
 
-Next, build the neighbourhood graph with the atomic chain (normalization → PCA →
-embedding initialization → ANN → neighbors → connectivity):
+Next, build the neighbourhood graph with the atomic chain: normalization, PCA, embedding
+initialization, the ANN index, the neighbour query, and the connectivity map.
 
 ```{code-cell} ipython3
 normalized = ds.run_normalization(feat_key='hvgs')
@@ -174,7 +170,13 @@ ds.build_embedding_initialization(pca)
 ann = ds.build_ann_index(pca)
 neighbors = ds.query_neighbors(ann, k=21)
 ds.build_connectivity_map(neighbors)
+
+ds.load_graph()
 ```
+
+Each step returns a reference to the artifact it wrote. Unlike {doc}`scrna_seq`, this page
+captures those references because later sections reuse the same normalized counts with a
+different PCA basis, and Harmony has to sit between PCA and the neighbour index.
 
 
 Calculating UMAP embedding of cells:
@@ -188,8 +190,13 @@ ds.run_umap(
 )
 ```
 
+The coordinates are now cell metadata columns:
+
 ```{code-cell} ipython3
-ds.cells.head()
+ds.cells.to_pandas_dataframe(
+    ['sample_id', 'RNA_UMAP1', 'RNA_UMAP2'],
+    key='I'
+).head()
 ```
 
 Visualization of cells from the two samples in the 2D UMAP space:
@@ -238,7 +245,9 @@ ds.cells.insert(
 ```
 
 Pass `pca_cell_key='is_ctrl'` to `run_pca` so only control cells define the PCA basis.
-Reuse the same normalized artifact from the naive analysis:
+Reuse the same normalized artifact from the naive analysis, then run UMAP with
+`label='pUMAP'` so the new coordinates land in `RNA_pUMAP` instead of overwriting the naive
+`RNA_UMAP` columns. The `RNA` prefix comes from the assay name.
 
 ```{code-cell} ipython3
 pca_partial = ds.run_pca(normalized, dims=25, pca_cell_key='is_ctrl')
@@ -246,14 +255,9 @@ ds.build_embedding_initialization(pca_partial)
 ann = ds.build_ann_index(pca_partial)
 neighbors = ds.query_neighbors(ann, k=21)
 ds.build_connectivity_map(neighbors)
-```
 
-
-We run UMAP as usual, but the UMAP embeddings are saved in a new cell attribute column so as to not overwrite the previous UMAP values. The new column will be called `RNA_pUMAP`; 'RNA' is automatically prepend because the assay name is `RNA`
-
-```{code-cell} ipython3
 ds.run_umap(
-    n_epochs=250, 
+    n_epochs=250,
     spread=5,
     min_dist=1,
     parallel=True,
@@ -286,7 +290,10 @@ ds.plots.embedding(
 ## 5) Harmony batch correction
 
 Harmony corrects the PCA embedding before ANN and neighbor query. Call `run_harmony`
-between PCA and `build_ann_index`:
+between PCA and `build_ann_index`. The graph is then built from the corrected coordinates,
+while `build_embedding_initialization` still takes the uncorrected PCA because it accepts a
+reduction artifact. That only seeds the starting positions for UMAP, which reads its edges
+from the corrected graph.
 
 ```{warning}
 Here `sample_id` distinguishes control from stimulated cells as well as the source dataset.
@@ -352,56 +359,79 @@ compares neighborhoods with 15, 50, or 90 neighbors, so use a matching `k` when 
 Scarf results to a published benchmark.
 
 
+`metric_lisi` returns one score per cell for each label, which is what the saved columns
+hold. Summarize them rather than printing the raw arrays.
+
 ```{code-cell} ipython3
-ds.metric_lisi(
+import numpy as np
+import pandas as pd
+
+lisi = ds.metric_lisi(
     label_colnames=['sample_id', 'orig_cluster_labels'],
     save_result=True,
     perplexity=7,
 )
-```
-
-**iLISI** summarizes batch mixing with the median and scIB scaling. **cLISI** summarizes
-preservation of the imported cell labels. Both are higher when the corresponding objective
-is better.
-
-```{code-cell} ipython3
-ds.metric_ilisi(batch_colname='sample_id', perplexity=7)
-```
-
-```{code-cell} ipython3
-ds.metric_clisi(label_colname='orig_cluster_labels', perplexity=7)
-```
-
-Scarf's proportion-aware summary instead uses mean batch LISI and the observed batch sizes.
-It complements iLISI when batches are imbalanced.
-
-```{code-cell} ipython3
-ds.metric_proportional_batch_mixing(label_colname='sample_id', perplexity=7)
-```
-
-**Graph connectivity** reports how much of each imported cell label remains in its largest
-connected component.
-
-```{code-cell} ipython3
-ds.metric_graph_connectivity(label_colname='orig_cluster_labels')
-```
-
-**Graph silhouette** scores how separated each cluster is from its nearest neighboring
-cluster, from -1 to 1. Values near 1 mean distinct clusters. Read it alongside the batch
-metrics, since over-correction can mix genuinely different cell types.
-
-```{code-cell} ipython3
-ds.metric_graph_silhouette(res_label='leiden_cluster')
-```
-
-**Label concordance** compares two labelings of the same cells with ARI or NMI. Here it checks how well the fresh Leiden clusters agree with the imported annotations. Note that this measures label agreement, not batch mixing.
-
-```{code-cell} ipython3
-ds.metric_label_concordance(
-    label_columns=['RNA_leiden_cluster', 'orig_cluster_labels'],
-    metric='ari'
+pd.DataFrame(
+    [
+        {
+            'label': label,
+            'median': float(np.median(scores)),
+            'mean': float(np.mean(scores)),
+        }
+        for label, scores in lisi
+    ]
 )
 ```
+
+A batch median well above 1 means neighbourhoods contain both samples, while a cell-type
+median near 1 means neighbourhoods stay within one annotated type. Those are the two
+objectives, and they pull against each other.
+
+The remaining metrics each reduce to a single number, so collect them in one table.
+**iLISI** summarizes batch mixing with scIB scaling and **cLISI** summarizes preservation of
+the imported labels, both higher-is-better. **Proportional batch mixing** uses mean batch
+LISI with observed batch sizes, which helps when batches are imbalanced. **Graph
+connectivity** reports how much of each imported label stays in its largest connected
+component. **Label concordance** compares two labelings of the same cells, here fresh Leiden
+clusters against imported annotations, which measures label agreement and not batch mixing.
+
+```{code-cell} ipython3
+pd.Series(
+    {
+        'iLISI (batch mixing)': ds.metric_ilisi(
+            batch_colname='sample_id',
+            perplexity=7,
+        ),
+        'cLISI (label purity)': ds.metric_clisi(
+            label_colname='orig_cluster_labels',
+            perplexity=7,
+        ),
+        'proportional batch mixing': ds.metric_proportional_batch_mixing(
+            label_colname='sample_id',
+            perplexity=7,
+        ),
+        'graph connectivity': ds.metric_graph_connectivity(
+            label_colname='orig_cluster_labels',
+        ),
+        'label concordance (ARI)': ds.metric_label_concordance(
+            label_columns=['RNA_leiden_cluster', 'orig_cluster_labels'],
+            metric='ari',
+        ),
+    }
+).round(3)
+```
+
+**Graph silhouette** is per cluster rather than per dataset, scoring how separated each
+cluster is from its nearest neighbour, from -1 to 1. Read it alongside the batch metrics,
+because over-correction shows up here as clusters losing separation.
+
+```{code-cell} ipython3
+silhouette = ds.metric_graph_silhouette(res_label='leiden_cluster')
+pd.Series(silhouette).describe().round(3)
+```
+
+Negative values flag clusters that sit closer to a neighbouring cluster than to their own
+cells, which is a signal to revisit the clustering resolution.
 
 ## Common mistakes and limitations
 
@@ -422,8 +452,7 @@ UMAP/Leiden columns (`RNA_UMAP`, `RNA_pUMAP`, `RNA_hUMAP`, and so on). With
 
 ## Next steps
 
-- {doc}`cite_seq_integration`
+- {doc}`cite_seq`
 - {doc}`mapping_and_label_transfer`
-- {doc}`reference_atlas`
 - {doc}`../reference/faq`
 - {doc}`../reference/api/integration`

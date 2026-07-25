@@ -785,8 +785,8 @@ class BaseDataStore:
                 v = self.cells.fetch(from_assay + "_nFeatures", key="I")
                 if min_features > np.median(v):
                     logger.warning(
-                        f"More than of half of the less have less than {min_features} features for assay: "
-                        f"{from_assay}. Will not remove low quality cells automatically."
+                        f"More than half of the cells have fewer than {min_features} features "
+                        f"for assay: {from_assay}. Will not remove low quality cells automatically."
                     )
                 else:
                     bv = self.cells.sift(

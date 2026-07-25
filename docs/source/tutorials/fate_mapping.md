@@ -33,8 +33,6 @@ fates without CellRank or Scanpy.
 ## Dataset
 
 ```{code-cell} ipython3
-from pathlib import Path
-
 import numpy as np
 import pandas as pd
 
@@ -49,102 +47,53 @@ The prepared Zarr store from the `scarf_docs` Cytebase catalog contains a KNN gr
 UMAP coordinates, Scarf clusters, and the published cell-type annotations.
 
 ```{code-cell} ipython3
-dataset_root = Path('./scarf_datasets')
-dataset_path = (
-    dataset_root
-    / 'bastidas-ponce_4K_pancreas-d15_rnaseq'
-    / 'data.zarr'
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
+    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
+    destination='scarf_datasets',
+    zarr=True,
 )
-if not dataset_path.exists():
-    scarf.cytebase.connect("scarf_docs").download_dataset(
-        name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-        destination=str(dataset_root),
-        zarr=True,
-    )
 ```
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(
-    str(dataset_path),
+    f'{dataset}/data.zarr',
     nthreads=4,
     default_assay='RNA',
 )
-if 'RNA_paris_cluster' not in ds.cells.columns:
-    ds.run_paris_clustering(n_clusters=10)
-```
-
-```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by=['clusters', 'RNA_paris_cluster'],
+    color_by='clusters',
     legend_loc='on_data',
 )
 ```
 
 ## 2. Define progenitor and terminal groups
 
-The existing pseudotime tutorial uses Scarf cluster 1 as the progenitor group.
-For each terminal cell type that is present in the annotations, we assign an
-unused Paris cluster that still contains that label, preferring higher counts.
+Fate mapping needs a starting point and a set of endpoints. The published `clusters`
+annotation names both: ductal cells are the progenitor pool of this stage, and the
+hormone-expressing states are the terminal fates.
 
 ```{code-cell} ipython3
-annotations = ds.cells.to_pandas_dataframe(
-    columns=['RNA_paris_cluster', 'clusters'],
-    key='I',
-)
-requested_terminals = ['Alpha', 'Beta', 'Delta']
-available_labels = set(annotations['clusters'].unique())
-missing_labels = [label for label in requested_terminals if label not in available_labels]
-if missing_labels:
-    raise ValueError(
-        f"Missing terminal labels in clusters: {missing_labels}. "
-        f"Available labels: {sorted(available_labels)}"
-    )
+progenitors = ['Ductal']
+terminal_cell_types = ['Alpha', 'Beta', 'Delta']
 
-source_clusters = [1]
-if source_clusters[0] not in set(annotations['RNA_paris_cluster']):
-    raise ValueError(
-        f"Source cluster {source_clusters[0]} is not present in RNA_paris_cluster"
-    )
-
-# Prefer a distinct Paris cluster per terminal type. Shared modal clusters are skipped
-# when another unused cluster still contains that annotation.
-used_clusters = set(source_clusters)
-terminal_clusters = {}
-for cell_type in requested_terminals:
-    counts = annotations.loc[
-        annotations['clusters'] == cell_type,
-        'RNA_paris_cluster',
-    ].value_counts()
-    for cluster_id in counts.index:
-        cluster_id = int(cluster_id)
-        if cluster_id not in used_clusters:
-            terminal_clusters[cell_type] = cluster_id
-            used_clusters.add(cluster_id)
-            break
-
-if len(terminal_clusters) < 2:
-    raise ValueError(
-        "Could not assign at least two distinct sink clusters for "
-        f"{requested_terminals}. Paris clusters may mix these labels too strongly "
-        "for multi-sink PBA on this store."
-    )
-
-terminal_cell_types = list(terminal_clusters)
-sink_clusters = list(terminal_clusters.values())
-terminal_clusters
+ds.cells.to_pandas_dataframe(
+    ['clusters'],
+    key='I'
+)['clusters'].value_counts()
 ```
 
 ## 3. Estimate a shared pseudotime
 
-PBA supplies the developmental direction. The assigned terminal clusters are used
-as sinks so the ordering covers the branches analyzed below.
+PBA supplies the developmental direction. The terminal cell types are used as sinks so the
+ordering covers the branches analyzed below. `label='fate_pseudotime'` keeps these columns
+separate from any pseudotime already stored on the object.
 
 ```{code-cell} ipython3
 pseudotime = ds.run_pseudotime_scoring(
-    source_sink_key='RNA_paris_cluster',
-    sources=source_clusters,
-    sinks=sink_clusters,
+    source_sink_key='clusters',
+    sources=progenitors,
+    sinks=terminal_cell_types,
     label='fate_pseudotime',
 )
 ```
@@ -160,10 +109,9 @@ ds.plots.embedding(
 ## 4. Compute fate probabilities
 
 `run_fate_mapping` biases the KNN graph toward increasing pseudotime and solves
-the absorption probability for each terminal cell type. The Scarf cluster IDs
-above direct PBA, while every cell carrying an Alpha, Beta, or Delta annotation
-defines the corresponding fate boundary. The PBA validity key excludes any
-unscored graph components from the fate calculation. Since that subset key is
+the absorption probability for each terminal cell type. Every cell carrying an Alpha, Beta,
+or Delta annotation defines the corresponding fate boundary. The PBA validity key excludes
+any unscored graph components from the fate calculation. Since that subset key is
 not `I`, Scarf includes it in the saved fate column names.
 
 ```{code-cell} ipython3

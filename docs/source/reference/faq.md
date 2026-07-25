@@ -32,9 +32,8 @@ After PCA, call `ds.run_harmony(['batch_column'], pca)` then continue with
 - Separate scRNA-seq batches: merge with `AssayMerge`, then Harmony or partial PCA
   ({doc}`../tutorials/data_integration`).
 - Multiple assays in the same cells (CITE-seq): SNN or WNN
-  ({doc}`../tutorials/cite_seq_integration`).
-- Map onto an existing reference: {doc}`../tutorials/mapping_and_label_transfer`
-  or {doc}`../tutorials/reference_atlas`.
+  ({ref}`multimodal integration <multimodal_integration>`).
+- Map onto an existing reference: {doc}`../tutorials/mapping_and_label_transfer`.
 
 Scarf does not include Scanorama, BBKNN, scVI, ComBat, or other external
 integration packages. Export with `to_anndata` or `SubsetZarr` when you need those

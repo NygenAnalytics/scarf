@@ -41,14 +41,13 @@ import scarf.plotting as splt
 
 scarf.set_verbosity('WARNING')
 
-dataset = "bastidas-ponce_4K_pancreas-d15_rnaseq"
-scarf.cytebase.connect("scarf_docs").download_dataset(
-    name=dataset,
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
+    name="bastidas-ponce_4K_pancreas-d15_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
 ds = scarf.DataStore(
-    str(Path("scarf_datasets") / dataset / "data.zarr"),
+    f"{dataset}/data.zarr",
     nthreads=4,
     default_assay="RNA",
 )

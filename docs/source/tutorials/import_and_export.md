@@ -49,32 +49,31 @@ datasets.list_datasets()
 
 Examples used below:
 
+Each download returns the directory it wrote, which the readers below use as their input
+path.
+
 ```{code-cell} ipython3
 # This dataset is in Cellranger (10x) HDF5 format.
-datasets.download_dataset(
+tenx_h5 = datasets.download_dataset(
     name='tenx_10K_pbmc-v1_atacseq',
-    destination='./scarf_datasets'
+    destination='scarf_datasets'
 )
-```
 
-The download lands under `scarf_datasets` in the current working directory unless
-`destination` is changed. The file above is 10x HDF5. Download a few more formats:
-
-```{code-cell} ipython3
 # This dataset is in MTX format along with barcodes and features TSV files.
-datasets.download_dataset(
+mtx_dir = datasets.download_dataset(
     name='xin_1K_pancreas_rnaseq',
-    destination='./scarf_datasets'
+    destination='scarf_datasets'
+)
+
+# This dataset is in H5ad (anndata) format.
+h5ad_dir = datasets.download_dataset(
+    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
+    destination='scarf_datasets'
 )
 ```
 
-```{code-cell} ipython3
-# This dataset is in H5ad (anndata) format.
-datasets.download_dataset(
-    name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    destination='./scarf_datasets'
-)
-```
+The downloads land under `scarf_datasets` in the current working directory unless
+`destination` is changed.
 
 ### 2. Convert data to a Scarf Zarr store
 
@@ -87,9 +86,7 @@ provide complementary classes that convert common count formats into that layout
 
 ```{code-cell} ipython3
 # Assay type is inferred from the H5 contents (RNA, ATAC, or multimodal).
-reader = scarf.CrH5Reader(
-    'scarf_datasets/tenx_10K_pbmc-v1_atacseq/data.h5'
-)
+reader = scarf.CrH5Reader(f'{tenx_h5}/data.h5')
 
 # change value of `zarr_loc` to your choice of filename and path
 writer = scarf.CrToZarr(
@@ -105,9 +102,7 @@ writer.dump()
 
 ```{code-cell} ipython3
  # Note here we only give name of directory containing MTX file (along with barcodes and features file)
-reader = scarf.CrDirReader(
-    'scarf_datasets/xin_1K_pancreas_rnaseq'
-)
+reader = scarf.CrDirReader(str(mtx_dir))
 
 # change value of `zarr_loc` to your choice of filename and path
 writer = scarf.CrToZarr(
@@ -123,7 +118,7 @@ writer.dump()
 # H5adReader takes the path to the .h5ad file directly.
 # In this catalog file, the feature index contains the gene names.
 reader = scarf.H5adReader(
-    'scarf_datasets/bastidas-ponce_4K_pancreas-d15_rnaseq/data.h5ad',
+    f'{h5ad_dir}/data.h5ad',
     cell_ids_key='index',
     feature_ids_key='index',
     feature_name_key='index',
@@ -149,6 +144,8 @@ Conversion from [Loom](https://loompy.org/) file formats is also supported using
 
 ```{code-cell} ipython3
 ds = scarf.DataStore('scarf_datasets/differentiating_pancreatic_cells.zarr')
+
+ds
 ```
 
 ```{code-cell} ipython3
@@ -164,10 +161,6 @@ scarf.writers.to_mtx(
 AnnData `obsm` by default. `DataStore.to_anndata` returns an in-memory AnnData object with
 counts, cell and feature metadata, and optional assay layers. It currently leaves layout
 coordinates as ordinary `obs` columns rather than populating `obsm` (see {doc}`downsampling`).
-
-```{code-cell} ipython3
-ds = scarf.DataStore('scarf_datasets/differentiating_pancreatic_cells.zarr')
-```
 
 ```{code-cell} ipython3
 scarf.writers.to_h5ad(

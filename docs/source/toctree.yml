@@ -20,17 +20,15 @@ subtrees:
         title: Scale, memory, and execution
   - caption: Core workflows
     entries:
-      - file: tutorials/atomic_graph_operations
-        title: Atomic graph operations
       - file: tutorials/scrna_seq
         title: scRNA-seq analysis
+        entries:
+          - file: tutorials/atomic_graph_operations
+            title: Atomic graph operations
       - file: tutorials/scatac_seq
         title: scATAC-seq analysis
       - file: tutorials/cite_seq
         title: CITE-seq analysis
-        entries:
-          - file: tutorials/cite_seq_integration
-            title: SNN and WNN integration
   - caption: Analysis essentials
     entries:
       - file: tutorials/quality_control
@@ -58,9 +56,7 @@ subtrees:
       - file: tutorials/data_integration
         title: Merge, Harmony, and partial PCA
       - file: tutorials/mapping_and_label_transfer
-        title: Mapping, label transfer, and unified embeddings
-      - file: tutorials/reference_atlas
-        title: Build and map a reference atlas
+        title: Mapping, label transfer, and reference atlases
   - caption: Specialized analyses
     entries:
       - file: tutorials/gene_set_enrichment

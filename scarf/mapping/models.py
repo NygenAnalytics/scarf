@@ -91,3 +91,24 @@ class MappingResult:
     uncorrected_latent: np.ndarray | None = None
     corrected_latent: np.ndarray | None = None
     uninformative: np.ndarray | None = None
+
+    def __repr__(self) -> str:
+        # The default dataclass repr prints every loaded array in full.
+        loaded = [
+            name
+            for name in (
+                "indices",
+                "distances",
+                "uncorrected_latent",
+                "corrected_latent",
+                "uninformative",
+            )
+            if getattr(self, name) is not None
+        ]
+        return (
+            f"MappingResult(n_cells={self.n_cells}, "
+            f"correction_method={self.correction_method!r}, "
+            f"diagnostics={self.diagnostics!r}, "
+            f"arrays={loaded or 'not loaded'}, "
+            f"projection_path='{self.projection_path[:40]}...')"
+        )

@@ -49,14 +49,14 @@ neighbourhood graph, UMAP coordinates, and cluster labels, so no graph or
 clustering bootstrap is required here.
 
 ```{code-cell} ipython3
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name='bastidas-ponce_4K_pancreas-d15_rnaseq',
     destination='scarf_datasets',
     zarr=True,
 )
 
 ds = scarf.DataStore(
-    'scarf_datasets/bastidas-ponce_4K_pancreas-d15_rnaseq/data.zarr',
+    f'{dataset}/data.zarr',
     default_assay='RNA',
     nthreads=4,
 )
@@ -150,12 +150,13 @@ ds.cells.insert(column_name='is_first_cluster', values=is_first_cluster, overwri
 ```
 
 ```{code-cell} ipython3
-:tags: [raises-exception]
-
-ds.cells.insert(
-    column_name='is_first_cluster',
-    values=is_first_cluster,
-)
+try:
+    ds.cells.insert(
+        column_name='is_first_cluster',
+        values=is_first_cluster,
+    )
+except ValueError as error:
+    print(error)
 ```
 
 See the `MetaData` API in {doc}`../reference/api/assays` for delete and update helpers.
@@ -187,9 +188,7 @@ Override normalization by assigning `normMethod`. Reassign a custom function eac
 open the store. `scarf.assay.norm_dummy` disables normalization for pre-normalized inputs.
 
 ```{code-cell} ipython3
-import inspect
-
-print(inspect.getsource(ds.RNA.normMethod))
+print('Current method:', ds.RNA.normMethod.__name__)
 ```
 
 ### 4. Released paths versus artifacts
@@ -199,8 +198,8 @@ artifacts. On such a store, assay state and artifact listings can be empty even
 when encoded graph groups exist:
 
 ```{code-cell} ipython3
-ds.get_assay_state('RNA')
-ds.list_artifacts()
+print('Published RNA state:', ds.get_assay_state('RNA'))
+print('Artifacts:', ds.list_artifacts())
 ```
 
 `get_normalized_group_path` falls back to the released encoded path when no
@@ -231,18 +230,22 @@ State and listings now include the published artifact. The normalized path
 switches to an artifact location:
 
 ```{code-cell} ipython3
-ds.get_assay_state('RNA')
-ds.list_artifacts(kind='normalized')
-ds.get_normalized_group_path('RNA', 'I', feat_key)
+state = ds.get_assay_state('RNA')
+print('Cell and feature keys:', state.cell_key, state.feat_key)
+print('Normalized artifacts:', ds.list_artifacts(kind='normalized'))
+print('Normalized path:', ds.get_normalized_group_path('RNA', 'I', feat_key))
 ```
 
 Inspect and load:
 
 ```{code-cell} ipython3
 status = ds.inspect_artifact(normalized)
-status.complete, status.operation, status.parameters
+print('Complete:', status.complete)
+print('Operation:', status.operation)
+print('Parameters:', status.parameters)
+
 group = ds.load_artifact(normalized)
-list(group.array_keys())[:5]
+print('Arrays:', list(group.array_keys())[:5])
 ```
 
 Identical provenance reuses the same ref. `invalidate_cache=True` forces a new
@@ -250,9 +253,9 @@ artifact ID:
 
 ```{code-cell} ipython3
 reused = ds.run_normalization(feat_key=feat_key)
-assert reused == normalized
 forced = ds.run_normalization(feat_key=feat_key, invalidate_cache=True)
-assert forced != normalized
+print('Reused the same artifact:', reused == normalized)
+print('Forced a new artifact:', forced != normalized)
 ```
 
 `load_graph` still returns a sparse matrix when a published connectivity map (or

@@ -46,31 +46,33 @@ The prepared Zarr store is available from the `scarf_docs` Cytebase catalog. It 
 includes the top 2000 highly variable genes, a neighbourhood graph, and a UMAP embedding. 
 
 ```{code-cell} ipython3
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name='bastidas-ponce_4K_pancreas-d15_rnaseq',
-    destination='./scarf_datasets',
+    destination='scarf_datasets',
     zarr=True,
 )
-```
 
-```{code-cell} ipython3
 ds = scarf.DataStore(
-    f"scarf_datasets/bastidas-ponce_4K_pancreas-d15_rnaseq/data.zarr",
-    nthreads=4, 
+    f'{dataset}/data.zarr',
+    nthreads=4,
     default_assay='RNA'
 )
-if 'RNA_paris_cluster' not in ds.cells.columns:
-    ds.run_paris_clustering(n_clusters=10)
+ds
 ```
 
+The store ships the published cell-type annotations in the `clusters` column:
+
 ```{code-cell} ipython3
-ds
+ds.cells.to_pandas_dataframe(
+    ['clusters'],
+    key='I'
+)['clusters'].value_counts()
 ```
 
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by=['RNA_paris_cluster', 'clusters'],
+    color_by='clusters',
     legend_loc='on_data',
 )
 ```
@@ -78,15 +80,26 @@ ds.plots.embedding(
 ---
 ## 2) Estimate pseudotime ordering
 
-Scarf uses a memory-efficient implementation of the [PBA algorithm](https://github.com/AllonKleinLab/PBA) ([Weinreb et al. 2018, PNAS](https://doi.org/10.1073/pnas.1714723115)) to estimate a pseudotime ordering. `run_pseudotime_scoring` works with any assay that has a neighborhood graph. The method is supervised, so provide source groups such as progenitor cells and sink groups such as differentiated cell states.
+Scarf uses a memory-efficient implementation of the [PBA algorithm](https://github.com/AllonKleinLab/PBA) ([Weinreb et al. 2018, PNAS](https://doi.org/10.1073/pnas.1714723115)) to estimate a pseudotime ordering. `run_pseudotime_scoring` works with any assay that has a neighborhood graph.
+
+The method is supervised: you name the groups that start the trajectory (sources) and the
+groups that end it (sinks), and those choices set the direction of the ordering. Here the
+annotations make the choice explicit. Ductal cells are the progenitor pool of this
+developmental stage, and the hormone-expressing states are its endpoints.
 
 ```{code-cell} ipython3
 pseudotime = ds.run_pseudotime_scoring(
-    source_sink_key="RNA_paris_cluster",  # Column that contains cluster information
-    sources=[1],                      # Source clusters
-    sinks=[3],                        # Sink clusters
+    source_sink_key='clusters',
+    sources=['Ductal'],
+    sinks=['Alpha', 'Beta', 'Delta'],
 )
 ```
+
+Any cell metadata column with group labels works for `source_sink_key`, including a Scarf
+clustering such as `RNA_leiden_cluster`. Without published annotations, read the cluster
+labels off the embedding and pick the ones at each end of the trajectory. Every group named
+in `sources` or `sinks` has to be present among the scored cells, otherwise the call fails
+rather than guessing.
 
 By default, the calculated values are saved under **'RNA_pseudotime'**, where 'RNA' is replaced by the assay name. A companion boolean column **'RNA_pseudotime__valid'** is also written. The returned result exposes both names as `pseudotime_key` and `validity_key`. When the selected graph is fully connected, every cell is valid. If the graph has multiple components, only the largest one is scored by default. The remaining cells hold `NaN`, and downstream steps should use the validity column as `cell_key`. The UMAP below shows progression from 0 to 1.
 
@@ -118,18 +131,11 @@ markers.table.head()
 ---
 ## 4) Visualize pseudotime correlated features
 
-This section uses the returned correlations for exploratory analysis.
-
-The returned table can be used directly for sorting and filtering.
-
-```{code-cell} ipython3
-corr_genes_df = markers.table
-```
-
-Genes with a negative correlation decrease in expression as pseudotime progresses.
+`markers.table` can be sorted and filtered directly. Genes with a negative correlation
+decrease in expression as pseudotime progresses.
 
 ```{code-cell} ipython3
-corr_genes_df.sort_values('r_value')[:15]
+markers.table.sort_values('r_value')[:15]
 ```
 
 Visualize a few of these genes on the UMAP plot. Gene symbols come from the
@@ -137,7 +143,7 @@ correlation table above, not from a fixed list.
 
 ```{code-cell} ipython3
 neg_genes = (
-    corr_genes_df.sort_values('r_value')['feature_name']
+    markers.table.sort_values('r_value')['feature_name']
     .head(3)
     .tolist()
 )
@@ -151,12 +157,12 @@ ds.plots.embedding(
 Genes with a positive correlation increase in expression as pseudotime progresses.
 
 ```{code-cell} ipython3
-corr_genes_df.sort_values('r_value', ascending=False)[:10]
+markers.table.sort_values('r_value', ascending=False)[:10]
 ```
 
 ```{code-cell} ipython3
 pos_genes = (
-    corr_genes_df.sort_values('r_value', ascending=False)['feature_name']
+    markers.table.sort_values('r_value', ascending=False)['feature_name']
     .head(3)
     .tolist()
 )

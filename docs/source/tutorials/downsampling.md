@@ -39,7 +39,7 @@ scarf.set_verbosity('WARNING')
 ### 1. Fetch prepared data
 
 ```{code-cell} ipython3
-scarf.cytebase.connect("scarf_docs").download_dataset(
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name='tenx_5K_pbmc_rnaseq',
     zarr=True,
     destination='scarf_datasets'
@@ -47,15 +47,15 @@ scarf.cytebase.connect("scarf_docs").download_dataset(
 ```
 
 ```{code-cell} ipython3
-ds = scarf.DataStore('scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr')
+ds = scarf.DataStore(f'{dataset}/data.zarr')
 
 ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-normalized = ds.run_normalization(feat_key='hvgs')
-pca = ds.run_pca(normalized, dims=15)
-ds.build_embedding_initialization(pca)
-ann = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann, k=11)
-ds.build_connectivity_map(neighbors)
+ds.run_normalization(feat_key='hvgs')
+ds.run_pca(dims=15)
+ds.build_embedding_initialization()
+ds.build_ann_index()
+ds.query_neighbors(k=11)
+ds.build_connectivity_map()
 ds.run_paris_clustering(n_clusters=15)
 
 ds.run_umap(n_epochs=250, parallel=True)
@@ -85,6 +85,9 @@ if 'RNA_sketched' not in ds.cells.columns:
     raise RuntimeError(
         "TopACeDo did not create RNA_sketched. Verify that topacedo is installed."
     )
+
+print('Active cells:', int(ds.cells.fetch_all('I').sum()))
+print('Selected cells:', int(ds.cells.fetch_all('RNA_sketched').sum()))
 ```
 
 Selected cells are marked `True` under `RNA_sketched`. Plot them with `subset_by`:
@@ -149,8 +152,9 @@ TopACeDo marks representative cells but leaves the source store unchanged. Use `
 to create a new Zarr store containing only the selected cells.
 
 ```{code-cell} ipython3
+subset_path = f'{dataset}/subset.zarr'
 writer = scarf.SubsetZarr(
-    zarr_loc='scarf_datasets/tenx_5K_pbmc_rnaseq/subset.zarr',
+    zarr_loc=subset_path,
     assays=[ds.RNA],
     cell_key='RNA_sketched',
     reset_cell_filter=False,
@@ -162,10 +166,8 @@ writer.dump()
 Open the downsampled store as a new `DataStore`:
 
 ```{code-cell} ipython3
-ds2 = scarf.DataStore('scarf_datasets/tenx_5K_pbmc_rnaseq/subset.zarr')
-```
+ds2 = scarf.DataStore(subset_path)
 
-```{code-cell} ipython3
 ds2
 ```
 
@@ -174,9 +176,7 @@ When the subset fits in memory, export to AnnData for tools in the
 
 ```{code-cell} ipython3
 adata = ds2.to_anndata()
-```
 
-```{code-cell} ipython3
 adata
 ```
 

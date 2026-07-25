@@ -83,6 +83,8 @@ def configure_doc_execution_env(
             "MKL_NUM_THREADS": "2",
             "OPENBLAS_NUM_THREADS": "2",
             "NUMEXPR_NUM_THREADS": "2",
+            # Widget-based download bars freeze at 0% in published HTML.
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
         }
     )
     return target

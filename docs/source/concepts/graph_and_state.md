@@ -34,10 +34,13 @@ partial recomputation:
 6. `query_neighbors`
 7. `build_connectivity_map`
 
-Each call returns an `ArtifactRef`. Pass refs into the next step. By default,
-successful steps publish into `AssayState` for the assay (`update_state=True`).
-Set `update_state=False` when building side branches you do not want as the
-current published chain.
+By default, successful steps publish into `AssayState` for the assay
+(`update_state=True`), and each step reads the published stage it needs. A plain chain of
+calls with no arguments passed between them is therefore enough for a linear analysis.
+
+Each call also returns an `ArtifactRef`. Capture those refs and pass them into later steps
+when you want a branch, for example two values of `k` from one ANN index. Combine that with
+`update_state=False` for side branches you do not want as the current published chain.
 
 See {doc}`../tutorials/atomic_graph_operations` for a short executable chain and
 a `make_graph` migration table.

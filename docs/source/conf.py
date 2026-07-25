@@ -94,6 +94,9 @@ nb_execution_cache_path = os.path.join(
 )
 nb_execution_timeout = 600
 
+# Widget-based download bars freeze at 0% in published HTML.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
 matplotlib.use("agg")
 
 # Suppress noisy autodoc type cross-refs until intersphinx inventories are complete (P7).

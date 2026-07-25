@@ -48,12 +48,12 @@ artifacts = ds.pipeline.run(
 )
 
 # After: atomic chain
-normalized = ds.run_normalization(feat_key="hvgs")
-pca = ds.run_pca(normalized, dims=15)
-ds.build_embedding_initialization(pca)
-ann = ds.build_ann_index(pca)
-neighbors = ds.query_neighbors(ann, k=11)
-graph = ds.build_connectivity_map(neighbors)
+ds.run_normalization(feat_key="hvgs")
+ds.run_pca(dims=15)
+ds.build_embedding_initialization()
+ds.build_ann_index()
+ds.query_neighbors(k=11)
+ds.build_connectivity_map()
 ```
 
 `make_graph` still works for one major cycle and emits `DeprecationWarning`.
