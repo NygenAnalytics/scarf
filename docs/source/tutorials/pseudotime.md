@@ -132,12 +132,18 @@ Genes with a negative correlation decrease in expression as pseudotime progresse
 corr_genes_df.sort_values('r_value')[:15]
 ```
 
-Visualize a few of these genes on the UMAP plot:
+Visualize a few of these genes on the UMAP plot. Gene symbols come from the
+correlation table above, not from a fixed list.
 
 ```{code-cell} ipython3
+neg_genes = (
+    corr_genes_df.sort_values('r_value')['feature_name']
+    .head(3)
+    .tolist()
+)
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by=['Spp1', 'Dbi', 'Sparc'],
+    color_by=neg_genes,
     sort_values=True,
 )
 ```
@@ -149,9 +155,14 @@ corr_genes_df.sort_values('r_value', ascending=False)[:10]
 ```
 
 ```{code-cell} ipython3
+pos_genes = (
+    corr_genes_df.sort_values('r_value', ascending=False)['feature_name']
+    .head(3)
+    .tolist()
+)
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by=['Aplp1', 'Gnas', 'Cpe'],
+    color_by=pos_genes,
     sort_values=True,
 )
 ```

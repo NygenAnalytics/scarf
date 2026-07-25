@@ -8,7 +8,7 @@ from typing import get_type_hints
 import numpy as np
 import scarf
 import scarf.merge as merge_module
-from scarf.merge import AssayMerge, DatasetMerge, DummyAssay, ZarrMerge
+from scarf.merge import AssayMerge, DatasetMerge, DummyAssay
 from tests.signature_contracts import signature_digest
 
 
@@ -22,7 +22,6 @@ _PUBLIC_CLASS_METHODS = {
         "update_feat_ids_for_map",
         "dump",
     ),
-    ZarrMerge: ("__init__",),
     DatasetMerge: (
         "__init__",
         "get_unique_assays",
@@ -33,7 +32,6 @@ _PUBLIC_CLASS_METHODS = {
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     AssayMerge: "732b39fd1d5b021a715df876e625efb3c7cd74580faa844d0c9bff1e12848006",
-    ZarrMerge: "752893a7c877b2cb73a6bdedffe4dfc6392b36e153be78bf35eb756c2330108c",
     DatasetMerge: "825504ddf1bcf69117305a124567b1f65a1cec8baf9876860f66960aabdb264b",
 }
 _FACADE_METHODS = {DummyAssay: ("__init__",), **_PUBLIC_CLASS_METHODS}
@@ -43,20 +41,19 @@ def test_merge_facade_surface_is_stable():
     assert merge_module.__all__ == [
         "DatasetMerge",
         "AssayMerge",
-        "ZarrMerge",
     ]
     expected = {
         "AssayMerge",
         "DatasetMerge",
         "DummyAssay",
         "MergeAssay",
-        "ZarrMerge",
         "_RowPlan",
         "controlled_compute",
         "load_zarr",
     }
     assert expected.issubset(dir(merge_module))
     assert all(getattr(merge_module, name) is not None for name in expected)
+    assert not hasattr(merge_module, "ZarrMerge")
 
 
 def test_merge_class_and_method_signatures_are_stable():
@@ -83,8 +80,6 @@ def test_merge_descriptor_and_hierarchy_contracts_are_stable():
         inspect.getattr_static(AssayMerge, "_get_feat_ids"),
         staticmethod,
     )
-    assert ZarrMerge.__bases__ == (AssayMerge,)
-    assert issubclass(ZarrMerge, AssayMerge)
 
 
 def test_merge_facade_classes_remain_pickle_resolvable():
@@ -194,16 +189,16 @@ assert {
     "DummyAssay",
     "MergeAssay",
     "ZARRLOC",
-    "ZarrMerge",
     "_RowPlan",
     "controlled_compute",
     "load_zarr",
 } <= vars(merge).keys()
+assert "ZarrMerge" not in vars(merge)
 
 dataset_merge = merge.DatasetMerge
 assert "scarf.merge.datasets" in sys.modules
 assert "scarf.datastore.datastore" not in sys.modules
-for cls in (assay_merge, dataset_merge, merge.DummyAssay, merge.ZarrMerge):
+for cls in (assay_merge, dataset_merge, merge.DummyAssay):
     assert cls.__module__ == "scarf.merge"
     for descriptor in cls.__dict__.values():
         if isinstance(descriptor, (classmethod, staticmethod)):
@@ -221,7 +216,6 @@ assert not {
     "DummyAssay",
     "MergeAssay",
     "ZARRLOC",
-    "ZarrMerge",
     "_RowPlan",
     "controlled_compute",
     "load_zarr",

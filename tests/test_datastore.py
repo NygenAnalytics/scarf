@@ -124,6 +124,31 @@ class TestDataStore:
             is None
         )
 
+    def test_assay_names_tolerates_repeated_group_listings(
+        self, datastore_ephemeral, monkeypatch
+    ):
+        # Object-store listings can yield the same group more than once.
+        root = datastore_ephemeral.z
+        expected = [
+            name for name in root.group_keys() if "is_assay" in root[name].attrs.keys()
+        ]
+        assert expected
+
+        class RepeatingGroup:
+            def group_keys(self):
+                keys = list(root.group_keys())
+                return iter(keys + keys + keys)
+
+            def __getitem__(self, key):
+                return root[key]
+
+        monkeypatch.setattr(
+            type(datastore_ephemeral),
+            "zw",
+            property(lambda self: RepeatingGroup()),
+        )
+        assert datastore_ephemeral.assay_names == expected
+
     def test_filter_cells(self, datastore_ephemeral):
         assert (
             datastore_ephemeral.filter_cells(
@@ -155,22 +180,39 @@ class TestDataStore:
         np.testing.assert_allclose(a, b, rtol=0, atol=1e-5)
 
     def test_atac_graph_indices(self, make_atac_graph, atac_datastore):
-        a = np.load(full_path("atac_knn_indices.npy"))
-        b = atac_datastore.z[make_atac_graph]["indices"][:]
-        assert a.shape == b.shape
+        expected = np.load(full_path("atac_knn_indices.npy"))
+        observed = np.asarray(atac_datastore.z[make_atac_graph]["indices"][:])
+        row_ids = np.arange(observed.shape[0])[:, None]
+        overlap = np.mean(
+            [
+                len(set(expected_row) & set(observed_row)) / len(expected_row)
+                for expected_row, observed_row in zip(
+                    expected,
+                    observed,
+                    strict=True,
+                )
+            ]
+        )
 
-        # TODO: activate this when this PR is merged and released in gensim
-        # https://github.com/RaRe-Technologies/gensim/pull/3194
-        # assert np.array_equal(a, b)
+        assert expected.shape == observed.shape
+        assert observed.min() >= 0
+        assert observed.max() < observed.shape[0]
+        assert not np.any(observed == row_ids)
+        assert all(np.unique(row).size == row.size for row in observed)
+        assert overlap >= 0.15
 
     def test_atac_graph_distances(self, make_atac_graph, atac_datastore):
-        a = np.load(full_path("atac_knn_distances.npy"))
-        b = atac_datastore.z[make_atac_graph]["distances"][:]
-        assert a.shape == b.shape
+        from scipy.stats import spearmanr
 
-        # TODO: activate this when this PR is merged and released in gensim
-        # https://github.com/RaRe-Technologies/gensim/pull/3194
-        # assert np.all((a - b) < 1e-5)
+        expected = np.load(full_path("atac_knn_distances.npy"))
+        observed = np.asarray(atac_datastore.z[make_atac_graph]["distances"][:])
+
+        assert expected.shape == observed.shape
+        assert np.isfinite(observed).all()
+        assert np.all(observed > 0)
+        assert np.all(np.diff(observed, axis=1) >= 0)
+        assert spearmanr(expected.ravel(), observed.ravel()).statistic >= 0.7
+        assert np.mean(np.abs(expected - observed)) < 1e-3
 
     def test_leiden_values(self, leiden_clustering, cell_attrs):
         assert len(set(leiden_clustering)) == 10

@@ -348,4 +348,5 @@ keys such as `unified_UMAP`; `project_mapping_layout` writes target coordinates 
 - {doc}`reference_atlas`
 - {doc}`data_integration`
 - {doc}`plotting`
-- {doc}`choosing_integration_methods`
+- {doc}`data_integration`
+

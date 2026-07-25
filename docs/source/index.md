@@ -39,30 +39,29 @@ object storage, and the analysis is built around one neighbourhood graph that ev
 later step reuses. Four things follow from that design.
 
 **Large datasets run on modest hardware.** The full pipeline (QC, HVGs, graph, UMAP,
-Leiden, markers) has been measured end to end through 2.5 million cells inside 64 GiB of
-RAM. The memory ceiling is set by graph construction and barely moves as datasets grow,
-so a single 64 GiB machine covers the range from a hundred thousand to ten million cells.
+Leiden, markers) has been measured end to end on feature-major `countsT` stores. Graph
+construction sets most of the memory ceiling, so peak RAM grows slowly from hundreds of
+thousands to tens of millions of cells.
 
 | Cells | Peak RAM | End-to-end wall time |
 |---|---|---|
 | 100k | ~7 GiB | ~15 min |
-| 500k | ~25 GiB | ~45 min |
-| 1M | ~28 GiB | ~1.5 h |
-| 2.5M | ~33 GiB | ~2.5 h |
-| 5M | ~33 GiB | ~4.5 h |
-| 10M | ~37 GiB | ~7 h |
+| 500k | ~25 GiB | ~47 min |
+| 5M | ~33 GiB | ~8.2 h |
+| 10M | ~37 GiB | ~22.8 h |
 
-Times are on 8 CPU cores. Runs through 2.5M cells are measured; 5M and 10M are projected
-from the same curve. Actual numbers depend on hardware, storage, and parameters.
+Times are measured on 8 CPU cores with the countsT speed pack. These are measured anchors,
+not projections. Actual numbers depend on hardware, storage, and parameters.
 
 **It is remote-first.** A Zarr store can live on S3-compatible object storage, and Scarf
 reads and writes it in place. You can analyze a dataset that never lands on your local
 disk as a full copy, which is what makes shared-storage and cloud workflows practical.
 
-**One graph keeps results concordant.** `make_graph` builds a single KNN graph, and
-embeddings, clustering, mapping, and multimodal integration all read from it. Your UMAP,
-your clusters, and your transferred labels see the same neighbourhood structure rather
-than three separately parameterized versions of it.
+**One graph keeps results concordant.** The standard workflow (`ds.pipeline`) or the
+atomic graph steps (normalize, reduce, optional Harmony, ANN, neighbors, connectivity)
+build a single KNN graph. Embeddings, clustering, mapping, and multimodal integration all
+read from it, so your UMAP, clusters, and transferred labels share the same neighbourhood
+structure rather than separately parameterized copies.
 
 **Results persist as you work.** Every step writes back into the store, so you can stop,
 inspect intermediate outputs, and resume later without recomputing. Filtering marks cells
@@ -70,15 +69,16 @@ inactive instead of deleting them, so quality-control choices stay reversible.
 
 ## What this documentation covers
 
-- Installing Scarf and running a minimal scRNA-seq pipeline
-- End-to-end tutorials for scRNA-seq, scATAC-seq, and CITE-seq
+- Installing Scarf and running a minimal scRNA-seq pipeline with `ds.pipeline.run`
+- Concepts for provenance, graph state, and measured scale/memory behavior
+- Atomic graph operations and end-to-end tutorials for scRNA-seq, scATAC-seq, and CITE-seq
 - Quality control, feature selection, neighbourhood graphs, embeddings, and clustering
 - Marker genes, gene-set enrichment, annotation, and subsetting with cell keys
 - Merging batches, Harmony, partial PCA, and integration metrics
 - Mapping query cells to a reference and transferring labels
 - Multimodal SNN/WNN integration
-- Large-scale analysis with downsampling and Zarr storage notes
-- Plotting through `ds.plots` or `scarf.plotting`, with the API reference
+- Zarr organization, remote stores, provenance reuse, and downsampling
+- Plotting through `ds.plots` or `import scarf.plotting as splt`, with the API reference
 
 ## What this documentation does not cover
 
@@ -95,14 +95,16 @@ lower-memory path for large data, start with {doc}`scarf_and_scanpy`.
 
 ## Structure of the documentation
 
-1. **Get started**: installation, quick start, and Scarf compared with Scanpy
-2. **Core workflows**: end-to-end scRNA-seq, scATAC-seq, and CITE-seq analysis
-3. **Analysis essentials**: quality control, dimensionality reduction, clustering, annotation, and plotting
-4. **Data management and scaling**: import/export, Zarr organization, and cell downsampling
-5. **Integration and mapping**: method choice, merge/Harmony, metrics, label transfer, and reference atlases
-6. **Specialized analyses**: gene-set enrichment, cell cycle, imputation, pseudobulk export, and trajectories
-7. **Reference and support**: API, FAQ, glossary, citation, and community links
-8. **Developers**: contributing and internals
+1. **Get started**: installation, quick start, what is new in 1.0, and Scarf with Scanpy
+2. **Concepts**: provenance, graph state, and scale/memory
+3. **Core workflows**: atomic graph operations, then scRNA-seq, scATAC-seq, and CITE-seq
+4. **Analysis essentials**: quality control, dimensionality reduction, clustering, annotation, and plotting
+5. **Data management and scaling**: Zarr organization, import/export, remote stores, provenance reuse, and downsampling
+6. **Integration and mapping**: merge/Harmony with metrics, label transfer, and reference atlases
+7. **Specialized analyses**: gene-set enrichment, cell cycle, pseudobulk export, and trajectories
+
+8. **Reference and support**: API, FAQ, glossary, citation, and community links
+9. **Developers**: contributing and internals
 
 ## Prerequisites
 
@@ -125,11 +127,17 @@ for how to build and execute documentation pages locally.
 
 1. {ref}`Install Scarf <installation>`
 2. Run the {ref}`Quick start <quickstart>`
-3. Read {doc}`scarf_and_scanpy` if you know Scanpy or Seurat
-4. Work through {doc}`tutorials/scrna_seq`
+3. Skim {doc}`whats_new_in_1_0` if you used Scarf 0.x
+4. Read {doc}`scarf_and_scanpy` if you know Scanpy or Seurat
+5. Work through {doc}`tutorials/scrna_seq` or {doc}`tutorials/atomic_graph_operations`
 
 Capability links:
 
+- Provenance and artifacts: {doc}`concepts/provenance`
+- Scale and memory: {doc}`concepts/scale_and_memory`
+- Atomic graph operations: {doc}`tutorials/atomic_graph_operations`
+- Data organization: {doc}`tutorials/data_organization`
+- Remote stores: {doc}`tutorials/remote_stores`
 - One scRNA-seq dataset: {doc}`tutorials/scrna_seq`
 - Merge batches: {doc}`tutorials/data_integration`
 - CITE-seq: {doc}`tutorials/cite_seq`

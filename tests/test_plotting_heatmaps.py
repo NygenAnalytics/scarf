@@ -5,7 +5,7 @@ import pytest
 matplotlib.use("Agg")
 
 import scarf.plotting as splt
-from scarf.plotting.heatmaps import _hierarchy_positions
+from scarf.plotting.cluster_tree import _hierarchy_positions
 
 
 def test_hierarchy_positions_are_pure_and_complete():

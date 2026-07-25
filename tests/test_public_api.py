@@ -33,7 +33,6 @@ _EXPECTED_EXPORTS = {
     "PseudotimeScoreResult": "scarf.trajectory.results",
     "SparseToZarr": "scarf.writers",
     "SubsetZarr": "scarf.writers",
-    "ZarrMerge": "scarf.merge",
     "clean_array": "scarf.utils",
     "controlled_compute": "scarf.utils",
     "coordinate_melding": "scarf.features.genomic.melding",
@@ -527,3 +526,12 @@ def test_legacy_plotting_surface_remains_absent():
     assert not [name for name in dir(DataStore) if name.startswith("plot_")]
     assert find_spec("scarf.plots") is None
     assert find_spec("scarf.plotting._legacy") is None
+
+
+def test_pipeline_accessor_has_a_public_import_path():
+    from scarf import DataStore
+    from scarf.datastore.pipeline_accessor import PipelineAccessor, StepOptions
+
+    assert hasattr(DataStore, "pipeline")
+    assert PipelineAccessor.__module__ == "scarf.datastore.pipeline_accessor"
+    assert StepOptions is not None

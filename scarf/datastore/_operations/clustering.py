@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from ...graph.paths import StoredAssayGraph
-from ...graph.state import validate_legacy_graph_selection
+from ...graph.state import resolve_stored_graph_input, validate_legacy_graph_selection
 from ...metadata.artifacts import (
     artifact_values,
     categorical_display,
@@ -20,9 +20,7 @@ from ...storage.artifacts import (
     ArtifactRef,
     artifact_path,
     fingerprint_array,
-    fingerprint_stored_arrays,
     inspect_artifact,
-    parse_artifact_path,
 )
 from ...storage.artifact_writer import (
     ArrayRequirement,
@@ -36,140 +34,13 @@ from ...storage.types import as_zarr_array, as_zarr_group
 from ...utils.logging import logger
 
 if TYPE_CHECKING:
-    from scipy.sparse import csr_matrix
-
-    from ...clustering._paris_core import ParisHierarchy
-    from ...clustering.paris_multiscale import ParisClusteringResult, PlateauForest
+    from ...clustering.paris_multiscale import ParisClusteringResult
     from .graph import _GraphOperationsMixin as _ClusteringOperationsBase
 else:
     _ClusteringOperationsBase = object
 
 
 class _ClusteringOperationsMixin(_ClusteringOperationsBase):
-    def _resolve_paris_hierarchy(
-        self,
-        *,
-        graph_loc: str,
-        from_assay: str,
-        cell_key: str,
-        feat_key: str,
-        force_recalc: bool,
-        cut_mode: Literal["adaptive", "fixed"],
-    ) -> tuple[
-        str,
-        "ParisHierarchy",
-        "PlateauForest",
-        bool,
-        int | None,
-        "csr_matrix | None",
-    ]:
-        import warnings
-
-        from ...clustering.paris_multiscale import collapse_equal_height_plateaus
-        from ...clustering.paris import fit_paris_hierarchy
-        from ...storage.budget import get_resource_budget
-        from .paris_persistence import (
-            LATEST_PARIS_GENERATION,
-            generation_location,
-            load_hierarchy_generation,
-            preflight_cached_paris_cut,
-            preflight_paris_fit,
-            write_hierarchy_generation,
-        )
-
-        try:
-            parse_artifact_path(graph_loc)
-        except ValueError:
-            pass
-        else:
-            raise RuntimeError(
-                "Paris hierarchy persistence for artifact-backed connectivity "
-                "is not enabled yet"
-            )
-        graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
-        generation_value = graph_group.attrs.get(LATEST_PARIS_GENERATION)
-        budget = get_resource_budget()
-        if generation_value is not None and not force_recalc:
-            generation_id = str(generation_value)
-            location = generation_location(graph_loc, generation_id)
-            if location in self.zw:
-                # Budget errors from the cached-cut preflight must propagate;
-                # only absent or invalid generations fall through to recompute.
-                preflight_cached_paris_cut(
-                    self.zw,
-                    graph_loc,
-                    generation_id,
-                    cut_mode,
-                    budget,
-                )
-                try:
-                    hierarchy, plateau_forest = load_hierarchy_generation(
-                        self.zw,
-                        graph_loc,
-                        generation_id,
-                    )
-                except ValueError as exc:
-                    logger.warning(
-                        f"Cached Paris hierarchy generation {generation_id!r} is "
-                        f"invalid ({exc}); recomputing."
-                    )
-                else:
-                    logger.info(f"Using Paris hierarchy generation {location}")
-                    return generation_id, hierarchy, plateau_forest, True, None, None
-            else:
-                logger.warning(
-                    f"Cached Paris hierarchy generation {generation_id!r} was not "
-                    f"found at {location}; recomputing."
-                )
-
-        legacy_dendrogram = f"{graph_loc}/dendrogram"
-        if generation_value is None and (
-            legacy_dendrogram in self.zw or "latest_dendrogram" in graph_group.attrs
-        ):
-            warnings.warn(
-                "The cached Paris hierarchy predates canonical additive graphs and "
-                "will be rebuilt. Existing Paris cluster labels can change even "
-                "when the requested integer cluster count is unchanged.",
-                UserWarning,
-                stacklevel=3,
-            )
-
-        n_cells, _effective_k = self._get_graph_ncells_k(graph_loc)
-        estimated_peak_bytes = preflight_paris_fit(
-            graph_group,
-            n_cells,
-            budget,
-        )
-        graph = self.load_graph(
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=feat_key,
-            symmetric=False,
-            upper_only=False,
-            graph_loc=graph_loc,
-        )
-        hierarchy = fit_paris_hierarchy(graph, n_threads=budget.workers)
-        plateau_forest = collapse_equal_height_plateaus(hierarchy)
-        generation_id, location = write_hierarchy_generation(
-            self.zw,
-            graph_loc,
-            hierarchy,
-            plateau_forest,
-        )
-        generation_group = as_zarr_group(self.zw[location], name=location)
-        generation_group.attrs["estimated_peak_bytes"] = estimated_peak_bytes
-        graph_group.attrs[LATEST_PARIS_GENERATION] = generation_id
-        if "latest_dendrogram" in graph_group.attrs:
-            del graph_group.attrs["latest_dendrogram"]
-        return (
-            generation_id,
-            hierarchy,
-            plateau_forest,
-            False,
-            estimated_peak_bytes,
-            graph,
-        )
-
     def _run_paris_from_artifacts(
         self,
         *,
@@ -502,8 +373,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                        used feature for the given assay will be used.
             resolution: Resolution parameter for `RBConfigurationVertexPartition` configuration
             integrated_graph:
-            symmetric_graph: This parameter is forwarded to `load_graph` and is same as there. (Default value: True)
-            graph_upper_only: This parameter is forwarded to `load_graph` and is same as there. (Default value: True)
+            symmetric_graph: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
+            graph_upper_only: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
             label: base label for cluster identity in the cell metadata column (Default value: 'leiden_cluster')
             random_seed: (Default value: 4444)
 
@@ -538,19 +409,10 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 feat_key,
             )
         )
-        try:
-            graph_input: object = parse_artifact_path(resolved_graph_loc)
-        except ValueError:
-            graph_group = as_zarr_group(
-                self.zw[resolved_graph_loc],
-                name=resolved_graph_loc,
-            )
-            graph_input = {
-                "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                    graph_group,
-                    ("edges", "weights"),
-                )
-            }
+        graph_input: object = resolve_stored_graph_input(
+            self.zw,
+            resolved_graph_loc,
+        )
         artifact_scope = (
             graph_input.scope
             if isinstance(graph_input, ArtifactRef)
@@ -709,16 +571,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         else:
             effective_min_cluster_size = None
 
-        try:
-            graph_ref: ArtifactRef | dict[str, str] = parse_artifact_path(graph_loc)
-        except ValueError:
-            graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
-            graph_ref = {
-                "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                    graph_group,
-                    ("edges", "weights"),
-                )
-            }
+        graph_ref = resolve_stored_graph_input(self.zw, graph_loc)
         return self._run_paris_from_artifacts(
             graph_ref=graph_ref,
             graph_loc=graph_loc,
@@ -732,64 +585,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             label=label,
             force_recalc=invalidate_artifacts,
         )
-
-    def run_clustering(
-        self,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
-        feat_key: str | None = None,
-        n_clusters: int | Literal["auto"] | None = None,
-        integrated_graph: str | None = None,
-        symmetric_graph: bool = False,
-        graph_upper_only: bool = False,
-        balanced_cut: bool = False,
-        max_size: int | None = None,
-        min_size: int | None = None,
-        max_distance_fc: float = 2,
-        force_recalc: bool = False,
-        label: str = "cluster",
-    ) -> None:
-        """Deprecated forwarding shim for `run_paris_clustering`."""
-        import warnings
-
-        warnings.warn(
-            "run_clustering is deprecated and will be removed in the next major "
-            "release. Use run_paris_clustering instead.",
-            FutureWarning,
-            stacklevel=2,
-        )
-        if (
-            balanced_cut
-            or max_size is not None
-            or min_size is not None
-            or max_distance_fc != 2
-        ):
-            raise ValueError(
-                "The DataStore balanced-cut mode has been removed. Use "
-                "run_paris_clustering(n_clusters='auto') and optionally set "
-                "min_cluster_size."
-            )
-        if n_clusters is None:
-            raise ValueError(
-                "n_clusters=None is no longer valid. Pass an integer or 'auto'."
-            )
-        if symmetric_graph or graph_upper_only:
-            warnings.warn(
-                "symmetric_graph and graph_upper_only are deprecated and ignored. "
-                "Paris always uses the canonical additive graph.",
-                FutureWarning,
-                stacklevel=2,
-            )
-        self.run_paris_clustering(
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=feat_key,
-            n_clusters=n_clusters,
-            integrated_graph=integrated_graph,
-            force_recalc=force_recalc,
-            label=label,
-        )
-        return None
 
     def run_topacedo_sampler(
         self,
@@ -837,7 +632,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                                will lead to a larger penalty. (Default value: 5.0)
             max_sampling_rate: Maximum fraction of cells to sample from each group. The effective sampling rate is lower
                                than this value depending on the neighbourhood degree and SNN density of cells.
-                               Should be greater than 0 and less than 1. (Default value: 0.1)
+                               Should be greater than 0 and less than 1. (Default value: 0.05)
             min_sampling_rate: Minimum sampling rate. Effective sampling rate is not allowed to be lower than this
                                value. Should be greater than 0 and less than 1. (Default value: 0.01)
             min_cells_per_group: Minimum number of cells to sample from each group. (Default value: 3)
@@ -845,10 +640,10 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                            lower sampling penalty. This value, is raised to mean SNN value of the cluster to obtain
                            sampling reward of the cluster. (Default value: 5.0)
             seed_reward: Reward/prize value for seed nodes. (Default value: 3.0)
-            non_seed_reward: Reward/prize for non-seed nodes. (Default value: 0.1)
+            non_seed_reward: Reward/prize for non-seed nodes. (Default value: 0)
             edge_cost_multiplier: This value is multiplier to each edge's cost. Higher values will make graph traversal
                                   costly and might lead to removal of poorly connected nodes (Default value: 1.0)
-            edge_cost_bandwidth: This value is raised to edge cost to get an adjusted edge cost (Default value: 1.0)
+            edge_cost_bandwidth: This value is raised to edge cost to get an adjusted edge cost (Default value: 10.0)
             save_sampling_key: base label for marking the cells that were sampled into a cell metadata column
                                (Default value: 'sketched')
             save_density_key: base label for saving the cell neighbourhood densities into a cell metadata column
@@ -882,24 +677,15 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                     f"An integrated graph with label {integrated_graph!r} does not exist"
                 )
             output_assay = integrated_graph
-        try:
-            graph_input: object = parse_artifact_path(graph_loc)
-        except ValueError:
-            if integrated_graph is None:
-                validate_legacy_graph_selection(
-                    self,
-                    graph_loc,
-                    from_assay,
-                    cell_key,
-                    feat_key,
-                )
-            graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
-            graph_input = {
-                "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                    graph_group,
-                    ("edges", "weights"),
-                )
-            }
+        graph_input: object = resolve_stored_graph_input(self.zw, graph_loc)
+        if not isinstance(graph_input, ArtifactRef) and integrated_graph is None:
+            validate_legacy_graph_selection(
+                self,
+                graph_loc,
+                from_assay,
+                cell_key,
+                feat_key,
+            )
         graph = self.load_graph(
             from_assay=from_assay,
             cell_key=cell_key,
@@ -996,7 +782,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 dendrogram_loc, _generation_id = resolve_compatibility_dendrogram(
                     self.zw,
                     graph_loc,
-                    final_label_key=cluster_key,
                 )
                 dendrogram = np.asarray(
                     as_zarr_array(
@@ -1060,8 +845,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             return_edges=return_edges,
             invalidate_cache=invalidate_cache,
         )
-        record = arguments.to_record()
-        planned = plan_artifact(
+        planned = arguments.plan(
             self.zw,
             scope=artifact_scope,
             assay=(
@@ -1071,11 +855,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 if artifact_scope == "assay"
                 else None
             ),
-            kind=arguments.artifact_kind,
-            operation=arguments.operation,
-            parameters=record.parameters,
-            inputs=record.inputs,
-            execution_options=record.execution_options,
             invalidate_cache=invalidate_cache,
             required_arrays=(
                 ArrayRequirement(

@@ -18,17 +18,20 @@ from scarf.storage.artifacts import (
     ArtifactScope,
     ValueFingerprintBuilder,
     artifact_exists,
+    artifact_group,
     artifact_path,
     canonical_bytes,
     callable_identity,
-    find_reusable_artifact,
+    find_reusable_artifacts,
     fingerprint_array,
+    group_at,
     inspect_artifact,
     list_artifacts,
     make_provenance,
     new_artifact_id,
     parse_artifact_path,
     provenance_hash,
+    require_complete_artifact,
 )
 
 
@@ -111,6 +114,56 @@ def _complete_artifact(
         }
     )
     return ref
+
+
+def test_artifact_group_helpers_and_require_complete() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    ref = _complete_artifact(
+        root,
+        kind="normalized",
+        operation="run_normalization",
+        parameters={},
+        inputs={},
+    )
+    path = artifact_path(ref)
+    assert group_at(root, path).path == root[path].path
+    assert artifact_group(root, ref).path == root[path].path
+    status = require_complete_artifact(root, ref)
+    assert status.complete
+    assert status.path == path
+
+    missing = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="normalized",
+        artifact_id="f" * 64,
+    )
+    with pytest.raises(KeyError, match="does not exist"):
+        require_complete_artifact(root, missing)
+
+    incomplete = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="normalized",
+        artifact_id="c" * 64,
+    )
+    incomplete_path = artifact_path(incomplete)
+    group = root.create_group(incomplete_path)
+    group.attrs.update(
+        {
+            "artifact_id": incomplete.artifact_id,
+            "kind": incomplete.kind,
+            "provenance": make_provenance(
+                operation="run_normalization",
+                parameters={},
+                inputs={},
+            ),
+            "execution_options": {},
+            "complete": False,
+        }
+    )
+    with pytest.raises(RuntimeError, match="incomplete"):
+        require_complete_artifact(root, incomplete)
 
 
 def test_artifact_kinds_cover_the_reviewed_taxonomy() -> None:
@@ -324,18 +377,15 @@ def test_artifact_inspection_listing_and_reuse_are_read_only(
         key=lambda ref: ref.artifact_id,
     )
     assert list_artifacts(root, scope="datastore") == [datastore_ref]
+    assert find_reusable_artifacts(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="normalized",
+        provenance=provenance,
+    ) == [complete_ref]
     assert (
-        find_reusable_artifact(
-            root,
-            scope="assay",
-            assay="RNA",
-            kind="normalized",
-            provenance=provenance,
-        )
-        == complete_ref
-    )
-    assert (
-        find_reusable_artifact(
+        find_reusable_artifacts(
             root,
             scope="assay",
             assay="RNA",
@@ -343,7 +393,7 @@ def test_artifact_inspection_listing_and_reuse_are_read_only(
             provenance=provenance,
             invalidate_cache=True,
         )
-        is None
+        == []
     )
     assert dict(root[artifact_path(complete_ref)].attrs) == before
 
@@ -363,16 +413,13 @@ def test_nondeterministic_artifacts_use_normal_provenance_reuse() -> None:
         inputs=provenance["inputs"],
     )
 
-    assert (
-        find_reusable_artifact(
-            root,
-            scope="assay",
-            assay="RNA",
-            kind="ann_index",
-            provenance=provenance,
-        )
-        == ref
-    )
+    assert find_reusable_artifacts(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="ann_index",
+        provenance=provenance,
+    ) == [ref]
 
 
 def test_datastore_exposes_artifact_inspection_without_writing() -> None:

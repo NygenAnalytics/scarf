@@ -4,10 +4,17 @@
 helpers from the classes below. Prefer this page over the inheritance appendix unless you
 are extending Scarf.
 
+The atomic graph methods are documented on {doc}`graph_ops` and the artifact inspection
+methods on {doc}`artifacts`, so they are excluded here rather than repeated.
+
 ```{eval-rst}
 .. autoclass:: scarf.datastore.datastore.DataStore
     :members:
     :inherited-members:
+    :exclude-members: run_normalization, run_pca, run_lsi, run_custom_reduction,
+        run_harmony, build_embedding_initialization, build_ann_index, query_neighbors,
+        build_connectivity_map, list_artifacts, inspect_artifact, load_artifact,
+        get_assay_state
 ```
 
 ## Store-bound plotting

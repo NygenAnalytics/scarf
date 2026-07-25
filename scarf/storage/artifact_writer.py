@@ -10,11 +10,12 @@ from .artifacts import (
     ArtifactRef,
     ArtifactScope,
     artifact_path,
+    canonical_bytes,
     find_reusable_artifacts,
     make_provenance,
     new_artifact_id,
+    serialize_artifact_value,
 )
-from .types import as_zarr_group
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,48 @@ class PlannedArtifact:
     required_arrays: tuple[Any, ...]
     required_attributes: tuple[Any, ...]
     reuse_validator: Callable[[ArtifactRef, zarr.Group], bool] | None
+
+    def invalidated(
+        self,
+        root: zarr.Group,
+        *,
+        required_arrays: tuple[Any, ...] | None = None,
+        required_attributes: tuple[Any, ...] | None = None,
+        reuse_validator: Callable[[ArtifactRef, zarr.Group], bool] | None = None,
+    ) -> "PlannedArtifact":
+        if not isinstance(self.provenance, dict):
+            raise TypeError("PlannedArtifact provenance must be a mapping")
+        operation = self.provenance.get("operation")
+        parameters = self.provenance.get("parameters")
+        inputs = self.provenance.get("inputs")
+        if (
+            not isinstance(operation, str)
+            or not isinstance(parameters, dict)
+            or not isinstance(inputs, dict)
+        ):
+            raise TypeError("PlannedArtifact provenance is incomplete for invalidation")
+        return plan_artifact(
+            root,
+            scope=self.ref.scope,
+            assay=self.ref.assay,
+            kind=self.ref.kind,
+            operation=operation,
+            parameters=parameters,
+            inputs=inputs,
+            execution_options=dict(self.execution_options),
+            invalidate_cache=True,
+            required_arrays=(
+                self.required_arrays if required_arrays is None else required_arrays
+            ),
+            required_attributes=(
+                self.required_attributes
+                if required_attributes is None
+                else required_attributes
+            ),
+            reuse_validator=(
+                self.reuse_validator if reuse_validator is None else reuse_validator
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +138,10 @@ def plan_artifact(
         parameters=parameters,
         inputs=inputs,
     )
+    stored_execution_options = serialize_artifact_value(execution_options)
+    if not isinstance(stored_execution_options, dict):
+        raise TypeError("execution_options must serialize to a mapping")
+    canonical_bytes(stored_execution_options)
     candidates = find_reusable_artifacts(
         root,
         scope=scope,
@@ -115,13 +162,12 @@ def plan_artifact(
         else AttributeRequirement(requirement)
         for requirement in required_attributes
     )
+    from .artifacts import artifact_group
+
     reused = None
     for candidate in candidates:
         try:
-            group = as_zarr_group(
-                root[artifact_path(candidate)],
-                name=artifact_path(candidate),
-            )
+            group = artifact_group(root, candidate)
         except KeyError:
             continue
         if any(not requirement.matches(group) for requirement in requirements):
@@ -141,7 +187,7 @@ def plan_artifact(
         return PlannedArtifact(
             ref=reused,
             provenance=provenance,
-            execution_options=execution_options,
+            execution_options=stored_execution_options,
             reused=True,
             required_arrays=required_arrays,
             required_attributes=required_attributes,
@@ -159,7 +205,7 @@ def plan_artifact(
     return PlannedArtifact(
         ref=ref,
         provenance=provenance,
-        execution_options=execution_options,
+        execution_options=stored_execution_options,
         reused=False,
         required_arrays=required_arrays,
         required_attributes=required_attributes,
@@ -232,9 +278,8 @@ def reused_artifact_group(
     root: zarr.Group,
     planned: PlannedArtifact,
 ) -> zarr.Group:
+    from .artifacts import artifact_group
+
     if not planned.reused:
         raise ValueError("Artifact is not reused")
-    return as_zarr_group(
-        root[artifact_path(planned.ref)],
-        name=artifact_path(planned.ref),
-    )
+    return artifact_group(root, planned.ref)

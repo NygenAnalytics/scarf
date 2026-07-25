@@ -50,8 +50,14 @@ scarf.cytebase.connect("scarf_docs").download_dataset(
 ds = scarf.DataStore('scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr')
 
 ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-ds.make_graph(feat_key='hvgs', k=11, dims=15)
+normalized = ds.run_normalization(feat_key='hvgs')
+pca = ds.run_pca(normalized, dims=15)
+ds.build_embedding_initialization(pca)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=11)
+ds.build_connectivity_map(neighbors)
 ds.run_paris_clustering(n_clusters=15)
+
 ds.run_umap(n_epochs=250, parallel=True)
 
 ds.plots.embedding(
@@ -147,7 +153,8 @@ writer = scarf.SubsetZarr(
     zarr_loc='scarf_datasets/tenx_5K_pbmc_rnaseq/subset.zarr',
     assays=[ds.RNA],
     cell_key='RNA_sketched',
-    reset_cell_filter=False
+    reset_cell_filter=False,
+    overwrite_existing_file=True,
 )
 writer.dump()
 ```

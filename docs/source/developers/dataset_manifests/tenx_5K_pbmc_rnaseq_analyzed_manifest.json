@@ -1,0 +1,167 @@
+{
+  "artifacts": [
+    {
+      "artifactId": "91f2a0858096fb6a50e012639f03ab681ae09df412affbd3b302a7472666c70b",
+      "assay": "RNA",
+      "kind": "ann_index",
+      "operation": "build_ann_index",
+      "path": "RNA/artifacts/ann_index/91f2a0858096fb6a50e012639f03ab681ae09df412affbd3b302a7472666c70b",
+      "scope": "assay"
+    },
+    {
+      "artifactId": "cddc6fe0d5ab585d555dcf89f18a114a0867740b648adb66c6c4e9cfd438f958",
+      "assay": "RNA",
+      "kind": "cluster_labels",
+      "operation": "run_leiden_clustering",
+      "path": "RNA/artifacts/cluster_labels/cddc6fe0d5ab585d555dcf89f18a114a0867740b648adb66c6c4e9cfd438f958",
+      "scope": "assay"
+    },
+    {
+      "artifactId": "8b528de952c0e205140950e4ab248af5682d1466c7429eb059ea70f42b4afea8",
+      "assay": "RNA",
+      "kind": "connectivity_map",
+      "operation": "build_connectivity_map",
+      "path": "RNA/artifacts/connectivity_map/8b528de952c0e205140950e4ab248af5682d1466c7429eb059ea70f42b4afea8",
+      "scope": "assay"
+    },
+    {
+      "artifactId": "9810787cae49b998f070cf75b10bbd8cd2a2e79967d61d446878b911f525bb0b",
+      "assay": "RNA",
+      "kind": "embedding",
+      "operation": "run_umap",
+      "path": "RNA/artifacts/embedding/9810787cae49b998f070cf75b10bbd8cd2a2e79967d61d446878b911f525bb0b",
+      "scope": "assay"
+    },
+    {
+      "artifactId": "2664071e0628ac34b53251601018274f7009b766937dad0906ad85d99f5a3bdb",
+      "assay": "RNA",
+      "kind": "embedding_initialization",
+      "operation": "build_embedding_initialization",
+      "path": "RNA/artifacts/embedding_initialization/2664071e0628ac34b53251601018274f7009b766937dad0906ad85d99f5a3bdb",
+      "scope": "assay"
+    },
+    {
+      "artifactId": "c5ea15cf45938d9e3dea592b4ff8d23196a773706bf9d5a59d2d56deadb5086b",
+      "assay": "RNA",
+      "kind": "feature_scaling",
+      "operation": "calculate_feature_scaling",
+      "path": "RNA/artifacts/feature_scaling/c5ea15cf45938d9e3dea592b4ff8d23196a773706bf9d5a59d2d56deadb5086b",
+      "scope": "assay"
+    },
+    {
+      "artifactId": "40eb286935ee8cd2a561e06357fb13a311676334635b2879777d3afa7aabe76f",
+      "assay": "RNA",
+      "kind": "feature_selection",
+      "operation": "mark_hvgs",
+      "path": "RNA/artifacts/feature_selection/40eb286935ee8cd2a561e06357fb13a311676334635b2879777d3afa7aabe76f",
+      "scope": "assay"
+    },
+    {
+      "artifactId": "ffa45d4990676c1b2e1378e163eff8efa1503a08aee192403a922b16c04f337b",
+      "assay": "RNA",
+      "kind": "neighbors",
+      "operation": "query_neighbors",
+      "path": "RNA/artifacts/neighbors/ffa45d4990676c1b2e1378e163eff8efa1503a08aee192403a922b16c04f337b",
+      "scope": "assay"
+    },
+    {
+      "artifactId": "78e09b9def0b550bef506d284ac6bad744ebdeec775e902dc112bb0761654dc8",
+      "assay": "RNA",
+      "kind": "normalized",
+      "operation": "run_normalization",
+      "path": "RNA/artifacts/normalized/78e09b9def0b550bef506d284ac6bad744ebdeec775e902dc112bb0761654dc8",
+      "scope": "assay"
+    },
+    {
+      "artifactId": "132668d147ac3b945f96830aebdbb278f52c1616f6bb3ddc94e694d53e4d0414",
+      "assay": "RNA",
+      "kind": "reduction",
+      "operation": "run_pca",
+      "path": "RNA/artifacts/reduction/132668d147ac3b945f96830aebdbb278f52c1616f6bb3ddc94e694d53e4d0414",
+      "scope": "assay"
+    }
+  ],
+  "dataset": "tenx_5K_pbmc_rnaseq",
+  "generatedAt": "2026-07-25T16:15:07.157908+00:00",
+  "generatorCommit": "401b64cac549baa2febc194cd90f49c776f7af8e",
+  "nCellsActive": 3940,
+  "outputPath": "/tmp/scarf_docs_datasets/tenx_5K_pbmc_rnaseq_analyzed.zarr",
+  "pipelineRefs": {
+    "ann_index": {
+      "artifact_id": "91f2a0858096fb6a50e012639f03ab681ae09df412affbd3b302a7472666c70b",
+      "assay": "RNA",
+      "kind": "ann_index",
+      "scope": "assay",
+      "type": "artifact"
+    },
+    "cell_selection": {
+      "artifact_id": "ddda5e8612b8356fe3d545f78e677c3ce816e727b575daefb1b1d4b8adcbb3e4",
+      "kind": "cell_selection",
+      "scope": "datastore",
+      "type": "artifact"
+    },
+    "connectivity_map": {
+      "artifact_id": "8b528de952c0e205140950e4ab248af5682d1466c7429eb059ea70f42b4afea8",
+      "assay": "RNA",
+      "kind": "connectivity_map",
+      "scope": "assay",
+      "type": "artifact"
+    },
+    "embedding_initialization": {
+      "artifact_id": "2664071e0628ac34b53251601018274f7009b766937dad0906ad85d99f5a3bdb",
+      "assay": "RNA",
+      "kind": "embedding_initialization",
+      "scope": "assay",
+      "type": "artifact"
+    },
+    "highly_variable_features": {
+      "artifact_id": "40eb286935ee8cd2a561e06357fb13a311676334635b2879777d3afa7aabe76f",
+      "assay": "RNA",
+      "kind": "feature_selection",
+      "scope": "assay",
+      "type": "artifact"
+    },
+    "leiden_1.0": {
+      "artifact_id": "cddc6fe0d5ab585d555dcf89f18a114a0867740b648adb66c6c4e9cfd438f958",
+      "assay": "RNA",
+      "kind": "cluster_labels",
+      "scope": "assay",
+      "type": "artifact"
+    },
+    "neighbors": {
+      "artifact_id": "ffa45d4990676c1b2e1378e163eff8efa1503a08aee192403a922b16c04f337b",
+      "assay": "RNA",
+      "kind": "neighbors",
+      "scope": "assay",
+      "type": "artifact"
+    },
+    "normalized": {
+      "artifact_id": "78e09b9def0b550bef506d284ac6bad744ebdeec775e902dc112bb0761654dc8",
+      "assay": "RNA",
+      "kind": "normalized",
+      "scope": "assay",
+      "type": "artifact"
+    },
+    "pca": {
+      "artifact_id": "132668d147ac3b945f96830aebdbb278f52c1616f6bb3ddc94e694d53e4d0414",
+      "assay": "RNA",
+      "kind": "reduction",
+      "scope": "assay",
+      "type": "artifact"
+    },
+    "umap": {
+      "artifact_id": "9810787cae49b998f070cf75b10bbd8cd2a2e79967d61d446878b911f525bb0b",
+      "assay": "RNA",
+      "kind": "embedding",
+      "scope": "assay",
+      "type": "artifact"
+    }
+  },
+  "publishNotes": [
+    "Upload the unpacked *.zarr directory for Repository.open_zarr demos.",
+    "Optionally pack a .zarr.tar.gz for download_dataset(zarr=True).",
+    "Do not overwrite the frozen 0.32.3 compatibility corpus with this store."
+  ],
+  "repository": "scarf_docs",
+  "scarfVersion": "1.0.0"
+}

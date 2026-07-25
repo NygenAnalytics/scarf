@@ -1,8 +1,11 @@
-"""Graph location values and encoded-path helpers.
+"""Graph package public surface.
 
-Public callers should use DataStore methods such as ``get_latest_graph_loc``
-and ``get_normalized_group_path``. Path types and parsers stay package-internal
-and are imported from ``scarf.graph.paths`` and ``scarf.graph.encoded_paths``.
+Analyst-facing types live here. Path helpers, encoded-path parsers, and
+operation argument planners stay package-internal.
 """
 
-__all__: list[str] = []
+from .state import AssayState as AssayState
+
+__all__ = [
+    "AssayState",
+]

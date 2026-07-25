@@ -13,10 +13,28 @@ kernelspec:
 ---
 
 (harmony_batch_correction)=
+(integration_guide)=
+(lisi_metrics)=
+(integration_metrics)=
 
 # Merge, Harmony, and partial PCA
 
-This tutorial merges datasets from different Zarr files, corrects batch effects with partial PCA or Harmony, and quantifies integration with LISI and related metrics. See also the {ref}`integration methods guide <integration_guide>`. Metrics details are in {doc}`integration_metrics`.
+This tutorial merges datasets from different Zarr files, corrects batch effects with
+partial PCA or Harmony, and quantifies integration with LISI and related metrics.
+
+**When to use which approach**
+
+| Goal | Approach |
+|---|---|
+| Merge two scRNA-seq batches in one object | `AssayMerge`, then this page |
+| Correct batch effects after merge | Atomic Harmony (`run_harmony`) or partial PCA (`pca_cell_key`) |
+| Integrate RNA + ADT in the same cells | {doc}`cite_seq_integration` (SNN / WNN) |
+| Map query cells onto a reference | {doc}`mapping_and_label_transfer` or {doc}`reference_atlas` |
+| Measure integration quality | `metric_*` helpers in the final section below |
+
+Scarf does not ship Scanorama, BBKNN, scVI, ComBat, or other external integrators.
+Export subsets with `to_anndata` or `SubsetZarr` when you need those tools. See
+{doc}`../reference/faq`.
 
 ## Prerequisites
 
@@ -26,8 +44,9 @@ This tutorial merges datasets from different Zarr files, corrects batch effects 
 ## What you will learn
 
 - Merge assays from separate Zarr files with `AssayMerge`
-- Compare a naive joint analysis with partial PCA and Harmony
+- Compare a naive joint analysis with partial PCA and Harmony using atomic graph ops
 - Quantify mixing and label preservation with LISI and related metrics
+
 
 ## Dataset
 
@@ -80,7 +99,7 @@ ds_stim
 ---
 ## 2) Merging datasets
 
-The merging step will make sure that the features are in the same order as in the merged file. The merged data will be dumped into a new Zarr file. Use `AssayMerge` to merge multiple samples (the `ZarrMerge` name is a deprecated alias that emits a warning).
+The merging step will make sure that the features are in the same order as in the merged file. The merged data will be dumped into a new Zarr file. Use `AssayMerge` to merge multiple samples.
 
 ```{code-cell} ipython3
 scarf.AssayMerge(
@@ -145,16 +164,18 @@ ds.mark_hvgs(
 )
 ```
 
-Next, we create a graph of cells in a standard way.
+Next, build the neighbourhood graph with the atomic chain (normalization → PCA →
+embedding initialization → ANN → neighbors → connectivity):
 
 ```{code-cell} ipython3
-ds.make_graph(
-    feat_key='hvgs',
-    k=21, 
-    dims=25,
-    n_centroids=100
-)
+normalized = ds.run_normalization(feat_key='hvgs')
+pca = ds.run_pca(normalized, dims=25)
+ds.build_embedding_initialization(pca)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=21)
+ds.build_connectivity_map(neighbors)
 ```
+
 
 Calculating UMAP embedding of cells:
 
@@ -216,18 +237,17 @@ ds.cells.insert(
 )
 ```
 
-PCA is trained during graph creation. Pass `pca_cell_key='is_ctrl'` so only control cells
-define the PCA basis.
+Pass `pca_cell_key='is_ctrl'` to `run_pca` so only control cells define the PCA basis.
+Reuse the same normalized artifact from the naive analysis:
 
 ```{code-cell} ipython3
-ds.make_graph(
-    feat_key='hvgs',
-    k=21, 
-    dims=25,
-    n_centroids=100,
-    pca_cell_key='is_ctrl'
-)
+pca_partial = ds.run_pca(normalized, dims=25, pca_cell_key='is_ctrl')
+ds.build_embedding_initialization(pca_partial)
+ann = ds.build_ann_index(pca_partial)
+neighbors = ds.query_neighbors(ann, k=21)
+ds.build_connectivity_map(neighbors)
 ```
+
 
 We run UMAP as usual, but the UMAP embeddings are saved in a new cell attribute column so as to not overwrite the previous UMAP values. The new column will be called `RNA_pUMAP`; 'RNA' is automatically prepend because the assay name is `RNA`
 
@@ -265,7 +285,8 @@ ds.plots.embedding(
 ---
 ## 5) Harmony batch correction
 
-Harmony runs inside `make_graph` on the PCA embedding before KNN construction. Pass `harmonize=True` and the batch column name:
+Harmony corrects the PCA embedding before ANN and neighbor query. Call `run_harmony`
+between PCA and `build_ann_index`:
 
 ```{warning}
 Here `sample_id` distinguishes control from stimulated cells as well as the source dataset.
@@ -274,14 +295,12 @@ columns that are not perfectly confounded with the biological comparison.
 ```
 
 ```{code-cell} ipython3
-ds.make_graph(
-    feat_key='hvgs',
-    k=21,
-    dims=25,
-    n_centroids=100,
-    harmonize=True,
-    batch_columns=['sample_id'],
-)
+pca_full = ds.run_pca(normalized, dims=25)
+corrected = ds.run_harmony(['sample_id'], pca_full)
+ds.build_embedding_initialization(pca_full)
+ann = ds.build_ann_index(corrected)
+neighbors = ds.query_neighbors(ann, k=21)
+ds.build_connectivity_map(neighbors)
 
 ds.run_umap(
     n_epochs=250,
@@ -293,6 +312,7 @@ ds.run_umap(
 
 ds.run_leiden_clustering(resolution=1.0)
 ```
+
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -317,14 +337,20 @@ The UMAP plots suggest that partial PCA and Harmony mix the two samples, but a v
 not enough. Scarf provides several metrics that quantify integration from different angles.
 The code below evaluates the latest graph, which is the Harmony graph at this point. To compare
 the naive, partial PCA, and Harmony results, calculate and retain these metrics immediately
-after building each graph. See {doc}`integration_metrics` and the
-{ref}`integration methods guide <integration_guide>`.
+after building each graph.
 
-**LISI** measures how well a label mixes inside each cell's KNN neighborhood. Running it on `sample_id` tells us whether batches are mixed, while running it on `orig_cluster_labels` checks that cell types are still grouped. Good integration raises batch LISI while keeping cell-type LISI low. With `save_result=True` the per-cell scores are written back as `lisi__sample_id__*` columns, which you can overlay on the UMAP layouts.
+**LISI** measures how well a label mixes inside each cell's KNN neighborhood. Running it on
+`sample_id` tells us whether batches are mixed, while running it on `orig_cluster_labels`
+checks that cell types are still grouped. Good integration raises batch LISI while keeping
+cell-type LISI low. With `save_result=True` the per-cell scores are written back as
+`lisi__sample_id__*` columns, which you can overlay on the UMAP layouts.
 
-Default `perplexity=30` needs at least 90 neighbors. This tutorial uses `k=21`, so the call
-sets `perplexity=7` explicitly to match the available neighborhood. Raise `k` when you need a
-larger LISI neighborhood.
+Default `perplexity=30` expects roughly `3 * perplexity` graph neighbors. This tutorial uses
+`k=21`, so the call sets `perplexity=7` explicitly. If you omit `perplexity` on a smaller
+graph, Scarf reduces it automatically and prints a warning. The scIB benchmark convention
+compares neighborhoods with 15, 50, or 90 neighbors, so use a matching `k` when comparing
+Scarf results to a published benchmark.
+
 
 ```{code-cell} ipython3
 ds.metric_lisi(
@@ -396,7 +422,8 @@ UMAP/Leiden columns (`RNA_UMAP`, `RNA_pUMAP`, `RNA_hUMAP`, and so on). With
 
 ## Next steps
 
-- {doc}`integration_metrics`
-- {doc}`choosing_integration_methods`
+- {doc}`cite_seq_integration`
 - {doc}`mapping_and_label_transfer`
 - {doc}`reference_atlas`
+- {doc}`../reference/faq`
+- {doc}`../reference/api/integration`

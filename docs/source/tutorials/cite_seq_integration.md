@@ -61,12 +61,12 @@ ds.mark_hvgs(
     max_mean=2,
     max_var=6,
 )
-ds.make_graph(
-    feat_key='hvgs',
-    k=21,
-    dims=15,
-    n_centroids=100,
-)
+normalized = ds.run_normalization(feat_key='hvgs')
+pca = ds.run_pca(normalized, dims=15)
+ds.build_embedding_initialization(pca)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=21)
+ds.build_connectivity_map(neighbors)
 ds.run_umap(
     n_epochs=250,
     spread=5,
@@ -79,6 +79,8 @@ adt_names = ds.ADT.feats.to_pandas_dataframe(['names'])['names']
 is_control = adt_names.str.contains('control').values
 ds.ADT.feats.update_key(~is_control, 'I')
 
+# ADT: dims=0 disables linear reduction (normalized features are used directly).
+# Prefer make_graph for this special case until a dedicated atomic helper exists.
 ds.make_graph(
     from_assay='ADT',
     feat_key='I',
@@ -98,6 +100,7 @@ ds.run_leiden_clustering(
     resolution=1,
 )
 ```
+
 
 ## Guided steps
 
@@ -199,6 +202,15 @@ ds.plots.embedding(
 
 SNN supports two or more assays; WNN is limited to two. Try WNN when one modality is sparse or weaker than the other.
 
+(multimodal_integration)=
+
+## HTO demultiplexing
+
+`DataStore.mark_hto_identities` assigns hashtag identities when an HTO assay is present
+(default assay name `HTO`). A public executable HTO dataset is not yet in the Scarf
+catalog; see {doc}`../reference/api/datastore` until one is added.
+
+
 ## Common mistakes and limitations
 
 - Building assay graphs from different cell subsets before integration
@@ -217,7 +229,8 @@ Leiden columns (for example `RNA+ADT_UMAP` and `RNA+ADT_wnn_leiden_cluster`).
 
 ## Next steps
 
-- {doc}`multimodal_integration`
-- {doc}`choosing_integration_methods`
+- {doc}`cite_seq`
 - {doc}`plotting`
 - {doc}`data_organization`
+- {doc}`data_integration`
+

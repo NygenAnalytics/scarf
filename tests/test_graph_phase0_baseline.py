@@ -173,12 +173,11 @@ def test_get_normalized_group_path_before_and_after_graph_exists() -> None:
     assert after in store.zw
 
 
-def test_get_latest_graph_loc_public_and_private_alias_match_master_chain() -> None:
+def test_get_latest_graph_loc_matches_master_chain() -> None:
     store = _memory_graph_store()
     locs = _install_master_format_assay_graph(store)
 
     assert store.get_latest_graph_loc("RNA", "I", "hvgs") == locs["graph"]
-    assert store._get_latest_graph_loc("RNA", "I", "hvgs") == locs["graph"]
 
 
 def test_lookup_and_load_graph_do_not_mutate_master_format_store() -> None:
@@ -264,9 +263,14 @@ def test_v1_prep_suffix_conventions_are_distinct_from_master() -> None:
 
 def test_parse_master_and_v1_prep_assay_graph_paths() -> None:
     from scarf.graph.encoded_paths import (
-        make_assay_graph_paths,
+        make_cell_graph_group_path,
+        make_nearest_neighbors_group_path,
+        make_neighbor_index_group_path,
+        make_normalized_group_path,
+        make_reduction_group_path,
         parse_assay_graph_paths,
     )
+    from scarf.graph.paths import AssayGraphPaths
 
     master = (
         "RNA/normed__I__hvgs/reduction__pca__10__I/"
@@ -284,23 +288,27 @@ def test_parse_master_and_v1_prep_assay_graph_paths() -> None:
     assert stored.local_connectivity == 1.0
     assert stored.bandwidth == 1.5
 
-    built = make_assay_graph_paths(
-        from_assay="RNA",
-        cell_key="I",
-        feat_key="hvgs",
-        reduction_method="pca",
-        dims=10,
-        pca_cell_key="I",
-        ann_metric="l2",
-        ann_efc=50,
-        ann_ef=50,
-        ann_m=16,
-        rand_state=1,
-        k=11,
-        local_connectivity=1.0,
-        bandwidth=1.5,
+    normalized = make_normalized_group_path("RNA", "I", "hvgs")
+    reduction = make_reduction_group_path(normalized, "pca", 10, "I")
+    neighbor_index = make_neighbor_index_group_path(
+        reduction,
+        "l2",
+        50,
+        50,
+        16,
+        1,
         feat_scaling=False,
         harmony_contract_hash="deadbeefcafebabe",
+    )
+    nearest_neighbors = make_nearest_neighbors_group_path(neighbor_index, 11)
+    cell_graph = make_cell_graph_group_path(nearest_neighbors, 1.0, 1.5)
+    built = AssayGraphPaths(
+        normalized_group_path=normalized,
+        reduction_group_path=reduction,
+        neighbor_index_group_path=neighbor_index,
+        nearest_neighbors_group_path=nearest_neighbors,
+        cell_graph_group_path=cell_graph,
+        kmeans_initialization_group_path=None,
     )
     assert built.neighbor_index_group_path.endswith(
         "ann__l2__50__50__16__1__unscaled__harmony_deadbeefcafebabe"

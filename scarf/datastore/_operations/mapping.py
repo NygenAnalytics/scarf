@@ -82,66 +82,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             "reduction_fingerprint",
         }
     )
-    _LEGACY_PROJECTION_ATTRS = {
-        "cell_key": "cellKey",
-        "feature_key": "featureKey",
-        "save_k": "saveK",
-        "reference_cell_fingerprint": "referenceCellHash",
-        "reference_feature_fingerprint": "referenceFeatureHash",
-        "reference_path": "referencePath",
-        "reduction_path": "reductionPath",
-        "ann_path": "annPath",
-        "normalization_fingerprint": "referenceSubsetHash",
-        "reduction_fingerprint": "reductionHash",
-        "correction_method": "correctionMethod",
-        "mapping_reference_path": "mappingReferencePath",
-        "feature_coverage": "featureCoverage",
-        "query_batch_count": "queryBatchCount",
-        "query_batch_columns": "queryBatchColumns",
-        "query_batch_fingerprint": "queryBatchHash",
-        "algorithm_variant": "algorithmVariant",
-        "target_name": "targetName",
-        "target_cell_key": "targetCellKey",
-        "target_feature_key": "targetFeatureKey",
-        "target_cell_fingerprint": "targetCellHash",
-        "selected_feature_fingerprint": "selectedFeatureHash",
-        "reduction_method": "reductionMethod",
-        "reduction_dimensions": "reductionDimensions",
-        "ann_metric": "annMetric",
-        "ann_efc": "annEfc",
-        "ann_ef": "annEf",
-        "ann_m": "annM",
-        "ann_random_state": "annRandomState",
-        "ann_feature_scaling": "annFeatureScaling",
-        "ann_is_harmonized": "annIsHarmonized",
-        "ann_source_path": "annSourcePath",
-    }
-    _LEGACY_PROJECTION_ARRAYS = {
-        "reference_feature_indices": "referenceFeatureIndices",
-        "uncorrected_latent": "uncorrectedLatent",
-        "corrected_latent": "correctedLatent",
-    }
-
-    @classmethod
-    def _projection_attr(
-        cls,
-        attrs: Any,
-        name: str,
-        default: Any = None,
-    ) -> Any:
-        if name in attrs:
-            return attrs[name]
-        legacy_name = cls._LEGACY_PROJECTION_ATTRS.get(name)
-        return attrs.get(legacy_name, default) if legacy_name is not None else default
-
-    @classmethod
-    def _projection_array_name(cls, store: zarr.Group, name: str) -> str:
-        if name in store:
-            return name
-        legacy_name = cls._LEGACY_PROJECTION_ARRAYS.get(name)
-        if legacy_name is not None and legacy_name in store:
-            return legacy_name
-        return name
 
     def _select_projection_artifact(
         self,
@@ -257,18 +197,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         attrs = store.attrs
         if not bool(attrs.get("complete", False)):
             return False
-        if any(
-            self._projection_attr(attrs, name) is None
-            for name in self._PROJECTION_PROVENANCE_ATTRS
-        ):
+        if any(attrs.get(name) is None for name in self._PROJECTION_PROVENANCE_ATTRS):
             return False
-        return (
-            self._projection_array_name(
-                store,
-                "reference_feature_indices",
-            )
-            in store
-        )
+        return "reference_feature_indices" in store
 
     def _load_complete_projection(
         self,
@@ -298,13 +229,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             # legacy projections lack it entirely. A projection that carries the
             # marker but is missing required provenance is a partial or corrupt
             # current write and must not silently downgrade to the legacy path.
-            if (
-                self._projection_array_name(
-                    store,
-                    "reference_feature_indices",
-                )
-                in store
-            ):
+            if "reference_feature_indices" in store:
                 raise ValueError(
                     f"Projection {target_name!r} has incomplete provenance metadata. "
                     "Re-run run_mapping to rebuild it."
@@ -316,22 +241,19 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 stacklevel=3,
             )
             return store
-        stored_cell_key = self._projection_attr(attrs, "cell_key")
+        stored_cell_key = attrs.get("cell_key")
         if attrs.get("assay") != from_assay or stored_cell_key != cell_key:
             raise ValueError(
                 f"Projection {target_name!r} does not match the selected reference assay or cells."
             )
-        stored_feat_key = self._projection_attr(attrs, "feature_key")
+        stored_feat_key = attrs.get("feature_key")
         if feat_key is not None and stored_feat_key != feat_key:
             logger.warning(
                 f"Projection {target_name!r} uses feature key {stored_feat_key!r}, "
                 f"not the current key {feat_key!r}; validating its stored provenance."
             )
         reference_cells = self.cells.fetch("ids", key=cast(str, stored_cell_key))
-        if self._projection_attr(
-            attrs,
-            "reference_cell_fingerprint",
-        ) != array_hash(reference_cells):
+        if attrs.get("reference_cell_fingerprint") != array_hash(reference_cells):
             raise ValueError(
                 f"Projection {target_name!r} was built from a different reference cell set."
             )
@@ -344,7 +266,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         from ...mapping.hashing import array_hash
 
         attrs = store.attrs
-        save_k = self._projection_attr(attrs, "save_k")
+        save_k = attrs.get("save_k")
         if (
             isinstance(save_k, bool)
             or not isinstance(save_k, int | np.integer)
@@ -355,24 +277,21 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 f"Projection {target_name!r} has inconsistent saved-neighbor provenance."
             )
         assay_name = cast(str, attrs["assay"])
-        cell_key = cast(str, self._projection_attr(attrs, "cell_key"))
-        feature_key = cast(str, self._projection_attr(attrs, "feature_key"))
+        cell_key = cast(str, attrs.get("cell_key"))
+        feature_key = cast(str, attrs.get("feature_key"))
         source_assay = self._get_assay(assay_name)
         feature_column = (
             feature_key if feature_key == "I" else f"{cell_key}__{feature_key}"
         )
         reference_features = source_assay.feats.fetch("ids", key=feature_column)
-        if self._projection_attr(
-            attrs,
-            "reference_feature_fingerprint",
-        ) != array_hash(reference_features):
+        if attrs.get("reference_feature_fingerprint") != array_hash(reference_features):
             raise ValueError(
                 f"Projection {target_name!r} was built from a different reference feature set."
             )
 
         reference_path = cast(
             str,
-            self._projection_attr(attrs, "reference_path", ""),
+            attrs.get("reference_path", ""),
         )
         if reference_path not in self.zw:
             raise ValueError(
@@ -385,17 +304,14 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             expected_normalized_identity = normed.attrs.get("subset_hash")
         else:
             expected_normalized_identity = normalized_ref.artifact_id
-        if (
-            self._projection_attr(attrs, "normalization_fingerprint")
-            != expected_normalized_identity
-        ):
+        if attrs.get("normalization_fingerprint") != expected_normalized_identity:
             raise ValueError(
                 f"Projection {target_name!r} references changed normalized data."
             )
 
         reduction_path = cast(
             str,
-            self._projection_attr(attrs, "reduction_path", ""),
+            attrs.get("reduction_path", ""),
         )
         if reduction_path not in self.zw:
             raise ValueError(
@@ -419,21 +335,18 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 name=reduction_array_name,
             )[:]
         )
-        if self._projection_attr(
-            attrs,
-            "reduction_fingerprint",
-        ) != array_hash(loadings):
+        if attrs.get("reduction_fingerprint") != array_hash(loadings):
             raise ValueError(
                 f"Projection {target_name!r} references changed reduction loadings."
             )
 
-        ann_path = cast(str, self._projection_attr(attrs, "ann_path", ""))
+        ann_path = cast(str, attrs.get("ann_path", ""))
         if ann_path not in self.zw:
             raise ValueError(
                 f"Projection {target_name!r} references a missing ANN index."
             )
         ann = as_zarr_group(self.zw[ann_path], name=ann_path)
-        expected_scaling = bool(self._projection_attr(attrs, "ann_feature_scaling"))
+        expected_scaling = bool(attrs.get("ann_feature_scaling"))
         try:
             ann_ref = parse_artifact_path(ann_path)
         except ValueError:
@@ -487,15 +400,14 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise ValueError(
                 f"Projection {target_name!r} references an ANN index with changed scaling."
             )
-        if actual_harmonized != bool(self._projection_attr(attrs, "ann_is_harmonized")):
+        if actual_harmonized != bool(attrs.get("ann_is_harmonized")):
             raise ValueError(
                 f"Projection {target_name!r} references a changed ANN coordinate space."
             )
         settings_ann_path = ann_path
         if "__intersection_" in ann_path:
             source_ann_path = ann.attrs.get(
-                "ann_source_path",
-                ann.attrs.get("sourceAnnPath"),
+                "ann_source_path", ann.attrs.get("sourceAnnPath")
             )
             if not isinstance(source_ann_path, str) or not source_ann_path:
                 raise ValueError(
@@ -524,10 +436,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             path_ann_m = int(artifact_ann_parameters["ann_m"])
             path_ann_random_state = int(artifact_ann_parameters["rand_state"])
         stored_ann_values = (
-            self._projection_attr(attrs, "ann_efc"),
-            self._projection_attr(attrs, "ann_ef"),
-            self._projection_attr(attrs, "ann_m"),
-            self._projection_attr(attrs, "ann_random_state"),
+            attrs.get("ann_efc"),
+            attrs.get("ann_ef"),
+            attrs.get("ann_m"),
+            attrs.get("ann_random_state"),
         )
         if not all(isinstance(value, int | float) for value in stored_ann_values):
             raise ValueError(
@@ -537,7 +449,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             tuple[int | float, ...], stored_ann_values
         )
         if (
-            self._projection_attr(attrs, "ann_metric") != path_ann_metric
+            attrs.get("ann_metric") != path_ann_metric
             or int(ann_efc) != path_ann_efc
             or int(ann_ef) != path_ann_ef
             or int(ann_m) != path_ann_m
@@ -547,18 +459,14 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 f"Projection {target_name!r} references incompatible ANN settings."
             )
 
-        feature_indices_name = self._projection_array_name(
-            store,
-            "reference_feature_indices",
-        )
-        if feature_indices_name not in store:
+        if "reference_feature_indices" not in store:
             raise ValueError(
                 f"Projection {target_name!r} is missing selected-feature provenance."
             )
         feature_indices = np.asarray(
             as_zarr_array(
-                store[feature_indices_name],
-                name=feature_indices_name,
+                store["reference_feature_indices"],
+                name="reference_feature_indices",
             )[:],
             dtype=np.int64,
         )
@@ -569,21 +477,20 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise ValueError(
                 f"Projection {target_name!r} contains invalid reference feature indices."
             )
-        if self._projection_attr(
-            attrs,
-            "selected_feature_fingerprint",
-        ) != array_hash(all_feature_ids[feature_indices]):
+        if attrs.get("selected_feature_fingerprint") != array_hash(
+            all_feature_ids[feature_indices]
+        ):
             raise ValueError(
                 f"Projection {target_name!r} references a changed selected feature set."
             )
         if "__intersection_" in ann_path and ann.attrs.get(
             "selectedFeatureHash"
-        ) != self._projection_attr(attrs, "selected_feature_fingerprint"):
+        ) != attrs.get("selected_feature_fingerprint"):
             raise ValueError(
                 f"Projection {target_name!r} references a changed intersection ANN index."
             )
         if "__intersection_" in ann_path:
-            source_ann_path = self._projection_attr(attrs, "ann_source_path")
+            source_ann_path = attrs.get("ann_source_path")
             if (
                 not isinstance(source_ann_path, str)
                 or not source_ann_path
@@ -598,11 +505,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 raise ValueError(
                     f"Projection {target_name!r} references a changed source ANN space."
                 )
-        if self._projection_attr(attrs, "correction_method") == "symphony":
-            mapping_path = self._projection_attr(
-                attrs,
-                "mapping_reference_path",
-            )
+        if attrs.get("correction_method") == "symphony":
+            mapping_path = attrs.get("mapping_reference_path")
             if not isinstance(mapping_path, str) or mapping_path not in self.zw:
                 raise ValueError(
                     f"Projection {target_name!r} references a missing mapping artifact."
@@ -2286,23 +2190,14 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         projection_path = str(getattr(store, "path", ""))
         indices = as_zarr_array(store["indices"], name="indices")
         n_cells = int(indices.shape[0])
-        correction_method = str(
-            self._projection_attr(
-                store.attrs,
-                "correction_method",
-                "none",
-            )
-        )
+        correction_method = str(store.attrs.get("correction_method", "none"))
         diagnostics: dict[str, float | str] = {}
         for output_key, attribute_name in (
             ("featureCoverage", "feature_coverage"),
             ("queryBatchCount", "query_batch_count"),
             ("algorithmVariant", "algorithm_variant"),
         ):
-            value = self._projection_attr(
-                store.attrs,
-                attribute_name,
-            )
+            value = store.attrs.get(attribute_name)
             if value is not None:
                 if isinstance(value, (bool, np.bool_)):
                     continue
@@ -2320,12 +2215,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
 
         def _optional_array(name: str) -> np.ndarray | None:
-            resolved_name = self._projection_array_name(store, name)
-            if resolved_name not in store:
+            if name not in store:
                 return None
-            return np.asarray(
-                as_zarr_array(store[resolved_name], name=resolved_name)[:]
-            )
+            return np.asarray(as_zarr_array(store[name], name=name)[:])
 
         return MappingResult(
             projection_path=projection_path,
@@ -2582,11 +2474,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             left=0.0,
             right=1.0,
         )
-        feature_coverage_value = self._projection_attr(
-            store.attrs,
-            "feature_coverage",
-            1.0,
-        )
+        feature_coverage_value = store.attrs.get("feature_coverage", 1.0)
         if not isinstance(feature_coverage_value, int | float):
             raise RuntimeError(
                 "Projection provenance is missing numeric feature coverage"
@@ -2643,10 +2531,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     )[:]
                 ),
             )
-        mapping_path = self._projection_attr(
-            projection.attrs,
-            "mapping_reference_path",
-        )
+        mapping_path = projection.attrs.get("mapping_reference_path")
         if isinstance(mapping_path, str) and mapping_path in self.zw:
             artifact = as_zarr_group(self.zw[mapping_path], name=mapping_path)
             if (
@@ -2686,17 +2571,11 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     ),
                 )
 
-        ann_path = self._projection_attr(projection.attrs, "ann_path")
+        ann_path = projection.attrs.get("ann_path")
         if not isinstance(ann_path, str) or ann_path not in self.zw:
             stored_assay = projection.attrs.get("assay")
-            stored_cell_key = self._projection_attr(
-                projection.attrs,
-                "cell_key",
-            )
-            stored_feature_key = self._projection_attr(
-                projection.attrs,
-                "feature_key",
-            )
+            stored_cell_key = projection.attrs.get("cell_key")
+            stored_feature_key = projection.attrs.get("feature_key")
             if isinstance(stored_assay, str):
                 from_assay = stored_assay
             if isinstance(stored_cell_key, str):

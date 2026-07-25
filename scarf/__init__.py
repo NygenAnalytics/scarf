@@ -63,7 +63,6 @@ if TYPE_CHECKING:
     from .merge import (
         AssayMerge as AssayMerge,
         DatasetMerge as DatasetMerge,
-        ZarrMerge as ZarrMerge,
     )
     from .readers import (
         CSVReader as CSVReader,
@@ -165,7 +164,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     ),
     "SparseToZarr": (".writers", "SparseToZarr"),
     "SubsetZarr": (".writers", "SubsetZarr"),
-    "ZarrMerge": (".merge", "ZarrMerge"),
     "clean_array": (".utils", "clean_array"),
     "controlled_compute": (".utils", "controlled_compute"),
     "coordinate_melding": (".features.genomic.melding", "coordinate_melding"),

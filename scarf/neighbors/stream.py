@@ -164,9 +164,6 @@ class AnnStream:
     def iter_blocks(self, msg: str = "") -> Generator[np.ndarray, None, None]:
         yield from self.transform_stream.iter_raw(msg)
 
-    def transform_z(self, values: np.ndarray) -> np.ndarray:
-        return np.asarray((values - self.mu) / self.sigma)
-
     def transform_query(self, values: np.ndarray) -> np.ndarray:
         query = np.asarray(values)
         if query.ndim != 2:

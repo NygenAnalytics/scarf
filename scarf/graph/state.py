@@ -10,9 +10,14 @@ import zarr
 
 from ..storage.artifacts import (
     ArtifactRef,
+    artifact_group,
     artifact_path,
+    fingerprint_stored_arrays,
     fingerprint_strings,
+    group_at,
     inspect_artifact,
+    parse_artifact_path,
+    require_complete_artifact,
 )
 from ..storage.types import as_zarr_array, as_zarr_group
 from .paths import AssayGraphPaths, StoredAssayGraph
@@ -247,17 +252,9 @@ def write_assay_state(root: zarr.Group, state: AssayState) -> None:
         ref = getattr(state, field_name)
         if ref is None:
             continue
-        status = inspect_artifact(root, ref)
-        if not status.exists or not status.complete:
-            raise RuntimeError(
-                f"Cannot select incomplete {field_name} artifact: {status.path}"
-            )
+        require_complete_artifact(root, ref)
     for name, ref in state.named_results.items():
-        status = inspect_artifact(root, ref)
-        if not status.exists or not status.complete:
-            raise RuntimeError(
-                f"Cannot select incomplete named result {name!r}: {status.path}"
-            )
+        status = require_complete_artifact(root, ref)
         if name == "mapping_reference":
             expected = {
                 "reduction": state.reduction,
@@ -285,25 +282,21 @@ def write_assay_state(root: zarr.Group, state: AssayState) -> None:
     if state.connectivity_map is not None:
         _stored_assay_graph(root, state)
     path = assay_state_path(state.assay)
-    group = (
-        as_zarr_group(root[path], name=path)
-        if path in root
-        else root.create_group(path)
-    )
+    group = group_at(root, path) if path in root else root.create_group(path)
     group.attrs["state"] = state.to_dict()
 
 
 def _complete_path(root: zarr.Group, ref: ArtifactRef, field_name: str) -> str:
-    status = inspect_artifact(root, ref)
-    if not status.exists:
+    try:
+        return require_complete_artifact(root, ref).path
+    except KeyError as exc:
         raise KeyError(
-            f"Assay state {field_name} artifact does not exist: {status.path}"
-        )
-    if not status.complete:
+            f"Assay state {field_name} artifact does not exist: {artifact_path(ref)}"
+        ) from exc
+    except RuntimeError as exc:
         raise RuntimeError(
-            f"Assay state {field_name} artifact is incomplete: {status.path}"
-        )
-    return status.path
+            f"Assay state {field_name} artifact is incomplete: {artifact_path(ref)}"
+        ) from exc
 
 
 def normalized_path_from_state(
@@ -330,7 +323,10 @@ def embedding_initialization_path_from_state(
     if state is None or not state.matches(cell_key, feat_key):
         return None
     if state.embedding_initialization is None:
-        raise KeyError("AssayState has no selected embedding initialization")
+        raise KeyError(
+            "AssayState has no selected embedding initialization; call "
+            "build_embedding_initialization or pass ini_embed"
+        )
     return _complete_path(
         root,
         state.embedding_initialization,
@@ -348,22 +344,30 @@ def _parameters(root: zarr.Group, ref: ArtifactRef | None) -> dict[str, Any]:
 
 
 def _input_ref(root: zarr.Group, ref: ArtifactRef, name: str) -> ArtifactRef:
-    status = inspect_artifact(root, ref)
-    if not status.exists:
-        raise KeyError(f"Artifact input owner does not exist: {status.path}")
-    if not status.complete:
-        raise RuntimeError(f"Artifact input owner is incomplete: {status.path}")
+    status = require_complete_artifact(root, ref)
     inputs = status.inputs or {}
     value = inputs.get(name)
     if not isinstance(value, Mapping):
         raise ValueError(f"{ref.kind} artifact has no {name!r} artifact input")
     input_ref = ArtifactRef.from_dict(value)
-    input_status = inspect_artifact(root, input_ref)
-    if not input_status.exists:
-        raise KeyError(f"Artifact input does not exist: {input_status.path}")
-    if not input_status.complete:
-        raise RuntimeError(f"Artifact input is incomplete: {input_status.path}")
+    require_complete_artifact(root, input_ref)
     return input_ref
+
+
+def resolve_stored_graph_input(
+    root: zarr.Group,
+    graph_loc: str,
+) -> ArtifactRef | dict[str, str]:
+    try:
+        return parse_artifact_path(graph_loc)
+    except ValueError:
+        graph_group = group_at(root, graph_loc)
+        return {
+            "legacy_graph_fingerprint": fingerprint_stored_arrays(
+                graph_group,
+                ("edges", "weights"),
+            )
+        }
 
 
 def _require_input(
@@ -495,10 +499,7 @@ def _stored_assay_graph(root: zarr.Group, state: AssayState) -> StoredAssayGraph
     else:
         reduction_dims = _optional_int(reduction.get("dims"))
     if reduction_dims is None and state.reduction is not None:
-        reduction_group = as_zarr_group(
-            root[artifact_path(state.reduction)],
-            name=artifact_path(state.reduction),
-        )
+        reduction_group = artifact_group(root, state.reduction)
         if "loadings" in reduction_group:
             reduction_dims = int(
                 as_zarr_array(
@@ -627,13 +628,10 @@ def _validate_selection_artifact(
         raise ValueError(f"{kind} artifact is incomplete")
     if table_path not in root:
         raise ValueError(f"Selection table {table_path!r} is unavailable")
-    table = as_zarr_group(root[table_path], name=table_path)
+    table = group_at(root, table_path)
     if column not in table or "ids" not in table:
         raise ValueError(f"Selection source column {column!r} is unavailable")
-    selection_group = as_zarr_group(
-        root[artifact_path(ref)],
-        name=artifact_path(ref),
-    )
+    selection_group = artifact_group(root, ref)
     if "values" not in selection_group:
         raise ValueError(f"{kind} artifact has no values")
     stored_values = np.asarray(

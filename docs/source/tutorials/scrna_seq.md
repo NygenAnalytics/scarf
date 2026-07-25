@@ -31,9 +31,11 @@ minimal pipeline see {ref}`Quick start <quickstart>`. For Scanpy equivalents see
 
 - Convert Cell Ranger H5 to Zarr and open a `DataStore`
 - Filter cells without deleting them from the store
-- Select highly variable genes and build a neighbourhood graph with `make_graph`
+- Select highly variable genes and build a neighbourhood graph with atomic ops
 - Run UMAP and Leiden clustering on that graph
 - Rank marker genes per cluster and plot them
+- Optionally impute sparse features with graph diffusion
+
 
 ## Dataset
 
@@ -163,25 +165,25 @@ ds.RNA.feats.head()
 
 ## 4) Neighbourhood graph
 
-`make_graph` is the central step. It normalizes selected features, runs PCA, builds an ANN
-index, queries K nearest neighbours, computes edge weights, and fits MiniBatch KMeans
-centroids used for embedding initialization.
+Build the graph as separate provenance-backed steps. For a shorter default path, see
+{ref}`Quick start <quickstart>` (`ds.pipeline.run`) or
+{doc}`atomic_graph_operations`.
 
 Important parameters:
 
 - `feat_key`: feature column to use (`hvgs` here)
-- `k`: neighbours per cell
 - `dims`: PCA dimensions
-- `n_centroids`: KMeans centroids
+- `k`: neighbours per cell
 
 ```{code-cell} ipython3
-ds.make_graph(
-    feat_key='hvgs',
-    k=11,
-    dims=15,
-    n_centroids=100
-)
+normalized = ds.run_normalization(feat_key='hvgs')
+pca = ds.run_pca(normalized, dims=15)
+ds.build_embedding_initialization(pca)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=11)
+ds.build_connectivity_map(neighbors)
 ```
+
 
 ## 5) Dimensionality reduction
 
@@ -291,12 +293,40 @@ are present.
 Annotation from markers, known gene panels, and subclustering is covered in
 {doc}`annotation`.
 
+(imputation)=
+
+## 8) Feature imputation
+
+Scarf can impute feature values by diffusing expression along the KNN graph
+(MAGIC-style). Use `get_imputed` after the neighbourhood graph exists.
+
+
+```{code-cell} ipython3
+imputed_cd4 = ds.get_imputed(feature_name='CD4', t=2)
+ds.cells.insert('CD4_imputed', imputed_cd4, overwrite=True)
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by=['CD4', 'CD4_imputed'],
+    n_columns=2,
+    sort_values=True,
+)
+```
+
+The `t` parameter controls diffusion depth. Higher values smooth more. The diffusion
+operator is cached under the graph location in the Zarr store.
+
+Raw CD4 is sparse; the imputed panel should keep the same high-expression neighborhoods
+while filling gaps inside them. Do not use imputed values as input counts for differential
+expression or as evidence that a gene was detected in a cell.
+
 ## Common mistakes and limitations
 
 - Reusing QC thresholds from another dataset without inspecting distributions
-- Calling `run_umap` or clustering before `make_graph`
+- Calling `run_umap` or clustering before building the neighbourhood graph
 - Treating marker `p_value` columns as FDR-corrected DE results
 - Expecting filtered cells to disappear from `ds.cells` (they remain, with `I=False`)
+- Treating imputed expression as a replacement for observed counts
+
 
 ## Summary of saved results
 
@@ -308,12 +338,14 @@ Annotation from markers, known gene panels, and subclustering is covered in
 | Embedding | `RNA_UMAP1`, `RNA_UMAP2` |
 | Clusters | `RNA_leiden_cluster` |
 | Markers | marker tables from `run_marker_search` / `get_markers` |
+| Imputed values | cell columns such as `CD4_imputed` after `insert` |
 
 ## Further reading
 
 - [Single-cell best practices: quality control](https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html)
 - [Single-cell best practices: clustering](https://www.sc-best-practices.org/cellular_structure/clustering.html)
 - [Scanpy clustering tutorial](https://scanpy.readthedocs.io/en/stable/tutorials/basics/clustering.html)
+- van Dijk et al. 2018, MAGIC (algorithmic ancestry for graph diffusion imputation; not feature parity with Scarf): https://doi.org/10.1016/j.cell.2018.05.061
 - Scarf paper: https://doi.org/10.1038/s41467-022-32097-3
 
 ## Next steps
@@ -323,3 +355,4 @@ Annotation from markers, known gene panels, and subclustering is covered in
 - {doc}`gene_set_enrichment`
 - {doc}`plotting`
 - {doc}`data_integration`
+

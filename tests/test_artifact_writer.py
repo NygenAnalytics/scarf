@@ -73,6 +73,39 @@ def test_incomplete_artifact_is_not_reused() -> None:
     assert second.ref != first.ref
 
 
+def test_execution_options_use_artifact_value_serialization() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    planned = plan_artifact(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="normalized",
+        operation="run_normalization",
+        parameters={},
+        inputs={},
+        execution_options={
+            "nan": float("nan"),
+            "positive_infinity": float("inf"),
+            "negative_infinity": float("-inf"),
+            "bytes": b"\x00\xff",
+            "set": {2, 1},
+            "numpy_scalar": np.int64(3),
+        },
+    )
+
+    start_artifact(root, planned)
+    status = inspect_artifact(root, planned.ref)
+
+    assert status.execution_options == {
+        "nan": {"special_float": "nan"},
+        "positive_infinity": {"special_float": "inf"},
+        "negative_infinity": {"special_float": "-inf"},
+        "bytes": {"bytes_hex": "00ff"},
+        "set": [1, 2],
+        "numpy_scalar": 3,
+    }
+
+
 def test_missing_required_attribute_prevents_reuse() -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     arguments = {
@@ -151,3 +184,28 @@ def test_finish_rejects_payload_that_violates_declared_shape() -> None:
         finish_artifact(group, planned)
 
     assert not inspect_artifact(root, planned.ref).complete
+
+
+def test_planned_artifact_invalidated_forces_new_ref() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    arguments = {
+        "scope": "assay",
+        "assay": "RNA",
+        "kind": "normalized",
+        "operation": "run_normalization",
+        "parameters": {"log_transform": True},
+        "inputs": {"selection": {"artifact_id": "e" * 64}},
+        "execution_options": {"batch_size": 50},
+    }
+    planned = plan_artifact(root, **arguments)
+    group = start_artifact(root, planned)
+    group.create_array("data", data=np.array([1.0, 2.0, 3.0]))
+    finish_artifact(group, planned)
+
+    reused = plan_artifact(root, **arguments)
+    assert reused.reused
+    invalidated = reused.invalidated(root)
+    assert not invalidated.reused
+    assert invalidated.ref != reused.ref
+    assert invalidated.provenance == reused.provenance
+    assert invalidated.execution_options == reused.execution_options

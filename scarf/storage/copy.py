@@ -67,14 +67,3 @@ def create_or_open_staged_normed_array(
     root = zarr.open_group(cache_path, mode="w")
     spec = normed_array_spec(shape[0], shape[1], profile="fast_local")
     return create_numeric_array(root, "data", spec)
-
-
-def open_or_create_staged_normed_array(
-    cache_path: str,
-    src: zarr.Array,
-) -> zarr.Array:
-    """Open a reusable local array matching a source array's shape."""
-    return create_or_open_staged_normed_array(
-        cache_path,
-        (int(src.shape[0]), int(src.shape[1])),
-    )

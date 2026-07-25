@@ -99,12 +99,12 @@ ds.mark_hvgs(
     max_var=6
 )
 
-ds.make_graph(
-    feat_key='hvgs',
-    k=21,
-    dims=15,
-    n_centroids=100
-)
+normalized = ds.run_normalization(feat_key='hvgs')
+pca = ds.run_pca(normalized, dims=15)
+ds.build_embedding_initialization(pca)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=21)
+ds.build_connectivity_map(neighbors)
 
 ds.run_umap(
     n_epochs=250,
@@ -115,6 +115,7 @@ ds.run_umap(
 
 ds.run_leiden_clustering(resolution=1)
 ```
+
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -162,7 +163,7 @@ print (ds.ADT)
 print (ds.ADT.normMethod.__name__)
 ```
 
-Now we are ready to create a KNN graph of cells using only ADT data. Here we will use all the features (except those that were filtered out) and that is why we use `I` as value for `feat_key`. It is important to note the value for `from_assay` parameter which has now been set to `ADT`. If no value is provided for `from_assay` then it is automatically set to the default assay. By setting `dims` to 0 we disable dimension reduction.
+Now we are ready to create a KNN graph of cells using only ADT data. Here we will use all the features (except those that were filtered out) and that is why we use `I` as value for `feat_key`. It is important to note the value for `from_assay` parameter which has now been set to `ADT`. If no value is provided for `from_assay` then it is automatically set to the default assay. By setting `dims` to 0 we disable dimension reduction. Prefer the deprecated `make_graph` facade for that special case until a dedicated atomic helper exists.
 
 ```{code-cell} ipython3
 ds.make_graph(
@@ -173,6 +174,7 @@ ds.make_graph(
     n_centroids=100
 )
 ```
+
 
 UMAP and clustering can be run on ADT assay by simply setting `from_assay` parameter value to 'ADT':
 
@@ -279,7 +281,7 @@ Each assay stores its own graph, UMAP, and cluster columns under assay-specific 
 ## Next steps
 
 - {doc}`cite_seq_integration`
-- {doc}`multimodal_integration`
-- {doc}`choosing_integration_methods`
 - {doc}`plotting`
 - {doc}`data_organization`
+- {doc}`data_integration`
+

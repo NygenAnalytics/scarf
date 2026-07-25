@@ -1,6 +1,5 @@
 import os
 import re
-import warnings
 from collections import Counter
 from collections.abc import Iterator
 from typing import Any
@@ -57,7 +56,6 @@ type _RowPlan = tuple[
 
 
 class AssayMerge:
-    # class ZarrMerge is renamed to AssayMerge for better understanding
     """Merge multiple Zarr files into a single Zarr file.
 
     Args:
@@ -751,19 +749,3 @@ class AssayMerge:
             self.merge_assay_name,
             self.outWorkspace,
         )
-
-
-# Compatibility subclass for AssayMerge
-class ZarrMerge(AssayMerge):
-    """
-    Alias for AssayMerge for backward compatibility.
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        warnings.warn(
-            "ZarrMerge is deprecated and will be removed in Scarf 2.0. "
-            "Use AssayMerge instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(*args, **kwargs)

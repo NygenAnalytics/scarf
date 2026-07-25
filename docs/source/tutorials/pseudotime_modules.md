@@ -105,9 +105,18 @@ modules.feature_clusters
 `ds.plots.pseudotime_heatmap` visualizes the binned matrix along with the feature clusters.
 
 ```{code-cell} ipython3
-# Highlighting some marker genes
-genes_to_label = ['S100b', 'Nrarp', 'Atoh8', 'Grin2c', 'Slc35d3',
-                  'Sst', 'Mnx1', 'Ins2', 'Gm11837', 'Irx1']
+# One representative gene per retained module, derived from the aggregation result
+ptime_feat = ds.RNA.feats.to_pandas_dataframe(
+    columns=['names', modules.cluster_key]
+)
+assigned = ptime_feat[ptime_feat[modules.cluster_key] != -1]
+genes_to_label = (
+    assigned.groupby(modules.cluster_key, sort=True)['names']
+    .first()
+    .head(10)
+    .tolist()
+)
+genes_to_label
 
 ds.plots.pseudotime_heatmap(
     cell_key=modules.cell_key,

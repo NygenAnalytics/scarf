@@ -6,10 +6,22 @@ subtrees:
         title: Installation
       - file: quickstart
         title: Quick start
+      - file: whats_new_in_1_0
+        title: What is new in Scarf 1.0
       - file: scarf_and_scanpy
         title: Scarf for Scanpy and Seurat users
+  - caption: Concepts
+    entries:
+      - file: concepts/provenance
+        title: Provenance and artifacts
+      - file: concepts/graph_and_state
+        title: Graph construction and published state
+      - file: concepts/scale_and_memory
+        title: Scale, memory, and execution
   - caption: Core workflows
     entries:
+      - file: tutorials/atomic_graph_operations
+        title: Atomic graph operations
       - file: tutorials/scrna_seq
         title: scRNA-seq analysis
       - file: tutorials/scatac_seq
@@ -17,8 +29,6 @@ subtrees:
       - file: tutorials/cite_seq
         title: CITE-seq analysis
         entries:
-          - file: tutorials/multimodal_integration
-            title: Multimodal integration overview
           - file: tutorials/cite_seq_integration
             title: SNN and WNN integration
   - caption: Analysis essentials
@@ -33,33 +43,30 @@ subtrees:
         title: Plotting
   - caption: Data management and scaling
     entries:
-      - file: tutorials/import_and_export
-        title: Import and export
       - file: tutorials/data_organization
         title: Data organization
+      - file: tutorials/import_and_export
+        title: Import and export
+      - file: tutorials/remote_stores
+        title: Remote Zarr stores
+      - file: tutorials/provenance_and_reuse
+        title: Provenance and reuse
       - file: tutorials/downsampling
         title: Cell downsampling
   - caption: Integration and mapping
     entries:
-      - file: tutorials/choosing_integration_methods
-        title: Choosing integration methods
-        entries:
-          - file: tutorials/data_integration
-            title: Merge, Harmony, and partial PCA
-          - file: tutorials/integration_metrics
-            title: Integration metrics
-          - file: tutorials/mapping_and_label_transfer
-            title: Mapping, label transfer, and unified embeddings
-          - file: tutorials/reference_atlas
-            title: Build and map a reference atlas
+      - file: tutorials/data_integration
+        title: Merge, Harmony, and partial PCA
+      - file: tutorials/mapping_and_label_transfer
+        title: Mapping, label transfer, and unified embeddings
+      - file: tutorials/reference_atlas
+        title: Build and map a reference atlas
   - caption: Specialized analyses
     entries:
       - file: tutorials/gene_set_enrichment
         title: Gene-set enrichment
       - file: tutorials/cell_cycle
         title: Cell cycle
-      - file: tutorials/imputation
-        title: Imputation
       - file: tutorials/pseudobulk_and_differential_expression
         title: Pseudobulk export for differential expression
       - file: tutorials/pseudotime
@@ -76,6 +83,12 @@ subtrees:
         entries:
           - file: reference/api/datastore
             title: DataStore
+          - file: reference/api/graph_ops
+            title: Atomic graph operations
+          - file: reference/api/artifacts
+            title: Artifacts and assay state
+          - file: reference/api/pipeline
+            title: Analysis pipeline
           - file: reference/api/import_export
             title: Import and export
           - file: reference/api/assays

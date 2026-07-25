@@ -61,9 +61,15 @@ ds.filter_cells(
 
 if 'RNA_UMAP1' not in ds.cells.columns:
     ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-    ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
+    normalized = ds.run_normalization(feat_key='hvgs')
+    pca = ds.run_pca(normalized, dims=15)
+    ds.build_embedding_initialization(pca)
+    ann = ds.build_ann_index(pca)
+    neighbors = ds.query_neighbors(ann, k=11)
+    ds.build_connectivity_map(neighbors)
     ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
 ```
+
 
 ## 1) Read and inspect gene sets
 

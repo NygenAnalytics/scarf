@@ -84,36 +84,60 @@ ds.plots.embedding(
 ## 2. Define progenitor and terminal groups
 
 The existing pseudotime tutorial uses Scarf cluster 1 as the progenitor group.
-For each terminal cell type, we select the Scarf cluster containing the largest
-number of cells with that published annotation.
+For each terminal cell type that is present in the annotations, we assign an
+unused Paris cluster that still contains that label, preferring higher counts.
 
 ```{code-cell} ipython3
 annotations = ds.cells.to_pandas_dataframe(
     columns=['RNA_paris_cluster', 'clusters'],
     key='I',
 )
-terminal_cell_types = ['Alpha', 'Beta', 'Delta']
-terminal_clusters = {
-    cell_type: annotations.loc[
+requested_terminals = ['Alpha', 'Beta', 'Delta']
+available_labels = set(annotations['clusters'].unique())
+missing_labels = [label for label in requested_terminals if label not in available_labels]
+if missing_labels:
+    raise ValueError(
+        f"Missing terminal labels in clusters: {missing_labels}. "
+        f"Available labels: {sorted(available_labels)}"
+    )
+
+source_clusters = [1]
+if source_clusters[0] not in set(annotations['RNA_paris_cluster']):
+    raise ValueError(
+        f"Source cluster {source_clusters[0]} is not present in RNA_paris_cluster"
+    )
+
+# Prefer a distinct Paris cluster per terminal type. Shared modal clusters are skipped
+# when another unused cluster still contains that annotation.
+used_clusters = set(source_clusters)
+terminal_clusters = {}
+for cell_type in requested_terminals:
+    counts = annotations.loc[
         annotations['clusters'] == cell_type,
         'RNA_paris_cluster',
-    ].value_counts().idxmax()
-    for cell_type in terminal_cell_types
-}
-terminal_clusters
-```
+    ].value_counts()
+    for cluster_id in counts.index:
+        cluster_id = int(cluster_id)
+        if cluster_id not in used_clusters:
+            terminal_clusters[cell_type] = cluster_id
+            used_clusters.add(cluster_id)
+            break
 
-```{code-cell} ipython3
-source_clusters = [1]
+if len(terminal_clusters) < 2:
+    raise ValueError(
+        "Could not assign at least two distinct sink clusters for "
+        f"{requested_terminals}. Paris clusters may mix these labels too strongly "
+        "for multi-sink PBA on this store."
+    )
+
+terminal_cell_types = list(terminal_clusters)
 sink_clusters = list(terminal_clusters.values())
-
-assert len(set(sink_clusters)) == len(terminal_cell_types)
-assert set(source_clusters).isdisjoint(sink_clusters)
+terminal_clusters
 ```
 
 ## 3. Estimate a shared pseudotime
 
-PBA supplies the developmental direction. All three terminal clusters are used
+PBA supplies the developmental direction. The assigned terminal clusters are used
 as sinks so the ordering covers the branches analyzed below.
 
 ```{code-cell} ipython3

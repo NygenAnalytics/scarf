@@ -10,7 +10,6 @@ if TYPE_CHECKING:
         DummyAssay as DummyAssay,
         MergeAssay as MergeAssay,
         ZARRLOC as ZARRLOC,
-        ZarrMerge as ZarrMerge,
         _RowPlan as _RowPlan,
         controlled_compute as controlled_compute,
         load_zarr as load_zarr,
@@ -20,13 +19,11 @@ if TYPE_CHECKING:
 __all__ = [
     "DatasetMerge",
     "AssayMerge",
-    "ZarrMerge",
 ]
 
 _LAZY_EXPORTS = {
     "DatasetMerge": "datasets",
     "AssayMerge": "assays",
-    "ZarrMerge": "assays",
     "DummyAssay": "assays",
     "MergeAssay": "assays",
     "_RowPlan": "assays",
@@ -39,7 +36,7 @@ for _export_name in _LAZY_EXPORTS:
     globals().pop(_export_name, None)
 del _export_name
 
-_CLASS_EXPORTS = frozenset({"DatasetMerge", "AssayMerge", "ZarrMerge", "DummyAssay"})
+_CLASS_EXPORTS = frozenset({"DatasetMerge", "AssayMerge", "DummyAssay"})
 
 
 def _normalize_class_metadata(value: type[Any]) -> None:

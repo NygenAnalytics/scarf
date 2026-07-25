@@ -9,7 +9,8 @@ highly variable genes
   Features selected with `mark_hvgs` for neighbourhood-graph construction.
 
 neighbourhood graph
-  KNN graph of cells built by `make_graph`. Embeddings, clustering, mapping, and multimodal integration reuse this graph.
+  KNN graph of cells built by atomic graph operations or `ds.pipeline.run`. Embeddings, clustering, mapping, and multimodal integration reuse this graph.
+
 
 cell key
   Boolean column in cell metadata selecting which cells participate in a step. Default is `I`. Filtering marks cells inactive rather than deleting them.
@@ -21,7 +22,8 @@ assay
   Named modality inside a `DataStore` (for example `RNA`, `ADT`, `ATAC`).
 
 Harmony
-  Batch correction applied to PCA embeddings inside `make_graph(harmonize=True)`.
+  Batch correction applied to PCA embeddings with `run_harmony` before ANN construction.
+
 
 partial PCA
   PCA trained on a subset of cells via `pca_cell_key`. A lightweight batch-correction option when one sample is the reference.

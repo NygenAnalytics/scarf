@@ -13,7 +13,8 @@ SPHINXPROJ    = Scarf
 help:
 	@$(SPHINXBUILD) -M help "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
-.PHONY: help Makefile execute-docs execute-page execute-vignette execute-vignettes resume-docs validate-cache prune-stale-cache html execute-notebooks-all nitpick
+.PHONY: help Makefile execute-docs execute-page execute-vignette execute-vignettes resume-docs validate-cache prune-stale-cache html execute-notebooks-all nitpick coverage check-reference
+
 
 # Execute one doc page locally and update docs/.jupyter_cache.
 # Usage: make execute-page PAGE=scrna_seq
@@ -46,6 +47,20 @@ html: validate-cache
 # Nitpicky HTML build used by docs CI (missing refs/toctree fail the build).
 nitpick: validate-cache
 	@$(SPHINXBUILD) -b html -n -W "$(SOURCEDIR)" "$(BUILDDIR)/html" $(SPHINXOPTS) $(O)
+
+# Sphinx coverage report for documented Python objects (sphinx.ext.coverage).
+# Use after expanding public __all__ and explicit autosummary pages; do not treat
+# package-wide undocumented internals as a release blocker until those boundaries
+# are complete. Report: build/coverage/python.txt
+coverage:
+	@$(SPHINXBUILD) -b coverage "$(SOURCEDIR)" "$(BUILDDIR)/coverage" $(SPHINXOPTS) $(O)
+	@echo "Coverage report written to $(BUILDDIR)/coverage/python.txt"
+
+# Fail when a public symbol is missing from, or duplicated in, the built reference.
+# Requires a prior HTML build because it reads build/html/objects.inv.
+check-reference: nitpick
+	@uv run python check_reference_coverage.py
+
 
 # Force all notebooks through the validated runner, then build strictly.
 execute-notebooks-all:

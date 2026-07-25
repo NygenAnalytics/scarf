@@ -2,7 +2,6 @@ import os
 import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 from weakref import WeakKeyDictionary
 
@@ -12,15 +11,8 @@ import zarr
 from numpy.typing import NDArray
 from scipy.sparse import coo_matrix, csr_matrix
 
-from ...embeddings.harmony import HarmonyResult
 from ...storage.types import as_zarr_array, as_zarr_group
-from ...assay import Assay, RNAassay
-from ...graph.build import (
-    GraphBuildPlan,
-    GraphDataInputs,
-    GraphExecutionOptions,
-    ResolvedGraphParameters,
-)
+from ...graph.build import GraphBuildPlan
 from ...graph.arguments import (
     AnnIndexArguments,
     ConnectivityMapArguments,
@@ -36,23 +28,13 @@ from ...graph.arguments import (
 from ...graph.encoded_paths import (
     is_integrated_graph_path,
     lookup_latest_assay_graph,
-    lookup_latest_cell_graph_group_path,
-    lookup_latest_kmeans_group_path,
-    lookup_latest_neighbor_index_group_path,
     lookup_latest_nearest_neighbor_paths,
-    lookup_latest_nearest_neighbors_group_path,
-    lookup_latest_reduction_group_path,
     lookup_stored_integrated_graph,
     make_integrated_graph_path,
-    make_nearest_neighbors_group_path,
-    make_neighbor_index_group_path,
     make_normalized_group_path,
-    make_reduction_group_path,
     nearest_neighbor_paths_from_loc,
     nearest_neighbors_group_path_from_cell_graph,
     parse_assay_graph_paths,
-    parse_cell_graph_group_path,
-    parse_kmeans_group_path,
     parse_nearest_neighbors_group_path,
     parse_neighbor_index_group_path,
     parse_reduction_group_path,
@@ -71,7 +53,6 @@ from ...graph.state import (
     write_assay_state,
 )
 from ...matrix import ChunkedArray
-from ...mapping.reference import MappingReference
 from ...metadata.artifacts import (
     categorical_display,
     link_feature_data_column,
@@ -96,7 +77,6 @@ from ...storage.ann_index import (
 from ...storage.arrays import create_zarr_dataset
 from ...storage.artifact_writer import (
     ArrayRequirement,
-    AttributeRequirement,
     PlannedArtifact,
     finish_artifact,
     plan_artifact,
@@ -106,12 +86,15 @@ from ...storage.artifact_writer import (
 from ...storage.artifacts import (
     ArtifactRef,
     ArtifactScope,
+    artifact_group,
     artifact_path,
     fingerprint_array,
     fingerprint_stored_arrays,
     fingerprint_strings,
+    group_at,
     inspect_artifact,
     parse_artifact_path,
+    require_complete_artifact,
 )
 from ...storage.copy import (
     copy_zarr_array,
@@ -130,7 +113,6 @@ if TYPE_CHECKING:
     from ..base_datastore import BaseDataStore as _GraphOperationsBase
 else:
     _GraphOperationsBase = object
-
 
 EMBEDDING_CACHE_MAX_BYTES = 256 * 1024 * 1024
 
@@ -182,879 +164,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         except AttributeError:
             return None
         return paths.get(ann_obj) if isinstance(ann_obj, AnnStream) else None
-
-    def _mapping_reference_metadata(
-        self,
-        assay: Assay,
-        from_assay: str,
-        cell_key: str,
-        feat_key: str,
-        reduction_loc: str,
-        ann_loc: str,
-        batch_columns: list[str],
-    ) -> dict[str, Any]:
-        from ...mapping.hashing import array_hash, array_store_hash
-
-        normed_loc = make_normalized_group_path(from_assay, cell_key, feat_key)
-        normed_group = as_zarr_group(self.zw[normed_loc], name=normed_loc)
-        reduction_group = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
-        feature_key = f"{cell_key}__{feat_key}" if feat_key != "I" else "I"
-        feature_ids = assay.feats.fetch("ids", key=feature_key)
-        batch_values = (
-            np.column_stack(
-                [self.cells.fetch(column, key=cell_key) for column in batch_columns]
-            )
-            if batch_columns
-            else np.empty((len(self.cells.active_index(cell_key)), 0), dtype=str)
-        )
-        loadings = np.asarray(
-            as_zarr_array(reduction_group["reduction"], name="reduction")[:]
-        )
-        corrected_hash = ""
-        if "harmonizedData" in reduction_group:
-            corrected_hash = array_store_hash(
-                as_zarr_array(reduction_group["harmonizedData"], name="harmonizedData")
-            )
-        ann_group = as_zarr_group(self.zw[ann_loc], name=ann_loc)
-        (
-            ann_metric,
-            ann_efc,
-            ann_ef,
-            ann_m,
-            ann_rand_state,
-            _,
-            _,
-        ) = parse_neighbor_index_group_path(ann_loc)
-        return {
-            "assay": from_assay,
-            "cellKey": cell_key,
-            "featureKey": feat_key,
-            "reductionPath": reduction_loc,
-            "annPath": ann_loc,
-            "featureHash": array_hash(feature_ids),
-            "cellHash": array_hash(self.cells.fetch("ids", key=cell_key)),
-            "batchValueHash": array_hash(batch_values),
-            "batchColumns": batch_columns,
-            "subsetHash": normed_group.attrs["subset_hash"],
-            "subsetParams": normed_group.attrs["subset_params"],
-            "loadingsHash": array_hash(loadings),
-            "correctedCoordinatesHash": corrected_hash,
-            "reductionMethod": "pca",
-            "annContract": {
-                "metric": ann_metric,
-                "efConstruction": ann_efc,
-                "ef": ann_ef,
-                "m": ann_m,
-                "randomState": ann_rand_state,
-                "featureScaling": bool(ann_group.attrs.get("featureScaling", True)),
-            },
-        }
-
-    def _persist_mapping_reference(
-        self,
-        assay: Assay,
-        from_assay: str,
-        cell_key: str,
-        feat_key: str,
-        reduction_loc: str,
-        ann_loc: str,
-        knn_loc: str,
-        batch_columns: list[str],
-        ann_obj: AnnStream,
-        mapping_artifact: PlannedArtifact,
-        normalized_ref: ArtifactRef,
-    ) -> None:
-        from ...mapping.artifact import write_artifact_mapping_reference
-        from ...mapping.confidence import _distance_quantile_summary
-        from ...mapping.models import SymphonyReferenceModel
-        from ...mapping.symphony import weighted_centroids
-
-        if ann_obj.harmonyResult is None:
-            return
-        if ann_obj.loadings is None:
-            raise RuntimeError(
-                "Cannot persist a mapping reference without PCA loadings"
-            )
-        harmony = ann_obj.harmonyResult
-        try:
-            cluster_mass, raw_centroids = weighted_centroids(
-                harmony.original.T, harmony.assignments
-            )
-            _, corrected_centroids = weighted_centroids(
-                harmony.corrected.T, harmony.assignments
-            )
-        except ValueError as exc:
-            if "empty cluster" not in str(exc):
-                raise
-            raise ValueError(
-                "Harmony produced an empty reference cluster. Rebuild with a "
-                "smaller harmony_params['nclust'] value."
-            ) from exc
-        ridge_values = np.diag(harmony.ridge)[1:]
-        correction_ridge = (
-            float(np.mean(ridge_values[ridge_values > 0]))
-            if np.any(ridge_values > 0)
-            else 1.0
-        )
-        model = SymphonyReferenceModel(
-            feature_means=ann_obj.mu,
-            feature_scales=ann_obj.sigma,
-            loadings=ann_obj.loadings,
-            centroids=harmony.centroids.T,
-            raw_centroids=raw_centroids,
-            corrected_centroids=corrected_centroids,
-            cluster_mass=cluster_mass,
-            sigma=harmony.sigma,
-            correction_ridge=correction_ridge,
-        )
-        feature_key = f"{cell_key}__{feat_key}" if feat_key != "I" else "I"
-        feature_ids = assay.feats.fetch("ids", key=feature_key)
-        metadata = {
-            "assay": from_assay,
-            "cell_key": cell_key,
-            "feature_key": feat_key,
-            "batch_columns": batch_columns,
-            "harmony_parameters": harmony.parameters,
-            "batch_levels": [list(levels) for levels in harmony.batch_levels],
-            "method": "symphony",
-            "normalization_parameters": (
-                inspect_artifact(self.zw, normalized_ref).parameters or {}
-            ),
-        }
-        knn_group = as_zarr_group(self.zw[knn_loc], name=knn_loc)
-        distance_quantiles, distance_values = _distance_quantile_summary(
-            as_zarr_array(knn_group["distances"], name="distances")
-        )
-        group = start_artifact(self.zw, mapping_artifact)
-        write_artifact_mapping_reference(
-            group,
-            model,
-            feature_ids,
-            metadata,
-            reference_distance_quantiles=distance_quantiles,
-            reference_distance_values=distance_values,
-        )
-        finish_artifact(group, mapping_artifact)
-
-    def _restore_harmony_result(
-        self,
-        ann_obj: AnnStream,
-        correction_ref: ArtifactRef,
-    ) -> None:
-        if ann_obj.harmonyResult is not None:
-            return
-        if ann_obj.harmonizedData is None:
-            raise RuntimeError("Stored Harmony coordinates are missing")
-        group = as_zarr_group(
-            self.zw[artifact_path(correction_ref)],
-            name=artifact_path(correction_ref),
-        )
-        required = ("assignments", "centroids", "sigma", "ridge")
-        if any(name not in group for name in required):
-            raise RuntimeError("Stored Harmony model metadata is incomplete")
-        status = inspect_artifact(self.zw, correction_ref)
-        parameters = status.parameters or {}
-        batch_columns = tuple(
-            str(column) for column in parameters.get("batch_columns", [])
-        )
-        batch_levels_raw = group.attrs.get("batch_levels", [])
-        batch_levels = tuple(
-            tuple(str(value) for value in levels)
-            for levels in cast(list[list[Any]], batch_levels_raw)
-        )
-        ann_obj.harmonyResult = HarmonyResult(
-            original=np.vstack(
-                ann_obj._reduced_blocks(
-                    "Restoring uncorrected latent dimensions",
-                )
-            ).T,
-            corrected=ann_obj.harmonizedData.compute().T,
-            assignments=np.asarray(
-                as_zarr_array(group["assignments"], name="assignments")[:]
-            ),
-            centroids=np.asarray(
-                as_zarr_array(group["centroids"], name="centroids")[:]
-            ),
-            sigma=np.asarray(as_zarr_array(group["sigma"], name="sigma")[:]),
-            ridge=np.asarray(as_zarr_array(group["ridge"], name="ridge")[:]),
-            batch_columns=batch_columns,
-            batch_levels=batch_levels,
-            parameters=dict(parameters.get("harmony_parameters", {})),
-        )
-
-    def get_mapping_reference(
-        self,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
-        feat_key: str | None = None,
-    ) -> MappingReference:
-        """Load a validated immutable RNA/PCA Symphony-style mapping reference."""
-        from ...mapping.artifact import (
-            load_mapping_reference,
-            resolve_mapping_reference_group,
-        )
-
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay, cell_key, feat_key
-        )
-        assay = self._get_assay(from_assay)
-        if not isinstance(assay, RNAassay):
-            raise TypeError("Mapping references currently support RNA assays only")
-        state = read_assay_state(self.zw, from_assay)
-        if state is not None and state.matches(cell_key, feat_key):
-            mapping_ref = state.named_results.get("mapping_reference")
-            if mapping_ref is None:
-                raise KeyError(
-                    "AssayState has no mapping reference for the selected graph"
-                )
-            from ...mapping.artifact import load_artifact_mapping_reference
-
-            return load_artifact_mapping_reference(
-                self,
-                mapping_ref,
-                from_assay,
-                cell_key,
-                feat_key,
-            )
-        normed_loc = make_normalized_group_path(from_assay, cell_key, feat_key)
-        if normed_loc not in self.zw:
-            raise KeyError("No normalized reference data exists for the requested keys")
-        try:
-            reduction_loc = lookup_latest_reduction_group_path(self.zw, normed_loc)
-        except KeyError:
-            reduction_loc = ""
-        if not reduction_loc or reduction_loc not in self.zw:
-            raise KeyError("No reduction exists for the requested reference")
-        reduction_group = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
-        try:
-            ann_loc = lookup_latest_neighbor_index_group_path(self.zw, reduction_loc)
-        except KeyError:
-            ann_loc = ""
-        if not ann_loc or ann_loc not in self.zw:
-            raise KeyError("No ANN index exists for the requested reference")
-        try:
-            artifact, _, is_legacy = resolve_mapping_reference_group(reduction_group)
-        except KeyError:
-            raise ValueError(
-                "This harmonized graph predates the mapping-reference artifact. "
-                "Rebuild it with build_mapping_reference."
-            ) from None
-        artifact_ann_path = artifact.attrs.get("annPath")
-        if isinstance(artifact_ann_path, str):
-            ann_loc = artifact_ann_path
-        if ann_loc not in self.zw:
-            raise ValueError(
-                "The mapping-reference ANN index is missing. Rebuild the reference."
-            )
-        ann_group = as_zarr_group(self.zw[ann_loc], name=ann_loc)
-        if not bool(ann_group.attrs.get("isHarmonized", False)):
-            raise ValueError(
-                "The requested graph is not harmonized. Build a harmonized mapping reference first."
-            )
-        batch_columns = [
-            str(column) for column in cast(list[Any], artifact.attrs["batchColumns"])
-        ]
-        expected = self._mapping_reference_metadata(
-            assay,
-            from_assay,
-            cell_key,
-            feat_key,
-            reduction_loc,
-            ann_loc,
-            batch_columns,
-        )
-        legacy_omissions = {"correctedCoordinatesHash", "annContract"}
-        for key, value in expected.items():
-            if is_legacy and key in legacy_omissions:
-                continue
-            if artifact.attrs.get(key) != value:
-                raise ValueError(
-                    f"Mapping reference is stale because {key} no longer matches. "
-                    "Rebuild it with build_mapping_reference."
-                )
-        return load_mapping_reference(
-            self, from_assay, cell_key, feat_key, reduction_loc, ann_loc
-        )
-
-    def build_mapping_reference(
-        self,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
-        feat_key: str | None = None,
-        batch_columns: list[str] | None = None,
-        **graph_kwargs: Any,
-    ) -> MappingReference:
-        """Build and return an RNA/PCA Symphony mapping reference."""
-        if self.zarr_mode != "r+":
-            raise ValueError("Building a mapping reference requires a read-write store")
-        if batch_columns is None:
-            raise ValueError("batch_columns is required to build a mapping reference")
-        if graph_kwargs.get("feat_scaling", True) is False:
-            raise ValueError(
-                "Mapping references require feat_scaling=True because query "
-                "projection uses the stored reference mean and scale."
-            )
-        reduction_method = graph_kwargs.get("reduction_method", "pca")
-        if reduction_method not in {"auto", "pca"}:
-            raise ValueError("Mapping references require PCA reduction")
-        force_harmony_refit = False
-        try:
-            current = self.get_mapping_reference(from_assay, cell_key, feat_key)
-        except (KeyError, ValueError):
-            force_harmony_refit = True
-        else:
-            current_columns = [
-                str(column)
-                for column in cast(
-                    list[Any],
-                    current.metadata.get(
-                        "batch_columns",
-                        current.metadata.get("batchColumns", []),
-                    ),
-                )
-            ]
-            force_harmony_refit = (
-                current_columns != batch_columns
-                or not bool(current.metadata.get("complete", False))
-                or (
-                    "artifact_id" not in current.metadata
-                    and "artifactHash" not in current.metadata
-                )
-            )
-        graph_kwargs["reduction_method"] = "pca"
-        graph_kwargs["feat_scaling"] = True
-        plan = self._resolve_graph_plan(
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=feat_key,
-            harmonize=True,
-            batch_columns=batch_columns,
-            force_harmony_refit=force_harmony_refit,
-            **graph_kwargs,
-        )
-        self._run_resolved_graph_plan(plan)
-        reference = self.get_mapping_reference(from_assay, cell_key, feat_key)
-        if not bool(reference.metadata.get("complete", False)):
-            raise RuntimeError(
-                "Mapping reference build did not produce a complete artifact"
-            )
-        return reference
-
-    @staticmethod
-    def _choose_reduction_method(assay: Assay, reduction_method: str) -> str:
-        """This is a convenience function to determine the linear dimension
-        reduction method to be used for a given assay. It is uses a
-        predetermined rule to make this determination.
-
-        Args:
-            assay: Assay object.
-            reduction_method: Name of reduction method to use. It can be one from either: 'pca', 'lsi', 'auto'.
-
-        Returns:
-            The name of dimension reduction method to be used. Either 'pca' or 'lsi'
-
-        Raises:
-            ValueError: If `reduction_method` is not one of either 'pca', 'lsi', 'auto'
-        """
-        reduction_method = reduction_method.lower()
-        if reduction_method not in ["pca", "lsi", "auto", "custom"]:
-            raise ValueError(
-                "ERROR: Please choose either 'pca' or 'lsi' as reduction method"
-            )
-        if reduction_method == "auto":
-            assay_type = str(assay.__class__).split(".")[-1][:-2]
-            if assay_type == "ATACassay":
-                logger.debug("Using LSI for dimension reduction")
-                reduction_method = "lsi"
-            else:
-                logger.debug("Using PCA for dimension reduction")
-                reduction_method = "pca"
-        return reduction_method
-
-    def _resolve_graph_parameters(
-        self,
-        from_assay: str,
-        cell_key: str,
-        feat_key: str,
-        log_transform: bool | None = None,
-        renormalize_subset: bool | None = None,
-        reduction_method: str = "auto",
-        dims: int | None = None,
-        pca_cell_key: str | None = None,
-        ann_metric: str | None = None,
-        ann_efc: int | None = None,
-        ann_ef: int | None = None,
-        ann_m: int | None = None,
-        rand_state: int | None = None,
-        k: int | None = None,
-        n_centroids: int | None = None,
-        local_connectivity: float | None = None,
-        bandwidth: float | None = None,
-        feat_scaling: bool = True,
-        lsi_skip_first: bool = True,
-        harmonize: bool = False,
-        batch_columns: list[str] | None = None,
-        harmony_params: dict[str, Any] | None = None,
-    ) -> ResolvedGraphParameters:
-        """Resolve graph parameters from explicit, cached, and default values.
-
-        Args:
-            from_assay: Same as from_assay in make_graph
-            cell_key: Same as cell_key in make_graph
-            feat_key: Same as feat_key in make_graph
-            log_transform: Same as log_transform in make_graph
-            renormalize_subset: Same as renormalize_subset in make_graph
-            reduction_method: Same as reduction_method in make_graph
-            dims: Same as dims in make_graph
-            pca_cell_key: Same as pca_cell_key in make_graph
-            ann_metric: Same as ann_metric in make_graph
-            ann_efc: Same as ann_efc in make_graph
-            ann_ef: Same as ann_ef in make_graph
-            ann_m: Same as ann_m in make_graph
-            rand_state: Same as rand_state in make_graph
-            k: Same as k in make_graph
-            n_centroids: Same as n_centroids in make_graph
-            local_connectivity: Same as local_connectivity in make_graph
-            bandwidth: Same as bandwidth in make_graph
-
-        Returns:
-            The complete resolved parameter set.
-        """
-
-        def log_message(
-            category: str,
-            name: str,
-            value: Any,
-            custom_msg: str | None = None,
-        ) -> bool:
-            """Convenience function to log variable usage messages for
-            make_graph.
-
-            Args:
-                category:
-                name:
-                value:
-                custom_msg:
-
-            Returns:
-            """
-            msg = f"No value provided for parameter `{name}`. "
-            if category == "default":
-                msg += f"Will use default value: {value}"
-                logger.debug(msg)
-            elif category == "cached":
-                msg += f"Will use previously used value: {value}"
-                logger.debug(msg)
-            else:
-                if custom_msg is None:
-                    return False
-                else:
-                    logger.info(custom_msg)
-            return True
-
-        default_values: dict[str, Any] = {
-            "log_transform": True,
-            "renormalize_subset": True,
-            "dims": 11,
-            "ann_metric": "l2",
-            "rand_state": 4466,
-            "k": 11,
-            "n_centroids": 1000,
-            "local_connectivity": 1.0,
-            "bandwidth": 1.5,
-        }
-        state = read_assay_state(self.zw, from_assay)
-        if state is not None and state.matches(cell_key, feat_key):
-            reduction_status = (
-                inspect_artifact(self.zw, state.reduction)
-                if state.reduction is not None
-                else None
-            )
-            state_normalized = (
-                inspect_artifact(self.zw, state.normalized).parameters or {}
-                if state.normalized is not None
-                else {}
-            )
-            state_reduction = (
-                reduction_status.parameters or {}
-                if reduction_status is not None
-                else {}
-            )
-            state_reduction_execution = (
-                reduction_status.execution_options or {}
-                if reduction_status is not None
-                else {}
-            )
-            state_ann = (
-                inspect_artifact(self.zw, state.ann_index).parameters or {}
-                if state.ann_index is not None
-                else {}
-            )
-            state_neighbors = (
-                inspect_artifact(self.zw, state.neighbors).parameters or {}
-                if state.neighbors is not None
-                else {}
-            )
-            state_connectivity = (
-                inspect_artifact(self.zw, state.connectivity_map).parameters or {}
-                if state.connectivity_map is not None
-                else {}
-            )
-            state_initialization = (
-                inspect_artifact(
-                    self.zw,
-                    state.embedding_initialization,
-                ).parameters
-                or {}
-                if state.embedding_initialization is not None
-                else {}
-            )
-            state_correction = (
-                inspect_artifact(self.zw, state.batch_correction).parameters or {}
-                if state.batch_correction is not None
-                else {}
-            )
-        else:
-            state_normalized = {}
-            state_reduction = {}
-            state_reduction_execution = {}
-            state_ann = {}
-            state_neighbors = {}
-            state_connectivity = {}
-            state_initialization = {}
-            state_correction = {}
-
-        normed_loc = make_normalized_group_path(from_assay, cell_key, feat_key)
-        if log_transform is None or renormalize_subset is None:
-            if state_normalized:
-                c_log_transform = state_normalized.get("log_transform")
-                c_renormalize_subset = state_normalized.get("renormalize_subset")
-            elif normed_loc in self.zw:
-                normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
-                if "subset_params" in normed_grp.attrs:
-                    # This works in coordination with save_normalized_data
-                    subset_params = cast(
-                        dict[str, Any], normed_grp.attrs["subset_params"]
-                    )
-                    c_log_transform, c_renormalize_subset = (
-                        subset_params["log_transform"],
-                        subset_params["renormalize_subset"],
-                    )
-                else:
-                    c_log_transform, c_renormalize_subset = None, None
-            else:
-                c_log_transform, c_renormalize_subset = None, None
-            if log_transform is None:
-                if c_log_transform is not None:
-                    log_transform = bool(c_log_transform)
-                    log_message("cached", "log_transform", log_transform)
-                else:
-                    log_transform = default_values["log_transform"]
-                    log_message("default", "log_transform", log_transform)
-            if renormalize_subset is None:
-                if c_renormalize_subset is not None:
-                    renormalize_subset = bool(c_renormalize_subset)
-                    log_message("cached", "renormalize_subset", renormalize_subset)
-                else:
-                    renormalize_subset = default_values["renormalize_subset"]
-                    log_message("default", "renormalize_subset", renormalize_subset)
-        log_transform = bool(log_transform)
-        renormalize_subset = bool(renormalize_subset)
-
-        if dims is None or pca_cell_key is None:
-            if state_reduction:
-                c_dims = state_reduction.get("dims")
-                c_pca_cell_key = state_reduction_execution.get("pca_cell_key")
-            elif normed_loc in self.zw:
-                try:
-                    reduction_loc_attr = lookup_latest_reduction_group_path(
-                        self.zw, normed_loc
-                    )
-                except KeyError:
-                    reduction_loc_attr = None
-                if reduction_loc_attr is not None:
-                    try:
-                        _, c_dims, c_pca_cell_key = parse_reduction_group_path(
-                            reduction_loc_attr
-                        )
-                    except ValueError:
-                        c_dims, c_pca_cell_key = None, None
-                else:
-                    c_dims, c_pca_cell_key = None, None
-            else:
-                c_dims, c_pca_cell_key = None, None
-            if dims is None:
-                if c_dims is not None:
-                    dims = int(c_dims)
-                    log_message("cached", "dims", dims)
-                else:
-                    dims = default_values["dims"]
-                    log_message("default", "dims", dims)
-            if pca_cell_key is None:
-                if c_pca_cell_key is not None:
-                    pca_cell_key = c_pca_cell_key
-                    log_message("cached", "pca_cell_key", pca_cell_key)
-                else:
-                    pca_cell_key = cell_key
-                    log_message("default", "pca_cell_key", pca_cell_key)
-            else:
-                if pca_cell_key not in self.cells.columns:
-                    raise ValueError(
-                        f"ERROR: `pca_use_cell_key` {pca_cell_key} does not exist in cell metadata"
-                    )
-                if self.cells.get_dtype(pca_cell_key) != bool:  # noqa: E721
-                    raise TypeError(
-                        "ERROR: Type of `pca_use_cell_key` column in cell metadata should be `bool`"
-                    )
-        dims = int(dims)
-        if reduction_method == "auto" and state_reduction.get("reduction_method"):
-            reduction_method = str(state_reduction["reduction_method"])
-        reduction_method = self._choose_reduction_method(
-            self._get_assay(from_assay), reduction_method
-        )
-        reduction_loc = make_reduction_group_path(
-            normed_loc, reduction_method, dims, pca_cell_key
-        )
-
-        latest_ann_loc: str | None = None
-        c_ann_metric: str | None = None
-        c_ann_efc: int | None = None
-        c_ann_ef: int | None = None
-        c_ann_m: int | None = None
-        c_rand_state: int | None = None
-        if state_ann:
-            c_ann_metric = cast(str | None, state_ann.get("ann_metric"))
-            c_ann_efc = cast(int | None, state_ann.get("ann_efc"))
-            c_ann_ef = cast(int | None, state_ann.get("ann_ef"))
-            c_ann_m = cast(int | None, state_ann.get("ann_m"))
-            c_rand_state = cast(int | None, state_ann.get("rand_state"))
-        elif reduction_loc in self.zw:
-            try:
-                latest_ann_loc = lookup_latest_neighbor_index_group_path(
-                    self.zw, reduction_loc
-                )
-            except KeyError:
-                latest_ann_loc = None
-            if latest_ann_loc is not None:
-                try:
-                    (
-                        c_ann_metric,
-                        c_ann_efc,
-                        c_ann_ef,
-                        c_ann_m,
-                        c_rand_state,
-                        _,
-                        _,
-                    ) = parse_neighbor_index_group_path(latest_ann_loc)
-                except ValueError:
-                    c_ann_metric = None
-                    c_ann_efc = None
-                    c_ann_ef = None
-                    c_ann_m = None
-                    c_rand_state = None
-
-        if (
-            ann_metric is None
-            or ann_efc is None
-            or ann_ef is None
-            or ann_m is None
-            or rand_state is None
-        ):
-            if ann_metric is None:
-                if c_ann_metric is not None:
-                    ann_metric = c_ann_metric
-                    log_message("cached", "ann_metric", ann_metric)
-                else:
-                    ann_metric = default_values["ann_metric"]
-                    log_message("default", "ann_metric", ann_metric)
-            if ann_efc is None:
-                if c_ann_efc is not None:
-                    ann_efc = int(c_ann_efc)
-                    log_message("cached", "ann_efc", ann_efc)
-                else:
-                    ann_efc = None  # Will be set after value for k is determined
-                    log_message("default", "ann_efc", "min(100, max(k * 3, 50))")
-            if ann_ef is None:
-                if c_ann_ef is not None:
-                    ann_ef = int(c_ann_ef)
-                    log_message("cached", "ann_ef", ann_ef)
-                else:
-                    ann_ef = None  # Will be set after value for k is determined
-                    log_message("default", "ann_ef", "min(100, max(k * 3, 50))")
-            if ann_m is None:
-                if c_ann_m is not None:
-                    ann_m = int(c_ann_m)
-                    log_message("cached", "ann_m", ann_m)
-                else:
-                    ann_m = min(max(48, int(dims * 1.5)), 64)
-                    log_message("default", "ann_m", ann_m)
-            if rand_state is None:
-                if c_rand_state is not None:
-                    rand_state = int(c_rand_state)
-                    log_message("cached", "rand_state", rand_state)
-                else:
-                    rand_state = default_values["rand_state"]
-                    log_message("default", "rand_state", rand_state)
-        ann_metric = str(ann_metric)
-        ann_m = int(ann_m)
-        rand_state = int(rand_state)
-
-        latest_ann_matches_parameters = (
-            c_ann_metric == ann_metric
-            and c_ann_efc == ann_efc
-            and c_ann_ef == ann_ef
-            and c_ann_m == ann_m
-            and c_rand_state == rand_state
-        )
-        latest_knn_loc: str | None = None
-        if latest_ann_loc is not None:
-            try:
-                latest_knn_loc = lookup_latest_nearest_neighbors_group_path(
-                    self.zw, latest_ann_loc
-                )
-            except KeyError:
-                latest_knn_loc = None
-
-        if k is None:
-            if state_neighbors.get("k") is not None:
-                k = int(cast(int | float | str, state_neighbors["k"]))
-                log_message("cached", "k", k)
-            elif latest_knn_loc is not None:
-                try:
-                    k = parse_nearest_neighbors_group_path(latest_knn_loc)
-                    log_message("cached", "k", k)
-                except ValueError:
-                    k = default_values["k"]
-                    log_message("default", "k", k)
-            else:
-                k = default_values["k"]
-                log_message("default", "k", k)
-        k = int(k)
-        if ann_ef is None:
-            ann_ef = min(100, max(k * 3, 50))
-        ann_ef = int(ann_ef)
-        if ann_efc is None:
-            ann_efc = min(100, max(k * 3, 50))
-        ann_efc = int(ann_efc)
-        # Intermediate path used only to read cached graph params; suffixes for
-        # scaling/Harmony are applied later in make_graph.
-        ann_loc = make_neighbor_index_group_path(
-            reduction_loc,
-            ann_metric,
-            ann_efc,
-            ann_ef,
-            ann_m,
-            rand_state,
-        )
-        knn_loc = make_nearest_neighbors_group_path(ann_loc, k)
-        graph_params_knn_loc = knn_loc
-        if latest_ann_matches_parameters and latest_knn_loc is not None:
-            try:
-                if parse_nearest_neighbors_group_path(latest_knn_loc) == k:
-                    graph_params_knn_loc = latest_knn_loc
-            except ValueError:
-                pass
-
-        if n_centroids is None:
-            if state_initialization.get("n_centroids") is not None:
-                n_centroids = int(
-                    cast(int | float | str, state_initialization["n_centroids"])
-                )
-                log_message("cached", "n_centroids", n_centroids)
-            elif reduction_loc in self.zw:
-                kmeans_loc_attr = lookup_latest_kmeans_group_path(
-                    self.zw, reduction_loc
-                )
-                if kmeans_loc_attr is not None:
-                    try:
-                        n_centroids, _ = parse_kmeans_group_path(kmeans_loc_attr)
-                        log_message("default", "n_centroids", n_centroids)
-                    except ValueError:
-                        n_centroids = default_values["n_centroids"]
-                        log_message("default", "n_centroids", n_centroids)
-                else:
-                    n_centroids = default_values["n_centroids"]
-                    log_message("default", "n_centroids", n_centroids)
-            else:
-                n_centroids = default_values["n_centroids"]
-                log_message("default", "n_centroids", n_centroids)
-        n_centroids = int(n_centroids)
-
-        if local_connectivity is None or bandwidth is None:
-            if state_connectivity:
-                c_local_connectivity = state_connectivity.get("local_connectivity")
-                c_bandwidth = state_connectivity.get("bandwidth")
-            elif graph_params_knn_loc in self.zw:
-                try:
-                    graph_loc_attr = lookup_latest_cell_graph_group_path(
-                        self.zw, graph_params_knn_loc
-                    )
-                except KeyError:
-                    graph_loc_attr = None
-                if graph_loc_attr is not None:
-                    try:
-                        c_local_connectivity, c_bandwidth = parse_cell_graph_group_path(
-                            graph_loc_attr
-                        )
-                    except ValueError:
-                        c_local_connectivity, c_bandwidth = None, None
-                else:
-                    c_local_connectivity, c_bandwidth = None, None
-            else:
-                c_local_connectivity, c_bandwidth = None, None
-            if local_connectivity is None:
-                if c_local_connectivity is not None:
-                    local_connectivity = c_local_connectivity
-                    log_message("cached", "local_connectivity", local_connectivity)
-                else:
-                    local_connectivity = default_values["local_connectivity"]
-                    log_message("default", "local_connectivity", local_connectivity)
-            if bandwidth is None:
-                if c_bandwidth is not None:
-                    bandwidth = c_bandwidth
-                    log_message("cached", "bandwidth", bandwidth)
-                else:
-                    bandwidth = default_values["bandwidth"]
-                    log_message("default", "bandwidth", bandwidth)
-        local_connectivity = float(local_connectivity)
-        bandwidth = float(bandwidth)
-        if feat_scaling is None:
-            feat_scaling = bool(state_reduction.get("feat_scaling", True))
-        if lsi_skip_first is None:
-            lsi_skip_first = bool(state_reduction.get("lsi_skip_first", True))
-        if harmonize is None:
-            harmonize = bool(state_correction)
-        if harmonize and state_correction:
-            if batch_columns is None:
-                stored_columns = state_correction.get("batch_columns")
-                if isinstance(stored_columns, list):
-                    batch_columns = [str(column) for column in stored_columns]
-            if harmony_params is None:
-                stored_parameters = state_correction.get("harmony_parameters")
-                if isinstance(stored_parameters, dict):
-                    harmony_params = dict(stored_parameters)
-
-        return ResolvedGraphParameters(
-            log_transform=log_transform,
-            renormalize_subset=renormalize_subset,
-            reduction_method=reduction_method,
-            dims=dims,
-            pca_cell_key=pca_cell_key,
-            ann_metric=ann_metric,
-            ann_efc=ann_efc,
-            ann_ef=ann_ef,
-            ann_m=ann_m,
-            rand_state=rand_state,
-            k=k,
-            n_centroids=n_centroids,
-            local_connectivity=local_connectivity,
-            bandwidth=bandwidth,
-            feat_scaling=feat_scaling,
-            lsi_skip_first=lsi_skip_first,
-            harmonize=harmonize,
-            batch_columns=batch_columns,
-            harmony_params=harmony_params,
-        )
 
     def _get_latest_keys(
         self,
@@ -1112,12 +221,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if not isinstance(stored, StoredAssayGraph):
             raise TypeError("Latest assay graph lookup returned a non-assay graph")
         return stored.paths.cell_graph_group_path
-
-    def _get_latest_graph_loc(
-        self, from_assay: str, cell_key: str, feat_key: str
-    ) -> str:
-        """Compatibility alias for :meth:`get_latest_graph_loc`."""
-        return self.get_latest_graph_loc(from_assay, cell_key, feat_key)
 
     def _resolve_integrated_graph_path(self, label: str) -> str:
         index_path = self._integratedGraphsLoc
@@ -1389,10 +492,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if any(ref is None for ref in required):
                 return False
             assert state.ann_index is not None
-            ann_group = as_zarr_group(
-                self.zw[artifact_path(state.ann_index)],
-                name=artifact_path(state.ann_index),
-            )
+            ann_group = artifact_group(self.zw, state.ann_index)
             if not has_ann_index(ann_group):
                 return False
             if feat_scaling is not None and state.reduction is not None:
@@ -1554,22 +654,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 raise ValueError("Unsupported neighbor coordinate artifact")
             normalized_ref = input_ref(reduction_ref, "normalized")
             scaling_ref = input_ref(reduction_ref, "feature_scaling")
-        normalized_group = as_zarr_group(
-            self.zw[artifact_path(normalized_ref)],
-            name=artifact_path(normalized_ref),
-        )
-        scaling_group = as_zarr_group(
-            self.zw[artifact_path(scaling_ref)],
-            name=artifact_path(scaling_ref),
-        )
-        reduction_group = as_zarr_group(
-            self.zw[artifact_path(reduction_ref)],
-            name=artifact_path(reduction_ref),
-        )
-        neighbors_group = as_zarr_group(
-            self.zw[artifact_path(neighbors_ref)],
-            name=artifact_path(neighbors_ref),
-        )
+        normalized_group = artifact_group(self.zw, normalized_ref)
+        scaling_group = artifact_group(self.zw, scaling_ref)
+        reduction_group = artifact_group(self.zw, reduction_ref)
+        neighbors_group = artifact_group(self.zw, neighbors_ref)
         data = ChunkedArray(
             as_zarr_array(normalized_group["data"], name="data"),
             nthreads=self.nthreads,
@@ -1611,10 +699,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             )
         corrected = None
         if correction_ref is not None:
-            correction_group = as_zarr_group(
-                self.zw[artifact_path(correction_ref)],
-                name=artifact_path(correction_ref),
-            )
+            correction_group = artifact_group(self.zw, correction_ref)
             corrected = ChunkedArray(
                 as_zarr_array(correction_group["data"], name="data"),
                 nthreads=self.nthreads,
@@ -1966,12 +1051,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             raise ValueError(f"Expected {kind!r} artifact, got {ref.kind!r}")
         if assay is not None and (ref.scope != "assay" or ref.assay != assay):
             raise ValueError(f"Artifact must belong to assay {assay!r}")
-        status = inspect_artifact(self.zw, ref)
-        if not status.exists:
-            raise KeyError(f"Artifact does not exist: {status.path}")
-        if not status.complete:
-            raise RuntimeError(f"Artifact is incomplete: {status.path}")
-        return status
+        return require_complete_artifact(self.zw, ref)
 
     def _artifact_input_ref(
         self,
@@ -2021,10 +1101,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                         and (status.inputs or {}).get("ordered_row_ids_fingerprint")
                         == fingerprint_strings(row_ids)
                     ):
-                        group = as_zarr_group(
-                            self.zw[status.path],
-                            name=status.path,
-                        )
+                        group = group_at(self.zw, status.path)
                         if "values" in group:
                             stored = np.asarray(
                                 as_zarr_array(
@@ -2303,7 +1380,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if cached is not None:
             return cached
         status = self._require_complete_artifact(ref, "normalized")
-        group = as_zarr_group(self.zw[status.path], name=status.path)
+        group = group_at(self.zw, status.path)
         return ChunkedArray(
             as_zarr_array(group["data"], name="data"),
             block_size=batch_size,
@@ -2317,6 +1394,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         local_cache: bool | str,
         batch_size: int,
     ) -> Iterator[None]:
+        try:
+            already_cached = ref in self._normalizedArtifactCache
+        except AttributeError:
+            already_cached = False
+        if already_cached:
+            yield
+            return
         enabled, cache_base, remove_on_success = self._resolve_local_cache_plan(
             self.zarr_loc,
             self.z,
@@ -2328,10 +1412,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if cache_base is None:
             raise RuntimeError("Local cache path is missing")
         status = self._require_complete_artifact(ref, "normalized")
-        source_group = as_zarr_group(
-            self.zw[status.path],
-            name=status.path,
-        )
+        source_group = group_at(self.zw, status.path)
         source = as_zarr_array(source_group["data"], name="data")
         cache_path = os.path.join(
             cache_base,
@@ -2360,11 +1441,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             block_size=batch_size,
             nthreads=self.nthreads,
         )
+        succeeded = False
         try:
             yield
+            succeeded = True
         finally:
             cache.pop(ref, None)
-            if remove_on_success:
+            if remove_on_success and succeeded:
                 import shutil
 
                 shutil.rmtree(cache_base, ignore_errors=True)
@@ -2406,16 +1489,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             normalized_ref,
             batch_size=batch_size,
         )
-        scaling_group = as_zarr_group(
-            self.zw[artifact_path(scaling_ref)],
-            name=artifact_path(scaling_ref),
-        )
+        scaling_group = artifact_group(self.zw, scaling_ref)
         mu = np.asarray(as_zarr_array(scaling_group["mean"], name="mean")[:])
         sigma = np.asarray(as_zarr_array(scaling_group["scale"], name="scale")[:])
-        reduction_group = as_zarr_group(
-            self.zw[status.path],
-            name=status.path,
-        )
+        reduction_group = group_at(self.zw, status.path)
         loadings = (
             np.asarray(
                 as_zarr_array(
@@ -2473,7 +1550,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 coordinates,
                 "batch_correction",
             )
-            group = as_zarr_group(self.zw[status.path], name=status.path)
+            group = group_at(self.zw, status.path)
             data = ChunkedArray(
                 as_zarr_array(group["data"], name="data"),
                 block_size=batch_size,
@@ -2550,9 +1627,46 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         log_transform: bool | None = None,
         renormalize_subset: bool | None = None,
         batch_size: int | None = None,
+        local_cache: bool | str = "auto",
         update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
+        """Normalize one cell and feature selection into an artifact.
+
+        An identical operation reuses a complete artifact unless
+        ``invalidate_cache`` is true. The returned reference can be passed
+        directly to a reduction method.
+
+        Args:
+            from_assay: Assay to normalize. Uses the default assay when omitted.
+            cell_key: Boolean cell metadata column selecting rows.
+            feat_key: Boolean feature metadata key selecting columns. For a
+                non-``I`` key, the stored feature column is
+                ``{cell_key}__{feat_key}``.
+            log_transform: Whether to apply the assay log transform. When
+                omitted, reuse the selected artifact setting or default to
+                true.
+            renormalize_subset: Whether to recompute size factors for the
+                selected feature subset. When omitted, reuse the selected
+                artifact setting or default to true.
+            batch_size: Number of selected cells processed per block.
+            local_cache: Local staging policy recorded for downstream atomic
+                operations. ``"auto"`` stages only remote stores, ``True``
+                creates temporary scratch, ``False`` disables staging, and a
+                path uses persistent scratch.
+            update_state: Publish the result as the assay's current normalized
+                artifact.
+            invalidate_cache: Force a new artifact instead of reusing an
+                identical complete result.
+
+        Returns:
+            Reference to the normalized artifact.
+
+        Raises:
+            KeyError: If the feature selection does not exist.
+            TypeError: If a selection is not boolean.
+            ValueError: If the assay, feature key, or selected data is invalid.
+        """
         assay_name = from_assay or self._defaultAssay
         if assay_name is None:
             raise ValueError("No assay was provided and no default is configured")
@@ -2642,7 +1756,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             renormalize_subset=renormalize_subset,
             batch_size=effective_batch_size,
             update_state=update_state,
-            local_cache=False,
+            local_cache=local_cache,
             invalidate_cache=invalidate_cache,
         )
         planned = self._plan_assay_artifact(
@@ -2681,6 +1795,59 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         return planned.ref
 
     def _run_reduction_artifact(
+        self,
+        *,
+        method: str,
+        normalized: ArtifactRef | None,
+        from_assay: str | None,
+        dims: int,
+        pca_cell_key: str | None,
+        feat_scaling: bool,
+        lsi_skip_first: bool,
+        custom_loadings: np.ndarray | None,
+        rand_state: int,
+        batch_size: int | None,
+        local_cache: bool | str,
+        show_elbow_plot: bool,
+        update_state: bool,
+        invalidate_cache: bool,
+    ) -> ArtifactRef:
+        normalized_ref = normalized or self._selected_artifact(
+            from_assay,
+            "normalized",
+            "normalized",
+        )
+        status = self._require_complete_artifact(normalized_ref, "normalized")
+        group = group_at(self.zw, status.path)
+        data = as_zarr_array(group["data"], name="data")
+        execution = status.execution_options or {}
+        effective_batch_size = min(
+            int(batch_size or execution.get("batch_size") or data.chunks[0]),
+            int(data.shape[0]),
+        )
+        with self._artifact_execution_context({"local_cache": local_cache}):
+            with self._cache_normalized_artifact(
+                normalized_ref,
+                local_cache,
+                effective_batch_size,
+            ):
+                return self._run_reduction_artifact_impl(
+                    method=method,
+                    normalized=normalized_ref,
+                    from_assay=from_assay,
+                    dims=dims,
+                    pca_cell_key=pca_cell_key,
+                    feat_scaling=feat_scaling,
+                    lsi_skip_first=lsi_skip_first,
+                    custom_loadings=custom_loadings,
+                    rand_state=rand_state,
+                    batch_size=effective_batch_size,
+                    show_elbow_plot=show_elbow_plot,
+                    update_state=update_state,
+                    invalidate_cache=invalidate_cache,
+                )
+
+    def _run_reduction_artifact_impl(
         self,
         *,
         method: str,
@@ -2938,10 +2105,33 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         pca_cell_key: str | None = None,
         feat_scaling: bool = True,
         batch_size: int | None = None,
+        local_cache: bool | str = "auto",
         show_elbow_plot: bool = False,
         update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
+        """Fit or reuse PCA for a normalized artifact.
+
+        Args:
+            normalized: Normalized artifact to reduce. Uses the selected assay
+                state when omitted.
+            from_assay: Assay used to resolve the selected normalized artifact.
+            dims: Requested number of principal components.
+            pca_cell_key: Optional boolean cell column used to fit PCA while
+                projecting every selected cell.
+            feat_scaling: Whether to standardize features before fitting PCA.
+            batch_size: Number of selected cells processed per block. This
+                affects PCA results and therefore participates in identity.
+            local_cache: Local staging policy for normalized data on remote
+                stores.
+            show_elbow_plot: Whether to display explained variance after a new
+                PCA fit.
+            update_state: Publish the result as the current reduction.
+            invalidate_cache: Force a new reduction artifact.
+
+        Returns:
+            Reference to the PCA reduction artifact.
+        """
         return self._run_reduction_artifact(
             method="pca",
             normalized=normalized,
@@ -2953,6 +2143,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             custom_loadings=None,
             rand_state=4466,
             batch_size=batch_size,
+            local_cache=local_cache,
             show_elbow_plot=show_elbow_plot,
             update_state=update_state,
             invalidate_cache=invalidate_cache,
@@ -2967,9 +2158,28 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         skip_first: bool = True,
         rand_state: int = 4466,
         batch_size: int | None = None,
+        local_cache: bool | str = "auto",
         update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
+        """Fit or reuse latent semantic indexing for normalized data.
+
+        Args:
+            normalized: Normalized artifact to reduce. Uses selected assay
+                state when omitted.
+            from_assay: Assay used to resolve selected normalized data.
+            dims: Requested number of retained LSI dimensions.
+            skip_first: Whether to omit the first singular component.
+            rand_state: Seed used by the randomized decomposition.
+            batch_size: Number of selected cells processed per block.
+            local_cache: Local staging policy for normalized data on remote
+                stores.
+            update_state: Publish the result as the current reduction.
+            invalidate_cache: Force a new reduction artifact.
+
+        Returns:
+            Reference to the LSI reduction artifact.
+        """
         return self._run_reduction_artifact(
             method="lsi",
             normalized=normalized,
@@ -2981,6 +2191,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             custom_loadings=None,
             rand_state=rand_state,
             batch_size=batch_size,
+            local_cache=local_cache,
             show_elbow_plot=False,
             update_state=update_state,
             invalidate_cache=invalidate_cache,
@@ -2993,9 +2204,27 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         *,
         from_assay: str | None = None,
         batch_size: int | None = None,
+        local_cache: bool | str = "auto",
         update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
+        """Register custom feature loadings as a reusable reduction.
+
+        Args:
+            loadings: Two-dimensional feature-by-dimension loading matrix. Its
+                row count must match the normalized feature selection.
+            normalized: Normalized artifact associated with the loadings. Uses
+                selected assay state when omitted.
+            from_assay: Assay used to resolve selected normalized data.
+            batch_size: Number of selected cells processed per block.
+            local_cache: Local staging policy for normalized data on remote
+                stores.
+            update_state: Publish the result as the current reduction.
+            invalidate_cache: Force a new reduction artifact.
+
+        Returns:
+            Reference to the custom reduction artifact.
+        """
         return self._run_reduction_artifact(
             method="custom",
             normalized=normalized,
@@ -3007,12 +2236,83 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             custom_loadings=np.asarray(loadings),
             rand_state=4466,
             batch_size=batch_size,
+            local_cache=local_cache,
             show_elbow_plot=False,
             update_state=update_state,
             invalidate_cache=invalidate_cache,
         )
 
     def run_harmony(
+        self,
+        batch_columns: list[str],
+        reduction: ArtifactRef | None = None,
+        *,
+        from_assay: str | None = None,
+        harmony_params: dict[str, Any] | None = None,
+        batch_size: int | None = None,
+        local_cache: bool | str = "auto",
+        update_state: bool = True,
+        invalidate_cache: bool = False,
+    ) -> ArtifactRef:
+        """Fit or reuse Harmony correction for a reduction artifact.
+
+        Args:
+            batch_columns: Non-empty cell metadata columns describing
+                technical batches.
+            reduction: PCA or other reduction artifact to correct. Uses the
+                selected reduction when omitted.
+            from_assay: Assay used to resolve the selected reduction.
+            harmony_params: Harmony fitting parameters.
+            batch_size: Number of selected cells processed per block.
+            local_cache: Local staging policy for normalized data on remote
+                stores.
+            update_state: Publish the result as the current batch correction.
+            invalidate_cache: Force a new correction artifact.
+
+        Returns:
+            Reference to the batch-correction artifact.
+
+        Raises:
+            ValueError: If batch columns, artifact inputs, or selections are
+                invalid.
+        """
+        reduction_ref = reduction or self._selected_artifact(
+            from_assay,
+            "reduction",
+            "reduction",
+        )
+        normalized_ref = self._artifact_input_ref(
+            reduction_ref,
+            "normalized",
+            "normalized",
+        )
+        reduction_parameters = (
+            inspect_artifact(
+                self.zw,
+                reduction_ref,
+            ).parameters
+            or {}
+        )
+        effective_batch_size = int(
+            batch_size or reduction_parameters.get("batch_size") or 1000
+        )
+        with self._artifact_execution_context({"local_cache": local_cache}):
+            with self._cache_normalized_artifact(
+                normalized_ref,
+                local_cache,
+                effective_batch_size,
+            ):
+                return self._run_harmony_impl(
+                    batch_columns=batch_columns,
+                    reduction=reduction_ref,
+                    from_assay=from_assay,
+                    harmony_params=harmony_params,
+                    batch_size=batch_size,
+                    update_state=update_state,
+                    invalidate_cache=invalidate_cache,
+                )
+
+    def _run_harmony_impl(
         self,
         batch_columns: list[str],
         reduction: ArtifactRef | None = None,
@@ -3254,260 +2554,59 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             finish_artifact(group, planned)
         return planned.ref
 
-    def _build_mapping_reference_artifact(
+    def build_embedding_initialization(
         self,
+        reduction: ArtifactRef | None = None,
         *,
-        reduction: ArtifactRef,
-        batch_correction: ArtifactRef,
-        ann_index: ArtifactRef,
-        neighbors: ArtifactRef,
-        invalidate_cache: bool,
+        from_assay: str | None = None,
+        n_centroids: int = 1000,
+        rand_state: int = 4466,
+        batch_size: int | None = None,
+        update_state: bool = True,
+        invalidate_cache: bool = False,
     ) -> ArtifactRef:
-        from ...mapping.artifact import write_artifact_mapping_reference
-        from ...mapping.confidence import _distance_quantile_summary
-        from ...mapping.models import SymphonyReferenceModel
-        from ...mapping.symphony import weighted_centroids
+        """Build or reuse K-means embedding initialization for a reduction.
 
-        if reduction.assay is None:
-            raise ValueError("Reduction artifact has no assay")
-        reduction_status = self._require_complete_artifact(
+        Downstream UMAP reads this artifact from ``AssayState`` unless you pass
+        ``ini_embed`` explicitly.
+
+        Args:
+            reduction: Reduction artifact to cluster. Uses the selected assay
+                reduction when omitted.
+            from_assay: Assay used to resolve the selected reduction.
+            n_centroids: Requested number of K-means centroids.
+            rand_state: K-means random seed.
+            batch_size: Number of cells processed per block.
+            update_state: Publish the result as the current embedding
+                initialization.
+            invalidate_cache: Force a new initialization artifact.
+
+        Returns:
+            Reference to the embedding-initialization artifact.
+        """
+        if reduction is None:
+            assay = from_assay or self._defaultAssay
+            if assay is None:
+                raise ValueError("No assay was provided and no default is configured")
+            state = read_assay_state(self.zw, assay)
+            if state is None or state.reduction is None:
+                raise KeyError(f"AssayState for {assay!r} has no selected reduction")
+            reduction = state.reduction
+        requested_batch_size = int(batch_size if batch_size is not None else 1000)
+        initialization = self._build_embedding_initialization(
             reduction,
-            "reduction",
-        )
-        if reduction_status.operation != "run_pca" or not bool(
-            (reduction_status.parameters or {}).get(
-                "feat_scaling",
-                False,
-            )
-        ):
-            raise ValueError("Mapping references require PCA with feature scaling")
-        if (
-            self._artifact_input_ref(
-                batch_correction,
-                "reduction",
-                "reduction",
-            )
-            != reduction
-        ):
-            raise ValueError("Batch correction uses another reduction")
-        if (
-            self._artifact_input_ref(
-                ann_index,
-                "coordinates",
-                "batch_correction",
-            )
-            != batch_correction
-        ):
-            raise ValueError("ANN index uses another batch correction")
-        if (
-            self._artifact_input_ref(
-                neighbors,
-                "ann_index",
-                "ann_index",
-            )
-            != ann_index
-            or self._artifact_input_ref(
-                neighbors,
-                "coordinates",
-                "batch_correction",
-            )
-            != batch_correction
-        ):
-            raise ValueError("Neighbors use another corrected graph chain")
-        normalized = self._artifact_input_ref(
-            reduction,
-            "normalized",
-            "normalized",
-        )
-        cell_selection = self._artifact_input_ref(
-            normalized,
-            "cell_selection",
-            "cell_selection",
-        )
-        feature_selection = self._artifact_input_ref(
-            normalized,
-            "feature_selection",
-            "feature_selection",
-        )
-        planned = plan_artifact(
-            self.zw,
-            scope="assay",
-            assay=reduction.assay,
-            kind="mapping_reference",
-            operation="build_mapping_reference",
-            parameters={"method": "symphony"},
-            inputs={
-                "reduction": reduction,
-                "batch_correction": batch_correction,
-                "ann_index": ann_index,
-                "neighbors": neighbors,
-                "cell_selection": cell_selection,
-                "feature_selection": feature_selection,
-            },
-            execution_options=dict(getattr(self, "_artifactExecutionContext", {})),
+            n_centroids=n_centroids,
+            rand_state=rand_state,
+            batch_size=requested_batch_size,
             invalidate_cache=invalidate_cache,
-            required_arrays=(
-                "feature_ids",
-                "feature_means",
-                "feature_scales",
-                "loadings",
-                "centroids",
-                "raw_centroids",
-                "corrected_centroids",
-                "cluster_mass",
-                "sigma",
-                "reference_distance_quantiles",
-                "reference_distance_values",
-            ),
-            required_attributes=(
-                AttributeRequirement(
-                    "correction_ridge",
-                    expected_types=(int, float),
-                    predicate=lambda value: (
-                        not isinstance(value, bool) and np.isfinite(value)
-                    ),
-                ),
-                AttributeRequirement(
-                    "reference_metadata",
-                    expected_types=(dict,),
-                ),
-            ),
         )
-        if planned.reused:
-            return planned.ref
-        reduction_parameters = reduction_status.parameters or {}
-        batch_size = int(reduction_parameters.get("batch_size", 1000))
-        transform, stream = self._load_reduction_stream(
-            reduction,
-            batch_size=batch_size,
-        )
-        if transform.loadings is None:
-            raise RuntimeError("Mapping reference requires persisted PCA loadings")
-        original = np.vstack(
-            stream.parallel_blocks(
-                "Loading reference coordinates",
+        if update_state:
+            self._publish_current_artifact(
+                reduction,
+                update_state=True,
+                embedding_initialization=initialization,
             )
-        )
-        correction_status = self._require_complete_artifact(
-            batch_correction,
-            "batch_correction",
-        )
-        correction_group = as_zarr_group(
-            self.zw[correction_status.path],
-            name=correction_status.path,
-        )
-        corrected = np.asarray(as_zarr_array(correction_group["data"], name="data")[:])
-        assignments = np.asarray(
-            as_zarr_array(
-                correction_group["assignments"],
-                name="assignments",
-            )[:]
-        )
-        cluster_mass, raw_centroids = weighted_centroids(
-            original,
-            assignments,
-        )
-        _, corrected_centroids = weighted_centroids(
-            corrected,
-            assignments,
-        )
-        ridge = np.asarray(as_zarr_array(correction_group["ridge"], name="ridge")[:])
-        ridge_values = np.diag(ridge)[1:]
-        correction_ridge = (
-            float(np.mean(ridge_values[ridge_values > 0]))
-            if np.any(ridge_values > 0)
-            else 1.0
-        )
-        scaling = self._artifact_input_ref(
-            reduction,
-            "feature_scaling",
-            "feature_scaling",
-        )
-        scaling_group = as_zarr_group(
-            self.zw[artifact_path(scaling)],
-            name=artifact_path(scaling),
-        )
-        model = SymphonyReferenceModel(
-            feature_means=np.asarray(
-                as_zarr_array(scaling_group["mean"], name="mean")[:]
-            ),
-            feature_scales=np.asarray(
-                as_zarr_array(scaling_group["scale"], name="scale")[:]
-            ),
-            loadings=transform.loadings,
-            centroids=np.asarray(
-                as_zarr_array(
-                    correction_group["centroids"],
-                    name="centroids",
-                )[:]
-            ).T,
-            raw_centroids=raw_centroids,
-            corrected_centroids=corrected_centroids,
-            cluster_mass=cluster_mass,
-            sigma=np.asarray(
-                as_zarr_array(
-                    correction_group["sigma"],
-                    name="sigma",
-                )[:]
-            ),
-            correction_ridge=correction_ridge,
-        )
-        normalized_execution = (
-            inspect_artifact(self.zw, normalized).execution_options or {}
-        )
-        feature_column = (
-            normalized_execution.get("feat_key")
-            if normalized_execution.get("feat_key") == "I"
-            else (
-                f"{normalized_execution.get('cell_key')}__"
-                f"{normalized_execution.get('feat_key')}"
-            )
-        )
-        assay = self._get_assay(reduction.assay)
-        feature_ids = assay.feats.fetch("ids", key=str(feature_column))
-        correction_parameters = correction_status.parameters or {}
-        metadata = {
-            "assay": reduction.assay,
-            "cell_key": normalized_execution.get("cell_key"),
-            "feature_key": normalized_execution.get("feat_key"),
-            "batch_columns": correction_parameters.get(
-                "batch_columns",
-                [],
-            ),
-            "harmony_parameters": correction_parameters.get(
-                "harmony_parameters",
-                {},
-            ),
-            "batch_levels": correction_group.attrs.get(
-                "batch_levels",
-                [],
-            ),
-            "method": "symphony",
-            "normalization_parameters": (
-                inspect_artifact(self.zw, normalized).parameters or {}
-            ),
-        }
-        neighbors_group = as_zarr_group(
-            self.zw[artifact_path(neighbors)],
-            name=artifact_path(neighbors),
-        )
-        distance_quantiles, distance_values = _distance_quantile_summary(
-            as_zarr_array(
-                neighbors_group["distances"],
-                name="distances",
-            )
-        )
-        group = start_artifact(self.zw, planned)
-        write_artifact_mapping_reference(
-            group,
-            model,
-            feature_ids,
-            metadata,
-            distance_quantiles,
-            distance_values,
-        )
-        finish_artifact(group, planned)
-        return planned.ref
+        return initialization
 
     def build_ann_index(
         self,
@@ -3523,6 +2622,123 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         batch_size: int | None = None,
         ann_index_fetcher: Callable | None = None,
         ann_index_saver: Callable | None = None,
+        local_cache: bool | str = "auto",
+        update_state: bool = True,
+        invalidate_cache: bool = False,
+    ) -> ArtifactRef:
+        """Build or reuse an approximate nearest-neighbor index.
+
+        Args:
+            coordinates: Reduction or batch-correction artifact. Uses current
+                assay state when omitted.
+            from_assay: Assay used to resolve current coordinates.
+            ann_metric: HNSW distance metric.
+            ann_efc: HNSW construction search breadth.
+            ann_ef: HNSW query search breadth stored on the index.
+            ann_m: Maximum HNSW graph degree.
+            ann_parallel: Whether HNSW construction may use datastore worker
+                threads.
+            rand_state: Index-construction random seed.
+            batch_size: Number of coordinate rows processed per block.
+            ann_index_fetcher: Optional callback that supplies a prebuilt
+                index. Stateful callbacks must define ``artifact_identity``.
+            ann_index_saver: Optional callback invoked after index creation.
+            local_cache: Local staging policy for normalized data used to
+                stream coordinates from a remote store.
+            update_state: Publish the result as the current ANN index.
+            invalidate_cache: Force a new index artifact.
+
+        Returns:
+            Reference to the ANN-index artifact.
+        """
+        coordinates_ref = coordinates
+        if coordinates_ref is None:
+            assay = from_assay or self._defaultAssay
+            if assay is None:
+                raise ValueError("No assay was provided and no default is configured")
+            state = read_assay_state(self.zw, assay)
+            if state is None or state.reduction is None:
+                raise KeyError("AssayState has no selected reduction")
+            coordinates_ref = (
+                state.batch_correction
+                if state.batch_correction is not None
+                else state.reduction
+            )
+        reduction_ref = (
+            self._artifact_input_ref(
+                coordinates_ref,
+                "reduction",
+                "reduction",
+            )
+            if coordinates_ref.kind == "batch_correction"
+            else coordinates_ref
+        )
+        normalized_ref = self._artifact_input_ref(
+            reduction_ref,
+            "normalized",
+            "normalized",
+        )
+        reduction_parameters = (
+            inspect_artifact(
+                self.zw,
+                reduction_ref,
+            ).parameters
+            or {}
+        )
+        normalized_status = self._require_complete_artifact(
+            normalized_ref,
+            "normalized",
+        )
+        normalized_group = as_zarr_group(
+            self.zw[normalized_status.path],
+            name=normalized_status.path,
+        )
+        normalized_data = as_zarr_array(
+            normalized_group["data"],
+            name="data",
+        )
+        effective_batch_size = min(
+            int(batch_size or reduction_parameters.get("batch_size") or 1000),
+            int(normalized_data.shape[0]),
+        )
+        with self._artifact_execution_context({"local_cache": local_cache}):
+            with self._cache_normalized_artifact(
+                normalized_ref,
+                local_cache,
+                effective_batch_size,
+            ):
+                return self._build_ann_index_impl(
+                    coordinates=coordinates_ref,
+                    from_assay=from_assay,
+                    ann_metric=ann_metric,
+                    ann_efc=ann_efc,
+                    ann_ef=ann_ef,
+                    ann_m=ann_m,
+                    ann_parallel=ann_parallel,
+                    rand_state=rand_state,
+                    batch_size=batch_size,
+                    ann_index_fetcher=ann_index_fetcher,
+                    ann_index_saver=ann_index_saver,
+                    local_cache=local_cache,
+                    update_state=update_state,
+                    invalidate_cache=invalidate_cache,
+                )
+
+    def _build_ann_index_impl(
+        self,
+        coordinates: ArtifactRef | None = None,
+        *,
+        from_assay: str | None = None,
+        ann_metric: str = "l2",
+        ann_efc: int = 50,
+        ann_ef: int = 50,
+        ann_m: int = 48,
+        ann_parallel: bool = False,
+        rand_state: int = 4466,
+        batch_size: int | None = None,
+        ann_index_fetcher: Callable | None = None,
+        ann_index_saver: Callable | None = None,
+        local_cache: bool | str = "auto",
         update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
@@ -3574,7 +2790,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size=effective_batch_size,
             ann_index_fetcher=ann_index_fetcher,
             ann_index_saver=ann_index_saver,
-            local_cache=False,
+            local_cache=local_cache,
             invalidate_cache=invalidate_cache,
         )
 
@@ -3642,6 +2858,84 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         return planned.ref
 
     def query_neighbors(
+        self,
+        ann_index: ArtifactRef | None = None,
+        *,
+        from_assay: str | None = None,
+        coordinates: ArtifactRef | None = None,
+        k: int = 11,
+        batch_size: int | None = None,
+        local_cache: bool | str = "auto",
+        update_state: bool = True,
+        invalidate_cache: bool = False,
+    ) -> ArtifactRef:
+        """Query an ANN artifact and persist neighbor indices and distances.
+
+        Args:
+            ann_index: ANN-index artifact. Uses current assay state when
+                omitted.
+            from_assay: Assay used to resolve the current ANN index.
+            coordinates: Optional explicit coordinates. When provided, they
+                must match the ANN index input.
+            k: Number of non-self neighbors per selected cell.
+            batch_size: Number of coordinate rows queried per block.
+            local_cache: Local staging policy for normalized data used to
+                stream coordinates from a remote store.
+            update_state: Publish the result as the current neighbors artifact.
+            invalidate_cache: Force a new neighbors artifact.
+
+        Returns:
+            Reference to the neighbors artifact.
+
+        Raises:
+            ValueError: If coordinates disagree with the ANN index or fewer
+                than two cells are available.
+        """
+        ann_ref = ann_index or self._selected_artifact(
+            from_assay,
+            "ann_index",
+            "ann_index",
+        )
+        ann_status = self._require_complete_artifact(ann_ref, "ann_index")
+        raw_coordinates = (ann_status.inputs or {}).get("coordinates")
+        if not isinstance(raw_coordinates, dict):
+            raise ValueError("ANN artifact has no coordinates input")
+        stored_coordinates = ArtifactRef.from_dict(raw_coordinates)
+        reduction_ref = (
+            self._artifact_input_ref(
+                stored_coordinates,
+                "reduction",
+                "reduction",
+            )
+            if stored_coordinates.kind == "batch_correction"
+            else stored_coordinates
+        )
+        normalized_ref = self._artifact_input_ref(
+            reduction_ref,
+            "normalized",
+            "normalized",
+        )
+        ann_execution = ann_status.execution_options or {}
+        effective_batch_size = int(
+            batch_size or ann_execution.get("batch_size") or 1000
+        )
+        with self._artifact_execution_context({"local_cache": local_cache}):
+            with self._cache_normalized_artifact(
+                normalized_ref,
+                local_cache,
+                effective_batch_size,
+            ):
+                return self._query_neighbors_impl(
+                    ann_index=ann_ref,
+                    from_assay=from_assay,
+                    coordinates=coordinates,
+                    k=k,
+                    batch_size=batch_size,
+                    update_state=update_state,
+                    invalidate_cache=invalidate_cache,
+                )
+
+    def _query_neighbors_impl(
         self,
         ann_index: ArtifactRef | None = None,
         *,
@@ -3792,6 +3086,21 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
+        """Convert persisted neighbors into a weighted connectivity graph.
+
+        Args:
+            neighbors: Neighbors artifact. Uses current assay state when
+                omitted.
+            from_assay: Assay used to resolve current neighbors.
+            local_connectivity: UMAP-style local-connectivity adjustment.
+            bandwidth: Distance-kernel bandwidth multiplier.
+            batch_size: Number of cells processed per block.
+            update_state: Publish the result as the current connectivity map.
+            invalidate_cache: Force a new connectivity artifact.
+
+        Returns:
+            Reference to the connectivity-map artifact.
+        """
         neighbors_ref = neighbors or self._selected_artifact(
             from_assay,
             "neighbors",
@@ -3803,7 +3112,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if neighbors_ref.assay is None:
             raise ValueError("Neighbors artifact has no assay")
-        group = as_zarr_group(self.zw[status.path], name=status.path)
+        group = group_at(self.zw, status.path)
         indices = as_zarr_array(group["indices"], name="indices")
         n_cells, n_neighbors = map(int, indices.shape)
         neighbor_execution = status.execution_options or {}
@@ -3856,166 +3165,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         return planned.ref
 
-    def _resolve_graph_plan(
-        self,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
-        feat_key: str | None = None,
-        pca_cell_key: str | None = None,
-        reduction_method: str = "auto",
-        dims: int | None = None,
-        k: int | None = None,
-        ann_metric: str | None = None,
-        ann_efc: int | None = None,
-        ann_ef: int | None = None,
-        ann_m: int | None = None,
-        ann_parallel: bool = False,
-        rand_state: int | None = None,
-        n_centroids: int | None = None,
-        batch_size: int | None = None,
-        log_transform: bool | None = None,
-        renormalize_subset: bool | None = None,
-        local_connectivity: float | None = None,
-        bandwidth: float | None = None,
-        update_keys: bool = True,
-        return_ann_object: bool = False,
-        custom_loadings: np.ndarray | None = None,
-        feat_scaling: bool = True,
-        lsi_skip_first: bool = True,
-        harmonize: bool = False,
-        batch_columns: list[str] | None = None,
-        show_elbow_plot: bool = False,
-        ann_index_fetcher: Callable | None = None,
-        ann_index_saver: Callable | None = None,
-        local_cache: bool | str = "auto",
-        harmony_params: dict[str, Any] | None = None,
-        force_harmony_refit: bool = False,
-        invalidate_cache: bool = False,
-    ) -> GraphBuildPlan:
-        if from_assay is None:
-            from_assay = self._defaultAssay
-        assay = self._get_assay(from_assay)
-        if cell_key is None:
-            cell_key = "I"
-        if feat_key is None:
-            bool_col_parts = [
-                x.split("__", 1)
-                for x in assay.feats.columns
-                if assay.feats.get_dtype(x) == bool and x != "I"  # noqa: E721
-            ]
-            bool_cols_msg = " ".join(f"{part[1]}({part[0]})" for part in bool_col_parts)
-            raise ValueError(
-                "ERROR: You have to choose which features that should be used for graph construction. "
-                "Ideally you should have performed a feature selection step before making this graph. "
-                "Feature selection step adds a column to your feature table. \n"
-                "You have following boolean columns in the feature "
-                f"metadata of assay {from_assay} which you can choose from: {bool_cols_msg}\n The values in "
-                f"brackets indicate the cell_key for which the feat_key is available. Choosing 'I' "
-                f"as `feat_key` means that you will use all the genes for graph creation."
-            )
-        if batch_size is None:
-            state = read_assay_state(self.zw, from_assay)
-            if (
-                state is not None
-                and state.matches(cell_key, feat_key)
-                and state.reduction is not None
-            ):
-                state_reduction = (
-                    inspect_artifact(self.zw, state.reduction).parameters or {}
-                )
-                stored_batch_size = state_reduction.get("batch_size")
-                batch_size = (
-                    int(cast(int | float | str, stored_batch_size))
-                    if stored_batch_size is not None
-                    else None
-                )
-            if batch_size is None:
-                batch_size = assay.rawData.chunksize[0]
-        if custom_loadings is not None:
-            reduction_method = "custom"
-            dims = custom_loadings.shape[1]
-            logger.info(
-                f"`dims` parameter and its default value ignored as using custom loadings "
-                f"with {dims} dims"
-            )
-
-        parameters = self._resolve_graph_parameters(
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=feat_key,
-            log_transform=log_transform,
-            renormalize_subset=renormalize_subset,
-            reduction_method=reduction_method,
-            dims=dims,
-            pca_cell_key=pca_cell_key,
-            ann_metric=ann_metric,
-            ann_efc=ann_efc,
-            ann_ef=ann_ef,
-            ann_m=ann_m,
-            rand_state=rand_state,
-            k=k,
-            n_centroids=n_centroids,
-            local_connectivity=local_connectivity,
-            bandwidth=bandwidth,
-            feat_scaling=feat_scaling,
-            lsi_skip_first=lsi_skip_first,
-            harmonize=harmonize,
-            batch_columns=batch_columns,
-            harmony_params=harmony_params,
-        )
-        n_active_cells = len(self.cells.active_index(cell_key))
-        effective_batch_size = min(int(batch_size), n_active_cells)
-        if effective_batch_size < 1:
-            raise ValueError("Graph construction requires at least one active cell")
-        if n_active_cells < 2:
-            raise ValueError("Graph construction requires at least two active cells")
-        effective_dims = parameters.dims
-        if custom_loadings is None:
-            effective_dims = min(effective_dims, len(self.cells.active_index(cell_key)))
-            if effective_dims >= effective_batch_size:
-                effective_dims = max(effective_batch_size - 1, 0)
-        effective_centroids = min(
-            max(parameters.n_centroids, 2),
-            effective_batch_size,
-        )
-        parameters = replace(
-            parameters,
-            dims=effective_dims,
-            n_centroids=effective_centroids,
-            k=min(parameters.k, n_active_cells - 1),
-        )
-        if parameters.harmonize:
-            if parameters.batch_columns is None:
-                raise ValueError("Harmonization requested but no batches provided")
-            if isinstance(parameters.batch_columns, list) is False:
-                raise ValueError(
-                    "batches must be a list of columns in cell metadata that represent batches"
-                )
-            for column in parameters.batch_columns:
-                self.cells.fetch(column, key=cell_key)
-        return GraphBuildPlan(
-            data_inputs=GraphDataInputs(
-                assay=assay,
-                from_assay=from_assay,
-                cell_key=cell_key,
-                feat_key=feat_key,
-                custom_loadings=custom_loadings,
-            ),
-            parameters=parameters,
-            options=GraphExecutionOptions(
-                batch_size=effective_batch_size,
-                update_keys=update_keys,
-                return_ann_object=return_ann_object,
-                show_elbow_plot=show_elbow_plot,
-                ann_parallel=ann_parallel,
-                ann_index_fetcher=ann_index_fetcher,
-                ann_index_saver=ann_index_saver,
-                local_cache=local_cache,
-                force_harmony_refit=force_harmony_refit,
-                invalidate_cache=invalidate_cache,
-            ),
-        )
-
     def _execute_atomic_graph_plan(
         self,
         plan: GraphBuildPlan,
@@ -4031,6 +3180,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 pca_cell_key=params.pca_cell_key,
                 feat_scaling=params.feat_scaling,
                 batch_size=options.batch_size,
+                local_cache=options.local_cache,
                 show_elbow_plot=options.show_elbow_plot,
                 update_state=False,
                 invalidate_cache=options.invalidate_cache,
@@ -4042,6 +3192,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 skip_first=params.lsi_skip_first,
                 rand_state=params.rand_state,
                 batch_size=options.batch_size,
+                local_cache=options.local_cache,
                 update_state=False,
                 invalidate_cache=options.invalidate_cache,
             )
@@ -4052,6 +3203,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 inputs.custom_loadings,
                 normalized,
                 batch_size=options.batch_size,
+                local_cache=options.local_cache,
                 update_state=False,
                 invalidate_cache=options.invalidate_cache,
             )
@@ -4066,6 +3218,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 reduction,
                 harmony_params=params.harmony_params,
                 batch_size=options.batch_size,
+                local_cache=options.local_cache,
                 update_state=False,
                 invalidate_cache=(
                     options.invalidate_cache or options.force_harmony_refit
@@ -4082,6 +3235,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size=options.batch_size,
             ann_index_fetcher=options.ann_index_fetcher,
             ann_index_saver=options.ann_index_saver,
+            local_cache=options.local_cache,
             update_state=False,
             invalidate_cache=options.invalidate_cache,
         )
@@ -4097,6 +3251,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             coordinates=coordinates,
             k=params.k,
             batch_size=options.batch_size,
+            local_cache=options.local_cache,
             update_state=False,
             invalidate_cache=options.invalidate_cache,
         )
@@ -4172,172 +3327,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     normalized,
                 )
 
-    def make_graph(
-        self,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
-        feat_key: str | None = None,
-        pca_cell_key: str | None = None,
-        reduction_method: str = "auto",
-        dims: int | None = None,
-        k: int | None = None,
-        ann_metric: str | None = None,
-        ann_efc: int | None = None,
-        ann_ef: int | None = None,
-        ann_m: int | None = None,
-        ann_parallel: bool = False,
-        rand_state: int | None = None,
-        n_centroids: int | None = None,
-        batch_size: int | None = None,
-        log_transform: bool | None = None,
-        renormalize_subset: bool | None = None,
-        local_connectivity: float | None = None,
-        bandwidth: float | None = None,
-        update_keys: bool = True,
-        return_ann_object: bool = False,
-        custom_loadings: np.ndarray | None = None,
-        feat_scaling: bool = True,
-        lsi_skip_first: bool = True,
-        harmonize: bool = False,
-        batch_columns: list[str] | None = None,
-        show_elbow_plot: bool = False,
-        ann_index_fetcher: Callable | None = None,
-        ann_index_saver: Callable | None = None,
-        local_cache: bool | str = "auto",
-        harmony_params: dict[str, Any] | None = None,
-        _force_harmony_refit: bool = False,
-    ) -> AnnStream | None:
-        """Compatibility facade for the atomic graph operations.
-
-        - Normalizes the data calling the `save_normalized_data` for the assay
-        - runs reduction and optional Harmony correction
-        - builds the ANN index and embedding initialization
-        - queries ANN index for nearest neighbours and saves the distances and indices of the neighbours
-        - recalculates distances into graph weights
-        - publishes the completed refs through `AssayState`
-
-        Args:
-            from_assay: Assay to use for graph creation. If no value is provided then `defaultAssay` will be used
-            cell_key: Cells to use for graph creation. By default all cells with True value in 'I' will be used.
-                      The provided value for `cell_key` should be a column in cell metadata table with boolean values.
-            feat_key: Features to use for graph creation. It is a required parameter. We have chosen not to set this
-                      to 'I' by default because this might lead to usage of too many features and may lead to poor
-                      results. The value for `feat_key` should be a column in feature metadata from the `from_assay`
-                      assay and should be boolean type.
-            pca_cell_key: Name of a column from cell metadata table. This column should be boolean type. If no value is
-                          provided then the value is set to same as `cell_key` which means all the cells in the
-                          normalized data will be used for fitting the pca. This parameter, hence, basically provides a
-                          mechanism to subset the normalized data only for PCA fitting step. This parameter can be
-                          useful, for example, the data has cells from multiple replicates which wont merge together, in
-                          which case the `pca_cell_key` can be used to fit PCA on cells from only one of the replicate.
-            reduction_method: Method to use for linear dimension reduction. Could be either 'pca', 'lsi' or 'auto'. In
-                              case of 'auto' `_choose_reduction_method` will be used to determine the best reduction
-                              type for the assay.
-            dims: Number of top reduced dimensions to use (Default value: 11)
-            k: Number of nearest neighbours to query for each cell (Default value: 11)
-            ann_metric: Refer to HNSWlib link above (Default value: 'l2')
-            ann_efc: Refer to HNSWlib link above (Default value: min(100, max(k * 3, 50)))
-            ann_ef: Refer to HNSWlib link above (Default value: min(100, max(k * 3, 50)))
-            ann_m: Refer to HNSWlib link above (Default value: min(max(48, int(dims * 1.5)), 64) )
-            ann_parallel: If True, then ANN graph is created in parallel mode using DataStore.nthreads number of
-                          threads. Results obtained in parallel mode will not be reproducible. (Default: False)
-            rand_state: Random seed number (Default value: 4466)
-            n_centroids: Number of centroids for Kmeans clustering. As a general indication, have a value of 1+ for
-                         every 100 cells. Small (<2000 cells) and very small (<500 cells) use a ballpark number for max
-                         expected number of clusters (Default value: 500). The results of kmeans clustering are only
-                         used to provide initial embedding for UMAP and tSNE. (Default value: 500)
-            batch_size: Number of cells in a batch. This number is guided by number of features being used and the
-                        amount of available free memory. Though the full data is already divided into chunks, however,
-                        if only a fraction of features is being used in the normalized dataset, then the chunk size
-                        can be increased to speed up the computation (i.e. PCA fitting and ANN index building).
-                        (Default value: 1000)
-            log_transform: If True, then the normalized data is log-transformed (only affects RNAassay type assays).
-                           (Default value: True)
-            renormalize_subset: If True, then the data is normalized using only those features that are True in
-                                `feat_key` column rather using total expression of all features in a cell (only affects
-                                RNAassay type assays). (Default value: True)
-            local_connectivity: This parameter is forwarded to `smooth_knn_dist` function from UMAP package. Higher
-                                value will push distribution of edge weights towards terminal values (binary like).
-                                Lower values will accumulate edge weights around the mean produced by `bandwidth`
-                                parameter. (Default value: 1.0)
-            bandwidth: This parameter is forwarded to `smooth_knn_dist` function from UMAP package. Higher value will
-                       push the mean of distribution of graph edge weights towards right.  (Default value: 1.5). Read
-                       more about `smooth_knn_dist` function here:
-                       https://umap-learn.readthedocs.io/en/latest/api.html#umap.umap_.smooth_knn_dist
-            update_keys: If True, publish the completed chain through
-                         `AssayState`. The name is retained for compatibility.
-            return_ann_object: If True then returns the ANNStream object. This allows one to directly interact with the
-                               PCA transformer and HNSWlib index. Check out ANNStream documentation to know more.
-                               (Default: False)
-            custom_loadings: Custom loadings/transformer for linear dimension reduction. If provided, should have a form
-                             (d x p) where d is same the number of active features in feat_key and p is the number of
-                             reduced dimensions. `dims` parameter is ignored when this is provided.
-                             (Default value: None)
-            feat_scaling: If True (default) then the feature will be z-scaled otherwise not. It is highly recommended
-                          that this is kept as True unless you know what you are doing.
-            lsi_skip_first: Whether to remove the first LSI dimension when using ATAC-Seq data.
-            harmonize: If True, run Harmony batch correction on the PCA embedding before
-                       building the KNN graph. Requires ``batch_columns``.
-            batch_columns: Cell metadata columns defining batch variables for Harmony.
-            harmony_params: Optional keyword arguments forwarded to ``fit_harmony``.
-            show_elbow_plot: If True, then an elbow plot is shown when PCA is fitted to the data. Not shown when using
-                            existing PCA loadings or custom loadings. (Default value: False)
-            ann_index_fetcher: Optional callable to load a pre-built ANN index instead of fitting one.
-            ann_index_saver: Optional callable to persist a fitted ANN index for reuse.
-            local_cache: When ``'auto'`` or ``True``, remote stores copy the normalized
-                         matrix to a local scratch Zarr before PCA/ANN/kmeans/KNN so
-                         multi-pass reads hit local disk instead of object storage.
-                         A string value is treated as a persistent scratch base path
-                         keyed by artifact ID (~8 GB for 1M cells x 2000 HVGs in
-                         float32). ``False`` disables staging.
-
-        Returns:
-            Either None or `AnnStream` object
-        """
-        import warnings
-
-        warnings.warn(
-            "make_graph is deprecated; call the atomic graph methods instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        plan = self._resolve_graph_plan(
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=feat_key,
-            pca_cell_key=pca_cell_key,
-            reduction_method=reduction_method,
-            dims=dims,
-            k=k,
-            ann_metric=ann_metric,
-            ann_efc=ann_efc,
-            ann_ef=ann_ef,
-            ann_m=ann_m,
-            ann_parallel=ann_parallel,
-            rand_state=rand_state,
-            n_centroids=n_centroids,
-            batch_size=batch_size,
-            log_transform=log_transform,
-            renormalize_subset=renormalize_subset,
-            local_connectivity=local_connectivity,
-            bandwidth=bandwidth,
-            update_keys=update_keys,
-            return_ann_object=return_ann_object,
-            custom_loadings=custom_loadings,
-            feat_scaling=feat_scaling,
-            lsi_skip_first=lsi_skip_first,
-            harmonize=harmonize,
-            batch_columns=batch_columns,
-            show_elbow_plot=show_elbow_plot,
-            ann_index_fetcher=ann_index_fetcher,
-            ann_index_saver=ann_index_saver,
-            local_cache=local_cache,
-            harmony_params=harmony_params,
-            force_harmony_refit=_force_harmony_refit,
-            invalidate_cache=False,
-        )
-        return self._run_resolved_graph_plan(plan)
-
     def load_graph(
         self,
         from_assay: str | None = None,
@@ -4362,7 +3351,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             use_k: Number of top k-nearest neighbours to keep in the graph. This value must be greater than 0 and less
                    the parameter k used. By default, all neighbours are used. (Default value: None)
             graph_loc: Zarr hierarchy where the graph is stored. If no value is provided then graph location is
-                       obtained from `_get_latest_graph_loc` method.
+                       obtained from `get_latest_graph_loc` method.
 
         Returns:
             A scipy sparse matrix representing cell neighbourhood graph.

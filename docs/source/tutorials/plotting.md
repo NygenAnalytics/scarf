@@ -270,7 +270,8 @@ For unified reference and query layouts from mapping, use
 
 Workflow chapters call a few standalone diagnostics:
 
-- `DataStore.make_graph(..., show_elbow_plot=True)` plots PCA explained variance
+- `DataStore.run_pca(..., show_elbow_plot=True)` plots PCA explained variance
+
 - `scarf.plotting.graph_qc(graph)` plots degree and edge-weight distributions for a
   sparse graph from `load_graph`
 - `mark_hvgs(..., show_plot=True)` or `scarf.plotting.highly_variable_features` shows the

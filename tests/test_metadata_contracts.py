@@ -1,4 +1,3 @@
-import inspect
 import pickle
 
 import numpy as np
@@ -8,6 +7,7 @@ from zarr.storage import MemoryStore
 import scarf.metadata as metadata
 from scarf.metadata.rows import MetaDataRowBlock as implementation_row_block
 from scarf.metadata.table import MetaData as implementation_metadata
+from tests.signature_contracts import signature_digest
 
 
 _METHODS = {
@@ -79,19 +79,10 @@ def test_metadata_facade_exports_canonical_objects():
 
 def test_metadata_method_ownership_and_signatures_remain_stable():
     assert _METHODS <= set(metadata.MetaData.__dict__)
-    assert str(inspect.signature(metadata.MetaData.__init__)) == (
-        "(self, zgrp: zarr.core.group.Group)"
-    )
-    assert str(inspect.signature(metadata.MetaData.iter_row_blocks)) == (
-        "(self, *, cell_key: str = 'I', "
-        "columns: collections.abc.Iterable[str] | None = None, "
-        "block_rows: int | None = None) -> "
-        "collections.abc.Iterator[scarf.metadata.MetaDataRowBlock]"
-    )
-    assert str(inspect.signature(metadata.MetaData.insert)) == (
-        "(self, column_name: str, values: numpy.ndarray | list, "
-        "fill_value: Any = nan, key: str = 'I', overwrite: bool = False, "
-        "location: str = 'primary', force: bool = False) -> None"
+    methods = {name: getattr(metadata.MetaData, name) for name in _METHODS}
+
+    assert signature_digest(methods) == (
+        "f882e8fb00453f282ab117edfa27a4433ee2e46446b71631f8c4c450f0327d5d"
     )
 
 

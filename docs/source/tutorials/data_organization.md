@@ -28,7 +28,9 @@ Low-level layout details for contributors live in {doc}`../developers/zarr_inter
 
 - Inspect the Zarr hierarchy
 - Read and write cell or feature metadata
-- Locate cached graph and marker results
+- See how released encoded paths and current artifacts coexist
+- Create, inspect, reuse, and invalidate a normalization artifact
+- Locate marker tables through the marker index
 
 ## Dataset
 
@@ -97,8 +99,10 @@ ds.show_zarr_tree(start='cellData')
 **The `I` column** tracks active cells. Values are boolean: filtered-out cells are `False`.
 Most `DataStore` methods take `cell_key` (default `I`) and operate only on cells marked `True`.
 
-Each assay group holds `counts`, `featureData`, optional `markers`, and cached normalized
-matrices such as `normed__I__hvgs`.
+Each assay group holds `counts`, `featureData`, optional `markers`, and analysis
+outputs. Released tutorial archives often still use encoded paths such as
+`normed__I__hvgs`. Current Scarf also writes provenance-backed groups under
+`{assay}/artifacts/...`. Both layouts can coexist in one store.
 
 ```{code-cell} ipython3
 ds.show_zarr_tree(start='RNA', depth=1)
@@ -188,45 +192,106 @@ import inspect
 print(inspect.getsource(ds.RNA.normMethod))
 ```
 
-### 4. Graph caching
+### 4. Released paths versus artifacts
 
-`make_graph` caches results under a name like `normed__{cell_key}__{feat_key}`. Intermediate
-PCA and ANN artefacts are kept so Scarf can skip recomputation when parameters match.
+Downloaded tutorial archives were often produced before provenance-backed
+artifacts. On such a store, assay state and artifact listings can be empty even
+when encoded graph groups exist:
 
 ```{code-cell} ipython3
-import warnings
+ds.get_assay_state('RNA')
+ds.list_artifacts()
+```
 
-with warnings.catch_warnings():
-    warnings.filterwarnings(
-        'ignore',
-        message='Object at ann_idx is not recognized as a component of a Zarr hierarchy.',
+`get_normalized_group_path` falls back to the released encoded path when no
+matching artifact state is published:
+
+```{code-cell} ipython3
+ds.get_normalized_group_path('RNA', 'I', 'hvgs')
+```
+
+If that path exists on this archive, inspect it as a plain Zarr group:
+
+```{code-cell} ipython3
+encoded = ds.get_normalized_group_path('RNA', 'I', 'hvgs')
+if encoded in ds.z:
+    ds.show_zarr_tree(start=encoded, depth=1)
+```
+
+Create one cheap current-format artifact with atomic normalization. Prefer a
+feature key that already exists on the store (`hvgs` here when present):
+
+```{code-cell} ipython3
+feat_key = 'hvgs' if 'I__hvgs' in ds.RNA.feats.columns else 'I'
+normalized = ds.run_normalization(feat_key=feat_key)
+normalized
+```
+
+State and listings now include the published artifact. The normalized path
+switches to an artifact location:
+
+```{code-cell} ipython3
+ds.get_assay_state('RNA')
+ds.list_artifacts(kind='normalized')
+ds.get_normalized_group_path('RNA', 'I', feat_key)
+```
+
+Inspect and load:
+
+```{code-cell} ipython3
+status = ds.inspect_artifact(normalized)
+status.complete, status.operation, status.parameters
+group = ds.load_artifact(normalized)
+list(group.array_keys())[:5]
+```
+
+Identical provenance reuses the same ref. `invalidate_cache=True` forces a new
+artifact ID:
+
+```{code-cell} ipython3
+reused = ds.run_normalization(feat_key=feat_key)
+assert reused == normalized
+forced = ds.run_normalization(feat_key=feat_key, invalidate_cache=True)
+assert forced != normalized
+```
+
+`load_graph` still returns a sparse matrix when a published connectivity map (or
+compatible released graph) is available. Prefer letting Scarf resolve the graph
+internally unless you need the matrix for a custom method.
+
+```{code-cell} ipython3
+try:
+    ds.load_graph(
+        from_assay='RNA',
+        cell_key='I',
+        feat_key=feat_key,
+        symmetric=False,
+        upper_only=False,
     )
-    ds.show_zarr_tree(start='RNA/normed__I__hvgs')
+except Exception as exc:
+    print(type(exc).__name__, exc)
 ```
 
-`load_graph` returns the latest graph for the given assay, cell key, and feature key as a
-sparse matrix. Prefer letting Scarf load graphs internally unless you need the matrix for a
-custom method.
-
-```{code-cell} ipython3
-ds.load_graph(
-    from_assay='RNA',
-    cell_key='I',
-    feat_key='hvgs',
-    symmetric=False,
-    upper_only=False,
-)
-```
+Concepts: {doc}`../concepts/provenance` and
+{doc}`../concepts/graph_and_state`. Hands-on reuse:
+{doc}`provenance_and_reuse`.
 
 ### 5. Marker features
 
-`run_marker_search` writes markers under `{assay}/markers/{cell_key}__{group_key}`.
-Fetch one group with `get_markers`, or export all groups with `export_markers_to_csv`.
+`run_marker_search` publishes a `marker_table` artifact. The assay keeps a small
+index under `{assay}/markers` whose `artifacts` attribute maps
+`{cell_key}__{group_key}` slots to those refs. Fetch one group with
+`get_markers`, or export all groups with `export_markers_to_csv`.
 
 ```{code-cell} ipython3
 if 'RNA/markers' not in ds.z:
-    ds.run_marker_search(group_key='clusters', gene_batch_size=100)
+    ds.run_marker_search(group_key='clusters')
 ds.show_zarr_tree(start='RNA/markers', depth=2)
+```
+
+```{code-cell} ipython3
+index = dict(ds.z['RNA/markers'].attrs.get('artifacts', {}))
+index
 ```
 
 ```{code-cell} ipython3
@@ -240,9 +305,10 @@ ds.get_markers(
 
 ### 6. Zarr v3, memory, and remote stores
 
-Current Scarf versions write new datasets as Zarr v3. Existing v2 stores remain readable. Count matrices
-from the writers use sharded arrays (default profile `fast_local`). Set the profile with
-`SCARF_ZARR_PROFILE` (`fast_local` or `cloud`) or `zarrProfile=` when opening a `DataStore`.
+Current Scarf versions write new datasets as Zarr v3. Existing v2 stores remain
+readable. Count matrices from the writers use sharded arrays (default profile
+`fast_local`). Set the profile with `SCARF_ZARR_PROFILE` (`fast_local` or
+`cloud`) or `zarrProfile=` when opening a `DataStore`.
 
 ```bash
 uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_local
@@ -254,24 +320,29 @@ Bound streaming memory with `mem_budget`:
 ds = scarf.DataStore('path/to/data.zarr', mem_budget='8G', nthreads=4)
 ```
 
-For object storage, use `zarrProfile='cloud'`. Pass `local_cache=True` to `make_graph` to stage
-normalized data locally before PCA and KNN. After Harmony, corrected embeddings are stored under
-the PCA reduction group as `harmonizedData` with `isHarmonized=True`.
+For object storage, use `zarrProfile='cloud'` and pass `local_cache` on atomic
+graph methods (or rely on `"auto"`) to stage normalized data locally before
+multi-pass PCA and KNN. See {doc}`remote_stores`.
 
 ## Common mistakes
 
 - Expecting filtered cells to be deleted instead of marked `False` in `I`
 - Treating `MetaData` as an in-memory pandas DataFrame
 - Using `fetch` when values for inactive cells are also required (`fetch_all`)
+- Assuming a downloaded archive already has `AssayState` or `list_artifacts()`
+  entries
 
 ## Saved results
 
-Metadata changes and graph caches are written to the Zarr store. Marker tables appear under
-`{assay}/markers/...` after `run_marker_search`. WAGGR and AUCell results are stored below
+Metadata changes and artifacts are written to the Zarr store. Marker payloads
+live under `{assay}/artifacts/marker_table/...` with an index under
+`{assay}/markers`. WAGGR and AUCell results are stored below
 `<assay>/enrichment/<label>`; see {doc}`gene_set_enrichment` for the scoring APIs.
 
 ## Next steps
 
+- {doc}`provenance_and_reuse`
+- {doc}`remote_stores`
 - {doc}`import_and_export`
 - {doc}`../reference/api`
 - {doc}`../developers/zarr_internals`

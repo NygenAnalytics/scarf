@@ -10,7 +10,6 @@ from zarr.storage import MemoryStore
 
 from scarf.clustering._paris_core import ParisHierarchy
 from scarf.clustering.paris_multiscale import PlateauForest
-from scarf.clustering.paris import fit_paris_hierarchy
 from scarf.datastore._operations.clustering import _ClusteringOperationsMixin
 from scarf.datastore._operations.presentation import _PresentationOperationsMixin
 from scarf.datastore._operations.paris_persistence import (
@@ -147,14 +146,6 @@ class _Store(_ClusteringOperationsMixin, _PresentationOperationsMixin):
         if self.raise_on_latest_graph:
             raise AssertionError("standard graph lookup was not expected")
         return "RNA/graph"
-
-    def _get_latest_graph_loc(
-        self,
-        from_assay: str,
-        cell_key: str,
-        feat_key: str,
-    ) -> str:
-        return self.get_latest_graph_loc(from_assay, cell_key, feat_key)
 
     def _lookup_stored_graph(
         self,
@@ -312,10 +303,44 @@ def test_fit_uses_additive_graph_and_fixed_cut_materializes_linkage_lazily() -> 
     generation_id = result.hierarchy_generation_id
     assert generation_id is not None
     hierarchy, _forest = _load_artifact_hierarchy(store, generation_id)
-    expected = fit_paris_hierarchy(graph, n_threads=1)
+    expected_children = np.asarray(
+        [
+            [0, 1],
+            [7, 8],
+            [2, 3],
+            [9, 10],
+            [4, 14],
+            [11, 12],
+            [13, 15],
+            [16, 18],
+            [5, 21],
+            [17, 19],
+            [20, 23],
+            [6, 24],
+            [22, 25],
+        ],
+        dtype=np.int64,
+    )
+    expected_heights = np.asarray(
+        [
+            0.2906300860265055,
+            0.5696349686119507,
+            0.2906300860265055,
+            0.5696349686119507,
+            0.2906300860265055,
+            0.5696349686119507,
+            0.5696349686119507,
+            0.2906300860265055,
+            0.2912113461985585,
+            0.5696349686119507,
+            0.5696349686119507,
+            0.5704487328528249,
+            1954.034061846082,
+        ]
+    )
 
-    assert np.array_equal(hierarchy.children, expected.children)
-    assert np.array_equal(hierarchy.heights, expected.heights)
+    np.testing.assert_array_equal(hierarchy.children, expected_children)
+    np.testing.assert_allclose(hierarchy.heights, expected_heights, rtol=1e-12)
     dendrograms = list_artifacts(
         store.zw,
         scope="assay",
@@ -896,37 +921,6 @@ def test_run_paris_clustering_validates_cut_arguments(
         store.run_paris_clustering(**arguments)
 
 
-def test_run_clustering_is_a_deprecated_none_returning_shim() -> None:
-    store = _Store(_block_graph())
-    with pytest.warns(FutureWarning, match="run_clustering is deprecated"):
-        returned = store.run_clustering(n_clusters=np.int64(2))
-
-    assert returned is None
-    assert store.cells.writes == ["RNA_cluster"]
-
-    with (
-        pytest.warns(FutureWarning),
-        pytest.raises(
-            ValueError,
-            match="balanced-cut mode has been removed",
-        ),
-    ):
-        store.run_clustering(
-            n_clusters=2,
-            balanced_cut=True,
-            max_size=100,
-            min_size=10,
-        )
-    with (
-        pytest.warns(FutureWarning),
-        pytest.raises(
-            ValueError,
-            match="n_clusters=None",
-        ),
-    ):
-        store.run_clustering()
-
-
 def test_run_paris_clustering_accepts_numpy_integer_cut_parameters() -> None:
     store = _Store(_block_graph())
 
@@ -939,17 +933,3 @@ def test_run_paris_clustering_accepts_numpy_integer_cut_parameters() -> None:
 
     assert fixed.n_clusters == 2
     assert adaptive.labels.shape == (14,)
-
-
-def test_deprecated_symmetry_flags_warn_and_are_ignored() -> None:
-    store = _Store(_block_graph())
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        store.run_clustering(
-            n_clusters=2,
-            symmetric_graph=True,
-            graph_upper_only=True,
-        )
-
-    assert [item.category for item in caught] == [FutureWarning, FutureWarning]
-    assert store.load_graph_calls == 1

@@ -33,8 +33,8 @@ if TYPE_CHECKING:
     from .distribution import distribution as distribution
     from .embedding import embedding as embedding
     from .embedding_raster import embedding_raster as embedding_raster
+    from .cluster_tree import cluster_tree as cluster_tree
     from .heatmaps import (
-        cluster_tree as cluster_tree,
         marker_heatmap as marker_heatmap,
         pseudotime_heatmap as pseudotime_heatmap,
     )
@@ -87,7 +87,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SizeScale": ("._contracts", "SizeScale"),
     "StudyDesign": ("._contracts", "StudyDesign"),
     "THEMES": ("._style", "THEMES"),
-    "cluster_tree": (".heatmaps", "cluster_tree"),
+    "cluster_tree": (".cluster_tree", "cluster_tree"),
     "collect_legends": ("._figure", "collect_legends"),
     "composition": (".composition", "composition"),
     "distribution": (".distribution", "distribution"),

@@ -71,5 +71,7 @@ and the developers guide.
 ## Next steps
 
 - {ref}`Quick start <quickstart>`
+- {doc}`whats_new_in_1_0`
 - {doc}`scarf_and_scanpy`
+- {doc}`concepts/scale_and_memory`
 - {doc}`tutorials/scrna_seq`

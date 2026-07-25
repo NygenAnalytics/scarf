@@ -1,20 +1,77 @@
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, fields
-from pathlib import Path
+from dataclasses import MISSING, dataclass, field, fields
 from types import MappingProxyType
 from typing import Any, ClassVar, Literal
 
 import numpy as np
+import zarr
 
+from ..storage.artifact_writer import (
+    ArrayRequirement,
+    AttributeRequirement,
+    PlannedArtifact,
+    plan_artifact,
+)
 from ..storage.artifacts import (
     ArtifactRef,
-    callable_identity,
-    fingerprint_array,
+    ArtifactScope,
     make_provenance,
     provenance_hash,
+    serialize_artifact_value,
 )
 
 type ArgumentRole = Literal["input", "parameter", "execution"]
+
+
+def parameter(
+    default: Any = MISSING,
+    *,
+    default_factory: Any = MISSING,
+) -> Any:
+    if default is not MISSING and default_factory is not MISSING:
+        raise ValueError("Cannot specify both default and default_factory")
+    if default_factory is not MISSING:
+        return field(
+            default_factory=default_factory,
+            metadata={"argument_role": "parameter"},
+        )
+    if default is not MISSING:
+        return field(default=default, metadata={"argument_role": "parameter"})
+    return field(metadata={"argument_role": "parameter"})
+
+
+def execution(
+    default: Any = MISSING,
+    *,
+    default_factory: Any = MISSING,
+) -> Any:
+    if default is not MISSING and default_factory is not MISSING:
+        raise ValueError("Cannot specify both default and default_factory")
+    if default_factory is not MISSING:
+        return field(
+            default_factory=default_factory,
+            metadata={"argument_role": "execution"},
+        )
+    if default is not MISSING:
+        return field(default=default, metadata={"argument_role": "execution"})
+    return field(metadata={"argument_role": "execution"})
+
+
+def artifact_input(
+    default: Any = MISSING,
+    *,
+    default_factory: Any = MISSING,
+) -> Any:
+    if default is not MISSING and default_factory is not MISSING:
+        raise ValueError("Cannot specify both default and default_factory")
+    if default_factory is not MISSING:
+        return field(
+            default_factory=default_factory,
+            metadata={"argument_role": "input"},
+        )
+    if default is not MISSING:
+        return field(default=default, metadata={"argument_role": "input"})
+    return field(metadata={"argument_role": "input"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,26 +79,6 @@ class ArgumentRecord:
     parameters: dict[str, Any]
     execution_options: dict[str, Any]
     inputs: dict[str, Any]
-
-
-def _serialize_argument(name: str, value: Any) -> Any:
-    if isinstance(value, ArtifactRef):
-        return value.to_dict()
-    if isinstance(value, np.ndarray):
-        return {"value_fingerprint": fingerprint_array(value)}
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, Path):
-        return str(value)
-    if callable(value):
-        return {"external_hook": True, **callable_identity(value)}
-    if isinstance(value, Mapping):
-        return {
-            str(key): _serialize_argument(str(key), item) for key, item in value.items()
-        }
-    if isinstance(value, tuple | list):
-        return [_serialize_argument(name, item) for item in value]
-    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,9 +98,8 @@ class OperationArguments:
                 raise TypeError(
                     f"{type(self).__name__}.{model_field.name} has no argument role"
                 )
-            partitions[role][model_field.name] = _serialize_argument(
-                model_field.name,
-                getattr(self, model_field.name),
+            partitions[role][model_field.name] = serialize_artifact_value(
+                getattr(self, model_field.name)
             )
         return ArgumentRecord(
             parameters=partitions["parameter"],
@@ -82,30 +118,52 @@ class OperationArguments:
     def provenance_hash(self) -> str:
         return provenance_hash(self.provenance())
 
+    def plan(
+        self,
+        root: zarr.Group,
+        *,
+        scope: ArtifactScope,
+        assay: str | None = None,
+        invalidate_cache: bool = False,
+        required_arrays: tuple[str | ArrayRequirement, ...] = (),
+        required_attributes: tuple[str | AttributeRequirement, ...] = (),
+        reuse_validator: Callable[[ArtifactRef, zarr.Group], bool] | None = None,
+    ) -> PlannedArtifact:
+        record = self.to_record()
+        return plan_artifact(
+            root,
+            scope=scope,
+            assay=assay,
+            kind=self.artifact_kind,
+            operation=self.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            invalidate_cache=invalidate_cache,
+            required_arrays=required_arrays,
+            required_attributes=required_attributes,
+            reuse_validator=reuse_validator,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class NormalizationArguments(OperationArguments):
     operation: ClassVar[str] = "run_normalization"
     artifact_kind: ClassVar[str] = "normalized"
 
-    from_assay: str = field(metadata={"argument_role": "execution"})
-    cell_key: str = field(metadata={"argument_role": "execution"})
-    feat_key: str = field(metadata={"argument_role": "execution"})
-    cell_selection: ArtifactRef = field(metadata={"argument_role": "input"})
-    feature_selection: ArtifactRef = field(metadata={"argument_role": "input"})
-    normalization_method: Callable[..., Any] | str = field(
-        metadata={"argument_role": "parameter"}
-    )
-    size_factor: float | None = field(metadata={"argument_role": "parameter"})
-    log_transform: bool = field(metadata={"argument_role": "parameter"})
-    renormalize_subset: bool = field(metadata={"argument_role": "parameter"})
-    batch_size: int = field(metadata={"argument_role": "execution"})
-    update_state: bool = field(metadata={"argument_role": "execution"})
-    local_cache: bool | str = field(metadata={"argument_role": "execution"})
-    invalidate_cache: bool = field(
-        default=False,
-        metadata={"argument_role": "execution"},
-    )
+    from_assay: str = execution()
+    cell_key: str = execution()
+    feat_key: str = execution()
+    cell_selection: ArtifactRef = artifact_input()
+    feature_selection: ArtifactRef = artifact_input()
+    normalization_method: Callable[..., Any] | str = parameter()
+    size_factor: float | None = parameter()
+    log_transform: bool = parameter()
+    renormalize_subset: bool = parameter()
+    batch_size: int = execution()
+    update_state: bool = execution()
+    local_cache: bool | str = execution()
+    invalidate_cache: bool = execution(False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,14 +171,11 @@ class FeatureScalingArguments(OperationArguments):
     operation: ClassVar[str] = "calculate_feature_scaling"
     artifact_kind: ClassVar[str] = "feature_scaling"
 
-    normalized: ArtifactRef = field(metadata={"argument_role": "input"})
-    enabled: bool = field(metadata={"argument_role": "parameter"})
-    calculation_batch_size: int | None = field(metadata={"argument_role": "parameter"})
-    batch_size: int = field(metadata={"argument_role": "execution"})
-    invalidate_cache: bool = field(
-        default=False,
-        metadata={"argument_role": "execution"},
-    )
+    normalized: ArtifactRef = artifact_input()
+    enabled: bool = parameter()
+    calculation_batch_size: int | None = parameter()
+    batch_size: int = execution()
+    invalidate_cache: bool = execution(False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,19 +183,16 @@ class PcaArguments(OperationArguments):
     operation: ClassVar[str] = "run_pca"
     artifact_kind: ClassVar[str] = "reduction"
 
-    normalized: ArtifactRef = field(metadata={"argument_role": "input"})
-    feature_scaling: ArtifactRef = field(metadata={"argument_role": "input"})
-    pca_cell_selection: ArtifactRef = field(metadata={"argument_role": "input"})
-    pca_cell_key: str = field(metadata={"argument_role": "execution"})
-    dims: int = field(metadata={"argument_role": "parameter"})
-    feat_scaling: bool = field(metadata={"argument_role": "parameter"})
-    batch_size: int = field(metadata={"argument_role": "parameter"})
-    show_elbow_plot: bool = field(metadata={"argument_role": "execution"})
-    update_state: bool = field(metadata={"argument_role": "execution"})
-    invalidate_cache: bool = field(
-        default=False,
-        metadata={"argument_role": "execution"},
-    )
+    normalized: ArtifactRef = artifact_input()
+    feature_scaling: ArtifactRef = artifact_input()
+    pca_cell_selection: ArtifactRef = artifact_input()
+    pca_cell_key: str = execution()
+    dims: int = parameter()
+    feat_scaling: bool = parameter()
+    batch_size: int = parameter()
+    show_elbow_plot: bool = execution()
+    update_state: bool = execution()
+    invalidate_cache: bool = execution(False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,17 +200,14 @@ class LsiArguments(OperationArguments):
     operation: ClassVar[str] = "run_lsi"
     artifact_kind: ClassVar[str] = "reduction"
 
-    normalized: ArtifactRef = field(metadata={"argument_role": "input"})
-    feature_scaling: ArtifactRef = field(metadata={"argument_role": "input"})
-    dims: int = field(metadata={"argument_role": "parameter"})
-    skip_first: bool = field(metadata={"argument_role": "parameter"})
-    rand_state: int = field(metadata={"argument_role": "parameter"})
-    batch_size: int = field(metadata={"argument_role": "execution"})
-    update_state: bool = field(metadata={"argument_role": "execution"})
-    invalidate_cache: bool = field(
-        default=False,
-        metadata={"argument_role": "execution"},
-    )
+    normalized: ArtifactRef = artifact_input()
+    feature_scaling: ArtifactRef = artifact_input()
+    dims: int = parameter()
+    skip_first: bool = parameter()
+    rand_state: int = parameter()
+    batch_size: int = execution()
+    update_state: bool = execution()
+    invalidate_cache: bool = execution(False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,14 +215,11 @@ class CustomReductionArguments(OperationArguments):
     operation: ClassVar[str] = "run_custom_reduction"
     artifact_kind: ClassVar[str] = "reduction"
 
-    normalized: ArtifactRef = field(metadata={"argument_role": "input"})
-    feature_scaling: ArtifactRef = field(metadata={"argument_role": "input"})
-    loadings: np.ndarray = field(metadata={"argument_role": "input"})
-    update_state: bool = field(metadata={"argument_role": "execution"})
-    invalidate_cache: bool = field(
-        default=False,
-        metadata={"argument_role": "execution"},
-    )
+    normalized: ArtifactRef = artifact_input()
+    feature_scaling: ArtifactRef = artifact_input()
+    loadings: np.ndarray = artifact_input()
+    update_state: bool = execution()
+    invalidate_cache: bool = execution(False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,18 +227,13 @@ class HarmonyArguments(OperationArguments):
     operation: ClassVar[str] = "run_harmony"
     artifact_kind: ClassVar[str] = "batch_correction"
 
-    reduction: ArtifactRef = field(metadata={"argument_role": "input"})
-    batch_values: ArtifactRef = field(metadata={"argument_role": "input"})
-    batch_columns: tuple[str, ...] = field(metadata={"argument_role": "parameter"})
-    harmony_parameters: Mapping[str, Any] = field(
-        metadata={"argument_role": "parameter"}
-    )
-    batch_size: int = field(metadata={"argument_role": "execution"})
-    force_refit: bool = field(metadata={"argument_role": "execution"})
-    invalidate_cache: bool = field(
-        default=False,
-        metadata={"argument_role": "execution"},
-    )
+    reduction: ArtifactRef = artifact_input()
+    batch_values: ArtifactRef = artifact_input()
+    batch_columns: tuple[str, ...] = parameter()
+    harmony_parameters: Mapping[str, Any] = parameter()
+    batch_size: int = execution()
+    force_refit: bool = execution()
+    invalidate_cache: bool = execution(False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -207,26 +248,19 @@ class AnnIndexArguments(OperationArguments):
     operation: ClassVar[str] = "build_ann_index"
     artifact_kind: ClassVar[str] = "ann_index"
 
-    coordinates: ArtifactRef = field(metadata={"argument_role": "input"})
-    ann_metric: str = field(metadata={"argument_role": "parameter"})
-    ann_efc: int = field(metadata={"argument_role": "parameter"})
-    ann_ef: int = field(metadata={"argument_role": "parameter"})
-    ann_m: int = field(metadata={"argument_role": "parameter"})
-    rand_state: int = field(metadata={"argument_role": "parameter"})
-    ann_parallel: bool = field(metadata={"argument_role": "parameter"})
-    parallel_threads: int | None = field(metadata={"argument_role": "parameter"})
-    batch_size: int = field(metadata={"argument_role": "execution"})
-    ann_index_fetcher: Callable[..., Any] | None = field(
-        metadata={"argument_role": "input"}
-    )
-    ann_index_saver: Callable[..., Any] | None = field(
-        metadata={"argument_role": "execution"}
-    )
-    local_cache: bool | str = field(metadata={"argument_role": "execution"})
-    invalidate_cache: bool = field(
-        default=False,
-        metadata={"argument_role": "execution"},
-    )
+    coordinates: ArtifactRef = artifact_input()
+    ann_metric: str = parameter()
+    ann_efc: int = parameter()
+    ann_ef: int = parameter()
+    ann_m: int = parameter()
+    rand_state: int = parameter()
+    ann_parallel: bool = parameter()
+    parallel_threads: int | None = parameter()
+    batch_size: int = execution()
+    ann_index_fetcher: Callable[..., Any] | None = artifact_input()
+    ann_index_saver: Callable[..., Any] | None = execution()
+    local_cache: bool | str = execution()
+    invalidate_cache: bool = execution(False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,14 +268,11 @@ class NeighborQueryArguments(OperationArguments):
     operation: ClassVar[str] = "query_neighbors"
     artifact_kind: ClassVar[str] = "neighbors"
 
-    ann_index: ArtifactRef = field(metadata={"argument_role": "input"})
-    coordinates: ArtifactRef = field(metadata={"argument_role": "input"})
-    k: int = field(metadata={"argument_role": "parameter"})
-    batch_size: int = field(metadata={"argument_role": "execution"})
-    invalidate_cache: bool = field(
-        default=False,
-        metadata={"argument_role": "execution"},
-    )
+    ann_index: ArtifactRef = artifact_input()
+    coordinates: ArtifactRef = artifact_input()
+    k: int = parameter()
+    batch_size: int = execution()
+    invalidate_cache: bool = execution(False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,14 +280,11 @@ class ConnectivityMapArguments(OperationArguments):
     operation: ClassVar[str] = "build_connectivity_map"
     artifact_kind: ClassVar[str] = "connectivity_map"
 
-    neighbors: ArtifactRef = field(metadata={"argument_role": "input"})
-    local_connectivity: float = field(metadata={"argument_role": "parameter"})
-    bandwidth: float = field(metadata={"argument_role": "parameter"})
-    batch_size: int = field(metadata={"argument_role": "execution"})
-    invalidate_cache: bool = field(
-        default=False,
-        metadata={"argument_role": "execution"},
-    )
+    neighbors: ArtifactRef = artifact_input()
+    local_connectivity: float = parameter()
+    bandwidth: float = parameter()
+    batch_size: int = execution()
+    invalidate_cache: bool = execution(False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,14 +292,11 @@ class EmbeddingInitializationArguments(OperationArguments):
     operation: ClassVar[str] = "build_embedding_initialization"
     artifact_kind: ClassVar[str] = "embedding_initialization"
 
-    reduction: ArtifactRef = field(metadata={"argument_role": "input"})
-    n_centroids: int = field(metadata={"argument_role": "parameter"})
-    rand_state: int = field(metadata={"argument_role": "parameter"})
-    batch_size: int = field(metadata={"argument_role": "parameter"})
-    invalidate_cache: bool = field(
-        default=False,
-        metadata={"argument_role": "execution"},
-    )
+    reduction: ArtifactRef = artifact_input()
+    n_centroids: int = parameter()
+    rand_state: int = parameter()
+    batch_size: int = parameter()
+    invalidate_cache: bool = execution(False)
 
 
 MAKE_GRAPH_ARGUMENT_OWNERS = {

@@ -4,7 +4,7 @@ Methods and classes for evaluation
 
 from ._types import MatrixData, NeighborMetric, ZarrArray
 from .connectivity import graph_connectivity
-from .concordance import integration_score, label_concordance_score
+from .concordance import label_concordance_score
 from .graph import (
     calculate_knn_cluster_similarity,
     calculate_top_k_neighbor_distances,
@@ -32,7 +32,6 @@ __all__ = [
     "compute_simpson",
     "graph_connectivity",
     "ilisi_knn",
-    "integration_score",
     "knn_to_csr_matrix",
     "label_concordance_score",
     "lisi_batch_mixing_score",

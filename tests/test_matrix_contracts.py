@@ -1,4 +1,3 @@
-import inspect
 import pickle
 from typing import get_type_hints
 
@@ -7,6 +6,7 @@ import numpy as np
 import scarf.matrix as matrix
 from scarf.matrix.blocks import Block as implementation_block
 from scarf.matrix.chunked import ChunkedArray as implementation_chunked_array
+from tests.signature_contracts import signature_digest
 
 
 def test_matrix_facade_exports_canonical_classes():
@@ -18,31 +18,16 @@ def test_matrix_facade_exports_canonical_classes():
 
 
 def test_chunked_array_signatures_remain_stable():
-    assert list(inspect.signature(matrix.ChunkedArray).parameters) == [
-        "backing",
-        "rows",
-        "cols",
-        "ops",
-        "out_cols",
-        "block_size",
-        "nthreads",
-        "is_numpy",
-    ]
-    assert list(inspect.signature(matrix.ChunkedArray.from_numpy).parameters) == [
-        "arr",
-        "block_size",
-        "nthreads",
-    ]
-    assert list(inspect.signature(matrix.ChunkedArray.stream_blocks).parameters) == [
-        "self",
-        "nthreads",
-        "msg",
-        "prefetch",
-    ]
-    assert list(inspect.signature(matrix.ChunkedArray.dot).parameters) == [
-        "self",
-        "b",
-    ]
+    methods = {
+        "ChunkedArray.__init__": matrix.ChunkedArray.__init__,
+        "ChunkedArray.from_numpy": matrix.ChunkedArray.from_numpy,
+        "ChunkedArray.stream_blocks": matrix.ChunkedArray.stream_blocks,
+        "ChunkedArray.dot": matrix.ChunkedArray.dot,
+    }
+
+    assert signature_digest(methods) == (
+        "afc65935760b3d549ef6b24ada2ff67b270d1eb6a4961d20e14a64b17ebf811a"
+    )
 
 
 def test_matrix_type_hints_and_pickle_paths_resolve():

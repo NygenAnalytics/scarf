@@ -47,3 +47,5 @@ jobs:
         run: uv run python docs/execute_all_vignettes.py --validate
       - name: Sphinx HTML build (nitpicky, warnings as errors)
         run: uv run sphinx-build -b html -n -W docs/source docs/build/html
+      - name: Reference coverage (every public symbol documented exactly once)
+        run: uv run python docs/check_reference_coverage.py

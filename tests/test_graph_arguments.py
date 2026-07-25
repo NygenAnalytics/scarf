@@ -1,9 +1,12 @@
 import inspect
+from dataclasses import fields
 
 import numpy as np
 import pytest
+import zarr
+from zarr.storage import MemoryStore
 
-from scarf.datastore._operations.graph import _GraphOperationsMixin
+from scarf.datastore._operations.graph_legacy_params import _GraphLegacyParamsMixin
 from scarf.graph.arguments import (
     MAKE_GRAPH_ARGUMENT_OWNERS,
     AnnIndexArguments,
@@ -16,7 +19,11 @@ from scarf.graph.arguments import (
     NeighborQueryArguments,
     NormalizationArguments,
     PcaArguments,
+    artifact_input,
+    execution,
+    parameter,
 )
+from scarf.storage.artifact_writer import finish_artifact, start_artifact
 from scarf.storage.artifacts import ArtifactRef
 
 
@@ -330,7 +337,7 @@ def test_dynamic_callable_requires_explicit_identity() -> None:
 
 
 def test_make_graph_signature_has_an_argument_owner() -> None:
-    signature = inspect.signature(_GraphOperationsMixin.make_graph)
+    signature = inspect.signature(_GraphLegacyParamsMixin.make_graph)
     public_arguments = set(signature.parameters) - {"self"}
     valid_owners = {
         "ann_index",
@@ -348,3 +355,35 @@ def test_make_graph_signature_has_an_argument_owner() -> None:
 
     assert public_arguments == set(MAKE_GRAPH_ARGUMENT_OWNERS)
     assert set(MAKE_GRAPH_ARGUMENT_OWNERS.values()) <= valid_owners
+
+
+def test_field_factories_set_argument_roles() -> None:
+    assert parameter().metadata["argument_role"] == "parameter"
+    assert execution(False).metadata["argument_role"] == "execution"
+    assert artifact_input().metadata["argument_role"] == "input"
+    roles = {
+        model_field.name: model_field.metadata["argument_role"]
+        for model_field in fields(NormalizationArguments)
+    }
+    assert roles["normalization_method"] == "parameter"
+    assert roles["cell_selection"] == "input"
+    assert roles["invalidate_cache"] == "execution"
+
+
+def test_operation_arguments_plan_reuses_complete_artifact() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    arguments = FeatureScalingArguments(
+        normalized=_ref("normalized", "1"),
+        enabled=True,
+        calculation_batch_size=None,
+        batch_size=100,
+        invalidate_cache=False,
+    )
+    first = arguments.plan(root, scope="assay", assay="RNA")
+    group = start_artifact(root, first)
+    group.create_array("mean", data=np.array([1.0, 2.0]))
+    finish_artifact(group, first)
+
+    reused = arguments.plan(root, scope="assay", assay="RNA")
+    assert reused.reused
+    assert reused.ref == first.ref

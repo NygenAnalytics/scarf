@@ -395,10 +395,13 @@ def test_live_bucket_catalog_is_public():
     assert "scarf_docs" in cytebase.list_repositories()
     repository = cytebase.connect("scarf_docs")
     assert len(repository.list_datasets()) == 22
-    assert repository.list_files("tenx_5K_pbmc_rnaseq") == [
+    files = repository.list_files("tenx_5K_pbmc_rnaseq")
+    assert {
         "tenx_5K_pbmc_rnaseq/data.h5",
         "tenx_5K_pbmc_rnaseq/data.zarr.tar.gz",
-    ]
+        "tenx_5K_pbmc_rnaseq/manifest.json",
+    } <= set(files)
+    assert any(name.startswith("tenx_5K_pbmc_rnaseq/data.zarr/") for name in files)
 
 
 @pytest.mark.integration

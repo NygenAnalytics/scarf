@@ -1,13 +1,12 @@
 import numpy as np
 import pytest
 
-from scarf.mapping.hashing import array_hash
 from scarf.writers import create_zarr_dataset
 
 
 def _ensure_graph(datastore) -> None:
     try:
-        datastore._get_latest_graph_loc("RNA", "I", "hvgs")
+        datastore.get_latest_graph_loc("RNA", "I", "hvgs")
     except KeyError:
         datastore.auto_filter_cells(show_qc_plots=False)
         datastore.mark_hvgs(top_n=100, show_plot=False, bin_strategy="fixed")
@@ -26,10 +25,6 @@ def _projection_store(datastore, name: str, indices: np.ndarray, distances: np.n
     zd[:] = distances
     store.attrs["complete"] = True
     store.attrs["assay"] = "RNA"
-    store.attrs["cellKey"] = "I"
-    store.attrs["featureKey"] = "hvgs"
-    store.attrs["referenceCellHash"] = array_hash(datastore.cells.fetch("ids", key="I"))
-    store.attrs["featureCoverage"] = 1.0
     return store
 
 
@@ -332,7 +327,7 @@ def test_partial_provenance_projection_is_rejected_not_downgraded(datastore_ephe
         np.array([[0, 1]], dtype=np.uint64),
         np.array([[0.0, 1.0]]),
     )
-    marker = create_zarr_dataset(store, "referenceFeatureIndices", (1,), "u8", (1,))
+    marker = create_zarr_dataset(store, "reference_feature_indices", (1,), "u8", (1,))
     marker[:] = [0]
 
     with pytest.raises(ValueError, match="incomplete provenance metadata"):

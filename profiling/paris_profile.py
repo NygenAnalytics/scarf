@@ -19,10 +19,7 @@ from scarf.clustering.paris_multiscale import (
 )
 from scarf.clustering.paris import fit_paris_hierarchy, hierarchy_to_dendrogram
 from scarf.datastore._operations.paris_persistence import (
-    adaptive_config_digest,
     estimate_paris_peak_bytes,
-    load_adaptive_result,
-    persist_adaptive_result,
     write_hierarchy_generation,
 )
 from scarf.storage.arrays import create_zarr_dataset
@@ -62,8 +59,6 @@ class ParisProfile:
     inMemoryCutSeconds: float
     linkageSeconds: float
     hierarchyWriteSeconds: float
-    adaptiveCacheWriteSeconds: float
-    adaptiveCacheLoadSeconds: float
     metadataWriteSeconds: float
     hierarchyBytes: int
     eventBytes: int
@@ -226,38 +221,13 @@ def profile_paris(
         root = zarr.open_group(store=str(path), mode="w")
         root.create_group("graph")
         start = time.perf_counter()
-        generation_id, _location = write_hierarchy_generation(
+        write_hierarchy_generation(
             root,
             "graph",
             hierarchy,
             forest,
         )
         hierarchy_write_seconds = time.perf_counter() - start
-        digest = adaptive_config_digest(generation_id, min_cluster_size)
-        start = time.perf_counter()
-        persist_adaptive_result(
-            root,
-            "graph",
-            "paris_cluster",
-            digest,
-            result,
-            generation_id=generation_id,
-            final_label_key="RNA_paris_cluster",
-            hierarchy_cache_hit=False,
-            cut_seconds=in_memory_cut_seconds,
-        )
-        adaptive_cache_write_seconds = time.perf_counter() - start
-        start = time.perf_counter()
-        cached_result = load_adaptive_result(
-            root,
-            "graph",
-            "paris_cluster",
-            digest,
-            hierarchy,
-        )
-        adaptive_cache_load_seconds = time.perf_counter() - start
-        if cached_result is None:
-            raise RuntimeError("Adaptive cache could not be reloaded")
         metadata = root.create_group("cells")
         start = time.perf_counter()
         labels = create_zarr_dataset(
@@ -267,7 +237,7 @@ def profile_paris(
             np.int32,
             (n_cells,),
         )
-        labels[:] = cached_result.labels
+        labels[:] = result.labels
         metadata_write_seconds = time.perf_counter() - start
         stored_bytes = _stored_bytes(path)
 
@@ -289,8 +259,6 @@ def profile_paris(
         inMemoryCutSeconds=in_memory_cut_seconds,
         linkageSeconds=linkage_seconds,
         hierarchyWriteSeconds=hierarchy_write_seconds,
-        adaptiveCacheWriteSeconds=adaptive_cache_write_seconds,
-        adaptiveCacheLoadSeconds=adaptive_cache_load_seconds,
         metadataWriteSeconds=metadata_write_seconds,
         hierarchyBytes=_hierarchy_bytes(hierarchy),
         eventBytes=_event_bytes(forest),

@@ -9,7 +9,7 @@ from scarf.storage.arrays import create_numeric_array
 from scarf.storage.copy import (
     copy_zarr_array,
     copy_zarr_group_tree,
-    open_or_create_staged_normed_array,
+    create_or_open_staged_normed_array,
 )
 from scarf.storage.layout import normed_array_spec
 from scarf.storage.profiles import (
@@ -242,19 +242,20 @@ def test_copy_zarr_group_tree(tmp_path):
     np.testing.assert_array_equal(dst_slot["0"]["score"][:], [1.0, 2.0, 3.0])
 
 
-def test_open_or_create_staged_normed_array_reuses_shape(tmp_path):
+def test_create_or_open_staged_normed_array_reuses_shape(tmp_path):
     src_root = zarr.open_group(str(tmp_path / "src.zarr"), mode="w")
     spec = normed_array_spec(32, 4, profile="cloud")
     src = create_numeric_array(src_root, "data", spec)
     src[:] = np.ones((32, 4), dtype=np.float32)
+    shape = (int(src.shape[0]), int(src.shape[1]))
 
     cache_path = str(tmp_path / "cache" / "abc123" / "normed.zarr")
-    staged = open_or_create_staged_normed_array(cache_path, src)
+    staged = create_or_open_staged_normed_array(cache_path, shape)
     copy_zarr_array(src, staged, block_rows=8)
     staged.attrs["staged_subset_hash"] = "abc123"
     staged.attrs["staged_complete"] = True
 
-    reopened = open_or_create_staged_normed_array(cache_path, src)
+    reopened = create_or_open_staged_normed_array(cache_path, shape)
     assert reopened.shape == src.shape
     np.testing.assert_allclose(reopened[:], np.ones((32, 4), dtype=np.float32))
 

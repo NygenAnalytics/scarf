@@ -4,13 +4,14 @@ from ..storage.types import ZarrMode
 from ..assay import Assay
 from ..storage.stores import ZARRLOC
 from ._operations.features import _FeatureOperationsMixin
+from ._operations.integration_metrics import _IntegrationMetricsOperationsMixin
 from ._operations.presentation import _PresentationOperationsMixin
 from ._operations.quality_control import _QualityControlOperationsMixin
 from ._operations.trajectory import _TrajectoryFeatureOperationsMixin
 from .mapping_datastore import MappingDatastore
 
 if TYPE_CHECKING:
-    from ._pipeline_accessor import PipelineAccessor
+    from .pipeline_accessor import PipelineAccessor
     from .plot_accessor import DataStorePlotAccessor
 
 __all__ = ["DataStore"]
@@ -20,6 +21,7 @@ class DataStore(
     _QualityControlOperationsMixin,
     _FeatureOperationsMixin,
     _TrajectoryFeatureOperationsMixin,
+    _IntegrationMetricsOperationsMixin,
     _PresentationOperationsMixin,
     MappingDatastore,
 ):
@@ -41,8 +43,9 @@ class DataStore(
                                will be filtered out.
         min_cells_per_feature: Minimum number of cells where a feature has a non-zero value. Genes with values
                                less than this will be filtered out.
-        mito_pattern: Regex pattern to capture mitochondrial genes. (default: 'MT-')
-        ribo_pattern: Regex pattern to capture ribosomal genes. (default: 'RPS|RPL|MRPS|MRPL')
+        mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``MT-|mt``.
+        ribo_pattern: Regex pattern to capture ribosomal genes. When None, uses
+                      ``RPS|RPL|MRPS|MRPL``.
         nthreads: Number of maximum threads to use in all multi-threaded functions
         zarr_mode: For read-write mode use r+' or for read-only use 'r'. (Default value: 'r+')
         workspace: Workspace for the data
@@ -117,7 +120,7 @@ class DataStore(
     @property
     def pipeline(self) -> "PipelineAccessor":
         """Return the store-bound analysis recipe runner."""
-        from ._pipeline_accessor import PipelineAccessor
+        from .pipeline_accessor import PipelineAccessor
 
         return PipelineAccessor(self)
 

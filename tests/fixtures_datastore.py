@@ -35,7 +35,11 @@ def _datastore_tar_path() -> str:
 
 def _has_graph(datastore) -> bool:
     try:
-        datastore._get_latest_graph_loc(from_assay="RNA", cell_key="I", feat_key="hvgs")
+        datastore.get_latest_graph_loc(
+            from_assay="RNA",
+            cell_key="I",
+            feat_key="hvgs",
+        )
         return True
     except KeyError:
         return False
@@ -102,21 +106,50 @@ def datastore_ephemeral(datastore_zarr_root):
 
 
 @pytest.fixture(scope="session")
+def analyzed_datastore_zarr_root(datastore_zarr_root, tmp_path_factory):
+    from scarf.datastore.datastore import DataStore
+
+    zarr_root = tmp_path_factory.mktemp("scarf_analyzed_1K_pbmc_") / "data.zarr"
+    shutil.copytree(datastore_zarr_root, zarr_root)
+    datastore = DataStore(str(zarr_root), default_assay="RNA")
+    datastore.auto_filter_cells(show_qc_plots=False)
+    datastore.mark_hvgs(
+        top_n=100,
+        show_plot=False,
+        bin_strategy="fixed",
+    )
+    datastore.make_graph(
+        feat_key="hvgs",
+        local_cache=False,
+    )
+    state = datastore.get_assay_state("RNA")
+    assert state is not None and state.connectivity_map is not None
+    return str(zarr_root)
+
+
+@pytest.fixture
+def analyzed_datastore_ephemeral(analyzed_datastore_zarr_root):
+    from scarf.datastore.datastore import DataStore
+
+    temp_dir = tempfile.mkdtemp(prefix="scarf_ephemeral_analyzed_1K_pbmc_")
+    shutil.copytree(analyzed_datastore_zarr_root, temp_dir, dirs_exist_ok=True)
+    yield DataStore(temp_dir, default_assay="RNA")
+    remove(temp_dir)
+
+
+@pytest.fixture(scope="session")
 def auto_filter_cells(datastore):
-    if not _has_graph(datastore):
-        datastore.auto_filter_cells(show_qc_plots=False)
+    datastore.auto_filter_cells(show_qc_plots=False)
 
 
 @pytest.fixture(scope="session")
 def mark_hvgs(auto_filter_cells, datastore):
-    if not _has_graph(datastore):
-        datastore.mark_hvgs(top_n=100, show_plot=False, bin_strategy="fixed")
+    datastore.mark_hvgs(top_n=100, show_plot=False, bin_strategy="fixed")
 
 
 @pytest.fixture(scope="session")
 def make_graph(mark_hvgs, datastore):
-    if not _has_graph(datastore):
-        datastore.make_graph(feat_key="hvgs")
+    datastore.make_graph(feat_key="hvgs")
     state = datastore.get_assay_state("RNA")
     assert state is not None and state.neighbors is not None
     yield datastore.inspect_artifact(state.neighbors).path

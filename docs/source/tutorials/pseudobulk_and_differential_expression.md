@@ -60,9 +60,15 @@ ds
 # Ensure a clustering column exists for aggregation demos.
 if 'RNA_leiden_cluster' not in ds.cells.columns:
     ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-    ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
+    normalized = ds.run_normalization(feat_key='hvgs')
+    pca = ds.run_pca(normalized, dims=15)
+    ds.build_embedding_initialization(pca)
+    ann = ds.build_ann_index(pca)
+    neighbors = ds.query_neighbors(ann, k=11)
+    ds.build_connectivity_map(neighbors)
     ds.run_leiden_clustering(resolution=0.5)
 ```
+
 
 The catalog Kang store already includes a UMAP. Leiden groups used for `make_bulk` below may
 differ from the published `cluster_labels` column.

@@ -15,6 +15,8 @@ from scarf.writers import (
     finalize_writer_counts,
 )
 
+pytestmark = pytest.mark.slow
+
 
 def _configure_enrichment_keys(datastore):
     assay = datastore.RNA

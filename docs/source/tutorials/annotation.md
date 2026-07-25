@@ -58,11 +58,17 @@ ds.filter_cells(
     reset_previous=True,
 )
 ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
+normalized = ds.run_normalization(feat_key='hvgs')
+pca = ds.run_pca(normalized, dims=15)
+ds.build_embedding_initialization(pca)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=11)
+ds.build_connectivity_map(neighbors)
 ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
 ds.run_leiden_clustering(resolution=0.5)
 ds.run_marker_search(group_key='RNA_leiden_cluster', gene_batch_size=100)
 ```
+
 
 ## 1) Marker tables
 
@@ -187,13 +193,12 @@ ds.mark_hvgs(
     show_plot=False,
 )
 
-ds.make_graph(
-    cell_key='focus_cells',
-    feat_key='hvgs',
-    k=11,
-    dims=15,
-    n_centroids=50,
-)
+normalized = ds.run_normalization(cell_key='focus_cells', feat_key='hvgs')
+pca = ds.run_pca(normalized, dims=15)
+ds.build_embedding_initialization(pca)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=11)
+ds.build_connectivity_map(neighbors)
 ds.run_umap(
     cell_key='focus_cells',
     n_epochs=100,

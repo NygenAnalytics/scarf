@@ -22,7 +22,7 @@ implementations.
 
 ```{eval-rst}
 .. automodule:: scarf.metrics
-    :members: compute_lisi, ilisi_knn, clisi_knn, graph_connectivity, silhouette_scoring, label_concordance_score, lisi_batch_mixing_score, integration_score
+    :members: compute_lisi, ilisi_knn, clisi_knn, graph_connectivity, silhouette_scoring, label_concordance_score, lisi_batch_mixing_score
     :imported-members:
 ```
 
@@ -35,6 +35,3 @@ Scarf's self-free persisted KNN arrays. Graph connectivity follows the
 original scIB symmetrized-graph definition. YosefLab `scib-metrics` currently
 uses directed strong components for graph connectivity, so those values need
 not match. See Luecken et al. 2022, doi: 10.1038/s41592-021-01336-8.
-
-`metric_integration`, `metric_batch_mixing`, and `metric_silhouette` are
-deprecated compatibility names and may be removed in Scarf 2.0.

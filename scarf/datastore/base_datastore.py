@@ -86,8 +86,9 @@ class BaseDataStore:
                                will be filtered out.
         min_cells_per_feature: Minimum number of cells where a feature has a non-zero value. Genes with values
                                less than this will be filtered out
-        mito_pattern: Regex pattern to capture mitochondrial genes (default: 'MT-')
-        ribo_pattern: Regex pattern to capture ribosomal genes (default: 'RPS|RPL|MRPS|MRPL')
+        mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``MT-|mt``.
+        ribo_pattern: Regex pattern to capture ribosomal genes. When None, uses
+                      ``RPS|RPL|MRPS|MRPL``.
         nthreads: Number of maximum threads to use in all multi-threaded functions
         zarr_mode: For read-write mode use r+' or for read-only use 'r' (Default value: 'r+')
         synchronizer: Used as `synchronizer` parameter when opening the Zarr file. Please refer to this page for
@@ -220,7 +221,8 @@ class BaseDataStore:
             Names of assays present in a Zarr file
         """
         assays = []
-        for i in self.zw.group_keys():
+        # Object-store listings can repeat a group, so keep first occurrences only.
+        for i in dict.fromkeys(self.zw.group_keys()):
             if "is_assay" in self.zw[i].attrs.keys():
                 validate_assay_name(i)
                 sanitize_hierarchy(self.z, i, self.workspace)
@@ -847,7 +849,8 @@ class BaseDataStore:
 
         Args:
             from_assay: Name of assay to be used.
-            cell_key: Boolean column in cell metadata selecting cells (default: ``'I'``).
+            cell_key: Boolean column in cell metadata selecting cells. Required; pass ``'I'``
+                      for the default active-cell key.
             k: Cell metadata column name or feature name whose values are fetched.
             clip_fraction: Fraction (0-1) for soft percentile clipping of numeric values.
 

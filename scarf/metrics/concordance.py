@@ -37,11 +37,3 @@ def label_concordance_score(
     if metric == "nmi":
         return float(normalized_mutual_info_score(first, second))
     raise ValueError(f"Metric {metric!r} is not one of 'ari' or 'nmi'")
-
-
-def integration_score(
-    batch_labels: Sequence[np.ndarray],
-    metric: Literal["ari", "nmi"] = "ari",
-) -> float:
-    """Backward-compatible name for :func:`label_concordance_score`."""
-    return label_concordance_score(batch_labels, metric)

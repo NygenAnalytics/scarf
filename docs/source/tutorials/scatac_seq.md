@@ -125,19 +125,23 @@ ds.ATAC.feats.head()
 
 ### 4. Create a KNN graph
 
-For scATAC-Seq datasets, Scarf uses TF-IDF normalization. The normalization is automatically performed during the graph building step. The selected features, marked as `prevalent_peaks` in feature metadata, are used for graph creation. For the dimension reduction step, LSI (latent semantic indexing) is used rather than PCA. The rest of the steps are same as for scRNA-Seq data.
+For scATAC-Seq datasets, Scarf uses TF-IDF normalization during `run_normalization`.
+The selected features, marked as `prevalent_peaks` in feature metadata, are used for
+graph creation. Dimension reduction uses LSI rather than PCA. The remaining ANN,
+neighbor, and connectivity steps match the RNA atomic chain.
 
-LSI reduction of scATAC-Seq is known to capture the sequencing depth of cells in the first LSI dimension. Hence, by default, the `lsi_skip_first` parameter is True but users can override it.
+LSI reduction of scATAC-Seq is known to capture the sequencing depth of cells in the
+first LSI dimension. `run_lsi` skips that component by default (`skip_first=True`).
 
 ```{code-cell} ipython3
-ds.make_graph(
-    feat_key='prevalent_peaks',
-    k=21,
-    dims=50,
-    n_centroids=100,
-    lsi_skip_first=True,
-)
+normalized = ds.run_normalization(feat_key='prevalent_peaks')
+lsi = ds.run_lsi(normalized, dims=50, skip_first=True)
+ds.build_embedding_initialization(lsi)
+ann = ds.build_ann_index(lsi)
+neighbors = ds.query_neighbors(ann, k=21)
+ds.build_connectivity_map(neighbors)
 ```
+
 
 ### 5. Run UMAP and clustering
 
@@ -287,4 +291,5 @@ labels, and the optional `GeneScores` assay.
 
 - {doc}`data_organization`
 - {doc}`plotting`
-- {doc}`choosing_integration_methods`
+- {doc}`data_integration`
+

@@ -1,10 +1,13 @@
 from dataclasses import fields
 
 import numpy as np
+import pytest
 
 from scarf import ArtifactRef
 from scarf.storage.artifacts import parse_artifact_path
 from scarf.graph.state import AssayState
+
+pytestmark = pytest.mark.slow
 
 
 def _graph_kwargs() -> dict:

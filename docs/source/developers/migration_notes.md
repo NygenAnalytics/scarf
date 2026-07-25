@@ -30,9 +30,8 @@ Plot functions render by default with `show=True`. Pass `show=False` when the re
 
 ## Merge APIs
 
-Prefer `AssayMerge` and `DatasetMerge`. `ZarrMerge` is a deprecated subclass of
-`AssayMerge`. Constructing it emits `DeprecationWarning`. It remains available
-through Scarf 1.x and may be removed in 2.0.
+Prefer `AssayMerge` and `DatasetMerge`. The former `ZarrMerge` alias has been
+removed; construct `AssayMerge` directly.
 
 ## Cell keys
 
@@ -49,20 +48,20 @@ graph topology, so a candidate split must add structure beyond the
 degree-preserving null model. Its
 `min_cluster_size` defaults to the graph's `k + 1`; pass it explicitly when a
 workflow needs a stable lower bound. Pass an integer `n_clusters` to request a
-fixed cut. `run_clustering` remains a deprecated forwarding method until the
-next major release, and the DataStore balanced-cut mode has been removed. The
-deprecated method keeps its legacy signature, so call `run_paris_clustering`
-directly to set `min_cluster_size`.
+fixed cut. The former `run_clustering` forwarding shim has been removed; call
+`run_paris_clustering` directly. The DataStore balanced-cut mode has been
+removed.
 
 Paris now fits the additive graph `A + A.T`. The first Paris call on an older
 store rebuilds its hierarchy and emits a warning. Fixed and adaptive labels can
 therefore differ from labels created by earlier releases, even when an integer
 cluster count is unchanged.
 
-The adaptive cache schema is now version 3. Cached automatic labels from an
-older schema are ignored and recomputed on first use; fixed cuts and the stored
-hierarchy are unaffected. `scikit-network` is no longer a runtime dependency.
-It remains in Scarf's test dependencies for reference comparisons, so
+Adaptive Paris labels are cached under a content digest of the hierarchy
+generation and `min_cluster_size`. Incomplete caches or caches missing the
+required diagnostic arrays are ignored and recomputed on first use; fixed cuts
+and the stored hierarchy are unaffected. `scikit-network` is no longer a runtime
+dependency. It remains in Scarf's test dependencies for reference comparisons, so
 applications that import it directly must declare it themselves.
 
 ## Mapping calls
@@ -80,21 +79,14 @@ Recomputed results can differ from earlier Scarf releases. Recalibrate downstrea
 
 ## Metric names
 
-`DataStore.metric_integration` measures label concordance. It now emits
-`DeprecationWarning`; use `metric_label_concordance` for ARI or NMI.
+Use `metric_label_concordance` for ARI or NMI label agreement.
+Use `metric_proportional_batch_mixing` for Scarf's mean LISI summary adjusted
+for global batch proportions, and `metric_ilisi` for the scIB median-scaled
+batch metric. These two summaries are intentionally different.
+Use `metric_graph_silhouette` for the sampled graph-guided silhouette score.
 
-`DataStore.metric_batch_mixing` is now a deprecated name for
-`metric_proportional_batch_mixing`, Scarf's mean LISI summary adjusted for
-global batch proportions. Use `metric_ilisi` for the scIB median-scaled batch
-metric. These two summaries are intentionally different.
-
-`DataStore.metric_silhouette` is now a deprecated name for
-`metric_graph_silhouette`, which makes its sampled graph-guided implementation
-explicit. The deprecated methods remain available through Scarf 1.x and may be
-removed in 2.0.
-
-The function name `scarf.metrics.integration_score` remains a supported 1.x
-compatibility name for `label_concordance_score`.
+The former aliases `metric_integration`, `metric_batch_mixing`,
+`metric_silhouette`, and `scarf.metrics.integration_score` have been removed.
 
 ## Internal import paths
 

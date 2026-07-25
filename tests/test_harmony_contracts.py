@@ -10,6 +10,7 @@ from scarf.embeddings.harmony.api import fit_harmony as implementation_fit_harmo
 from scarf.embeddings.harmony.api import run_harmony as implementation_run_harmony
 from scarf.embeddings.harmony.models import HarmonyResult as implementation_result
 from scarf.embeddings.harmony.optimizer import Harmony as implementation_optimizer
+from tests.signature_contracts import signature_digest
 
 
 def test_harmony_facade_exports_canonical_objects():
@@ -42,16 +43,12 @@ def test_harmony_public_metadata_and_signatures_remain_stable():
         harmony.safe_entropy,
     )
     assert {obj.__module__ for obj in public_objects} == {"scarf.embeddings.harmony"}
-    assert str(inspect.signature(harmony.run_harmony)) == (
-        "(data_mat: numpy.ndarray, meta_data: pandas.core.frame.DataFrame, "
-        "theta: float | int | numpy.ndarray | list[float] | None = None, "
-        "lamb: float | int | numpy.ndarray | list[float] | None = None, "
-        "sigma: float | numpy.ndarray = 0.1, nclust: int | None = None, "
-        "tau: float = 0, block_size: float = 0.05, "
-        "max_iter_harmony: int = 50, max_iter_kmeans: int = 20, "
-        "epsilon_cluster: float = 1e-05, epsilon_harmony: float = 0.0001, "
-        "random_state: int = 0, cluster_fn: ClusterFn = 'kmeans') -> numpy.ndarray"
-    )
+    assert signature_digest(
+        {
+            "fit_harmony": harmony.fit_harmony,
+            "run_harmony": harmony.run_harmony,
+        }
+    ) == ("7b192e50655559a92f78d67ba963db2f4bb1df3195f5f7305effc37f913dbf9c")
     assert (
         inspect.signature(harmony.fit_harmony).parameters
         == inspect.signature(harmony.run_harmony).parameters

@@ -54,23 +54,23 @@ ds.filter_cells(
     reset_previous=True,
 )
 
-if 'hvgs' not in ds.RNA.feats.columns:
+# HVG columns are stored as `{cell_key}__{hvg_key_name}` (here `I__hvgs`)
+if 'I__hvgs' not in ds.RNA.feats.columns:
     ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-ds.make_graph(
-    feat_key='hvgs',
-    k=11,
-    dims=15,
-    n_centroids=100,
-    show_elbow_plot=True,
-)
-if 'RNA_UMAP1' not in ds.cells.columns:
-    ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
-if 'RNA_leiden_cluster' not in ds.cells.columns:
-    ds.run_leiden_clustering(resolution=0.5)
+normalized = ds.run_normalization(feat_key='hvgs')
+pca = ds.run_pca(normalized, dims=15, show_elbow_plot=True)
+ds.build_embedding_initialization(pca)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=11)
+ds.build_connectivity_map(neighbors)
+# Always run layout and clustering on this page so prepared stores still demonstrate the APIs
+ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
+ds.run_leiden_clustering(resolution=0.5)
 ```
 
-`show_elbow_plot=True` plots PCA explained variance and marks a detected elbow. Use it when
-choosing `dims`, not as a unique truth for the number of components.
+`show_elbow_plot=True` on `run_pca` plots explained variance and marks a detected elbow.
+Use it when choosing `dims`, not as a unique truth for the number of components.
+
 
 Inspect the loaded KNN graph degree and edge-weight distributions:
 
@@ -91,20 +91,19 @@ splt.graph_qc(graph)
 
 ### 1. Run densMAP
 
-`make_graph` normalizes the selected features, calculates PCA coordinates, and builds the KNN
-graph used by every step below. Enable density-preserving UMAP when local density structure
-matters.
+The setup above built the KNN graph used by every step below. Enable density-preserving
+UMAP when local density structure matters.
+
 
 ```{code-cell} ipython3
-if 'RNA_densMAP1' not in ds.cells.columns:
-    ds.run_umap(
-        n_epochs=150,
-        spread=5,
-        min_dist=1,
-        parallel=True,
-        use_density_map=True,
-        label='densMAP',
-    )
+ds.run_umap(
+    n_epochs=150,
+    spread=5,
+    min_dist=1,
+    parallel=True,
+    use_density_map=True,
+    label='densMAP',
+)
 ```
 
 densMAP keeps local density structure that standard UMAP may flatten.
@@ -117,13 +116,12 @@ Windows. Use a Linux environment such as WSL.
 ```
 
 ```{code-cell} ipython3
-if 'RNA_tSNE1' not in ds.cells.columns:
-    ds.run_tsne(
-        alpha=10,
-        box_h=1,
-        early_iter=250,
-        max_iter=500,
-    )
+ds.run_tsne(
+    alpha=10,
+    box_h=1,
+    early_iter=250,
+    max_iter=500,
+)
 ```
 
 tSNE uses the same KNN graph; cluster separation can look sharper than on UMAP.

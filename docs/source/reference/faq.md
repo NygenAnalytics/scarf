@@ -21,7 +21,24 @@ Seurat subsection.
 
 ## How do I run Harmony batch correction in Scarf?
 
-Pass `harmonize=True` and `batch_columns` to `make_graph` on a merged dataset. See {ref}`Harmony batch correction <harmony_batch_correction>` and the {ref}`integration methods guide <integration_guide>`.
+After PCA, call `ds.run_harmony(['batch_column'], pca)` then continue with
+`build_embedding_initialization`, `build_ann_index`, `query_neighbors`, and
+`build_connectivity_map`. See
+{ref}`Harmony batch correction <harmony_batch_correction>` and the
+{ref}`integration methods guide <integration_guide>`.
+
+## Which integration method should I choose?
+
+- Separate scRNA-seq batches: merge with `AssayMerge`, then Harmony or partial PCA
+  ({doc}`../tutorials/data_integration`).
+- Multiple assays in the same cells (CITE-seq): SNN or WNN
+  ({doc}`../tutorials/cite_seq_integration`).
+- Map onto an existing reference: {doc}`../tutorials/mapping_and_label_transfer`
+  or {doc}`../tutorials/reference_atlas`.
+
+Scarf does not include Scanorama, BBKNN, scVI, ComBat, or other external
+integration packages. Export with `to_anndata` or `SubsetZarr` when you need those
+tools.
 
 ## What is the difference between SNN and WNN integration?
 
@@ -32,6 +49,7 @@ Both merge modality-specific KNN graphs with `integrate_assays`. SNN (default) s
 Use `metric_lisi` for raw per-cell LISI values. Use `metric_ilisi` for a
 single scIB-scaled batch-mixing score and `metric_clisi` for a scIB-scaled
 biological-label conservation score. See {ref}`LISI metrics <lisi_metrics>`.
+
 
 ## Should I use tSNE or UMAP?
 

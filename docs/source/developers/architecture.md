@@ -161,8 +161,6 @@ implementation directly unless it intentionally needs a public patch seam.
 
 Compatibility policy for the 1.x series:
 
-- `ZarrMerge` is a deprecated subclass of `AssayMerge`.
-- `DataStore.metric_integration` is a deprecated name for label concordance.
 - Deprecated `run_mapping` flags remain accepted with `DeprecationWarning`.
 - These Python API compatibility paths are retained through 1.x and may be
   removed in 2.0.

@@ -14,6 +14,14 @@ You can run the tests locally on your branch with [pytest]. Configurations are i
 Install dependencies with `uv sync --extra test --extra extra`, then run `uv run pytest`.
 Python 3.12 or newer is required (`requires-python >=3.12`).
 
+Two markers select the expensive parts of the suite: `slow` for tests that build
+neighbourhood graphs or run iterative numerical workflows, and `integration` for tests
+that need live network access. While iterating, skip both:
+
+    uv run pytest -m "not slow and not integration"
+
+CI runs the whole suite, so run `uv run pytest` before opening a pull request.
+
 ## Contributions to the documentation
 
 You may contribute to the documentation by either adding new sections or modifying existing

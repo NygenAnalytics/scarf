@@ -1,56 +1,23 @@
-import inspect
+from dataclasses import fields
 from importlib.util import find_spec
 
 from scarf.embeddings.sgtsne import run_sgtsne
 from scarf.neighbors.stream import AnnStream
 from scarf.trajectory.feature_dynamics import validate_pseudotime_regressor
 from scarf.trajectory.results import PseudotimeScoreResult
+from tests.signature_contracts import signature_digest
 
 
 def test_embedding_and_trajectory_entry_point_signatures_are_stable():
-    assert list(inspect.signature(AnnStream).parameters) == [
-        "data",
-        "k",
-        "n_cluster",
-        "reduction_method",
-        "dims",
-        "loadings",
-        "use_for_pca",
-        "mu",
-        "sigma",
-        "ann_metric",
-        "ann_efc",
-        "ann_ef",
-        "ann_m",
-        "nthreads",
-        "ann_parallel",
-        "rand_state",
-        "do_kmeans_fit",
-        "disable_scaling",
-        "ann_idx",
-        "lsi_skip_first",
-        "lsi_params",
-        "harmonize",
-        "harmonized_data",
-        "batches",
-        "cache_embeddings",
-        "harmony_params",
-    ]
-    assert list(inspect.signature(run_sgtsne).parameters) == [
-        "graph",
-        "ini_embed",
-        "tsne_dims",
-        "max_iter",
-        "early_iter",
-        "alpha",
-        "lambda_scale",
-        "box_h",
-        "temp_file_loc",
-        "verbose",
-        "parallel",
-        "nthreads",
-    ]
-    assert list(inspect.signature(PseudotimeScoreResult).parameters) == [
+    methods = {
+        "AnnStream.__init__": AnnStream.__init__,
+        "run_sgtsne": run_sgtsne,
+        "validate_pseudotime_regressor": validate_pseudotime_regressor,
+    }
+    assert signature_digest(methods) == (
+        "6acbf182fdfe286497935d4741b7484d712d51565e07fe09f4cebe099329291d"
+    )
+    assert [field.name for field in fields(PseudotimeScoreResult)] == [
         "pseudotime_key",
         "validity_key",
         "assay",
@@ -59,13 +26,6 @@ def test_embedding_and_trajectory_entry_point_signatures_are_stable():
         "feature_key",
         "values",
         "valid",
-    ]
-    assert list(inspect.signature(validate_pseudotime_regressor).parameters) == [
-        "values",
-        "expected_size",
-        "pseudotime_key",
-        "cell_key",
-        "has_validity_column",
     ]
 
 

@@ -137,6 +137,14 @@ def artifact_path(ref: ArtifactRef) -> str:
     return f"artifacts/{ref.kind}/{ref.artifact_id}"
 
 
+def group_at(root: zarr.Group, path: str) -> zarr.Group:
+    return as_zarr_group(root[path], name=path)
+
+
+def artifact_group(root: zarr.Group, ref: ArtifactRef) -> zarr.Group:
+    return group_at(root, artifact_path(ref))
+
+
 def parse_artifact_path(path: str) -> ArtifactRef:
     parts = path.strip("/").split("/")
     if len(parts) == 3 and parts[0] == "artifacts":
@@ -397,13 +405,13 @@ def callable_identity(value: Any) -> dict[str, str]:
     }
 
 
-def _stored_value(name: str, value: Any) -> Any:
+def serialize_artifact_value(value: Any) -> Any:
     if isinstance(value, ArtifactRef):
         return value.to_dict()
     if isinstance(value, np.ndarray):
         return {"value_fingerprint": fingerprint_array(value)}
     if isinstance(value, np.generic):
-        return _stored_value(name, value.item())
+        return serialize_artifact_value(value.item())
     if isinstance(value, float) and not math.isfinite(value):
         if math.isnan(value):
             return {"special_float": "nan"}
@@ -415,11 +423,11 @@ def _stored_value(name: str, value: Any) -> Any:
     if callable(value):
         return {"external_hook": True, **callable_identity(value)}
     if isinstance(value, Mapping):
-        return {str(key): _stored_value(str(key), item) for key, item in value.items()}
+        return {str(key): serialize_artifact_value(item) for key, item in value.items()}
     if isinstance(value, tuple | list):
-        return [_stored_value(name, item) for item in value]
+        return [serialize_artifact_value(item) for item in value]
     if isinstance(value, set | frozenset):
-        values = [_stored_value(name, item) for item in value]
+        values = [serialize_artifact_value(item) for item in value]
         return sorted(values, key=canonical_bytes)
     return value
 
@@ -433,8 +441,8 @@ def make_provenance(
     _validate_name(operation, "operation")
     provenance = {
         "operation": operation,
-        "parameters": _stored_value("parameters", parameters),
-        "inputs": _stored_value("inputs", inputs),
+        "parameters": serialize_artifact_value(parameters),
+        "inputs": serialize_artifact_value(inputs),
     }
     canonical_bytes(provenance)
     return provenance
@@ -486,11 +494,23 @@ def _mapping_attr(group: zarr.Group, name: str) -> dict[str, Any] | None:
     return dict(value)
 
 
+def require_complete_artifact(
+    root: zarr.Group,
+    ref: ArtifactRef,
+) -> ArtifactStatus:
+    status = inspect_artifact(root, ref)
+    if not status.exists:
+        raise KeyError(f"Artifact does not exist: {status.path}")
+    if not status.complete:
+        raise RuntimeError(f"Artifact is incomplete: {status.path}")
+    return status
+
+
 def inspect_artifact(root: zarr.Group, ref: ArtifactRef) -> ArtifactStatus:
     path = artifact_path(ref)
     if path not in root:
         return ArtifactStatus(ref=ref, path=path, exists=False, complete=False)
-    group = as_zarr_group(root[path], name=path)
+    group = group_at(root, path)
     stored_id = group.attrs.get("artifact_id")
     stored_kind = group.attrs.get("kind")
     if stored_id is not None and stored_id != ref.artifact_id:
@@ -597,26 +617,6 @@ def list_artifacts(
     return refs
 
 
-def find_reusable_artifact(
-    root: zarr.Group,
-    *,
-    scope: ArtifactScope,
-    kind: str,
-    provenance: Mapping[str, Any],
-    assay: str | None = None,
-    invalidate_cache: bool = False,
-) -> ArtifactRef | None:
-    refs = find_reusable_artifacts(
-        root,
-        scope=scope,
-        kind=kind,
-        provenance=provenance,
-        assay=assay,
-        invalidate_cache=invalidate_cache,
-    )
-    return refs[0] if refs else None
-
-
 def find_reusable_artifacts(
     root: zarr.Group,
     *,
@@ -651,7 +651,7 @@ def find_reusable_artifacts(
         if provenance_hash(status.provenance) != requested_hash:
             continue
         if canonical_bytes(status.provenance) == requested_bytes:
-            group = as_zarr_group(root[status.path], name=status.path)
+            group = group_at(root, status.path)
             raw_created = group.attrs.get("created_at_ns", 0)
             created_at_ns = (
                 int(raw_created)

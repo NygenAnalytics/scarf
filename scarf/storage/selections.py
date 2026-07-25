@@ -75,16 +75,8 @@ def resolve_selection_artifact(
                     and np.array_equal(stored_values, mask)
                 ):
                     return planned.ref
-        planned = plan_artifact(
+        planned = planned.invalidated(
             root,
-            scope=scope,
-            assay=assay,
-            kind=kind,
-            operation=operation,
-            parameters=parameters,
-            inputs=selection_inputs,
-            execution_options={"source_column": source_column},
-            invalidate_cache=True,
             required_arrays=(
                 ArrayRequirement(
                     "values",
@@ -154,24 +146,7 @@ def resolve_generated_selection_artifact(
             and stored_values.shape == mask.shape
         ):
             return planned.ref, stored_values
-        planned = plan_artifact(
-            root,
-            scope=scope,
-            assay=assay,
-            kind=kind,
-            operation=operation,
-            parameters=parameters,
-            inputs=selection_inputs,
-            execution_options={"source_column": source_column},
-            invalidate_cache=True,
-            required_arrays=(
-                ArrayRequirement(
-                    "values",
-                    shape=mask.shape,
-                    dtype_kind="b",
-                ),
-            ),
-        )
+        planned = planned.invalidated(root)
     group = start_artifact(root, planned)
     create_metadata_column(
         group,
@@ -239,16 +214,7 @@ def resolve_metadata_snapshot(
                 )
                 if np.array_equal(stored_values, expected_values):
                     return planned.ref
-        planned = plan_artifact(
-            root,
-            scope="datastore",
-            kind="metadata_snapshot",
-            operation=operation,
-            parameters=snapshot_parameters,
-            inputs=snapshot_inputs,
-            execution_options={"source_columns": source_columns},
-            invalidate_cache=True,
-        )
+        planned = planned.invalidated(root)
     group = start_artifact(root, planned)
     create_metadata_column(
         group,

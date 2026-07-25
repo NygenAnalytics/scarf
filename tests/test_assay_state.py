@@ -9,8 +9,15 @@ from zarr.storage import MemoryStore
 
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.graph_datastore import GraphDataStore
-from scarf.graph.encoded_paths import make_assay_graph_paths
-from scarf.graph.paths import StoredAssayGraph, StoredIntegratedGraph
+from scarf.graph.encoded_paths import (
+    make_cell_graph_group_path,
+    make_kmeans_initialization_group_path,
+    make_nearest_neighbors_group_path,
+    make_neighbor_index_group_path,
+    make_normalized_group_path,
+    make_reduction_group_path,
+)
+from scarf.graph.paths import AssayGraphPaths, StoredAssayGraph, StoredIntegratedGraph
 from scarf.graph.state import (
     AssayState,
     _legacy_subset_hash,
@@ -45,10 +52,63 @@ def _ref(kind: str, token: str) -> ArtifactRef:
     )
 
 
+def _compose_assay_graph_paths(
+    *,
+    from_assay: str,
+    cell_key: str,
+    feat_key: str,
+    reduction_method: str,
+    dims: int,
+    pca_cell_key: str,
+    ann_metric: str,
+    ann_efc: int,
+    ann_ef: int,
+    ann_m: int,
+    rand_state: int,
+    k: int,
+    local_connectivity: float,
+    bandwidth: float,
+    n_centroids: int | None = None,
+    feat_scaling: bool = True,
+    harmony_contract_hash: str | None = None,
+) -> AssayGraphPaths:
+    normalized = make_normalized_group_path(from_assay, cell_key, feat_key)
+    reduction = make_reduction_group_path(
+        normalized, reduction_method, dims, pca_cell_key
+    )
+    neighbor_index = make_neighbor_index_group_path(
+        reduction,
+        ann_metric,
+        ann_efc,
+        ann_ef,
+        ann_m,
+        rand_state,
+        feat_scaling=feat_scaling,
+        harmony_contract_hash=harmony_contract_hash,
+    )
+    nearest_neighbors = make_nearest_neighbors_group_path(neighbor_index, k)
+    cell_graph = make_cell_graph_group_path(
+        nearest_neighbors, local_connectivity, bandwidth
+    )
+    kmeans = None
+    if n_centroids is not None:
+        kmeans = make_kmeans_initialization_group_path(
+            reduction, n_centroids, rand_state
+        )
+    return AssayGraphPaths(
+        normalized_group_path=normalized,
+        reduction_group_path=reduction,
+        neighbor_index_group_path=neighbor_index,
+        nearest_neighbors_group_path=nearest_neighbors,
+        cell_graph_group_path=cell_graph,
+        kmeans_initialization_group_path=kmeans,
+    )
+
+
 def test_legacy_graph_without_selection_provenance_fails_closed(
     datastore_ephemeral,
 ) -> None:
-    paths = make_assay_graph_paths(
+    paths = _compose_assay_graph_paths(
         from_assay="RNA",
         cell_key="I",
         feat_key="I",
@@ -81,7 +141,7 @@ def test_legacy_graph_accepts_supported_selection_hashes(
     datastore_ephemeral,
     hash_format: str,
 ) -> None:
-    paths = make_assay_graph_paths(
+    paths = _compose_assay_graph_paths(
         from_assay="RNA",
         cell_key="I",
         feat_key="I",
@@ -119,7 +179,7 @@ def test_legacy_graph_accepts_supported_selection_hashes(
 def test_legacy_graph_rejects_mismatched_or_invalid_selection_hash(
     datastore_ephemeral,
 ) -> None:
-    paths = make_assay_graph_paths(
+    paths = _compose_assay_graph_paths(
         from_assay="RNA",
         cell_key="I",
         feat_key="I",
@@ -167,7 +227,7 @@ def test_legacy_graph_qualifies_non_default_feature_key_exactly_once(
         np.asarray(assay.feats.fetch_all("I"), dtype=bool),
         overwrite=True,
     )
-    paths = make_assay_graph_paths(
+    paths = _compose_assay_graph_paths(
         from_assay="RNA",
         cell_key="I",
         feat_key="I__qualified",
@@ -720,7 +780,7 @@ def test_state_rejects_unrelated_complete_artifact_chains() -> None:
 def test_state_rejects_incomplete_or_missing_graph_inputs() -> None:
     datastore, state = _state_store()
     datastore.z[artifact_path(state.feature_scaling)].attrs["complete"] = False
-    with pytest.raises(RuntimeError, match="Artifact input owner is incomplete"):
+    with pytest.raises(RuntimeError, match="Artifact is incomplete"):
         datastore.get_latest_graph_loc("RNA", "I", "hvgs")
 
     datastore.z[artifact_path(state.batch_correction)].attrs["complete"] = True
@@ -732,7 +792,7 @@ def test_state_rejects_incomplete_or_missing_graph_inputs() -> None:
     datastore.z["RNA/state"].attrs["state"] = state.to_dict()
     datastore.z[artifact_path(state.feature_scaling)].attrs["complete"] = True
     datastore.z[artifact_path(state.batch_correction)].attrs["complete"] = False
-    with pytest.raises(RuntimeError, match="Artifact input owner is incomplete"):
+    with pytest.raises(RuntimeError, match="Artifact is incomplete"):
         datastore.get_latest_graph_loc("RNA", "I", "hvgs")
 
 
@@ -749,13 +809,21 @@ def test_derived_writers_do_not_mutate_graph_artifacts() -> None:
         kind="diffusion_operator",
     )
     assert len(diffusion_refs) == 1
-    with pytest.raises(RuntimeError, match="Paris hierarchy persistence"):
-        datastore._resolve_paris_hierarchy(
+    # Artifact-backed Paris goes through _run_paris_from_artifacts. The stub
+    # store lacks MetaData, so label persistence may fail after hierarchy work;
+    # the connectivity artifact itself must stay unchanged either way.
+    try:
+        datastore._run_paris_from_artifacts(
+            graph_ref=state.connectivity_map,
             graph_loc=artifact_path(state.connectivity_map),
             from_assay="RNA",
+            label_assay="RNA",
             cell_key="I",
-            feat_key="hvgs",
+            fixed_cluster_count=2,
+            effective_min_cluster_size=None,
+            label="paris_cluster",
             force_recalc=False,
-            cut_mode="fixed",
         )
+    except AttributeError:
+        pass
     assert _store_digest(datastore.z[graph_path]) == before

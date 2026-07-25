@@ -12,6 +12,7 @@ author = "Parashar Dhapola"
 extensions = [
     "IPython.sphinxext.ipython_console_highlighting",
     "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
     "sphinx.ext.napoleon",
     "sphinx_autodoc_typehints",
     "sphinx.ext.coverage",
@@ -21,6 +22,10 @@ extensions = [
     "sphinx_tabs.tabs",
     "myst_nb",
 ]
+# Explicit autosummary/autodoc on reference pages only. Do not enable recursive
+# generation over the whole package until public __all__ boundaries are complete.
+autosummary_generate = False
+
 autodoc_type_aliases = {
     "DataStore": "scarf.datastore.datastore.DataStore",
     "DataStorePlotAccessor": "scarf.datastore.plot_accessor.DataStorePlotAccessor",
@@ -35,9 +40,15 @@ exclude_patterns = [
     "**.ipynb_checkpoints",
     "vignettes/dev",
     "tutorials/dev",
+    # Retired tutorial stubs (anchors preserved on destination pages).
+    "tutorials/choosing_integration_methods.md",
+    "tutorials/imputation.md",
+    "tutorials/integration_metrics.md",
+    "tutorials/multimodal_integration.md",
     "scarf_datasets",
     "**/scarf_datasets",
 ]
+
 pygments_style = "sphinx"
 language = "en"
 

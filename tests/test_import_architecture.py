@@ -927,7 +927,14 @@ def test_datastore_operation_mixins_are_runtime_isolated():
     from scarf.datastore._operations.embeddings import _EmbeddingOperationsMixin
     from scarf.datastore._operations.features import _FeatureOperationsMixin
     from scarf.datastore._operations.graph import _GraphOperationsMixin
+    from scarf.datastore._operations.graph_legacy_params import _GraphLegacyParamsMixin
+    from scarf.datastore._operations.integration_metrics import (
+        _IntegrationMetricsOperationsMixin,
+    )
     from scarf.datastore._operations.mapping import _MappingOperationsMixin
+    from scarf.datastore._operations.mapping_reference import (
+        _MappingReferenceOperationsMixin,
+    )
     from scarf.datastore._operations.presentation import _PresentationOperationsMixin
     from scarf.datastore._operations.quality_control import (
         _QualityControlOperationsMixin,
@@ -945,6 +952,7 @@ def test_datastore_operation_mixins_are_runtime_isolated():
         "datastore.mapping_datastore",
     }
     allowed_operation_helpers = {
+        "datastore._operations.enrichment_store",
         "datastore._operations.paris_persistence",
     }
     for path in operations_root.glob("*.py"):
@@ -962,11 +970,14 @@ def test_datastore_operation_mixins_are_runtime_isolated():
         _EmbeddingOperationsMixin,
         _ClusteringOperationsMixin,
         _TrajectoryOperationsMixin,
+        _MappingReferenceOperationsMixin,
+        _GraphLegacyParamsMixin,
         _GraphOperationsMixin,
         _MappingOperationsMixin,
         _QualityControlOperationsMixin,
         _FeatureOperationsMixin,
         _TrajectoryFeatureOperationsMixin,
+        _IntegrationMetricsOperationsMixin,
         _PresentationOperationsMixin,
     )
     assert all("__init__" not in mixin.__dict__ for mixin in mixins)

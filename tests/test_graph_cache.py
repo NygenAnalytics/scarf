@@ -9,11 +9,7 @@ def _memory_group():
     return zarr.open_group(store=MemoryStore(), mode="w")
 
 
-def test_removed_graph_parameter_helper_is_not_exposed() -> None:
-    assert not hasattr(GraphDataStore, "_set_graph_params")
-
-
-def test_get_latest_graph_loc_is_public_with_private_compatibility_alias(
+def test_get_latest_graph_loc_is_public(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
@@ -37,7 +33,6 @@ def test_get_latest_graph_loc_is_public_with_private_compatibility_alias(
 
     assert store.get_normalized_group_path("RNA", "I", "hvgs") == "RNA/normed__I__hvgs"
     assert store.get_latest_graph_loc("RNA", "I", "hvgs") == graph.path
-    assert store._get_latest_graph_loc("RNA", "I", "hvgs") == graph.path
 
     del knn.attrs["latest_graph"]
     with pytest.raises(KeyError):

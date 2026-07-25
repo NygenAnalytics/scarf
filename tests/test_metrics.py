@@ -15,7 +15,6 @@ from scarf.metrics import (
     compute_simpson,
     graph_connectivity,
     ilisi_knn,
-    integration_score,
     knn_to_csr_matrix,
     label_concordance_score,
     lisi_batch_mixing_score,
@@ -539,7 +538,6 @@ def test_label_concordance_identical_partitions(metric):
     labels = np.array([0, 0, 1, 1])
 
     assert label_concordance_score([labels, labels], metric) == pytest.approx(1)
-    assert integration_score([labels, labels], metric) == pytest.approx(1)
 
 
 @pytest.mark.parametrize(
@@ -572,6 +570,9 @@ def test_metric_label_concordance(datastore, make_graph, leiden_clustering):
     rng = np.random.default_rng(42)
     labels1 = rng.integers(0, 2, datastore.cells.N)
     labels2 = labels1.copy()
+    selected = np.zeros(datastore.cells.N, dtype=bool)
+    selected[: datastore.cells.N // 2] = True
+    labels2[~selected] = 1 - labels2[~selected]
     datastore.cells.insert(
         column_name="labels1",
         values=labels1,
@@ -582,12 +583,23 @@ def test_metric_label_concordance(datastore, make_graph, leiden_clustering):
         values=labels2,
         overwrite=True,
     )
-
-    assert datastore.metric_label_concordance(["labels1", "labels2"]) == pytest.approx(
-        1
+    datastore.cells.insert(
+        column_name="metric_subset",
+        values=selected,
+        overwrite=True,
     )
-    with pytest.warns(DeprecationWarning, match="metric_integration"):
-        assert datastore.metric_integration(["labels1", "labels2"]) == pytest.approx(1)
+
+    assert datastore.metric_label_concordance(
+        ["labels1", "labels2"],
+        cell_key="metric_subset",
+    ) == pytest.approx(1)
+    assert (
+        datastore.metric_label_concordance(
+            ["labels1", "labels2"],
+            cell_key="I",
+        )
+        < 1
+    )
     mixing_score = datastore.metric_proportional_batch_mixing("labels1")
     assert 0 <= mixing_score <= 1
 
@@ -603,7 +615,7 @@ def test_datastore_scib_metrics(datastore, make_graph, leiden_clustering):
         cell_key="I",
         feat_key="hvgs",
     )
-    graph_loc = datastore._get_latest_graph_loc(
+    graph_loc = datastore.get_latest_graph_loc(
         from_assay="RNA",
         cell_key="I",
         feat_key="hvgs",

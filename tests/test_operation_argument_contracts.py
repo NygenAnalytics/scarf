@@ -54,12 +54,12 @@ _CONTRACTS = (
     OperationContract(
         DataStore.build_ann_index,
         graph_arguments.AnnIndexArguments,
+        constructor=_GraphOperationsMixin._build_ann_index_impl,
         signature_only={
             **_classified("routing", "from_assay"),
             **_classified("publication", "update_state"),
         },
         model_only={
-            **_classified("execution", "local_cache"),
             **_classified("derived", "parallel_threads"),
         },
     ),
@@ -74,9 +74,10 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_custom_reduction,
         graph_arguments.CustomReductionArguments,
-        constructor=_GraphOperationsMixin._run_reduction_artifact,
+        constructor=_GraphOperationsMixin._run_reduction_artifact_impl,
         signature_only={
             **_classified("execution", "batch_size"),
+            **_classified("execution", "local_cache"),
             **_classified("routing", "from_assay"),
         },
         model_only=_classified("resolved_input", "feature_scaling"),
@@ -86,7 +87,7 @@ _CONTRACTS = (
         graph_arguments.EmbeddingInitializationArguments,
     ),
     OperationContract(
-        _GraphOperationsMixin._run_reduction_artifact,
+        _GraphOperationsMixin._run_reduction_artifact_impl,
         graph_arguments.FeatureScalingArguments,
         aliases={"feat_scaling": "enabled"},
         signature_only=_classified(
@@ -106,8 +107,10 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_harmony,
         graph_arguments.HarmonyArguments,
+        constructor=_GraphOperationsMixin._run_harmony_impl,
         aliases={"harmony_params": "harmony_parameters"},
         signature_only={
+            **_classified("execution", "local_cache"),
             **_classified("routing", "from_assay"),
             **_classified("publication", "update_state"),
         },
@@ -119,14 +122,19 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_lsi,
         graph_arguments.LsiArguments,
-        constructor=_GraphOperationsMixin._run_reduction_artifact,
-        signature_only=_classified("routing", "from_assay"),
+        constructor=_GraphOperationsMixin._run_reduction_artifact_impl,
+        signature_only={
+            **_classified("execution", "local_cache"),
+            **_classified("routing", "from_assay"),
+        },
         model_only=_classified("resolved_input", "feature_scaling"),
     ),
     OperationContract(
         DataStore.query_neighbors,
         graph_arguments.NeighborQueryArguments,
+        constructor=_GraphOperationsMixin._query_neighbors_impl,
         signature_only={
+            **_classified("execution", "local_cache"),
             **_classified("routing", "from_assay"),
             **_classified("publication", "update_state"),
         },
@@ -145,14 +153,16 @@ _CONTRACTS = (
                 "normalization_method",
                 "size_factor",
             ),
-            **_classified("execution", "local_cache"),
         },
     ),
     OperationContract(
         DataStore.run_pca,
         graph_arguments.PcaArguments,
-        constructor=_GraphOperationsMixin._run_reduction_artifact,
-        signature_only=_classified("routing", "from_assay"),
+        constructor=_GraphOperationsMixin._run_reduction_artifact_impl,
+        signature_only={
+            **_classified("execution", "local_cache"),
+            **_classified("routing", "from_assay"),
+        },
         model_only=_classified(
             "resolved_input",
             "feature_scaling",

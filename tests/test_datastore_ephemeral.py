@@ -5,16 +5,15 @@ from scarf import ArtifactRef
 from scarf.storage.artifacts import parse_artifact_path
 from tests.fixtures_datastore import _has_graph
 
+pytestmark = pytest.mark.slow
+
 
 def _active_cell_count(datastore) -> int:
     return len(datastore.cells.active_index("I"))
 
 
 def _ensure_graph(datastore):
-    if not _has_graph(datastore):
-        datastore.auto_filter_cells(show_qc_plots=False)
-        datastore.mark_hvgs(top_n=100, show_plot=False, bin_strategy="fixed")
-        datastore.make_graph(feat_key="hvgs")
+    assert _has_graph(datastore), "analyzed datastore fixture has no RNA/I/hvgs graph"
 
 
 def _clear_umap_columns(datastore):
@@ -42,8 +41,8 @@ def _projection_group(datastore, name: str):
     return datastore._load_complete_projection(name, "RNA", "I")
 
 
-def test_run_umap_recomputes_coordinates(datastore_ephemeral):
-    ds = datastore_ephemeral
+def test_run_umap_recomputes_coordinates(analyzed_datastore_ephemeral):
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     _clear_umap_columns(ds)
 
@@ -55,8 +54,8 @@ def test_run_umap_recomputes_coordinates(datastore_ephemeral):
     assert len(umap2) == _active_cell_count(ds)
 
 
-def test_run_leiden_writes_cluster_labels(datastore_ephemeral):
-    ds = datastore_ephemeral
+def test_run_leiden_writes_cluster_labels(analyzed_datastore_ephemeral):
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
 
     ds.run_leiden_clustering(label="ephemeral_leiden")
@@ -66,8 +65,8 @@ def test_run_leiden_writes_cluster_labels(datastore_ephemeral):
     assert np.unique(groups).size >= 1
 
 
-def test_run_mapping_writes_projection(datastore_ephemeral):
-    ds = datastore_ephemeral
+def test_run_mapping_writes_projection(analyzed_datastore_ephemeral):
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     _clear_projection(ds, "freshmap")
 
@@ -89,9 +88,9 @@ def test_run_mapping_writes_projection(datastore_ephemeral):
 
 
 def test_mapping_projection_reuses_and_explicitly_invalidates(
-    datastore_ephemeral,
+    analyzed_datastore_ephemeral,
 ):
-    ds = datastore_ephemeral
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     _clear_projection(ds, "projection_reuse")
     kwargs = {
@@ -125,8 +124,8 @@ def test_run_mapping_supports_all_features_key(datastore_ephemeral):
     assert _projection_group(ds, "all_features_map").attrs["complete"]
 
 
-def test_run_mapping_with_coral_writes_corrected_data(datastore_ephemeral):
-    ds = datastore_ephemeral
+def test_run_mapping_with_coral_writes_corrected_data(analyzed_datastore_ephemeral):
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     _clear_projection(ds, "freshmap_coral")
 
@@ -143,8 +142,8 @@ def test_run_mapping_with_coral_writes_corrected_data(datastore_ephemeral):
     assert _projection_group(ds, "freshmap_coral").attrs["complete"]
 
 
-def test_coral_mapping_cache_and_rebuild_are_equivalent(datastore_ephemeral):
-    ds = datastore_ephemeral
+def test_coral_mapping_cache_and_rebuild_are_equivalent(analyzed_datastore_ephemeral):
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     ds.run_mapping(
         target_assay=ds.RNA,
@@ -174,8 +173,8 @@ def test_coral_mapping_cache_and_rebuild_are_equivalent(datastore_ephemeral):
     np.testing.assert_allclose(cached_distances, rebuilt["distances"][:])
 
 
-def test_run_unified_umap_after_mapping(datastore_ephemeral):
-    ds = datastore_ephemeral
+def test_run_unified_umap_after_mapping(analyzed_datastore_ephemeral):
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     _clear_projection(ds, "freshmap_unified_src")
     _clear_projection(ds, "unified_UMAP")
@@ -196,11 +195,13 @@ def test_run_unified_umap_after_mapping(datastore_ephemeral):
     assert coords.shape[0] >= _active_cell_count(ds)
 
 
-def test_build_and_reload_symphony_mapping_reference(datastore_ephemeral, tmp_path):
+def test_build_and_reload_symphony_mapping_reference(
+    analyzed_datastore_ephemeral, tmp_path
+):
     import numpy as np
     import pandas as pd
 
-    ds = datastore_ephemeral
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     batches = np.where(np.arange(ds.cells.N) % 2 == 0, "a", "b")
     ds.cells.insert("mapping_batch", batches, overwrite=True)
@@ -403,8 +404,10 @@ def test_build_and_reload_symphony_mapping_reference(datastore_ephemeral, tmp_pa
     assert old_reference_result.projection_path
 
 
-def test_mapping_rejects_reference_normalization_overwrite(datastore_ephemeral):
-    ds = datastore_ephemeral
+def test_mapping_rejects_reference_normalization_overwrite(
+    analyzed_datastore_ephemeral,
+):
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     state = ds.get_assay_state("RNA")
     assert state is not None
@@ -449,8 +452,10 @@ def test_mapping_rejects_reference_normalization_overwrite(datastore_ephemeral):
     assert dict(ann.attrs) == ann_metadata
 
 
-def test_cached_harmony_can_rebuild_missing_mapping_artifact(datastore_ephemeral):
-    ds = datastore_ephemeral
+def test_cached_harmony_can_rebuild_missing_mapping_artifact(
+    analyzed_datastore_ephemeral,
+):
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     batches = np.where(np.arange(ds.cells.N) % 2 == 0, "a", "b")
     ds.cells.insert("mapping_batch", batches, overwrite=True)
@@ -480,9 +485,9 @@ def test_cached_harmony_can_rebuild_missing_mapping_artifact(datastore_ephemeral
 
 
 def test_mapping_reference_rebuilds_after_missing_artifact(
-    datastore_ephemeral,
+    analyzed_datastore_ephemeral,
 ):
-    ds = datastore_ephemeral
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     batches = np.where(np.arange(ds.cells.N) % 2 == 0, "a", "b")
     ds.cells.insert("mapping_batch", batches, overwrite=True)
@@ -517,9 +522,9 @@ def test_mapping_reference_rebuilds_after_missing_artifact(
 
 
 def test_mapping_reference_tracks_changed_batch_values(
-    datastore_ephemeral,
+    analyzed_datastore_ephemeral,
 ):
-    ds = datastore_ephemeral
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     batches = np.where(np.arange(ds.cells.N) % 2 == 0, "a", "b")
     ds.cells.insert("mapping_batch", batches, overwrite=True)
@@ -548,9 +553,9 @@ def test_mapping_reference_tracks_changed_batch_values(
 
 
 def test_deprecated_reference_scaling_flags_do_not_break_mapping(
-    datastore_ephemeral,
+    analyzed_datastore_ephemeral,
 ):
-    ds = datastore_ephemeral
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
 
     with pytest.warns(DeprecationWarning, match="ignored"):
@@ -566,8 +571,8 @@ def test_deprecated_reference_scaling_flags_do_not_break_mapping(
     assert _projection_group(ds, "deprecated_scaling_flags").attrs["complete"]
 
 
-def test_mapping_feature_scaling_uses_isolated_ann_cache(datastore_ephemeral):
-    ds = datastore_ephemeral
+def test_mapping_feature_scaling_uses_isolated_ann_cache(analyzed_datastore_ephemeral):
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     original_state = ds.get_assay_state("RNA")
     assert original_state is not None and original_state.ann_index is not None
@@ -595,9 +600,9 @@ def test_mapping_feature_scaling_uses_isolated_ann_cache(datastore_ephemeral):
 
 
 def test_mapping_reference_rebuilds_unscaled_state_with_pca_scaling(
-    datastore_ephemeral,
+    analyzed_datastore_ephemeral,
 ) -> None:
-    ds = datastore_ephemeral
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     ds.make_graph(
         feat_key="hvgs",
@@ -629,9 +634,9 @@ def test_mapping_reference_rebuilds_unscaled_state_with_pca_scaling(
 
 
 def test_mapping_reference_identical_call_reuses_complete_chain(
-    datastore_ephemeral,
+    analyzed_datastore_ephemeral,
 ) -> None:
-    ds = datastore_ephemeral
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     ds.cells.insert(
         "mapping_reuse_batch",
@@ -656,9 +661,9 @@ def test_mapping_reference_identical_call_reuses_complete_chain(
 
 
 def test_projection_uses_stored_feature_key_and_rejects_stale_provenance(
-    datastore_ephemeral,
+    analyzed_datastore_ephemeral,
 ):
-    ds = datastore_ephemeral
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     ds.run_mapping(
         target_assay=ds.RNA,
@@ -686,11 +691,11 @@ def test_projection_uses_stored_feature_key_and_rejects_stale_provenance(
 
 
 def test_mapping_missing_feature_policies_and_legacy_intersection(
-    datastore_ephemeral,
+    analyzed_datastore_ephemeral,
 ):
     from scarf.datastore.datastore import DataStore
 
-    ds = datastore_ephemeral
+    ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
     shared_ids = ds.RNA.feats.fetch("ids", key="I__hvgs")[: ds.assay2.feats.N]
     ds.assay2.feats.insert(

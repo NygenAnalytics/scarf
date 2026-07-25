@@ -10,6 +10,7 @@ from ...graph.paths import StoredAssayGraph
 from ...graph.state import (
     embedding_initialization_path_from_state,
     read_assay_state,
+    resolve_stored_graph_input,
     validate_legacy_graph_selection,
 )
 from ...metadata.artifacts import (
@@ -25,8 +26,6 @@ from ...storage.artifacts import (
     ArtifactRef,
     artifact_path,
     fingerprint_array,
-    fingerprint_stored_arrays,
-    parse_artifact_path,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...utils.logging import logger
@@ -152,9 +151,11 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             cell_key,
             feat_key,
         )
-        try:
-            graph_input: object = parse_artifact_path(resolved_graph_loc)
-        except ValueError:
+        graph_input: object = resolve_stored_graph_input(
+            self.zw,
+            resolved_graph_loc,
+        )
+        if not isinstance(graph_input, ArtifactRef):
             validate_legacy_graph_selection(
                 self,
                 resolved_graph_loc,
@@ -162,16 +163,6 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 cell_key,
                 feat_key,
             )
-            graph_group = as_zarr_group(
-                self.zw[resolved_graph_loc],
-                name=resolved_graph_loc,
-            )
-            graph_input = {
-                "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                    graph_group,
-                    ("edges", "weights"),
-                )
-            }
         graph = self.load_graph(
             from_assay=from_assay,
             cell_key=cell_key,
@@ -438,19 +429,10 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 feat_key,
             )
         )
-        try:
-            graph_input: object = parse_artifact_path(resolved_graph_loc)
-        except ValueError:
-            graph_group = as_zarr_group(
-                self.zw[resolved_graph_loc],
-                name=resolved_graph_loc,
-            )
-            graph_input = {
-                "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                    graph_group,
-                    ("edges", "weights"),
-                )
-            }
+        graph_input: object = resolve_stored_graph_input(
+            self.zw,
+            resolved_graph_loc,
+        )
         user_initialization = ini_embed is not None
         if ini_embed is None:
             ini_embed = self._get_ini_embed(from_assay, cell_key, feat_key, umap_dims)

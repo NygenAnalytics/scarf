@@ -32,6 +32,20 @@
     :members:
 ```
 
+## H5AD inspection
+
+Use this before `H5adReader` when you do not know which matrix and metadata keys an
+H5AD file uses.
+
+```{eval-rst}
+.. autofunction:: scarf.inspect_h5ad
+```
+
+```{eval-rst}
+.. autoclass:: scarf.H5adInspectResult
+    :members:
+```
+
 ## Writers
 
 ```{eval-rst}
@@ -98,8 +112,7 @@
 
 ## Merge
 
-Use `AssayMerge` for new code. `ZarrMerge` is a deprecated compatibility
-subclass retained through Scarf 1.x.
+Use `AssayMerge` to merge assay matrices across samples.
 
 ```{eval-rst}
 .. autoclass:: scarf.merge.AssayMerge
@@ -108,10 +121,5 @@ subclass retained through Scarf 1.x.
 
 ```{eval-rst}
 .. autoclass:: scarf.merge.DatasetMerge
-    :members:
-```
-
-```{eval-rst}
-.. autoclass:: scarf.merge.ZarrMerge
     :members:
 ```

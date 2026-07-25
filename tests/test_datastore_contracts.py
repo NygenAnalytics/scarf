@@ -19,9 +19,9 @@ _METHODS = {
     ),
     GraphDataStore: (
         "__init__",
-        "_get_latest_graph_loc",
         "build_ann_index",
         "build_connectivity_map",
+        "build_embedding_initialization",
         "build_mapping_reference",
         "get_diffusion_operator",
         "get_latest_graph_loc",
@@ -32,7 +32,6 @@ _METHODS = {
         "load_graph",
         "make_graph",
         "query_neighbors",
-        "run_clustering",
         "run_fate_mapping",
         "run_leiden_clustering",
         "run_lsi",
@@ -73,16 +72,13 @@ _METHODS = {
         "mark_hto_identities",
         "mark_hvgs",
         "mark_prevalent_peaks",
-        "metric_batch_mixing",
         "metric_clisi",
         "metric_graph_connectivity",
         "metric_graph_silhouette",
         "metric_ilisi",
-        "metric_integration",
         "metric_label_concordance",
         "metric_lisi",
         "metric_proportional_batch_mixing",
-        "metric_silhouette",
         "run_aucell",
         "run_cell_cycle_scoring",
         "run_doublet_detection",
@@ -99,9 +95,9 @@ _METHODS = {
 
 _SIGNATURE_DIGESTS = {
     BaseDataStore: "1057b1cbeb909e7f7f599f88d91fae2aacb024a3da626b8a028bdd600644e248",
-    GraphDataStore: "9a7880a2d14851d71a5ab89bcf1db2f8e54b5a3b7a26d994c04e54f8c9760099",
+    GraphDataStore: "10dd6f9f5350529ae3f70372cc8aa37e636877acc3a0275df2979e7a6708dae0",
     MappingDatastore: "eaa8df1bda8fb83066fbac9e30a112fb8a0a46b1e278cce304b300ac5603e16f",
-    DataStore: "f496fc7cc0237ee43465167546999f4953e65816c8f95d956b318b16009b36b8",
+    DataStore: "2244dbcf37da8448a472cc22ad99f963f982f83152c2689dd24bf8f75a2c5994",
 }
 
 
@@ -175,18 +171,28 @@ def test_datastore_static_method_contracts_are_stable():
     assert hasattr(MappingDatastore, "_projection_has_provenance")
     assert not hasattr(MappingDatastore, "_PROJECTION_SCHEMA_VERSION")
     assert not hasattr(MappingDatastore, "_LEGACY_PROJECTION_SCHEMA_VERSIONS")
+    assert not hasattr(MappingDatastore, "_LEGACY_PROJECTION_ATTRS")
+    assert not hasattr(MappingDatastore, "_LEGACY_PROJECTION_ARRAYS")
+    assert not hasattr(MappingDatastore, "_projection_attr")
+    assert not hasattr(MappingDatastore, "_projection_array_name")
 
 
 def test_graph_datastore_private_mixin_order_is_stable():
     from scarf.datastore._operations.clustering import _ClusteringOperationsMixin
     from scarf.datastore._operations.embeddings import _EmbeddingOperationsMixin
     from scarf.datastore._operations.graph import _GraphOperationsMixin
+    from scarf.datastore._operations.graph_legacy_params import _GraphLegacyParamsMixin
+    from scarf.datastore._operations.mapping_reference import (
+        _MappingReferenceOperationsMixin,
+    )
     from scarf.datastore._operations.trajectory import _TrajectoryOperationsMixin
 
     assert GraphDataStore.__bases__ == (
         _EmbeddingOperationsMixin,
         _ClusteringOperationsMixin,
         _TrajectoryOperationsMixin,
+        _MappingReferenceOperationsMixin,
+        _GraphLegacyParamsMixin,
         _GraphOperationsMixin,
         BaseDataStore,
     )
@@ -215,6 +221,9 @@ def test_unified_layout_adapter_signature_is_stable():
 
 def test_datastore_private_mixin_order_is_stable():
     from scarf.datastore._operations.features import _FeatureOperationsMixin
+    from scarf.datastore._operations.integration_metrics import (
+        _IntegrationMetricsOperationsMixin,
+    )
     from scarf.datastore._operations.presentation import _PresentationOperationsMixin
     from scarf.datastore._operations.quality_control import (
         _QualityControlOperationsMixin,
@@ -227,14 +236,16 @@ def test_datastore_private_mixin_order_is_stable():
         _QualityControlOperationsMixin,
         _FeatureOperationsMixin,
         _TrajectoryFeatureOperationsMixin,
+        _IntegrationMetricsOperationsMixin,
         _PresentationOperationsMixin,
         MappingDatastore,
     )
-    assert DataStore.mro()[:6] == [
+    assert DataStore.mro()[:7] == [
         DataStore,
         _QualityControlOperationsMixin,
         _FeatureOperationsMixin,
         _TrajectoryFeatureOperationsMixin,
+        _IntegrationMetricsOperationsMixin,
         _PresentationOperationsMixin,
         MappingDatastore,
     ]
@@ -361,7 +372,14 @@ def test_datastore_operation_mixins_have_unique_method_owners():
     from scarf.datastore._operations.embeddings import _EmbeddingOperationsMixin
     from scarf.datastore._operations.features import _FeatureOperationsMixin
     from scarf.datastore._operations.graph import _GraphOperationsMixin
+    from scarf.datastore._operations.graph_legacy_params import _GraphLegacyParamsMixin
+    from scarf.datastore._operations.integration_metrics import (
+        _IntegrationMetricsOperationsMixin,
+    )
     from scarf.datastore._operations.mapping import _MappingOperationsMixin
+    from scarf.datastore._operations.mapping_reference import (
+        _MappingReferenceOperationsMixin,
+    )
     from scarf.datastore._operations.presentation import _PresentationOperationsMixin
     from scarf.datastore._operations.quality_control import (
         _QualityControlOperationsMixin,
@@ -375,11 +393,14 @@ def test_datastore_operation_mixins_have_unique_method_owners():
         _EmbeddingOperationsMixin,
         _ClusteringOperationsMixin,
         _TrajectoryOperationsMixin,
+        _MappingReferenceOperationsMixin,
+        _GraphLegacyParamsMixin,
         _GraphOperationsMixin,
         _MappingOperationsMixin,
         _QualityControlOperationsMixin,
         _FeatureOperationsMixin,
         _TrajectoryFeatureOperationsMixin,
+        _IntegrationMetricsOperationsMixin,
         _PresentationOperationsMixin,
     )
     owners: dict[str, list[str]] = {}

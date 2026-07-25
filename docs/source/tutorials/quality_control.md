@@ -80,6 +80,8 @@ Thresholds are dataset-specific. The values below match the PBMC example in
 {doc}`scrna_seq`. Filtered cells are marked inactive in cell key `I`.
 
 ```{code-cell} ipython3
+# Prepared stores may already have an `I` filter. Reset so before/after counts are meaningful.
+ds.cells.reset_key(key='I')
 n_before = int(ds.cells.fetch_all('I').sum())
 ds.filter_cells(
     attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
@@ -98,7 +100,9 @@ ds.plots.distribution(
 )
 ```
 
-After filtering, the same metrics are restricted to active cells (`I=True`).
+After filtering, the same metrics are restricted to active cells (`I=True`). If
+`n_before` and `n_after` are equal, the thresholds did not remove additional cells on
+this store; inspect the violins and adjust the cutoffs.
 
 ## 3) Custom percent-feature columns
 
@@ -141,11 +145,17 @@ remove cells automatically. It requires an existing cluster column.
 
 ```{code-cell} ipython3
 ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-ds.make_graph(feat_key='hvgs', k=11, dims=15, n_centroids=100)
+normalized = ds.run_normalization(feat_key='hvgs')
+pca = ds.run_pca(normalized, dims=15)
+ds.build_embedding_initialization(pca)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=11)
+ds.build_connectivity_map(neighbors)
 ds.run_leiden_clustering(resolution=0.5)
 score_col = ds.run_doublet_detection(cluster_key='RNA_leiden_cluster')
 ds.run_umap(n_epochs=100, spread=5, min_dist=1, parallel=True)
 ```
+
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -165,7 +175,8 @@ ds.cells.to_pandas_dataframe(columns=[score_col], key='I').describe()
 
 - Copying thresholds from another dataset without checking distributions
 - Expecting `run_doublet_detection` to drop cells (it only scores)
-- Running doublet detection before `make_graph` and clustering
+- Running doublet detection before building the neighbourhood graph and clustering
+
 
 ## Summary of saved results
 

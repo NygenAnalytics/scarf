@@ -546,6 +546,15 @@ def _select_matrix(
 
 
 def inspect_h5ad(h5ad_fn: str) -> H5adInspectResult:
+    """Report the matrix and metadata layout of an H5AD file.
+
+    Args:
+        h5ad_fn: Path to the H5AD file.
+
+    Returns:
+        Keys, shape, and column names needed to configure
+        :class:`~scarf.readers.H5adReader`.
+    """
     with h5py.File(h5ad_fn, mode="r") as h5:
         candidates = _matrix_candidates(h5)
         if not candidates:

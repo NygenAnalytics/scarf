@@ -80,60 +80,6 @@ def make_integrated_graph_path(integrated_graphs_loc: str, label: str) -> str:
     return f"{integrated_graphs_loc}/{label}"
 
 
-def make_assay_graph_paths(
-    *,
-    from_assay: str,
-    cell_key: str,
-    feat_key: str,
-    reduction_method: str,
-    dims: int,
-    pca_cell_key: str,
-    ann_metric: str,
-    ann_efc: int,
-    ann_ef: int,
-    ann_m: int,
-    rand_state: int,
-    k: int,
-    local_connectivity: float,
-    bandwidth: float,
-    n_centroids: int | None = None,
-    feat_scaling: bool = True,
-    harmony_contract_hash: str | None = None,
-) -> AssayGraphPaths:
-    """Build the full assay graph path set from resolved path parameters."""
-    normalized = make_normalized_group_path(from_assay, cell_key, feat_key)
-    reduction = make_reduction_group_path(
-        normalized, reduction_method, dims, pca_cell_key
-    )
-    neighbor_index = make_neighbor_index_group_path(
-        reduction,
-        ann_metric,
-        ann_efc,
-        ann_ef,
-        ann_m,
-        rand_state,
-        feat_scaling=feat_scaling,
-        harmony_contract_hash=harmony_contract_hash,
-    )
-    nearest_neighbors = make_nearest_neighbors_group_path(neighbor_index, k)
-    cell_graph = make_cell_graph_group_path(
-        nearest_neighbors, local_connectivity, bandwidth
-    )
-    kmeans = None
-    if n_centroids is not None:
-        kmeans = make_kmeans_initialization_group_path(
-            reduction, n_centroids, rand_state
-        )
-    return AssayGraphPaths(
-        normalized_group_path=normalized,
-        reduction_group_path=reduction,
-        neighbor_index_group_path=neighbor_index,
-        nearest_neighbors_group_path=nearest_neighbors,
-        cell_graph_group_path=cell_graph,
-        kmeans_initialization_group_path=kmeans,
-    )
-
-
 def is_integrated_graph_path(graph_loc: str, integrated_graphs_loc: str) -> bool:
     return graph_loc == integrated_graphs_loc or graph_loc.startswith(
         f"{integrated_graphs_loc}/"

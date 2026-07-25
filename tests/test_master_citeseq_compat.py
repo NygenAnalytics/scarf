@@ -262,7 +262,7 @@ def test_current_reader_loads_master_graph_branches(
         datastore.get_latest_graph_loc("RNA", "I", "compat_hvgs_200")
         == _RNA_GRAPH_HARMONY
     )
-    assert datastore._get_latest_graph_loc(
+    assert datastore.get_latest_graph_loc(
         "RNA", "I", "compat_hvgs_100"
     ) == datastore.get_latest_graph_loc("RNA", "I", "compat_hvgs_100")
 

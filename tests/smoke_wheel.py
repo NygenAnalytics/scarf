@@ -96,7 +96,7 @@ from scarf.features import (
     select_highly_variable_features,
 )
 from scarf.matrix import Block, ChunkedArray
-from scarf.merge import AssayMerge, DatasetMerge, DummyAssay, ZarrMerge
+from scarf.merge import AssayMerge, DatasetMerge, DummyAssay
 from scarf.metadata import MetaData, MetaDataRowBlock
 from scarf.readers import (
     CSVReader,
@@ -135,10 +135,10 @@ for metadata_class in (MetaData, MetaDataRowBlock):
     assert metadata_class.__module__ == "scarf.metadata"
 assert scarf.AssayMerge is scarf.merge.AssayMerge is AssayMerge
 assert scarf.DatasetMerge is scarf.merge.DatasetMerge is DatasetMerge
-assert scarf.ZarrMerge is scarf.merge.ZarrMerge is ZarrMerge
 assert scarf.merge.DummyAssay is DummyAssay
-assert issubclass(ZarrMerge, AssayMerge)
-for merge_class in (AssayMerge, DatasetMerge, DummyAssay, ZarrMerge):
+assert not hasattr(scarf, "ZarrMerge")
+assert not hasattr(scarf.merge, "ZarrMerge")
+for merge_class in (AssayMerge, DatasetMerge, DummyAssay):
     assert merge_class.__module__ == "scarf.merge"
 assert scarf.CrH5Reader is scarf.readers.CrH5Reader
 assert scarf.CrToZarr is scarf.writers.CrToZarr

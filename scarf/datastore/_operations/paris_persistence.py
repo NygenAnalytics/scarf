@@ -1,20 +1,12 @@
-import hashlib
-import json
 from math import prod
 from typing import Literal, cast
-from urllib.parse import quote
 from uuid import uuid4
 
 import numpy as np
 import zarr
 
 from ...clustering._paris_core import ParisHierarchy
-from ...clustering.paris_multiscale import (
-    ParisClusterDiagnostic,
-    ParisClusteringResult,
-    PlateauForest,
-    labels_from_selected_nodes,
-)
+from ...clustering.paris_multiscale import PlateauForest
 from ...storage.arrays import create_zarr_dataset
 from ...storage.budget import ResourceBudget, get_resource_budget
 from ...storage.types import as_zarr_array, as_zarr_group
@@ -37,19 +29,6 @@ _PARIS_PLATEAU_ARRAYS = (
     "child_refs",
     "min_leaves",
     "component_roots",
-)
-_ADAPTIVE_RESULT_ARRAYS = (
-    "selected_nodes",
-    "parent_events",
-    "components",
-    "sizes",
-    "resolution_lower",
-    "resolution_upper",
-    "persistence",
-    "margins",
-    "forced",
-    "blocking_child_counts",
-    "folded_cell_counts",
 )
 _MEMORY_HEADROOM = 1.35
 _CACHED_FIXED_TRANSIENT_BYTES_PER_CELL = 128
@@ -477,23 +456,11 @@ def ensure_compatibility_dendrogram(
 def resolve_compatibility_dendrogram(
     root: zarr.Group,
     graph_loc: str,
-    *,
-    final_label_key: str | None = None,
 ) -> tuple[str, str | None]:
-    """Resolve a label-compatible linkage, falling back only for legacy stores."""
+    """Resolve a linkage, falling back only for legacy stores."""
     graph_group = as_zarr_group(root[graph_loc], name=graph_loc)
     latest_value = graph_group.attrs.get(LATEST_PARIS_GENERATION)
-    latest_generation = None if latest_value is None else str(latest_value)
-    label_generation = (
-        None
-        if final_label_key is None
-        else resolve_adaptive_label_generation(
-            root,
-            graph_loc,
-            final_label_key,
-        )
-    )
-    generation_id = label_generation or latest_generation
+    generation_id = None if latest_value is None else str(latest_value)
     # A stale generation pointer (for example an old paris_hierarchy/v2 layout)
     # must fall through to the legacy alias or dendrogram rather than crash.
     if (
@@ -507,8 +474,7 @@ def resolve_compatibility_dendrogram(
             dendrogram_loc in root
             and generation.attrs.get("dendrogram_complete") is True
         ):
-            if generation_id == latest_generation:
-                graph_group.attrs["latest_dendrogram"] = dendrogram_loc
+            graph_group.attrs["latest_dendrogram"] = dendrogram_loc
             return dendrogram_loc, generation_id
         preflight_cached_paris_cut(
             root,
@@ -528,7 +494,7 @@ def resolve_compatibility_dendrogram(
                 graph_loc,
                 generation_id,
                 hierarchy,
-                update_alias=generation_id == latest_generation,
+                update_alias=True,
             ),
             generation_id,
         )
@@ -543,342 +509,3 @@ def resolve_compatibility_dendrogram(
         "No Paris hierarchy is available for this graph. "
         "Run run_paris_clustering first."
     )
-
-
-def adaptive_config_digest(generation_id: str, min_cluster_size: int) -> str:
-    payload = json.dumps(
-        {
-            "hierarchy_generation_id": generation_id,
-            "min_cluster_size": min_cluster_size,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.blake2b(payload.encode(), digest_size=16).hexdigest()
-
-
-def _adaptive_label_location(graph_loc: str, label: str) -> str:
-    return f"{graph_loc}/adaptive_clustering/{quote(label, safe='')}"
-
-
-def persist_adaptive_result(
-    root: zarr.Group,
-    graph_loc: str,
-    label: str,
-    digest: str,
-    result: ParisClusteringResult,
-    *,
-    generation_id: str,
-    final_label_key: str,
-    hierarchy_cache_hit: bool,
-    cut_seconds: float,
-) -> str:
-    """Write a complete inactive adaptive result cache."""
-    if result.mode != "auto" or result.min_cluster_size is None:
-        raise ValueError("Only adaptive Paris results can be persisted here")
-    location = f"{_adaptive_label_location(graph_loc, label)}/{digest}"
-    config = root.create_group(location, overwrite=True)
-    config.attrs.update(
-        {
-            "complete": False,
-            "hierarchy_generation_id": generation_id,
-            "min_cluster_size": result.min_cluster_size,
-            "final_label_key": final_label_key,
-            "hierarchy_cache_hit": hierarchy_cache_hit,
-            "cut_seconds": cut_seconds,
-            "metadata_write_seconds": np.nan,
-        }
-    )
-    diagnostics = result.diagnostics
-    _write_array(
-        config,
-        "selected_nodes",
-        np.asarray([item.selected_node for item in diagnostics], dtype=np.int64),
-    )
-    _write_array(
-        config,
-        "parent_events",
-        np.asarray([item.parent_event for item in diagnostics], dtype=np.int64),
-    )
-    _write_array(
-        config,
-        "components",
-        np.asarray([item.component for item in diagnostics], dtype=np.int32),
-    )
-    _write_array(
-        config,
-        "sizes",
-        np.asarray([item.size for item in diagnostics], dtype=np.int64),
-    )
-    for name, values in (
-        (
-            "resolution_lower",
-            [item.resolution_lower for item in diagnostics],
-        ),
-        (
-            "resolution_upper",
-            [item.resolution_upper for item in diagnostics],
-        ),
-        ("persistence", [item.persistence for item in diagnostics]),
-        ("margins", [item.decision_margin for item in diagnostics]),
-    ):
-        _write_array(
-            config,
-            name,
-            np.asarray(
-                [np.nan if value is None else value for value in values],
-                dtype=np.float64,
-            ),
-        )
-    _write_array(
-        config,
-        "forced",
-        np.asarray([item.forced for item in diagnostics], dtype=bool),
-    )
-    _write_array(
-        config,
-        "blocking_child_counts",
-        np.asarray(
-            [item.blocking_child_count for item in diagnostics],
-            dtype=np.int32,
-        ),
-    )
-    _write_array(
-        config,
-        "folded_cell_counts",
-        np.asarray(
-            [item.folded_cell_count for item in diagnostics],
-            dtype=np.int64,
-        ),
-    )
-    config.attrs["complete"] = True
-    return location
-
-
-def _optional_float(value: np.floating) -> float | None:
-    return None if np.isnan(value) else float(value)
-
-
-def load_adaptive_result(
-    root: zarr.Group,
-    graph_loc: str,
-    label: str,
-    digest: str,
-    hierarchy: ParisHierarchy,
-) -> ParisClusteringResult | None:
-    """Load adaptive diagnostics and regenerate their O(N) label vector."""
-    location = f"{_adaptive_label_location(graph_loc, label)}/{digest}"
-    if location not in root:
-        return None
-    config = as_zarr_group(root[location], name=location)
-    if config.attrs.get("complete") is not True:
-        return None
-    if any(name not in config for name in _ADAPTIVE_RESULT_ARRAYS):
-        return None
-
-    selected_nodes = _read_array(config, "selected_nodes")
-    labels = labels_from_selected_nodes(hierarchy, selected_nodes)
-    parent_events = _read_array(config, "parent_events")
-    components = _read_array(config, "components")
-    sizes = _read_array(config, "sizes")
-    resolution_lower = _read_array(config, "resolution_lower")
-    resolution_upper = _read_array(config, "resolution_upper")
-    persistence = _read_array(config, "persistence")
-    margins = _read_array(config, "margins")
-    forced = _read_array(config, "forced")
-    blocking_counts = _read_array(config, "blocking_child_counts")
-    folded_counts = _read_array(config, "folded_cell_counts")
-    n_clusters = selected_nodes.size
-    arrays = (
-        parent_events,
-        components,
-        sizes,
-        resolution_lower,
-        resolution_upper,
-        persistence,
-        margins,
-        forced,
-        blocking_counts,
-        folded_counts,
-    )
-    if any(values.shape != (n_clusters,) for values in arrays):
-        raise ValueError(f"Adaptive Paris diagnostics are misaligned at {location!r}")
-
-    diagnostics = tuple(
-        ParisClusterDiagnostic(
-            label=index + 1,
-            selected_node=int(selected_nodes[index]),
-            parent_event=int(parent_events[index]),
-            component=int(components[index]),
-            size=int(sizes[index]),
-            resolution_lower=_optional_float(resolution_lower[index]),
-            resolution_upper=_optional_float(resolution_upper[index]),
-            persistence=_optional_float(persistence[index]),
-            forced=bool(forced[index]),
-            blocking_child_count=int(blocking_counts[index]),
-            folded_cell_count=int(folded_counts[index]),
-            decision_margin=_optional_float(margins[index]),
-        )
-        for index in range(n_clusters)
-    )
-    return ParisClusteringResult(
-        labels=labels,
-        mode="auto",
-        n_clusters=n_clusters,
-        diagnostics=diagnostics,
-        min_cluster_size=cast(int, config.attrs["min_cluster_size"]),
-        label_key=str(config.attrs["final_label_key"]),
-        hierarchy_generation_id=str(config.attrs["hierarchy_generation_id"]),
-    )
-
-
-def activate_adaptive_result(
-    root: zarr.Group,
-    graph_loc: str,
-    label: str,
-    digest: str,
-    *,
-    metadata_write_seconds: float,
-) -> None:
-    label_location = _adaptive_label_location(graph_loc, label)
-    config_location = f"{label_location}/{digest}"
-    config = as_zarr_group(root[config_location], name=config_location)
-    if config.attrs.get("complete") is not True:
-        raise ValueError("Cannot activate an incomplete adaptive Paris result")
-    config.attrs["metadata_write_seconds"] = metadata_write_seconds
-    label_group = as_zarr_group(root[label_location], name=label_location)
-    label_group.attrs["active_digest"] = digest
-
-
-def clear_active_adaptive_result(
-    root: zarr.Group,
-    graph_loc: str,
-    label: str,
-) -> None:
-    label_location = _adaptive_label_location(graph_loc, label)
-    if label_location not in root:
-        return
-    label_group = as_zarr_group(root[label_location], name=label_location)
-    if "active_digest" in label_group.attrs:
-        del label_group.attrs["active_digest"]
-
-
-def resolve_adaptive_label_generation(
-    root: zarr.Group,
-    graph_loc: str,
-    final_label_key: str,
-) -> str | None:
-    adaptive_location = f"{graph_loc}/adaptive_clustering"
-    if adaptive_location not in root:
-        return None
-    adaptive_group = as_zarr_group(root[adaptive_location], name=adaptive_location)
-    for label in adaptive_group.group_keys():
-        label_location = f"{adaptive_location}/{label}"
-        label_group = as_zarr_group(root[label_location], name=label_location)
-        active_digest = label_group.attrs.get("active_digest")
-        if active_digest is None:
-            continue
-        config_location = f"{label_location}/{active_digest}"
-        if config_location not in root:
-            continue
-        config = as_zarr_group(root[config_location], name=config_location)
-        if (
-            config.attrs.get("complete") is True
-            and config.attrs.get("final_label_key") == final_label_key
-        ):
-            return str(config.attrs["hierarchy_generation_id"])
-    return None
-
-
-def _reusable_adaptive_generation(
-    config: zarr.Group,
-    digest: str,
-    available_generations: set[str],
-) -> str | None:
-    if config.attrs.get("complete") is not True:
-        return None
-    if any(name not in config for name in _ADAPTIVE_RESULT_ARRAYS):
-        return None
-    generation_value = config.attrs.get("hierarchy_generation_id")
-    min_cluster_size = config.attrs.get("min_cluster_size")
-    final_label_key = config.attrs.get("final_label_key")
-    if (
-        generation_value is None
-        or isinstance(min_cluster_size, (bool, np.bool_))
-        or not isinstance(min_cluster_size, (int, np.integer))
-        or not isinstance(final_label_key, str)
-    ):
-        return None
-    generation_id = str(generation_value)
-    if generation_id not in available_generations:
-        return None
-    if digest != adaptive_config_digest(generation_id, int(min_cluster_size)):
-        return None
-    return generation_id
-
-
-def garbage_collect_hierarchy_generations(
-    root: zarr.Group,
-    graph_loc: str,
-) -> None:
-    graph_group = as_zarr_group(root[graph_loc], name=graph_loc)
-    latest = graph_group.attrs.get(LATEST_PARIS_GENERATION)
-    hierarchy_location = f"{graph_loc}/{PARIS_HIERARCHY_ROOT}"
-    if hierarchy_location in root:
-        hierarchy_group = as_zarr_group(
-            root[hierarchy_location], name=hierarchy_location
-        )
-        available_generations = set(hierarchy_group.group_keys())
-    else:
-        hierarchy_group = None
-        available_generations = set()
-    retained = (
-        {str(latest)}
-        if latest is not None and str(latest) in available_generations
-        else set()
-    )
-    adaptive_location = f"{graph_loc}/adaptive_clustering"
-    if adaptive_location in root:
-        adaptive_group = as_zarr_group(root[adaptive_location], name=adaptive_location)
-        for label in adaptive_group.group_keys():
-            label_location = f"{adaptive_location}/{label}"
-            label_group = as_zarr_group(root[label_location], name=label_location)
-            active_digest = label_group.attrs.get("active_digest")
-            if active_digest is None:
-                continue
-            config_location = f"{label_location}/{active_digest}"
-            if config_location in root:
-                config = as_zarr_group(root[config_location], name=config_location)
-                generation_id = _reusable_adaptive_generation(
-                    config,
-                    str(active_digest),
-                    available_generations,
-                )
-                if generation_id is not None:
-                    retained.add(generation_id)
-
-    if hierarchy_group is not None:
-        for generation_id in tuple(hierarchy_group.group_keys()):
-            if generation_id not in retained:
-                del root[f"{hierarchy_location}/{generation_id}"]
-
-    if adaptive_location not in root:
-        return
-    adaptive_group = as_zarr_group(root[adaptive_location], name=adaptive_location)
-    for label in tuple(adaptive_group.group_keys()):
-        label_location = f"{adaptive_location}/{label}"
-        label_group = as_zarr_group(root[label_location], name=label_location)
-        active_value = label_group.attrs.get("active_digest")
-        active_digest = None if active_value is None else str(active_value)
-        for digest in tuple(label_group.group_keys()):
-            config_location = f"{label_location}/{digest}"
-            config = as_zarr_group(root[config_location], name=config_location)
-            if _reusable_adaptive_generation(config, digest, retained) is not None:
-                continue
-            del root[config_location]
-            if active_digest == digest and "active_digest" in label_group.attrs:
-                del label_group.attrs["active_digest"]
-        if not tuple(label_group.group_keys()):
-            del root[label_location]
-    if not tuple(adaptive_group.group_keys()):
-        del root[adaptive_location]

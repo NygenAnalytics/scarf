@@ -5,7 +5,7 @@ import pandas as pd
 from scipy.sparse import coo_matrix
 
 from ...assay import Assay
-from ...graph.state import validate_legacy_graph_selection
+from ...graph.state import resolve_stored_graph_input, validate_legacy_graph_selection
 from ...matrix import ChunkedArray
 from ...metadata.arguments import (
     FateMappingArguments,
@@ -36,8 +36,6 @@ from ...storage.artifacts import (
     ArtifactRef,
     artifact_path,
     callable_identity,
-    fingerprint_stored_arrays,
-    parse_artifact_path,
     provenance_hash,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
@@ -109,16 +107,7 @@ def _stored_graph_input(
     feat_key: str,
 ) -> tuple[str, object]:
     graph_loc = store.get_latest_graph_loc(from_assay, cell_key, feat_key)
-    try:
-        return graph_loc, parse_artifact_path(graph_loc)
-    except ValueError:
-        graph_group = as_zarr_group(store.zw[graph_loc], name=graph_loc)
-        return graph_loc, {
-            "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                graph_group,
-                ("edges", "weights"),
-            )
-        }
+    return graph_loc, resolve_stored_graph_input(store.zw, graph_loc)
 
 
 class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
@@ -141,18 +130,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             feat_key,
         )
         graph_loc = self.get_latest_graph_loc(from_assay, cell_key, feat_key)
-        try:
-            graph_ref = parse_artifact_path(graph_loc)
-        except ValueError:
-            legacy_graph = as_zarr_group(self.zw[graph_loc], name=graph_loc)
-            graph_input: object = {
-                "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                    legacy_graph,
-                    ("edges", "weights"),
-                )
-            }
-        else:
-            graph_input = graph_ref
+        graph_input: object = resolve_stored_graph_input(self.zw, graph_loc)
         planned = plan_artifact(
             self.zw,
             scope="assay",
@@ -1036,16 +1014,10 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 ),
                 invalidate_cache=invalidate_cache,
             )
-            record = arguments.to_record()
-            planned = plan_artifact(
+            planned = arguments.plan(
                 self.zw,
                 scope="assay",
                 assay=assay.name,
-                kind=arguments.artifact_kind,
-                operation=arguments.operation,
-                parameters=record.parameters,
-                inputs=record.inputs,
-                execution_options=record.execution_options,
                 invalidate_cache=invalidate_cache,
                 required_arrays=(
                     ArrayRequirement(
@@ -1303,16 +1275,10 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             n_threads=self.nthreads,
             invalidate_cache=invalidate_cache,
         )
-        record = arguments.to_record()
-        planned = plan_artifact(
+        planned = arguments.plan(
             self.zw,
             scope="assay",
             assay=assay.name,
-            kind=arguments.artifact_kind,
-            operation=arguments.operation,
-            parameters=record.parameters,
-            inputs=record.inputs,
-            execution_options=record.execution_options,
             invalidate_cache=invalidate_cache,
             required_arrays=(
                 ArrayRequirement(
