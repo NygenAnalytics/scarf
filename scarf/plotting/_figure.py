@@ -114,7 +114,7 @@ class PlotResult:
             return
         from IPython.display import display
 
-        display({"text/plain": repr(self)}, raw=True)
+        display({"text/plain": repr(self)}, raw=True)  # type: ignore[no-untyped-call]
 
     def close(self) -> None:
         if not self.owns_figure:
