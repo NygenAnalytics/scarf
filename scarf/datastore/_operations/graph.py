@@ -123,6 +123,18 @@ class _GraphOperationsMixin(_GraphOperationsBase):
     _normalizedArtifactCache: dict[ArtifactRef, ChunkedArray]
     _artifactExecutionContext: dict[str, Any]
 
+    if TYPE_CHECKING:
+
+        def _build_mapping_reference_artifact(
+            self,
+            *,
+            reduction: ArtifactRef,
+            batch_correction: ArtifactRef,
+            ann_index: ArtifactRef,
+            neighbors: ArtifactRef,
+            invalidate_cache: bool,
+        ) -> ArtifactRef: ...
+
     def _remember_ann_stream_path(self, ann_obj: AnnStream, path: str) -> None:
         try:
             paths = self._annStreamPaths

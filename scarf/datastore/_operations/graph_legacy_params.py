@@ -34,7 +34,7 @@ from ...storage.types import as_zarr_group
 from ...utils.logging import logger
 
 if TYPE_CHECKING:
-    from ..base_datastore import BaseDataStore as _GraphLegacyParamsBase
+    from .graph import _GraphOperationsMixin as _GraphLegacyParamsBase
 else:
     _GraphLegacyParamsBase = object
 

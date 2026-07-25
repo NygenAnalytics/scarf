@@ -252,7 +252,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 f"Projection {target_name!r} uses feature key {stored_feat_key!r}, "
                 f"not the current key {feat_key!r}; validating its stored provenance."
             )
-        reference_cells = self.cells.fetch("ids", key=cast(str, stored_cell_key))
+        reference_cells = self.cells.fetch("ids", key=stored_cell_key)
         if attrs.get("reference_cell_fingerprint") != array_hash(reference_cells):
             raise ValueError(
                 f"Projection {target_name!r} was built from a different reference cell set."

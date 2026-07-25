@@ -221,8 +221,9 @@ class BaseDataStore:
             Names of assays present in a Zarr file
         """
         assays = []
-        # Object-store listings can repeat a group, so keep first occurrences only.
-        for i in dict.fromkeys(self.zw.group_keys()):
+        # Object-store listings can repeat a group and may not preserve order
+        # across calls, so keep unique names in sorted order.
+        for i in sorted(dict.fromkeys(self.zw.group_keys())):
             if "is_assay" in self.zw[i].attrs.keys():
                 validate_assay_name(i)
                 sanitize_hierarchy(self.z, i, self.workspace)

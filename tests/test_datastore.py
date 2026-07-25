@@ -129,14 +129,16 @@ class TestDataStore:
     ):
         # Object-store listings can yield the same group more than once.
         root = datastore_ephemeral.z
-        expected = [
-            name for name in root.group_keys() if "is_assay" in root[name].attrs.keys()
-        ]
+        keys = list(root.group_keys())
+        expected = sorted(
+            name
+            for name in dict.fromkeys(keys)
+            if "is_assay" in root[name].attrs.keys()
+        )
         assert expected
 
         class RepeatingGroup:
             def group_keys(self):
-                keys = list(root.group_keys())
                 return iter(keys + keys + keys)
 
             def __getitem__(self, key):

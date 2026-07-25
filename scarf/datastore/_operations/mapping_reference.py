@@ -35,7 +35,9 @@ from ...storage.artifacts import (
 from ...storage.types import as_zarr_array, as_zarr_group
 
 if TYPE_CHECKING:
-    from ..base_datastore import BaseDataStore as _MappingReferenceOperationsBase
+    from .graph_legacy_params import (
+        _GraphLegacyParamsMixin as _MappingReferenceOperationsBase,
+    )
 else:
     _MappingReferenceOperationsBase = object
 
