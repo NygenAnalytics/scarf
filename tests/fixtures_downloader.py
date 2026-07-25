@@ -12,6 +12,7 @@ def bastidas_ponce_data():
     if not os.path.isfile(local_h5ad):
         pytest.skip(
             f"Bundled test data missing at {local_h5ad}. "
-            "Add data.h5ad under tests/datasets/ to run h5ad reader tests."
+            "Download via `python -m tests.download_fixtures --with-h5ad` "
+            "(transient Hugging Face failures are skipped after retries)."
         )
     yield local_h5ad

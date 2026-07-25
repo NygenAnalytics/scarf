@@ -5,6 +5,7 @@ import gzip
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -12,6 +13,8 @@ from pathlib import Path
 import h5py
 import pandas as pd
 from scipy.sparse import csr_matrix
+
+_H5AD_DOWNLOAD_ATTEMPTS = 3
 
 _FIXTURES_BASE_URL = "https://raw.githubusercontent.com/parashardhapola/scarf/master/scarf/tests/datasets"
 
@@ -131,18 +134,45 @@ def build_mtx_dir_fixture() -> None:
             tar.add(mtx_dir, arcname=mtx_dir.name)
 
 
-def download_optional_h5ad() -> None:
+def download_optional_h5ad(*, attempts: int = _H5AD_DOWNLOAD_ATTEMPTS) -> bool:
     sample = "bastidas-ponce_4K_pancreas-d15_rnaseq"
     local_h5ad = datasets_dir() / sample / "data.h5ad"
     if local_h5ad.is_file():
-        return
+        return True
 
     from scarf import cytebase
 
-    cytebase.connect("scarf_docs").download_dataset(
-        sample,
-        destination=datasets_dir(),
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            cytebase.connect("scarf_docs").download_dataset(
+                sample,
+                destination=datasets_dir(),
+            )
+            if local_h5ad.is_file():
+                return True
+            last_error = FileNotFoundError(
+                f"Cytebase download finished without creating {local_h5ad}"
+            )
+        except Exception as exc:
+            last_error = exc
+
+        if attempt >= attempts:
+            break
+        delay = min(60.0, 2.0**attempt)
+        print(
+            f"Warning: h5ad download attempt {attempt}/{attempts} failed "
+            f"({last_error}); retrying in {delay:.0f}s",
+            file=sys.stderr,
+        )
+        time.sleep(delay)
+
+    print(
+        f"Warning: skipping optional h5ad fixture after {attempts} attempts "
+        f"({last_error}). Tests that need {local_h5ad} will be skipped.",
+        file=sys.stderr,
     )
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
