@@ -60,8 +60,8 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    Assay: "ec3721b2cc5d31858beb1652cc3ea20050dc675c70328b444bfb2cbb535038bc",
-    RNAassay: "5af40e0f5579c8ef6dff03b41eaec1a1ea184b653bc7c66c8ecb1e5b5d51a60a",
+    Assay: "969cbfaa6f87f623aac16c449875890f75685a20819deb0a7257d6aa70dca647",
+    RNAassay: "246c85c9322349d4bc8f4f1adf2e28b4efe2268dfe84049425497269eea9eccf",
     ATACassay: "491bb1c63ad83fa5d9634200c5b3778a3018e39abdd3ae87208eb3e85659633c",
     ADTassay: "a1ff1bebdd8fcd3f30a1b64a42dbf2931f6b8031ddce75abcf362750eb4e9c34",
 }

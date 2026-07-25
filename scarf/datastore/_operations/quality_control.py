@@ -1,13 +1,40 @@
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pandas as pd
 
 from ...assay import ATACassay, RNAassay
+from ...graph.state import read_assay_state
 from ...quality_control.cell_cycle import assign_cell_cycle_phase
 from ...quality_control.filtering import gaussian_quantile_bounds
 from ...quality_control.hto import hto_demux
+from ...metadata.artifacts import (
+    artifact_values,
+    categorical_display,
+    column_display,
+    continuous_display,
+    feature_column_display,
+    link_cell_data_column,
+    link_feature_data_column,
+    plan_cell_data_artifact,
+    write_cell_data_artifact,
+)
+from ...metadata.arguments import (
+    CellCycleArguments,
+    DoubletScoreArguments,
+    HtoIdentityArguments,
+    PrevalentPeakArguments,
+)
+from ...storage.artifacts import (
+    artifact_path,
+    callable_identity,
+    fingerprint_array,
+    fingerprint_stored_arrays,
+    fingerprint_strings,
+)
+from ...storage.selections import resolve_generated_selection_artifact
+from ...storage.types import as_zarr_group
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
 
@@ -37,6 +64,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         highs: Iterable[int],
         reset_previous: bool = False,
         keep_bounds: bool = False,
+        invalidate_cache: bool = False,
     ) -> None:
         """Filter cells based on the cell metadata column values. Filtering
         triggers `update` method on  'I' column of cell metadata which uses
@@ -57,8 +85,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         Returns:
         """
+        attrs = list(attrs)
+        lows = list(lows)
+        highs = list(highs)
+        input_fingerprints = {}
         new_bool = np.ones(self.cells.N).astype(bool)
-        for i, j, k in zip(attrs, lows, highs):
+        for i, j, k in zip(attrs, lows, highs, strict=False):
             # Checking here to avoid hard error from metadata class
             if i not in self.cells.columns:
                 logger.warning(
@@ -70,6 +102,12 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             if k is None:
                 k = np.inf
             x = self.cells.sift(i, j, k, keep_bounds=keep_bounds)
+            values = np.asarray(self.cells.fetch_all(i))
+            input_fingerprints[i] = (
+                fingerprint_strings(values)
+                if values.dtype.kind in {"O", "S", "U"}
+                else fingerprint_array(values)
+            )
             logger.info(
                 f"{len(x) - x.sum()} cells flagged for filtering out using attribute {i}"
             )
@@ -77,6 +115,19 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if reset_previous:
             self.cells.reset_key(key="I")
         self.cells.update_key(new_bool, key="I")
+        self._record_cell_selection(
+            column="I",
+            operation="filter_cells",
+            parameters={
+                "attrs": attrs,
+                "lows": lows,
+                "highs": highs,
+                "reset_previous": reset_previous,
+                "keep_bounds": keep_bounds,
+            },
+            inputs={"metadata_fingerprints": input_fingerprints},
+            invalidate_cache=invalidate_cache,
+        )
 
     def auto_filter_cells(
         self,
@@ -84,6 +135,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         min_p: float = 0.01,
         max_p: float = 0.99,
         show_qc_plots: bool = True,
+        invalidate_cache: bool = False,
     ) -> None:
         """Automatically filter cells based on columns of the cell metadata
         table.
@@ -113,6 +165,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                     attrs.append(i)
 
         attrs_used: list[str] = []
+        resolved_bounds: dict[str, dict[str, float]] = {}
         for i in attrs:
             if i not in self.cells.columns:
                 logger.warning(
@@ -121,12 +174,27 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 continue
             a = self.cells.fetch_all(i)
             low, high = gaussian_quantile_bounds(a, min_p, max_p)
+            resolved_bounds[i] = {"low": float(low), "high": float(high)}
             self.filter_cells(
                 attrs=[i],
                 lows=[cast(int, low)],
                 highs=[cast(int, high)],
+                invalidate_cache=False,
             )
             attrs_used.append(i)
+
+        self._record_cell_selection(
+            column="I",
+            operation="auto_filter_cells",
+            parameters={
+                "attrs": attrs_used,
+                "min_p": min_p,
+                "max_p": max_p,
+                "resolved_bounds": resolved_bounds,
+            },
+            inputs={},
+            invalidate_cache=invalidate_cache,
+        )
 
         if show_qc_plots and attrs_used:
             # Match the previous plot_cells_dists contract: pre uses every cell,
@@ -153,6 +221,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         from_assay: str | None = None,
         cell_key: str | None = None,
         label: str = "Hashtag_identity",
+        random_seed: int = 0,
+        invalidate_cache: bool = False,
     ) -> None:
         """Assign HTO hashtag identities to cells using demultiplexing.
 
@@ -160,6 +230,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             from_assay: HTO assay name (default: ``'HTO'``).
             cell_key: Boolean cell metadata column selecting cells (default: latest for assay).
             label: Column name to store identities in cell metadata.
+            random_seed: Seed used for HTO demultiplexing.
+            invalidate_cache: Recompute even when matching provenance exists.
 
         Returns:
             None
@@ -169,17 +241,89 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if cell_key is None:
             cell_key = self._get_latest_cell_key(from_assay)
         assay = self._get_assay(from_assay)
+        if isinstance(random_seed, bool) or not isinstance(random_seed, int):
+            raise TypeError("random_seed must be an integer")
+        n_cells = len(self.cells.active_index(cell_key))
+        required_cells = assay.feats.N + 1
+        if n_cells < required_cells:
+            raise ValueError(
+                f"HTO demultiplexing requires at least {required_cells} selected cells"
+            )
+        selection = self._ensure_cell_selection(cell_key)
+        arguments = HtoIdentityArguments(
+            cell_selection=selection,
+            feature_ids_fingerprint=fingerprint_strings(
+                np.asarray(assay.feats.fetch_all("ids"))
+            ),
+            algorithm_version=2,
+            random_seed=random_seed,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            label=label,
+            invalidate_cache=invalidate_cache,
+        )
+        record = arguments.to_record()
+        planned = plan_cell_data_artifact(
+            self.zw,
+            scope="assay",
+            assay=from_assay,
+            kind=arguments.artifact_kind,
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            cell_selection=selection,
+            arrays={"values": ((n_cells,), None)},
+            invalidate_cache=invalidate_cache,
+        )
+        preserved_display = column_display(self.zw, label)
+        if planned.reused:
+            artifact_group = as_zarr_group(
+                self.zw[artifact_path(planned.ref)],
+                name=planned.ref.artifact_id,
+            )
+            values = artifact_values(artifact_group, "values")
+            self.cells.insert(
+                column_name=label,
+                values=values,
+                overwrite=True,
+                key=cell_key,
+            )
+            link_cell_data_column(
+                self.zw,
+                label,
+                planned.ref,
+                value_name="values",
+                default_display=categorical_display(values),
+                preserved_display=preserved_display,
+            )
+            return
         counts = controlled_compute(
             assay.rawData[self.cells.fetch_all(cell_key)], self.nthreads
         )
         hto_idents = hto_demux(
-            pd.DataFrame(counts, columns=assay.feats.fetch_all("ids"))
+            pd.DataFrame(counts, columns=assay.feats.fetch_all("ids")),
+            random_seed=random_seed,
+        )
+        values = np.asarray(hto_idents.values)
+        write_cell_data_artifact(
+            self.zw,
+            planned,
+            {"values": values},
         )
         self.cells.insert(
             column_name=label,
-            values=np.array(hto_idents.values),
+            values=values,
             overwrite=True,
             key=cell_key,
+        )
+        link_cell_data_column(
+            self.zw,
+            label,
+            planned.ref,
+            value_name="values",
+            default_display=categorical_display(values),
+            preserved_display=preserved_display,
         )
 
     def run_doublet_detection(
@@ -198,6 +342,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         label: str = "doublet_score",
         batch_size: int = 1000,
         random_seed: int = 4444,
+        invalidate_cache: bool = False,
     ) -> str:
         """Flag potential doublets by simulating and mapping synthetic doublets.
 
@@ -269,10 +414,96 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 f"ERROR: `cluster_key` {cluster_key} not found in cell metadata. Provide a column "
                 f"with cluster or group labels, for example '{from_assay}_cluster'"
             )
+        selection = self._ensure_cell_selection(cell_key)
+        cluster_input = self._resolve_cell_data_provenance_input(
+            cluster_key,
+            cell_key=cell_key,
+        )
+        state = read_assay_state(self.zw, from_assay)
+        if (
+            state is not None
+            and state.matches(cell_key, feat_key)
+            and state.connectivity_map is not None
+        ):
+            graph_input: object = state.connectivity_map
+            graph_selection = self._graph_cell_selection(state.connectivity_map)
+            if not self._selection_artifacts_match(graph_selection, selection):
+                raise ValueError("cell_key does not match the graph cell selection")
+        else:
+            graph_path = self.get_latest_graph_loc(
+                from_assay,
+                cell_key,
+                feat_key,
+            )
+            graph_group = as_zarr_group(
+                self.zw[graph_path],
+                name=graph_path,
+            )
+            graph_input = {
+                "legacy_graph_fingerprint": fingerprint_stored_arrays(
+                    graph_group,
+                    ("edges", "weights"),
+                )
+            }
+        n_active = len(self.cells.active_index(cell_key))
+        arguments = DoubletScoreArguments(
+            clusters=cluster_input,
+            connectivity_map=graph_input,
+            cluster_sample_fraction=cluster_sample_fraction,
+            max_cells_per_cluster=max_cells_per_cluster,
+            simulation_ratio=simulation_ratio,
+            heterotypic_fraction=heterotypic_fraction,
+            save_k=save_k,
+            smoothing_t=smoothing_t,
+            normalize_scores=normalize_scores,
+            random_seed=random_seed,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            label=label,
+            batch_size=batch_size,
+            invalidate_cache=invalidate_cache,
+        )
+        record = arguments.to_record()
+        planned = plan_cell_data_artifact(
+            self.zw,
+            scope="assay",
+            assay=from_assay,
+            kind=arguments.artifact_kind,
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            cell_selection=selection,
+            arrays={"values": ((n_active,), "f")},
+            invalidate_cache=invalidate_cache,
+        )
+        final_col = self._col_renamer(from_assay, cell_key, label)
+        preserved_display = column_display(self.zw, final_col)
+        if planned.reused:
+            artifact_group = as_zarr_group(
+                self.zw[artifact_path(planned.ref)],
+                name=planned.ref.artifact_id,
+            )
+            scores = artifact_values(artifact_group, "values")
+            self.cells.insert(
+                final_col,
+                scores,
+                key=cell_key,
+                overwrite=True,
+            )
+            link_cell_data_column(
+                self.zw,
+                final_col,
+                planned.ref,
+                value_name="values",
+                default_display=continuous_display(scores),
+                preserved_display=preserved_display,
+            )
+            return final_col
 
         rng = np.random.default_rng(random_seed)
         active_idx = self.cells.active_index(cell_key)
-        n_active = len(active_idx)
         clusters = self.cells.fetch(cluster_key, key=cell_key)
 
         pool_positions = sample_cluster_pool(
@@ -300,7 +531,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         temp_dir = tempfile.mkdtemp(prefix="scarf_doublet_")
         target_name = f"_doublet_sim_{from_assay}"
         target_feat_key = f"{feat_key}_doublet"
-        final_col: str | None = None
         try:
             write_doublet_target_zarr(
                 zarr_loc=temp_dir,
@@ -356,10 +586,29 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             if normalize_scores:
                 lo, hi = scores.min(), scores.max()
                 scores = (scores - lo) / (hi - lo) if hi > lo else np.zeros_like(scores)
-            final_col = self._col_renamer(from_assay, cell_key, label)
+            write_cell_data_artifact(
+                self.zw,
+                planned,
+                {"values": scores},
+            )
             self.cells.insert(final_col, scores, key=cell_key, overwrite=True)
+            link_cell_data_column(
+                self.zw,
+                final_col,
+                planned.ref,
+                value_name="values",
+                default_display=continuous_display(scores),
+                preserved_display=preserved_display,
+            )
             logger.info(f"Doublet scores stored in cell metadata column '{final_col}'")
         finally:
+            try:
+                self._delete_projection_artifact(
+                    from_assay,
+                    target_name,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"Could not remove temporary projection artifact: {e}")
             store_loc = f"{from_assay}/projections/{target_name}"
             try:
                 if store_loc in self.zw:
@@ -367,8 +616,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Could not remove temporary projection group: {e}")
             shutil.rmtree(temp_dir, ignore_errors=True)
-        if final_col is None:
-            raise RuntimeError("Doublet score column was not created")
         return final_col
 
     def mark_prevalent_peaks(
@@ -377,6 +624,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         cell_key: str | None = None,
         top_n: int = 10000,
         prevalence_key_name: str = "prevalent_peaks",
+        invalidate_cache: bool = False,
     ) -> None:
         """Feature selection method for ATACassay type assays.
 
@@ -403,7 +651,63 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 f"ERROR: This method of feature selection can only be applied to ATACassay type of assay. "
                 f"The provided assay is {type(assay)} type"
             )
-        assay.mark_prevalent_peaks(cell_key, top_n, prevalence_key_name)
+        output_key = f"{cell_key}__{prevalence_key_name}"
+        preserved_display = feature_column_display(assay.z, output_key)
+        cell_selection = self._ensure_cell_selection(cell_key)
+        feature_values = np.asarray(assay.feats.fetch_all("I"), dtype=bool)
+        feature_selection = self._resolve_selection_input(
+            metadata_group=as_zarr_group(
+                assay.z["featureData"],
+                name="featureData",
+            ),
+            column="I",
+            values=feature_values,
+            row_ids=np.asarray(assay.feats.fetch_all("ids")),
+            scope="assay",
+            kind="feature_selection",
+            assay=assay.name,
+            invalidate_cache=False,
+        )
+        arguments = PrevalentPeakArguments(
+            cell_selection=cell_selection,
+            feature_selection=feature_selection,
+            normalization_method=callable_identity(assay.normMethod),
+            algorithm_version=1,
+            top_n=top_n,
+            from_assay=assay.name,
+            cell_key=cell_key,
+            prevalence_key_name=prevalence_key_name,
+            invalidate_cache=invalidate_cache,
+        )
+        record = arguments.to_record()
+        values = assay._prevalent_peak_mask(cell_key, top_n)
+        selection, values = resolve_generated_selection_artifact(
+            self.zw,
+            scope="assay",
+            assay=assay.name,
+            kind=arguments.artifact_kind,
+            values=values,
+            row_ids=np.asarray(assay.feats.fetch_all("ids")),
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            source_column=output_key,
+            invalidate_cache=invalidate_cache,
+        )
+        assay.feats.insert(
+            output_key,
+            values,
+            fill_value=False,
+            overwrite=True,
+        )
+        link_feature_data_column(
+            assay.z,
+            output_key,
+            selection,
+            value_name="values",
+            default_display=categorical_display(values),
+            preserved_display=preserved_display,
+        )
 
     def run_cell_cycle_scoring(
         self,
@@ -416,6 +720,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         s_score_label: str = "S_score",
         g2m_score_label: str = "G2M_score",
         phase_label: str = "cell_cycle_phase",
+        invalidate_cache: bool = False,
     ) -> None:
         """Computes S and G2M phase scores by taking into account the average
         expression of S and G2M phase genes respectively. Following steps are
@@ -462,19 +767,130 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
             g2m_genes = list(g2m_phase_genes)
         control_size = min(len(s_genes), len(g2m_genes))
-
-        s_score = assay.score_features(
-            s_genes, cell_key, control_size, n_bins, rand_seed
+        s_gene_indices = assay.feats.get_index_by(
+            s_genes,
+            "names",
+            None,
+        ).tolist()
+        g2m_gene_indices = assay.feats.get_index_by(
+            g2m_genes,
+            "names",
+            None,
+        ).tolist()
+        selection = self._ensure_cell_selection(cell_key)
+        n_cells = len(self.cells.active_index(cell_key))
+        arguments = CellCycleArguments(
+            s_gene_indices=tuple(s_gene_indices),
+            g2m_gene_indices=tuple(g2m_gene_indices),
+            normalization_method=callable_identity(assay.normMethod),
+            size_factor=getattr(assay, "sf", None),
+            control_size=control_size,
+            n_bins=n_bins,
+            rand_seed=rand_seed,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            s_score_label=s_score_label,
+            g2m_score_label=g2m_score_label,
+            phase_label=phase_label,
+            invalidate_cache=invalidate_cache,
         )
-        s_score_label = self._col_renamer(from_assay, cell_key, s_score_label)
+        record = arguments.to_record()
+        planned = plan_cell_data_artifact(
+            self.zw,
+            scope="assay",
+            assay=from_assay,
+            kind=arguments.artifact_kind,
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            cell_selection=selection,
+            arrays={
+                "s_score": ((n_cells,), "f"),
+                "g2m_score": ((n_cells,), "f"),
+                "phase": ((n_cells,), None),
+            },
+            invalidate_cache=invalidate_cache,
+        )
+        if planned.reused:
+            artifact_group = as_zarr_group(
+                self.zw[artifact_path(planned.ref)],
+                name=planned.ref.artifact_id,
+            )
+            s_score = artifact_values(artifact_group, "s_score")
+            g2m_score = artifact_values(artifact_group, "g2m_score")
+            phase = artifact_values(artifact_group, "phase")
+        else:
+            try:
+                assay._load_stats_loc(cell_key)
+            except KeyError:
+                cast(Any, assay).set_feature_stats(cell_key)
+            s_score = assay.score_features(
+                s_genes,
+                cell_key,
+                control_size,
+                n_bins,
+                rand_seed,
+            )
+            g2m_score = assay.score_features(
+                g2m_genes,
+                cell_key,
+                control_size,
+                n_bins,
+                rand_seed,
+            )
+            phase = np.asarray(assign_cell_cycle_phase(s_score, g2m_score))
+            write_cell_data_artifact(
+                self.zw,
+                planned,
+                {
+                    "s_score": np.asarray(s_score),
+                    "g2m_score": np.asarray(g2m_score),
+                    "phase": phase,
+                },
+            )
+        s_score_label = self._col_renamer(
+            from_assay,
+            cell_key,
+            s_score_label,
+        )
+        g2m_score_label = self._col_renamer(
+            from_assay,
+            cell_key,
+            g2m_score_label,
+        )
+        phase_label = self._col_renamer(
+            from_assay,
+            cell_key,
+            phase_label,
+        )
+        s_display = column_display(self.zw, s_score_label)
+        g2m_display = column_display(self.zw, g2m_score_label)
+        phase_display = column_display(self.zw, phase_label)
         self.cells.insert(s_score_label, s_score, key=cell_key, overwrite=True)
-
-        g2m_score = assay.score_features(
-            g2m_genes, cell_key, control_size, n_bins, rand_seed
+        link_cell_data_column(
+            self.zw,
+            s_score_label,
+            planned.ref,
+            value_name="s_score",
+            default_display=continuous_display(s_score),
+            preserved_display=s_display,
         )
-        g2m_score_label = self._col_renamer(from_assay, cell_key, g2m_score_label)
         self.cells.insert(g2m_score_label, g2m_score, key=cell_key, overwrite=True)
-
-        phase = assign_cell_cycle_phase(s_score, g2m_score)
-        phase_label = self._col_renamer(from_assay, cell_key, phase_label)
+        link_cell_data_column(
+            self.zw,
+            g2m_score_label,
+            planned.ref,
+            value_name="g2m_score",
+            default_display=continuous_display(g2m_score),
+            preserved_display=g2m_display,
+        )
         self.cells.insert(phase_label, np.asarray(phase), key=cell_key, overwrite=True)
+        link_cell_data_column(
+            self.zw,
+            phase_label,
+            planned.ref,
+            value_name="phase",
+            default_display=categorical_display(np.asarray(phase)),
+            preserved_display=phase_display,
+        )

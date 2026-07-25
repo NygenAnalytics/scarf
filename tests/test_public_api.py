@@ -6,7 +6,10 @@ from typing import cast
 
 
 _EXPECTED_EXPORTS = {
+    "ArtifactRef": "scarf.storage.artifacts",
+    "ArtifactStatus": "scarf.storage.artifacts",
     "AssayMerge": "scarf.merge",
+    "AssayState": "scarf.graph.state",
     "CSVReader": "scarf.readers",
     "CSVtoZarr": "scarf.writers",
     "CrDirReader": "scarf.readers",

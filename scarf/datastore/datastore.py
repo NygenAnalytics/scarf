@@ -10,6 +10,7 @@ from ._operations.trajectory import _TrajectoryFeatureOperationsMixin
 from .mapping_datastore import MappingDatastore
 
 if TYPE_CHECKING:
+    from ._pipeline_accessor import PipelineAccessor
     from .plot_accessor import DataStorePlotAccessor
 
 __all__ = ["DataStore"]
@@ -112,6 +113,13 @@ class DataStore(
         from .plot_accessor import DataStorePlotAccessor
 
         return DataStorePlotAccessor(self)
+
+    @property
+    def pipeline(self) -> "PipelineAccessor":
+        """Return the store-bound analysis recipe runner."""
+        from ._pipeline_accessor import PipelineAccessor
+
+        return PipelineAccessor(self)
 
     def get_assay(self, assay_name: str) -> Assay:
         """Returns the assay object for the given assay name.

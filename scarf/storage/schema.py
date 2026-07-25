@@ -11,14 +11,19 @@ from .layout import _group_zarr_format, count_array_spec
 from .profiles import StorageProfile, get_storage_profile
 from .sharding import finalize_sharded_counts, write_counts_t
 
-RESERVED_ASSAY_NAMES = frozenset({"plots"})
+RESERVED_ASSAY_NAMES = frozenset({"artifacts", "pipeline", "plots"})
 
 
 def validate_assay_name(assay_name: str) -> None:
     """Reject assay names reserved by the datastore API."""
     if assay_name in RESERVED_ASSAY_NAMES:
+        owner = (
+            "datastore artifact storage"
+            if assay_name == "artifacts"
+            else f"DataStore.{assay_name}"
+        )
         raise ValueError(
-            f"Assay name {assay_name!r} is reserved for DataStore.plots. "
+            f"Assay name {assay_name!r} is reserved for {owner}. "
             "Choose another name, or rename the assay in the Zarr store before "
             "opening it with Scarf."
         )

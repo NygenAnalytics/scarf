@@ -86,6 +86,10 @@ def embedding_raster(
     """
     require_matplotlib()
     color_scale = color_scale or ColorScale(cmap="viridis", quantiles=(0.01, 0.99))
+    if color_scale.scale != "linear":
+        raise NotImplementedError(
+            "embedding_raster currently supports only linear color scales"
+        )
     x_key = f"{layout_key}1"
     y_key = f"{layout_key}2"
     for key in (x_key, y_key):

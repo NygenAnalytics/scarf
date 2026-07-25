@@ -1,11 +1,12 @@
 """Embedding scatter plots."""
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Hashable
 
 import numpy as np
 import pandas as pd
 
+from ..metadata.artifacts import validate_display_metadata
 from ._contracts import (
     CategoricalScale,
     CellField,
@@ -252,7 +253,8 @@ def _embedding_multiple_layouts(
     for layout, child in children:
         tables.update({f"{layout}:{key}": value for key, value in child.tables.items()})
         legends.extend(child.legends)
-        scales.extend(child.scales)
+        if not scales:
+            scales.extend(child.scales)
 
     provenances = {layout: child.provenance for layout, child in children}
     first_provenance = children[0][1].provenance
@@ -402,8 +404,17 @@ def _continuous_limits(
         vmax = color_scale.vmax
     if vmax <= vmin:
         if color_scale.vmin is not None or color_scale.vmax is not None:
-            raise ValueError("Color limits must satisfy vmin < vmax")
-        vmax = vmin + 1.0
+            if color_scale.scale == "log":
+                if vmin <= 0:
+                    raise ValueError("Log color scale requires positive values")
+                vmin *= 0.99
+                vmax *= 1.01
+            else:
+                padding = max(abs(vmin) * 0.01, 0.5)
+                vmin -= padding
+                vmax += padding
+        else:
+            vmax = vmin + 1.0
     return vmin, vmax
 
 
@@ -450,6 +461,7 @@ def _add_categorical_legend(
     *,
     order: list[Any],
     palette: dict[Any, str],
+    labels: dict[Any, str] | None,
     label: str,
     missing: bool,
     missing_color: str,
@@ -467,7 +479,7 @@ def _add_categorical_legend(
             markeredgecolor=edgecolor,
             markeredgewidth=0.3,
             markersize=5,
-            label=str(value),
+            label=(labels.get(value, str(value)) if labels is not None else str(value)),
         )
         for value in order
     ]
@@ -520,6 +532,7 @@ def _add_on_data_labels(
     vv: np.ndarray,
     *,
     order: list[Any],
+    labels: dict[Any, str] | None,
     theme: str,
 ) -> None:
     from matplotlib import patheffects
@@ -533,7 +546,7 @@ def _add_on_data_labels(
         ax.text(
             float(np.median(xx[mask])),
             float(np.median(yy[mask])),
-            str(value),
+            (labels.get(value, str(value)) if labels is not None else str(value)),
             ha="center",
             va="center",
             fontsize=8,
@@ -554,6 +567,7 @@ def _draw_continuous(
     limits: tuple[float, float],
     cmap_name: str | None,
     vcenter: float | None,
+    scale: str,
     missing_color: str,
     default_color: str,
     edgecolor: str,
@@ -595,7 +609,23 @@ def _draw_continuous(
     vmin, vmax = limits
     if vmax == vmin:
         vmax = vmin + 1.0
-    norm = continuous_norm(mpl, vmin=vmin, vmax=vmax, vcenter=vcenter)
+    if scale == "log":
+        if vmin <= 0:
+            raise ValueError("Log color scale requires positive values")
+        norm = mpl.colors.LogNorm(vmin=vmin, vmax=vmax)
+    elif scale == "symlog":
+        norm = mpl.colors.SymLogNorm(
+            linthresh=max(abs(vmax - vmin) * 0.001, 1e-12),
+            vmin=vmin,
+            vmax=vmax,
+        )
+    else:
+        norm = continuous_norm(
+            mpl,
+            vmin=vmin,
+            vmax=vmax,
+            vcenter=vcenter,
+        )
     cmap = plt.get_cmap(cmap_name or "viridis")
     face = np.empty((len(vnum), 4))
     face[:] = mpl.colors.to_rgba(missing_color)
@@ -665,7 +695,7 @@ def embedding(
     color_scale: ColorScale | None = None,
     categorical_scale: CategoricalScale | None = None,
     default_color: str = "steelblue",
-    missing_color: str = "#bdbdbd",
+    missing_color: str | None = None,
     clip_fraction: float = 0.0,
     subset_by: str | None = None,
     groups: Sequence[Any] | None = None,
@@ -751,12 +781,10 @@ def embedding(
     if rasterize_threshold < 0:
         raise ValueError("rasterize_threshold must be >= 0")
     normalization = normalization or NormalizationSpec()
+    color_scale_was_explicit = color_scale is not None
+    categorical_scale_was_explicit = categorical_scale is not None
     color_scale = color_scale or ColorScale(cmap="viridis", scope="feature")
-    missing = (
-        categorical_scale.missing_color
-        if categorical_scale is not None
-        else missing_color
-    )
+    resolved_missing_color = missing_color or "#bdbdbd"
 
     x = np.asarray(store.cells.fetch(f"{layout_key}1", key=cell_key), dtype=np.float64)
     y = np.asarray(store.cells.fetch(f"{layout_key}2", key=cell_key), dtype=np.float64)
@@ -783,6 +811,27 @@ def embedding(
     )
 
     color_items = _coerce_color_items(color_by)
+    cell_data = store.zw["cellData"]
+    stored_displays: list[dict[str, Any] | None] = []
+    for item in color_items:
+        column = (
+            item
+            if isinstance(item, str)
+            else item.key
+            if isinstance(item, CellField)
+            else None
+        )
+        if column is None or column not in cell_data:
+            stored_displays.append(None)
+            continue
+        attrs = cell_data[column].attrs
+        if "display" not in attrs:
+            stored_displays.append(None)
+            continue
+        raw_display = attrs["display"]
+        if not isinstance(raw_display, Mapping):
+            raise TypeError("Display metadata must be a mapping")
+        stored_displays.append(validate_display_metadata(raw_display))
     color_cache = _prefetch_colors(
         store,
         color_items,
@@ -791,6 +840,54 @@ def embedding(
         n_cells=n,
         normalization=normalization,
     )
+    classified_cache: list[tuple[np.ndarray, str, bool, bool]] = []
+    for index, entry in enumerate(color_cache):
+        values, label, is_categorical, is_uniform = entry
+        item = color_items[index]
+        display = stored_displays[index]
+        cell_kind = item.kind if isinstance(item, CellField) else "auto"
+        if display is not None and cell_kind == "auto":
+            is_categorical = display["kind"] == "categorical"
+        classified_cache.append((values, label, is_categorical, is_uniform))
+    color_cache = classified_cache
+    stored_color_scales: dict[int, ColorScale] = {}
+    stored_categorical_scales: dict[int, CategoricalScale] = {}
+    for index, display in enumerate(stored_displays):
+        if display is None:
+            continue
+        if display["kind"] == "continuous" and not color_scale_was_explicit:
+            stored_color_scales[index] = ColorScale(
+                cmap=str(display["colormap"]),
+                vmin=(
+                    float(display["minimum"])
+                    if display["minimum"] is not None and clip_fraction == 0
+                    else None
+                ),
+                vmax=(
+                    float(display["maximum"])
+                    if display["maximum"] is not None and clip_fraction == 0
+                    else None
+                ),
+                scope="feature",
+                scale=str(display["scale"]),  # type: ignore[arg-type]
+            )
+        elif display["kind"] == "categorical" and not categorical_scale_was_explicit:
+            categories = display["categories"]
+            stored_categorical_scales[index] = CategoricalScale(
+                order=tuple(category["value"] for category in categories),
+                palette={
+                    category["value"]: str(category["color"]) for category in categories
+                },
+                labels={
+                    category["value"]: str(category["label"]) for category in categories
+                },
+                missing_color=(
+                    missing_color
+                    if missing_color is not None
+                    else str(display.get("missing_color", "#bdbdbd"))
+                ),
+                missing_label=str(display.get("missing_label", "NA")),
+            )
     if clip_fraction > 0:
         clipped: list[tuple[np.ndarray, str, bool, bool]] = []
         for vals, label, is_cat, is_uniform in color_cache:
@@ -809,21 +906,23 @@ def embedding(
     )
     facet_values: np.ndarray | None = None
     groups_category: np.ndarray | None = None
+    groups_color_index: int | None = None
     if facet_by is not None:
         facet_values = np.asarray(store.cells.fetch(facet_by, key=cell_key))
         if groups is not None:
             groups_category = facet_values
     elif groups is not None:
         cat_columns = [
-            vals
-            for vals, _, is_cat, is_uniform in color_cache
+            (index, vals)
+            for index, (vals, _, is_cat, is_uniform) in enumerate(color_cache)
             if is_cat and not is_uniform
         ]
         if not cat_columns:
             raise ValueError(
                 "groups requires a categorical color_by column, or facet_by"
             )
-        groups_category = np.asarray(cat_columns[0])
+        groups_color_index, group_values = cat_columns[0]
+        groups_category = np.asarray(group_values)
 
     selection_mask, group_order = resolve_cell_selection(
         n,
@@ -870,6 +969,8 @@ def embedding(
 
     limit_map: dict[int, tuple[float, float]] = {}
     categorical_maps: dict[int, tuple[list[Any], dict[Any, str]]] = {}
+    resolved_categorical_scales: dict[int, CategoricalScale | None] = {}
+    resolved_color_scales: dict[int, ColorScale] = {}
     shared_limits: tuple[float, float] | None = None
     if color_scale.scope == "shared":
         shared_values = [
@@ -887,10 +988,29 @@ def embedding(
         if is_uniform:
             continue
         vals_sel = np.asarray(vals)[base_mask]
+        active_color_scale = color_scale
         if is_cat:
+            active_categorical_scale = (
+                categorical_scale
+                if categorical_scale_was_explicit
+                else stored_categorical_scales.get(color_index)
+            )
             observed = list(pd.Series(vals_sel).dropna().unique())
-            if categorical_scale and categorical_scale.order is not None:
-                order = list(categorical_scale.order)
+            if (
+                categorical_scale_was_explicit
+                and active_categorical_scale
+                and active_categorical_scale.order is not None
+            ):
+                order = list(active_categorical_scale.order)
+                if (
+                    groups is not None
+                    and group_order is not None
+                    and facet_by is None
+                    and groups_category is not None
+                    and color_index == groups_color_index
+                ):
+                    selected_groups = set(group_order)
+                    order = [value for value in order if value in selected_groups]
                 unlisted = [value for value in observed if value not in order]
                 if unlisted:
                     raise ValueError(
@@ -902,21 +1022,40 @@ def embedding(
                 and group_order is not None
                 and facet_by is None
                 and groups_category is not None
+                and color_index == groups_color_index
             ):
                 order = [g for g in group_order if g in set(observed)]
+            elif (
+                active_categorical_scale and active_categorical_scale.order is not None
+            ):
+                order = list(active_categorical_scale.order)
             else:
                 order = sort_categories(observed)
             palette = categorical_color_map(
                 order,
-                palette=categorical_scale.palette if categorical_scale else None,
+                palette=(
+                    active_categorical_scale.palette
+                    if active_categorical_scale
+                    else None
+                ),
                 missing_label=None,
             )
             categorical_maps[color_index] = (order, palette)
-        elif color_scale.scope != "panel":
+            resolved_categorical_scales[color_index] = active_categorical_scale
+        else:
+            active_color_scale = stored_color_scales.get(
+                color_index,
+                color_scale,
+            )
+            resolved_color_scales[color_index] = active_color_scale
+        if not is_cat and active_color_scale.scope != "panel":
             limit_map[color_index] = (
                 shared_limits
-                if shared_limits is not None
-                else _continuous_limits(vals_sel, color_scale)
+                if shared_limits is not None and color_scale_was_explicit
+                else _continuous_limits(
+                    vals_sel,
+                    active_color_scale,
+                )
             )
 
     legend_locs: dict[int, LegendLoc] = {
@@ -936,10 +1075,42 @@ def embedding(
         figsize = (width, height)
 
     legends: list[LegendSpec] = []
-    scales_out: list[Any] = [color_scale]
+    scales_out: list[Any] = [
+        resolved_color_scales[index] for index in sorted(resolved_color_scales)
+    ]
+    if not scales_out:
+        scales_out.append(color_scale)
     for color_index, (order, palette) in categorical_maps.items():
         label = labels[color_index]
-        scales_out.append(CategoricalScale(order=tuple(order), palette=dict(palette)))
+        active_categorical_scale = resolved_categorical_scales.get(color_index)
+        scales_out.append(
+            CategoricalScale(
+                order=tuple(order),
+                palette=dict(palette),
+                labels=(
+                    {
+                        value: active_categorical_scale.labels.get(
+                            value,
+                            str(value),
+                        )
+                        for value in order
+                    }
+                    if active_categorical_scale is not None
+                    and active_categorical_scale.labels is not None
+                    else None
+                ),
+                missing_color=(
+                    active_categorical_scale.missing_color
+                    if active_categorical_scale is not None
+                    else resolved_missing_color
+                ),
+                missing_label=(
+                    active_categorical_scale.missing_label
+                    if active_categorical_scale is not None
+                    else "NA"
+                ),
+            )
+        )
         legends.append(
             LegendSpec(
                 kind="categorical",
@@ -1000,6 +1171,14 @@ def embedding(
 
                 if is_cat:
                     order, palette = categorical_maps[color_index]
+                    active_categorical_scale = resolved_categorical_scales.get(
+                        color_index
+                    )
+                    category_missing_color = (
+                        active_categorical_scale.missing_color
+                        if active_categorical_scale is not None
+                        else resolved_missing_color
+                    )
                     _draw_categorical(
                         ax,
                         xx,
@@ -1008,7 +1187,7 @@ def embedding(
                         ss,
                         order=order,
                         palette=palette,
-                        missing_color=missing,
+                        missing_color=category_missing_color,
                         edgecolor=edgecolor,
                         edgewidth=edgewidth,
                         rasterized=rasterized,
@@ -1021,6 +1200,11 @@ def embedding(
                             yy,
                             vv,
                             order=order,
+                            labels=(
+                                active_categorical_scale.labels
+                                if active_categorical_scale is not None
+                                else None
+                            ),
                             theme=theme,
                         )
                     elif panel_legend == "right" and fac_i == n_facets - 1:
@@ -1030,30 +1214,42 @@ def embedding(
                             mpl,
                             order=order,
                             palette=palette,
+                            labels=(
+                                active_categorical_scale.labels
+                                if active_categorical_scale is not None
+                                else None
+                            ),
                             label=label,
                             missing=bool(pd.isna(np.asarray(vals)[base_mask]).any()),
-                            missing_color=missing,
+                            missing_color=category_missing_color,
                             missing_label=(
-                                categorical_scale.missing_label
-                                if categorical_scale is not None
+                                active_categorical_scale.missing_label
+                                if active_categorical_scale is not None
                                 else "NA"
                             ),
                             edgecolor=edgecolor,
                             figure_level=owns,
                         )
                 else:
+                    active_color_scale = resolved_color_scales.get(
+                        color_index,
+                        color_scale,
+                    )
                     vnum = pd.to_numeric(pd.Series(vv), errors="coerce").to_numpy(
                         dtype=np.float64
                     )
                     if is_uniform:
                         limits = (0.0, 1.0)
-                    elif color_scale.scope == "panel":
-                        limits = _continuous_limits(vnum, color_scale)
+                    elif active_color_scale.scope == "panel":
+                        limits = _continuous_limits(
+                            vnum,
+                            active_color_scale,
+                        )
                         panel_limit_map[str(panel_key)] = limits
                     else:
                         limits = limit_map[color_index]
                     add_cb = (not is_uniform) and (
-                        color_scale.scope == "panel"
+                        active_color_scale.scope == "panel"
                         or facet_by is None
                         or fac_i == n_facets - 1
                     )
@@ -1065,9 +1261,10 @@ def embedding(
                         vnum,
                         ss,
                         limits=limits,
-                        cmap_name=color_scale.cmap,
-                        vcenter=color_scale.vcenter,
-                        missing_color=color_scale.missing_color,
+                        cmap_name=active_color_scale.cmap,
+                        vcenter=active_color_scale.vcenter,
+                        scale=active_color_scale.scale,
+                        missing_color=active_color_scale.missing_color,
                         default_color=default_color,
                         edgecolor=edgecolor,
                         edgewidth=edgewidth,

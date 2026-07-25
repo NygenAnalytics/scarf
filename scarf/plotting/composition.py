@@ -17,6 +17,8 @@ from ._style import (
     theme_context,
 )
 
+_MISSING_CATEGORY = "\x00scarf_missing_category\x00"
+
 
 def _constant_within_sample(
     samples: np.ndarray,
@@ -200,8 +202,11 @@ def composition(
     missing_label = (
         categorical_scale.missing_label if categorical_scale is not None else "NA"
     )
-    cats[pd.isna(cats)] = missing_label
-    observed_categories = list(pd.unique(cats))
+    missing_mask = pd.isna(cats)
+    cats[missing_mask] = _MISSING_CATEGORY
+    observed_categories = [
+        value for value in pd.unique(cats) if value != _MISSING_CATEGORY
+    ]
     if categorical_scale and categorical_scale.order is not None:
         cat_order = list(categorical_scale.order)
         unlisted = [
@@ -214,6 +219,8 @@ def composition(
             )
     else:
         cat_order = sort_categories(observed_categories)
+    if missing_mask.any():
+        cat_order.append(_MISSING_CATEGORY)
 
     pair_col: str | None = None
     n_pair_lines = 0
@@ -301,10 +308,28 @@ def composition(
             .reset_index()
         )
 
+    nonmissing_order = [
+        category for category in cat_order if category != _MISSING_CATEGORY
+    ]
     palette = categorical_color_map(
-        cat_order,
+        nonmissing_order,
         palette=categorical_scale.palette if categorical_scale else None,
     )
+    resolved_missing_color = (
+        categorical_scale.missing_color if categorical_scale is not None else "#bdbdbd"
+    )
+    if missing_mask.any():
+        palette[_MISSING_CATEGORY] = resolved_missing_color
+    display_labels = (
+        categorical_scale.labels
+        if categorical_scale is not None and categorical_scale.labels is not None
+        else {}
+    )
+
+    def category_label(value: Any) -> str:
+        if value == _MISSING_CATEGORY:
+            return missing_label
+        return display_labels.get(value, str(value))
 
     panel_key: Hashable = "composition"
     resolved_figsize = figsize
@@ -352,7 +377,7 @@ def composition(
                         val,
                         bottom=bottom,
                         color=palette[cat],
-                        label=str(cat),
+                        label=category_label(cat),
                         width=0.6,
                     )
                     bottom += val
@@ -371,7 +396,7 @@ def composition(
                         heights,
                         bottom=bottoms,
                         color=palette[cat],
-                        label=str(cat),
+                        label=category_label(cat),
                         width=0.8,
                     )
                     bottoms += heights
@@ -433,7 +458,7 @@ def composition(
                 ]
                 ax.set_xticks(centers)
                 ax.set_xticklabels(
-                    [str(category) for category in cat_order],
+                    [category_label(category) for category in cat_order],
                     rotation=45,
                     ha="right",
                 )
@@ -452,7 +477,7 @@ def composition(
                         markerfacecolor=palette[cat],
                         markeredgecolor=edgecolor,
                         markersize=6,
-                        label=str(cat),
+                        label=category_label(cat),
                     )
                     for cat in cat_order
                 ]
@@ -493,12 +518,12 @@ def composition(
                         s=40,
                         edgecolors=edgecolor,
                         linewidths=0.3,
-                        label=str(cat),
+                        label=category_label(cat),
                         zorder=2,
                     )
                 ax.set_xticks(range(len(cat_order)))
                 ax.set_xticklabels(
-                    [str(c) for c in cat_order],
+                    [category_label(c) for c in cat_order],
                     rotation=45,
                     ha="right",
                 )
@@ -512,9 +537,19 @@ def composition(
             ax.set_ylim(-0.02, min(1.02, max(0.2, ymax * 1.15)))
         apply_figure_chrome(fig, theme)
 
-    tables = {"aggregate": aggregate}
+    aggregate_table = aggregate.copy()
+    aggregate_table["category"] = aggregate_table["category"].mask(
+        aggregate_table["category"] == _MISSING_CATEGORY,
+        None,
+    )
+    tables = {"aggregate": aggregate_table}
     if per_sample is not None:
-        tables["per_sample"] = per_sample
+        per_sample_table = per_sample.copy()
+        per_sample_table["category"] = per_sample_table["category"].mask(
+            per_sample_table["category"] == _MISSING_CATEGORY,
+            None,
+        )
+        tables["per_sample"] = per_sample_table
 
     from importlib.metadata import version
 
@@ -532,7 +567,19 @@ def composition(
         axes=axes,
         tables=tables,
         legends=(LegendSpec(kind="categorical", label=category_by),),
-        scales=(CategoricalScale(order=tuple(cat_order), palette=palette),),
+        scales=(
+            CategoricalScale(
+                order=tuple(nonmissing_order),
+                palette={category: palette[category] for category in nonmissing_order},
+                labels=(dict(display_labels) if display_labels else None),
+                missing_color=resolved_missing_color,
+                missing_label=(
+                    categorical_scale.missing_label
+                    if categorical_scale is not None
+                    else "NA"
+                ),
+            ),
+        ),
         provenance=PlotProvenance(
             scarf_version=scarf_version,
             cell_key=cell_key,

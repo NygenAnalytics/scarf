@@ -11,6 +11,7 @@ matplotlib.use("Agg")
 import scarf.plotting as splt
 from scarf.datastore.mapping_datastore import MappingDatastore
 from scarf.plotting.unified import _load_unified_layout
+from scarf.plotting._contracts import CategoricalScale
 
 
 def _memory_layout_store(
@@ -57,9 +58,11 @@ def test_unified_embedding_matches_projection_rows(run_unified_umap, datastore):
         layout_key="unified_UMAP",
         show=False,
     )
-    layout = datastore.z["RNA"]["projections"]["unified_UMAP"]
-    assert result.provenance.n_cells == layout.shape[0]
-    assert result.tables["cells"].shape[0] == layout.shape[0]
+    x, _y, _reference_count, _target_counts, _target_names = (
+        datastore._load_unified_layout_data("unified_UMAP", "RNA")
+    )
+    assert result.provenance.n_cells == len(x)
+    assert result.tables["cells"].shape[0] == len(x)
     ax = next(iter(result.axes.values()))
     assert ax.get_box_aspect() == pytest.approx(1.0)
     assert result.figure.legends or ax.get_legend() is not None
@@ -69,9 +72,10 @@ def test_unified_embedding_matches_projection_rows(run_unified_umap, datastore):
 def test_unified_embedding_show_target_only_and_groups(
     run_unified_umap, paris_clustering, datastore
 ):
-    layout = datastore.z["RNA"]["projections"]["unified_UMAP"]
-    n_cells = list(layout.attrs["n_cells"])
-    n_target = int(sum(n_cells[1:]))
+    _x, _y, _reference_count, target_counts, _target_names = (
+        datastore._load_unified_layout_data("unified_UMAP", "RNA")
+    )
+    n_target = int(sum(target_counts))
     groups = [f"g{i % 3}" for i in range(n_target)]
     result = splt.unified_embedding(
         datastore,
@@ -93,3 +97,40 @@ def test_unified_embedding_rejects_bad_target_groups(run_unified_umap, datastore
             target_groups=["only-one"],
             show=False,
         )
+
+
+def test_unified_embedding_preserves_explicit_category_labels() -> None:
+    store = _memory_layout_store(
+        {
+            "n_cells": [2, 1],
+            "target_names": ["query"],
+        }
+    )
+    scale = CategoricalScale(
+        order=("reference", "query"),
+        palette={
+            "reference": "#123456",
+            "query": "#654321",
+        },
+        labels={
+            "reference": "Reference cells",
+            "query": "Query cells",
+        },
+        missing_color="#111111",
+        missing_label="Missing",
+    )
+
+    result = splt.unified_embedding(
+        store,
+        layout_key="layout",
+        categorical_scale=scale,
+        show=False,
+    )
+
+    returned = next(
+        item for item in result.scales if isinstance(item, CategoricalScale)
+    )
+    assert returned.labels == scale.labels
+    assert returned.missing_color == scale.missing_color
+    assert returned.missing_label == scale.missing_label
+    result.close()

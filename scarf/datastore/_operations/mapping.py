@@ -18,14 +18,39 @@ from ...graph.encoded_paths import (
     parse_neighbor_index_group_path,
     reduction_group_path_from_neighbor_index,
 )
+from ...graph.state import read_assay_state
+from ...storage.artifacts import (
+    ArtifactRef,
+    ValueFingerprintBuilder,
+    artifact_path,
+    fingerprint_array,
+    fingerprint_stored_arrays,
+    inspect_artifact,
+    parse_artifact_path,
+)
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...assay import Assay, RNAassay
 from ...matrix import ChunkedArray
 from ...mapping.models import MappingResult
 from ...mapping.reference import MappingReference
-from ...mapping.symphony import SYMPHONY_STYLE_VARIANT
+from ...mapping.symphony import SYMPHONY_ALGORITHM
 from ...neighbors.stream import AnnStream
+from ...neighbors.stages import (
+    AnnIndexStage,
+    LazyTransformStream,
+    NeighborQueryStage,
+    ReductionTransform,
+)
 from ...storage.arrays import create_zarr_dataset
+from ...storage.ann_index import serialize_ann_index
+from ...storage.artifact_writer import (
+    ArrayRequirement,
+    PlannedArtifact,
+    finish_artifact,
+    plan_artifact,
+    reused_artifact_group,
+    start_artifact,
+)
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
 from ...utils.progress import tqdmbar
@@ -37,21 +62,175 @@ else:
 
 
 class _MappingOperationsMixin(_MappingOperationsBase):
+    # Mapping artifacts in this module intentionally preserve the current
+    # reference-store workflow, including query-owned projections written into
+    # that store. This is a compatibility bridge, not the final mapping model.
+    # A separate refactor should keep query data in its source store and expose
+    # a lazy, virtually aligned feature stream for the reference ANN index.
     _PROJECTION_PROVENANCE_ATTRS = frozenset(
         {
             "assay",
-            "cellKey",
-            "featureKey",
-            "saveK",
-            "referenceCellHash",
-            "referenceFeatureHash",
-            "referencePath",
-            "reductionPath",
-            "annPath",
-            "referenceSubsetHash",
-            "reductionHash",
+            "cell_key",
+            "feature_key",
+            "save_k",
+            "reference_cell_fingerprint",
+            "reference_feature_fingerprint",
+            "reference_path",
+            "reduction_path",
+            "ann_path",
+            "normalization_fingerprint",
+            "reduction_fingerprint",
         }
     )
+    _LEGACY_PROJECTION_ATTRS = {
+        "cell_key": "cellKey",
+        "feature_key": "featureKey",
+        "save_k": "saveK",
+        "reference_cell_fingerprint": "referenceCellHash",
+        "reference_feature_fingerprint": "referenceFeatureHash",
+        "reference_path": "referencePath",
+        "reduction_path": "reductionPath",
+        "ann_path": "annPath",
+        "normalization_fingerprint": "referenceSubsetHash",
+        "reduction_fingerprint": "reductionHash",
+        "correction_method": "correctionMethod",
+        "mapping_reference_path": "mappingReferencePath",
+        "feature_coverage": "featureCoverage",
+        "query_batch_count": "queryBatchCount",
+        "query_batch_columns": "queryBatchColumns",
+        "query_batch_fingerprint": "queryBatchHash",
+        "algorithm_variant": "algorithmVariant",
+        "target_name": "targetName",
+        "target_cell_key": "targetCellKey",
+        "target_feature_key": "targetFeatureKey",
+        "target_cell_fingerprint": "targetCellHash",
+        "selected_feature_fingerprint": "selectedFeatureHash",
+        "reduction_method": "reductionMethod",
+        "reduction_dimensions": "reductionDimensions",
+        "ann_metric": "annMetric",
+        "ann_efc": "annEfc",
+        "ann_ef": "annEf",
+        "ann_m": "annM",
+        "ann_random_state": "annRandomState",
+        "ann_feature_scaling": "annFeatureScaling",
+        "ann_is_harmonized": "annIsHarmonized",
+        "ann_source_path": "annSourcePath",
+    }
+    _LEGACY_PROJECTION_ARRAYS = {
+        "reference_feature_indices": "referenceFeatureIndices",
+        "uncorrected_latent": "uncorrectedLatent",
+        "corrected_latent": "correctedLatent",
+    }
+
+    @classmethod
+    def _projection_attr(
+        cls,
+        attrs: Any,
+        name: str,
+        default: Any = None,
+    ) -> Any:
+        if name in attrs:
+            return attrs[name]
+        legacy_name = cls._LEGACY_PROJECTION_ATTRS.get(name)
+        return attrs.get(legacy_name, default) if legacy_name is not None else default
+
+    @classmethod
+    def _projection_array_name(cls, store: zarr.Group, name: str) -> str:
+        if name in store:
+            return name
+        legacy_name = cls._LEGACY_PROJECTION_ARRAYS.get(name)
+        if legacy_name is not None and legacy_name in store:
+            return legacy_name
+        return name
+
+    def _select_projection_artifact(
+        self,
+        from_assay: str,
+        target_name: str,
+        ref: ArtifactRef,
+    ) -> None:
+        assay = self._get_assay(from_assay)
+        projections = (
+            as_zarr_group(assay.z["projections"], name="projections")
+            if "projections" in assay.z
+            else assay.z.create_group("projections")
+        )
+        raw_artifacts = projections.attrs.get("artifacts", {})
+        if "artifacts" in projections.attrs and not isinstance(
+            raw_artifacts,
+            dict,
+        ):
+            raise RuntimeError("Projection artifact index is invalid")
+        artifacts = dict(raw_artifacts) if isinstance(raw_artifacts, dict) else {}
+        artifacts[target_name] = ref.to_dict()
+        projections.attrs["artifacts"] = artifacts
+
+    def _projection_artifact_path(
+        self,
+        from_assay: str,
+        target_name: str,
+    ) -> str | None:
+        assay = self._get_assay(from_assay)
+        if "projections" not in assay.z:
+            return None
+        projections = as_zarr_group(assay.z["projections"], name="projections")
+        raw_artifacts = projections.attrs.get("artifacts", {})
+        if "artifacts" in projections.attrs and not isinstance(
+            raw_artifacts,
+            dict,
+        ):
+            raise RuntimeError("Projection artifact index is invalid")
+        if not isinstance(raw_artifacts, dict):
+            return None
+        raw_ref = raw_artifacts.get(target_name)
+        if target_name in raw_artifacts and not isinstance(raw_ref, dict):
+            raise RuntimeError(f"Projection index for {target_name!r} is invalid")
+        if not isinstance(raw_ref, dict):
+            return None
+        try:
+            ref = ArtifactRef.from_dict(raw_ref)
+            if (
+                ref.scope != "assay"
+                or ref.assay != from_assay
+                or ref.kind != "projection"
+            ):
+                raise ValueError("Projection index has an invalid reference")
+            status = inspect_artifact(self.zw, ref)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Projection index for {target_name!r} is invalid"
+            ) from exc
+        if not status.exists or not status.complete:
+            raise RuntimeError(f"Projection index for {target_name!r} is incomplete")
+        return status.path
+
+    def _delete_projection_artifact(
+        self,
+        from_assay: str,
+        target_name: str,
+    ) -> None:
+        assay = self._get_assay(from_assay)
+        if "projections" not in assay.z:
+            return
+        projections = as_zarr_group(
+            assay.z["projections"],
+            name="projections",
+        )
+        raw_artifacts = projections.attrs.get("artifacts", {})
+        if not isinstance(raw_artifacts, dict):
+            raise RuntimeError("Projection artifact index is invalid")
+        raw_ref = raw_artifacts.get(target_name)
+        if not isinstance(raw_ref, dict):
+            return
+        ref = ArtifactRef.from_dict(raw_ref)
+        if ref.kind != "projection" or ref.scope != "assay" or ref.assay != from_assay:
+            raise RuntimeError(f"Projection index for {target_name!r} is invalid")
+        path = artifact_path(ref)
+        if path in self.zw:
+            del self.zw[path]
+        artifacts = dict(raw_artifacts)
+        artifacts.pop(target_name, None)
+        projections.attrs["artifacts"] = artifacts
 
     @staticmethod
     def _validate_projection_arrays(store: zarr.Group, target_name: str) -> None:
@@ -78,9 +257,18 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         attrs = store.attrs
         if not bool(attrs.get("complete", False)):
             return False
-        if not self._PROJECTION_PROVENANCE_ATTRS.issubset(attrs):
+        if any(
+            self._projection_attr(attrs, name) is None
+            for name in self._PROJECTION_PROVENANCE_ATTRS
+        ):
             return False
-        return "referenceFeatureIndices" in store
+        return (
+            self._projection_array_name(
+                store,
+                "reference_feature_indices",
+            )
+            in store
+        )
 
     def _load_complete_projection(
         self,
@@ -91,7 +279,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
     ) -> zarr.Group:
         from ...mapping.hashing import array_hash
 
-        store_loc = f"{from_assay}/projections/{target_name}"
+        store_loc = self._projection_artifact_path(from_assay, target_name)
+        if store_loc is None:
+            store_loc = f"{from_assay}/projections/{target_name}"
         if store_loc not in self.zw:
             raise KeyError(
                 f"Projections have not been computed for {target_name}. Run run_mapping first."
@@ -104,11 +294,17 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 f"Projection {target_name!r} is incomplete. Run run_mapping again."
             )
         if not self._projection_has_provenance(store):
-            # ``referenceFeatureIndices`` is the provenance-era marker; genuine
+            # The feature-index array is the provenance-era marker; genuine
             # legacy projections lack it entirely. A projection that carries the
             # marker but is missing required provenance is a partial or corrupt
             # current write and must not silently downgrade to the legacy path.
-            if "referenceFeatureIndices" in store:
+            if (
+                self._projection_array_name(
+                    store,
+                    "reference_feature_indices",
+                )
+                in store
+            ):
                 raise ValueError(
                     f"Projection {target_name!r} has incomplete provenance metadata. "
                     "Re-run run_mapping to rebuild it."
@@ -120,18 +316,22 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 stacklevel=3,
             )
             return store
-        if attrs.get("assay") != from_assay or attrs.get("cellKey") != cell_key:
+        stored_cell_key = self._projection_attr(attrs, "cell_key")
+        if attrs.get("assay") != from_assay or stored_cell_key != cell_key:
             raise ValueError(
                 f"Projection {target_name!r} does not match the selected reference assay or cells."
             )
-        stored_feat_key = attrs.get("featureKey")
+        stored_feat_key = self._projection_attr(attrs, "feature_key")
         if feat_key is not None and stored_feat_key != feat_key:
             logger.warning(
                 f"Projection {target_name!r} uses feature key {stored_feat_key!r}, "
                 f"not the current key {feat_key!r}; validating its stored provenance."
             )
-        reference_cells = self.cells.fetch("ids", key=cast(str, attrs["cellKey"]))
-        if attrs.get("referenceCellHash") != array_hash(reference_cells):
+        reference_cells = self.cells.fetch("ids", key=cast(str, stored_cell_key))
+        if self._projection_attr(
+            attrs,
+            "reference_cell_fingerprint",
+        ) != array_hash(reference_cells):
             raise ValueError(
                 f"Projection {target_name!r} was built from a different reference cell set."
             )
@@ -144,7 +344,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         from ...mapping.hashing import array_hash
 
         attrs = store.attrs
-        save_k = attrs.get("saveK")
+        save_k = self._projection_attr(attrs, "save_k")
         if (
             isinstance(save_k, bool)
             or not isinstance(save_k, int | np.integer)
@@ -155,91 +355,179 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 f"Projection {target_name!r} has inconsistent saved-neighbor provenance."
             )
         assay_name = cast(str, attrs["assay"])
-        cell_key = cast(str, attrs["cellKey"])
-        feature_key = cast(str, attrs["featureKey"])
+        cell_key = cast(str, self._projection_attr(attrs, "cell_key"))
+        feature_key = cast(str, self._projection_attr(attrs, "feature_key"))
         source_assay = self._get_assay(assay_name)
         feature_column = (
             feature_key if feature_key == "I" else f"{cell_key}__{feature_key}"
         )
         reference_features = source_assay.feats.fetch("ids", key=feature_column)
-        if attrs.get("referenceFeatureHash") != array_hash(reference_features):
+        if self._projection_attr(
+            attrs,
+            "reference_feature_fingerprint",
+        ) != array_hash(reference_features):
             raise ValueError(
                 f"Projection {target_name!r} was built from a different reference feature set."
             )
 
-        reference_path = cast(str, attrs.get("referencePath", ""))
+        reference_path = cast(
+            str,
+            self._projection_attr(attrs, "reference_path", ""),
+        )
         if reference_path not in self.zw:
             raise ValueError(
                 f"Projection {target_name!r} references missing normalized data."
             )
         normed = as_zarr_group(self.zw[reference_path], name=reference_path)
-        if attrs.get("referenceSubsetHash") != normed.attrs.get("subset_hash"):
+        try:
+            normalized_ref = parse_artifact_path(reference_path)
+        except ValueError:
+            expected_normalized_identity = normed.attrs.get("subset_hash")
+        else:
+            expected_normalized_identity = normalized_ref.artifact_id
+        if (
+            self._projection_attr(attrs, "normalization_fingerprint")
+            != expected_normalized_identity
+        ):
             raise ValueError(
                 f"Projection {target_name!r} references changed normalized data."
             )
 
-        reduction_path = cast(str, attrs.get("reductionPath", ""))
+        reduction_path = cast(
+            str,
+            self._projection_attr(attrs, "reduction_path", ""),
+        )
         if reduction_path not in self.zw:
             raise ValueError(
                 f"Projection {target_name!r} references a missing reduction."
             )
         reduction = as_zarr_group(self.zw[reduction_path], name=reduction_path)
-        if "reduction" not in reduction:
+        reduction_array_name = (
+            "loadings"
+            if "loadings" in reduction
+            else "reduction"
+            if "reduction" in reduction
+            else None
+        )
+        if reduction_array_name is None:
             raise ValueError(
                 f"Projection {target_name!r} references a reduction without loadings."
             )
         loadings = np.asarray(
-            as_zarr_array(reduction["reduction"], name="reduction")[:]
+            as_zarr_array(
+                reduction[reduction_array_name],
+                name=reduction_array_name,
+            )[:]
         )
-        if attrs.get("reductionHash") != array_hash(loadings):
+        if self._projection_attr(
+            attrs,
+            "reduction_fingerprint",
+        ) != array_hash(loadings):
             raise ValueError(
                 f"Projection {target_name!r} references changed reduction loadings."
             )
 
-        ann_path = cast(str, attrs.get("annPath", ""))
+        ann_path = cast(str, self._projection_attr(attrs, "ann_path", ""))
         if ann_path not in self.zw:
             raise ValueError(
                 f"Projection {target_name!r} references a missing ANN index."
             )
         ann = as_zarr_group(self.zw[ann_path], name=ann_path)
-        expected_scaling = bool(attrs.get("annFeatureScaling"))
-        if bool(ann.attrs.get("featureScaling", True)) != expected_scaling:
+        expected_scaling = bool(self._projection_attr(attrs, "ann_feature_scaling"))
+        try:
+            ann_ref = parse_artifact_path(ann_path)
+        except ValueError:
+            actual_scaling = bool(ann.attrs.get("featureScaling", True))
+            actual_harmonized = bool(ann.attrs.get("isHarmonized", False))
+            artifact_ann_parameters = None
+        else:
+            ann_status = inspect_artifact(self.zw, ann_ref)
+            artifact_ann_parameters = ann_status.parameters or {}
+            ann_inputs = ann_status.inputs or {}
+            if ann_ref.kind == "intersection_ann_index":
+                raw_source = ann_inputs.get("source_ann_index")
+                if not isinstance(raw_source, dict):
+                    raise ValueError("Intersection ANN source is missing")
+                try:
+                    source_ann_ref = ArtifactRef.from_dict(raw_source)
+                except (KeyError, TypeError, ValueError):
+                    actual_harmonized = False
+                    actual_scaling = bool(
+                        artifact_ann_parameters.get("feat_scaling", True)
+                    )
+                    coordinates_ref = None
+                else:
+                    source_status = inspect_artifact(self.zw, source_ann_ref)
+                    ann_inputs = source_status.inputs or {}
+                    coordinates_ref = None
+            else:
+                coordinates_ref = None
+            if coordinates_ref is None and "coordinates" in ann_inputs:
+                raw_coordinates = ann_inputs.get("coordinates")
+                if not isinstance(raw_coordinates, dict):
+                    raise ValueError("ANN coordinate provenance is missing")
+                coordinates_ref = ArtifactRef.from_dict(raw_coordinates)
+            if coordinates_ref is not None:
+                actual_harmonized = coordinates_ref.kind == "batch_correction"
+                if actual_harmonized:
+                    correction_inputs = (
+                        inspect_artifact(self.zw, coordinates_ref).inputs or {}
+                    )
+                    raw_reduction = correction_inputs.get("reduction")
+                    if not isinstance(raw_reduction, dict):
+                        raise ValueError("Batch correction reduction input is missing")
+                    reduction_ref = ArtifactRef.from_dict(raw_reduction)
+                else:
+                    reduction_ref = coordinates_ref
+                reduction_parameters = (
+                    inspect_artifact(self.zw, reduction_ref).parameters or {}
+                )
+                actual_scaling = bool(reduction_parameters.get("feat_scaling", True))
+        if actual_scaling != expected_scaling:
             raise ValueError(
                 f"Projection {target_name!r} references an ANN index with changed scaling."
             )
-        if bool(ann.attrs.get("isHarmonized", False)) != bool(
-            attrs.get("annIsHarmonized")
-        ):
+        if actual_harmonized != bool(self._projection_attr(attrs, "ann_is_harmonized")):
             raise ValueError(
                 f"Projection {target_name!r} references a changed ANN coordinate space."
             )
         settings_ann_path = ann_path
         if "__intersection_" in ann_path:
-            source_ann_path = ann.attrs.get("sourceAnnPath")
+            source_ann_path = ann.attrs.get(
+                "ann_source_path",
+                ann.attrs.get("sourceAnnPath"),
+            )
             if not isinstance(source_ann_path, str) or not source_ann_path:
                 raise ValueError(
                     f"Projection {target_name!r} has invalid intersection ANN provenance."
                 )
             settings_ann_path = source_ann_path
-        try:
-            (
-                path_ann_metric,
-                path_ann_efc,
-                path_ann_ef,
-                path_ann_m,
-                path_ann_random_state,
-                _,
-                _,
-            ) = parse_neighbor_index_group_path(settings_ann_path)
-        except ValueError as exc:
-            raise ValueError(
-                f"Projection {target_name!r} has an invalid ANN provenance path."
-            ) from exc
+        if artifact_ann_parameters is None:
+            try:
+                (
+                    path_ann_metric,
+                    path_ann_efc,
+                    path_ann_ef,
+                    path_ann_m,
+                    path_ann_random_state,
+                    _,
+                    _,
+                ) = parse_neighbor_index_group_path(settings_ann_path)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Projection {target_name!r} has an invalid ANN provenance path."
+                ) from exc
+        else:
+            path_ann_metric = str(artifact_ann_parameters["ann_metric"])
+            path_ann_efc = int(artifact_ann_parameters["ann_efc"])
+            path_ann_ef = int(artifact_ann_parameters["ann_ef"])
+            path_ann_m = int(artifact_ann_parameters["ann_m"])
+            path_ann_random_state = int(artifact_ann_parameters["rand_state"])
         stored_ann_values = (
-            attrs.get("annEfc"),
-            attrs.get("annEf"),
-            attrs.get("annM"),
-            attrs.get("annRandomState"),
+            self._projection_attr(attrs, "ann_efc"),
+            self._projection_attr(attrs, "ann_ef"),
+            self._projection_attr(attrs, "ann_m"),
+            self._projection_attr(attrs, "ann_random_state"),
         )
         if not all(isinstance(value, int | float) for value in stored_ann_values):
             raise ValueError(
@@ -249,7 +537,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             tuple[int | float, ...], stored_ann_values
         )
         if (
-            attrs.get("annMetric") != path_ann_metric
+            self._projection_attr(attrs, "ann_metric") != path_ann_metric
             or int(ann_efc) != path_ann_efc
             or int(ann_ef) != path_ann_ef
             or int(ann_m) != path_ann_m
@@ -259,13 +547,18 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 f"Projection {target_name!r} references incompatible ANN settings."
             )
 
-        if "referenceFeatureIndices" not in store:
+        feature_indices_name = self._projection_array_name(
+            store,
+            "reference_feature_indices",
+        )
+        if feature_indices_name not in store:
             raise ValueError(
                 f"Projection {target_name!r} is missing selected-feature provenance."
             )
         feature_indices = np.asarray(
             as_zarr_array(
-                store["referenceFeatureIndices"], name="referenceFeatureIndices"
+                store[feature_indices_name],
+                name=feature_indices_name,
             )[:],
             dtype=np.int64,
         )
@@ -276,20 +569,21 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise ValueError(
                 f"Projection {target_name!r} contains invalid reference feature indices."
             )
-        if attrs.get("selectedFeatureHash") != array_hash(
-            all_feature_ids[feature_indices]
-        ):
+        if self._projection_attr(
+            attrs,
+            "selected_feature_fingerprint",
+        ) != array_hash(all_feature_ids[feature_indices]):
             raise ValueError(
                 f"Projection {target_name!r} references a changed selected feature set."
             )
         if "__intersection_" in ann_path and ann.attrs.get(
             "selectedFeatureHash"
-        ) != attrs.get("selectedFeatureHash"):
+        ) != self._projection_attr(attrs, "selected_feature_fingerprint"):
             raise ValueError(
                 f"Projection {target_name!r} references a changed intersection ANN index."
             )
         if "__intersection_" in ann_path:
-            source_ann_path = attrs.get("annSourcePath")
+            source_ann_path = self._projection_attr(attrs, "ann_source_path")
             if (
                 not isinstance(source_ann_path, str)
                 or not source_ann_path
@@ -304,17 +598,29 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 raise ValueError(
                     f"Projection {target_name!r} references a changed source ANN space."
                 )
-        if attrs.get("correctionMethod") == "symphony":
-            artifact_path = attrs.get("mappingReferencePath")
-            if not isinstance(artifact_path, str) or artifact_path not in self.zw:
+        if self._projection_attr(attrs, "correction_method") == "symphony":
+            mapping_path = self._projection_attr(
+                attrs,
+                "mapping_reference_path",
+            )
+            if not isinstance(mapping_path, str) or mapping_path not in self.zw:
                 raise ValueError(
                     f"Projection {target_name!r} references a missing mapping artifact."
                 )
-            from ...mapping.artifact import validate_mapping_reference_artifact
+            try:
+                mapping_ref = parse_artifact_path(mapping_path)
+            except ValueError:
+                from ...mapping.artifact import validate_mapping_reference_artifact
 
-            validate_mapping_reference_artifact(
-                as_zarr_group(self.zw[artifact_path], name=artifact_path)
-            )
+                validate_mapping_reference_artifact(
+                    as_zarr_group(self.zw[mapping_path], name=mapping_path)
+                )
+            else:
+                mapping_status = inspect_artifact(self.zw, mapping_ref)
+                if not mapping_status.exists or not mapping_status.complete:
+                    raise ValueError(
+                        f"Projection {target_name!r} mapping artifact is incomplete."
+                    )
 
     @staticmethod
     def _same_assay_store(source_assay: Assay, target_assay: Assay) -> bool:
@@ -362,6 +668,22 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         if chunks is not None and len(chunks) > 0:
             return int(chunks[0])
         return min(max(int(indices.shape[0]), 1), 10_000)
+
+    def _fingerprint_mapping_matrix(self, data: Any) -> str:
+        shape = tuple(int(value) for value in data.shape)
+        builder = ValueFingerprintBuilder()
+        builder.begin_array("target_normalized", shape, np.dtype(data.dtype))
+        offset = 0
+        for delayed_block in data.blocks:
+            block = np.asarray(controlled_compute(delayed_block, self.nthreads))
+            builder.update_array_block(
+                "target_normalized",
+                (offset,) + (0,) * (block.ndim - 1),
+                block,
+            )
+            offset += block.shape[0]
+        builder.end_array("target_normalized")
+        return builder.hexdigest()
 
     def _iter_projection_neighbor_rows(
         self, store: zarr.Group
@@ -435,17 +757,57 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             source_assay_name, cell_key, feat_key
         )
         reduction_path: str | None = None
+        ann_source_path = ""
         ann_path = self._ann_stream_path(ann_obj)
         if ann_path is not None:
-            reduction_source_path = ann_path
-            if "__intersection_" in ann_path and ann_path in self.zw:
-                intersection_group = as_zarr_group(self.zw[ann_path], name=ann_path)
-                stored_source_path = intersection_group.attrs.get("sourceAnnPath")
-                if isinstance(stored_source_path, str):
-                    reduction_source_path = stored_source_path
-            reduction_path = reduction_group_path_from_neighbor_index(
-                reduction_source_path
-            )
+            try:
+                ann_ref = parse_artifact_path(ann_path)
+            except ValueError:
+                reduction_source_path = ann_path
+                if "__intersection_" in ann_path and ann_path in self.zw:
+                    intersection_group = as_zarr_group(self.zw[ann_path], name=ann_path)
+                    stored_source_path = intersection_group.attrs.get("sourceAnnPath")
+                    if isinstance(stored_source_path, str):
+                        reduction_source_path = stored_source_path
+                reduction_path = reduction_group_path_from_neighbor_index(
+                    reduction_source_path
+                )
+            else:
+                ann_status = inspect_artifact(self.zw, ann_ref)
+                ann_inputs = ann_status.inputs or {}
+                if ann_ref.kind == "intersection_ann_index":
+                    raw_source = ann_inputs.get("source_ann_index")
+                    if not isinstance(raw_source, dict):
+                        raise ValueError("Intersection ANN source is missing")
+                    source_ann_ref = ArtifactRef.from_dict(raw_source)
+                    ann_source_path = artifact_path(source_ann_ref)
+                    ann_inputs = (
+                        inspect_artifact(
+                            self.zw,
+                            source_ann_ref,
+                        ).inputs
+                        or {}
+                    )
+                raw_coordinates = ann_inputs.get("coordinates")
+                if not isinstance(raw_coordinates, dict):
+                    raise ValueError("ANN coordinate provenance is missing")
+                coordinates_ref = ArtifactRef.from_dict(raw_coordinates)
+                if coordinates_ref.kind == "batch_correction":
+                    correction_inputs = (
+                        inspect_artifact(self.zw, coordinates_ref).inputs or {}
+                    )
+                    raw_reduction = correction_inputs.get("reduction")
+                    if not isinstance(raw_reduction, dict):
+                        raise ValueError("Batch correction reduction is missing")
+                    reduction_ref = ArtifactRef.from_dict(raw_reduction)
+                else:
+                    reduction_ref = coordinates_ref
+                reduction_path = artifact_path(reduction_ref)
+                reduction_inputs = inspect_artifact(self.zw, reduction_ref).inputs or {}
+                raw_normalized = reduction_inputs.get("normalized")
+                if not isinstance(raw_normalized, dict):
+                    raise ValueError("Reduction normalized input is missing")
+                reference_path = artifact_path(ArtifactRef.from_dict(raw_normalized))
         if reference_path in self.zw:
             if reduction_path is None:
                 try:
@@ -462,11 +824,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                         )
                     except KeyError:
                         ann_path = None
-        reduction_hash = ""
-        reference_subset_hash: int | str = ""
+        reduction_fingerprint = ""
+        normalization_fingerprint: int | str = ""
         ann_feature_scaling = ann_obj.featureScaling
         ann_is_harmonized = ann_obj.harmonize
-        ann_source_path = ""
         if ann_path is not None and ann_path in self.zw:
             ann_group = as_zarr_group(self.zw[ann_path], name=ann_path)
             stored_source_path = ann_group.attrs.get("sourceAnnPath")
@@ -474,50 +835,72 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 ann_source_path = stored_source_path
         if reference_path in self.zw:
             normed = as_zarr_group(self.zw[reference_path], name=reference_path)
-            reference_subset_hash = cast(int | str, normed.attrs.get("subset_hash", ""))
+            normalization_fingerprint = cast(
+                int | str,
+                normed.attrs.get("subset_hash", ""),
+            )
+            if not normalization_fingerprint:
+                try:
+                    normalized_ref = parse_artifact_path(reference_path)
+                except ValueError:
+                    pass
+                else:
+                    normalization_fingerprint = normalized_ref.artifact_id
         if reduction_path is not None and reduction_path in self.zw:
             reduction = as_zarr_group(self.zw[reduction_path], name=reduction_path)
-            if "reduction" in reduction:
-                reduction_hash = array_hash(
+            reduction_array_name = (
+                "loadings"
+                if "loadings" in reduction
+                else "reduction"
+                if "reduction" in reduction
+                else None
+            )
+            if reduction_array_name is not None:
+                reduction_fingerprint = array_hash(
                     np.asarray(
-                        as_zarr_array(reduction["reduction"], name="reduction")[:]
+                        as_zarr_array(
+                            reduction[reduction_array_name],
+                            name=reduction_array_name,
+                        )[:]
                     )
                 )
         return {
             "complete": False,
             "assay": source_assay_name,
-            "targetName": target_name,
-            "cellKey": cell_key,
-            "featureKey": feat_key,
-            "targetCellKey": target_cell_key,
-            "targetFeatureKey": target_feat_key,
-            "referencePath": reference_path,
-            "reductionPath": reduction_path or "",
-            "annPath": ann_path or "",
-            "referenceCellHash": array_hash(self.cells.fetch("ids", key=cell_key)),
-            "targetCellHash": array_hash(
+            "target_name": target_name,
+            "cell_key": cell_key,
+            "feature_key": feat_key,
+            "target_cell_key": target_cell_key,
+            "target_feature_key": target_feat_key,
+            "reference_path": reference_path,
+            "reduction_path": reduction_path or "",
+            "ann_path": ann_path or "",
+            "reference_cell_fingerprint": array_hash(
+                self.cells.fetch("ids", key=cell_key)
+            ),
+            "target_cell_fingerprint": array_hash(
                 target_assay.cells.fetch("ids", key=target_cell_key)
             ),
-            "referenceFeatureHash": array_hash(reference_features),
-            "selectedFeatureHash": array_hash(selected_feature_ids),
-            "referenceSubsetHash": reference_subset_hash,
-            "reductionHash": reduction_hash,
-            "featureCoverage": feature_coverage,
-            "reductionMethod": ann_obj.method,
-            "reductionDimensions": int(
+            "reference_feature_fingerprint": array_hash(reference_features),
+            "selected_feature_fingerprint": array_hash(selected_feature_ids),
+            "normalization_fingerprint": normalization_fingerprint,
+            "reduction_fingerprint": reduction_fingerprint,
+            "feature_coverage": feature_coverage,
+            "reduction_method": ann_obj.method,
+            "reduction_dimensions": int(
                 ann_obj.dims if ann_obj.dims is not None else ann_obj.nFeats
             ),
-            "annMetric": ann_obj.annMetric,
-            "annEfc": int(ann_obj.annEfc),
-            "annEf": int(ann_obj.annEf),
-            "annM": int(ann_obj.annM),
-            "annRandomState": int(ann_obj.randState),
-            "annFeatureScaling": ann_feature_scaling,
-            "annIsHarmonized": ann_is_harmonized,
-            "annSourcePath": ann_source_path,
-            "correctionMethod": correction_method,
-            "algorithmVariant": (
-                SYMPHONY_STYLE_VARIANT
+            "ann_metric": ann_obj.annMetric,
+            "ann_efc": int(ann_obj.annEfc),
+            "ann_ef": int(ann_obj.annEf),
+            "ann_m": int(ann_obj.annM),
+            "ann_random_state": int(ann_obj.randState),
+            "ann_feature_scaling": ann_feature_scaling,
+            "ann_is_harmonized": ann_is_harmonized,
+            "ann_source_path": ann_source_path,
+            "correction_method": correction_method,
+            "algorithm_variant": (
+                SYMPHONY_ALGORITHM
                 if correction_method == "symphony"
                 else correction_method
             ),
@@ -551,16 +934,167 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             active_indices[positions], feature_indices
         ):
             raise ValueError("Failed to align selected reference feature positions")
-        intersection_ann = AnnStream(
-            data=ann_obj.data[:, positions],
-            k=ann_obj.k,
-            n_cluster=2,
-            reduction_method="pca",
+        ann_path = self._ann_stream_path(ann_obj)
+        if ann_path is None:
+            raise ValueError("The reference ANN path is unavailable")
+        selected_feature_fingerprint = array_hash(
+            source_assay.feats.fetch_all("ids")[feature_indices]
+        )
+        try:
+            source_ann_ref = parse_artifact_path(ann_path)
+        except ValueError:
+            source_ann_ref = None
+        if source_ann_ref is None:
+            source_input: object = {
+                "legacy_ann_index_fingerprint": fingerprint_array(
+                    serialize_ann_index(ann_obj.annIdx)
+                )
+            }
+            artifact_assay = str(source_assay.name)
+        else:
+            source_input = source_ann_ref
+            if source_ann_ref.assay is None:
+                raise ValueError("Assay-scoped ANN artifact has no assay")
+            artifact_assay = source_ann_ref.assay
+        planned = plan_artifact(
+            self.zw,
+            scope="assay",
+            assay=artifact_assay,
+            kind="intersection_ann_index",
+            operation="build_intersection_ann_index",
+            parameters={
+                "ann_metric": ann_obj.annMetric,
+                "ann_efc": int(ann_obj.annEfc),
+                "ann_ef": int(ann_obj.annEf),
+                "ann_m": int(ann_obj.annM),
+                "rand_state": int(ann_obj.randState),
+                "feat_scaling": bool(ann_obj.featureScaling),
+            },
+            inputs={
+                "source_ann_index": source_input,
+                "selected_feature_fingerprint": selected_feature_fingerprint,
+            },
+            execution_options={"external_saver": ann_index_saver is not None},
+            required_arrays=(
+                "ann_idx_bytes",
+                "reference_distance_quantiles",
+                "reference_distance_values",
+            ),
+        )
+        intersection_path = artifact_path(planned.ref)
+        source_data = ann_obj.data[:, positions]
+        reduction = ReductionTransform(
+            data=source_data,
+            method="pca",
             dims=ann_obj.loadings.shape[1],
             loadings=ann_obj.loadings[positions, :],
             use_for_pca=np.ones(ann_obj.nCells, dtype=bool),
             mu=ann_obj.mu[positions],
             sigma=ann_obj.sigma[positions],
+            batch_size=ann_obj.batchSize,
+            nthreads=self.nthreads,
+            rand_state=ann_obj.randState,
+            disable_scaling=not ann_obj.featureScaling,
+            lsi_skip_first=True,
+            lsi_params={},
+        )
+        stream = LazyTransformStream(
+            data=source_data,
+            transform=reduction.transform,
+            nthreads=self.nthreads,
+            batch_size=ann_obj.batchSize,
+        )
+        intersection_idx = None
+        if planned.reused:
+            intersection_idx = self._resolve_ann_index(
+                intersection_path,
+                ann_obj.annMetric,
+                ann_obj.loadings.shape[1],
+            )
+            if intersection_idx is None:
+                raise RuntimeError("Reusable intersection ANN artifact has no index")
+            intersection_idx = AnnIndexStage.configure(
+                intersection_idx,
+                ef=ann_obj.annEf,
+                threads=1,
+            )
+        else:
+            intersection_idx = AnnIndexStage.fit(
+                coordinates=stream,
+                metric=ann_obj.annMetric,
+                dims=ann_obj.loadings.shape[1],
+                n_cells=ann_obj.nCells,
+                ef_construction=ann_obj.annEfc,
+                ef=ann_obj.annEf,
+                m=ann_obj.annM,
+                rand_state=ann_obj.randState,
+                ann_threads=1,
+            )
+            intersection_group = start_artifact(self.zw, planned)
+            self._persist_ann_index(
+                intersection_path,
+                intersection_idx,
+                ann_index_saver,
+            )
+            sample_stride = max(
+                int(np.ceil(ann_obj.nCells / 100_000)),
+                1,
+            )
+            query = NeighborQueryStage(intersection_idx, ann_obj.k)
+            sampled_distances: list[np.ndarray] = []
+            entry_start = 0
+            for block in stream.iter_raw():
+                entry_end = entry_start + len(block)
+                transformed = reduction.transform(block)
+                _indices, distances, _missed = cast(
+                    tuple[np.ndarray, np.ndarray, int],
+                    query.query(
+                        transformed,
+                        self_indices=np.arange(entry_start, entry_end),
+                    ),
+                )
+                sample_mask = (
+                    np.arange(
+                        entry_start,
+                        entry_end,
+                        dtype=np.int64,
+                    )
+                    % sample_stride
+                    == 0
+                )
+                sampled_distances.append(
+                    np.asarray(
+                        distances[sample_mask, 0],
+                        dtype=np.float64,
+                    )
+                )
+                entry_start = entry_end
+            distance_quantiles, distance_values = _distance_quantile_summary(
+                np.concatenate(sampled_distances)
+            )
+            for name, values in (
+                ("reference_distance_quantiles", distance_quantiles),
+                ("reference_distance_values", distance_values),
+            ):
+                output = create_zarr_dataset(
+                    intersection_group,
+                    name,
+                    (min(len(values), 1_001),),
+                    "f8",
+                    values.shape,
+                )
+                output[:] = values
+            finish_artifact(intersection_group, planned)
+        intersection_ann = AnnStream(
+            data=source_data,
+            k=ann_obj.k,
+            n_cluster=2,
+            reduction_method="pca",
+            dims=ann_obj.loadings.shape[1],
+            loadings=reduction.loadings,
+            use_for_pca=np.ones(ann_obj.nCells, dtype=bool),
+            mu=reduction.mu,
+            sigma=reduction.sigma,
             ann_metric=ann_obj.annMetric,
             ann_efc=ann_obj.annEfc,
             ann_ef=ann_obj.annEf,
@@ -570,77 +1104,17 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             rand_state=ann_obj.randState,
             do_kmeans_fit=False,
             disable_scaling=not ann_obj.featureScaling,
-            ann_idx=None,
+            ann_idx=intersection_idx,
             lsi_skip_first=True,
             lsi_params={},
             harmonize=False,
             cache_embeddings=False,
         )
-        ann_path = self._ann_stream_path(ann_obj)
-        if ann_path is None:
-            raise ValueError("The reference ANN path is unavailable")
-        selected_feature_hash = array_hash(
-            source_assay.feats.fetch_all("ids")[feature_indices]
-        )
-        intersection_path = f"{ann_path}__intersection_{selected_feature_hash[:16]}"
-        if intersection_path not in self.zw:
-            self.zw.create_group(intersection_path)
-        intersection_group = as_zarr_group(
-            self.zw[intersection_path], name=intersection_path
-        )
-        intersection_group.attrs.update(
-            {
-                "featureScaling": intersection_ann.featureScaling,
-                "isHarmonized": False,
-                "selectedFeatureHash": selected_feature_hash,
-                "sourceAnnPath": ann_path,
-            }
-        )
-        self._persist_ann_index(
-            intersection_path,
-            intersection_ann.annIdx,
-            ann_index_saver,
-        )
-        sample_stride = max(
-            int(np.ceil(intersection_ann.nCells / 100_000)),
-            1,
-        )
-        sampled_distances: list[np.ndarray] = []
-        entry_start = 0
-        for block in intersection_ann.iter_blocks():
-            entry_end = entry_start + len(block)
-            transformed = intersection_ann.transform_query(block)
-            _, distances, _ = cast(
-                tuple[np.ndarray, np.ndarray, int],
-                intersection_ann.transform_ann(
-                    transformed,
-                    self_indices=np.arange(entry_start, entry_end),
-                ),
-            )
-            sample_mask = (
-                np.arange(entry_start, entry_end, dtype=np.int64) % sample_stride == 0
-            )
-            sampled_distances.append(
-                np.asarray(distances[sample_mask, 0], dtype=np.float64)
-            )
-            entry_start = entry_end
-        nearest_distances = np.concatenate(sampled_distances)
-        distance_quantiles, distance_values = _distance_quantile_summary(
-            nearest_distances
-        )
-        for name, values in (
-            ("referenceDistanceQuantiles", distance_quantiles),
-            ("referenceDistanceValues", distance_values),
-        ):
-            output = create_zarr_dataset(
-                intersection_group,
-                name,
-                (min(len(values), 1_001),),
-                "f8",
-                values.shape,
-            )
-            output[:] = values
         self._remember_ann_stream_path(intersection_ann, intersection_path)
+        self._remember_ann_stream_neighbors(
+            intersection_ann,
+            intersection_path,
+        )
         return intersection_ann
 
     def run_mapping(
@@ -664,6 +1138,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         ann_index_saver: Callable | None = None,
         missing_feature_policy: str | None = None,
         query_batches: pd.DataFrame | None = None,
+        invalidate_cache: bool = False,
     ) -> None:
         """Projects cells from external assays into the cell-neighbourhood
         graph using existing PCA loadings and ANN index. For each external cell
@@ -766,8 +1241,20 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             target_feat_key,
         )
 
+        artifact_state = read_assay_state(self.zw, from_assay)
+        state_matches = artifact_state is not None and artifact_state.matches(
+            cell_key,
+            feat_key,
+        )
+        if (
+            state_matches
+            and artifact_state is not None
+            and artifact_state.batch_correction is not None
+            and "mapping_reference" not in artifact_state.named_results
+        ):
+            raise ValueError("AssayState has batch correction but no mapping reference")
         normed_loc = make_normalized_group_path(from_assay, cell_key, feat_key)
-        if normed_loc in self.zw:
+        if not state_matches and normed_loc in self.zw:
             try:
                 reduction_loc = lookup_latest_reduction_group_path(self.zw, normed_loc)
             except KeyError:
@@ -843,14 +1330,57 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                             missing_feature_policy=(
                                 missing_feature_policy or "reference_mean"
                             ),
+                            invalidate_cache=invalidate_cache,
                         )
                         return None
 
+        if (
+            artifact_state is not None
+            and artifact_state.matches(cell_key, feat_key)
+            and artifact_state.batch_correction is not None
+            and "mapping_reference" in artifact_state.named_results
+        ):
+            if run_coral:
+                raise ValueError(
+                    "CORAL cannot be combined with a harmonized mapping reference"
+                )
+            if exclude_missing or missing_feature_policy == "intersection":
+                raise ValueError(
+                    "Harmonized mapping references do not support "
+                    "intersection-only feature mapping"
+                )
+            reference = self.get_mapping_reference(
+                from_assay,
+                cell_key,
+                feat_key,
+            )
+            reference.map_query(
+                target_assay,
+                target_name,
+                target_feat_key,
+                target_cell_key=target_cell_key,
+                save_k=save_k,
+                query_batches=query_batches,
+                missing_feature_policy=missing_feature_policy or "reference_mean",
+                invalidate_cache=invalidate_cache,
+            )
+            return None
+
         if missing_feature_policy is None:
-            missing_feature_policy = "intersection" if exclude_missing else "zero"
-        if missing_feature_policy not in {"zero", "intersection", "error"}:
+            state = read_assay_state(self.zw, from_assay)
+            if state is not None and state.batch_correction is not None:
+                missing_feature_policy = "reference_mean"
+            else:
+                missing_feature_policy = "intersection" if exclude_missing else "zero"
+        if missing_feature_policy not in {
+            "zero",
+            "intersection",
+            "error",
+            "reference_mean",
+        }:
             raise ValueError(
-                "missing_feature_policy must be one of 'zero', 'intersection', or 'error'"
+                "missing_feature_policy must be zero, intersection, error, "
+                "or reference_mean"
             )
         if exclude_missing and missing_feature_policy != "intersection":
             raise ValueError(
@@ -862,6 +1392,16 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 "Use zero or error feature handling."
             )
 
+        normalization_parameters = None
+        state = read_assay_state(self.zw, from_assay)
+        if (
+            state is not None
+            and state.matches(cell_key, feat_key)
+            and state.normalized is not None
+        ):
+            normalization_parameters = (
+                inspect_artifact(self.zw, state.normalized).parameters or {}
+            )
         feat_idx = align_features(
             source_assay,
             target_assay,
@@ -873,6 +1413,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             exclude_missing,
             self.nthreads,
             missing_feature_policy,
+            norm_params=normalization_parameters,
         )
         logger.debug(f"{len(feat_idx)} features being used for mapping")
         source_feature_indices = source_assay.feats.active_index(
@@ -900,29 +1441,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 feat_scaling=feat_scaling,
             )
         else:
-            previous_ann_path: str | None = None
-            reference_normed_path = make_normalized_group_path(
-                from_assay, cell_key, ann_feat_key
-            )
-            reference_reduction_path: str | None = None
-            if reference_normed_path in self.zw:
-                try:
-                    reference_reduction_path = lookup_latest_reduction_group_path(
-                        self.zw, reference_normed_path
-                    )
-                except KeyError:
-                    reference_reduction_path = None
-                if (
-                    reference_reduction_path is not None
-                    and reference_reduction_path in self.zw
-                ):
-                    try:
-                        previous_ann_path = lookup_latest_neighbor_index_group_path(
-                            self.zw, reference_reduction_path
-                        )
-                    except KeyError:
-                        previous_ann_path = None
-            ann_obj = self.make_graph(
+            graph_plan = self._resolve_graph_plan(
                 from_assay=from_assay,
                 cell_key=cell_key,
                 feat_key=ann_feat_key,
@@ -932,23 +1451,35 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 ann_index_fetcher=ann_index_fetcher,
                 ann_index_saver=ann_index_saver,
             )
-            if (
-                previous_ann_path is not None
-                and reference_reduction_path is not None
-                and ann_obj is not None
-                and self._ann_stream_path(ann_obj) != previous_ann_path
-            ):
-                as_zarr_group(
-                    self.zw[reference_reduction_path],
-                    name=reference_reduction_path,
-                ).attrs["latest_ann"] = previous_ann_path
+            ann_obj = self._run_resolved_graph_plan(graph_plan)
         if ann_obj is None:
             raise ValueError("ERROR: AnnStream could not be created for mapping")
         if ann_obj.harmonize:
-            raise ValueError(
-                "This harmonized reference predates the Symphony-style mapping artifact. "
-                "Rebuild it with build_mapping_reference before mapping a query."
+            if run_coral:
+                raise ValueError(
+                    "CORAL cannot be combined with a harmonized mapping reference"
+                )
+            if missing_feature_policy == "intersection":
+                raise ValueError(
+                    "Harmonized mapping references do not support "
+                    "intersection-only feature mapping"
+                )
+            reference = self.get_mapping_reference(
+                from_assay,
+                cell_key,
+                feat_key,
             )
+            reference.map_query(
+                target_assay,
+                target_name,
+                target_feat_key,
+                target_cell_key=target_cell_key,
+                save_k=save_k,
+                query_batches=query_batches,
+                missing_feature_policy=missing_feature_policy,
+                invalidate_cache=invalidate_cache,
+            )
+            return None
         if missing_feature_policy == "intersection":
             if not full_feature_overlap:
                 if exclude_missing:
@@ -961,7 +1492,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                         fill_value=False,
                         overwrite=True,
                     )
-                    self.make_graph(
+                    compatibility_plan = self._resolve_graph_plan(
                         from_assay=from_assay,
                         cell_key=cell_key,
                         feat_key=compatibility_feat_key,
@@ -980,6 +1511,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                         ann_index_fetcher=ann_index_fetcher,
                         ann_index_saver=ann_index_saver,
                     )
+                    self._run_resolved_graph_plan(compatibility_plan)
                 ann_obj = self._build_intersection_ann(
                     ann_obj,
                     source_assay,
@@ -1017,26 +1549,113 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 ),
                 nthreads=self.nthreads,
             )
-        if "projections" not in source_assay.z:
-            source_assay.z.create_group("projections")
-        projections = as_zarr_group(source_assay.z["projections"], name="projections")
-        store = projections.create_group(target_name, overwrite=True)
-        store.attrs["complete"] = False
         nc = target_assay.cells.active_index(target_cell_key).shape[0]
         nk = save_k
+        correction_method = "coral" if run_coral else "none"
+        if missing_feature_policy == "intersection":
+            correction_method = "intersection"
+        from ...mapping.hashing import array_hash
+
+        target_matrix_fingerprint = self._fingerprint_mapping_matrix(target_data)
+        ann_path = self._ann_stream_path(ann_obj)
+        if ann_path is None:
+            raise ValueError("ANN artifact path is unavailable")
+        try:
+            ann_input: object = parse_artifact_path(ann_path)
+        except ValueError:
+            ann_input = {
+                "legacy_ann_fingerprint": fingerprint_array(
+                    serialize_ann_index(ann_obj.annIdx)
+                )
+            }
+        neighbors_path = self._ann_stream_neighbors_path(ann_obj)
+        if neighbors_path is None:
+            state = read_assay_state(self.zw, from_assay)
+            if state is None or state.ann_index != ann_input or state.neighbors is None:
+                raise ValueError("ANN stream has no exact neighbors provenance")
+            neighbors_path = artifact_path(state.neighbors)
+        reference_neighbors: object
+        try:
+            reference_neighbors = parse_artifact_path(neighbors_path)
+        except ValueError:
+            legacy_neighbors = as_zarr_group(
+                self.zw[neighbors_path],
+                name=neighbors_path,
+            )
+            reference_neighbors = {
+                "legacy_neighbor_fingerprint": fingerprint_stored_arrays(
+                    legacy_neighbors,
+                    ("distances",),
+                )
+            }
+        projection_plan = plan_artifact(
+            self.zw,
+            scope="assay",
+            assay=from_assay,
+            kind="projection",
+            operation="run_mapping",
+            parameters={
+                "save_k": save_k,
+                "correction_method": correction_method,
+                "missing_feature_policy": missing_feature_policy,
+                "feat_scaling": feat_scaling,
+            },
+            inputs={
+                "ann_index": ann_input,
+                "reference_neighbors": reference_neighbors,
+                "reference_features": array_hash(
+                    source_assay.feats.fetch_all("ids")[feat_idx]
+                ),
+                "target_cells": array_hash(
+                    target_assay.cells.fetch("ids", key=target_cell_key)
+                ),
+                "target_features": array_hash(target_assay.feats.fetch_all("ids")),
+                "target_normalized": target_matrix_fingerprint,
+            },
+            execution_options={
+                "target_name": target_name,
+                "target_feat_key": target_feat_key,
+                "target_cell_key": target_cell_key,
+                "batch_size": batch_size,
+            },
+            invalidate_cache=invalidate_cache,
+            required_arrays=(
+                ArrayRequirement("indices", shape=(nc, nk), dtype_kind="u"),
+                ArrayRequirement("distances", shape=(nc, nk), dtype_kind="f"),
+                ArrayRequirement(
+                    "reference_feature_indices",
+                    shape=feat_idx.shape,
+                    dtype_kind="i",
+                ),
+                ArrayRequirement(
+                    "reference_distance_quantiles",
+                    dtype_kind="f",
+                ),
+                ArrayRequirement(
+                    "reference_distance_values",
+                    dtype_kind="f",
+                ),
+            ),
+            required_attributes=tuple(self._PROJECTION_PROVENANCE_ATTRS),
+        )
+        if projection_plan.reused:
+            self._select_projection_artifact(
+                from_assay,
+                target_name,
+                projection_plan.ref,
+            )
+            return None
+        store = start_artifact(self.zw, projection_plan)
         zi = create_zarr_dataset(store, "indices", (batch_size,), "u8", (nc, nk))
         zd = create_zarr_dataset(store, "distances", (batch_size,), "f8", (nc, nk))
         feature_index_store = create_zarr_dataset(
             store,
-            "referenceFeatureIndices",
+            "reference_feature_indices",
             (min(max(len(feat_idx), 1), 100_000),),
             "i8",
             feat_idx.shape,
         )
         feature_index_store[:] = feat_idx
-        correction_method = "coral" if run_coral else "none"
-        if missing_feature_policy == "intersection":
-            correction_method = "intersection"
         for key, value in self._projection_provenance(
             source_assay,
             target_assay,
@@ -1051,7 +1670,48 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             ann_obj,
         ).items():
             store.attrs[key] = value
-        store.attrs["saveK"] = int(save_k)
+        store.attrs["save_k"] = int(save_k)
+        from ...mapping.confidence import _distance_quantile_summary
+
+        neighbors_group = as_zarr_group(
+            self.zw[neighbors_path],
+            name=neighbors_path,
+        )
+        if (
+            "reference_distance_quantiles" in neighbors_group
+            and "reference_distance_values" in neighbors_group
+        ):
+            reference_quantiles = np.asarray(
+                as_zarr_array(
+                    neighbors_group["reference_distance_quantiles"],
+                    name="reference_distance_quantiles",
+                )[:]
+            )
+            reference_values = np.asarray(
+                as_zarr_array(
+                    neighbors_group["reference_distance_values"],
+                    name="reference_distance_values",
+                )[:]
+            )
+        else:
+            reference_quantiles, reference_values = _distance_quantile_summary(
+                as_zarr_array(
+                    neighbors_group["distances"],
+                    name="distances",
+                )
+            )
+        for name, values in (
+            ("reference_distance_quantiles", reference_quantiles),
+            ("reference_distance_values", reference_values),
+        ):
+            output = create_zarr_dataset(
+                store,
+                name,
+                (min(max(len(values), 1), 1_001),),
+                "f8",
+                values.shape,
+            )
+            output[:] = values
         entry_start = 0
         try:
             for i in tqdmbar(
@@ -1072,11 +1732,78 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 raise RuntimeError(
                     f"Mapped {entry_start} target cells but expected {nc}"
                 )
-            store.attrs["complete"] = True
+            finish_artifact(store, projection_plan)
+            self._select_projection_artifact(
+                from_assay,
+                target_name,
+                projection_plan.ref,
+            )
         except Exception:
             store.attrs["complete"] = False
             raise
         return None
+
+    def _load_mapping_reference_ann(
+        self,
+        reference: MappingReference,
+    ) -> AnnStream:
+        if reference.ann_path not in self.zw:
+            raise ValueError(
+                "The mapping reference ANN index is missing. Rebuild the reference."
+            )
+        reference_ann_group = as_zarr_group(
+            self.zw[reference.ann_path],
+            name=reference.ann_path,
+        )
+        try:
+            parse_artifact_path(reference.ann_path)
+        except ValueError:
+            feature_scaling = bool(
+                reference_ann_group.attrs.get("featureScaling", True)
+            )
+            try:
+                reference_knn_path = lookup_latest_nearest_neighbors_group_path(
+                    self.zw,
+                    reference.ann_path,
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    "The mapping reference KNN metadata is missing. "
+                    "Rebuild the reference."
+                ) from exc
+        else:
+            mapping_inputs = reference.metadata.get("artifact_inputs", {})
+            if not isinstance(mapping_inputs, dict):
+                raise ValueError("Mapping reference artifact inputs are missing")
+            raw_reduction = mapping_inputs.get("reduction")
+            raw_neighbors = mapping_inputs.get("neighbors")
+            if not isinstance(raw_reduction, dict) or not isinstance(
+                raw_neighbors,
+                dict,
+            ):
+                raise ValueError("Mapping reference graph inputs are incomplete")
+            reference_reduction = ArtifactRef.from_dict(raw_reduction)
+            neighbors_ref = ArtifactRef.from_dict(raw_neighbors)
+            reduction_parameters = (
+                inspect_artifact(self.zw, reference_reduction).parameters or {}
+            )
+            feature_scaling = bool(reduction_parameters.get("feat_scaling", True))
+            neighbors_status = inspect_artifact(self.zw, neighbors_ref)
+            if not neighbors_status.exists or not neighbors_status.complete:
+                raise ValueError("Mapping reference neighbors are incomplete")
+            reference_knn_path = artifact_path(neighbors_ref)
+        if not feature_scaling:
+            raise ValueError(
+                "The mapping reference ANN was built without feature scaling "
+                "and cannot use reference-scaled query projection."
+            )
+        return self._load_ann_stream(
+            reference.assay_name,
+            reference.cell_key,
+            reference.feature_key,
+            feat_scaling=True,
+            knn_loc=reference_knn_path,
+        )
 
     def _map_with_mapping_reference(
         self,
@@ -1090,6 +1817,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         correction_method: str,
         missing_feature_policy: str,
         result_store: zarr.Group | None = None,
+        invalidate_cache: bool = False,
     ) -> MappingResult:
         from ...mapping.features import align_features
         from ...mapping.hashing import array_hash
@@ -1127,6 +1855,22 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             target_cell_key,
             target_feat_key,
         )
+        stored_normalization = reference.metadata.get("normalization_parameters")
+        normalization_parameters = (
+            dict(stored_normalization)
+            if isinstance(stored_normalization, dict)
+            else None
+        )
+        if normalization_parameters is None:
+            state = read_assay_state(self.zw, reference.assay_name)
+            if (
+                state is not None
+                and state.matches(reference.cell_key, reference.feature_key)
+                and state.normalized is not None
+            ):
+                normalization_parameters = (
+                    inspect_artifact(self.zw, state.normalized).parameters or {}
+                )
         feature_indices = align_features(
             source_assay,
             target_assay,
@@ -1139,6 +1883,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             nthreads=self.nthreads,
             missing_feature_policy=missing_feature_policy,
             missing_feature_values=reference.model.feature_means,
+            norm_params=normalization_parameters,
         )
         source_feature_indices = source_assay.feats.active_index(
             f"{reference.cell_key}__{reference.feature_key}"
@@ -1177,7 +1922,105 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             if query_batches is not None
             else []
         )
-        query_batch_hash = array_hash(batch_codes)
+        query_batch_fingerprint = array_hash(batch_codes)
+        target_matrix_fingerprint = self._fingerprint_mapping_matrix(target_data)
+        ann_obj = self._load_mapping_reference_ann(reference)
+        if not ann_obj.harmonize:
+            raise RuntimeError("Mapping reference ANN index is not harmonized")
+        if save_k > ann_obj.k:
+            logger.warning(f"`save_k` was decreased to {ann_obj.k}")
+            save_k = ann_obj.k
+        projection_plan = None
+        if self.zarr_mode == "r+" and result_store is None:
+            try:
+                reference_input: object = parse_artifact_path(reference.artifact_path)
+            except ValueError:
+                from ...mapping.artifact import mapping_reference_hash
+
+                reference_input = {
+                    "legacy_mapping_reference_fingerprint": mapping_reference_hash(
+                        reference.model,
+                        reference.feature_ids,
+                        reference.metadata,
+                        reference.reference_distance_quantiles,
+                        reference.reference_distance_values,
+                    )
+                }
+            projection_plan = plan_artifact(
+                self.zw,
+                scope="assay",
+                assay=reference.assay_name,
+                kind="projection",
+                operation="map_with_reference",
+                parameters={
+                    "save_k": save_k,
+                    "correction_method": correction_method,
+                    "missing_feature_policy": missing_feature_policy,
+                },
+                inputs={
+                    "mapping_reference": reference_input,
+                    "target_cells": array_hash(
+                        target_assay.cells.fetch("ids", key=target_cell_key)
+                    ),
+                    "target_features": array_hash(target_assay.feats.fetch_all("ids")),
+                    "target_normalized": target_matrix_fingerprint,
+                    "query_batches": query_batch_fingerprint,
+                },
+                execution_options={
+                    "target_name": target_name,
+                    "target_feat_key": target_feat_key,
+                    "target_cell_key": target_cell_key,
+                },
+                invalidate_cache=invalidate_cache,
+                required_arrays=(
+                    ArrayRequirement(
+                        "indices",
+                        shape=(n_cells, save_k),
+                        dtype_kind="u",
+                    ),
+                    ArrayRequirement(
+                        "distances",
+                        shape=(n_cells, save_k),
+                        dtype_kind="f",
+                    ),
+                    ArrayRequirement(
+                        "uncorrected_latent",
+                        shape=(n_cells, reference.model.n_dims),
+                        dtype_kind="f",
+                    ),
+                    ArrayRequirement(
+                        "corrected_latent",
+                        shape=(n_cells, reference.model.n_dims),
+                        dtype_kind="f",
+                    ),
+                    ArrayRequirement(
+                        "uninformative",
+                        shape=(n_cells,),
+                        dtype_kind="b",
+                    ),
+                    ArrayRequirement(
+                        "reference_feature_indices",
+                        shape=feature_indices.shape,
+                        dtype_kind="i",
+                    ),
+                    ArrayRequirement(
+                        "reference_distance_quantiles",
+                        dtype_kind="f",
+                    ),
+                    ArrayRequirement(
+                        "reference_distance_values",
+                        dtype_kind="f",
+                    ),
+                ),
+                required_attributes=tuple(self._PROJECTION_PROVENANCE_ATTRS),
+            )
+            if projection_plan.reused:
+                self._select_projection_artifact(
+                    reference.assay_name,
+                    target_name,
+                    projection_plan.ref,
+                )
+                return self.get_mapping_result(target_name)
         counts, sums = initialize_sufficient_statistics(n_batches, reference.model)
         entry_start = 0
         zero_norm_count = 0
@@ -1203,40 +2046,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 f"Read {entry_start} query cells but expected {n_cells} during correction"
             )
         correction = solve_query_correction(counts, sums, reference.model)
-        if reference.ann_path not in self.zw:
-            raise ValueError(
-                "The mapping reference ANN index is missing. Rebuild the reference."
-            )
-        reference_ann_group = as_zarr_group(
-            self.zw[reference.ann_path], name=reference.ann_path
-        )
-        if not bool(reference_ann_group.attrs.get("featureScaling", True)):
-            raise ValueError(
-                "The mapping reference ANN was built without feature scaling "
-                "and cannot use reference-scaled query projection."
-            )
-        try:
-            reference_knn_path = lookup_latest_nearest_neighbors_group_path(
-                self.zw, reference.ann_path
-            )
-        except KeyError:
-            reference_knn_path = ""
-        if not reference_knn_path or reference_knn_path not in self.zw:
-            raise ValueError(
-                "The mapping reference KNN metadata is missing. Rebuild the reference."
-            )
-        ann_obj = self._load_ann_stream(
-            reference.assay_name,
-            reference.cell_key,
-            reference.feature_key,
-            feat_scaling=True,
-            knn_loc=reference_knn_path,
-        )
-        if not ann_obj.harmonize:
-            raise RuntimeError("Mapping reference ANN index is not harmonized")
-        if save_k > ann_obj.k:
-            logger.warning(f"`save_k` was decreased to {ann_obj.k}")
-            save_k = ann_obj.k
         write_projection = self.zarr_mode == "r+" or result_store is not None
         store: zarr.Group | None = result_store
         projection_path = ""
@@ -1249,13 +2058,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         )
         if write_projection:
             if store is None:
-                if "projections" not in source_assay.z:
-                    source_assay.z.create_group("projections")
-                projections = as_zarr_group(
-                    source_assay.z["projections"], name="projections"
-                )
-                store = projections.create_group(target_name, overwrite=True)
-                projection_path = f"{reference.assay_name}/projections/{target_name}"
+                if projection_plan is None:
+                    raise RuntimeError("Projection artifact plan is missing")
+                store = start_artifact(self.zw, projection_plan)
+                projection_path = artifact_path(projection_plan.ref)
             else:
                 projection_path = getattr(store, "path", "")
             store.attrs["complete"] = False
@@ -1273,14 +2079,32 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 ann_obj,
             ).items():
                 store.attrs[key] = value
-            store.attrs["saveK"] = int(save_k)
-            store.attrs["mappingReferencePath"] = reference.artifact_path
-            store.attrs["queryBatchCount"] = int(n_batches)
-            store.attrs["queryBatchColumns"] = query_batch_columns
-            store.attrs["queryBatchHash"] = query_batch_hash
+            store.attrs["save_k"] = int(save_k)
+            store.attrs["mapping_reference_path"] = reference.artifact_path
+            store.attrs["query_batch_count"] = int(n_batches)
+            store.attrs["query_batch_columns"] = query_batch_columns
+            store.attrs["query_batch_fingerprint"] = query_batch_fingerprint
+            reference_quantiles, reference_values = self._reference_distance_summary(
+                store,
+                reference.assay_name,
+                reference.cell_key,
+                reference.feature_key,
+            )
+            for name, values in (
+                ("reference_distance_quantiles", reference_quantiles),
+                ("reference_distance_values", reference_values),
+            ):
+                output = create_zarr_dataset(
+                    store,
+                    name,
+                    (min(max(len(values), 1), 1_001),),
+                    "f8",
+                    values.shape,
+                )
+                output[:] = values
             feature_index_store = create_zarr_dataset(
                 store,
-                "referenceFeatureIndices",
+                "reference_feature_indices",
                 (min(max(len(feature_indices), 1), 100_000),),
                 "i8",
                 feature_indices.shape,
@@ -1295,14 +2119,14 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
             uncorrected: Any = create_zarr_dataset(
                 store,
-                "uncorrectedLatent",
+                "uncorrected_latent",
                 (row_chunk, reference.model.n_dims),
                 "f8",
                 (n_cells, reference.model.n_dims),
             )
             corrected: Any = create_zarr_dataset(
                 store,
-                "correctedLatent",
+                "corrected_latent",
                 (row_chunk, reference.model.n_dims),
                 "f8",
                 (n_cells, reference.model.n_dims),
@@ -1357,7 +2181,15 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     f"Mapped {entry_start} query cells but expected {n_cells}"
                 )
             if store is not None:
-                store.attrs["complete"] = True
+                if projection_plan is not None and result_store is None:
+                    finish_artifact(store, projection_plan)
+                    self._select_projection_artifact(
+                        reference.assay_name,
+                        target_name,
+                        projection_plan.ref,
+                    )
+                else:
+                    store.attrs["complete"] = True
         except Exception:
             if store is not None:
                 store.attrs["complete"] = False
@@ -1370,7 +2202,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 "featureCoverage": feature_coverage,
                 "queryBatchCount": float(n_batches),
                 "zeroNormCellCount": float(zero_norm_count),
-                "algorithmVariant": SYMPHONY_STYLE_VARIANT,
+                "algorithmVariant": SYMPHONY_ALGORITHM,
             },
             indices=None if store is not None else indices,
             distances=None if store is not None else distances,
@@ -1451,18 +2283,33 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         store = self._load_complete_projection(
             target_name, from_assay, cell_key, feat_key
         )
-        projection_path = f"{from_assay}/projections/{target_name}"
+        projection_path = str(getattr(store, "path", ""))
         indices = as_zarr_array(store["indices"], name="indices")
         n_cells = int(indices.shape[0])
-        correction_method = str(store.attrs.get("correctionMethod", "none"))
+        correction_method = str(
+            self._projection_attr(
+                store.attrs,
+                "correction_method",
+                "none",
+            )
+        )
         diagnostics: dict[str, float | str] = {}
-        for key in ("featureCoverage", "queryBatchCount", "algorithmVariant"):
-            if key in store.attrs:
-                value = store.attrs[key]
+        for output_key, attribute_name in (
+            ("featureCoverage", "feature_coverage"),
+            ("queryBatchCount", "query_batch_count"),
+            ("algorithmVariant", "algorithm_variant"),
+        ):
+            value = self._projection_attr(
+                store.attrs,
+                attribute_name,
+            )
+            if value is not None:
                 if isinstance(value, (bool, np.bool_)):
                     continue
                 if isinstance(value, (int, float, np.integer, np.floating, str)):
-                    diagnostics[key] = value if isinstance(value, str) else float(value)
+                    diagnostics[output_key] = (
+                        value if isinstance(value, str) else float(value)
+                    )
 
         if not load_arrays:
             return MappingResult(
@@ -1473,9 +2320,12 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
 
         def _optional_array(name: str) -> np.ndarray | None:
-            if name not in store:
+            resolved_name = self._projection_array_name(store, name)
+            if resolved_name not in store:
                 return None
-            return np.asarray(as_zarr_array(store[name], name=name)[:])
+            return np.asarray(
+                as_zarr_array(store[resolved_name], name=resolved_name)[:]
+            )
 
         return MappingResult(
             projection_path=projection_path,
@@ -1486,8 +2336,8 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             distances=np.asarray(
                 as_zarr_array(store["distances"], name="distances")[:]
             ),
-            uncorrected_latent=_optional_array("uncorrectedLatent"),
-            corrected_latent=_optional_array("correctedLatent"),
+            uncorrected_latent=_optional_array("uncorrected_latent"),
+            corrected_latent=_optional_array("corrected_latent"),
             uninformative=_optional_array("uninformative"),
         )
 
@@ -1732,7 +2582,11 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             left=0.0,
             right=1.0,
         )
-        feature_coverage_value = store.attrs.get("featureCoverage", 1.0)
+        feature_coverage_value = self._projection_attr(
+            store.attrs,
+            "feature_coverage",
+            1.0,
+        )
         if not isinstance(feature_coverage_value, int | float):
             raise RuntimeError(
                 "Projection provenance is missing numeric feature coverage"
@@ -1771,9 +2625,48 @@ class _MappingOperationsMixin(_MappingOperationsBase):
     ) -> tuple[np.ndarray, np.ndarray]:
         from ...mapping.confidence import _distance_quantile_summary
 
-        artifact_path = projection.attrs.get("mappingReferencePath")
-        if isinstance(artifact_path, str) and artifact_path in self.zw:
-            artifact = as_zarr_group(self.zw[artifact_path], name=artifact_path)
+        if (
+            "reference_distance_quantiles" in projection
+            and "reference_distance_values" in projection
+        ):
+            return (
+                np.asarray(
+                    as_zarr_array(
+                        projection["reference_distance_quantiles"],
+                        name="reference_distance_quantiles",
+                    )[:]
+                ),
+                np.asarray(
+                    as_zarr_array(
+                        projection["reference_distance_values"],
+                        name="reference_distance_values",
+                    )[:]
+                ),
+            )
+        mapping_path = self._projection_attr(
+            projection.attrs,
+            "mapping_reference_path",
+        )
+        if isinstance(mapping_path, str) and mapping_path in self.zw:
+            artifact = as_zarr_group(self.zw[mapping_path], name=mapping_path)
+            if (
+                "reference_distance_quantiles" in artifact
+                and "reference_distance_values" in artifact
+            ):
+                return (
+                    np.asarray(
+                        as_zarr_array(
+                            artifact["reference_distance_quantiles"],
+                            name="reference_distance_quantiles",
+                        )[:]
+                    ),
+                    np.asarray(
+                        as_zarr_array(
+                            artifact["reference_distance_values"],
+                            name="reference_distance_values",
+                        )[:]
+                    ),
+                )
             if (
                 "referenceDistanceQuantiles" in artifact
                 and "referenceDistanceValues" in artifact
@@ -1793,21 +2686,58 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     ),
                 )
 
-        ann_path = projection.attrs.get("annPath")
+        ann_path = self._projection_attr(projection.attrs, "ann_path")
         if not isinstance(ann_path, str) or ann_path not in self.zw:
             stored_assay = projection.attrs.get("assay")
-            stored_cell_key = projection.attrs.get("cellKey")
-            stored_feature_key = projection.attrs.get("featureKey")
+            stored_cell_key = self._projection_attr(
+                projection.attrs,
+                "cell_key",
+            )
+            stored_feature_key = self._projection_attr(
+                projection.attrs,
+                "feature_key",
+            )
             if isinstance(stored_assay, str):
                 from_assay = stored_assay
             if isinstance(stored_cell_key, str):
                 cell_key = stored_cell_key
             if isinstance(stored_feature_key, str):
                 feat_key = stored_feature_key
+            state = read_assay_state(self.zw, from_assay)
+            if (
+                state is not None
+                and state.matches(cell_key, feat_key)
+                and state.neighbors is not None
+            ):
+                neighbors_group = as_zarr_group(
+                    self.zw[artifact_path(state.neighbors)],
+                    name=artifact_path(state.neighbors),
+                )
+                return _distance_quantile_summary(
+                    as_zarr_array(
+                        neighbors_group["distances"],
+                        name="distances",
+                    )
+                )
             normed_path = make_normalized_group_path(from_assay, cell_key, feat_key)
             reduction_path = lookup_latest_reduction_group_path(self.zw, normed_path)
             ann_path = lookup_latest_neighbor_index_group_path(self.zw, reduction_path)
         ann = as_zarr_group(self.zw[ann_path], name=ann_path)
+        if "reference_distance_quantiles" in ann and "reference_distance_values" in ann:
+            return (
+                np.asarray(
+                    as_zarr_array(
+                        ann["reference_distance_quantiles"],
+                        name="reference_distance_quantiles",
+                    )[:]
+                ),
+                np.asarray(
+                    as_zarr_array(
+                        ann["reference_distance_values"],
+                        name="reference_distance_values",
+                    )[:]
+                ),
+            )
         if "referenceDistanceQuantiles" in ann and "referenceDistanceValues" in ann:
             return (
                 np.asarray(
@@ -1823,7 +2753,15 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     )[:]
                 ),
             )
-        knn_path = lookup_latest_nearest_neighbors_group_path(self.zw, ann_path)
+        try:
+            parse_artifact_path(ann_path)
+        except ValueError:
+            knn_path = lookup_latest_nearest_neighbors_group_path(self.zw, ann_path)
+        else:
+            state = read_assay_state(self.zw, from_assay)
+            if state is None or state.neighbors is None:
+                raise ValueError("Artifact graph state has no neighbors artifact")
+            knn_path = artifact_path(state.neighbors)
         knn = as_zarr_group(self.zw[knn_path], name=knn_path)
         reference_distances = as_zarr_array(knn["distances"], name="referenceDistances")
         return _distance_quantile_summary(reference_distances)
@@ -1860,6 +2798,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         from_assay: str | None = None,
         cell_key: str | None = None,
         label: str | None = None,
+        invalidate_cache: bool = False,
     ) -> str | np.ndarray:
         """Place query cells into an unchanged reference layout by neighbor weighting.
 
@@ -1883,10 +2822,62 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         indices = as_zarr_array(store["indices"], name="indices")
         distances = as_zarr_array(store["distances"], name="distances")
         persist_layout = self.zarr_mode == "r+"
+        layout_plan = None
         if persist_layout:
+            from ...mapping.hashing import array_hash
+
+            projection_path = self._projection_artifact_path(
+                from_assay,
+                target_name,
+            )
+            try:
+                projection_input: object = (
+                    parse_artifact_path(projection_path)
+                    if projection_path is not None
+                    else {
+                        "legacy_projection_fingerprint": fingerprint_stored_arrays(
+                            store,
+                            ("indices", "distances"),
+                        )
+                    }
+                )
+            except ValueError:
+                projection_input = {
+                    "legacy_projection_fingerprint": fingerprint_stored_arrays(
+                        store,
+                        ("indices", "distances"),
+                    )
+                }
+            layout_plan = plan_artifact(
+                self.zw,
+                scope="assay",
+                assay=from_assay,
+                kind="embedding",
+                operation="project_mapping_layout",
+                parameters={},
+                inputs={
+                    "projection": projection_input,
+                    "reference_layout": array_hash(reference_layout),
+                },
+                execution_options={
+                    "label": label,
+                    "reference_layout_key": reference_layout_key,
+                },
+                invalidate_cache=invalidate_cache,
+                required_arrays=(
+                    ArrayRequirement(
+                        "data",
+                        shape=(indices.shape[0], 2),
+                        dtype_kind="f",
+                    ),
+                ),
+            )
+            if layout_plan.reused:
+                return artifact_path(layout_plan.ref)
+            layout_group = start_artifact(self.zw, layout_plan)
             layout: Any = create_zarr_dataset(
-                store,
-                label,
+                layout_group,
+                "data",
                 (self._projection_block_size(indices), 2),
                 "f8",
                 (indices.shape[0], 2),
@@ -1903,9 +2894,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 "nk,nkd->nd", block_weights, reference_layout[block_indices]
             )
         if persist_layout:
-            layout.attrs["complete"] = True
-            layout.attrs["referenceLayoutKey"] = reference_layout_key
-            return f"{from_assay}/projections/{target_name}/{label}"
+            assert layout_plan is not None
+            finish_artifact(layout_group, layout_plan)
+            return artifact_path(layout_plan.ref)
         return np.asarray(layout)
 
     def load_unified_graph(
@@ -2001,34 +2992,124 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         ]
         return np.vstack([ini_embed, ini_embed[targets_best_nn]])
 
-    def _save_embedding(
+    def _plan_unified_embedding(
         self,
         from_assay: str,
         cell_key: str,
+        feat_key: str,
         label: str,
-        embedding: np.ndarray,
+        n_cells: list[int],
+        target_names: list[str],
+        initialization: np.ndarray,
+        operation: str,
+        parameters: dict[str, Any],
+        invalidate_cache: bool,
+    ) -> PlannedArtifact:
+        state = read_assay_state(self.zw, from_assay)
+        inputs: dict[str, Any] = {}
+        if state is not None and state.connectivity_map is not None:
+            inputs["connectivity_map"] = state.connectivity_map
+        else:
+            graph_path = self.get_latest_graph_loc(
+                from_assay,
+                cell_key,
+                feat_key,
+            )
+            graph_group = as_zarr_group(self.zw[graph_path], name=graph_path)
+            inputs["connectivity_map"] = {
+                "legacy_graph_fingerprint": fingerprint_stored_arrays(
+                    graph_group,
+                    ("edges", "weights"),
+                )
+            }
+        projection_inputs: list[Any] = []
+        for target_name in target_names:
+            path = self._projection_artifact_path(from_assay, target_name)
+            if path is None:
+                projection_group = self._load_complete_projection(
+                    target_name,
+                    from_assay,
+                    cell_key,
+                )
+                projection_inputs.append(
+                    {
+                        "legacy_projection_fingerprint": fingerprint_stored_arrays(
+                            projection_group,
+                            ("indices", "distances"),
+                        )
+                    }
+                )
+            else:
+                projection_inputs.append(parse_artifact_path(path))
+        inputs["projections"] = projection_inputs
+        inputs["initialization"] = fingerprint_array(initialization)
+        stored_parameters = dict(parameters)
+        initialization_label = stored_parameters.pop("ini_embed_with", None)
+        return plan_artifact(
+            self.zw,
+            scope="assay",
+            assay=from_assay,
+            kind="embedding",
+            operation=operation,
+            parameters=stored_parameters,
+            inputs=inputs,
+            execution_options={
+                "label": label,
+                "target_names": target_names,
+                "initialization_label": initialization_label,
+            },
+            invalidate_cache=invalidate_cache,
+            required_arrays=(
+                ArrayRequirement(
+                    "data",
+                    shape=(sum(n_cells), 2),
+                    dtype_kind="f",
+                ),
+            ),
+        )
+
+    def _save_embedding(
+        self,
+        planned: PlannedArtifact,
+        from_assay: str,
+        cell_key: str,
+        label: str,
+        embedding: np.ndarray | None,
         n_cells: list[int],
         target_names: list[str],
     ) -> None:
-        g = create_zarr_dataset(
-            as_zarr_group(
-                as_zarr_group(self.zw[from_assay], name=from_assay)["projections"],
-                name="projections",
-            ),
-            label,
-            (1000, 2),
-            "float64",
-            embedding.shape,
+        if planned.reused:
+            group = reused_artifact_group(self.zw, planned)
+        else:
+            if embedding is None:
+                raise ValueError("A new embedding artifact requires coordinates")
+            group = start_artifact(self.zw, planned)
+            output = create_zarr_dataset(
+                group,
+                "data",
+                (1000, 2),
+                "float64",
+                embedding.shape,
+            )
+            output[:] = embedding
+            group.attrs["n_cells"] = [int(x) for x in n_cells]
+            group.attrs["target_names"] = target_names
+            finish_artifact(group, planned)
+        projections = as_zarr_group(
+            as_zarr_group(self.zw[from_assay], name=from_assay)["projections"],
+            name="projections",
         )
-        g[:] = embedding
-        g.attrs["n_cells"] = [
-            int(x) for x in n_cells
-        ]  # forcing int type here otherwise json raises TypeError
-        g.attrs["target_names"] = target_names
+        raw_layouts = projections.attrs.get("layouts", {})
+        if "layouts" in projections.attrs and not isinstance(raw_layouts, dict):
+            raise RuntimeError("Unified layout artifact index is invalid")
+        layouts = dict(raw_layouts) if isinstance(raw_layouts, dict) else {}
+        layouts[label] = planned.ref.to_dict()
+        projections.attrs["layouts"] = layouts
+        stored_embedding = np.asarray(as_zarr_array(group["data"], name="data")[:])
         for i in range(2):
             self.cells.insert(
                 self._col_renamer(from_assay, cell_key, f"{label}{i + 1}"),
-                embedding[: n_cells[0], i],
+                stored_embedding[: n_cells[0], i],
                 key=cell_key,
                 overwrite=True,
             )
@@ -2049,7 +3130,41 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 as_zarr_group(self.zw[assay], name=assay)["projections"],
                 name="projections",
             )
-            layout = as_zarr_array(projections[layout_key], name=layout_key)
+            raw_layouts = projections.attrs.get("layouts", {})
+            if "layouts" in projections.attrs and not isinstance(
+                raw_layouts,
+                dict,
+            ):
+                raise ValueError("Unified layout artifact index is invalid")
+            raw_ref = (
+                raw_layouts.get(layout_key) if isinstance(raw_layouts, dict) else None
+            )
+            if (
+                isinstance(raw_layouts, dict)
+                and layout_key in raw_layouts
+                and not isinstance(raw_ref, dict)
+            ):
+                raise ValueError(f"Unified layout index for {layout_key!r} is invalid")
+            if isinstance(raw_ref, dict):
+                ref = ArtifactRef.from_dict(raw_ref)
+                if (
+                    ref.scope != "assay"
+                    or ref.assay != assay
+                    or ref.kind != "embedding"
+                ):
+                    raise ValueError("Unified layout reference is invalid")
+                status = inspect_artifact(self.zw, ref)
+                if not status.exists or not status.complete:
+                    raise ValueError("Unified layout artifact is incomplete")
+                layout_group = as_zarr_group(
+                    self.zw[artifact_path(ref)],
+                    name=artifact_path(ref),
+                )
+                layout = as_zarr_array(layout_group["data"], name="data")
+                attrs = dict(layout_group.attrs)
+            else:
+                layout = as_zarr_array(projections[layout_key], name=layout_key)
+                attrs = dict(layout.attrs)
         except Exception as exc:
             raise KeyError(
                 f"Unified layout {layout_key!r} not found under assay {assay!r}. "
@@ -2058,7 +3173,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         coords = np.asarray(layout[:], dtype=np.float64)
         if coords.ndim != 2 or coords.shape[1] < 2:
             raise ValueError(f"Unified layout {layout_key!r} must be an (n, 2) array")
-        attrs = dict(layout.attrs)
         raw_n_cells = attrs.get("n_cells")
         raw_target_names = attrs.get("target_names")
         if not isinstance(raw_n_cells, (list, tuple)) or not isinstance(
@@ -2098,6 +3212,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         label: str = "unified_UMAP",
         parallel: bool = False,
         nthreads: int | None = None,
+        invalidate_cache: bool = False,
     ) -> None:
         """Calculates the UMAP embedding for graph obtained using
         ``load_unified_graph``.
@@ -2163,6 +3278,43 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         )
         if nthreads is None:
             nthreads = self.nthreads
+        parameters = {
+            "use_k": use_k,
+            "target_weight": target_weight,
+            "spread": spread,
+            "min_dist": min_dist,
+            "n_epochs": n_epochs,
+            "repulsion_strength": repulsion_strength,
+            "initial_alpha": initial_alpha,
+            "negative_sample_rate": negative_sample_rate,
+            "random_seed": random_seed,
+            "ini_embed_with": ini_embed_with,
+            "parallel": parallel,
+            "nthreads": nthreads if parallel else None,
+        }
+        embedding_plan = self._plan_unified_embedding(
+            from_assay,
+            cell_key,
+            feat_key,
+            label,
+            n_cells,
+            target_names,
+            ini_embed,
+            operation="run_unified_umap",
+            parameters=parameters,
+            invalidate_cache=invalidate_cache,
+        )
+        if embedding_plan.reused:
+            self._save_embedding(
+                embedding_plan,
+                from_assay,
+                cell_key,
+                label,
+                None,
+                n_cells,
+                target_names,
+            )
+            return None
         verbose = False
         if get_log_level() <= 20:
             verbose = True
@@ -2181,7 +3333,15 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             nthreads=nthreads,
             verbose=verbose,
         )
-        self._save_embedding(from_assay, cell_key, label, t, n_cells, target_names)
+        self._save_embedding(
+            embedding_plan,
+            from_assay,
+            cell_key,
+            label,
+            t,
+            n_cells,
+            target_names,
+        )
         return None
 
     def run_unified_tsne(
@@ -2201,6 +3361,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         verbose: bool = True,
         ini_embed_with: str = "kmeans",
         label: str = "unified_tSNE",
+        invalidate_cache: bool = False,
     ) -> None:
         """Calculates the tSNE embedding for graph obtained using
         ``load_unified_graph``. The loaded graph is processed the same way as
@@ -2248,6 +3409,39 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         ini_embed = self._get_uni_ini_embed(
             from_assay, cell_key, feat_key, graph, ini_embed_with, n_cells[0]
         )
+        parameters = {
+            "use_k": use_k,
+            "target_weight": target_weight,
+            "lambda_scale": lambda_scale,
+            "max_iter": max_iter,
+            "early_iter": early_iter,
+            "alpha": alpha,
+            "box_h": box_h,
+            "ini_embed_with": ini_embed_with,
+        }
+        embedding_plan = self._plan_unified_embedding(
+            from_assay,
+            cell_key,
+            feat_key,
+            label,
+            n_cells,
+            target_names,
+            ini_embed,
+            operation="run_unified_tsne",
+            parameters=parameters,
+            invalidate_cache=invalidate_cache,
+        )
+        if embedding_plan.reused:
+            self._save_embedding(
+                embedding_plan,
+                from_assay,
+                cell_key,
+                label,
+                None,
+                n_cells,
+                target_names,
+            )
+            return None
         emb = run_sgtsne(
             graph,
             ini_embed,
@@ -2260,5 +3454,13 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             temp_file_loc=temp_file_loc,
             verbose=verbose,
         )
-        self._save_embedding(from_assay, cell_key, label, emb.T, n_cells, target_names)
+        self._save_embedding(
+            embedding_plan,
+            from_assay,
+            cell_key,
+            label,
+            emb.T,
+            n_cells,
+            target_names,
+        )
         return None

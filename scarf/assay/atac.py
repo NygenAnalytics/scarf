@@ -140,6 +140,29 @@ class ATACassay(Assay):
 
         Returns: None
         """
+        import warnings
+
+        warnings.warn(
+            "ATACassay.mark_prevalent_peaks writes legacy metadata directly; "
+            "use DataStore.mark_prevalent_peaks for artifact-backed persistence.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        values = self._prevalent_peak_mask(cell_key, top_n)
+        prevalence_key_name = cell_key + "__" + prevalence_key_name
+        self.feats.insert(
+            prevalence_key_name,
+            values,
+            fill_value=False,
+            overwrite=True,
+        )
+        return None
+
+    def _prevalent_peak_mask(
+        self,
+        cell_key: str,
+        top_n: int,
+    ) -> np.ndarray:
         if top_n >= self.feats.N:
             raise ValueError(
                 f"ERROR: n_top should be less than total number of features ({self.feats.N})]"
@@ -153,11 +176,4 @@ class ATACassay(Assay):
             .sort_values(ascending=False)
             .index.values[:top_n]
         )
-        prevalence_key_name = cell_key + "__" + prevalence_key_name
-        self.feats.insert(
-            prevalence_key_name,
-            self.feats.index_to_bool(idx),
-            fill_value=False,
-            overwrite=True,
-        )
-        return None
+        return np.asarray(self.feats.index_to_bool(idx), dtype=bool)

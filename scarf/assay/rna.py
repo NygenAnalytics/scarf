@@ -193,6 +193,7 @@ class RNAassay(Assay):
         renormalize_subset: bool,
         update_keys: bool,
         mirror: zarr.Array | None = None,
+        artifact_mode: bool = False,
     ) -> ChunkedArray:
         if not renormalize_subset:
             return super().save_normalized_data(
@@ -204,6 +205,7 @@ class RNAassay(Assay):
                 renormalize_subset,
                 update_keys,
                 mirror=mirror,
+                artifact_mode=artifact_mode,
             )
 
         from ..storage.materialize import write_renorm_subset_to_zarr
@@ -211,6 +213,31 @@ class RNAassay(Assay):
         if feat_key != "I":
             feat_key = cell_key + "__" + feat_key
         cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
+        if artifact_mode:
+            if location not in self.z:
+                raise KeyError(f"Artifact group does not exist at {location}")
+            if location + "/data" in self.z:
+                return ChunkedArray(
+                    as_zarr_array(
+                        self.z[location + "/data"],
+                        name=location + "/data",
+                    ),
+                    nthreads=self.nthreads,
+                )
+            write_renorm_subset_to_zarr(
+                self,
+                cell_idx,
+                feat_idx,
+                self.z,
+                location + "/data",
+                self.nthreads,
+                log_transform=log_transform,
+                mirror=mirror,
+            )
+            return ChunkedArray(
+                as_zarr_array(self.z[location + "/data"], name=location + "/data"),
+                nthreads=self.nthreads,
+            )
         subset_hash = self._create_subset_hash(cell_idx, feat_idx)
         subset_params = {
             "log_transform": log_transform,

@@ -3,7 +3,8 @@
 import hashlib
 import json
 import warnings
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, cast
 
 import numpy as np
 import zarr
@@ -13,7 +14,7 @@ from ..storage.arrays import create_zarr_dataset, create_zarr_obj_array
 from .hashing import array_hash
 from .models import SymphonyReferenceModel
 from .reference import MappingReference
-from .symphony import SYMPHONY_STYLE_VARIANT
+from .symphony import SYMPHONY_ALGORITHM
 
 MAPPING_REFERENCE_GROUP = "mappingReference"
 MAPPING_REFERENCES_GROUP = "mappingReferences"
@@ -29,6 +30,155 @@ _MAPPING_REFERENCE_ARRAYS = (
     "clusterMass",
     "sigma",
 )
+
+
+def write_artifact_mapping_reference(
+    group: zarr.Group,
+    model: SymphonyReferenceModel,
+    feature_ids: np.ndarray,
+    metadata: dict[str, Any],
+    reference_distance_quantiles: np.ndarray | None = None,
+    reference_distance_values: np.ndarray | None = None,
+) -> None:
+    create_zarr_obj_array(group, "feature_ids", np.asarray(feature_ids))
+    _write_array(group, "feature_means", model.feature_means)
+    _write_array(group, "feature_scales", model.feature_scales)
+    _write_array(group, "loadings", model.loadings)
+    _write_array(group, "centroids", model.centroids)
+    _write_array(group, "raw_centroids", model.raw_centroids)
+    _write_array(group, "corrected_centroids", model.corrected_centroids)
+    _write_array(group, "cluster_mass", model.cluster_mass)
+    _write_array(group, "sigma", model.sigma)
+    if reference_distance_quantiles is not None:
+        _write_array(
+            group,
+            "reference_distance_quantiles",
+            reference_distance_quantiles,
+        )
+    if reference_distance_values is not None:
+        _write_array(
+            group,
+            "reference_distance_values",
+            reference_distance_values,
+        )
+    group.attrs["correction_ridge"] = float(model.correction_ridge)
+    group.attrs["reference_metadata"] = metadata
+
+
+def load_artifact_mapping_reference(
+    datastore: Any,
+    ref: Any,
+    assay_name: str,
+    cell_key: str,
+    feature_key: str,
+) -> MappingReference:
+    from ..storage.artifacts import ArtifactRef, artifact_path, inspect_artifact
+
+    status = inspect_artifact(datastore.zw, ref)
+    if not status.exists or not status.complete:
+        raise ValueError("Mapping reference artifact is incomplete")
+
+    def input_ref(name: str, expected_kind: str) -> ArtifactRef:
+        raw_ref = (status.inputs or {}).get(name)
+        if not isinstance(raw_ref, Mapping):
+            raise ValueError(f"Mapping reference is missing {name!r} input")
+        input_artifact = ArtifactRef.from_dict(raw_ref)
+        if input_artifact.kind != expected_kind:
+            raise ValueError(
+                f"Mapping reference {name!r} input has kind "
+                f"{input_artifact.kind!r}, expected {expected_kind!r}"
+            )
+        input_status = inspect_artifact(datastore.zw, input_artifact)
+        if not input_status.exists or not input_status.complete:
+            raise ValueError(f"Mapping reference {name!r} input is incomplete")
+        return input_artifact
+
+    reduction_ref = input_ref("reduction", "reduction")
+    correction_ref = input_ref("batch_correction", "batch_correction")
+    ann_ref = input_ref("ann_index", "ann_index")
+    neighbors_ref = input_ref("neighbors", "neighbors")
+    correction_inputs = inspect_artifact(datastore.zw, correction_ref).inputs or {}
+    ann_inputs = inspect_artifact(datastore.zw, ann_ref).inputs or {}
+    neighbors_inputs = inspect_artifact(datastore.zw, neighbors_ref).inputs or {}
+    expected_reduction = reduction_ref.to_dict()
+    expected_correction = correction_ref.to_dict()
+    expected_ann = ann_ref.to_dict()
+    if correction_inputs.get("reduction") != expected_reduction:
+        raise ValueError("Mapping reference correction uses another reduction")
+    if ann_inputs.get("coordinates") != expected_correction:
+        raise ValueError("Mapping reference ANN uses another correction")
+    if (
+        neighbors_inputs.get("ann_index") != expected_ann
+        or neighbors_inputs.get("coordinates") != expected_correction
+    ):
+        raise ValueError("Mapping reference neighbors use another graph chain")
+
+    reduction_path = artifact_path(reduction_ref)
+    ann_path = artifact_path(ann_ref)
+    path = artifact_path(ref)
+    group = as_zarr_group(datastore.zw[path], name=path)
+    required = (
+        "feature_ids",
+        "feature_means",
+        "feature_scales",
+        "loadings",
+        "centroids",
+        "raw_centroids",
+        "corrected_centroids",
+        "cluster_mass",
+        "sigma",
+    )
+    missing = [name for name in required if name not in group]
+    if missing:
+        raise ValueError(
+            "Mapping reference is missing required arrays: " + ", ".join(missing)
+        )
+
+    def values(name: str) -> np.ndarray:
+        return np.asarray(as_zarr_array(group[name], name=name)[:])
+
+    model = SymphonyReferenceModel(
+        feature_means=values("feature_means"),
+        feature_scales=values("feature_scales"),
+        loadings=values("loadings"),
+        centroids=values("centroids"),
+        raw_centroids=values("raw_centroids"),
+        corrected_centroids=values("corrected_centroids"),
+        cluster_mass=values("cluster_mass"),
+        sigma=values("sigma"),
+        correction_ridge=float(
+            cast(int | float | str, group.attrs["correction_ridge"])
+        ),
+    )
+    raw_metadata = group.attrs.get("reference_metadata", {})
+    if not isinstance(raw_metadata, Mapping):
+        raise TypeError("Mapping reference metadata must be a mapping")
+    metadata = dict(raw_metadata)
+    metadata["complete"] = True
+    metadata["artifact_id"] = ref.artifact_id
+    metadata["artifact_inputs"] = status.inputs or {}
+    return MappingReference(
+        datastore=datastore,
+        assay_name=assay_name,
+        cell_key=cell_key,
+        feature_key=feature_key,
+        reduction_path=reduction_path,
+        ann_path=ann_path,
+        artifact_path=path,
+        model=model,
+        feature_ids=values("feature_ids"),
+        metadata=metadata,
+        reference_distance_quantiles=(
+            values("reference_distance_quantiles")
+            if "reference_distance_quantiles" in group
+            else None
+        ),
+        reference_distance_values=(
+            values("reference_distance_values")
+            if "reference_distance_values" in group
+            else None
+        ),
+    )
 
 
 def persist_mapping_reference(
@@ -61,7 +211,7 @@ def persist_mapping_reference(
             reference_distance_values,
             dtype=np.float64,
         )
-    metadata = {**metadata, "algorithmVariant": SYMPHONY_STYLE_VARIANT}
+    metadata = {**metadata, "algorithmVariant": SYMPHONY_ALGORITHM}
     artifact_hash = mapping_reference_hash(
         model,
         feature_ids,

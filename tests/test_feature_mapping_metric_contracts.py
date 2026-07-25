@@ -29,6 +29,7 @@ def test_feature_mapping_and_metric_entry_point_signatures_are_stable():
         "correction_method",
         "missing_feature_policy",
         "result_store",
+        "invalidate_cache",
     ]
     assert list(inspect.signature(compute_lisi).parameters) == [
         "distances",

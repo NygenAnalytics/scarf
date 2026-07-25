@@ -53,7 +53,7 @@ class DataStorePlotAccessor:
         color_scale: "ColorScale | None" = None,
         categorical_scale: "CategoricalScale | None" = None,
         default_color: str = "steelblue",
-        missing_color: str = "#bdbdbd",
+        missing_color: str | None = None,
         clip_fraction: float = 0.0,
         subset_by: str | None = None,
         groups: Sequence[Any] | None = None,

@@ -8,6 +8,7 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
+from ..storage.artifacts import ArtifactRef, inspect_artifact
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..matrix import ChunkedArray
 from ..utils.arrays import array_digest
@@ -52,14 +53,17 @@ def _prepare_marker_heatmap(
     assay_group = as_zarr_group(store.zw[assay.name], name=assay.name)
     if "markers" not in assay_group:
         raise KeyError("ERROR: Please run `run_marker_search` first")
-    slot_name = f"{cell_key}__{group_key}"
-    marker_root = as_zarr_group(assay_group["markers"], name="markers")
-    if slot_name not in marker_root:
+    try:
+        marker_slot = store._resolve_marker_group(
+            assay.name,
+            cell_key,
+            group_key,
+        )
+    except KeyError:
         raise KeyError(
             "ERROR: Please run `run_marker_search` first with "
             f"{group_key} as `group_key` and {cell_key} as `cell_key`"
-        )
-    marker_slot = as_zarr_group(marker_root[slot_name], name=slot_name)
+        ) from None
 
     feature_indices: list[int] = []
     marker_rows: list[dict[str, Any]] = []
@@ -780,16 +784,60 @@ def _prepare_pseudotime_heatmap(
         for values in (cell_index, feature_index, cell_ordering)
     ]
     location = f"aggregated_{cell_key}_{feat_key}_{pseudotime_key}"
-    if location not in assay.z:
-        raise KeyError(
-            "ERROR: Could not find aggregated feature values at location "
-            f"'{location}' Please make sure that you have run "
-            "`run_pseudotime_aggregation` with the same values for parameters: "
-            "`cell_key`, `feat_key` and `pseudotime_key`"
+    aggregation_group = None
+    artifact_backed = False
+    feature_data = as_zarr_group(assay.z["featureData"], name="featureData")
+    if feature_cluster_key in feature_data:
+        cluster_column = as_zarr_array(
+            feature_data[feature_cluster_key],
+            name=feature_cluster_key,
         )
-    aggregation_group = as_zarr_group(assay.z[location], name=location)
+        raw_ref = cluster_column.attrs.get("source_artifact")
+        if isinstance(raw_ref, dict):
+            try:
+                aggregation_ref = ArtifactRef.from_dict(raw_ref)
+                status = inspect_artifact(store.zw, aggregation_ref)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Feature cluster column has an invalid source artifact. "
+                    "Rerun run_pseudotime_aggregation"
+                ) from exc
+            source_value = cluster_column.attrs.get("source_value")
+            if (
+                aggregation_ref.kind != "pseudotime_aggregation"
+                or aggregation_ref.scope != "assay"
+                or aggregation_ref.assay != assay.name
+                or status.operation != "run_pseudotime_aggregation"
+                or not status.complete
+                or source_value != "cluster_values"
+                or "value_index" in cluster_column.attrs
+            ):
+                raise ValueError(
+                    "Feature cluster column is not linked to a complete "
+                    "pseudotime aggregation artifact for this assay"
+                )
+            aggregation_group = as_zarr_group(
+                store.zw[status.path],
+                name=status.path,
+            )
+            location = status.path
+            artifact_backed = True
+        elif raw_ref is not None:
+            raise ValueError(
+                "Feature cluster column has a malformed source artifact. "
+                "Rerun run_pseudotime_aggregation"
+            )
+    if aggregation_group is None:
+        if location not in assay.z:
+            raise KeyError(
+                "ERROR: Could not find aggregated feature values. "
+                "Please run `run_pseudotime_aggregation` with the same "
+                "`cell_key`, `feat_key`, and `pseudotime_key`"
+            )
+        aggregation_group = as_zarr_group(assay.z[location], name=location)
     if (
-        "hashes" not in aggregation_group.attrs
+        ("input_fingerprints" if artifact_backed else "hashes")
+        not in aggregation_group.attrs
         or "data" not in aggregation_group
         or "feature_indices" not in aggregation_group
         or "valid_features" not in aggregation_group
@@ -798,7 +846,8 @@ def _prepare_pseudotime_heatmap(
             f"Aggregated data at '{location}' is incomplete. "
             "Rerun run_pseudotime_aggregation before plotting"
         )
-    if hashes != cast(list[str], aggregation_group.attrs["hashes"]):
+    fingerprint_attr = "input_fingerprints" if artifact_backed else "hashes"
+    if hashes != cast(list[str], aggregation_group.attrs[fingerprint_attr]):
         raise ValueError(
             "ERROR: The values under one or more of these columns: `cell_key`, "
             "`feat_key` or/and `pseudotime_key have been updated after running "
@@ -832,24 +881,43 @@ def _prepare_pseudotime_heatmap(
         raise ValueError("Aggregated feature matrix contains non-finite values")
 
     all_feature_clusters = assay.feats.fetch_all(feature_cluster_key)
-    cached_cluster_label = aggregation_group.attrs.get("cluster_label")
-    cached_cluster_digest = aggregation_group.attrs.get("cluster_digest")
-    current_cluster_digest = array_digest(np.asarray(all_feature_clusters).astype(str))
-    if cached_cluster_label is None or cached_cluster_digest is None:
-        raise ValueError(
-            "Aggregated data has no completed feature-clustering provenance. "
-            "Rerun run_pseudotime_aggregation"
+    if artifact_backed:
+        if "cluster_values" not in aggregation_group:
+            raise ValueError(
+                "Aggregation artifact has no stored feature-cluster values"
+            )
+        stored_cluster_values = np.asarray(
+            as_zarr_array(
+                aggregation_group["cluster_values"],
+                name="cluster_values",
+            )[:]
         )
-    if cached_cluster_label != feature_cluster_key:
-        logger.warning(
-            f"Heatmap requested feature clusters '{feature_cluster_key}', but "
-            f"the aggregation cache was clustered as '{cached_cluster_label}'"
+        if not np.array_equal(stored_cluster_values, all_feature_clusters):
+            logger.warning(
+                f"Feature cluster column '{feature_cluster_key}' changed after "
+                "aggregation and may be stale"
+            )
+    else:
+        cached_cluster_label = aggregation_group.attrs.get("cluster_label")
+        cached_cluster_digest = aggregation_group.attrs.get("cluster_digest")
+        current_cluster_digest = array_digest(
+            np.asarray(all_feature_clusters).astype(str)
         )
-    if cached_cluster_digest != current_cluster_digest:
-        logger.warning(
-            f"Feature cluster column '{feature_cluster_key}' changed after "
-            "aggregation and may be stale"
-        )
+        if cached_cluster_label is None or cached_cluster_digest is None:
+            raise ValueError(
+                "Aggregated data has no completed feature-clustering provenance. "
+                "Rerun run_pseudotime_aggregation"
+            )
+        if cached_cluster_label != feature_cluster_key:
+            logger.warning(
+                f"Heatmap requested feature clusters '{feature_cluster_key}', but "
+                f"the aggregation cache was clustered as '{cached_cluster_label}'"
+            )
+        if cached_cluster_digest != current_cluster_digest:
+            logger.warning(
+                f"Feature cluster column '{feature_cluster_key}' changed after "
+                "aggregation and may be stale"
+            )
 
     feature_clusters = np.asarray(all_feature_clusters)[feature_indices]
     feature_labels = np.asarray(assay.feats.fetch_all("names"))[feature_indices]

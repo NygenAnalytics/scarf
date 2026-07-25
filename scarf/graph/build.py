@@ -1,17 +1,10 @@
-"""Coarse graph-build plan and stage result types.
-
-These are plain holders for orchestration in ``make_graph``. They do not
-compute, write Zarr groups, or own AnnStream internals.
-"""
+"""Graph-build plan types used by ``make_graph``."""
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import pandas as pd
-
-from .paths import AssayGraphPaths
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,8 +13,6 @@ class GraphDataInputs:
     from_assay: str
     cell_key: str
     feat_key: str
-    pca_cell_key: str
-    batches: pd.DataFrame | None
     custom_loadings: np.ndarray | None
 
 
@@ -46,7 +37,6 @@ class ResolvedGraphParameters:
     harmonize: bool
     batch_columns: list[str] | None
     harmony_params: dict[str, Any] | None
-    harmony_contract_hash: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +50,7 @@ class GraphExecutionOptions:
     ann_index_saver: Callable | None
     local_cache: bool | str
     force_harmony_refit: bool
+    invalidate_cache: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,35 +58,3 @@ class GraphBuildPlan:
     data_inputs: GraphDataInputs
     parameters: ResolvedGraphParameters
     options: GraphExecutionOptions
-    paths: AssayGraphPaths
-
-
-@dataclass(frozen=True, slots=True)
-class NormalizedMatrix:
-    data: Any  # ChunkedArray
-
-
-@dataclass(frozen=True, slots=True)
-class FeatureMeansAndScales:
-    mu: np.ndarray
-    sigma: np.ndarray
-
-
-@dataclass(frozen=True, slots=True)
-class NearestNeighbors:
-    knn_group_path: str
-    recall: str | None
-    graph_already_complete: bool
-
-
-@dataclass(frozen=True, slots=True)
-class CellGraph:
-    cell_graph_group_path: str
-
-
-@dataclass(frozen=True, slots=True)
-class _GraphBuildOutcome:
-    plan: GraphBuildPlan
-    ann_stream: Any | None  # AnnStream | None
-    cell_graph_group_path: str
-    fresh_batch_correction: bool

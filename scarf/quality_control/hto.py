@@ -6,7 +6,11 @@ import pandas as pd
 __all__ = ["hto_demux"]
 
 
-def hto_demux(hto_counts: pd.DataFrame) -> pd.Series:
+def hto_demux(
+    hto_counts: pd.DataFrame,
+    *,
+    random_seed: int = 0,
+) -> pd.Series:
     """Assigns HTO identity to each cell based on the HTO count distribution.
     The algorithm is adapted from the Seurat package's HTOdemux function [Satija15]_.
 
@@ -20,6 +24,14 @@ def hto_demux(hto_counts: pd.DataFrame) -> pd.Series:
     from sklearn.cluster import KMeans
     from statsmodels.discrete.discrete_model import NegativeBinomial
 
+    if isinstance(random_seed, bool) or not isinstance(random_seed, int):
+        raise TypeError("random_seed must be an integer")
+    required_cells = hto_counts.shape[1] + 1
+    if hto_counts.shape[0] < required_cells:
+        raise ValueError(
+            f"HTO demultiplexing requires at least {required_cells} selected cells"
+        )
+
     def clr_normalize(df: pd.DataFrame) -> pd.DataFrame:
         f = np.exp(np.log1p(df).sum(axis=0) / len(df))
         return np.log1p(df / f)
@@ -29,7 +41,12 @@ def hto_demux(hto_counts: pd.DataFrame) -> pd.Series:
     ) -> np.ndarray:
         if n_centers is None:
             n_centers = df.shape[1] + 1
-        kmeans = KMeans(n_clusters=n_centers, init="random", n_init=n_starts)
+        kmeans = KMeans(
+            n_clusters=n_centers,
+            init="random",
+            n_init=n_starts,
+            random_state=random_seed,
+        )
         kmeans.fit(df)
         return np.asarray(kmeans.labels_)
 

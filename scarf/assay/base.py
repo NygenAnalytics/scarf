@@ -392,6 +392,7 @@ class Assay:
         renormalize_subset: bool,
         update_keys: bool,
         mirror: zarr.Array | None = None,
+        artifact_mode: bool = False,
     ) -> ChunkedArray:
         """Create a new zarr group and saves the normalized data in the group
         for the selected features only.
@@ -430,6 +431,35 @@ class Assay:
             "log_transform": log_transform,
             "renormalize_subset": renormalize_subset,
         }
+        if artifact_mode:
+            if location not in self.z:
+                raise KeyError(f"Artifact group does not exist at {location}")
+            if location + "/data" in self.z:
+                return ChunkedArray(
+                    as_zarr_array(
+                        self.z[location + "/data"],
+                        name=location + "/data",
+                    ),
+                    nthreads=self.nthreads,
+                )
+            vals = self.normed(
+                cell_idx,
+                feat_idx,
+                log_transform=log_transform,
+                renormalize_subset=renormalize_subset,
+            )
+            dask_to_zarr(
+                vals,
+                self.z,
+                location + "/data",
+                vals.chunksize,
+                self.nthreads,
+                mirror=mirror,
+            )
+            return ChunkedArray(
+                as_zarr_array(self.z[location + "/data"], name=location + "/data"),
+                nthreads=self.nthreads,
+            )
         if location in self.z:
             attrs = self.z[location].attrs
             if (
@@ -539,40 +569,27 @@ class Assay:
                     feat_idx[chunk],
                 )
 
-    def save_aggregated_ordering(
+    def _prepare_aggregated_ordering(
         self,
         cell_key: str,
         feat_key: str,
         ordering_key: str,
-        min_exp: float = 1e-3,
-        window_size: int = 200,
-        chunk_size: int = 50,
-        smoothen: bool = True,
-        z_scale: bool = True,
-        batch_size: int = 100,
-        **norm_params: Any,
-    ) -> tuple[ChunkedArray, NDArray[Any]]:
-        """Bin normalized expression along a cell ordering and cache the result.
-
-        Args:
-            cell_key: Boolean column in cell metadata selecting cells.
-            feat_key: Boolean column in feature metadata selecting features.
-            ordering_key: Cell metadata column with pseudotime or ordering values.
-            min_exp: Minimum mean expression to retain a feature.
-            window_size: Rolling window size for smoothing along ordering.
-            chunk_size: Number of ordering bins stored per feature row.
-            smoothen: Whether to apply rolling-window smoothing.
-            z_scale: Whether to z-scale values within each feature.
-            batch_size: Feature batch size for iteration.
-            **norm_params: Extra keyword arguments forwarded to ``normed``.
-
-        Returns:
-            None
-        """
-
-        from ..storage.arrays import create_zarr_dataset
-        from ..trajectory.feature_dynamics import aggregate_feature_profiles
-
+        *,
+        min_exp: float,
+        window_size: int,
+        chunk_size: int,
+        smoothen: bool,
+        z_scale: bool,
+        norm_params: dict[str, Any],
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        int,
+        int,
+        list[str],
+        dict[str, Any],
+    ]:
         cell_ordering = np.asarray(
             self.cells.fetch(ordering_key, key=cell_key),
             dtype=float,
@@ -604,7 +621,6 @@ class Assay:
                 f"Reducing chunk_size from {chunk_size} to {effective_bins} "
                 "for the selected cell count"
             )
-
         hashes = [array_digest(x) for x in (cell_idx, feat_idx, cell_ordering)]
         params = {
             "min_exp": min_exp,
@@ -616,6 +632,153 @@ class Assay:
             "z_scale": z_scale,
             "norm_params": norm_params,
         }
+        return (
+            cell_ordering,
+            cell_idx,
+            feat_idx,
+            effective_window,
+            effective_bins,
+            hashes,
+            params,
+        )
+
+    def _write_aggregated_ordering_group(
+        self,
+        group: zarr.Group,
+        *,
+        cell_key: str,
+        feat_key: str,
+        cell_ordering: np.ndarray,
+        feat_idx: np.ndarray,
+        min_exp: float,
+        effective_window: int,
+        effective_bins: int,
+        smoothen: bool,
+        z_scale: bool,
+        batch_size: int,
+        norm_params: dict[str, Any],
+    ) -> tuple[ChunkedArray, np.ndarray, np.ndarray]:
+        from ..storage.arrays import create_zarr_dataset
+        from ..trajectory.feature_dynamics import aggregate_feature_profiles
+
+        data_array = create_zarr_dataset(
+            group,
+            "data",
+            (batch_size,),
+            "float64",
+            (feat_idx.shape[0], effective_bins),
+        )
+        ordering_idx = np.argsort(cell_ordering, kind="stable")
+        stored_feat_idx: list[int] = []
+        valid_feat_flags: list[bool] = []
+        offset = 0
+        for item in self.iter_normed_feature_wise(
+            cell_key,
+            feat_key,
+            batch_size,
+            "Binning over cell-ordering",
+            True,
+            **norm_params,
+        ):
+            frame = cast(pd.DataFrame, item)
+            stored_feat_idx.extend(list(frame.columns))
+            aggregated, valid_features = aggregate_feature_profiles(
+                frame.to_numpy(dtype=float),
+                ordering_idx,
+                np.asarray(frame.columns),
+                min_expression=min_exp,
+                window_size=effective_window,
+                n_bins=effective_bins,
+                smooth=smoothen,
+                z_scale=z_scale,
+            )
+            valid_feat_flags.extend(valid_features.tolist())
+            data_array[offset : offset + aggregated.shape[0]] = aggregated
+            offset += aggregated.shape[0]
+
+        feature_indices = np.asarray(stored_feat_idx, dtype=np.uint64)
+        valid = np.asarray(valid_feat_flags, dtype=bool)
+        feature_array = create_zarr_dataset(
+            group,
+            "feature_indices",
+            (max(len(feature_indices), 1),),
+            "uint64",
+            (len(feature_indices),),
+        )
+        feature_array[:] = feature_indices
+        valid_array = create_zarr_dataset(
+            group,
+            "valid_features",
+            (max(len(valid), 1),),
+            "bool",
+            (len(valid),),
+        )
+        valid_array[:] = valid
+        return (
+            ChunkedArray(data_array, nthreads=self.nthreads),
+            feature_indices,
+            valid,
+        )
+
+    def save_aggregated_ordering(
+        self,
+        cell_key: str,
+        feat_key: str,
+        ordering_key: str,
+        min_exp: float = 1e-3,
+        window_size: int = 200,
+        chunk_size: int = 50,
+        smoothen: bool = True,
+        z_scale: bool = True,
+        batch_size: int = 100,
+        **norm_params: Any,
+    ) -> tuple[ChunkedArray, NDArray[Any]]:
+        """Bin normalized expression along a cell ordering and cache the result.
+
+        Args:
+            cell_key: Boolean column in cell metadata selecting cells.
+            feat_key: Boolean column in feature metadata selecting features.
+            ordering_key: Cell metadata column with pseudotime or ordering values.
+            min_exp: Minimum mean expression to retain a feature.
+            window_size: Rolling window size for smoothing along ordering.
+            chunk_size: Number of ordering bins stored per feature row.
+            smoothen: Whether to apply rolling-window smoothing.
+            z_scale: Whether to z-scale values within each feature.
+            batch_size: Feature batch size for iteration.
+            **norm_params: Extra keyword arguments forwarded to ``normed``.
+
+        Returns:
+            None
+        """
+        import warnings
+
+        warnings.warn(
+            "Assay.save_aggregated_ordering writes the legacy cache layout; "
+            "use DataStore.run_pseudotime_aggregation for artifact-backed persistence.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        (
+            cell_ordering,
+            _cell_idx,
+            feat_idx,
+            effective_window,
+            effective_bins,
+            hashes,
+            params,
+        ) = Assay._prepare_aggregated_ordering(
+            self,
+            cell_key,
+            feat_key,
+            ordering_key,
+            min_exp=min_exp,
+            window_size=window_size,
+            chunk_size=chunk_size,
+            smoothen=smoothen,
+            z_scale=z_scale,
+            norm_params=dict(norm_params),
+        )
         location = f"aggregated_{cell_key}_{feat_key}_{ordering_key}"
 
         def _cached_aggregation_valid() -> bool:
@@ -646,63 +809,24 @@ class Assay:
         else:
             if location in self.z:
                 del self.z[location]
-
-            # The actual size might be smaller due to dynamic filtering of features
-            g = create_zarr_dataset(
-                self.z,
-                location + "/data",
-                (batch_size,),
-                "float64",
-                (feat_idx.shape[0], effective_bins),
+            group = self.z.create_group(location)
+            Assay._write_aggregated_ordering_group(
+                self,
+                group,
+                cell_key=cell_key,
+                feat_key=feat_key,
+                cell_ordering=cell_ordering,
+                feat_idx=feat_idx,
+                min_exp=min_exp,
+                effective_window=effective_window,
+                effective_bins=effective_bins,
+                smoothen=smoothen,
+                z_scale=z_scale,
+                batch_size=batch_size,
+                norm_params=dict(norm_params),
             )
-            ordering_idx = np.argsort(cell_ordering, kind="stable")
-            stored_feat_idx: list[int] = []
-            valid_feat_flags: list[bool] = []
-            s = 0
-            for item in self.iter_normed_feature_wise(
-                cell_key,
-                feat_key,
-                batch_size,
-                "Binning over cell-ordering",
-                True,
-                **norm_params,
-            ):
-                df = cast(pd.DataFrame, item)
-                stored_feat_idx.extend(list(df.columns))
-                df_mean, valid_features = aggregate_feature_profiles(
-                    df.to_numpy(dtype=float),
-                    ordering_idx,
-                    np.asarray(df.columns),
-                    min_expression=min_exp,
-                    window_size=effective_window,
-                    n_bins=effective_bins,
-                    smooth=smoothen,
-                    z_scale=z_scale,
-                )
-                valid_feat_flags.extend(valid_features.tolist())
-                g[s : s + df_mean.shape[0]] = df_mean
-                s += df_mean.shape[0]
-
-            g = create_zarr_dataset(
-                self.z,
-                location + "/feature_indices",
-                (len(stored_feat_idx),),
-                "uint64",
-                (len(stored_feat_idx),),
-            )
-            g[:] = np.array(stored_feat_idx).astype(int)
-
-            g = create_zarr_dataset(
-                self.z,
-                location + "/valid_features",
-                (len(stored_feat_idx),),
-                "bool",
-                (len(stored_feat_idx),),
-            )
-            g[:] = np.array(valid_feat_flags).astype(int)
-
-            self.z[location].attrs["hashes"] = hashes
-            self.z[location].attrs["params"] = cast(Any, params)
+            group.attrs["hashes"] = hashes
+            group.attrs["params"] = cast(Any, params)
 
         ret_val1 = ChunkedArray(
             as_zarr_array(self.z[location + "/data"], name=location + "/data"),

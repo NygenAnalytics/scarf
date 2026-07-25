@@ -1,5 +1,6 @@
 import shutil
 import sys
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -13,6 +14,7 @@ from scarf.assay import ATACassay
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.graph.build import ResolvedGraphParameters
+from scarf.storage.artifacts import ArtifactRef, artifact_path, list_artifacts
 
 
 class _MemoryGraphStore(GraphDataStore):
@@ -175,8 +177,14 @@ def test_load_graph_option_matrix(
     np.testing.assert_allclose(graph.toarray(), expected)
 
 
-def test_load_graph_latest_location_formats_and_errors() -> None:
+def test_load_graph_latest_location_formats_and_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = _memory_graph_store()
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.validate_legacy_graph_selection",
+        lambda *_args, **_kwargs: None,
+    )
     graph_loc = _add_test_graph(store)
     normed_loc = "RNA/normed__I__I"
     reduction_loc = f"{normed_loc}/reduction__pca__2__I"
@@ -261,7 +269,6 @@ def test_resolve_graph_parameters_defaults_and_reduction_validation(
         harmonize=False,
         batch_columns=None,
         harmony_params=None,
-        harmony_contract_hash=None,
     )
 
     assert store._choose_reduction_method(store.RNA, "PCA") == "pca"
@@ -355,7 +362,6 @@ def test_resolve_graph_parameters_reuses_cached_hierarchy(
         harmonize=False,
         batch_columns=None,
         harmony_params=None,
-        harmony_contract_hash=None,
     )
 
 
@@ -392,7 +398,6 @@ def test_resolve_graph_parameters_uses_missing_metadata_fallbacks(
         harmonize=False,
         batch_columns=None,
         harmony_params=None,
-        harmony_contract_hash=None,
     )
 
     normed_loc = "RNA/normed__I__coveragePartial"
@@ -434,7 +439,6 @@ def test_resolve_graph_parameters_uses_missing_metadata_fallbacks(
         harmonize=False,
         batch_columns=None,
         harmony_params=None,
-        harmony_contract_hash=None,
     )
 
 
@@ -443,6 +447,10 @@ def test_latest_knn_and_ann_stream_cache_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = _memory_graph_store(["RNA"])
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.validate_legacy_graph_selection",
+        lambda *_args, **_kwargs: None,
+    )
     assay_group = store.zw.create_group("RNA")
     assay_group.attrs["latest_cell_key"] = "I"
     assay_group.attrs["latest_feat_key"] = "I"
@@ -581,7 +589,8 @@ def test_ann_index_resolution_and_persistence_paths(
         custom_only_loc, custom_index, ann_index_saver=custom_saver
     )
     custom_saver.assert_called_once_with(custom_index, custom_only_loc)
-    assert custom_only_loc not in store.zw
+    assert custom_only_loc in store.zw
+    save_index.assert_called_once_with(store.zw[custom_only_loc], custom_index)
 
     fallback_loc = "fallback/ann"
     failing_saver = Mock(side_effect=RuntimeError("save failed"))
@@ -660,10 +669,10 @@ def test_custom_ann_fetcher_precedes_and_falls_back_to_zarr(
             3,
             ann_index_fetcher=lambda _: str(custom_path),
         )
-        is custom_index
+        is zarr_index
     )
-    load_path.assert_called_once_with(str(custom_path), "l2", 3)
-    load_zarr.assert_not_called()
+    load_path.assert_not_called()
+    load_zarr.assert_called_once_with(ann_group, "l2", 3)
 
     failing_fetcher = Mock(side_effect=RuntimeError("fetch failed"))
     assert (
@@ -675,7 +684,8 @@ def test_custom_ann_fetcher_precedes_and_falls_back_to_zarr(
         )
         is zarr_index
     )
-    load_zarr.assert_called_once_with(ann_group, "l2", 3)
+    assert load_zarr.call_count == 2
+    failing_fetcher.assert_not_called()
 
 
 def test_legacy_ann_load_does_not_create_zarr_bytes(
@@ -706,87 +716,6 @@ def test_legacy_ann_load_does_not_create_zarr_bytes(
     np.testing.assert_allclose(actual_distances, expected_distances)
     assert "ann_idx_bytes" not in ann_group
     assert dict(ann_group.attrs) == before_attrs
-
-
-def test_normalized_cache_validation_paths(
-    isolated_toy_datastore: DataStore,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    assay = isolated_toy_datastore.RNA
-    location = "coverageNormedCache"
-    group = assay.z.create_group(location)
-    cell_idx, feat_idx = assay._get_cell_feat_idx("I", "I")
-    subset_hash = assay._create_subset_hash(cell_idx, feat_idx)
-    subset_params = {
-        "log_transform": False,
-        "renormalize_subset": True,
-    }
-    group.attrs["subset_hash"] = subset_hash
-    group.attrs["subset_params"] = subset_params
-
-    assert (
-        GraphDataStore._normed_data_cached(assay, "I", "I", location, False, True)
-        is True
-    )
-    group.attrs["subset_params"] = {
-        "log_transform": True,
-        "renormalize_subset": True,
-    }
-    assert (
-        GraphDataStore._normed_data_cached(assay, "I", "I", location, False, True)
-        is False
-    )
-    del group.attrs["subset_hash"]
-    assert (
-        GraphDataStore._normed_data_cached(assay, "I", "I", location, False, True)
-        is False
-    )
-
-    missing_path = tmp_path / "missing.zarr"
-    assert (
-        GraphDataStore._staged_normed_cached(
-            str(missing_path), subset_hash, subset_params
-        )
-        is False
-    )
-
-    staged_path = tmp_path / "staged.zarr"
-    staged_root = zarr.open_group(str(staged_path), mode="w")
-    assert (
-        GraphDataStore._staged_normed_cached(
-            str(staged_path), subset_hash, subset_params
-        )
-        is False
-    )
-    staged = staged_root.create_array("data", data=np.eye(2))
-    staged.attrs["staged_subset_hash"] = subset_hash
-    staged.attrs["staged_subset_params"] = subset_params
-    staged.attrs["staged_complete"] = True
-    assert (
-        GraphDataStore._staged_normed_cached(
-            str(staged_path), subset_hash, subset_params
-        )
-        is True
-    )
-    staged.attrs["staged_complete"] = False
-    assert (
-        GraphDataStore._staged_normed_cached(
-            str(staged_path), subset_hash, subset_params
-        )
-        is False
-    )
-
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.zarr.open_group",
-        Mock(side_effect=RuntimeError("broken cache")),
-    )
-    assert (
-        GraphDataStore._staged_normed_cached(
-            str(staged_path), subset_hash, subset_params
-        )
-        is False
-    )
 
 
 def test_partial_normalization_statistics_cache_paths(
@@ -881,8 +810,15 @@ def test_get_imputed_creates_loads_and_reuses_operator() -> None:
 
     first = store.get_imputed(feature_name="gene", t=1)
     np.testing.assert_allclose(first, np.array([3.0, 2.5, 1.5]))
-    assert f"{graph_loc}/magic_1" in store.zw
-    assert store._cachedMagicOperatorLoc == f"{graph_loc}/magic_1"
+    diffusion_refs = list_artifacts(
+        store.zw,
+        scope="assay",
+        assay="RNA",
+        kind="diffusion_operator",
+    )
+    assert len(diffusion_refs) == 1
+    assert artifact_path(diffusion_refs[0]) in store.zw
+    assert store._cachedMagicOperatorLoc == diffusion_refs[0].artifact_id
     assert store._cachedMagicOperator is not None
     store.load_graph.assert_called_once_with(
         from_assay="RNA",
@@ -903,7 +839,7 @@ def test_get_imputed_creates_loads_and_reuses_operator() -> None:
     loaded = store.get_imputed(feature_name="gene", t=1, cache_operator=True)
     np.testing.assert_allclose(loaded, first)
     assert store._cachedMagicOperator is not None
-    assert store._cachedMagicOperatorLoc == f"{graph_loc}/magic_1"
+    assert store._cachedMagicOperatorLoc == diffusion_refs[0].artifact_id
 
     store._cachedMagicOperator = None
     store._cachedMagicOperatorLoc = None
@@ -914,7 +850,17 @@ def test_get_imputed_creates_loads_and_reuses_operator() -> None:
 
     squared = store.get_imputed(feature_name="gene", t=2, cache_operator=False)
     np.testing.assert_allclose(squared, np.array([2.0, 2.25, 2.75]))
-    assert f"{graph_loc}/magic_2" in store.zw
+    assert (
+        len(
+            list_artifacts(
+                store.zw,
+                scope="assay",
+                assay="RNA",
+                kind="diffusion_operator",
+            )
+        )
+        == 2
+    )
     assert store.load_graph.call_count == 2
     assert store._cachedMagicOperator is None
     assert store._cachedMagicOperatorLoc is None
@@ -938,12 +884,57 @@ def test_get_diffusion_operator_discards_stale_in_memory_cache() -> None:
     store.load_graph = Mock(side_effect=[first_graph, replacement_graph])
 
     first = store.get_diffusion_operator(t=1)
-    del store.zw[f"{graph_loc}/magic_1"]
+    first_ref = list_artifacts(
+        store.zw,
+        scope="assay",
+        assay="RNA",
+        kind="diffusion_operator",
+    )[0]
+    del store.zw[artifact_path(first_ref)]
     replacement = store.get_diffusion_operator(t=1)
 
     assert store.load_graph.call_count == 2
     assert replacement is not first
     np.testing.assert_allclose(replacement.toarray(), np.eye(3))
+
+
+def test_read_only_diffusion_operator_reuses_memory_cache() -> None:
+    store = _memory_graph_store()
+    graph_loc = _add_test_graph(store)
+    graph = csr_matrix(
+        np.array(
+            [
+                [0.0, 1.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+            ]
+        )
+    )
+    store.zarr_mode = "r"
+    store._get_latest_keys = Mock(return_value=("RNA", "I", "I"))
+    store.get_latest_graph_loc = Mock(return_value=graph_loc)
+    store.load_graph = Mock(return_value=graph)
+
+    first = store.get_diffusion_operator(t=1, cache_operator=True)
+    second = store.get_diffusion_operator(t=1, cache_operator=True)
+
+    assert second is first
+    assert store.load_graph.call_count == 1
+    assert store._cachedMagicOperatorLoc is not None
+    assert store._cachedMagicOperatorLoc.startswith("read_only:")
+
+    invalidated = store.get_diffusion_operator(
+        t=1,
+        cache_operator=True,
+        invalidate_cache=True,
+    )
+    assert invalidated is not first
+    assert store.load_graph.call_count == 2
+
+    store.get_diffusion_operator(t=1, cache_operator=False)
+    assert store.load_graph.call_count == 3
+    assert store._cachedMagicOperator is None
+    assert store._cachedMagicOperatorLoc is None
 
 
 def test_filter_cells_open_bounds_reset_and_boundaries(
@@ -1064,9 +1055,13 @@ def test_make_graph_harmony_input_validation(
         harmonize=True,
         batch_columns=None,
         harmony_params=None,
-        harmony_contract_hash=None,
     )
-    resolve_parameters = Mock(return_value=graph_params)
+    resolve_parameters = Mock(
+        side_effect=[
+            graph_params,
+            replace(graph_params, batch_columns="ids"),  # type: ignore[arg-type]
+        ]
+    )
     monkeypatch.setattr(store, "_resolve_graph_parameters", resolve_parameters)
 
     with pytest.raises(ValueError, match="no batches provided"):
@@ -1121,9 +1116,22 @@ def test_run_tsne_orchestration_and_error_paths(
     load_graph = Mock(return_value=graph)
     get_initial = Mock(return_value=initial)
     runner = Mock(return_value=embedding)
+    graph_loc = "RNA/coverage_tsne_graph"
+    graph_group = store.zw.create_group(graph_loc)
+    graph_coo = graph.tocoo()
+    graph_group.create_array(
+        "edges",
+        data=np.column_stack((graph_coo.row, graph_coo.col)).astype(np.uint64),
+    )
+    graph_group.create_array("weights", data=graph_coo.data)
     monkeypatch.setattr(store, "_get_latest_keys", latest_keys)
     monkeypatch.setattr(store, "load_graph", load_graph)
+    monkeypatch.setattr(store, "get_latest_graph_loc", Mock(return_value=graph_loc))
     monkeypatch.setattr(store, "_get_ini_embed", get_initial)
+    monkeypatch.setattr(
+        "scarf.datastore._operations.embeddings.validate_legacy_graph_selection",
+        Mock(),
+    )
     monkeypatch.setattr("scarf.embeddings.sgtsne.run_sgtsne", runner)
 
     store.run_tsne(
@@ -1143,6 +1151,20 @@ def test_run_tsne_orchestration_and_error_paths(
     assert first_call.kwargs["max_iter"] == 20
     np.testing.assert_allclose(store.cells.fetch("RNA_coverageTsne1"), embedding[0])
     np.testing.assert_allclose(store.cells.fetch("RNA_coverageTsne2"), embedding[1])
+    first_ref = ArtifactRef.from_dict(
+        store.zw["cellData/RNA_coverageTsne1"].attrs["source_artifact"]
+    )
+    assert first_ref.kind == "embedding"
+    assert (
+        ArtifactRef.from_dict(
+            store.zw["cellData/RNA_coverageTsne2"].attrs["source_artifact"]
+        )
+        == first_ref
+    )
+    np.testing.assert_allclose(
+        store.load_artifact(first_ref)["values"][:],
+        embedding.T,
+    )
 
     store.run_tsne(
         from_assay="RNA",
@@ -1151,6 +1173,7 @@ def test_run_tsne_orchestration_and_error_paths(
         ini_embed=initial,
         parallel=False,
         label="serialTsne",
+        invalidate_cache=True,
     )
     assert runner.call_args.kwargs["nthreads"] == 1
     assert runner.call_args.kwargs["parallel"] is False
@@ -1170,14 +1193,41 @@ def test_run_tsne_orchestration_and_error_paths(
     )
     assert runner.call_args.kwargs["nthreads"] == 2
 
-    latest_calls = latest_keys.call_count
+    runner_calls = runner.call_count
     monkeypatch.setattr(sys, "platform", "win32")
-    assert store.run_tsne() is None
-    assert latest_keys.call_count == latest_calls
+    assert (
+        store.run_tsne(
+            symmetric_graph=True,
+            graph_upper_only=True,
+            parallel=True,
+            nthreads=None,
+            max_iter=20,
+            label="cachedTsne",
+        )
+        is None
+    )
+    assert runner.call_count == runner_calls
+    np.testing.assert_allclose(
+        store.cells.fetch("RNA_cachedTsne1"),
+        embedding[0],
+    )
 
 
-def test_integrate_assays_snn_writes_and_overwrites_graph() -> None:
+def test_integrate_assays_snn_writes_and_overwrites_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = _memory_graph_store(["RNA", "ADT"])
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.validate_cell_selection_artifact",
+        lambda *_args, **_kwargs: None,
+    )
+    selection_ref = ArtifactRef(
+        scope="datastore",
+        kind="cell_selection",
+        artifact_id="a" * 64,
+    )
+    store._ensure_cell_selection = Mock(return_value=selection_ref)
+    store._graph_cell_selection = Mock(return_value=selection_ref)
     graphs = {
         "RNA": csr_matrix(
             np.array(
@@ -1200,6 +1250,14 @@ def test_integrate_assays_snn_writes_and_overwrites_graph() -> None:
     }
     load_graph = Mock(side_effect=lambda **kwargs: graphs[kwargs["from_assay"]])
     store.load_graph = load_graph
+    source_paths = {
+        assay: _add_test_graph(store, f"{assay}_source") for assay in graphs
+    }
+    store._get_latest_cell_key = Mock(return_value="I")
+    store._get_latest_feat_key = Mock(return_value="I")
+    store.get_latest_graph_loc = Mock(
+        side_effect=lambda assay, *_args: source_paths[assay]
+    )
 
     store.integrate_assays(
         assays=["RNA", "ADT"],
@@ -1214,19 +1272,20 @@ def test_integrate_assays_snn_writes_and_overwrites_graph() -> None:
         chunk_size=2,
     )
 
-    integrated_group = store.zw["integratedGraphs/joint"]
+    integrated_path = store._resolve_integrated_graph_path("joint")
+    integrated_group = store.zw[integrated_path]
     assert integrated_group.attrs["n_cells"] == 3
     assert integrated_group.attrs["n_neighbors"] == 2
     assert integrated_group["edges"].shape == (6, 2)
     assert integrated_group["weights"].shape == (6,)
-    assert load_graph.call_count == 4
+    assert load_graph.call_count == 2
 
     integrated = GraphDataStore.load_graph(
         store,
         from_assay="RNA",
         cell_key="I",
         feat_key="I",
-        graph_loc="integratedGraphs/joint",
+        graph_loc=integrated_path,
     )
     assert integrated.shape == (3, 3)
     np.testing.assert_array_equal(np.diff(integrated.indptr), [2, 2, 2])
@@ -1238,6 +1297,13 @@ def test_integrate_assays_snn_writes_and_overwrites_graph() -> None:
 
 def test_integrate_assays_validation_errors() -> None:
     store = _memory_graph_store(["RNA", "ADT"])
+    store._ensure_cell_selection = Mock(
+        return_value=ArtifactRef(
+            scope="datastore",
+            kind="cell_selection",
+            artifact_id="a" * 64,
+        )
+    )
     graph = csr_matrix(
         np.array(
             [
@@ -1248,6 +1314,10 @@ def test_integrate_assays_validation_errors() -> None:
         )
     )
     store.load_graph = Mock(return_value=graph)
+    source_path = _add_test_graph(store, "source")
+    store._get_latest_cell_key = Mock(return_value="I")
+    store._get_latest_feat_key = Mock(return_value="I")
+    store.get_latest_graph_loc = Mock(return_value=source_path)
 
     with pytest.raises(ValueError, match="missing was not found"):
         store.integrate_assays(

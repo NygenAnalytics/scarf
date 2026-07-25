@@ -22,7 +22,6 @@ _MOVED_SYMBOLS = {
     },
     "datastore.graph_datastore": {
         "EMBEDDING_CACHE_MAX_BYTES",
-        "_GraphBuildProgress",
         "_make_source_sink_vector",
         "_random_walk_laplacian_transpose",
         "_select_pseudotime_component",

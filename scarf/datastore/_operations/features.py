@@ -10,9 +10,30 @@ import zarr
 from numpy.typing import NDArray
 
 from ...storage.types import as_zarr_array, as_zarr_group
+from ...storage.artifact_writer import (
+    ArrayRequirement,
+    AttributeRequirement,
+    finish_artifact,
+    plan_artifact,
+    start_artifact,
+)
+from ...storage.artifacts import (
+    ArtifactRef,
+    ArtifactStatus,
+    artifact_path,
+    callable_identity,
+    inspect_artifact,
+)
+from ...storage.selections import resolve_selection_artifact
 from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
 from ...features.enrichment.results import EnrichmentResult
 from ...features.markers import resolve_marker_gene_batch_size, sort_marker_results
+from ...metadata.arguments import AucellArguments, MarkerTableArguments, WaggrArguments
+from ...metadata.artifacts import (
+    categorical_display,
+    feature_column_display,
+    link_feature_data_column,
+)
 from ...utils.arrays import array_digest
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
@@ -37,6 +58,8 @@ _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
 _ENRICHMENT_LAYOUT = "cells_by_sources"
 _ENRICHMENT_ACTIVE_SLOT = "_active_slot"
 _ENRICHMENT_RUN_PREFIX = "_run_"
+_ENRICHMENT_ARTIFACT_RESULTS = "artifact_results"
+_ENRICHMENT_LEGACY_ARTIFACTS = "artifacts"
 
 
 def _feature_column_chunk(assay: Assay, n_features: int) -> int:
@@ -168,88 +191,104 @@ def _resolve_enrichment_slot(
     )
 
 
-def _prepare_enrichment_slot(
+def _enrichment_artifact_entry(
     assay: Assay,
-    *,
     label: str,
-    execution_digest: str,
-    overwrite: bool,
-) -> tuple[zarr.Group, bool, str | None]:
+) -> tuple[ArtifactRef, str | None, str | None] | None:
+    if "enrichment" not in assay.z:
+        return None
+    enrichment_group = as_zarr_group(
+        assay.z["enrichment"],
+        name=f"{assay.name}/enrichment",
+    )
+    raw_results = enrichment_group.attrs.get(_ENRICHMENT_ARTIFACT_RESULTS)
+    if raw_results is not None:
+        if not isinstance(raw_results, dict):
+            raise ValueError("Enrichment artifact index is invalid")
+        raw_entry = raw_results.get(label)
+        if raw_entry is not None:
+            if not isinstance(raw_entry, dict):
+                raise ValueError(
+                    f"Enrichment label {label!r} has an invalid artifact entry"
+                )
+            raw_ref = raw_entry.get("artifact")
+            cell_key = raw_entry.get("cell_key")
+            feat_key = raw_entry.get("feat_key")
+            if (
+                not isinstance(raw_ref, dict)
+                or not isinstance(cell_key, str)
+                or not cell_key
+                or not isinstance(feat_key, str)
+                or not feat_key
+            ):
+                raise ValueError(
+                    f"Enrichment label {label!r} has invalid execution metadata"
+                )
+            return ArtifactRef.from_dict(raw_ref), cell_key, feat_key
+    raw_artifacts = enrichment_group.attrs.get(_ENRICHMENT_LEGACY_ARTIFACTS)
+    if raw_artifacts is None:
+        return None
+    if not isinstance(raw_artifacts, dict):
+        raise ValueError("Enrichment artifact index is invalid")
+    raw_ref = raw_artifacts.get(label)
+    if raw_ref is None:
+        return None
+    if not isinstance(raw_ref, dict):
+        raise ValueError(f"Enrichment label {label!r} has an invalid artifact ref")
+    return ArtifactRef.from_dict(raw_ref), None, None
+
+
+def _enrichment_artifact_ref(
+    assay: Assay,
+    label: str,
+) -> ArtifactRef | None:
+    entry = _enrichment_artifact_entry(assay, label)
+    return None if entry is None else entry[0]
+
+
+def _legacy_enrichment_slot(
+    assay: Assay,
+    label: str,
+) -> zarr.Group | None:
+    if "enrichment" not in assay.z:
+        return None
+    enrichment_group = as_zarr_group(
+        assay.z["enrichment"],
+        name=f"{assay.name}/enrichment",
+    )
+    if label not in enrichment_group:
+        return None
+    label_group = as_zarr_group(
+        enrichment_group[label],
+        name=f"{assay.name}/enrichment/{label}",
+    )
+    return _resolve_enrichment_slot(label_group, label=label)
+
+
+def _publish_enrichment_artifact(
+    assay: Assay,
+    label: str,
+    ref: ArtifactRef,
+    *,
+    cell_key: str,
+    feat_key: str,
+) -> None:
     if "enrichment" not in assay.z:
         assay.z.create_group("enrichment")
     enrichment_group = as_zarr_group(
         assay.z["enrichment"],
         name=f"{assay.name}/enrichment",
     )
-    if label in enrichment_group:
-        label_group = as_zarr_group(
-            enrichment_group[label],
-            name=f"{assay.name}/enrichment/{label}",
-        )
-        existing = _resolve_enrichment_slot(label_group, label=label)
-        complete = existing.attrs.get("complete") is True
-        same_execution = (
-            str(existing.attrs.get("execution_digest", "")) == execution_digest
-        )
-        if complete and same_execution:
-            return existing, True, None
-        if complete and not overwrite:
-            method = existing.attrs.get("method", "unknown")
-            raise ValueError(
-                f"Enrichment label {label!r} already contains a different "
-                f"{method!r} execution; pass overwrite=True to replace it"
-            )
-        if complete:
-            pending_name = f"{_ENRICHMENT_RUN_PREFIX}{execution_digest}"
-            if pending_name in label_group:
-                del label_group[pending_name]
-            slot = label_group.create_group(pending_name)
-            slot.attrs["complete"] = False
-            return slot, False, pending_name
-        del enrichment_group[label]
-    slot = enrichment_group.create_group(label)
-    slot.attrs["complete"] = False
-    return slot, False, None
-
-
-def _commit_enrichment_slot(
-    assay: Assay,
-    *,
-    label: str,
-    pending_name: str | None,
-) -> None:
-    if pending_name is None:
-        return
-    enrichment_group = as_zarr_group(
-        assay.z["enrichment"],
-        name=f"{assay.name}/enrichment",
-    )
-    label_group = as_zarr_group(
-        enrichment_group[label],
-        name=f"{assay.name}/enrichment/{label}",
-    )
-    pending = as_zarr_group(
-        label_group[pending_name],
-        name=f"{assay.name}/enrichment/{label}/{pending_name}",
-    )
-    if pending.attrs.get("complete") is not True:
-        raise ValueError(f"Replacement enrichment slot {label!r} is incomplete")
-
-    label_group.attrs[_ENRICHMENT_ACTIVE_SLOT] = pending_name
-    try:
-        for name in tuple(label_group.array_keys()):
-            del label_group[name]
-        for name in tuple(label_group.group_keys()):
-            if name != pending_name:
-                del label_group[name]
-        for name in tuple(label_group.attrs):
-            if name != _ENRICHMENT_ACTIVE_SLOT:
-                del label_group.attrs[name]
-    except Exception as exc:
-        logger.warning(
-            f"Enrichment label {label!r} was replaced, but stale slot cleanup "
-            f"failed: {exc}"
-        )
+    raw_results = enrichment_group.attrs.get(_ENRICHMENT_ARTIFACT_RESULTS, {})
+    if not isinstance(raw_results, dict):
+        raise ValueError("Enrichment artifact index is invalid")
+    results = dict(raw_results)
+    results[label] = {
+        "artifact": ref.to_dict(),
+        "cell_key": cell_key,
+        "feat_key": feat_key,
+    }
+    enrichment_group.attrs[_ENRICHMENT_ARTIFACT_RESULTS] = results
 
 
 def _write_enrichment_slot(
@@ -358,40 +397,259 @@ def _write_enrichment_slot(
         raise
 
 
+def _enrichment_artifact_matches(
+    group: zarr.Group,
+    *,
+    attrs: dict[str, Any],
+    cell_index: np.ndarray,
+    matched_feature_index: np.ndarray,
+    source_names: np.ndarray,
+    source_sizes: np.ndarray,
+    rank_feature_index: np.ndarray | None,
+) -> bool:
+    for key, expected in attrs.items():
+        if key in {"cell_key", "complete", "feat_key"}:
+            continue
+        if group.attrs.get(key) != expected:
+            return False
+    try:
+        scores = as_zarr_array(group["scores"], name="scores")
+    except (KeyError, TypeError):
+        return False
+    if (
+        scores.ndim != 2
+        or scores.shape != (len(cell_index), len(source_names))
+        or np.dtype(scores.dtype) != np.dtype(np.float32)
+    ):
+        return False
+    expected_arrays = {
+        "cell_index": np.asarray(cell_index, dtype=np.int64),
+        "matched_feature_index": np.asarray(
+            matched_feature_index,
+            dtype=np.int64,
+        ),
+        "source_names": np.asarray(source_names).astype(str),
+        "source_sizes": np.asarray(source_sizes, dtype=np.int64),
+    }
+    if rank_feature_index is not None:
+        expected_arrays["rank_feature_index"] = np.asarray(
+            rank_feature_index,
+            dtype=np.int64,
+        )
+    try:
+        for name, expected in expected_arrays.items():
+            stored = np.asarray(as_zarr_array(group[name], name=name)[:])
+            if name == "source_names":
+                stored = stored.astype(str)
+            if not np.array_equal(stored, expected):
+                return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    if rank_feature_index is None and "rank_feature_index" in group:
+        return False
+    return True
+
+
+def _validate_enrichment_artifact_provenance(
+    root: zarr.Group,
+    assay: Assay,
+    status: ArtifactStatus,
+    group: zarr.Group,
+    method: str,
+    cell_key: str,
+    feat_key: str,
+) -> tuple[str, str]:
+    parameters = status.parameters or {}
+    inputs = status.inputs or {}
+    execution = status.execution_options or {}
+    expected_parameters: dict[str, Any] = {
+        "algorithm_version": group.attrs["algorithm_version"],
+        "tmin": group.attrs["tmin"],
+    }
+    if method == "waggr":
+        normalization_method = parameters.get("normalization_method")
+        if normalization_method != callable_identity(assay.normMethod):
+            raise ValueError("Enrichment artifact normalization provenance is invalid")
+        expected_parameters.update(
+            {
+                "log_transform": group.attrs["log_transform"],
+                "mode": group.attrs["waggr_mode"],
+                "size_factor": group.attrs["size_factor"],
+            }
+        )
+    else:
+        expected_parameters.update(
+            {
+                "n_up": group.attrs["n_up"],
+                "tie_seed": group.attrs["tie_seed"],
+            }
+        )
+    if any(parameters.get(key) != value for key, value in expected_parameters.items()):
+        raise ValueError("Enrichment artifact parameters do not match its metadata")
+    if inputs.get("network_digest") != group.attrs["network_digest"]:
+        raise ValueError(
+            "Enrichment artifact network input does not match its metadata"
+        )
+    if (
+        execution.get("cell_key") != group.attrs["cell_key"]
+        or execution.get("feat_key") != group.attrs["feat_key"]
+    ):
+        raise ValueError("Enrichment artifact selection keys do not match its metadata")
+
+    resolved_columns: dict[str, str] = {}
+    for (
+        input_name,
+        expected_kind,
+        expected_scope,
+        digest_name,
+        source_column,
+        metadata,
+    ) in (
+        (
+            "cell_selection",
+            "cell_selection",
+            "datastore",
+            "cell_digest",
+            cell_key,
+            assay.cells,
+        ),
+        (
+            "feature_selection",
+            "feature_selection",
+            "assay",
+            "feature_digest",
+            feat_key,
+            assay.feats,
+        ),
+    ):
+        raw_ref = inputs.get(input_name)
+        if not isinstance(raw_ref, dict):
+            raise ValueError(
+                f"Enrichment artifact is missing {input_name!r} provenance"
+            )
+        selection_ref = ArtifactRef.from_dict(raw_ref)
+        selection_status = inspect_artifact(root, selection_ref)
+        if (
+            selection_ref.kind != expected_kind
+            or selection_ref.scope != expected_scope
+            or (expected_scope == "assay" and selection_ref.assay != status.ref.assay)
+            or not selection_status.exists
+            or not selection_status.complete
+        ):
+            raise ValueError(f"Enrichment artifact has an invalid {input_name!r} input")
+        selection_group = as_zarr_group(
+            root[selection_status.path],
+            name=selection_status.path,
+        )
+        selection_values = np.asarray(
+            as_zarr_array(selection_group["values"], name="values")[:]
+        )
+        if selection_values.ndim != 1 or selection_values.dtype != np.dtype(bool):
+            raise ValueError(f"Enrichment artifact has malformed {input_name!r} values")
+        candidates = [source_column]
+        candidates.extend(
+            sorted(column for column in metadata.columns if column != source_column)
+        )
+        resolved_column = None
+        for candidate in candidates:
+            try:
+                current_values = np.asarray(metadata.fetch_all(candidate))
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (
+                current_values.ndim == 1
+                and current_values.dtype == np.dtype(bool)
+                and current_values.shape == selection_values.shape
+                and np.array_equal(current_values, selection_values)
+            ):
+                resolved_column = candidate
+                break
+        if resolved_column is None:
+            raise ValueError(
+                f"Enrichment selection column {source_column!r} "
+                "is unavailable and no equivalent column exists"
+            )
+        resolved_columns[input_name] = resolved_column
+        selected_index = np.flatnonzero(selection_values).astype(np.int64)
+        if array_digest(selected_index) != group.attrs[digest_name]:
+            raise ValueError(
+                f"Enrichment artifact {input_name!r} does not match its metadata"
+            )
+    return (
+        resolved_columns["cell_selection"],
+        resolved_columns["feature_selection"],
+    )
+
+
 def _load_enrichment_result(
     assay: Assay,
     *,
     label: str,
     sources: Sequence[str] | None,
+    artifact_root: zarr.Group | None = None,
 ) -> EnrichmentResult:
     from ...matrix import ChunkedArray
 
-    storage_path = f"{getattr(assay.z, 'path', assay.name)}/enrichment/{label}"
-    if "enrichment" not in assay.z:
-        raise KeyError(f"Enrichment label {label!r} was not found for {assay.name}")
-    enrichment_group = as_zarr_group(
-        assay.z["enrichment"],
-        name=f"{assay.name}/enrichment",
-    )
-    if label not in enrichment_group:
-        raise KeyError(f"Enrichment label {label!r} was not found for {assay.name}")
-    label_group = as_zarr_group(enrichment_group[label], name=storage_path)
-    slot = _resolve_enrichment_slot(label_group, label=label)
+    artifact_entry = _enrichment_artifact_entry(assay, label)
+    ref = None if artifact_entry is None else artifact_entry[0]
+    indexed_cell_key = None if artifact_entry is None else artifact_entry[1]
+    indexed_feat_key = None if artifact_entry is None else artifact_entry[2]
+    artifact_backed = ref is not None
+    artifact_operation: str | None = None
+    artifact_status: ArtifactStatus | None = None
+    resolved_cell_key: str | None = indexed_cell_key
+    resolved_feat_key: str | None = indexed_feat_key
+    if ref is not None:
+        if artifact_root is None:
+            raise ValueError("Artifact root is required for indexed enrichment")
+        status = inspect_artifact(artifact_root, ref)
+        artifact_status = status
+        if (
+            ref.kind != "enrichment_scores"
+            or ref.scope != "assay"
+            or ref.assay != assay.name
+            or not status.complete
+        ):
+            raise ValueError(f"Enrichment label {label!r} has an invalid artifact")
+        artifact_operation = status.operation
+        slot = as_zarr_group(
+            artifact_root[status.path],
+            name=status.path,
+        )
+        root_path = str(getattr(artifact_root, "path", "")).strip("/")
+        storage_path = f"{root_path}/{status.path}" if root_path else status.path
+    else:
+        storage_path = f"{getattr(assay.z, 'path', assay.name)}/enrichment/{label}"
+        if "enrichment" not in assay.z:
+            raise KeyError(f"Enrichment label {label!r} was not found for {assay.name}")
+        enrichment_group = as_zarr_group(
+            assay.z["enrichment"],
+            name=f"{assay.name}/enrichment",
+        )
+        if label not in enrichment_group:
+            raise KeyError(f"Enrichment label {label!r} was not found for {assay.name}")
+        label_group = as_zarr_group(enrichment_group[label], name=storage_path)
+        slot = _resolve_enrichment_slot(label_group, label=label)
     if slot.attrs.get("complete") is not True:
         raise ValueError(f"Enrichment slot {label!r} is incomplete")
     method = str(slot.attrs.get("method", ""))
     if method not in {"waggr", "aucell"}:
         raise ValueError(f"Enrichment slot {label!r} has an unknown method")
+    if artifact_backed and artifact_operation != f"run_{method}":
+        raise ValueError(
+            f"Enrichment label {label!r} has a mismatched artifact operation"
+        )
     required_attrs = {
         "algorithm_version",
         "cell_digest",
         "cell_key",
-        "execution_digest",
         "feature_digest",
         "feat_key",
         "network_digest",
         "tmin",
     }
+    if not artifact_backed:
+        required_attrs.add("execution_digest")
     if not required_attrs.issubset(slot.attrs):
         raise ValueError(f"Enrichment slot {label!r} is missing required metadata")
     method_attrs = (
@@ -417,7 +675,6 @@ def _load_enrichment_result(
         raise ValueError(f"Enrichment slot {label!r} has invalid tmin metadata")
     for digest_name in (
         "cell_digest",
-        "execution_digest",
         "feature_digest",
         "network_digest",
     ):
@@ -425,6 +682,12 @@ def _load_enrichment_result(
         if not isinstance(digest_value, str) or not digest_value:
             raise ValueError(
                 f"Enrichment slot {label!r} has invalid {digest_name} metadata"
+            )
+    if not artifact_backed:
+        execution_digest = slot.attrs["execution_digest"]
+        if not isinstance(execution_digest, str) or not execution_digest:
+            raise ValueError(
+                f"Enrichment slot {label!r} has invalid execution_digest metadata"
             )
     for key_name in ("cell_key", "feat_key"):
         key_value = slot.attrs[key_name]
@@ -458,6 +721,25 @@ def _load_enrichment_result(
         ):
             raise ValueError(f"AUCell slot {label!r} has invalid method metadata")
         stored_n_up = int(n_up)
+    if artifact_backed:
+        assert artifact_root is not None and artifact_status is not None
+        resolved_cell_key, resolved_feat_key = _validate_enrichment_artifact_provenance(
+            artifact_root,
+            assay,
+            artifact_status,
+            slot,
+            method,
+            (
+                indexed_cell_key
+                if indexed_cell_key is not None
+                else str(slot.attrs["cell_key"])
+            ),
+            (
+                indexed_feat_key
+                if indexed_feat_key is not None
+                else str(slot.attrs["feat_key"])
+            ),
+        )
 
     required_arrays = {
         "cell_index",
@@ -571,8 +853,16 @@ def _load_enrichment_result(
         label=label,
         storage_path=storage_path,
         assay=assay.name,
-        cell_key=str(slot.attrs["cell_key"]),
-        feature_key=str(slot.attrs["feat_key"]),
+        cell_key=(
+            resolved_cell_key
+            if resolved_cell_key is not None
+            else str(slot.attrs["cell_key"])
+        ),
+        feature_key=(
+            resolved_feat_key
+            if resolved_feat_key is not None
+            else str(slot.attrs["feat_key"])
+        ),
         method=method,
     )
 
@@ -592,6 +882,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         blacklist: str | None = None,
         blacklist_exclusions: str | None = None,
         blacklist_indexes: Sequence[int] | None = None,
+        invalidate_cache: bool = False,
     ) -> str:
         """Install a supplied HVG selection on an RNA assay."""
         assay = self._get_assay(from_assay)
@@ -600,7 +891,14 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "set_hvgs can only be applied to an RNAassay; "
                 f"received {type(assay).__name__}"
             )
-        return assay.set_hvgs(
+        expected_key = f"{cell_key}__{hvg_key_name}"
+        storage_backed = (
+            hasattr(self, "z") and hasattr(self, "cells") and hasattr(assay, "z")
+        )
+        preserved_display = (
+            feature_column_display(assay.z, expected_key) if storage_backed else None
+        )
+        stored_key = assay.set_hvgs(
             cell_key,
             mask=mask,
             feature_indexes=feature_indexes,
@@ -612,6 +910,49 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             blacklist_exclusions=blacklist_exclusions,
             blacklist_indexes=blacklist_indexes,
         )
+        if not storage_backed:
+            return stored_key
+        cell_selection = self._linked_cell_selection(cell_key)
+        if cell_selection is None:
+            cell_selection = self._record_cell_selection(
+                column=cell_key,
+                operation="manual_selection",
+                parameters={},
+                inputs={},
+            )
+        feature_selection = resolve_selection_artifact(
+            self.zw,
+            scope="assay",
+            assay=assay.name,
+            kind="feature_selection",
+            values=np.asarray(assay.feats.fetch_all(stored_key)),
+            row_ids=np.asarray(assay.feats.fetch_all("ids")),
+            operation="set_hvgs",
+            parameters={
+                "n_bins": n_bins,
+                "lowess_frac": lowess_frac,
+                "bin_strategy": bin_strategy,
+                "blacklist": blacklist,
+                "blacklist_exclusions": blacklist_exclusions,
+                "blacklist_indexes": list(blacklist_indexes)
+                if blacklist_indexes is not None
+                else None,
+            },
+            inputs={"cell_selection": cell_selection},
+            source_column=stored_key,
+            invalidate_cache=invalidate_cache,
+        )
+        link_feature_data_column(
+            assay.z,
+            stored_key,
+            feature_selection,
+            value_name="values",
+            default_display=categorical_display(
+                np.asarray(assay.feats.fetch_all(stored_key))
+            ),
+            preserved_display=preserved_display,
+        )
+        return stored_key
 
     def mark_hvgs(
         self,
@@ -631,6 +972,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         hvg_key_name: str = "hvgs",
         max_cells: float | None = None,
         bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
+        invalidate_cache: bool = False,
         **plot_kwargs: Any,
     ) -> None:
         """Identify and mark genes as highly variable genes (HVGs). This is a
@@ -693,6 +1035,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             max_cells_int: int | float = np.inf
         else:
             max_cells_int = int(max_cells)
+        stored_key = f"{cell_key}__{hvg_key_name}"
+        preserved_display = feature_column_display(
+            assay.z,
+            stored_key,
+        )
         assay.mark_hvgs(
             cell_key=cell_key,
             min_cells=min_cells,
@@ -711,6 +1058,50 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             show_plot=show_plot,
             **plot_kwargs,
         )
+        cell_selection = self._linked_cell_selection(cell_key)
+        if cell_selection is None:
+            cell_selection = self._record_cell_selection(
+                column=cell_key,
+                operation="manual_selection",
+                parameters={},
+                inputs={},
+            )
+        feature_selection = resolve_selection_artifact(
+            self.zw,
+            scope="assay",
+            assay=assay.name,
+            kind="feature_selection",
+            values=np.asarray(assay.feats.fetch_all(stored_key)),
+            row_ids=np.asarray(assay.feats.fetch_all("ids")),
+            operation="mark_hvgs",
+            parameters={
+                "min_cells": min_cells,
+                "max_cells": max_cells_int,
+                "top_n": top_n,
+                "min_var": min_var,
+                "max_var": max_var,
+                "min_mean": min_mean,
+                "max_mean": max_mean,
+                "n_bins": n_bins,
+                "lowess_frac": lowess_frac,
+                "blacklist": blacklist,
+                "keep_bounds": keep_bounds,
+                "bin_strategy": bin_strategy,
+            },
+            inputs={"cell_selection": cell_selection},
+            source_column=stored_key,
+            invalidate_cache=invalidate_cache,
+        )
+        link_feature_data_column(
+            assay.z,
+            stored_key,
+            feature_selection,
+            value_name="values",
+            default_display=categorical_display(
+                np.asarray(assay.feats.fetch_all(stored_key))
+            ),
+            preserved_display=preserved_display,
+        )
 
     def run_waggr(
         self,
@@ -724,6 +1115,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         tmin: int = 5,
         log_transform: bool = False,
         overwrite: bool = False,
+        invalidate_cache: bool = False,
     ) -> EnrichmentResult:
         """Score weighted gene sets from streamed normalized RNA counts.
 
@@ -822,7 +1214,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             "cell_digest": cell_digest,
             "cell_key": cell_key,
             "complete": False,
-            "execution_digest": execution,
             "feature_digest": feature_digest,
             "feat_key": feat_key,
             "layout": _ENRICHMENT_LAYOUT,
@@ -834,14 +1225,145 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             "tmin": tmin,
             "waggr_mode": mode,
         }
-        slot, cache_hit, pending_name = _prepare_enrichment_slot(
-            assay,
-            label=label,
-            execution_digest=execution,
-            overwrite=overwrite,
+        cell_selection = self._ensure_cell_selection(cell_key)
+        feature_values = np.asarray(assay.feats.fetch_all(feat_key), dtype=bool)
+        feature_selection = self._resolve_selection_input(
+            metadata_group=as_zarr_group(
+                assay.z["featureData"],
+                name="featureData",
+            ),
+            column=feat_key,
+            values=feature_values,
+            row_ids=np.asarray(assay.feats.fetch_all("ids")),
+            scope="assay",
+            kind="feature_selection",
+            assay=assay.name,
+            invalidate_cache=False,
         )
-        if cache_hit:
-            return _load_enrichment_result(assay, label=label, sources=None)
+        arguments = WaggrArguments(
+            cell_selection=cell_selection,
+            feature_selection=feature_selection,
+            network_digest=network.network_digest,
+            algorithm_version=WAGGR_ALGORITHM_VERSION,
+            mode=mode,
+            tmin=tmin,
+            log_transform=log_transform,
+            normalization_method=callable_identity(assay.normMethod),
+            size_factor=size_factor,
+            from_assay=assay.name,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            label=label,
+            overwrite=overwrite,
+            invalidate_cache=invalidate_cache,
+        )
+        record = arguments.to_record()
+        planned = plan_artifact(
+            self.zw,
+            scope="assay",
+            assay=assay.name,
+            kind=arguments.artifact_kind,
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            invalidate_cache=invalidate_cache,
+            required_arrays=(
+                ArrayRequirement(
+                    "scores",
+                    shape=(len(cell_index), len(network.source_names)),
+                    dtype_kind="f",
+                ),
+                ArrayRequirement(
+                    "cell_index",
+                    shape=(len(cell_index),),
+                    dtype_kind="i",
+                ),
+                ArrayRequirement("matched_feature_index", dtype_kind="i"),
+                ArrayRequirement(
+                    "source_names",
+                    shape=(len(network.source_names),),
+                ),
+                ArrayRequirement(
+                    "source_sizes",
+                    shape=(len(network.source_names),),
+                    dtype_kind="i",
+                ),
+            ),
+            required_attributes=(
+                "algorithm_version",
+                "method",
+                "network_digest",
+            ),
+            reuse_validator=lambda _ref, group: _enrichment_artifact_matches(
+                group,
+                attrs=attrs,
+                cell_index=cell_index,
+                matched_feature_index=network.matched_feature_index,
+                source_names=network.source_names,
+                source_sizes=network.source_sizes,
+                rank_feature_index=None,
+            ),
+        )
+        existing_ref = _enrichment_artifact_ref(assay, label)
+        legacy_slot = (
+            _legacy_enrichment_slot(assay, label) if existing_ref is None else None
+        )
+        if existing_ref is not None:
+            existing_status = inspect_artifact(self.zw, existing_ref)
+            if (
+                existing_ref.kind != "enrichment_scores"
+                or existing_ref.scope != "assay"
+                or existing_ref.assay != assay.name
+                or not existing_status.complete
+            ):
+                raise ValueError(f"Enrichment label {label!r} has an invalid artifact")
+            if existing_status.provenance != planned.provenance and not overwrite:
+                raise ValueError(
+                    f"Enrichment label {label!r} already contains a different "
+                    f"{existing_status.operation!r} execution; pass overwrite=True "
+                    "to replace it"
+                )
+        elif legacy_slot is not None:
+            same_legacy_execution = (
+                str(legacy_slot.attrs.get("execution_digest", "")) == execution
+            )
+            if (
+                legacy_slot.attrs.get("complete") is True
+                and same_legacy_execution
+                and not invalidate_cache
+            ):
+                return _load_enrichment_result(
+                    assay,
+                    label=label,
+                    sources=None,
+                    artifact_root=self.zw,
+                )
+            if (
+                legacy_slot.attrs.get("complete") is True
+                and not same_legacy_execution
+                and not overwrite
+            ):
+                method = legacy_slot.attrs.get("method", "unknown")
+                raise ValueError(
+                    f"Enrichment label {label!r} already contains a different "
+                    f"{method!r} execution; pass overwrite=True to replace it"
+                )
+        if planned.reused:
+            _publish_enrichment_artifact(
+                assay,
+                label,
+                planned.ref,
+                cell_key=cell_key,
+                feat_key=feat_key,
+            )
+            return _load_enrichment_result(
+                assay,
+                label=label,
+                sources=None,
+                artifact_root=self.zw,
+            )
+        slot = start_artifact(self.zw, planned)
 
         cell_scalars = np.asarray(
             assay.cells.fetch_all(f"{assay.name}_nCounts")[cell_index],
@@ -887,12 +1409,20 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             matched_feature_index=network.matched_feature_index,
             rank_feature_index=None,
         )
-        _commit_enrichment_slot(
+        finish_artifact(slot, planned)
+        _publish_enrichment_artifact(
+            assay,
+            label,
+            planned.ref,
+            cell_key=cell_key,
+            feat_key=feat_key,
+        )
+        return _load_enrichment_result(
             assay,
             label=label,
-            pending_name=pending_name,
+            sources=None,
+            artifact_root=self.zw,
         )
-        return _load_enrichment_result(assay, label=label, sources=None)
 
     def run_aucell(
         self,
@@ -906,6 +1436,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         n_up: int | None = None,
         tie_seed: int = 0,
         overwrite: bool = False,
+        invalidate_cache: bool = False,
     ) -> EnrichmentResult:
         """Score gene sets by recovery among each cell's top-ranked RNA features.
 
@@ -991,7 +1522,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             "cell_digest": cell_digest,
             "cell_key": cell_key,
             "complete": False,
-            "execution_digest": execution,
             "feature_digest": feature_digest,
             "feat_key": feat_key,
             "layout": _ENRICHMENT_LAYOUT,
@@ -1001,14 +1531,148 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             "tie_seed": tie_seed,
             "tmin": tmin,
         }
-        slot, cache_hit, pending_name = _prepare_enrichment_slot(
-            assay,
-            label=label,
-            execution_digest=execution,
-            overwrite=overwrite,
+        cell_selection = self._ensure_cell_selection(cell_key)
+        feature_values = np.asarray(assay.feats.fetch_all(feat_key), dtype=bool)
+        feature_selection = self._resolve_selection_input(
+            metadata_group=as_zarr_group(
+                assay.z["featureData"],
+                name="featureData",
+            ),
+            column=feat_key,
+            values=feature_values,
+            row_ids=np.asarray(assay.feats.fetch_all("ids")),
+            scope="assay",
+            kind="feature_selection",
+            assay=assay.name,
+            invalidate_cache=False,
         )
-        if cache_hit:
-            return _load_enrichment_result(assay, label=label, sources=None)
+        arguments = AucellArguments(
+            cell_selection=cell_selection,
+            feature_selection=feature_selection,
+            network_digest=network.network_digest,
+            algorithm_version=AUCELL_ALGORITHM_VERSION,
+            tmin=tmin,
+            n_up=resolved_n_up,
+            tie_seed=tie_seed,
+            from_assay=assay.name,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            label=label,
+            overwrite=overwrite,
+            invalidate_cache=invalidate_cache,
+        )
+        record = arguments.to_record()
+        planned = plan_artifact(
+            self.zw,
+            scope="assay",
+            assay=assay.name,
+            kind=arguments.artifact_kind,
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            invalidate_cache=invalidate_cache,
+            required_arrays=(
+                ArrayRequirement(
+                    "scores",
+                    shape=(len(cell_index), len(network.source_names)),
+                    dtype_kind="f",
+                ),
+                ArrayRequirement(
+                    "cell_index",
+                    shape=(len(cell_index),),
+                    dtype_kind="i",
+                ),
+                ArrayRequirement("matched_feature_index", dtype_kind="i"),
+                ArrayRequirement(
+                    "rank_feature_index",
+                    shape=(len(rank_feature_index),),
+                    dtype_kind="i",
+                ),
+                ArrayRequirement(
+                    "source_names",
+                    shape=(len(network.source_names),),
+                ),
+                ArrayRequirement(
+                    "source_sizes",
+                    shape=(len(network.source_names),),
+                    dtype_kind="i",
+                ),
+            ),
+            required_attributes=(
+                "algorithm_version",
+                "method",
+                "network_digest",
+            ),
+            reuse_validator=lambda _ref, group: _enrichment_artifact_matches(
+                group,
+                attrs=attrs,
+                cell_index=cell_index,
+                matched_feature_index=network.matched_feature_index,
+                source_names=network.source_names,
+                source_sizes=network.source_sizes,
+                rank_feature_index=rank_feature_index,
+            ),
+        )
+        existing_ref = _enrichment_artifact_ref(assay, label)
+        legacy_slot = (
+            _legacy_enrichment_slot(assay, label) if existing_ref is None else None
+        )
+        if existing_ref is not None:
+            existing_status = inspect_artifact(self.zw, existing_ref)
+            if (
+                existing_ref.kind != "enrichment_scores"
+                or existing_ref.scope != "assay"
+                or existing_ref.assay != assay.name
+                or not existing_status.complete
+            ):
+                raise ValueError(f"Enrichment label {label!r} has an invalid artifact")
+            if existing_status.provenance != planned.provenance and not overwrite:
+                raise ValueError(
+                    f"Enrichment label {label!r} already contains a different "
+                    f"{existing_status.operation!r} execution; pass overwrite=True "
+                    "to replace it"
+                )
+        elif legacy_slot is not None:
+            same_legacy_execution = (
+                str(legacy_slot.attrs.get("execution_digest", "")) == execution
+            )
+            if (
+                legacy_slot.attrs.get("complete") is True
+                and same_legacy_execution
+                and not invalidate_cache
+            ):
+                return _load_enrichment_result(
+                    assay,
+                    label=label,
+                    sources=None,
+                    artifact_root=self.zw,
+                )
+            if (
+                legacy_slot.attrs.get("complete") is True
+                and not same_legacy_execution
+                and not overwrite
+            ):
+                method = legacy_slot.attrs.get("method", "unknown")
+                raise ValueError(
+                    f"Enrichment label {label!r} already contains a different "
+                    f"{method!r} execution; pass overwrite=True to replace it"
+                )
+        if planned.reused:
+            _publish_enrichment_artifact(
+                assay,
+                label,
+                planned.ref,
+                cell_key=cell_key,
+                feat_key=feat_key,
+            )
+            return _load_enrichment_result(
+                assay,
+                label=label,
+                sources=None,
+                artifact_root=self.zw,
+            )
+        slot = start_artifact(self.zw, planned)
 
         raw = assay.rawData[:, feature_index][cell_index, :]
 
@@ -1056,12 +1720,20 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             )
         finally:
             numba.set_num_threads(previous_threads)
-        _commit_enrichment_slot(
+        finish_artifact(slot, planned)
+        _publish_enrichment_artifact(
+            assay,
+            label,
+            planned.ref,
+            cell_key=cell_key,
+            feat_key=feat_key,
+        )
+        return _load_enrichment_result(
             assay,
             label=label,
-            pending_name=pending_name,
+            sources=None,
+            artifact_root=self.zw,
         )
-        return _load_enrichment_result(assay, label=label, sources=None)
 
     def get_enrichment(
         self,
@@ -1085,7 +1757,12 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         assay = self._get_assay(from_assay)
         if not isinstance(assay, RNAassay):
             raise TypeError("Enrichment results are only available for an RNAassay")
-        return _load_enrichment_result(assay, label=label, sources=sources)
+        return _load_enrichment_result(
+            assay,
+            label=label,
+            sources=sources,
+            artifact_root=self.zw,
+        )
 
     def run_marker_search(
         self,
@@ -1096,6 +1773,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         gene_batch_size: int | None = None,
         n_threads: int | None = None,
         skip_save: bool = False,
+        invalidate_cache: bool = False,
         **norm_params: Any,
     ) -> dict[str, Any] | None:
         """Identifies group specific features for a given assay.
@@ -1133,6 +1811,14 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         if n_threads is None:
             n_threads = self.nthreads
         assay = self._get_assay(from_assay)
+        resolved_norm_params = {
+            **norm_params,
+            "log_transform": norm_params.get("log_transform", False),
+            "renormalize_subset": norm_params.get(
+                "renormalize_subset",
+                False,
+            ),
+        }
 
         n_features = len(assay.feats.active_index(feat_key))
         if gene_batch_size is None:
@@ -1151,6 +1837,100 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         if "markers" not in assay_grp:
             assay_grp.create_group("markers")
         markers_grp = as_zarr_group(assay_grp["markers"], name="markers")
+        planned = None
+        if not skip_save:
+            cell_selection = self._ensure_cell_selection(cell_key)
+            cluster_input = self._resolve_cell_data_provenance_input(
+                group_key,
+                cell_key=cell_key,
+            )
+            feature_values = np.asarray(
+                assay.feats.fetch_all(feat_key),
+                dtype=bool,
+            )
+            preserved_feature_display = feature_column_display(
+                assay.z,
+                feat_key,
+            )
+            feature_selection = resolve_selection_artifact(
+                self.zw,
+                scope="assay",
+                assay=from_assay,
+                kind="feature_selection",
+                values=feature_values,
+                row_ids=np.asarray(assay.feats.fetch_all("ids")),
+                operation="manual_selection",
+                parameters={},
+                inputs={},
+                source_column=feat_key,
+                invalidate_cache=False,
+            )
+            link_feature_data_column(
+                assay.z,
+                feat_key,
+                feature_selection,
+                value_name="values",
+                default_display=categorical_display(feature_values),
+                preserved_display=preserved_feature_display,
+            )
+            arguments = MarkerTableArguments(
+                cell_selection=cell_selection,
+                feature_selection=feature_selection,
+                clusters=cluster_input,
+                normalization=resolved_norm_params,
+                normalization_method=callable_identity(assay.normMethod),
+                size_factor=getattr(assay, "sf", None),
+                group_key=group_key,
+                cell_key=cell_key,
+                feat_key=feat_key,
+                gene_batch_size=gene_batch_size,
+                n_threads=n_threads,
+                invalidate_cache=invalidate_cache,
+            )
+            record = arguments.to_record()
+            planned = plan_artifact(
+                self.zw,
+                scope="assay",
+                assay=from_assay,
+                kind=arguments.artifact_kind,
+                operation=arguments.operation,
+                parameters=record.parameters,
+                inputs=record.inputs,
+                execution_options=record.execution_options,
+                invalidate_cache=invalidate_cache,
+                required_arrays=(
+                    ArrayRequirement(
+                        "feature_index",
+                        dtype_kind="i",
+                    ),
+                ),
+                required_attributes=(
+                    AttributeRequirement(
+                        "stat_columns",
+                        expected_types=(list, tuple),
+                    ),
+                ),
+            )
+
+            def select_marker_artifact(ref: ArtifactRef) -> None:
+                raw_artifacts = markers_grp.attrs.get(
+                    "artifacts",
+                    {},
+                )
+                if "artifacts" in markers_grp.attrs and not isinstance(
+                    raw_artifacts,
+                    dict,
+                ):
+                    raise RuntimeError("Marker artifact index is invalid")
+                artifacts = (
+                    dict(raw_artifacts) if isinstance(raw_artifacts, dict) else {}
+                )
+                artifacts[slot_name] = ref.to_dict()
+                markers_grp.attrs["artifacts"] = artifacts
+
+            if planned.reused:
+                select_marker_artifact(planned.ref)
+                return None
 
         markers = find_markers_by_rank(
             assay=assay,
@@ -1159,7 +1939,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             feat_key=feat_key,
             batch_size=gene_batch_size,
             n_threads=n_threads,
-            **norm_params,
+            **resolved_norm_params,
         )
 
         if skip_save:
@@ -1169,15 +1949,18 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         remote = is_remote_datastore(self.zarr_loc, self.z)
         t_save = time.perf_counter()
-        remote_slot = markers_grp.create_group(slot_name, overwrite=True)
+        assert planned is not None
+        remote_slot = start_artifact(self.zw, planned)
         workers = max(1, int(n_threads or self.nthreads))
         self._write_marker_slot(
             remote_slot,
             markers,
             workers=workers if remote else 1,
         )
+        finish_artifact(remote_slot, planned)
+        select_marker_artifact(planned.ref)
         logger.info(
-            f"Saved marker results to {assay.name}/markers/{slot_name} "
+            f"Saved marker results to {artifact_path(planned.ref)} "
             f"in {time.perf_counter() - t_save:.1f}s "
             f"({len(markers)} clusters)"
         )
@@ -1193,7 +1976,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         from ...storage.arrays import create_metadata_column
 
         feature_index = _shared_marker_feature_index(markers)
-        group.attrs["statColumns"] = list(_MARKER_STAT_COLUMNS)
+        group.attrs["stat_columns"] = list(_MARKER_STAT_COLUMNS)
         create_metadata_column(
             group,
             "feature_index",
@@ -1222,6 +2005,68 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 list(ex.map(write_cluster, items))
+
+    def _resolve_marker_group(
+        self,
+        from_assay: str | None,
+        cell_key: str,
+        group_key: str,
+    ) -> zarr.Group:
+        assay = self._get_assay(from_assay)
+        markers_group = as_zarr_group(
+            assay.z["markers"],
+            name="markers",
+        )
+        slot_name = f"{cell_key}__{group_key}"
+        raw_artifacts = markers_group.attrs.get("artifacts", {})
+        if "artifacts" in markers_group.attrs and not isinstance(
+            raw_artifacts,
+            dict,
+        ):
+            raise ValueError("Marker artifact index is invalid")
+        artifacts = dict(raw_artifacts) if isinstance(raw_artifacts, dict) else {}
+        raw_ref = artifacts.get(slot_name)
+        if slot_name in artifacts and not isinstance(raw_ref, dict):
+            raise ValueError("Marker artifact index is invalid")
+        if isinstance(raw_ref, dict):
+            ref = ArtifactRef.from_dict(raw_ref)
+            if (
+                ref.kind != "marker_table"
+                or ref.scope != "assay"
+                or ref.assay != assay.name
+            ):
+                raise ValueError("Marker artifact ref is invalid")
+            status = self.inspect_artifact(ref)
+            if not status.complete:
+                raise ValueError("Marker artifact is incomplete")
+            inputs = status.inputs or {}
+            current_selection = self._ensure_cell_selection(cell_key)
+            stored_selection = inputs.get("cell_selection")
+            if not isinstance(stored_selection, dict) or not (
+                self._selection_artifacts_match(
+                    ArtifactRef.from_dict(stored_selection),
+                    current_selection,
+                )
+            ):
+                raise ValueError("Marker artifact cell selection is stale")
+            current_clusters = self._resolve_cell_data_provenance_input(
+                group_key,
+                cell_key=cell_key,
+            )
+            stored_clusters = inputs.get("clusters")
+            if (
+                stored_clusters != current_clusters
+                and stored_clusters != current_clusters["artifact"]
+            ):
+                raise ValueError("Marker artifact cluster labels are stale")
+            return as_zarr_group(
+                self.zw[artifact_path(ref)],
+                name=artifact_path(ref),
+            )
+        return as_zarr_group(
+            markers_group[slot_name],
+            name=slot_name,
+        )
 
     def get_markers(
         self,
@@ -1266,10 +2111,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             )
         assay = self._get_assay(from_assay)
         try:
-            markers_grp = as_zarr_group(assay.z["markers"], name="markers")
-            g = as_zarr_group(
-                markers_grp[f"{cell_key}__{group_key}"],
-                name=f"{cell_key}__{group_key}",
+            g = self._resolve_marker_group(
+                from_assay,
+                cell_key,
+                group_key,
             )
         except KeyError:
             raise KeyError(
@@ -1446,7 +2291,29 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         grouped_assay = self._get_assay(assay_label)
         grouped_assay.attrs["grouped_from_assay"] = assay.name
         grouped_assay.attrs["grouped_group_key"] = group_key
-        grouped_assay.attrs["grouped_group_digest"] = _group_assignment_digest(groups)
+        group_column = as_zarr_array(
+            as_zarr_group(assay.z["featureData"], name="featureData")[group_key],
+            name=group_key,
+        )
+        raw_source = group_column.attrs.get("source_artifact")
+        if isinstance(raw_source, dict):
+            try:
+                source_ref = ArtifactRef.from_dict(raw_source)
+                source_status = inspect_artifact(self.zw, source_ref)
+            except (KeyError, TypeError, ValueError):
+                source_ref = None
+            if source_ref is not None and source_status.complete:
+                grouped_assay.attrs["grouped_group_artifact"] = source_ref.to_dict()
+                if "grouped_group_digest" in grouped_assay.attrs:
+                    del grouped_assay.attrs["grouped_group_digest"]
+            else:
+                grouped_assay.attrs["grouped_group_digest"] = _group_assignment_digest(
+                    groups
+                )
+        else:
+            grouped_assay.attrs["grouped_group_digest"] = _group_assignment_digest(
+                groups
+            )
 
     def add_melded_assay(
         self,

@@ -137,14 +137,15 @@ class ColorScale:
     quantiles: tuple[float, float] | None = None
     missing_color: str = "#bdbdbd"
     scope: Literal["feature", "panel", "shared"] = "feature"
+    scale: Literal["linear", "log", "symlog"] = "linear"
 
     def __post_init__(self) -> None:
         if self.quantiles is not None:
             low, high = self.quantiles
             if not (0.0 <= low < high <= 1.0):
                 raise ValueError("quantiles must satisfy 0 <= low < high <= 1")
-        if self.vmin is not None and self.vmax is not None and self.vmax <= self.vmin:
-            raise ValueError("vmax must be greater than vmin")
+        if self.vmin is not None and self.vmax is not None and self.vmax < self.vmin:
+            raise ValueError("vmax must be greater than or equal to vmin")
         if (
             self.vcenter is not None
             and self.vmin is not None
@@ -154,6 +155,8 @@ class ColorScale:
             raise ValueError("vcenter must be strictly between vmin and vmax")
         if self.scope not in ("feature", "panel", "shared"):
             raise ValueError("scope must be 'feature', 'panel', or 'shared'")
+        if self.scale not in ("linear", "log", "symlog"):
+            raise ValueError("scale must be 'linear', 'log', or 'symlog'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +170,7 @@ class CategoricalScale:
 
     order: tuple[Any, ...] | None = None
     palette: dict[Any, str] | None = None
+    labels: dict[Any, str] | None = None
     missing_color: str = "#bdbdbd"
     missing_label: str = "NA"
 

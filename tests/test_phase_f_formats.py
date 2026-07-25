@@ -6,6 +6,7 @@ from zarr.storage import MemoryStore
 
 from scarf.assay.base import Assay
 from scarf.storage.ann_index import save_ann_index
+from scarf.storage.arrays import create_zarr_dataset
 
 
 def test_subset_hash_is_stable_string_digest() -> None:
@@ -57,4 +58,19 @@ def test_save_ann_index_writes_exact_zarr_bytes() -> None:
         group["ann_idx_bytes"][:],
         np.frombuffer(b"hnsw-bytes", dtype=np.uint8),
     )
-    assert group["ann_idx_bytes"].attrs["byteLength"] == len(b"hnsw-bytes")
+    assert group["ann_idx_bytes"].attrs["byte_length"] == len(b"hnsw-bytes")
+
+
+def test_empty_array_uses_nonzero_chunk_dimensions() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+
+    output = create_zarr_dataset(
+        root,
+        "empty_edges",
+        (1, 2),
+        np.int64,
+        (0, 2),
+    )
+
+    assert output.shape == (0, 2)
+    assert output.chunks == (1, 2)

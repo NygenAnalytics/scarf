@@ -6,7 +6,7 @@ import numpy as np
 
 from .models import QueryCorrection, SymphonyReferenceModel
 
-SYMPHONY_STYLE_VARIANT = "symphonyStyleV1"
+SYMPHONY_ALGORITHM = "symphony"
 
 
 def project_pca(values: np.ndarray, model: SymphonyReferenceModel) -> np.ndarray:

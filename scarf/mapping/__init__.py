@@ -15,7 +15,7 @@ from .hashing import array_hash, array_store_hash
 from .models import MappingResult, QueryCorrection, SymphonyReferenceModel
 from .reference import MappingReference
 from .symphony import (
-    SYMPHONY_STYLE_VARIANT,
+    SYMPHONY_ALGORITHM,
     accumulate_sufficient_statistics,
     apply_query_correction,
     initialize_sufficient_statistics,
@@ -33,7 +33,7 @@ __all__ = [
     "MappingReference",
     "MappingResult",
     "QueryCorrection",
-    "SYMPHONY_STYLE_VARIANT",
+    "SYMPHONY_ALGORITHM",
     "SymphonyReferenceModel",
     "accumulate_sufficient_statistics",
     "align_features",

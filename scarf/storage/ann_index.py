@@ -32,13 +32,7 @@ def save_ann_index(
     profile: StorageProfile | None = None,
 ) -> None:
     """Persist an hnswlib index as a chunked byte array."""
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        path = tmp.name
-    try:
-        ann_idx.save_index(path)
-        data = np.fromfile(path, dtype=np.uint8)
-    finally:
-        os.unlink(path)
+    data = serialize_ann_index(ann_idx)
 
     if name in group:
         del group[name]
@@ -56,7 +50,18 @@ def save_ann_index(
         ),
     )
     array[:] = data
-    array.attrs["byteLength"] = int(data.shape[0])
+    array.attrs["byte_length"] = int(data.shape[0])
+
+
+def serialize_ann_index(ann_idx: Any) -> np.ndarray:
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        path = tmp.name
+    try:
+        ann_idx.save_index(path)
+        data = np.fromfile(path, dtype=np.uint8)
+    finally:
+        os.unlink(path)
+    return data
 
 
 def load_ann_index(

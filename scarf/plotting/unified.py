@@ -150,6 +150,15 @@ def unified_embedding(
         order,
         palette=categorical_scale.palette if categorical_scale is not None else None,
     )
+    display_labels = categorical_scale.labels if categorical_scale is not None else None
+    resolved_missing_color = (
+        categorical_scale.missing_color
+        if categorical_scale is not None
+        else missing_color
+    )
+    resolved_missing_label = (
+        categorical_scale.missing_label if categorical_scale is not None else "NA"
+    )
 
     if seed is not None:
         rng = np.random.default_rng(seed)
@@ -190,11 +199,7 @@ def unified_embedding(
             sizes,
             order=order,
             palette=palette,
-            missing_color=(
-                categorical_scale.missing_color
-                if categorical_scale is not None
-                else missing_color
-            ),
+            missing_color=resolved_missing_color,
             edgecolor=edgecolor,
             edgewidth=edgewidth,
             rasterized=len(x) >= rasterize_threshold,
@@ -221,6 +226,7 @@ def unified_embedding(
                 y,
                 groups,
                 order=order,
+                labels=display_labels,
                 theme=theme,
             )
         elif resolved_legend == "right":
@@ -230,10 +236,11 @@ def unified_embedding(
                 mpl,
                 order=order,
                 palette=palette,
+                labels=display_labels,
                 label="cells",
                 missing=False,
-                missing_color=missing_color,
-                missing_label="NA",
+                missing_color=resolved_missing_color,
+                missing_label=resolved_missing_label,
                 edgecolor=edgecolor,
                 figure_level=owns,
             )
@@ -256,7 +263,9 @@ def unified_embedding(
             CategoricalScale(
                 order=tuple(order),
                 palette=dict(palette),
-                missing_color=missing_color,
+                labels=(dict(display_labels) if display_labels is not None else None),
+                missing_color=resolved_missing_color,
+                missing_label=resolved_missing_label,
             ),
         ),
         provenance=PlotProvenance(

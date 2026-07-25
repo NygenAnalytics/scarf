@@ -30,9 +30,6 @@ def _extract_zarr_fixture(tar_path: str, prefix: str) -> tuple[str, str]:
 
 
 def _datastore_tar_path() -> str:
-    analyzed = full_path("1K_pbmc_citeseq_analyzed.zarr.tar.gz")
-    if os.path.isfile(analyzed):
-        return analyzed
     return full_path("1K_pbmc_citeseq.zarr.tar.gz")
 
 
@@ -78,7 +75,10 @@ def datastore_zarr_root():
 def datastore(datastore_zarr_root):
     from scarf.datastore.datastore import DataStore
 
-    yield DataStore(datastore_zarr_root, default_assay="RNA")
+    temp_dir = tempfile.mkdtemp(prefix="scarf_session_working_1K_pbmc_")
+    shutil.copytree(datastore_zarr_root, temp_dir, dirs_exist_ok=True)
+    yield DataStore(temp_dir, default_assay="RNA")
+    remove(temp_dir)
 
 
 @pytest.fixture(scope="session")
@@ -117,10 +117,9 @@ def mark_hvgs(auto_filter_cells, datastore):
 def make_graph(mark_hvgs, datastore):
     if not _has_graph(datastore):
         datastore.make_graph(feat_key="hvgs")
-    graph_loc = datastore._get_latest_graph_loc(
-        from_assay="RNA", cell_key="I", feat_key="hvgs"
-    )
-    yield graph_loc.rsplit("/", 1)[0]
+    state = datastore.get_assay_state("RNA")
+    assert state is not None and state.neighbors is not None
+    yield datastore.inspect_artifact(state.neighbors).path
 
 
 @pytest.fixture(scope="session")
@@ -177,7 +176,11 @@ def pseudotime_scoring(datastore, leiden_clustering):
 
 @pytest.fixture(scope="session")
 def pseudotime_markers(datastore, pseudotime_scoring):
-    if "I__RNA_pseudotime__r" not in datastore.RNA.feats.columns:
+    marker_key = "I__RNA_pseudotime__r"
+    if (
+        marker_key not in datastore.RNA.feats.columns
+        or "source_artifact" not in datastore.RNA.z["featureData"][marker_key].attrs
+    ):
         datastore.run_pseudotime_marker_search(pseudotime_key="RNA_pseudotime")
     df = datastore.RNA.feats.to_pandas_dataframe(
         ["names", "I__RNA_pseudotime__r"], key="I"
@@ -237,7 +240,8 @@ def run_unified_umap(run_mapping, datastore):
 
 
 @pytest.fixture(scope="session")
-def cell_cycle_scoring(datastore):
+def cell_cycle_scoring(auto_filter_cells, datastore):
+    del auto_filter_cells
     if not _cell_has(datastore, "RNA_cell_cycle_phase"):
         datastore.run_cell_cycle_scoring()
     return datastore.cells.fetch("RNA_cell_cycle_phase")
@@ -277,7 +281,6 @@ def mark_prevalent_peaks(atac_datastore):
 @pytest.fixture(scope="session")
 def make_atac_graph(mark_prevalent_peaks, atac_datastore):
     atac_datastore.make_graph(feat_key="prevalent_peaks")
-    graph_loc = atac_datastore._get_latest_graph_loc(
-        from_assay="ATAC", cell_key="I", feat_key="prevalent_peaks"
-    )
-    yield graph_loc.rsplit("/", 1)[0]
+    state = atac_datastore.get_assay_state("ATAC")
+    assert state is not None and state.neighbors is not None
+    yield atac_datastore.inspect_artifact(state.neighbors).path

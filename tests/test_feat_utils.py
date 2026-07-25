@@ -327,8 +327,10 @@ def test_hto_demux_assigns_singlet_and_negative_labels():
 
     hto_counts = pd.DataFrame(counts, columns=hto_names)
     assignments = hto_demux(hto_counts)
+    repeated = hto_demux(hto_counts)
 
     assert len(assignments) == n_cells
+    pd.testing.assert_series_equal(assignments, repeated)
     assert assignments.index.equals(hto_counts.index)
     allowed = {"Negative", "Singlet", "Doublet", *hto_names}
     assert set(assignments.unique()).issubset(allowed)
@@ -343,4 +345,15 @@ def test_hto_demux_rejects_empty_cluster_means():
         }
     )
     with pytest.raises(AssertionError):
+        hto_demux(hto_counts)
+
+
+def test_hto_demux_rejects_too_few_cells():
+    hto_counts = pd.DataFrame(
+        {
+            "HTO_A": [1, 2],
+            "HTO_B": [2, 1],
+        }
+    )
+    with pytest.raises(ValueError, match="at least 3 selected cells"):
         hto_demux(hto_counts)

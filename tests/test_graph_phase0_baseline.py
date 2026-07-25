@@ -21,6 +21,16 @@ class _MemoryGraphStore(GraphDataStore):
         return self._assay_names
 
 
+@pytest.fixture(autouse=True)
+def _isolate_path_parser_tests_from_selection_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.validate_legacy_graph_selection",
+        lambda *_args, **_kwargs: None,
+    )
+
+
 def _memory_graph_store(
     *,
     workspace: str | None = None,

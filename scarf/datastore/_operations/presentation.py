@@ -9,11 +9,45 @@ from scipy.sparse import csr_matrix, vstack
 
 from ...graph.encoded_paths import (
     is_integrated_graph_path,
-    parse_assay_graph_paths,
     parse_assay_keys_from_nearest_neighbors_path,
 )
+from ...graph.paths import StoredAssayGraph
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...storage.arrays import create_zarr_dataset
+from ...storage.artifacts import (
+    ArtifactRef,
+    artifact_path,
+    fingerprint_strings,
+    fingerprint_stored_arrays,
+    inspect_artifact,
+    parse_artifact_path,
+)
+from ...storage.artifact_writer import (
+    ArrayRequirement,
+    finish_artifact,
+    plan_artifact,
+    reused_artifact_group,
+    start_artifact,
+)
+from ...graph.state import (
+    read_assay_state,
+    validate_legacy_graph_selection,
+    validate_normalized_artifact_selection,
+)
+from ...metadata.arguments import (
+    LisiArguments,
+    MembershipStrengthArguments,
+    SmartLabelArguments,
+)
+from ...metadata.artifacts import (
+    artifact_values,
+    categorical_display,
+    column_display,
+    continuous_display,
+    link_cell_data_column,
+    plan_cell_data_artifact,
+    write_cell_data_artifact,
+)
 from ...utils.logging import logger
 
 if TYPE_CHECKING:
@@ -23,6 +57,113 @@ else:
 
 
 class _PresentationOperationsMixin(_PresentationOperationsBase):
+    def _keys_from_knn_path(
+        self,
+        from_assay: str,
+        knn_loc: str,
+    ) -> tuple[str, str]:
+        try:
+            ref = parse_artifact_path(knn_loc)
+        except ValueError:
+            (
+                path_assay,
+                cell_key,
+                feat_key,
+            ) = parse_assay_keys_from_nearest_neighbors_path(knn_loc)
+            if path_assay != from_assay:
+                raise ValueError(
+                    f"KNN path belongs to assay {path_assay!r}, not {from_assay!r}"
+                )
+            validate_legacy_graph_selection(
+                self,
+                knn_loc,
+                from_assay,
+                cell_key,
+                feat_key,
+            )
+            return cell_key, feat_key
+        if ref.kind != "neighbors":
+            raise ValueError(f"Not a neighbors artifact: {knn_loc}")
+        if ref.scope != "assay" or ref.assay != from_assay:
+            raise ValueError(
+                f"KNN artifact belongs to assay {ref.assay!r}, not {from_assay!r}"
+            )
+        state = read_assay_state(self.zw, from_assay)
+
+        def require_artifact(
+            candidate: ArtifactRef,
+            expected_kind: str,
+        ) -> Any:
+            status = inspect_artifact(self.zw, candidate)
+            if (
+                candidate.kind != expected_kind
+                or candidate.scope != "assay"
+                or candidate.assay != from_assay
+                or not status.exists
+                or not status.complete
+            ):
+                raise ValueError(f"{expected_kind} artifact is incomplete or invalid")
+            return status
+
+        def input_ref(status: Any, owner_kind: str, name: str) -> ArtifactRef:
+            value = (status.inputs or {}).get(name)
+            if not isinstance(value, dict):
+                raise ValueError(f"{owner_kind} has no {name!r} input")
+            return ArtifactRef.from_dict(value)
+
+        neighbors_status = require_artifact(ref, "neighbors")
+        coordinates = input_ref(neighbors_status, "neighbors", "coordinates")
+        ann_index = input_ref(neighbors_status, "neighbors", "ann_index")
+        ann_status = require_artifact(ann_index, "ann_index")
+        ann_coordinates = input_ref(ann_status, "ann_index", "coordinates")
+        if ann_coordinates != coordinates:
+            raise ValueError(
+                "Neighbors and ANN artifacts reference different coordinates"
+            )
+        if coordinates.kind not in {"reduction", "batch_correction"}:
+            raise ValueError("Neighbors coordinates have an invalid artifact kind")
+        coordinates_status = require_artifact(coordinates, coordinates.kind)
+        reduction = (
+            input_ref(coordinates_status, "batch_correction", "reduction")
+            if coordinates.kind == "batch_correction"
+            else coordinates
+        )
+        reduction_status = require_artifact(reduction, "reduction")
+        normalized = input_ref(reduction_status, "reduction", "normalized")
+        normalized_status = require_artifact(normalized, "normalized")
+        selected_cell_key: object
+        selected_feature_key: object
+        if state is not None and state.neighbors == ref:
+            selected_cell_key = state.cell_key
+            selected_feature_key = state.feat_key
+        else:
+            normalized_execution = normalized_status.execution_options or {}
+            selected_cell_key = normalized_execution.get("cell_key")
+            selected_feature_key = normalized_execution.get("feat_key")
+        if not isinstance(selected_cell_key, str) or not isinstance(
+            selected_feature_key,
+            str,
+        ):
+            raise ValueError("Selection source columns are missing")
+        validate_normalized_artifact_selection(
+            self.zw,
+            normalized,
+            selected_cell_key,
+            selected_feature_key,
+        )
+        return selected_cell_key, selected_feature_key
+
+    @staticmethod
+    def _lisi_graph_label(
+        knn_loc: str,
+        neighbors_ref: ArtifactRef | None,
+    ) -> str:
+        if neighbors_ref is not None:
+            return neighbors_ref.artifact_id
+        leaf = knn_loc.rsplit("/", 1)[-1]
+        graph_id = fingerprint_strings(np.asarray([knn_loc], dtype=str))[:12]
+        return f"legacy_{leaf}_{graph_id}"
+
     def to_anndata(
         self,
         from_assay: str | None = None,
@@ -196,7 +337,12 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             print(f"  {key}: {array_info(as_zarr_array(node[key], name=key))}")
 
     def calc_membership_strength(
-        self, from_assay: str, cell_key: str, feat_key: str, clust_key: str
+        self,
+        from_assay: str,
+        cell_key: str,
+        feat_key: str,
+        clust_key: str,
+        invalidate_cache: bool = False,
     ) -> None:
         """Store per-cell cluster membership strength from the latest KNN graph.
 
@@ -216,16 +362,131 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             from_assay=from_assay, cell_key=cell_key, feat_key=feat_key
         )
         n_cells, k = self._get_graph_ncells_k(graph_loc=loc)
+        selection = self._ensure_cell_selection(cell_key)
+        try:
+            graph_ref = parse_artifact_path(loc)
+        except ValueError:
+            validate_legacy_graph_selection(
+                self,
+                loc,
+                from_assay,
+                cell_key,
+                feat_key,
+            )
+            legacy_group = as_zarr_group(self.zw[loc], name=loc)
+            graph_input: object = {
+                "legacy_graph_fingerprint": fingerprint_stored_arrays(
+                    legacy_group,
+                    ("edges", "weights"),
+                )
+            }
+        else:
+            graph_input = graph_ref
+            graph_selection = self._graph_cell_selection(graph_ref)
+            if not self._selection_artifacts_match(graph_selection, selection):
+                raise ValueError("cell_key does not match the graph cell selection")
+        cluster_input = self._resolve_cell_data_provenance_input(
+            clust_key,
+            cell_key=cell_key,
+        )
+        output_key = f"{from_assay}_{cell_key}_cluster_membership_strength"
+        arguments = MembershipStrengthArguments(
+            connectivity_map=graph_input,
+            clusters=cluster_input,
+            cell_selection=selection,
+            algorithm_version=2,
+            decimals=3,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            clust_key=clust_key,
+            output_key=output_key,
+            invalidate_cache=invalidate_cache,
+        )
+        record = arguments.to_record()
+        planned = plan_cell_data_artifact(
+            self.zw,
+            scope="assay",
+            assay=from_assay,
+            kind=arguments.artifact_kind,
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            cell_selection=selection,
+            arrays={"values": ((n_cells,), "f")},
+            invalidate_cache=invalidate_cache,
+        )
+        preserved_display = column_display(self.zw, output_key)
+        if planned.reused:
+            artifact_group = as_zarr_group(
+                self.zw[artifact_path(planned.ref)],
+                name=planned.ref.artifact_id,
+            )
+            values = artifact_values(artifact_group, "values")
+            self.cells.insert(
+                output_key,
+                values,
+                key=cell_key,
+                overwrite=True,
+            )
+            link_cell_data_column(
+                self.zw,
+                output_key,
+                planned.ref,
+                value_name="values",
+                default_display={
+                    **continuous_display(values),
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                },
+                preserved_display=preserved_display,
+            )
+            return None
         clusts = self.cells.fetch(clust_key, key=cell_key)
         graph_grp = as_zarr_group(self.zw[loc], name=loc)
         edges = np.asarray(as_zarr_array(graph_grp["edges"], name="edges")[:])
-        v = pd.DataFrame(clusts[edges[:, 1].reshape(k, n_cells)])
-        x = np.array([v[x].value_counts().index[0] for x in v])
+        if edges.shape != (n_cells * k, 2):
+            raise ValueError(
+                "Graph edges do not match the stored cell and k dimensions"
+            )
+        edge_rows = edges.reshape(n_cells, k, 2)
+        expected_sources = np.broadcast_to(
+            np.arange(n_cells, dtype=edge_rows.dtype)[:, None],
+            (n_cells, k),
+        )
+        if not np.array_equal(edge_rows[:, :, 0], expected_sources):
+            raise ValueError("Graph edges are not stored in cell-major order")
+        neighbor_clusters = np.asarray(clusts)[edge_rows[:, :, 1]]
+        values = np.asarray(
+            [
+                pd.Series(row).value_counts(dropna=False).iloc[0] / k
+                for row in neighbor_clusters
+            ],
+            dtype=np.float64,
+        ).round(3)
+        write_cell_data_artifact(
+            self.zw,
+            planned,
+            {"values": values},
+        )
         self.cells.insert(
-            f"{from_assay}_{cell_key}_cluster_membership_strength",
-            (np.array((v == x).sum().values) / k).round(3),
+            output_key,
+            values,
             key=cell_key,
             overwrite=True,
+        )
+        link_cell_data_column(
+            self.zw,
+            output_key,
+            planned.ref,
+            value_name="values",
+            default_display={
+                **continuous_display(values),
+                "minimum": 0.0,
+                "maximum": 1.0,
+            },
+            preserved_display=preserved_display,
         )
         return None
 
@@ -235,6 +496,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         base_label: str,
         cell_key: str = "I",
         new_col_name: str | None = None,
+        invalidate_cache: bool = False,
     ) -> None | list[str]:
         """A convenience function to relabel the values in a cell attribute
         column (A) based on the values in another cell attribute column (B).
@@ -255,9 +517,73 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
         Returns: None or a list of relabelled values
         """
+        values_to_relabel = np.asarray(self.cells.fetch(to_relabel, key=cell_key))
+        base_values = np.asarray(self.cells.fetch(base_label, key=cell_key))
+        if len(values_to_relabel) == 0:
+            if new_col_name is None:
+                return []
+            raise ValueError(f"cell_key {cell_key!r} selects no cells")
+        planned = None
+        preserved_display = None
+        if new_col_name is not None:
+            selection = self._ensure_cell_selection(cell_key)
+            arguments = SmartLabelArguments(
+                values=self._resolve_cell_data_provenance_input(
+                    to_relabel,
+                    cell_key=cell_key,
+                ),
+                base_labels=self._resolve_cell_data_provenance_input(
+                    base_label,
+                    cell_key=cell_key,
+                ),
+                cell_selection=selection,
+                algorithm_version=2,
+                suffix_style="lowercase_letter",
+                to_relabel=to_relabel,
+                base_label=base_label,
+                cell_key=cell_key,
+                new_col_name=new_col_name,
+                invalidate_cache=invalidate_cache,
+            )
+            record = arguments.to_record()
+            planned = plan_cell_data_artifact(
+                self.zw,
+                scope="datastore",
+                kind=arguments.artifact_kind,
+                operation=arguments.operation,
+                parameters=record.parameters,
+                inputs=record.inputs,
+                execution_options=record.execution_options,
+                cell_selection=selection,
+                arrays={"values": ((len(self.cells.active_index(cell_key)),), None)},
+                invalidate_cache=invalidate_cache,
+            )
+            preserved_display = column_display(self.zw, new_col_name)
+            if planned.reused:
+                artifact_group = as_zarr_group(
+                    self.zw[artifact_path(planned.ref)],
+                    name=planned.ref.artifact_id,
+                )
+                values = artifact_values(artifact_group, "values")
+                self.cells.insert(
+                    new_col_name,
+                    values,
+                    key=cell_key,
+                    overwrite=True,
+                )
+                link_cell_data_column(
+                    self.zw,
+                    new_col_name,
+                    planned.ref,
+                    value_name="values",
+                    default_display=categorical_display(values),
+                    preserved_display=preserved_display,
+                )
+                return None
+
         df = pd.crosstab(
-            self.cells.fetch(base_label, key=cell_key),
-            self.cells.fetch(to_relabel, key=cell_key),
+            base_values,
+            values_to_relabel,
         )
         normed_frac = df.divide(df.sum(axis=1), axis="index")
         idxmax = df.idxmax()
@@ -269,18 +595,228 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                 a = chr(ord("@") + n)
                 new_names[k] = f"{i}{a.lower()}"
 
-        missing_vals = list(set(df.index).difference(idxmax.unique()))
+        missing_vals = df.index.difference(
+            pd.Index(idxmax.unique()),
+            sort=False,
+        ).tolist()
         if len(missing_vals) > 0:
             miss_idxmax = df.loc[missing_vals].idxmax(axis=1).to_dict()
             for k, v in miss_idxmax.items():
                 new_names[v] = f"{new_names[v][:-1]}-{k}{new_names[v][-1]}"
 
-        ret_val = [new_names[x] for x in self.cells.fetch(to_relabel, key=cell_key)]
+        ret_val = [new_names[x] for x in values_to_relabel]
         if new_col_name is None:
             return ret_val
+        assert planned is not None
+        values = np.asarray(ret_val)
+        write_cell_data_artifact(
+            self.zw,
+            planned,
+            {"values": values},
+        )
+        self.cells.insert(
+            new_col_name,
+            values,
+            key=cell_key,
+            overwrite=True,
+        )
+        link_cell_data_column(
+            self.zw,
+            new_col_name,
+            planned.ref,
+            value_name="values",
+            default_display=categorical_display(values),
+            preserved_display=preserved_display,
+        )
+        return None
+
+    def _prepare_artifact_cluster_tree(
+        self,
+        *,
+        graph_ref: ArtifactRef | dict[str, Any],
+        graph_loc: str,
+        from_assay: str,
+        cell_key: str,
+        feat_key: str,
+        integrated_graph: str | None,
+        cluster_key: str,
+        fill_by_value: str | None,
+        invalidate_cache: bool,
+    ) -> dict[str, Any]:
+        from networkx import DiGraph, to_pandas_edgelist
+
+        from ...clustering.cluster_tree import CoalesceTree, make_digraph
+        from ...clustering.paris import hierarchy_to_dendrogram
+        from .paris_persistence import load_hierarchy_group
+
+        cell_data = as_zarr_group(self.zw["cellData"], name="cellData")
+        cluster_column = as_zarr_array(cell_data[cluster_key], name=cluster_key)
+        raw_cut_ref = cluster_column.attrs.get("source_artifact")
+        if not isinstance(raw_cut_ref, dict):
+            raise ValueError("Cluster column has no source artifact")
+        cut_ref = ArtifactRef.from_dict(raw_cut_ref)
+        cut_inputs = inspect_artifact(self.zw, cut_ref).inputs or {}
+        raw_graph_ref = cut_inputs.get("connectivity_map")
+        expected_graph_input = (
+            graph_ref.to_dict() if isinstance(graph_ref, ArtifactRef) else graph_ref
+        )
+        if raw_graph_ref != expected_graph_input:
+            raise ValueError("Cluster cut does not belong to the requested graph")
+        raw_hierarchy_ref = cut_inputs.get("cluster_hierarchy")
+        if not isinstance(raw_hierarchy_ref, dict):
+            raise ValueError("Cluster cut has no hierarchy input")
+        hierarchy_ref = ArtifactRef.from_dict(raw_hierarchy_ref)
+        hierarchy_group = as_zarr_group(
+            self.zw[inspect_artifact(self.zw, hierarchy_ref).path],
+            name=hierarchy_ref.artifact_id,
+        )
+        hierarchy, _plateau = load_hierarchy_group(
+            hierarchy_group,
+            hierarchy_ref.artifact_id,
+        )
+        dendrogram_plan = plan_artifact(
+            self.zw,
+            scope=hierarchy_ref.scope,
+            assay=hierarchy_ref.assay,
+            kind="dendrogram",
+            operation="materialize_paris_dendrogram",
+            parameters={"compatibility": True},
+            inputs={"cluster_hierarchy": hierarchy_ref},
+            execution_options={},
+            invalidate_cache=invalidate_cache,
+            required_arrays=(ArrayRequirement("data", dtype_kind="f"),),
+        )
+        if dendrogram_plan.reused:
+            dendrogram_group = reused_artifact_group(self.zw, dendrogram_plan)
         else:
-            self.cells.insert(new_col_name, ret_val, overwrite=True)
-            return None
+            dendrogram = hierarchy_to_dendrogram(hierarchy, compatibility=True)
+            dendrogram_group = start_artifact(self.zw, dendrogram_plan)
+            output = create_zarr_dataset(
+                dendrogram_group,
+                "data",
+                (min(max(dendrogram.shape[0], 1), 5000), 4),
+                "f8",
+                dendrogram.shape,
+            )
+            output[:] = dendrogram
+            finish_artifact(dendrogram_group, dendrogram_plan)
+        dendrogram = np.asarray(as_zarr_array(dendrogram_group["data"], name="data")[:])
+        cut_group = as_zarr_group(
+            self.zw[artifact_path(cut_ref)],
+            name=artifact_path(cut_ref),
+        )
+        clusters = np.asarray(as_zarr_array(cut_group["labels"], name="labels")[:])
+        coalesced_plan = plan_artifact(
+            self.zw,
+            scope=cut_ref.scope,
+            assay=cut_ref.assay,
+            kind="coalesced_tree",
+            operation="coalesce_cluster_tree",
+            parameters={},
+            inputs={
+                "dendrogram": dendrogram_plan.ref,
+                "cluster_cut": cut_ref,
+            },
+            execution_options={"cluster_key": cluster_key},
+            invalidate_cache=invalidate_cache,
+            required_arrays=(
+                ArrayRequirement("edgelist"),
+                ArrayRequirement("nodelist"),
+                ArrayRequirement("partition_id"),
+            ),
+        )
+        if coalesced_plan.reused:
+            coalesced_group = reused_artifact_group(self.zw, coalesced_plan)
+            subgraph = DiGraph()
+            subgraph.add_edges_from(
+                np.asarray(
+                    as_zarr_array(
+                        coalesced_group["edgelist"],
+                        name="edgelist",
+                    )[:]
+                )
+            )
+            nodelist = np.asarray(
+                as_zarr_array(coalesced_group["nodelist"], name="nodelist")[:]
+            )
+            partition_ids = np.asarray(
+                as_zarr_array(
+                    coalesced_group["partition_id"],
+                    name="partition_id",
+                )[:]
+            )
+            cluster_labels = {str(value): value for value in set(clusters)}
+            for node_data, partition_id in zip(
+                nodelist,
+                partition_ids,
+                strict=True,
+            ):
+                node = int(node_data[0])
+                subgraph.nodes[node]["nleaves"] = int(node_data[1])
+                if str(partition_id) != "-1":
+                    subgraph.nodes[node]["partition_id"] = cluster_labels.get(
+                        str(partition_id),
+                        partition_id,
+                    )
+        else:
+            subgraph = CoalesceTree(make_digraph(dendrogram), clusters)
+            edge_list = to_pandas_edgelist(subgraph).values
+            coalesced_group = start_artifact(self.zw, coalesced_plan)
+            edge_array = create_zarr_dataset(
+                coalesced_group,
+                "edgelist",
+                (100000,),
+                "u8",
+                edge_list.shape,
+            )
+            edge_array[:] = edge_list
+            node_list = []
+            partition_id_values = []
+            for node in subgraph.nodes():
+                node_data = subgraph.nodes[node]
+                node_list.append((node, node_data["nleaves"]))
+                partition_id_values.append(str(node_data.get("partition_id", -1)))
+            node_values = np.asarray(node_list)
+            node_array = create_zarr_dataset(
+                coalesced_group,
+                "nodelist",
+                (100000,),
+                node_values.dtype,
+                node_values.shape,
+            )
+            node_array[:] = node_values
+            partition_array = create_zarr_dataset(
+                coalesced_group,
+                "partition_id",
+                (100000,),
+                str,
+                (len(partition_id_values),),
+            )
+            partition_array[:] = partition_id_values
+            finish_artifact(coalesced_group, coalesced_plan)
+        color_values = (
+            self.get_cell_vals(
+                from_assay=from_assay,
+                cell_key=cell_key,
+                k=fill_by_value,
+            )
+            if fill_by_value is not None
+            else None
+        )
+        return {
+            "graph": subgraph,
+            "clusters": clusters,
+            "color_values": color_values,
+            "from_assay": from_assay,
+            "cell_key": cell_key,
+            "feat_key": feat_key,
+            "integrated_graph": integrated_graph,
+            "cluster_key": cluster_key,
+            "coalesced_location": inspect_artifact(
+                self.zw,
+                coalesced_plan.ref,
+            ).path,
+        }
 
     def _prepare_cluster_tree(
         self,
@@ -291,6 +827,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         integrated_graph: str | None = None,
         cluster_key: str | None = None,
         fill_by_value: str | None = None,
+        invalidate_cache: bool = False,
     ) -> dict[str, Any]:
         from networkx import DiGraph, to_pandas_edgelist
 
@@ -306,15 +843,60 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                 "ERROR: Please provide a value for `cluster_key` parameter"
             )
 
-        clusters = np.asarray(self.cells.fetch(cluster_key, key=cell_key))
         if integrated_graph is None:
             graph_loc = self.get_latest_graph_loc(from_assay, cell_key, feat_key)
         else:
-            graph_loc = f"{self._integratedGraphsLoc}/{integrated_graph}"
-            if graph_loc not in self.zw:
+            graph_loc = self._resolve_integrated_graph_path(integrated_graph)
+            if graph_loc is None:
                 raise KeyError(
                     f"An integrated graph with label {integrated_graph!r} does not exist"
                 )
+        cell_data = as_zarr_group(self.zw["cellData"], name="cellData")
+        cluster_column = as_zarr_array(cell_data[cluster_key], name=cluster_key)
+        raw_cut_ref = cluster_column.attrs.get("source_artifact")
+        if integrated_graph is None and isinstance(raw_cut_ref, dict):
+            cut_ref = ArtifactRef.from_dict(raw_cut_ref)
+            if cut_ref.kind == "cluster_cut":
+                cut_inputs = inspect_artifact(self.zw, cut_ref).inputs or {}
+                raw_graph_ref = cut_inputs.get("connectivity_map")
+                if isinstance(raw_graph_ref, dict):
+                    try:
+                        selected_graph_ref = ArtifactRef.from_dict(raw_graph_ref)
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                    else:
+                        graph_loc = artifact_path(selected_graph_ref)
+        try:
+            graph_ref: ArtifactRef | dict[str, str] | None = parse_artifact_path(
+                graph_loc
+            )
+        except ValueError:
+            if isinstance(raw_cut_ref, dict):
+                graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
+                graph_ref = {
+                    "legacy_graph_fingerprint": fingerprint_stored_arrays(
+                        graph_group,
+                        ("edges", "weights"),
+                    )
+                }
+            else:
+                graph_ref = None
+        if isinstance(raw_cut_ref, dict):
+            assert graph_ref is not None
+            return self._prepare_artifact_cluster_tree(
+                graph_ref=graph_ref,
+                graph_loc=graph_loc,
+                from_assay=from_assay,
+                cell_key=cell_key,
+                feat_key=feat_key,
+                integrated_graph=integrated_graph,
+                cluster_key=cluster_key,
+                fill_by_value=fill_by_value,
+                invalidate_cache=invalidate_cache,
+            )
+        if isinstance(graph_ref, ArtifactRef):
+            raise ValueError("Cluster column has no source artifact for this graph")
+        clusters = np.asarray(self.cells.fetch(cluster_key, key=cell_key))
         dendrogram_loc, generation_id = resolve_compatibility_dendrogram(
             self.zw,
             graph_loc,
@@ -471,7 +1053,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             resolved_knn_loc = knn_loc
             logger.info(f"Using the knn graph at location: {resolved_knn_loc}")
 
-        _, cell_key, _ = parse_assay_keys_from_nearest_neighbors_path(resolved_knn_loc)
+        cell_key, _ = self._keys_from_knn_path(from_assay, resolved_knn_loc)
         knn_grp = as_zarr_group(
             self.zw[resolved_knn_loc],
             name=resolved_knn_loc,
@@ -489,6 +1071,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         save_result: bool = False,
         return_lisi: bool = True,
         perplexity: float = 30,
+        invalidate_cache: bool = False,
     ) -> list[tuple[str, np.ndarray]] | None:
         """Calculate Local Inverse Simpson Index (LISI) scores for cell populations.
 
@@ -524,7 +1107,15 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             Higher scores indicate more mixing between different labels.
         """
 
+        if isinstance(label_colnames, str):
+            raise TypeError("label_colnames must be an iterable of column names")
         label_cols = list(label_colnames)
+        if not label_cols:
+            raise ValueError("label_colnames must be non-empty")
+        if not all(isinstance(column, str) for column in label_cols):
+            raise TypeError("label_colnames must contain only strings")
+        if len(set(label_cols)) != len(label_cols):
+            raise ValueError("label_colnames contains duplicate names")
         if from_assay is None:
             from_assay = self._load_default_assay()
 
@@ -540,11 +1131,100 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
             logger.info(f"Using the knn graph at location: {knn_loc}")
 
-        _, cell_key, _ = parse_assay_keys_from_nearest_neighbors_path(knn_loc)
+        cell_key, feat_key = self._keys_from_knn_path(from_assay, knn_loc)
         knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
+        try:
+            neighbors_ref = parse_artifact_path(knn_loc)
+        except ValueError:
+            neighbors_ref = None
 
         distances = as_zarr_array(knn_grp["distances"], name="distances")
         indices = as_zarr_array(knn_grp["indices"], name="indices")
+        planned = None
+        graph_label = self._lisi_graph_label(knn_loc, neighbors_ref)
+        output_columns = [f"lisi__{column}__{graph_label}" for column in label_cols]
+        preserved_displays: dict[str, dict[str, Any] | None] = {}
+        if save_result:
+            selection = self._ensure_cell_selection(cell_key)
+            neighbors_input: object
+            if neighbors_ref is None:
+                neighbors_input = {
+                    "legacy_neighbors_fingerprint": fingerprint_stored_arrays(
+                        knn_grp,
+                        ("indices", "distances"),
+                    )
+                }
+            else:
+                neighbors_input = neighbors_ref
+            label_inputs = tuple(
+                self._resolve_cell_data_provenance_input(
+                    column,
+                    cell_key=cell_key,
+                )
+                for column in label_cols
+            )
+            arguments = LisiArguments(
+                neighbors=neighbors_input,
+                labels=label_inputs,
+                cell_selection=selection,
+                algorithm_version=1,
+                perplexity=perplexity,
+                from_assay=from_assay,
+                cell_key=cell_key,
+                label_colnames=tuple(label_cols),
+                save_result=save_result,
+                return_lisi=return_lisi,
+                invalidate_cache=invalidate_cache,
+            )
+            record = arguments.to_record()
+            planned = plan_cell_data_artifact(
+                self.zw,
+                scope="assay",
+                assay=from_assay,
+                kind=arguments.artifact_kind,
+                operation=arguments.operation,
+                parameters=record.parameters,
+                inputs=record.inputs,
+                execution_options=record.execution_options,
+                cell_selection=selection,
+                arrays={
+                    "values": (
+                        (distances.shape[0], len(label_cols)),
+                        "f",
+                    )
+                },
+                invalidate_cache=invalidate_cache,
+            )
+            preserved_displays = {
+                column: column_display(self.zw, column) for column in output_columns
+            }
+            if planned.reused:
+                artifact_group = as_zarr_group(
+                    self.zw[artifact_path(planned.ref)],
+                    name=planned.ref.artifact_id,
+                )
+                lisi_scores = artifact_values(artifact_group, "values")
+                for index, (column, values) in enumerate(
+                    zip(output_columns, lisi_scores.T, strict=True)
+                ):
+                    self.cells.insert(
+                        column_name=column,
+                        values=values,
+                        overwrite=True,
+                        key=cell_key,
+                    )
+                    link_cell_data_column(
+                        self.zw,
+                        column,
+                        planned.ref,
+                        value_name="values",
+                        value_index=index,
+                        default_display=continuous_display(values),
+                        preserved_display=preserved_displays[column],
+                    )
+                if return_lisi:
+                    return list(zip(label_cols, lisi_scores.T, strict=True))
+                return None
 
         try:
             metadata = self.cells.to_pandas_dataframe(columns=label_cols + [cell_key])
@@ -565,14 +1245,30 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         )
         # lisi_scores Shape -> (n_cells, n_labels)
         if save_result:
-            for col, vals in zip(label_cols, lisi_scores.T):
-                col_name = f"lisi__{col}__{knn_loc.split('/')[-1]}"
+            assert planned is not None
+            write_cell_data_artifact(
+                self.zw,
+                planned,
+                {"values": lisi_scores},
+            )
+            for index, (col_name, vals) in enumerate(
+                zip(output_columns, lisi_scores.T, strict=True)
+            ):
                 self.cells.insert(
                     column_name=col_name, values=vals, overwrite=True, key=cell_key
                 )
+                link_cell_data_column(
+                    self.zw,
+                    col_name,
+                    planned.ref,
+                    value_name="values",
+                    value_index=index,
+                    default_display=continuous_display(vals),
+                    preserved_display=preserved_displays[col_name],
+                )
 
         if return_lisi:
-            return list(zip(label_cols, lisi_scores.T))
+            return list(zip(label_cols, lisi_scores.T, strict=True))
         else:
             return None
 
@@ -709,7 +1405,14 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
                 feat_key,
             )
         else:
-            if is_integrated_graph_path(graph_loc, self._integratedGraphsLoc):
+            try:
+                explicit_ref = parse_artifact_path(graph_loc)
+            except ValueError:
+                explicit_ref = None
+            if is_integrated_graph_path(
+                graph_loc,
+                self._integratedGraphsLoc,
+            ) or (explicit_ref is not None and explicit_ref.kind == "integrated_graph"):
                 raise ValueError(
                     "Integrated graph connectivity is unavailable because the "
                     "graph does not record its cell-key provenance"
@@ -717,12 +1420,9 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             if graph_loc not in self.zw:
                 raise ValueError(f"Could not find the graph at location: {graph_loc}")
 
-            try:
-                stored_graph = parse_assay_graph_paths(graph_loc)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Could not determine graph provenance from location: {graph_loc}"
-                ) from exc
+            stored_graph = self._lookup_stored_graph(graph_loc=graph_loc)
+            if not isinstance(stored_graph, StoredAssayGraph):
+                raise ValueError("Graph connectivity requires an assay graph")
 
             path_assay = stored_graph.from_assay
             path_cell_key = stored_graph.cell_key
@@ -803,9 +1503,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
         from ...metrics import silhouette_scoring
 
-        _, cell_key, feat_key_parsed = parse_assay_keys_from_nearest_neighbors_path(
-            knn_loc
-        )
+        cell_key, feat_key_parsed = self._keys_from_knn_path(from_assay, knn_loc)
         ann_obj = self._load_ann_stream(
             from_assay=from_assay,
             cell_key=cell_key,
@@ -813,7 +1511,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             knn_loc=knn_loc,
         )
 
-        knn_grp = as_zarr_group(self.z[knn_loc], name=knn_loc)
+        knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
         neighbor_indices = as_zarr_array(knn_grp["indices"], name="indices")
         neighbor_distances = as_zarr_array(knn_grp["distances"], name="distances")
         if ann_obj.harmonizedData is not None:
@@ -973,7 +1671,10 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         if lisi_result is None:
             raise RuntimeError("LISI computation did not return scores")
 
-        _, cell_key, _ = parse_assay_keys_from_nearest_neighbors_path(resolved_knn_loc)
+        cell_key, _ = self._keys_from_knn_path(
+            from_assay,
+            resolved_knn_loc,
+        )
         batch_labels = self.cells.fetch(label_colname, key=cell_key)
         return lisi_batch_mixing_score(lisi_result[0][1], batch_labels)
 

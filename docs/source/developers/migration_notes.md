@@ -221,8 +221,6 @@ focused paths:
 - `scarf.ann.EMBEDDING_CACHE_MAX_BYTES` and
   `scarf.datastore.graph_datastore.EMBEDDING_CACHE_MAX_BYTES` moved to
   `scarf.datastore._operations.graph.EMBEDDING_CACHE_MAX_BYTES`.
-- `scarf.datastore.graph_datastore._GraphBuildProgress` moved to
-  `scarf.datastore._operations.graph._GraphBuildProgress`.
 - Graph merging functions from `scarf.knn_utils` moved to
   `scarf.neighbors.graph`.
 - `scarf.knn_utils._is_umap_version_new` moved to

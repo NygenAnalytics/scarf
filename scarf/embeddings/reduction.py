@@ -91,7 +91,7 @@ def fit_lsi(
         list(data.stream_blocks(nthreads=nthreads, msg="Fitting LSI model"))
     )
     model = TruncatedSVD(
-        n_components=dims + 1,
+        n_components=dims + int(skip_first),
         random_state=random_state,
         **params,
     )

@@ -85,6 +85,7 @@ def test_frozen_master_store_is_v2_master_layout(frozen_master_store: str) -> No
 @pytest.mark.integration
 def test_frozen_master_graph_lookup_and_load(frozen_master_store: str) -> None:
     from scarf.datastore.datastore import DataStore
+    from scarf.graph.state import validate_legacy_graph_selection
 
     datastore = DataStore(frozen_master_store, default_assay=_ASSAY, zarr_mode="r")
 
@@ -116,6 +117,17 @@ def test_frozen_master_graph_lookup_and_load(frozen_master_store: str) -> None:
     )
     assert ann_stream.k == 11
     assert ann_stream.annIdx is not None
+    validate_legacy_graph_selection(
+        datastore,
+        _EXPECTED_KNN_LOC,
+        _ASSAY,
+        _CELL_KEY,
+        _FEAT_KEY,
+    )
+    assert datastore._keys_from_knn_path(_ASSAY, _EXPECTED_KNN_LOC) == (
+        _CELL_KEY,
+        _FEAT_KEY,
+    )
     graph_group = datastore.zw[_EXPECTED_GRAPH_LOC]
     assert (
         _array_digest(graph_group["edges"][:])
@@ -174,6 +186,7 @@ def test_frozen_master_legacy_dendrogram_triggers_hierarchy_rebuild(
     tmp_path,
 ) -> None:
     from scarf.datastore.datastore import DataStore
+    from scarf.storage.artifacts import list_artifacts
 
     working_copy = str(tmp_path / "data.zarr")
     shutil.copytree(frozen_master_store, working_copy)
@@ -184,19 +197,23 @@ def test_frozen_master_legacy_dendrogram_triggers_hierarchy_rebuild(
     datastore = DataStore(working_copy, default_assay=_ASSAY, zarr_mode="r+")
     assert hierarchy_root not in datastore.zw
 
-    with pytest.warns(UserWarning, match="predates canonical additive graphs"):
-        result = datastore.run_paris_clustering(
-            from_assay=_ASSAY,
-            cell_key=_CELL_KEY,
-            feat_key=_FEAT_KEY,
-            n_clusters=8,
-            label="frozen_paris",
-        )
+    result = datastore.run_paris_clustering(
+        from_assay=_ASSAY,
+        cell_key=_CELL_KEY,
+        feat_key=_FEAT_KEY,
+        n_clusters=8,
+        label="frozen_paris",
+    )
 
     labels = datastore.cells.fetch("RNA_frozen_paris")
     assert len(set(labels.tolist())) == 8
     np.testing.assert_array_equal(labels, result.labels)
-    # Recompute must have written a fresh generation under the current root.
-    generations = list(datastore.zw[hierarchy_root].group_keys())
-    assert len(generations) >= 1
-    assert result.hierarchy_generation_id in generations
+    # The released graph remains untouched; the new hierarchy is independent.
+    assert hierarchy_root not in datastore.zw
+    hierarchies = list_artifacts(
+        datastore.zw,
+        scope="assay",
+        assay=_ASSAY,
+        kind="cluster_hierarchy",
+    )
+    assert result.hierarchy_generation_id in {ref.artifact_id for ref in hierarchies}

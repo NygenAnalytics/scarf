@@ -106,7 +106,7 @@ def test_mapping_reference_roundtrip(tmp_path):
         reference.model.corrected_centroids, _model().corrected_centroids
     )
     np.testing.assert_allclose(reference.reference_distance_values, [0.1, 2.0])
-    assert reference.metadata["algorithmVariant"] == "symphonyStyleV1"
+    assert reference.metadata["algorithmVariant"] == "symphony"
 
     repeated_path = persist_mapping_reference(
         reduction,

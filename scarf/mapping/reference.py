@@ -42,6 +42,7 @@ class MappingReference:
         correction_method: str = "symphony",
         missing_feature_policy: str = "reference_mean",
         result_store: zarr.Group | None = None,
+        invalidate_cache: bool = False,
     ) -> MappingResult:
         """Map a query into the fixed reference coordinate system.
 
@@ -62,5 +63,6 @@ class MappingReference:
                 correction_method=correction_method,
                 missing_feature_policy=missing_feature_policy,
                 result_store=result_store,
+                invalidate_cache=invalidate_cache,
             ),
         )

@@ -1,15 +1,37 @@
 import numpy as np
 import zarr
 from collections.abc import Iterable
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
-from ..storage.types import ZarrMode, as_zarr_group
+from ..storage.artifacts import (
+    ArtifactRef,
+    ArtifactScope,
+    ArtifactStatus,
+    ValueFingerprintBuilder,
+    artifact_path,
+    canonical_bytes,
+    fingerprint_array,
+    fingerprint_strings,
+    inspect_artifact,
+    list_artifacts as list_artifact_refs,
+)
+from ..storage.types import ZarrMode, as_zarr_array, as_zarr_group
 from ..assay import RNAassay, ATACassay, ADTassay, Assay
 from ..metadata import MetaData
+from ..metadata.artifacts import (
+    artifact_values,
+    link_cell_data_column,
+    plan_cell_data_artifact,
+    write_cell_data_artifact,
+)
 from ..storage.schema import validate_assay_name
 from ..storage.stores import ZARRLOC, load_zarr
+from ..storage.selections import resolve_selection_artifact
 from ..utils.compute import controlled_compute, show_dask_progress
 from ..utils.logging import logger
+
+if TYPE_CHECKING:
+    from ..graph.state import AssayState
 
 
 def sanitize_hierarchy(z: zarr.Group, assay_name: str, workspace: str | None) -> bool:
@@ -125,6 +147,55 @@ class BaseDataStore:
         else:
             ret_val: zarr.Group = self.z[self.workspace]  # type: ignore
         return ret_val
+
+    def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus:
+        """Inspect a logical artifact without mutating the store."""
+        return inspect_artifact(self.zw, ref)
+
+    def load_artifact(self, ref: ArtifactRef) -> zarr.Group:
+        """Open a complete artifact through a read-only Zarr group."""
+        status = self.inspect_artifact(ref)
+        if not status.exists:
+            raise KeyError(f"Artifact does not exist: {status.path}")
+        if not status.complete:
+            raise RuntimeError(f"Artifact is incomplete: {status.path}")
+        workspace_path = str(getattr(self.zw, "path", "")).strip("/")
+        store_path = (
+            f"{workspace_path}/{status.path}" if workspace_path else status.path
+        )
+        return zarr.open_group(
+            store=self.zw.store,
+            path=store_path,
+            mode="r",
+        )
+
+    def get_assay_state(self, from_assay: str | None = None) -> "AssayState | None":
+        """Return the selected artifact state for one assay."""
+        from ..graph.state import read_assay_state
+
+        assay = from_assay or self._defaultAssay
+        if assay is None:
+            raise ValueError("No assay was provided and no default is configured")
+        return read_assay_state(self.zw, assay)
+
+    def list_artifacts(
+        self,
+        *,
+        kind: str | None = None,
+        from_assay: str | None = None,
+        scope: ArtifactScope = "assay",
+        complete_only: bool = False,
+    ) -> list[ArtifactRef]:
+        """List logical artifact references in one scope."""
+        if scope == "assay" and from_assay is None:
+            from_assay = self._defaultAssay
+        return list_artifact_refs(
+            self.zw,
+            scope=scope,
+            assay=from_assay,
+            kind=kind,
+            complete_only=complete_only,
+        )
 
     def _load_cells(self) -> MetaData:
         """This convenience function loads cellData level from the Zarr
@@ -331,6 +402,11 @@ class BaseDataStore:
         Returns:
             Name of the latest feature that was used to run `save_normalized_data`
         """
+        from ..graph.state import read_assay_state
+
+        state = read_assay_state(self.zw, from_assay)
+        if state is not None:
+            return state.feat_key
         assay = self._get_assay(from_assay)
         return cast(str, assay.attrs["latest_feat_key"])
 
@@ -344,8 +420,301 @@ class BaseDataStore:
         Returns:
             Name of the latest feature that was used to run `save_normalized_data`
         """
+        from ..graph.state import read_assay_state
+
+        state = read_assay_state(self.zw, from_assay)
+        if state is not None:
+            return state.cell_key
         assay = self._get_assay(from_assay)
         return cast(str, assay.attrs.get("latest_cell_key", "I"))
+
+    def _ensure_dataset_fingerprint(self, from_assay: str) -> str:
+        assay = self._get_assay(from_assay)
+        existing = assay.attrs.get("dataset_fingerprint")
+        if existing is not None:
+            return str(existing)
+        if self.zarr_mode != "r+":
+            raise PermissionError(
+                "dataset_fingerprint is missing and cannot be stored read-only"
+            )
+        fingerprint = self._calculate_dataset_fingerprint(from_assay)
+        assay.attrs["dataset_fingerprint"] = fingerprint
+        return fingerprint
+
+    def _calculate_dataset_fingerprint(self, from_assay: str) -> str:
+        assay = self._get_assay(from_assay)
+        builder = ValueFingerprintBuilder()
+        builder.update_bytes(
+            "dataset",
+            canonical_bytes(
+                {
+                    "assay": from_assay,
+                    "shape": list(assay.rawData.shape),
+                    "dtype": np.dtype(assay.rawData.dtype).str,
+                }
+            ),
+        )
+        builder.update_array(
+            "cell_ids",
+            np.asarray(self.cells.fetch_all("ids")).astype(str),
+        )
+        builder.update_array(
+            "feature_ids",
+            np.asarray(assay.feats.fetch_all("ids")).astype(str),
+        )
+        builder.update_array(
+            "cell_n_counts",
+            np.asarray(self.cells.fetch_all(f"{from_assay}_nCounts")),
+        )
+        builder.update_array(
+            "cell_n_features",
+            np.asarray(self.cells.fetch_all(f"{from_assay}_nFeatures")),
+        )
+        builder.update_array(
+            "feature_n_cells",
+            np.asarray(assay.feats.fetch_all("nCells")),
+        )
+        return builder.hexdigest()
+
+    def _record_cell_selection(
+        self,
+        *,
+        column: str,
+        operation: str,
+        parameters: dict[str, Any],
+        inputs: dict[str, Any],
+        invalidate_cache: bool = False,
+    ) -> ArtifactRef:
+        ref = resolve_selection_artifact(
+            self.zw,
+            scope="datastore",
+            kind="cell_selection",
+            values=np.asarray(self.cells.fetch_all(column)),
+            row_ids=np.asarray(self.cells.fetch_all("ids")),
+            operation=operation,
+            parameters=parameters,
+            inputs=inputs,
+            source_column=column,
+            invalidate_cache=invalidate_cache,
+        )
+        column_array = as_zarr_array(
+            as_zarr_group(self.zw["cellData"], name="cellData")[column],
+            name=column,
+        )
+        column_array.attrs["source_artifact"] = ref.to_dict()
+        column_array.attrs["source_value"] = "values"
+        return ref
+
+    def _linked_cell_selection(self, column: str) -> ArtifactRef | None:
+        cell_data = as_zarr_group(self.zw["cellData"], name="cellData")
+        column_array = as_zarr_array(cell_data[column], name=column)
+        raw_ref = column_array.attrs.get("source_artifact")
+        if not isinstance(raw_ref, dict):
+            return None
+        try:
+            ref = ArtifactRef.from_dict(raw_ref)
+            status = self.inspect_artifact(ref)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            ref.kind != "cell_selection"
+            or ref.scope != "datastore"
+            or not status.complete
+        ):
+            return None
+        inputs = status.inputs or {}
+        if inputs.get("ordered_row_ids_fingerprint") != fingerprint_strings(
+            np.asarray(self.cells.fetch_all("ids"))
+        ):
+            return None
+        group = as_zarr_group(self.zw[status.path], name=status.path)
+        if "values" not in group:
+            return None
+        stored = np.asarray(as_zarr_array(group["values"], name="values")[:])
+        current = np.asarray(self.cells.fetch_all(column))
+        return (
+            ref
+            if stored.ndim == 1
+            and stored.dtype == np.dtype(bool)
+            and current.ndim == 1
+            and current.dtype == np.dtype(bool)
+            and stored.shape == current.shape
+            and np.array_equal(stored, current)
+            else None
+        )
+
+    def _ensure_cell_selection(self, column: str) -> ArtifactRef:
+        ref = self._linked_cell_selection(column)
+        if ref is not None:
+            return ref
+        return self._record_cell_selection(
+            column=column,
+            operation="manual_selection",
+            parameters={},
+            inputs={},
+        )
+
+    def _selection_artifacts_match(
+        self,
+        first: ArtifactRef,
+        second: ArtifactRef,
+    ) -> bool:
+        if first == second:
+            return True
+        if (
+            first.kind != second.kind
+            or first.scope != second.scope
+            or first.assay != second.assay
+        ):
+            return False
+        try:
+            first_status = inspect_artifact(self.zw, first)
+            second_status = inspect_artifact(self.zw, second)
+            if (
+                not first_status.complete
+                or not second_status.complete
+                or (first_status.inputs or {}).get("ordered_row_ids_fingerprint")
+                != (second_status.inputs or {}).get("ordered_row_ids_fingerprint")
+            ):
+                return False
+            first_group = as_zarr_group(
+                self.zw[artifact_path(first)],
+                name=artifact_path(first),
+            )
+            second_group = as_zarr_group(
+                self.zw[artifact_path(second)],
+                name=artifact_path(second),
+            )
+            first_values = np.asarray(
+                as_zarr_array(
+                    first_group["values"],
+                    name="values",
+                )[:]
+            )
+            second_values = np.asarray(
+                as_zarr_array(
+                    second_group["values"],
+                    name="values",
+                )[:]
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        return (
+            first_values.ndim == 1
+            and second_values.ndim == 1
+            and first_values.dtype == np.dtype(bool)
+            and second_values.dtype == np.dtype(bool)
+            and first_values.shape == second_values.shape
+            and np.array_equal(first_values, second_values)
+        )
+
+    def _resolve_cell_data_input(
+        self,
+        column: str,
+        *,
+        cell_key: str,
+    ) -> ArtifactRef:
+        selection = self._ensure_cell_selection(cell_key)
+        current = np.asarray(self.cells.fetch(column, key=cell_key))
+        cell_data = as_zarr_group(self.zw["cellData"], name="cellData")
+        column_array = as_zarr_array(cell_data[column], name=column)
+        raw_ref = column_array.attrs.get("source_artifact")
+        if isinstance(raw_ref, dict):
+            try:
+                ref = ArtifactRef.from_dict(raw_ref)
+                status = self.inspect_artifact(ref)
+            except (KeyError, TypeError, ValueError):
+                pass
+            else:
+                inputs = status.inputs or {}
+                source_value = column_array.attrs.get(
+                    "source_value",
+                    "values",
+                )
+                value_index = column_array.attrs.get("value_index")
+                if (
+                    status.complete
+                    and inputs.get("cell_selection") == selection.to_dict()
+                    and isinstance(source_value, str)
+                ):
+                    group = as_zarr_group(
+                        self.zw[status.path],
+                        name=status.path,
+                    )
+                    if source_value in group:
+                        stored = artifact_values(
+                            group,
+                            source_value,
+                            (
+                                int(value_index)
+                                if isinstance(value_index, int)
+                                else None
+                            ),
+                        )
+                        if np.array_equal(stored, current):
+                            return ref
+        values_fingerprint = (
+            fingerprint_strings(current)
+            if current.dtype.kind in {"O", "S", "U"}
+            else fingerprint_array(current)
+        )
+        planned = plan_cell_data_artifact(
+            self.zw,
+            scope="datastore",
+            kind="metadata_snapshot",
+            operation="manual_cell_data",
+            parameters={"dtype": str(current.dtype)},
+            inputs={"values_fingerprint": values_fingerprint},
+            execution_options={"source_column": column},
+            cell_selection=selection,
+            arrays={
+                "values": (
+                    current.shape,
+                    (
+                        None
+                        if current.dtype.kind in {"O", "S", "U"}
+                        else current.dtype.kind
+                    ),
+                )
+            },
+        )
+        write_cell_data_artifact(
+            self.zw,
+            planned,
+            {"values": current},
+        )
+        link_cell_data_column(
+            self.zw,
+            column,
+            planned.ref,
+            value_name="values",
+        )
+        return planned.ref
+
+    def _resolve_cell_data_provenance_input(
+        self,
+        column: str,
+        *,
+        cell_key: str,
+    ) -> dict[str, Any]:
+        ref = self._resolve_cell_data_input(column, cell_key=cell_key)
+        column_array = as_zarr_array(
+            as_zarr_group(self.zw["cellData"], name="cellData")[column],
+            name=column,
+        )
+        source_value = column_array.attrs.get("source_value", "values")
+        if not isinstance(source_value, str):
+            raise TypeError("Cell-data source_value must be a string")
+        raw_index = column_array.attrs.get("value_index")
+        if raw_index is not None and (
+            isinstance(raw_index, bool) or not isinstance(raw_index, int | np.integer)
+        ):
+            raise TypeError("Cell-data value_index must be an integer")
+        return {
+            "artifact": ref.to_dict(),
+            "source_value": source_value,
+            "value_index": int(raw_index) if raw_index is not None else None,
+        }
 
     def _ini_cell_props(
         self,

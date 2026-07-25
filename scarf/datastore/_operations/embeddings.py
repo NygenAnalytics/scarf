@@ -5,9 +5,29 @@ from scipy.sparse import csr_matrix
 
 from ...graph.encoded_paths import (
     lookup_latest_kmeans_path,
-    make_integrated_graph_path,
 )
 from ...graph.paths import StoredAssayGraph
+from ...graph.state import (
+    embedding_initialization_path_from_state,
+    read_assay_state,
+    validate_legacy_graph_selection,
+)
+from ...metadata.artifacts import (
+    artifact_values,
+    column_display,
+    continuous_display,
+    link_cell_data_column,
+    plan_cell_data_artifact,
+    write_cell_data_artifact,
+)
+from ...metadata.arguments import TsneArguments, UmapArguments
+from ...storage.artifacts import (
+    ArtifactRef,
+    artifact_path,
+    fingerprint_array,
+    fingerprint_stored_arrays,
+    parse_artifact_path,
+)
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...utils.logging import logger
 
@@ -39,7 +59,19 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
 
         # Initial embedding only needs the reduction and k-means groups, not an
         # ANN index, KNN graph, or built cell graph.
-        kmeans_loc = lookup_latest_kmeans_path(self.zw, from_assay, cell_key, feat_key)
+        kmeans_loc = embedding_initialization_path_from_state(
+            self.zw,
+            from_assay,
+            cell_key,
+            feat_key,
+        )
+        if kmeans_loc is None:
+            kmeans_loc = lookup_latest_kmeans_path(
+                self.zw,
+                from_assay,
+                cell_key,
+                feat_key,
+            )
         if kmeans_loc is None:
             raise KeyError("No k-means initialization group found for assay graph")
         kmeans_grp = as_zarr_group(self.zw[kmeans_loc], name=kmeans_loc)
@@ -73,6 +105,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         verbose: bool = True,
         parallel: bool = False,
         nthreads: int | None = None,
+        invalidate_cache: bool = False,
     ) -> None:
         """Run SGtSNE-pi (Read more here:
         https://github.com/fcdimitr/sgtsnepi/tree/v1.0.1). This is an
@@ -110,17 +143,35 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
 
         Returns:
         """
-        from ...embeddings.sgtsne import run_sgtsne
-        import sys
-
-        if sys.platform not in ["posix", "linux"]:
-            logger.error(f"{sys.platform} operating system is currently not supported.")
-            return None
-
         from_assay, cell_key, feat_key = self._get_latest_keys(
             from_assay, cell_key, feat_key
         )
 
+        resolved_graph_loc = self.get_latest_graph_loc(
+            from_assay,
+            cell_key,
+            feat_key,
+        )
+        try:
+            graph_input: object = parse_artifact_path(resolved_graph_loc)
+        except ValueError:
+            validate_legacy_graph_selection(
+                self,
+                resolved_graph_loc,
+                from_assay,
+                cell_key,
+                feat_key,
+            )
+            graph_group = as_zarr_group(
+                self.zw[resolved_graph_loc],
+                name=resolved_graph_loc,
+            )
+            graph_input = {
+                "legacy_graph_fingerprint": fingerprint_stored_arrays(
+                    graph_group,
+                    ("edges", "weights"),
+                )
+            }
         graph = self.load_graph(
             from_assay=from_assay,
             cell_key=cell_key,
@@ -128,6 +179,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             symmetric=symmetric_graph,
             upper_only=graph_upper_only,
         )
+        user_initialization = ini_embed is not None
         if ini_embed is None:
             ini_embed = self._get_ini_embed(from_assay, cell_key, feat_key, tsne_dims)
         else:
@@ -136,6 +188,17 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                     "ERROR: Provided initial embedding does not shape required shape: "
                     f"{(graph.shape[0], tsne_dims)}"
                 )
+        state = read_assay_state(self.zw, from_assay)
+        initialization_input: object
+        if (
+            not user_initialization
+            and state is not None
+            and state.matches(cell_key, feat_key)
+            and state.embedding_initialization is not None
+        ):
+            initialization_input = state.embedding_initialization
+        else:
+            initialization_input = {"value_fingerprint": fingerprint_array(ini_embed)}
         if parallel:
             if nthreads is None:
                 nthreads = self.nthreads
@@ -143,33 +206,133 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 assert isinstance(nthreads, int)
         else:
             nthreads = 1
-        try:
-            emb = run_sgtsne(
-                graph,
-                ini_embed,
-                tsne_dims=tsne_dims,
-                max_iter=max_iter,
-                early_iter=early_iter,
-                alpha=alpha,
-                lambda_scale=lambda_scale,
-                box_h=box_h,
-                temp_file_loc=temp_file_loc,
-                verbose=verbose,
-                parallel=parallel,
-                nthreads=nthreads,
+        selection = self._ensure_cell_selection(cell_key)
+        if isinstance(graph_input, ArtifactRef):
+            graph_selection = self._graph_cell_selection(graph_input)
+            if not self._selection_artifacts_match(graph_selection, selection):
+                raise ValueError("cell_key does not match the graph cell selection")
+            selection = graph_selection
+        artifact_scope = (
+            graph_input.scope if isinstance(graph_input, ArtifactRef) else "assay"
+        )
+        arguments = TsneArguments(
+            graph=graph_input,
+            initialization=initialization_input,
+            symmetric_graph=symmetric_graph,
+            graph_upper_only=graph_upper_only,
+            tsne_dims=tsne_dims,
+            lambda_scale=lambda_scale,
+            max_iter=max_iter,
+            early_iter=early_iter,
+            alpha=alpha,
+            box_h=box_h,
+            parallel=parallel,
+            parallel_threads=nthreads,
+            label=label,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            temp_file_loc=temp_file_loc,
+            verbose=verbose,
+            invalidate_cache=invalidate_cache,
+        )
+        record = arguments.to_record()
+        planned = plan_cell_data_artifact(
+            self.zw,
+            scope=artifact_scope,
+            assay=(
+                graph_input.assay
+                if isinstance(graph_input, ArtifactRef) and graph_input.scope == "assay"
+                else from_assay
+                if artifact_scope == "assay"
+                else None
+            ),
+            kind=arguments.artifact_kind,
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            cell_selection=selection,
+            arrays={"values": ((graph.shape[0], tsne_dims), "f")},
+            invalidate_cache=invalidate_cache,
+        )
+        columns = [
+            self._col_renamer(
+                from_assay,
+                cell_key,
+                f"{label}{i + 1}",
             )
-            for i in range(tsne_dims):
-                self.cells.insert(
-                    self._col_renamer(from_assay, cell_key, f"{label}{i + 1}"),
-                    emb[i],
-                    key=cell_key,
-                    overwrite=True,
+            for i in range(tsne_dims)
+        ]
+        preserved_displays = [column_display(self.zw, column) for column in columns]
+        if planned.reused:
+            artifact_group = as_zarr_group(
+                self.zw[artifact_path(planned.ref)],
+                name=planned.ref.artifact_id,
+            )
+            values = artifact_values(artifact_group, "values")
+        else:
+            import sys
+
+            if sys.platform not in ["posix", "linux"]:
+                logger.error(
+                    f"{sys.platform} operating system is currently not supported."
                 )
-        except (FileNotFoundError, ImportError) as exc:
-            logger.error(
-                "SG-tSNE failed, possibly due to missing sgtsne executable or "
-                f"sgtsnepi package: {exc}"
+                return None
+            from ...embeddings.sgtsne import run_sgtsne
+
+            try:
+                raw_embedding = np.asarray(
+                    run_sgtsne(
+                        graph,
+                        ini_embed,
+                        tsne_dims=tsne_dims,
+                        max_iter=max_iter,
+                        early_iter=early_iter,
+                        alpha=alpha,
+                        lambda_scale=lambda_scale,
+                        box_h=box_h,
+                        temp_file_loc=temp_file_loc,
+                        verbose=verbose,
+                        parallel=parallel,
+                        nthreads=nthreads,
+                    )
+                )
+            except (FileNotFoundError, ImportError) as exc:
+                logger.error(
+                    "SG-tSNE failed, possibly due to missing sgtsne executable or "
+                    f"sgtsnepi package: {exc}"
+                )
+                return None
+            if raw_embedding.shape != (tsne_dims, graph.shape[0]):
+                raise ValueError(
+                    "SG-tSNE returned an embedding with shape "
+                    f"{raw_embedding.shape}; expected {(tsne_dims, graph.shape[0])}"
+                )
+            values = raw_embedding.T
+            write_cell_data_artifact(
+                self.zw,
+                planned,
+                {"values": values},
             )
+        for i, column in enumerate(columns):
+            self.cells.insert(
+                column,
+                values[:, i],
+                key=cell_key,
+                overwrite=True,
+            )
+        for i, column in enumerate(columns):
+            link_cell_data_column(
+                self.zw,
+                column,
+                planned.ref,
+                value_name="values",
+                value_index=i,
+                default_display=continuous_display(values[:, i]),
+                preserved_display=preserved_displays[i],
+            )
+        return None
 
     def run_umap(
         self,
@@ -195,6 +358,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         integrated_graph: str | None = None,
         parallel: bool = False,
         nthreads: int | None = None,
+        invalidate_cache: bool = False,
     ) -> None:
         """Runs UMAP algorithm using the precomputed cell-neighbourhood graph.
         The calculated UMAP coordinates are saved in the cell metadata table.
@@ -251,9 +415,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         )
         graph_loc = None
         if integrated_graph is not None:
-            graph_loc = make_integrated_graph_path(
-                self._integratedGraphsLoc, integrated_graph
-            )
+            graph_loc = self._resolve_integrated_graph_path(integrated_graph)
             if graph_loc not in self.zw:
                 raise KeyError(
                     f"ERROR: An integrated graph with label: {integrated_graph} does not exist"
@@ -267,19 +429,113 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             graph_loc=graph_loc,
         )
 
+        resolved_graph_loc = (
+            graph_loc
+            if graph_loc is not None
+            else self.get_latest_graph_loc(
+                from_assay,
+                cell_key,
+                feat_key,
+            )
+        )
+        try:
+            graph_input: object = parse_artifact_path(resolved_graph_loc)
+        except ValueError:
+            graph_group = as_zarr_group(
+                self.zw[resolved_graph_loc],
+                name=resolved_graph_loc,
+            )
+            graph_input = {
+                "legacy_graph_fingerprint": fingerprint_stored_arrays(
+                    graph_group,
+                    ("edges", "weights"),
+                )
+            }
+        user_initialization = ini_embed is not None
         if ini_embed is None:
             ini_embed = self._get_ini_embed(from_assay, cell_key, feat_key, umap_dims)
+        state = read_assay_state(self.zw, from_assay)
+        initialization_input: object
+        if (
+            not user_initialization
+            and state is not None
+            and state.matches(cell_key, feat_key)
+            and state.embedding_initialization is not None
+        ):
+            initialization_input = state.embedding_initialization
+        else:
+            initialization_input = {"value_fingerprint": fingerprint_array(ini_embed)}
         if nthreads is None:
             nthreads = self.nthreads
+        selection = self._ensure_cell_selection(cell_key)
+        if isinstance(graph_input, ArtifactRef):
+            graph_selection = self._graph_cell_selection(graph_input)
+            if not self._selection_artifacts_match(graph_selection, selection):
+                raise ValueError("cell_key does not match the graph cell selection")
+            selection = graph_selection
+        effective_density_map = use_density_map and integrated_graph is None
+        artifact_scope = (
+            graph_input.scope
+            if isinstance(graph_input, ArtifactRef)
+            else "datastore"
+            if integrated_graph is not None
+            else "assay"
+        )
+        arguments = UmapArguments(
+            graph=graph_input,
+            initialization=initialization_input,
+            symmetric_graph=symmetric_graph,
+            graph_upper_only=graph_upper_only,
+            umap_dims=umap_dims,
+            spread=spread,
+            min_dist=min_dist,
+            n_epochs=n_epochs,
+            repulsion_strength=repulsion_strength,
+            initial_alpha=initial_alpha,
+            negative_sample_rate=negative_sample_rate,
+            use_density_map=effective_density_map,
+            dens_lambda=dens_lambda,
+            dens_frac=dens_frac,
+            dens_var_shift=dens_var_shift,
+            random_seed=random_seed,
+            parallel=parallel,
+            parallel_threads=nthreads if parallel else None,
+            label=label,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            integrated_graph=integrated_graph,
+            invalidate_cache=invalidate_cache,
+        )
+        record = arguments.to_record()
+        planned = plan_cell_data_artifact(
+            self.zw,
+            scope=artifact_scope,
+            assay=(
+                graph_input.assay
+                if isinstance(graph_input, ArtifactRef) and graph_input.scope == "assay"
+                else from_assay
+                if artifact_scope == "assay"
+                else None
+            ),
+            kind=arguments.artifact_kind,
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            cell_selection=selection,
+            arrays={"values": ((graph.shape[0], umap_dims), "f")},
+            invalidate_cache=invalidate_cache,
+        )
         verbose = False
         if get_log_level() <= 20:
             verbose = True
 
-        if use_density_map:
-            if integrated_graph is not None:
-                logger.warning(
-                    "DensMap is not available for integrated graphs. Will run without UMAP without DensMap"
-                )
+        if use_density_map and integrated_graph is not None:
+            logger.warning(
+                "DensMap is not available for integrated graphs. Running standard UMAP."
+            )
+        if effective_density_map:
             stored = self._lookup_stored_graph(from_assay, cell_key, feat_key)
             if not isinstance(stored, StoredAssayGraph):
                 raise TypeError("DensMAP requires an assay graph")
@@ -313,29 +569,59 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         else:
             densmap_kwds = {}
 
-        t, a, b = fit_transform(
-            graph=graph.tocoo(),
-            ini_embed=ini_embed,
-            spread=spread,
-            min_dist=min_dist,
-            n_epochs=n_epochs,
-            random_seed=random_seed,
-            repulsion_strength=repulsion_strength,
-            initial_alpha=initial_alpha,
-            negative_sample_rate=negative_sample_rate,
-            densmap_kwds=densmap_kwds,
-            parallel=parallel,
-            nthreads=nthreads,
-            verbose=verbose,
-        )
+        if planned.reused:
+            artifact_group = as_zarr_group(
+                self.zw[artifact_path(planned.ref)],
+                name=planned.ref.artifact_id,
+            )
+            t = artifact_values(artifact_group, "values")
+        else:
+            t, _a, _b = fit_transform(
+                graph=graph.tocoo(),
+                ini_embed=ini_embed,
+                spread=spread,
+                min_dist=min_dist,
+                n_epochs=n_epochs,
+                random_seed=random_seed,
+                repulsion_strength=repulsion_strength,
+                initial_alpha=initial_alpha,
+                negative_sample_rate=negative_sample_rate,
+                densmap_kwds=densmap_kwds,
+                parallel=parallel,
+                nthreads=nthreads,
+                verbose=verbose,
+            )
+            write_cell_data_artifact(
+                self.zw,
+                planned,
+                {"values": t},
+            )
 
         if integrated_graph is not None:
             from_assay = integrated_graph
-        for i in range(umap_dims):
+        columns = [
+            self._col_renamer(
+                from_assay,
+                cell_key,
+                f"{label}{i + 1}",
+            )
+            for i in range(umap_dims)
+        ]
+        preserved_displays = [column_display(self.zw, column) for column in columns]
+        for i, column in enumerate(columns):
             self.cells.insert(
-                self._col_renamer(from_assay, cell_key, f"{label}{i + 1}"),
+                column,
                 t[:, i],
                 key=cell_key,
                 overwrite=True,
+            )
+            link_cell_data_column(
+                self.zw,
+                column,
+                planned.ref,
+                value_name="values",
+                value_index=i,
+                default_display=continuous_display(t[:, i]),
+                preserved_display=preserved_displays[i],
             )
         return None

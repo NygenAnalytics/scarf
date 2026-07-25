@@ -126,6 +126,8 @@ def dotplot(
     """
     _, mpl = require_matplotlib()
     color_scale = color_scale or ColorScale(cmap="viridis")
+    if color_scale.scale != "linear":
+        raise NotImplementedError("dotplot currently supports only linear color scales")
     size_scale = size_scale or SizeScale()
     normalization = normalization or NormalizationSpec()
 
@@ -325,6 +327,10 @@ def matrixplot(
     if value not in ("mean", "fraction"):
         raise ValueError("value must be 'mean' or 'fraction'")
     color_scale = color_scale or ColorScale(cmap="viridis")
+    if color_scale.scale != "linear":
+        raise NotImplementedError(
+            "matrixplot currently supports only linear color scales"
+        )
     normalization = normalization or NormalizationSpec()
 
     aggregate, per_sample = summarize_features_by_group(

@@ -15,14 +15,19 @@ from scarf.datastore._operations.clustering import _ClusteringOperationsMixin
 from scarf.datastore._operations.presentation import _PresentationOperationsMixin
 from scarf.datastore._operations.paris_persistence import (
     LATEST_PARIS_GENERATION,
-    adaptive_config_digest,
-    estimate_cached_paris_peak_bytes,
     estimate_paris_adaptive_cut_peak_bytes,
     estimate_paris_peak_bytes,
+    estimate_hierarchy_group_peak_bytes,
     generation_location,
-    load_adaptive_result,
-    load_hierarchy_generation,
+    load_hierarchy_group,
 )
+from scarf.storage.artifacts import (
+    ArtifactRef,
+    artifact_path,
+    inspect_artifact,
+    list_artifacts,
+)
+from scarf.storage.selections import resolve_selection_artifact
 from scarf.storage.budget import (
     ResourceBudget,
     _get_resource_budget_override,
@@ -31,10 +36,22 @@ from scarf.storage.budget import (
 
 
 class _Cells:
-    def __init__(self, active: np.ndarray) -> None:
+    def __init__(self, active: np.ndarray, root: zarr.Group) -> None:
         self.active = active
-        self.data: dict[str, np.ndarray] = {"I": active.copy()}
+        self.data: dict[str, np.ndarray] = {
+            "I": active.copy(),
+            "ids": np.asarray([f"cell_{i}" for i in range(len(active))]),
+        }
         self.writes: list[str] = []
+        self.root = root
+        self.N = len(active)
+        cell_data = root.create_group("cellData")
+        cell_data.create_array("I", data=active.copy())
+        cell_data.create_array("ids", data=self.data["ids"])
+
+    @property
+    def columns(self) -> list[str]:
+        return list(self.data)
 
     def fetch_all(self, name: str) -> np.ndarray:
         return self.data[name]
@@ -60,6 +77,10 @@ class _Cells:
         filled[active] = incoming
         self.data[name] = filled
         self.writes.append(name)
+        cell_data = self.root["cellData"]
+        if name in cell_data:
+            del cell_data[name]
+        cell_data.create_array(name, data=filled)
 
 
 class _Store(_ClusteringOperationsMixin, _PresentationOperationsMixin):
@@ -74,7 +95,7 @@ class _Store(_ClusteringOperationsMixin, _PresentationOperationsMixin):
         self.zw = zarr.open_group(store=MemoryStore(), mode="w")
         active = np.zeros(graph.shape[0] + extra_cells, dtype=bool)
         active[: graph.shape[0]] = True
-        self.cells = _Cells(active)
+        self.cells = _Cells(active, self.zw)
         self.nthreads = 2
         self.zarr_mode = "r+"
         self.graphs: dict[str, csr_matrix] = {}
@@ -103,6 +124,9 @@ class _Store(_ClusteringOperationsMixin, _PresentationOperationsMixin):
         self, label: str, graph: csr_matrix, *, k: int = 3
     ) -> None:
         self._write_graph(f"{self._integratedGraphsLoc}/{label}", graph, k=k)
+
+    def _resolve_integrated_graph_path(self, label: str) -> str:
+        return f"{self._integratedGraphsLoc}/{label}"
 
     def _get_latest_keys(
         self,
@@ -191,6 +215,19 @@ class _Store(_ClusteringOperationsMixin, _PresentationOperationsMixin):
         del from_assay
         return self.cells.fetch(k, key=cell_key)
 
+    def _ensure_cell_selection(self, column: str) -> ArtifactRef:
+        return resolve_selection_artifact(
+            self.zw,
+            scope="datastore",
+            kind="cell_selection",
+            values=self.cells.fetch_all(column),
+            row_ids=self.cells.fetch_all("ids"),
+            operation="manual_selection",
+            parameters={},
+            inputs={},
+            source_column=column,
+        )
+
 
 def _block_graph() -> csr_matrix:
     graph = np.zeros((14, 14), dtype=np.float64)
@@ -222,19 +259,36 @@ def _disconnected_graph() -> csr_matrix:
     )
 
 
+def _load_artifact_hierarchy(
+    store: _Store,
+    artifact_id: str,
+) -> tuple[ParisHierarchy, PlateauForest]:
+    ref = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_hierarchy",
+        artifact_id=artifact_id,
+    )
+    group = store.zw[artifact_path(ref)]
+    return load_hierarchy_group(group, artifact_id)
+
+
+def _column_artifact(store: _Store, column: str) -> ArtifactRef:
+    raw_ref = store.zw["cellData"][column].attrs["source_artifact"]
+    return ArtifactRef.from_dict(raw_ref)
+
+
 def test_auto_cut_persists_typed_hierarchy_and_reuses_diagnostics() -> None:
     store = _Store(_block_graph(), extra_cells=2)
     first = store.run_paris_clustering(min_cluster_size=2)
     graph_group = store.zw["RNA/graph"]
-    generation_id = str(graph_group.attrs[LATEST_PARIS_GENERATION])
-    hierarchy, forest = load_hierarchy_generation(
-        store.zw,
-        "RNA/graph",
-        generation_id,
-    )
+    generation_id = first.hierarchy_generation_id
+    assert generation_id is not None
+    hierarchy, forest = _load_artifact_hierarchy(store, generation_id)
 
     assert hierarchy.n_leaves == 14
     assert forest.n_leaves == 14
+    assert LATEST_PARIS_GENERATION not in graph_group.attrs
     assert "latest_dendrogram" not in graph_group.attrs
     assert first.n_clusters == 2
     assert first.labels[:6].tolist() == [1] * 6
@@ -244,7 +298,7 @@ def test_auto_cut_persists_typed_hierarchy_and_reuses_diagnostics() -> None:
     assert store.cells.writes == ["RNA_paris_cluster"]
 
     second = store.run_paris_clustering(min_cluster_size=2)
-    assert str(graph_group.attrs[LATEST_PARIS_GENERATION]) == generation_id
+    assert second.hierarchy_generation_id == generation_id
     assert np.array_equal(second.labels, first.labels)
     assert second.diagnostics == first.diagnostics
     assert store.load_graph_calls == 1
@@ -257,20 +311,20 @@ def test_fit_uses_additive_graph_and_fixed_cut_materializes_linkage_lazily() -> 
     result = store.run_paris_clustering(n_clusters=3)
     generation_id = result.hierarchy_generation_id
     assert generation_id is not None
-    hierarchy, _forest = load_hierarchy_generation(
-        store.zw,
-        "RNA/graph",
-        generation_id,
-    )
+    hierarchy, _forest = _load_artifact_hierarchy(store, generation_id)
     expected = fit_paris_hierarchy(graph, n_threads=1)
 
     assert np.array_equal(hierarchy.children, expected.children)
     assert np.array_equal(hierarchy.heights, expected.heights)
-    dendrogram_loc = str(store.zw["RNA/graph"].attrs["latest_dendrogram"])
-    assert dendrogram_loc == (
-        f"{generation_location('RNA/graph', generation_id)}/dendrogram"
+    dendrograms = list_artifacts(
+        store.zw,
+        scope="assay",
+        assay="RNA",
+        kind="dendrogram",
     )
-    assert dendrogram_loc in store.zw
+    assert len(dendrograms) == 1
+    assert artifact_path(dendrograms[0]) in store.zw
+    assert "latest_dendrogram" not in store.zw["RNA/graph"].attrs
     assert result.mode == "fixed"
     assert result.n_clusters == 3
     assert set(result.labels) == {1, 2, 3}
@@ -290,14 +344,15 @@ def test_fixed_cut_uses_raw_hierarchy_for_disconnected_graph() -> None:
     assert len({result.labels[0], result.labels[2], result.labels[4]}) == 3
     generation_id = result.hierarchy_generation_id
     assert generation_id is not None
-    hierarchy, _forest = load_hierarchy_generation(
-        store.zw,
-        "RNA/graph",
-        generation_id,
-    )
+    hierarchy, _forest = _load_artifact_hierarchy(store, generation_id)
     assert hierarchy.synthetic_joins.sum() == 1
-    dendrogram_loc = str(store.zw["RNA/graph"].attrs["latest_dendrogram"])
-    compatibility = np.asarray(store.zw[dendrogram_loc][:])
+    dendrogram_ref = list_artifacts(
+        store.zw,
+        scope="assay",
+        assay="RNA",
+        kind="dendrogram",
+    )[0]
+    compatibility = np.asarray(store.zw[artifact_path(dendrogram_ref)]["data"][:])
     assert compatibility[hierarchy.synthetic_joins, 2].tolist() == [0.0]
 
 
@@ -336,44 +391,16 @@ def test_auto_cut_defaults_minimum_cluster_size_to_graph_k_plus_one() -> None:
 def test_incomplete_adaptive_cache_is_recomputed() -> None:
     store = _Store(_block_graph())
     first = store.run_paris_clustering(min_cluster_size=2)
-    generation_id = first.hierarchy_generation_id
-    assert generation_id is not None
-    hierarchy, _forest = load_hierarchy_generation(
-        store.zw,
-        "RNA/graph",
-        generation_id,
-    )
-    digest = adaptive_config_digest(generation_id, 2)
-    location = f"RNA/graph/adaptive_clustering/paris_cluster/{digest}"
-    config = store.zw[location]
-
-    assert (
-        load_adaptive_result(
-            store.zw,
-            "RNA/graph",
-            "paris_cluster",
-            digest,
-            hierarchy,
-        )
-        is not None
-    )
-    del config["selected_nodes"]
-    assert (
-        load_adaptive_result(
-            store.zw,
-            "RNA/graph",
-            "paris_cluster",
-            digest,
-            hierarchy,
-        )
-        is None
-    )
+    first_cut = _column_artifact(store, "RNA_paris_cluster")
+    del store.zw[artifact_path(first_cut)]["labels"]
 
     second = store.run_paris_clustering(min_cluster_size=2)
+    second_cut = _column_artifact(store, "RNA_paris_cluster")
 
     assert np.array_equal(second.labels, first.labels)
-    assert "selected_nodes" in store.zw[location]
-    assert "schema_version" not in store.zw[location].attrs
+    assert second_cut != first_cut
+    assert "labels" in store.zw[artifact_path(second_cut)]
+    assert second.hierarchy_generation_id == first.hierarchy_generation_id
     assert store.load_graph_calls == 2
 
 
@@ -386,83 +413,67 @@ def test_force_recalculation_retains_only_referenced_generations() -> None:
         force_recalc=True,
     )
     assert first.hierarchy_generation_id != second.hierarchy_generation_id
-    hierarchy_group = store.zw["RNA/graph/paris_hierarchy"]
-    assert set(hierarchy_group.group_keys()) == {
+    hierarchy_ids = {
+        ref.artifact_id
+        for ref in list_artifacts(
+            store.zw,
+            scope="assay",
+            assay="RNA",
+            kind="cluster_hierarchy",
+        )
+    }
+    assert hierarchy_ids == {
         first.hierarchy_generation_id,
         second.hierarchy_generation_id,
     }
 
     store.run_paris_clustering(n_clusters=2, label="first")
-    assert set(hierarchy_group.group_keys()) == {second.hierarchy_generation_id}
-    assert "RNA/graph/adaptive_clustering/first" not in store.zw
-    assert "RNA/graph/adaptive_clustering/second" in store.zw
+    assert {
+        ref.artifact_id
+        for ref in list_artifacts(
+            store.zw,
+            scope="assay",
+            assay="RNA",
+            kind="cluster_hierarchy",
+        )
+    } == hierarchy_ids
+    assert "paris_hierarchy" not in store.zw["RNA/graph"]
 
 
 def test_stale_generation_pointer_recomputes_without_crashing() -> None:
     store = _Store(_block_graph())
     first = store.run_paris_clustering(n_clusters=2)
-    # Simulate an old paris_hierarchy/v2 pointer whose target no longer exists
-    # at the current root: the hierarchy must be recomputed, not raise KeyError.
+    # A released-layout pointer must not influence new artifact reuse.
     store.zw["RNA/graph"].attrs[LATEST_PARIS_GENERATION] = "missing-generation"
     assert generation_location("RNA/graph", "missing-generation") not in store.zw
 
     second = store.run_paris_clustering(n_clusters=2)
 
-    # Re-fetch the group so the pointer read is not from a stale attrs cache.
-    new_generation = str(store.zw["RNA/graph"].attrs[LATEST_PARIS_GENERATION])
-    assert new_generation != "missing-generation"
-    assert generation_location("RNA/graph", new_generation) in store.zw
+    assert second.hierarchy_generation_id == first.hierarchy_generation_id
+    assert store.zw["RNA/graph"].attrs[LATEST_PARIS_GENERATION] == "missing-generation"
     assert np.array_equal(second.labels, first.labels)
 
 
 def test_adaptive_cache_collection_prunes_only_unusable_configurations() -> None:
     store = _Store(_block_graph())
-    result = store.run_paris_clustering(min_cluster_size=2)
-    generation_id = result.hierarchy_generation_id
-    assert generation_id is not None
-    label_location = "RNA/graph/adaptive_clustering/paris_cluster"
-    reusable_digest = adaptive_config_digest(generation_id, 2)
+    first = store.run_paris_clustering(
+        min_cluster_size=2,
+        label="small",
+    )
+    second = store.run_paris_clustering(
+        min_cluster_size=3,
+        label="large",
+    )
 
-    mismatched_digest = adaptive_config_digest(generation_id, 3)
-    incomplete_digest = adaptive_config_digest(generation_id, 4)
-    orphan_digest = adaptive_config_digest("missing-generation", 2)
-    for digest, config_generation, min_size, complete in (
-        (
-            mismatched_digest,
-            generation_id,
-            3,
-            True,
-        ),
-        (
-            incomplete_digest,
-            generation_id,
-            4,
-            False,
-        ),
-        (
-            orphan_digest,
-            "missing-generation",
-            2,
-            True,
-        ),
-    ):
-        config = store.zw.create_group(f"{label_location}/{digest}")
-        config.attrs.update(
-            {
-                "complete": complete,
-                "hierarchy_generation_id": config_generation,
-                "min_cluster_size": min_size,
-                "final_label_key": "RNA_paris_cluster",
-            }
-        )
-
-    store.run_paris_clustering(n_clusters=2)
-
-    assert f"{label_location}/{reusable_digest}" in store.zw
-    assert f"{label_location}/{mismatched_digest}" not in store.zw
-    assert f"{label_location}/{incomplete_digest}" not in store.zw
-    assert f"{label_location}/{orphan_digest}" not in store.zw
-    assert "active_digest" not in store.zw[label_location].attrs
+    cuts = list_artifacts(
+        store.zw,
+        scope="assay",
+        assay="RNA",
+        kind="cluster_cut",
+    )
+    assert len(cuts) == 2
+    assert first.hierarchy_generation_id == second.hierarchy_generation_id
+    assert "adaptive_clustering" not in store.zw["RNA/graph"]
 
 
 def test_stale_legacy_dendrogram_warns_once_and_is_not_reused() -> None:
@@ -471,16 +482,26 @@ def test_stale_legacy_dendrogram_warns_once_and_is_not_reused() -> None:
     graph_group.create_array("dendrogram", data=np.zeros((13, 4)))
     graph_group.attrs["latest_dendrogram"] = "RNA/graph/dendrogram"
 
-    with pytest.warns(UserWarning, match="predates canonical additive graphs"):
-        first = store.run_paris_clustering(n_clusters=2)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        second = store.run_paris_clustering(n_clusters=2)
+        first = store.run_paris_clustering(n_clusters=2)
     assert caught == []
+    second = store.run_paris_clustering(n_clusters=2)
 
     assert first.hierarchy_generation_id == second.hierarchy_generation_id
     assert (
-        str(store.zw["RNA/graph"].attrs["latest_dendrogram"]) != "RNA/graph/dendrogram"
+        str(store.zw["RNA/graph"].attrs["latest_dendrogram"]) == "RNA/graph/dendrogram"
+    )
+    assert (
+        len(
+            list_artifacts(
+                store.zw,
+                scope="assay",
+                assay="RNA",
+                kind="dendrogram",
+            )
+        )
+        == 1
     )
 
 
@@ -496,7 +517,17 @@ def test_integrated_graph_is_resolved_without_standard_graph_lookup() -> None:
     )
 
     assert result.label_key == "joint_paris_cluster"
-    assert LATEST_PARIS_GENERATION in store.zw["integratedGraphs/joint"].attrs
+    assert LATEST_PARIS_GENERATION not in store.zw["integratedGraphs/joint"].attrs
+    assert (
+        len(
+            list_artifacts(
+                store.zw,
+                scope="datastore",
+                kind="cluster_hierarchy",
+            )
+        )
+        == 1
+    )
     assert store.latest_graph_calls == 0
 
 
@@ -520,10 +551,14 @@ def test_cached_hierarchy_adaptive_preflight_fails_before_graph_load() -> None:
     assert store.load_graph_calls == 1
     generation_id = fixed.hierarchy_generation_id
     assert generation_id is not None
-    cached_estimate = estimate_cached_paris_peak_bytes(
-        store.zw,
-        "RNA/graph",
-        generation_id,
+    hierarchy_ref = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_hierarchy",
+        artifact_id=generation_id,
+    )
+    cached_estimate = estimate_hierarchy_group_peak_bytes(
+        store.zw[artifact_path(hierarchy_ref)],
         "adaptive",
     )
     graph_group = store.zw["RNA/graph"]
@@ -657,25 +692,23 @@ def test_interrupted_replacement_keeps_previous_generation_authoritative(
     store = _Store(_block_graph())
     first = store.run_paris_clustering(min_cluster_size=2)
     previous_generation = first.hierarchy_generation_id
+    previous_cut = _column_artifact(store, "RNA_paris_cluster")
 
-    def fail_write(
-        root: zarr.Group,
-        graph_loc: str,
-        *_args: object,
-        **_kwargs: object,
-    ) -> tuple[str, str]:
-        location = f"{graph_loc}/paris_hierarchy/incomplete"
-        group = root.create_group(location, overwrite=True)
-        group.attrs["complete"] = False
+    def fail_write(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated interrupted write")
 
-    monkeypatch.setattr(cache, "write_hierarchy_generation", fail_write)
+    monkeypatch.setattr(cache, "write_hierarchy_group", fail_write)
     with pytest.raises(OSError, match="interrupted"):
         store.run_paris_clustering(force_recalc=True)
 
-    assert (
-        str(store.zw["RNA/graph"].attrs[LATEST_PARIS_GENERATION]) == previous_generation
+    assert _column_artifact(store, "RNA_paris_cluster") == previous_cut
+    hierarchy_ref = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="cluster_hierarchy",
+        artifact_id=previous_generation,
     )
+    assert inspect_artifact(store.zw, hierarchy_ref).complete
     assert store.cells.writes == ["RNA_paris_cluster"]
 
 
@@ -692,7 +725,7 @@ def test_graph_rebuild_clears_generation_pointer() -> None:
 
 def test_cluster_tree_cache_tracks_generation_and_cluster_identity() -> None:
     store = _Store(_block_graph())
-    first = store.run_paris_clustering(
+    store.run_paris_clustering(
         min_cluster_size=2,
         label="first",
     )
@@ -706,17 +739,14 @@ def test_cluster_tree_cache_tracks_generation_and_cluster_identity() -> None:
     values[values == -1] = 2
     store.cells.data["RNA_first"] = values
     changed = store._prepare_cluster_tree(cluster_key="RNA_first")
-    assert changed["coalesced_location"] != prepared["coalesced_location"]
+    assert changed["coalesced_location"] == prepared["coalesced_location"]
 
-    store.cells.data["RNA_first"] = first.labels.copy()
-    second = store.run_paris_clustering(
-        min_cluster_size=2,
+    store.run_paris_clustering(
+        n_clusters=3,
         label="second",
-        force_recalc=True,
     )
-    old_generation = store._prepare_cluster_tree(cluster_key="RNA_first")
-    assert first.hierarchy_generation_id in old_generation["coalesced_location"]
-    assert second.hierarchy_generation_id not in old_generation["coalesced_location"]
+    second_tree = store._prepare_cluster_tree(cluster_key="RNA_second")
+    assert second_tree["coalesced_location"] != prepared["coalesced_location"]
 
 
 def test_topacedo_uses_the_generation_recorded_for_adaptive_labels(
@@ -739,8 +769,13 @@ def test_topacedo_uses_the_generation_recorded_for_adaptive_labels(
             self.densities = np.ones(n_cells)
             self.meanSnn = np.ones(n_cells)
             self.seeds = np.asarray([0], dtype=np.int64)
+            self.rand_state = int(_args[-1])
 
         def run(self) -> tuple[np.ndarray, list[tuple[int, int]]]:
+            if self.rand_state == 99:
+                return np.asarray([0], dtype=np.int64), []
+            if self.rand_state == 100:
+                return np.asarray([0], dtype=np.int64), [(0, len(self.densities))]
             return np.asarray([0, 1], dtype=np.int64), [(0, 1)]
 
     monkeypatch.setitem(
@@ -748,15 +783,86 @@ def test_topacedo_uses_the_generation_recorded_for_adaptive_labels(
         "topacedo",
         SimpleNamespace(TopacedoSampler=Sampler),
     )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.clustering.validate_legacy_graph_selection",
+        lambda *_args, **_kwargs: None,
+    )
     edges = store.run_topacedo_sampler(
         cluster_key=result.label_key,
         return_edges=True,
     )
 
     assert edges == [(0, 1)]
+    output_columns = [
+        "RNA_sketched",
+        "RNA_cell_density",
+        "RNA_snn_value",
+        "RNA_sketch_seeds",
+    ]
+    output_refs = {
+        ArtifactRef.from_dict(store.zw[f"cellData/{column}"].attrs["source_artifact"])
+        for column in output_columns
+    }
+    assert len(output_refs) == 1
+    sampling_ref = output_refs.pop()
+    assert sampling_ref.kind == "sampling"
+    sampling_group = store.zw[artifact_path(sampling_ref)]
+    assert set(sampling_group.array_keys()) == {
+        "sampled",
+        "density",
+        "mean_snn",
+        "seeds",
+        "edges",
+    }
+    np.testing.assert_array_equal(sampling_group["edges"][:], [[0, 1]])
+    monkeypatch.setitem(sys.modules, "topacedo", None)
+    assert store.run_topacedo_sampler(
+        cluster_key=result.label_key,
+        return_edges=True,
+    ) == [(0, 1)]
+    monkeypatch.setitem(
+        sys.modules,
+        "topacedo",
+        SimpleNamespace(TopacedoSampler=Sampler),
+    )
+    assert (
+        store.run_topacedo_sampler(
+            cluster_key=result.label_key,
+            rand_state=99,
+            return_edges=True,
+        )
+        == []
+    )
+    sampling_refs = list_artifacts(
+        store.zw,
+        scope="assay",
+        assay="RNA",
+        kind="sampling",
+    )
+    empty_group = next(
+        store.zw[artifact_path(ref)]
+        for ref in sampling_refs
+        if store.zw[artifact_path(ref)]["edges"].shape == (0, 2)
+    )
+    assert empty_group["edges"].chunks == (1, 2)
+    with pytest.raises(ValueError, match="edge endpoints"):
+        store.run_topacedo_sampler(
+            cluster_key=result.label_key,
+            rand_state=100,
+            return_edges=True,
+        )
     assert captured["dendrogram"].shape == (13, 4)
-    assert result.hierarchy_generation_id in str(
-        store.zw["RNA/graph"].attrs["latest_dendrogram"]
+    dendrogram_ref = list_artifacts(
+        store.zw,
+        scope="assay",
+        assay="RNA",
+        kind="dendrogram",
+    )[0]
+    dendrogram_inputs = inspect_artifact(store.zw, dendrogram_ref).inputs
+    assert dendrogram_inputs is not None
+    assert (
+        ArtifactRef.from_dict(dendrogram_inputs["cluster_hierarchy"]).artifact_id
+        == result.hierarchy_generation_id
     )
 
 

@@ -1,5 +1,6 @@
 import matplotlib
 import networkx as nx
+import pytest
 
 matplotlib.use("Agg")
 
@@ -107,3 +108,24 @@ def test_pseudotime_heatmap_returns_aligned_tables(
     assert result.legends
     assert result.scales
     result.close()
+
+
+def test_pseudotime_heatmap_rejects_malformed_artifact_link(
+    pseudotime_aggregation,
+    datastore,
+):
+    column = datastore.RNA.z["featureData/pseudotime_clusters"]
+    original_ref = dict(column.attrs["source_artifact"])
+    column.attrs["source_artifact"] = "broken"
+    try:
+        with pytest.raises(ValueError, match="malformed source artifact"):
+            splt.pseudotime_heatmap(
+                datastore,
+                cell_key="I",
+                feat_key="I",
+                feature_cluster_key="pseudotime_clusters",
+                pseudotime_key="RNA_pseudotime",
+                show=False,
+            )
+    finally:
+        column.attrs["source_artifact"] = original_ref

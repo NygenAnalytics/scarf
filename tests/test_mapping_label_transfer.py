@@ -89,7 +89,7 @@ def test_mapping_evidence_and_fixed_layout_projection(datastore_ephemeral):
         threshold_fraction=0.75,
     )
     layout_path = datastore.project_mapping_layout("manual_evidence", "fixed_layout")
-    projected = datastore.z[layout_path][:]
+    projected = datastore.z[layout_path]["data"][:]
 
     assert evidence["isUnknown"].tolist() == [False, True]
     assert evidence["label"].tolist()[1] == "NA"

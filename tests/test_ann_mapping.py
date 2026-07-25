@@ -2,7 +2,6 @@ import numpy as np
 import pytest
 
 from scarf.matrix import ChunkedArray
-from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.neighbors.stream import AnnStream
 
 
@@ -55,26 +54,3 @@ def test_transform_query_validates_feature_shape_and_finite_results():
         ann.transform_query(np.ones((2, 3)))
     with pytest.raises(ValueError, match="non-finite"):
         ann.transform_query(np.array([[np.nan, 0.0]]))
-
-
-def test_graph_orchestration_owns_embedding_cache_budget(monkeypatch):
-    data = ChunkedArray.from_numpy(np.ones((3, 2)), block_size=2)
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.EMBEDDING_CACHE_MAX_BYTES",
-        1,
-    )
-
-    assert not GraphDataStore._should_cache_ann_embeddings(
-        data,
-        2,
-        np.eye(2),
-        needed=True,
-        harmonize=False,
-    )
-    assert not GraphDataStore._should_cache_ann_embeddings(
-        data,
-        2,
-        np.eye(2),
-        needed=False,
-        harmonize=False,
-    )

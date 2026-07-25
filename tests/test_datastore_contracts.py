@@ -11,11 +11,17 @@ _METHODS = {
     BaseDataStore: (
         "__init__",
         "get_cell_vals",
+        "get_assay_state",
+        "inspect_artifact",
+        "list_artifacts",
+        "load_artifact",
         "set_default_assay",
     ),
     GraphDataStore: (
         "__init__",
         "_get_latest_graph_loc",
+        "build_ann_index",
+        "build_connectivity_map",
         "build_mapping_reference",
         "get_diffusion_operator",
         "get_latest_graph_loc",
@@ -25,10 +31,16 @@ _METHODS = {
         "integrate_assays",
         "load_graph",
         "make_graph",
+        "query_neighbors",
         "run_clustering",
         "run_fate_mapping",
         "run_leiden_clustering",
+        "run_lsi",
+        "run_custom_reduction",
+        "run_harmony",
+        "run_normalization",
         "run_paris_clustering",
+        "run_pca",
         "run_pseudotime_scoring",
         "run_topacedo_sampler",
         "run_tsne",
@@ -86,10 +98,10 @@ _METHODS = {
 }
 
 _SIGNATURE_DIGESTS = {
-    BaseDataStore: "ed2e08a687942d2339c1ab09bf1eac3af20c290319cf527b8662fb937a401cd2",
-    GraphDataStore: "05074067772f41c5e7ab852974545917c91168dacccf18fb53a086b135195d95",
-    MappingDatastore: "a1e2fe91d8430b54a2a67f42c537a8a5e189691f81e2fddc8a959e1fd87fb3a9",
-    DataStore: "e61d06c48bdd945a5d913de6275b9fff6d1e949154f7934f690fae3156685e0b",
+    BaseDataStore: "1057b1cbeb909e7f7f599f88d91fae2aacb024a3da626b8a028bdd600644e248",
+    GraphDataStore: "9a7880a2d14851d71a5ab89bcf1db2f8e54b5a3b7a26d994c04e54f8c9760099",
+    MappingDatastore: "eaa8df1bda8fb83066fbac9e30a112fb8a0a46b1e278cce304b300ac5603e16f",
+    DataStore: "f496fc7cc0237ee43465167546999f4953e65816c8f95d956b318b16009b36b8",
 }
 
 
@@ -142,10 +154,7 @@ def test_datastore_static_method_contracts_are_stable():
     static_methods = {
         GraphDataStore: (
             "_choose_reduction_method",
-            "_normed_data_cached",
             "_resolve_local_cache_plan",
-            "_should_cache_ann_embeddings",
-            "_staged_normed_cached",
         ),
         MappingDatastore: (
             "_label_vote_decision",

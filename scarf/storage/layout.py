@@ -162,14 +162,23 @@ def normalize_chunks(
     shape: tuple[int, ...],
 ) -> tuple[int, ...]:
     """Map a chunk specification to the dimensions in ``shape``."""
+
+    def bounded_chunk(chunk: int, dimension: int) -> int:
+        return max(1, min(max(1, int(chunk)), max(1, int(dimension))))
+
     if isinstance(chunks, int):
         chunks = (chunks,)
     if len(chunks) == len(shape):
-        return tuple(min(chunk, dim) for chunk, dim in zip(chunks, shape))
+        return tuple(
+            bounded_chunk(chunk, dimension)
+            for chunk, dimension in zip(chunks, shape, strict=True)
+        )
     if len(chunks) == 1 and len(shape) > 1:
-        return (min(chunks[0], shape[0]),) + tuple(shape[1:])
+        return (bounded_chunk(chunks[0], shape[0]),) + tuple(
+            max(1, int(dimension)) for dimension in shape[1:]
+        )
     if len(chunks) == 1:
-        return (min(chunks[0], shape[0]),)
+        return (bounded_chunk(chunks[0], shape[0]),)
     raise ValueError(
         f"Cannot map chunks {chunks} to array shape {shape}. "
         "Provide one chunk size per dimension."

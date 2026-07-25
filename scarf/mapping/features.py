@@ -87,6 +87,7 @@ def align_features(
     nthreads: int,
     missing_feature_policy: str | None = None,
     missing_feature_values: np.ndarray | None = None,
+    norm_params: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """Aligns target features to source features."""
     from ..storage.arrays import create_zarr_dataset
@@ -142,10 +143,11 @@ def align_features(
             )
         if not np.all(np.isfinite(missing_feature_values)):
             raise ValueError("missing_feature_values must be finite")
-    normed_loc = make_normalized_leaf_name(source_cell_key, source_feat_key)
-    norm_params = cast(
-        dict[str, Any], source_assay.z[normed_loc].attrs["subset_params"]
-    )
+    if norm_params is None:
+        normed_loc = make_normalized_leaf_name(source_cell_key, source_feat_key)
+        norm_params = cast(
+            dict[str, Any], source_assay.z[normed_loc].attrs["subset_params"]
+        )
     sorted_t_idx = np.array(sorted(t_idx[t_idx != -1]))
 
     normed_data = target_assay.normed(
@@ -153,6 +155,9 @@ def align_features(
         sorted_t_idx,
         **norm_params,
     )
+    # TODO(mapping-refactor): Stream virtually aligned blocks into the reference
+    # transform instead of materializing an aligned copy in the target assay.
+    # Revisit mapping artifact ownership and cross-datastore provenance together.
     normed_loc = make_normalized_leaf_name(target_cell_key, target_feat_key)
     og = create_zarr_dataset(
         target_assay.z,

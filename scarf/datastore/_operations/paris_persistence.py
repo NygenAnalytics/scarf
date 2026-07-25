@@ -183,8 +183,16 @@ def estimate_cached_paris_peak_bytes(
     """Estimate hierarchy loading plus fixed or cached-adaptive cut buffers."""
     location = generation_location(graph_loc, generation_id)
     generation = as_zarr_group(root[location], name=location)
+    return estimate_hierarchy_group_peak_bytes(generation, cut_mode)
+
+
+def estimate_hierarchy_group_peak_bytes(
+    generation: zarr.Group,
+    cut_mode: Literal["adaptive", "fixed"],
+) -> int:
+    """Estimate loading and cutting an independent hierarchy artifact."""
     n_cells = cast(int, generation.attrs["n_leaves"])
-    plateau = as_zarr_group(generation["plateau"], name=f"{location}/plateau")
+    plateau = as_zarr_group(generation["plateau"], name="plateau")
     hierarchy_bytes = sum(
         _zarr_array_nbytes(generation, name)
         for name in (
@@ -271,6 +279,23 @@ def preflight_cached_paris_cut(
     return estimate
 
 
+def preflight_hierarchy_artifact_cut(
+    hierarchy_group: zarr.Group,
+    cut_mode: Literal["adaptive", "fixed"],
+    budget: ResourceBudget,
+) -> int:
+    estimate = estimate_hierarchy_group_peak_bytes(
+        hierarchy_group,
+        cut_mode,
+    )
+    _raise_if_over_budget(
+        estimate,
+        budget,
+        f"Cached Paris {cut_mode} cut",
+    )
+    return estimate
+
+
 def preflight_paris_adaptive_cut(
     graph_group: zarr.Group,
     n_cells: int,
@@ -315,9 +340,18 @@ def write_hierarchy_generation(
     generation_id = uuid4().hex
     location = generation_location(graph_loc, generation_id)
     generation = root.create_group(location, overwrite=False)
+    write_hierarchy_group(generation, hierarchy, plateau_forest)
+    generation.attrs["complete"] = True
+    return generation_id, location
+
+
+def write_hierarchy_group(
+    generation: zarr.Group,
+    hierarchy: ParisHierarchy,
+    plateau_forest: PlateauForest,
+) -> None:
     generation.attrs.update(
         {
-            "complete": False,
             "n_leaves": hierarchy.n_leaves,
             "total_weight": hierarchy.total_weight,
         }
@@ -347,8 +381,6 @@ def write_hierarchy_generation(
                 "reciprocal_rounds": len(hierarchy.diagnostics.rounds),
             }
         )
-    generation.attrs["complete"] = True
-    return generation_id, location
 
 
 def _read_array(group: zarr.Group, name: str) -> np.ndarray:
@@ -365,19 +397,22 @@ def load_hierarchy_generation(
     generation = as_zarr_group(root[location], name=location)
     if generation.attrs.get("complete") is not True:
         raise ValueError(f"Paris hierarchy generation {generation_id!r} is incomplete")
+    return load_hierarchy_group(generation, location)
+
+
+def load_hierarchy_group(
+    generation: zarr.Group,
+    label: str,
+) -> tuple[ParisHierarchy, PlateauForest]:
     missing = [name for name in _PARIS_HIERARCHY_ARRAYS if name not in generation]
     if missing or "plateau" not in generation:
-        raise ValueError(
-            f"Paris hierarchy generation {generation_id!r} is missing required arrays"
-        )
-    plateau_group = as_zarr_group(generation["plateau"], name=f"{location}/plateau")
+        raise ValueError(f"Paris hierarchy {label!r} is missing required arrays")
+    plateau_group = as_zarr_group(generation["plateau"], name=f"{label}/plateau")
     missing_plateau = [
         name for name in _PARIS_PLATEAU_ARRAYS if name not in plateau_group
     ]
     if missing_plateau:
-        raise ValueError(
-            f"Paris hierarchy generation {generation_id!r} is missing plateau arrays"
-        )
+        raise ValueError(f"Paris hierarchy {label!r} is missing plateau arrays")
     n_leaves = cast(int, generation.attrs["n_leaves"])
     hierarchy = ParisHierarchy(
         children=_read_array(generation, "children"),

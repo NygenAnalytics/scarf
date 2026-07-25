@@ -173,6 +173,19 @@ def test_writer_rejects_reserved_assay_name_before_mutation():
 
     assert list(root.group_keys()) == []
 
+    with pytest.raises(ValueError, match="artifact storage"):
+        writers_module.create_zarr_count_assay(
+            root,
+            "artifacts",
+            None,
+            (2, 2),
+            2,
+            ["g1", "g2"],
+            ["Gene 1", "Gene 2"],
+        )
+
+    assert list(root.group_keys()) == []
+
 
 def test_writer_type_hints_resolve_from_facade_objects():
     for cls, names in _PUBLIC_CLASS_METHODS.items():
