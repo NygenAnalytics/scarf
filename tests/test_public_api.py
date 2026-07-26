@@ -28,6 +28,7 @@ _EXPECTED_EXPORTS = {
     "LoomToZarr": "scarf.writers",
     "MappingReference": "scarf.mapping.reference",
     "MappingResult": "scarf.mapping.models",
+    "mount_datastore": "scarf.datastore.datastore",
     "PseudotimeAggregationResult": "scarf.trajectory.results",
     "PseudotimeMarkerResult": "scarf.trajectory.results",
     "PseudotimeScoreResult": "scarf.trajectory.results",

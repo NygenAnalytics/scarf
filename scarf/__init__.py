@@ -150,6 +150,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "LoomToZarr": (".writers", "LoomToZarr"),
     "MappingReference": (".mapping.reference", "MappingReference"),
     "MappingResult": (".mapping.models", "MappingResult"),
+    "mount_datastore": (".datastore.datastore", "mount_datastore"),
     "PseudotimeAggregationResult": (
         ".trajectory.results",
         "PseudotimeAggregationResult",

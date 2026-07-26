@@ -1,11 +1,12 @@
 import os
+from typing import Any
 
 import numpy as np
 import zarr
 
 from .types import as_zarr_array
-from .arrays import create_metadata_column, create_numeric_array
-from .layout import array_shard_rows, normed_array_spec
+from .arrays import create_metadata_column, create_numeric_array, dtype_fix
+from .layout import PROFILE_METADATA_CHUNK, array_shard_rows, normed_array_spec
 from .sharding import write_dense_in_shard_rows
 
 
@@ -30,6 +31,74 @@ def copy_zarr_array(
     )
 
 
+def _metadata_block_rows(array: zarr.Array) -> int:
+    if array.chunks is not None and len(array.chunks) > 0:
+        return max(1, int(array.chunks[0]))
+    return PROFILE_METADATA_CHUNK
+
+
+def _resolve_metadata_dtype(
+    array: zarr.Array,
+    block_rows: int,
+) -> np.dtype[Any]:
+    dtype: np.dtype[Any] = np.dtype(array.dtype)
+    if not (dtype.kind in {"O", "S"} or dtype.hasobject):
+        return dtype
+    n_rows = int(array.shape[0])
+    if n_rows == 0:
+        return np.dtype("U1")
+    max_len = 1
+    for start in range(0, n_rows, block_rows):
+        stop = min(start + block_rows, n_rows)
+        block = np.asarray(array[start:stop])
+        if block.size == 0:
+            continue
+        resolved: np.dtype[Any] = np.dtype(dtype_fix(dtype, block))
+        if resolved.kind == "U":
+            max_len = max(max_len, resolved.itemsize // 4)
+        else:
+            return resolved
+    return np.dtype(f"U{max_len}")
+
+
+def _copy_metadata_array(
+    src: zarr.Array,
+    dst: zarr.Group,
+    name: str,
+    *,
+    overwrite: bool,
+) -> None:
+    if src.ndim != 1:
+        create_metadata_column(
+            dst,
+            name,
+            data=np.asarray(src[:]),
+            dtype=src.dtype,
+            overwrite=overwrite,
+            chunkSize=PROFILE_METADATA_CHUNK,
+        )
+        target = as_zarr_array(dst[name], name=name)
+    else:
+        block_rows = _metadata_block_rows(src)
+        dtype = _resolve_metadata_dtype(src, block_rows)
+        target = create_metadata_column(
+            dst,
+            name,
+            data=None,
+            dtype=dtype,
+            overwrite=overwrite,
+            chunkSize=PROFILE_METADATA_CHUNK,
+            shape=int(src.shape[0]),
+        )
+        n_rows = int(src.shape[0])
+        for start in range(0, n_rows, block_rows):
+            stop = min(start + block_rows, n_rows)
+            target[start:stop] = np.asarray(src[start:stop], dtype=dtype)
+
+    if "display" in src.attrs:
+        target.attrs["display"] = src.attrs["display"]
+
+
 def copy_zarr_group_tree(
     src: zarr.Group,
     dst: zarr.Group,
@@ -43,14 +112,7 @@ def copy_zarr_group_tree(
             copy_zarr_group_tree(node, child, overwrite=overwrite)
         else:
             array = as_zarr_array(node, name=name)
-            create_metadata_column(
-                dst,
-                name,
-                data=np.asarray(array[:]),
-                dtype=array.dtype,
-                overwrite=overwrite,
-                chunkSize=100000,
-            )
+            _copy_metadata_array(array, dst, name, overwrite=overwrite)
 
 
 def create_or_open_staged_normed_array(

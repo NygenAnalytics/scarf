@@ -2,7 +2,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from ..storage.types import ZarrMode
 from ..assay import Assay
-from ..storage.stores import ZARRLOC
+from ..storage.stores import ZARRLOC, create_matrix_source
 from ._operations.features import _FeatureOperationsMixin
 from ._operations.integration_metrics import _IntegrationMetricsOperationsMixin
 from ._operations.presentation import _PresentationOperationsMixin
@@ -14,7 +14,57 @@ if TYPE_CHECKING:
     from .pipeline_accessor import PipelineAccessor
     from .plot_accessor import DataStorePlotAccessor
 
-__all__ = ["DataStore"]
+__all__ = ["DataStore", "mount_datastore"]
+
+
+def mount_datastore(
+    source: str,
+    at: ZARRLOC,
+    *,
+    workspace: str | None = None,
+    storage_options: dict[str, Any] | None = None,
+    **datastore_options: Any,
+) -> "DataStore":
+    """Create a writable DataStore whose count matrices come from ``source``.
+
+    The target store receives copied cell and feature metadata plus all new
+    analysis artifacts. Count matrices remain in the read-only source and are
+    remounted automatically when the target is reopened with ``DataStore``.
+    """
+    from ..storage.profiles import (
+        _get_storage_profile_override,
+        set_storage_profile,
+    )
+
+    if "zarr_loc" in datastore_options:
+        raise TypeError("mount_datastore takes the target location through 'at'")
+    zarr_mode = datastore_options.pop("zarr_mode", "r+")
+    if zarr_mode != "r+":
+        raise ValueError(
+            f"A mounted datastore is writable and needs zarr_mode 'r+', got "
+            f"{zarr_mode!r}. Reopen the target with DataStore to read it."
+        )
+
+    profile = _get_storage_profile_override()
+    requested_profile = datastore_options.get("zarrProfile")
+    try:
+        if requested_profile is not None:
+            set_storage_profile(requested_profile)
+        create_matrix_source(
+            source,
+            at,
+            workspace=workspace,
+            storage_options=storage_options,
+        )
+    finally:
+        set_storage_profile(profile)
+    return DataStore(
+        at,
+        zarr_mode=zarr_mode,
+        workspace=workspace,
+        storage_options=storage_options,
+        **datastore_options,
+    )
 
 
 class DataStore(

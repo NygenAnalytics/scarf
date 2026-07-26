@@ -24,6 +24,8 @@ from scarf.storage.artifacts import (
     callable_identity,
     find_reusable_artifacts,
     fingerprint_array,
+    fingerprint_stored_strings,
+    fingerprint_strings,
     group_at,
     inspect_artifact,
     list_artifacts,
@@ -320,6 +322,15 @@ def test_streamed_value_fingerprint_is_block_size_independent() -> None:
     streamed.end_array("values")
 
     assert streamed.hexdigest() == whole.hexdigest()
+
+
+def test_stored_string_fingerprint_supports_variable_length_strings() -> None:
+    values = np.array(["a", "longer", "中"], dtype=np.dtypes.StringDType())
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    array = root.create_array("ids", data=values, chunks=(1,))
+
+    expected = fingerprint_strings(values.astype("U6"))
+    assert fingerprint_stored_strings(array) == expected
 
 
 def test_value_fingerprint_normalizes_endian_alignment_and_padding() -> None:

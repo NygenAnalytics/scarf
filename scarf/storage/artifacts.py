@@ -364,6 +364,12 @@ def fingerprint_array(values: np.ndarray) -> str:
     return builder.hexdigest()
 
 
+def _stored_array_chunk_rows(array: zarr.Array) -> int:
+    if array.ndim > 0 and array.chunks is not None:
+        return max(int(array.chunks[0]), 1)
+    return 1
+
+
 def fingerprint_stored_arrays(
     group: zarr.Group,
     names: Sequence[str],
@@ -372,11 +378,7 @@ def fingerprint_stored_arrays(
     for name in names:
         array = as_zarr_array(group[name], name=name)
         builder.begin_array(name, array.shape, array.dtype)
-        chunk_rows = (
-            max(int(array.chunks[0]), 1)
-            if array.ndim > 0 and array.chunks is not None
-            else 1
-        )
+        chunk_rows = _stored_array_chunk_rows(array)
         for start in range(0, array.shape[0], chunk_rows):
             stop = min(start + chunk_rows, array.shape[0])
             block = np.asarray(array[start:stop])
@@ -386,6 +388,37 @@ def fingerprint_stored_arrays(
                 block,
             )
         builder.end_array(name)
+    return builder.hexdigest()
+
+
+def fingerprint_stored_strings(array: zarr.Array) -> str:
+    """Fingerprint a stored string column without loading it in full."""
+    if array.ndim != 1:
+        raise ValueError("Stored string fingerprints require a one-dimensional array")
+
+    chunk_rows = _stored_array_chunk_rows(array)
+    source_dtype = np.dtype(array.dtype)
+    if source_dtype.hasobject:
+        max_length = 1
+        for start in range(0, array.shape[0], chunk_rows):
+            stop = min(start + chunk_rows, array.shape[0])
+            values = np.asarray(array[start:stop])
+            if values.size:
+                max_length = max(
+                    max_length,
+                    max(len(str(value)) for value in values),
+                )
+        string_dtype = np.dtype(f"U{max_length}")
+    else:
+        string_dtype = np.empty(0, dtype=source_dtype).astype(str).dtype
+
+    builder = ValueFingerprintBuilder()
+    builder.begin_array("values", array.shape, string_dtype)
+    for start in range(0, array.shape[0], chunk_rows):
+        stop = min(start + chunk_rows, array.shape[0])
+        block = np.asarray(array[start:stop]).astype(string_dtype)
+        builder.update_array_block("values", (start,), block)
+    builder.end_array("values")
     return builder.hexdigest()
 
 

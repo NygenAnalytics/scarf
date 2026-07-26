@@ -25,7 +25,7 @@ from ..metadata.artifacts import (
     write_cell_data_artifact,
 )
 from ..storage.schema import validate_assay_name
-from ..storage.stores import ZARRLOC, load_zarr
+from ..storage.stores import ZARRLOC, load_zarr, resolve_matrix_source
 from ..storage.selections import resolve_selection_artifact
 from ..utils.compute import controlled_compute, show_dask_progress
 from ..utils.logging import logger
@@ -34,17 +34,24 @@ if TYPE_CHECKING:
     from ..graph.state import AssayState
 
 
-def sanitize_hierarchy(z: zarr.Group, assay_name: str, workspace: str | None) -> bool:
+def sanitize_hierarchy(
+    z: zarr.Group,
+    assay_name: str,
+    workspace: str | None,
+    matrix_root: zarr.Group | None = None,
+) -> bool:
     """Test if an assay node in zarr object was created properly.
 
     Args:
         z: Zarr hierarchy object
         assay_name: String value with name of assay.
         workspace: Workspace name (None for legacy layout without ``matrices/``).
+        matrix_root: Optional root that owns count matrices. Defaults to ``z``.
 
     Returns:
         True if assay_name is present in z and contains `counts` and `featureData` child nodes else raises error
     """
+    matrix_root = z if matrix_root is None else matrix_root
     if workspace is None:
         zw = z
     else:
@@ -55,12 +62,13 @@ def sanitize_hierarchy(z: zarr.Group, assay_name: str, workspace: str | None) ->
     if "featureData" not in assay_zw:
         raise KeyError(f"ERROR: 'featureData' not found in {assay_name}")
     if workspace is None:
-        if "counts" not in assay_zw:
+        matrix_assay = as_zarr_group(matrix_root[assay_name], name=assay_name)
+        if "counts" not in matrix_assay:
             raise KeyError(f"ERROR: 'counts' not found in {assay_name}")
     else:
-        if "matrices" not in z:
+        if "matrices" not in matrix_root:
             raise KeyError("ERROR: Workspace defined but no 'matrices' slot found")
-        matrices = as_zarr_group(z["matrices"], name="matrices")
+        matrices = as_zarr_group(matrix_root["matrices"], name="matrices")
         if assay_name not in matrices:
             raise KeyError(f"ERROR: {assay_name} not found in workspace matrices slot")
         matrix_assay = as_zarr_group(matrices[assay_name], name=assay_name)
@@ -125,7 +133,23 @@ class BaseDataStore:
             synchronizer=synchronizer,
             storage_options=storage_options,
         )
-        self.workspace = workspace
+        resolved = resolve_matrix_source(
+            self.z,
+            storage_options=storage_options,
+        )
+        if resolved is None:
+            self._matrix_z = None
+            self.workspace = workspace
+        else:
+            self._matrix_z, source_workspace = resolved
+            if workspace is None:
+                self.workspace = source_workspace
+            elif workspace != source_workspace:
+                raise ValueError(
+                    "workspace does not match the mounted matrixSource workspace"
+                )
+            else:
+                self.workspace = workspace
         self.nthreads = nthreads
         _ = self.assay_names
         # The order is critical here:
@@ -226,7 +250,12 @@ class BaseDataStore:
         for i in sorted(dict.fromkeys(self.zw.group_keys())):
             if "is_assay" in self.zw[i].attrs.keys():
                 validate_assay_name(i)
-                sanitize_hierarchy(self.z, i, self.workspace)
+                sanitize_hierarchy(
+                    self.z,
+                    i,
+                    self.workspace,
+                    matrix_root=self._matrix_z,
+                )
                 assays.append(i)
         return assays
 
@@ -371,6 +400,7 @@ class BaseDataStore:
                     cell_data=self.cells,
                     min_cells_per_feature=min_cells,
                     nthreads=self.nthreads,
+                    matrix_root=self._matrix_z,
                 ),
             )
         if self.zw.attrs["assayTypes"] != z_attrs:

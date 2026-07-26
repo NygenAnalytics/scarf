@@ -51,26 +51,31 @@ class Assay:
         cell_data: MetaData,
         nthreads: int,
         min_cells_per_feature: int = 10,
+        matrix_root: zarr.Group | None = None,
     ) -> None:
         self.name = name
         self.cells = cell_data
         self.nthreads = nthreads
+        matrix_root = z if matrix_root is None else matrix_root
         if workspace is None:
             counts_path = f"{name}/counts"
             counts_t_path = f"{name}/countsT"
-            matrix_group = as_zarr_group(z[name], name=name)
+            matrix_group = as_zarr_group(matrix_root[name], name=name)
             self.rawData = ChunkedArray(
-                as_zarr_array(z[counts_path], name=counts_path),
+                as_zarr_array(matrix_root[counts_path], name=counts_path),
                 nthreads=nthreads,
             )
             self.feats = MetaData(z[f"{name}/featureData"])  # type: ignore
-            self.z = matrix_group
+            self.z = as_zarr_group(z[name], name=name)
         else:
             counts_path = f"matrices/{name}/counts"
             counts_t_path = f"matrices/{name}/countsT"
-            matrix_group = as_zarr_group(z[f"matrices/{name}"], name=f"matrices/{name}")
+            matrix_group = as_zarr_group(
+                matrix_root[f"matrices/{name}"],
+                name=f"matrices/{name}",
+            )
             self.rawData = ChunkedArray(
-                as_zarr_array(z[counts_path], name=counts_path),
+                as_zarr_array(matrix_root[counts_path], name=counts_path),
                 nthreads=nthreads,
             )
             self.feats = MetaData(z[f"{workspace}/{name}/featureData"])  # type: ignore

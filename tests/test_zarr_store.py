@@ -82,11 +82,13 @@ def _memory_group():
 
 def test_is_remote_datastore():
     local_root = _memory_group()
+    local_array = local_root.create_array("values", shape=(4,), dtype="i4")
     assert is_remote_datastore("/tmp/foo.zarr", local_root) is False
     assert is_remote_datastore("s3://bucket/path", local_root) is True
     # Missing/empty location must inspect the group store, not treat "" as local.
     assert is_remote_datastore("", local_root) is False
     assert is_remote_datastore(None, local_root) is False
+    assert is_remote_datastore(None, local_array) is False
 
 
 def test_copy_zarr_array_round_trip(tmp_path):
@@ -235,11 +237,57 @@ def test_copy_zarr_group_tree(tmp_path):
     slot = src_root.create_group("I__cluster")
     cluster = slot.create_group("0")
     create_zarr_obj_array(cluster, "score", [1.0, 2.0, 3.0], dtype="float64")
+    score = cluster["score"]
+    score.attrs["display"] = {"label": "Score"}
+    score.attrs["source_artifact"] = {"kind": "metadata_snapshot"}
+    score.attrs["source_value"] = "values"
+    score.attrs["value_index"] = 0
 
     dst_root = zarr.open_group(str(tmp_path / "dst.zarr"), mode="w")
     dst_slot = dst_root.create_group("I__cluster")
     copy_zarr_group_tree(slot, dst_slot)
-    np.testing.assert_array_equal(dst_slot["0"]["score"][:], [1.0, 2.0, 3.0])
+    copied = dst_slot["0"]["score"]
+    np.testing.assert_array_equal(copied[:], [1.0, 2.0, 3.0])
+    assert copied.attrs["display"] == {"label": "Score"}
+    assert "source_artifact" not in copied.attrs
+    assert "source_value" not in copied.attrs
+    assert "value_index" not in copied.attrs
+
+
+def test_copy_zarr_group_tree_copies_metadata_in_source_blocks(
+    monkeypatch,
+    tmp_path,
+):
+    from scarf.writers import create_zarr_obj_array
+
+    values = np.array([f"cell-{i}" for i in range(8)])
+    src_root = zarr.open_group(str(tmp_path / "src.zarr"), mode="w")
+    create_zarr_obj_array(
+        src_root,
+        "ids",
+        values,
+        dtype="U20",
+        chunk_size=3,
+    )
+    source_store = src_root.store
+    read_array = zarr.Array.__getitem__
+
+    def reject_wide_source_reads(array, selection):
+        if array.store is source_store and array.path == "ids":
+            if not isinstance(selection, slice):
+                raise AssertionError(f"Unexpected metadata selection: {selection!r}")
+            start = 0 if selection.start is None else selection.start
+            stop = len(values) if selection.stop is None else selection.stop
+            if stop - start > 3:
+                raise AssertionError(
+                    f"Metadata read exceeded source chunk: {selection}"
+                )
+        return read_array(array, selection)
+
+    monkeypatch.setattr(zarr.Array, "__getitem__", reject_wide_source_reads)
+    dst_root = zarr.open_group(str(tmp_path / "dst.zarr"), mode="w")
+    copy_zarr_group_tree(src_root, dst_root)
+    np.testing.assert_array_equal(dst_root["ids"][:], values)
 
 
 def test_create_or_open_staged_normed_array_reuses_shape(tmp_path):

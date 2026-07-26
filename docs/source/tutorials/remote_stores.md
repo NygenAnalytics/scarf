@@ -1,5 +1,5 @@
 ---
-description: Open Scarf DataStores on S3 or GCS, tune the cloud profile, and stage local scratch.
+description: Open or mount remote Scarf DataStores, tune cloud storage, and stage local scratch.
 jupytext:
   text_representation:
     extension: .md
@@ -31,6 +31,7 @@ remote overhead.
 
 - Open a public demo store on object storage without downloading it
 - Open `DataStore` on `s3://` or `gs://` with `storage_options`
+- Mount shared count matrices into a separate writable analysis store
 - Select the `cloud` storage profile
 - Stage normalized data locally with `local_cache`
 - Repack an older store with `scarf.tools.repack_zarr`
@@ -63,6 +64,114 @@ state = ds.get_assay_state('RNA')
 print('Reduction published:', state.reduction is not None)
 print('Graph published:', state.connectivity_map is not None)
 ```
+
+## Mount read-only counts into a writable store
+
+Use `mount_datastore` when count matrices must remain in a shared source store,
+but each analysis needs its own writable store. Scarf copies cell and feature
+metadata into the target. It reads `counts` and `countsT` from the source and
+writes new metadata and analysis artifacts only to the target.
+
+This executable example downloads the prepared demo store so it has a source
+path accepted by `mount_datastore`. The mounted target lives in a temporary
+directory for the lifetime of the notebook.
+
+```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import numpy as np
+import zarr
+
+mounted_dataset = repository.download_dataset(
+    name='tenx_5K_pbmc_rnaseq',
+    destination='scarf_datasets',
+    zarr=True,
+)
+source_path = Path(mounted_dataset) / 'data.zarr'
+mount_directory = TemporaryDirectory()
+target_path = Path(mount_directory.name) / 'analysis.zarr'
+```
+
+The target path must not already exist:
+
+```{code-cell} ipython3
+mounted = scarf.mount_datastore(
+    str(source_path),
+    at=str(target_path),
+    nthreads=4,
+)
+mounted
+```
+
+The target assay has no count array. `rawData` still exposes the complete source
+matrix:
+
+```{code-cell} ipython3
+source_root = zarr.open_group(str(source_path), mode='r')
+source_counts = source_root['RNA/counts']
+
+print('Counts stored in target:', 'counts' in mounted.z['RNA'])
+print('Source shape:', source_counts.shape)
+print('Mounted shape:', mounted.RNA.rawData.shape)
+```
+
+Metadata changes and analysis methods persist their output in the target. This
+example adds a cell column and normalizes the existing `hvgs` feature selection:
+
+```{code-cell} ipython3
+mounted.cells.insert(
+    'analysisCopy',
+    np.ones(
+        len(mounted.cells.active_index('I')),
+        dtype=bool,
+    ),
+)
+
+normalization = mounted.run_normalization(feat_key='hvgs')
+mounted.inspect_artifact(normalization).complete
+```
+
+The new cell column is present only in the target:
+
+```{code-cell} ipython3
+print(
+    'Cell column in source:',
+    'analysisCopy' in source_root['cellData'],
+)
+print(
+    'Cell column in target:',
+    'analysisCopy' in mounted.z['cellData'],
+)
+```
+
+Opening the target later resolves the source automatically. The source must
+remain accessible at the recorded path or URI:
+
+```{code-cell} ipython3
+reopened = scarf.DataStore(str(target_path), nthreads=4)
+same_counts = np.array_equal(
+    reopened.RNA.rawData[:20, :20].compute(),
+    source_counts[:20, :20],
+)
+print('Counts still match:', same_counts)
+print('Normalization complete:', reopened.inspect_artifact(normalization).complete)
+```
+
+For an S3 or GCS source, pass the URI directly. The target can remain local:
+
+```python
+mounted = scarf.mount_datastore(
+    's3://shared-bucket/atlas.zarr',
+    at='my-analysis.zarr',
+    storage_options={'anon': True},
+    zarrProfile='fast_local',
+)
+```
+
+The mount records matrix shape, dtype, and source identity. Reopening fails if
+the source no longer matches that identity. Metadata is copied at mount time,
+so later source metadata changes are not synchronized into the target.
 
 ## Open your own remote store
 

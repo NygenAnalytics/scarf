@@ -377,7 +377,7 @@ class RNAassay(Assay):
             def read_block(block_idx: int) -> np.ndarray:
                 return _read_facade_block(zarr_arr, cell_idx, batches[block_idx])
 
-        remote = is_remote_datastore(None, self.z)
+        remote = is_remote_datastore(None, zarr_arr)
         for block_idx, raw, read_sec, source in iter_column_blocks(
             n_blocks,
             read_block,
@@ -596,7 +596,7 @@ class RNAassay(Assay):
                     tiles.append((local_cells, rows, local_feats, cols))
 
         n_blocks = len(tiles)
-        remote = is_remote_datastore(None, self.z)
+        remote = is_remote_datastore(None, zarr_arr)
         sub_rows, sub_cols = _feature_stats_tile_shape(
             max((len(rows) for _, rows, _, _ in tiles), default=1),
             max((len(cols) for _, _, _, cols in tiles), default=1),
