@@ -7,6 +7,15 @@ are extending Scarf.
 The atomic graph methods are documented on {doc}`graph_ops` and the artifact inspection
 methods on {doc}`artifacts`, so they are excluded here rather than repeated.
 
+## Mounting shared count matrices
+
+Use `mount_datastore` when count matrices stay in a read-only source store and analysis
+artifacts should write to a separate target. See {doc}`../../tutorials/remote_stores`.
+
+```{eval-rst}
+.. autofunction:: scarf.mount_datastore
+```
+
 ```{eval-rst}
 .. autoclass:: scarf.datastore.datastore.DataStore
     :members:
