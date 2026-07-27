@@ -11,8 +11,7 @@ resultsUri = "s3://example-bucket/scarf-profiling"
 # runTag = "chunk256m"
 # [storageLayout]
 # targetChunkBytes = 268435456
-# minFeatureChunk = 500
-# maxFeatureChunk = 10000
+# targetShardBytes = 805306368
 targetSizes = [
     10000,
     25000,
@@ -79,7 +78,6 @@ modalCpuRequest = 8.0
 modalCpuLimit = 8.0
 scarfMemoryBudget = 51539607552
 workers = 8
-workingCopies = 4
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -90,7 +88,6 @@ modalCpuRequest = 8.0
 modalCpuLimit = 8.0
 scarfMemoryBudget = 51539607552
 workers = 8
-workingCopies = 4
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -101,7 +98,6 @@ modalCpuRequest = 4.0
 modalCpuLimit = 4.0
 scarfMemoryBudget = 12884901888
 workers = 4
-workingCopies = 2
 timeoutSeconds = 3600
 ephemeralDiskMb = 524288
 
@@ -112,7 +108,6 @@ modalCpuRequest = 8.0
 modalCpuLimit = 8.0
 scarfMemoryBudget = 25769803776
 workers = 8
-workingCopies = 4
 timeoutSeconds = 14400
 ephemeralDiskMb = 524288
 
@@ -123,7 +118,6 @@ modalCpuRequest = 8.0
 modalCpuLimit = 8.0
 scarfMemoryBudget = 51539607552
 workers = 8
-workingCopies = 4
 timeoutSeconds = 43200
 ephemeralDiskMb = 524288
 
@@ -134,7 +128,6 @@ modalCpuRequest = 16.0
 modalCpuLimit = 16.0
 scarfMemoryBudget = 120259084288
 workers = 16
-workingCopies = 4
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -145,7 +138,6 @@ modalCpuRequest = 8.0
 modalCpuLimit = 8.0
 scarfMemoryBudget = 51539607552
 workers = 8
-workingCopies = 4
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -156,7 +148,6 @@ modalCpuRequest = 2.0
 modalCpuLimit = 2.0
 scarfMemoryBudget = 25769803776
 workers = 2
-workingCopies = 2
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
@@ -167,6 +158,5 @@ modalCpuRequest = 16.0
 modalCpuLimit = 16.0
 scarfMemoryBudget = 120259084288
 workers = 16
-workingCopies = 4
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288

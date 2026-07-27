@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 from collections import Counter
 from collections.abc import Iterator
 from typing import Any
@@ -15,15 +16,23 @@ from ..assay import Assay
 from ..matrix import Block, ChunkedArray
 from ..metadata import MetaData
 from ..storage.arrays import create_zarr_obj_array
-from ..storage.budget import worker_prefetch_depth
-from ..storage.profiles import is_local_zarr_path
-from ..storage.schema import create_zarr_count_assay, finalize_counts
-from ..storage.sharding import accumulate_sparse_to_shards
-from ..storage.stores import ZARRLOC, load_zarr as load_zarr
-from ..utils.arrays import permute_into_chunks
+from ..storage.budget import admitted_worker_count, resolve_budget
+from ..storage.layout import array_shard_rows
+from ..storage.profiles import (
+    StorageProfile,
+    ZarrLocation,
+    is_local_zarr_path,
+    resolve_storage_profile,
+)
+from ..storage.schema import create_zarr_count_assay
+from ..storage.sharding import (
+    accumulate_sparse_to_shards,
+    sparse_producer_peak_bytes,
+)
+from ..storage.stores import load_zarr as load_zarr
+from ..utils.arrays import canonicalize_sparse, permute_into_chunks
 from ..utils.compute import controlled_compute as controlled_compute
 from ..utils.logging import logger
-from ..utils.prefetch import prefetch_blocks
 from ..utils.progress import tqdmbar
 
 
@@ -55,6 +64,27 @@ type _RowPlan = tuple[
 ]
 
 
+def _dtype_for_integer_sum(dtype: np.dtype[Any], copies: int) -> np.dtype[Any]:
+    if copies <= 1 or dtype.kind not in "biu":
+        return dtype
+    if dtype.kind in "bu":
+        lower = 0
+        upper = (1 if dtype.kind == "b" else np.iinfo(dtype).max) * copies
+        for candidate in (np.uint8, np.uint16, np.uint32, np.uint64):
+            candidate_info = np.iinfo(candidate)
+            if lower >= candidate_info.min and upper <= candidate_info.max:
+                return np.dtype(candidate)
+    else:
+        info = np.iinfo(dtype)
+        lower = info.min * copies
+        upper = info.max * copies
+        for signed_candidate in (np.int8, np.int16, np.int32, np.int64):
+            candidate_info = np.iinfo(signed_candidate)
+            if lower >= candidate_info.min and upper <= candidate_info.max:
+                return np.dtype(signed_candidate)
+    return np.dtype(np.uint64 if dtype.kind in "bu" else np.int64)
+
+
 class AssayMerge:
     """Merge multiple Zarr files into a single Zarr file.
 
@@ -67,7 +97,6 @@ class AssayMerge:
                           'RNA'.
         in_workspaces: Source workspace per assay (None uses each assay's default layout).
         out_workspace: Target workspace name in the merged Zarr file.
-        chunk_size: Tuple of cell and feature chunk size. (Default value: (1000, 1000)).
         dtype: Dtype of the raw values in the assay. Dtype is automatically inferred from the provided assays. If
                assays have different dtypes then a float type is used.
         overwrite: If True, then overwrites previously created assay in the Zarr file. (Default value: False).
@@ -93,13 +122,12 @@ class AssayMerge:
 
     def __init__(
         self,
-        zarr_path: ZARRLOC,
+        zarr_path: ZarrLocation,
         assays: list[MergeAssay],
         names: list[str],
         merge_assay_name: str,
         in_workspaces: list[str] | None = None,
         out_workspace: str | None = None,
-        chunk_size: tuple[int, int] = (1000, 1000),
         dtype: str | None = None,
         overwrite: bool = False,
         prepend_text: str | None = "orig",
@@ -107,6 +135,11 @@ class AssayMerge:
         seed: int | None = 42,
         storage_options: dict[str, Any] | None = None,
         source_column: str | None = None,
+        mem_budget: int | str | None = None,
+        nthreads: int | None = None,
+        profile: StorageProfile | None = None,
+        targetChunkBytes: int | None = None,
+        targetShardBytes: int | None = None,
         _row_plan: _RowPlan | None = None,
         _row_chunk_sizes: list[int] | None = None,
     ) -> None:
@@ -115,7 +148,55 @@ class AssayMerge:
         self.inWorkspaces = in_workspaces
         self.outWorkspace = out_workspace
         self.merge_assay_name = merge_assay_name
-        self.chunk_size = chunk_size
+        assay_resources = [
+            assay.resources for assay in assays if hasattr(assay, "resources")
+        ]
+        resolved_memory = (
+            mem_budget
+            if mem_budget is not None
+            else (
+                min(resource.memoryBytes for resource in assay_resources)
+                if assay_resources
+                else None
+            )
+        )
+        resolved_workers = (
+            nthreads
+            if nthreads is not None
+            else (
+                min(resource.workers for resource in assay_resources)
+                if assay_resources
+                else None
+            )
+        )
+        self.resources = resolve_budget(resolved_memory, resolved_workers)
+        if _row_chunk_sizes is not None and len(_row_chunk_sizes) != len(assays):
+            raise ValueError("Row chunk sizes must match the number of assays")
+        if _row_chunk_sizes is not None and any(rows <= 0 for rows in _row_chunk_sizes):
+            raise ValueError("Row chunk sizes must be positive")
+        plan_rows = sum(int(assay.rawData.shape[0]) for assay in assays)
+        chunk_rows = (
+            [int(assay.rawData.chunksize[0]) for assay in assays]
+            if _row_chunk_sizes is None
+            else [int(rows) for rows in _row_chunk_sizes]
+        )
+        plan_chunks = sum(
+            (int(assay.rawData.shape[0]) + rows - 1) // rows
+            for assay, rows in zip(assays, chunk_rows, strict=True)
+        )
+        plan_features = sum(int(assay.rawData.shape[1]) for assay in assays)
+        index_bytes = np.dtype(np.int64).itemsize
+        row_plan_bytes = (
+            3 * plan_rows * index_bytes
+            + 2 * plan_chunks * index_bytes
+            + 2 * plan_features * index_bytes
+        )
+        admitted_worker_count(
+            self.resources,
+            taskBytes=max(1, row_plan_bytes),
+            requested=1,
+        )
+        self.profile = resolve_storage_profile(zarr_path, profile)
         self.storage_options = storage_options
         self._usesSharedRowPlan = _row_plan is not None or _row_chunk_sizes is not None
         row_plan = (
@@ -165,13 +246,34 @@ class AssayMerge:
             self.featOrder_map = self.featOrder.copy()
 
         self.cellOrder: dict[int, dict[int, np.ndarray]] = self._ref_order_cell_idx()
+        admitted_worker_count(
+            self.resources,
+            taskBytes=1,
+            residentBytes=(
+                self._metadata_resident_bytes() + self._row_plan_resident_bytes()
+            ),
+            requested=1,
+        )
         self.z: zarr.Group = self._use_existing_zarr(
             zarr_path, merge_assay_name, overwrite
         )
         self._ini_cell_data(overwrite)
         if dtype is None:
             if len(set([str(x.rawData.dtype) for x in self.assays])) == 1:
-                dtype = str(self.assays[0].rawData.dtype)
+                max_copies = max(
+                    (
+                        int(np.unique(order_map, return_counts=True)[1].max())
+                        for order_map in self.featOrder_map
+                        if order_map.size
+                    ),
+                    default=1,
+                )
+                dtype = str(
+                    _dtype_for_integer_sum(
+                        np.dtype(self.assays[0].rawData.dtype),
+                        max_copies,
+                    )
+                )
             else:
                 dtype = "float"
 
@@ -179,12 +281,71 @@ class AssayMerge:
             z=self.z,
             assay_name=merge_assay_name,
             workspace=self.outWorkspace,
-            chunk_size=chunk_size,
             n_cells=self.nCells,
             feat_ids=np.array(self.mergedFeats_map["ids"]),
             feat_names=np.array(self.mergedFeats_map["names"]),
             dtype=dtype,
+            profile=self.profile,
+            targetChunkBytes=targetChunkBytes,
+            targetShardBytes=targetShardBytes,
         )
+
+    def _metadata_resident_bytes(self) -> int:
+        frames = (self.mergedCells, self.mergedFeats, self.mergedFeats_map)
+        frame_bytes = sum(
+            int(frame.memory_usage(index=True, deep=True).sum()) for frame in frames
+        )
+        feature_bytes = 0
+        seen: set[int] = set()
+        for collection in (self.featCollection, self.featCollection_map):
+            feature_bytes += sys.getsizeof(collection)
+            for mapping in collection:
+                if id(mapping) in seen:
+                    continue
+                seen.add(id(mapping))
+                feature_bytes += sys.getsizeof(mapping)
+                for key, value in mapping.items():
+                    for item in (key, value):
+                        if id(item) not in seen:
+                            seen.add(id(item))
+                            feature_bytes += sys.getsizeof(item)
+        return frame_bytes + feature_bytes
+
+    def _row_plan_resident_bytes(self) -> int:
+        arrays = [
+            self.coordinates_permutations,
+            *(
+                rows
+                for chunks in self.permutations_rows.values()
+                for rows in chunks.values()
+            ),
+            *(
+                rows
+                for chunks in self.permutations_rows_offset.values()
+                for rows in chunks.values()
+            ),
+            *(rows for chunks in self.cellOrder.values() for rows in chunks.values()),
+            *self.featOrder,
+            *self.featOrder_map,
+        ]
+        array_bytes = sum(
+            array.nbytes for array in {id(array): array for array in arrays}.values()
+        )
+        mappings = (
+            self.permutations_rows,
+            self.permutations_rows_offset,
+            self.cellOrder,
+        )
+        container_bytes = (
+            sys.getsizeof(self.featOrder)
+            + sys.getsizeof(self.featOrder_map)
+            + sum(
+                sys.getsizeof(mapping)
+                + sum(sys.getsizeof(chunks) for chunks in mapping.values())
+                for mapping in mappings
+            )
+        )
+        return array_bytes + container_bytes
 
     def perform_randomization_rows(
         self,
@@ -290,19 +451,18 @@ class AssayMerge:
         # Example:
         # cellOrder = {0: {0: array([0, 1, 2]), 1: array([3, 4, 5]), 2: array([ 9, 10, 11]), 3: array([18])}, 1: {0: array([15, 16, 17]), 1: array([12, 13, 14]), 2: array([6, 7, 8]), 3: array([19])}}
         # Here we see that the cells [2, 0, 1] from the first chunk of the first assay are mapped to [0, 1, 2] in the merged assay. Similarly, the cells [2, 0, 1] from the first chunk of the second assay are mapped to [15, 16, 17] in the merged assay.
-        new_cells = {}
+        new_cells: dict[int, dict[int, np.ndarray]] = {}
         for i in range(len(self.assays)):
-            in_dict: dict[int, np.ndarray] = {}
-            for j in range(len(self.permutations_rows[i])):
-                in_dict[j] = np.array([])
-            new_cells[i] = in_dict
+            new_cells[i] = {}
         offset = 0
-        for i, (x, y) in enumerate(self.coordinates_permutations):
-            arr = self.permutations_rows[x][y]
-            arr = np.array(range(len(arr)))
-            arr = arr + offset
-            new_cells[x][y] = arr
-            offset = arr.max() + 1
+        for x, y in self.coordinates_permutations:
+            size = self.permutations_rows[x][y].size
+            new_cells[x][y] = np.arange(
+                offset,
+                offset + size,
+                dtype=np.int64,
+            )
+            offset += size
         return new_cells
 
     def _merge_cell_table(
@@ -561,10 +721,8 @@ class AssayMerge:
         return featorder
 
     def _use_existing_zarr(
-        self, zarr_loc: ZARRLOC, merge_assay_name: str, overwrite: bool
+        self, zarr_loc: ZarrLocation, merge_assay_name: str, overwrite: bool
     ) -> zarr.Group:
-        from . import load_zarr
-
         if self.outWorkspace is None:
             cell_slot = "cellData"
             assay_slot = merge_assay_name
@@ -670,15 +828,16 @@ class AssayMerge:
             (source.data, (source.row, order_map[source.col])),
             shape=(computed_data.shape[0], self.nFeats),
         )
-        if not np.array_equal(order, order_map):
-            mapped.sum_duplicates()
+        if not bool(mapped.has_canonical_format):
+            destination = getattr(self, "assayGroup", None)
+            mapped = canonicalize_sparse(
+                mapped,
+                None if destination is None else destination.dtype,
+            )
         return mapped
 
-    def dump(self, nthreads: int = 4) -> None:
+    def dump(self) -> None:
         """Copy the values from individual assays to the merged assay.
-
-        Args:
-            nthreads: Number of compute threads to use. (Default value: 2)
 
         Returns:
         """
@@ -720,32 +879,99 @@ class AssayMerge:
                 block,
                 self.featOrder[assay_idx],
                 self.featOrder_map[assay_idx],
-                nthreads,
+                self.resources.workers,
             )
 
         def block_stream() -> Iterator[coo_matrix]:
-            blocks = prefetch_blocks(
-                coordinates,
-                convert_block,
-                max_ahead=worker_prefetch_depth(),
-            )
+            blocks = map(convert_block, coordinates)
             yield from tqdmbar(
                 blocks,
                 total=len(coordinates),
                 desc="Writing merged assay",
             )
 
+        source_rows = max(
+            (
+                int(rows.size)
+                for chunks in self.permutations_rows.values()
+                for rows in chunks.values()
+            ),
+            default=0,
+        )
+        buffered_rows = min(
+            self.nCells,
+            source_rows + array_shard_rows(self.assayGroup),
+        )
+        row_nnz: list[np.ndarray] = []
+        for assay in self.assays:
+            column = f"{assay.name}_nFeatures"
+            if column in assay.cells.columns:
+                counts = np.asarray(
+                    assay.cells.fetch_all(column),
+                    dtype=np.int64,
+                )
+            else:
+                counts = np.full(
+                    int(assay.rawData.shape[0]),
+                    int(assay.rawData.shape[1]),
+                    dtype=np.int64,
+                )
+            row_nnz.append(counts)
+        ordered_nnz = np.concatenate(
+            [
+                row_nnz[assay_idx][self.permutations_rows[assay_idx][block_idx]]
+                for assay_idx, block_idx in coordinates
+            ]
+        )
+        source_nnz = max(
+            (
+                int(
+                    row_nnz[assay_idx][
+                        self.permutations_rows[assay_idx][block_idx]
+                    ].sum()
+                )
+                for assay_idx, block_idx in coordinates
+            ),
+            default=0,
+        )
+        if ordered_nnz.size:
+            width = min(buffered_rows, ordered_nnz.size)
+            cumulative = np.empty(ordered_nnz.size + 1, dtype=np.int64)
+            cumulative[0] = 0
+            np.cumsum(ordered_nnz, dtype=np.int64, out=cumulative[1:])
+            buffered_nnz = int(np.max(cumulative[width:] - cumulative[:-width]))
+            del cumulative
+        else:
+            buffered_nnz = 0
+        dense_source_elements = max(
+            (
+                rows.size * int(self.assays[assay_idx].rawData.shape[1])
+                for assay_idx, chunks in self.permutations_rows.items()
+                for rows in chunks.values()
+            ),
+            default=0,
+        )
+        del row_nnz, ordered_nnz
+        value_bytes = max(
+            np.dtype(self.assayGroup.dtype).itemsize,
+            *(np.dtype(assay.rawData.dtype).itemsize for assay in self.assays),
+        )
+        resident_bytes = (
+            self._row_plan_resident_bytes() + self._metadata_resident_bytes()
+        )
         counter = accumulate_sparse_to_shards(
             self.assayGroup,
             block_stream(),
-            dtype=self.assayGroup.dtype,
+            resources=self.resources,
+            residentBytes=resident_bytes,
+            producerReserveBytes=sparse_producer_peak_bytes(
+                buffered_nnz,
+                source_nnz,
+                value_bytes,
+            )
+            + dense_source_elements * value_bytes,
         )
         if counter != self.nCells or expected_start != self.nCells:
             raise AssertionError(
                 "ERROR: Mismatch in number of cells in the merged assay. Please report this issue."
             )
-        self.assayGroup = finalize_counts(
-            self.z,
-            self.merge_assay_name,
-            self.outWorkspace,
-        )

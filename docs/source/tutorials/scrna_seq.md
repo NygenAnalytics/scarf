@@ -71,7 +71,6 @@ reader.nCells, reader.nFeatures
 writer = scarf.CrToZarr(
     reader,
     zarr_loc=f'{dataset}/data.zarr',
-    chunk_size=(2000, 1000)
 )
 writer.dump(batch_size=1000)
 ```

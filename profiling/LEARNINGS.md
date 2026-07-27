@@ -7,9 +7,107 @@ Dataset source: nested CELLxGENE samples already prepared on R2
 
 This note is the baseline for quantifying later changes (code defaults, orchestrator CPU/mem tables, layout ideas). Times are stage wall seconds from result JSON. Peaks are `peakRssBytes` / `peakCgroupBytes` as reported (RSS unless noted).
 
+## Principled storage baseline at 250k
+
+Run tag `principled_baseline_250k_714e5c1_326c58e_c8_m32` records the
+pre-refactor code at commit `714e5c1a0ef072e4283507fb9dae009e3274d05a`.
+The working-tree diff SHA-256 was
+`326c58e19c48b7a84ac5f1ddd0d6bd1a6634ca217a84af82fab7215ba73904e2`.
+Every measured job used 8 CPU, 32 GiB Modal memory, a 24 GiB Scarf budget,
+and 8 workers. The legacy H5AD read batch was 8,844 cells. The resolved count
+dtype was `uint16`.
+
+| Operation | Seconds | Peak GiB (RSS / cgroup) |
+|-----------|--------:|------------------------:|
+| createStore | 57.8 | 12.3 / 12.2 |
+| repair countsT | 72.0 | 9.8 / 9.8 |
+| initializeStore | 100.6 | 3.2 / 2.9 |
+| reopenStore | 9.6 | 0.5 / 0.5 |
+| filterCells | 74.1 | 0.7 / 0.7 |
+| markHvgs | 140.3 | 1.2 / 1.2 |
+| IO baseline: HVG tiles | 43.1 | 1.1 / 1.1 |
+| IO baseline: marker batches | 247.3 | 2.4 / 2.3 |
+| IO baseline: graph raw bands | 41.3 | 3.0 / 3.2 |
+
+`counts` used chunks `(8844, 7588)` and the repaired `countsT` used chunks
+`(7588, 8844)`. The IO baseline read 11.76 GiB through each of the HVG and
+marker patterns. Its normalized graph pattern could not run because the
+baseline store did not contain `latest_feat_key`; the raw graph pattern passed.
+
+Durable results:
+
+- stages: `s3://scarf-tests/scarf-profiling/results/principled_baseline_250k_714e5c1_326c58e_c8_m32/250000/`
+- countsT Modal result: `fc-01KYFS0W0331VK3HX6GQ8Q74PG`
+- IO: `s3://scarf-tests/scarf-profiling/io-baseline/principled_baseline_250k_714e5c1_326c58e_c8_m32.json`
+- store: `s3://scarf-tests/scarf-profiling/stores/principled_baseline_250k_714e5c1_326c58e_c8_m32/250000.zarr`
+
+The recording-store probes for complete sparse bands, bounded writers,
+countsT range coalescing, overlap, and failure completeness all passed. The
+full pre-change suite passed 1,322 tests. These timings are one fresh sample;
+candidate comparisons below use repeated runs and report medians.
+
+### Column read-ahead decision
+
+Three column-only repetitions compared direct ordered reads at depths 1 and 2
+with the disk-staging pipeline at depth 2. Every run read 11.76 GiB for 174 HVG
+tiles and 16 marker batches from the same store.
+
+- Direct depth 1 median: 62.4 seconds for HVG tiles and 31.6 seconds for markers.
+- Direct depth 2 median: 41.0 seconds for HVG tiles and 38.4 seconds for markers.
+- Disk staging depth 2 median: 52.5 seconds for HVG tiles and 36.7 seconds for markers.
+
+Disk staging made HVG reads 28 percent slower than direct depth 2. Its marker
+median was only 4 percent faster, below the 10 percent retention gate, while
+marker peak RSS increased from about 4.9 GiB to 6.3 through 6.8 GiB. Scarf now
+uses direct ordered reads with `READ_AHEAD = 2` and no scratch-file pipeline.
+The repeated result JSON files use suffixes `direct-a1-r1` through
+`direct-a1-r3`, `direct-a2-r1` through `direct-a2-r3`, and `staged-a2-r2`
+through `staged-a2-r4` under the IO baseline prefix above.
+
+### countsT object-write decision
+
+Three 250k repair repetitions compared complete row bands, synchronous inner
+chunks, and asynchronous inner-chunk object writes on 8 CPU and 32 GiB.
+
+- Complete row bands: 58.3, 63.0, and 95.9 seconds; median 63.0 seconds; peak RSS about 12.5 GiB.
+- Synchronous inner chunks: 52.7, 86.3, and 62.2 seconds; median 62.2 seconds; peak RSS about 2.1 GiB.
+- Asynchronous inner chunks: 48.1, 40.5, and 47.4 seconds; median 47.4 seconds; peak RSS about 2.3 GiB.
+
+Asynchronous object writes reduced median wall time by 24 percent relative to
+synchronous inner chunks and stayed below 2.5 GiB RSS. `write_counts_t` keeps a
+synchronous public API and uses async only for bounded destination chunk writes.
+The two slower implementations and their strategy switch were removed.
+
+### Final 250k and 500k gates
+
+The final geometry used `uint16`, count chunks `(7370, 9105)`, count shards
+`(7370, 45525)`, and `countsT` chunks `(9105, 7370)`. Stage results are under
+`principled_final_714e5c1_fe53b97_c8_m32` and
+`principled_final_714e5c1_fe53b97_c16_m32`.
+The countsT calls were `fc-01KYFYY2VGCW73DQE7B0XSQSG4`,
+`fc-01KYFZERV2P70TB40CGW9K2TDP`, `fc-01KYG05388M6P1DXN7KVXK7RGR`, and
+`fc-01KYG12HM25ZSKA2HZ5W4W897S` in the order listed below.
+
+- 250k at 8 CPU: counts 106.4 seconds, countsT 53.0 seconds, initialization 101.3 seconds, reopen 6.2 seconds, and HVG 90.1 seconds.
+- 250k at 16 CPU: counts 81.9 seconds, countsT 39.9 seconds, initialization 91.3 seconds, reopen 6.7 seconds, and HVG 97.4 seconds.
+- 500k at 8 CPU: counts 160.8 seconds, countsT 98.8 seconds, initialization 87.7 seconds, reopen 7.1 seconds, and HVG 148.3 seconds.
+- 500k at 16 CPU: counts 292.1 seconds, countsT 73.5 seconds, initialization 178.5 seconds, reopen 6.6 seconds, and HVG 120.6 seconds.
+
+At 250k, 16 CPU met both sub-100-second conversion phase targets and had a
+combined conversion time of 121.9 seconds, compared with the 129.8-second
+pre-change baseline. The 8 CPU counts phase missed its target by 6.4 seconds.
+Initialization, reopen, and HVG did not regress against the baseline at either
+resource size. Maximum cgroup use was 13.3 GiB at 250k and 14.2 GiB at 500k,
+well below the 90 percent memory gate.
+
+The 500k samples show that more workers are not uniformly better. Sixteen CPUs
+improved countsT and HVG, but its counts and initialization samples were slower.
+Eight CPU therefore remains the general 32 GiB default. Use 16 CPU when the
+250k conversion latency target matters, or for an isolated countsT build.
+
 ## Objective
 
-Minimize wall time without pointless overprovisioning. Prefer using memory and CPU in ways that actually cut stage time. Do not treat `workingCopies` as a speed dial.
+Minimize wall time without pointless overprovisioning. Prefer using memory and CPU in ways that actually cut stage time.
 
 **Default layout going forward: feature-major `countsT` (Zarr v3).** Row-major tags remain as historical controls. New funnel profiles should use countsT stores.
 
@@ -36,8 +134,8 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 
 | Change | Location | Effect |
 |--------|----------|--------|
-| Cloud default `targetChunkBytes` = 128 MiB when remote and unset | `scarf/storage/zarr_store.py` (`DEFAULT_CLOUD_TARGET_CHUNK_BYTES`) | Matches layout-sweep winner |
-| Auto marker batch when `gene_batch_size is None` | `scarf/features/markers/batching.py` `resolve_marker_gene_batch_size` | `min(col_chunk, n_features, budgetCap)` with `budgetCap = (memoryBytes // workingCopies) // (n_cells * 32)` |
+| Cloud default count layout | `scarf/storage/layout.py` | Uses the measured 128 MiB inner-chunk target and canonical shard target |
+| Auto marker batch when `gene_batch_size is None` | `scarf/features/markers/batching.py` `resolve_marker_gene_batch_size` | `min(col_chunk, n_features, budgetCap)` with the explicit operation memory and read concurrency |
 | Optional profiling override | `profiling` `markerGeneBatchSize` | Layout sweep forced `50`; later runs leave unset for auto |
 | Leiden child-process isolation | `profiling/stages.py`, `profiling/leiden_worker.py` | Parent keeps Modal heartbeats alive during long `leidenalg` GIL holds |
 | Paris child-process isolation | `profiling/stages.py`, `profiling/paris_worker.py` | Same heartbeat pattern; fixed or adaptive Paris cut |
@@ -81,14 +179,13 @@ Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.m
 
 | Knob | Value used in successful speed runs | Rule |
 |------|-------------------------------------|------|
-| `workingCopies` | 4 in profiling configs (library default is 8) | Model of concurrent in-memory copies. Change only if peaks/OOM show the model is wrong |
 | Assay / workflow seeds | graph 4466, umap/leiden 4444, `topN=2000`, `k=11`, `dims=50` | Keep fixed across A/B |
 | Modal vs Scarf coupling | Usually Scarf ≈ 75% of Modal | Decouple on purpose only for budget-mismatch experiments (below) |
 
 ## How to quantify a future change
 
 1. Pick a fixed reference run tag (see tables below). Prefer `counts_t_c8_m32_100k` / `counts_t_c8_m32_500k` when comparing gene-wise IO. Use `auto_markers_c8_m32*` for row-major baselines.
-2. Change one variable (size, CPU, mem, parallel flags, or code). Keep `workingCopies` and workflow seeds fixed unless the experiment is about the copy model.
+2. Change one variable (size, CPU, memory, parallel flags, or code). Keep workflow seeds fixed.
 3. Compare stage seconds and peak GiB. Also report total seconds and max peak.
 4. Result URIs: `{resultsUri}/results/{runTag}/{nRows}/{stage}.json`
 5. Spawn via deployed app bare `run_all_jobs.spawn(...)` (see Agent / ops rules). Stage workers still apply config resources inside the deployed orchestrator.
@@ -121,7 +218,7 @@ paris_5m=fc-01KY4TNN5D4QTFHAY9DDYKRHJE
 
 ## Layout sweep @ 100k (4 CPU / 32 GiB)
 
-All layouts: forced `markerGeneBatchSize=50`, `annParallel=false`, `umapParallel=false`, workers=4, workingCopies=4.
+All layouts: forced `markerGeneBatchSize=50`, `annParallel=false`, `umapParallel=false`, and workers=4.
 
 | Tag | Nominal chunk target | Total s | Max peak GiB | Markers s | Markers peak |
 |-----|---------------------|--------:|-------------:|----------:|-------------:|
@@ -179,14 +276,14 @@ Cloud 128 MiB default (no forced batch 50). Scarf budget ~24 GiB on 32 GiB Modal
 
 1. **Auto marker batches beat forced batch 50** on markers (353s → 269s at 4CPU/32GiB) and raise marker peak (1.0 → 4.5 GiB). That is productive use of Scarf budget.
 2. **Shrinking Modal RAM alone is the wrong optimization for speed.** 16 GiB vs 32 GiB: totals similar; markers got slower (269 → 316s). Peaks stayed ~6.5 GiB on non-marker heavy stages.
-3. **Extra Modal RAM does nothing unless Scarf `memoryBytes` grows** so auto batches can grow under fixed `workingCopies`.
+3. **Extra Modal RAM does nothing unless Scarf `memoryBytes` grows** so auto batches can grow.
 4. **Parallel UMAP is the clearest speed win** (146s → 58s). Almost no RAM change.
 5. **8 workers did not speed markers**; they slowed them (269 → 331s) even with higher peak (7.1 GiB). Treat marker thread/worker scaling as unresolved.
 6. **HVG and markers dominate** after UMAP is fixed (~22% each of the 4CPU control total).
 
 ## Scale: 100k → 250k (same speed pack)
 
-Config family: 8 CPU / 32 GiB, workers=8, workingCopies=4, `annParallel=true`, `umapParallel=true`, auto markers, cloud 128 MiB chunks.
+Config family: 8 CPU / 32 GiB, workers=8, `annParallel=true`, `umapParallel=true`, auto markers, cloud 128 MiB chunks.
 
 | Stage | 100k (`c8_m32`) | 250k (`c8_m32_250k`) | Time scale | Peak 100k | Peak 250k |
 |-------|----------------:|---------------------:|-----------:|----------:|----------:|
@@ -219,7 +316,6 @@ Configs:
 | More Modal RAM with same Scarf budget | No | Peaks unchanged |
 | Cutting Modal RAM for its own sake | No for speed | 16G markers slower |
 | Raising `workers` for markers | Not shown; can hurt | 4→8 workers, markers +62s |
-| Tuning `workingCopies` for speed | Do not | It is a copy-count model, not a perf knob |
 | Feature-major `countsT` (Zarr v3) | **Yes** for HVG/markers | 100k/500k A/B below; createStore pays write cost |
 
 ## Ops notes (Modal)
@@ -260,7 +356,7 @@ Rough Modal RAM floor from peaks: 100k ≥8 GiB, 250k ≥16 GiB, 500k ≥24–32
 
 ## Budget mismatch @ 100k: Modal 32 GiB, Scarf 16 GiB (done)
 
-Tag `auto_markers_c4_m32_scarf16`. Matched to `c4_m32` (4 CPU, workers=4, workingCopies=4, UMAP/ANN off). Only Scarf budget cut to 16 GiB; Modal stayed 32 GiB. Store built under that budget.
+Tag `auto_markers_c4_m32_scarf16`. Matched to `c4_m32` (4 CPU, workers=4, UMAP/ANN off). Only Scarf budget cut to 16 GiB; Modal stayed 32 GiB. Store built under that budget.
 
 | Stage | c4_m32 (~24G Scarf) | scarf16 (16G Scarf) | Δ |
 |-------|--------------------:|--------------------:|--:|
@@ -379,7 +475,7 @@ Tag `auto_markers_c8_m64_2_5m`. Same speed-pack knobs as 1M. Call `fc-01KXPPVXKA
 
 ## Feature-major `countsT` A/B (done)
 
-Zarr v3 secondary matrix written on finalize (`write_counts_t` / `finalize_writer_counts`). RNA HVG/markers use `assay.rawDataT` when present. Same speed pack as row-major controls (8 CPU / 32 GiB, parallel UMAP/ANN, auto markers, cloud 128 MiB chunks). Fresh stores so createStore pays for `countsT` write.
+Zarr v3 secondary matrix written explicitly with `write_counts_t`. RNA HVG/markers use `assay.rawDataT` when present. Same speed pack as row-major controls (8 CPU / 32 GiB, parallel UMAP/ANN, auto markers, cloud 128 MiB chunks). Fresh stores so createStore pays for `countsT` write.
 
 | Stage | 100k row | 100k countsT | 500k row | 500k countsT |
 |-------|---------:|-------------:|---------:|-------------:|

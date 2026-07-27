@@ -9,7 +9,6 @@ if TYPE_CHECKING:
         AssayMerge as AssayMerge,
         DummyAssay as DummyAssay,
         MergeAssay as MergeAssay,
-        ZARRLOC as ZARRLOC,
         _RowPlan as _RowPlan,
         controlled_compute as controlled_compute,
         load_zarr as load_zarr,
@@ -29,7 +28,6 @@ _LAZY_EXPORTS = {
     "_RowPlan": "assays",
     "load_zarr": "assays",
     "controlled_compute": "assays",
-    "ZARRLOC": "assays",
 }
 
 for _export_name in _LAZY_EXPORTS:

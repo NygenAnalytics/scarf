@@ -2,12 +2,14 @@ import builtins
 
 import pytest
 
+import scarf.storage.budget as budget_module
 from scarf.storage.budget import (
-    READ_AHEAD,
     ResourceBudget,
+    admitted_worker_count,
+    admitted_worker_split,
     detect_total_memory_bytes,
+    detect_workers,
     resolve_budget,
-    worker_prefetch_depth,
 )
 
 
@@ -101,6 +103,79 @@ def test_detect_memory_uses_sysconf_when_meminfo_unavailable(monkeypatch):
     assert detect_total_memory_bytes() == 4096 * 1024
 
 
+def test_detect_memory_uses_process_cgroup_path(monkeypatch):
+    nested_limit = 2 * 1024**3
+    monkeypatch.setattr(
+        budget_module,
+        "_process_cgroup_path",
+        lambda controller: "batch/job.scope" if controller == "" else None,
+    )
+    monkeypatch.setattr(
+        budget_module,
+        "_read_int",
+        lambda path: (
+            nested_limit if path == "/sys/fs/cgroup/batch/memory.max" else None
+        ),
+    )
+    monkeypatch.setattr(budget_module, "_physical_memory_bytes", lambda: 16 * 1024**3)
+
+    assert detect_total_memory_bytes() == nested_limit
+
+
+def test_process_cgroup_path_parses_unified_and_legacy_entries(monkeypatch):
+    content = "0::/batch/job.scope\n5:cpu,cpuacct:/legacy/job.scope\n"
+    monkeypatch.setattr("pathlib.Path.read_text", lambda path: content)
+
+    assert budget_module._process_cgroup_path("") == "batch/job.scope"
+    assert budget_module._process_cgroup_path("cpu") == "legacy/job.scope"
+    assert budget_module._process_cgroup_path("memory") is None
+
+
+def test_detect_workers_uses_process_cgroup_path(monkeypatch):
+    monkeypatch.setattr(
+        budget_module,
+        "_process_cgroup_path",
+        lambda controller: "batch/job.scope" if controller == "" else None,
+    )
+
+    def read_text(path):
+        if str(path) == "/sys/fs/cgroup/batch/job.scope/cpu.max":
+            return "250000 100000"
+        raise OSError("missing")
+
+    monkeypatch.setattr("pathlib.Path.read_text", read_text)
+    monkeypatch.setattr("os.cpu_count", lambda: 16)
+    monkeypatch.setattr("os.sched_getaffinity", lambda pid: set(range(16)))
+
+    assert detect_workers() == 2
+
+
+def test_detect_workers_uses_combined_legacy_controller_mount(monkeypatch):
+    monkeypatch.setattr(
+        budget_module,
+        "_process_cgroup_entry",
+        lambda controller: (
+            (["cpu", "cpuacct"], "batch/job.scope") if controller == "cpu" else None
+        ),
+    )
+
+    def read_text(path):
+        values = {
+            "/sys/fs/cgroup/cpu,cpuacct/batch/cpu.cfs_quota_us": "200000",
+            "/sys/fs/cgroup/cpu,cpuacct/batch/cpu.cfs_period_us": "100000",
+        }
+        try:
+            return values[str(path)]
+        except KeyError:
+            raise OSError("missing") from None
+
+    monkeypatch.setattr("pathlib.Path.read_text", read_text)
+    monkeypatch.setattr("os.cpu_count", lambda: 16)
+    monkeypatch.setattr("os.sched_getaffinity", lambda pid: set(range(16)))
+
+    assert detect_workers() == 2
+
+
 def test_invalid_workers_env_rejected(monkeypatch):
     monkeypatch.delenv("SCARF_MEM_BUDGET", raising=False)
     monkeypatch.setenv("SCARF_WORKERS", "not-a-number")
@@ -115,32 +190,62 @@ def test_fraction_uses_total_memory(monkeypatch):
     assert abs(got - int(total * 0.25)) <= total * 0.01
 
 
-def test_worker_prefetch_depth_capped_by_read_ahead():
-    budget = ResourceBudget(memoryBytes=4 * 1024**3, workers=4, workingCopies=8)
-    assert worker_prefetch_depth(budget=budget) == READ_AHEAD
-    assert worker_prefetch_depth(requested=1, budget=budget) == 1
-    assert worker_prefetch_depth(requested=10, budget=budget) == READ_AHEAD
-    assert worker_prefetch_depth(requested=0, budget=budget) == 1
+def test_admitted_worker_count_respects_cpu_memory_and_resident_bytes():
+    resources = ResourceBudget(memoryBytes=4 * 1024**3, workers=8)
+    assert admitted_worker_count(resources, taskBytes=1024**3) == 4
+    assert (
+        admitted_worker_count(
+            resources,
+            taskBytes=1024**3,
+            residentBytes=1024**3,
+        )
+        == 3
+    )
+    assert (
+        admitted_worker_count(
+            resources,
+            taskBytes=1024**3,
+            requested=2,
+        )
+        == 2
+    )
 
 
-def test_worker_prefetch_depth_capped_by_working_copies():
-    budget = ResourceBudget(memoryBytes=4 * 1024**3, workers=4, workingCopies=1)
-    assert worker_prefetch_depth(budget=budget) == 1
+def test_admitted_worker_count_rejects_oversized_task():
+    resources = ResourceBudget(memoryBytes=1024, workers=8)
+    with pytest.raises(MemoryError):
+        admitted_worker_count(resources, taskBytes=2048)
 
 
-def test_working_copies_from_env(monkeypatch):
-    monkeypatch.delenv("SCARF_MEM_BUDGET", raising=False)
-    monkeypatch.setenv("SCARF_WORKING_COPIES", "8")
-    budget = resolve_budget(memory="4G", workers=1)
-    assert budget.workingCopies == 8
+def test_admitted_worker_split_bounds_outer_inner_and_resident_bytes():
+    resources = ResourceBudget(memoryBytes=500, workers=8)
+    outer, inner = admitted_worker_split(
+        resources,
+        nTasks=20,
+        taskBytes=lambda concurrency: 100 + 10 * concurrency,
+        residentBytes=100,
+    )
+    assert (outer, inner) == (3, 2)
+    assert outer * inner <= resources.workers
+    assert 100 + outer * (100 + 10 * inner) <= resources.memoryBytes
 
 
-def test_layout_geometry_independent_of_workers():
-    from scarf.storage.layout import matrix_layout
+def test_admitted_worker_split_rejects_resident_data_at_limit():
+    resources = ResourceBudget(memoryBytes=500, workers=8)
+    with pytest.raises(MemoryError, match="Resident data"):
+        admitted_worker_split(
+            resources,
+            nTasks=1,
+            taskBytes=lambda _: 1,
+            residentBytes=500,
+        )
 
-    one = ResourceBudget(memoryBytes=8 * 1024**3, workers=1, workingCopies=4)
-    eight = ResourceBudget(memoryBytes=8 * 1024**3, workers=8, workingCopies=4)
-    c1, s1 = matrix_layout(1_000_000, 50_000, budget=one, itemsize=4)
-    c8, s8 = matrix_layout(1_000_000, 50_000, budget=eight, itemsize=4)
-    assert c1 == c8
-    assert s1 == s8
+
+def test_admitted_worker_split_can_reduce_inner_concurrency_to_fit():
+    resources = ResourceBudget(memoryBytes=150, workers=8)
+    outer, inner = admitted_worker_split(
+        resources,
+        nTasks=1,
+        taskBytes=lambda concurrency: 100 + 20 * concurrency,
+    )
+    assert (outer, inner) == (1, 2)

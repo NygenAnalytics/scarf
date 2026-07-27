@@ -62,6 +62,7 @@ def test_crtozarr_preserves_exact_counts_metadata_and_transpose():
 
     class ExactReader:
         nCells = values.shape[0]
+        matrix_dtype = values.dtype
         assayFeats = pd.DataFrame(
             {"RNA": ["Gene Expression", 0, values.shape[1], values.shape[1]]},
             index=["type", "start", "end", "nFeatures"],
@@ -80,19 +81,29 @@ def test_crtozarr_preserves_exact_counts_metadata_and_transpose():
             for start in range(0, self.nCells, batch_size):
                 yield coo_matrix(values[start : start + batch_size])
 
+        def max_window_nnz(self, window_rows):
+            width = min(window_rows, self.nCells)
+            return max(
+                np.count_nonzero(values[start : start + width])
+                for start in range(self.nCells - width + 1)
+            )
+
+        def producer_staging_bytes(self, batch_size, lines_in_mem):
+            return 0
+
     store = MemoryStore()
     writer = CrToZarr(
         ExactReader(),
         zarr_loc=store,
         dtype="uint16",
-        chunk_size=(2, 2),
+        targetChunkBytes=12,
+        targetShardBytes=12,
     )
     writer.dump(batch_size=2)
 
     root = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
-    assert root["RNA/countsT"].attrs["complete"] is True
+    assert "countsT" not in root["RNA"]
     np.testing.assert_array_equal(root["cellData/ids"][:], ["c1", "c2", "c3"])
     np.testing.assert_array_equal(root["RNA/featureData/ids"][:], ["f1", "f2", "f3"])
 
@@ -178,7 +189,8 @@ def test_h5adtozarr_splits_noncontiguous_feature_types():
                 zarr_loc=store,
                 assay_name="ignored",
                 assay_split_key="feature_types",
-                chunk_size=(2, 2),
+                targetChunkBytes=8,
+                targetShardBytes=8,
             )
             writer.dump(batch_size=2)
         finally:
@@ -188,8 +200,8 @@ def test_h5adtozarr_splits_noncontiguous_feature_types():
     assert set(root.group_keys()) == {"cellData", "RNA", "ADT"}
     np.testing.assert_array_equal(root["RNA/counts"][:], values[:, [0, 2]])
     np.testing.assert_array_equal(root["ADT/counts"][:], values[:, [1, 3]])
-    np.testing.assert_array_equal(root["RNA/countsT"][:], values[:, [0, 2]].T)
-    np.testing.assert_array_equal(root["ADT/countsT"][:], values[:, [1, 3]].T)
+    assert "countsT" not in root["RNA"]
+    assert "countsT" not in root["ADT"]
     np.testing.assert_array_equal(root["cellData/batch"][:], ["A", "A", "B"])
     np.testing.assert_array_equal(root["RNA/featureData/ids"][:], ["f1", "f2"])
     np.testing.assert_array_equal(root["ADT/featureData/ids"][:], ["a1", "a2"])
@@ -201,6 +213,343 @@ def test_h5adtozarr_splits_noncontiguous_feature_types():
         root["ADT/featureData/feature_types"][:],
         ["Antibody Capture", "Antibody Capture"],
     )
+
+
+def _write_h5ad(
+    path,
+    values: np.ndarray,
+    *,
+    encoding: str = "csr",
+    feature_types: list[bytes] | None = None,
+):
+    """Write a minimal AnnData file with the requested matrix encoding."""
+    import h5py
+    from scipy.sparse import csc_matrix, csr_matrix
+
+    n_cells, n_feats = values.shape
+    with h5py.File(path, mode="w") as h5:
+        if encoding == "dense":
+            h5.create_dataset("X", data=values)
+        else:
+            matrix = csr_matrix(values) if encoding == "csr" else csc_matrix(values)
+            group = h5.create_group("X")
+            group.attrs["encoding-type"] = f"{encoding}_matrix"
+            group.attrs["shape"] = values.shape
+            group.create_dataset("data", data=matrix.data)
+            group.create_dataset("indices", data=matrix.indices)
+            group.create_dataset("indptr", data=matrix.indptr)
+
+        obs = h5.create_group("obs")
+        obs.create_dataset(
+            "_index",
+            data=np.array([f"c{i}".encode() for i in range(n_cells)]),
+        )
+        var = h5.create_group("var")
+        var.create_dataset(
+            "_index",
+            data=np.array([f"f{i}".encode() for i in range(n_feats)]),
+        )
+        var.create_dataset(
+            "feature_name",
+            data=np.array([f"g{i}".encode() for i in range(n_feats)]),
+        )
+        if feature_types is not None:
+            var.create_dataset("feature_types", data=np.array(feature_types))
+    return path
+
+
+# Sizes a 12-row uint32 assay into (4, n_feats) row shards.
+_SHARD_BAND_BUDGET = {
+    "mem_budget": 1024**2,
+    "nthreads": 4,
+    "targetChunkBytes": 48,
+    "targetShardBytes": 48,
+}
+
+
+def _band_counts(n_cells: int, n_feats: int) -> np.ndarray:
+    rng = np.random.default_rng(7)
+    values = rng.integers(0, 5, size=(n_cells, n_feats), dtype=np.uint32)
+    values[4:8] = 0
+    return values
+
+
+@pytest.mark.parametrize("encoding", ["csr", "csc", "dense"])
+def test_h5adtozarr_writes_shard_bands_for_every_encoding(tmp_path, encoding):
+    from scarf.readers import H5adReader
+    from scarf.storage.types import array_metadata_shards
+    from scarf.writers import H5adToZarr
+
+    values = _band_counts(12, 3)
+    path = _write_h5ad(tmp_path / f"{encoding}.h5ad", values, encoding=encoding)
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = MemoryStore()
+    try:
+        H5adToZarr(reader, zarr_loc=store, **_SHARD_BAND_BUDGET).dump(batch_size=5)
+    finally:
+        reader.h5.close()
+
+    root = zarr.open_group(store=store, mode="r")
+    counts = root["RNA/counts"]
+    assert array_metadata_shards(counts) == (4, 3)
+    np.testing.assert_array_equal(counts[:], values)
+    assert "countsT" not in root["RNA"]
+
+
+@pytest.mark.parametrize(
+    ("fractional", "expected_dtype"),
+    [(False, np.dtype("uint16")), (True, np.dtype("float32"))],
+)
+def test_h5adtozarr_uses_smallest_lossless_dtype_for_float_counts(
+    tmp_path,
+    fractional,
+    expected_dtype,
+):
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    values = _band_counts(12, 3).astype(np.float32)
+    values[0, 0] = 1.5 if fractional else 3308
+    path = _write_h5ad(tmp_path / "float_counts.h5ad", values, encoding="csr")
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = MemoryStore()
+    try:
+        H5adToZarr(
+            reader,
+            zarr_loc=store,
+            mem_budget=1024**2,
+            nthreads=2,
+            targetChunkBytes=48,
+            targetShardBytes=48,
+        ).dump(batch_size=4)
+    finally:
+        reader.h5.close()
+
+    root = zarr.open_group(store=store, mode="r")
+    assert np.dtype(root["RNA/counts"].dtype) == expected_dtype
+    np.testing.assert_array_equal(root["RNA/counts"][:], values)
+    assert "countsT" not in root["RNA"]
+
+
+@pytest.mark.parametrize("encoding", ["csr", "csc"])
+def test_h5adtozarr_preserves_duplicate_coordinate_sums(tmp_path, encoding):
+    import h5py
+
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    path = _write_h5ad(
+        tmp_path / f"duplicate_{encoding}.h5ad",
+        np.zeros((1, 1), dtype=np.float32),
+        encoding=encoding,
+    )
+    with h5py.File(path, mode="r+") as h5:
+        group = h5["X"]
+        for name in ("data", "indices", "indptr"):
+            del group[name]
+        group.create_dataset("data", data=np.array([200, 100], dtype=np.float32))
+        group.create_dataset("indices", data=np.array([0, 0], dtype=np.int32))
+        group.create_dataset("indptr", data=np.array([0, 2], dtype=np.int32))
+
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = MemoryStore()
+    try:
+        H5adToZarr(
+            reader,
+            zarr_loc=store,
+            mem_budget=1024**2,
+            nthreads=2,
+            targetChunkBytes=16,
+            targetShardBytes=16,
+        ).dump(batch_size=1)
+    finally:
+        reader.h5.close()
+
+    counts = zarr.open_group(store=store, mode="r")["RNA/counts"]
+    assert counts.dtype == np.dtype("float32")
+    assert counts[0, 0] == 300
+
+
+@pytest.mark.parametrize("encoding", ["csr", "csc"])
+def test_h5adtozarr_reduces_duplicates_before_explicit_dtype_cast(
+    tmp_path,
+    encoding,
+):
+    import h5py
+
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    path = _write_h5ad(
+        tmp_path / f"explicit_duplicate_{encoding}.h5ad",
+        np.zeros((1, 1), dtype=np.float32),
+        encoding=encoding,
+    )
+    with h5py.File(path, mode="r+") as h5:
+        group = h5["X"]
+        for name in ("data", "indices", "indptr"):
+            del group[name]
+        group.create_dataset(
+            "data",
+            data=np.array([100.5, 99.5], dtype=np.float32),
+        )
+        group.create_dataset("indices", data=np.array([0, 0], dtype=np.int32))
+        group.create_dataset("indptr", data=np.array([0, 2], dtype=np.int32))
+
+    reader = H5adReader(
+        str(path),
+        feature_name_key="feature_name",
+        dtype="uint8",
+    )
+    store = MemoryStore()
+    try:
+        H5adToZarr(
+            reader,
+            zarr_loc=store,
+            mem_budget=1024**2,
+            nthreads=1,
+            targetChunkBytes=16,
+            targetShardBytes=16,
+        ).dump(batch_size=1)
+    finally:
+        reader.h5.close()
+
+    counts = zarr.open_group(store=store, mode="r")["RNA/counts"]
+    assert counts.dtype == np.dtype("uint8")
+    assert counts[0, 0] == 200
+
+
+def test_h5adtozarr_reads_the_source_once_for_all_assays(tmp_path, monkeypatch):
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    values = _band_counts(12, 4)
+    # An empty leading band for the second assay must not shift its row offsets.
+    values[:5, [1, 3]] = 0
+    path = _write_h5ad(
+        tmp_path / "multi.h5ad",
+        values,
+        feature_types=[
+            b"Gene Expression",
+            b"Antibody Capture",
+            b"Gene Expression",
+            b"Antibody Capture",
+        ],
+    )
+
+    consumed: list[int] = []
+    original = H5adReader.consume
+
+    def spy(self, batch_size):
+        consumed.append(batch_size)
+        return original(self, batch_size)
+
+    monkeypatch.setattr(H5adReader, "consume", spy)
+
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = MemoryStore()
+    try:
+        H5adToZarr(
+            reader,
+            zarr_loc=store,
+            assay_split_key="feature_types",
+            **_SHARD_BAND_BUDGET,
+        ).dump(batch_size=5)
+    finally:
+        reader.h5.close()
+
+    assert consumed == [5]
+    root = zarr.open_group(store=store, mode="r")
+    assert set(root.group_keys()) == {"cellData", "RNA", "ADT"}
+    np.testing.assert_array_equal(root["RNA/counts"][:], values[:, [0, 2]])
+    np.testing.assert_array_equal(root["ADT/counts"][:], values[:, [1, 3]])
+    assert "countsT" not in root["RNA"]
+    assert "countsT" not in root["ADT"]
+    assert root["RNA/counts"].dtype == values.dtype
+
+
+def test_h5adtozarr_small_assay_does_not_serialize_row_band_writes(
+    tmp_path,
+):
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+    from tests.store_probes import RecordingStore
+
+    values = _band_counts(12, 4)
+    path = _write_h5ad(
+        tmp_path / "uneven_multi.h5ad",
+        values,
+        feature_types=[
+            b"Gene Expression",
+            b"Gene Expression",
+            b"Gene Expression",
+            b"Antibody Capture",
+        ],
+    )
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = RecordingStore(delay=0.01)
+    try:
+        writer = H5adToZarr(
+            reader,
+            zarr_loc=store,
+            assay_split_key="feature_types",
+            **_SHARD_BAND_BUDGET,
+        )
+        store.reset()
+        writer.dump(batch_size=5)
+    finally:
+        reader.h5.close()
+
+    assert store.max_in_flight > 1
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], values[:, :3])
+    np.testing.assert_array_equal(root["ADT/counts"][:], values[:, 3:])
+
+
+def test_h5adtozarr_propagates_band_write_failure(
+    tmp_path,
+):
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+    from tests.store_probes import RecordingStore
+
+    values = _band_counts(12, 3)
+    path = _write_h5ad(tmp_path / "failing.h5ad", values)
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = RecordingStore(fail_on="RNA/counts/c/2/0")
+    try:
+        writer = H5adToZarr(reader, zarr_loc=store, **_SHARD_BAND_BUDGET)
+        with pytest.raises(RuntimeError, match="injected write failure"):
+            writer.dump(batch_size=5)
+    finally:
+        reader.h5.close()
+
+    assert ("set", "RNA/counts/c/2/0") in store.ops
+
+
+def test_h5adtozarr_counts_materialized_csr_as_resident_memory(tmp_path):
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    values = (
+        np.arange(400 * 400, dtype=np.uint32).reshape(400, 400) % 65_534 + 1
+    ).astype(np.uint16)
+    path = _write_h5ad(tmp_path / "resident_csc.h5ad", values, encoding="csc")
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    try:
+        reader.infer_storage_dtype()
+        conversion_peak = reader.csc_conversion_peak_bytes()
+        writer = H5adToZarr(
+            reader,
+            zarr_loc=MemoryStore(),
+            mem_budget=conversion_peak,
+            nthreads=4,
+        )
+        assert reader.materialized_csr_bytes() > 0
+        with pytest.raises(MemoryError, match="operation limit"):
+            writer.dump(batch_size=values.shape[0])
+    finally:
+        reader.h5.close()
 
 
 def test_loomtozarr(loom_reader, tmp_path):
@@ -229,15 +578,19 @@ def test_loomtozarr_preserves_exact_counts_and_transpose(tmp_path):
     reader = LoomReader(str(path))
     store = MemoryStore()
     try:
-        writer = LoomToZarr(reader, zarr_loc=store, chunk_size=(2, 2))
+        writer = LoomToZarr(
+            reader,
+            zarr_loc=store,
+            targetChunkBytes=8,
+            targetShardBytes=8,
+        )
         writer.dump(batch_size=2)
     finally:
         reader.h5.close()
 
     root = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
-    assert root["RNA/countsT"].attrs["complete"] is True
+    assert "countsT" not in root["RNA"]
 
 
 def test_sparsetozarr(tmp_path):
@@ -262,8 +615,7 @@ def test_sparsetozarr(tmp_path):
     writer.dump()
     root = zarr.open_group(fn, mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], mat.toarray())
-    np.testing.assert_array_equal(root["RNA/countsT"][:], mat.toarray().T)
-    assert root["RNA/countsT"].attrs["complete"] is True
+    assert "countsT" not in root["RNA"]
 
 
 def test_sparsetozarr_sharded_layout(tmp_path):
@@ -331,8 +683,7 @@ def test_csv_to_zarr_round_trip(tmp_path):
         dtype=np.uint16,
     )
     np.testing.assert_array_equal(root["RNA/counts"][:], expected)
-    np.testing.assert_array_equal(root["RNA/countsT"][:], expected.T)
-    assert root["RNA/countsT"].attrs["complete"] is True
+    assert "countsT" not in root["RNA"]
     np.testing.assert_array_equal(
         root["RNA/featureData/ids"][:],
         np.array(["geneA", "geneB", "geneC"]),
@@ -344,6 +695,40 @@ def test_csv_to_zarr_round_trip(tmp_path):
     np.testing.assert_array_equal(
         root["cellData/quality"][:],
         np.array([10, 20, 30, 40, 50]),
+    )
+
+
+def test_csv_to_zarr_writes_extra_cell_columns_into_workspace(tmp_path):
+    csv_path = tmp_path / "counts.csv"
+    csv_path.write_text(
+        "quality,geneA,geneB\n1,1,2\n2,3,4\n3,5,6\n",
+        encoding="utf-8",
+    )
+    reader = CSVReader(
+        str(csv_path),
+        cell_data_cols=["quality"],
+        batch_size=2,
+    )
+    store = MemoryStore()
+    writer = CSVtoZarr(
+        reader,
+        zarr_loc=store,
+        assay_name="RNA",
+        workspace="run1",
+        dtype=np.dtype("uint16"),
+    )
+
+    writer.dump()
+
+    root = zarr.open_group(store=store, mode="r")
+    assert "cellData" not in root
+    np.testing.assert_array_equal(
+        root["run1/cellData/quality"][:],
+        np.array([1, 2, 3]),
+    )
+    np.testing.assert_array_equal(
+        root["matrices/RNA/counts"][:],
+        np.array([[1, 2], [3, 4], [5, 6]], dtype=np.uint16),
     )
 
 
@@ -368,7 +753,8 @@ def test_subset_assay_zarr_selects_ordered_rows_and_columns():
         out_grp="selected",
         cells_idx=cells,
         feat_idx=features,
-        chunk_size=(2, 2),
+        targetChunkBytes=8,
+        targetShardBytes=8,
     )
 
     selected = root["selected"]
@@ -532,7 +918,7 @@ def test_subset_zarr_remote_uri_skips_local_guard(monkeypatch):
         calls.append((zarr_loc, mode, storage_options))
         return zarr.open_group(store=MemoryStore(), mode="w")
 
-    monkeypatch.setattr("scarf.writers.load_zarr", fake_load_zarr)
+    monkeypatch.setattr("scarf.writers.subset.load_zarr", fake_load_zarr)
     subset = object.__new__(SubsetZarr)
     subset.overFn = False
     subset.storage_options = {"access_key_id": "key"}
@@ -543,15 +929,18 @@ def test_subset_zarr_remote_uri_skips_local_guard(monkeypatch):
 def test_crtozarr_forwards_storage_options(monkeypatch):
     captured = {}
 
-    def fake_load_zarr(zarr_loc, mode, storage_options=None, synchronizer=None):
+    def fake_load_zarr(zarr_loc, mode, storage_options=None):
         captured["zarr_loc"] = zarr_loc
         captured["mode"] = mode
         captured["storage_options"] = storage_options
         return zarr.open_group(store=MemoryStore(), mode="w")
 
-    monkeypatch.setattr("scarf.writers.load_zarr", fake_load_zarr)
-    monkeypatch.setattr("scarf.writers.create_cell_data", lambda **kwargs: None)
-    monkeypatch.setattr("scarf.writers.create_zarr_count_assay", lambda **kwargs: None)
+    monkeypatch.setattr("scarf.storage.stores.load_zarr", fake_load_zarr)
+    monkeypatch.setattr("scarf.storage.schema.create_cell_data", lambda **kwargs: None)
+    monkeypatch.setattr(
+        "scarf.storage.schema.create_zarr_count_assay",
+        lambda **kwargs: None,
+    )
 
     class FakeCr:
         def cell_names(self):
@@ -581,55 +970,38 @@ def test_crtozarr_forwards_storage_options(monkeypatch):
     assert captured["storage_options"] == {"access_key_id": "id"}
 
 
-def test_h5adtozarr_forwards_storage_resources_and_chunk_controls(monkeypatch):
+def test_h5adtozarr_applies_storage_resources_and_chunk_controls(tmp_path):
+    from scarf.readers import H5adReader
+    from scarf.storage.layout import count_array_spec
     from scarf.writers import H5adToZarr
 
-    captured = {}
-
-    def fake_load_zarr(zarr_loc, mode, storage_options=None):
-        captured["store"] = (zarr_loc, mode, storage_options)
-        return zarr.open_group(store=MemoryStore(), mode="w")
-
-    def fake_budget(mem_budget, nthreads, working_copies):
-        captured["budget"] = (mem_budget, nthreads, working_copies)
-
-    def fake_create_count(**kwargs):
-        captured["count"] = kwargs
-
-    monkeypatch.setattr("scarf.writers.load_zarr", fake_load_zarr)
-    monkeypatch.setattr("scarf.writers._apply_budget_override", fake_budget)
-    monkeypatch.setattr("scarf.writers.create_zarr_count_assay", fake_create_count)
-    monkeypatch.setattr(H5adToZarr, "_ini_cell_data", lambda self: None)
-    monkeypatch.setattr(H5adToZarr, "_ini_feature_data", lambda self: None)
-
-    class FakeH5ad:
-        nCells = 1
-        matrixDtype = np.dtype("uint16")
-
-        def feat_ids(self):
-            return np.array(["f1"])
-
-        def feat_names(self):
-            return np.array(["g1"])
-
-    H5adToZarr(
-        FakeH5ad(),
-        zarr_loc="s3://bucket/out.zarr",
-        storage_options={"access_key_id": "id"},
-        mem_budget="2G",
-        nthreads=3,
-        working_copies=2,
-        targetChunkBytes=4096,
-        minFeatureChunk=16,
-        maxFeatureChunk=128,
+    values = (np.arange(100 * 50, dtype=np.uint32).reshape(100, 50) % 1_000).astype(
+        np.uint16
     )
+    path = _write_h5ad(tmp_path / "layout_controls.h5ad", values)
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    try:
+        writer = H5adToZarr(
+            reader,
+            zarr_loc=MemoryStore(),
+            mem_budget="2G",
+            nthreads=3,
+            targetChunkBytes=4_096,
+            targetShardBytes=20_480,
+        )
+    finally:
+        reader.h5.close()
 
-    assert captured["store"] == (
-        "s3://bucket/out.zarr",
-        "w",
-        {"access_key_id": "id"},
+    expected = count_array_spec(
+        100,
+        50,
+        dtype=np.uint16,
+        profile="fast_local",
+        targetChunkBytes=4_096,
+        targetShardBytes=20_480,
     )
-    assert captured["budget"] == ("2G", 3, 2)
-    assert captured["count"]["targetChunkBytes"] == 4096
-    assert captured["count"]["minFeatureChunk"] == 16
-    assert captured["count"]["maxFeatureChunk"] == 128
+    counts = writer.z["RNA/counts"]
+    assert writer.resources.memoryBytes == 2 * 1024**3
+    assert writer.resources.workers == 3
+    assert counts.chunks == expected.chunks
+    assert counts.metadata.shards == expected.shards

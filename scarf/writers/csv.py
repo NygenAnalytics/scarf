@@ -5,8 +5,12 @@ import numpy as np
 
 from ..storage.types import as_zarr_group
 from ..readers import CSVReader
+from ..storage.profiles import (
+    StorageProfile,
+    ZarrLocation,
+    resolve_storage_profile,
+)
 from ..storage.sharding import write_dense_from_row_batches
-from ..storage.stores import ZARRLOC
 
 
 class CSVtoZarr:
@@ -16,35 +20,36 @@ class CSVtoZarr:
         cr: A CSVReader object
         zarr_loc: The file name for the Zarr hierarchy.
         assay_name: A label for the assay. Ex. "RNA" or "ATAC"
-        chunk_size: The requested size of chunks to load into memory and process.
         dtype: the dtype of the data.
 
     Attributes:
         csvr: A CSVReader object
         fn: The file name for the Zarr hierarchy.
-        chunkSizes: The requested size of chunks to store in Zarr file
         z: The Zarr hierarchy (array or group).
     """
 
     def __init__(
         self,
         cr: CSVReader,
-        zarr_loc: ZARRLOC,
+        zarr_loc: ZarrLocation,
         assay_name: str,
-        chunk_size: tuple[int, int] = (1000, 1000),
         workspace: str | None = None,
         dtype: np.dtype | None = None,
         storage_options: dict[str, Any] | None = None,
+        mem_budget: int | str | None = None,
+        nthreads: int | None = None,
+        profile: StorageProfile | None = None,
+        targetChunkBytes: int | None = None,
+        targetShardBytes: int | None = None,
     ) -> None:
-        from . import (
-            create_cell_data,
-            create_zarr_count_assay,
-            load_zarr,
-        )
+        from ..storage.budget import resolve_budget
+        from ..storage.schema import create_cell_data, create_zarr_count_assay
+        from ..storage.stores import load_zarr
 
         self.csvr = cr
         self.assayName = assay_name
-        self.chunkSizes = chunk_size
+        self.resources = resolve_budget(mem_budget, nthreads)
+        self.profile = resolve_storage_profile(zarr_loc, profile)
         self.workspace = workspace
         self.storage_options = storage_options
         self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
@@ -54,20 +59,23 @@ class CSVtoZarr:
             self.dtype = next(self.csvr.consume())[0].dtype
         cell_ids = self.csvr.cell_ids()
         _ = create_cell_data(
-            z=self.z,
+            root=self.z,
             workspace=workspace,
             ids=cell_ids,
             names=cell_ids,
+            profile=self.profile,
         )
         create_zarr_count_assay(
             z=self.z,
             assay_name=self.assayName,
             workspace=workspace,
-            chunk_size=chunk_size,
             n_cells=self.csvr.nCells,
             feat_ids=self.csvr.feature_ids(),
             feat_names=self.csvr.feature_ids(),
             dtype=str(self.dtype),
+            profile=self.profile,
+            targetChunkBytes=targetChunkBytes,
+            targetShardBytes=targetShardBytes,
         )
 
     def dump(self) -> None:
@@ -81,17 +89,25 @@ class CSVtoZarr:
         Returns:
             None
         """
-        from . import (
-            create_zarr_obj_array,
-            finalize_writer_counts,
-            load_count_store,
-        )
+        from ..storage.arrays import create_zarr_obj_array
+        from ..storage.schema import load_count_array
 
-        store = load_count_store(self.z, self.assayName, self.workspace)
-        cell_data_grp = as_zarr_group(self.z["cellData"], name="cellData")
+        store = load_count_array(self.z, self.assayName, self.workspace)
+        cell_data_path = (
+            "cellData" if self.workspace is None else f"{self.workspace}/cellData"
+        )
+        cell_data_grp = as_zarr_group(
+            self.z[cell_data_path],
+            name=cell_data_path,
+        )
         cell_data = [
             create_zarr_obj_array(
-                cell_data_grp, name=x, data=None, dtype=y, shape=self.csvr.nCells
+                cell_data_grp,
+                name=x,
+                data=None,
+                dtype=y,
+                shape=self.csvr.nCells,
+                profile=self.profile,
             )
             for x, y in zip(self.csvr.cellDataCols, self.csvr.cellDataDtypes or [])
         ]
@@ -113,10 +129,10 @@ class CSVtoZarr:
             store,
             count_batches(),
             msg="Writing CSV counts",
+            resources=self.resources,
         )
         if e != self.csvr.nCells:
             raise AssertionError(
                 "ERROR: This is a bug in CSVtoZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
-        finalize_writer_counts(self.z, self.assayName, self.workspace)

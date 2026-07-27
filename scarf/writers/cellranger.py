@@ -1,11 +1,15 @@
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from ..readers import CrReader
-from ..storage.stores import ZARRLOC
-from ..utils.logging import logger
+from ..storage.profiles import (
+    StorageProfile,
+    ZarrLocation,
+    resolve_storage_profile,
+)
 from ..utils.progress import tqdmbar
 
 
@@ -16,65 +20,61 @@ class CrToZarr:
     Args:
         cr: A CrReader object, containing the Cellranger data.
         zarr_loc: The file name for the Zarr hierarchy or a store
-        chunk_size: The requested size of chunks to load into memory and process.
         dtype: the dtype of the data.
-        mem_budget: Memory budget driving write-time chunk and shard geometry. Accepts bytes, a
+        mem_budget: Memory available to the conversion. Accepts bytes, a
                     suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
-                    Set it to simulate writing on a machine with a different memory size.
         nthreads: Worker count for write-time concurrency. When None, auto-detected.
-        working_copies: Number of concurrent in-memory working copies the memory budget is divided
-                        across. When None, uses SCARF_WORKING_COPIES env var or the default.
 
     Attributes:
         cr: A CrReader object, containing the Cellranger data.
-        chunkSizes: The requested size of chunks to load into memory and process.
         z: The Zarr hierarchy (array or group).
     """
 
     def __init__(
         self,
         cr: CrReader,
-        zarr_loc: ZARRLOC,
-        chunk_size: tuple[int, int] = (1000, 1000),
+        zarr_loc: ZarrLocation,
         dtype: str = "uint32",
         workspace: str | None = None,
         storage_options: dict[str, Any] | None = None,
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
-        working_copies: int | None = None,
+        profile: StorageProfile | None = None,
+        targetChunkBytes: int | None = None,
+        targetShardBytes: int | None = None,
     ) -> None:
-        from . import (
-            _apply_budget_override,
-            create_cell_data,
-            create_zarr_count_assay,
-            load_zarr,
-        )
+        from ..storage.budget import resolve_budget
+        from ..storage.schema import create_cell_data, create_zarr_count_assay
+        from ..storage.stores import load_zarr
 
-        _apply_budget_override(mem_budget, nthreads, working_copies)
+        self.resources = resolve_budget(mem_budget, nthreads)
+        self.profile = resolve_storage_profile(zarr_loc, profile)
         self.cr = cr
         mark_schema_captured = getattr(self.cr, "_mark_schema_captured", None)
         if callable(mark_schema_captured):
             mark_schema_captured()
-        self.chunkSizes = chunk_size
         self.workspace = workspace
         self.storage_options = storage_options
         self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
         create_cell_data(
-            z=self.z,
+            root=self.z,
             workspace=self.workspace,
             ids=np.array(self.cr.cell_names()),
             names=np.array(self.cr.cell_names()),
+            profile=self.profile,
         )
         for assay_name in dict.fromkeys(self.cr.assayFeats.columns):
             create_zarr_count_assay(
                 z=self.z,
                 assay_name=assay_name,
                 workspace=workspace,
-                chunk_size=chunk_size,
                 n_cells=self.cr.nCells,
                 feat_ids=self.cr.feature_ids(assay_name),
                 feat_names=self.cr.feature_names(assay_name),
                 dtype=dtype,
+                profile=self.profile,
+                targetChunkBytes=targetChunkBytes,
+                targetShardBytes=targetShardBytes,
             )
 
     @staticmethod
@@ -121,37 +121,114 @@ class CrToZarr:
         Returns:
             None
         """
-        from . import finalize_writer_counts, load_count_store
+        from scipy.sparse import coo_matrix
+
+        from ..storage.budget import admitted_worker_count
+        from ..storage.schema import load_count_array
+        from ..storage.sharding import (
+            SparseShardBuffer,
+            SparseWriteBand,
+            sparse_matrix_bytes,
+            sparse_producer_peak_bytes,
+            write_sparse_bands,
+        )
 
         input_ranges = self._prep_assay_input_ranges(self.cr.assayFeats)
-        stores = {x: load_count_store(self.z, x, self.workspace) for x in input_ranges}
+        stores = {
+            assay: load_count_array(self.z, assay, self.workspace)
+            for assay in input_ranges
+        }
+        buffers = {assay: SparseShardBuffer(store) for assay, store in stores.items()}
         feat_offset = self._prep_feat_index_offset(input_ranges)
-        s = 0
-        n_chunks = self.cr.nCells // batch_size + 1
-        for a in tqdmbar(self.cr.consume(batch_size, lines_in_mem), total=n_chunks):
-            for assay in input_ranges:
-                idx = np.zeros(a.col.shape[0]).astype(bool)
-                feat_coords = a.col.copy()
-                for r, of in zip(input_ranges[assay], feat_offset[assay]):
-                    temp = (a.col >= r[0]) & (a.col < r[1])
-                    if of != 0:
-                        feat_coords[temp] = (
-                            feat_coords[temp] + of
-                        )  # of is already a negative value
-                    idx = idx | temp
-                if idx.sum() > 0:
-                    stores[assay].set_coordinate_selection(
-                        (s + a.row[idx], feat_coords[idx]), a.data[idx]
-                    )
-                else:
-                    logger.warning(
-                        f"No feature captured from chunk {s} to {s + a.shape[0]} for assay: {assay}"
-                    )
-            s += a.shape[0]
-        if s != self.cr.nCells:
-            raise AssertionError(
-                "ERROR: This is a bug in CrToZarr. All cells might not have been successfully "
-                "written into the zarr file. Please report this issue"
+
+        def writes() -> Iterator[SparseWriteBand]:
+            n_chunks = (self.cr.nCells + batch_size - 1) // batch_size
+            source = tqdmbar(
+                self.cr.consume(batch_size, lines_in_mem),
+                total=n_chunks,
+                desc="Writing counts",
             )
-        for assay in input_ranges:
-            finalize_writer_counts(self.z, assay, self.workspace)
+            for matrix in source:
+                chunk = matrix.tocoo(copy=False)
+                source_bytes = sparse_matrix_bytes(matrix, chunk)
+                for assay in input_ranges:
+                    selected = np.zeros(chunk.col.shape[0], dtype=bool)
+                    columns = chunk.col.copy()
+                    for bounds, offset in zip(
+                        input_ranges[assay],
+                        feat_offset[assay],
+                        strict=True,
+                    ):
+                        inside = (chunk.col >= bounds[0]) & (chunk.col < bounds[1])
+                        columns[inside] += offset
+                        selected |= inside
+                    projected = coo_matrix(
+                        (
+                            chunk.data[selected],
+                            (chunk.row[selected], columns[selected]),
+                        ),
+                        shape=(chunk.shape[0], buffers[assay].nColumns),
+                    )
+                    for band in buffers[assay].add(projected):
+                        producer_bytes = (
+                            source_bytes
+                            + selected.nbytes
+                            + columns.nbytes
+                            + inside.nbytes
+                            + sparse_matrix_bytes(projected)
+                            + sum(item.residentBytes for item in buffers.values())
+                        )
+                        yield SparseWriteBand(
+                            stores[assay],
+                            band,
+                            producer_bytes,
+                        )
+            if self.cr.nCells:
+                del matrix, chunk, selected, columns, inside, projected
+            for assay, buffer in buffers.items():
+                for band in buffer.finish():
+                    producer_bytes = sum(
+                        item.residentBytes for item in buffers.values()
+                    )
+                    yield SparseWriteBand(
+                        stores[assay],
+                        band,
+                        producer_bytes,
+                    )
+
+        staging_bytes = self.cr.producer_staging_bytes(
+            batch_size,
+            lines_in_mem,
+        )
+        admitted_worker_count(
+            self.resources,
+            taskBytes=1,
+            residentBytes=staging_bytes,
+            requested=1,
+        )
+        source_nnz = self.cr.max_window_nnz(batch_size)
+        producer_rows = batch_size + max(
+            buffer.shardRows for buffer in buffers.values()
+        )
+        buffered_nnz = self.cr.max_window_nnz(producer_rows)
+        value_bytes = max(
+            np.dtype(self.cr.matrix_dtype).itemsize,
+            *(np.dtype(store.dtype).itemsize for store in stores.values()),
+        )
+        producer_reserve_bytes = (
+            sparse_producer_peak_bytes(
+                buffered_nnz,
+                source_nnz,
+                value_bytes,
+            )
+            + staging_bytes
+        )
+        write_sparse_bands(
+            writes(),
+            resources=self.resources,
+            producerReserveBytes=producer_reserve_bytes,
+        )
+        if any(buffer.rows != self.cr.nCells for buffer in buffers.values()):
+            raise AssertionError(
+                "Cell Ranger conversion did not write every source row"
+            )

@@ -7,6 +7,7 @@ import numpy as np
 import zarr
 from numpy.typing import NDArray
 
+from ..storage.budget import ResourceBudget, admitted_worker_count
 from ._indexing import is_contiguous, local_positions
 from ._operations import (
     _Op,
@@ -38,13 +39,19 @@ class ChunkedArray:
         out_cols: int | None = None,
         block_size: int | None = None,
         nthreads: int = 1,
+        resources: ResourceBudget | None = None,
         is_numpy: bool | None = None,
     ) -> None:
         self._backing = backing
         self._rows = None if rows is None else np.asarray(rows)
         self._cols = None if cols is None else np.asarray(cols)
         self._ops: list[_Op] = list(ops) if ops else []
-        self._nthreads = nthreads
+        self._resources = resources
+        self._nthreads = (
+            max(1, min(int(nthreads), resources.workers))
+            if resources is not None
+            else max(1, int(nthreads))
+        )
         if is_numpy is None:
             is_numpy = isinstance(backing, np.ndarray)
         self._is_numpy = is_numpy
@@ -67,12 +74,14 @@ class ChunkedArray:
         arr: np.ndarray,
         block_size: int | None = None,
         nthreads: int = 1,
+        resources: ResourceBudget | None = None,
     ) -> "ChunkedArray":
         arr = np.asarray(arr)
         return cls(
             arr,
             block_size=block_size,
             nthreads=nthreads,
+            resources=resources,
             is_numpy=True,
         )
 
@@ -192,8 +201,19 @@ class ChunkedArray:
         from ..storage.parallel import map_shards
 
         ranges = self._ranges()
-        nthreads = self._nthreads if nthreads is None else nthreads
-        results = map_shards(ranges, fn, workers=nthreads, msg=msg)
+        requested = self._nthreads if nthreads is None else max(1, int(nthreads))
+        workers = requested
+        if self._resources is not None:
+            rows = min(self._block_size, max(1, self._n_rows))
+            elements = rows * max(1, self._out_cols)
+            input_bytes = elements * max(1, int(self._backing.dtype.itemsize))
+            output_bytes = elements * max(1, int(self.dtype.itemsize))
+            workers = admitted_worker_count(
+                self._resources,
+                taskBytes=input_bytes + (output_bytes if self._ops else 0),
+                requested=requested,
+            )
+        results = map_shards(ranges, fn, workers=workers, msg=msg)
         return [np.asarray(result) for result in results]
 
     def stream_blocks(
@@ -203,17 +223,29 @@ class ChunkedArray:
         prefetch: int | None = None,
     ) -> Iterator[np.ndarray]:
         """Yield materialized row blocks with bounded read-ahead."""
-        from ..storage.budget import worker_prefetch_depth
+        from ..storage.budget import READ_AHEAD
         from ..storage.parallel import stream_shards
 
-        threads = self._nthreads if nthreads is None else nthreads
-        depth = worker_prefetch_depth(prefetch)
+        threads = self._nthreads if nthreads is None else max(1, int(nthreads))
+        requested = READ_AHEAD if prefetch is None else max(1, int(prefetch))
+        depth = min(threads, requested)
+        if self._resources is not None:
+            rows = min(self._block_size, max(1, self._n_rows))
+            elements = rows * max(1, self._out_cols)
+            input_bytes = elements * max(1, int(self._backing.dtype.itemsize))
+            output_bytes = elements * max(1, int(self.dtype.itemsize))
+            depth = admitted_worker_count(
+                self._resources,
+                taskBytes=input_bytes + (output_bytes if self._ops else 0),
+                requested=depth,
+            )
+        within = max(1, threads // depth)
         ranges = self._ranges()
         yield from stream_shards(
             ranges,
             lambda interval: self._materialize_range(interval[0], interval[1]),
             workers=depth,
-            within_block_threads=threads if threads and threads > 1 else None,
+            within_block_threads=within,
             msg=msg,
             total=len(ranges),
         )
@@ -263,6 +295,7 @@ class ChunkedArray:
             out_cols=self._out_cols if out_cols is None else out_cols,
             block_size=self._block_size,
             nthreads=self._nthreads,
+            resources=self._resources,
             is_numpy=self._is_numpy,
         )
 
@@ -390,6 +423,7 @@ class ChunkedArray:
             out_cols=out_cols,
             block_size=block_size,
             nthreads=self._nthreads,
+            resources=self._resources,
             is_numpy=self._is_numpy,
         )
 

@@ -51,12 +51,12 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    CrToZarr: "dd6edcf6a9fe30470e72a3e7444c6dbd657d6d72301656e668b70abd9b4b0e23",
-    H5adToZarr: "98ab5f8d78100fdefca876142cdb5d7e3de4eaf6eea8ef3c2c1dab6b454d7bd1",
-    LoomToZarr: "fbf990e0ca352387e78ad58689a322de2408e434255f594c7ce30e8c413a5d01",
-    SparseToZarr: "72f1da0ae143a964d9cc361bcd526cf92d66baffe16a37a495274d88eed19e43",
-    CSVtoZarr: "29792109de0712bb812788fc7d2d5d3f35f8fc6f826931d27a1c714237708548",
-    SubsetZarr: "5f190befb39892bf22e836fe8d92137bb349c3669a3319652aea523f5cce3622",
+    CrToZarr: "2b793bfd94fd2d4e9cf49e47db0a2af9d3dec0ab9008a87c67076edf1349d21c",
+    H5adToZarr: "9d15d8b78b69ba5d8d86b192711d90df439dfa4e889be159386c6b25e93210f0",
+    LoomToZarr: "a840271f303b73a2187148efb1e4651a6671b4283af83c0f28251d449f5754dd",
+    SparseToZarr: "78dcbc0d0d7d48a3d971ba0654260be39fd69157a5d3cb87f4d7191f0dee450d",
+    CSVtoZarr: "30b241f964ead70d6a44e0f09be571ea88d227cd78335651b3f1a38cadf3268e",
+    SubsetZarr: "ae6eb9a73c50d32b3716ea33002993bcd005461c68e0e784aec87a66ac3061e5",
 }
 _MODULE_FUNCTIONS = (
     "create_zarr_count_assay",
@@ -69,7 +69,7 @@ _MODULE_FUNCTIONS = (
     "write_renorm_subset_to_zarr",
 )
 _MODULE_SIGNATURE_DIGEST = (
-    "0694afa2ccf5190ec57dca8b8e362d2092c05be4589e0dcb910d01262951271e"
+    "dbe97d2ed890118780c3618b3c3433ea56954dc3ed23b67c93b665cbae46debf"
 )
 
 
@@ -91,16 +91,14 @@ def test_writers_facade_surface_is_stable():
         "CSVtoZarr",
     ]
     expected = set(writers_module.__all__) | {
-        "_apply_budget_override",
         "bed_to_sparse_array",
         "create_cell_data",
-        "finalize_writer_counts",
         "load_count_store",
         "load_zarr",
-        "sparse_writer",
     }
     assert expected.issubset(dir(writers_module))
     assert all(getattr(writers_module, name) is not None for name in expected)
+    assert not hasattr(writers_module, "sparse_writer")
 
 
 def test_writer_class_and_method_signatures_are_stable():
@@ -149,7 +147,6 @@ def test_writer_storage_wrappers_remain_distinct_objects():
         is not storage_schema.create_zarr_count_assay
     )
     assert writers_module.create_cell_data is not storage_schema.create_cell_data
-    assert writers_module.finalize_writer_counts is not storage_schema.finalize_counts
     assert writers_module.dask_to_zarr is not storage_materialize.dask_to_zarr
     assert (
         writers_module.write_renorm_subset_to_zarr
@@ -165,7 +162,6 @@ def test_writer_rejects_reserved_assay_name_before_mutation():
             root,
             "plots",
             None,
-            (2, 2),
             2,
             ["g1", "g2"],
             ["Gene 1", "Gene 2"],
@@ -178,7 +174,6 @@ def test_writer_rejects_reserved_assay_name_before_mutation():
             root,
             "artifacts",
             None,
-            (2, 2),
             2,
             ["g1", "g2"],
             ["Gene 1", "Gene 2"],

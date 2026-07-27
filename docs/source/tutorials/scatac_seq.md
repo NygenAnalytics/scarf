@@ -63,7 +63,6 @@ reader.assayFeats
 writer = scarf.CrToZarr(
     reader,
     zarr_loc=f'{dataset}/data.zarr',
-    chunk_size=(1000, 2000)
 )
 writer.dump(batch_size=1000)
 ```

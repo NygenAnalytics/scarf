@@ -7,7 +7,7 @@ import zarr
 
 from .types import as_zarr_array
 from .layout import _group_zarr_format, get_compressors
-from .profiles import StorageProfile, get_storage_profile
+from .profiles import StorageProfile
 
 ANN_INDEX_ARRAY = "ann_idx_bytes"
 ANN_INDEX_CHUNK_BYTES = 8 * 1024 * 1024
@@ -28,8 +28,9 @@ def legacy_ann_index_path(zw_root: str | None, ann_loc: str) -> str | None:
 def save_ann_index(
     group: zarr.Group,
     ann_idx: Any,
+    *,
+    profile: StorageProfile,
     name: str = ANN_INDEX_ARRAY,
-    profile: StorageProfile | None = None,
 ) -> None:
     """Persist an hnswlib index as a chunked byte array."""
     data = serialize_ann_index(ann_idx)
@@ -45,7 +46,7 @@ def save_ann_index(
         dtype="uint8",
         overwrite=True,
         compressors=get_compressors(
-            profile or get_storage_profile(),
+            profile,
             zarrFormat=zarr_format,
         ),
     )

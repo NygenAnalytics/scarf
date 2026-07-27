@@ -16,7 +16,6 @@ def _resources() -> StageResources:
         modalCpuLimit=2.0,
         scarfMemoryBudget=12 * 1024**3,
         workers=2,
-        workingCopies=2,
         timeoutSeconds=82_800,
         ephemeralDiskMb=524_288,
     )

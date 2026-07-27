@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 import zarr
+from zarr.codecs import ZstdCodec
 
 from scarf.tools.repack_zarr import repack_store
 
@@ -80,12 +81,9 @@ def test_repack_rebuilds_incorrect_source_counts_t(tmp_path):
     assert result["RNA/countsT"].attrs["complete"] is True
 
 
-def test_repack_finalizes_workspace_counts_with_requested_profile(
+def test_repack_workspace_counts_uses_requested_profile(
     tmp_path,
-    monkeypatch,
 ):
-    import scarf.tools.repack_zarr as repack_module
-
     source = tmp_path / "source_workspace.zarr"
     output = tmp_path / "output_workspace.zarr"
     root = zarr.open_group(str(source), mode="w")
@@ -95,19 +93,6 @@ def test_repack_finalizes_workspace_counts_with_requested_profile(
     values = np.arange(8, dtype=np.uint32).reshape(4, 2)
     counts_group.create_array("counts", data=values, chunks=(2, 2))
 
-    calls = []
-    original = repack_module.finalize_counts
-
-    def tracked_finalize(store, assay_name, workspace=None, profile=None):
-        calls.append((assay_name, workspace, profile))
-        return original(
-            store,
-            assay_name,
-            workspace=workspace,
-            profile=profile,
-        )
-
-    monkeypatch.setattr(repack_module, "finalize_counts", tracked_finalize)
     repack_store(
         str(source),
         str(output),
@@ -116,9 +101,14 @@ def test_repack_finalizes_workspace_counts_with_requested_profile(
     )
 
     result = zarr.open_group(str(output), mode="r")
-    assert calls == [("RNA", "workspace", "cloud")]
-    np.testing.assert_array_equal(result["matrices/RNA/countsT"][:], values.T)
-    assert result["matrices/RNA/countsT"].attrs["complete"] is True
+    assay = result["matrices/RNA"]
+    counts = assay["counts"]
+    counts_t = assay["countsT"]
+    np.testing.assert_array_equal(counts_t[:], values.T)
+    assert counts_t.attrs["complete"] is True
+    assert assay.attrs["scarf:zarr_spec"]["profile"] == "cloud"
+    assert isinstance(counts.compressors[0], ZstdCodec)
+    assert isinstance(counts_t.compressors[0], ZstdCodec)
 
 
 def test_repack_rejects_source_destination_alias_before_overwrite(tmp_path):

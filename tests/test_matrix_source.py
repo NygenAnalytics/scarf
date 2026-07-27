@@ -9,7 +9,8 @@ from zarr.codecs import BloscCodec, ZstdCodec
 from zarr.storage import ObjectStore
 
 from scarf.datastore.datastore import DataStore, mount_datastore
-from scarf.storage.profiles import get_storage_profile, set_storage_profile
+from scarf.storage.budget import ResourceBudget
+from scarf.storage.sharding import write_counts_t
 from scarf.storage.stores import (
     MATRIX_SOURCE_ATTR,
     create_matrix_source,
@@ -20,7 +21,6 @@ from scarf.writers import (
     create_cell_data,
     create_zarr_count_assay,
     create_zarr_obj_array,
-    finalize_writer_counts,
 )
 
 
@@ -37,7 +37,6 @@ def _write_assay(
         z=root,
         assay_name=assay_name,
         workspace=workspace,
-        chunk_size=(min(5, n_cells), min(2, n_feats)),
         n_cells=n_cells,
         feat_ids=np.array([f"{assay_name.lower()}-f{i}" for i in range(n_feats)]),
         feat_names=np.array([f"{assay_name.lower()}-g{i}" for i in range(n_feats)]),
@@ -50,7 +49,14 @@ def _write_assay(
         counts = root[f"matrices/{assay_name}/counts"]
         assay = root[f"{workspace}/{assay_name}"]
     counts[:] = values
-    finalize_writer_counts(root, assay_name, workspace)
+    matrix_group = (
+        root[assay_name] if workspace is None else root[f"matrices/{assay_name}"]
+    )
+    write_counts_t(
+        counts,
+        matrix_group,
+        resources=ResourceBudget(1024**2, 2),
+    )
     if dataset_fingerprint is not None:
         assay.attrs["dataset_fingerprint"] = dataset_fingerprint
 
@@ -95,13 +101,6 @@ def _snapshot_store_files(path: str) -> dict[str, bytes]:
         for file in root.rglob("*")
         if file.is_file()
     }
-
-
-@pytest.fixture(autouse=True)
-def _reset_storage_profile():
-    set_storage_profile(None)
-    yield
-    set_storage_profile(None)
 
 
 @pytest.mark.parametrize("workspace", [None, "analysis"])
@@ -393,30 +392,14 @@ def test_dataset_fingerprint_fast_path_reads_no_identifiers(monkeypatch, tmp_pat
     assert workspace is None
 
 
-def test_source_profile_is_restored_before_target_writes(monkeypatch, tmp_path):
+def test_source_open_does_not_change_target_profile(tmp_path):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
     _write_source_store(source, workspace=None)
 
-    from scarf.storage import stores as stores_module
-
-    real_load = stores_module.load_zarr
-
-    def fake_load(zarr_loc, mode, synchronizer=None, storage_options=None):
-        if mode == "r":
-            set_storage_profile("cloud")
-        return real_load(
-            zarr_loc,
-            mode,
-            synchronizer=synchronizer,
-            storage_options=storage_options,
-        )
-
-    monkeypatch.setattr(stores_module, "load_zarr", fake_load)
     create_matrix_source(source, target, workspace=None)
     target_ids = zarr.open_group(target, mode="r")["cellData/ids"]
     assert isinstance(target_ids.compressors[0], BloscCodec)
-    assert get_storage_profile() == "fast_local"
 
 
 def test_mount_profile_applies_to_store_target(tmp_path):
@@ -479,21 +462,6 @@ def test_mounted_datastore_reads_remote_counts_as_remote(monkeypatch, tmp_path):
         min_cells_per_feature=1,
     )
     assert is_remote_datastore(None, ds.RNA.rawData._backing) is True
-
-    from scarf.utils import prefetch as prefetch_module
-
-    resolve_read_ahead = prefetch_module.remote_column_ram_ahead
-
-    def require_remote_read_ahead(*, remote, n_blocks):
-        if not remote:
-            raise AssertionError("Mounted count reads were treated as local")
-        return resolve_read_ahead(remote=remote, n_blocks=n_blocks)
-
-    monkeypatch.setattr(
-        prefetch_module,
-        "remote_column_ram_ahead",
-        require_remote_read_ahead,
-    )
 
     cell_idx = ds.cells.active_index("I")
     feat_idx = ds.RNA.feats.active_index("I")

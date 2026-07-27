@@ -9,8 +9,7 @@ from typing import Any
 
 import numpy as np
 from scarf import DataStore, H5adReader, H5adToZarr, SubsetZarr
-from scarf.storage.budget import resolve_budget, set_resource_budget
-from scarf.storage.profiles import set_storage_profile
+from scarf.storage.budget import resolve_budget
 from scarf.storage.sharding import write_counts_t
 from scarf.storage.stores import open_store
 from scarf.storage.types import as_zarr_array, as_zarr_group
@@ -62,7 +61,6 @@ def _open_datastore(
         "zarrProfile": ("cloud" if storeUri.startswith("s3://") else "fast_local"),
         "storage_options": options,
         "mem_budget": resources.scarfMemoryBudget,
-        "working_copies": resources.workingCopies,
     }
     if initialize:
         arguments.update(
@@ -95,12 +93,11 @@ def run_create_store(
         feature_name_key="feature_name",
     )
     layout_kwargs: dict[str, Any] = {}
-    if storageLayout is not None and storageLayout.targetChunkBytes is not None:
-        layout_kwargs = {
-            "targetChunkBytes": storageLayout.targetChunkBytes,
-            "minFeatureChunk": storageLayout.minFeatureChunk,
-            "maxFeatureChunk": storageLayout.maxFeatureChunk,
-        }
+    if storageLayout is not None:
+        if storageLayout.targetChunkBytes is not None:
+            layout_kwargs["targetChunkBytes"] = storageLayout.targetChunkBytes
+        if storageLayout.targetShardBytes is not None:
+            layout_kwargs["targetShardBytes"] = storageLayout.targetShardBytes
     try:
         writer = H5adToZarr(
             reader,
@@ -109,7 +106,6 @@ def run_create_store(
             storage_options=options,
             mem_budget=resources.scarfMemoryBudget,
             nthreads=resources.workers,
-            working_copies=resources.workingCopies,
             **layout_kwargs,
         )
         writer.dump(batch_size=workflow.h5adBatchSize)
@@ -334,6 +330,14 @@ def _pseudotime_sources_sinks(
     return [source], [sink]
 
 
+def _peak_cgroup_bytes(measurement: ResourceMeasurement | None) -> int | None:
+    if measurement is None:
+        return None
+    if measurement.operationPeakSource in {"cgroupMemoryCurrent", "cgroupMemoryPeak"}:
+        return measurement.operationPeakBytes
+    return measurement.cgroupMemoryCurrentPeakBytes
+
+
 def run_stage(
     stage: StageName,
     *,
@@ -465,15 +469,7 @@ def run_stage(
             measurement = sampler.stop()
 
     seconds = timer.result.measuredOperationSeconds
-    peak_cgroup = None
-    if measurement is not None:
-        if measurement.operationPeakSource in {
-            "cgroupMemoryCurrent",
-            "cgroupMemoryPeak",
-        }:
-            peak_cgroup = measurement.operationPeakBytes
-        else:
-            peak_cgroup = measurement.cgroupMemoryCurrentPeakBytes
+    peak_cgroup = _peak_cgroup_bytes(measurement)
     return StageRunResult(
         stage=stage,
         nRows=nRows,
@@ -632,15 +628,12 @@ def repair_counts_t(
     resources: StageResources,
     nCheckTiles: int = 3,
     seed: int = 0,
+    sampleIntervalSeconds: float = 0.25,
 ) -> dict[str, Any]:
     """Rewrite feature-major ``countsT`` and only then mark it complete."""
-    set_storage_profile("cloud" if storeUri.startswith("s3://") else "fast_local")
-    set_resource_budget(
-        resolve_budget(
-            memory=resources.scarfMemoryBudget,
-            workers=resources.workers,
-            working_copies=resources.workingCopies,
-        )
+    budget = resolve_budget(
+        memory=resources.scarfMemoryBudget,
+        workers=resources.workers,
     )
     root = open_store(
         storeUri,
@@ -653,9 +646,19 @@ def repair_counts_t(
     if "countsT" in group:
         before_complete = group["countsT"].attrs.get("complete")
 
+    sampler = ResourceSampler(sampleIntervalSeconds=sampleIntervalSeconds)
+    sampler.start()
     started = time.perf_counter()
-    counts_t = write_counts_t(counts, group)
-    seconds = time.perf_counter() - started
+    try:
+        counts_t = write_counts_t(
+            counts,
+            group,
+            profile="cloud" if storeUri.startswith("s3://") else "fast_local",
+            resources=budget,
+        )
+    finally:
+        seconds = time.perf_counter() - started
+        measurement = sampler.stop()
     if counts_t is None:
         raise RuntimeError(
             f"write_counts_t skipped for {assayName} (Zarr format < 3); "
@@ -712,6 +715,10 @@ def repair_counts_t(
         "beforeComplete": before_complete,
         "complete": True,
         "shape": list(counts_t.shape),
+        "chunks": list(counts_t.chunks),
         "dtype": str(counts_t.dtype),
+        "workers": resources.workers,
+        "peakRssBytes": measurement.processTreeRssPeakBytes if measurement else None,
+        "peakCgroupBytes": _peak_cgroup_bytes(measurement),
         "checkedTiles": checks,
     }

@@ -22,7 +22,6 @@ from .normalization import norm_dummy as norm_dummy
 from .normalization import norm_lib_size as norm_lib_size
 from .normalization import norm_lib_size_log as norm_lib_size_log
 from .normalization import norm_tf_idf as norm_tf_idf
-from .persistence import _feature_stats_tile_shape as _feature_stats_tile_shape
 from .persistence import _read_block as _read_block
 from .rna import RNAassay as RNAassay
 
@@ -33,7 +32,6 @@ def _normalize_public_metadata() -> None:
     norm_lib_size.__globals__["Assay"] = Assay
 
     for function in (
-        _feature_stats_tile_shape,
         _read_block,
         lib_size_feature_stream_eligible,
         norm_clr,

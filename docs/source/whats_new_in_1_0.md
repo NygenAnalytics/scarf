@@ -109,7 +109,7 @@ references when you need full provenance. Details:
 - `ds.pipeline.run` for `basic_rna_analysis`
 - Atomic graph API and `AssayState`
 - Direct object-store `DataStore` with `storage_options` and `zarrProfile`
-- `mem_budget` / `working_copies` resource controls
+- Explicit `mem_budget` and `nthreads` resource controls
 - `python -m scarf.tools.repack_zarr` for layout migration
 
 ## Next steps

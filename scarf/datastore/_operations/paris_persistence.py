@@ -8,7 +8,7 @@ import zarr
 from ...clustering._paris_core import ParisHierarchy
 from ...clustering.paris_multiscale import PlateauForest
 from ...storage.arrays import create_zarr_dataset
-from ...storage.budget import ResourceBudget, get_resource_budget
+from ...storage.budget import ResourceBudget
 from ...storage.types import as_zarr_array, as_zarr_group
 
 PARIS_HIERARCHY_ROOT = "paris_hierarchy"
@@ -456,6 +456,7 @@ def ensure_compatibility_dendrogram(
 def resolve_compatibility_dendrogram(
     root: zarr.Group,
     graph_loc: str,
+    budget: ResourceBudget,
 ) -> tuple[str, str | None]:
     """Resolve a linkage, falling back only for legacy stores."""
     graph_group = as_zarr_group(root[graph_loc], name=graph_loc)
@@ -481,7 +482,7 @@ def resolve_compatibility_dendrogram(
             graph_loc,
             generation_id,
             "fixed",
-            get_resource_budget(),
+            budget,
         )
         hierarchy, _plateau_forest = load_hierarchy_generation(
             root,

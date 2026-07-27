@@ -436,14 +436,7 @@ def test_internal_modules_use_canonical_storage_and_utility_paths():
     assert _facade_importers("knn_utils") == set()
     assert _facade_importers("results") == set()
     assert _facade_importers("umap") == set()
-    assert _facade_importers("writers") == {
-        "writers/cellranger.py",
-        "writers/csv.py",
-        "writers/h5ad.py",
-        "writers/loom.py",
-        "writers/sparse.py",
-        "writers/subset.py",
-    }
+    assert _facade_importers("writers") == set()
     assert _facade_importers("parallel") == set()
     assert _facade_importers("storage.zarr_store") == set()
     assert _facade_importers("utils") == set()
@@ -647,7 +640,7 @@ def test_merge_implementations_are_runtime_isolated():
 
     forbidden_roots = {"datastore", "mapping", "plotting", "readers", "writers"}
     expected_merge_edges = {
-        "assays.py": {"merge.controlled_compute", "merge.load_zarr"},
+        "assays.py": {"merge.controlled_compute"},
         "datasets.py": {
             "merge.AssayMerge",
             "merge.DummyAssay",
@@ -675,10 +668,7 @@ def test_merge_implementations_are_runtime_isolated():
         )
         function_local_merge_edges = merge_edges - module_scope_imports
         if file_name == "assays.py":
-            assert function_local_merge_edges == {
-                "merge.controlled_compute",
-                "merge.load_zarr",
-            }
+            assert function_local_merge_edges == {"merge.controlled_compute"}
         else:
             assert function_local_merge_edges == {
                 "merge.AssayMerge",
@@ -810,14 +800,11 @@ def test_writer_implementations_are_runtime_isolated():
     }
     format_names = {name.rsplit(".", 1)[-1] for name in format_modules}
     facade_edges = {
-        "writers._apply_budget_override",
         "writers.create_cell_data",
         "writers.create_zarr_count_assay",
         "writers.create_zarr_obj_array",
-        "writers.finalize_writer_counts",
         "writers.load_count_store",
         "writers.load_zarr",
-        "writers.sparse_writer",
     }
     shared_edges = {"writers._materialize", "writers._store"}
     matching_reader_exports = {

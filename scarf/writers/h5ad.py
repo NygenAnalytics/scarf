@@ -1,11 +1,18 @@
+import time
+from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
+from scipy.sparse import coo_matrix
 
 from ..storage.types import as_zarr_group
 from ..readers import H5adReader
 from ..readers.h5ad import _H5adAssayFeatures
-from ..storage.stores import ZARRLOC
+from ..storage.profiles import (
+    StorageProfile,
+    ZarrLocation,
+    resolve_storage_profile,
+)
 from ..utils.logging import logger
 from ..utils.progress import tqdmbar
 
@@ -37,17 +44,12 @@ class H5adToZarr:
         assay_split_key: A var column used to split features into assays.
         assay_name_map: Feature type to assay name overrides.
         workspace: An optional workspace id.
-        chunk_size: The requested size of chunks to load into memory and process.
-        mem_budget: Memory budget driving write-time chunk and shard geometry. Accepts bytes, a
+        mem_budget: Memory available to the conversion. Accepts bytes, a
                     suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
-                    Set it to simulate writing on a machine with a different memory size.
         nthreads: Worker count for write-time concurrency. When None, auto-detected.
-        working_copies: Number of concurrent in-memory working copies the memory budget is divided
-                        across. When None, uses SCARF_WORKING_COPIES env var or the default.
 
     Attributes:
         h5ad: A h5ad object (h5 file with added AnnData structure).
-        chunkSizes: The requested size of chunks to load into memory and process.
         assayName: The Zarr hierarchy (array or group).
         z: The Zarr hierarchy (array or group).
     """
@@ -55,29 +57,39 @@ class H5adToZarr:
     def __init__(
         self,
         h5ad: H5adReader,
-        zarr_loc: ZARRLOC,
+        zarr_loc: ZarrLocation,
         assay_name: str | None = None,
         workspace: str | None = None,
-        chunk_size: tuple[int, int] = (1000, 1000),
         storage_options: dict[str, Any] | None = None,
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
-        working_copies: int | None = None,
+        profile: StorageProfile | None = None,
         targetChunkBytes: int | None = None,
-        minFeatureChunk: int | None = None,
-        maxFeatureChunk: int | None = None,
+        targetShardBytes: int | None = None,
         assay_split_key: str | None = None,
         assay_name_map: dict[str, str] | None = None,
     ) -> None:
-        from . import (
-            _apply_budget_override,
-            create_zarr_count_assay,
-            load_zarr,
-        )
+        from ..storage.budget import resolve_budget
+        from ..storage.schema import create_zarr_count_assay
+        from ..storage.stores import load_zarr
 
-        _apply_budget_override(mem_budget, nthreads, working_copies)
+        self.resources = resolve_budget(mem_budget, nthreads)
+        self.profile = resolve_storage_profile(zarr_loc, profile)
         self.h5ad = h5ad
-        self.chunkSizes = chunk_size
+        self.h5ad.infer_storage_dtype(self.resources.memoryBytes)
+        csc_peak = self.h5ad.csc_conversion_peak_bytes()
+        if csc_peak > self.resources.memoryBytes:
+            raise MemoryError(
+                f"CSC to CSR conversion needs about {csc_peak} bytes, but the "
+                f"conversion memory limit is {self.resources.memoryBytes} bytes"
+            )
+        if csc_peak:
+            self.h5ad.materialize_csc()
+        self.storageDtype = getattr(
+            self.h5ad,
+            "storageDtype",
+            self.h5ad.matrixDtype,
+        )
         self.workspace = workspace
         self.storage_options = storage_options
         self.assaySplitKey = assay_split_key
@@ -120,32 +132,33 @@ class H5adToZarr:
                 z=self.z,
                 assay_name=resolved_assay_name,
                 workspace=workspace,
-                chunk_size=chunk_size,
                 n_cells=self.h5ad.nCells,
                 feat_ids=feature_ids,
                 feat_names=feature_names,
-                dtype=self.h5ad.matrixDtype,
+                dtype=self.storageDtype,
+                profile=self.profile,
                 targetChunkBytes=targetChunkBytes,
-                minFeatureChunk=minFeatureChunk,
-                maxFeatureChunk=maxFeatureChunk,
+                targetShardBytes=targetShardBytes,
             )
         self._ini_feature_data()
 
     def _ini_cell_data(self) -> None:
-        from . import create_cell_data, create_zarr_obj_array
+        from ..storage.arrays import create_zarr_obj_array
+        from ..storage.schema import create_cell_data
 
         ids = self.h5ad.cell_ids()
         g = create_cell_data(
-            z=self.z,
+            root=self.z,
             workspace=self.workspace,
             ids=ids,
             names=ids,
+            profile=self.profile,
         )
         for i, j in self.h5ad.get_cell_columns():
-            create_zarr_obj_array(g, i, j, j.dtype)
+            create_zarr_obj_array(g, i, j, j.dtype, profile=self.profile)
 
     def _ini_feature_data(self) -> None:
-        from . import create_zarr_obj_array
+        from ..storage.arrays import create_zarr_obj_array
 
         targets: list[tuple[Any, np.ndarray | None]] = []
         for assay_name in self.assayNames:
@@ -175,13 +188,14 @@ class H5adToZarr:
                     column_name,
                     selected,
                     selected.dtype,
+                    profile=self.profile,
                 )
 
     def dump(self, batch_size: int = 1000) -> None:
         """Write h5ad matrix data into the Zarr counts array.
 
         Args:
-            batch_size: Number of cells written per sparse_writer batch.
+            batch_size: Number of cells read from the source per batch.
 
         Raises:
             AssertionError: If written cell count does not match expected nCells.
@@ -189,83 +203,189 @@ class H5adToZarr:
         Returns:
             None
         """
-        from . import finalize_writer_counts, load_count_store, sparse_writer
+        from ..storage.budget import admitted_worker_count
+        from ..storage.sharding import (
+            SparseShardBuffer,
+            sparse_producer_peak_bytes,
+            write_sparse_bands,
+        )
+        from ..storage.schema import load_count_array
 
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        if self.assayFeatures is not None:
-            self._dump_multi_assay(batch_size)
-            return
 
-        assay_name = self.assayNames[0]
-        store = load_count_store(self.z, assay_name, self.workspace)
-        total_cells_written = sparse_writer(
-            store=store,
-            data_stream=self.h5ad.consume(batch_size),
-            n_cells=self.h5ad.nCells,
-            batch_size=batch_size,
-        )
-        if total_cells_written != self.h5ad.nCells:
-            raise AssertionError(
-                "ERROR: This is a bug in H5adToZarr. All cells might not have been successfully "
-                "written into the zarr file. Please report this issue"
-            )
-        finalize_writer_counts(self.z, assay_name, self.workspace)
-
-    def _dump_multi_assay(self, batch_size: int) -> None:
-        from . import finalize_writer_counts, load_count_store
-
-        if self.assayFeatures is None:
-            raise RuntimeError("Multi-assay features have not been initialized")
-        stores = {
-            assay_name: load_count_store(self.z, assay_name, self.workspace)
+        destinations = {
+            assay_name: load_count_array(self.z, assay_name, self.workspace)
             for assay_name in self.assayNames
         }
-        offsets: dict[str, tuple[int, ...]] = {}
-        for assay_name, features in self.assayFeatures.items():
-            current = 0
-            assay_offsets = []
-            for start, end in features.ranges:
-                assay_offsets.append(-start + current)
-                current += end - start
-            offsets[assay_name] = tuple(assay_offsets)
-
-        cell_start = 0
-        n_chunks = (self.h5ad.nCells + batch_size - 1) // batch_size
-        for matrix in tqdmbar(
-            self.h5ad.consume(batch_size),
-            total=n_chunks,
-        ):
-            chunk = matrix.tocoo(copy=False)
-            # SciPy treats repeated coordinates additively; Zarr coordinate
-            # assignment keeps only the last write, so collapse duplicates first.
-            chunk.sum_duplicates()
-            for assay_name, features in self.assayFeatures.items():
-                selected = np.zeros(chunk.nnz, dtype=bool)
-                feature_coordinates = chunk.col.copy()
-                for feature_range, offset in zip(
-                    features.ranges,
-                    offsets[assay_name],
-                    strict=True,
-                ):
-                    start, end = feature_range
-                    in_range = (chunk.col >= start) & (chunk.col < end)
-                    feature_coordinates[in_range] += offset
-                    selected |= in_range
-                if np.any(selected):
-                    stores[assay_name].set_coordinate_selection(
-                        (
-                            cell_start + chunk.row[selected],
-                            feature_coordinates[selected],
-                        ),
-                        chunk.data[selected],
-                    )
-            cell_start += chunk.shape[0]
-
-        if cell_start != self.h5ad.nCells:
-            raise AssertionError(
-                "ERROR: This is a bug in H5adToZarr. All cells might not have "
-                "been successfully written into the zarr file. Please report this issue"
+        buffers = {
+            assay_name: SparseShardBuffer(destination)
+            for assay_name, destination in destinations.items()
+        }
+        logger.info(
+            f"Writing counts with up to {self.resources.workers} row-band writer(s)"
+        )
+        started = time.perf_counter()
+        batch_rows = min(batch_size, self.h5ad.nCells)
+        resident_source_bytes = self.h5ad.materialized_csr_bytes()
+        if self.assayFeatures is None:
+            feature_index_bytes = 0
+            projection_bytes = 0
+            projection_scratch_bytes = 0
+        else:
+            feature_index_bytes = sum(
+                assay.featureIndexes.nbytes for assay in self.assayFeatures.values()
             )
-        for assay_name in self.assayNames:
-            finalize_writer_counts(self.z, assay_name, self.workspace)
+            projection_bytes = 2 * self.h5ad.nFeatures * np.dtype(np.int64).itemsize
+            projection_scratch_bytes = (
+                max(assay.featureIndexes.size for assay in self.assayFeatures.values())
+                * np.dtype(np.int64).itemsize
+            )
+        admitted_worker_count(
+            self.resources,
+            taskBytes=max(
+                1,
+                self.h5ad.max_batch_nnz_peak_bytes(),
+                projection_scratch_bytes,
+            ),
+            residentBytes=(
+                resident_source_bytes + feature_index_bytes + projection_bytes
+            ),
+            requested=1,
+        )
+        source_nnz = self.h5ad.max_batch_nnz(batch_size)
+        producer_rows = batch_size + max(
+            buffer.shardRows for buffer in buffers.values()
+        )
+        buffered_nnz = self.h5ad.max_batch_nnz(producer_rows)
+        value_bytes = max(
+            np.dtype(self.h5ad.sourceMatrixDtype).itemsize,
+            np.dtype(self.h5ad.matrixDtype).itemsize,
+            np.dtype(self.storageDtype).itemsize,
+        )
+        producer_reserve_bytes = sparse_producer_peak_bytes(
+            buffered_nnz,
+            source_nnz,
+            value_bytes,
+        ) + self.h5ad.producer_batch_staging_bytes(batch_size)
+        if self.h5ad.matrixOrientation == "dense":
+            producer_reserve_bytes += (
+                batch_rows
+                * self.h5ad.nFeatures
+                * np.dtype(self.h5ad.sourceMatrixDtype).itemsize
+            )
+        projection = (
+            None if self.assayFeatures is None else self._assay_feature_projection()
+        )
+        if projection is not None:
+            resident_source_bytes += sum(array.nbytes for array in projection)
+        resident_source_bytes += feature_index_bytes
+        write_sparse_bands(
+            self._count_shard_tasks(
+                batch_size,
+                buffers,
+                destinations,
+                projection,
+            ),
+            resources=self.resources,
+            residentBytes=resident_source_bytes,
+            producerReserveBytes=producer_reserve_bytes,
+        )
+        counts_seconds = time.perf_counter() - started
+
+        for assay_name, buffer in buffers.items():
+            if buffer.rows != self.h5ad.nCells:
+                raise AssertionError(
+                    "ERROR: This is a bug in H5adToZarr. All cells might not have been "
+                    f"successfully written into the {assay_name} counts array. "
+                    "Please report this issue"
+                )
+        # counts is the durable physical orientation for H5AD imports. Assay
+        # readers use it directly when the optional derived countsT is absent.
+        logger.info(f"Counts written in {counts_seconds:.1f}s")
+
+    def _count_shard_tasks(
+        self,
+        batch_size: int,
+        buffers: dict[str, Any],
+        destinations: dict[str, Any],
+        projection: tuple[np.ndarray, np.ndarray] | None,
+    ) -> Iterator[Any]:
+        """Yield complete row-band writes from one serial pass over the source."""
+        from ..storage.sharding import SparseWriteBand, sparse_matrix_bytes
+
+        n_batches = (self.h5ad.nCells + batch_size - 1) // batch_size
+        stream = tqdmbar(
+            self.h5ad.consume(batch_size),
+            total=n_batches,
+            desc="Writing counts",
+        )
+        if self.assayFeatures is None:
+            buffer = buffers[self.assayNames[0]]
+            destination = destinations[self.assayNames[0]]
+            for matrix in stream:
+                chunk = matrix.tocoo(copy=False)
+                source_bytes = sparse_matrix_bytes(matrix, chunk)
+                for band in buffer.add(chunk):
+                    producer_bytes = source_bytes + sum(
+                        item.residentBytes for item in buffers.values()
+                    )
+                    yield SparseWriteBand(destination, band, producer_bytes)
+            if self.h5ad.nCells:
+                del matrix, chunk
+        else:
+            if projection is None:
+                raise RuntimeError("Multi-assay projection was not initialized")
+            codes, columns = projection
+            for matrix in stream:
+                chunk = matrix.tocoo(copy=False)
+                source_bytes = sparse_matrix_bytes(matrix, chunk)
+                batch_codes = codes[chunk.col]
+                batch_columns = columns[chunk.col]
+                source_bytes += batch_codes.nbytes + batch_columns.nbytes
+                for code, assay_name in enumerate(self.assayNames):
+                    buffer = buffers[assay_name]
+                    selected = batch_codes == code
+                    # Every assay sees every batch, including one with no
+                    # values, so all buffers share the same row offsets.
+                    projected = coo_matrix(
+                        (
+                            chunk.data[selected],
+                            (chunk.row[selected], batch_columns[selected]),
+                        ),
+                        shape=(chunk.shape[0], buffer.nColumns),
+                    )
+                    for band in buffer.add(projected):
+                        producer_bytes = (
+                            source_bytes
+                            + selected.nbytes
+                            + sparse_matrix_bytes(projected)
+                            + sum(item.residentBytes for item in buffers.values())
+                        )
+                        yield SparseWriteBand(
+                            destinations[assay_name],
+                            band,
+                            producer_bytes,
+                        )
+            if self.h5ad.nCells:
+                del matrix, chunk, batch_codes, batch_columns, selected, projected
+        for assay_name, buffer in buffers.items():
+            for band in buffer.finish():
+                producer_bytes = sum(item.residentBytes for item in buffers.values())
+                yield SparseWriteBand(
+                    destinations[assay_name],
+                    band,
+                    producer_bytes,
+                )
+
+    def _assay_feature_projection(self) -> tuple[np.ndarray, np.ndarray]:
+        """Map each source feature to its assay code and assay-local column."""
+        if self.assayFeatures is None:
+            raise RuntimeError("Multi-assay features have not been initialized")
+        codes = np.full(int(self.h5ad.nFeatures), -1, dtype=np.int64)
+        columns = np.zeros(int(self.h5ad.nFeatures), dtype=np.int64)
+        for code, assay_name in enumerate(self.assayNames):
+            indexes = self.assayFeatures[assay_name].featureIndexes
+            codes[indexes] = code
+            columns[indexes] = np.arange(indexes.size, dtype=np.int64)
+        return codes, columns

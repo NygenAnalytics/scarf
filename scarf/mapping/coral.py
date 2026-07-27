@@ -132,7 +132,7 @@ def coral(
         data,
         assay.z,
         f"{normed_loc}/data_coral",
-        data.chunksize,
         nthreads,
         msg="Writing out coral corrected data",
+        resources=assay.resources,
     )

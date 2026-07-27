@@ -7,55 +7,20 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.matrix import ChunkedArray
-from scarf.storage.budget import (
-    READ_AHEAD,
-    ResourceBudget,
-    set_resource_budget,
-    shard_parallelism,
-)
 from scarf.storage.parallel import in_shard_context, map_shards, stream_shards
 
 
-@pytest.fixture
-def budget():
-    set_resource_budget(
-        ResourceBudget(memoryBytes=32 * 1024**3, workers=8, workingCopies=8)
-    )
-    yield
-    set_resource_budget(None)
-
-
-def test_shard_parallelism_spends_budget_within_shard(budget):
-    plan = shard_parallelism(workers=8, n_shards=20)
-    assert plan.readAhead == READ_AHEAD
-    assert plan.ioConcurrency == 8
-    assert plan.withinBlockThreads == 1
-
-
-def test_shard_parallelism_read_ahead_capped_by_shard_count(budget):
-    plan = shard_parallelism(workers=8, n_shards=1)
-    assert plan.readAhead == 1
-
-
-def test_shard_parallelism_read_ahead_capped_by_working_copies():
-    tight = ResourceBudget(memoryBytes=32 * 1024**3, workers=8, workingCopies=1)
-    plan = shard_parallelism(workers=8, n_shards=100, budget=tight)
-    assert plan.readAhead == 1
-    assert plan.ioConcurrency == 8
-    assert plan.withinBlockThreads == 1
-
-
-def test_map_shards_preserves_order(budget):
+def test_map_shards_preserves_order():
     ranges = [(i * 10, i * 10 + 10) for i in range(6)]
     out = map_shards(ranges, lambda idx, s, e: (idx, s, e), workers=8)
     assert out == [(i, i * 10, i * 10 + 10) for i in range(6)]
 
 
-def test_map_shards_empty(budget):
+def test_map_shards_empty():
     assert map_shards([], lambda i, s, e: i, workers=8) == []
 
 
-def test_map_shards_bounds_in_flight(budget):
+def test_map_shards_bounds_in_flight():
     lock = threading.Lock()
     in_flight = 0
     max_seen = 0
@@ -72,10 +37,10 @@ def test_map_shards_bounds_in_flight(budget):
         return idx
 
     map_shards(ranges, produce, workers=8)
-    assert max_seen <= READ_AHEAD
+    assert 1 < max_seen <= 8
 
 
-def test_map_shards_serial_backend_runs_inline(budget):
+def test_map_shards_serial_backend_runs_inline():
     seen_context = []
 
     def produce(idx, s, e):
@@ -86,7 +51,7 @@ def test_map_shards_serial_backend_runs_inline(budget):
     assert out == [0, 1]
 
 
-def test_nested_map_shards_runs_serial(budget):
+def test_nested_map_shards_runs_serial():
     inner_context = []
 
     def outer(idx, s, e):
@@ -102,7 +67,7 @@ def test_nested_map_shards_runs_serial(budget):
     assert inner_context and all(inner_context)
 
 
-def test_stream_shards_preserves_order(budget):
+def test_stream_shards_preserves_order():
     out = list(stream_shards(range(5), lambda x: x * 2, workers=4))
     assert out == [0, 2, 4, 6, 8]
 
@@ -133,18 +98,108 @@ def test_stream_shards_config_neutral_without_io():
         assert seen and all(s == 5 for s in seen)
 
 
-def test_map_shards_sets_io_concurrency_from_plan(budget):
+def test_stream_shards_cancels_unconsumed_work():
+    started = []
+    lock = threading.Lock()
+
+    def work(value):
+        with lock:
+            started.append(value)
+        time.sleep(0.02)
+        return value
+
+    stream = stream_shards(range(100), work, workers=2)
+    assert next(stream) == 0
+    stream.close()
+    assert set(started).issubset({0, 1, 2})
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_stream_shards_closes_source_iterator(workers):
+    closed = False
+
+    def source():
+        nonlocal closed
+        try:
+            yield from range(100)
+        finally:
+            closed = True
+
+    stream = stream_shards(source(), lambda value: value, workers=workers)
+    assert next(stream) == 0
+    stream.close()
+    assert closed
+
+
+def test_stream_shards_cancels_pending_work_after_failure():
+    started = []
+    lock = threading.Lock()
+
+    def work(value):
+        with lock:
+            started.append(value)
+        if value == 0:
+            raise RuntimeError("injected worker failure")
+        time.sleep(0.05)
+        return value
+
+    with pytest.raises(RuntimeError, match="injected worker failure"):
+        list(stream_shards(range(100), work, workers=2))
+    assert set(started).issubset({0, 1})
+
+
+def test_io_concurrency_isolated_across_parallel_runtimes():
+    before = zarr.config.get("async.concurrency")
+    barrier = threading.Barrier(2)
+    seen = {3: [], 7: []}
+
+    def run(io_concurrency):
+        def inspect_config(value):
+            barrier.wait()
+            seen[io_concurrency].append(zarr.config.get("async.concurrency"))
+            return value
+
+        list(
+            stream_shards(
+                [0],
+                inspect_config,
+                workers=1,
+                io_concurrency=io_concurrency,
+            )
+        )
+
+    first = threading.Thread(target=run, args=(3,))
+    second = threading.Thread(target=run, args=(7,))
+    first.start()
+    second.start()
+    first.join()
+    second.join()
+    assert seen == {3: [3], 7: [7]}
+    assert zarr.config.get("async.concurrency") == before
+
+
+def test_map_shards_uses_worker_budget_once_across_tasks_and_io():
     with zarr.config.set({"async.concurrency": 99}):
         seen = []
+        lock = threading.Lock()
+        in_flight = 0
+        max_in_flight = 0
 
         def produce(idx, s, e):
+            nonlocal in_flight, max_in_flight
+            with lock:
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
             seen.append(zarr.config.get("async.concurrency"))
+            time.sleep(0.01)
+            with lock:
+                in_flight -= 1
             return idx
 
-        # budget: workers=8; the whole worker budget is spent within a shard, so
-        # async.concurrency is set to 8 for the duration of the op.
-        map_shards([(i, i + 1) for i in range(4)], produce, workers=8)
-        assert seen and all(s == 8 for s in seen)
+        map_shards([(i, i + 1) for i in range(16)], produce, workers=8)
+        assert seen and all(s == 1 for s in seen)
+        assert max_in_flight > 1
+        assert max_in_flight * seen[0] <= 8
         assert zarr.config.get("async.concurrency") == 99
 
 

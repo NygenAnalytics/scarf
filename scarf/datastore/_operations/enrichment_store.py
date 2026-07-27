@@ -208,6 +208,7 @@ def _write_enrichment_slot(
 ) -> None:
     from ...storage.arrays import create_metadata_column, create_numeric_array
     from ...storage.layout import normed_array_spec
+    from ...storage.profiles import resolve_storage_profile
     from ...storage.sharding import write_dense_from_row_batches
 
     names = np.asarray(source_names)
@@ -270,7 +271,11 @@ def _write_enrichment_slot(
         scores = create_numeric_array(
             slot,
             "scores",
-            normed_array_spec(n_cells, n_sources),
+            normed_array_spec(
+                n_cells,
+                n_sources,
+                profile=resolve_storage_profile(slot.store),
+            ),
         )
 
         def checked_batches() -> Iterator[np.ndarray]:

@@ -5,8 +5,9 @@ import zarr
 
 from ..matrix import ChunkedArray
 from ..storage.arrays import create_zarr_dataset
+from ..storage.profiles import StorageProfile, ZarrLocation
 from ..utils.logging import logger
-from .assays import AssayMerge, DummyAssay, MergeAssay, ZARRLOC, _RowPlan
+from .assays import AssayMerge, DummyAssay, MergeAssay, _RowPlan
 
 
 class DatasetMerge:
@@ -20,7 +21,6 @@ class DatasetMerge:
                `datasets` parameter.
         in_workspaces: List of workspaces to be merged. If None, all workspaces are merged.
         out_workspace: Name of the workspace in the merged Zarr file. If None, the name of the first workspace is used.
-        chunk_size: Tuple of cell and feature chunk size. (Default value: (1000, 1000)).
         dtype: Dtype of the raw values in the assay. Dtype is automatically inferred from the provided assays. If
                assays have different dtypes then a float type is used.
         overwrite: If True, then overwrites previously created assay in the Zarr file. (Default value: False).
@@ -48,11 +48,10 @@ class DatasetMerge:
     def __init__(
         self,
         datasets: list["scarf.DataStore"],
-        zarr_path: ZARRLOC,
+        zarr_path: ZarrLocation,
         names: list[str],
         in_workspaces: list[str] | None = None,
         out_workspace: str | None = None,
-        chunk_size: tuple[int, int] = (1000, 1000),
         dtype: str | None = None,
         overwrite: bool = False,
         prepend_text: str | None = "orig",
@@ -60,13 +59,17 @@ class DatasetMerge:
         seed: int | None = 42,
         storage_options: dict[str, Any] | None = None,
         source_column: str | None = None,
+        mem_budget: int | str | None = None,
+        nthreads: int | None = None,
+        profile: StorageProfile | None = None,
+        targetChunkBytes: int | None = None,
+        targetShardBytes: int | None = None,
     ) -> None:
         self.datasets = datasets
         self.names = names
         self.zarr_path = zarr_path
         self.in_workspaces = in_workspaces
         self.out_workspace = out_workspace
-        self.chunk_size = chunk_size
         self.dtype = dtype
         self.overwrite = overwrite
         self.prepend_text = prepend_text
@@ -74,6 +77,17 @@ class DatasetMerge:
         self.seed = seed
         self.storage_options = storage_options
         self.source_column = source_column
+        self.memBudget = (
+            mem_budget
+            if mem_budget is not None
+            else min(ds.memoryBytes for ds in datasets)
+        )
+        self.nthreads = (
+            nthreads if nthreads is not None else min(ds.nthreads for ds in datasets)
+        )
+        self.profile = profile
+        self.targetChunkBytes = targetChunkBytes
+        self.targetShardBytes = targetShardBytes
         self.unique_assays = self.get_unique_assays()
         self.n_unique_assays = len(self.unique_assays)
         self.merge_generators = self.create_merge_generators()
@@ -120,7 +134,6 @@ class DatasetMerge:
                 merge_assay_name=assay,
                 in_workspaces=self.in_workspaces,
                 out_workspace=self.out_workspace,
-                chunk_size=self.chunk_size,
                 dtype=self.dtype,
                 overwrite=self.overwrite,
                 prepend_text=self.prepend_text,
@@ -128,6 +141,11 @@ class DatasetMerge:
                 seed=self.seed,
                 storage_options=self.storage_options,
                 source_column=self.source_column,
+                mem_budget=self.memBudget,
+                nthreads=self.nthreads,
+                profile=self.profile,
+                targetChunkBytes=self.targetChunkBytes,
+                targetShardBytes=self.targetShardBytes,
                 _row_plan=shared_row_plan,
                 _row_chunk_sizes=row_chunk_sizes,
             )
@@ -178,19 +196,23 @@ class DatasetMerge:
             reference_assay.rawData.dtype,
             dummy_shape,
         )
-        dummy_counts = ChunkedArray(dummy_array, nthreads=1)
+        dummy_counts = ChunkedArray(
+            dummy_array,
+            nthreads=ds.nthreads,
+            resources=ds.resources,
+        )
         dummy_assay = DummyAssay(
             ds, dummy_counts, reference_assay.feats, reference_assay.name
         )
         logger.info(f"Generated dummy {assay_name} assay for datastore {ds}")
         return dummy_assay
 
-    def dump(self, nthreads: int = 4) -> None:
+    def dump(self) -> None:
         """
         Dump the merged data to the zarr file
         """
         for gen in self.merge_generators:
             logger.info(f"Dumping {gen.merge_assay_name}")
-            gen.dump(nthreads)
+            gen.dump()
         logger.info("Merging complete")
         return None

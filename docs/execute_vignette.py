@@ -77,7 +77,6 @@ def configure_doc_execution_env(
     target.update(
         {
             "SCARF_MEM_BUDGET": "4G",
-            "SCARF_WORKING_COPIES": "1",
             "SCARF_WORKERS": "2",
             "OMP_NUM_THREADS": "2",
             "MKL_NUM_THREADS": "2",

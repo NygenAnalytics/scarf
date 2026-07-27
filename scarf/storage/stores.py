@@ -8,14 +8,8 @@ from zarr.abc.store import Store
 from .types import ZarrMode, as_zarr_array, as_zarr_group
 from .profiles import (
     ZarrLocation,
-    _get_storage_profile_override,
-    _maybe_auto_cloud_profile,
-    configure_zarr_io_for_profile,
     is_remote_zarr_location,
-    set_storage_profile,
 )
-
-type ZARRLOC = str | Store
 
 MATRIX_SOURCE_ATTR = "matrixSource"
 _ASSAY_COPY_ATTRS = ("is_assay", "misc", "percentFeatures", "size_factor")
@@ -80,7 +74,6 @@ def make_store(
                 from zarr.storage import ObjectStore
             except ImportError as exc:
                 raise ImportError("Remote Zarr stores require obstore.") from exc
-            _maybe_auto_cloud_profile(location)
             obstore = obstore_from_url(location, **(storage_options or {}))
             return ObjectStore(store=obstore, read_only=read_only)  # type: ignore[type-var]
         return location
@@ -97,32 +90,18 @@ def open_store(
 ) -> zarr.Group:
     """Open a Zarr group from a path, URI, or store object."""
     store = make_store(path, storage_options=storage_options, read_only=(mode == "r"))
-    configure_zarr_io_for_profile()
     if isinstance(store, str):
         return zarr.open_group(store, mode=mode)
     return zarr.open_group(store=store, mode=mode)
 
 
 def load_zarr(
-    zarr_loc: ZARRLOC,
+    zarr_loc: ZarrLocation,
     mode: ZarrMode,
-    synchronizer: Any = None,
     storage_options: dict[str, Any] | None = None,
 ) -> zarr.Group:
-    """Open a local or remote Zarr group."""
-    if synchronizer is not None:
-        from ..utils.logging import logger
-
-        logger.debug("ThreadSynchronizer is ignored under Zarr v3")
-    store = make_store(
-        zarr_loc,
-        storage_options=storage_options,
-        read_only=(mode == "r"),
-    )
-    configure_zarr_io_for_profile()
-    if isinstance(store, str):
-        return zarr.open_group(store, mode=mode)
-    return zarr.open_group(store=store, mode=mode)
+    """Open a Zarr group through the compatibility entry point."""
+    return open_store(zarr_loc, mode=mode, storage_options=storage_options)
 
 
 def _persistable_location(source: str) -> str:
@@ -132,7 +111,7 @@ def _persistable_location(source: str) -> str:
     return os.path.abspath(source)
 
 
-def _discard_target(target: zarr.Group, at: ZARRLOC) -> None:
+def _discard_target(target: zarr.Group, at: ZarrLocation) -> None:
     """Delete a target created by this call so the mount can be retried."""
     from zarr.core.sync import sync
 
@@ -247,7 +226,7 @@ def _validate_assay_identity(
 
 def create_matrix_source(
     source: str,
-    at: ZARRLOC,
+    at: ZarrLocation,
     *,
     workspace: str | None = None,
     storage_options: dict[str, Any] | None = None,
@@ -258,100 +237,83 @@ def create_matrix_source(
     if not isinstance(source, str) or not source:
         raise TypeError("Matrix source location must be a non-empty string")
     source = _persistable_location(source)
+    source_root = load_zarr(
+        source,
+        mode="r",
+        storage_options=storage_options,
+    )
+    assay_names = _list_assay_names(source_root, workspace)
+    if not assay_names:
+        raise ValueError("No assays found in the matrix source")
 
-    profile = _get_storage_profile_override()
+    source_zw = _workspace_group(source_root, workspace)
+    source_cell_data = as_zarr_group(
+        source_zw["cellData"],
+        name="cellData",
+    )
+    cell_ids = as_zarr_array(source_cell_data["ids"], name="ids")
+    source_assays: dict[str, zarr.Group] = {}
+    needs_id_fingerprint = False
+    for assay_name in assay_names:
+        source_assay = as_zarr_group(source_zw[assay_name], name=assay_name)
+        feature_data = as_zarr_group(
+            source_assay["featureData"],
+            name=f"{assay_name}/featureData",
+        )
+        as_zarr_array(feature_data["ids"], name="ids")
+        source_assays[assay_name] = source_assay
+        needs_id_fingerprint = (
+            needs_id_fingerprint
+            or source_assay.attrs.get("dataset_fingerprint") is None
+        )
+
+    cell_ids_fingerprint: str | None = None
+    if needs_id_fingerprint:
+        from .artifacts import fingerprint_stored_strings
+
+        cell_ids_fingerprint = fingerprint_stored_strings(cell_ids)
+
+    assay_manifest = {
+        assay_name: _assay_identity(
+            source_root,
+            source_assays[assay_name],
+            assay_name,
+            workspace,
+            cell_ids_fingerprint=cell_ids_fingerprint,
+        )
+        for assay_name in assay_names
+    }
+
+    target = load_zarr(at, mode="w-", storage_options=storage_options)
     try:
-        source_root = load_zarr(
-            source,
-            mode="r",
-            storage_options=storage_options,
-        )
-        set_storage_profile(profile)
-        assay_names = _list_assay_names(source_root, workspace)
-        if not assay_names:
-            raise ValueError("No assays found in the matrix source")
+        target_zw = target if workspace is None else target.create_group(workspace)
+        for key in _WORKSPACE_COPY_ATTRS:
+            if key in source_zw.attrs:
+                target_zw.attrs[key] = source_zw.attrs[key]
 
-        source_zw = _workspace_group(source_root, workspace)
-        source_cell_data = as_zarr_group(
-            source_zw["cellData"],
-            name="cellData",
-        )
-        cell_ids = as_zarr_array(source_cell_data["ids"], name="ids")
-        source_assays: dict[str, zarr.Group] = {}
-        needs_id_fingerprint = False
+        cell_data = target_zw.create_group("cellData")
+        copy_zarr_group_tree(source_cell_data, cell_data)
         for assay_name in assay_names:
-            source_assay = as_zarr_group(source_zw[assay_name], name=assay_name)
-            feature_data = as_zarr_group(
-                source_assay["featureData"],
-                name=f"{assay_name}/featureData",
-            )
-            as_zarr_array(feature_data["ids"], name="ids")
-            source_assays[assay_name] = source_assay
-            needs_id_fingerprint = (
-                needs_id_fingerprint
-                or source_assay.attrs.get("dataset_fingerprint") is None
-            )
-
-        cell_ids_fingerprint: str | None = None
-        if needs_id_fingerprint:
-            from .artifacts import fingerprint_stored_strings
-
-            cell_ids_fingerprint = fingerprint_stored_strings(cell_ids)
-
-        assay_manifest = {
-            assay_name: _assay_identity(
-                source_root,
-                source_assays[assay_name],
-                assay_name,
-                workspace,
-                cell_ids_fingerprint=cell_ids_fingerprint,
-            )
-            for assay_name in assay_names
-        }
-
-        target = load_zarr(at, mode="w-", storage_options=storage_options)
-        # A target without matrixSource is an ordinary store that cannot be
-        # recreated with "w-", so a partial copy is discarded rather than left
-        # behind.
-        try:
-            if workspace is None:
-                target_zw = target
-            else:
-                target_zw = target.create_group(workspace)
-
-            for key in _WORKSPACE_COPY_ATTRS:
-                if key in source_zw.attrs:
-                    target_zw.attrs[key] = source_zw.attrs[key]
-
-            cell_data = target_zw.create_group("cellData")
+            source_assay = source_assays[assay_name]
+            target_assay = target_zw.create_group(assay_name)
+            for key in _ASSAY_COPY_ATTRS:
+                if key in source_assay.attrs:
+                    target_assay.attrs[key] = source_assay.attrs[key]
+            feature_data = target_assay.create_group("featureData")
             copy_zarr_group_tree(
-                source_cell_data,
-                cell_data,
+                as_zarr_group(source_assay["featureData"], name="featureData"),
+                feature_data,
             )
 
-            for assay_name in assay_names:
-                source_assay = source_assays[assay_name]
-                target_assay = target_zw.create_group(assay_name)
-                for key in _ASSAY_COPY_ATTRS:
-                    if key in source_assay.attrs:
-                        target_assay.attrs[key] = source_assay.attrs[key]
-                feature_data = target_assay.create_group("featureData")
-                copy_zarr_group_tree(
-                    as_zarr_group(source_assay["featureData"], name="featureData"),
-                    feature_data,
-                )
-
-            target.attrs[MATRIX_SOURCE_ATTR] = {
-                "location": source,
-                "workspace": workspace,
-                "assays": assay_manifest,
-            }
-        except BaseException:
-            _discard_target(target, at)
-            raise
-        return target
-    finally:
-        set_storage_profile(profile)
+        target.attrs[MATRIX_SOURCE_ATTR] = {
+            "location": source,
+            "workspace": workspace,
+            "assays": assay_manifest,
+        }
+    except BaseException:
+        _discard_target(target, at)
+        raise
+    return target
 
 
 def resolve_matrix_source(
@@ -375,43 +337,38 @@ def resolve_matrix_source(
     if not isinstance(assays, dict) or not assays:
         raise ValueError("matrixSource.assays must be a non-empty mapping")
 
-    profile = _get_storage_profile_override()
-    try:
-        source_root = load_zarr(
-            location,
-            mode="r",
-            storage_options=storage_options,
-        )
-        set_storage_profile(profile)
-        entries: list[tuple[str, dict[str, Any]]] = []
-        for assay_name, expected in assays.items():
-            if not isinstance(assay_name, str):
-                raise ValueError("matrixSource assay names must be strings")
-            if not isinstance(expected, dict):
-                raise ValueError(
-                    f"matrixSource assay entry for {assay_name!r} must be a mapping"
-                )
-            entries.append((assay_name, expected))
-
-        source_zw = _workspace_group(source_root, workspace)
-        cell_ids_fingerprint: str | None = None
-        if any(expected.get("datasetFingerprint") is None for _, expected in entries):
-            from .artifacts import fingerprint_stored_strings
-
-            cell_data = as_zarr_group(source_zw["cellData"], name="cellData")
-            cell_ids = as_zarr_array(cell_data["ids"], name="ids")
-            cell_ids_fingerprint = fingerprint_stored_strings(cell_ids)
-
-        for assay_name, expected in entries:
-            source_assay = as_zarr_group(source_zw[assay_name], name=assay_name)
-            _validate_assay_identity(
-                source_root,
-                source_assay,
-                assay_name,
-                workspace,
-                expected,
-                cell_ids_fingerprint=cell_ids_fingerprint,
+    source_root = load_zarr(
+        location,
+        mode="r",
+        storage_options=storage_options,
+    )
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for assay_name, expected in assays.items():
+        if not isinstance(assay_name, str):
+            raise ValueError("matrixSource assay names must be strings")
+        if not isinstance(expected, dict):
+            raise ValueError(
+                f"matrixSource assay entry for {assay_name!r} must be a mapping"
             )
-        return source_root, workspace
-    finally:
-        set_storage_profile(profile)
+        entries.append((assay_name, expected))
+
+    source_zw = _workspace_group(source_root, workspace)
+    cell_ids_fingerprint: str | None = None
+    if any(expected.get("datasetFingerprint") is None for _, expected in entries):
+        from .artifacts import fingerprint_stored_strings
+
+        cell_data = as_zarr_group(source_zw["cellData"], name="cellData")
+        cell_ids = as_zarr_array(cell_data["ids"], name="ids")
+        cell_ids_fingerprint = fingerprint_stored_strings(cell_ids)
+
+    for assay_name, expected in entries:
+        source_assay = as_zarr_group(source_zw[assay_name], name=assay_name)
+        _validate_assay_identity(
+            source_root,
+            source_assay,
+            assay_name,
+            workspace,
+            expected,
+            cell_ids_fingerprint=cell_ids_fingerprint,
+        )
+    return source_root, workspace

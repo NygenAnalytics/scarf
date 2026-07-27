@@ -26,7 +26,7 @@ def test_chunked_array_signatures_remain_stable():
     }
 
     assert signature_digest(methods) == (
-        "afc65935760b3d549ef6b24ada2ff67b270d1eb6a4961d20e14a64b17ebf811a"
+        "0ac8b1f50482e55a8697f2fba39d0fa51c3b588c81923a0c70f4ef5a8ae2fee7"
     )
 
 

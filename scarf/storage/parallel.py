@@ -7,8 +7,6 @@ from typing import Any, Literal
 
 from threadpoolctl import threadpool_limits
 
-from .budget import ShardPlan, shard_parallelism
-
 __all__ = ["map_shards", "stream_shards", "in_shard_context"]
 
 type Backend = Literal["thread", "serial"]
@@ -49,6 +47,12 @@ def _blas_limit(within: int | None) -> Any:
     return threadpool_limits(limits=within)
 
 
+def _close_iterator(iterator: Iterator[Any]) -> None:
+    close = getattr(iterator, "close", None)
+    if callable(close):
+        close()
+
+
 def _imap_ordered(
     items: Iterable[Any],
     fn: Callable[[Any], Any],
@@ -61,10 +65,8 @@ def _imap_ordered(
         return fn(item)
 
     iterator = iter(items)
-    with (
-        _blas_limit(within_block_threads),
-        ThreadPoolExecutor(max_workers=workers) as executor,
-    ):
+    with _blas_limit(within_block_threads):
+        executor = ThreadPoolExecutor(max_workers=workers)
         pending: deque[Future[Any]] = deque()
 
         def enqueue() -> bool:
@@ -75,23 +77,30 @@ def _imap_ordered(
             pending.append(executor.submit(worker, item))
             return True
 
-        for _ in range(workers):
-            if not enqueue():
-                break
-        while pending:
-            result = pending.popleft().result()
-            enqueue()
-            yield result
+        try:
+            for _ in range(workers):
+                if not enqueue():
+                    break
+            while pending:
+                result = pending.popleft().result()
+                enqueue()
+                yield result
+        finally:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            _close_iterator(iterator)
 
 
 def _resolve_plan(
-    workers: int | None,
-    n_shards: int | None,
+    workers: int,
+    n_shards: int,
     backend: Backend,
-) -> ShardPlan:
+) -> tuple[int, int, int]:
     if backend == "serial" or in_shard_context():
-        return ShardPlan(readAhead=1, ioConcurrency=1, withinBlockThreads=1)
-    return shard_parallelism(workers=workers, n_shards=n_shards)
+        return 1, 1, 1
+    outer_workers = min(max(1, int(workers)), max(1, int(n_shards)))
+    return outer_workers, 1, 1
 
 
 def _progress(
@@ -121,8 +130,12 @@ def stream_shards(
     """Yield transformed items in order with bounded read-ahead."""
     workers = max(1, int(workers))
     if backend == "serial" or workers <= 1 or in_shard_context():
+        iterator = iter(items)
         with _io_concurrency(io_concurrency), _blas_limit(within_block_threads):
-            yield from _progress((fn(item) for item in items), msg, total)
+            try:
+                yield from _progress((fn(item) for item in iterator), msg, total)
+            finally:
+                _close_iterator(iterator)
         return
     with _io_concurrency(io_concurrency):
         base = _imap_ordered(
@@ -138,7 +151,7 @@ def map_shards(
     ranges: list[tuple[int, int]],
     produce: RangeProduce,
     *,
-    workers: int | None = None,
+    workers: int,
     msg: str | None = None,
     backend: Backend = "thread",
 ) -> list[Any]:
@@ -146,25 +159,29 @@ def map_shards(
     n_ranges = len(ranges)
     if n_ranges == 0:
         return []
-    plan = _resolve_plan(workers, n_ranges, backend)
+    worker_count, io_concurrency, within_block_threads = _resolve_plan(
+        workers,
+        n_ranges,
+        backend,
+    )
     indexed = list(enumerate(ranges))
 
     def call(item: tuple[int, tuple[int, int]]) -> Any:
         index, (start, end) = item
         return produce(index, start, end)
 
-    if plan.readAhead <= 1:
-        with _io_concurrency(plan.ioConcurrency), _blas_limit(plan.withinBlockThreads):
+    if worker_count <= 1:
+        with _io_concurrency(io_concurrency), _blas_limit(within_block_threads):
             return list(_progress((call(item) for item in indexed), msg, n_ranges))
 
     with (
         _shard_context(),
-        _io_concurrency(plan.ioConcurrency),
+        _io_concurrency(io_concurrency),
     ):
         stream = _imap_ordered(
             indexed,
             call,
-            workers=plan.readAhead,
-            within_block_threads=plan.withinBlockThreads,
+            workers=worker_count,
+            within_block_threads=within_block_threads,
         )
         return list(_progress(stream, msg, n_ranges))

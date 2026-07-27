@@ -5,7 +5,9 @@ import zarr
 
 from ..utils.compute import controlled_compute
 from .arrays import create_numeric_array
+from .budget import ResourceBudget
 from .layout import normed_array_spec
+from .profiles import resolve_storage_profile
 from .sharding import write_dense_in_shard_rows
 
 
@@ -23,7 +25,11 @@ def write_renorm_subset_to_zarr(
     counts = assay.rawData[:, feat_idx][cell_idx, :]
     if msg is None:
         msg = f"Writing data to {loc}"
-    spec = normed_array_spec(counts.shape[0], counts.shape[1])
+    spec = normed_array_spec(
+        counts.shape[0],
+        counts.shape[1],
+        profile=resolve_storage_profile(root.store),
+    )
     output = create_numeric_array(root, loc, spec)
     scale_factor = assay.sf
 
@@ -43,6 +49,7 @@ def write_renorm_subset_to_zarr(
         ),
         msg=msg,
         also_write_to=mirror,
+        resources=assay.resources,
     )
 
 
@@ -50,14 +57,18 @@ def dask_to_zarr(
     data: Any,
     root: zarr.Group,
     loc: str,
-    chunk_size: tuple[int, int],
     nthreads: int,
     msg: str | None = None,
     mirror: zarr.Array | None = None,
+    resources: ResourceBudget | None = None,
 ) -> None:
     if msg is None:
         msg = f"Writing data to {loc}"
-    spec = normed_array_spec(data.shape[0], data.shape[1])
+    spec = normed_array_spec(
+        data.shape[0],
+        data.shape[1],
+        profile=resolve_storage_profile(root.store),
+    )
     output = create_numeric_array(root, loc, spec)
     write_dense_in_shard_rows(
         output,
@@ -67,4 +78,5 @@ def dask_to_zarr(
         ).astype(np.float32, copy=False),
         msg=msg,
         also_write_to=mirror,
+        resources=resources,
     )

@@ -12,7 +12,6 @@ from scarf.utils.arrays import array_digest
 from scarf.writers import (
     create_cell_data,
     create_zarr_count_assay,
-    finalize_writer_counts,
 )
 
 pytestmark = pytest.mark.slow
@@ -594,7 +593,6 @@ def test_workspace_results_are_written_to_the_assay_shell(tmp_path):
         z=root,
         assay_name="RNA",
         workspace="ws",
-        chunk_size=(2, 3),
         n_cells=5,
         feat_ids=np.array([f"f{i}" for i in range(6)]),
         feat_names=np.array([f"g{i}" for i in range(6)]),
@@ -610,7 +608,6 @@ def test_workspace_results_are_written_to_the_assay_shell(tmp_path):
         ],
         dtype=np.uint32,
     )
-    finalize_writer_counts(root, "RNA", "ws")
     datastore = DataStore(
         str(path),
         default_assay="RNA",

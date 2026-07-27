@@ -213,6 +213,66 @@ def test_crdir_reader_filters_and_streams_selected_barcodes(tmp_path):
     np.testing.assert_array_equal(chunks[1].toarray(), [[6, 0, 0]])
 
 
+def test_crdir_reader_splits_many_cells_from_one_input_chunk(tmp_path):
+    from scarf.readers import CrDirReader
+
+    (tmp_path / "features.tsv").write_text("f1\tg1\tGene Expression\n")
+    (tmp_path / "barcodes.tsv").write_text("".join(f"b{index}\n" for index in range(5)))
+    (tmp_path / "matrix.mtx").write_text(
+        "\n".join(
+            [
+                "%%MatrixMarket matrix coordinate integer general",
+                "1 5 5",
+                *(f"1 {index + 1} {index + 1}" for index in range(5)),
+            ]
+        )
+        + "\n"
+    )
+
+    reader = CrDirReader(str(tmp_path))
+    chunks = list(reader.consume(batch_size=1, lines_in_mem=100))
+
+    assert reader.producer_staging_bytes(1, 100) > (
+        100 * 3 * np.dtype(np.int64).itemsize
+    )
+    assert [chunk.shape for chunk in chunks] == [(1, 1)] * 5
+    np.testing.assert_array_equal(
+        np.vstack([chunk.toarray() for chunk in chunks]),
+        np.arange(1, 6).reshape(-1, 1),
+    )
+
+
+def test_crdir_reader_coalesces_duplicates_across_input_chunks(tmp_path):
+    from scarf.readers import CrDirReader
+
+    n_entries = 1_000
+    (tmp_path / "features.tsv").write_text("f1\tg1\tGene Expression\n")
+    (tmp_path / "barcodes.tsv").write_text("b1\n")
+    (tmp_path / "matrix.mtx").write_text(
+        "\n".join(
+            [
+                "%%MatrixMarket matrix coordinate integer general",
+                f"1 1 {n_entries}",
+                *("1 1 1" for _ in range(n_entries)),
+            ]
+        )
+        + "\n"
+    )
+
+    reader = CrDirReader(str(tmp_path))
+    chunks = list(
+        reader.consume(
+            batch_size=1,
+            lines_in_mem=100,
+            dtype=np.uint32,
+        )
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].nnz == 1
+    np.testing.assert_array_equal(chunks[0].toarray(), [[n_entries]])
+
+
 def test_crdir_reader_supports_gzip_and_metadata_fallback(tmp_path):
     import gzip
 
@@ -282,6 +342,10 @@ def test_crh5reader_streams_counts(crh5_reader):
     streamed_rows = 0
     streamed_nnz = 0
 
+    indptr = crh5_reader.grp["indptr"]
+    assert crh5_reader.producer_staging_bytes(300, 1) > (
+        indptr.size * indptr.dtype.itemsize
+    )
     for chunk in crh5_reader.consume(batch_size=300):
         assert 0 < chunk.shape[0] <= 300
         assert chunk.shape[1] == crh5_reader.nFeatures
@@ -584,6 +648,14 @@ def test_h5ad_reader_preserves_sparse_batches(tmp_path, values, batch_size):
     _write_sparse_h5ad(file_name, values)
     reader = H5adReader(str(file_name), feature_name_key="feature_name")
     try:
+        expected_max_nnz = max(
+            np.count_nonzero(values[start : start + batch_size])
+            for start in range(
+                0,
+                max(1, values.shape[0] - batch_size + 1),
+            )
+        )
+        assert reader.max_batch_nnz(batch_size) == expected_max_nnz
         chunks = list(reader.consume(batch_size=batch_size))
         assert sum(chunk.shape[0] for chunk in chunks) == values.shape[0]
         assert sum(chunk.nnz for chunk in chunks) == np.count_nonzero(values)
@@ -643,7 +715,7 @@ def test_h5ad_reader_converts_csc_sparse_encoding(tmp_path):
 
     root = zarr.open_group(str(zarr_path), mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
+    assert "countsT" not in root["RNA"]
 
 
 def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
@@ -673,8 +745,7 @@ def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
 
     root = zarr.open_group(str(zarr_path), mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    np.testing.assert_array_equal(root["RNA/countsT"][:], values.T)
-    assert root["RNA/countsT"].attrs["complete"] is True
+    assert "countsT" not in root["RNA"]
 
 
 def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):

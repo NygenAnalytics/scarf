@@ -4,6 +4,7 @@ from typing import Any
 import numpy as np
 
 from ..utils.logging import logger
+from ..utils.numba import restore_numba_threads
 from ..utils.progress import tqdm_params as default_tqdm_params
 
 locale.setlocale(locale.LC_NUMERIC, "C")
@@ -37,6 +38,7 @@ def calc_dens_map_params(
     return mu_sum, standardized_ro
 
 
+@restore_numba_threads
 def simplicial_set_embedding(
     g: Any,
     embedding: np.ndarray,

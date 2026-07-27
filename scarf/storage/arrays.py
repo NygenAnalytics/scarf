@@ -9,7 +9,7 @@ from .layout import (
     get_compressors,
     normalize_chunks,
 )
-from .profiles import StorageProfile, get_storage_profile
+from .profiles import StorageProfile, resolve_storage_profile
 
 
 def create_numeric_array(
@@ -20,15 +20,18 @@ def create_numeric_array(
     """Create a numeric Zarr array from a specification."""
     zarrFormat = _group_zarr_format(group)
     chunks = normalize_chunks(spec.chunks, spec.shape)
-    profile = get_storage_profile()
-    compressors = get_compressors(profile, zarrFormat=zarrFormat)
-    if spec.compressors is not None and zarrFormat >= 3:
-        compressors = spec.compressors
     kwargs: dict[str, Any] = {
         "shape": spec.shape,
         "chunks": chunks,
         "dtype": spec.dtype,
-        "compressors": compressors,
+        "compressors": (
+            spec.compressors
+            if zarrFormat >= 3
+            else get_compressors(
+                resolve_storage_profile(group.store),
+                zarrFormat=2,
+            )
+        ),
         "overwrite": spec.overwrite,
     }
     if spec.shards is not None and zarrFormat >= 3:
@@ -67,8 +70,9 @@ def create_metadata_column(
     else:
         chunks = (chunkSize,)
 
+    resolved_profile = profile or resolve_storage_profile(group.store)
     compressors = get_compressors(
-        profile or get_storage_profile(),
+        resolved_profile,
         zarrFormat=_group_zarr_format(group),
     )
 
@@ -112,11 +116,17 @@ def create_zarr_dataset(
     dtype: Any,
     shape: tuple[int, ...],
     overwrite: bool = True,
+    profile: StorageProfile | None = None,
 ) -> zarr.Array:
+    resolved_profile = profile or resolve_storage_profile(group.store)
     spec = ZarrArraySpec(
         shape=shape,
         chunks=_normalize_chunks(chunks),
         dtype=dtype,
+        compressors=get_compressors(
+            resolved_profile,
+            zarrFormat=_group_zarr_format(group),
+        ),
         overwrite=overwrite,
     )
     return create_numeric_array(group, name, spec)
@@ -130,6 +140,7 @@ def create_zarr_obj_array(
     overwrite: bool = True,
     chunk_size: int = 100000,
     shape: int | None = None,
+    profile: StorageProfile | None = None,
 ) -> zarr.Array:
     return create_metadata_column(
         group,
@@ -139,4 +150,5 @@ def create_zarr_obj_array(
         overwrite=overwrite,
         chunkSize=chunk_size,
         shape=shape if data is None else None,
+        profile=profile,
     )

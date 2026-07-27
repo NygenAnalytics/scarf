@@ -3,6 +3,7 @@ from typing import Any
 import numpy as np
 import zarr
 
+from ..storage.budget import ResourceBudget
 from ..storage.materialize import (
     dask_to_zarr as _dask_to_zarr,
     write_renorm_subset_to_zarr as _write_renorm_subset_to_zarr,
@@ -42,10 +43,10 @@ def dask_to_zarr(
     df: Any,
     z: zarr.Group,
     loc: str,
-    chunk_size: tuple[int, int],
     nthreads: int,
     msg: str | None = None,
     mirror: zarr.Array | None = None,
+    resources: ResourceBudget | None = None,
 ) -> None:
     """Creates a Zarr hierarchy from a chunked array.
 
@@ -53,7 +54,6 @@ def dask_to_zarr(
         df: ChunkedArray to materialize and write.
         z: Root Zarr group.
         loc: Array path within the group.
-        chunk_size: Legacy row chunk hint (superseded by profile spec when writing normed data).
         nthreads: Threads for block compute.
         msg: Progress bar message (default: ``Writing data to {loc}``).
         mirror: Optional second array of the same shape to write each band into
@@ -63,8 +63,8 @@ def dask_to_zarr(
         df,
         z,
         loc,
-        chunk_size,
         nthreads,
         msg=msg,
         mirror=mirror,
+        resources=resources,
     )

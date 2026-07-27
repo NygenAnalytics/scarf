@@ -39,7 +39,7 @@ from ...utils.compute import controlled_compute
 from ...utils.logging import logger
 
 if TYPE_CHECKING:
-    from ...storage.stores import ZARRLOC
+    from ...storage.profiles import ZarrLocation
     from ..mapping_datastore import MappingDatastore as _QualityControlOperationsBase
 else:
     _QualityControlOperationsBase = object
@@ -48,9 +48,9 @@ else:
 class _QualityControlOperationsMixin(_QualityControlOperationsBase):
     if TYPE_CHECKING:
 
-        @staticmethod
         def _create_temporary_datastore(
-            zarr_loc: ZARRLOC,
+            self,
+            zarr_loc: ZarrLocation,
             *,
             default_assay: str,
             assay_types: dict[str, str],
@@ -539,7 +539,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 feat_ids=source_assay.feats.fetch_all("ids"),
                 feat_names=source_assay.feats.fetch_all("names"),
                 dtype=str(source_assay.rawData.dtype),
-                batch_size=batch_size,
+                mem_budget=self.memoryBytes,
+                nthreads=self.nthreads,
+                profile="fast_local",
             )
             target_ds = self._create_temporary_datastore(
                 temp_dir,

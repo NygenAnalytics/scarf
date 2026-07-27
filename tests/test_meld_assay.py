@@ -12,6 +12,7 @@ from scarf.features.genomic.intervals import (
     get_feature_mappings,
 )
 from scarf.features.genomic.melding import create_counts_mat
+from scarf.storage.budget import ResourceBudget
 from scarf.writers import create_zarr_dataset
 
 
@@ -34,6 +35,11 @@ class _FakeRawData:
         self.blocks = blocks
         self.numblocks = (len(blocks),)
         self.shape = (sum(b.shape[0] for b in blocks), blocks[0].shape[1])
+        self.dtype = np.asarray(blocks[0]).dtype
+        self.chunksize = (
+            max(block.shape[0] for block in blocks),
+            self.shape[1],
+        )
 
     def stream_blocks(self, nthreads=None, msg=None, prefetch=None):
         # Mirrors ChunkedArray.stream_blocks: yields materialized, in-order blocks.
@@ -43,6 +49,7 @@ class _FakeRawData:
 class _FakeAssay:
     name = "ATAC"
     nthreads = 1
+    resources = ResourceBudget(1024**3, 1)
 
     def __init__(self, cells, feats, raw_data):
         self.cells = cells

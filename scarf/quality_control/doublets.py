@@ -5,6 +5,7 @@ import zarr
 from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 
+from ..storage.profiles import StorageProfile
 from ..utils.logging import logger
 
 __all__ = [
@@ -61,7 +62,11 @@ def write_doublet_target_zarr(
     feat_ids: NDArray,
     feat_names: NDArray,
     dtype: str = "uint32",
-    batch_size: int = 1000,
+    mem_budget: int | str | None = None,
+    nthreads: int | None = None,
+    profile: StorageProfile | None = None,
+    targetChunkBytes: int | None = None,
+    targetShardBytes: int | None = None,
 ) -> zarr.Group:
     """Materialise simulated doublet counts as a minimal Scarf Zarr hierarchy."""
     from ..storage.schema import (
@@ -69,12 +74,13 @@ def write_doublet_target_zarr(
         create_zarr_count_assay,
         load_count_array,
     )
-    from ..storage.sharding import (
-        finalize_sharded_counts,
-        write_dense_in_shard_rows,
-    )
+    from ..storage.sharding import write_dense_in_shard_rows
+    from ..storage.budget import resolve_budget
+    from ..storage.profiles import resolve_storage_profile
     from ..storage.stores import load_zarr
 
+    resources = resolve_budget(mem_budget, nthreads)
+    resolved_profile = resolve_storage_profile(zarr_loc, profile)
     n_sim = sim_counts.shape[0]
     z = load_zarr(zarr_loc=zarr_loc, mode="w")
     ids = np.array([f"doublet_{i}" for i in range(n_sim)])
@@ -83,18 +89,20 @@ def write_doublet_target_zarr(
         z=z,
         assay_name=assay_name,
         workspace=None,
-        chunk_size=(batch_size, 1000),
         n_cells=n_sim,
         feat_ids=np.asarray(feat_ids),
         feat_names=np.asarray(feat_names),
         dtype=dtype,
+        profile=resolved_profile,
+        targetChunkBytes=targetChunkBytes,
+        targetShardBytes=targetShardBytes,
     )
     store = load_count_array(z, assay_name, None)
     write_dense_in_shard_rows(
         store,
         lambda s, e: sim_counts[s:e].toarray().astype(dtype),
         msg="Writing simulated doublets",
+        resources=resources,
     )
-    finalize_sharded_counts(z, assay_name, None)
     logger.debug(f"Wrote {n_sim} simulated doublets to {zarr_loc}")
     return z

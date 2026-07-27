@@ -1,8 +1,9 @@
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ..storage.types import ZarrMode
 from ..assay import Assay
-from ..storage.stores import ZARRLOC, create_matrix_source
+from ..storage.profiles import StorageProfile, ZarrLocation
+from ..storage.stores import create_matrix_source
 from ._operations.features import _FeatureOperationsMixin
 from ._operations.integration_metrics import _IntegrationMetricsOperationsMixin
 from ._operations.presentation import _PresentationOperationsMixin
@@ -19,7 +20,7 @@ __all__ = ["DataStore", "mount_datastore"]
 
 def mount_datastore(
     source: str,
-    at: ZARRLOC,
+    at: ZarrLocation,
     *,
     workspace: str | None = None,
     storage_options: dict[str, Any] | None = None,
@@ -31,11 +32,6 @@ def mount_datastore(
     analysis artifacts. Count matrices remain in the read-only source and are
     remounted automatically when the target is reopened with ``DataStore``.
     """
-    from ..storage.profiles import (
-        _get_storage_profile_override,
-        set_storage_profile,
-    )
-
     if "zarr_loc" in datastore_options:
         raise TypeError("mount_datastore takes the target location through 'at'")
     zarr_mode = datastore_options.pop("zarr_mode", "r+")
@@ -45,19 +41,12 @@ def mount_datastore(
             f"{zarr_mode!r}. Reopen the target with DataStore to read it."
         )
 
-    profile = _get_storage_profile_override()
-    requested_profile = datastore_options.get("zarrProfile")
-    try:
-        if requested_profile is not None:
-            set_storage_profile(requested_profile)
-        create_matrix_source(
-            source,
-            at,
-            workspace=workspace,
-            storage_options=storage_options,
-        )
-    finally:
-        set_storage_profile(profile)
+    create_matrix_source(
+        source,
+        at,
+        workspace=workspace,
+        storage_options=storage_options,
+    )
     return DataStore(
         at,
         zarr_mode=zarr_mode,
@@ -99,20 +88,15 @@ class DataStore(
         nthreads: Number of maximum threads to use in all multi-threaded functions
         zarr_mode: For read-write mode use r+' or for read-only use 'r'. (Default value: 'r+')
         workspace: Workspace for the data
-        synchronizer: Used as `synchronizer` parameter when opening the Zarr file. Please refer to this page for
-                      more details: https://zarr.readthedocs.io/en/stable/api/sync.html. By default
-                      ThreadSynchronizer will be used.
         mem_budget: Memory budget bounding streaming and concurrency. Accepts bytes, a suffixed size
                     (e.g. '8G'), or a fraction of total system memory (e.g. '0.6'). When None, it is
                     auto-detected (SCARF_MEM_BUDGET env var, else total system memory). Override it to
                     simulate reading on a machine with a different memory size than the writer.
-        working_copies: Number of concurrent in-memory working copies the memory budget is divided
-                        across. When None, uses SCARF_WORKING_COPIES env var or the default.
     """
 
     def __init__(
         self,
-        zarr_loc: ZARRLOC,
+        zarr_loc: ZarrLocation,
         assay_types: dict[str, str] | None = None,
         default_assay: str | None = None,
         min_features_per_cell: int = 10,
@@ -122,25 +106,15 @@ class DataStore(
         nthreads: int = 2,
         zarr_mode: ZarrMode = "r+",
         workspace: str | None = None,
-        synchronizer: Any = None,
-        zarrProfile: Literal["fast_local", "cloud"] | None = None,
+        zarrProfile: StorageProfile | None = None,
         storage_options: dict[str, Any] | None = None,
         mem_budget: int | str | None = None,
-        working_copies: int | None = None,
     ) -> None:
-        from ..storage.budget import resolve_budget, set_resource_budget
-        from ..storage.profiles import (
-            configure_zarr_io_for_profile,
-            set_storage_profile,
-        )
+        from ..storage.budget import resolve_budget
+        from ..storage.profiles import resolve_storage_profile
 
-        set_storage_profile(zarrProfile)
-        set_resource_budget(
-            resolve_budget(
-                memory=mem_budget, workers=nthreads, working_copies=working_copies
-            )
-        )
-        configure_zarr_io_for_profile()
+        resources = resolve_budget(memory=mem_budget, workers=nthreads)
+        profile = resolve_storage_profile(zarr_loc, zarrProfile)
         if zarr_mode not in ["r", "r+"]:
             raise ValueError(
                 "ERROR: Zarr file can only be accessed using either 'r' or 'r+' mode"
@@ -153,10 +127,10 @@ class DataStore(
             min_cells_per_feature=min_cells_per_feature,
             mito_pattern=mito_pattern,
             ribo_pattern=ribo_pattern,
-            nthreads=nthreads,
             zarr_mode=zarr_mode,
             workspace=workspace,
-            synchronizer=synchronizer,
+            resources=resources,
+            storage_profile=profile,
             storage_options=storage_options,
         )
 
@@ -188,36 +162,18 @@ class DataStore(
         else:
             return cast(Assay, getattr(self, assay_name))
 
-    @staticmethod
     def _create_temporary_datastore(
-        zarr_loc: ZARRLOC,
+        self,
+        zarr_loc: ZarrLocation,
         *,
         default_assay: str,
         assay_types: dict[str, str],
         nthreads: int,
     ) -> "DataStore":
-        import zarr
-
-        from ..storage.budget import (
-            _get_resource_budget_override,
-            set_resource_budget,
+        return DataStore(
+            zarr_loc,
+            default_assay=default_assay,
+            assay_types=assay_types,
+            nthreads=nthreads,
+            mem_budget=self.memoryBytes,
         )
-        from ..storage.profiles import (
-            _get_storage_profile_override,
-            set_storage_profile,
-        )
-
-        profile = _get_storage_profile_override()
-        budget = _get_resource_budget_override()
-        async_concurrency = zarr.config.get("async.concurrency")
-        try:
-            return DataStore(
-                zarr_loc,
-                default_assay=default_assay,
-                assay_types=assay_types,
-                nthreads=nthreads,
-            )
-        finally:
-            set_storage_profile(profile)
-            set_resource_budget(budget)
-            zarr.config.set({"async.concurrency": async_concurrency})

@@ -57,7 +57,8 @@ class LoomReader:
         self.cellAttrsKey, self.featureAttrsKey = cell_attrs_key, feature_attrs_key
         self.cellNamesKey, self.featureNamesKey = cell_names_key, feature_names_key
         self.featureIdsKey = feature_ids_key
-        self.matrixDtype = self.h5[self.matrixKey].dtype if dtype is None else dtype
+        self.sourceMatrixDtype = self.h5[self.matrixKey].dtype
+        self.matrixDtype = self.sourceMatrixDtype if dtype is None else dtype
         self._check_integrity()
         self.nFeatures, self.nCells = self.h5[self.matrixKey].shape
 

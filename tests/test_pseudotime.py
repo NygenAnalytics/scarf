@@ -6,6 +6,7 @@ from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.assay import Assay
+from scarf.storage.budget import ResourceBudget
 from scarf.trajectory.feature_dynamics import knn_clustering
 from scarf.datastore.datastore import DataStore
 from scarf.trajectory.feature_dynamics import (
@@ -283,6 +284,7 @@ class _AggregationAssay:
         self.cells = _AggregationCells(ordering)
         self.z = zarr.open_group(store=MemoryStore(), mode="w")
         self.nthreads = 1
+        self.resources = ResourceBudget(1024**3, 1)
 
     def _get_cell_feat_idx(
         self,

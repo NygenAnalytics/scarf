@@ -49,6 +49,7 @@ def _memory_graph_store(
     store._cachedMagicOperator = None
     store._cachedMagicOperatorLoc = None
     store.nthreads = 1
+    store.storageProfile = "fast_local"
     return store
 
 
@@ -590,13 +591,21 @@ def test_ann_index_resolution_and_persistence_paths(
     )
     custom_saver.assert_called_once_with(custom_index, custom_only_loc)
     assert custom_only_loc in store.zw
-    save_index.assert_called_once_with(store.zw[custom_only_loc], custom_index)
+    save_index.assert_called_once_with(
+        store.zw[custom_only_loc],
+        custom_index,
+        profile="fast_local",
+    )
 
     fallback_loc = "fallback/ann"
     failing_saver = Mock(side_effect=RuntimeError("save failed"))
     store._persist_ann_index(fallback_loc, legacy_index, ann_index_saver=failing_saver)
     assert fallback_loc in store.zw
-    save_index.assert_called_with(store.zw[fallback_loc], legacy_index)
+    save_index.assert_called_with(
+        store.zw[fallback_loc],
+        legacy_index,
+        profile="fast_local",
+    )
 
     store.zarr_mode = "r"
     read_only_loc = "readonly/ann"

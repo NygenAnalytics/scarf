@@ -99,17 +99,16 @@ def _write_compact_marker_stats(
     cluster_group: zarr.Group,
     stats: np.ndarray,
 ) -> None:
-    from ...storage.arrays import create_numeric_array
-    from ...storage.layout import ZarrArraySpec
+    from ...storage.arrays import create_zarr_dataset
 
     n_features = int(stats.shape[0])
-    spec = ZarrArraySpec(
-        shape=(n_features, len(_MARKER_STAT_COLUMNS)),
-        chunks=(n_features, len(_MARKER_STAT_COLUMNS)),
-        dtype="float64",
-        overwrite=True,
+    arr = create_zarr_dataset(
+        cluster_group,
+        "stats",
+        (n_features, len(_MARKER_STAT_COLUMNS)),
+        "float64",
+        (n_features, len(_MARKER_STAT_COLUMNS)),
     )
-    arr = create_numeric_array(cluster_group, "stats", spec)
     arr[:] = stats
 
 
@@ -1007,6 +1006,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 n_features=n_features,
                 n_cells=len(assay.cells.active_index(cell_key)),
                 column_chunk=_feature_column_chunk(assay, n_features),
+                resources=self.resources,
             )
 
         slot_name = f"{cell_key}__{group_key}"
@@ -1410,7 +1410,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         from ...storage.sharding import write_dense_in_shard_rows
 
-        from ...storage.schema import create_zarr_count_assay, finalize_counts
+        from ...storage.schema import create_zarr_count_assay
 
         if assay_label is None:
             raise ValueError(
@@ -1435,11 +1435,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             z=self.zw,
             assay_name=assay_label,
             workspace=self.workspace,
-            chunk_size=assay.rawData.chunksize,  # type: ignore
             n_cells=assay.cells.N,
             feat_ids=module_ids,
             feat_names=module_ids,
             dtype="float",
+            profile=self.storageProfile,
         )
 
         cell_idx = np.array(list(range(assay.cells.N)))
@@ -1458,8 +1458,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             g,
             lambda start, end: matrix[start:end, :],
             msg="Writing grouped assay",
+            resources=self.resources,
         )
-        finalize_counts(self.zw, assay_label, self.workspace)
 
         self._load_assays(min_cells=0, custom_assay_types={assay_label: "Assay"})
         self._ini_cell_props(min_features=0, mito_pattern="", ribo_pattern="")

@@ -295,6 +295,8 @@ def test_find_markers_by_regression_identifies_nonfinite_feature():
 
 
 def test_find_markers_by_rank_rejects_fast_path_for_non_rna_assay():
+    import numba
+
     class Cells:
         @staticmethod
         def fetch(_group_key, _cell_key):
@@ -306,6 +308,7 @@ def test_find_markers_by_rank_rejects_fast_path_for_non_rna_assay():
             self.normMethod = norm_lib_size
             self.sf = 1.0
 
+    previous_threads = numba.get_num_threads()
     with pytest.raises(TypeError, match="requires an RNAassay"):
         find_markers_by_rank(
             Assay(),
@@ -315,6 +318,7 @@ def test_find_markers_by_rank_rejects_fast_path_for_non_rna_assay():
             batch_size=2,
             n_threads=1,
         )
+    assert numba.get_num_threads() == previous_threads
 
 
 def test_find_markers_by_rank_slow_path_returns_groupwise_statistics():
@@ -445,7 +449,6 @@ def test_iter_raw_feature_columns_matches_normed(datastore):
         batch_size=37,
         scalar=scalar,
         sf=float(assay.sf),
-        prefetch_depth=3,
     ):
         mats.append(mat)
         cols.append(batch_cols)
@@ -499,19 +502,20 @@ def test_compact_marker_save_roundtrip():
 
 def test_resolve_marker_gene_batch_size_respects_chunk_and_budget():
     from scarf.features.markers import resolve_marker_gene_batch_size
+    from scarf.storage.budget import ResourceBudget
 
     batch = resolve_marker_gene_batch_size(
         n_features=25_683,
         n_cells=88_955,
         column_chunk=948,
-        memory_bytes=24 * 1024**3,
-        working_copies=4,
+        resources=ResourceBudget(24 * 1024**3, 8),
     )
     assert batch == 948
 
 
 def test_resolve_marker_gene_batch_size_shrinks_with_more_cells():
     from scarf.features.markers import resolve_marker_gene_batch_size
+    from scarf.storage.budget import ResourceBudget
 
     sizes = []
     for n_cells in (100_000, 1_000_000, 10_000_000):
@@ -520,13 +524,25 @@ def test_resolve_marker_gene_batch_size_shrinks_with_more_cells():
                 n_features=45_525,
                 n_cells=n_cells,
                 column_chunk=10_000,
-                memory_bytes=24 * 1024**3,
-                working_copies=4,
+                resources=ResourceBudget(24 * 1024**3, 8),
             )
         )
     assert sizes[0] > sizes[1] > sizes[2]
     assert sizes[-1] >= 1
     assert all(size <= 10_000 for size in sizes)
+
+
+def test_resolve_marker_gene_batch_size_rejects_one_feature_over_budget():
+    from scarf.features.markers import resolve_marker_gene_batch_size
+    from scarf.storage.budget import ResourceBudget
+
+    with pytest.raises(MemoryError, match="One marker feature batch"):
+        resolve_marker_gene_batch_size(
+            n_features=10,
+            n_cells=1_000,
+            column_chunk=10,
+            resources=ResourceBudget(63_999, 2),
+        )
 
 
 def test_explicit_marker_gene_batch_size_bypasses_resolver(

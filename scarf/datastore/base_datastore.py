@@ -16,6 +16,7 @@ from ..storage.artifacts import (
     list_artifacts as list_artifact_refs,
 )
 from ..storage.types import ZarrMode, as_zarr_array, as_zarr_group
+from ..storage.budget import ResourceBudget
 from ..assay import RNAassay, ATACassay, ADTassay, Assay
 from ..metadata import MetaData
 from ..metadata.artifacts import (
@@ -25,7 +26,8 @@ from ..metadata.artifacts import (
     write_cell_data_artifact,
 )
 from ..storage.schema import validate_assay_name
-from ..storage.stores import ZARRLOC, load_zarr, resolve_matrix_source
+from ..storage.profiles import StorageProfile, ZarrLocation
+from ..storage.stores import load_zarr, resolve_matrix_source
 from ..storage.selections import resolve_selection_artifact
 from ..utils.compute import controlled_compute, show_dask_progress
 from ..utils.logging import logger
@@ -99,9 +101,6 @@ class BaseDataStore:
                       ``RPS|RPL|MRPS|MRPL``.
         nthreads: Number of maximum threads to use in all multi-threaded functions
         zarr_mode: For read-write mode use r+' or for read-only use 'r' (Default value: 'r+')
-        synchronizer: Used as `synchronizer` parameter when opening the Zarr file. Please refer to this page for
-                      more details: https://zarr.readthedocs.io/en/stable/api/sync.html. By default
-                      ThreadSynchronizer will be used.
         workspace: Workspace name within the Zarr store (None for legacy single-workspace layout).
 
     Attributes:
@@ -112,17 +111,17 @@ class BaseDataStore:
 
     def __init__(
         self,
-        zarr_loc: ZARRLOC,
+        zarr_loc: ZarrLocation,
         assay_types: dict[str, str],
         default_assay: str,
         min_features_per_cell: int,
         min_cells_per_feature: int,
         mito_pattern: str,
         ribo_pattern: str,
-        nthreads: int,
         zarr_mode: ZarrMode,
         workspace: str | None,
-        synchronizer: Any,
+        resources: ResourceBudget,
+        storage_profile: StorageProfile,
         storage_options: dict[str, Any] | None = None,
     ):
         self.zarr_mode = zarr_mode
@@ -130,7 +129,6 @@ class BaseDataStore:
         self.z = load_zarr(
             zarr_loc=zarr_loc,
             mode=zarr_mode,
-            synchronizer=synchronizer,
             storage_options=storage_options,
         )
         resolved = resolve_matrix_source(
@@ -150,7 +148,10 @@ class BaseDataStore:
                 )
             else:
                 self.workspace = workspace
-        self.nthreads = nthreads
+        self.resources = resources
+        self.nthreads = self.resources.workers
+        self.memoryBytes = self.resources.memoryBytes
+        self.storageProfile = storage_profile
         _ = self.assay_names
         # The order is critical here:
         self.cells = self._load_cells()
@@ -401,6 +402,7 @@ class BaseDataStore:
                     min_cells_per_feature=min_cells,
                     nthreads=self.nthreads,
                     matrix_root=self._matrix_z,
+                    resources=self.resources,
                 ),
             )
         if self.zw.attrs["assayTypes"] != z_attrs:

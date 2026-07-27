@@ -1,15 +1,13 @@
 import numpy as np
 import zarr
 
-from .types import as_zarr_array, as_zarr_group
+from .types import as_zarr_array
 from .arrays import (
     create_numeric_array,
-    create_zarr_dataset,
     create_zarr_obj_array,
 )
 from .layout import _group_zarr_format, count_array_spec
-from .profiles import StorageProfile, get_storage_profile
-from .sharding import finalize_sharded_counts, write_counts_t
+from .profiles import StorageProfile, resolve_storage_profile
 
 RESERVED_ASSAY_NAMES = frozenset({"artifacts", "pipeline", "plots"})
 
@@ -33,15 +31,14 @@ def create_zarr_count_assay(
     z: zarr.Group,
     assay_name: str,
     workspace: str | None,
-    chunk_size: tuple[int, int],
     n_cells: int,
     feat_ids: np.ndarray | list[str],
     feat_names: np.ndarray | list[str],
     dtype: str = "uint32",
     *,
+    profile: StorageProfile | None = None,
     targetChunkBytes: int | None = None,
-    minFeatureChunk: int | None = None,
-    maxFeatureChunk: int | None = None,
+    targetShardBytes: int | None = None,
 ) -> zarr.Array:
     validate_assay_name(assay_name)
     if workspace is None:
@@ -50,58 +47,47 @@ def create_zarr_count_assay(
         group = z.create_group(f"{workspace}/{assay_name}", overwrite=True)
     group.attrs["is_assay"] = True
     group.attrs["misc"] = {}
-    create_zarr_obj_array(group, "featureData/ids", feat_ids)
-    create_zarr_obj_array(group, "featureData/names", feat_names)
+    resolved_profile = profile or resolve_storage_profile(group.store)
+    create_zarr_obj_array(
+        group,
+        "featureData/ids",
+        feat_ids,
+        profile=resolved_profile,
+    )
+    create_zarr_obj_array(
+        group,
+        "featureData/names",
+        feat_names,
+        profile=resolved_profile,
+    )
     create_zarr_obj_array(
         group,
         "featureData/I",
         [True for _ in range(len(feat_ids))],
         "bool",
+        profile=resolved_profile,
     )
     if workspace is not None:
         group = z.create_group(f"matrices/{assay_name}", overwrite=True)
     n_feats = len(feat_ids)
-    if _group_zarr_format(group) >= 3:
-        spec = count_array_spec(
-            n_cells,
-            n_feats,
-            dtype=dtype,
-            remote=get_storage_profile() == "cloud",
-            targetChunkBytes=targetChunkBytes,
-            minFeatureChunk=minFeatureChunk,
-            maxFeatureChunk=maxFeatureChunk,
-        )
-        return create_numeric_array(group, "counts", spec)
-    return create_zarr_dataset(
-        group,
-        "counts",
-        chunk_size,
-        dtype,
-        (n_cells, n_feats),
-        overwrite=True,
+    zarr_format = _group_zarr_format(group)
+    spec = count_array_spec(
+        n_cells,
+        n_feats,
+        dtype=dtype,
+        profile=resolved_profile,
+        targetChunkBytes=targetChunkBytes,
+        targetShardBytes=targetShardBytes,
+        zarrFormat=zarr_format,
     )
-
-
-def finalize_counts(
-    store: zarr.Group,
-    assay_name: str,
-    workspace: str | None = None,
-    profile: StorageProfile | None = None,
-) -> zarr.Array:
-    counts = finalize_sharded_counts(
-        store,
-        assay_name,
-        workspace,
-        profile=profile,
-    )
-    if workspace is None:
-        group = as_zarr_group(store[assay_name], name=assay_name)
-    else:
-        group = as_zarr_group(
-            store[f"matrices/{assay_name}"],
-            name=f"matrices/{assay_name}",
-        )
-    write_counts_t(counts, group, profile=profile)
+    counts = create_numeric_array(group, "counts", spec)
+    group.attrs["scarf:zarr_spec"] = {
+        "profile": resolved_profile,
+        "dtype": np.dtype(dtype).str,
+        "chunks": list(counts.chunks),
+        "shards": None if spec.shards is None else list(spec.shards),
+        "zarr_format": zarr_format,
+    }
     return counts
 
 
@@ -126,12 +112,19 @@ def create_cell_data(
     workspace: str | None,
     ids: np.ndarray,
     names: np.ndarray,
+    profile: StorageProfile | None = None,
 ) -> zarr.Group:
     if workspace is None:
         group = root.create_group("cellData")
     else:
         group = root.create_group(f"{workspace}/cellData")
-    create_zarr_obj_array(group, "ids", ids, ids.dtype)
-    create_zarr_obj_array(group, "names", names, names.dtype)
-    create_zarr_obj_array(group, "I", [True for _ in range(len(ids))], "bool")
+    create_zarr_obj_array(group, "ids", ids, ids.dtype, profile=profile)
+    create_zarr_obj_array(group, "names", names, names.dtype, profile=profile)
+    create_zarr_obj_array(
+        group,
+        "I",
+        [True for _ in range(len(ids))],
+        "bool",
+        profile=profile,
+    )
     return group

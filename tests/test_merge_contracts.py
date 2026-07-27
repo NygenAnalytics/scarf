@@ -31,8 +31,8 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    AssayMerge: "732b39fd1d5b021a715df876e625efb3c7cd74580faa844d0c9bff1e12848006",
-    DatasetMerge: "825504ddf1bcf69117305a124567b1f65a1cec8baf9876860f66960aabdb264b",
+    AssayMerge: "28945aa6ef349e023f76969f30fd5b97fd95bb762b6b005106c3cd1ee0d7ac21",
+    DatasetMerge: "c556a12844cd893c19ae605443bce2f384fa1d9277dfe157a3b5e1ee456d7189",
 }
 _FACADE_METHODS = {DummyAssay: ("__init__",), **_PUBLIC_CLASS_METHODS}
 
@@ -117,7 +117,6 @@ def test_dataset_merge_resolves_assay_factory_from_facade(monkeypatch):
     merge.zarr_path = "merged.zarr"
     merge.in_workspaces = None
     merge.out_workspace = None
-    merge.chunk_size = (2, 2)
     merge.dtype = None
     merge.overwrite = False
     merge.prepend_text = "orig"
@@ -125,6 +124,11 @@ def test_dataset_merge_resolves_assay_factory_from_facade(monkeypatch):
     merge.seed = 42
     merge.storage_options = None
     merge.source_column = None
+    merge.memBudget = 1024**3
+    merge.nthreads = 2
+    merge.profile = "fast_local"
+    merge.targetChunkBytes = None
+    merge.targetShardBytes = None
     merge.unique_assays = ["RNA"]
 
     assert merge.create_merge_generators() == [generator]
@@ -142,6 +146,8 @@ def test_dataset_merge_resolves_dummy_factory_from_facade(monkeypatch):
         assay_names=["RNA"],
         cells=SimpleNamespace(N=3),
         get_assay=lambda name: reference_assay,
+        nthreads=2,
+        resources=None,
     )
     sentinel = object()
     captured = {}
@@ -188,7 +194,6 @@ assert {
     "AssayMerge",
     "DummyAssay",
     "MergeAssay",
-    "ZARRLOC",
     "_RowPlan",
     "controlled_compute",
     "load_zarr",
@@ -215,7 +220,6 @@ assert not {
     "DatasetMerge",
     "DummyAssay",
     "MergeAssay",
-    "ZARRLOC",
     "_RowPlan",
     "controlled_compute",
     "load_zarr",

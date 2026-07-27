@@ -19,11 +19,7 @@ if TYPE_CHECKING:
         set_verbosity as set_verbosity,
     )
     from .prefetch import (
-        ColumnBlockPipeline as ColumnBlockPipeline,
         iter_column_blocks as iter_column_blocks,
-        prefetch_blocks as prefetch_blocks,
-        remote_column_disk_ahead as remote_column_disk_ahead,
-        remote_column_ram_ahead as remote_column_ram_ahead,
     )
     from .process import (
         process_rss_mb as process_rss_mb,
@@ -34,10 +30,7 @@ if TYPE_CHECKING:
         tqdm_params as tqdm_params,
         tqdmbar as tqdmbar,
     )
-    from ..storage.stores import (
-        ZARRLOC as ZARRLOC,
-        load_zarr as load_zarr,
-    )
+    from ..storage.stores import load_zarr as load_zarr
 
 __all__ = [
     "logger",
@@ -52,11 +45,7 @@ __all__ = [
     "permute_into_chunks",
     "show_dask_progress",
     "controlled_compute",
-    "prefetch_blocks",
-    "ColumnBlockPipeline",
     "iter_column_blocks",
-    "remote_column_disk_ahead",
-    "remote_column_ram_ahead",
     "process_rss_mb",
     "rss_peak_tracker",
     "array_digest",
@@ -76,19 +65,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "permute_into_chunks": (".arrays", "permute_into_chunks"),
     "show_dask_progress": (".compute", "show_dask_progress"),
     "controlled_compute": (".compute", "controlled_compute"),
-    "prefetch_blocks": (".prefetch", "prefetch_blocks"),
-    "ColumnBlockPipeline": (".prefetch", "ColumnBlockPipeline"),
     "iter_column_blocks": (".prefetch", "iter_column_blocks"),
-    "remote_column_disk_ahead": (".prefetch", "remote_column_disk_ahead"),
-    "remote_column_ram_ahead": (".prefetch", "remote_column_ram_ahead"),
     "process_rss_mb": (".process", "process_rss_mb"),
     "rss_peak_tracker": (".process", "rss_peak_tracker"),
     "array_digest": (".arrays", "array_digest"),
     "rolling_window": (".arrays", "rolling_window"),
-    "ZARRLOC": ("..storage.stores", "ZARRLOC"),
     "stdout_is_interactive": (".logging", "stdout_is_interactive"),
     "is_notebook": (".progress", "is_notebook"),
-    "REMOTE_COLUMN_DISK_AHEAD": (".prefetch", "REMOTE_COLUMN_DISK_AHEAD"),
 }
 
 for _export_name in _LAZY_EXPORTS:

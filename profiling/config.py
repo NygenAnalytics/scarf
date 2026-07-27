@@ -148,7 +148,6 @@ class StageResources(BaseModel):
     modalCpuLimit: float
     scarfMemoryBudget: int
     workers: int
-    workingCopies: int
     timeoutSeconds: int
     ephemeralDiskMb: int
 
@@ -164,8 +163,8 @@ class StageResources(BaseModel):
             raise ValueError("modalCpuLimit must be >= modalCpuRequest")
         if self.scarfMemoryBudget <= 0:
             raise ValueError("scarfMemoryBudget must be positive")
-        if self.workers <= 0 or self.workingCopies <= 0:
-            raise ValueError("workers and workingCopies must be positive")
+        if self.workers <= 0:
+            raise ValueError("workers must be positive")
         if not (0 < self.timeoutSeconds <= MAX_TIMEOUT_SECONDS):
             raise ValueError(f"timeoutSeconds must be in 1..{MAX_TIMEOUT_SECONDS}")
         if self.ephemeralDiskMb <= 0:
@@ -206,17 +205,14 @@ class StorageLayout(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     targetChunkBytes: int | None = None
-    minFeatureChunk: int = 500
-    maxFeatureChunk: int = 10_000
+    targetShardBytes: int | None = None
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Self:
         if self.targetChunkBytes is not None and self.targetChunkBytes <= 0:
             raise ValueError("targetChunkBytes must be positive when set")
-        if self.minFeatureChunk <= 0 or self.maxFeatureChunk <= 0:
-            raise ValueError("feature chunk bounds must be positive")
-        if self.minFeatureChunk > self.maxFeatureChunk:
-            raise ValueError("minFeatureChunk must be <= maxFeatureChunk")
+        if self.targetShardBytes is not None and self.targetShardBytes <= 0:
+            raise ValueError("targetShardBytes must be positive when set")
         return self
 
 

@@ -6,8 +6,12 @@ import pandas as pd
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ..storage.layout import array_shard_rows
+from ..storage.profiles import (
+    StorageProfile,
+    ZarrLocation,
+    resolve_storage_profile,
+)
 from ..storage.sharding import accumulate_sparse_to_shards
-from ..storage.stores import ZARRLOC
 from ..utils.logging import logger
 from ..utils.progress import tqdmbar
 
@@ -21,7 +25,6 @@ class SparseToZarr:
         cell_ids: Cell IDs for the cells in the dataset.
         feature_ids: Feature IDs for the features in the dataset.
         assay_name: Name for the output assay. If not provided then automatically set to RNA.
-        chunk_size: The requested size of chunks to load into memory and process.
 
     Raises:
         ValueError: Raised if number of input cell or feature IDs does not match the matrix.
@@ -30,7 +33,6 @@ class SparseToZarr:
     Attributes:
         mat: Input CSR matrix
         fn: The file name for the Zarr hierarchy.
-        chunkSizes: The requested size of chunks to load into memory and process.
         assayName: The Zarr hierarchy (array or group).
         z: The Zarr hierarchy (array or group).
     """
@@ -38,24 +40,27 @@ class SparseToZarr:
     def __init__(
         self,
         csr_mat: csr_matrix,
-        zarr_loc: ZARRLOC,
+        zarr_loc: ZarrLocation,
         cell_ids: np.ndarray | list[str],
         feature_ids: np.ndarray | list[str],
         assay_name: str | None = None,
         workspace: str | None = None,
         feature_names: np.ndarray | list[str] | None = None,
-        chunk_size: tuple[int, int] = (1000, 1000),
         matrix_dtype: np.dtype | None = None,
         storage_options: dict[str, Any] | None = None,
+        mem_budget: int | str | None = None,
+        nthreads: int | None = None,
+        profile: StorageProfile | None = None,
+        targetChunkBytes: int | None = None,
+        targetShardBytes: int | None = None,
     ) -> None:
-        from . import (
-            create_cell_data,
-            create_zarr_count_assay,
-            load_zarr,
-        )
+        from ..storage.budget import resolve_budget
+        from ..storage.schema import create_cell_data, create_zarr_count_assay
+        from ..storage.stores import load_zarr
 
         self.mat = csr_mat
-        self.chunkSizes = chunk_size
+        self.resources = resolve_budget(mem_budget, nthreads)
+        self.profile = resolve_storage_profile(zarr_loc, profile)
         self.workspace = workspace
         self.storage_options = storage_options
         cell_ids = np.array(cell_ids)
@@ -82,10 +87,11 @@ class SparseToZarr:
 
         self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
         _ = create_cell_data(
-            z=self.z,
+            root=self.z,
             workspace=self.workspace,
             ids=cell_ids,
             names=cell_ids,
+            profile=self.profile,
         )
         if feature_names is None:
             feature_names = feature_ids
@@ -93,11 +99,13 @@ class SparseToZarr:
             z=self.z,
             assay_name=self.assayName,
             workspace=workspace,
-            chunk_size=chunk_size,
             n_cells=self.nCells,
             feat_ids=feature_ids,
             feat_names=feature_names,
             dtype=str(self.matrixDtype),
+            profile=self.profile,
+            targetChunkBytes=targetChunkBytes,
+            targetShardBytes=targetShardBytes,
         )
 
     def dump(self, batch_size: int | None = None) -> None:
@@ -114,11 +122,37 @@ class SparseToZarr:
         Returns:
             None
         """
-        from . import finalize_writer_counts, load_count_store
+        from ..storage.budget import admitted_worker_count
+        from ..storage.schema import load_count_array
+        from ..storage.sharding import (
+            sparse_matrix_bytes,
+            sparse_producer_peak_bytes,
+        )
 
-        store = load_count_store(self.z, self.assayName, self.workspace)
+        store = load_count_array(self.z, self.assayName, self.workspace)
         if batch_size is None:
             batch_size = array_shard_rows(store)
+        resident_bytes = sparse_matrix_bytes(self.mat)
+        indptr = np.asarray(self.mat.indptr)
+        admitted_worker_count(
+            self.resources,
+            taskBytes=max(1, self.nCells * indptr.dtype.itemsize),
+            residentBytes=resident_bytes,
+            requested=1,
+        )
+
+        def max_window_nnz(window_rows: int) -> int:
+            width = min(window_rows, self.nCells)
+            if width == 0:
+                return 0
+            return int(np.max(indptr[width:] - indptr[:-width]))
+
+        source_nnz = max_window_nnz(batch_size)
+        buffered_nnz = max_window_nnz(batch_size + array_shard_rows(store))
+        value_bytes = max(
+            np.dtype(self.mat.dtype).itemsize,
+            np.dtype(self.matrixDtype).itemsize,
+        )
 
         def row_batches() -> Iterator[coo_matrix]:
             s = 0
@@ -133,14 +167,19 @@ class SparseToZarr:
         e = accumulate_sparse_to_shards(
             store,
             row_batches(),
-            dtype=self.matrixDtype,
+            resources=self.resources,
+            residentBytes=resident_bytes,
+            producerReserveBytes=sparse_producer_peak_bytes(
+                buffered_nnz,
+                source_nnz,
+                value_bytes,
+            ),
         )
         if e != self.nCells:
             raise AssertionError(
                 "ERROR: This is a bug in SparseToZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
-        finalize_writer_counts(self.z, self.assayName, self.workspace)
 
 
 def bed_to_sparse_array(

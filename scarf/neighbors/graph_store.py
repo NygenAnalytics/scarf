@@ -6,9 +6,9 @@ import numpy as np
 import zarr
 
 from ..storage.arrays import create_zarr_dataset
-from ..storage.budget import worker_prefetch_depth
+from ..storage.budget import READ_AHEAD
+from ..storage.parallel import stream_shards
 from ..utils.compute import controlled_compute
-from ..utils.prefetch import prefetch_blocks
 from ..utils.progress import tqdmbar
 from .stream import AnnStream
 
@@ -50,10 +50,10 @@ def self_query_knn(
             def transform(block: np.ndarray) -> np.ndarray:
                 return controlled_compute(block, nthreads)
 
-        blocks = prefetch_blocks(
+        blocks = stream_shards(
             source.blocks,
             transform,
-            max_ahead=worker_prefetch_depth(),
+            workers=min(READ_AHEAD, max(1, nthreads)),
         )
         yield from tqdmbar(blocks, desc=msg, total=source.numblocks[0])
 

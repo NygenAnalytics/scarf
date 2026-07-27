@@ -14,7 +14,6 @@ from ._h5ad_inspect import H5adInspectResult, inspect_h5ad as inspect_h5ad
 
 @dataclass(frozen=True)
 class _H5adAssayFeatures:
-    ranges: tuple[tuple[int, int], ...]
     featureIndexes: np.ndarray
     featureIds: np.ndarray
     featureNames: np.ndarray
@@ -89,7 +88,10 @@ class H5adReader:
         self.featIdsKey = self._fix_name_key(self.featureAttrsKey, feature_ids_key)
         self.featNamesKey = feature_name_key
         self.catNamesKey = category_names_key
-        self.matrixDtype: Any = self._get_matrix_dtype() if dtype is None else dtype
+        self.sourceMatrixDtype: Any = self._get_matrix_dtype()
+        self.matrixDtype: Any = self.sourceMatrixDtype if dtype is None else dtype
+        self.storageDtype: Any = self.matrixDtype
+        self._dtypeOverridden = dtype is not None
 
     @classmethod
     def from_inspect(
@@ -451,7 +453,6 @@ class H5adReader:
                 [np.arange(start, end, dtype=np.int64) for start, end in ranges]
             )
             assays[str(assay_name)] = _H5adAssayFeatures(
-                ranges=ranges,
                 featureIndexes=indexes,
                 featureIds=feature_ids[indexes],
                 featureNames=feature_names[indexes],
@@ -471,12 +472,224 @@ class H5adReader:
             yield coo_matrix(dset[s:e])
             s = e
 
+    def _sparse_indices_are_strictly_sorted(self, maxValues: int) -> bool:
+        group = self.h5[self.matrixKey]
+        if not isinstance(group, h5py.Group) or maxValues < 1:
+            return False
+        indptr_node = group["indptr"]
+        indices_node = group["indices"]
+        compressed_size = int(indptr_node.size) - 1
+        start = 0
+        while start < compressed_size:
+            pointer_end = min(compressed_size, start + maxValues)
+            pointers = np.asarray(indptr_node[start : pointer_end + 1])
+            base = int(pointers[0])
+            relative = pointers - base
+            vectors = int(np.searchsorted(relative, maxValues, side="right") - 1)
+            if vectors < 1:
+                return False
+            pointers = pointers[: vectors + 1]
+            end = start + vectors
+            indices = np.asarray(indices_node[base : int(pointers[-1])])
+            offsets = pointers - base
+            for left, right in zip(offsets[:-1], offsets[1:], strict=True):
+                vector = indices[int(left) : int(right)]
+                if vector.size > 1 and np.any(vector[1:] <= vector[:-1]):
+                    return False
+            start = end
+        return True
+
+    def infer_storage_dtype(self, maxScanBytes: int = 64 * 1024 * 1024) -> Any:
+        """Resolve the smallest lossless storage dtype."""
+        if (
+            self._dtypeOverridden
+            or self.groupCodes[self.matrixKey] != 2
+            or np.dtype(self.matrixDtype).kind != "f"
+        ):
+            return self.storageDtype
+        group = self.h5[self.matrixKey]
+        if not isinstance(group, h5py.Group):
+            return self.storageDtype
+
+        data_node = group["data"]
+        indices_node = group["indices"]
+        bytes_per_value = max(
+            64,
+            3 * int(data_node.dtype.itemsize)
+            + 3 * int(indices_node.dtype.itemsize)
+            + int(group["indptr"].dtype.itemsize),
+        )
+        check_values = min(
+            1024 * 1024,
+            max(0, int(maxScanBytes)) // bytes_per_value,
+        )
+        if not self._sparse_indices_are_strictly_sorted(check_values):
+            logger.info(
+                "Keeping the H5AD source dtype because sparse coordinates are "
+                "not canonical within the dtype-scan memory limit"
+            )
+            return self.storageDtype
+
+        finite = True
+        integral = True
+        minimum = np.inf
+        maximum = -np.inf
+        for start in range(0, data_node.size, check_values):
+            values = np.asarray(data_node[start : start + check_values])
+            if not values.size:
+                continue
+            finite = finite and bool(np.isfinite(values).all())
+            integral = integral and bool(np.equal(values, np.trunc(values)).all())
+            minimum = min(minimum, float(values.min()))
+            maximum = max(maximum, float(values.max()))
+
+        source_dtype = np.dtype(self.matrixDtype)
+        storage_dtype = source_dtype
+        if finite and integral and minimum >= 0:
+            for candidate in (
+                np.dtype("uint8"),
+                np.dtype("uint16"),
+                np.dtype("uint32"),
+            ):
+                if (
+                    maximum <= np.iinfo(candidate).max
+                    and candidate.itemsize < source_dtype.itemsize
+                ):
+                    storage_dtype = candidate
+                    break
+
+        self.storageDtype = storage_dtype
+        logger.info(f"Resolved H5AD storage dtype={storage_dtype}")
+        return storage_dtype
+
+    def csc_conversion_peak_bytes(self) -> int:
+        """Return a conservative peak estimate for one CSC to CSR conversion."""
+        if self.matrixOrientation != "csc":
+            return 0
+        group = self.h5[self.matrixKey]
+        if not isinstance(group, h5py.Group):
+            raise TypeError("CSC matrix slot must be an HDF5 group")
+        data_node = group["data"]
+        indices_node = group["indices"]
+        indptr_node = group["indptr"]
+        source = sum(
+            int(dataset.size) * int(dataset.dtype.itemsize)
+            for dataset in (data_node, indices_node, indptr_node)
+        )
+        index_itemsize = int(indices_node.dtype.itemsize)
+        if (
+            max(self.nCells, self.nFeatures, int(data_node.size))
+            <= np.iinfo(np.int32).max
+        ):
+            index_itemsize = np.dtype("int32").itemsize
+        normalized = (
+            int(data_node.size) * np.dtype(self.storageDtype).itemsize
+            + int(indices_node.size) * index_itemsize
+            + int(indptr_node.size) * index_itemsize
+        )
+        canonical_value_itemsize = max(
+            int(data_node.dtype.itemsize),
+            np.dtype(np.int64).itemsize,
+        )
+        canonicalization = int(data_node.size) * (
+            4 * canonical_value_itemsize + 6 * np.dtype(np.int64).itemsize + 4
+        )
+        destination = (
+            int(data_node.size)
+            * (np.dtype(self.storageDtype).itemsize + index_itemsize)
+            + (self.nCells + 1) * index_itemsize
+        )
+        return int(source + normalized + canonicalization + destination)
+
+    def materialized_csr_bytes(self) -> int:
+        """Return bytes retained by the materialized CSC-to-CSR conversion."""
+        if self._convertedCsr is None:
+            return 0
+        return int(
+            self._convertedCsr.data.nbytes
+            + self._convertedCsr.indices.nbytes
+            + self._convertedCsr.indptr.nbytes
+        )
+
+    def max_batch_nnz(self, batch_size: int) -> int:
+        """Return the largest contiguous row-window nnz without loading values."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        batch_rows = min(batch_size, self.nCells)
+        if self.matrixOrientation == "dense":
+            return int(batch_rows * self.nFeatures)
+        if self._convertedCsr is not None:
+            indptr = np.asarray(self._convertedCsr.indptr)
+        elif self.matrixOrientation == "csr":
+            indptr = np.asarray(self.h5[self.matrixKey]["indptr"])
+        else:
+            return int(batch_rows * self.nFeatures)
+
+        if self.nCells == 0:
+            return 0
+        return int(np.max(indptr[batch_rows:] - indptr[:-batch_rows]))
+
+    def max_batch_nnz_peak_bytes(self) -> int:
+        """Bound temporary row-pointer arrays used to plan sparse batches."""
+        if self.matrixOrientation == "dense":
+            return 0
+        if self._convertedCsr is not None:
+            itemsize = np.asarray(self._convertedCsr.indptr).dtype.itemsize
+            return int(self.nCells * itemsize)
+        if self.matrixOrientation == "csr":
+            indptr = self.h5[self.matrixKey]["indptr"]
+            return int((2 * self.nCells + 1) * indptr.dtype.itemsize)
+        return 0
+
+    def producer_batch_staging_bytes(self, batch_size: int) -> int:
+        """Bound sparse row pointers retained while one batch is produced."""
+        rows = min(max(1, int(batch_size)), self.nCells)
+        if rows == 0 or self.matrixOrientation == "dense":
+            return 0
+        if self._convertedCsr is not None:
+            itemsize = np.asarray(self._convertedCsr.indptr).dtype.itemsize
+        else:
+            itemsize = self.h5[self.matrixKey]["indptr"].dtype.itemsize
+        normalized_itemsize = np.dtype(np.int32).itemsize
+        return int((rows + 1) * (2 * itemsize + normalized_itemsize))
+
+    def materialize_csc(self) -> None:
+        """Convert the complete CSC source to CSR once."""
+        from ..utils.arrays import canonicalize_sparse
+
+        if self.matrixOrientation != "csc" or self._convertedCsr is not None:
+            return
+        group = self.h5[self.matrixKey]
+        if not isinstance(group, h5py.Group):
+            raise TypeError("CSC matrix slot must be an HDF5 group")
+        data_node = group["data"]
+        data = np.asarray(data_node[:])
+        indices = np.asarray(group["indices"][:])
+        indptr = np.asarray(group["indptr"][:])
+        if max(self.nCells, self.nFeatures, data.size) <= np.iinfo(np.int32).max:
+            indices = indices.astype(np.int32, copy=False)
+            indptr = indptr.astype(np.int32, copy=False)
+
+        source = csc_matrix(
+            (data, indices, indptr),
+            shape=(self.nCells, self.nFeatures),
+        )
+        canonical = canonicalize_sparse(
+            source.tocoo(copy=False),
+            self.storageDtype,
+        )
+        self._convertedCsr = canonical.tocsr()
+        logger.info(
+            f"Materialized H5AD CSR matrix for conversion with "
+            f"dtype={self.storageDtype}"
+        )
+
     def consume_group(self, batch_size: int) -> Generator[coo_matrix, None, None]:
         """Returns a generator that yield chunks of data."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
 
-        if self.matrixOrientation == "csc":
+        if self._convertedCsr is not None or self.matrixOrientation == "csc":
             yield from self._consume_converted_csr(batch_size)
             return
 
@@ -488,17 +701,15 @@ class H5adReader:
             data_end = int(indptr[-1])
             local_indptr = indptr - data_start
             n_rows = row_end - row_start
-            row_indices = np.repeat(
-                np.arange(n_rows),
-                np.diff(local_indptr),
-            )
-            yield coo_matrix(
+            batch = csr_matrix(
                 (
-                    grp["data"][data_start:data_end],
-                    (row_indices, grp["indices"][data_start:data_end]),
+                    np.asarray(grp["data"][data_start:data_end]),
+                    np.asarray(grp["indices"][data_start:data_end]),
+                    local_indptr,
                 ),
                 shape=(n_rows, self.nFeatures),
             )
+            yield batch.tocoo(copy=False)
 
     def _consume_converted_csr(
         self,
@@ -506,18 +717,9 @@ class H5adReader:
     ) -> Generator[coo_matrix, None, None]:
         """Convert the complete CSC matrix once before yielding row batches."""
         if self._convertedCsr is None:
-            group = self.h5[self.matrixKey]
-            if not isinstance(group, h5py.Group):
-                raise TypeError("CSC matrix slot must be an HDF5 group")
-            converted = csc_matrix(
-                (
-                    np.asarray(group["data"][:]),
-                    np.asarray(group["indices"][:]),
-                    np.asarray(group["indptr"][:]),
-                ),
-                shape=(self.nCells, self.nFeatures),
-            ).tocsr()
-            self._convertedCsr = converted.astype(self.matrixDtype, copy=False)
+            self.materialize_csc()
+        if self._convertedCsr is None:
+            raise RuntimeError("CSC materialization did not produce a CSR matrix")
 
         for row_start in range(0, self.nCells, batch_size):
             row_end = min(row_start + batch_size, self.nCells)

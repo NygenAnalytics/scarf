@@ -51,7 +51,7 @@ def test_save_ann_index_writes_exact_zarr_bytes() -> None:
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
     group = root.create_group("ann")
-    save_ann_index(group, _FakeIndex())
+    save_ann_index(group, _FakeIndex(), profile="fast_local")
 
     assert "ann_idx_bytes" in group
     np.testing.assert_array_equal(

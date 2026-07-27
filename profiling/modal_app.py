@@ -208,11 +208,18 @@ def prepare_fixture_datasets_job(
 def io_baseline_job(
     configDict: dict[str, Any],
     nRows: int = 1_000_000,
+    resultLabel: str | None = None,
+    columnOnly: bool = False,
 ) -> dict[str, Any]:
     """No-compute R2 stream of HVG / marker / makeGraph read patterns."""
     config = ProfilingConfig.model_validate(configDict)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
-    return run_io_baseline_body(config, nRows=nRows)
+    return run_io_baseline_body(
+        config,
+        nRows=nRows,
+        resultLabel=resultLabel,
+        columnOnly=columnOnly,
+    )
 
 
 @app.function(
@@ -283,7 +290,8 @@ def repair_counts_t_job(
     resources = config.resourcesFor("createStore")
     store_uri = config.storeUri(nRows)
     print(
-        f"[repair_counts_t] store={store_uri} memMb={resources.modalMemoryLimitMb}",
+        f"[repair_counts_t] store={store_uri} memMb={resources.modalMemoryLimitMb} "
+        f"workers={resources.workers}",
         flush=True,
     )
     result = repair_counts_t(
@@ -293,7 +301,8 @@ def repair_counts_t_job(
     )
     print(
         f"[repair_counts_t] DONE status={result['status']} "
-        f"seconds={result['seconds']} complete={result['complete']}",
+        f"seconds={result['seconds']} complete={result['complete']} "
+        f"workers={result['workers']} peakRss={result['peakRssBytes']}",
         flush=True,
     )
     return {
@@ -731,10 +740,19 @@ def main(*arg_list: str) -> None:
     )
     repair_parser.add_argument("--config", required=True)
     repair_parser.add_argument("--size", type=int, required=True)
+    repair_parser.add_argument("--wait", action="store_true")
 
     io_parser = sub.add_parser("io-baseline")
     io_parser.add_argument("--config", required=True)
     io_parser.add_argument("--size", type=int, default=1_000_000)
+    io_parser.add_argument("--result-label")
+    io_parser.add_argument("--column-only", action="store_true")
+    io_parser.add_argument("--wait", action="store_true")
+    io_parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="Spawn from this modal run app without a deploy.",
+    )
 
     args = parser.parse_args(list(arg_list))
     config = _load_config(args.config)
@@ -874,22 +892,48 @@ def main(*arg_list: str) -> None:
             retries=0,
         )
         # Ephemeral under `modal run` (prefer --detach). No deploy required.
-        call = repair_counts_t_job.with_options(**options).spawn(payload, args.size)
+        call = repair_counts_t_job.with_options(**options).spawn(
+            payload,
+            args.size,
+        )
         _print_spawned(f"repair_counts_t_job {args.size}", call)
+        if args.wait:
+            print(
+                await_function_call(
+                    call,
+                    deadlineSeconds=float(
+                        config.resourcesFor("createStore").timeoutSeconds
+                    ),
+                )
+            )
         print("Prefer: modal run --detach ... so the rewrite survives disconnect.")
         return
 
     if args.command == "io-baseline":
         resources = config.resourcesFor("markHvgs")
         options = modal_function_options(config, resources, maxContainers=1)
-        call = (
-            _deployed_function(config, "io_baseline_job")
-            .with_options(**options)
-            .spawn(payload, args.size)
+        target = (
+            io_baseline_job
+            if args.ephemeral
+            else _deployed_function(config, "io_baseline_job")
+        )
+        call = target.with_options(**options).spawn(
+            payload,
+            args.size,
+            args.result_label,
+            args.column_only,
         )
         _print_spawned(f"io_baseline_job size={args.size}", call)
+        if args.wait:
+            print(
+                await_function_call(
+                    call,
+                    deadlineSeconds=float(resources.timeoutSeconds),
+                )
+            )
         print(
             "result URI (when done): "
-            f"{config.resultsUri.rstrip('/')}/io-baseline/{config.runTag}.json"
+            f"{config.resultsUri.rstrip('/')}/io-baseline/{config.runTag}"
+            f"{'-' + args.result_label if args.result_label else ''}.json"
         )
         return

@@ -775,6 +775,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         dendrogram_loc, generation_id = resolve_compatibility_dendrogram(
             self.zw,
             graph_loc,
+            self.resources,
         )
         if clusters.dtype.hasobject:
             hashed_clusters = pd.util.hash_pandas_object(

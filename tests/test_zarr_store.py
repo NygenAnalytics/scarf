@@ -3,25 +3,33 @@ import types
 import numpy as np
 import pytest
 import zarr
+from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
+from scarf.matrix.chunked import ChunkedArray
 from scarf.storage.arrays import create_numeric_array
+from scarf.storage.budget import ResourceBudget
 from scarf.storage.copy import (
     copy_zarr_array,
     copy_zarr_group_tree,
     create_or_open_staged_normed_array,
 )
-from scarf.storage.layout import normed_array_spec
+from scarf.storage.layout import (
+    _CODEC_MAX_BYTES,
+    count_array_spec,
+    normed_array_spec,
+)
 from scarf.storage.profiles import (
-    get_storage_profile,
     is_local_zarr_path,
     is_remote_zarr_location,
-    set_storage_profile,
+    resolve_storage_profile,
 )
+from scarf.storage.schema import create_zarr_count_assay
 from scarf.storage.sharding import (
     accumulate_sparse_to_shards,
-    finalize_sharded_counts,
+    sparse_producer_peak_bytes,
     write_dense_from_row_batches,
+    write_counts_t,
 )
 from scarf.storage.stores import (
     is_remote_datastore,
@@ -30,328 +38,66 @@ from scarf.storage.stores import (
 )
 from scarf.storage.types import array_metadata_shards
 from scarf.utils import load_zarr
+from tests.store_probes import RecordingStore
 
 
-@pytest.fixture(autouse=True)
-def reset_profile():
-    set_storage_profile(None)
-    yield
-    set_storage_profile(None)
+def test_location_classification_is_pure():
+    memory = MemoryStore()
+    assert is_remote_zarr_location("s3://bucket/path")
+    assert is_remote_zarr_location("gs://bucket/path")
+    assert not is_remote_zarr_location("/tmp/data.zarr")
+    assert is_local_zarr_path("/tmp/data.zarr")
+    assert not is_local_zarr_path("s3://bucket/path")
+    assert not is_local_zarr_path(memory)
+    assert resolve_storage_profile("s3://bucket/path") == "cloud"
+    assert resolve_storage_profile("/tmp/data.zarr") == "fast_local"
+    assert resolve_storage_profile("s3://bucket/path", "fast_local") == "fast_local"
 
 
-def test_is_remote_zarr_location():
-    assert is_remote_zarr_location("s3://bucket/path") is True
-    assert is_remote_zarr_location("gs://bucket/path") is True
-    assert is_remote_zarr_location("/tmp/foo.zarr") is False
-    assert is_remote_zarr_location("file:///tmp/foo.zarr") is False
-
-
-def test_is_local_zarr_path():
-    assert is_local_zarr_path("/tmp/foo.zarr") is True
-    assert is_local_zarr_path("s3://bucket/path") is False
-    assert is_local_zarr_path("gs://bucket/path") is False
-    assert is_local_zarr_path(MemoryStore()) is False
-
-
-def test_load_zarr_forwards_storage_options_to_make_store(monkeypatch):
+def test_load_zarr_forwards_storage_options(monkeypatch):
     captured = {}
 
     def fake_make_store(location, storage_options=None, read_only=False):
-        captured["location"] = location
-        captured["storage_options"] = storage_options
-        captured["read_only"] = read_only
-        return MemoryStore()
+        captured.update(
+            location=location,
+            storageOptions=storage_options,
+            readOnly=read_only,
+        )
+        store = MemoryStore()
+        zarr.open_group(store=store, mode="w")
+        return store
 
     monkeypatch.setattr("scarf.storage.stores.make_store", fake_make_store)
-    monkeypatch.setattr(
-        "scarf.storage.stores.configure_zarr_io_for_profile", lambda: None
-    )
-    monkeypatch.setattr("zarr.open_group", lambda **kwargs: object())
     load_zarr(
         "s3://bucket/path",
         mode="r",
         storage_options={"secret_access_key": "secret"},
     )
-    assert captured["storage_options"] == {"secret_access_key": "secret"}
-    assert captured["read_only"] is True
-
-
-def _memory_group():
-    return zarr.open_group(store=MemoryStore(), mode="w")
-
-
-def test_is_remote_datastore():
-    local_root = _memory_group()
-    local_array = local_root.create_array("values", shape=(4,), dtype="i4")
-    assert is_remote_datastore("/tmp/foo.zarr", local_root) is False
-    assert is_remote_datastore("s3://bucket/path", local_root) is True
-    # Missing/empty location must inspect the group store, not treat "" as local.
-    assert is_remote_datastore("", local_root) is False
-    assert is_remote_datastore(None, local_root) is False
-    assert is_remote_datastore(None, local_array) is False
-
-
-def test_copy_zarr_array_round_trip(tmp_path):
-    src_root = zarr.open_group(str(tmp_path / "src.zarr"), mode="w")
-    spec = normed_array_spec(64, 8, profile="fast_local")
-    src = create_numeric_array(src_root, "data", spec)
-    expected = np.random.rand(64, 8).astype(np.float32)
-    src[:] = expected
-
-    dst_root = zarr.open_group(str(tmp_path / "dst.zarr"), mode="w")
-    dst = create_numeric_array(dst_root, "data", spec)
-    copy_zarr_array(src, dst, block_rows=16)
-    np.testing.assert_allclose(dst[:], expected, rtol=1e-6)
-
-
-def test_write_dense_from_row_batches_flushes_at_shard_boundaries():
-    root = _memory_group()
-    dst = root.create_array(
-        "counts",
-        shape=(7, 3),
-        chunks=(2, 3),
-        shards=(4, 3),
-        dtype=np.uint16,
-        fill_value=0,
-    )
-    expected = np.arange(21, dtype=np.int64).reshape(7, 3)
-    writes = []
-    write_dtypes = []
-
-    class RecordingArray:
-        def __init__(self, array):
-            self._array = array
-            self.metadata = array.metadata
-            self.shape = array.shape
-
-        def __setitem__(self, selection, value):
-            row_slice = selection[0]
-            writes.append((row_slice.start, row_slice.stop))
-            write_dtypes.append(value.dtype)
-            self._array[selection] = value
-
-    rows_written = write_dense_from_row_batches(
-        RecordingArray(dst),
-        iter(
-            [
-                expected[:1],
-                expected[1:5],
-                np.empty((0, 3), dtype=np.int64),
-                expected[5:],
-            ]
-        ),
-        dtype=np.uint16,
-    )
-
-    assert rows_written == 7
-    assert writes == [(0, 4), (4, 7)]
-    assert write_dtypes == [np.dtype(np.uint16), np.dtype(np.uint16)]
-    np.testing.assert_array_equal(dst[:], expected.astype(np.uint16))
-
-
-@pytest.mark.parametrize(
-    ("workspace", "counts_group_path"),
-    [(None, "RNA"), ("workspace", "matrices/RNA")],
-)
-def test_finalize_sharded_counts_repacks_and_cleans_up(
-    monkeypatch, workspace, counts_group_path
-):
-    from scarf.storage.budget import ResourceBudget
-
-    root = _memory_group()
-    counts_group = root.create_group(counts_group_path)
-    source = counts_group.create_array(
-        "counts",
-        shape=(5, 3),
-        chunks=(2, 3),
-        dtype=np.uint32,
-        fill_value=0,
-    )
-    expected = np.arange(15, dtype=np.uint32).reshape(5, 3)
-    source[:] = expected
-    assert array_metadata_shards(source) is None
-
-    budget = ResourceBudget(memoryBytes=24, workers=1, workingCopies=1)
-    monkeypatch.setattr("scarf.storage.layout.get_resource_budget", lambda: budget)
-
-    result = finalize_sharded_counts(
-        root,
-        "RNA",
-        workspace=workspace,
-        profile="fast_local",
-    )
-
-    np.testing.assert_array_equal(result[:], expected)
-    assert result.chunks == (2, 1)
-    assert array_metadata_shards(result) == (2, 3)
-    refreshed_group = root[counts_group_path]
-    assert "counts__sharded_tmp" not in refreshed_group
-    assert refreshed_group.attrs["scarf:zarr_spec"] == {
-        "profile": "fast_local",
-        "chunks": [2, 1],
-        "shards": [2, 3],
-        "zarr_format": 3,
+    assert captured == {
+        "location": "s3://bucket/path",
+        "storageOptions": {"secret_access_key": "secret"},
+        "readOnly": True,
     }
 
 
-def test_accumulate_sparse_to_shards_preserves_offsets_across_zero_runs():
-    from scipy.sparse import coo_matrix
+def test_store_opening_and_remote_detection(tmp_path):
+    path = str(tmp_path / "data.zarr")
+    assert make_store(path) == path
+    memory = MemoryStore()
+    assert make_store(memory) is memory
 
-    root = _memory_group()
-    dst = root.create_array(
-        "counts",
-        shape=(36, 3),
-        chunks=(2, 3),
-        dtype=np.uint32,
-        fill_value=0,
-    )
-
-    zero_batch = coo_matrix((1, 3), dtype=np.uint32)
-    batches = [
-        coo_matrix(
-            (np.array([11], dtype=np.uint32), ([0], [0])),
-            shape=(1, 3),
-        ),
-        *[zero_batch for _ in range(32)],
-        coo_matrix(
-            (np.array([22, 33], dtype=np.uint32), ([0, 1], [1, 2])),
-            shape=(2, 3),
-        ),
-        zero_batch,
-    ]
-
-    rows_written = accumulate_sparse_to_shards(dst, iter(batches), shard_rows=2)
-
-    expected = np.zeros((36, 3), dtype=np.uint32)
-    expected[0, 0] = 11
-    expected[33, 1] = 22
-    expected[34, 2] = 33
-    assert rows_written == 36
-    np.testing.assert_array_equal(dst[:], expected)
-
-
-def test_copy_zarr_group_tree(tmp_path):
-    from scarf.writers import create_zarr_obj_array
-
-    src_root = zarr.open_group(str(tmp_path / "src.zarr"), mode="w")
-    slot = src_root.create_group("I__cluster")
-    cluster = slot.create_group("0")
-    create_zarr_obj_array(cluster, "score", [1.0, 2.0, 3.0], dtype="float64")
-    score = cluster["score"]
-    score.attrs["display"] = {"label": "Score"}
-    score.attrs["source_artifact"] = {"kind": "metadata_snapshot"}
-    score.attrs["source_value"] = "values"
-    score.attrs["value_index"] = 0
-
-    dst_root = zarr.open_group(str(tmp_path / "dst.zarr"), mode="w")
-    dst_slot = dst_root.create_group("I__cluster")
-    copy_zarr_group_tree(slot, dst_slot)
-    copied = dst_slot["0"]["score"]
-    np.testing.assert_array_equal(copied[:], [1.0, 2.0, 3.0])
-    assert copied.attrs["display"] == {"label": "Score"}
-    assert "source_artifact" not in copied.attrs
-    assert "source_value" not in copied.attrs
-    assert "value_index" not in copied.attrs
-
-
-def test_copy_zarr_group_tree_copies_metadata_in_source_blocks(
-    monkeypatch,
-    tmp_path,
-):
-    from scarf.writers import create_zarr_obj_array
-
-    values = np.array([f"cell-{i}" for i in range(8)])
-    src_root = zarr.open_group(str(tmp_path / "src.zarr"), mode="w")
-    create_zarr_obj_array(
-        src_root,
-        "ids",
-        values,
-        dtype="U20",
-        chunk_size=3,
-    )
-    source_store = src_root.store
-    read_array = zarr.Array.__getitem__
-
-    def reject_wide_source_reads(array, selection):
-        if array.store is source_store and array.path == "ids":
-            if not isinstance(selection, slice):
-                raise AssertionError(f"Unexpected metadata selection: {selection!r}")
-            start = 0 if selection.start is None else selection.start
-            stop = len(values) if selection.stop is None else selection.stop
-            if stop - start > 3:
-                raise AssertionError(
-                    f"Metadata read exceeded source chunk: {selection}"
-                )
-        return read_array(array, selection)
-
-    monkeypatch.setattr(zarr.Array, "__getitem__", reject_wide_source_reads)
-    dst_root = zarr.open_group(str(tmp_path / "dst.zarr"), mode="w")
-    copy_zarr_group_tree(src_root, dst_root)
-    np.testing.assert_array_equal(dst_root["ids"][:], values)
-
-
-def test_create_or_open_staged_normed_array_reuses_shape(tmp_path):
-    src_root = zarr.open_group(str(tmp_path / "src.zarr"), mode="w")
-    spec = normed_array_spec(32, 4, profile="cloud")
-    src = create_numeric_array(src_root, "data", spec)
-    src[:] = np.ones((32, 4), dtype=np.float32)
-    shape = (int(src.shape[0]), int(src.shape[1]))
-
-    cache_path = str(tmp_path / "cache" / "abc123" / "normed.zarr")
-    staged = create_or_open_staged_normed_array(cache_path, shape)
-    copy_zarr_array(src, staged, block_rows=8)
-    staged.attrs["staged_subset_hash"] = "abc123"
-    staged.attrs["staged_complete"] = True
-
-    reopened = create_or_open_staged_normed_array(cache_path, shape)
-    assert reopened.shape == src.shape
-    np.testing.assert_allclose(reopened[:], np.ones((32, 4), dtype=np.float32))
-
-
-def test_make_store_local_path_returns_str(tmp_path):
-    path = str(tmp_path / "ds.zarr")
-    store = make_store(path)
-    assert store == path
-
-
-def test_make_store_memory_store():
-    mem = MemoryStore()
-    store = make_store(mem)
-    assert store is mem
-
-
-def test_open_store_memory(tmp_path):
-    path = str(tmp_path / "ds.zarr")
     root = open_store(path, mode="w")
-    root.create_group("g")
-    loaded = open_store(path, mode="r")
-    assert "g" in loaded
+    root.create_group("group")
+    assert "group" in open_store(path, mode="r")
+
+    memory_root = zarr.open_group(store=memory, mode="w")
+    values = memory_root.create_array("values", shape=(4,), dtype="i4")
+    assert not is_remote_datastore(None, memory_root)
+    assert not is_remote_datastore("", values)
+    assert is_remote_datastore("s3://bucket/path", memory_root)
 
 
-def test_load_zarr_memory_store():
-    mem = MemoryStore()
-    root = zarr.open_group(store=mem, mode="w")
-    root.create_group("assay")
-    loaded = load_zarr(mem, mode="r")
-    assert "assay" in loaded
-
-
-def test_make_store_remote_requires_obstore(monkeypatch):
-    import builtins
-
-    real_import = builtins.__import__
-
-    def mock_import(name, *args, **kwargs):
-        if name in ("obstore", "obstore.store"):
-            raise ImportError("no obstore")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", mock_import)
-    with pytest.raises(ImportError, match="obstore"):
-        make_store("s3://bucket/path")
-
-
-def test_make_store_remote_auto_cloud_profile(monkeypatch):
+def test_remote_store_uses_obstore_without_mutating_profile(monkeypatch):
     class FakeObstore:
         pass
 
@@ -360,298 +106,571 @@ def test_make_store_remote_auto_cloud_profile(monkeypatch):
             self.store = store
             self.read_only = read_only
 
-    fake_mod = types.ModuleType("obstore.store")
-    fake_mod.from_url = lambda url, **kwargs: FakeObstore()
-    monkeypatch.setitem(__import__("sys").modules, "obstore.store", fake_mod)
-    monkeypatch.setattr(
-        "zarr.storage.ObjectStore",
-        FakeObjectStore,
-    )
-    store = make_store("s3://bucket/path")
-    assert isinstance(store, FakeObjectStore)
-    assert get_storage_profile() == "cloud"
-
-
-def test_explicit_profile_not_overridden_by_remote(monkeypatch):
-    class FakeObstore:
-        pass
-
-    class FakeObjectStore:
-        def __init__(self, store, read_only=False):
-            self.store = store
-
-    fake_mod = types.ModuleType("obstore.store")
-    fake_mod.from_url = lambda url, **kwargs: FakeObstore()
-    monkeypatch.setitem(__import__("sys").modules, "obstore.store", fake_mod)
+    fake_module = types.ModuleType("obstore.store")
+    fake_module.from_url = lambda url, **kwargs: FakeObstore()
+    monkeypatch.setitem(__import__("sys").modules, "obstore.store", fake_module)
     monkeypatch.setattr("zarr.storage.ObjectStore", FakeObjectStore)
 
-    set_storage_profile("fast_local")
-    make_store("s3://bucket/path")
-    assert get_storage_profile() == "fast_local"
+    store = make_store("s3://bucket/path", read_only=True)
+    assert isinstance(store, FakeObjectStore)
+    assert store.read_only is True
+    assert resolve_storage_profile("/tmp/data.zarr") == "fast_local"
 
 
-def test_normed_array_spec_plain_chunks():
-    from scarf.storage.budget import ResourceBudget
-    from scarf.storage.layout import normed_array_spec
-    from scarf.storage.profiles import set_storage_profile
-
-    set_storage_profile("cloud")
-    budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=4, workingCopies=4)
-    spec = normed_array_spec(1_000_000, 2000, budget=budget)
-    assert spec.dtype == "float32"
-    assert spec.shards is None
-    assert spec.chunks[1] == 2000
-    assert spec.chunks[0] >= 1
-
-
-@pytest.mark.parametrize("n_cells", [1_000_000, 2_500_000, 5_000_000, 10_000_000])
-def test_normed_array_spec_respects_codec_limit(n_cells):
-    from scarf.storage.budget import ResourceBudget
-    from scarf.storage.layout import _CODEC_MAX_BYTES, normed_array_spec
-
-    budget = ResourceBudget(
-        memoryBytes=112 * 1024**3,
-        workers=16,
-        workingCopies=4,
-    )
-    spec = normed_array_spec(
-        n_cells,
-        2000,
+def test_count_plan_uses_aligned_five_chunk_shards():
+    spec = count_array_spec(
+        250_000,
+        45_525,
+        "uint16",
         profile="cloud",
-        budget=budget,
+        targetChunkBytes=128 * 1024**2,
+        targetShardBytes=5 * 128 * 1024**2,
+    )
+    assert spec.shards is not None
+    assert spec.shards[1] == 45_525
+    assert spec.shards[1] // spec.chunks[1] == 5
+    assert spec.chunks[0] * spec.chunks[1] * 2 <= 128 * 1024**2
+    assert spec.shards[0] * spec.shards[1] * 2 <= 5 * 128 * 1024**2
+
+
+@pytest.mark.parametrize(
+    ("n_features", "dtype"),
+    [
+        (101, "uint8"),
+        (997, "float64"),
+        (45_524, "uint16"),
+    ],
+)
+def test_count_plan_alignment_and_byte_limits_are_shape_independent(
+    n_features,
+    dtype,
+):
+    chunk_target = 1024**2
+    shard_target = 5 * chunk_target
+    spec = count_array_spec(
+        10_000,
+        n_features,
+        dtype,
+        profile="cloud",
+        targetChunkBytes=chunk_target,
+        targetShardBytes=shard_target,
+    )
+    assert spec.shards is not None
+    assert spec.shards[1] == n_features
+    assert all(
+        shard % chunk == 0
+        for shard, chunk in zip(spec.shards, spec.chunks, strict=True)
+    )
+    itemsize = np.dtype(dtype).itemsize
+    assert np.prod(spec.chunks) * itemsize <= chunk_target
+    assert np.prod(spec.shards) * itemsize <= shard_target
+
+
+def test_count_plan_does_not_depend_on_process_resource_environment(monkeypatch):
+    kwargs = {
+        "profile": "cloud",
+        "targetChunkBytes": 1024**2,
+        "targetShardBytes": 5 * 1024**2,
+    }
+    monkeypatch.setenv("SCARF_MEM_BUDGET", "1G")
+    monkeypatch.setenv("SCARF_WORKERS", "1")
+    small_machine = count_array_spec(10_000, 997, "uint16", **kwargs)
+    monkeypatch.setenv("SCARF_MEM_BUDGET", "64G")
+    monkeypatch.setenv("SCARF_WORKERS", "32")
+    large_machine = count_array_spec(10_000, 997, "uint16", **kwargs)
+    assert small_machine == large_machine
+
+
+def test_count_plan_respects_codec_limit_and_small_dimensions():
+    spec = count_array_spec(
+        3,
+        7,
+        "float64",
+        profile="fast_local",
+    )
+    assert all(
+        chunk <= size for chunk, size in zip(spec.chunks, spec.shape, strict=True)
+    )
+    assert np.prod(spec.chunks) * 8 <= _CODEC_MAX_BYTES
+
+
+def test_numeric_array_adapts_codecs_to_zarr_format():
+    spec = count_array_spec(
+        8,
+        4,
+        "uint16",
+        profile="cloud",
+        targetChunkBytes=16,
+        targetShardBytes=32,
+    )
+    for zarr_format in (2, 3):
+        root = zarr.open_group(
+            store=MemoryStore(),
+            mode="w",
+            zarr_format=zarr_format,
+        )
+        array = create_numeric_array(root, "counts", spec)
+        values = np.arange(32, dtype=np.uint16).reshape(8, 4)
+        array[:] = values
+        np.testing.assert_array_equal(array[:], values)
+        if zarr_format == 2:
+            assert array_metadata_shards(array) is None
+        else:
+            assert array_metadata_shards(array) == spec.shards
+
+
+def test_new_assay_in_zarr_v2_stays_chunk_only():
+    root = zarr.open_group(
+        store=MemoryStore(),
+        mode="w",
+        zarr_format=2,
+    )
+    counts = create_zarr_count_assay(
+        root,
+        "RNA",
+        None,
+        8,
+        ["f0", "f1", "f2", "f3"],
+        ["g0", "g1", "g2", "g3"],
+        profile="fast_local",
+    )
+    values = np.arange(32, dtype=np.uint32).reshape(8, 4)
+    counts[:] = values
+
+    assert array_metadata_shards(counts) is None
+    assert root["RNA"].attrs["scarf:zarr_spec"]["zarr_format"] == 2
+    assert write_counts_t(counts, root["RNA"]) is None
+    np.testing.assert_array_equal(counts[:], values)
+
+
+def test_normed_plan_respects_codec_limit():
+    spec = normed_array_spec(
+        10_000_000,
+        2_000,
+        profile="cloud",
     )
     assert spec.shards is None
     assert spec.chunks[0] * spec.chunks[1] * 4 <= _CODEC_MAX_BYTES
 
 
-@pytest.mark.parametrize("n_feats", [500, 2000, 3000, 5000, 8192, 30_000])
-def test_normed_array_spec_creates_array(tmp_path, n_feats):
-    from scarf.storage.arrays import create_numeric_array
-    from scarf.storage.layout import normed_array_spec
-    from scarf.storage.profiles import set_storage_profile
-
-    set_storage_profile("cloud")
-    spec = normed_array_spec(1_000_000, n_feats)
-    root = zarr.open_group(str(tmp_path / f"normed_{n_feats}.zarr"), mode="w")
-    create_numeric_array(root, "data", spec)
-    assert root["data"].shape == (1_000_000, n_feats)
-    assert spec.shards is None
-
-
-def test_memory_first_layout_worked_example():
-    from scarf.storage.budget import ResourceBudget
-    from scarf.storage.layout import _CODEC_MAX_BYTES, matrix_layout
-
-    budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=8, workingCopies=4)
-    chunks, shards = matrix_layout(1_000_000, 50_000, budget=budget, itemsize=4)
-    assert shards is not None
-    row_shard, shard_cols = shards
-    feature_chunk = chunks[1]
-    work = (8 * 1024**3) // 4
-    assert feature_chunk == work // (1_000_000 * 4)
-    assert shard_cols % feature_chunk == 0
-    assert shard_cols >= 50_000
-    assert row_shard * shard_cols * 4 <= _CODEC_MAX_BYTES
-
-
-def test_ceil_pad_awkward_feature_count():
-    from scarf.storage.budget import ResourceBudget
-    from scarf.storage.layout import matrix_layout
-
-    budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=1, workingCopies=4)
-    chunks, shards = matrix_layout(1_000_000, 36_601, budget=budget, itemsize=4)
-    assert shards is not None
-    feature_chunk = chunks[1]
-    shard_cols = shards[1]
-    assert feature_chunk >= 1
-    assert shard_cols % feature_chunk == 0
-    assert shard_cols >= 36_601
-
-
-def test_float64_halves_row_shard():
-    from scarf.storage.budget import ResourceBudget
-    from scarf.storage.layout import matrix_layout
-
-    budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=1, workingCopies=4)
-    u32, _ = matrix_layout(100_000, 20_000, budget=budget, itemsize=4)
-    f64, _ = matrix_layout(100_000, 20_000, budget=budget, itemsize=8)
-    assert f64[0] <= u32[0]
-
-
-def test_matrix_layout_scales_with_cells():
-    from scarf.storage.budget import ResourceBudget
-    from scarf.storage.layout import matrix_layout
-
-    budget = ResourceBudget(memoryBytes=64 * 1024**3, workers=2, workingCopies=4)
-    small_chunks, small_shards = matrix_layout(1_000, 2_000, budget=budget, itemsize=4)
-    large_chunks, large_shards = matrix_layout(
-        1_000_000, 50_000, budget=budget, itemsize=4
+def test_dense_row_batches_flush_at_shard_boundaries():
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    destination = root.create_array(
+        "counts",
+        shape=(7, 3),
+        chunks=(2, 3),
+        shards=(4, 3),
+        dtype=np.uint16,
+        fill_value=0,
     )
-    assert small_shards is not None and large_shards is not None
-    assert large_chunks[0] >= small_chunks[0]
-    assert large_shards[0] >= small_shards[0]
-
-
-def test_matrix_layout_shard_chunk_alignment():
-    from scarf.storage.budget import ResourceBudget
-    from scarf.storage.layout import _CODEC_MAX_BYTES, matrix_layout
-
-    budget = ResourceBudget(memoryBytes=8 * 1024**3, workers=4, workingCopies=4)
-    chunks, shards = matrix_layout(100_000, 50_000, budget=budget, itemsize=4)
-    assert shards is not None
-    row_chunk, col_chunk = chunks
-    shard_rows, shard_cols = shards
-    assert shard_cols % col_chunk == 0
-    assert shard_rows % row_chunk == 0
-    assert shard_cols >= 50_000
-    assert shard_rows * shard_cols * 4 <= _CODEC_MAX_BYTES
-
-
-def test_matrix_layout_respects_codec_limit():
-    from scarf.storage.budget import get_resource_budget
-    from scarf.storage.layout import _CODEC_MAX_BYTES, matrix_layout
-
-    budget = get_resource_budget()
-    for n_cells, n_feats in [
-        (10_000, 89_796),
-        (1_000_000, 50_000),
-        (1_000_000, 36_601),
-    ]:
-        chunks, shards = matrix_layout(n_cells, n_feats, budget=budget, itemsize=4)
-        assert shards is not None
-        row_shard, shard_cols = shards
-        feature_chunk = chunks[1]
-        assert row_shard * shard_cols * 4 <= _CODEC_MAX_BYTES
-        assert shard_cols % feature_chunk == 0
-        assert row_shard % chunks[0] == 0
-
-
-def test_matrix_layout_target_chunk_bytes_clamps_features():
-    from scarf.storage.budget import ResourceBudget
-    from scarf.storage.layout import matrix_layout
-
-    budget = ResourceBudget(memoryBytes=48 * 1024**3, workers=4, workingCopies=4)
-    chunks, shards = matrix_layout(
-        100_000,
-        45_525,
-        budget=budget,
-        itemsize=4,
-        targetChunkBytes=256 * 1024 * 1024,
-        minFeatureChunk=500,
-        maxFeatureChunk=10_000,
+    expected = np.arange(21, dtype=np.int64).reshape(7, 3)
+    rows = write_dense_from_row_batches(
+        destination,
+        iter([expected[:1], expected[1:5], expected[5:]]),
+        dtype=np.uint16,
+        resources=ResourceBudget(1024**2, 4),
     )
-    assert shards is not None
-    assert 500 <= chunks[1] <= 10_000
-    assert chunks[1] <= 45_525
-    assert shards[1] % chunks[1] == 0
-    assert chunks[0] * chunks[1] * 4 <= 256 * 1024 * 1024 + chunks[1] * 4
+    assert rows == 7
+    np.testing.assert_array_equal(destination[:], expected.astype(np.uint16))
 
 
-def test_count_array_spec_passes_target_chunk_bytes():
-    from scarf.storage.budget import ResourceBudget, set_resource_budget
-    from scarf.storage.layout import count_array_spec
+def test_sparse_batches_write_complete_shards():
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    destination = root.create_array(
+        "counts",
+        shape=(12, 3),
+        chunks=(2, 3),
+        shards=(4, 3),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    expected = np.arange(36, dtype=np.uint16).reshape(12, 3)
+    expected[4:8] = 0
+    batches = (
+        csr_matrix(expected[start : start + 5]) for start in range(0, len(expected), 5)
+    )
+    rows = accumulate_sparse_to_shards(
+        destination,
+        batches,
+        resources=ResourceBudget(1024**2, 4),
+        producerReserveBytes=sparse_producer_peak_bytes(27, 15, 2),
+    )
+    assert rows == len(expected)
+    np.testing.assert_array_equal(destination[:], expected)
 
-    budget = ResourceBudget(memoryBytes=24 * 1024**3, workers=4, workingCopies=4)
-    try:
-        set_resource_budget(budget)
-        capped = count_array_spec(
-            100_000,
-            45_525,
-            dtype="uint32",
-            remote=True,
-            targetChunkBytes=64 * 1024 * 1024,
-            minFeatureChunk=500,
-            maxFeatureChunk=10_000,
+
+@pytest.mark.parametrize(
+    ("dtype", "values"),
+    [
+        (np.uint8, np.array([200, 100], dtype=np.uint8)),
+        (bool, np.array([True, True], dtype=bool)),
+    ],
+)
+def test_sparse_duplicate_sum_rejects_destination_overflow(dtype, values):
+    from scipy.sparse import coo_matrix
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    destination = root.create_array(
+        "counts",
+        shape=(1, 1),
+        chunks=(1, 1),
+        shards=(1, 1),
+        dtype=dtype,
+        fill_value=0,
+    )
+    batch = coo_matrix(
+        (values, (np.array([0, 0]), np.array([0, 0]))),
+        shape=(1, 1),
+    )
+
+    with pytest.raises(OverflowError, match="destination dtype"):
+        accumulate_sparse_to_shards(
+            destination,
+            iter([batch]),
+            resources=ResourceBudget(1024**2, 1),
+            producerReserveBytes=sparse_producer_peak_bytes(
+                2,
+                2,
+                values.itemsize,
+            ),
         )
-        baseline = count_array_spec(100_000, 45_525, dtype="uint32", remote=True)
-    finally:
-        set_resource_budget(None)
-    assert capped.chunks[1] <= 10_000
-    assert capped.chunks[1] < baseline.chunks[1] or baseline.chunks[1] <= 10_000
 
 
-def test_count_array_spec_applies_cloud_default_target_chunk_bytes():
-    from scarf.storage.budget import ResourceBudget, set_resource_budget
-    from scarf.storage.layout import (
-        DEFAULT_CLOUD_TARGET_CHUNK_BYTES,
-        count_array_spec,
-        matrix_layout,
+def test_empty_sparse_bands_clear_existing_values():
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    destination = root.create_array(
+        "counts",
+        shape=(8, 3),
+        chunks=(2, 3),
+        shards=(4, 3),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    destination[:] = np.arange(1, 25, dtype=np.uint16).reshape(8, 3)
+
+    rows = accumulate_sparse_to_shards(
+        destination,
+        iter([csr_matrix((3, 3)), csr_matrix((5, 3))]),
+        resources=ResourceBudget(1024**2, 4),
+        producerReserveBytes=0,
     )
 
-    budget = ResourceBudget(memoryBytes=24 * 1024**3, workers=4, workingCopies=4)
-    try:
-        set_resource_budget(budget)
-        cloud = count_array_spec(100_000, 45_525, dtype="uint32", remote=True)
-        local = count_array_spec(100_000, 45_525, dtype="uint32", remote=False)
-        expected, _ = matrix_layout(
-            100_000,
-            45_525,
-            budget=budget,
-            itemsize=4,
-            targetChunkBytes=DEFAULT_CLOUD_TARGET_CHUNK_BYTES,
-            minFeatureChunk=500,
-            maxFeatureChunk=10_000,
-        )
-        memory_first, _ = matrix_layout(
-            100_000,
-            45_525,
-            budget=budget,
-            itemsize=4,
-        )
-    finally:
-        set_resource_budget(None)
-    assert cloud.chunks == expected
-    assert local.chunks == memory_first
-    assert DEFAULT_CLOUD_TARGET_CHUNK_BYTES == 128 * 1024 * 1024
-
-
-def test_large_atac_count_array_accepts_sparse_writes(tmp_path):
-    import numpy as np
-
-    from scarf.storage.arrays import create_numeric_array
-    from scarf.storage.layout import count_array_spec
-
-    n_cells, n_feats = 10_000, 89_796
-    spec = count_array_spec(n_cells, n_feats, dtype="uint32")
-    root = zarr.open_group(str(tmp_path / "atac.zarr"), mode="w")
-    arr = create_numeric_array(root, "counts", spec)
-    rows = np.arange(1000, dtype=np.int64)
-    cols = np.arange(1000, dtype=np.int64)
-    arr.set_coordinate_selection((rows, cols), np.ones(1000, dtype=np.uint32))
-
-
-def test_v2_group_skips_shards(tmp_path):
-    from scarf.storage.arrays import create_numeric_array
-    from scarf.storage.layout import count_array_spec
-
-    root = zarr.open_group(str(tmp_path / "v2.zarr"), mode="w", zarr_format=2)
-    spec = count_array_spec(100, 50, dtype="uint32")
-    arr = create_numeric_array(root, "counts", spec)
-    assert array_metadata_shards(arr) is None
-
-
-def test_ann_index_round_trip(tmp_path):
-    import hnswlib
-
-    from scarf.storage.ann_index import (
-        has_ann_index,
-        load_ann_index,
-        save_ann_index,
+    assert rows == 8
+    np.testing.assert_array_equal(
+        destination[:],
+        np.zeros((8, 3), dtype=np.uint16),
     )
 
-    root = zarr.open_group(str(tmp_path / "ds.zarr"), mode="w")
-    g = root.create_group("ann")
-    dim = 8
-    n = 200
-    idx = hnswlib.Index(space="l2", dim=dim)
-    idx.init_index(max_elements=n, ef_construction=50, M=16)
-    data = np.random.rand(n, dim).astype(np.float32)
-    idx.add_items(data)
-    save_ann_index(g, idx)
-    assert has_ann_index(g)
-    loaded = load_ann_index(g, "l2", dim)
-    q = data[:5]
-    i1, d1 = idx.knn_query(q, k=3)
-    i2, d2 = loaded.knn_query(q, k=3)
-    np.testing.assert_array_equal(i1, i2)
-    np.testing.assert_allclose(d1, d2, rtol=1e-5)
+
+def test_complete_sparse_bands_put_each_shard_once_without_get():
+    store = RecordingStore()
+    root = zarr.open_group(store=store, mode="w")
+    destination = root.create_array(
+        "counts",
+        shape=(12, 3),
+        chunks=(2, 3),
+        shards=(4, 3),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    expected = np.arange(1, 37, dtype=np.uint16).reshape(12, 3)
+    store.reset()
+
+    accumulate_sparse_to_shards(
+        destination,
+        (csr_matrix(expected[start : start + 5]) for start in range(0, 12, 5)),
+        resources=ResourceBudget(1024**2, 4),
+        producerReserveBytes=sparse_producer_peak_bytes(27, 15, 2),
+    )
+
+    operations = store.chunk_ops("counts/c/")
+    assert not [key for kind, key in operations if kind == "get"]
+    written = [key for kind, key in operations if kind == "set"]
+    assert len(written) == len(set(written)) == 3
+
+
+def test_sparse_band_writes_respect_memory_admission():
+    store = RecordingStore(delay=0.01)
+    root = zarr.open_group(store=store, mode="w")
+    destination = root.create_array(
+        "counts",
+        shape=(12, 3),
+        chunks=(2, 3),
+        shards=(4, 3),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    expected = np.arange(1, 37, dtype=np.uint16).reshape(12, 3)
+    store.reset()
+
+    accumulate_sparse_to_shards(
+        destination,
+        (csr_matrix(expected[start : start + 5]) for start in range(0, 12, 5)),
+        resources=ResourceBudget(9_000, 4),
+        producerReserveBytes=sparse_producer_peak_bytes(27, 15, 2),
+    )
+
+    assert store.max_in_flight_for("set") == 1
+    np.testing.assert_array_equal(destination[:], expected)
+
+
+def test_sparse_writer_releases_completed_band_before_reading_more():
+    import gc
+    import weakref
+
+    from scarf.storage.sharding import (
+        SparseRowBand,
+        SparseWriteBand,
+        write_sparse_bands,
+    )
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    destination = root.create_array(
+        "counts",
+        shape=(8, 3),
+        chunks=(2, 3),
+        shards=(4, 3),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    expected = np.arange(1, 25, dtype=np.uint16).reshape(8, 3)
+
+    def writes():
+        for start in (0, 4):
+            row = np.repeat(np.arange(4, dtype=np.int64), 3)
+            row_ref = weakref.ref(row)
+            yield SparseWriteBand(
+                destination=destination,
+                band=SparseRowBand(
+                    start=start,
+                    end=start + 4,
+                    nColumns=3,
+                    row=row,
+                    column=np.tile(np.arange(3, dtype=np.int64), 4),
+                    data=expected[start : start + 4].ravel(),
+                    dtype=np.uint16,
+                ),
+            )
+            del row
+            gc.collect()
+            assert row_ref() is None
+
+    write_sparse_bands(
+        writes(),
+        resources=ResourceBudget(7_000, 4),
+    )
+    np.testing.assert_array_equal(destination[:], expected)
+
+
+def test_sparse_writer_admits_row_chunks_and_retained_producer_bytes():
+    from scarf.storage.sharding import (
+        SparseRowBand,
+        SparseWriteBand,
+        write_sparse_bands,
+    )
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    row_chunked = root.create_array(
+        "row_chunked",
+        shape=(4, 3),
+        chunks=(2, 3),
+        shards=(4, 3),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+
+    def empty_write(destination, producer_bytes=0):
+        return SparseWriteBand(
+            destination=destination,
+            band=SparseRowBand(
+                start=0,
+                end=4,
+                nColumns=3,
+                row=np.array([], dtype=np.int64),
+                column=np.array([], dtype=np.int64),
+                data=np.array([], dtype=np.uint16),
+                dtype=np.uint16,
+            ),
+            producerBytes=producer_bytes,
+        )
+
+    with pytest.raises(MemoryError):
+        write_sparse_bands(
+            iter([empty_write(row_chunked)]),
+            resources=ResourceBudget(5_000, 4),
+        )
+
+    destination = root.create_array(
+        "producer",
+        shape=(4, 3),
+        chunks=(4, 3),
+        shards=(4, 3),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    write = empty_write(destination, producer_bytes=5_000)
+
+    with pytest.raises(MemoryError):
+        write_sparse_bands(
+            iter([write]),
+            resources=ResourceBudget(7_000, 4),
+        )
+
+    pulled = False
+
+    def writes():
+        nonlocal pulled
+        pulled = True
+        yield write
+
+    with pytest.raises(MemoryError, match="Sparse producer"):
+        write_sparse_bands(
+            writes(),
+            resources=ResourceBudget(7_000, 4),
+            producerReserveBytes=7_001,
+        )
+    assert pulled is False
+
+
+def test_padded_shard_geometry_stays_readable_and_transposable():
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    counts = root.create_array(
+        "counts",
+        shape=(10, 7),
+        chunks=(3, 3),
+        shards=(6, 6),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    expected = np.arange(1, 71, dtype=np.uint16).reshape(10, 7)
+    resources = ResourceBudget(1024**2, 4)
+
+    rows = write_dense_from_row_batches(
+        counts,
+        iter([expected[:4], expected[4:]]),
+        resources=resources,
+    )
+    assert rows == 10
+    np.testing.assert_array_equal(counts[:], expected)
+    np.testing.assert_array_equal(
+        ChunkedArray(counts, resources=resources).compute(),
+        expected,
+    )
+
+    counts_t = write_counts_t(counts, root, resources=resources)
+    assert counts_t is not None
+    assert counts_t.attrs["complete"] is True
+    np.testing.assert_array_equal(counts_t[:], expected.T)
+
+
+def test_write_counts_t_works_inside_running_event_loop():
+    import asyncio
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    counts = root.create_array(
+        "counts",
+        shape=(4, 3),
+        chunks=(2, 3),
+        shards=(2, 3),
+        dtype=np.uint16,
+        fill_value=0,
+    )
+    expected = np.arange(12, dtype=np.uint16).reshape(4, 3)
+    counts[:] = expected
+
+    async def invoke():
+        return write_counts_t(
+            counts,
+            root,
+            resources=ResourceBudget(1024**2, 2),
+        )
+
+    counts_t = asyncio.run(invoke())
+    assert counts_t is not None
+    assert counts_t.attrs["complete"] is True
+    np.testing.assert_array_equal(counts_t[:], expected.T)
+
+
+def test_empty_dense_and_transpose_writes_need_no_task_memory():
+    from scipy.sparse import coo_matrix
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    counts = root.create_array(
+        "counts",
+        shape=(0, 3),
+        chunks=(1, 3),
+        shards=(1, 3),
+        dtype=np.uint8,
+        fill_value=0,
+    )
+    resources = ResourceBudget(1, 4)
+
+    assert write_dense_from_row_batches(counts, iter(()), resources=resources) == 0
+    counts_t = write_counts_t(counts, root, resources=resources)
+    assert counts_t is not None
+    assert counts_t.shape == (3, 0)
+    assert counts_t.attrs["complete"] is True
+
+    sparse_counts = root.create_array(
+        "sparse_counts",
+        shape=(0, 3),
+        chunks=(1, 3),
+        shards=(1, 3),
+        dtype=np.uint8,
+        fill_value=0,
+    )
+    rows = accumulate_sparse_to_shards(
+        sparse_counts,
+        iter([coo_matrix((0, 3), dtype=np.uint8)]),
+        resources=resources,
+        producerReserveBytes=1024,
+    )
+    assert rows == 0
+
+
+def test_copy_array_and_metadata_tree(tmp_path):
+    source_root = zarr.open_group(str(tmp_path / "source.zarr"), mode="w")
+    spec = normed_array_spec(64, 8, profile="fast_local")
+    source = create_numeric_array(source_root, "data", spec)
+    expected = np.random.default_rng(0).random((64, 8), dtype=np.float32)
+    source[:] = expected
+
+    target_root = zarr.open_group(str(tmp_path / "target.zarr"), mode="w")
+    target = create_numeric_array(target_root, "data", spec)
+    copy_zarr_array(
+        source,
+        target,
+        resources=ResourceBudget(1024**2, 2),
+    )
+    np.testing.assert_allclose(target[:], expected)
+
+    metadata = source_root.create_group("metadata")
+    score = metadata.create_array("score", data=np.array([1.0, 2.0, 3.0]))
+    score.attrs["display"] = {"label": "Score"}
+    copied_metadata = target_root.create_group("metadata")
+    copy_zarr_group_tree(metadata, copied_metadata)
+    np.testing.assert_array_equal(copied_metadata["score"][:], score[:])
+    assert copied_metadata["score"].attrs["display"] == {"label": "Score"}
+
+
+def test_staged_normed_array_reuses_matching_shape(tmp_path):
+    path = str(tmp_path / "cache" / "normalized.zarr")
+    first = create_or_open_staged_normed_array(path, (32, 4))
+    first[:] = 1
+    reopened = create_or_open_staged_normed_array(path, (32, 4))
+    np.testing.assert_array_equal(reopened[:], np.ones((32, 4), dtype=np.float32))
+
+
+def test_remote_store_requires_obstore(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def reject_obstore(name, *args, **kwargs):
+        if name in {"obstore", "obstore.store"}:
+            raise ImportError("missing obstore")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_obstore)
+    with pytest.raises(ImportError, match="obstore"):
+        make_store("s3://bucket/path")

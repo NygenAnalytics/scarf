@@ -60,8 +60,8 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    Assay: "1261108919058e4cbba0567ac91a17d53a30d4e70965885646c1d297ecae5ccb",
-    RNAassay: "246c85c9322349d4bc8f4f1adf2e28b4efe2268dfe84049425497269eea9eccf",
+    Assay: "73b1223c51c85bd0a691300cd675e12bc74b16adedde87c994aad43eda56c1d4",
+    RNAassay: "0ae282c2b967eac23cb8fe6a5b774d25349b48d616cbd85961a94ebe28b8fe0f",
     ATACassay: "491bb1c63ad83fa5d9634200c5b3778a3018e39abdd3ae87208eb3e85659633c",
     ADTassay: "a1ff1bebdd8fcd3f30a1b64a42dbf2931f6b8031ddce75abcf362750eb4e9c34",
 }
@@ -87,7 +87,6 @@ def test_assay_facade_surface_is_stable():
         "NormMethod",
         "PercentFeatures",
         "RNAassay",
-        "_feature_stats_tile_shape",
         "_read_block",
         "lib_size_feature_stream_eligible",
         "norm_clr",
@@ -196,6 +195,8 @@ def test_normalization_numerical_contracts_are_stable():
 
 
 def test_assay_read_block_facade_remains_patchable(monkeypatch):
+    from scarf.storage.budget import ResourceBudget
+
     root = zarr.open_group(store=MemoryStore(), mode="w")
     counts_t = root.create_array(
         "countsT",
@@ -205,6 +206,7 @@ def test_assay_read_block_facade_remains_patchable(monkeypatch):
     rna.name = "RNA"
     rna.z = root
     rna.rawDataT = counts_t
+    rna.resources = ResourceBudget(memoryBytes=1024**2, workers=1)
 
     original = assay_module._read_block
     calls = []

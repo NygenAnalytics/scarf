@@ -27,11 +27,7 @@ from scarf.storage.artifacts import (
     list_artifacts,
 )
 from scarf.storage.selections import resolve_selection_artifact
-from scarf.storage.budget import (
-    ResourceBudget,
-    _get_resource_budget_override,
-    set_resource_budget,
-)
+from scarf.storage.budget import ResourceBudget
 
 
 class _Cells:
@@ -96,6 +92,7 @@ class _Store(_ClusteringOperationsMixin, _PresentationOperationsMixin):
         active[: graph.shape[0]] = True
         self.cells = _Cells(active, self.zw)
         self.nthreads = 2
+        self.resources = ResourceBudget(8 * 1024**3, self.nthreads)
         self.zarr_mode = "r+"
         self.graphs: dict[str, csr_matrix] = {}
         self.latest_graph_calls = 0
@@ -558,13 +555,9 @@ def test_integrated_graph_is_resolved_without_standard_graph_lookup() -> None:
 
 def test_memory_preflight_fails_before_loading_edges() -> None:
     store = _Store(_block_graph())
-    previous = _get_resource_budget_override()
-    try:
-        set_resource_budget(ResourceBudget(memoryBytes=1, workers=1, workingCopies=1))
-        with pytest.raises(MemoryError, match="resource budget"):
-            store.run_paris_clustering()
-    finally:
-        set_resource_budget(previous)
+    store.resources = ResourceBudget(memoryBytes=1, workers=1)
+    with pytest.raises(MemoryError, match="resource budget"):
+        store.run_paris_clustering()
 
     assert store.load_graph_calls == 0
     assert LATEST_PARIS_GENERATION not in store.zw["RNA/graph"].attrs
@@ -597,23 +590,16 @@ def test_cached_hierarchy_adaptive_preflight_fails_before_graph_load() -> None:
     )
     assert graph_estimate > cached_estimate
 
-    previous = _get_resource_budget_override()
-    try:
-        set_resource_budget(
-            ResourceBudget(
-                memoryBytes=(cached_estimate + graph_estimate) // 2,
-                workers=1,
-                workingCopies=1,
-            )
+    store.resources = ResourceBudget(
+        memoryBytes=(cached_estimate + graph_estimate) // 2,
+        workers=1,
+    )
+    with pytest.raises(MemoryError, match="^Paris adaptive cut"):
+        store.run_paris_clustering(
+            n_clusters="auto",
+            min_cluster_size=2,
+            label="guarded",
         )
-        with pytest.raises(MemoryError, match="^Paris adaptive cut"):
-            store.run_paris_clustering(
-                n_clusters="auto",
-                min_cluster_size=2,
-                label="guarded",
-            )
-    finally:
-        set_resource_budget(previous)
 
     assert store.load_graph_calls == 1
     assert "RNA/graph/adaptive_clustering/guarded" not in store.zw
@@ -630,19 +616,15 @@ def test_cached_fixed_and_adaptive_cuts_preflight_hierarchy_loading() -> None:
     writes_before = store.cells.writes.copy()
     loads_before = store.load_graph_calls
 
-    previous = _get_resource_budget_override()
-    try:
-        set_resource_budget(ResourceBudget(memoryBytes=1, workers=1, workingCopies=1))
-        with pytest.raises(MemoryError, match="Cached Paris fixed cut"):
-            store.run_paris_clustering(n_clusters=3, label="other_fixed")
-        with pytest.raises(MemoryError, match="Cached Paris adaptive cut"):
-            store.run_paris_clustering(
-                n_clusters="auto",
-                min_cluster_size=2,
-                label="adaptive",
-            )
-    finally:
-        set_resource_budget(previous)
+    store.resources = ResourceBudget(memoryBytes=1, workers=1)
+    with pytest.raises(MemoryError, match="Cached Paris fixed cut"):
+        store.run_paris_clustering(n_clusters=3, label="other_fixed")
+    with pytest.raises(MemoryError, match="Cached Paris adaptive cut"):
+        store.run_paris_clustering(
+            n_clusters="auto",
+            min_cluster_size=2,
+            label="adaptive",
+        )
 
     assert store.cells.writes == writes_before
     assert store.load_graph_calls == loads_before

@@ -8,6 +8,7 @@ from numpy.typing import NDArray
 from scipy.sparse import csr_matrix, vstack
 
 from ..storage.types import as_zarr_array, as_zarr_group
+from ..storage.budget import ResourceBudget, resolve_budget
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
 from ..utils.arrays import array_digest
@@ -52,10 +53,12 @@ class Assay:
         nthreads: int,
         min_cells_per_feature: int = 10,
         matrix_root: zarr.Group | None = None,
+        resources: ResourceBudget | None = None,
     ) -> None:
         self.name = name
         self.cells = cell_data
-        self.nthreads = nthreads
+        self.resources = resources or resolve_budget(workers=nthreads)
+        self.nthreads = self.resources.workers
         matrix_root = z if matrix_root is None else matrix_root
         if workspace is None:
             counts_path = f"{name}/counts"
@@ -63,7 +66,8 @@ class Assay:
             matrix_group = as_zarr_group(matrix_root[name], name=name)
             self.rawData = ChunkedArray(
                 as_zarr_array(matrix_root[counts_path], name=counts_path),
-                nthreads=nthreads,
+                nthreads=self.nthreads,
+                resources=self.resources,
             )
             self.feats = MetaData(z[f"{name}/featureData"])  # type: ignore
             self.z = as_zarr_group(z[name], name=name)
@@ -76,7 +80,8 @@ class Assay:
             )
             self.rawData = ChunkedArray(
                 as_zarr_array(matrix_root[counts_path], name=counts_path),
-                nthreads=nthreads,
+                nthreads=self.nthreads,
+                resources=self.resources,
             )
             self.feats = MetaData(z[f"{workspace}/{name}/featureData"])  # type: ignore
             self.z = as_zarr_group(z[f"{workspace}/{name}"], name=f"{workspace}/{name}")
@@ -446,6 +451,7 @@ class Assay:
                         name=location + "/data",
                     ),
                     nthreads=self.nthreads,
+                    resources=self.resources,
                 )
             vals = self.normed(
                 cell_idx,
@@ -457,13 +463,14 @@ class Assay:
                 vals,
                 self.z,
                 location + "/data",
-                vals.chunksize,
                 self.nthreads,
                 mirror=mirror,
+                resources=self.resources,
             )
             return ChunkedArray(
                 as_zarr_array(self.z[location + "/data"], name=location + "/data"),
                 nthreads=self.nthreads,
+                resources=self.resources,
             )
         if location in self.z:
             attrs = self.z[location].attrs
@@ -482,6 +489,7 @@ class Assay:
                 return ChunkedArray(
                     as_zarr_array(self.z[location + "/data"], name=location + "/data"),
                     nthreads=self.nthreads,
+                    resources=self.resources,
                 )
             else:
                 # Creating group here to overwrite all children
@@ -496,9 +504,9 @@ class Assay:
             vals,
             self.z,
             location + "/data",
-            vals.chunksize,
             self.nthreads,
             mirror=mirror,
+            resources=self.resources,
         )
         self.z[location].attrs["subset_hash"] = subset_hash
         self.z[location].attrs["subset_params"] = subset_params
@@ -511,6 +519,7 @@ class Assay:
         return ChunkedArray(
             as_zarr_array(self.z[location + "/data"], name=location + "/data"),
             nthreads=self.nthreads,
+            resources=self.resources,
         )
 
     def iter_normed_feature_wise(
@@ -720,7 +729,11 @@ class Assay:
         )
         valid_array[:] = valid
         return (
-            ChunkedArray(data_array, nthreads=self.nthreads),
+            ChunkedArray(
+                data_array,
+                nthreads=self.nthreads,
+                resources=self.resources,
+            ),
             feature_indices,
             valid,
         )
@@ -836,6 +849,7 @@ class Assay:
         ret_val1 = ChunkedArray(
             as_zarr_array(self.z[location + "/data"], name=location + "/data"),
             nthreads=self.nthreads,
+            resources=self.resources,
         )
         ret_val2 = np.asarray(
             as_zarr_array(

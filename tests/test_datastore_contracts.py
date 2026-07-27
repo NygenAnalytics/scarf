@@ -94,10 +94,10 @@ _METHODS = {
 }
 
 _SIGNATURE_DIGESTS = {
-    BaseDataStore: "1057b1cbeb909e7f7f599f88d91fae2aacb024a3da626b8a028bdd600644e248",
+    BaseDataStore: "ba5c5e4e09f310114b2f7e09ac346bc759d87912e04d034153e5bc5b41e0f6a5",
     GraphDataStore: "10dd6f9f5350529ae3f70372cc8aa37e636877acc3a0275df2979e7a6708dae0",
     MappingDatastore: "eaa8df1bda8fb83066fbac9e30a112fb8a0a46b1e278cce304b300ac5603e16f",
-    DataStore: "2244dbcf37da8448a472cc22ad99f963f982f83152c2689dd24bf8f75a2c5994",
+    DataStore: "5baeb2e039afc5d69e2ba70f11cde7fb0a5a1fed5932916691358d021c6e8cc1",
 }
 
 
@@ -251,102 +251,48 @@ def test_datastore_private_mixin_order_is_stable():
     ]
 
 
-def test_datastore_temporary_factory_is_static_and_facade_owned(monkeypatch):
-    from importlib import import_module
+def test_datastore_temporary_factory_uses_parent_budget_and_local_profile(tmp_path):
+    import numpy as np
+    from scipy.sparse import csr_matrix
 
     from scarf.datastore._operations.quality_control import (
         _QualityControlOperationsMixin,
     )
+    from scarf.quality_control.doublets import write_doublet_target_zarr
 
     descriptor = inspect.getattr_static(DataStore, "_create_temporary_datastore")
-    assert isinstance(descriptor, staticmethod)
+    assert not isinstance(descriptor, staticmethod)
     assert "_create_temporary_datastore" in DataStore.__dict__
     assert "_create_temporary_datastore" not in _QualityControlOperationsMixin.__dict__
 
     class DataStoreSubclass(DataStore):
         pass
 
-    calls = []
-    sentinel = object()
+    path = tmp_path / "temporary.zarr"
+    write_doublet_target_zarr(
+        zarr_loc=str(path),
+        assay_name="RNA",
+        sim_counts=csr_matrix(np.array([[1, 0], [0, 2]], dtype=np.uint16)),
+        feat_ids=np.array(["f1", "f2"]),
+        feat_names=np.array(["g1", "g2"]),
+        dtype="uint16",
+        mem_budget=64 * 1024 * 1024,
+        nthreads=1,
+        profile="fast_local",
+    )
 
-    def construct_concrete(*args, **kwargs):
-        calls.append((args, kwargs))
-        return sentinel
-
-    module = import_module("scarf.datastore.datastore")
-    monkeypatch.setattr(module, "DataStore", construct_concrete)
-    result = DataStoreSubclass._create_temporary_datastore(
-        "temporary.zarr",
+    source = object.__new__(DataStoreSubclass)
+    source.memoryBytes = 64 * 1024 * 1024
+    source.storageProfile = "cloud"
+    result = source._create_temporary_datastore(
+        str(path),
         default_assay="RNA",
         assay_types={"RNA": "RNA"},
         nthreads=3,
     )
-    assert result is sentinel
-    assert calls == [
-        (
-            ("temporary.zarr",),
-            {
-                "default_assay": "RNA",
-                "assay_types": {"RNA": "RNA"},
-                "nthreads": 3,
-            },
-        )
-    ]
-
-
-def test_datastore_temporary_factory_restores_process_resources(monkeypatch):
-    from importlib import import_module
-
-    import zarr
-
-    from scarf.storage.budget import (
-        ResourceBudget,
-        _get_resource_budget_override,
-        set_resource_budget,
-    )
-    from scarf.storage.profiles import (
-        _get_storage_profile_override,
-        set_storage_profile,
-    )
-
-    module = import_module("scarf.datastore.datastore")
-    previous_profile = _get_storage_profile_override()
-    previous_budget = _get_resource_budget_override()
-    previous_concurrency = zarr.config.get("async.concurrency")
-    expected_budget = ResourceBudget(
-        memoryBytes=64 * 1024 * 1024,
-        workers=3,
-        workingCopies=2,
-    )
-    sentinel = object()
-
-    def construct_temporary(*args, **kwargs):
-        set_storage_profile(None)
-        set_resource_budget(ResourceBudget(memoryBytes=1, workers=1, workingCopies=1))
-        zarr.config.set({"async.concurrency": 1})
-        return sentinel
-
-    try:
-        set_storage_profile("cloud")
-        set_resource_budget(expected_budget)
-        zarr.config.set({"async.concurrency": expected_budget.workers})
-        monkeypatch.setattr(module, "DataStore", construct_temporary)
-
-        result = DataStore._create_temporary_datastore(
-            "temporary.zarr",
-            default_assay="RNA",
-            assay_types={"RNA": "RNA"},
-            nthreads=3,
-        )
-
-        assert result is sentinel
-        assert _get_storage_profile_override() == "cloud"
-        assert _get_resource_budget_override() is expected_budget
-        assert zarr.config.get("async.concurrency") == expected_budget.workers
-    finally:
-        set_storage_profile(previous_profile)
-        set_resource_budget(previous_budget)
-        zarr.config.set({"async.concurrency": previous_concurrency})
+    assert result.memoryBytes == 64 * 1024 * 1024
+    assert result.nthreads == 3
+    assert result.storageProfile == "fast_local"
 
 
 def test_datastore_facades_only_own_composition_methods():

@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import zarr
 
+from ..storage.budget import READ_AHEAD
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
@@ -16,7 +17,6 @@ from .normalization import (
     norm_lib_size,
     norm_lib_size_log,
 )
-from .persistence import _feature_stats_tile_shape
 
 
 def _read_facade_block(
@@ -223,6 +223,7 @@ class RNAassay(Assay):
                         name=location + "/data",
                     ),
                     nthreads=self.nthreads,
+                    resources=self.resources,
                 )
             write_renorm_subset_to_zarr(
                 self,
@@ -237,6 +238,7 @@ class RNAassay(Assay):
             return ChunkedArray(
                 as_zarr_array(self.z[location + "/data"], name=location + "/data"),
                 nthreads=self.nthreads,
+                resources=self.resources,
             )
         subset_hash = self._create_subset_hash(cell_idx, feat_idx)
         subset_params = {
@@ -260,6 +262,7 @@ class RNAassay(Assay):
                 return ChunkedArray(
                     as_zarr_array(self.z[location + "/data"], name=location + "/data"),
                     nthreads=self.nthreads,
+                    resources=self.resources,
                 )
             self.z.create_group(location, overwrite=True)
 
@@ -284,6 +287,7 @@ class RNAassay(Assay):
         return ChunkedArray(
             as_zarr_array(self.z[location + "/data"], name=location + "/data"),
             nthreads=self.nthreads,
+            resources=self.resources,
         )
 
     def normed(
@@ -343,12 +347,11 @@ class RNAassay(Assay):
         batch_size: int,
         msg: str | None = None,
     ) -> Generator[tuple[int, np.ndarray, np.ndarray, float, str], None, None]:
-        """Read raw count column batches with remote-aware staging.
+        """Read raw count column batches with shallow read-ahead.
 
         Yields ``(block_idx, raw, feat_cols, read_sec, source)`` where ``raw`` has
         shape ``(len(cell_idx), len(feat_cols))``.
         """
-        from ..storage.stores import is_remote_datastore
         from ..utils.prefetch import iter_column_blocks
 
         cell_idx = np.asarray(cell_idx)
@@ -377,11 +380,10 @@ class RNAassay(Assay):
             def read_block(block_idx: int) -> np.ndarray:
                 return _read_facade_block(zarr_arr, cell_idx, batches[block_idx])
 
-        remote = is_remote_datastore(None, zarr_arr)
         for block_idx, raw, read_sec, source in iter_column_blocks(
             n_blocks,
             read_block,
-            remote=remote,
+            workers=self.resources.workers,
             msg=msg,
         ):
             yield block_idx, raw, batches[block_idx], read_sec, source
@@ -394,7 +396,6 @@ class RNAassay(Assay):
         scalar: np.ndarray,
         sf: float,
         log_transform: bool = False,
-        prefetch_depth: int = 1,
         msg: str | None = None,
     ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
         """Iterate library-size normalized feature columns without streaming
@@ -411,7 +412,6 @@ class RNAassay(Assay):
             scalar: Per-cell normalization factor aligned to ``cell_idx``.
             sf: Size factor multiplier applied before dividing by ``scalar``.
             log_transform: If True, apply ``log1p`` after normalization.
-            prefetch_depth: Number of batches to read ahead in parallel.
             msg: Progress bar description.
 
         Yields:
@@ -466,8 +466,8 @@ class RNAassay(Assay):
         parallel and accumulated as they arrive (each writes a disjoint row
         slice, so order does not matter).
         """
-        from ..storage.budget import worker_prefetch_depth
-        from ..utils.prefetch import prefetch_blocks
+        from ..storage.budget import admitted_worker_count
+        from ..storage.parallel import stream_shards
 
         zarr_arr = cast(zarr.Array, self.rawData._backing)
         cell_idx = np.asarray(cell_idx)
@@ -505,8 +505,23 @@ class RNAassay(Assay):
             rows = cell_idx[start : start + block_rows]
             return start, _read_facade_block(zarr_arr, rows, union)
 
-        max_ahead = worker_prefetch_depth()
-        for start, raw in prefetch_blocks(starts, read, max_ahead=max_ahead):
+        task_bytes = (
+            block_rows
+            * max(1, len(union))
+            * (np.dtype(zarr_arr.dtype).itemsize + np.dtype(np.float64).itemsize)
+        )
+        workers = admitted_worker_count(
+            self.resources,
+            taskBytes=task_bytes,
+            requested=READ_AHEAD,
+        )
+        io_concurrency = max(1, self.resources.workers // workers)
+        for start, raw in stream_shards(
+            starts,
+            read,
+            workers=workers,
+            io_concurrency=io_concurrency,
+        ):
             end = start + raw.shape[0]
             normed = (sf * raw.astype(np.float64)) / scalar[start:end, None]
             for key, pos in local_pos.items():
@@ -520,16 +535,14 @@ class RNAassay(Assay):
     ) -> dict[str, np.ndarray]:
         """Per-feature library-size normalized stats in one streaming pass.
 
-        Decodes each physical Zarr chunk at most once for the selected cells and
-        features, normalizes dense sub-tiles in float64 in place, and accumulates
-        per-feature nonzero count, sum, and sum of squares. Remote stores may
-        prefetch the next physical chunk while compute continues. Values match
-        ``norm_lib_size``. Returns ``normed_tot`` (sum), ``normed_n`` (nonzero
-        count), and ``sigmas`` (population variance).
+        Decodes each selected physical Zarr tile once, normalizes it in float64,
+        and accumulates per-feature nonzero count, sum, and sum of squares.
+        Reads use shallow ordered prefetch. Values match ``norm_lib_size``.
+        Returns ``normed_tot`` (sum), ``normed_n`` (nonzero count), and
+        ``sigmas`` (population variance).
         """
         import time
 
-        from ..storage.stores import is_remote_datastore
         from ..utils.prefetch import iter_column_blocks
         from ..utils.process import process_rss_mb
 
@@ -596,13 +609,6 @@ class RNAassay(Assay):
                     tiles.append((local_cells, rows, local_feats, cols))
 
         n_blocks = len(tiles)
-        remote = is_remote_datastore(None, zarr_arr)
-        sub_rows, sub_cols = _feature_stats_tile_shape(
-            max((len(rows) for _, rows, _, _ in tiles), default=1),
-            max((len(cols) for _, _, _, cols in tiles), default=1),
-            row_chunk=cell_chunk,
-            col_chunk=feat_chunk,
-        )
 
         def read_block(block_idx: int) -> np.ndarray:
             _, rows, _, cols = tiles[block_idx]
@@ -615,26 +621,18 @@ class RNAassay(Assay):
             local_cells: np.ndarray,
             local_feats: np.ndarray,
         ) -> None:
-            height = raw.shape[0]
-            width = raw.shape[1]
-            for row_start in range(0, height, sub_rows):
-                row_end = min(height, row_start + sub_rows)
-                local_inv = inv_scalar[local_cells[row_start:row_end]]
-                for col_start in range(0, width, sub_cols):
-                    col_end = min(width, col_start + sub_cols)
-                    band = raw[row_start:row_end, col_start:col_end]
-                    feat_slice = local_feats[col_start:col_end]
-                    nz[feat_slice] += (band > 0).sum(axis=0)
-                    scaled = band.astype(np.float64, copy=True)
-                    scaled *= sf
-                    np.multiply(scaled, local_inv[:, None], out=scaled)
-                    s1[feat_slice] += scaled.sum(axis=0)
-                    s2[feat_slice] += np.einsum("ij,ij->j", scaled, scaled)
+            local_inv = inv_scalar[local_cells]
+            nz[local_feats] += (raw > 0).sum(axis=0)
+            scaled = raw.astype(np.float64, copy=True)
+            scaled *= sf
+            np.multiply(scaled, local_inv[:, None], out=scaled)
+            s1[local_feats] += scaled.sum(axis=0)
+            s2[local_feats] += np.einsum("ij,ij->j", scaled, scaled)
 
         for block_idx, raw, read_sec, source in iter_column_blocks(
             n_blocks,
             read_block,
-            remote=remote,
+            workers=self.resources.workers,
             msg=f"({self.name}) Computing feature stats",
         ):
             local_cells, _, local_feats, _ = tiles[block_idx]

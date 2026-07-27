@@ -25,8 +25,7 @@ from scarf.storage.types import as_zarr_array
 from scarf.assay import _read_block
 from scarf.datastore._operations.features import _feature_column_chunk
 from scarf.features.markers import resolve_marker_gene_batch_size
-from scarf.storage.budget import resolve_budget, set_resource_budget
-from scarf.storage.stores import is_remote_datastore
+from scarf.storage.budget import ResourceBudget
 from scarf.utils import iter_column_blocks
 
 _CONFIG_PATH = "profiling/layouts/1m_auto_markers_c8_m64.toml"
@@ -50,13 +49,6 @@ def _fmt_rss(peakRssBytes: int | None) -> str:
 
 
 def _open_store(storeUri: str, resources: StageResources) -> DataStore:
-    set_resource_budget(
-        resolve_budget(
-            memory=resources.scarfMemoryBudget,
-            workers=resources.workers,
-            working_copies=resources.workingCopies,
-        )
-    )
     return DataStore(
         storeUri,
         nthreads=resources.workers,
@@ -64,7 +56,6 @@ def _open_store(storeUri: str, resources: StageResources) -> DataStore:
         zarrProfile="cloud" if storeUri.startswith("s3://") else None,
         storage_options=storage_options(storeUri),
         mem_budget=resources.scarfMemoryBudget,
-        working_copies=resources.workingCopies,
     )
 
 
@@ -127,7 +118,9 @@ def _progress(
 
 
 def _stream_hvg_tiles(
-    assay: Any, cellIdx: np.ndarray, featIdx: np.ndarray
+    assay: Any,
+    cellIdx: np.ndarray,
+    featIdx: np.ndarray,
 ) -> dict[str, Any]:
     """Physical chunk tiles, same layout walk as HVG feature stats."""
     use_counts_t = getattr(assay, "rawDataT", None) is not None
@@ -166,7 +159,6 @@ def _stream_hvg_tiles(
         f"chunks=({cell_chunk},{feat_chunk}) tiles={n_blocks} "
         f"source={'countsT' if use_counts_t else 'counts'}"
     )
-    remote = is_remote_datastore(None, assay.z)
     bytes_read = 0
     chunks_read = 0
     t0 = time.perf_counter()
@@ -180,8 +172,7 @@ def _stream_hvg_tiles(
     for block_idx, raw, read_sec, source in iter_column_blocks(
         n_blocks,
         read_block,
-        remote=remote,
-        msg=None,
+        workers=assay.resources.workers,
     ):
         bytes_read += int(raw.nbytes)
         chunks_read += 1
@@ -220,15 +211,31 @@ def _stream_marker_batches(
         f"[plan] markerBatches cells={len(cellIdx)} feats={len(featIdx)} "
         f"geneBatchSize={batchSize} batches={n_blocks} source={array_source}"
     )
+    batches = [
+        featIdx[start : start + batchSize]
+        for start in range(0, len(featIdx), max(1, batchSize))
+    ]
+    zarr_arr = (
+        assay.rawDataT
+        if getattr(assay, "rawDataT", None) is not None
+        else assay.rawData._backing
+    )
+
+    def read_block(block_idx: int) -> np.ndarray:
+        columns = batches[block_idx]
+        if array_source == "countsT":
+            return _read_block(zarr_arr, columns, cellIdx).T
+        return _read_block(zarr_arr, cellIdx, columns)
+
     bytes_read = 0
     done = 0
     t0 = time.perf_counter()
-    for block_idx, raw, feat_cols, read_sec, source in assay.iter_raw_column_blocks(
-        cellIdx,
-        featIdx,
-        batchSize,
-        msg=None,
+    for block_idx, raw, read_sec, source in iter_column_blocks(
+        n_blocks,
+        read_block,
+        workers=assay.resources.workers,
     ):
+        feat_cols = batches[block_idx]
         bytes_read += int(raw.nbytes)
         done += 1
         if done % _LOG_EVERY_BLOCKS == 0 or done == n_blocks:
@@ -327,6 +334,8 @@ def run_io_baseline_body(
     config: ProfilingConfig,
     *,
     nRows: int = _N_ROWS,
+    resultLabel: str | None = None,
+    columnOnly: bool = False,
 ) -> dict[str, Any]:
     resources = config.resourcesFor("markHvgs")
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
@@ -367,8 +376,10 @@ def run_io_baseline_body(
         n_features=len(feat_idx),
         n_cells=len(cell_idx),
         column_chunk=_feature_column_chunk(assay, len(feat_idx)),
-        memory_bytes=resources.scarfMemoryBudget,
-        working_copies=resources.workingCopies,
+        resources=ResourceBudget(
+            memoryBytes=resources.scarfMemoryBudget,
+            workers=resources.workers,
+        ),
     )
     raw_chunks = list(getattr(assay.rawData._backing, "chunks", ()) or ())
     _log(
@@ -386,23 +397,29 @@ def run_io_baseline_body(
     results.append(
         _measure(
             "markerBatches",
-            lambda: _stream_marker_batches(assay, cell_idx, feat_idx, marker_batch),
-        )
-    )
-    results.append(
-        _measure(
-            "makeGraphRawCellBands",
-            lambda: _stream_makegraph_raw_cell_bands(assay, cell_idx, hvg_idx),
-        )
-    )
-    results.append(
-        _measure(
-            "makeGraphNormedCellBands",
-            lambda: _stream_makegraph_normed_cell_bands(
-                store, config.workflow.assayName
+            lambda: _stream_marker_batches(
+                assay,
+                cell_idx,
+                feat_idx,
+                marker_batch,
             ),
         )
     )
+    if not columnOnly:
+        results.append(
+            _measure(
+                "makeGraphRawCellBands",
+                lambda: _stream_makegraph_raw_cell_bands(assay, cell_idx, hvg_idx),
+            )
+        )
+        results.append(
+            _measure(
+                "makeGraphNormedCellBands",
+                lambda: _stream_makegraph_normed_cell_bands(
+                    store, config.workflow.assayName
+                ),
+            )
+        )
 
     total_seconds = sum(r["seconds"] for r in results if r["status"] == "ok")
     summary = {
@@ -412,6 +429,7 @@ def run_io_baseline_body(
         "modalCpu": resources.modalCpuRequest,
         "modalMemoryMb": resources.modalMemoryLimitMb,
         "modalRegion": config.modalRegion,
+        "columnOnly": columnOnly,
         "markerGeneBatchSize": marker_batch,
         "nActiveCells": int(len(cell_idx)),
         "nActiveFeatures": int(len(feat_idx)),
@@ -421,7 +439,10 @@ def run_io_baseline_body(
         "patterns": results,
     }
     _log(f"[job] finished totalSeconds={total_seconds:.1f}")
-    result_uri = f"{config.resultsUri.rstrip('/')}/io-baseline/{config.runTag}.json"
+    suffix = f"-{resultLabel}" if resultLabel else ""
+    result_uri = (
+        f"{config.resultsUri.rstrip('/')}/io-baseline/{config.runTag}{suffix}.json"
+    )
     try:
         put_json(result_uri, summary)
         _log(f"[job] wrote {result_uri}")

@@ -73,7 +73,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             preflight_paris_fit,
             write_hierarchy_group,
         )
-        from ...storage.budget import get_resource_budget
 
         artifact_scope = (
             graph_ref.scope
@@ -94,7 +93,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             "fixed" if fixed_cluster_count is not None else "adaptive"
         )
         graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
-        budget = get_resource_budget()
+        budget = self.resources
         hierarchy_plan = plan_artifact(
             self.zw,
             scope=artifact_scope,
@@ -782,6 +781,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 dendrogram_loc, _generation_id = resolve_compatibility_dendrogram(
                     self.zw,
                     graph_loc,
+                    self.resources,
                 )
                 dendrogram = np.asarray(
                     as_zarr_array(

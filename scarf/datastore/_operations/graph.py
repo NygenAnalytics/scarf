@@ -471,7 +471,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if self.zarr_mode != "r+":
             logger.debug("Skipping ANN index persistence on read-only store")
             return
-        save_ann_index(as_zarr_group(self.zw[ann_loc], name=ann_loc), ann_idx)
+        save_ann_index(
+            as_zarr_group(self.zw[ann_loc], name=ann_loc),
+            ann_idx,
+            profile=self.storageProfile,
+        )
 
     def _has_ann_stream_cache(
         self,
@@ -1441,6 +1445,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 source,
                 staged,
                 msg="Staging normalized data locally",
+                resources=self.resources,
             )
             staged.attrs["complete"] = True
         try:

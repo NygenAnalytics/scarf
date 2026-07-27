@@ -5,21 +5,31 @@ import numpy as np
 import zarr
 
 from ..storage.types import as_zarr_array, as_zarr_group
-from ..storage.arrays import create_numeric_array
+from ..storage.arrays import create_numeric_array, create_zarr_obj_array
 from ..storage.layout import count_array_spec
-from ..storage.profiles import is_local_zarr_path
+from ..storage.profiles import (
+    StorageProfile,
+    ZarrLocation,
+    is_local_zarr_path,
+    resolve_storage_profile,
+)
+from ..storage.schema import create_zarr_count_assay
 from ..storage.sharding import write_dense_in_shard_rows
-from ..storage.stores import ZARRLOC
+from ..storage.stores import load_zarr
 
 
 def subset_assay_zarr(
-    zarr_loc: ZARRLOC,
+    zarr_loc: ZarrLocation,
     in_grp: str,
     out_grp: str,
     cells_idx: np.ndarray,
     feat_idx: np.ndarray,
-    chunk_size: tuple[int, int],
     storage_options: dict[str, Any] | None = None,
+    mem_budget: int | str | None = None,
+    nthreads: int | None = None,
+    profile: StorageProfile | None = None,
+    targetChunkBytes: int | None = None,
+    targetShardBytes: int | None = None,
 ) -> None:
     """Selects a subset of the data in an assay in the specified Zarr
     hierarchy.
@@ -33,16 +43,23 @@ def subset_assay_zarr(
         out_grp: Group name in Zarr hierarchy to write subsetted assay to.
         cells_idx: Indices of cells to keep in the subset.
         feat_idx: Indices of features to keep in the subset.
-        chunk_size: Chunk size for the output Zarr array.
-
     Returns:
         None
     """
-    from . import load_zarr
+    from ..storage.budget import resolve_budget
 
+    resources = resolve_budget(mem_budget, nthreads)
+    resolved_profile = resolve_storage_profile(zarr_loc, profile)
     z = load_zarr(zarr_loc, "r+", storage_options=storage_options)
     ig = as_zarr_array(z[in_grp], name=in_grp)
-    spec = count_array_spec(len(cells_idx), len(feat_idx), dtype="uint32")
+    spec = count_array_spec(
+        len(cells_idx),
+        len(feat_idx),
+        dtype="uint32",
+        profile=resolved_profile,
+        targetChunkBytes=targetChunkBytes,
+        targetShardBytes=targetShardBytes,
+    )
     og = create_numeric_array(z, out_grp, spec)
     write_dense_in_shard_rows(
         og,
@@ -50,6 +67,7 @@ def subset_assay_zarr(
             ig.get_orthogonal_selection((cells_idx[start:end], feat_idx))
         ),
         msg="Subsetting assay",
+        resources=resources,
     )
     return None
 
@@ -74,7 +92,7 @@ class SubsetZarr:
 
     def __init__(
         self,
-        zarr_loc: ZARRLOC,
+        zarr_loc: ZarrLocation,
         assays: list[Any],
         in_workspace: str | None = None,
         out_workspace: str | None = None,
@@ -84,20 +102,51 @@ class SubsetZarr:
         overwrite_existing_file: bool = False,
         overwrite_cell_data: bool = False,
         storage_options: dict[str, Any] | None = None,
+        mem_budget: int | str | None = None,
+        nthreads: int | None = None,
+        profile: StorageProfile | None = None,
+        targetChunkBytes: int | None = None,
+        targetShardBytes: int | None = None,
     ) -> None:
+        from ..storage.budget import resolve_budget
+
         self.resetCells = reset_cell_filter
         self.overFn = overwrite_existing_file
         self.overCells = overwrite_cell_data
         self.inWorkspace = in_workspace
         self.outWorkspace = out_workspace
         self.storage_options = storage_options
+        assay_resources = [
+            assay.resources for assay in assays if hasattr(assay, "resources")
+        ]
+        self.resources = resolve_budget(
+            (
+                mem_budget
+                if mem_budget is not None
+                else (
+                    min(resource.memoryBytes for resource in assay_resources)
+                    if assay_resources
+                    else None
+                )
+            ),
+            (
+                nthreads
+                if nthreads is not None
+                else (
+                    min(resource.workers for resource in assay_resources)
+                    if assay_resources
+                    else None
+                )
+            ),
+        )
+        self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.targetChunkBytes = targetChunkBytes
+        self.targetShardBytes = targetShardBytes
         self.z = self._check_files(zarr_loc)
         self.assays = self._check_assays(assays)
         self.cellIdx = self._check_idx(cell_key, cell_idx)
 
-    def _check_files(self, zarr_loc: ZARRLOC) -> zarr.Group:
-        from . import load_zarr
-
+    def _check_files(self, zarr_loc: ZarrLocation) -> zarr.Group:
         if (
             is_local_zarr_path(zarr_loc)
             and isinstance(zarr_loc, str)
@@ -177,8 +226,6 @@ class SubsetZarr:
         return cell_idx
 
     def _prep_cell_data(self) -> None:
-        from . import create_zarr_obj_array
-
         if self.outWorkspace is None:
             cell_slot = "cellData"
         else:
@@ -203,24 +250,22 @@ class SubsetZarr:
             create_zarr_obj_array(cell_group, i, v, dtype=v.dtype)
 
     def _prep_counts(self) -> None:
-        from . import create_zarr_count_assay
-
         n_cells = len(self.cellIdx)
         for assay in self.assays:
             create_zarr_count_assay(
                 z=self.z,
                 assay_name=assay.name,
                 workspace=self.outWorkspace,
-                chunk_size=assay.rawData.chunksize,
                 n_cells=n_cells,
                 feat_ids=assay.feats.fetch_all("ids"),
                 feat_names=assay.feats.fetch_all("names"),
                 dtype=assay.rawData.dtype,
+                profile=self.profile,
+                targetChunkBytes=self.targetChunkBytes,
+                targetShardBytes=self.targetShardBytes,
             )
 
     def dump(self) -> None:
-        from . import finalize_writer_counts
-
         self._prep_cell_data()
         self._prep_counts()
         for assay in self.assays:
@@ -239,5 +284,5 @@ class SubsetZarr:
                 store,
                 lambda start, end: raw_data[start:end, :].compute(),
                 msg=f"Subsetting assay: {assay.name}",
+                resources=self.resources,
             )
-            finalize_writer_counts(self.z, assay.name, self.outWorkspace)

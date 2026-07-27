@@ -11,11 +11,12 @@ from scarf.features.genomic.melding import coordinate_melding
 from scarf.features.markers import find_markers_by_rank, find_markers_by_regression
 from scarf.metadata import MetaData
 from scarf.quality_control.doublets import write_doublet_target_zarr
+from scarf.storage.budget import ResourceBudget
 from scarf.storage.sharding import write_counts_t
+from tests.store_probes import RecordingStore
 from scarf.writers import (
     create_cell_data,
     create_zarr_count_assay,
-    finalize_writer_counts,
 )
 
 
@@ -40,7 +41,6 @@ def _write_small_assay(
         z=root,
         assay_name="RNA",
         workspace=workspace,
-        chunk_size=(2, 2),
         n_cells=n_cells,
         feat_ids=np.array([f"f{i}" for i in range(n_feats)]),
         feat_names=np.array([f"g{i}" for i in range(n_feats)]),
@@ -51,11 +51,17 @@ def _write_small_assay(
     else:
         counts = root["matrices/RNA/counts"]
     counts[:] = values
-    return finalize_writer_counts(root, "RNA", workspace)
+    group = root["RNA"] if workspace is None else root["matrices/RNA"]
+    write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(1024**3, 2),
+    )
+    return counts
 
 
 @pytest.mark.parametrize("workspace", [None, "ws"])
-def test_finalize_writer_counts_builds_complete_counts_t(workspace):
+def test_explicit_write_counts_t_builds_complete_counts_t(workspace):
     root = _memory_root()
     values = np.arange(20, dtype=np.uint32).reshape(5, 4)
     counts = _write_small_assay(root, workspace=workspace, values=values)
@@ -436,7 +442,7 @@ def test_iter_normed_feature_wise_uses_slow_path_when_ineligible(monkeypatch):
     assert calls["base"] >= 1
 
 
-def test_coordinate_melding_builds_counts_t():
+def test_coordinate_melding_leaves_counts_t_on_demand():
     root = _memory_root()
     values = np.array(
         [
@@ -460,14 +466,12 @@ def test_coordinate_melding_builds_counts_t():
         z=root,
         assay_name="ATAC",
         workspace=None,
-        chunk_size=(2, 2),
         n_cells=n_cells,
         feat_ids=peak_ids,
         feat_names=peak_ids,
         dtype="uint32",
     )
     root["ATAC/counts"][:] = values
-    finalize_writer_counts(root, "ATAC", None)
     cells = MetaData(root["cellData"])
     n_features = (values > 0).sum(axis=1).astype(np.float64)
     n_cells_per_peak = (values > 0).sum(axis=0).astype(np.float64)
@@ -494,16 +498,11 @@ def test_coordinate_melding_builds_counts_t():
         peaks_col="ids",
         renormalization=False,
     )
-    assert "countsT" in root["GENE"]
-    assert root["GENE/countsT"].attrs.get("complete") is True
-    assert root["GENE/countsT"].shape == (
-        root["GENE/counts"].shape[1],
-        root["GENE/counts"].shape[0],
-    )
+    assert "counts" in root["GENE"]
+    assert "countsT" not in root["GENE"]
 
 
-def test_grouped_assay_finalize_builds_counts_t():
-    """Grouped assays use finalize_writer_counts; durable float matrices get countsT."""
+def test_count_assay_leaves_counts_t_on_demand():
     root = _memory_root()
     values = np.arange(12, dtype=np.float32).reshape(3, 4)
     n_cells, n_feats = values.shape
@@ -517,17 +516,13 @@ def test_grouped_assay_finalize_builds_counts_t():
         z=root,
         assay_name="PTIME_MODULES",
         workspace=None,
-        chunk_size=(2, 2),
         n_cells=n_cells,
         feat_ids=np.array([f"group_{i}" for i in range(n_feats)]),
         feat_names=np.array([f"group_{i}" for i in range(n_feats)]),
         dtype="float",
     )
     root["PTIME_MODULES/counts"][:] = values
-    finalize_writer_counts(root, "PTIME_MODULES", None)
-    assert "countsT" in root["PTIME_MODULES"]
-    assert root["PTIME_MODULES/countsT"].attrs.get("complete") is True
-    np.testing.assert_array_equal(root["PTIME_MODULES/countsT"][:], values.T)
+    assert "countsT" not in root["PTIME_MODULES"]
 
 
 def test_write_doublet_target_zarr_skips_counts_t(tmp_path):
@@ -540,10 +535,255 @@ def test_write_doublet_target_zarr_skips_counts_t(tmp_path):
         feat_ids=np.array(["f0", "f1", "f2"]),
         feat_names=np.array(["g0", "g1", "g2"]),
         dtype="uint32",
-        batch_size=2,
     )
     assert "counts" in root["RNA"]
     assert "countsT" not in root["RNA"]
+
+
+def _counts_array(
+    values: np.ndarray,
+    *,
+    chunks: tuple[int, int] = (3, 2),
+    shards: tuple[int, int] | None = None,
+    store: MemoryStore | None = None,
+) -> tuple[zarr.Group, zarr.Array]:
+    root = zarr.open_group(
+        store=store if store is not None else MemoryStore(), mode="w"
+    )
+    group = root.create_group("RNA")
+    counts = group.create_array(
+        "counts",
+        shape=values.shape,
+        chunks=chunks,
+        shards=shards,
+        dtype=values.dtype,
+        fill_value=0,
+    )
+    counts[:] = values
+    return group, counts
+
+
+def _dense_values(n_cells: int, n_feats: int) -> np.ndarray:
+    return (np.arange(n_cells * n_feats, dtype=np.uint32) + 1).reshape(n_cells, n_feats)
+
+
+@pytest.mark.parametrize("workers", [1, 4])
+def test_write_counts_t_transposes_exactly(workers):
+    values = _dense_values(24, 8)
+    group, counts = _counts_array(values)
+    counts_t = write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(8 * 1024**3, workers),
+    )
+    assert counts_t is not None
+    assert counts_t.attrs["complete"] is True
+    np.testing.assert_array_equal(counts_t[:], values.T)
+
+
+def test_write_counts_t_geometry_matches_serial_baseline():
+    values = _dense_values(22, 7)
+    metadata = []
+    for workers in (1, 4):
+        group, counts = _counts_array(values)
+        counts_t = write_counts_t(
+            counts,
+            group,
+            resources=ResourceBudget(8 * 1024**3, workers),
+        )
+        np.testing.assert_array_equal(counts_t[:], values.T)
+        metadata.append(counts_t.metadata.to_dict())
+
+    assert metadata[0] == metadata[1]
+    assert metadata[0]["shape"] == (7, 22)
+    assert metadata[0]["chunk_grid"]["configuration"]["chunk_shape"] == (2, 3)
+    assert metadata[0]["fill_value"] == 0
+
+
+def test_write_counts_t_covers_edge_tiles():
+    # 7 features over a 2-wide grid and 22 cells over a 6-wide grid leave a
+    # partial tile on both axes, including the shared corner tile.
+    values = _dense_values(22, 7)
+    group, counts = _counts_array(values)
+    counts_t = write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(8 * 1024**3, 4),
+    )
+    np.testing.assert_array_equal(counts_t[0:2, 0:3], values[0:3, 0:2].T)
+    np.testing.assert_array_equal(counts_t[6:7, 0:3], values[0:3, 6:7].T)
+    np.testing.assert_array_equal(counts_t[0:2, 21:22], values[21:22, 0:2].T)
+    np.testing.assert_array_equal(counts_t[6:7, 21:22], values[21:22, 6:7].T)
+
+
+def test_write_counts_t_writes_each_chunk_once_without_destination_read():
+    store = RecordingStore()
+    values = _dense_values(22, 7)
+    group, counts = _counts_array(values, store=store)
+    store.reset()
+    counts_t = write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(8 * 1024**3, 4),
+    )
+
+    chunk_ops = store.chunk_ops("RNA/countsT/c/")
+    assert {kind for kind, _ in chunk_ops} == {"set"}
+    keys = [key for _, key in chunk_ops]
+    assert len(keys) == len(set(keys))
+    n_tiles = len(range(0, 7, 2)) * len(range(0, 22, 3))
+    assert len(keys) == n_tiles
+    np.testing.assert_array_equal(counts_t[:], values.T)
+
+
+def test_write_counts_t_reads_each_source_inner_chunk_once():
+    store = RecordingStore()
+    values = _dense_values(24, 8)
+    group, counts = _counts_array(
+        values,
+        chunks=(3, 2),
+        shards=(6, 8),
+        store=store,
+    )
+    store.reset()
+
+    counts_t = write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(8 * 1024**3, 4),
+    )
+
+    source_gets = [
+        (key, byte_range)
+        for kind, key, byte_range in store.byte_ranges
+        if kind == "get" and key.startswith("RNA/counts/c/")
+    ]
+    shard_rows, shard_columns = counts.metadata.shards
+    expected_shard_keys = {
+        f"RNA/counts/c/{row}/{column}"
+        for row in range((counts.shape[0] + shard_rows - 1) // shard_rows)
+        for column in range((counts.shape[1] + shard_columns - 1) // shard_columns)
+    }
+    assert {key for key, _ in source_gets} == expected_shard_keys
+    assert all(byte_range is not None for _, byte_range in source_gets)
+    index_reads = [
+        (key, byte_range.suffix)
+        for key, byte_range in source_gets
+        if hasattr(byte_range, "suffix")
+    ]
+    chunk_reads = [
+        (key, byte_range.start, byte_range.end)
+        for key, byte_range in source_gets
+        if hasattr(byte_range, "start")
+    ]
+    n_tasks = ((counts.shape[0] + shard_rows - 1) // shard_rows) * (
+        (counts.shape[1] + counts.chunks[1] - 1) // counts.chunks[1]
+    )
+    chunks_per_task = (shard_rows + counts.chunks[0] - 1) // counts.chunks[0]
+    assert len(index_reads) == n_tasks
+    assert len(chunk_reads) == len(set(chunk_reads))
+    assert len(chunk_reads) == n_tasks * chunks_per_task
+    np.testing.assert_array_equal(counts_t[:], values.T)
+
+
+def test_write_counts_t_overwrite_leaves_no_stale_chunks():
+    store = RecordingStore()
+    values = _dense_values(22, 7)
+    group, counts = _counts_array(values, store=store)
+    write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(8 * 1024**3, 4),
+    )
+    stale = sorted(k for k in store._store_dict if k.startswith("RNA/countsT/c/"))
+
+    smaller = values[:6]
+    counts.resize(smaller.shape)
+    counts[:] = smaller
+    counts_t = write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(8 * 1024**3, 4),
+    )
+
+    live = sorted(k for k in store._store_dict if k.startswith("RNA/countsT/c/"))
+    assert live == sorted(set(live))
+    assert len(live) < len(stale)
+    np.testing.assert_array_equal(counts_t[:], smaller.T)
+
+
+def test_write_counts_t_overlaps_tiles_within_worker_budget():
+    store = RecordingStore(delay=0.01)
+    values = _dense_values(24, 8)
+    group, counts = _counts_array(values, store=store)
+    store.reset()
+    write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(8 * 1024**3, 4),
+    )
+    assert store.max_in_flight_for("set") > 1
+    assert store.max_in_flight_for("set") <= 4
+
+
+def test_write_counts_t_keeps_concurrency_within_worker_budget():
+    store = RecordingStore(delay=0.005)
+    values = _dense_values(24, 8)
+    group, counts = _counts_array(values, store=store)
+    store.reset()
+    write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(8 * 1024**3, 2),
+    )
+    assert store.max_in_flight_for("set") <= 2
+
+
+def test_write_counts_t_restores_zarr_concurrency():
+    before = zarr.config.get("async.concurrency")
+    values = _dense_values(24, 8)
+
+    group, counts = _counts_array(values)
+    write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(8 * 1024**3, 4),
+    )
+    assert zarr.config.get("async.concurrency") == before
+
+    store = RecordingStore(fail_on="RNA/countsT/c/1/1")
+    group, counts = _counts_array(values, store=store)
+    with pytest.raises(RuntimeError, match="injected write failure"):
+        write_counts_t(
+            counts,
+            group,
+            resources=ResourceBudget(8 * 1024**3, 4),
+        )
+    assert zarr.config.get("async.concurrency") == before
+
+
+def test_write_counts_t_stays_incomplete_when_a_tile_fails():
+    store = RecordingStore(fail_on="RNA/countsT/c/1/1")
+    values = _dense_values(24, 8)
+    group, counts = _counts_array(values, store=store)
+    with pytest.raises(RuntimeError, match="injected write failure"):
+        write_counts_t(
+            counts,
+            group,
+            resources=ResourceBudget(8 * 1024**3, 4),
+        )
+    assert group["countsT"].attrs["complete"] is False
+
+
+def test_write_counts_t_rejects_oversized_tile():
+    values = _dense_values(24, 8)
+    group, counts = _counts_array(values)
+    with pytest.raises(MemoryError):
+        write_counts_t(
+            counts,
+            group,
+            resources=ResourceBudget(100, 8),
+        )
 
 
 def test_repack_preserves_counts_t_attrs(tmp_path):

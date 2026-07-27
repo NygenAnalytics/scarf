@@ -6,28 +6,27 @@ import zarr
 
 from .types import as_zarr_array
 from .arrays import create_metadata_column, create_numeric_array, dtype_fix
-from .layout import PROFILE_METADATA_CHUNK, array_shard_rows, normed_array_spec
+from .budget import ResourceBudget
+from .layout import PROFILE_METADATA_CHUNK, normed_array_spec
 from .sharding import write_dense_in_shard_rows
 
 
 def copy_zarr_array(
     src: zarr.Array,
     dst: zarr.Array,
-    block_rows: int | None = None,
     msg: str | None = None,
+    resources: ResourceBudget | None = None,
 ) -> None:
     """Stream-copy a 2D Zarr array in row blocks."""
     if src.shape != dst.shape:
         raise ValueError(f"Shape mismatch: src {src.shape} vs dst {dst.shape}")
     if len(src.shape) != 2:
         raise ValueError("copy_zarr_array only supports 2D arrays")
-    if block_rows is None:
-        block_rows = array_shard_rows(dst)
     write_dense_in_shard_rows(
         dst,
         lambda start, end: np.asarray(src[start:end, :]),
         msg=msg or "Copying Zarr array",
-        shard_rows=block_rows,
+        resources=resources,
     )
 
 

@@ -8,11 +8,17 @@ from urllib.parse import urlsplit, urlunsplit
 import numpy as np
 import zarr
 
-from scarf.storage.layout import array_info, get_compressors, normalize_chunks
-from scarf.storage.profiles import StorageProfile, get_storage_profile
-from scarf.storage.schema import finalize_counts
+from scarf.storage.arrays import create_numeric_array
+from scarf.storage.layout import (
+    array_info,
+    count_array_spec,
+    get_compressors,
+    normalize_chunks,
+)
+from scarf.storage.profiles import StorageProfile
+from scarf.storage.sharding import write_counts_t, write_dense_in_shard_rows
 from scarf.storage.stores import open_store
-from scarf.storage.types import as_zarr_group
+from scarf.storage.types import as_zarr_array, as_zarr_group
 
 
 def _location_identity(location: str) -> tuple[str, str]:
@@ -96,23 +102,54 @@ def _copy_group(
     src: zarr.Group,
     dst: zarr.Group,
     profile: StorageProfile,
+    *,
+    path: str = "",
+    shardedCounts: frozenset[str] = frozenset(),
 ) -> None:
     for key in src.keys():
         node = src[key]
+        child_path = f"{path}/{key}" if path else key
         if isinstance(node, zarr.Group):
             new_group = dst.create_group(key, overwrite=True)
             for attr_key, attr_val in node.attrs.items():
                 new_group.attrs[attr_key] = attr_val
-            _copy_group(node, new_group, profile)
+            _copy_group(
+                node,
+                new_group,
+                profile,
+                path=child_path,
+                shardedCounts=shardedCounts,
+            )
             continue
-        chunks = normalize_chunks(node.chunks, node.shape)
-        dst_array = dst.create_array(
-            key,
-            data=np.asarray(node[...]),
-            chunks=chunks,
-            compressors=get_compressors(profile, zarrFormat=3),
-            overwrite=True,
-        )
+        if child_path in shardedCounts:
+            spec = count_array_spec(
+                int(node.shape[0]),
+                int(node.shape[1]),
+                dtype=node.dtype,
+                profile=profile,
+            )
+            dst_array = create_numeric_array(dst, key, spec)
+            write_dense_in_shard_rows(
+                dst_array,
+                lambda start, end: np.asarray(node[start:end, :]),
+                msg=f"Repacking {child_path}",
+            )
+            dst.attrs["scarf:zarr_spec"] = {
+                "profile": profile,
+                "dtype": np.dtype(node.dtype).str,
+                "chunks": list(dst_array.chunks),
+                "shards": None if spec.shards is None else list(spec.shards),
+                "zarr_format": 3,
+            }
+        else:
+            chunks = normalize_chunks(node.chunks, node.shape)
+            dst_array = dst.create_array(
+                key,
+                data=np.asarray(node[...]),
+                chunks=chunks,
+                compressors=get_compressors(profile, zarrFormat=3),
+                overwrite=True,
+            )
         for attr_key, attr_val in node.attrs.items():
             dst_array.attrs[attr_key] = attr_val
 
@@ -140,20 +177,31 @@ def repack_store(
 
     src = open_store(input_path, mode="r", storage_options=storage_options)
     dst = open_store(output_path, mode="w", storage_options=storage_options)
-    _copy_group(src, dst, profile)
+    assays = _count_assays(src)
+    count_paths = frozenset(
+        f"{assay_name}/counts" if workspace is None else f"matrices/{assay_name}/counts"
+        for assay_name, workspace in assays
+    )
+    _copy_group(
+        src,
+        dst,
+        profile,
+        shardedCounts=count_paths if shard_counts else frozenset(),
+    )
     if not shard_counts:
         return
-    for assay_name, workspace in _count_assays(dst):
-        counts = finalize_counts(
-            dst,
-            assay_name,
-            workspace=workspace,
-            profile=profile,
-        )
+    for assay_name, workspace in assays:
         counts_path = (
             f"{assay_name}/counts"
             if workspace is None
             else f"matrices/{assay_name}/counts"
+        )
+        group_path = assay_name if workspace is None else f"matrices/{assay_name}"
+        counts = as_zarr_array(dst[counts_path], name=counts_path)
+        write_counts_t(
+            counts,
+            as_zarr_group(dst[group_path], name=group_path),
+            profile=profile,
         )
         print(f"  {counts_path}: {array_info(counts)}")
 
@@ -167,7 +215,7 @@ def main() -> None:
     parser.add_argument(
         "--profile",
         choices=["fast_local", "cloud"],
-        default=get_storage_profile(),
+        default="fast_local",
     )
     parser.add_argument("--no-shard-counts", action="store_true")
     args = parser.parse_args()

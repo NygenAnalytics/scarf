@@ -1,18 +1,13 @@
-import threading
-
 import numpy as np
 import pandas as pd
 import pytest
+import sys
 import zarr
 from zarr.storage import MemoryStore
 
 from scarf.matrix import ChunkedArray
 from scarf.merge import AssayMerge
-from scarf.storage.budget import (
-    ResourceBudget,
-    get_resource_budget,
-    set_resource_budget,
-)
+from scarf.storage.budget import ResourceBudget
 from scarf.storage.layout import count_array_spec
 
 
@@ -57,19 +52,12 @@ class _MergeDataStore:
         self._assays = {assay.name: assay for assay in assays}
         self.assay_names = list(self._assays)
         self.cells = assays[0].cells
+        self.nthreads = 2
+        self.memoryBytes = 1024**3
+        self.resources = ResourceBudget(self.memoryBytes, self.nthreads)
 
     def get_assay(self, name):
         return self._assays[name]
-
-
-@pytest.fixture
-def tiny_merge_budget():
-    previous = get_resource_budget()
-    set_resource_budget(ResourceBudget(memoryBytes=96, workers=2, workingCopies=2))
-    try:
-        yield
-    finally:
-        set_resource_budget(previous)
 
 
 def test_assay_merge(datastore, rna_raw_total, tmp_path):
@@ -90,7 +78,6 @@ def test_assay_merge(datastore, rna_raw_total, tmp_path):
 
 def test_assay_merge_maps_features_and_preserves_row_order(
     tmp_path,
-    tiny_merge_budget,
 ):
     cell_ids = ["c0", "c1", "c2"]
     left = _MergeAssay(
@@ -123,8 +110,7 @@ def test_assay_merge_maps_features_and_preserves_row_order(
     root = zarr.open_group(fn, mode="r")
     counts_array = root["RNA/counts"]
     counts = np.asarray(counts_array[:])
-    np.testing.assert_array_equal(root["RNA/countsT"][:], counts.T)
-    assert root["RNA/countsT"].attrs["complete"] is True
+    assert "countsT" not in root["RNA"]
     merged_cell_ids = np.asarray(root["cellData/ids"][:]).astype(str)
     merged_feature_ids = np.asarray(root["RNA/featureData/ids"][:]).astype(str)
 
@@ -140,17 +126,112 @@ def test_assay_merge_maps_features_and_preserves_row_order(
     for cell_id, row in zip(merged_cell_ids, counts, strict=True):
         np.testing.assert_array_equal(row, expected[cell_id])
 
-    spec = count_array_spec(*counts_array.shape, dtype=counts_array.dtype)
+    spec = count_array_spec(
+        *counts_array.shape,
+        dtype=counts_array.dtype,
+        profile="fast_local",
+    )
     assert spec.shards is not None
-    assert spec.shards[0] < counts_array.shape[0]
     assert counts_array.chunks == spec.chunks
     assert counts_array.metadata.shards == spec.shards
     assert counts_array.fill_value == 0
 
 
+@pytest.mark.parametrize("dtype", [None, "uint16"])
+def test_assay_merge_widens_before_consolidating_features(tmp_path, dtype):
+    feature_ids = ["gene_0", "gene_1"]
+    left = _MergeAssay(
+        "RNA",
+        np.array([[200, 100]], dtype=np.uint8),
+        ["left"],
+        feature_ids,
+        feature_ids,
+        block_size=1,
+    )
+    right = _MergeAssay(
+        "RNA",
+        np.array([[150, 150]], dtype=np.uint8),
+        ["right"],
+        feature_ids,
+        feature_ids,
+        block_size=1,
+    )
+    path = str(tmp_path / "consolidated_features.zarr")
+
+    AssayMerge(
+        zarr_path=path,
+        assays=[left, right],
+        names=["left", "right"],
+        merge_assay_name="RNA",
+        prepend_text="",
+        dtype=dtype,
+    ).dump()
+
+    counts = zarr.open_group(path, mode="r")["RNA/counts"]
+    assert counts.dtype == np.dtype("uint16")
+    np.testing.assert_array_equal(counts[:], [[300], [300]])
+
+
+def test_assay_merge_rejects_metadata_over_memory_budget(tmp_path):
+    cell_ids = [f"cell-{index}-{'x' * 1000}" for index in range(100)]
+    left = _MergeAssay(
+        "RNA",
+        np.ones((100, 1), dtype=np.uint8),
+        cell_ids,
+        ["gene-id"],
+        ["gene"],
+        block_size=25,
+    )
+    right = _MergeAssay(
+        "RNA",
+        np.ones((100, 1), dtype=np.uint8),
+        cell_ids,
+        ["gene-id"],
+        ["gene"],
+        block_size=25,
+    )
+
+    with pytest.raises(MemoryError, match="operation limit"):
+        AssayMerge(
+            zarr_path=str(tmp_path / "metadata_budget.zarr"),
+            assays=[left, right],
+            names=["left", "right"],
+            merge_assay_name="RNA",
+            prepend_text="",
+            mem_budget="64K",
+        )
+
+
+def test_assay_merge_metadata_bytes_deduplicate_aliased_feature_maps():
+    merge = object.__new__(AssayMerge)
+    merge.mergedCells = pd.DataFrame()
+    merge.mergedFeats = pd.DataFrame()
+    merge.mergedFeats_map = pd.DataFrame()
+    mapping = {"gene-id": "gene"}
+    merge.featCollection = [mapping]
+    merge.featCollection_map = [mapping]
+
+    frame_bytes = sum(
+        int(frame.memory_usage(index=True, deep=True).sum())
+        for frame in (
+            merge.mergedCells,
+            merge.mergedFeats,
+            merge.mergedFeats_map,
+        )
+    )
+    expected = (
+        frame_bytes
+        + sys.getsizeof(merge.featCollection)
+        + sys.getsizeof(merge.featCollection_map)
+        + sys.getsizeof(mapping)
+        + sys.getsizeof("gene-id")
+        + sys.getsizeof("gene")
+    )
+    assert merge._metadata_resident_bytes() == expected
+
+
 def test_assay_merge_keeps_source_metadata_aligned_after_permutation(
     tmp_path,
-    tiny_merge_budget,
 ):
     left = _MergeAssay(
         "RNA",
@@ -245,13 +326,7 @@ def test_assay_merge_rejects_source_column_conflict(tmp_path):
         )
 
 
-def test_assay_merge_preserves_order_when_prefetch_finishes_out_of_order(
-    monkeypatch,
-    tmp_path,
-    tiny_merge_budget,
-):
-    import scarf.merge as merge_module
-
+def test_assay_merge_preserves_order_across_source_block_sizes(tmp_path):
     cell_ids = ["c0", "c1", "c2", "c3"]
     left = _MergeAssay(
         "RNA",
@@ -269,34 +344,6 @@ def test_assay_merge_preserves_order_when_prefetch_finishes_out_of_order(
         ["B", "C"],
         block_size=4,
     )
-    first_started = threading.Event()
-    second_finished = threading.Event()
-    lock = threading.Lock()
-    call_count = 0
-    completed: list[int] = []
-    original_compute = merge_module.controlled_compute
-
-    def delayed_compute(arr, nthreads):
-        nonlocal call_count
-        with lock:
-            call_index = call_count
-            call_count += 1
-        if call_index == 0:
-            first_started.set()
-            if not second_finished.wait(timeout=2):
-                raise RuntimeError("Second prefetched block did not complete")
-        elif call_index == 1:
-            if not first_started.wait(timeout=2):
-                raise RuntimeError("First prefetched block did not start")
-
-        result = original_compute(arr, nthreads)
-        with lock:
-            completed.append(call_index)
-        if call_index == 1:
-            second_finished.set()
-        return result
-
-    monkeypatch.setattr(merge_module, "controlled_compute", delayed_compute)
     fn = str(tmp_path / "out_of_order_prefetch.zarr")
     writer = AssayMerge(
         zarr_path=fn,
@@ -308,7 +355,6 @@ def test_assay_merge_preserves_order_when_prefetch_finishes_out_of_order(
     )
     writer.dump()
 
-    assert completed.index(1) < completed.index(0)
     root = zarr.open_group(fn, mode="r")
     counts = np.asarray(root["RNA/counts"][:])
     merged_cell_ids = np.asarray(root["cellData/ids"][:]).astype(str)
@@ -344,7 +390,6 @@ def test_dask_to_coo_sums_consolidated_features():
 
 def test_dataset_merge_shares_row_order_across_assay_chunk_sizes(
     tmp_path,
-    tiny_merge_budget,
 ):
     from scarf.merge import DatasetMerge
 
@@ -439,7 +484,6 @@ def test_dataset_merge_shares_row_order_across_assay_chunk_sizes(
 
 def test_dataset_merge_shared_row_plan_handles_missing_assays(
     tmp_path,
-    tiny_merge_budget,
 ):
     from scarf.merge import DatasetMerge
 
@@ -604,8 +648,7 @@ def test_assay_merge_rejects_existing_workspace_assay(
     counts = root["matrices/RNA/counts"]
     assert counts.shape[0] == 2 * datastore.cells.N
     assert int(counts[...].sum()) == 2 * rna_raw_total
-    np.testing.assert_array_equal(root["matrices/RNA/countsT"][:], counts[:].T)
-    assert root["matrices/RNA/countsT"].attrs["complete"] is True
+    assert "countsT" not in root["matrices/RNA"]
 
     with pytest.raises(ValueError, match="already contains RNA assay"):
         AssayMerge(
@@ -630,7 +673,7 @@ def test_assay_merge_validation_failure_does_not_overwrite_store(monkeypatch):
             return root
         pytest.fail(f"Unexpected destructive open mode: {mode}")
 
-    monkeypatch.setattr("scarf.merge.load_zarr", fake_load_zarr)
+    monkeypatch.setattr("scarf.merge.assays.load_zarr", fake_load_zarr)
     merge = object.__new__(AssayMerge)
     merge.outWorkspace = None
     merge.storage_options = None
@@ -650,7 +693,7 @@ def test_assay_merge_store_skips_local_exists_guard(monkeypatch):
             raise FileNotFoundError("missing")
         return zarr.open_group(store=MemoryStore(), mode="w")
 
-    monkeypatch.setattr("scarf.merge.load_zarr", fake_load_zarr)
+    monkeypatch.setattr("scarf.merge.assays.load_zarr", fake_load_zarr)
     merge = object.__new__(AssayMerge)
     merge.outWorkspace = None
     merge.storage_options = {"region": "us-east-1"}

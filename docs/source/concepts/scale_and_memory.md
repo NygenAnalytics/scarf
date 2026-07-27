@@ -37,20 +37,19 @@ ds = scarf.DataStore(
     "data.zarr",
     mem_budget="16G",
     nthreads=8,
-    working_copies=8,
 )
 ```
 
-Three knobs matter:
+Two resource controls matter:
 
 | Knob | Role |
 |---|---|
-| `mem_budget` | Total software memory budget. Accepts bytes, a size like `"8G"`, or a fraction of system RAM like `"0.6"`. Drives write-time chunk geometry and auto marker batch size. |
+| `mem_budget` | Total software memory budget. Accepts bytes, a size like `"8G"`, or a fraction of system RAM like `"0.6"`. Bounds admitted write tasks and auto marker batch size. |
 | `nthreads` / workers | Read concurrency and async IO parallelism. Also the default thread count for multi-threaded steps. |
-| `working_copies` | How many concurrent in-memory copies the budget is divided across when sizing tiles. Default is 8. Treat it as a copy-count model, not a speed dial. |
 
 Once arrays are written, reads follow on-disk chunk and shard geometry. Raising
-host RAM without raising `mem_budget` does not enlarge auto marker batches.
+host RAM without raising `mem_budget` does not admit more write tasks or enlarge
+auto marker batches. Storage geometry is stable across machine sizes.
 
 Within a reduction block, BLAS threads stay pinned so numeric results remain
 stable across worker counts where that contract is tested. Extra BLAS threads

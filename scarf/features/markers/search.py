@@ -7,12 +7,14 @@ from numba import set_num_threads
 
 from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
 from ...utils.logging import logger
+from ...utils.numba import restore_numba_threads
 from .rank import _batch_stats, sort_marker_results
 from .regression import _regression_batch_results
 
 __all__ = ["find_markers_by_rank", "find_markers_by_regression"]
 
 
+@restore_numba_threads
 def find_markers_by_rank(
     assay: Assay,
     group_key: str,
@@ -20,7 +22,6 @@ def find_markers_by_rank(
     feat_key: str,
     batch_size: int,
     n_threads: int,
-    prefetch_depth: int = 1,
     **norm_params: Any,
 ) -> dict[Any, pd.DataFrame]:
     """Identify marker features for groups with rank-based statistics."""
@@ -128,6 +129,7 @@ def find_markers_by_rank(
     return results
 
 
+@restore_numba_threads
 def find_markers_by_regression(
     assay: Assay,
     cell_key: str,

@@ -6,16 +6,12 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ._materialize import dask_to_zarr, write_renorm_subset_to_zarr
     from ._store import (
-        ZARRLOC as ZARRLOC,
-        _apply_budget_override as _apply_budget_override,
         create_cell_data as create_cell_data,
         create_zarr_count_assay,
         create_zarr_dataset,
         create_zarr_obj_array,
-        finalize_writer_counts as finalize_writer_counts,
         load_count_store as load_count_store,
         load_zarr as load_zarr,
-        sparse_writer as sparse_writer,
     )
     from .cellranger import CrToZarr
     from .csv import CSVtoZarr
@@ -43,16 +39,12 @@ __all__ = [
 ]
 
 _LAZY_EXPORTS = {
-    "ZARRLOC": "_store",
-    "_apply_budget_override": "_store",
     "create_cell_data": "_store",
     "create_zarr_count_assay": "_store",
     "create_zarr_dataset": "_store",
     "create_zarr_obj_array": "_store",
-    "finalize_writer_counts": "_store",
     "load_count_store": "_store",
     "load_zarr": "_store",
-    "sparse_writer": "_store",
     "dask_to_zarr": "_materialize",
     "write_renorm_subset_to_zarr": "_materialize",
     "CrToZarr": "cellranger",
@@ -71,7 +63,7 @@ for _export_name in _LAZY_EXPORTS:
     globals().pop(_export_name, None)
 del _export_name
 
-_METADATA_EXPORTS = frozenset(_LAZY_EXPORTS) - {"ZARRLOC", "load_zarr"}
+_METADATA_EXPORTS = frozenset(_LAZY_EXPORTS) - {"load_zarr"}
 
 
 def _normalize_export_metadata(value: Any) -> None:

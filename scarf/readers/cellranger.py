@@ -66,6 +66,26 @@ class CrReader(ABC):
         """
         pass
 
+    def max_window_nnz(self, window_rows: int) -> int:
+        """Bound nnz in any source row window."""
+        if window_rows <= 0:
+            raise ValueError("window_rows must be positive")
+        return min(window_rows, self.nCells) * self.nFeatures
+
+    @property
+    def matrix_dtype(self) -> np.dtype[Any]:
+        """Return the count dtype yielded by the default consume call."""
+        return np.dtype(np.uint32)
+
+    def producer_staging_bytes(
+        self,
+        batch_size: int,
+        lines_in_mem: int,
+    ) -> int:
+        """Return source-reader bytes retained while a matrix batch is yielded."""
+        valid_idx = getattr(self, "validBarcodeIdx", None)
+        return int(valid_idx.nbytes) if isinstance(valid_idx, np.ndarray) else 0
+
     def _subset_by_assay(self, v: list[Any], assay: str | None) -> list[Any]:
         if assay is None:
             return v
@@ -312,6 +332,11 @@ class CrH5Reader(CrReader):
         assert len(indptr) == (s + len(idx))
         return np.where(np.hstack(valid_idx))[0]
 
+    @property
+    def matrix_dtype(self) -> np.dtype[Any]:
+        dtype: np.dtype[Any] = np.dtype(self.grp["data"].dtype)
+        return dtype
+
     def _read_dataset(self, key: str | None = None) -> list[str]:
         if key is None:
             raise ValueError("Dataset key must be provided")
@@ -340,17 +365,24 @@ class CrH5Reader(CrReader):
         indptr = self.grp["indptr"][:]
         for s in range(0, len(valid_idx), batch_size):
             v_pos = valid_idx[s : s + batch_size]
-            row_ranges = [
-                np.arange(x, y) for x, y in zip(indptr[v_pos], indptr[v_pos + 1])
-            ]
+            starts = indptr[v_pos]
+            ends = indptr[v_pos + 1]
+            counts = ends - starts
             cell_idx = np.repeat(
-                np.arange(len(row_ranges)), [len(x) for x in row_ranges]
+                np.arange(len(v_pos)),
+                counts,
             )
-            idx = np.hstack(row_ranges) if row_ranges else np.array([], dtype=np.int64)
+            nonempty = np.flatnonzero(counts)
+            idx = (
+                np.concatenate([np.arange(starts[i], ends[i]) for i in nonempty])
+                if nonempty.size
+                else np.array([], dtype=np.int64)
+            )
             if idx.size == 0:
                 yield coo_matrix(
                     ([], ([], [])),
                     shape=(len(v_pos), self.nFeatures),
+                    dtype=self.matrix_dtype,
                 )
                 continue
             data = np.asarray(self.grp["data"][idx])
@@ -358,6 +390,35 @@ class CrH5Reader(CrReader):
             yield coo_matrix(
                 (data, (cell_idx, indices)), shape=(len(v_pos), self.nFeatures)
             )
+
+    def max_window_nnz(self, window_rows: int) -> int:
+        """Return the largest selected-cell row-window nnz."""
+        if window_rows <= 0:
+            raise ValueError("window_rows must be positive")
+        valid_idx = self.validBarcodeIdx
+        assert valid_idx is not None
+        width = min(window_rows, len(valid_idx))
+        if width == 0:
+            return 0
+        indptr = np.asarray(self.grp["indptr"])
+        row_nnz = np.diff(indptr)[valid_idx]
+        cumulative = np.empty(row_nnz.size + 1, dtype=np.int64)
+        cumulative[0] = 0
+        np.cumsum(row_nnz, dtype=np.int64, out=cumulative[1:])
+        return int(np.max(cumulative[width:] - cumulative[:-width]))
+
+    def producer_staging_bytes(
+        self,
+        batch_size: int,
+        lines_in_mem: int,
+    ) -> int:
+        """Count selected-cell indexes and the CSR row pointer loaded by consume."""
+        indptr = self.grp["indptr"]
+        indptr_bytes = int(indptr.size * indptr.dtype.itemsize)
+        planning_arrays = 3 * (self.nCells + 1) * np.dtype(np.int64).itemsize
+        return super().producer_staging_bytes(batch_size, lines_in_mem) + int(
+            2 * indptr_bytes + planning_arrays
+        )
 
     def close(self) -> None:
         """Closes file connection."""
@@ -395,6 +456,9 @@ class CrDirReader(CrReader):
         self.indexOffset = index_offset
         self.validBarcodeIdx: np.ndarray | None = None
         super().__init__(self._handle_version())
+        self.matrixEntryCount = (
+            0 if self.nCells == 0 else int(self.read_header().iloc[0]["nCounts"])
+        )
         if is_filtered:
             self.validBarcodeIdx = np.array(range(self.nCells))
             self.validBarcodeIdx -= self.indexOffset
@@ -613,6 +677,38 @@ class CrDirReader(CrReader):
         df["barcode"] = cell_idx
         return np.array(df)
 
+    def producer_staging_bytes(
+        self,
+        batch_size: int,
+        lines_in_mem: int,
+    ) -> int:
+        """Bound pandas input and split state retained across a yielded batch."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if lines_in_mem <= 0:
+            raise ValueError("lines_in_mem must be positive")
+        integer_bytes = np.dtype(np.int64).itemsize
+        mask_bytes = np.dtype(np.bool_).itemsize
+        frame_and_index = 3 * integer_bytes + integer_bytes
+        grouping_scratch = 4 * integer_bytes
+        pending_entries = min(
+            min(batch_size, self.nCells) * self.nFeatures,
+            self.matrixEntryCount,
+        )
+        pending_bytes = pending_entries * (
+            3 * frame_and_index + grouping_scratch + mask_bytes
+        )
+        return super().producer_staging_bytes(batch_size, lines_in_mem) + int(
+            lines_in_mem * (4 * frame_and_index + grouping_scratch + mask_bytes)
+            + pending_bytes
+        )
+
+    def max_window_nnz(self, window_rows: int) -> int:
+        return min(
+            super().max_window_nnz(window_rows),
+            self.matrixEntryCount,
+        )
+
     # noinspection DuplicatedCode
     def consume(
         self,
@@ -627,6 +723,8 @@ class CrDirReader(CrReader):
             lines_in_mem: The number of lines to read into memory.
             dtype: The data type of the matrix.
         """
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         matrixIO = pd.read_csv(
             self.matFn,
             comment="%",
@@ -635,28 +733,38 @@ class CrDirReader(CrReader):
             chunksize=lines_in_mem,
             names=["gene", "barcode", "count"],
         )
-        unique_list: list[Any] = []
-        collect: list[pd.DataFrame] = []
+        pending: pd.DataFrame | None = None
         for chunk in matrixIO:
             chunk = chunk[chunk["barcode"].isin(self.validBarcodeIdx)]
-            in_uniques = np.unique(chunk["barcode"].values)
-            unique_list.extend(in_uniques.tolist())
-            unique_list = list(set(unique_list))
-            if len(unique_list) > batch_size:
-                diff = batch_size - (len(unique_list) - len(in_uniques))
-                mask_pos = in_uniques[:diff]
-                mask_neg = in_uniques[diff:]
-                extra = chunk[chunk["barcode"].isin(mask_pos)]
-                collect.append(extra)
-                batch_arr = self.rename_batches(collect)
-                mtx = self.to_sparse(batch_arr, dtype=dtype)
-                yield mtx
-                left_out = chunk[chunk["barcode"].isin(mask_neg)]
-                collect = [left_out]
-                unique_list = mask_neg.tolist()
-            else:
-                collect.append(chunk)
-        if len(collect) > 0:
-            batch_arr = self.rename_batches(collect)
-            mtx = self.to_sparse(batch_arr, dtype=dtype)
-            yield mtx
+            if chunk.empty:
+                continue
+            pending = (
+                chunk.reset_index(drop=True)
+                if pending is None
+                else pd.concat((pending, chunk), ignore_index=True)
+            )
+            pending = (
+                pending.groupby(
+                    ["gene", "barcode"],
+                    sort=False,
+                    as_index=False,
+                )["count"]
+                .sum()
+                .reset_index(drop=True)
+            )
+            barcodes = pending["barcode"].to_numpy()
+            if np.any(barcodes[1:] < barcodes[:-1]):
+                raise ValueError("Cell Ranger MTX entries must be sorted by barcode")
+            unique_barcodes = np.unique(barcodes)
+            complete = (len(unique_barcodes) - 1) // batch_size
+            consumed = 0
+            for boundary in range(batch_size, complete * batch_size + 1, batch_size):
+                end = int(np.searchsorted(barcodes, unique_barcodes[boundary]))
+                batch_arr = self.rename_batches([pending.iloc[consumed:end]])
+                yield self.to_sparse(batch_arr, dtype=dtype)
+                consumed = end
+            if consumed:
+                pending = pending.iloc[consumed:].reset_index(drop=True)
+        if pending is not None and not pending.empty:
+            batch_arr = self.rename_batches([pending])
+            yield self.to_sparse(batch_arr, dtype=dtype)

@@ -10,6 +10,7 @@ from scarf.embeddings.umap import (
     calc_dens_map_params,
     fit_transform,
     fuzzy_simplicial_set,
+    simplicial_set_embedding,
 )
 from scarf.embeddings.harmony import run_harmony
 
@@ -53,6 +54,35 @@ def test_calc_dens_map_params():
         rtol=1e-6,
         atol=1e-6,
     )
+
+
+def test_simplicial_embedding_restores_numba_threads_on_failure(monkeypatch):
+    import numba
+    import umap.layouts
+
+    def fail(**_kwargs):
+        raise RuntimeError("injected UMAP failure")
+
+    monkeypatch.setattr(umap.layouts, "optimize_layout_euclidean", fail)
+    graph = _ring_graph(4)
+    previous_threads = numba.get_num_threads()
+    with pytest.raises(RuntimeError, match="injected UMAP failure"):
+        simplicial_set_embedding(
+            graph,
+            np.zeros((4, 2), dtype=np.float32),
+            2,
+            1.0,
+            1.0,
+            1,
+            1.0,
+            1.0,
+            5,
+            {},
+            False,
+            1,
+            False,
+        )
+    assert numba.get_num_threads() == previous_threads
 
 
 def test_fuzzy_simplicial_set_produces_coo_graph():

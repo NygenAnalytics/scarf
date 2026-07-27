@@ -81,7 +81,3 @@ selection code.
 ```{eval-rst}
 .. autofunction:: scarf.permute_into_chunks
 ```
-
-```{eval-rst}
-.. autofunction:: scarf.prefetch_blocks
-```

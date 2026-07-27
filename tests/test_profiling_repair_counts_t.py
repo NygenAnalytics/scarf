@@ -25,7 +25,6 @@ def test_repair_counts_t_rewrites_incomplete_array(tmp_path):
         modalCpuLimit=1.0,
         scarfMemoryBudget=2 * 1024**3,
         workers=1,
-        workingCopies=1,
         timeoutSeconds=600,
         ephemeralDiskMb=524288,
     )
