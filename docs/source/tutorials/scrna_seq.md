@@ -75,8 +75,10 @@ writer = scarf.CrToZarr(
 writer.dump(batch_size=1000)
 ```
 
-Open a `DataStore`. On first open Scarf computes per-cell QC columns such as `RNA_nCounts`
-and `RNA_nFeatures`, and mito/ribo fractions when gene-name patterns match.
+Open a `DataStore`. On first open Scarf streams the count matrix once to compute
+initialization statistics: per-cell QC columns such as `RNA_nCounts` and
+`RNA_nFeatures`, mito/ribo fractions when gene-name patterns match, and the
+per-feature cell counts used for feature filtering.
 `min_features_per_cell` marks cells inactive when they have fewer non-zero features
 than the threshold. Feature filtering uses `min_cells_per_feature` (default 20).
 

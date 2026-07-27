@@ -56,6 +56,10 @@ ds.query_neighbors(k=11)
 ds.build_connectivity_map()
 ```
 
+For ADT panels that previously used `dims=0` (neighbours on normalized
+features with no PCA), pass an identity loading matrix to
+`run_custom_reduction` instead. See {doc}`tutorials/cite_seq`.
+
 Datastores containing graphs written by earlier releases remain readable.
 
 See {doc}`concepts/graph_and_state` and

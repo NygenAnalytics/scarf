@@ -31,7 +31,7 @@ standalone after `import scarf.plotting as splt`.
 | Stage | Scanpy | Scarf |
 |---|---|---|
 | Load counts | `sc.read_*` → `AnnData` | Readers (`CrH5Reader`, `H5adReader`, …) → `*ToZarr` → `DataStore` |
-| QC metrics | `sc.pp.calculate_qc_metrics` | Computed on `DataStore` creation (`RNA_nCounts`, `RNA_nFeatures`, mito/ribo fractions) |
+| QC metrics | `sc.pp.calculate_qc_metrics` | Single-pass initialization on `DataStore` creation (`RNA_nCounts`, `RNA_nFeatures`, mito/ribo fractions, feature cell counts) |
 | Filter cells | `sc.pp.filter_cells` | `filter_cells` / `auto_filter_cells` (marks cells inactive via cell key `I`, does not delete) |
 | Normalize | `sc.pp.normalize_total`, `sc.pp.log1p` | `run_normalization` (also inside `ds.pipeline.run`) |
 | Highly variable genes | `sc.pp.highly_variable_genes` | `mark_hvgs` |

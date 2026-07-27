@@ -40,6 +40,7 @@ merges the two graphs with SNN and WNN.
 `RNA` and `ADT`.
 
 ```{code-cell} ipython3
+import numpy as np
 import scarf
 
 scarf.set_verbosity('WARNING')
@@ -155,16 +156,22 @@ print(
 )
 ```
 
-Now build the ADT graph. Two arguments differ from the RNA chain:
+Now build the ADT graph. Arguments differ from the RNA chain:
 
 - `from_assay='ADT'` targets the non-default assay on every step
 - `feat_key='I'` uses every active antibody, since there is no feature selection column
-- `dims=0` turns off dimension reduction, so neighbours are found on the normalized
-  antibody values directly
+- `run_custom_reduction` with an identity loading matrix keeps neighbours in the
+  normalized antibody space (the former `make_graph(..., dims=0)` behaviour).
+  `run_pca` no longer accepts `dims=0`
 
 ```{code-cell} ipython3
-ds.run_normalization(from_assay='ADT', feat_key='I')
-ds.run_pca(from_assay='ADT', dims=0)
+normalized_adt = ds.run_normalization(from_assay='ADT', feat_key='I')
+n_adt_features = int(ds.load_artifact(normalized_adt)['data'].shape[1])
+ds.run_custom_reduction(
+    np.eye(n_adt_features, dtype=np.float64),
+    normalized_adt,
+    from_assay='ADT',
+)
 ds.build_embedding_initialization(from_assay='ADT', n_centroids=100)
 ds.build_ann_index(from_assay='ADT')
 ds.query_neighbors(from_assay='ADT', k=21)
@@ -174,8 +181,8 @@ ds.load_graph(from_assay='ADT')
 
 ```{note}
 A PCA of 15 components over a panel of roughly 20 antibodies would discard little and cost
-an extra fit, which is why `dims=0` is the sensible default for ADT. For RNA, where
-thousands of genes are in play, reduction is what makes the neighbour search tractable.
+an extra fit, which is why an identity reduction is the sensible default for ADT. For RNA,
+where thousands of genes are in play, PCA is what makes the neighbour search tractable.
 ```
 
 UMAP and clustering take the same `from_assay` argument and write assay-prefixed columns.

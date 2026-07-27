@@ -64,6 +64,7 @@ above. Existing datastores remain readable without rebuilding their graphs.
 | Whole RNA workflow with defaults | `ds.pipeline.run(...)` |
 | `feat_key`, `cell_key`, `log_transform`, `renormalize_subset` | `run_normalization(...)` |
 | `dims`, `feat_scaling`, `pca_cell_key`, `custom_loadings`, `show_elbow_plot` | `run_pca(...)` (or `run_lsi` for ATAC) |
+| `dims=0` (use normalized features directly) | `run_custom_reduction(np.eye(n_features), normalized, ...)` |
 | `harmonize=True`, `batch_columns`, `harmony_params` | `run_harmony(batch_columns, reduction, ...)` |
 | `ann_metric`, `ann_efc`, `ann_ef`, `ann_m`, `ann_parallel` | `build_ann_index(...)` |
 | `k` | `query_neighbors(..., k=...)` |

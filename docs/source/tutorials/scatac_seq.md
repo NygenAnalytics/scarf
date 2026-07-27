@@ -72,9 +72,9 @@ writer.dump(batch_size=1000)
 +++
 
 Load the Zarr store with `DataStore`, which is the main interface for the rest of the
-analysis. On first load, Scarf calculates the number of cells in which each peak is present,
-the number of accessible peaks per cell (`nFeatures`), and the total fragments or cut sites
-per cell.
+analysis. On first load, Scarf streams the count matrix once to compute initialization
+statistics: accessible peaks per cell (`nFeatures`), total fragments or cut sites per
+cell (`nCounts`), and the per-peak cell counts used for feature filtering.
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(

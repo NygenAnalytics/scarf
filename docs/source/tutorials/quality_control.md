@@ -54,8 +54,9 @@ ds
 
 ## 1) Inspect QC distributions
 
-On open, Scarf computes columns such as `RNA_nCounts`, `RNA_nFeatures`, and mito/ribo
-fractions when gene names match the configured patterns.
+On open, Scarf streams the count matrix once to compute initialization statistics:
+columns such as `RNA_nCounts`, `RNA_nFeatures`, and mito/ribo fractions when gene
+names match the configured patterns, plus per-feature cell counts for feature filtering.
 
 ```{code-cell} ipython3
 qc_cols = [

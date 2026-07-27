@@ -55,10 +55,12 @@ neighbors = ds.query_neighbors(ann_index, k=11)
 ds.build_connectivity_map(neighbors)
 ```
 
-Use `run_lsi` for ATAC or `run_custom_reduction` for custom loadings. Replace
-Harmony flags with `run_harmony(batch_columns, reduction, ...)`, then pass its
-result to `build_ann_index` and `query_neighbors`. Build Symphony mapping
-references separately with `build_mapping_reference`.
+Use `run_lsi` for ATAC or `run_custom_reduction` for custom loadings. The old
+`dims=0` shortcut (neighbours on normalized features with no PCA) is now an
+identity custom reduction: `run_custom_reduction(np.eye(n_features), normalized)`.
+Replace Harmony flags with `run_harmony(batch_columns, reduction, ...)`, then
+pass its result to `build_ann_index` and `query_neighbors`. Build Symphony
+mapping references separately with `build_mapping_reference`.
 
 The former graph call derived `ann_efc` and `ann_ef` from `k`, and `ann_m` from
 `dims`. For equivalent settings, pass
