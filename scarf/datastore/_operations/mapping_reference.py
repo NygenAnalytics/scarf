@@ -9,6 +9,7 @@ from ...graph.encoded_paths import (
     make_normalized_group_path,
     parse_neighbor_index_group_path,
 )
+from ...graph.arguments import _positive_integer
 from ...graph.state import read_assay_state
 from ...mapping.artifact import (
     load_artifact_mapping_reference,
@@ -20,7 +21,6 @@ from ...mapping.confidence import _distance_quantile_summary
 from ...mapping.hashing import array_hash, array_store_hash
 from ...mapping.models import SymphonyReferenceModel
 from ...mapping.reference import MappingReference
-from ...mapping.symphony import weighted_centroids
 from ...storage.artifact_writer import (
     AttributeRequirement,
     finish_artifact,
@@ -35,9 +35,7 @@ from ...storage.artifacts import (
 from ...storage.types import as_zarr_array, as_zarr_group
 
 if TYPE_CHECKING:
-    from .graph_legacy_params import (
-        _GraphLegacyParamsMixin as _MappingReferenceOperationsBase,
-    )
+    from .graph import _GraphOperationsMixin as _MappingReferenceOperationsBase
 else:
     _MappingReferenceOperationsBase = object
 
@@ -211,51 +209,167 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             raise ValueError("Building a mapping reference requires a read-write store")
         if batch_columns is None:
             raise ValueError("batch_columns is required to build a mapping reference")
-        if graph_kwargs.get("feat_scaling", True) is False:
+        feat_scaling = graph_kwargs.pop("feat_scaling", True)
+        if feat_scaling is not True:
             raise ValueError(
                 "Mapping references require feat_scaling=True because query "
                 "projection uses the stored reference mean and scale."
             )
-        reduction_method = graph_kwargs.get("reduction_method", "pca")
+        reduction_method = graph_kwargs.pop("reduction_method", "pca")
         if reduction_method not in {"auto", "pca"}:
             raise ValueError("Mapping references require PCA reduction")
-        force_harmony_refit = False
-        try:
-            current = self.get_mapping_reference(from_assay, cell_key, feat_key)
-        except (KeyError, ValueError):
-            force_harmony_refit = True
-        else:
-            current_columns = [
-                str(column)
-                for column in cast(
-                    list[Any],
-                    current.metadata.get(
-                        "batch_columns",
-                        current.metadata.get("batchColumns", []),
-                    ),
-                )
-            ]
-            force_harmony_refit = (
-                current_columns != batch_columns
-                or not bool(current.metadata.get("complete", False))
-                or (
-                    "artifact_id" not in current.metadata
-                    and "artifactHash" not in current.metadata
-                )
-            )
-        graph_kwargs["reduction_method"] = "pca"
-        graph_kwargs["feat_scaling"] = True
-        plan = self._resolve_graph_plan(
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=feat_key,
-            harmonize=True,
-            batch_columns=batch_columns,
-            force_harmony_refit=force_harmony_refit,
-            **graph_kwargs,
+        supported_options = {
+            "dims",
+            "k",
+            "batch_size",
+            "local_cache",
+            "invalidate_cache",
+            "rand_state",
+            "ann_efc",
+            "ann_ef",
+            "ann_m",
+            "n_centroids",
+            "update_keys",
+            "log_transform",
+            "renormalize_subset",
+            "pca_cell_key",
+            "pca_use_cell_key",
+            "show_elbow_plot",
+            "harmony_params",
+            "ann_metric",
+            "ann_parallel",
+            "local_connectivity",
+            "bandwidth",
+        }
+        unknown_options = set(graph_kwargs).difference(supported_options)
+        if unknown_options:
+            unknown = ", ".join(sorted(unknown_options))
+            raise TypeError(f"Unsupported mapping-reference options: {unknown}")
+        assay_name = from_assay or self._defaultAssay
+        if assay_name is None:
+            raise ValueError("No assay was provided and no default is configured")
+        selected_cell_key = cell_key or "I"
+        if feat_key is None:
+            raise ValueError("feat_key is required to build a mapping reference")
+        dims = _positive_integer(graph_kwargs.pop("dims", 11), "dims")
+        k = _positive_integer(graph_kwargs.pop("k", 11), "k")
+        batch_size = graph_kwargs.pop("batch_size", None)
+        local_cache = graph_kwargs.pop("local_cache", "auto")
+        invalidate_cache = graph_kwargs.pop("invalidate_cache", False)
+        if not isinstance(invalidate_cache, bool):
+            raise TypeError("invalidate_cache must be a boolean")
+        rand_state = _positive_integer(
+            graph_kwargs.pop("rand_state", 4466),
+            "rand_state",
         )
-        self._run_resolved_graph_plan(plan)
-        reference = self.get_mapping_reference(from_assay, cell_key, feat_key)
+        ann_efc = _positive_integer(
+            graph_kwargs.pop("ann_efc", min(100, max(k * 3, 50))),
+            "ann_efc",
+        )
+        ann_ef = _positive_integer(
+            graph_kwargs.pop("ann_ef", min(100, max(k * 3, 50))),
+            "ann_ef",
+        )
+        ann_m = _positive_integer(
+            graph_kwargs.pop(
+                "ann_m",
+                min(max(48, int(dims * 1.5)), 64),
+            ),
+            "ann_m",
+        )
+        n_centroids = _positive_integer(
+            graph_kwargs.pop("n_centroids", 1000),
+            "n_centroids",
+        )
+        update_keys = graph_kwargs.pop("update_keys", True)
+        if not isinstance(update_keys, bool):
+            raise TypeError("update_keys must be a boolean")
+        normalized = self.run_normalization(
+            from_assay=assay_name,
+            cell_key=selected_cell_key,
+            feat_key=feat_key,
+            log_transform=graph_kwargs.pop("log_transform", None),
+            renormalize_subset=graph_kwargs.pop("renormalize_subset", None),
+            batch_size=batch_size,
+            update_state=False,
+            invalidate_cache=invalidate_cache,
+        )
+        reduction = self.run_pca(
+            normalized,
+            dims=dims,
+            pca_cell_key=graph_kwargs.pop(
+                "pca_cell_key",
+                graph_kwargs.pop("pca_use_cell_key", selected_cell_key),
+            ),
+            feat_scaling=True,
+            batch_size=batch_size,
+            local_cache=local_cache,
+            show_elbow_plot=bool(graph_kwargs.pop("show_elbow_plot", False)),
+            update_state=False,
+            invalidate_cache=invalidate_cache,
+        )
+        correction = self.run_harmony(
+            batch_columns,
+            reduction,
+            harmony_params=graph_kwargs.pop("harmony_params", None),
+            batch_size=batch_size,
+            update_state=False,
+            invalidate_cache=invalidate_cache,
+        )
+        ann_index = self.build_ann_index(
+            correction,
+            ann_metric=str(graph_kwargs.pop("ann_metric", "l2")),
+            ann_efc=ann_efc,
+            ann_ef=ann_ef,
+            ann_m=ann_m,
+            ann_parallel=graph_kwargs.pop("ann_parallel", False),
+            rand_state=rand_state,
+            batch_size=batch_size,
+            update_state=False,
+            invalidate_cache=invalidate_cache,
+        )
+        initialization = self._build_embedding_initialization(
+            reduction,
+            n_centroids=n_centroids,
+            rand_state=rand_state,
+            batch_size=batch_size,
+            invalidate_cache=invalidate_cache,
+        )
+        neighbors = self.query_neighbors(
+            ann_index,
+            coordinates=correction,
+            k=k,
+            batch_size=batch_size,
+            update_state=False,
+            invalidate_cache=invalidate_cache,
+        )
+        connectivity = self.build_connectivity_map(
+            neighbors,
+            local_connectivity=graph_kwargs.pop("local_connectivity", 1.0),
+            bandwidth=graph_kwargs.pop("bandwidth", 1.5),
+            update_state=False,
+            invalidate_cache=invalidate_cache,
+        )
+        reference_ref = self._build_mapping_reference_artifact(
+            reduction=reduction,
+            batch_correction=correction,
+            ann_index=ann_index,
+            neighbors=neighbors,
+            invalidate_cache=invalidate_cache,
+        )
+        self._publish_current_artifact(
+            connectivity,
+            update_state=update_keys,
+            embedding_initialization=initialization,
+            named_results={"mapping_reference": reference_ref},
+        )
+        reference = load_artifact_mapping_reference(
+            self,
+            reference_ref,
+            assay_name,
+            selected_cell_key,
+            feat_key,
+        )
         if not bool(reference.metadata.get("complete", False)):
             raise RuntimeError(
                 "Mapping reference build did not produce a complete artifact"
@@ -379,18 +493,17 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
         )
         if planned.reused:
             return planned.ref
-        reduction_parameters = reduction_status.parameters or {}
-        batch_size = int(reduction_parameters.get("batch_size", 1000))
-        transform, stream = self._load_reduction_stream(
-            reduction,
-            batch_size=batch_size,
+        reduction_group = as_zarr_group(
+            self.zw[reduction_status.path],
+            name=reduction_status.path,
         )
-        if transform.loadings is None:
+        if "loadings" not in reduction_group:
             raise RuntimeError("Mapping reference requires persisted PCA loadings")
-        original = np.vstack(
-            stream.parallel_blocks(
-                "Loading reference coordinates",
-            )
+        loadings = np.asarray(
+            as_zarr_array(
+                reduction_group["loadings"],
+                name="loadings",
+            )[:]
         )
         correction_status = self._require_complete_artifact(
             batch_correction,
@@ -400,27 +513,23 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             self.zw[correction_status.path],
             name=correction_status.path,
         )
-        corrected = np.asarray(as_zarr_array(correction_group["data"], name="data")[:])
-        assignments = np.asarray(
+        cluster_mass = np.asarray(
             as_zarr_array(
-                correction_group["assignments"],
-                name="assignments",
+                correction_group["cluster_mass"],
+                name="cluster_mass",
             )[:]
         )
-        cluster_mass, raw_centroids = weighted_centroids(
-            original,
-            assignments,
+        raw_centroids = np.asarray(
+            as_zarr_array(
+                correction_group["raw_centroids"],
+                name="raw_centroids",
+            )[:]
         )
-        _, corrected_centroids = weighted_centroids(
-            corrected,
-            assignments,
-        )
-        ridge = np.asarray(as_zarr_array(correction_group["ridge"], name="ridge")[:])
-        ridge_values = np.diag(ridge)[1:]
-        correction_ridge = (
-            float(np.mean(ridge_values[ridge_values > 0]))
-            if np.any(ridge_values > 0)
-            else 1.0
+        corrected_centroids = np.asarray(
+            as_zarr_array(
+                correction_group["corrected_centroids"],
+                name="corrected_centroids",
+            )[:]
         )
         scaling = self._artifact_input_ref(
             reduction,
@@ -435,7 +544,7 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             feature_scales=np.asarray(
                 as_zarr_array(scaling_group["scale"], name="scale")[:]
             ),
-            loadings=transform.loadings,
+            loadings=loadings,
             centroids=np.asarray(
                 as_zarr_array(
                     correction_group["centroids"],
@@ -451,7 +560,7 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
                     name="sigma",
                 )[:]
             ),
-            correction_ridge=correction_ridge,
+            correction_ridge=1.0,
         )
         normalized_execution = (
             inspect_artifact(self.zw, normalized).execution_options or {}

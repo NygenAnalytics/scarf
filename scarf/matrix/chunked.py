@@ -97,7 +97,13 @@ class ChunkedArray:
     def dtype(self) -> np.dtype[Any]:
         if not self._ops:
             return self._backing.dtype
-        return np.dtype(np.float64)
+        base_columns = (
+            int(self._backing.shape[1]) if self._cols is None else int(self._cols.size)
+        )
+        sample = np.empty((0, base_columns), dtype=self._backing.dtype)
+        for operation in self._ops:
+            sample = operation.apply(sample, 0, 0)
+        return sample.dtype
 
     @property
     def chunksize(self) -> tuple[int, int]:
@@ -223,6 +229,21 @@ class ChunkedArray:
         prefetch: int | None = None,
     ) -> Iterator[np.ndarray]:
         """Yield materialized row blocks with bounded read-ahead."""
+        yield from self._stream_blocks(
+            nthreads=nthreads,
+            msg=msg,
+            prefetch=prefetch,
+            row_mask=None,
+        )
+
+    def _stream_blocks(
+        self,
+        *,
+        nthreads: int | None,
+        msg: str | None,
+        prefetch: int | None,
+        row_mask: np.ndarray | None,
+    ) -> Iterator[np.ndarray]:
         from ..storage.budget import READ_AHEAD
         from ..storage.parallel import stream_shards
 
@@ -241,9 +262,24 @@ class ChunkedArray:
             )
         within = max(1, threads // depth)
         ranges = self._ranges()
+        mask = None if row_mask is None else np.asarray(row_mask)
+        if mask is not None:
+            if mask.dtype != bool or mask.shape != (self._n_rows,):
+                raise ValueError(
+                    "row_mask must be a boolean vector matching array rows"
+                )
+            ranges = [
+                (start, end) for start, end in ranges if bool(mask[start:end].any())
+            ]
+
+        def materialize(interval: tuple[int, int]) -> np.ndarray:
+            start, end = interval
+            values = self._materialize_range(start, end)
+            return values if mask is None else values[mask[start:end]]
+
         yield from stream_shards(
             ranges,
-            lambda interval: self._materialize_range(interval[0], interval[1]),
+            materialize,
             workers=depth,
             within_block_threads=within,
             msg=msg,
@@ -497,10 +533,18 @@ class ChunkedArray:
             if op == "sum":
                 return np.asarray(array.sum(axis=axis))
             if op == "mean":
-                return np.asarray(array.mean(axis=axis))
+                return np.asarray(
+                    array.sum() if axis is None else array.mean(axis=axis)
+                )
             if op == "var":
+                if axis is None:
+                    values = array.astype(np.float64, copy=False)
+                    return np.asarray([values.sum(), np.square(values).sum()])
                 return np.asarray(array.var(axis=axis))
             if op == "std":
+                if axis is None:
+                    values = array.astype(np.float64, copy=False)
+                    return np.asarray([values.sum(), np.square(values).sum()])
                 return np.asarray(array.std(axis=axis))
             if op == "count_nonzero":
                 return np.asarray(np.count_nonzero(array, axis=axis))
@@ -514,7 +558,17 @@ class ChunkedArray:
             if op == "sum":
                 return np.asarray(array.sum())
             if op == "mean":
-                return np.asarray(array.mean())
+                return np.asarray(array.sum() / (self._n_rows * self._out_cols))
+            if op in ("var", "std"):
+                total, squared_total = np.sum(parts, axis=0)
+                count = self._n_rows * self._out_cols
+                mean = total / count
+                variance = squared_total / count - np.square(mean)
+                if op == "std":
+                    return np.asarray(np.sqrt(max(float(variance), 0.0)))
+                return np.asarray(variance)
+            if op == "count_nonzero":
+                return np.asarray(array.sum())
             raise ValueError(f"Reduction {op} with axis=None is not supported")
         return np.concatenate(parts)
 

@@ -38,6 +38,52 @@ removed; construct `AssayMerge` directly.
 Filtering still marks cells inactive via boolean cell keys (default `I`) rather than
 deleting rows. Custom keys remain the supported way to subset for reclustering and mapping.
 
+## Graph construction
+
+`DataStore.make_graph` has been removed. Existing datastores remain readable,
+including stores written before artifact-backed graph stages.
+
+Use `ds.pipeline.run(...)` for a standard workflow. For direct control, replace
+one graph call with an explicit artifact chain:
+
+```python
+normalized = ds.run_normalization(feat_key="hvgs")
+reduction = ds.run_pca(normalized, dims=15)
+ann_index = ds.build_ann_index(reduction)
+ds.build_embedding_initialization(reduction, n_centroids=100)
+neighbors = ds.query_neighbors(ann_index, k=11)
+ds.build_connectivity_map(neighbors)
+```
+
+Use `run_lsi` for ATAC or `run_custom_reduction` for custom loadings. Replace
+Harmony flags with `run_harmony(batch_columns, reduction, ...)`, then pass its
+result to `build_ann_index` and `query_neighbors`. Build Symphony mapping
+references separately with `build_mapping_reference`.
+
+The former graph call derived `ann_efc` and `ann_ef` from `k`, and `ann_m` from
+`dims`. For equivalent settings, pass
+`ann_efc=ann_ef=min(100, max(k * 3, 50))` and
+`ann_m=min(max(48, int(dims * 1.5)), 64)` to `build_ann_index`.
+`local_cache` remains available on reduction methods. It has been removed from
+normalization, `run_harmony`, `build_ann_index`, and `query_neighbors` because
+only reductions reread normalized expression.
+
+Custom ANN fetcher and saver callbacks were removed because ANN payloads are
+stored inside their artifacts. New ANN payloads include metric, dimension,
+element-count, and digest checks. Metadata-free ANN payloads from existing
+stores remain readable.
+
+`build_connectivity_map` no longer accepts `batch_size`; connectivity is built
+in memory and written once. New L2 neighbor artifacts store Euclidean
+distances, rather than the squared values returned by HNSW. Inner-product ANN
+is no longer accepted for graph construction because it can produce negative
+values that are invalid for connectivity kernels. Existing graph artifacts
+remain readable.
+
+The neighbor artifact attribute formerly named `recall` measured only whether
+the ANN query returned each cell itself. New artifacts store that diagnostic as
+`self_hit_rate`.
+
 ## Paris clustering
 
 Use `run_paris_clustering` for Paris clustering. Its default
@@ -210,9 +256,7 @@ focused paths:
 - `scarf.ann.AnnStream` moved to `scarf.neighbors.stream.AnnStream`.
 - `scarf.ann.fix_knn_query` and `instantiate_knn_index` moved to
   `scarf.neighbors.index`.
-- `scarf.ann.EMBEDDING_CACHE_MAX_BYTES` and
-  `scarf.datastore.graph_datastore.EMBEDDING_CACHE_MAX_BYTES` moved to
-  `scarf.datastore._operations.graph.EMBEDDING_CACHE_MAX_BYTES`.
+- `EMBEDDING_CACHE_MAX_BYTES` was removed with the cross-stage embedding cache.
 - Graph merging functions from `scarf.knn_utils` moved to
   `scarf.neighbors.graph`.
 - `scarf.knn_utils._is_umap_version_new` moved to
@@ -221,8 +265,8 @@ focused paths:
   `scarf.neighbors.integration.wnn_integration`.
 - `scarf.knn_utils.run_sgtsne` and `export_knn_to_mtx` moved to
   `scarf.embeddings.sgtsne`.
-- `scarf.knn_utils.self_query_knn` and `smoothen_dists` moved to
-  `scarf.neighbors.graph_store`; `scarf.knn_utils` was removed.
+- `self_query_knn` and `smoothen_dists` were removed. Connectivity construction
+  now lives in `scarf.neighbors.graph`; `scarf.knn_utils` was removed.
 - `scarf.umap` implementations moved to `scarf.embeddings.umap`.
 - `scarf.dendrogram.BalancedCut` moved to
   `scarf.clustering.balanced_cut`. Cluster-tree helpers moved to

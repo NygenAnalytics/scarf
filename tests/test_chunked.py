@@ -56,7 +56,15 @@ class TestChunkedArrayParity:
 
     def test_boolean_comparison_reduction(self, backed_pair):
         ca, dense = backed_pair
+        assert (ca > 0).dtype == np.dtype(bool)
         assert np.array_equal((ca > 0).sum(axis=0).compute(), (dense > 0).sum(0))
+
+    def test_scalar_reductions_weight_the_short_final_block(self, backed_pair):
+        ca, dense = backed_pair
+        assert np.allclose(ca.mean().compute(), dense.mean())
+        assert np.allclose(ca.var().compute(), dense.var())
+        assert np.allclose(ca.std().compute(), dense.std())
+        assert ca.count_nonzero().compute() == np.count_nonzero(dense)
 
     def test_fancy_subset(self, backed_pair):
         ca, dense = backed_pair

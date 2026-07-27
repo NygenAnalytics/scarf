@@ -53,11 +53,9 @@ class AnnStream:
         harmonize: bool,
         harmonized_data: ChunkedArray | None = None,
         batches: pd.DataFrame | None = None,
-        cache_embeddings: bool = True,
         harmony_params: dict[str, Any] | None = None,
     ) -> None:
         self.data = data
-        self._embeddings: np.ndarray | None = None
         self.k = min(k, self.data.shape[0] - 1)
         self.nClusters = max(n_cluster, 2)
         self.dims = dims
@@ -115,12 +113,12 @@ class AnnStream:
                 nthreads=self.nthreads,
                 batch_size=self.batchSize,
             )
-            if cache_embeddings:
-                self._maybe_build_embeddings()
-
             self.batch_correction = (
                 BatchCorrectionStage(
                     stream=self.transform_stream,
+                    n_cells=self.nCells,
+                    dims=int(self.dims or self.nFeats),
+                    batch_size=self.batchSize,
                     batches=self.batches,
                     parameters=self.harmonyParams,
                     corrected_data=self.harmonizedData,
@@ -137,29 +135,19 @@ class AnnStream:
                     ef=self.annEf,
                     threads=self.annThreads,
                 )
-            self.neighbor_query = NeighborQueryStage(self.annIdx, self.k)
+            self.neighbor_query = NeighborQueryStage(
+                self.annIdx,
+                self.k,
+                self.annMetric,
+            )
             self._sync_batch_correction()
             self.kmeans = self._fit_kmeans(do_kmeans_fit)
-
-    @property
-    def embeddings(self) -> np.ndarray | None:
-        return self._embeddings
 
     def _sync_batch_correction(self) -> None:
         if self.batch_correction is None:
             return
         self.harmonizedData = self.batch_correction.corrected_data
         self.harmonyResult = self.batch_correction.result
-
-    def _reduced_blocks(self, msg: str) -> list[np.ndarray]:
-        return self.transform_stream.parallel_blocks(msg)
-
-    def _maybe_build_embeddings(self) -> None:
-        if self.harmonize:
-            return
-        self._embeddings = self.transform_stream.cache(
-            "Building cell embeddings",
-        )
 
     def iter_blocks(self, msg: str = "") -> Generator[np.ndarray, None, None]:
         yield from self.transform_stream.iter_raw(msg)
@@ -223,6 +211,8 @@ class AnnStream:
     def _fit_kmeans(self, enabled: bool) -> Any | None:
         result = KMeansInitializationStage.fit(
             stream=self.transform_stream,
+            n_rows=self.nCells,
+            batch_size=self.batchSize,
             n_clusters=self.nClusters,
             rand_state=self.randState,
             nthreads=self.nthreads,

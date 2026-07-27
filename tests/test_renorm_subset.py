@@ -125,9 +125,13 @@ def test_save_normalized_data_without_renorm_still_uses_normed(
 
 
 def test_save_normalized_data_renorm_cache_hit(toy_crdir_ds, monkeypatch):
+    from scarf.storage.materialize import (
+        write_renorm_subset_to_zarr as materialize_renorm_subset,
+    )
+
     rna = toy_crdir_ds.RNA
     called = {"fused": 0}
-    orig_fused = write_renorm_subset_to_zarr
+    orig_fused = materialize_renorm_subset
 
     def counting_fused(*args, **kwargs):
         called["fused"] += 1

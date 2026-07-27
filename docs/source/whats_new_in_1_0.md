@@ -28,7 +28,7 @@ datasets.download_dataset("tenx_5K_pbmc_rnaseq", destination="scarf_datasets")
 
 ## Graph construction
 
-`make_graph` is **deprecated**. Prefer the standard recipe or atomic steps:
+`make_graph` has been removed. Use the standard recipe or atomic steps:
 
 ```python
 # Before
@@ -56,8 +56,7 @@ ds.query_neighbors(k=11)
 ds.build_connectivity_map()
 ```
 
-`make_graph` still works for one major cycle and emits `DeprecationWarning`.
-Deprecation warnings are no longer globally suppressed.
+Datastores containing graphs written by earlier releases remain readable.
 
 See {doc}`concepts/graph_and_state` and
 {doc}`tutorials/atomic_graph_operations`.

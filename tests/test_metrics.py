@@ -328,7 +328,7 @@ def test_graph_connectivity_validates_inputs():
         )
 
 
-def test_metric_lisi_single_category_is_one(datastore, make_graph):
+def test_metric_lisi_single_category_is_one(datastore, graph_artifacts):
     labels = np.zeros(datastore.cells.N, dtype=np.int8)
     datastore.cells.insert(
         column_name="single_batch",
@@ -467,7 +467,7 @@ def test_top_k_distances_reject_unsupported_metric():
         )
 
 
-def test_metric_silhouette(datastore, make_graph, leiden_clustering):
+def test_metric_silhouette(datastore, graph_artifacts, leiden_clustering):
     scores = datastore.metric_graph_silhouette(random_seed=42)
     scores_from_full_label = datastore.metric_graph_silhouette(
         res_label="RNA_leiden_cluster",
@@ -566,7 +566,7 @@ def test_lisi_batch_mixing_score():
     assert lisi_batch_mixing_score(np.full(4, 2.0), labels) == pytest.approx(1)
 
 
-def test_metric_label_concordance(datastore, make_graph, leiden_clustering):
+def test_metric_label_concordance(datastore, graph_artifacts, leiden_clustering):
     rng = np.random.default_rng(42)
     labels1 = rng.integers(0, 2, datastore.cells.N)
     labels2 = labels1.copy()
@@ -604,7 +604,7 @@ def test_metric_label_concordance(datastore, make_graph, leiden_clustering):
     assert 0 <= mixing_score <= 1
 
 
-def test_datastore_scib_metrics(datastore, make_graph, leiden_clustering):
+def test_datastore_scib_metrics(datastore, graph_artifacts, leiden_clustering):
     label_colname = "RNA_leiden_cluster"
 
     ilisi = datastore.metric_ilisi(label_colname)

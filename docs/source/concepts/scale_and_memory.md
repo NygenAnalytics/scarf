@@ -66,8 +66,9 @@ New stores use Zarr v3. Choose a storage profile with `zarrProfile=` or
 At 100k cells, the same countsT funnel took about **421 s** on ephemeral local
 disk versus about **735 s** on a reorganized R2 store (~1.75× remote overhead).
 Remote analysis is still practical; expect IO wait, especially on gene-wise
-stages, and prefer `zarrProfile="cloud"` plus `local_cache` for multi-pass graph
-steps. See {doc}`../tutorials/remote_stores`.
+stages, and prefer `zarrProfile="cloud"` plus `local_cache` for multi-pass
+reduction. Downstream graph stages read persisted reduced coordinates. See
+{doc}`../tutorials/remote_stores`.
 
 ## Practical sizing
 

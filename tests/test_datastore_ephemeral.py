@@ -3,7 +3,7 @@ import pytest
 
 from scarf import ArtifactRef
 from scarf.storage.artifacts import parse_artifact_path
-from tests.fixtures_datastore import _has_graph
+from tests.fixtures_datastore import _has_graph, build_atomic_graph
 
 pytestmark = pytest.mark.slow
 
@@ -112,7 +112,7 @@ def test_mapping_projection_reuses_and_explicitly_invalidates(
 def test_run_mapping_supports_all_features_key(datastore_ephemeral):
     ds = datastore_ephemeral
     ds.auto_filter_cells(show_qc_plots=False)
-    ds.make_graph(feat_key="I", dims=5, k=3, n_centroids=10)
+    build_atomic_graph(ds, feat_key="I", dims=5, k=3, n_centroids=10)
 
     ds.run_mapping(
         target_assay=ds.RNA,
@@ -228,11 +228,6 @@ def test_build_and_reload_symphony_mapping_reference(
     correction_parameters = ds.inspect_artifact(state.batch_correction).parameters
     assert correction_parameters is not None
     assert correction_parameters["harmony_parameters"]["nclust"] == 5
-    ds.make_graph(
-        feat_key="hvgs",
-        harmonize=None,
-        batch_columns=None,
-    )
     assert ds.get_assay_state("RNA") == state
     loaded = ds.get_mapping_reference(feat_key="hvgs")
     with pytest.raises(ValueError, match="matches the reference path"):
@@ -249,6 +244,15 @@ def test_build_and_reload_symphony_mapping_reference(
         save_k=3,
         query_batches=pd.DataFrame({"mapping_batch": active_batches}),
     )
+    del ds.RNA.z["normed__I__hvgs_symphony_self"]
+    reused = loaded.map_query(
+        ds.RNA,
+        "symphony_self",
+        "hvgs_symphony_self",
+        save_k=3,
+        query_batches=pd.DataFrame({"mapping_batch": active_batches}),
+    )
+    assert reused.projection_path == result.projection_path
 
     assert reference.model.n_dims == loaded.model.n_dims
     assert reference.metadata["harmony_parameters"]["nclust"] == 5
@@ -467,8 +471,18 @@ def test_cached_harmony_can_rebuild_missing_mapping_artifact(
     )
     state = ds.get_assay_state("RNA")
     assert state is not None
+    first_harmony = state.batch_correction
     first_ref = state.named_results["mapping_reference"]
     artifact = ds.zw[ds.inspect_artifact(first_ref).path]
+    for name in (
+        "reference_distance_quantiles",
+        "reference_distance_values",
+    ):
+        values = artifact[name][:]
+        del artifact[name]
+        with pytest.raises(ValueError, match="missing required arrays"):
+            ds.get_mapping_reference(feat_key="hvgs")
+        artifact.create_array(name, data=values)
     del artifact["sigma"]
     with pytest.raises(ValueError, match="missing required arrays"):
         ds.get_mapping_reference(feat_key="hvgs")
@@ -481,7 +495,29 @@ def test_cached_harmony_can_rebuild_missing_mapping_artifact(
     assert rebuilt.metadata["complete"]
     rebuilt_state = ds.get_assay_state("RNA")
     assert rebuilt_state is not None
+    assert rebuilt_state.batch_correction == first_harmony
     assert rebuilt_state.named_results["mapping_reference"] != first_ref
+
+
+def test_mapping_reference_update_keys_false_returns_detached_reference(
+    analyzed_datastore_ephemeral,
+):
+    ds = analyzed_datastore_ephemeral
+    _ensure_graph(ds)
+    batches = np.where(np.arange(ds.cells.N) % 2 == 0, "a", "b")
+    ds.cells.insert("detached_mapping_batch", batches, overwrite=True)
+    initial_state = ds.get_assay_state("RNA")
+
+    reference = ds.build_mapping_reference(
+        feat_key="hvgs",
+        batch_columns=["detached_mapping_batch"],
+        k=3,
+        n_centroids=10,
+        update_keys=False,
+    )
+
+    assert reference.metadata["complete"]
+    assert ds.get_assay_state("RNA") == initial_state
 
 
 def test_mapping_reference_rebuilds_after_missing_artifact(
@@ -604,7 +640,8 @@ def test_mapping_reference_rebuilds_unscaled_state_with_pca_scaling(
 ) -> None:
     ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
-    ds.make_graph(
+    build_atomic_graph(
+        ds,
         feat_key="hvgs",
         feat_scaling=False,
         dims=5,
@@ -672,7 +709,8 @@ def test_projection_uses_stored_feature_key_and_rejects_stale_provenance(
         save_k=3,
     )
     projection = _projection_group(ds, "provenance_map")
-    ds.make_graph(
+    build_atomic_graph(
+        ds,
         feat_key="I",
         dims=5,
         k=3,
@@ -812,13 +850,35 @@ def test_mapping_missing_feature_policies_and_legacy_intersection(
     assert result.diagnostics["featureCoverage"] == pytest.approx(
         len(shared_ids) / len(reference.feature_ids)
     )
-    mean_aligned = mapped.assay2.z["normed__I__missing_reference_mean_target/data"][:]
+    mean_loaded = mapped.get_mapping_result(
+        "missing_reference_mean",
+        load_arrays=True,
+    )
+    zero_result = reference.map_query(
+        mapped.assay2,
+        "missing_reference_zero",
+        "missing_reference_zero_target",
+        save_k=3,
+        missing_feature_policy="zero",
+    )
+    assert zero_result.n_cells == mapped.cells.active_index("I").shape[0]
+    zero_loaded = mapped.get_mapping_result(
+        "missing_reference_zero",
+        load_arrays=True,
+    )
+    assert mean_loaded.uncorrected_latent is not None
+    assert zero_loaded.uncorrected_latent is not None
+    missing = slice(len(shared_ids), len(reference.feature_ids))
+    expected_shift = (
+        -reference.model.feature_means[missing]
+        / reference.model.feature_scales[missing]
+    ) @ reference.model.loadings[missing]
     np.testing.assert_allclose(
-        mean_aligned[:, len(shared_ids) :],
+        zero_loaded.uncorrected_latent - mean_loaded.uncorrected_latent,
         np.broadcast_to(
-            reference.model.feature_means[np.newaxis, len(shared_ids) :],
-            mean_aligned[:, len(shared_ids) :].shape,
+            expected_shift,
+            mean_loaded.uncorrected_latent.shape,
         ),
-        rtol=0,
-        atol=0,
+        rtol=1e-6,
+        atol=1e-6,
     )

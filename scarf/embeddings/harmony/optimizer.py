@@ -28,9 +28,10 @@ class Harmony:
         random_state: int | None = None,
         cluster_fn: ClusterFn = "kmeans",
     ) -> None:
-        self.Z_corr = np.array(Z)
-        self.Z_orig = np.array(Z)
+        self.Z_orig = np.array(Z, dtype=np.float64, copy=True)
+        self.Z_corr = np.array(self.Z_orig, copy=True)
         self.Z_cos = _normalize_columns(self.Z_orig)
+        self._rng = np.random.RandomState(random_state)
 
         self.Phi = Phi
         self.Phi_moe = Phi_moe
@@ -143,6 +144,8 @@ class Harmony:
             converged = self.check_convergence(1)
             if converged:
                 break
+        self.Y = _normalize_columns(np.dot(self.Z_cos, self.R.T))
+        self.dist_mat = 2 * (1 - np.dot(self.Y.T, self.Z_cos))
         if not converged:
             logger.warning("Stopped before convergence")
         return 0
@@ -166,8 +169,7 @@ class Harmony:
         self._scale_dist = self._scale_dist / self.sigma[:, None]
         self._scale_dist -= np.max(self._scale_dist, axis=0)
         self._scale_dist = np.exp(self._scale_dist)
-        update_order = np.arange(self.N)
-        np.random.shuffle(update_order)
+        update_order = self._rng.permutation(self.N)
         n_blocks = np.ceil(1 / self.block_size).astype(int)
         blocks = np.array_split(update_order, n_blocks)
         for block in blocks:

@@ -17,6 +17,7 @@ from scarf.storage.stores import (
     is_remote_datastore,
     resolve_matrix_source,
 )
+from tests.fixtures_datastore import build_atomic_graph
 from scarf.writers import (
     create_cell_data,
     create_zarr_count_assay,
@@ -509,7 +510,14 @@ def test_mounted_store_normalization_and_graph(tmp_path):
     feature_mask = np.zeros(ds.RNA.feats.N, dtype=bool)
     feature_mask[:12] = True
     ds.RNA.feats.insert("I__hvgs", feature_mask, overwrite=True)
-    ds.make_graph(feat_key="hvgs", k=3, dims=3, batch_size=25, local_cache=False)
+    build_atomic_graph(
+        ds,
+        feat_key="hvgs",
+        k=3,
+        dims=3,
+        batch_size=25,
+        local_cache=False,
+    )
     state = ds.get_assay_state("RNA")
     assert state is not None
     assert state.connectivity_map is not None

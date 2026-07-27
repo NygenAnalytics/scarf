@@ -39,12 +39,11 @@ def _ann_stream() -> AnnStream:
 def test_transform_query_matches_existing_reference_reducer():
     ann = _ann_stream()
     query = np.array([[1.5, 0.0], [0.0, 1.5]], dtype=np.float64)
-    reference_embeddings = ann.embeddings.copy()
 
     assert not hasattr(ann, "annPath")
     assert not hasattr(ann, "_embedding_bytes")
+    assert not hasattr(ann, "embeddings")
     np.testing.assert_array_equal(ann.transform_query(query), ann.reducer(query))
-    np.testing.assert_array_equal(ann.embeddings, reference_embeddings)
 
 
 def test_transform_query_validates_feature_shape_and_finite_results():

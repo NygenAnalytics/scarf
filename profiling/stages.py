@@ -485,6 +485,57 @@ def run_stage(
     )
 
 
+def _build_profile_graph(
+    store: DataStore,
+    workflow: WorkflowParameters,
+    *,
+    harmonize: bool,
+) -> None:
+    normalized = store.run_normalization(
+        from_assay=workflow.assayName,
+        cell_key=workflow.cellKey,
+        feat_key=workflow.hvgKey,
+        update_state=False,
+    )
+    reduction = store.run_pca(
+        normalized,
+        dims=workflow.dims,
+        local_cache=workflow.graphLocalCache,
+        show_elbow_plot=False,
+        update_state=False,
+    )
+    coordinates = (
+        store.run_harmony(
+            [workflow.harmonyBatchColumn],
+            reduction,
+            update_state=False,
+        )
+        if harmonize
+        else reduction
+    )
+    ann_index = store.build_ann_index(
+        coordinates,
+        ann_efc=min(100, max(workflow.k * 3, 50)),
+        ann_ef=min(100, max(workflow.k * 3, 50)),
+        ann_m=min(max(48, int(workflow.dims * 1.5)), 64),
+        ann_parallel=workflow.annParallel,
+        rand_state=workflow.graphSeed,
+        update_state=False,
+    )
+    store.build_embedding_initialization(
+        reduction,
+        n_centroids=workflow.nCentroids,
+        rand_state=workflow.graphSeed,
+    )
+    neighbors = store.query_neighbors(
+        ann_index,
+        coordinates=coordinates,
+        k=workflow.k,
+        update_state=False,
+    )
+    store.build_connectivity_map(neighbors, update_state=True)
+
+
 def _run_analysis(
     stage: StageName,
     store: DataStore,
@@ -512,18 +563,7 @@ def _run_analysis(
         )
         return
     if stage == "makeGraph":
-        store.make_graph(
-            from_assay=workflow.assayName,
-            cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
-            dims=workflow.dims,
-            k=workflow.k,
-            ann_parallel=workflow.annParallel,
-            rand_state=workflow.graphSeed,
-            n_centroids=workflow.nCentroids,
-            show_elbow_plot=False,
-            local_cache=workflow.graphLocalCache,
-        )
+        _build_profile_graph(store, workflow, harmonize=False)
         return
     if stage == "runUmap":
         store.run_umap(
@@ -578,20 +618,7 @@ def _run_analysis(
         return
     if stage == "makeGraphHarmony":
         _insert_synthetic_batches(store, workflow)
-        store.make_graph(
-            from_assay=workflow.assayName,
-            cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
-            dims=workflow.dims,
-            k=workflow.k,
-            ann_parallel=workflow.annParallel,
-            rand_state=workflow.graphSeed,
-            n_centroids=workflow.nCentroids,
-            show_elbow_plot=False,
-            local_cache=workflow.graphLocalCache,
-            harmonize=True,
-            batch_columns=[workflow.harmonyBatchColumn],
-        )
+        _build_profile_graph(store, workflow, harmonize=True)
         return
     if stage == "subsetZarr":
         if workDir is None:

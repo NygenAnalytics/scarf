@@ -1,5 +1,4 @@
 import re
-import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -83,23 +82,10 @@ def validate_legacy_graph_selection(
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("Legacy graph selection columns cannot be validated") from exc
     if stored_hash is None:
-        if "data" not in normalized_group:
-            raise ValueError("Legacy graph selection provenance is missing")
-        normalized_data = as_zarr_array(
-            normalized_group["data"],
-            name=f"{normalized_path}/data",
+        raise ValueError(
+            "Legacy graph selection provenance is missing, so it cannot be "
+            "selected safely"
         )
-        if normalized_data.shape != (len(cell_indices), len(feature_indices)):
-            raise ValueError(
-                "Legacy graph dimensions do not match the current selection"
-            )
-        warnings.warn(
-            "Legacy graph predates exact selection provenance; validation is "
-            "limited to cell and feature counts.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return
     if isinstance(stored_hash, str):
         current_hash: str | int = assay._create_subset_hash(
             cell_indices,

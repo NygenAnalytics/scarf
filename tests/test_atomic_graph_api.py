@@ -1,7 +1,9 @@
 import numpy as np
+import pandas as pd
 import pytest
 
 from scarf.datastore._operations import graph as graph_operations
+from scarf.embeddings.harmony import fit_harmony
 from scarf.graph.state import stored_assay_graph_from_ref
 from scarf.storage.artifacts import ArtifactRef, artifact_path
 from tests import full_path
@@ -35,11 +37,89 @@ def test_atomic_graph_methods_chain_refs_and_publish_current_results(
     pca = datastore.run_pca(normalized, dims=5, batch_size=100)
     ann = datastore.build_ann_index(pca, batch_size=100)
     neighbors = datastore.query_neighbors(ann, k=3, batch_size=100)
-    graph = datastore.build_connectivity_map(neighbors, batch_size=100)
+    graph = datastore.build_connectivity_map(neighbors)
 
     assert all(
         isinstance(ref, ArtifactRef) for ref in (normalized, pca, ann, neighbors, graph)
     )
+    normalized_group = datastore.zw[artifact_path(normalized)]
+    assert normalized_group["feature_sum"].dtype == np.dtype(np.float64)
+    assert normalized_group["feature_squared_sum"].dtype == np.dtype(np.float64)
+    normalized_values = normalized_group["data"][:]
+    np.testing.assert_allclose(
+        normalized_group["feature_sum"][:],
+        normalized_values.sum(axis=0, dtype=np.float64),
+        rtol=1e-6,
+    )
+    np.testing.assert_allclose(
+        normalized_group["feature_squared_sum"][:],
+        np.square(normalized_values, dtype=np.float64).sum(axis=0),
+        rtol=1e-6,
+    )
+    reduction_group = datastore.zw[artifact_path(pca)]
+    assert reduction_group["loadings"].dtype == np.dtype(np.float64)
+    assert reduction_group["data"].dtype == np.dtype(np.float32)
+    assert reduction_group["data"].shape == (
+        int(datastore.cells.fetch_all("I").sum()),
+        5,
+    )
+    stored_scores = reduction_group["data"][:]
+    _, legacy_projection = datastore._load_reduction_stream(
+        pca,
+        batch_size=100,
+    )
+    legacy_scores = np.concatenate(
+        tuple(legacy_projection.iter_coordinate_blocks("")),
+        axis=0,
+    )
+    np.testing.assert_allclose(
+        stored_scores,
+        legacy_scores,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    reduction_inputs = datastore.inspect_artifact(pca).inputs
+    assert reduction_inputs is not None
+    scaling = ArtifactRef.from_dict(reduction_inputs["feature_scaling"])
+    scaling_group = datastore.load_artifact(scaling)
+    assert scaling_group["mean"].dtype == np.dtype(np.float64)
+    assert scaling_group["scale"].dtype == np.dtype(np.float64)
+    neighbors_group = datastore.zw[artifact_path(neighbors)]
+    assert neighbors_group["indices"].dtype == np.dtype(np.uint32)
+    assert neighbors_group["distances"].dtype == np.dtype(np.float32)
+    squared_distances = np.square(
+        stored_scores[:, np.newaxis, :] - stored_scores[np.newaxis, :, :],
+        dtype=np.float64,
+    ).sum(axis=2)
+    np.fill_diagonal(squared_distances, np.inf)
+    exact_neighbors = np.argpartition(squared_distances, kth=2, axis=1)[:, :3]
+    approximate_neighbors = neighbors_group["indices"][:]
+    expected_neighbor_distances = np.sqrt(
+        squared_distances[
+            np.arange(len(stored_scores))[:, np.newaxis],
+            approximate_neighbors,
+        ]
+    )
+    np.testing.assert_allclose(
+        neighbors_group["distances"][:],
+        expected_neighbor_distances,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    recall = np.mean(
+        [
+            len(set(exact) & set(approximate)) / 3
+            for exact, approximate in zip(
+                exact_neighbors,
+                approximate_neighbors,
+                strict=True,
+            )
+        ]
+    )
+    assert recall >= 0.95
+    graph_group = datastore.zw[artifact_path(graph)]
+    assert graph_group["edges"].dtype == np.dtype(np.uint32)
+    assert graph_group["weights"].dtype == np.dtype(np.float32)
     state = datastore.get_assay_state("RNA")
     assert state is not None
     assert state.normalized == normalized
@@ -50,6 +130,78 @@ def test_atomic_graph_methods_chain_refs_and_publish_current_results(
     loaded = datastore.load_graph(graph_loc=artifact_path(graph))
     assert loaded.shape[0] == int(datastore.cells.fetch_all("I").sum())
     assert np.isfinite(loaded.data).all()
+
+
+@pytest.mark.parametrize("dims", [0, -1, 1.5, True])
+def test_reduction_rejects_invalid_dimensions(datastore_ephemeral, dims) -> None:
+    datastore = datastore_ephemeral
+    _prepare_atomic_features(datastore)
+    normalized = datastore.run_normalization(
+        from_assay="RNA",
+        feat_key="atomic_hvgs",
+    )
+
+    with pytest.raises((TypeError, ValueError), match="dims"):
+        datastore.run_pca(normalized, dims=dims, update_state=False)
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, 1, 1.5, True])
+def test_reduction_rejects_invalid_batch_sizes(
+    datastore_ephemeral,
+    batch_size,
+) -> None:
+    datastore = datastore_ephemeral
+    _prepare_atomic_features(datastore)
+    normalized = datastore.run_normalization(
+        from_assay="RNA",
+        feat_key="atomic_hvgs",
+    )
+
+    with pytest.raises((TypeError, ValueError), match="batch_size"):
+        datastore.run_pca(
+            normalized,
+            dims=3,
+            batch_size=batch_size,
+            update_state=False,
+        )
+
+
+def test_pca_rejects_empty_fit_selection(datastore_ephemeral) -> None:
+    datastore = datastore_ephemeral
+    _prepare_atomic_features(datastore)
+    normalized = datastore.run_normalization(
+        from_assay="RNA",
+        feat_key="atomic_hvgs",
+    )
+    datastore.cells.insert(
+        "no_pca_cells",
+        np.zeros(datastore.cells.N, dtype=bool),
+        overwrite=True,
+    )
+
+    with pytest.raises(ValueError, match="dims \\+ 1 selected cells"):
+        datastore.run_pca(
+            normalized,
+            dims=3,
+            pca_cell_key="no_pca_cells",
+            update_state=False,
+        )
+
+
+def test_custom_reduction_rejects_invalid_loadings(datastore_ephemeral) -> None:
+    datastore = datastore_ephemeral
+    _prepare_atomic_features(datastore)
+    normalized = datastore.run_normalization(
+        from_assay="RNA",
+        feat_key="atomic_hvgs",
+    )
+
+    with pytest.raises(ValueError, match="two-dimensional"):
+        datastore.run_custom_reduction(
+            np.ones(4),
+            normalized,
+            update_state=False,
+        )
 
 
 def test_atomic_graph_operations_reuse_persistent_local_cache(
@@ -69,9 +221,9 @@ def test_atomic_graph_operations_reuse_persistent_local_cache(
         from_assay="RNA",
         feat_key="atomic_hvgs",
         batch_size=100,
-        local_cache=str(cache_path),
         update_state=False,
     )
+    assert datastore.load_artifact(normalized)["data"].chunks[0] == 100
     reduction = datastore.run_pca(
         normalized,
         dims=4,
@@ -82,14 +234,12 @@ def test_atomic_graph_operations_reuse_persistent_local_cache(
     ann = datastore.build_ann_index(
         reduction,
         batch_size=100,
-        local_cache=str(cache_path),
         update_state=False,
     )
     neighbors = datastore.query_neighbors(
         ann,
         k=3,
         batch_size=100,
-        local_cache=str(cache_path),
         update_state=False,
     )
 
@@ -101,12 +251,13 @@ def test_atomic_graph_operations_reuse_persistent_local_cache(
         "feat_key": "atomic_hvgs",
         "batch_size": 100,
         "update_state": False,
-        "local_cache": str(cache_path),
         "invalidate_cache": False,
     }
-    for ref in (reduction, ann, neighbors):
+    reduction_execution = datastore.inspect_artifact(reduction).execution_options or {}
+    assert reduction_execution["local_cache"] == str(cache_path)
+    for ref in (ann, neighbors):
         execution = datastore.inspect_artifact(ref).execution_options or {}
-        assert execution["local_cache"] == str(cache_path)
+        assert "local_cache" not in execution
 
 
 @pytest.mark.parametrize("local_cache", [True, "auto"])
@@ -122,7 +273,6 @@ def test_temporary_local_cache_is_removed_after_success(
         from_assay="RNA",
         feat_key="atomic_hvgs",
         batch_size=100,
-        local_cache=False,
         update_state=False,
     )
     cache_root = tmp_path / str(local_cache).lower()
@@ -148,7 +298,7 @@ def test_temporary_local_cache_is_removed_after_success(
     assert not cache_root.exists()
 
 
-def test_temporary_local_cache_is_retained_after_failure(
+def test_temporary_local_cache_is_removed_after_failure(
     datastore_ephemeral,
     monkeypatch,
     tmp_path,
@@ -159,7 +309,6 @@ def test_temporary_local_cache_is_retained_after_failure(
         from_assay="RNA",
         feat_key="atomic_hvgs",
         batch_size=100,
-        local_cache=False,
         update_state=False,
     )
     cache_root = tmp_path / "failed"
@@ -179,7 +328,7 @@ def test_temporary_local_cache_is_retained_after_failure(
         with datastore._cache_normalized_artifact(normalized, "auto", 100):
             raise RuntimeError("stop after staging")
 
-    assert cache_root.is_dir()
+    assert not cache_root.exists()
 
 
 def test_new_reduction_becomes_current_and_clears_downstream_refs(
@@ -209,6 +358,95 @@ def test_new_reduction_becomes_current_and_clears_downstream_refs(
     assert state.ann_index is None
     assert state.neighbors is None
     assert state.connectivity_map is None
+
+
+def test_embedding_initialization_preserves_same_reduction_graph_state(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    _prepare_atomic_features(datastore)
+    normalized = datastore.run_normalization(
+        from_assay="RNA",
+        feat_key="atomic_hvgs",
+    )
+    reduction = datastore.run_pca(normalized, dims=4)
+    ann = datastore.build_ann_index(reduction)
+    neighbors = datastore.query_neighbors(ann, k=3)
+    graph = datastore.build_connectivity_map(neighbors)
+    before = datastore.get_assay_state("RNA")
+    assert before is not None
+
+    initialization = datastore.build_embedding_initialization(
+        reduction,
+        n_centroids=5,
+    )
+
+    after = datastore.get_assay_state("RNA")
+    assert after is not None
+    assert datastore.load_artifact(initialization)["cluster_labels"].dtype == np.uint32
+    assert after.embedding_initialization == initialization
+    assert after.batch_correction == before.batch_correction
+    assert after.ann_index == ann
+    assert after.neighbors == neighbors
+    assert after.connectivity_map == graph
+    assert after.named_results == before.named_results
+
+
+def test_connectivity_rejects_invalid_kernel_parameters(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    _prepare_atomic_features(datastore)
+    normalized = datastore.run_normalization(
+        from_assay="RNA",
+        feat_key="atomic_hvgs",
+    )
+    reduction = datastore.run_pca(normalized, dims=4)
+    ann = datastore.build_ann_index(reduction)
+    neighbors = datastore.query_neighbors(ann, k=3)
+
+    for values in (
+        {"local_connectivity": -1.0},
+        {"local_connectivity": np.nan},
+        {"local_connectivity": True},
+        {"bandwidth": 0.0},
+        {"bandwidth": -1.0},
+        {"bandwidth": np.nan},
+        {"bandwidth": True},
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            datastore.build_connectivity_map(
+                neighbors,
+                update_state=False,
+                **values,
+            )
+
+
+def test_ann_index_rejects_invalid_runtime_parameters(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    _prepare_atomic_features(datastore)
+    normalized = datastore.run_normalization(
+        from_assay="RNA",
+        feat_key="atomic_hvgs",
+    )
+    reduction = datastore.run_pca(normalized, dims=4)
+
+    for values, error, match in (
+        ({"ann_metric": "ip"}, ValueError, "l2, cosine"),
+        ({"ann_efc": 1.5}, TypeError, "positive integer"),
+        ({"ann_ef": True}, TypeError, "positive integer"),
+        ({"ann_m": 1}, ValueError, "at least two"),
+        ({"rand_state": 0}, ValueError, "greater than zero"),
+        ({"batch_size": 0}, ValueError, "greater than zero"),
+    ):
+        with pytest.raises(error, match=match):
+            datastore.build_ann_index(
+                reduction,
+                update_state=False,
+                **values,
+            )
 
 
 def test_neighbor_count_changes_only_neighbor_and_connectivity_artifacts(
@@ -295,19 +533,16 @@ def test_cache_identity_distinguishes_parameters_from_execution_options(
     )
     reused_ann = datastore.build_ann_index(
         state.reduction,
-        local_cache="auto",
         update_state=False,
     )
     reused_neighbors = datastore.query_neighbors(
         state.ann_index,
         k=11,
-        local_cache="auto",
         update_state=False,
     )
     changed_neighbors = datastore.query_neighbors(
         state.ann_index,
         k=3,
-        local_cache=False,
         update_state=False,
     )
     invalidated_reduction = datastore.run_pca(
@@ -323,7 +558,10 @@ def test_cache_identity_distinguishes_parameters_from_execution_options(
     assert reused_neighbors == state.neighbors
     assert changed_neighbors != state.neighbors
     assert invalidated_reduction != state.reduction
-    assert datastore.inspect_artifact(changed_neighbors).parameters == {"k": 3}
+    assert datastore.inspect_artifact(changed_neighbors).parameters == {
+        "k": 3,
+        "distance_convention": "euclidean_v1",
+    }
 
 
 @pytest.mark.slow
@@ -338,14 +576,12 @@ def test_seeded_graph_rebuild_is_deterministic(
         ann = datastore.build_ann_index(
             state.reduction,
             rand_state=4466,
-            local_cache=False,
             update_state=False,
             invalidate_cache=True,
         )
         neighbors = datastore.query_neighbors(
             ann,
             k=11,
-            local_cache=False,
             update_state=False,
             invalidate_cache=True,
         )
@@ -589,6 +825,7 @@ def test_datastore_inspects_and_loads_artifact_read_only(
 
 def test_atomic_harmony_becomes_default_ann_coordinates(
     datastore_ephemeral,
+    monkeypatch,
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_atomic_features(datastore)
@@ -599,6 +836,29 @@ def test_atomic_harmony_becomes_default_ann_coordinates(
         feat_key="atomic_hvgs",
     )
     pca = datastore.run_pca(normalized, dims=5)
+    pca_scores = datastore.load_artifact(pca)["data"][:]
+    active_batches = pd.DataFrame(
+        {
+            "atomic_batch": datastore.cells.fetch(
+                "atomic_batch",
+                key="I",
+            ).astype(object)
+        }
+    )
+    expected_correction = fit_harmony(
+        np.asarray(pca_scores.T, dtype=np.float64),
+        active_batches,
+        nclust=5,
+    )
+
+    def fail_legacy_projection(*_args, **_kwargs):
+        raise AssertionError("persisted coordinates should be used")
+
+    monkeypatch.setattr(
+        datastore,
+        "_load_reduction_stream",
+        fail_legacy_projection,
+    )
 
     corrected = datastore.run_harmony(
         ["atomic_batch"],
@@ -606,6 +866,12 @@ def test_atomic_harmony_becomes_default_ann_coordinates(
         harmony_params={"nclust": 5},
     )
     ann = datastore.build_ann_index(batch_size=100)
+    datastore.query_neighbors(ann, k=3, update_state=False)
+    datastore.build_embedding_initialization(
+        pca,
+        n_centroids=5,
+        update_state=False,
+    )
 
     state = datastore.get_assay_state("RNA")
     assert state is not None
@@ -614,6 +880,20 @@ def test_atomic_harmony_becomes_default_ann_coordinates(
     ann_inputs = datastore.inspect_artifact(ann).inputs
     assert ann_inputs is not None
     assert ann_inputs["coordinates"] == corrected.to_dict()
+    correction_group = datastore.load_artifact(corrected)
+    assert correction_group["data"].dtype == np.dtype(np.float32)
+    np.testing.assert_allclose(
+        correction_group["data"][:],
+        expected_correction.corrected.T,
+        rtol=2e-5,
+        atol=2e-6,
+    )
+    assert "assignments" not in correction_group
+    assert {
+        "cluster_mass",
+        "raw_centroids",
+        "corrected_centroids",
+    } <= set(correction_group.array_keys())
 
 
 def test_lsi_and_custom_reduction_have_distinct_public_methods(
@@ -685,9 +965,52 @@ def test_atomic_chain_matches_released_knn_golden(
     )
     np.testing.assert_allclose(
         group["distances"][:],
-        np.load(full_path("knn_distances.npy")),
+        np.sqrt(np.load(full_path("knn_distances.npy"))),
         rtol=0,
         atol=1e-3,
+    )
+
+
+def test_connectivity_rebuild_supports_legacy_squared_l2_neighbors(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    _prepare_atomic_features(datastore)
+    normalized = datastore.run_normalization(
+        from_assay="RNA",
+        feat_key="atomic_hvgs",
+    )
+    reduction = datastore.run_pca(normalized, dims=4)
+    ann = datastore.build_ann_index(reduction)
+    neighbors = datastore.query_neighbors(ann, k=3)
+    expected = datastore.build_connectivity_map(
+        neighbors,
+        update_state=False,
+        invalidate_cache=True,
+    )
+    expected_group = datastore.load_artifact(expected)
+    expected_edges = expected_group["edges"][:]
+    expected_weights = expected_group["weights"][:]
+
+    neighbor_group = datastore.zw[artifact_path(neighbors)]
+    distances = neighbor_group["distances"][:]
+    neighbor_group["distances"][:] = distances * distances
+    provenance = dict(neighbor_group.attrs["provenance"])
+    provenance["parameters"] = {"k": 3}
+    neighbor_group.attrs["provenance"] = provenance
+    legacy = datastore.build_connectivity_map(
+        neighbors,
+        update_state=False,
+        invalidate_cache=True,
+    )
+    legacy_group = datastore.load_artifact(legacy)
+
+    np.testing.assert_array_equal(legacy_group["edges"][:], expected_edges)
+    np.testing.assert_allclose(
+        legacy_group["weights"][:],
+        expected_weights,
+        rtol=1e-6,
+        atol=1e-7,
     )
 
 
@@ -701,13 +1024,32 @@ def test_corrupt_ann_bytes_are_not_reused(
         feat_key="atomic_hvgs",
     )
     reduction = datastore.run_pca(normalized, dims=3)
-    first = datastore.build_ann_index(reduction)
-    ann_group = datastore.zw[artifact_path(first)]
+    current = datastore.build_ann_index(reduction)
+    for attribute, invalid_value in (
+        ("metric", "cosine"),
+        ("dimensions", 2),
+        ("element_count", 1),
+    ):
+        ann_group = datastore.zw[artifact_path(current)]
+        ann_group["ann_idx_bytes"].attrs[attribute] = invalid_value
+        repaired = datastore.build_ann_index(reduction)
+        assert repaired != current
+        current = repaired
+
+    ann_group = datastore.zw[artifact_path(current)]
     ann_group["ann_idx_bytes"][:] = 0
-
     repaired = datastore.build_ann_index(reduction)
-    reused = datastore.build_ann_index(reduction)
-
-    assert repaired != first
-    assert reused == repaired
+    assert repaired != current
+    assert datastore.build_ann_index(reduction) == repaired
     assert datastore.inspect_artifact(repaired).complete
+
+    legacy_group = datastore.zw[artifact_path(repaired)]["ann_idx_bytes"]
+    for attribute in (
+        "ann_index_format_version",
+        "metric",
+        "dimensions",
+        "element_count",
+        "payload_sha256",
+    ):
+        del legacy_group.attrs[attribute]
+    assert datastore.build_ann_index(reduction) == repaired

@@ -9,6 +9,121 @@ import pytest
 from . import full_path, remove, dask_total_sum
 
 
+def build_atomic_graph(
+    datastore,
+    *,
+    from_assay: str | None = None,
+    cell_key: str = "I",
+    feat_key: str,
+    reduction_method: str = "pca",
+    dims: int = 11,
+    pca_cell_key: str | None = None,
+    k: int = 11,
+    ann_metric: str = "l2",
+    ann_efc: int | None = None,
+    ann_ef: int | None = None,
+    ann_m: int | None = None,
+    ann_parallel: bool = False,
+    rand_state: int = 4466,
+    n_centroids: int = 1000,
+    batch_size: int | None = None,
+    log_transform: bool | None = None,
+    renormalize_subset: bool | None = None,
+    local_connectivity: float = 1.0,
+    bandwidth: float = 1.5,
+    feat_scaling: bool = True,
+    lsi_skip_first: bool = True,
+    harmonize: bool = False,
+    batch_columns: list[str] | None = None,
+    harmony_params: dict | None = None,
+    local_cache: bool | str = "auto",
+    update_state: bool = True,
+    invalidate_cache: bool = False,
+):
+    normalized = datastore.run_normalization(
+        from_assay=from_assay,
+        cell_key=cell_key,
+        feat_key=feat_key,
+        log_transform=log_transform,
+        renormalize_subset=renormalize_subset,
+        batch_size=batch_size,
+        update_state=False,
+        invalidate_cache=invalidate_cache,
+    )
+    if reduction_method == "lsi":
+        reduction = datastore.run_lsi(
+            normalized,
+            dims=dims,
+            skip_first=lsi_skip_first,
+            batch_size=batch_size,
+            local_cache=local_cache,
+            update_state=False,
+            invalidate_cache=invalidate_cache,
+        )
+    elif reduction_method == "pca":
+        reduction = datastore.run_pca(
+            normalized,
+            dims=dims,
+            pca_cell_key=pca_cell_key or cell_key,
+            feat_scaling=feat_scaling,
+            batch_size=batch_size,
+            local_cache=local_cache,
+            update_state=False,
+            invalidate_cache=invalidate_cache,
+        )
+    else:
+        raise ValueError(f"Unsupported test reduction method: {reduction_method}")
+    coordinates = reduction
+    if harmonize:
+        coordinates = datastore.run_harmony(
+            batch_columns or [],
+            reduction,
+            harmony_params=harmony_params,
+            batch_size=batch_size,
+            update_state=False,
+            invalidate_cache=invalidate_cache,
+        )
+    effective_ann_efc = ann_efc or min(100, max(k * 3, 50))
+    effective_ann_ef = ann_ef or min(100, max(k * 3, 50))
+    effective_ann_m = ann_m or min(max(48, int(dims * 1.5)), 64)
+    ann_index = datastore.build_ann_index(
+        coordinates,
+        ann_metric=ann_metric,
+        ann_efc=effective_ann_efc,
+        ann_ef=effective_ann_ef,
+        ann_m=effective_ann_m,
+        ann_parallel=ann_parallel,
+        rand_state=rand_state,
+        batch_size=batch_size,
+        update_state=False,
+        invalidate_cache=invalidate_cache,
+    )
+    datastore.build_embedding_initialization(
+        reduction,
+        n_centroids=n_centroids,
+        rand_state=rand_state,
+        batch_size=batch_size,
+        update_state=update_state,
+        invalidate_cache=invalidate_cache,
+    )
+    neighbors = datastore.query_neighbors(
+        ann_index,
+        coordinates=coordinates,
+        k=k,
+        batch_size=batch_size,
+        update_state=False,
+        invalidate_cache=invalidate_cache,
+    )
+    connectivity = datastore.build_connectivity_map(
+        neighbors,
+        local_connectivity=local_connectivity,
+        bandwidth=bandwidth,
+        update_state=update_state,
+        invalidate_cache=invalidate_cache,
+    )
+    return connectivity
+
+
 def _extract_zarr_fixture(tar_path: str, prefix: str) -> tuple[str, str]:
     import tarfile
 
@@ -118,7 +233,8 @@ def analyzed_datastore_zarr_root(datastore_zarr_root, tmp_path_factory):
         show_plot=False,
         bin_strategy="fixed",
     )
-    datastore.make_graph(
+    build_atomic_graph(
+        datastore,
         feat_key="hvgs",
         local_cache=False,
     )
@@ -148,29 +264,29 @@ def mark_hvgs(auto_filter_cells, datastore):
 
 
 @pytest.fixture(scope="session")
-def make_graph(mark_hvgs, datastore):
-    datastore.make_graph(feat_key="hvgs")
+def graph_artifacts(mark_hvgs, datastore):
+    build_atomic_graph(datastore, feat_key="hvgs")
     state = datastore.get_assay_state("RNA")
     assert state is not None and state.neighbors is not None
     yield datastore.inspect_artifact(state.neighbors).path
 
 
 @pytest.fixture(scope="session")
-def leiden_clustering(make_graph, datastore):
+def leiden_clustering(graph_artifacts, datastore):
     if not _cell_has(datastore, "RNA_leiden_cluster"):
         datastore.run_leiden_clustering()
     yield datastore.cells.fetch("RNA_leiden_cluster")
 
 
 @pytest.fixture(scope="session")
-def paris_clustering(make_graph, datastore):
+def paris_clustering(graph_artifacts, datastore):
     if not _cell_has(datastore, "RNA_cluster"):
         datastore.run_paris_clustering(n_clusters=10, label="cluster")
     yield datastore.cells.fetch("RNA_cluster")
 
 
 @pytest.fixture(scope="session")
-def paris_clustering_auto(make_graph, datastore):
+def paris_clustering_auto(graph_artifacts, datastore):
     if not _cell_has(datastore, "RNA_adaptive_clusters"):
         datastore.run_paris_clustering(
             n_clusters="auto",
@@ -181,7 +297,7 @@ def paris_clustering_auto(make_graph, datastore):
 
 
 @pytest.fixture(scope="session")
-def umap(make_graph, datastore):
+def umap(graph_artifacts, datastore):
     if not _cell_has(datastore, "RNA_UMAP1"):
         datastore.run_umap(n_epochs=50)
     yield np.array(
@@ -241,7 +357,7 @@ def grouped_assay(datastore, pseudotime_aggregation):
 
 
 @pytest.fixture(scope="session")
-def run_mapping(make_graph, datastore):
+def run_mapping(graph_artifacts, datastore):
     projections = datastore.z["RNA"].get("projections", None)
     if projections is None or "selfmap" not in projections:
         datastore.run_mapping(
@@ -253,7 +369,7 @@ def run_mapping(make_graph, datastore):
 
 
 @pytest.fixture(scope="session")
-def run_mapping_coral(make_graph, datastore):
+def run_mapping_coral(graph_artifacts, datastore):
     projections = datastore.z["RNA"].get("projections", None)
     if projections is None or "selfmap_coral" not in projections:
         datastore.run_mapping(
@@ -313,7 +429,12 @@ def mark_prevalent_peaks(atac_datastore):
 
 @pytest.fixture(scope="session")
 def make_atac_graph(mark_prevalent_peaks, atac_datastore):
-    atac_datastore.make_graph(feat_key="prevalent_peaks")
+    build_atomic_graph(
+        atac_datastore,
+        feat_key="prevalent_peaks",
+        reduction_method="lsi",
+        feat_scaling=False,
+    )
     state = atac_datastore.get_assay_state("ATAC")
     assert state is not None and state.neighbors is not None
     yield atac_datastore.inspect_artifact(state.neighbors).path

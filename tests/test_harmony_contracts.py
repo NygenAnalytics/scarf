@@ -71,3 +71,61 @@ def test_run_harmony_resolves_fit_through_public_facade(monkeypatch):
 
     assert actual is corrected
     assert len(calls) == 1
+
+
+def test_harmony_keeps_an_independent_original_coordinate_snapshot():
+    values = np.random.default_rng(4).normal(size=(3, 12))
+    metadata = pd.DataFrame({"batch": ["a", "b"] * 6})
+
+    result = harmony.fit_harmony(
+        values,
+        metadata,
+        nclust=2,
+        max_iter_harmony=1,
+        max_iter_kmeans=1,
+    )
+
+    assert result.original is not values
+    np.testing.assert_array_equal(result.original, values)
+    assert result.corrected.dtype == np.dtype(np.float64)
+
+
+def test_harmony_supports_numeric_batch_columns_without_global_rng_changes():
+    values = np.random.default_rng(9).normal(size=(3, 12))
+    metadata = pd.DataFrame({"batch": [0, 1] * 6})
+    np.random.seed(17)
+    expected_next = np.random.random()
+    np.random.seed(17)
+
+    result = harmony.fit_harmony(
+        values,
+        metadata,
+        nclust=2,
+        max_iter_harmony=1,
+        max_iter_kmeans=1,
+    )
+
+    assert result.parameters["clusterBackend"] == "sklearn.cluster.KMeans"
+    assert np.random.random() == expected_next
+
+
+def test_harmony_centroids_match_final_assignments_and_coordinates():
+    values = np.random.default_rng(11).normal(size=(4, 16))
+    metadata = pd.DataFrame({"batch": ["a", "b"] * 8})
+
+    result = harmony.fit_harmony(
+        values,
+        metadata,
+        nclust=3,
+        max_iter_harmony=2,
+        max_iter_kmeans=2,
+    )
+
+    normalized = result.corrected / np.linalg.norm(
+        result.corrected,
+        axis=0,
+        keepdims=True,
+    )
+    expected = normalized @ result.assignments.T
+    expected /= np.linalg.norm(expected, axis=0, keepdims=True)
+    np.testing.assert_allclose(result.centroids, expected)

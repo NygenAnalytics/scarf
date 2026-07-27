@@ -37,8 +37,8 @@ def write_artifact_mapping_reference(
     model: SymphonyReferenceModel,
     feature_ids: np.ndarray,
     metadata: dict[str, Any],
-    reference_distance_quantiles: np.ndarray | None = None,
-    reference_distance_values: np.ndarray | None = None,
+    reference_distance_quantiles: np.ndarray,
+    reference_distance_values: np.ndarray,
 ) -> None:
     create_zarr_obj_array(group, "feature_ids", np.asarray(feature_ids))
     _write_array(group, "feature_means", model.feature_means)
@@ -49,18 +49,16 @@ def write_artifact_mapping_reference(
     _write_array(group, "corrected_centroids", model.corrected_centroids)
     _write_array(group, "cluster_mass", model.cluster_mass)
     _write_array(group, "sigma", model.sigma)
-    if reference_distance_quantiles is not None:
-        _write_array(
-            group,
-            "reference_distance_quantiles",
-            reference_distance_quantiles,
-        )
-    if reference_distance_values is not None:
-        _write_array(
-            group,
-            "reference_distance_values",
-            reference_distance_values,
-        )
+    _write_array(
+        group,
+        "reference_distance_quantiles",
+        reference_distance_quantiles,
+    )
+    _write_array(
+        group,
+        "reference_distance_values",
+        reference_distance_values,
+    )
     group.attrs["correction_ridge"] = float(model.correction_ridge)
     group.attrs["reference_metadata"] = metadata
 
@@ -127,6 +125,8 @@ def load_artifact_mapping_reference(
         "corrected_centroids",
         "cluster_mass",
         "sigma",
+        "reference_distance_quantiles",
+        "reference_distance_values",
     )
     missing = [name for name in required if name not in group]
     if missing:
@@ -168,16 +168,8 @@ def load_artifact_mapping_reference(
         model=model,
         feature_ids=values("feature_ids"),
         metadata=metadata,
-        reference_distance_quantiles=(
-            values("reference_distance_quantiles")
-            if "reference_distance_quantiles" in group
-            else None
-        ),
-        reference_distance_values=(
-            values("reference_distance_values")
-            if "reference_distance_values" in group
-            else None
-        ),
+        reference_distance_quantiles=values("reference_distance_quantiles"),
+        reference_distance_values=values("reference_distance_values"),
     )
 
 

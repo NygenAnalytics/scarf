@@ -54,7 +54,6 @@ _CONTRACTS = (
     OperationContract(
         DataStore.build_ann_index,
         graph_arguments.AnnIndexArguments,
-        constructor=_GraphOperationsMixin._build_ann_index_impl,
         signature_only={
             **_classified("routing", "from_assay"),
             **_classified("publication", "update_state"),
@@ -107,16 +106,14 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_harmony,
         graph_arguments.HarmonyArguments,
-        constructor=_GraphOperationsMixin._run_harmony_impl,
         aliases={"harmony_params": "harmony_parameters"},
         signature_only={
-            **_classified("execution", "local_cache"),
             **_classified("routing", "from_assay"),
             **_classified("publication", "update_state"),
         },
         model_only={
             **_classified("resolved_input", "batch_values"),
-            **_classified("execution", "force_refit"),
+            **_classified("algorithm_version", "algorithm_version"),
         },
     ),
     OperationContract(
@@ -132,12 +129,11 @@ _CONTRACTS = (
     OperationContract(
         DataStore.query_neighbors,
         graph_arguments.NeighborQueryArguments,
-        constructor=_GraphOperationsMixin._query_neighbors_impl,
         signature_only={
-            **_classified("execution", "local_cache"),
             **_classified("routing", "from_assay"),
             **_classified("publication", "update_state"),
         },
+        model_only=_classified("algorithm_version", "distance_convention"),
     ),
     OperationContract(
         DataStore.run_normalization,

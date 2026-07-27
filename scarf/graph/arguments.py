@@ -1,3 +1,4 @@
+import operator
 from collections.abc import Callable, Mapping
 from dataclasses import MISSING, dataclass, field, fields
 from types import MappingProxyType
@@ -21,6 +22,18 @@ from ..storage.artifacts import (
 )
 
 type ArgumentRole = Literal["input", "parameter", "execution"]
+
+
+def _positive_integer(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a positive integer")
+    try:
+        resolved = operator.index(value)
+    except TypeError:
+        raise TypeError(f"{name} must be a positive integer") from None
+    if resolved < 1:
+        raise ValueError(f"{name} must be greater than zero")
+    return int(resolved)
 
 
 def parameter(
@@ -162,7 +175,6 @@ class NormalizationArguments(OperationArguments):
     renormalize_subset: bool = parameter()
     batch_size: int = execution()
     update_state: bool = execution()
-    local_cache: bool | str = execution()
     invalidate_cache: bool = execution(False)
 
 
@@ -231,8 +243,8 @@ class HarmonyArguments(OperationArguments):
     batch_values: ArtifactRef = artifact_input()
     batch_columns: tuple[str, ...] = parameter()
     harmony_parameters: Mapping[str, Any] = parameter()
+    algorithm_version: str = parameter()
     batch_size: int = execution()
-    force_refit: bool = execution()
     invalidate_cache: bool = execution(False)
 
     def __post_init__(self) -> None:
@@ -257,9 +269,6 @@ class AnnIndexArguments(OperationArguments):
     ann_parallel: bool = parameter()
     parallel_threads: int | None = parameter()
     batch_size: int = execution()
-    ann_index_fetcher: Callable[..., Any] | None = artifact_input()
-    ann_index_saver: Callable[..., Any] | None = execution()
-    local_cache: bool | str = execution()
     invalidate_cache: bool = execution(False)
 
 
@@ -271,6 +280,7 @@ class NeighborQueryArguments(OperationArguments):
     ann_index: ArtifactRef = artifact_input()
     coordinates: ArtifactRef = artifact_input()
     k: int = parameter()
+    distance_convention: str = parameter()
     batch_size: int = execution()
     invalidate_cache: bool = execution(False)
 
@@ -283,8 +293,17 @@ class ConnectivityMapArguments(OperationArguments):
     neighbors: ArtifactRef = artifact_input()
     local_connectivity: float = parameter()
     bandwidth: float = parameter()
-    batch_size: int = execution()
     invalidate_cache: bool = execution(False)
+
+    def __post_init__(self) -> None:
+        from ..neighbors.graph import validate_connectivity_parameters
+
+        local_connectivity, bandwidth = validate_connectivity_parameters(
+            self.local_connectivity,
+            self.bandwidth,
+        )
+        object.__setattr__(self, "local_connectivity", local_connectivity)
+        object.__setattr__(self, "bandwidth", bandwidth)
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,39 +316,3 @@ class EmbeddingInitializationArguments(OperationArguments):
     rand_state: int = parameter()
     batch_size: int = parameter()
     invalidate_cache: bool = execution(False)
-
-
-MAKE_GRAPH_ARGUMENT_OWNERS = {
-    "from_assay": "normalization",
-    "cell_key": "normalization",
-    "feat_key": "normalization",
-    "pca_cell_key": "reduction",
-    "reduction_method": "reduction",
-    "dims": "reduction",
-    "k": "neighbors",
-    "ann_metric": "ann_index",
-    "ann_efc": "ann_index",
-    "ann_ef": "ann_index",
-    "ann_m": "ann_index",
-    "ann_parallel": "ann_index",
-    "rand_state": "reduction_ann_index_and_embedding_initialization",
-    "n_centroids": "embedding_initialization",
-    "batch_size": "stage_specific_parameter_or_execution_option",
-    "log_transform": "normalization",
-    "renormalize_subset": "normalization",
-    "local_connectivity": "connectivity_map",
-    "bandwidth": "connectivity_map",
-    "update_keys": "normalization",
-    "return_ann_object": "facade",
-    "custom_loadings": "reduction",
-    "feat_scaling": "reduction",
-    "lsi_skip_first": "reduction",
-    "harmonize": "facade",
-    "batch_columns": "harmony",
-    "show_elbow_plot": "reduction",
-    "ann_index_fetcher": "ann_index",
-    "ann_index_saver": "ann_index",
-    "local_cache": "stage_execution",
-    "harmony_params": "harmony",
-    "_force_harmony_refit": "harmony",
-}

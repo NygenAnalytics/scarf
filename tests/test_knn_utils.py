@@ -2,18 +2,12 @@ import warnings
 
 import numpy as np
 import pytest
-import zarr
 from scipy.sparse import coo_matrix, csr_matrix
 from sklearn.metrics import adjusted_rand_score
-from zarr.storage import MemoryStore
 
 from scarf.clustering.leiden import leiden_membership
-from scarf.neighbors.graph_store import (
-    _patch_null_weights,
-    self_query_knn,
-    smoothen_dists,
-)
 from scarf.neighbors.graph import (
+    build_connectivity_arrays,
     calc_snn,
     merge_graphs,
     weight_sort_indices,
@@ -21,7 +15,6 @@ from scarf.neighbors.graph import (
 from scarf.neighbors.diffusion import diffusion_operator
 from scarf.neighbors.integration import wnn_integration
 from scarf.utils import logger
-from scarf.writers import create_zarr_dataset
 
 
 def _simple_knn_graph(n: int, k: int = 3) -> csr_matrix:
@@ -92,104 +85,6 @@ def _multimodal_wnn_inputs() -> tuple[csr_matrix, np.ndarray, csr_matrix, np.nda
     return g1, ld1, g2, ld2
 
 
-class _BlockSource:
-    def __init__(self, blocks: list[np.ndarray]):
-        self.blocks = blocks
-        self.numblocks = (len(blocks), 1)
-        self.shape = (sum(len(block) for block in blocks), blocks[0].shape[1])
-
-
-class _SyntheticAnn:
-    def __init__(
-        self,
-        data: _BlockSource,
-        embeddings: np.ndarray | None,
-        harmonized_data: _BlockSource | None,
-    ):
-        self.data = data
-        self.embeddings = embeddings
-        self.harmonizedData = harmonized_data
-        self.nCells = data.shape[0]
-        self.k = 2
-        self.batchSize = 2
-        self.queries: list[tuple[np.ndarray, np.ndarray]] = []
-
-    @staticmethod
-    def reducer(values: np.ndarray) -> np.ndarray:
-        return np.asarray(values) + 10
-
-    def transform_ann(
-        self,
-        values: np.ndarray,
-        k: int,
-        self_indices: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, int]:
-        self.queries.append((np.asarray(values).copy(), self_indices.copy()))
-        offsets = np.arange(1, k + 1)
-        indices = (self_indices[:, None] + offsets) % self.nCells
-        distances = np.broadcast_to(offsets, indices.shape).astype(np.float64)
-        missed_self = int(np.count_nonzero(self_indices % 2))
-        return indices, distances, missed_self
-
-
-def test_self_query_knn_uses_cached_embeddings_and_writes_graph():
-    raw = np.arange(10, dtype=np.float64).reshape(5, 2)
-    data = _BlockSource([raw[:2], raw[2:4], raw[4:]])
-    embeddings = raw + 100
-    ann = _SyntheticAnn(data, embeddings=embeddings, harmonized_data=None)
-    store = zarr.open_group(store=MemoryStore(), mode="w")
-
-    recall = self_query_knn(ann, store, chunk_size=2, nthreads=1)
-
-    expected_indices = (np.arange(5)[:, None] + np.array([1, 2], dtype=np.int64)) % 5
-    assert recall == pytest.approx(60.0)
-    np.testing.assert_array_equal(store["indices"][:], expected_indices)
-    np.testing.assert_allclose(store["distances"][:], [[1.0, 2.0]] * 5)
-    np.testing.assert_array_equal(
-        np.vstack([values for values, _ in ann.queries]),
-        embeddings,
-    )
-    np.testing.assert_array_equal(
-        np.concatenate([indices for _, indices in ann.queries]),
-        np.arange(5),
-    )
-
-
-@pytest.mark.parametrize("use_harmonized", [False, True])
-def test_self_query_knn_streams_reduced_or_harmonized_blocks(use_harmonized):
-    raw = np.arange(10, dtype=np.float64).reshape(5, 2)
-    data = _BlockSource([raw[:2], raw[2:4], raw[4:]])
-    harmonized_values = raw + 100
-    harmonized_data = (
-        _BlockSource(
-            [
-                harmonized_values[:2],
-                harmonized_values[2:4],
-                harmonized_values[4:],
-            ]
-        )
-        if use_harmonized
-        else None
-    )
-    ann = _SyntheticAnn(
-        data,
-        embeddings=None,
-        harmonized_data=harmonized_data,
-    )
-    store = zarr.open_group(store=MemoryStore(), mode="w")
-
-    recall = self_query_knn(ann, store, chunk_size=3, nthreads=1)
-
-    expected_queries = harmonized_values if use_harmonized else raw + 10
-    assert recall == pytest.approx(60.0)
-    np.testing.assert_array_equal(
-        np.vstack([values for values, _ in ann.queries]),
-        expected_queries,
-    )
-    assert store["indices"].shape == (5, 2)
-    assert store["distances"].shape == (5, 2)
-
-
 def test_calc_snn_returns_normalized_overlap():
     graph = _simple_knn_graph(6, k=3)
     indices = graph.indices.reshape((6, 3))
@@ -225,40 +120,117 @@ def test_merge_graphs_rejects_mismatched_shapes():
         merge_graphs([g1, g2])
 
 
-def test_patch_null_weights_matches_full_rewrite(tmp_path):
-    weights = np.array([0.0, 0.2, 0.0, 0.5, 0.0, 0.3], dtype=np.float64)
-    null_positions = np.flatnonzero(weights == 0).tolist()
-    fill = 0.15
+def test_merge_graphs_rejects_one_neighbor_snn_input():
+    graph = _simple_knn_graph(6, k=1)
 
-    expected = weights.copy()
-    expected[null_positions] = fill
-
-    root = zarr.open_group(str(tmp_path / "weights.zarr"), mode="w")
-    zgw = create_zarr_dataset(root, "weights", (2,), "f8", weights.shape)
-    zgw[:] = weights
-    _patch_null_weights(zgw, null_positions, fill, patch_chunk=2)
-    np.testing.assert_allclose(zgw[:], expected)
+    with pytest.raises(ValueError, match="at least two neighbors"):
+        merge_graphs([graph, graph.copy()])
 
 
-def test_smoothen_dists_runs(tmp_path):
-    pytest.importorskip("umap")
-    n_cells, n_neighbors = 24, 5
-    chunk_size = 8
-    rng = np.random.default_rng(0)
-    dist = rng.random((n_cells, n_neighbors)).astype(np.float64)
-    dist[:, 0] = 0.0
-    idx = np.tile(np.arange(n_cells), (n_cells, 1)) % n_cells
+def test_build_connectivity_arrays_runs_in_memory():
+    n_cells, n_neighbors = 6, 5
+    idx = np.array(
+        [
+            [(row + offset + 1) % n_cells for offset in range(n_neighbors)]
+            for row in range(n_cells)
+        ]
+    )
+    dist = np.array(
+        [
+            [0.10, 0.30, 0.80, 1.50, 3.00],
+            [0.13, 0.35, 0.82, 1.60, 3.20],
+            [0.16, 0.40, 0.84, 1.70, 3.40],
+            [0.19, 0.45, 0.86, 1.80, 3.60],
+            [0.22, 0.50, 0.88, 1.90, 3.80],
+            [0.25, 0.55, 0.90, 2.00, 4.00],
+        ]
+    )
+    expected_weights = np.array(
+        [
+            1.0,
+            0.9779863,
+            0.92504877,
+            0.8557153,
+            0.7241439,
+            1.0,
+            0.97687674,
+            0.92925274,
+            0.85528576,
+            0.7214707,
+            1.0,
+            0.97586185,
+            0.9331116,
+            0.8548864,
+            0.7190224,
+            1.0,
+            0.97493076,
+            0.93666923,
+            0.8545199,
+            0.71678144,
+            1.0,
+            0.9740712,
+            0.9399542,
+            0.85416996,
+            0.71470064,
+            1.0,
+            0.973276,
+            0.9429993,
+            0.8538406,
+            0.7127714,
+        ],
+        dtype=np.float32,
+    )
 
-    root = zarr.open_group(str(tmp_path / "graph.zarr"), mode="w")
-    knn = root.create_group("knn")
-    z_idx = create_zarr_dataset(knn, "indices", (chunk_size,), "u8", idx.shape)
-    z_dist = create_zarr_dataset(knn, "distances", (chunk_size,), "f8", dist.shape)
-    z_idx[:] = idx
-    z_dist[:] = dist
-    graph = root.create_group("graph")
-    smoothen_dists(graph, z_idx, z_dist, lc=1.0, bw=1.5, chunk_size=chunk_size)
-    assert graph["weights"].shape[0] == graph["edges"].shape[0]
-    assert graph["weights"].shape[0] > 0
+    edges, weights = build_connectivity_arrays(
+        idx,
+        dist,
+        local_connectivity=1.0,
+        bandwidth=1.5,
+    )
+
+    assert edges.shape == (n_cells * n_neighbors, 2)
+    assert weights.shape == (n_cells * n_neighbors,)
+    assert edges.dtype == np.uint32
+    assert weights.dtype == np.float32
+    assert np.all(weights > 0)
+    np.testing.assert_array_equal(
+        edges,
+        np.column_stack(
+            (
+                np.repeat(np.arange(n_cells), n_neighbors),
+                idx.reshape(-1),
+            )
+        ).astype(np.uint32),
+    )
+    np.testing.assert_allclose(weights, expected_weights, rtol=1e-6, atol=1e-7)
+
+
+def test_connectivity_omits_zero_membership_edges():
+    n_cells, n_neighbors = 10, 5
+    indices = np.array(
+        [
+            [(row + offset + 1) % n_cells for offset in range(n_neighbors)]
+            for row in range(n_cells)
+        ]
+    )
+    distances = np.tile(
+        np.array([0.0, 1.0, 1e20, 1e30, 1e35]),
+        (n_cells, 1),
+    )
+
+    edges, weights = build_connectivity_arrays(
+        indices,
+        distances,
+        local_connectivity=1.0,
+        bandwidth=1.5,
+    )
+
+    expected = np.tile(
+        np.array([1.0, 1.0, 1.0, 0.9512299], dtype=np.float32),
+        n_cells,
+    )
+    assert len(edges) == n_cells * 4
+    np.testing.assert_allclose(weights, expected, rtol=1e-6, atol=1e-7)
 
 
 def test_wnn_integration_handles_extreme_affinities_without_runtime_warnings():

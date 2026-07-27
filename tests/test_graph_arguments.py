@@ -1,4 +1,3 @@
-import inspect
 from dataclasses import fields
 
 import numpy as np
@@ -6,9 +5,7 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.datastore._operations.graph_legacy_params import _GraphLegacyParamsMixin
 from scarf.graph.arguments import (
-    MAKE_GRAPH_ARGUMENT_OWNERS,
     AnnIndexArguments,
     ConnectivityMapArguments,
     CustomReductionArguments,
@@ -54,7 +51,6 @@ def test_normalization_arguments_partition_every_value() -> None:
         renormalize_subset=False,
         batch_size=100,
         update_state=True,
-        local_cache="auto",
         invalidate_cache=False,
     )
     record = arguments.to_record()
@@ -72,7 +68,6 @@ def test_normalization_arguments_partition_every_value() -> None:
         "feat_key": "hvgs",
         "batch_size": 100,
         "update_state": True,
-        "local_cache": "auto",
         "invalidate_cache": False,
     }
 
@@ -89,7 +84,6 @@ def test_execution_options_do_not_change_provenance_hash() -> None:
         "log_transform": True,
         "renormalize_subset": False,
         "update_state": True,
-        "local_cache": "auto",
     }
     small_batch = NormalizationArguments(
         batch_size=100,
@@ -154,20 +148,20 @@ def test_stage_models_chain_logical_artifact_refs() -> None:
         batch_values=_ref("metadata_snapshot", "2", scope="datastore"),
         batch_columns=("donor", "sample"),
         harmony_parameters={"theta": 2.0},
+        algorithm_version="centroid_snapshot_v2",
         batch_size=100,
-        force_refit=False,
     )
     neighbors = NeighborQueryArguments(
         ann_index=_ref("ann_index", "3"),
         coordinates=_ref("batch_correction", "4"),
         k=15,
+        distance_convention="euclidean_v1",
         batch_size=100,
     )
     connectivity = ConnectivityMapArguments(
         neighbors=_ref("neighbors", "5"),
         local_connectivity=1.0,
         bandwidth=1.5,
-        batch_size=100,
     )
 
     assert harmony.to_record().parameters["batch_columns"] == ["donor", "sample"]
@@ -257,9 +251,6 @@ def test_ann_parallel_is_normal_provenance_not_cache_policy() -> None:
         "ann_m": 16,
         "rand_state": 4466,
         "batch_size": 100,
-        "ann_index_fetcher": None,
-        "ann_index_saver": None,
-        "local_cache": False,
         "invalidate_cache": False,
     }
     serial = AnnIndexArguments(
@@ -275,43 +266,6 @@ def test_ann_parallel_is_normal_provenance_not_cache_policy() -> None:
 
     assert serial.provenance_hash() != parallel.provenance_hash()
     assert parallel.to_record().parameters["ann_parallel"] is True
-
-
-def test_ann_fetcher_identity_is_an_input() -> None:
-    def first_fetcher(_path: str) -> None:
-        return None
-
-    def second_fetcher(_path: str) -> None:
-        return None
-
-    first_fetcher.artifact_identity = "first"  # type: ignore[attr-defined]
-    second_fetcher.artifact_identity = "second"  # type: ignore[attr-defined]
-    common = {
-        "coordinates": _ref("reduction", "1"),
-        "ann_metric": "l2",
-        "ann_efc": 50,
-        "ann_ef": 50,
-        "ann_m": 16,
-        "rand_state": 4466,
-        "ann_parallel": False,
-        "parallel_threads": None,
-        "batch_size": 100,
-        "ann_index_saver": None,
-        "local_cache": False,
-        "invalidate_cache": False,
-    }
-    first = AnnIndexArguments(ann_index_fetcher=first_fetcher, **common)
-    second = AnnIndexArguments(ann_index_fetcher=second_fetcher, **common)
-
-    assert first.provenance_hash() != second.provenance_hash()
-    assert "ann_index_fetcher" in first.to_record().inputs
-    second_fetcher.artifact_identity = "first"  # type: ignore[attr-defined]
-    equivalent = AnnIndexArguments(ann_index_fetcher=second_fetcher, **common)
-    assert first.provenance_hash() == equivalent.provenance_hash()
-    assert first.to_record().inputs["ann_index_fetcher"] == {
-        "external_hook": True,
-        "identity": "first",
-    }
 
 
 def test_dynamic_callable_requires_explicit_identity() -> None:
@@ -332,29 +286,7 @@ def test_dynamic_callable_requires_explicit_identity() -> None:
             renormalize_subset=False,
             batch_size=100,
             update_state=True,
-            local_cache=False,
         ).to_record()
-
-
-def test_make_graph_signature_has_an_argument_owner() -> None:
-    signature = inspect.signature(_GraphLegacyParamsMixin.make_graph)
-    public_arguments = set(signature.parameters) - {"self"}
-    valid_owners = {
-        "ann_index",
-        "connectivity_map",
-        "embedding_initialization",
-        "facade",
-        "harmony",
-        "neighbors",
-        "normalization",
-        "reduction",
-        "reduction_ann_index_and_embedding_initialization",
-        "stage_execution",
-        "stage_specific_parameter_or_execution_option",
-    }
-
-    assert public_arguments == set(MAKE_GRAPH_ARGUMENT_OWNERS)
-    assert set(MAKE_GRAPH_ARGUMENT_OWNERS.values()) <= valid_owners
 
 
 def test_field_factories_set_argument_roles() -> None:

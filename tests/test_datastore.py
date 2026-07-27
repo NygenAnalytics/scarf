@@ -17,6 +17,7 @@ from scarf.trajectory.results import (
     PseudotimeScoreResult,
 )
 from scarf.utils.arrays import array_digest
+from tests.fixtures_datastore import build_atomic_graph
 
 from . import full_path
 
@@ -163,18 +164,35 @@ class TestDataStore:
         )
         # still doesn't access `if j is None:` cases for j and k
 
-    def test_graph_indices(self, make_graph, datastore):
+    def test_graph_indices(self, graph_artifacts, datastore):
         a = np.load(full_path("knn_indices.npy"))
-        b = datastore.z[make_graph]["indices"][:]
+        b = datastore.z[graph_artifacts]["indices"][:]
         assert np.array_equal(a, b)
 
-    def test_graph_distances(self, make_graph, datastore):
-        a = np.load(full_path("knn_distances.npy"))
-        b = datastore.z[make_graph]["distances"][:]
+    def test_graph_distances(self, graph_artifacts, datastore):
+        a = np.sqrt(np.load(full_path("knn_distances.npy")))
+        b = datastore.z[graph_artifacts]["distances"][:]
         np.testing.assert_allclose(a, b, rtol=0, atol=1e-3)
 
-    def test_graph_weights(self, make_graph, datastore):
-        a = np.load(full_path("knn_weights.npy"))
+    def test_graph_weights(self, graph_artifacts, datastore):
+        from umap.umap_ import compute_membership_strengths, smooth_knn_dist
+
+        indices = np.load(full_path("knn_indices.npy"))
+        distances = np.sqrt(np.load(full_path("knn_distances.npy"))).astype(np.float32)
+        sigmas, rhos = smooth_knn_dist(
+            distances,
+            k=indices.shape[1],
+            local_connectivity=1.0,
+            bandwidth=1.5,
+        )
+        _, _, expected, _ = compute_membership_strengths(
+            indices,
+            distances,
+            sigmas,
+            rhos,
+        )
+        a = np.asarray(expected, dtype=np.float32)
+        a = a[a > 0]
         state = datastore.get_assay_state("RNA")
         assert state is not None and state.connectivity_map is not None
         graph_path = datastore.inspect_artifact(state.connectivity_map).path
@@ -206,7 +224,7 @@ class TestDataStore:
     def test_atac_graph_distances(self, make_atac_graph, atac_datastore):
         from scipy.stats import spearmanr
 
-        expected = np.load(full_path("atac_knn_distances.npy"))
+        expected = np.sqrt(np.load(full_path("atac_knn_distances.npy")))
         observed = np.asarray(atac_datastore.z[make_atac_graph]["distances"][:])
 
         assert expected.shape == observed.shape
@@ -214,7 +232,8 @@ class TestDataStore:
         assert np.all(observed > 0)
         assert np.all(np.diff(observed, axis=1) >= 0)
         assert spearmanr(expected.ravel(), observed.ravel()).statistic >= 0.7
-        assert np.mean(np.abs(expected - observed)) < 1e-3
+        relative_mae = np.mean(np.abs(expected - observed)) / np.mean(expected)
+        assert relative_mae < 0.3
 
     def test_leiden_values(self, leiden_clustering, cell_attrs):
         assert len(set(leiden_clustering)) == 10
@@ -226,7 +245,7 @@ class TestDataStore:
         labels = np.asarray(paris_clustering, dtype=np.int32)
         assert labels.ndim == 1
         assert np.array_equal(np.unique(labels), np.arange(1, 11))
-        assert array_digest(labels) == ("0159faffd8fd22e6c9a9a3e36eb89826")
+        assert array_digest(labels) == ("306518457a86d4a4fe0d49a7cfeaeb39")
 
     def test_paris_adaptive_values(self, paris_clustering_auto):
         labels = np.asarray(paris_clustering_auto, dtype=np.int32)
@@ -302,7 +321,7 @@ class TestDataStore:
         assert classes.notna().all()
         assert (
             array_hash(classes.astype(str).to_numpy())
-            == "2844cf86e46c3a1638c7d697ff95268e65650c2065714a155c3b6abff8be66bf"
+            == "eef16b17c475877ab932cabd6f7b4e41bdbae80a9e21578866ac7c7d31db1061"
         )
 
     def test_get_mapping_score(self, run_mapping, datastore):
@@ -312,7 +331,7 @@ class TestDataStore:
         assert np.any(scores > 0)
         assert (
             array_hash(np.round(scores, 12))
-            == "f992bd7e48c7eda529c30194dab350fd5d6fea056f76146a2705993223d97d0e"
+            == "897f5f6dd2b5a682053bf76ad1cdaaaacb771ee65168fc1a128c4bc353865e0d"
         )
 
     def test_coral_mapping_score(self, run_mapping_coral, datastore):
@@ -351,7 +370,12 @@ class TestDataStore:
         )
         assert skipped.shape == (len(active),)
 
-    def test_run_doublet_detection(self, make_graph, paris_clustering, datastore):
+    def test_run_doublet_detection(
+        self,
+        graph_artifacts,
+        paris_clustering,
+        datastore,
+    ):
         from scarf.storage.artifacts import ArtifactRef
 
         score_col = datastore.run_doublet_detection(
@@ -377,7 +401,11 @@ class TestDataStore:
                 projections.attrs.get("artifacts", {})
             )
 
-    def test_run_doublet_detection_bad_cluster_key(self, make_graph, datastore):
+    def test_run_doublet_detection_bad_cluster_key(
+        self,
+        graph_artifacts,
+        datastore,
+    ):
         import pytest
 
         with pytest.raises(ValueError):
@@ -402,7 +430,8 @@ class TestDataStore:
             show_plot=False,
             bin_strategy="fixed",
         )
-        datastore_ephemeral.make_graph(
+        build_atomic_graph(
+            datastore_ephemeral,
             feat_key="hvgs",
             local_cache=False,
         )

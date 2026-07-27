@@ -466,6 +466,12 @@ class Assay:
                 self.nthreads,
                 mirror=mirror,
                 resources=self.resources,
+                stats_group=(
+                    as_zarr_group(self.z[location], name=location)
+                    if artifact_mode
+                    else None
+                ),
+                batch_size=batch_size,
             )
             return ChunkedArray(
                 as_zarr_array(self.z[location + "/data"], name=location + "/data"),
@@ -507,6 +513,7 @@ class Assay:
             self.nthreads,
             mirror=mirror,
             resources=self.resources,
+            batch_size=batch_size,
         )
         self.z[location].attrs["subset_hash"] = subset_hash
         self.z[location].attrs["subset_params"] = subset_params

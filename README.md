@@ -41,7 +41,12 @@ ds.filter_cells(
     lows=[1000, 500],
 )
 ds.mark_hvgs(min_cells=20, top_n=500)
-ds.make_graph(feat_key="hvgs", k=11, dims=15, n_centroids=100)
+normalized = ds.run_normalization(feat_key="hvgs")
+reduction = ds.run_pca(normalized, dims=15)
+ann_index = ds.build_ann_index(reduction)
+ds.build_embedding_initialization(reduction, n_centroids=100)
+neighbors = ds.query_neighbors(ann_index, k=11)
+ds.build_connectivity_map(neighbors)
 ds.run_umap(n_epochs=250, spread=5, min_dist=1, parallel=True)
 ds.run_leiden_clustering(resolution=0.5)
 
@@ -58,21 +63,21 @@ Same path with more explanation: [docs quick start](https://scarf.readthedocs.io
 
 ## Why Scarf
 
-- **Large datasets on modest RAM**: the full pipeline (QC, HVGs, graph, UMAP, Leiden, markers) fits inside a single 64 GiB machine from 100k to 10M cells. Peak memory is set by graph construction and barely grows with dataset size.
+- **Measured multi-million-cell scale**: the core funnel from store creation through markers completed against cloud Zarr through 10M cells. The largest run peaked at about 36 GiB and took about 23 hours. Memory and wall time both depend on dataset size and stage.
 - **Remote-first Zarr**: keep the store on S3-compatible object storage and analyze it in place, without a local full copy.
-- **One graph, reused everywhere**: `make_graph` builds a single KNN graph that embeddings, clustering, mapping, and WNN/SNN integration all read from, so those results stay concordant.
+- **Reusable graph state**: atomic stages persist reductions, ANN indexes, neighbour queries, and connectivity maps for embedding, clustering, and mapping. SNN/WNN combines modality-specific graphs into a separate integrated graph.
 - **Persistent results**: every step writes back into the store, so you can stop, inspect, and resume without recomputing. Filtering marks cells inactive rather than deleting them.
 
-| Cells | Peak RAM | End-to-end |
+| Cells | Peak memory | Core funnel wall |
 |---|---|---|
 | 100k | ~7 GiB | ~15 min |
-| 500k | ~25 GiB | ~45 min |
-| 1M | ~28 GiB | ~1.5 h |
-| 2.5M | ~33 GiB | ~2.5 h |
-| 5M | ~33 GiB | ~4.5 h |
-| 10M | ~37 GiB | ~7 h |
+| 500k | ~17 GiB | ~47 min |
+| 1M | ~28 GiB | ~2.5 h |
+| 2.5M | ~25 GiB | ~4.2 h |
+| 5M | ~33 GiB | ~8.2 h |
+| 10M | ~36 GiB | ~22.8 h |
 
-On 8 CPU cores. Measured through 2.5M cells; 5M and 10M projected from the same curve. Full method and per-stage details in [`profiling/LEARNINGS.md`](profiling/LEARNINGS.md).
+These cloud R2 profiling results use the reference runs documented in [`profiling/LEARNINGS.md`](profiling/LEARNINGS.md), not one controlled scaling series. The 10M wall replaces a cached HVG timer with the documented estimate for a full pass.
 
 Graph-centric methods available: UMAP, densMAP, tSNE, Leiden and Paris clustering, Harmony, WNN/SNN multimodal integration, reference mapping and label transfer, and TopACeDo subsampling.
 

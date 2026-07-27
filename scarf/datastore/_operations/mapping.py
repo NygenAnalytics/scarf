@@ -1,4 +1,4 @@
-from collections.abc import Callable, Generator
+from collections.abc import Generator
 from typing import TYPE_CHECKING, Any, cast
 import os
 import warnings
@@ -29,7 +29,7 @@ from ...storage.artifacts import (
     parse_artifact_path,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
-from ...assay import Assay, RNAassay
+from ...assay import ATACassay, Assay, RNAassay
 from ...matrix import ChunkedArray
 from ...mapping.models import MappingResult
 from ...mapping.reference import MappingReference
@@ -347,6 +347,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
         ann = as_zarr_group(self.zw[ann_path], name=ann_path)
         expected_scaling = bool(attrs.get("ann_feature_scaling"))
+        artifact_intersection = False
+        intersection_source_path: str | None = None
+        intersection_feature_fingerprint: str | None = None
         try:
             ann_ref = parse_artifact_path(ann_path)
         except ValueError:
@@ -358,6 +361,13 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             artifact_ann_parameters = ann_status.parameters or {}
             ann_inputs = ann_status.inputs or {}
             if ann_ref.kind == "intersection_ann_index":
+                artifact_intersection = True
+                raw_fingerprint = ann_inputs.get("selected_feature_fingerprint")
+                if not isinstance(raw_fingerprint, str):
+                    raise ValueError(
+                        "Intersection ANN selected-feature fingerprint is missing"
+                    )
+                intersection_feature_fingerprint = raw_fingerprint
                 raw_source = ann_inputs.get("source_ann_index")
                 if not isinstance(raw_source, dict):
                     raise ValueError("Intersection ANN source is missing")
@@ -370,7 +380,15 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     )
                     coordinates_ref = None
                 else:
+                    if (
+                        source_ann_ref.kind != "ann_index"
+                        or source_ann_ref.assay != ann_ref.assay
+                    ):
+                        raise ValueError("Intersection ANN source is invalid")
                     source_status = inspect_artifact(self.zw, source_ann_ref)
+                    if not source_status.exists or not source_status.complete:
+                        raise ValueError("Intersection ANN source is incomplete")
+                    intersection_source_path = artifact_path(source_ann_ref)
                     ann_inputs = source_status.inputs or {}
                     coordinates_ref = None
             else:
@@ -483,6 +501,22 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             raise ValueError(
                 f"Projection {target_name!r} references a changed selected feature set."
             )
+        if artifact_intersection:
+            if intersection_feature_fingerprint != attrs.get(
+                "selected_feature_fingerprint"
+            ):
+                raise ValueError(
+                    f"Projection {target_name!r} references a changed "
+                    "intersection ANN index."
+                )
+            if (
+                intersection_source_path is not None
+                and attrs.get("ann_source_path") != intersection_source_path
+            ):
+                raise ValueError(
+                    f"Projection {target_name!r} references a changed "
+                    "intersection ANN source."
+                )
         if "__intersection_" in ann_path and ann.attrs.get(
             "selectedFeatureHash"
         ) != attrs.get("selected_feature_fingerprint"):
@@ -817,7 +851,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         cell_key: str,
         feat_key: str,
         feature_indices: np.ndarray,
-        ann_index_saver: Callable | None,
     ) -> AnnStream:
         from ...mapping.confidence import _distance_quantile_summary
         from ...mapping.hashing import array_hash
@@ -878,7 +911,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 "source_ann_index": source_input,
                 "selected_feature_fingerprint": selected_feature_fingerprint,
             },
-            execution_options={"external_saver": ann_index_saver is not None},
+            execution_options={},
             required_arrays=(
                 "ann_idx_bytes",
                 "reference_distance_quantiles",
@@ -887,14 +920,18 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         )
         intersection_path = artifact_path(planned.ref)
         source_data = ann_obj.data[:, positions]
+        selected_mu = ann_obj.mu[positions] if ann_obj.featureScaling else ann_obj.mu
+        selected_sigma = (
+            ann_obj.sigma[positions] if ann_obj.featureScaling else ann_obj.sigma
+        )
         reduction = ReductionTransform(
             data=source_data,
             method="pca",
             dims=ann_obj.loadings.shape[1],
             loadings=ann_obj.loadings[positions, :],
             use_for_pca=np.ones(ann_obj.nCells, dtype=bool),
-            mu=ann_obj.mu[positions],
-            sigma=ann_obj.sigma[positions],
+            mu=selected_mu,
+            sigma=selected_sigma,
             batch_size=ann_obj.batchSize,
             nthreads=self.nthreads,
             rand_state=ann_obj.randState,
@@ -914,6 +951,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 intersection_path,
                 ann_obj.annMetric,
                 ann_obj.loadings.shape[1],
+                expected_count=ann_obj.nCells,
             )
             if intersection_idx is None:
                 raise RuntimeError("Reusable intersection ANN artifact has no index")
@@ -938,13 +976,19 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             self._persist_ann_index(
                 intersection_path,
                 intersection_idx,
-                ann_index_saver,
+                ann_metric=ann_obj.annMetric,
+                dimensions=ann_obj.loadings.shape[1],
+                element_count=ann_obj.nCells,
             )
             sample_stride = max(
                 int(np.ceil(ann_obj.nCells / 100_000)),
                 1,
             )
-            query = NeighborQueryStage(intersection_idx, ann_obj.k)
+            query = NeighborQueryStage(
+                intersection_idx,
+                ann_obj.k,
+                ann_obj.annMetric,
+            )
             sampled_distances: list[np.ndarray] = []
             entry_start = 0
             for block in stream.iter_raw():
@@ -1012,7 +1056,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             lsi_skip_first=True,
             lsi_params={},
             harmonize=False,
-            cache_embeddings=False,
         )
         self._remember_ann_stream_path(intersection_ann, intersection_path)
         self._remember_ann_stream_neighbors(
@@ -1038,8 +1081,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         exclude_missing: bool = False,
         filter_null: bool = False,
         feat_scaling: bool = True,
-        ann_index_fetcher: Callable | None = None,
-        ann_index_saver: Callable | None = None,
         missing_feature_policy: str | None = None,
         query_batches: pd.DataFrame | None = None,
         invalidate_cache: bool = False,
@@ -1087,9 +1128,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 ``'intersection'``.
             query_batches: Optional query batch metadata for Symphony-style correction
                 when mapping into a reusable harmonized reference.
-            ann_index_fetcher:
-            ann_index_saver:
-
         Returns:
             None
         """
@@ -1327,35 +1365,53 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             feat_idx
         ) and np.array_equal(source_feature_indices, feat_idx)
         ann_feat_key = feat_key
-        if (
-            ann_feat_key == feat_key
-            and ann_index_fetcher is None
-            and ann_index_saver is None
-            and self._has_ann_stream_cache(
-                from_assay,
-                cell_key,
-                ann_feat_key,
-                feat_scaling=feat_scaling,
-            )
+        ann_feat_scaling = feat_scaling and not isinstance(source_assay, ATACassay)
+        if ann_feat_key == feat_key and self._has_ann_stream_cache(
+            from_assay,
+            cell_key,
+            ann_feat_key,
+            feat_scaling=ann_feat_scaling,
         ):
             ann_obj: AnnStream | None = self._load_ann_stream(
                 from_assay,
                 cell_key,
                 ann_feat_key,
-                feat_scaling=feat_scaling,
+                feat_scaling=ann_feat_scaling,
             )
         else:
-            graph_plan = self._resolve_graph_plan(
+            normalized = self.run_normalization(
                 from_assay=from_assay,
                 cell_key=cell_key,
                 feat_key=ann_feat_key,
-                return_ann_object=True,
-                update_keys=False,
-                feat_scaling=feat_scaling,
-                ann_index_fetcher=ann_index_fetcher,
-                ann_index_saver=ann_index_saver,
+                update_state=False,
             )
-            ann_obj = self._run_resolved_graph_plan(graph_plan)
+            if isinstance(source_assay, ATACassay):
+                reduction = self.run_lsi(
+                    normalized,
+                    update_state=False,
+                )
+            else:
+                reduction = self.run_pca(
+                    normalized,
+                    feat_scaling=ann_feat_scaling,
+                    update_state=False,
+                )
+            ann_index_ref = self.build_ann_index(
+                reduction,
+                update_state=False,
+            )
+            neighbors_ref = self.query_neighbors(
+                ann_index_ref,
+                coordinates=reduction,
+                update_state=False,
+            )
+            ann_obj = self._load_artifact_ann_stream(
+                from_assay,
+                cell_key,
+                ann_feat_key,
+                ann_feat_scaling,
+                neighbors_ref=neighbors_ref,
+            )
         if ann_obj is None:
             raise ValueError("ERROR: AnnStream could not be created for mapping")
         if ann_obj.harmonize:
@@ -1396,33 +1452,12 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                         fill_value=False,
                         overwrite=True,
                     )
-                    compatibility_plan = self._resolve_graph_plan(
-                        from_assay=from_assay,
-                        cell_key=cell_key,
-                        feat_key=compatibility_feat_key,
-                        dims=min(
-                            int(
-                                ann_obj.dims
-                                if ann_obj.dims is not None
-                                else len(feat_idx)
-                            ),
-                            max(len(feat_idx) - 1, 1),
-                        ),
-                        k=ann_obj.k,
-                        return_ann_object=False,
-                        update_keys=False,
-                        feat_scaling=feat_scaling,
-                        ann_index_fetcher=ann_index_fetcher,
-                        ann_index_saver=ann_index_saver,
-                    )
-                    self._run_resolved_graph_plan(compatibility_plan)
                 ann_obj = self._build_intersection_ann(
                     ann_obj,
                     source_assay,
                     cell_key,
                     feat_key,
                     feat_idx,
-                    ann_index_saver,
                 )
         if save_k > ann_obj.k:
             logger.warning(f"`save_k` was decreased to {ann_obj.k}")
@@ -1435,6 +1470,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 name=target_data_path,
             ),
             nthreads=self.nthreads,
+            resources=target_assay.resources,
         )
         if run_coral is True:
             # Reversing coral here to correct target data
@@ -1452,6 +1488,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     name=f"{target_normed_path}/data_coral",
                 ),
                 nthreads=self.nthreads,
+                resources=target_assay.resources,
             )
         nc = target_assay.cells.active_index(target_cell_key).shape[0]
         nk = save_k
@@ -1723,7 +1760,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         result_store: zarr.Group | None = None,
         invalidate_cache: bool = False,
     ) -> MappingResult:
-        from ...mapping.features import align_features
+        from ...mapping.features import _order_features, align_features
         from ...mapping.hashing import array_hash
         from ...mapping.symphony import (
             accumulate_sufficient_statistics,
@@ -1751,6 +1788,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 f"Resetting target assay's size factor from {target_assay.sf} to {source_assay.sf}"
             )
             target_assay.sf = source_assay.sf
+        target_size_factor = target_assay.sf
+        if target_size_factor is None:
+            raise ValueError("Target assay has no normalization size factor")
         self._guard_mapping_target_path(
             source_assay,
             target_assay,
@@ -1775,51 +1815,35 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 normalization_parameters = (
                     inspect_artifact(self.zw, state.normalized).parameters or {}
                 )
-        feature_indices = align_features(
+        source_feature_key = (
+            reference.feature_key
+            if reference.feature_key == "I"
+            else f"{reference.cell_key}__{reference.feature_key}"
+        )
+        source_feature_ids = source_assay.feats.fetch(
+            "ids",
+            key=source_feature_key,
+        )
+        feature_indices, target_feature_indices = _order_features(
             source_assay,
             target_assay,
-            reference.cell_key,
-            reference.feature_key,
-            target_feat_key,
-            target_cell_key,
+            source_feature_ids,
             filter_null=False,
-            exclude_missing=False,
             nthreads=self.nthreads,
             missing_feature_policy=missing_feature_policy,
-            missing_feature_values=reference.model.feature_means,
-            norm_params=normalization_parameters,
+            target_cell_key=target_cell_key,
         )
-        source_feature_indices = source_assay.feats.active_index(
-            f"{reference.cell_key}__{reference.feature_key}"
-            if reference.feature_key != "I"
-            else "I"
-        )
+        source_feature_indices = source_assay.feats.active_index(source_feature_key)
         if not np.array_equal(feature_indices, source_feature_indices):
             raise ValueError(
                 "The mapping reference requires its complete reference feature set"
             )
-        source_feature_ids = source_assay.feats.fetch(
-            "ids",
-            key=(
-                f"{reference.cell_key}__{reference.feature_key}"
-                if reference.feature_key != "I"
-                else "I"
-            ),
-        )
         if not np.array_equal(source_feature_ids, reference.feature_ids):
             raise ValueError(
                 "Reference feature identifiers no longer match the immutable artifact"
             )
-        target_normed_path = make_normalized_leaf_name(target_cell_key, target_feat_key)
-        target_data_path = f"{target_normed_path}/data"
-        target_data = ChunkedArray(
-            as_zarr_array(
-                target_assay.z[target_data_path],
-                name=target_data_path,
-            ),
-            nthreads=self.nthreads,
-        )
-        n_cells = target_data.shape[0]
+        target_cell_indices = target_assay.cells.active_index(target_cell_key)
+        n_cells = len(target_cell_indices)
         batch_codes, n_batches = self._query_batch_codes(query_batches, n_cells)
         query_batch_columns = (
             [str(column) for column in query_batches.columns]
@@ -1827,7 +1851,14 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             else []
         )
         query_batch_fingerprint = array_hash(batch_codes)
-        target_matrix_fingerprint = self._fingerprint_mapping_matrix(target_data)
+        present_target_features = np.sort(
+            target_feature_indices[target_feature_indices >= 0]
+        )
+        target_source = target_assay.rawData[:, present_target_features][
+            target_cell_indices,
+            :,
+        ]
+        target_source_fingerprint = self._fingerprint_mapping_matrix(target_source)
         ann_obj = self._load_mapping_reference_ann(reference)
         if not ann_obj.harmonize:
             raise RuntimeError("Mapping reference ANN index is not harmonized")
@@ -1867,7 +1898,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                         target_assay.cells.fetch("ids", key=target_cell_key)
                     ),
                     "target_features": array_hash(target_assay.feats.fetch_all("ids")),
-                    "target_normalized": target_matrix_fingerprint,
+                    "target_expression": target_source_fingerprint,
+                    "target_feature_alignment": array_hash(target_feature_indices),
+                    "target_size_factor": float(target_size_factor),
+                    "normalization_parameters": normalization_parameters,
                     "query_batches": query_batch_fingerprint,
                 },
                 execution_options={
@@ -1925,6 +1959,41 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     projection_plan.ref,
                 )
                 return self.get_mapping_result(target_name)
+        aligned_feature_indices = align_features(
+            source_assay,
+            target_assay,
+            reference.cell_key,
+            reference.feature_key,
+            target_feat_key,
+            target_cell_key,
+            filter_null=False,
+            exclude_missing=False,
+            nthreads=self.nthreads,
+            missing_feature_policy=missing_feature_policy,
+            missing_feature_values=(
+                reference.model.feature_means
+                if missing_feature_policy == "reference_mean"
+                else None
+            ),
+            norm_params=normalization_parameters,
+        )
+        if not np.array_equal(aligned_feature_indices, feature_indices):
+            raise RuntimeError("Target feature alignment changed during mapping")
+        target_normed_path = make_normalized_leaf_name(
+            target_cell_key,
+            target_feat_key,
+        )
+        target_data_path = f"{target_normed_path}/data"
+        target_data = ChunkedArray(
+            as_zarr_array(
+                target_assay.z[target_data_path],
+                name=target_data_path,
+            ),
+            nthreads=self.nthreads,
+            resources=target_assay.resources,
+        )
+        if target_data.shape[0] != n_cells:
+            raise RuntimeError("Aligned target matrix has an unexpected cell count")
         counts, sums = initialize_sufficient_statistics(n_batches, reference.model)
         entry_start = 0
         zero_norm_count = 0

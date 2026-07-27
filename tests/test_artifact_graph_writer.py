@@ -6,6 +6,7 @@ import pytest
 from scarf import ArtifactRef
 from scarf.storage.artifacts import parse_artifact_path
 from scarf.graph.state import AssayState
+from tests.fixtures_datastore import build_atomic_graph
 
 pytestmark = pytest.mark.slow
 
@@ -43,13 +44,13 @@ def _state_refs(state: AssayState) -> dict[str, str]:
     }
 
 
-def test_make_graph_writes_only_artifacts_and_state(
+def test_atomic_graph_chain_writes_only_artifacts_and_state(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
     assay_attrs_before = dict(datastore.get_assay("RNA").attrs)
-    datastore.make_graph(**_graph_kwargs())
+    build_atomic_graph(datastore, **_graph_kwargs())
     state = datastore.get_assay_state("RNA")
 
     assert state is not None
@@ -128,34 +129,24 @@ def test_make_graph_writes_only_artifacts_and_state(
     assert lisi is not None
 
 
-def test_make_graph_reuses_provenance(
+def test_atomic_graph_chain_reuses_provenance(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
     kwargs = _graph_kwargs()
-    datastore.make_graph(**kwargs)
+    build_atomic_graph(datastore, **kwargs)
     first = datastore.get_assay_state("RNA")
     assert first is not None
     first_refs = _state_refs(first)
 
-    datastore.make_graph(**kwargs)
+    build_atomic_graph(datastore, **kwargs)
     reused = datastore.get_assay_state("RNA")
     assert reused is not None
     assert _state_refs(reused) == first_refs
 
-    datastore.make_graph(
-        from_assay="RNA",
-        cell_key="I",
-        feat_key="artifact_hvgs",
-        local_cache=False,
-    )
-    resolved_from_state = datastore.get_assay_state("RNA")
-    assert resolved_from_state is not None
-    assert _state_refs(resolved_from_state) == first_refs
 
-
-def test_make_graph_replays_pca_selection_from_execution_metadata(
+def test_atomic_graph_chain_records_pca_selection(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
@@ -165,10 +156,9 @@ def test_make_graph_replays_pca_selection_from_execution_metadata(
     datastore.cells.insert("pca_cells", pca_cells, overwrite=True)
     kwargs = _graph_kwargs() | {"pca_cell_key": "pca_cells"}
 
-    datastore.make_graph(**kwargs)
+    build_atomic_graph(datastore, **kwargs)
     first = datastore.get_assay_state("RNA")
     assert first is not None
-    datastore.make_graph(**(kwargs | {"pca_cell_key": None}))
 
     assert datastore.get_assay_state("RNA") == first
     assert datastore._lookup_stored_graph().pca_cell_key == "pca_cells"
@@ -185,13 +175,12 @@ def test_lsi_artifact_replay_keeps_requested_dimensions(
         "feat_scaling": False,
         "lsi_skip_first": True,
     }
-    datastore.make_graph(**kwargs)
+    build_atomic_graph(datastore, **kwargs)
 
-    ann = datastore.make_graph(**kwargs, return_ann_object=True)
-
-    assert ann is not None
-    assert ann.loadings is not None
-    assert ann.loadings.shape[1] == 3
+    state = datastore.get_assay_state("RNA")
+    assert state is not None and state.reduction is not None
+    reduction = datastore.load_artifact(state.reduction)
+    assert reduction["loadings"].shape[1] == 3
     stored = datastore._lookup_stored_graph()
     assert stored.reduction_method == "lsi"
     assert stored.dims == 3
@@ -199,19 +188,19 @@ def test_lsi_artifact_replay_keeps_requested_dimensions(
     assert stored.feat_scaling is False
 
 
-def test_make_graph_treats_structurally_invalid_cache_as_missing(
+def test_atomic_graph_chain_treats_structurally_invalid_cache_as_missing(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
     kwargs = _graph_kwargs()
-    datastore.make_graph(**kwargs)
+    build_atomic_graph(datastore, **kwargs)
     first = datastore.get_assay_state("RNA")
     assert first is not None and first.normalized is not None
     normalized_path = datastore.inspect_artifact(first.normalized).path
     del datastore.zw[normalized_path]["data"]
 
-    datastore.make_graph(**kwargs)
+    build_atomic_graph(datastore, **kwargs)
     repaired = datastore.get_assay_state("RNA")
 
     assert repaired is not None and repaired.normalized is not None
@@ -225,7 +214,7 @@ def test_paris_writes_hierarchy_cut_and_dendrogram_artifacts(
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
-    datastore.make_graph(**_graph_kwargs())
+    build_atomic_graph(datastore, **_graph_kwargs())
 
     result = datastore.run_paris_clustering(
         from_assay="RNA",
@@ -272,8 +261,9 @@ def test_integrated_graphs_use_random_artifacts_and_label_index(
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
-    datastore.make_graph(**_graph_kwargs())
-    datastore.make_graph(
+    build_atomic_graph(datastore, **_graph_kwargs())
+    build_atomic_graph(
+        datastore,
         from_assay="assay2",
         cell_key="I",
         feat_key="I",
@@ -332,7 +322,8 @@ def test_wnn_uses_exact_nondefault_cell_selection(
         datastore.RNA.feats.fetch_all("I__artifact_hvgs"),
         overwrite=True,
     )
-    datastore.make_graph(
+    build_atomic_graph(
+        datastore,
         from_assay="RNA",
         cell_key="wnn_cells",
         feat_key="artifact_hvgs",
@@ -344,7 +335,8 @@ def test_wnn_uses_exact_nondefault_cell_selection(
         harmony_params={"nclust": 5},
         local_cache=False,
     )
-    datastore.make_graph(
+    build_atomic_graph(
+        datastore,
         from_assay="assay2",
         cell_key="wnn_cells",
         feat_key="I",

@@ -432,8 +432,10 @@ def write_dense_from_row_batches(
     shard_rows = array_shard_rows(dst)
 
     def aligned() -> Iterator[_DenseWriteBand]:
-        pending: list[np.ndarray] = []
-        pending_rows = 0
+        target_dtype = np.dtype(dst.dtype if dtype is None else dtype)
+        n_columns = int(dst.shape[1])
+        buffer = np.empty((shard_rows, n_columns), dtype=target_dtype)
+        buffered_rows = 0
         position = 0
         try:
             for batch in source:
@@ -442,24 +444,35 @@ def write_dense_from_row_batches(
                     raise ValueError("Dense source batch has an invalid shape")
                 if values.shape[0] == 0:
                     continue
-                pending.append(values)
-                pending_rows += int(values.shape[0])
-                while pending_rows >= shard_rows:
-                    block = np.vstack(pending) if len(pending) > 1 else pending[0]
-                    piece = block[:shard_rows]
-                    if dtype is not None:
-                        piece = piece.astype(dtype, copy=False)
-                    yield _DenseWriteBand(position, position + shard_rows, piece)
-                    position += shard_rows
-                    pending = (
-                        [block[shard_rows:]] if block.shape[0] > shard_rows else []
+                source_start = 0
+                while source_start < int(values.shape[0]):
+                    copied = min(
+                        shard_rows - buffered_rows,
+                        int(values.shape[0]) - source_start,
                     )
-                    pending_rows = int(block.shape[0] - shard_rows)
-            if pending_rows:
-                block = np.vstack(pending) if len(pending) > 1 else pending[0]
-                if dtype is not None:
-                    block = block.astype(dtype, copy=False)
-                yield _DenseWriteBand(position, position + pending_rows, block)
+                    buffer[buffered_rows : buffered_rows + copied] = values[
+                        source_start : source_start + copied
+                    ]
+                    buffered_rows += copied
+                    source_start += copied
+                    if buffered_rows == shard_rows:
+                        yield _DenseWriteBand(
+                            position,
+                            position + shard_rows,
+                            buffer,
+                        )
+                        position += shard_rows
+                        buffer = np.empty(
+                            (shard_rows, n_columns),
+                            dtype=target_dtype,
+                        )
+                        buffered_rows = 0
+            if buffered_rows:
+                yield _DenseWriteBand(
+                    position,
+                    position + buffered_rows,
+                    buffer[:buffered_rows],
+                )
         finally:
             _close_iterator(source)
 
@@ -501,12 +514,17 @@ def write_dense_in_shard_rows(
     msg: str | None = None,
     also_write_to: zarr.Array | None = None,
     resources: ResourceBudget | None = None,
-) -> None:
+    summarize: Callable[[np.ndarray], Any] | None = None,
+    merge_summary: Callable[[Any, Any], Any] | None = None,
+) -> Any | None:
     """Produce and write complete destination row bands in the same worker."""
+    if (summarize is None) != (merge_summary is None):
+        raise ValueError("summarize and merge_summary must be provided together")
+    merger = merge_summary
     resources = resources or resolve_budget()
     n_rows = int(dst.shape[0])
     if n_rows == 0:
-        return
+        return None
     rows = array_shard_rows(dst)
     if also_write_to is not None and (
         tuple(also_write_to.shape) != tuple(dst.shape)
@@ -516,7 +534,7 @@ def write_dense_in_shard_rows(
     slices = list(iter_shard_row_slices(n_rows, rows))
     workers, inner = _writer_count(dst, resources, len(slices))
 
-    def produce_and_write(bounds: tuple[int, int]) -> None:
+    def produce_and_write(bounds: tuple[int, int]) -> Any:
         start, end = bounds
         block = np.asarray(produce(start, end))
         expected = (end - start, int(dst.shape[1]))
@@ -527,8 +545,10 @@ def write_dense_in_shard_rows(
         dst[start:end, :] = block
         if also_write_to is not None:
             also_write_to[start:end, :] = block
+        return None if summarize is None else summarize(block)
 
-    for _ in stream_shards(
+    summary: Any | None = None
+    for result in stream_shards(
         slices,
         produce_and_write,
         workers=workers,
@@ -537,7 +557,10 @@ def write_dense_in_shard_rows(
         msg=msg or "Writing Zarr array",
         total=len(slices),
     ):
-        pass
+        if summarize is not None:
+            assert merger is not None
+            summary = result if summary is None else merger(summary, result)
+    return summary
 
 
 def accumulate_sparse_to_shards(

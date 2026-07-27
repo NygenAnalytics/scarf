@@ -214,6 +214,79 @@ def normed_array_spec(
     )
 
 
+def row_sharded_array_spec(
+    shape: tuple[int, ...],
+    dtype: Any,
+    *,
+    profile: StorageProfile,
+    band_rows: int,
+    target_chunk_bytes: int | None = None,
+    zarr_format: int = 3,
+    fill_value: Any | None = 0,
+) -> ZarrArraySpec:
+    """Build a full-width array specification sharded along the first axis."""
+    if not shape:
+        raise ValueError("Row-sharded arrays require at least one dimension")
+    dimensions = tuple(int(value) for value in shape)
+    if any(value < 0 for value in dimensions):
+        raise ValueError("Array dimensions cannot be negative")
+    if int(band_rows) < 1:
+        raise ValueError("band_rows must be positive")
+    trailing = dimensions[1:]
+    trailing_values = int(np.prod(trailing, dtype=np.int64)) if trailing else 1
+    row_bytes = trailing_values * int(np.dtype(dtype).itemsize)
+    if row_bytes < 1 or row_bytes > _CODEC_MAX_BYTES:
+        raise ValueError(
+            f"One full-width row requires {row_bytes} bytes, exceeding "
+            f"the codec input limit of {_CODEC_MAX_BYTES} bytes"
+        )
+    requested_target = (
+        DEFAULT_TARGET_CHUNK_BYTES
+        if target_chunk_bytes is None
+        else int(target_chunk_bytes)
+    )
+    if requested_target < 1:
+        raise ValueError("Chunk target must be positive")
+    n_rows = max(1, dimensions[0])
+    shard_rows = min(n_rows, int(band_rows))
+    codec_rows = max(1, _CODEC_MAX_BYTES // row_bytes)
+    target_rows = max(
+        1,
+        min(
+            shard_rows,
+            requested_target // row_bytes,
+            codec_rows,
+        ),
+    )
+    if zarr_format >= 3:
+        candidates = tuple(
+            value for value in _divisors(shard_rows) if value <= codec_rows
+        )
+        chunk_rows = min(
+            candidates,
+            key=lambda value: (abs(value - target_rows), value > target_rows),
+            default=1,
+        )
+        if chunk_rows == 1 and target_rows > 1:
+            shard_rows = target_rows
+            chunk_rows = target_rows
+    else:
+        chunk_rows = target_rows
+    shard_shape = (shard_rows, *tuple(max(1, value) for value in trailing))
+    chunk_shape = (
+        chunk_rows,
+        *tuple(max(1, value) for value in trailing),
+    )
+    return ZarrArraySpec(
+        shape=dimensions,
+        chunks=chunk_shape,
+        shards=shard_shape if zarr_format >= 3 else None,
+        dtype=dtype,
+        compressors=get_compressors(profile, zarrFormat=zarr_format),
+        fillValue=fill_value,
+    )
+
+
 def array_shard_rows(array: zarr.Array) -> int:
     """Return the row extent of a shard, chunk, or full array."""
     shards_meta = array_metadata_shards(array)

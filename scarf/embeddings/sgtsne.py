@@ -39,7 +39,13 @@ def export_knn_to_mtx(
                     "d": subgraph.data,
                 }
             )
-            frame.to_csv(handle, sep=" ", header=False, index=False, mode="a")
+            frame.to_csv(
+                handle,
+                sep=" ",
+                header=False,
+                index=False,
+                mode="a",
+            )
             start = end
         if start != n_cells:
             raise ValueError(

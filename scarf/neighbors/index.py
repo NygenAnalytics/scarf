@@ -34,30 +34,28 @@ def fix_knn_query(
     ref_idx: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Remove self-neighbor entries from KNN query results."""
-    fixed_ind, fixed_dist = indices.copy()[:, 1:], distances.copy()[:, 1:]
-    mis_idx = indices[:, 0].reshape(1, -1)[0] != ref_idx
-    n_mis = int(mis_idx.sum())
-    if n_mis > 0:
-        for n, i, neighbors, neighbor_distances in zip(
-            np.where(mis_idx)[0],
-            ref_idx[mis_idx],
-            indices[mis_idx],
-            distances[mis_idx],
-        ):
-            self_positions = np.where(neighbors == i)[0]
-            if len(self_positions) > 0:
-                self_position = self_positions[0]
-                neighbors = np.array(
-                    list(neighbors[:self_position])
-                    + list(neighbors[self_position + 1 :])
-                )
-                neighbor_distances = np.array(
-                    list(neighbor_distances[:self_position])
-                    + list(neighbor_distances[self_position + 1 :])
-                )
-            else:
-                neighbors = neighbors[:-1]
-                neighbor_distances = neighbor_distances[:-1]
-            fixed_ind[n] = neighbors
-            fixed_dist[n] = neighbor_distances
-    return fixed_ind, fixed_dist, n_mis
+    neighbor_indices = np.asarray(indices)
+    neighbor_distances = np.asarray(distances)
+    references = np.asarray(ref_idx)
+    if (
+        neighbor_indices.ndim != 2
+        or neighbor_distances.shape != neighbor_indices.shape
+        or references.shape != (neighbor_indices.shape[0],)
+        or neighbor_indices.shape[1] < 2
+    ):
+        raise ValueError("KNN query arrays have incompatible shapes")
+    matches = neighbor_indices == references[:, np.newaxis]
+    has_self = matches.any(axis=1)
+    self_positions = matches.argmax(axis=1)
+    drop_positions = np.where(
+        has_self,
+        self_positions,
+        neighbor_indices.shape[1] - 1,
+    )
+    columns = np.arange(neighbor_indices.shape[1])[np.newaxis, :]
+    keep = columns != drop_positions[:, np.newaxis]
+    output_shape = (neighbor_indices.shape[0], neighbor_indices.shape[1] - 1)
+    fixed_indices = neighbor_indices[keep].reshape(output_shape)
+    fixed_distances = neighbor_distances[keep].reshape(output_shape)
+    missed_self_hits = int(np.count_nonzero(~has_self))
+    return fixed_indices, fixed_distances, missed_self_hits

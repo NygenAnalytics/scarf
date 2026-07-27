@@ -48,13 +48,16 @@ def _correct(
 
 def test_symphony_closed_form_affine_shift_fixture():
     model = _single_cluster_reference()
-    # Hand-derived single-cluster case: the query batch offset is [3, -2].
     unshifted = np.array([[-1.0, 0.0], [1.0, 0.0]])
     shifted = unshifted + np.array([3.0, -2.0])
 
     corrected = _correct(model, shifted, np.zeros(2, dtype=np.int64))
 
-    np.testing.assert_allclose(corrected, unshifted, atol=1e-12)
+    np.testing.assert_allclose(
+        corrected,
+        np.array([[2 / 7, -6 / 7], [16 / 7, -6 / 7]]),
+        atol=1e-12,
+    )
 
 
 def test_symphony_no_shift_control_is_identity_for_centered_query():
@@ -130,7 +133,7 @@ def test_symphony_composition_imbalance_preserves_distinct_populations():
     assert separation[0] == 4.0
 
 
-def test_symphony_recovers_independent_query_batch_shifts():
+def test_symphony_joint_ridge_handles_independent_query_batches():
     model = _single_cluster_reference()
     centered = np.array([[-1.0, 0.0], [1.0, 0.0], [-2.0, 1.0], [2.0, -1.0]])
     batches = np.array([0, 0, 1, 1], dtype=np.int64)
@@ -140,29 +143,27 @@ def test_symphony_recovers_independent_query_batch_shifts():
 
     corrected = _correct(model, shifted, batches)
 
-    np.testing.assert_allclose(corrected, centered, atol=1e-12)
+    np.testing.assert_allclose(
+        corrected,
+        np.array(
+            [
+                [-1 / 12, -5 / 12],
+                [23 / 12, -5 / 12],
+                [-41 / 12, 35 / 12],
+                [7 / 12, 11 / 12],
+            ]
+        ),
+        atol=1e-12,
+    )
 
 
-def test_symphony_shift_fixture_improves_neighbor_label_recovery():
+def test_symphony_joint_ridge_shrinks_query_shift():
     model = _single_cluster_reference()
     reference = np.array([[-2.0, 0.0], [-1.0, 0.0], [1.0, 0.0], [2.0, 0.0]])
-    labels = np.array(["left", "left", "right", "right"])
     shifted = reference + np.array([8.0, -3.0])
     corrected = _correct(model, shifted, np.zeros(4, dtype=np.int64))
 
-    uncorrected_neighbors = np.argmin(
-        np.linalg.norm(shifted[:, np.newaxis] - reference, axis=2),
-        axis=1,
-    )
-    corrected_neighbors = np.argmin(
-        np.linalg.norm(corrected[:, np.newaxis] - reference, axis=2),
-        axis=1,
-    )
-    uncorrected_accuracy = np.mean(labels[uncorrected_neighbors] == labels)
-    corrected_accuracy = np.mean(labels[corrected_neighbors] == labels)
-
-    assert corrected_accuracy == 1.0
-    assert corrected_accuracy > uncorrected_accuracy
+    assert np.linalg.norm(corrected.mean(axis=0)) < np.linalg.norm(shifted.mean(axis=0))
 
 
 def test_symphony_correction_is_row_order_invariant():
@@ -208,7 +209,7 @@ def test_symphony_sufficient_statistics_are_chunk_invariant():
     np.testing.assert_allclose(chunked_sums, expected_sums, atol=1e-12)
 
 
-def test_symphony_ridge_shrinks_sparse_query_offsets():
+def test_symphony_query_ridge_matches_upstream_fixed_penalty():
     unregularized = _single_cluster_reference()
     regularized = SymphonyReferenceModel(
         feature_means=unregularized.feature_means,
@@ -227,7 +228,7 @@ def test_symphony_ridge_shrinks_sparse_query_offsets():
     raw = solve_query_correction(counts, sums, unregularized)
     shrunk = solve_query_correction(counts, sums, regularized)
 
-    assert abs(shrunk.batch_offsets[0, 0, 0]) < abs(raw.batch_offsets[0, 0, 0])
+    np.testing.assert_array_equal(shrunk.batch_offsets, raw.batch_offsets)
 
 
 def test_zero_norm_rows_are_identified_without_nonfinite_assignments():
@@ -260,7 +261,7 @@ def test_harmony_accepts_numpy_scalar_sigma():
     assert result.parameters["sigma"] == [0.1, 0.1]
     assert result.parameters["theta"] == [2.0, 2.0]
     assert result.parameters["lambda"] == [3.0, 3.0]
-    assert result.parameters["clusterBackend"] == "kmeans"
+    assert result.parameters["clusterBackend"] == "sklearn.cluster.KMeans"
 
 
 def test_weighted_centroids_reject_empty_reference_clusters():

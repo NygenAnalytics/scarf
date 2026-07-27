@@ -91,9 +91,15 @@ def fit_harmony(
     if not np.all(np.isfinite(sigma_arr)) or np.any(sigma_arr <= 0):
         raise ValueError("Harmony sigma values must be finite and positive")
 
-    phi_frame = pd.get_dummies(meta_data)
+    categorical_metadata = meta_data.astype(
+        {column: "category" for column in meta_data.columns}
+    )
+    phi_frame = pd.get_dummies(categorical_metadata)
     phi = phi_frame.to_numpy().T
-    phi_n = meta_data.describe().loc["unique"].to_numpy().astype(int)
+    phi_n = np.asarray(
+        [meta_data[column].nunique() for column in meta_data.columns],
+        dtype=int,
+    )
 
     def _expand_parameter(
         values: float | int | np.ndarray | list[float] | None,
@@ -124,7 +130,8 @@ def fit_harmony(
 
     lamb_mat = np.diag(np.insert(lamb_arr, 0, 0))
     phi_moe = np.vstack((np.repeat(1, n_cells), phi))
-    np.random.seed(random_state)
+    if isinstance(cluster_fn, str) and cluster_fn != "kmeans":
+        raise ValueError("Harmony cluster_fn must be 'kmeans' or a callable")
 
     optimizer = Harmony(
         data_mat,
@@ -150,7 +157,7 @@ def fit_harmony(
         for column in meta_data.columns
     )
     cluster_backend = (
-        cluster_fn
+        "sklearn.cluster.KMeans"
         if isinstance(cluster_fn, str)
         else (
             f"{getattr(cluster_fn, '__module__', type(cluster_fn).__module__)}."
@@ -173,12 +180,12 @@ def fit_harmony(
         "phiColumns": [str(column) for column in phi_frame.columns],
     }
     return HarmonyResult(
-        original=np.asarray(data_mat, dtype=np.float64).copy(),
+        original=optimizer.Z_orig,
         corrected=optimizer.result(),
-        assignments=optimizer.R.copy(),
-        centroids=optimizer.Y.copy(),
+        assignments=optimizer.R,
+        centroids=optimizer.Y,
         sigma=sigma_arr.copy(),
-        ridge=lamb_mat.copy(),
+        ridge=lamb_mat,
         batch_columns=batch_columns,
         batch_levels=batch_levels,
         parameters=parameters,

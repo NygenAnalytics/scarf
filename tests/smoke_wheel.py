@@ -29,6 +29,7 @@ _RETIRED_MODULES = {
     "scarf/genomics/intervals.py",
     "scarf/genomics/melding.py",
     "scarf/genomics/reference.py",
+    "scarf/graph/build.py",
     "scarf/knn_utils.py",
     "scarf/mapping_reference.py",
     "scarf/mapping_utils.py",
@@ -42,7 +43,9 @@ _RETIRED_MODULES = {
     "scarf/merge.py",
     "scarf/metadata.py",
     "scarf/metrics.py",
+    "scarf/neighbors/graph_store.py",
     "scarf/neighbors/persistence.py",
+    "scarf/neighbors/query.py",
     "scarf/parallel.py",
     "scarf/plots.py",
     "scarf/plots/__init__.py",
@@ -186,7 +189,6 @@ for writer_function in (
     assert callable(writer_function)
     assert writer_function.__module__ == "scarf.writers"
 for method in (
-    "make_graph",
     "run_mapping",
     "run_marker_search",
     "mark_hvgs",

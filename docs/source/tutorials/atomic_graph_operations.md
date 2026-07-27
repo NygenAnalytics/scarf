@@ -100,8 +100,8 @@ ds.run_leiden_clustering(resolution=0.5)
 
 ## Migration from `make_graph`
 
-`make_graph` is deprecated. It still runs the same chain underneath. Prefer the
-table below in new code.
+`DataStore.make_graph` has been removed. Use the table below to migrate an older
+workflow. Existing datastores and their stored graphs remain readable.
 
 | Former `make_graph` concern | Atomic / pipeline replacement |
 |---|---|
@@ -113,21 +113,29 @@ table below in new code.
 | `k` | `query_neighbors(..., k=...)` |
 | `local_connectivity`, `bandwidth` | `build_connectivity_map(...)` |
 | `n_centroids`, `rand_state` (k-means init) | `build_embedding_initialization(...)` (required before UMAP unless you pass `ini_embed`) |
-| `local_cache` | Same name on atomic methods (`"auto"`, `True`, `False`, or a path) |
+| `local_cache` | Use on `run_pca`, `run_lsi`, or `run_custom_reduction` |
 | `update_keys=True` | `update_state=True` on atomic methods |
 | `return_ann_object=True` | Load ANN from the `ann_index` artifact when needed |
 
 ```{warning}
-`make_graph` derived the ANN search breadth from `k` as `min(100, max(k * 3, 50))`, while
-`build_ann_index` uses a fixed default of 50 for `ann_efc` and `ann_ef`. For any `k` above
-16 the two produce slightly different approximate neighbours, so a migrated call can give
-marginally different edge weights and clusters. Pass the derived values explicitly when you
+The removed method derived ANN search breadth from `k` as
+`min(100, max(k * 3, 50))` and `ann_m` from `dims` as
+`min(max(48, int(dims * 1.5)), 64)`. Direct `build_ann_index` uses fixed
+defaults of 50, 50, and 48. Pass all three derived values explicitly when you
 need to reproduce an older graph exactly.
 ```
 
-Identity parameters (for example `dims`, `k`) decide artifact reuse.
-Execution-only options (for example `local_cache`, `batch_size`) do not. See
+Artifact identity is operation-specific. `dims` and `k` are identity
+parameters, while `local_cache` is a reduction execution option. `batch_size`
+is part of identity for PCA and embedding initialization, but is execution-only
+for normalization and several later stages. See
 {doc}`../concepts/provenance` and {doc}`provenance_and_reuse`.
+
+For Harmony, pass the `run_harmony` result to `build_ann_index` and
+`query_neighbors`. Call `build_mapping_reference` separately when query mapping
+needs a Symphony reference. `run_harmony`, `build_ann_index`, and
+`query_neighbors` no longer accept `local_cache` because they read persisted
+coordinate artifacts.
 
 ## Next steps
 

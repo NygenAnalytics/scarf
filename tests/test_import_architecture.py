@@ -405,7 +405,7 @@ def test_extracted_domains_have_only_narrow_storage_dependencies():
     forbidden = {"datastore", "plotting", "readers", "writers"}
     storage_exceptions = {
         "features": {"genomic/melding.py", "markers/batching.py"},
-        "neighbors": {"graph_store.py"},
+        "neighbors": set(),
         "quality_control": {"doublets.py"},
     }
     for package_name, allowed_storage_importers in storage_exceptions.items():
@@ -914,7 +914,6 @@ def test_datastore_operation_mixins_are_runtime_isolated():
     from scarf.datastore._operations.embeddings import _EmbeddingOperationsMixin
     from scarf.datastore._operations.features import _FeatureOperationsMixin
     from scarf.datastore._operations.graph import _GraphOperationsMixin
-    from scarf.datastore._operations.graph_legacy_params import _GraphLegacyParamsMixin
     from scarf.datastore._operations.integration_metrics import (
         _IntegrationMetricsOperationsMixin,
     )
@@ -958,7 +957,6 @@ def test_datastore_operation_mixins_are_runtime_isolated():
         _ClusteringOperationsMixin,
         _TrajectoryOperationsMixin,
         _MappingReferenceOperationsMixin,
-        _GraphLegacyParamsMixin,
         _GraphOperationsMixin,
         _MappingOperationsMixin,
         _QualityControlOperationsMixin,

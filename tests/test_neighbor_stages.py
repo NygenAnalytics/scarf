@@ -43,7 +43,7 @@ def _custom_inputs() -> tuple[np.ndarray, np.ndarray]:
     return data, loadings
 
 
-def _ann_stream(*, cache_embeddings: bool) -> AnnStream:
+def _ann_stream() -> AnnStream:
     values, loadings = _custom_inputs()
     return AnnStream(
         data=ChunkedArray.from_numpy(values, block_size=4, nthreads=1),
@@ -68,7 +68,6 @@ def _ann_stream(*, cache_embeddings: bool) -> AnnStream:
         lsi_skip_first=False,
         lsi_params={},
         harmonize=False,
-        cache_embeddings=cache_embeddings,
     )
 
 
@@ -142,28 +141,18 @@ def test_lsi_dims_are_final_output_dimensions(skip_first: bool) -> None:
     assert loadings.shape == (values.shape[1], 2)
 
 
-def test_ann_stream_adapter_preserves_cached_and_lazy_numerics() -> None:
+def test_ann_stream_adapter_preserves_reduction_numerics() -> None:
     values, loadings = _custom_inputs()
-    cached = _ann_stream(cache_embeddings=True)
-    lazy = _ann_stream(cache_embeddings=False)
+    stream = _ann_stream()
     expected = values.dot(loadings)
 
-    np.testing.assert_allclose(cached.embeddings, expected)
-    assert lazy.embeddings is None
-    np.testing.assert_allclose(lazy.transform_query(values), expected)
-    np.testing.assert_array_equal(cached.clusterLabels, lazy.clusterLabels)
-    np.testing.assert_allclose(
-        cached.kmeans.cluster_centers_,
-        lazy.kmeans.cluster_centers_,
-    )
-
-    cached_indices, cached_distances = cached.transform_ann(expected, k=3)
-    lazy_indices, lazy_distances = lazy.transform_ann(expected, k=3)
-    np.testing.assert_array_equal(cached_indices, lazy_indices)
-    np.testing.assert_allclose(cached_distances, lazy_distances)
+    np.testing.assert_allclose(stream.transform_query(values), expected)
+    assert stream.clusterLabels.shape == (values.shape[0],)
+    indices, distances = stream.transform_ann(expected, k=3)
+    assert indices.shape == distances.shape == (values.shape[0], 3)
 
 
-def test_lazy_transform_cache_is_shared_by_ann_and_kmeans() -> None:
+def test_lazy_coordinate_stages_do_not_hide_a_cross_stage_cache() -> None:
     values, loadings = _custom_inputs()
     data = _CountingChunkedArray(values, block_size=3)
     stream = LazyTransformStream(
@@ -172,12 +161,6 @@ def test_lazy_transform_cache_is_shared_by_ann_and_kmeans() -> None:
         nthreads=1,
         batch_size=3,
     )
-
-    assert data.read_count == 0
-    cached = stream.cache("cache")
-    assert data.read_count == 3
-    assert stream.cache("cache again") is cached
-    assert data.read_count == 3
 
     index = AnnIndexStage.fit(
         coordinates=stream,
@@ -198,13 +181,28 @@ def test_lazy_transform_cache_is_shared_by_ann_and_kmeans() -> None:
         enabled=True,
     )
 
-    assert data.read_count == 3
+    assert data.read_count == 9
     assert index.get_current_count() == values.shape[0]
-    query = NeighborQueryStage(index, k=3)
-    indices, distances = query.query(cached, k=3)
+    query = NeighborQueryStage(index, k=3, metric="l2")
+    indices, distances = query.query(values.dot(loadings), k=3)
     assert indices.shape == distances.shape == (values.shape[0], 3)
     assert initialization.model is not None
     assert initialization.labels.shape == (values.shape[0],)
+
+
+def test_neighbor_query_validates_and_converts_metric_distances() -> None:
+    stage = NeighborQueryStage(index=None, k=2, metric="l2")
+    distances = np.array([[4.0, -1e-7]], dtype=np.float32)
+    np.testing.assert_allclose(
+        stage._metric_distances(distances),
+        [[2.0, 0.0]],
+    )
+
+    cosine = NeighborQueryStage(index=None, k=2, metric="cosine")
+    with pytest.raises(ValueError, match="negative"):
+        cosine._metric_distances(np.array([[0.1, -0.01]], dtype=np.float32))
+    with pytest.raises(ValueError, match="non-finite"):
+        cosine._metric_distances(np.array([[0.1, np.nan]], dtype=np.float32))
 
 
 def test_kmeans_initialization_runs_on_demand_without_ann() -> None:
@@ -239,7 +237,7 @@ def test_kmeans_initialization_runs_on_demand_without_ann() -> None:
     assert data.read_count == 6
 
 
-def test_kmeans_initialization_caps_small_inputs_and_rejects_empty() -> None:
+def test_kmeans_initialization_rejects_single_row_and_empty_inputs() -> None:
     values, loadings = _custom_inputs()
     single_data = ChunkedArray.from_numpy(values[:1], block_size=1, nthreads=1)
     single_stream = LazyTransformStream(
@@ -248,16 +246,14 @@ def test_kmeans_initialization_caps_small_inputs_and_rejects_empty() -> None:
         nthreads=1,
         batch_size=1,
     )
-    single = KMeansInitializationStage.fit(
-        stream=single_stream,
-        n_clusters=5,
-        rand_state=4466,
-        nthreads=1,
-        enabled=True,
-    )
-    assert single.model is not None
-    assert single.model.n_clusters == 1
-    assert single.labels.shape == (1,)
+    with pytest.raises(ValueError, match="at least two rows"):
+        KMeansInitializationStage.fit(
+            stream=single_stream,
+            n_clusters=5,
+            rand_state=4466,
+            nthreads=1,
+            enabled=True,
+        )
 
     empty_stream = LazyTransformStream(
         data=ChunkedArray.from_numpy(
@@ -314,6 +310,9 @@ def test_harmony_stage_materializes_uncorrected_coordinates_once(
     monkeypatch.setattr("scarf.neighbors.stages.fit_harmony", fake_harmony)
     stage = BatchCorrectionStage(
         stream=stream,
+        n_cells=values.shape[0],
+        dims=loadings.shape[1],
+        batch_size=3,
         batches=pd.DataFrame({"batch": ["a", "b"] * 4}),
         parameters={},
         corrected_data=None,
@@ -366,7 +365,6 @@ def test_invalid_ann_configuration_fails_before_harmony_reads(
             lsi_params={},
             harmonize=True,
             batches=pd.DataFrame({"batch": ["a", "b"] * 4}),
-            cache_embeddings=False,
         )
 
     assert not harmony_called

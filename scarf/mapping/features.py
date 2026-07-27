@@ -173,13 +173,16 @@ def align_features(
         msg=f"({target_assay.name}) Writing aligned data to {normed_loc}",
     ):
         pos_end += i.shape[0]
-        if missing_feature_values is None:
-            a = np.zeros((i.shape[0], len(t_idx)), dtype=i.dtype)
-        else:
+        if (
+            missing_feature_policy == "reference_mean"
+            and missing_feature_values is not None
+        ):
             a = np.broadcast_to(
                 missing_feature_values,
                 (i.shape[0], len(t_idx)),
             ).copy()
+        else:
+            a = np.zeros((i.shape[0], len(t_idx)), dtype=i.dtype)
         a[:, np.where(t_idx != -1)[0]] = i[:, unsorter_idx]
         og[pos_start:pos_end, :] = a
         pos_start = pos_end

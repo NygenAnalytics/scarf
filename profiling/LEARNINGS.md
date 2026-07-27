@@ -179,7 +179,7 @@ Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.m
 
 | Knob | Value used in successful speed runs | Rule |
 |------|-------------------------------------|------|
-| Assay / workflow seeds | graph 4466, umap/leiden 4444, `topN=2000`, `k=11`, `dims=50` | Keep fixed across A/B |
+| Assay / workflow seeds | graph 4466, umap/leiden 4444, `topN=2000`, `k=11`, `dims=50`, `ann_m=64` | Keep fixed across A/B |
 | Modal vs Scarf coupling | Usually Scarf ≈ 75% of Modal | Decouple on purpose only for budget-mismatch experiments (below) |
 
 ## How to quantify a future change
@@ -657,7 +657,7 @@ Tag `counts_t_extras_c8_m32_250k`. Config `profiling/layouts/250k_counts_t_extra
 | `runPseudotime` | PBA using Leiden first/last cluster as source/sink |
 | `prepareMappingQuery` | Build 25k query Zarr (prep cost) |
 | `runMapping` | Project 25k onto 250k reference (mapping cost only) |
-| `makeGraphHarmony` | Synthetic 4 batches + `make_graph(harmonize=True)` |
+| `makeGraphHarmony` | Synthetic 4 batches plus the atomic Harmony graph chain |
 | `subsetZarr` | Export active cells to local Zarr |
 | `toH5ad` | Export assay to local H5AD |
 

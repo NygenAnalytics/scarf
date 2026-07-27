@@ -324,8 +324,9 @@ ds = scarf.DataStore('path/to/data.zarr', mem_budget='8G', nthreads=4)
 ```
 
 For object storage, use `zarrProfile='cloud'` and pass `local_cache` on atomic
-graph methods (or rely on `"auto"`) to stage normalized data locally before
-multi-pass PCA and KNN. See {doc}`remote_stores`.
+reduction methods (or rely on `"auto"`) to stage normalized data locally before
+multi-pass PCA. KNN reads persisted reduced coordinates. See
+{doc}`remote_stores`.
 
 ## Common mistakes
 

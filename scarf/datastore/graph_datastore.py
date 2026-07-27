@@ -5,7 +5,6 @@ from ..neighbors.stream import AnnStream
 from ._operations.clustering import _ClusteringOperationsMixin
 from ._operations.embeddings import _EmbeddingOperationsMixin
 from ._operations.graph import _GraphOperationsMixin
-from ._operations.graph_legacy_params import _GraphLegacyParamsMixin
 from ._operations.mapping_reference import _MappingReferenceOperationsMixin
 from ._operations.trajectory import _TrajectoryOperationsMixin
 from .base_datastore import BaseDataStore
@@ -16,7 +15,6 @@ class GraphDataStore(
     _ClusteringOperationsMixin,
     _TrajectoryOperationsMixin,
     _MappingReferenceOperationsMixin,
-    _GraphLegacyParamsMixin,
     _GraphOperationsMixin,
     BaseDataStore,
 ):

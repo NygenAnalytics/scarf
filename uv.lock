@@ -3271,7 +3271,7 @@ requires-dist = [
     { name = "topacedo", marker = "extra == 'docs'" },
     { name = "topacedo", marker = "extra == 'test'", specifier = ">=0.2.10" },
     { name = "tqdm", specifier = ">=4.60" },
-    { name = "umap-learn", specifier = ">=0.5.6" },
+    { name = "umap-learn", specifier = ">=0.5.12" },
     { name = "zarr", specifier = ">=3.1.2" },
 ]
 provides-extras = ["extra", "test", "docs"]

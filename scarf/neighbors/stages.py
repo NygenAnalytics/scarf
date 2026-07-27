@@ -159,25 +159,6 @@ class LazyTransformStream:
         self.transform = transform
         self.nthreads = nthreads
         self.batch_size = batch_size
-        self._cached: np.ndarray | None = None
-
-    @property
-    def cached(self) -> np.ndarray | None:
-        return self._cached
-
-    def parallel_blocks(self, message: str) -> list[np.ndarray]:
-        return self.data.map_blocks(
-            lambda _index, start, end: self.transform(
-                self.data._materialize_range(start, end)
-            ),
-            nthreads=self.nthreads,
-            msg=message,
-        )
-
-    def cache(self, message: str) -> np.ndarray:
-        if self._cached is None:
-            self._cached = np.vstack(self.parallel_blocks(message))
-        return self._cached
 
     def iter_raw(self, message: str = "") -> Iterator[np.ndarray]:
         yield from self.data.stream_blocks(nthreads=self.nthreads, msg=message)
@@ -187,40 +168,26 @@ class LazyTransformStream:
             yield self.transform(block)
 
     def iter_coordinate_blocks(self, message: str) -> Iterator[np.ndarray]:
-        if self.cached is None:
-            yield from self.iter_transformed(message)
-            return
-        starts = self.cached_ranges()
-        for start in tqdmbar(
-            starts,
-            desc=message,
-            total=len(starts),
-        ):
-            yield self.cached_block(start)
-
-    def cached_ranges(self) -> range:
-        if self._cached is None:
-            raise RuntimeError("No transformed coordinates are cached")
-        return range(0, self._cached.shape[0], self.batch_size)
-
-    def cached_block(self, start: int) -> np.ndarray:
-        if self._cached is None:
-            raise RuntimeError("No transformed coordinates are cached")
-        end = min(start + self.batch_size, self._cached.shape[0])
-        return self._cached[start:end]
+        yield from self.iter_transformed(message)
 
 
 class BatchCorrectionStage:
     def __init__(
         self,
         *,
-        stream: LazyTransformStream,
+        stream: "CoordinateSource",
+        n_cells: int,
+        dims: int,
+        batch_size: int,
         batches: pd.DataFrame | None,
         parameters: Mapping[str, Any],
         corrected_data: ChunkedArray | None,
         nthreads: int,
     ) -> None:
         self.stream = stream
+        self.n_cells = int(n_cells)
+        self.dims = int(dims)
+        self.batch_size = int(batch_size)
         self.batches = batches
         self.parameters = dict(parameters)
         self.corrected_data = corrected_data
@@ -232,11 +199,24 @@ class BatchCorrectionStage:
             return self.corrected_data
         if self.batches is None:
             raise ValueError("Harmony requires batch metadata")
-        uncorrected = np.vstack(
-            self.stream.parallel_blocks(
-                "Calculating uncorrected latent dimensions",
+        uncorrected = np.empty(
+            (self.dims, self.n_cells),
+            dtype=np.float64,
+        )
+        start = 0
+        for block in self.stream.iter_coordinate_blocks(
+            "Loading uncorrected latent dimensions",
+        ):
+            values = np.asarray(block)
+            stop = start + int(values.shape[0])
+            if values.shape != (stop - start, self.dims) or stop > self.n_cells:
+                raise ValueError("Coordinate block has an invalid shape")
+            uncorrected[:, start:stop] = values.T
+            start = stop
+        if start != self.n_cells:
+            raise ValueError(
+                f"Coordinate source contains {start} rows, expected {self.n_cells}"
             )
-        ).T
         with threadpool_limits(limits=self.nthreads):
             self.result = fit_harmony(
                 uncorrected,
@@ -245,7 +225,7 @@ class BatchCorrectionStage:
             )
         self.corrected_data = ChunkedArray.from_numpy(
             self.result.corrected.T,
-            block_size=self.stream.data.chunksize[0],
+            block_size=self.batch_size,
             nthreads=self.nthreads,
         )
         return self.corrected_data
@@ -333,9 +313,24 @@ class AnnIndexStage:
 
 
 class NeighborQueryStage:
-    def __init__(self, index: Any, k: int) -> None:
+    def __init__(self, index: Any, k: int, metric: str) -> None:
         self.index = index
         self.k = k
+        self.metric = metric
+
+    def _metric_distances(self, distances: np.ndarray) -> np.ndarray:
+        values = np.asarray(distances)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("ANN metric produced non-finite neighbor distances")
+        if self.metric in {"l2", "cosine"}:
+            if np.any(values < -1e-6):
+                raise ValueError("ANN metric produced negative neighbor distances")
+            np.maximum(values, 0, out=values)
+        if self.metric == "l2":
+            np.sqrt(values, out=values)
+        if self.metric != "ip" and np.any(values < 0):
+            raise ValueError("ANN metric produced negative neighbor distances")
+        return values
 
     def query(
         self,
@@ -347,9 +342,18 @@ class NeighborQueryStage:
         use_k = self.k if k is None else k
         if self_indices is None:
             indices, distances = self.index.knn_query(values, k=use_k)
-            return np.asarray(indices), np.asarray(distances)
+            return np.asarray(indices), self._metric_distances(distances)
         indices, distances = self.index.knn_query(values, k=use_k + 1)
-        return fix_knn_query(indices, distances, self_indices)
+        fixed_indices, fixed_distances, missed = fix_knn_query(
+            indices,
+            distances,
+            self_indices,
+        )
+        return (
+            fixed_indices,
+            self._metric_distances(fixed_distances),
+            missed,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,60 +366,57 @@ class KMeansInitializationStage:
     @staticmethod
     def fit(
         *,
-        stream: LazyTransformStream,
+        stream: CoordinateSource,
+        n_rows: int | None = None,
+        batch_size: int | None = None,
         n_clusters: int,
         rand_state: int,
         nthreads: int,
         enabled: bool,
     ) -> KMeansInitialization:
+        if n_rows is None:
+            data = getattr(stream, "data", None)
+            if data is None:
+                raise ValueError("n_rows is required for this coordinate source")
+            n_rows = int(data.shape[0])
+        if batch_size is None:
+            raw_batch_size = getattr(stream, "batch_size", None)
+            if raw_batch_size is None:
+                raise ValueError("batch_size is required for this coordinate source")
+            batch_size = int(raw_batch_size)
         if not enabled:
             return KMeansInitialization(
                 model=None,
-                labels=np.repeat(-1, stream.data.shape[0]),
+                labels=np.repeat(-1, n_rows),
             )
-        if stream.data.shape[0] == 0:
+        if n_rows == 0:
             raise ValueError("K-means initialization requires at least one row")
         from sklearn.cluster import MiniBatchKMeans
 
         effective_clusters = min(
             max(n_clusters, 2),
-            stream.batch_size,
-            stream.data.shape[0],
+            batch_size,
+            n_rows,
         )
+        if effective_clusters < 2:
+            raise ValueError(
+                "K-means initialization requires at least two rows per batch"
+            )
         model = MiniBatchKMeans(
             n_clusters=effective_clusters,
             random_state=rand_state,
-            batch_size=stream.batch_size,
+            batch_size=batch_size,
             n_init=3,
         )
         labels: list[int] = []
         with threadpool_limits(limits=nthreads):
-            if stream.cached is not None:
-                starts = stream.cached_ranges()
-                for start in tqdmbar(
-                    starts,
-                    desc="Fitting kmeans",
-                    total=len(starts),
-                ):
-                    model.partial_fit(stream.cached_block(start))
-                for start in tqdmbar(
-                    starts,
-                    desc="Estimating seed partitions",
-                    total=len(starts),
-                ):
-                    labels.extend(model.predict(stream.cached_block(start)))
-            else:
-                for block in stream.iter_transformed("Fitting kmeans"):
-                    model.partial_fit(block)
-                predicted = stream.data.map_blocks(
-                    lambda _index, start, end: np.asarray(
-                        model.predict(
-                            stream.transform(stream.data._materialize_range(start, end))
-                        )
-                    ),
-                    nthreads=nthreads,
-                    msg="Estimating seed partitions",
-                )
-                for part in predicted:
-                    labels.extend(part)
-        return KMeansInitialization(model=model, labels=np.asarray(labels))
+            for block in stream.iter_coordinate_blocks("Fitting kmeans"):
+                model.partial_fit(block)
+            for block in stream.iter_coordinate_blocks(
+                "Estimating seed partitions",
+            ):
+                labels.extend(model.predict(block))
+        return KMeansInitialization(
+            model=model,
+            labels=np.asarray(labels, dtype=np.uint32),
+        )

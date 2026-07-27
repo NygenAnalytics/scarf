@@ -14,7 +14,6 @@ if TYPE_CHECKING:
         instantiate_knn_index as instantiate_knn_index,
     )
     from .integration import wnn_integration as wnn_integration
-    from .query import self_query_blocks as self_query_blocks
     from .stream import AnnStream as AnnStream
 
 __all__ = [
@@ -24,7 +23,6 @@ __all__ = [
     "fix_knn_query",
     "instantiate_knn_index",
     "merge_graphs",
-    "self_query_blocks",
     "smooth_knn_chunk",
     "weight_sort_indices",
     "wnn_integration",
@@ -37,7 +35,6 @@ _LAZY_EXPORTS = {
     "fix_knn_query": (".index", "fix_knn_query"),
     "instantiate_knn_index": (".index", "instantiate_knn_index"),
     "merge_graphs": (".graph", "merge_graphs"),
-    "self_query_blocks": (".query", "self_query_blocks"),
     "smooth_knn_chunk": (".graph", "smooth_knn_chunk"),
     "weight_sort_indices": (".graph", "weight_sort_indices"),
     "wnn_integration": (".integration", "wnn_integration"),

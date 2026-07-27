@@ -76,6 +76,7 @@ class ArrayRequirement:
     name: str
     shape: tuple[int | None, ...] | None = None
     dtype_kind: str | None = None
+    dtype: Any | None = None
 
     def matches(self, group: zarr.Group) -> bool:
         from .types import as_zarr_array
@@ -97,6 +98,8 @@ class ArrayRequirement:
         if self.dtype_kind is not None:
             if np.dtype(array.dtype).kind != self.dtype_kind:
                 return False
+        if self.dtype is not None and np.dtype(array.dtype) != np.dtype(self.dtype):
+            return False
         return True
 
 

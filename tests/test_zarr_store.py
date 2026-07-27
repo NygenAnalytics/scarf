@@ -18,6 +18,7 @@ from scarf.storage.layout import (
     _CODEC_MAX_BYTES,
     count_array_spec,
     normed_array_spec,
+    row_sharded_array_spec,
 )
 from scarf.storage.profiles import (
     is_local_zarr_path,
@@ -29,6 +30,7 @@ from scarf.storage.sharding import (
     accumulate_sparse_to_shards,
     sparse_producer_peak_bytes,
     write_dense_from_row_batches,
+    write_dense_in_shard_rows,
     write_counts_t,
 )
 from scarf.storage.stores import (
@@ -253,6 +255,71 @@ def test_normed_plan_respects_codec_limit():
     assert spec.chunks[0] * spec.chunks[1] * 4 <= _CODEC_MAX_BYTES
 
 
+def test_row_sharded_plan_uses_full_width_divisible_chunks():
+    spec = row_sharded_array_spec(
+        (10_000_000, 100),
+        np.float32,
+        profile="cloud",
+        band_rows=1_000_000,
+    )
+
+    assert spec.shards == (1_000_000, 100)
+    assert spec.chunks[1] == 100
+    assert spec.shards[0] % spec.chunks[0] == 0
+    assert np.prod(spec.chunks) * np.dtype(spec.dtype).itemsize <= 128 * 1024**2
+
+
+def test_row_sharded_plan_uses_band_chunks_for_zarr_v2():
+    spec = row_sharded_array_spec(
+        (12, 3),
+        np.uint32,
+        profile="fast_local",
+        band_rows=5,
+        zarr_format=2,
+    )
+
+    assert spec.shards is None
+    assert spec.chunks == (5, 3)
+
+
+def test_row_sharded_plan_avoids_unit_chunks_for_irregular_rows():
+    spec = row_sharded_array_spec(
+        (500_009, 100),
+        np.float32,
+        profile="cloud",
+        band_rows=1_000_000,
+    )
+
+    assert spec.shards == (500_009, 100)
+    assert spec.chunks[0] > 1
+    assert spec.shards[0] % spec.chunks[0] == 0
+
+
+def test_row_sharded_plan_caps_zarr_v2_chunk_bytes():
+    spec = row_sharded_array_spec(
+        (300_000_000, 2),
+        np.uint32,
+        profile="cloud",
+        band_rows=300_000_000,
+        zarr_format=2,
+    )
+
+    assert spec.shards is None
+    assert np.prod(spec.chunks) * np.dtype(spec.dtype).itemsize <= _CODEC_MAX_BYTES
+
+
+def test_flat_connectivity_shards_align_to_one_million_cells():
+    k = 50
+    spec = row_sharded_array_spec(
+        (10_000_000 * k, 2),
+        np.uint32,
+        profile="cloud",
+        band_rows=1_000_000 * k,
+    )
+
+    assert spec.shards == (1_000_000 * k, 2)
+
+
 def test_dense_row_batches_flush_at_shard_boundaries():
     root = zarr.open_group(store=MemoryStore(), mode="w")
     destination = root.create_array(
@@ -272,6 +339,45 @@ def test_dense_row_batches_flush_at_shard_boundaries():
     )
     assert rows == 7
     np.testing.assert_array_equal(destination[:], expected.astype(np.uint16))
+
+
+def test_dense_shard_summaries_are_merged_incrementally():
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    destination = root.create_array(
+        "values",
+        shape=(100, 3),
+        chunks=(10, 3),
+        dtype=np.float32,
+    )
+    values = np.arange(300, dtype=np.float32).reshape(100, 3)
+    merge_count = 0
+
+    def summarize(block):
+        return (
+            block.sum(axis=0, dtype=np.float64),
+            np.square(block, dtype=np.float64).sum(axis=0),
+        )
+
+    def merge(accumulated, current):
+        nonlocal merge_count
+        merge_count += 1
+        accumulated[0][:] += current[0]
+        accumulated[1][:] += current[1]
+        return accumulated
+
+    summary = write_dense_in_shard_rows(
+        destination,
+        lambda start, end: values[start:end],
+        summarize=summarize,
+        merge_summary=merge,
+    )
+
+    assert merge_count == 9
+    np.testing.assert_allclose(summary[0], values.sum(axis=0, dtype=np.float64))
+    np.testing.assert_allclose(
+        summary[1],
+        np.square(values, dtype=np.float64).sum(axis=0),
+    )
 
 
 def test_sparse_batches_write_complete_shards():

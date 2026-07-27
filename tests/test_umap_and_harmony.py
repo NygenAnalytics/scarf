@@ -3,8 +3,6 @@ import pandas as pd
 import pytest
 from scipy.sparse import coo_matrix
 
-pytest.importorskip("umap")
-
 from scarf.embeddings.initialization import initial_embedding
 from scarf.embeddings.umap import (
     calc_dens_map_params,
@@ -163,6 +161,21 @@ def test_initial_embedding_matches_regression_values():
         rtol=1e-6,
         atol=1e-6,
     )
+
+
+def test_initial_embedding_accepts_integral_float_labels_and_rejects_invalid():
+    centers = np.eye(3)
+    integral = initial_embedding(centers, np.array([0.0, 1.0, 2.0]), 2)
+    assert integral.shape == (3, 2)
+
+    for labels in (
+        np.array([0.0, 1.5]),
+        np.array([0.0, -1.0]),
+        np.array([0.0, np.nan]),
+        np.array([0, 3]),
+    ):
+        with pytest.raises(ValueError):
+            initial_embedding(centers, labels, 2)
 
 
 def test_run_harmony_corrects_batch_structure():

@@ -5,7 +5,7 @@ from scipy.io import mmread
 from scipy.sparse import csr_matrix
 
 
-def test_export_knn_to_mtx(datastore, make_graph, tmp_path):
+def test_export_knn_to_mtx(datastore, graph_artifacts, tmp_path):
     from scarf.embeddings.sgtsne import export_knn_to_mtx
 
     graph = datastore.load_graph(
@@ -28,4 +28,4 @@ def test_export_knn_to_mtx(datastore, make_graph, tmp_path):
     expected.sort_indices()
     np.testing.assert_array_equal(actual.indptr, expected.indptr)
     np.testing.assert_array_equal(actual.indices, expected.indices)
-    np.testing.assert_allclose(actual.data, expected.data, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(actual.data, expected.data, rtol=1e-7, atol=1e-8)

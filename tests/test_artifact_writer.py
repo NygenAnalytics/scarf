@@ -186,6 +186,37 @@ def test_finish_rejects_payload_that_violates_declared_shape() -> None:
     assert not inspect_artifact(root, planned.ref).complete
 
 
+def test_exact_dtype_requirement_prevents_reuse() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    arguments = {
+        "scope": "assay",
+        "assay": "RNA",
+        "kind": "reduction",
+        "operation": "run_pca",
+        "parameters": {},
+        "inputs": {},
+        "execution_options": {},
+    }
+    first = plan_artifact(root, **arguments)
+    group = start_artifact(root, first)
+    group.create_array("data", data=np.array([1.0], dtype=np.float64))
+    finish_artifact(group, first)
+
+    same_kind = plan_artifact(
+        root,
+        **arguments,
+        required_arrays=(ArrayRequirement("data", dtype_kind="f"),),
+    )
+    exact = plan_artifact(
+        root,
+        **arguments,
+        required_arrays=(ArrayRequirement("data", dtype=np.float32),),
+    )
+
+    assert same_kind.reused
+    assert not exact.reused
+
+
 def test_planned_artifact_invalidated_forces_new_ref() -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     arguments = {

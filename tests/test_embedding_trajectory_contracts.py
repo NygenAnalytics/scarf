@@ -15,7 +15,7 @@ def test_embedding_and_trajectory_entry_point_signatures_are_stable():
         "validate_pseudotime_regressor": validate_pseudotime_regressor,
     }
     assert signature_digest(methods) == (
-        "6acbf182fdfe286497935d4741b7484d712d51565e07fe09f4cebe099329291d"
+        "b963e7139e72eea4843182060350a8c907e973014df48a84a13806ec6b435dfd"
     )
     assert [field.name for field in fields(PseudotimeScoreResult)] == [
         "pseudotime_key",

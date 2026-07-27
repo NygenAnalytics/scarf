@@ -13,7 +13,7 @@ A Scarf Zarr store is a directory hierarchy. Typical top-level groups include:
 - per-assay feature metadata
 - normalized matrices, reductions, and graph artefacts under assay-specific paths
 
-Exact group names depend on the assay and the parameters passed to `make_graph`. Prefer
+Exact group names depend on the assay and the graph-stage parameters. Prefer
 inspecting a store with `zarr.open` or Scarf's `DataStore` summary rather than hard-coding
 internal paths in analysis scripts.
 

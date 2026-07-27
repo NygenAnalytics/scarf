@@ -1,15 +1,10 @@
+from numbers import Real
+
 import numpy as np
 from numba import jit
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ..utils.progress import tqdmbar
-
-
-def _is_umap_version_new() -> bool:
-    import umap
-    from packaging import version
-
-    return version.parse(umap.__version__) >= version.parse("0.5.0")
 
 
 def smooth_knn_chunk(
@@ -32,21 +27,87 @@ def smooth_knn_chunk(
         local_connectivity=local_connectivity,
         bandwidth=bandwidth,
     )
-    if _is_umap_version_new():
-        rows, columns, values, _ = compute_membership_strengths(
-            indices_array,
-            distance_array,
-            sigmas,
-            rhos,
-        )
-    else:
-        rows, columns, values = compute_membership_strengths(
-            indices_array,
-            distance_array,
-            sigmas,
-            rhos,
-        )
+    rows, columns, values, _ = compute_membership_strengths(
+        indices_array,
+        distance_array,
+        sigmas,
+        rhos,
+    )
     return np.asarray(rows), np.asarray(columns), np.asarray(values)
+
+
+def validate_connectivity_parameters(
+    local_connectivity: float,
+    bandwidth: float,
+) -> tuple[float, float]:
+    if isinstance(local_connectivity, bool) or not isinstance(
+        local_connectivity,
+        Real,
+    ):
+        raise TypeError("local_connectivity must be a real number")
+    if isinstance(bandwidth, bool) or not isinstance(bandwidth, Real):
+        raise TypeError("bandwidth must be a real number")
+    resolved_local_connectivity = float(local_connectivity)
+    resolved_bandwidth = float(bandwidth)
+    if not np.isfinite(resolved_local_connectivity) or resolved_local_connectivity < 0:
+        raise ValueError("local_connectivity must be finite and non-negative")
+    if not np.isfinite(resolved_bandwidth) or resolved_bandwidth <= 0:
+        raise ValueError("bandwidth must be finite and greater than zero")
+    return resolved_local_connectivity, resolved_bandwidth
+
+
+def build_connectivity_arrays(
+    indices: np.ndarray,
+    distances: np.ndarray,
+    *,
+    local_connectivity: float,
+    bandwidth: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build compact edge and weight arrays for a complete KNN matrix."""
+    local_connectivity, bandwidth = validate_connectivity_parameters(
+        local_connectivity,
+        bandwidth,
+    )
+    neighbor_indices = np.asarray(indices)
+    neighbor_distances = np.asarray(distances)
+    if neighbor_indices.ndim != 2 or neighbor_distances.shape != neighbor_indices.shape:
+        raise ValueError("Neighbor indices and distances must have matching matrices")
+    if not np.issubdtype(neighbor_indices.dtype, np.integer):
+        raise TypeError("Neighbor indices must be integers")
+    if np.any(neighbor_indices < 0) or np.any(
+        neighbor_indices >= neighbor_indices.shape[0]
+    ):
+        raise ValueError("Neighbor indices are outside the cell range")
+    if not np.all(np.isfinite(neighbor_distances)) or np.any(neighbor_distances < 0):
+        raise ValueError("Neighbor distances must be finite and non-negative")
+    rows, columns, values = smooth_knn_chunk(
+        neighbor_indices,
+        neighbor_distances,
+        local_connectivity=local_connectivity,
+        bandwidth=bandwidth,
+    )
+    expected = int(neighbor_indices.size)
+    if (
+        rows.shape != (expected,)
+        or columns.shape != (expected,)
+        or values.shape != (expected,)
+    ):
+        raise ValueError("UMAP membership output does not match the KNN matrix")
+    if (
+        np.any(rows < 0)
+        or np.any(columns < 0)
+        or np.any(rows > np.iinfo(np.uint32).max)
+        or np.any(columns > np.iinfo(np.uint32).max)
+    ):
+        raise ValueError("Connectivity endpoints exceed uint32 bounds")
+    edges = np.empty((expected, 2), dtype=np.uint32)
+    edges[:, 0] = rows
+    edges[:, 1] = columns
+    weights = np.asarray(values, dtype=np.float32)
+    if not np.all(np.isfinite(weights)):
+        raise ValueError("Connectivity weights must be finite")
+    positive = weights > 0
+    return edges[positive], weights[positive]
 
 
 @jit(nopython=True)
@@ -78,23 +139,24 @@ def weight_sort_indices(
 
 def merge_graphs(csr_mats: list[csr_matrix]) -> coo_matrix:
     """Merge regular graphs using edge weights and shared neighbors."""
-    try:
-        assert len({matrix.shape for matrix in csr_mats}) == 1
-    except AssertionError:
+    if not csr_mats:
+        raise ValueError("At least one graph is required")
+    if len({matrix.shape for matrix in csr_mats}) != 1:
         raise ValueError("ERROR: All graphs do not have the same shape.")
-    try:
-        assert len({matrix.size for matrix in csr_mats}) == 1
-    except AssertionError:
+    row_counts = [np.diff(matrix.indptr) for matrix in csr_mats]
+    if any(
+        len(counts) == 0 or not np.all(counts == counts[0]) for counts in row_counts
+    ):
+        raise ValueError("ERROR: All graphs must have a regular neighbor count")
+    neighbor_counts = {int(counts[0]) for counts in row_counts}
+    if len(neighbor_counts) != 1:
         raise ValueError("ERROR: All graphs do not have the same number of edges")
-
-    nk = csr_mats[0][0].indices.shape[0]
+    nk = neighbor_counts.pop()
+    if nk < 2:
+        raise ValueError("SNN integration requires at least two neighbors per cell")
     snns = []
     for matrix in tqdmbar(csr_mats, desc="Identifying SNNs in graphs"):
-        snns.append(
-            calc_snn(
-                matrix.indices.reshape((matrix.shape[0], matrix[0].indices.shape[0]))
-            )
-        )
+        snns.append(calc_snn(matrix.indices.reshape((matrix.shape[0], nk))))
     columns: list[int] = []
     data: list[float] = []
     for row_idx in tqdmbar(

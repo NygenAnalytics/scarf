@@ -7,6 +7,13 @@ from ..matrix import ChunkedArray
 from ..utils.logging import logger
 
 
+def _mutable_fit_block(block: np.ndarray) -> np.ndarray:
+    values = np.asarray(block)
+    if values.flags.owndata and values.flags.writeable and values.flags.c_contiguous:
+        return values
+    return np.array(values, copy=True, order="C")
+
+
 def fit_incremental_pca(
     data: ChunkedArray,
     *,
@@ -25,14 +32,14 @@ def fit_incremental_pca(
         batch_size=batch_size,
     )
     subset_samples = use_for_pca.sum() != data.shape[0]
-    start = 0
     end_reservoir: np.ndarray | None = None
     carry_over: np.ndarray | None = None
-    for block in data.stream_blocks(nthreads=nthreads, msg="Fitting PCA"):
-        if subset_samples:
-            end = start + block.shape[0]
-            block = block[use_for_pca[start:end]]
-            start = end
+    for block in data._stream_blocks(
+        nthreads=nthreads,
+        msg="Fitting PCA",
+        prefetch=None,
+        row_mask=use_for_pca if subset_samples else None,
+    ):
         if scale is not None:
             block = scale(block)
         if carry_over is not None:
@@ -45,7 +52,7 @@ def fit_incremental_pca(
             end_reservoir = block
             continue
         try:
-            model.partial_fit(np.array(block, copy=True), check_input=False)
+            model.partial_fit(_mutable_fit_block(block), check_input=False)
         except LinAlgError:
             carry_over = block
 
@@ -58,14 +65,7 @@ def fit_incremental_pca(
     else:
         assert end_reservoir is not None
         fit_batch = end_reservoir
-    try:
-        model.partial_fit(np.array(fit_batch, copy=True), check_input=False)
-    except LinAlgError:
-        logger.warning(
-            f"{fit_batch.shape[0]} samples were not used in PCA fitting "
-            "due to LinAlgError",
-            flush=True,
-        )
+    model.partial_fit(_mutable_fit_block(fit_batch), check_input=False)
     return model.components_[:-1, :].T, model
 
 

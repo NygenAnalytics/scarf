@@ -55,8 +55,8 @@ Downstream UMAP and clustering read the published state.
 
 ## Migration from `make_graph`
 
-`DataStore.make_graph` is deprecated. It remains a facade over the same atomic chain and
-emits `DeprecationWarning`. Prefer `ds.pipeline.run` or the methods above.
+`DataStore.make_graph` has been removed. Use `ds.pipeline.run` or the methods
+above. Existing datastores remain readable without rebuilding their graphs.
 
 
 | Former `make_graph` concern | Replacement |
@@ -69,11 +69,23 @@ emits `DeprecationWarning`. Prefer `ds.pipeline.run` or the methods above.
 | `k` | `query_neighbors(..., k=...)` |
 | `local_connectivity`, `bandwidth` | `build_connectivity_map(...)` |
 | `n_centroids`, `rand_state` (k-means init) | `build_embedding_initialization(...)` |
-| `local_cache` | Same name on atomic methods (`"auto"`, `True`, `False`, or a path) |
+| `local_cache` | `run_pca`, `run_lsi`, or `run_custom_reduction` |
 | `update_keys=True` | `update_state=True` on atomic methods |
+| `return_ann_object=True` | Reload the completed ANN and neighbors artifacts when an `AnnStream` is required |
 
-`make_graph` derives some ANN construction defaults from `k` and `dims`. Direct
+The removed method derived some ANN construction defaults from `k` and `dims`. Direct
 `build_ann_index` uses fixed defaults (`ann_efc=50`, `ann_ef=50`, `ann_m=48`) unless you
-override them. Pass explicit ANN parameters when you need parity with an old `make_graph`
-call. The full deprecated signature remains under {doc}`datastore`.
+override them. For parity when `k > 16`, pass
+`ann_efc=ann_ef=min(100, max(k * 3, 50))`. For dimension parity, pass
+`ann_m=min(max(48, int(dims * 1.5)), 64)`.
+
+Harmony workflows should call `run_harmony`, build ANN and neighbors from its
+returned coordinates, then call `build_mapping_reference` when Symphony mapping
+support is required. `local_cache` is no longer accepted by `run_harmony`,
+`build_ann_index`, or `query_neighbors` because those stages read persisted
+coordinates instead of normalized expression.
+
+ANN graph construction supports L2 and cosine metrics. Persisted L2 neighbor
+distances are Euclidean distances; Scarf converts the squared values returned
+by HNSW before connectivity is calculated.
 

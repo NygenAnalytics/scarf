@@ -1,11 +1,12 @@
 (graph_and_state)=
 # Graph construction and published state
 
-Scarf builds one neighbourhood graph per selected cell and feature set, then
-reuses that graph for embeddings, clustering, mapping, and multimodal
-integration. You can construct that graph at three levels of control. They are
-not competing APIs: all three publish the same `AssayState` that downstream
-methods read.
+Scarf persists one graph artifact chain per assay and selected cell and feature
+set. Embedding and clustering reuse its connectivity map, while mapping can
+reuse its reduction and ANN index. Multimodal integration consumes
+modality-specific graphs and writes a separate integrated graph. You can
+construct each assay graph at three levels of control. They are not competing
+APIs: all three publish the same `AssayState` that downstream methods read.
 
 ## Three levels, one system
 
@@ -43,14 +44,13 @@ when you want a branch, for example two values of `k` from one ANN index. Combin
 `update_state=False` for side branches you do not want as the current published chain.
 
 See {doc}`../tutorials/atomic_graph_operations` for a short executable chain and
-a `make_graph` migration table.
+a migration table for older graph calls.
 
-### 3. Compatibility path: deprecated `make_graph`
+### 3. Older workflows
 
-`make_graph` remains available as a facade over the same atomic chain. It emits
-`DeprecationWarning` and will be removed in a future major release. Prefer
-`pipeline.run` or the atomic methods in new code. Existing tutorials that still
-call `make_graph` produce the same published state once the call finishes.
+`DataStore.make_graph` has been removed. Use `pipeline.run` for the standard
+workflow or call the atomic methods directly. Datastores created by older
+versions remain readable. Rebuilding a graph writes the current artifact layout.
 
 ## AssayState
 
@@ -69,9 +69,8 @@ appear under `named_results`.
 
 Downstream methods such as `run_umap`, `run_leiden_clustering`, and
 `run_paris_clustering` resolve the graph through this published state (or an
-explicit graph location when you pass one). Construction path does not matter:
-pipeline, atomic calls, and `make_graph` all leave the same kind of state for
-consumers.
+explicit graph location when you pass one). Pipeline and atomic calls publish
+the same kind of state for consumers.
 
 If `get_assay_state` returns `None`, the assay has no current published artifact
 chain. Released archives that predate artifacts often look like this even when
@@ -85,7 +84,6 @@ are in {doc}`../tutorials/data_organization`.
 |---|---|
 | Standard RNA analysis with sensible defaults | `ds.pipeline.run` |
 | Change one stage, branch Harmony, or control reuse | Atomic methods |
-| Keep an old script running briefly | `make_graph` (deprecated) |
 
 Stay on one level per workflow unless you have a reason to drop into atomic
 calls. Mixing is supported because state is shared, but reading

@@ -234,6 +234,12 @@ class RNAassay(Assay):
                 self.nthreads,
                 log_transform=log_transform,
                 mirror=mirror,
+                stats_group=(
+                    as_zarr_group(self.z[location], name=location)
+                    if artifact_mode
+                    else None
+                ),
+                batch_size=batch_size,
             )
             return ChunkedArray(
                 as_zarr_array(self.z[location + "/data"], name=location + "/data"),
@@ -275,6 +281,7 @@ class RNAassay(Assay):
             self.nthreads,
             log_transform=log_transform,
             mirror=mirror,
+            batch_size=batch_size,
         )
         self.z[location].attrs["subset_hash"] = subset_hash
         self.z[location].attrs["subset_params"] = subset_params
@@ -326,19 +333,24 @@ class RNAassay(Assay):
             feat_idx = self.feats.active_index("I")
         counts = self.rawData[:, feat_idx][cell_idx, :]
         norm_method_cache = self.normMethod
-        if log_transform:
-            self.normMethod = norm_lib_size_log
-        if renormalize_subset:
-            a = show_dask_progress(
-                counts.sum(axis=1), "Normalizing with feature subset", self.nthreads
-            )
-            a[a == 0] = 1
-            self.scalar = a
-        else:
-            self.scalar = self.cells.fetch_all(self.name + "_nCounts")[cell_idx]
-        val = self.normMethod(self, counts)
-        self.normMethod = norm_method_cache
-        return val
+        scalar_cache = self.scalar
+        try:
+            if log_transform:
+                self.normMethod = norm_lib_size_log
+            if renormalize_subset:
+                scalar = show_dask_progress(
+                    counts.sum(axis=1),
+                    "Normalizing with feature subset",
+                    self.nthreads,
+                )
+                scalar[scalar == 0] = 1
+                self.scalar = scalar
+            else:
+                self.scalar = self.cells.fetch_all(self.name + "_nCounts")[cell_idx]
+            return self.normMethod(self, counts)
+        finally:
+            self.normMethod = norm_method_cache
+            self.scalar = scalar_cache
 
     def iter_raw_column_blocks(
         self,

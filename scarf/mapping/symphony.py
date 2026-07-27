@@ -89,23 +89,38 @@ def solve_query_correction(
     sums: np.ndarray,
     model: SymphonyReferenceModel,
 ) -> QueryCorrection:
-    """Fit cluster-aware batch offsets against reference raw centroids."""
+    """Fit Symphony's joint cluster-aware query batch correction."""
     if counts.ndim != 2 or counts.shape[1] != model.n_clusters:
         raise ValueError("Query count statistics have incompatible dimensions")
     if sums.shape != (counts.shape[0], model.n_clusters, model.n_dims):
         raise ValueError("Query sum statistics have incompatible dimensions")
-    expected = counts[:, :, np.newaxis] * model.raw_centroids[np.newaxis, :, :]
-    median_mass = max(float(np.median(model.cluster_mass)), 1.0)
-    reference_regularization = model.correction_ridge * model.cluster_mass / median_mass
-    denominator = (
-        counts[:, :, np.newaxis] + reference_regularization[np.newaxis, :, np.newaxis]
-    )
-    offsets = np.divide(
-        sums - expected,
-        denominator,
-        out=np.zeros_like(sums),
-        where=denominator > 0,
-    )
+    n_batches = counts.shape[0]
+    offsets = np.zeros_like(sums)
+    for cluster in range(model.n_clusters):
+        cluster_counts = counts[:, cluster]
+        design_crossproduct = np.zeros(
+            (n_batches + 1, n_batches + 1),
+            dtype=np.float64,
+        )
+        design_crossproduct[0, 0] = cluster_counts.sum() + model.cluster_mass[cluster]
+        design_crossproduct[0, 1:] = cluster_counts
+        design_crossproduct[1:, 0] = cluster_counts
+        design_crossproduct[1:, 1:] = np.diag(cluster_counts + 1.0)
+
+        coordinate_crossproduct = np.empty(
+            (n_batches + 1, model.n_dims),
+            dtype=np.float64,
+        )
+        coordinate_crossproduct[0] = (
+            sums[:, cluster].sum(axis=0)
+            + model.cluster_mass[cluster] * model.corrected_centroids[cluster]
+        )
+        coordinate_crossproduct[1:] = sums[:, cluster]
+        coefficients = np.linalg.solve(
+            design_crossproduct,
+            coordinate_crossproduct,
+        )
+        offsets[:, cluster] = coefficients[1:]
     return QueryCorrection(batch_offsets=offsets, batch_counts=counts.copy())
 
 
@@ -128,8 +143,7 @@ def apply_query_correction(
     query_offsets = np.einsum(
         "nk,nkd->nd", assignments, correction.batch_offsets[batch_codes]
     )
-    reference_shift = assignments @ (model.raw_centroids - model.corrected_centroids)
-    corrected = coordinates - query_offsets - reference_shift
+    corrected = coordinates - query_offsets
     if not np.all(np.isfinite(corrected)):
         raise ValueError("Query correction produced non-finite coordinates")
     return cast(np.ndarray, corrected)

@@ -25,7 +25,7 @@ remote overhead.
 
 - Scarf installed with the `extra` optional dependencies
 - Credentials for your bucket (except for anonymous public reads)
-- Enough local disk for optional `local_cache` scratch on multi-pass graph steps
+- Enough local disk for optional `local_cache` scratch during reduction
 
 ## What you will learn
 
@@ -33,7 +33,7 @@ remote overhead.
 - Open `DataStore` on `s3://` or `gs://` with `storage_options`
 - Mount shared count matrices into a separate writable analysis store
 - Select the `cloud` storage profile
-- Stage normalized data locally with `local_cache`
+- Stage normalized data locally for PCA with `local_cache`
 - Repack an older store with `scarf.tools.repack_zarr`
 
 ## Open the public demo store
@@ -220,10 +220,12 @@ credentials on the VM, or an explicit token in `storage_options`).
 After open, call the same analysis APIs as on a local store:
 `ds.pipeline.run(...)` or the atomic graph methods.
 
-## Local scratch for graph stages
+## Local scratch for reductions
 
-Multi-pass PCA, ANN, and neighbor queries re-read the normalized matrix.
-Against object storage, set `local_cache` so those passes hit local disk:
+PCA fitting and score projection make multiple passes over normalized
+expression. Against object storage, set `local_cache` on the reduction so those
+passes hit local disk. Harmony, ANN, and neighbor queries read persisted
+reduced coordinates and do not use normalized-expression scratch.
 
 | Value | Behavior |
 |---|---|
@@ -233,12 +235,12 @@ Against object storage, set `local_cache` so those passes hit local disk:
 | `"/path/to/scratch"` | Persistent scratch keyed by artifact ID |
 
 ```python
-ds.run_normalization(feat_key="hvgs", local_cache=True)
-ds.run_pca(dims=15, local_cache=True)
-ds.build_embedding_initialization()
-ds.build_ann_index(local_cache=True)
-ds.query_neighbors(k=11, local_cache=True)
-ds.build_connectivity_map()
+normalized = ds.run_normalization(feat_key="hvgs")
+reduction = ds.run_pca(normalized, dims=15, local_cache=True)
+ds.build_embedding_initialization(reduction)
+ann_index = ds.build_ann_index(reduction)
+neighbors = ds.query_neighbors(ann_index, k=11)
+ds.build_connectivity_map(neighbors)
 ```
 
 `local_cache` is an execution option. It does not change artifact identity, so

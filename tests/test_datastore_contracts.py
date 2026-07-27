@@ -30,7 +30,6 @@ _METHODS = {
         "get_mapping_reference",
         "integrate_assays",
         "load_graph",
-        "make_graph",
         "query_neighbors",
         "run_fate_mapping",
         "run_leiden_clustering",
@@ -95,8 +94,8 @@ _METHODS = {
 
 _SIGNATURE_DIGESTS = {
     BaseDataStore: "ba5c5e4e09f310114b2f7e09ac346bc759d87912e04d034153e5bc5b41e0f6a5",
-    GraphDataStore: "10dd6f9f5350529ae3f70372cc8aa37e636877acc3a0275df2979e7a6708dae0",
-    MappingDatastore: "eaa8df1bda8fb83066fbac9e30a112fb8a0a46b1e278cce304b300ac5603e16f",
+    GraphDataStore: "e919b40195887fd7befd39e7822059953ef0f94101522c135e14f80a5326007a",
+    MappingDatastore: "2ef564043bc620e6f4e18daec36e62cffe8130972be6eae31e16d5a41297d3d8",
     DataStore: "5baeb2e039afc5d69e2ba70f11cde7fb0a5a1fed5932916691358d021c6e8cc1",
 }
 
@@ -148,10 +147,7 @@ def test_datastore_plot_namespace_contract_is_stable():
 
 def test_datastore_static_method_contracts_are_stable():
     static_methods = {
-        GraphDataStore: (
-            "_choose_reduction_method",
-            "_resolve_local_cache_plan",
-        ),
+        GraphDataStore: ("_resolve_local_cache_plan",),
         MappingDatastore: (
             "_label_vote_decision",
             "_projection_block_size",
@@ -181,7 +177,6 @@ def test_graph_datastore_private_mixin_order_is_stable():
     from scarf.datastore._operations.clustering import _ClusteringOperationsMixin
     from scarf.datastore._operations.embeddings import _EmbeddingOperationsMixin
     from scarf.datastore._operations.graph import _GraphOperationsMixin
-    from scarf.datastore._operations.graph_legacy_params import _GraphLegacyParamsMixin
     from scarf.datastore._operations.mapping_reference import (
         _MappingReferenceOperationsMixin,
     )
@@ -192,10 +187,10 @@ def test_graph_datastore_private_mixin_order_is_stable():
         _ClusteringOperationsMixin,
         _TrajectoryOperationsMixin,
         _MappingReferenceOperationsMixin,
-        _GraphLegacyParamsMixin,
         _GraphOperationsMixin,
         BaseDataStore,
     )
+    assert not hasattr(GraphDataStore, "make_graph")
 
 
 def test_mapping_datastore_private_mixin_order_is_stable():
@@ -318,7 +313,6 @@ def test_datastore_operation_mixins_have_unique_method_owners():
     from scarf.datastore._operations.embeddings import _EmbeddingOperationsMixin
     from scarf.datastore._operations.features import _FeatureOperationsMixin
     from scarf.datastore._operations.graph import _GraphOperationsMixin
-    from scarf.datastore._operations.graph_legacy_params import _GraphLegacyParamsMixin
     from scarf.datastore._operations.integration_metrics import (
         _IntegrationMetricsOperationsMixin,
     )
@@ -340,7 +334,6 @@ def test_datastore_operation_mixins_have_unique_method_owners():
         _ClusteringOperationsMixin,
         _TrajectoryOperationsMixin,
         _MappingReferenceOperationsMixin,
-        _GraphLegacyParamsMixin,
         _GraphOperationsMixin,
         _MappingOperationsMixin,
         _QualityControlOperationsMixin,
