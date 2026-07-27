@@ -3,23 +3,251 @@ from importlib import import_module, util
 import numpy as np
 import pandas as pd
 import pytest
+import zarr
 from scipy.spatial import procrustes
 from sklearn.metrics import adjusted_rand_score
 
 import scarf
 import scarf.plotting as splt
+from scarf.assay import Assay
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.mapping_datastore import MappingDatastore
 from scarf.mapping.hashing import array_hash
+from scarf.metadata import MetaData
 from scarf.storage.artifacts import ArtifactRef
 from scarf.trajectory.results import (
     PseudotimeAggregationResult,
     PseudotimeScoreResult,
 )
 from scarf.utils.arrays import array_digest
+from scarf.writers import create_cell_data, create_zarr_count_assay
 from tests.fixtures_datastore import build_atomic_graph
+from tests.store_probes import RecordingStore
 
 from . import full_path
+
+
+_QC_VALUES = np.array(
+    [
+        [5, 0, 1, 0, 0, 2],
+        [0, 3, 0, 4, 0, 0],
+        [1, 2, 0, 0, 0, 0],
+        [0, 0, 0, 5, 0, 1],
+        [0, 0, 0, 0, 0, 0],
+        [2, 1, 3, 1, 0, 0],
+    ],
+    dtype=np.uint32,
+)
+_QC_FEATURE_NAMES = np.array(["MT-CO1", "RPS3", "GENE_A", "RPL5", "ZERO", "GENE_B"])
+
+
+def _qc_store() -> tuple[RecordingStore, int]:
+    store = RecordingStore()
+    root = zarr.open_group(store=store, mode="w")
+    n_cells, n_features = _QC_VALUES.shape
+    create_cell_data(
+        root,
+        None,
+        ids=np.array([f"c{i}" for i in range(n_cells)]),
+        names=np.array([f"c{i}" for i in range(n_cells)]),
+        profile="fast_local",
+    )
+    counts = create_zarr_count_assay(
+        root,
+        "RNA",
+        None,
+        n_cells,
+        feat_ids=np.array([f"f{i}" for i in range(n_features)]),
+        feat_names=_QC_FEATURE_NAMES,
+        dtype="uint32",
+        profile="fast_local",
+        targetChunkBytes=16,
+        targetShardBytes=48,
+    )
+    counts[:] = _QC_VALUES
+    assert counts.shards is not None
+    expected_reads = int(np.ceil(n_cells / counts.shards[0]))
+    store.reset()
+    return store, expected_reads
+
+
+def _open_qc_store(store: RecordingStore, **overrides) -> DataStore:
+    options = {
+        "default_assay": "RNA",
+        "min_features_per_cell": 0,
+        "min_cells_per_feature": 0,
+        "mito_pattern": "^MT-",
+        "ribo_pattern": "^(RPS|RPL)",
+        "nthreads": 1,
+        "zarrProfile": "fast_local",
+    }
+    options.update(overrides)
+    return DataStore(store, **options)
+
+
+def _count_chunk_gets(store: RecordingStore) -> list[str]:
+    return [
+        key for operation, key in store.chunk_ops("RNA/counts/c/") if operation == "get"
+    ]
+
+
+def _assert_one_counts_stream(store: RecordingStore, expected_reads: int) -> None:
+    gets = _count_chunk_gets(store)
+    assert len(gets) == expected_reads
+    assert len(set(gets)) == expected_reads
+
+
+def test_initialization_fuses_qc_stats_in_one_counts_stream():
+    store, expected_reads = _qc_store()
+    datastore = _open_qc_store(store)
+
+    expected_n_counts = _QC_VALUES.sum(axis=1).astype(np.float64)
+    expected_n_features = (_QC_VALUES > 0).sum(axis=1).astype(np.float64)
+    expected_n_cells = (_QC_VALUES > 0).sum(axis=0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        expected_mito = 100 * _QC_VALUES[:, 0] / expected_n_counts
+        expected_ribo = 100 * _QC_VALUES[:, [1, 3]].sum(axis=1) / expected_n_counts
+
+    np.testing.assert_array_equal(
+        datastore.cells.fetch_all("RNA_nCounts"),
+        expected_n_counts,
+    )
+    np.testing.assert_array_equal(
+        datastore.cells.fetch_all("RNA_nFeatures"),
+        expected_n_features,
+    )
+    np.testing.assert_allclose(
+        datastore.cells.fetch_all("RNA_percentMito"),
+        expected_mito,
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        datastore.cells.fetch_all("RNA_percentRibo"),
+        expected_ribo,
+        equal_nan=True,
+    )
+    np.testing.assert_array_equal(
+        datastore.RNA.feats.fetch_all("nCells"),
+        expected_n_cells,
+    )
+    np.testing.assert_array_equal(
+        datastore.RNA.feats.fetch_all("dropOuts"),
+        _QC_VALUES.shape[0] - expected_n_cells,
+    )
+    np.testing.assert_array_equal(
+        datastore.RNA.feats.fetch_all("I"),
+        expected_n_cells > 0,
+    )
+    _assert_one_counts_stream(store, expected_reads)
+
+    for column in (
+        "RNA_nCounts",
+        "RNA_nFeatures",
+        "RNA_percentMito",
+        "RNA_percentRibo",
+    ):
+        assert "source_artifact" not in datastore.zw["cellData"][column].attrs
+    for column in ("nCells", "dropOuts"):
+        assert "source_artifact" not in datastore.RNA.z["featureData"][column].attrs
+
+
+def test_cached_initialization_is_read_and_write_free():
+    store, _ = _qc_store()
+    _open_qc_store(store)
+    store.reset()
+
+    _open_qc_store(store, zarr_mode="r")
+
+    assert _count_chunk_gets(store) == []
+    assert [operation for operation, _ in store.ops if operation == "set"] == []
+
+
+def test_partial_initialization_preserves_hvg_cache():
+    store, expected_reads = _qc_store()
+    datastore = _open_qc_store(store)
+    datastore.RNA.set_feature_stats("I")
+    subset_hash = datastore.RNA.z["summary_stats_I"].attrs["subset_hash"]
+    feature_index = datastore.RNA.feats.fetch_all("I")
+    datastore.cells.drop("RNA_nFeatures")
+    store.reset()
+
+    reopened = _open_qc_store(store)
+
+    _assert_one_counts_stream(store, expected_reads)
+    assert reopened.RNA.z["summary_stats_I"].attrs["subset_hash"] == subset_hash
+    np.testing.assert_array_equal(
+        reopened.RNA.feats.fetch_all("I"),
+        feature_index,
+    )
+    reopened.RNA._streaming_feature_stats = lambda *_: pytest.fail(
+        "valid feature statistics should be reused"
+    )
+    reopened.RNA.set_feature_stats("I")
+
+
+def test_percent_cache_remains_attribute_only():
+    store, expected_reads = _qc_store()
+    datastore = _open_qc_store(store)
+    datastore.cells.drop("RNA_percentMito")
+    store.reset()
+
+    cached = _open_qc_store(store)
+
+    assert _count_chunk_gets(store) == []
+    assert "RNA_percentMito" not in cached.cells.columns
+    store.reset()
+
+    refreshed = _open_qc_store(store, mito_pattern="^MT-|^GENE_A$")
+
+    _assert_one_counts_stream(store, expected_reads)
+    assert "RNA_percentMito" in refreshed.cells.columns
+
+
+def test_partial_feature_props_are_recomputed_together():
+    store, expected_reads = _qc_store()
+    datastore = _open_qc_store(store)
+    datastore.RNA.feats.insert(
+        "nCells",
+        np.zeros(_QC_VALUES.shape[1], dtype=np.int64),
+        overwrite=True,
+    )
+    datastore.RNA.feats.drop("dropOuts")
+    feature_index = datastore.RNA.feats.fetch_all("I")
+    store.reset()
+
+    reopened = _open_qc_store(store)
+
+    _assert_one_counts_stream(store, expected_reads)
+    expected_n_cells = (_QC_VALUES > 0).sum(axis=0)
+    np.testing.assert_array_equal(
+        reopened.RNA.feats.fetch_all("nCells"),
+        expected_n_cells,
+    )
+    np.testing.assert_array_equal(
+        reopened.RNA.feats.fetch_all("I"),
+        feature_index,
+    )
+    expected_dropouts = _QC_VALUES.shape[0] - expected_n_cells[feature_index]
+    np.testing.assert_array_equal(
+        reopened.RNA.feats.fetch("dropOuts"),
+        expected_dropouts,
+    )
+
+
+def test_standalone_assay_keeps_eager_feature_initialization():
+    store, _ = _qc_store()
+    root = zarr.open_group(store=store, mode="r+")
+    assay = Assay(
+        root,
+        None,
+        "RNA",
+        MetaData(root["cellData"]),
+        nthreads=1,
+        min_cells_per_feature=0,
+    )
+
+    assert {"nCells", "dropOuts"}.issubset(assay.feats.columns)
+    assert assay._deferred_min_cells_per_feature is None
 
 
 class TestToyDataStore:

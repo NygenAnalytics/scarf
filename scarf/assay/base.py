@@ -1,4 +1,6 @@
 from collections.abc import Generator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -8,7 +10,7 @@ from numpy.typing import NDArray
 from scipy.sparse import csr_matrix, vstack
 
 from ..storage.types import as_zarr_array, as_zarr_group
-from ..storage.budget import ResourceBudget, resolve_budget
+from ..storage.budget import READ_AHEAD, ResourceBudget, resolve_budget
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
 from ..utils.arrays import array_digest
@@ -17,6 +19,20 @@ from ..utils.logging import logger
 from .normalization import NormMethod, norm_dummy, norm_lib_size
 
 type PercentFeatures = dict[str, str]
+
+_DEFER_FEATURE_PROPS: ContextVar[bool] = ContextVar(
+    "scarf_defer_feature_props",
+    default=False,
+)
+
+
+@contextmanager
+def _defer_feature_props() -> Generator[None, None, None]:
+    token = _DEFER_FEATURE_PROPS.set(True)
+    try:
+        yield
+    finally:
+        _DEFER_FEATURE_PROPS.reset(token)
 
 
 class Assay:
@@ -116,6 +132,7 @@ class Assay:
         self.n_term_per_doc: np.ndarray | None = None
         self.n_docs: int | None = None
         self.n_docs_per_term: np.ndarray | None = None
+        self._deferred_min_cells_per_feature: int | None = None
         self._ini_feature_props(min_cells_per_feature)
 
     def _percent_features(self) -> PercentFeatures:
@@ -188,38 +205,88 @@ class Assay:
 
         """
         if "nCells" in self.feats.columns and "dropOuts" in self.feats.columns:
-            pass
-        else:
-            ncells = show_dask_progress(
-                (self.rawData > 0).sum(axis=0),
-                f"({self.name}) Computing nCells and dropOuts",
-                self.nthreads,
+            return
+        if _DEFER_FEATURE_PROPS.get():
+            self._deferred_min_cells_per_feature = min_cells
+            return
+        ncells = show_dask_progress(
+            (self.rawData > 0).sum(axis=0),
+            f"({self.name}) Computing nCells and dropOuts",
+            self.nthreads,
+        )
+        self._store_feature_props(ncells, min_cells)
+
+    def _store_feature_props(self, ncells: np.ndarray, min_cells: int) -> None:
+        self.feats.insert("nCells", ncells, overwrite=True)
+        self.feats.insert(
+            "dropOuts",
+            abs(self.cells.N - self.feats.fetch("nCells")),
+            overwrite=True,
+        )
+        self.feats.update_key(ncells > min_cells, "I")
+        self._deferred_min_cells_per_feature = None
+
+    def _stream_initialization_stats(
+        self,
+        *,
+        compute_n_counts: bool,
+        compute_n_features: bool,
+        compute_n_cells: bool,
+        percent_feature_indices: dict[str, np.ndarray],
+    ) -> dict[str, np.ndarray]:
+        n_cells, n_features = self.rawData.shape
+        sum_dtype = np.asarray(np.empty(0, dtype=self.rawData.dtype).sum()).dtype
+        stats: dict[str, np.ndarray] = {}
+        if compute_n_counts:
+            stats["nCounts"] = np.empty(n_cells, dtype=sum_dtype)
+        if compute_n_features:
+            stats["nFeatures"] = np.empty(n_cells, dtype=np.int64)
+        if compute_n_cells:
+            stats["nCells"] = np.zeros(n_features, dtype=np.int64)
+        for name in percent_feature_indices:
+            stats[name] = np.empty(n_cells, dtype=sum_dtype)
+
+        row_start = 0
+        for raw in self.rawData.stream_blocks(
+            nthreads=self.nthreads,
+            msg=f"({self.name}) Computing initialization statistics",
+            prefetch=READ_AHEAD,
+        ):
+            row_stop = row_start + raw.shape[0]
+            if compute_n_counts:
+                stats["nCounts"][row_start:row_stop] = raw.sum(axis=1)
+
+            positive = None
+            if compute_n_features or compute_n_cells:
+                positive = raw > 0
+            if compute_n_features:
+                assert positive is not None
+                stats["nFeatures"][row_start:row_stop] = positive.sum(axis=1)
+            if compute_n_cells:
+                assert positive is not None
+                stats["nCells"] += positive.sum(axis=0)
+
+            for name, feat_idx in percent_feature_indices.items():
+                stats[name][row_start:row_stop] = raw[:, feat_idx].sum(axis=1)
+            row_start = row_stop
+
+        if row_start != n_cells:
+            raise RuntimeError(
+                f"({self.name}) Initialization stream produced {row_start} rows; "
+                f"expected {n_cells}"
             )
-            self.feats.insert("nCells", ncells, overwrite=True)
-            self.feats.insert(
-                "dropOuts",
-                abs(self.cells.N - self.feats.fetch("nCells")),
-                overwrite=True,
-            )
-            self.feats.update_key(ncells > min_cells, "I")
+        return stats
 
-    def add_percent_feature(self, feat_pattern: str, name: str) -> None:
-        """
-
-        Args:
-            feat_pattern: A regular expression pattern to identify the features of interest
-            name: This will be used as the name of column under which the percentages will
-                  be saved
-
-        Returns:
-
-        """
-        if name in self._percent_features():
-            if self._percent_features()[name] == feat_pattern:
-                return None
-            else:
-                logger.info(f"Pattern for percentage feature {name} updated.")
+    def _plan_percent_feature(
+        self,
+        feat_pattern: str,
+        name: str,
+    ) -> np.ndarray | None:
         percent_features = self._percent_features()
+        if name in percent_features:
+            if percent_features[name] == feat_pattern:
+                return None
+            logger.info(f"Pattern for percentage feature {name} updated.")
         self.attrs["percentFeatures"] = {
             **percent_features,
             **{name: feat_pattern},
@@ -233,21 +300,48 @@ class Assay:
                 f" Will not add/update percentage feature"
             )
             return None
+        return np.asarray(feat_idx, dtype=np.int64)
+
+    def _write_percent_feature(
+        self,
+        name: str,
+        total: np.ndarray,
+        *,
+        n_counts: np.ndarray | None = None,
+    ) -> None:
+        if total.sum() == 0:
+            logger.warning(
+                f"Percentage feature {name} not added because not detected in any cell"
+            )
+            return
+        if n_counts is None:
+            n_counts = self.cells.fetch_all(self.name + "_nCounts")
+        self.cells.insert(
+            name,
+            100 * total / n_counts,
+            overwrite=True,
+        )
+
+    def add_percent_feature(self, feat_pattern: str, name: str) -> None:
+        """
+
+        Args:
+            feat_pattern: A regular expression pattern to identify the features of interest
+            name: This will be used as the name of column under which the percentages will
+                  be saved
+
+        Returns:
+
+        """
+        feat_idx = self._plan_percent_feature(feat_pattern, name)
+        if feat_idx is None:
+            return None
         total = show_dask_progress(
             self.rawData[:, feat_idx].sum(axis=1),
             f"({self.name}) Computing {name}",
             self.nthreads,
         )
-        if total.sum() == 0:
-            logger.warning(
-                f"Percentage feature {name} not added because not detected in any cell"
-            )
-            return None
-        self.cells.insert(
-            name,
-            100 * total / self.cells.fetch_all(self.name + "_nCounts"),
-            overwrite=True,
-        )
+        self._write_percent_feature(name, total)
 
     def _verify_keys(self, cell_key: str, feat_key: str) -> None:
         """Checks if provided key names are present in cells and feature

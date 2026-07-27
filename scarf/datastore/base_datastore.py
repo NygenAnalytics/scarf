@@ -18,6 +18,7 @@ from ..storage.artifacts import (
 from ..storage.types import ZarrMode, as_zarr_array, as_zarr_group
 from ..storage.budget import ResourceBudget
 from ..assay import RNAassay, ATACassay, ADTassay, Assay
+from ..assay.base import _defer_feature_props
 from ..metadata import MetaData
 from ..metadata.artifacts import (
     artifact_values,
@@ -29,7 +30,7 @@ from ..storage.schema import validate_assay_name
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.stores import load_zarr, resolve_matrix_source
 from ..storage.selections import resolve_selection_artifact
-from ..utils.compute import controlled_compute, show_dask_progress
+from ..utils.compute import controlled_compute
 from ..utils.logging import logger
 
 if TYPE_CHECKING:
@@ -391,10 +392,8 @@ class BaseDataStore:
                 else:
                     z_attrs[i] = assay_name
                     logger.debug(f"Setting assay {i} to assay type: {assay.__name__}")
-            setattr(
-                self,
-                i,
-                assay(
+            with _defer_feature_props():
+                loaded_assay = assay(
                     z=self.z,
                     workspace=self.workspace,
                     name=i,
@@ -403,8 +402,8 @@ class BaseDataStore:
                     nthreads=self.nthreads,
                     matrix_root=self._matrix_z,
                     resources=self.resources,
-                ),
-            )
+                )
+            setattr(self, i, loaded_assay)
         if self.zw.attrs["assayTypes"] != z_attrs:
             self.zw.attrs["assayTypes"] = z_attrs
         return None
@@ -772,14 +771,65 @@ class BaseDataStore:
         for from_assay in self.assay_names:
             assay = self._get_assay(from_assay)
 
-            var_name = from_assay + "_nCounts"
-            if var_name not in self.cells.columns:
-                n_c = show_dask_progress(
-                    assay.rawData.sum(axis=1),
-                    f"({from_assay}) Computing nCounts",
-                    self.nthreads,
+            n_counts_name = from_assay + "_nCounts"
+            compute_n_counts = n_counts_name not in self.cells.columns
+            n_features_name = from_assay + "_nFeatures"
+            compute_n_features = n_features_name not in self.cells.columns
+            pending_min_cells = assay._deferred_min_cells_per_feature
+            compute_n_cells = pending_min_cells is not None
+
+            percent_feature_indices: dict[str, np.ndarray] = {}
+            if isinstance(assay, RNAassay):
+                if mito_pattern != "":
+                    resolved_mito_pattern = (
+                        "MT-|mt" if mito_pattern is None else mito_pattern
+                    )
+                    percent_mito_name = from_assay + "_percentMito"
+                    mito_idx = assay._plan_percent_feature(
+                        resolved_mito_pattern,
+                        percent_mito_name,
+                    )
+                    if mito_idx is not None:
+                        percent_feature_indices[percent_mito_name] = mito_idx
+
+                if ribo_pattern != "":
+                    resolved_ribo_pattern = (
+                        "RPS|RPL|MRPS|MRPL" if ribo_pattern is None else ribo_pattern
+                    )
+                    percent_ribo_name = from_assay + "_percentRibo"
+                    ribo_idx = assay._plan_percent_feature(
+                        resolved_ribo_pattern,
+                        percent_ribo_name,
+                    )
+                    if ribo_idx is not None:
+                        percent_feature_indices[percent_ribo_name] = ribo_idx
+
+            stats: dict[str, np.ndarray] = {}
+            if (
+                compute_n_counts
+                or compute_n_features
+                or compute_n_cells
+                or percent_feature_indices
+            ):
+                stats = assay._stream_initialization_stats(
+                    compute_n_counts=compute_n_counts,
+                    compute_n_features=compute_n_features,
+                    compute_n_cells=compute_n_cells,
+                    percent_feature_indices=percent_feature_indices,
                 )
-                self.cells.insert(var_name, n_c.astype(np.float64), overwrite=True)
+
+            if pending_min_cells is not None:
+                assay._store_feature_props(stats["nCells"], pending_min_cells)
+
+            computed_n_counts: np.ndarray | None = None
+            if compute_n_counts:
+                n_c = stats["nCounts"]
+                computed_n_counts = n_c.astype(np.float64)
+                self.cells.insert(
+                    n_counts_name,
+                    computed_n_counts,
+                    overwrite=True,
+                )
                 if isinstance(assay, RNAassay):
                     min_nc = min(n_c)
                     if min(n_c) < assay.sf:
@@ -787,31 +837,25 @@ class BaseDataStore:
                             f"Minimum cell count ({min_nc}) is lower than "
                             f"size factor multiplier ({assay.sf})"
                         )
-            var_name = from_assay + "_nFeatures"
-            if var_name not in self.cells.columns:
-                n_f = show_dask_progress(
-                    (assay.rawData > 0).sum(axis=1),
-                    f"({from_assay}) Computing nFeatures",
-                    self.nthreads,
+
+            if compute_n_features:
+                self.cells.insert(
+                    n_features_name,
+                    stats["nFeatures"].astype(np.float64),
+                    overwrite=True,
                 )
-                self.cells.insert(var_name, n_f.astype(np.float64), overwrite=True)
 
-            if isinstance(assay, RNAassay):
-                if mito_pattern == "":
-                    pass
-                else:
-                    if mito_pattern is None:
-                        mito_pattern = "MT-|mt"
-                    var_name = from_assay + "_percentMito"
-                    assay.add_percent_feature(mito_pattern, var_name)
+            for name in percent_feature_indices:
+                assay._write_percent_feature(
+                    name,
+                    stats[name],
+                    n_counts=computed_n_counts,
+                )
 
-                if ribo_pattern == "":
-                    pass
-                else:
-                    if ribo_pattern is None:
-                        ribo_pattern = "RPS|RPL|MRPS|MRPL"
-                    var_name = from_assay + "_percentRibo"
-                    assay.add_percent_feature(ribo_pattern, var_name)
+            if assay._deferred_min_cells_per_feature is not None:
+                raise RuntimeError(
+                    f"({from_assay}) Deferred feature initialization was not completed"
+                )
 
             if from_assay == self._defaultAssay:
                 v = self.cells.fetch(from_assay + "_nFeatures", key="I")
