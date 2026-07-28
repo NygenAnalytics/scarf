@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from obstore.exceptions import AlreadyExistsError
 from obstore.store import from_url
 
 _ENV_PATH = Path(__file__).resolve().parent / ".env"
@@ -124,12 +125,29 @@ def get_json(uri: str) -> dict[str, Any]:
     return payload
 
 
-def put_json(uri: str, value: dict[str, Any]) -> None:
-    store, key = open_r2_object(uri)
-    body = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
+def _encode_json(value: dict[str, Any]) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode(
         "utf-8"
     )
-    store.put(key, body)
+
+
+def put_json(uri: str, value: dict[str, Any]) -> None:
+    store, key = open_r2_object(uri)
+    store.put(key, _encode_json(value))
+
+
+def put_json_if_absent(uri: str, value: dict[str, Any]) -> bool:
+    store, key = open_r2_object(uri)
+    try:
+        store.put(
+            key,
+            _encode_json(value),
+            mode="create",
+            use_multipart=False,
+        )
+    except AlreadyExistsError:
+        return False
+    return True
 
 
 def download_file(

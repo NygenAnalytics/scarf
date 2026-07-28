@@ -81,6 +81,16 @@ workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
+[stageResources.writeCountsT]
+modalMemoryRequestMb = 65536
+modalMemoryLimitMb = 73728
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 51539607552
+workers = 8
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
 [stageResources.initializeStore]
 modalMemoryRequestMb = 65536
 modalMemoryLimitMb = 73728
@@ -121,7 +131,57 @@ workers = 8
 timeoutSeconds = 43200
 ephemeralDiskMb = 524288
 
-[stageResources.makeGraph]
+[stageResources.runNormalization]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.runPca]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.buildEmbeddingInitialization]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.buildAnnIndex]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.queryNeighbors]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.buildConnectivityMap]
 modalMemoryRequestMb = 131072
 modalMemoryLimitMb = 147456
 modalCpuRequest = 16.0
@@ -147,6 +207,16 @@ modalMemoryLimitMb = 32768
 modalCpuRequest = 2.0
 modalCpuLimit = 2.0
 scarfMemoryBudget = 25769803776
+workers = 2
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.runClustering]
+modalMemoryRequestMb = 16384
+modalMemoryLimitMb = 16384
+modalCpuRequest = 2.0
+modalCpuLimit = 2.0
+scarfMemoryBudget = 12884901888
 workers = 2
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288

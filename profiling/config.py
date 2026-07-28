@@ -8,10 +8,17 @@ from profiling.datasets import DEFAULT_TARGET_SIZES
 
 StageName = Literal[
     "createStore",
+    "writeCountsT",
     "initializeStore",
     "reopenStore",
     "filterCells",
     "markHvgs",
+    "runNormalization",
+    "runPca",
+    "buildEmbeddingInitialization",
+    "buildAnnIndex",
+    "queryNeighbors",
+    "buildConnectivityMap",
     "makeGraph",
     "runUmap",
     "runLeiden",
@@ -26,7 +33,30 @@ StageName = Literal[
     "toH5ad",
 ]
 
+ATOMIC_GRAPH_STAGE_ORDER: tuple[StageName, ...] = (
+    "runNormalization",
+    "runPca",
+    "buildEmbeddingInitialization",
+    "buildAnnIndex",
+    "queryNeighbors",
+    "buildConnectivityMap",
+)
+
 CORE_STAGE_ORDER: tuple[StageName, ...] = (
+    "createStore",
+    "writeCountsT",
+    "initializeStore",
+    "reopenStore",
+    "filterCells",
+    "markHvgs",
+    *ATOMIC_GRAPH_STAGE_ORDER,
+    "runUmap",
+    "runLeiden",
+    "runClustering",
+    "findMarkers",
+)
+
+LEGACY_CORE_STAGE_ORDER: tuple[StageName, ...] = (
     "createStore",
     "initializeStore",
     "reopenStore",
@@ -40,19 +70,24 @@ CORE_STAGE_ORDER: tuple[StageName, ...] = (
 
 OPTIONAL_STAGE_ORDER: tuple[StageName, ...] = (
     "getImputed",
-    "runClustering",
     "runPseudotime",
     "prepareMappingQuery",
     "runMapping",
-    "makeGraphHarmony",
     "subsetZarr",
     "toH5ad",
 )
 
-# Default when config.stages is unset (backward compatible).
+LEGACY_STAGE_ORDER: tuple[StageName, ...] = (
+    "makeGraph",
+    "makeGraphHarmony",
+)
+
+# Default when config.stages is unset.
 STAGE_ORDER: tuple[StageName, ...] = CORE_STAGE_ORDER
 
-FULL_STAGE_ORDER: tuple[StageName, ...] = CORE_STAGE_ORDER + OPTIONAL_STAGE_ORDER
+FULL_STAGE_ORDER: tuple[StageName, ...] = (
+    CORE_STAGE_ORDER + OPTIONAL_STAGE_ORDER + LEGACY_STAGE_ORDER
+)
 
 MAX_TIMEOUT_SECONDS = 86_400
 
@@ -91,7 +126,7 @@ class WorkflowParameters(BaseModel):
     markerFeatureKey: str = "I"
     markerGeneBatchSize: int | None = None
     graphLocalCache: bool | str = "auto"
-    # Optional extras (countsT funnel + non-core stages).
+    # Optional analysis stages.
     harmonyBatchColumn: str = "synth_batch"
     harmonyNBatches: int = 4
     harmonyBatchSeed: int = 1234
@@ -296,6 +331,12 @@ class ProfilingConfig(BaseModel):
     def resultUri(self, nRows: int, stage: StageName) -> str:
         return f"{self._tagged_prefix('results')}/{nRows}/{stage}.json"
 
+    def funnelResultUri(self, nRows: int) -> str:
+        return f"{self._tagged_prefix('results')}/{nRows}/funnel.json"
+
+    def e2eClaimUri(self) -> str:
+        return f"{self._tagged_prefix('results')}/e2e-claim.json"
+
     def resourcesFor(self, stage: StageName) -> StageResources:
         return self.stageResources[stage]
 
@@ -313,6 +354,14 @@ def _normalize_raw_config(raw: dict[str, Any]) -> dict[str, Any]:
         stages = payload.get("stages")
         selected = tuple(stages) if stages is not None else CORE_STAGE_ORDER
         payload["stageResources"] = {stage: fixed for stage in selected}
+    stage_resources = payload.get("stageResources")
+    if (
+        "stages" not in payload
+        and isinstance(stage_resources, dict)
+        and all(stage in stage_resources for stage in LEGACY_CORE_STAGE_ORDER)
+        and not all(stage in stage_resources for stage in CORE_STAGE_ORDER)
+    ):
+        payload["stages"] = LEGACY_CORE_STAGE_ORDER
     payload.pop("sourceProvenance", None)
     payload.pop("capacityCases", None)
     payload.pop("blockSeeds", None)

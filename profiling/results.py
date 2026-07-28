@@ -11,3 +11,13 @@ def write_result(config: ProfilingConfig, result: StageRunResult) -> str:
     uri = config.resultUri(result.nRows, result.stage)
     put_json(uri, result.to_json())
     return uri
+
+
+def write_funnel_result(
+    config: ProfilingConfig,
+    nRows: int,
+    payload: dict[str, object],
+) -> str:
+    uri = config.funnelResultUri(nRows)
+    put_json(uri, payload)
+    return uri

@@ -95,10 +95,14 @@ def test_worker_runs_historical_leiden(
         "label": "leiden_cluster",
         "random_seed": 4444,
     }
-    assert json.loads(status_path.read_text(encoding="utf-8")) == {
-        "status": "ok",
-        "error": None,
-    }
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "ok"
+    assert status["error"] is None
+    assert status["inputSetupSeconds"] >= 0
+    assert status["operationSeconds"] >= 0
+    assert status["wholeWorkerSeconds"] >= (
+        status["inputSetupSeconds"] + status["operationSeconds"]
+    )
 
 
 def test_worker_records_error(
@@ -116,10 +120,12 @@ def test_worker_records_error(
     with pytest.raises(ValueError, match="bad graph"):
         leiden_worker.run_leiden_worker(request_path)
 
-    assert json.loads(status_path.read_text(encoding="utf-8")) == {
-        "status": "error",
-        "error": "ValueError: bad graph",
-    }
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "error"
+    assert status["error"] == "ValueError: bad graph"
+    assert status["inputSetupSeconds"] >= 0
+    assert status["operationSeconds"] >= 0
+    assert status["wholeWorkerSeconds"] >= status["operationSeconds"]
 
 
 def test_monitor_warns_without_terminating(
@@ -200,8 +206,13 @@ def test_run_stage_routes_leiden_to_child(
 ) -> None:
     called: dict[str, object] = {}
 
-    def fake_child(**arguments: object) -> None:
+    def fake_child(**arguments: object) -> dict[str, object]:
         called.update(arguments)
+        return {
+            "inputSetupSeconds": 0.5,
+            "operationSeconds": 1.5,
+            "wholeWorkerSeconds": 2.25,
+        }
 
     def unexpected_open(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("parent opened the datastore")
@@ -220,5 +231,9 @@ def test_run_stage_routes_leiden_to_child(
     )
 
     assert result.status == "ok"
+    assert result.inputSetupSeconds == 0.5
+    assert result.seconds == 1.5
+    assert result.details is not None
+    assert result.details["workerWholeSeconds"] == 2.25
     assert called["storeUri"] == "s3://bucket/store.zarr"
     assert called["workDir"] == tmp_path

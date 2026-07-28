@@ -339,6 +339,7 @@ class ResourceSampler:
         cgroupRoot: str | Path = "/sys/fs/cgroup",
         cgroupPath: str | Path | None = None,
         ephemeralDiskPath: str | Path | None = "/tmp",
+        resetCgroupPeak: bool = True,
         readText: _ReadText | None = None,
         writeText: _WriteText | None = None,
         listPids: _ListPids | None = None,
@@ -362,6 +363,7 @@ class ResourceSampler:
         self.ephemeralDiskPath = (
             None if ephemeralDiskPath is None else Path(ephemeralDiskPath)
         )
+        self.resetCgroupPeak = resetCgroupPeak
         self._readText = _default_read_text if readText is None else readText
         self._writeText = _default_write_text if writeText is None else writeText
         self._listPids = _default_list_pids if listPids is None else listPids
@@ -616,6 +618,8 @@ class ResourceSampler:
         initial_peak = _nonnegative_int(_optional_read(path, self._readText))
         if initial_peak is None:
             return "unavailable", None
+        if not self.resetCgroupPeak:
+            return "containerLifetime", initial_peak
         # cgroup v1 max_usage_in_bytes is usually not resettable mid-run.
         if self._cgroupVersion == 1:
             return "containerLifetime", initial_peak

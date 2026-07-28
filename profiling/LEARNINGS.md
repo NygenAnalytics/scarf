@@ -779,3 +779,154 @@ Avoid:
 > Scarf is the only / most scalable single-cell package.
 
 Market pull for that narrower job is real (atlas-sized studies, shared CPU nodes, cloud object storage) alongside GPU-first and sketch/disk-backed R workflows that serve other needs well.
+
+## Same-container R2 e2e method (2026-07-27)
+
+The `run-e2e` path profiles the core funnel in one long-lived Modal container.
+It downloads the prepared H5AD once to ephemeral disk, while the Zarr store and
+all durable results stay on R2. The command only spawns the deployed function
+and returns, following the existing disconnect-safe rule.
+
+Each run requires a non-empty, fresh `runTag`. It refuses an existing store or
+result instead of resuming, because resumed stages would not represent one
+process lifetime. An atomic `e2e-claim.json` create prevents concurrent jobs
+from acquiring the same tag. Completed stage JSON files and a final
+`funnel.json` remain available if a later stage fails. Use tags such as
+`e2e_r2_c8_m64_100k`.
+
+The default graph path is now timed as separate operations:
+`runNormalization`, `runPca`, `buildEmbeddingInitialization`, `buildAnnIndex`,
+`queryNeighbors`, and `buildConnectivityMap`. Each operation publishes its
+artifact to assay state before the next DataStore reopen. The historical
+`makeGraph` and `makeGraphHarmony` handlers remain selectable for old controls,
+but they are not part of the e2e funnel.
+
+`createStore` reports writer/schema setup separately from row-major `counts`
+writing. `writeCountsT` is a separate validated stage and must finish with
+`complete=True`. Leiden runs at the Scarf default resolution of 1.0, Paris is
+timed independently, and marker search uses the Leiden groups.
+
+Stage JSON records operation wall time separately from R2 DataStore-open time.
+It also records RSS and cgroup baseline, absolute peak, incremental peak, and
+the value after normal object release. No forced garbage collection occurs
+between stages. `funnel.json` records the whole-invocation peak and final
+memory. Inner stage samplers preserve the outer sampler's cgroup peak and use
+sampled `memory.current` for stage attribution. Historical `makeGraph` timings
+above remain unchanged; sums of the new atomic stages include separate R2
+reopens and are not strict equivalents.
+
+## Same-container R2 e2e baseline (2026-07-27)
+
+The first complete ladder used 8 CPUs, a 64 GiB Modal memory request with a
+72 GiB limit, a 48 GiB Scarf budget, and R2-backed Zarr. The 10k smoke ran
+first. The 50k, 100k, and 250k funnels then ran concurrently in separate
+containers. Every run completed all 16 stages, including validated
+`writeCountsT`, Leiden at resolution 1.0, Paris, and Leiden marker search.
+
+Funnel-level sampled cgroup baseline / peak / after:
+
+- 10k, tag `e2e_r2_c8_m64_10k_20260727_r1`: 828.6s, 0.47 / 3.10 / 1.20 GiB.
+- 50k, tag `e2e_r2_c8_m64_50k_20260727_r1`: 676.6s, 0.47 / 8.37 / 2.84 GiB.
+- 100k, tag `e2e_r2_c8_m64_100k_20260727_r1`: 1056.4s, 0.47 / 15.42 / 3.75 GiB.
+- 250k, tag `e2e_r2_c8_m64_250k_20260727_r1`: 1471.4s, 0.47 / 17.91 / 4.41 GiB.
+
+RSS peaks were within about 0.06 GiB of the corresponding cgroup peaks. Final
+cgroup growth above the common 0.47 GiB baseline was 0.73, 2.37, 3.28, and
+3.93 GiB. This is retained allocator or application memory, not by itself
+evidence of a leak.
+
+The first durable jump at 50k and above occurred during normalization. Cgroup
+after-memory moved from 1.03 to 2.51 GiB at 50k, 1.34 to 3.44 GiB at 100k,
+and 1.61 to 4.05 GiB at 250k. From normalization through UMAP, retained
+growth was then only about 0.22 to 0.28 GiB at each of those sizes. This makes
+normalization the first place to inspect when separating expected caches and
+allocator retention from unreachable objects.
+
+The absolute peak driver changed with scale:
+
+- At 10k and 50k, `createStore` peaked at 2.96 and 7.95 GiB.
+- At 100k and 250k, `findMarkers` peaked at 15.33 and 17.86 GiB.
+- Marker memory was transient. Its cgroup after-values were 1.30, 2.93, 3.85,
+  and 4.56 GiB across the ladder.
+- `writeCountsT` peaked at 2.22, 2.65, 2.91, and 3.14 GiB, so it was not the
+  funnel peak driver.
+- PCA through UMAP produced small incremental retained growth after the
+  normalization jump.
+
+Immediate stage after-memory can overstate retention. For example, memory
+after `createStore` fell again before the next stage baseline at 50k, 100k,
+and 250k. Native child-process memory from Leiden and Paris also took time to
+leave the cgroup after the worker exited. Use the baseline of the following
+stage and the final funnel after-value alongside each immediate after-value.
+
+The Modal cgroup did not expose a resettable `memory.peak`, so these cgroup
+figures come from sampled `memory.current` and can miss very short spikes.
+The close agreement with independently sampled process-tree RSS is reassuring,
+but the values remain sampled peaks.
+
+Do not treat these four wall times as a clean scaling curve. The 10k smoke ran
+alone and cold, while the larger three shared R2 concurrently. This campaign
+is suitable for memory-growth diagnosis; a timing campaign should run each
+size under the same concurrency condition.
+
+Durable calls and summaries:
+
+- 10k: `fc-01KYJB7B0074377MR3GATFHBPW`
+- 50k: `fc-01KYJC6Y97VNN489TJV740PGJF`
+- 100k: `fc-01KYJC34W6WDBDGVQTB5KJFHC8`
+- 250k: `fc-01KYJC6YYQ75ZRB6PEJHPNE4ET`
+
+Operational finding: `_e2e_function_options` currently sets
+`max_containers=1`. Separate `run-e2e` CLI launches therefore queued behind
+one another. The queued 50k and 250k calls were cancelled before execution
+and respawned with a runtime limit of three, after which Modal showed three
+active containers. Update this launch cap before using the plain CLI for a
+future parallel size ladder.
+
+### 1M continuation (same knobs)
+
+Tag `e2e_r2_c8_m64_1m_20260727_r1`. Call `fc-01KYJE26R1AR90VW945FKDYFCS`.
+Same 8 CPU / 64–72 GiB envelope and default workflow knobs
+(`umapParallel=false`, `annParallel=false`). Ran alone after the smaller
+ladder finished. Status **ok**; all 16 stages completed.
+
+Funnel: **7451.6s (~2.07 h)**, cgroup baseline / peak / after
+**0.47 / 19.71 / 5.96 GiB**, RSS peak **19.76 GiB**.
+
+| Stage | Seconds | cgroup base / peak / after (GiB) | op incremental peak (GiB) |
+|-------|--------:|---------------------------------:|--------------------------:|
+| createStore | 649.4 | 0.47 / 10.58 / 4.12 | 10.11 |
+| writeCountsT | 243.6 | 2.31 / 3.61 / 2.47 | 1.30 |
+| initializeStore | 188.2 | 2.31 / 4.31 / 2.35 | 2.00 |
+| reopenStore | 7.1 | 2.35 / 2.35 / 2.35 | 0.00 |
+| filterCells | 41.8 | 2.35 / 2.74 / 2.57 | 0.39 |
+| markHvgs | 391.2 | 2.57 / 3.09 / 2.61 | 0.52 |
+| runNormalization | 279.8 | 2.61 / 8.63 / 5.63 | 6.02 |
+| runPca | 604.6 | 5.63 / 6.79 / 5.73 | 1.16 |
+| buildEmbeddingInitialization | 188.5 | 5.73 / 6.31 / 5.75 | 0.58 |
+| buildAnnIndex | 172.5 | 5.75 / 6.51 / 5.75 | 0.77 |
+| queryNeighbors | 114.4 | 5.75 / 6.86 / 5.78 | 1.12 |
+| buildConnectivityMap | 43.1 | 5.76 / 6.15 / 5.82 | 0.39 |
+| runUmap | **2199.9** | 5.82 / 6.20 / 5.84 | 0.39 |
+| runLeiden | 317.6 | 5.84 / 8.44 / 6.99 | 2.60 |
+| runClustering | 146.8 | 5.84 / 7.77 / 6.17 | 1.93 |
+| findMarkers | 1427.1 | 5.84 / **19.68** / 5.96 | 13.84 |
+
+Memory pattern continues the smaller ladder: normalization still creates the
+first durable retained jump (2.61 → 5.63 GiB after), markers drive the absolute
+peak (19.68 GiB) and release almost all of it (after 5.96 GiB). Final retained
+growth above the 0.47 GiB baseline is **5.49 GiB**.
+
+Wall caveats at 1M:
+
+1. **UMAP was the heartbeat risk.** With `umapParallel=false`, UMAP held the
+   GIL for ~37 min. Modal logged heartbeat failures for over 20 minutes mid
+   train; the container survived and finished, but this is not safe to rely
+   on. Future 1M+ e2e timing runs should set `umapParallel=true`.
+2. Versus old row-major `auto_markers_c8_m64_1m` (**9156s**, parallel UMAP on,
+   no Paris, `makeGraph` peak 28.3 GiB): this e2e funnel is faster overall
+   (~2.07 h vs ~2.54 h) despite slower UMAP and included Paris, mainly from
+   countsT HVG/markers and a cheaper init/create path. Do not treat that as a
+   clean A/B; knobs and stage boundaries differ.
+3. Versus old countsT 100k/500k anchors, 1M markers at **1427s** sit between
+   the small-N countsT curve and old row-major 1M markers (2379s).

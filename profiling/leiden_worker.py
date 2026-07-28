@@ -1,5 +1,6 @@
 import argparse
 import json
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,11 @@ def run_leiden_worker(requestPath: Path) -> None:
         f"[leiden_worker] START backend=leidenalg store={store_uri}",
         flush=True,
     )
+    worker_started = time.perf_counter()
+    setup_started = worker_started
+    input_setup_seconds: float | None = None
+    operation_started: float | None = None
+    operation_seconds: float | None = None
     try:
         store = _open_datastore(
             store_uri,
@@ -33,10 +39,12 @@ def run_leiden_worker(requestPath: Path) -> None:
             resources,
             initialize=False,
         )
+        input_setup_seconds = time.perf_counter() - setup_started
         print(
             "[leiden_worker] datastore open; ENTER run_leiden_clustering",
             flush=True,
         )
+        operation_started = time.perf_counter()
         store.run_leiden_clustering(
             from_assay=workflow.assayName,
             cell_key=workflow.cellKey,
@@ -45,14 +53,38 @@ def run_leiden_worker(requestPath: Path) -> None:
             label=workflow.leidenLabel,
             random_seed=workflow.leidenSeed,
         )
+        operation_seconds = time.perf_counter() - operation_started
         del store
     except BaseException as exc:
+        now = time.perf_counter()
+        if input_setup_seconds is None:
+            input_setup_seconds = now - setup_started
+        if operation_started is not None and operation_seconds is None:
+            operation_seconds = now - operation_started
         error = f"{type(exc).__name__}: {exc}"
-        _write_status(status_path, {"status": "error", "error": error})
+        _write_status(
+            status_path,
+            {
+                "status": "error",
+                "error": error,
+                "inputSetupSeconds": input_setup_seconds,
+                "operationSeconds": operation_seconds,
+                "wholeWorkerSeconds": now - worker_started,
+            },
+        )
         print(f"[leiden_worker] ERROR {error}", flush=True)
         raise
 
-    _write_status(status_path, {"status": "ok", "error": None})
+    _write_status(
+        status_path,
+        {
+            "status": "ok",
+            "error": None,
+            "inputSetupSeconds": input_setup_seconds,
+            "operationSeconds": operation_seconds,
+            "wholeWorkerSeconds": time.perf_counter() - worker_started,
+        },
+    )
     print("[leiden_worker] DONE run_leiden_clustering", flush=True)
 
 

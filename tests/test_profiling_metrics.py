@@ -154,6 +154,32 @@ def test_unresettable_cgroup_peak_is_labeled_container_lifetime(tmp_path):
     assert result.operationIncrementalPeakBytes == 200
 
 
+def test_sampler_can_preserve_an_outer_cgroup_peak(tmp_path):
+    proc_root = tmp_path / "proc"
+    cgroup = tmp_path / "cgroup"
+    _write_status(proc_root, 100, 1, 10)
+    _write_cgroup(cgroup, current=100, peak=1000)
+
+    sampler = ResourceSampler(
+        sampleIntervalSeconds=60,
+        rootPid=100,
+        procRoot=proc_root,
+        cgroupPath=cgroup,
+        ephemeralDiskPath=None,
+        resetCgroupPeak=False,
+    ).start()
+
+    assert (cgroup / "memory.peak").read_text() == "1000"
+    (cgroup / "memory.current").write_text("300")
+    sampler.sample()
+    result = sampler.stop()
+
+    assert result.cgroupMemoryPeakScope == "containerLifetime"
+    assert result.cgroupMemoryPeakBytes == 1000
+    assert result.operationPeakBytes == 300
+    assert result.operationPeakSource == "cgroupMemoryCurrent"
+
+
 def test_sampler_reads_cgroup_v1_memory_files(tmp_path):
     proc_root = tmp_path / "proc"
     cgroup_root = tmp_path / "cgroup"

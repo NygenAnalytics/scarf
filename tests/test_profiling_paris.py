@@ -89,10 +89,14 @@ def test_worker_auto_cut_uses_minimum_cluster_size(
         "n_clusters": "auto",
         "min_cluster_size": 7,
     }
-    assert json.loads(status_path.read_text(encoding="utf-8")) == {
-        "status": "ok",
-        "error": None,
-    }
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "ok"
+    assert status["error"] is None
+    assert status["inputSetupSeconds"] >= 0
+    assert status["operationSeconds"] >= 0
+    assert status["wholeWorkerSeconds"] >= (
+        status["inputSetupSeconds"] + status["operationSeconds"]
+    )
 
 
 def test_worker_straight_cut_uses_n_clusters(

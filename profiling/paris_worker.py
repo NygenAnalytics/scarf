@@ -1,5 +1,6 @@
 import argparse
 import json
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,11 @@ def run_paris_worker(requestPath: Path) -> None:
     status_path = Path(str(request["statusPath"]))
 
     print(f"[paris_worker] START store={store_uri}", flush=True)
+    worker_started = time.perf_counter()
+    setup_started = worker_started
+    input_setup_seconds: float | None = None
+    operation_started: float | None = None
+    operation_seconds: float | None = None
     try:
         store = _open_datastore(
             store_uri,
@@ -30,6 +36,7 @@ def run_paris_worker(requestPath: Path) -> None:
             resources,
             initialize=False,
         )
+        input_setup_seconds = time.perf_counter() - setup_started
         arguments: dict[str, Any] = {
             "from_assay": workflow.assayName,
             "cell_key": workflow.cellKey,
@@ -46,15 +53,40 @@ def run_paris_worker(requestPath: Path) -> None:
         )
 
         print("[paris_worker] datastore open; ENTER run_paris_clustering", flush=True)
+        operation_started = time.perf_counter()
         store.run_paris_clustering(**arguments)
+        operation_seconds = time.perf_counter() - operation_started
         del store
     except BaseException as exc:
+        now = time.perf_counter()
+        if input_setup_seconds is None:
+            input_setup_seconds = now - setup_started
+        if operation_started is not None and operation_seconds is None:
+            operation_seconds = now - operation_started
         error = f"{type(exc).__name__}: {exc}"
-        _write_status(status_path, {"status": "error", "error": error})
+        _write_status(
+            status_path,
+            {
+                "status": "error",
+                "error": error,
+                "inputSetupSeconds": input_setup_seconds,
+                "operationSeconds": operation_seconds,
+                "wholeWorkerSeconds": now - worker_started,
+            },
+        )
         print(f"[paris_worker] ERROR {error}", flush=True)
         raise
 
-    _write_status(status_path, {"status": "ok", "error": None})
+    _write_status(
+        status_path,
+        {
+            "status": "ok",
+            "error": None,
+            "inputSetupSeconds": input_setup_seconds,
+            "operationSeconds": operation_seconds,
+            "wholeWorkerSeconds": time.perf_counter() - worker_started,
+        },
+    )
     print("[paris_worker] DONE run_paris_clustering", flush=True)
 
 

@@ -10,23 +10,28 @@ disconnects:
   modal run --env scarf_profiling -m profiling.modal_app -- run --config profiling/config.toml --size 10000 --stage createStore
   modal run --env scarf_profiling -m profiling.modal_app -- run-all --config profiling/config.toml --sizes 10000
 
-prepare / run / run-all / run-local spawn on the deployed app and return immediately.
+prepare / run / run-all / run-local / run-e2e spawn and return immediately.
 run-all fans out one size pipeline per container (stages stay sequential on R2).
 run-local runs the full funnel in one container on ephemeral-disk Zarr (fast_local).
+run-e2e runs the atomic core in one container while keeping Zarr on R2.
 Watch progress with: modal app logs scarf-profiling --env scarf_profiling
 """
 
 import argparse
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 import modal
 
 from profiling.config import (
+    CORE_STAGE_ORDER,
     FULL_STAGE_ORDER,
+    MAX_TIMEOUT_SECONDS,
     ProfilingConfig,
     StageName,
+    StageResources,
     load_profiling_config,
 )
 from profiling.datasets import (
@@ -44,8 +49,18 @@ from profiling.modal_resources import (
     validate_modal_environment,
 )
 from profiling.io_baseline import run_io_baseline_body
-from profiling.r2 import download_file, object_exists, object_size, upload_file
-from profiling.results import result_exists, write_result
+from profiling.r2 import (
+    download_file,
+    object_exists,
+    object_size,
+    put_json_if_absent,
+    upload_file,
+)
+from profiling.results import (
+    result_exists,
+    write_funnel_result,
+    write_result,
+)
 from profiling.spawn_wait import (
     DEFAULT_GRACE_SECONDS,
     DEFAULT_STAGE_SPAWN_ATTEMPTS,
@@ -53,9 +68,88 @@ from profiling.spawn_wait import (
     await_many_function_calls,
     await_stage_result,
 )
-from profiling.stages import repair_counts_t, run_stage
+from profiling.metrics import ResourceSampler
+from profiling.stages import (
+    repair_counts_t,
+    run_stage,
+    summarize_resource_measurement,
+)
 
 _WORK = Path("/tmp/scarf-profiling")
+
+
+def _e2e_conflicting_uris(
+    config: ProfilingConfig,
+    nRows: int,
+) -> list[str]:
+    store_uri = config.storeUri(nRows).rstrip("/")
+    candidates = [
+        f"{store_uri}/zarr.json",
+        f"{store_uri}/.zgroup",
+        config.e2eClaimUri(),
+        config.funnelResultUri(nRows),
+        *(config.resultUri(nRows, stage) for stage in FULL_STAGE_ORDER),
+    ]
+    return [uri for uri in candidates if object_exists(uri)]
+
+
+def _e2e_function_options(config: ProfilingConfig) -> dict[str, Any]:
+    envelope = _e2e_resource_envelope(config)
+    resources = _e2e_resources(config)
+    peak = max(
+        resources,
+        key=lambda item: (
+            item.modalMemoryLimitMb,
+            item.modalCpuLimit,
+            item.timeoutSeconds,
+        ),
+    )
+    options = modal_function_options(
+        config,
+        peak,
+        maxContainers=1,
+        retries=0,
+    )
+    options["memory"] = (
+        envelope["modalMemoryRequestMb"],
+        envelope["modalMemoryLimitMb"],
+    )
+    options["cpu"] = (
+        envelope["modalCpuRequest"],
+        envelope["modalCpuLimit"],
+    )
+    options["timeout"] = MAX_TIMEOUT_SECONDS
+    return options
+
+
+def _e2e_resources(config: ProfilingConfig) -> list[StageResources]:
+    missing_resources = [
+        stage for stage in CORE_STAGE_ORDER if stage not in config.stageResources
+    ]
+    if missing_resources:
+        raise ValueError(
+            "run-e2e is missing stageResources for: " + ", ".join(missing_resources)
+        )
+    return [config.resourcesFor(stage) for stage in CORE_STAGE_ORDER]
+
+
+def _e2e_resource_envelope(config: ProfilingConfig) -> dict[str, int | float]:
+    resources = _e2e_resources(config)
+    requested_ephemeral_disk = max(item.ephemeralDiskMb for item in resources)
+    if requested_ephemeral_disk > BASE_EPHEMERAL_DISK_MB:
+        raise ValueError(
+            "run-e2e cannot apply ephemeralDiskMb above "
+            f"{BASE_EPHEMERAL_DISK_MB}; Modal does not allow a dynamic "
+            "ephemeral_disk override"
+        )
+    return {
+        "modalMemoryRequestMb": max(item.modalMemoryRequestMb for item in resources),
+        "modalMemoryLimitMb": max(item.modalMemoryLimitMb for item in resources),
+        "modalCpuRequest": max(item.modalCpuRequest for item in resources),
+        "modalCpuLimit": max(item.modalCpuLimit for item in resources),
+        "ephemeralDiskMb": BASE_EPHEMERAL_DISK_MB,
+        "timeoutSeconds": MAX_TIMEOUT_SECONDS,
+    }
 
 
 @app.function(
@@ -287,7 +381,7 @@ def repair_counts_t_job(
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     if nRows not in config.targetSizes:
         raise ValueError(f"size {nRows} is not in config.targetSizes")
-    resources = config.resourcesFor("createStore")
+    resources = config.resourcesFor("writeCountsT")
     store_uri = config.storeUri(nRows)
     print(
         f"[repair_counts_t] store={store_uri} memMb={resources.modalMemoryLimitMb} "
@@ -473,6 +567,143 @@ def run_local_funnel_job(
     }
 
 
+def run_e2e_funnel_body(
+    configDict: dict[str, Any],
+    nRows: int,
+) -> dict[str, Any]:
+    """Run the atomic core once in one container against a fresh R2 store."""
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    if nRows not in config.targetSizes:
+        raise ValueError(f"size {nRows} is not in config.targetSizes")
+    if not config.runTag.strip():
+        raise ValueError("run-e2e requires a non-empty runTag")
+    resource_envelope = _e2e_resource_envelope(config)
+    conflicts = _e2e_conflicting_uris(config, nRows)
+    if conflicts:
+        raise FileExistsError(
+            "run-e2e requires a fresh runTag; existing R2 objects: "
+            + ", ".join(conflicts)
+        )
+    claimed = put_json_if_absent(
+        config.e2eClaimUri(),
+        {
+            "runTag": config.runTag,
+            "nRows": nRows,
+            "status": "claimed",
+            "storeUri": config.storeUri(nRows),
+        },
+    )
+    if not claimed:
+        raise FileExistsError(
+            f"run-e2e runTag was claimed concurrently: {config.runTag}"
+        )
+
+    work = _WORK / f"e2e-{config.runTag}-{nRows}"
+    work.mkdir(parents=True, exist_ok=False)
+    local_h5ad = work / f"{nRows}.h5ad"
+    store_uri = config.storeUri(nRows)
+
+    sampler = ResourceSampler()
+    sampler.start()
+    started = time.perf_counter()
+    download_seconds: float | None = None
+    outcomes: list[dict[str, Any]] = []
+    completed_stages: list[StageName] = []
+    status = "ok"
+    error: str | None = None
+    failed_stage: StageName | None = None
+    try:
+        download_started = time.perf_counter()
+        print(f"e2e dataset download start: {config.datasetUri(nRows)}", flush=True)
+        download_file(config.datasetUri(nRows), local_h5ad)
+        download_seconds = time.perf_counter() - download_started
+        print(
+            f"e2e dataset download done: seconds={download_seconds:.1f}",
+            flush=True,
+        )
+
+        for stage in CORE_STAGE_ORDER:
+            failed_stage = stage
+            resources = config.resourcesFor(stage)
+            stage_work = work / stage
+            stage_work.mkdir(parents=True, exist_ok=True)
+            print(f"e2e stage start: {stage}", flush=True)
+            result = run_stage(
+                stage,
+                nRows=nRows,
+                storeUri=store_uri,
+                workflow=config.workflow,
+                resources=resources,
+                localH5adPath=local_h5ad if stage == "createStore" else None,
+                storageLayout=config.storageLayout,
+                workDir=stage_work,
+                containerMemoryMb=int(resource_envelope["modalMemoryLimitMb"]),
+                containerCpuRequest=float(resource_envelope["modalCpuRequest"]),
+                containerCpuLimit=float(resource_envelope["modalCpuLimit"]),
+                resetCgroupPeak=False,
+            )
+            result_uri = write_result(config, result)
+            payload = result.to_json()
+            payload["resultUri"] = result_uri
+            payload["storeBackend"] = "r2"
+            outcomes.append(payload)
+            print(
+                f"e2e stage done: {stage} status={result.status} "
+                f"seconds={result.seconds}",
+                flush=True,
+            )
+            if result.status != "ok":
+                status = "error"
+                error = result.error or f"{stage} failed"
+                break
+            completed_stages.append(stage)
+        else:
+            failed_stage = None
+    except Exception as exc:  # noqa: BLE001 - persist a durable failure summary
+        status = "error"
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        measurement = sampler.stop()
+
+    summary: dict[str, Any] = {
+        "runTag": config.runTag,
+        "nRows": nRows,
+        "status": status,
+        "stopped": status != "ok",
+        "error": error,
+        "failedStage": failed_stage,
+        "storeBackend": "r2",
+        "storeUri": store_uri,
+        "datasetUri": config.datasetUri(nRows),
+        "datasetDownloadSeconds": download_seconds,
+        "wholeFunctionSeconds": time.perf_counter() - started,
+        "modalResources": resource_envelope,
+        "stageOrder": list(CORE_STAGE_ORDER),
+        "completedStages": completed_stages,
+        "outcomes": outcomes,
+        "claimUri": config.e2eClaimUri(),
+        "funnelResultUri": config.funnelResultUri(nRows),
+        **summarize_resource_measurement(measurement),
+    }
+    write_funnel_result(config, nRows, summary)
+    return summary
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=MAX_TIMEOUT_SECONDS,
+    memory=32_768,
+    cpu=8.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def run_e2e_funnel_job(
+    configDict: dict[str, Any],
+    nRows: int,
+) -> dict[str, Any]:
+    return run_e2e_funnel_body(configDict, nRows)
+
+
 @app.function(
     **COMMON_FUNCTION_OPTIONS,
     timeout=86_400,
@@ -506,15 +737,25 @@ def run_size_jobs(
             )
             continue
         resources = config.resourcesFor(stage)
-        options = modal_function_options(
-            config,
-            resources,
-            maxContainers=parallel_sizes,
+        options = (
+            modal_function_options(
+                config,
+                resources,
+                maxContainers=parallel_sizes,
+                retries=0,
+            )
+            if stage == "writeCountsT"
+            else modal_function_options(
+                config,
+                resources,
+                maxContainers=parallel_sizes,
+            )
         )
         deadline_seconds = float(resources.timeoutSeconds) + DEFAULT_GRACE_SECONDS
         result: dict[str, Any] | None = None
         last_error: BaseException | None = None
-        for attempt in range(1, DEFAULT_STAGE_SPAWN_ATTEMPTS + 1):
+        spawn_attempts = 1 if stage == "writeCountsT" else DEFAULT_STAGE_SPAWN_ATTEMPTS
+        for attempt in range(1, spawn_attempts + 1):
             if result_exists(config, nRows, stage):
                 result = {
                     "nRows": nRows,
@@ -552,11 +793,11 @@ def run_size_jobs(
                         "callError": str(exc),
                     }
                     break
-                if attempt >= DEFAULT_STAGE_SPAWN_ATTEMPTS:
+                if attempt >= spawn_attempts:
                     raise
                 print(
                     f"stage {stage} spawn attempt {attempt}/"
-                    f"{DEFAULT_STAGE_SPAWN_ATTEMPTS} failed ({exc}); retrying",
+                    f"{spawn_attempts} failed ({exc}); retrying",
                     flush=True,
                 )
         if result is None:
@@ -723,6 +964,13 @@ def main(*arg_list: str) -> None:
         "--stages", nargs="*", choices=FULL_STAGE_ORDER, default=None
     )
 
+    e2e_parser = sub.add_parser(
+        "run-e2e",
+        help="One-container atomic funnel with a fresh R2 Zarr store",
+    )
+    e2e_parser.add_argument("--config", required=True)
+    e2e_parser.add_argument("--size", type=int, required=True)
+
     probe_parser = sub.add_parser(
         "probe-leiden",
         help="Run historical Leiden in a monitored child process",
@@ -812,7 +1060,11 @@ def main(*arg_list: str) -> None:
             )
             return
         resources = config.resourcesFor(args.stage)
-        options = modal_function_options(config, resources)
+        options = (
+            modal_function_options(config, resources, retries=0)
+            if args.stage == "writeCountsT"
+            else modal_function_options(config, resources)
+        )
         target = (
             run_stage_job
             if args.ephemeral
@@ -837,6 +1089,21 @@ def main(*arg_list: str) -> None:
         )
         call = target.with_options(**coordinator_options).spawn(payload, sizes, stages)
         _print_spawned("run_all_jobs", call)
+        return
+
+    if args.command == "run-e2e":
+        if args.size not in config.targetSizes:
+            raise SystemExit(f"size {args.size} is not in config.targetSizes")
+        if not config.runTag.strip():
+            raise SystemExit("run-e2e requires a non-empty runTag")
+        options = _e2e_function_options(config)
+        call = (
+            _deployed_function(config, "run_e2e_funnel_job")
+            .with_options(**options)
+            .spawn(payload, args.size)
+        )
+        _print_spawned(f"run_e2e_funnel_job {args.size}", call)
+        print(f"result URI (when done): {config.funnelResultUri(args.size)}")
         return
 
     if args.command == "run-local":
@@ -887,7 +1154,7 @@ def main(*arg_list: str) -> None:
         # retries=0: overlapping rewrites leave complete=False again.
         options = modal_function_options(
             config,
-            config.resourcesFor("createStore"),
+            config.resourcesFor("writeCountsT"),
             maxContainers=1,
             retries=0,
         )
@@ -902,7 +1169,7 @@ def main(*arg_list: str) -> None:
                 await_function_call(
                     call,
                     deadlineSeconds=float(
-                        config.resourcesFor("createStore").timeoutSeconds
+                        config.resourcesFor("writeCountsT").timeoutSeconds
                     ),
                 )
             )
