@@ -8,7 +8,6 @@ import pandas as pd
 import zarr
 from numpy.typing import NDArray
 
-from ...storage.types import as_zarr_array, as_zarr_group
 from ...storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
@@ -22,10 +21,10 @@ from ...storage.artifacts import (
     inspect_artifact,
 )
 from ...storage.selections import resolve_selection_artifact
-from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
+from ...storage.types import as_zarr_array, as_zarr_group
+from ...assay import RNAassay, lib_size_feature_stream_eligible
 from ...features.enrichment.results import EnrichmentResult
-from ...features.markers import resolve_marker_gene_batch_size, sort_marker_results
-from ...features.markers.batching import feature_column_chunk
+from ...features.markers import sort_marker_results
 from ...metadata.arguments import AucellArguments, MarkerTableArguments, WaggrArguments
 from ...metadata.artifacts import (
     categorical_display,
@@ -66,10 +65,6 @@ _MARKER_STAT_COLUMNS = (
 _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
 
 
-def _feature_column_chunk(assay: Assay, n_features: int) -> int:
-    return feature_column_chunk(assay, n_features)
-
-
 def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray:
     for vals in markers.values():
         if len(vals) != 0:
@@ -107,6 +102,7 @@ def _load_marker_cluster_frame(
     feature_names: np.ndarray,
     *,
     group_id: Any,
+    feature_ids: np.ndarray | None = None,
 ) -> pd.DataFrame:
     out_cols = list(_MARKER_OUT_COLUMNS)
     if "feature_index" in slot_group and "stats" in cluster_group:
@@ -119,6 +115,41 @@ def _load_marker_cluster_frame(
         df["feature_name"] = feature_names[feature_index.astype(int)]
         df["group_id"] = group_id
         return sort_marker_results(df[["group_id", "feature_name", *out_cols[1:]]])
+
+    if "names" in cluster_group and "scores" in cluster_group:
+        stored_names = np.asarray(
+            as_zarr_array(cluster_group["names"], name="names")[:]
+        ).astype(str)
+        scores = np.asarray(
+            as_zarr_array(cluster_group["scores"], name="scores")[:],
+            dtype=np.float64,
+        )
+        lookup_values = feature_names if feature_ids is None else feature_ids
+        lookup = {str(value): index for index, value in enumerate(lookup_values)}
+        for index, value in enumerate(feature_names):
+            lookup.setdefault(str(value), index)
+        feature_index = np.asarray(
+            [lookup.get(value, -1) for value in stored_names],
+            dtype=np.int64,
+        )
+        display_names = stored_names.astype(object)
+        found = feature_index >= 0
+        display_names[found] = feature_names[feature_index[found]]
+        return (
+            pd.DataFrame(
+                {
+                    "group_id": group_id,
+                    "feature_name": display_names,
+                    "feature_index": feature_index,
+                    "score": scores,
+                }
+            )
+            .sort_values(
+                ["score", "feature_name"],
+                ascending=[False, True],
+            )
+            .reset_index(drop=True)
+        )
 
     available_cols = [col for col in out_cols if col in cluster_group]
     if not available_cols:
@@ -957,9 +988,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             cell_key: To run the test on specific subset of cells, provide the name of a boolean column in
                         the cell metadata table. (Default value: 'I')
             feat_key: Boolean feature metadata column selecting features (default: ``'I'``).
-            gene_batch_size: Number of genes loaded per batch; all selected cells are loaded for each batch.
-                             When None (default), the batch size is the minimum of the on-disk feature chunk
-                             width and a budget-safe cap derived from the active memory budget.
+            gene_batch_size: Number of genes loaded per batch. When None,
+                selected genes are grouped into chunk-aligned blocks that fit
+                the operation memory budget.
             n_threads: Threads for marker search.
             skip_save: If True, return results without writing to Zarr.
             **norm_params: Extra keyword arguments forwarded to ``normed``.
@@ -974,7 +1005,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "ERROR: Please provide a value for `group_key`. This should be the name of a column from "
                 "cell metadata object that has information on how cells should be grouped."
             )
-        from_assay, cell_key, _ = self._get_latest_keys(from_assay, cell_key, None)
+        from_assay, cell_key, _ = self._get_latest_keys(
+            from_assay,
+            cell_key,
+            feat_key if feat_key is not None else "I",
+        )
         if feat_key is None:
             feat_key = "I"
         if n_threads is None:
@@ -989,26 +1024,18 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             ),
         }
 
-        n_features = len(assay.feats.active_index(feat_key))
-        if gene_batch_size is None:
-            gene_batch_size = resolve_marker_gene_batch_size(
-                n_features=n_features,
-                n_cells=len(assay.cells.active_index(cell_key)),
-                column_chunk=_feature_column_chunk(assay, n_features),
-                resources=self.resources,
-            )
-
         slot_name = f"{cell_key}__{group_key}"
         logger.debug(
             f"Running marker search for {from_assay}/{slot_name} "
-            f"(feat_key={feat_key}, batch_size={gene_batch_size})"
+            f"(feat_key={feat_key}, "
+            f"batch_size={gene_batch_size if gene_batch_size is not None else 'auto'})"
         )
-        assay_grp = as_zarr_group(self.zw[assay.name], name=assay.name)
-        if "markers" not in assay_grp:
-            assay_grp.create_group("markers")
-        markers_grp = as_zarr_group(assay_grp["markers"], name="markers")
         planned = None
         if not skip_save:
+            assay_grp = as_zarr_group(self.zw[assay.name], name=assay.name)
+            if "markers" not in assay_grp:
+                assay_grp.create_group("markers")
+            markers_grp = as_zarr_group(assay_grp["markers"], name="markers")
             cell_selection = self._ensure_cell_selection(cell_key)
             cluster_input = self._resolve_cell_data_provenance_input(
                 group_key,
@@ -1291,6 +1318,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             gids = [group_id]
 
         feature_names = assay.feats.fetch_all("names")
+        feature_ids = assay.feats.fetch_all("ids")
         dfs = []
         for gid in gids:
             group_name = str(gid)
@@ -1301,6 +1329,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                     marker_grp,
                     feature_names,
                     group_id=gid,
+                    feature_ids=feature_ids,
                 )
             else:
                 logger.debug(f"No markers found for {gid} returning empty dataframe")
@@ -1310,9 +1339,12 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 df = df[["group_id", "feature_name"] + list(out_cols[1:])]
             dfs.append(df)
         dfs = pd.concat(dfs)
-        return dfs[
-            (dfs.score >= min_score) & (dfs.frac_exp >= min_frac_exp)
-        ].reset_index(drop=True)
+        keep = np.ones(len(dfs), dtype=bool)
+        if "score" in dfs and dfs["score"].notna().any():
+            keep &= dfs["score"].fillna(-np.inf).to_numpy() >= min_score
+        if "frac_exp" in dfs and dfs["frac_exp"].notna().any():
+            keep &= dfs["frac_exp"].fillna(-np.inf).to_numpy() >= min_frac_exp
+        return dfs.loc[keep].reset_index(drop=True)
 
     def export_markers_to_csv(
         self,

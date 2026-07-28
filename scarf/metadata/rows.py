@@ -4,6 +4,9 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from ..storage.geometry import array_geometry
+from ..storage.partition import row_band
+
 
 class _RowReadableMetaData(Protocol):
     N: int
@@ -30,11 +33,11 @@ class MetaDataRowBlock:
 
 def default_block_rows(metadata: _RowReadableMetaData, column: str = "I") -> int:
     """Return a row block size aligned with the backing Zarr chunks."""
-    array = metadata._get_array(column)
-    chunks = getattr(array, "chunks", None)
-    if chunks and len(chunks) > 0 and int(chunks[0]) > 0:
-        return int(chunks[0])
-    return max(1, min(metadata.N, 100_000))
+    return row_band(
+        array_geometry(metadata._get_array(column)),
+        unit="chunk",
+        fallback=min(metadata.N, 100_000),
+    )
 
 
 def iter_row_blocks(

@@ -181,6 +181,38 @@ def test_frozen_master_read_only_open_does_not_mutate(
 
 
 @pytest.mark.integration
+def test_frozen_master_reads_and_recomputes_markers_without_mutation(
+    frozen_master_store: str,
+) -> None:
+    from scarf.datastore.datastore import DataStore
+
+    before = _tree_digest(frozen_master_store)
+    datastore = DataStore(frozen_master_store, default_assay=_ASSAY, zarr_mode="r")
+    stored = datastore.get_markers(
+        from_assay=_ASSAY,
+        cell_key=_CELL_KEY,
+        group_key="RNA_cluster",
+        group_id=1,
+        min_score=0,
+        min_frac_exp=0,
+    )
+    computed = datastore.run_marker_search(
+        from_assay=_ASSAY,
+        cell_key=_CELL_KEY,
+        feat_key="I__hvgs",
+        group_key="RNA_cluster",
+        gene_batch_size=100,
+        n_threads=1,
+        skip_save=True,
+    )
+
+    assert not stored.empty
+    assert computed
+    assert all(frame.shape[0] > 0 for frame in computed.values())
+    assert _tree_digest(frozen_master_store) == before
+
+
+@pytest.mark.integration
 def test_frozen_master_legacy_dendrogram_triggers_hierarchy_rebuild(
     frozen_master_store: str,
     tmp_path,

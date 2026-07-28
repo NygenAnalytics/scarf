@@ -9,10 +9,10 @@ import zarr
 from numpy.typing import NDArray
 from scipy.sparse import csr_matrix, vstack
 
-from ..storage.types import as_zarr_array, as_zarr_group
-from ..storage.budget import READ_AHEAD, ResourceBudget, resolve_budget
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
+from ..storage.budget import ResourceBudget, resolve_budget
+from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.arrays import array_digest
 from ..utils.compute import controlled_compute, show_dask_progress
 from ..utils.logging import logger
@@ -247,10 +247,12 @@ class Assay:
             stats[name] = np.empty(n_cells, dtype=sum_dtype)
 
         row_start = 0
-        for raw in self.rawData.stream_blocks(
+        for raw in self.rawData._stream_blocks(
             nthreads=self.nthreads,
             msg=f"({self.name}) Computing initialization statistics",
-            prefetch=READ_AHEAD,
+            prefetch=None,
+            row_mask=None,
+            resident_bytes=sum(value.nbytes for value in stats.values()),
         ):
             row_stop = row_start + raw.shape[0]
             if compute_n_counts:
@@ -636,8 +638,9 @@ class Assay:
             feat_key: Name of the key (column) from feature attribute table. The data will be fetched
                       for only those features that have a True value in this column. If None then all the features are
                       used
-            batch_size: Number of genes to be loaded in the memory at a time. When
-                None, the stored feature chunk width capped by the memory budget is used.
+            batch_size: Number of genes loaded at a time. When None, selected
+                features are grouped into chunk-aligned blocks that fit the
+                operation memory budget.
             msg: Message to be displayed in the progress bar
             as_dataframe: If true (default) then the yielded matrices are pandas dataframe
             **norm_params: Extra keyword arguments forwarded to ``normed``.
@@ -645,7 +648,7 @@ class Assay:
         Returns:
             Generator yielding DataFrames or (matrix, feature index) tuples.
         """
-        from ..features.markers.batching import resolve_feature_batch_size
+        from ..storage.feature_stream import plan_feature_stream
         from ..utils.progress import tqdmbar
 
         if cell_key is None:
@@ -659,32 +662,43 @@ class Assay:
             feat_idx = self.feats.active_index(feat_key)
         if msg is None:
             msg = ""
-        batch_size = resolve_feature_batch_size(
-            self,
-            n_features=len(feat_idx),
-            n_cells=len(cell_idx),
-            resources=self.resources,
-            requested=batch_size,
-        )
-
         data: ChunkedArray = self.normed(
             cell_idx=cell_idx,
             feat_idx=feat_idx,
             **norm_params,
         )
-        logger.debug("Will iterate over data of shape: ", data.shape)
-        starts = range(0, data.shape[1], batch_size)
-        for start in tqdmbar(starts, desc=msg, total=len(starts)):
-            chunk = np.arange(start, min(start + batch_size, data.shape[1]))
+        backing = cast(zarr.Array, self.rawData._backing)
+        raw_itemsize = max(1, int(np.dtype(backing.dtype).itemsize))
+        out_itemsize = max(1, int(np.dtype(data.dtype).itemsize))
+        n_cells = len(cell_idx)
+        plan = plan_feature_stream(
+            backing,
+            featureAxis=1,
+            cellAxis=0,
+            featureIndices=feat_idx,
+            cellIndices=cell_idx,
+            resources=self.resources,
+            blockBytes=lambda width: max(
+                1,
+                n_cells * width * (raw_itemsize + 2 * out_itemsize),
+            ),
+            requestedBatchSize=batch_size,
+        )
+        logger.debug(
+            f"Will iterate over data of shape {data.shape} "
+            f"in {len(plan.blocks)} feature blocks"
+        )
+        for block in tqdmbar(plan.blocks, desc=msg, total=len(plan.blocks)):
+            chunk = block.destinations
             if as_dataframe:
                 yield pd.DataFrame(
                     controlled_compute(data[:, chunk], self.nthreads),
-                    columns=feat_idx[chunk],
+                    columns=block.indices,
                 )
             else:
                 yield (
                     controlled_compute(data[:, chunk], self.nthreads).T,
-                    feat_idx[chunk],
+                    block.indices,
                 )
 
     def _prepare_aggregated_ordering(
@@ -872,8 +886,9 @@ class Assay:
             chunk_size: Number of ordering bins stored per feature row.
             smoothen: Whether to apply rolling-window smoothing.
             z_scale: Whether to z-scale values within each feature.
-            batch_size: Feature batch size for iteration. When None (default), the
-                batch is the on-disk feature chunk width capped by the memory budget.
+            batch_size: Feature batch size for iteration. When None, selected
+                features are grouped into chunk-aligned blocks that fit the
+                operation memory budget.
             **norm_params: Extra keyword arguments forwarded to ``normed``.
 
         Returns:

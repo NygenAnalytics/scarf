@@ -341,10 +341,6 @@ def test_domain_packages_export_canonical_objects():
             "scarf.features",
             "find_markers_by_rank",
         ): "scarf.features.markers.search",
-        (
-            "scarf.features",
-            "resolve_marker_gene_batch_size",
-        ): "scarf.features.markers.batching",
         ("scarf.matrix", "ChunkedArray"): "scarf.matrix.chunked",
         ("scarf.metrics", "clisi_knn"): "scarf.metrics.lisi",
         ("scarf.metrics", "compute_lisi"): "scarf.metrics.lisi",

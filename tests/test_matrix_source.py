@@ -281,6 +281,48 @@ def test_mounted_store_writes_only_to_target(tmp_path):
     assert int(np.asarray(ds.cells.fetch_all("I")).sum()) == 3
 
 
+def test_mounted_store_computes_markers_without_writing_source(tmp_path):
+    source = str(tmp_path / "source.zarr")
+    target = str(tmp_path / "target.zarr")
+    values = np.array(
+        [
+            [4, 0, 1, 0],
+            [3, 0, 1, 0],
+            [0, 5, 1, 2],
+            [0, 6, 1, 2],
+        ],
+        dtype=np.uint32,
+    )
+    _write_source_store(source, workspace=None, values=values)
+    source_before = _snapshot_store_files(source)
+    ds = mount_datastore(
+        source,
+        at=target,
+        default_assay="RNA",
+        min_features_per_cell=1,
+        min_cells_per_feature=1,
+    )
+    ds.cells.insert(
+        "marker_groups",
+        np.array(["a", "a", "b", "b"]),
+        overwrite=True,
+    )
+
+    markers = ds.run_marker_search(
+        from_assay="RNA",
+        cell_key="I",
+        feat_key="I",
+        group_key="marker_groups",
+        gene_batch_size=None,
+        n_threads=1,
+        skip_save=True,
+    )
+
+    assert set(markers) == {"a", "b"}
+    assert _snapshot_store_files(source) == source_before
+    assert "markers" not in zarr.open_group(target, mode="r")["RNA"]
+
+
 @pytest.mark.parametrize(
     ("group_path", "prefix"),
     [

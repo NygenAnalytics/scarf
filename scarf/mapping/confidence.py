@@ -2,6 +2,9 @@ from typing import Any, cast
 
 import numpy as np
 
+from ..storage.geometry import array_geometry
+from ..storage.partition import row_band
+
 
 def _distance_quantile_summary(
     distances: Any,
@@ -21,11 +24,10 @@ def _distance_quantile_summary(
         raise ValueError("Sampling and quantile counts must be positive")
 
     stride = max(int(np.ceil(n_rows / max_samples)), 1)
-    chunks = getattr(distances, "chunks", None)
-    block_size = (
-        int(chunks[0])
-        if chunks is not None and len(chunks) > 0
-        else min(n_rows, 10_000)
+    block_size = row_band(
+        array_geometry(distances),
+        unit="chunk",
+        fallback=min(n_rows, 10_000),
     )
     sampled: list[np.ndarray] = []
     for start in range(0, n_rows, block_size):

@@ -125,6 +125,7 @@ class WorkflowParameters(BaseModel):
     leidenLabel: str = "leiden_cluster"
     markerFeatureKey: str = "I"
     markerGeneBatchSize: int | None = None
+    countsTLayout: Literal["source", "featureMajor"] = "source"
     graphLocalCache: bool | str = "auto"
     # Optional analysis stages.
     harmonyBatchColumn: str = "synth_batch"

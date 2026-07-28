@@ -7,7 +7,9 @@ import zarr
 from .types import as_zarr_array
 from .arrays import create_metadata_column, create_numeric_array, dtype_fix
 from .budget import ResourceBudget
+from .geometry import array_geometry
 from .layout import PROFILE_METADATA_CHUNK, normed_array_spec
+from .partition import row_band
 from .sharding import write_dense_in_shard_rows
 
 
@@ -31,9 +33,11 @@ def copy_zarr_array(
 
 
 def _metadata_block_rows(array: zarr.Array) -> int:
-    if array.chunks is not None and len(array.chunks) > 0:
-        return max(1, int(array.chunks[0]))
-    return PROFILE_METADATA_CHUNK
+    return row_band(
+        array_geometry(array),
+        unit="chunk",
+        fallback=PROFILE_METADATA_CHUNK,
+    )
 
 
 def _resolve_metadata_dtype(

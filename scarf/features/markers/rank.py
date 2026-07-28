@@ -8,7 +8,10 @@ _MARKER_SORT_ASCENDING = (False, True)
 
 __all__ = [
     "_batch_stats",
+    "_batch_stats_gene_major",
     "_marker_stats_batch",
+    "_marker_stats_gene_major",
+    "gene_major_rank_scratch_bytes",
     "mannwhitneyu_from_ranks",
     "sort_marker_results",
 ]
@@ -152,6 +155,163 @@ def _marker_stats_batch(
             out[g, x, 4] = e_o
             out[g, x, 5] = fc
             out[g, x, 6] = z
+    return out
+
+
+@njit(parallel=True, cache=True)
+def _marker_stats_gene_major(
+    raw: np.ndarray,
+    scalar: np.ndarray,
+    size_factor: np.float32,
+    log_transform: bool,
+    int_indices: np.ndarray,
+    group_counts: np.ndarray,
+    n_total: np.float32,
+    destination_rows: np.ndarray,
+    out: np.ndarray,
+) -> None:
+    """Compute marker statistics from non-negative feature-major raw counts."""
+    n_genes = raw.shape[0]
+    n_cells = raw.shape[1]
+    n_groups = group_counts.shape[0]
+    for g in prange(n_genes):
+        nz_values = np.empty(n_cells, dtype=np.float32)
+        nz_cells = np.empty(n_cells, dtype=np.int64)
+        zero_g = np.zeros(n_groups)
+        sum_g = np.zeros(n_groups)
+        nz_g = np.zeros(n_groups)
+        rank_g = np.zeros(n_groups)
+        drank_g = np.zeros(n_groups)
+        n_nz = 0
+        for c in range(n_cells):
+            grp = int_indices[c]
+            value = (size_factor * np.float32(raw[g, c])) / scalar[c]
+            if log_transform:
+                value = np.log1p(value)
+            if value > 0.0:
+                nz_values[n_nz] = value
+                nz_cells[n_nz] = c
+                n_nz += 1
+                sum_g[grp] += value
+                nz_g[grp] += 1.0
+            else:
+                zero_g[grp] += 1.0
+
+        n_zero = n_cells - n_nz
+        tie_sum = 0.0
+        if n_zero > 0:
+            zero_rank = (n_zero + 1.0) / 2.0
+            zero_t = float(n_zero)
+            if n_zero > 1:
+                tie_sum += zero_t * zero_t * zero_t - zero_t
+            for x in range(n_groups):
+                rank_g[x] = zero_g[x] * zero_rank
+                drank_g[x] = zero_g[x]
+
+        order = np.argsort(nz_values[:n_nz])
+        i = 0
+        dense_rank = 1.0 if n_zero > 0 else 0.0
+        while i < n_nz:
+            j = i
+            value = nz_values[order[i]]
+            while j + 1 < n_nz and nz_values[order[j + 1]] == value:
+                j += 1
+            dense_rank += 1.0
+            average_rank = n_zero + (i + j + 2.0) / 2.0
+            tied = j - i + 1
+            tied_float = float(tied)
+            if tied > 1:
+                tie_sum += tied_float * tied_float * tied_float - tied_float
+            for k in range(i, j + 1):
+                cell = nz_cells[order[k]]
+                grp = int_indices[cell]
+                rank_g[grp] += average_rank
+                drank_g[grp] += dense_rank
+            i = j + 1
+
+        total_sum = 0.0
+        total_nz = 0.0
+        for x in range(n_groups):
+            total_sum += sum_g[x]
+            total_nz += nz_g[x]
+        rank_total = 0.0
+        rank_values = np.empty(n_groups)
+        for x in range(n_groups):
+            count = group_counts[x]
+            rank_values[x] = drank_g[x] / count if count > 0 else 0.0
+            rank_total += rank_values[x]
+        tie_correction = tie_sum / (n_total * (n_total - 1.0)) if n_total > 1 else 0.0
+
+        row = destination_rows[g]
+        for x in range(n_groups):
+            count = group_counts[x]
+            rest = n_total - count
+            mean = sum_g[x] / count if count > 0 else 0.0
+            mean_rest = (total_sum - sum_g[x]) / rest if rest > 0 else 0.0
+            fraction = nz_g[x] / count if count > 0 else 0.0
+            fraction_rest = (total_nz - nz_g[x]) / rest if rest > 0 else 0.0
+            if mean_rest == 0.0:
+                fold_change = 0.0 if mean == 0.0 else 100.1
+            else:
+                fold_change = mean / mean_rest
+            score = rank_values[x] / rank_total if rank_total > 0 else 0.0
+            n1 = count
+            n2 = rest
+            rank_sum = rank_g[x]
+            u1 = rank_sum - (n1 * (n1 + 1.0)) / 2.0
+            mu = (n1 * n2) / 2.0
+            variance = (n1 * n2 / 12.0) * ((n_total + 1.0) - tie_correction)
+            z = (u1 - mu - 0.5) / np.sqrt(variance) if variance > 0.0 else 0.0
+            out[row, x, 0] = score
+            out[row, x, 1] = mean
+            out[row, x, 2] = mean_rest
+            out[row, x, 3] = fraction
+            out[row, x, 4] = fraction_rest
+            out[row, x, 5] = fold_change
+            out[row, x, 6] = z
+
+
+def gene_major_rank_scratch_bytes(
+    *,
+    n_cells: int,
+    n_groups: int,
+    n_threads: int,
+) -> int:
+    """Return the worst-case scratch owned by active gene workers."""
+    cells = max(0, int(n_cells))
+    groups = max(0, int(n_groups))
+    threads = max(1, int(n_threads))
+    per_thread = (
+        cells * (np.dtype(np.float32).itemsize + 2 * np.dtype(np.int64).itemsize)
+        + groups * 6 * np.dtype(np.float64).itemsize
+    )
+    return threads * per_thread
+
+
+def _batch_stats_gene_major(
+    raw: np.ndarray,
+    scalar: np.ndarray,
+    size_factor: float,
+    log_transform: bool,
+    int_indices: np.ndarray,
+    group_counts: np.ndarray,
+    n_total: int,
+) -> np.ndarray:
+    """Run the feature-major kernel and convert z statistics to p-values."""
+    n_genes = int(raw.shape[0])
+    out = np.zeros((n_genes, len(group_counts), 7), dtype=np.float64)
+    _marker_stats_gene_major(
+        np.ascontiguousarray(raw),
+        np.asarray(scalar, dtype=np.float32),
+        np.float32(size_factor),
+        bool(log_transform),
+        np.asarray(int_indices, dtype=np.int64),
+        np.asarray(group_counts, dtype=np.float32),
+        np.float32(n_total),
+        np.arange(n_genes, dtype=np.int64),
+        out,
+    )
+    out[:, :, 6] = 2.0 * norm.sf(np.abs(out[:, :, 6]))
     return out
 
 

@@ -6,7 +6,7 @@ from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.assay import Assay, RNAassay, lib_size_feature_stream_eligible, norm_dummy
-from scarf.datastore._operations.features import _feature_column_chunk
+from scarf.features.markers.batching import feature_column_chunk
 from scarf.features.genomic.melding import coordinate_melding
 from scarf.features.markers import find_markers_by_rank, find_markers_by_regression
 from scarf.metadata import MetaData
@@ -95,6 +95,28 @@ def test_write_counts_t_marks_incomplete_until_finished():
     np.testing.assert_array_equal(counts_t[:], counts[:].T)
 
 
+def test_write_counts_t_feature_major_candidate_inherits_chunk_area():
+    root = _memory_root()
+    group = root.create_group("RNA")
+    values = np.arange(22 * 7, dtype=np.uint32).reshape(22, 7)
+    counts = group.create_array(
+        "counts",
+        data=values,
+        chunks=(6, 4),
+    )
+
+    counts_t = write_counts_t(
+        counts,
+        group,
+        resources=ResourceBudget(1024**2, 2),
+        feature_major_layout=True,
+    )
+
+    assert counts_t is not None
+    assert counts_t.chunks == (1, 22)
+    np.testing.assert_array_equal(counts_t[:], values.T)
+
+
 def test_assay_loads_counts_t_and_falls_back_when_incomplete():
     root = _memory_root()
     values = np.arange(12, dtype=np.uint32).reshape(3, 4)
@@ -159,6 +181,13 @@ def test_rna_feature_reads_match_with_and_without_counts_t():
         dtype=np.uint32,
     )
     _write_small_assay(root, workspace=None, values=values)
+    del root["RNA/countsT"]
+    counts_t = root["RNA"].create_array(
+        "countsT",
+        data=values.T,
+        chunks=(1, 2),
+    )
+    counts_t.attrs["complete"] = True
     cells = MetaData(root["cellData"])
     cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
 
@@ -194,8 +223,8 @@ def test_rna_feature_reads_match_with_and_without_counts_t():
     for left, right in zip(blocks_with, blocks_without, strict=True):
         np.testing.assert_array_equal(left, right)
 
-    assert _feature_column_chunk(with_t, n_features=4) == int(with_t.rawDataT.chunks[0])
-    assert _feature_column_chunk(without_t, n_features=4) == int(
+    assert feature_column_chunk(with_t, n_features=4) == int(with_t.rawDataT.chunks[0])
+    assert feature_column_chunk(without_t, n_features=4) == int(
         without_t.rawData._backing.chunks[1]
     )
 
@@ -212,6 +241,13 @@ def test_marker_results_match_with_and_without_counts_t():
         dtype=np.uint32,
     )
     _write_small_assay(root, workspace=None, values=values)
+    del root["RNA/countsT"]
+    counts_t = root["RNA"].create_array(
+        "countsT",
+        data=values.T,
+        chunks=(1, 2),
+    )
+    counts_t.attrs["complete"] = True
     cells = MetaData(root["cellData"])
     cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
     cells.insert("cluster", np.array(["a", "a", "b", "b"]), overwrite=True)
@@ -435,7 +471,7 @@ def test_iter_normed_feature_wise_uses_slow_path_when_ineligible(monkeypatch):
     assert lib_size_feature_stream_eligible(assay, renormalize_subset=True) is False
 
     calls = {"raw": 0, "base": 0}
-    orig_raw = RNAassay.iter_raw_feature_columns
+    orig_raw = RNAassay._iter_raw_feature_columns
     orig_base = Assay.iter_normed_feature_wise
 
     def spy_raw(self, *args, **kwargs):
@@ -446,7 +482,7 @@ def test_iter_normed_feature_wise_uses_slow_path_when_ineligible(monkeypatch):
         calls["base"] += 1
         yield from orig_base(self, *args, **kwargs)
 
-    monkeypatch.setattr(RNAassay, "iter_raw_feature_columns", spy_raw)
+    monkeypatch.setattr(RNAassay, "_iter_raw_feature_columns", spy_raw)
     monkeypatch.setattr(Assay, "iter_normed_feature_wise", spy_base)
 
     list(assay.iter_normed_feature_wise("I", "I", 2, None))

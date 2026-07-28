@@ -21,11 +21,10 @@ from profiling.config import ProfilingConfig, StageResources
 from profiling.metrics import ResourceSampler
 from profiling.r2 import put_json, storage_options
 from scarf import DataStore
-from scarf.storage.types import as_zarr_array
 from scarf.assay import _read_block
-from scarf.datastore._operations.features import _feature_column_chunk
-from scarf.features.markers import resolve_marker_gene_batch_size
 from scarf.storage.budget import ResourceBudget
+from scarf.storage.feature_stream import FeatureStreamPlan, plan_feature_stream
+from scarf.storage.types import as_zarr_array
 from scarf.utils import iter_column_blocks
 
 _CONFIG_PATH = "profiling/layouts/1m_auto_markers_c8_m64.toml"
@@ -199,22 +198,19 @@ def _stream_hvg_tiles(
 def _stream_marker_batches(
     assay: Any,
     cellIdx: np.ndarray,
-    featIdx: np.ndarray,
-    batchSize: int,
+    plan: FeatureStreamPlan,
 ) -> dict[str, Any]:
     """All cells × gene batches, same path as marker search."""
     array_source = (
         "countsT" if getattr(assay, "rawDataT", None) is not None else "counts"
     )
-    n_blocks = int(np.ceil(len(featIdx) / max(1, batchSize)))
+    n_blocks = len(plan.blocks)
     _log(
-        f"[plan] markerBatches cells={len(cellIdx)} feats={len(featIdx)} "
-        f"geneBatchSize={batchSize} batches={n_blocks} source={array_source}"
+        f"[plan] markerBatches cells={len(cellIdx)} "
+        f"feats={sum(len(block.indices) for block in plan.blocks)} "
+        f"batches={n_blocks} source={array_source}"
     )
-    batches = [
-        featIdx[start : start + batchSize]
-        for start in range(0, len(featIdx), max(1, batchSize))
-    ]
+    batches = [block.indices for block in plan.blocks]
     zarr_arr = (
         assay.rawDataT
         if getattr(assay, "rawDataT", None) is not None
@@ -233,7 +229,8 @@ def _stream_marker_batches(
     for block_idx, raw, read_sec, source in iter_column_blocks(
         n_blocks,
         read_block,
-        workers=assay.resources.workers,
+        workers=plan.readWorkers,
+        io_concurrency=plan.ioConcurrency,
     ):
         feat_cols = batches[block_idx]
         bytes_read += int(raw.nbytes)
@@ -249,8 +246,8 @@ def _stream_marker_batches(
         del feat_cols
     return {
         "nCells": int(len(cellIdx)),
-        "nFeatures": int(len(featIdx)),
-        "geneBatchSize": int(batchSize),
+        "nFeatures": int(sum(len(batch) for batch in batches)),
+        "geneBatchSize": int(max((len(batch) for batch in batches), default=0)),
         "nBlocks": done,
         "bytesRead": bytes_read,
         "arraySource": array_source,
@@ -372,14 +369,32 @@ def run_io_baseline_body(
     # mark_hvgs stores the column as ``{cell_key}__{hvg_key}``.
     hvg_col = f"{config.workflow.cellKey}__{config.workflow.hvgKey}"
     hvg_idx = np.asarray(assay.feats.active_index(hvg_col), dtype=np.intp)
-    marker_batch = resolve_marker_gene_batch_size(
-        n_features=len(feat_idx),
-        n_cells=len(cell_idx),
-        column_chunk=_feature_column_chunk(assay, len(feat_idx)),
-        resources=ResourceBudget(
-            memoryBytes=resources.scarfMemoryBudget,
-            workers=resources.workers,
+    if getattr(assay, "rawDataT", None) is not None:
+        marker_source = assay.rawDataT
+        feature_axis, cell_axis = 0, 1
+    else:
+        marker_source = assay.rawData._backing
+        feature_axis, cell_axis = 1, 0
+    marker_resources = ResourceBudget(
+        memoryBytes=resources.scarfMemoryBudget,
+        workers=resources.workers,
+    )
+    marker_plan = plan_feature_stream(
+        marker_source,
+        featureAxis=feature_axis,
+        cellAxis=cell_axis,
+        featureIndices=feat_idx,
+        cellIndices=cell_idx,
+        resources=marker_resources,
+        blockBytes=lambda width: max(
+            1,
+            len(cell_idx) * width * max(1, int(np.dtype(marker_source.dtype).itemsize)),
         ),
+        requestedBatchSize=config.workflow.markerGeneBatchSize,
+    )
+    marker_batch = max(
+        (len(block.indices) for block in marker_plan.blocks),
+        default=0,
     )
     raw_chunks = list(getattr(assay.rawData._backing, "chunks", ()) or ())
     _log(
@@ -400,8 +415,7 @@ def run_io_baseline_body(
             lambda: _stream_marker_batches(
                 assay,
                 cell_idx,
-                feat_idx,
-                marker_batch,
+                marker_plan,
             ),
         )
     )

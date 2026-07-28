@@ -13,6 +13,8 @@ from typing import Any, Literal
 import numpy as np
 import zarr
 
+from .geometry import array_geometry
+from .partition import row_band
 from .types import as_zarr_array, as_zarr_group
 
 type ArtifactScope = Literal["assay", "datastore"]
@@ -365,9 +367,7 @@ def fingerprint_array(values: np.ndarray) -> str:
 
 
 def _stored_array_chunk_rows(array: zarr.Array) -> int:
-    if array.ndim > 0 and array.chunks is not None:
-        return max(int(array.chunks[0]), 1)
-    return 1
+    return row_band(array_geometry(array), unit="chunk", fallback=1)
 
 
 def fingerprint_stored_arrays(

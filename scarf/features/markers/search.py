@@ -4,11 +4,18 @@ import numba
 import numpy as np
 import pandas as pd
 from numba import set_num_threads
+from scipy.special import ndtr
 
 from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
+from ...storage.feature_stream import plan_feature_stream
 from ...utils.logging import logger
 from ...utils.numba import restore_numba_threads
-from .rank import _batch_stats, sort_marker_results
+from .rank import (
+    _batch_stats,
+    _marker_stats_gene_major,
+    gene_major_rank_scratch_bytes,
+    sort_marker_results,
+)
 from .regression import _regression_batch_results
 
 __all__ = ["find_markers_by_rank", "find_markers_by_regression"]
@@ -20,8 +27,8 @@ def find_markers_by_rank(
     group_key: str,
     cell_key: str,
     feat_key: str,
-    batch_size: int,
-    n_threads: int,
+    batch_size: int | None = None,
+    n_threads: int = 1,
     **norm_params: Any,
 ) -> dict[Any, pd.DataFrame]:
     """Identify marker features for groups with rank-based statistics."""
@@ -29,7 +36,7 @@ def find_markers_by_rank(
     group_set = np.array(sorted(set(groups)))
     n_groups = len(group_set)
     idx_map = dict(zip(group_set, range(n_groups)))
-    int_indices = np.array([idx_map[x] for x in groups])
+    int_indices = np.asarray([idx_map[x] for x in groups], dtype=np.int64)
     out_cols = [
         "feature_index",
         "score",
@@ -41,7 +48,18 @@ def find_markers_by_rank(
         "p_value",
     ]
     results: dict[Any, pd.DataFrame] = {}
-    set_num_threads(min(max(1, n_threads), numba.config.NUMBA_NUM_THREADS))
+    worker_limit = getattr(
+        getattr(assay, "resources", None),
+        "workers",
+        n_threads,
+    )
+    set_num_threads(
+        min(
+            max(1, n_threads),
+            max(1, int(worker_limit)),
+            numba.config.NUMBA_NUM_THREADS,
+        )
+    )
     group_counts = pd.Series(groups).value_counts().reindex(group_set).values
     n_total = len(groups)
 
@@ -51,6 +69,9 @@ def find_markers_by_rank(
         assay,
         renormalize_subset=renormalize_subset,
     )
+    if use_fast and isinstance(assay, RNAassay):
+        raw_source, _, _ = assay._raw_feature_stream_source()
+        use_fast = np.issubdtype(raw_source.dtype, np.unsignedinteger)
 
     if use_fast:
         if not isinstance(assay, RNAassay):
@@ -59,36 +80,72 @@ def find_markers_by_rank(
             )
         cell_idx = assay.cells.active_index(cell_key)
         feat_idx = assay.feats.active_index(feat_key)
-        n_batches = max(1, (len(feat_idx) + batch_size - 1) // batch_size)
-        logger.debug(
-            f"Marker search (fast): {len(feat_idx)} features, {n_groups} groups, "
-            f"{n_batches} batches of {batch_size}"
-        )
         scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
         sf = assay.sf
         if sf is None:
             raise ValueError("RNA library-size normalization requires a size factor")
-        scalar_col = np.asarray(scalar, dtype=np.float32).reshape(-1, 1)
-        scalar_col[scalar_col == 0] = 1
-        batch_stats: list[np.ndarray] = []
-        for (
-            _block_idx,
-            raw,
-            _cols,
-            _read_sec,
-            _source,
-        ) in assay.iter_raw_column_blocks(
+        scalar_values = np.asarray(scalar, dtype=np.float32)
+        scalar_values[scalar_values == 0] = 1
+        group_counts32 = np.asarray(group_counts, dtype=np.float32)
+        stats_matrix = np.zeros(
+            (len(feat_idx), n_groups, 7),
+            dtype=np.float64,
+        )
+        raw_source, feature_axis, cell_axis = assay._raw_feature_stream_source()
+        active_threads = numba.get_num_threads()
+        resident_bytes = (
+            scalar_values.nbytes
+            + int_indices.nbytes
+            + group_counts32.nbytes
+            + stats_matrix.nbytes
+            + gene_major_rank_scratch_bytes(
+                n_cells=len(cell_idx),
+                n_groups=n_groups,
+                n_threads=active_threads,
+            )
+        )
+        orientation_buffers = 1 if feature_axis == 0 else 2
+        raw_itemsize = max(1, int(np.dtype(raw_source.dtype).itemsize))
+        plan = plan_feature_stream(
+            raw_source,
+            featureAxis=feature_axis,
+            cellAxis=cell_axis,
+            featureIndices=feat_idx,
+            cellIndices=cell_idx,
+            resources=assay.resources,
+            residentBytes=resident_bytes,
+            blockBytes=lambda width: max(
+                1,
+                len(cell_idx) * width * raw_itemsize * orientation_buffers,
+            ),
+            requestedBatchSize=batch_size,
+        )
+        logger.debug(
+            f"Marker search (fast): {len(feat_idx)} features, "
+            f"{n_groups} groups, {len(plan.blocks)} blocks, "
+            f"repeated chunk decodes={plan.repeatedDecodeCount}"
+        )
+        for block, raw, _read_sec, _source in assay.iter_raw_feature_major_blocks(
             cell_idx=cell_idx,
-            feat_idx=feat_idx,
-            batch_size=batch_size,
+            plan=plan,
             msg="Finding markers",
         ):
-            normed = (float(sf) * raw.astype(np.float32)) / scalar_col
-            if log_transform:
-                normed = np.log1p(normed)
-            stats = _batch_stats(normed, int_indices, group_counts, n_total)
-            batch_stats.append(stats)
-        stats_matrix = np.vstack(batch_stats)
+            _marker_stats_gene_major(
+                raw,
+                scalar_values,
+                np.float32(sf),
+                log_transform,
+                int_indices,
+                group_counts32,
+                np.float32(n_total),
+                block.destinations,
+                stats_matrix,
+            )
+        p_values = stats_matrix[:, :, 6]
+        np.abs(p_values, out=p_values)
+        np.negative(p_values, out=p_values)
+        ndtr(p_values, out=p_values)
+        p_values *= 2.0
     else:
         batch_stats = []
         iterator = iter(

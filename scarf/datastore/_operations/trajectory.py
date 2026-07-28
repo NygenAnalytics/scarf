@@ -918,15 +918,15 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             feat_key: Boolean feature metadata column selecting features.
             pseudotime_key: Numeric cell metadata column containing pseudotime values.
             min_cells: Minimum number of expressing cells required for a feature.
-            gene_batch_size: Number of features loaded per batch. When None (default),
-                the batch is the on-disk feature chunk width capped by the memory budget.
+            gene_batch_size: Number of features loaded per batch. When None,
+                selected features are grouped into chunk-aligned blocks that
+                fit the operation memory budget.
             **norm_params: Extra keyword arguments forwarded to normalized expression.
 
         Returns:
             Correlation table and the feature metadata keys where it was saved.
         """
         from ...features.markers import find_markers_by_regression
-        from ...features.markers.batching import resolve_feature_batch_size
 
         if pseudotime_key is None:
             raise ValueError(
@@ -955,16 +955,10 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         n_cells = len(assay.cells.active_index(cell_key))
         feature_index = assay.feats.active_index(feat_key)
         n_feats = len(feature_index)
-        gene_batch_size = resolve_feature_batch_size(
-            assay,
-            n_features=n_feats,
-            n_cells=n_cells,
-            resources=self.resources,
-            requested=gene_batch_size,
-        )
         logger.info(
             f"Pseudotime markers: correlating features "
-            f"(cells={n_cells}, features={n_feats}, batch_size={gene_batch_size})"
+            f"(cells={n_cells}, features={n_feats}, "
+            f"batch_size={gene_batch_size if gene_batch_size is not None else 'auto'})"
         )
         correlation_key = f"{cell_key}__{pseudotime_key}__r"
         p_value_key = f"{cell_key}__{pseudotime_key}__p"
@@ -1172,8 +1166,9 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             z_scale: Whether to standardize each retained feature.
             n_neighbours: Number of neighbors in the feature graph.
             n_clusters: Number of feature modules to create.
-            batch_size: Number of features processed per batch. When None (default),
-                the batch is the on-disk feature chunk width capped by the memory budget.
+            batch_size: Number of features processed per batch. When None,
+                selected features are grouped into chunk-aligned blocks that
+                fit the operation memory budget.
             ann_params: Parameters forwarded to the HNSW index.
             nan_cluster_value: Value assigned to features excluded from clustering.
             **norm_params: Extra keyword arguments forwarded to normalized expression.
@@ -1181,7 +1176,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         Returns:
             Lazy aggregated matrix with aligned feature indices and clusters.
         """
-        from ...features.markers.batching import resolve_feature_batch_size
         from ...trajectory.feature_dynamics import knn_clustering
 
         feat_key = feat_key or "I"
@@ -1220,13 +1214,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             ),
         }
         resolved_ann_params = {} if ann_params is None else dict(ann_params)
-        batch_size = resolve_feature_batch_size(
-            assay,
-            n_features=len(assay.feats.active_index(feat_key)),
-            n_cells=len(assay.cells.active_index(cell_key)),
-            resources=self.resources,
-            requested=batch_size,
-        )
         (
             cell_ordering,
             _cell_indices,

@@ -7,7 +7,13 @@ import numpy as np
 import zarr
 from numpy.typing import NDArray
 
-from ..storage.budget import ResourceBudget, admitted_worker_count
+from ..storage.budget import (
+    DEFAULT_READ_AHEAD_BLOCKS,
+    ResourceBudget,
+    admit_stream,
+    admitted_worker_count,
+)
+from ..storage.geometry import ArrayGeometry, array_geometry
 from ._indexing import is_contiguous, local_positions
 from ._operations import (
     _Op,
@@ -63,9 +69,12 @@ class ChunkedArray:
             if self._is_numpy:
                 block_size = self._n_rows if self._n_rows > 0 else 1
             else:
-                from ..storage.layout import array_shard_rows
+                from ..storage.partition import row_band
 
-                block_size = array_shard_rows(cast(zarr.Array, self._backing))
+                block_size = row_band(
+                    self._geometry(),
+                    fallback=int(self._backing.shape[0]),
+                )
         self._block_size = max(int(block_size), 1)
 
     @classmethod
@@ -134,10 +143,9 @@ class ChunkedArray:
         return int(np.ceil(self._n_rows / self._block_size))
 
     def _ranges(self) -> list[tuple[int, int]]:
-        return [
-            (start, min(start + self._block_size, self._n_rows))
-            for start in range(0, self._n_rows, self._block_size)
-        ]
+        from ..storage.partition import contiguous_ranges
+
+        return contiguous_ranges(self._n_rows, self._block_size)
 
     def _read(self, start: int, end: int) -> np.ndarray:
         if self._rows is None:
@@ -198,6 +206,25 @@ class ChunkedArray:
             array = operation.apply(array, start, end)
         return array
 
+    def _geometry(self) -> ArrayGeometry | None:
+        return array_geometry(self._backing)
+
+    def _max_decode_bytes(self) -> int:
+        geometry = self._geometry()
+        return 0 if geometry is None else geometry.nominalChunkBytes()
+
+    def _block_owned_bytes(self) -> int:
+        """Bytes one materialized row block owns, excluding its chunk decode."""
+        rows = min(self._block_size, max(1, self._n_rows))
+        elements = rows * max(1, self._out_cols)
+        input_bytes = elements * max(1, int(self._backing.dtype.itemsize))
+        output_bytes = elements * max(1, int(self.dtype.itemsize))
+        return input_bytes + (output_bytes if self._ops else 0)
+
+    def _block_task_bytes(self) -> int:
+        """Bytes one row block owns where its reader decodes one chunk at a time."""
+        return self._block_owned_bytes() + self._max_decode_bytes()
+
     def _map_blocks(
         self,
         fn: BlockFn,
@@ -210,13 +237,10 @@ class ChunkedArray:
         requested = self._nthreads if nthreads is None else max(1, int(nthreads))
         workers = requested
         if self._resources is not None:
-            rows = min(self._block_size, max(1, self._n_rows))
-            elements = rows * max(1, self._out_cols)
-            input_bytes = elements * max(1, int(self._backing.dtype.itemsize))
-            output_bytes = elements * max(1, int(self.dtype.itemsize))
+            # map_shards pins Zarr to one decode per worker, so one chunk is exact.
             workers = admitted_worker_count(
                 self._resources,
-                taskBytes=input_bytes + (output_bytes if self._ops else 0),
+                taskBytes=self._block_task_bytes(),
                 requested=requested,
             )
         results = map_shards(ranges, fn, workers=workers, msg=msg)
@@ -234,6 +258,7 @@ class ChunkedArray:
             msg=msg,
             prefetch=prefetch,
             row_mask=None,
+            resident_bytes=0,
         )
 
     def _stream_blocks(
@@ -243,24 +268,15 @@ class ChunkedArray:
         msg: str | None,
         prefetch: int | None,
         row_mask: np.ndarray | None,
+        resident_bytes: int = 0,
     ) -> Iterator[np.ndarray]:
-        from ..storage.budget import READ_AHEAD
         from ..storage.parallel import stream_shards
 
         threads = self._nthreads if nthreads is None else max(1, int(nthreads))
-        requested = READ_AHEAD if prefetch is None else max(1, int(prefetch))
+        requested = (
+            DEFAULT_READ_AHEAD_BLOCKS if prefetch is None else max(1, int(prefetch))
+        )
         depth = min(threads, requested)
-        if self._resources is not None:
-            rows = min(self._block_size, max(1, self._n_rows))
-            elements = rows * max(1, self._out_cols)
-            input_bytes = elements * max(1, int(self._backing.dtype.itemsize))
-            output_bytes = elements * max(1, int(self.dtype.itemsize))
-            depth = admitted_worker_count(
-                self._resources,
-                taskBytes=input_bytes + (output_bytes if self._ops else 0),
-                requested=depth,
-            )
-        within = max(1, threads // depth)
         ranges = self._ranges()
         mask = None if row_mask is None else np.asarray(row_mask)
         if mask is not None:
@@ -272,6 +288,19 @@ class ChunkedArray:
                 (start, end) for start, end in ranges if bool(mask[start:end].any())
             ]
 
+        io_concurrency: int | None = None
+        if self._resources is not None:
+            admission = admit_stream(
+                self._resources,
+                nBlocks=min(depth, max(1, len(ranges))),
+                blockBytes=self._block_owned_bytes(),
+                decodeBytes=self._max_decode_bytes(),
+                residentBytes=max(0, int(resident_bytes)),
+            )
+            depth = admission.outerWorkers
+            io_concurrency = admission.ioConcurrency
+        within = max(1, threads // depth)
+
         def materialize(interval: tuple[int, int]) -> np.ndarray:
             start, end = interval
             values = self._materialize_range(start, end)
@@ -282,6 +311,7 @@ class ChunkedArray:
             materialize,
             workers=depth,
             within_block_threads=within,
+            io_concurrency=io_concurrency,
             msg=msg,
             total=len(ranges),
         )

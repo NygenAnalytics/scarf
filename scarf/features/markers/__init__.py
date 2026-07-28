@@ -26,10 +26,7 @@ _LAZY_EXPORTS = {
     "find_markers_by_rank": (".search", "find_markers_by_rank"),
     "find_markers_by_regression": (".search", "find_markers_by_regression"),
     "mannwhitneyu_from_ranks": (".rank", "mannwhitneyu_from_ranks"),
-    "resolve_marker_gene_batch_size": (
-        ".batching",
-        "resolve_marker_gene_batch_size",
-    ),
+    "resolve_marker_gene_batch_size": (".batching", "resolve_marker_gene_batch_size"),
     "sort_marker_results": (".rank", "sort_marker_results"),
 }
 

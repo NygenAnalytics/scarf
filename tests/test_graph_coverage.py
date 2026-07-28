@@ -656,9 +656,9 @@ def test_run_marker_search_skip_save_and_errors(
     assert first_call["group_key"] == "ids"
     assert first_call["cell_key"] == "I"
     assert first_call["feat_key"] == "I"
-    assert first_call["batch_size"] >= 1
+    assert first_call["batch_size"] is None
     assert first_call["n_threads"] == store.nthreads
-    assert "I__ids" not in store.zw["RNA/markers"]
+    assert "markers" not in store.zw["RNA"]
 
     finder.reset_mock()
     result = store.run_marker_search(

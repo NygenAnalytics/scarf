@@ -6,6 +6,8 @@ import numpy as np
 import zarr
 from zarr.codecs import BloscCodec, ZstdCodec
 
+from .geometry import array_geometry
+from .partition import contiguous_ranges, row_band
 from .profiles import StorageProfile
 from .types import array_metadata_shards
 
@@ -346,13 +348,11 @@ def bounded_row_sharded_array_spec(
 
 def array_shard_rows(array: zarr.Array) -> int:
     """Return the row extent of a shard, chunk, or full array."""
-    shards_meta = array_metadata_shards(array)
-    if shards_meta is not None and len(shards_meta) > 0:
-        return int(shards_meta[0])
-    chunks = getattr(array, "chunks", None)
-    if chunks is not None and len(chunks) > 0:
-        return int(chunks[0])
-    return max(int(array.shape[0]), 1)
+    return row_band(
+        array_geometry(array),
+        unit="shard",
+        fallback=max(int(array.shape[0]), 1),
+    )
 
 
 def iter_shard_row_slices(
@@ -360,10 +360,7 @@ def iter_shard_row_slices(
     shard_rows: int,
 ) -> Iterator[tuple[int, int]]:
     """Yield row slices aligned to a shard height."""
-    shard_rows = max(1, int(shard_rows))
-    n_rows = max(0, int(n_rows))
-    for start in range(0, n_rows, shard_rows):
-        yield start, min(start + shard_rows, n_rows)
+    yield from contiguous_ranges(n_rows, shard_rows)
 
 
 def array_info(array: zarr.Array) -> str:

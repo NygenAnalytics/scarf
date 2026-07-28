@@ -625,6 +625,7 @@ def write_counts_t(
     *,
     profile: StorageProfile | None = None,
     resources: ResourceBudget | None = None,
+    feature_major_layout: bool = False,
 ) -> zarr.Array | None:
     """Write the optional feature-major count matrix using public Zarr APIs."""
     from ..utils.logging import logger
@@ -636,9 +637,20 @@ def write_counts_t(
     n_cells = int(counts.shape[0])
     n_feats = int(counts.shape[1])
     itemsize = max(1, int(np.dtype(counts.dtype).itemsize))
-    source_rows = array_shard_rows(counts)
-    feature_chunk = max(1, min(n_feats, int(counts.chunks[1])))
-    cell_chunk = max(1, min(n_cells, source_rows))
+    if feature_major_layout:
+        chunk_elements = max(1, int(np.prod(counts.chunks, dtype=np.int64)))
+        cell_chunk = max(1, min(max(1, n_cells), chunk_elements))
+        feature_chunk = max(
+            1,
+            min(
+                max(1, n_feats),
+                chunk_elements // cell_chunk,
+            ),
+        )
+    else:
+        source_rows = array_shard_rows(counts)
+        feature_chunk = max(1, min(max(1, n_feats), int(counts.chunks[1])))
+        cell_chunk = max(1, min(max(1, n_cells), source_rows))
     inner_bytes = feature_chunk * cell_chunk * itemsize
 
     counts_t = create_numeric_array(

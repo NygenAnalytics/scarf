@@ -12,7 +12,12 @@ from scarf.features.markers import (
     mannwhitneyu_from_ranks,
     sort_marker_results,
 )
-from scarf.features.markers.rank import _batch_stats, _marker_stats_batch
+from scarf.features.markers.rank import (
+    _batch_stats,
+    _batch_stats_gene_major,
+    _marker_stats_batch,
+    _marker_stats_gene_major,
+)
 from scarf.features.markers.regression import (
     _regression_batch_results,
     _regression_r_batch,
@@ -140,6 +145,118 @@ def test_marker_stats_python_kernel_handles_single_cell_population():
             ]
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        np.array(
+            [
+                [1, 2, 3],
+                [3, 2, 1],
+                [2, 1, 4],
+                [4, 3, 2],
+            ],
+            dtype=np.uint32,
+        ),
+        np.zeros((4, 3), dtype=np.uint32),
+        np.full((4, 3), 2, dtype=np.uint32),
+        np.array(
+            [
+                [0, 0, 0],
+                [0, 0, 5],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+            dtype=np.uint32,
+        ),
+        np.array(
+            [
+                [0, 2, 1],
+                [0, 2, 1],
+                [3, 2, 0],
+                [3, 2, 0],
+            ],
+            dtype=np.uint32,
+        ),
+        np.array([[0, 2, 2]], dtype=np.uint32),
+    ],
+    ids=[
+        "no-zeros",
+        "all-zero",
+        "constant",
+        "single-nonzero",
+        "heavy-ties",
+        "single-cell",
+    ],
+)
+@pytest.mark.parametrize("log_transform", [False, True])
+def test_gene_major_zero_aware_kernel_is_bit_identical(
+    raw: np.ndarray,
+    log_transform: bool,
+) -> None:
+    n_cells = raw.shape[0]
+    groups = np.arange(n_cells, dtype=np.int64) % max(1, min(3, n_cells))
+    group_counts = np.bincount(
+        groups,
+        minlength=int(groups.max()) + 1,
+    )
+    scalar = raw.sum(axis=1).astype(np.float32)
+    scalar[scalar == 0] = 1
+    normalized = (float(1000.0) * raw.astype(np.float32)) / scalar[:, None]
+    if log_transform:
+        normalized = np.log1p(normalized)
+
+    expected = _batch_stats(
+        normalized,
+        groups,
+        group_counts,
+        n_cells,
+    )
+    observed = _batch_stats_gene_major(
+        raw.T,
+        scalar,
+        1000.0,
+        log_transform,
+        groups,
+        group_counts,
+        n_cells,
+    )
+
+    np.testing.assert_array_equal(observed, expected)
+
+
+def test_gene_major_python_kernel_matches_compiled_kernel() -> None:
+    raw = np.array(
+        [
+            [0, 2, 0, 4],
+            [1, 2, 0, 0],
+            [1, 0, 3, 4],
+            [0, 0, 3, 0],
+        ],
+        dtype=np.uint32,
+    ).T
+    scalar = np.array([2, 4, 6, 8], dtype=np.float32)
+    groups = np.array([0, 0, 1, 1], dtype=np.int64)
+    group_counts = np.array([2, 2], dtype=np.float32)
+    destinations = np.arange(raw.shape[0], dtype=np.int64)
+    compiled = np.zeros((raw.shape[0], 2, 7), dtype=np.float64)
+    python = np.zeros_like(compiled)
+    args = (
+        raw,
+        scalar,
+        np.float32(1000),
+        False,
+        groups,
+        group_counts,
+        np.float32(4),
+        destinations,
+    )
+
+    _marker_stats_gene_major(*args, compiled)
+    _marker_stats_gene_major.py_func(*args, python)
+
+    np.testing.assert_allclose(compiled, python, rtol=1e-7, atol=1e-12)
 
 
 def test_sort_marker_results_adds_deterministic_tie_breakers():
@@ -375,6 +492,11 @@ def test_find_markers_by_rank_slow_path_returns_groupwise_statistics():
 def test_find_markers_fast_raw_path_computes_groupwise_statistics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import zarr
+    from zarr.storage import MemoryStore
+
+    from scarf.storage.budget import ResourceBudget
+
     data = np.array(
         [
             [4.0, 0.0, 1.0, 0.0],
@@ -409,11 +531,28 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
             self.normMethod = norm_lib_size
             self.sf = 1_000.0
             self.name = "RNA"
+            self.resources = ResourceBudget(1024**3, 2)
+            root = zarr.open_group(store=MemoryStore(), mode="w")
+            self.raw = root.create_array(
+                "counts",
+                data=data.astype(np.uint32),
+                chunks=(2, 2),
+            )
 
-        def iter_raw_column_blocks(self, **_kwargs):
-            for block_index, start in enumerate(range(0, data.shape[1], 2)):
-                columns = np.arange(start, min(start + 2, data.shape[1]))
-                yield block_index, data[:, columns], columns, 0.01, "memory"
+        def _raw_feature_stream_source(self):
+            return self.raw, 1, 0
+
+        @staticmethod
+        def iter_raw_feature_major_blocks(cell_idx, plan, **_kwargs):
+            for block in plan.blocks:
+                yield (
+                    block,
+                    np.ascontiguousarray(
+                        data[np.asarray(cell_idx)][:, block.indices].T
+                    ),
+                    0.01,
+                    "memory",
+                )
 
     monkeypatch.setattr(marker_search_module, "RNAassay", FakeRNA)
     results = find_markers_by_rank(
@@ -500,52 +639,38 @@ def test_compact_marker_save_roundtrip():
     assert loaded.iloc[0]["feature_name"] == "g10"
 
 
-def test_resolve_marker_gene_batch_size_respects_chunk_and_budget():
-    from scarf.features.markers import resolve_marker_gene_batch_size
-    from scarf.storage.budget import ResourceBudget
+def test_legacy_marker_names_and_scores_are_readable():
+    import zarr
+    from zarr.storage import MemoryStore
 
-    batch = resolve_marker_gene_batch_size(
-        n_features=25_683,
-        n_cells=88_955,
-        column_chunk=948,
-        resources=ResourceBudget(24 * 1024**3, 8),
+    from scarf.datastore._operations.features import _load_marker_cluster_frame
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    slot = root.create_group("slot")
+    cluster = slot.create_group("1")
+    cluster.create_array(
+        "names",
+        data=np.array(["id2", "id0"]),
     )
-    assert batch == 948
+    cluster.create_array(
+        "scores",
+        data=np.array([0.9, 0.8]),
+    )
+
+    loaded = _load_marker_cluster_frame(
+        slot,
+        cluster,
+        np.array(["gene0", "gene1", "gene2"]),
+        group_id=1,
+        feature_ids=np.array(["id0", "id1", "id2"]),
+    )
+
+    assert loaded["feature_index"].tolist() == [2, 0]
+    assert loaded["feature_name"].tolist() == ["gene2", "gene0"]
+    assert loaded["score"].tolist() == [0.9, 0.8]
 
 
-def test_resolve_marker_gene_batch_size_shrinks_with_more_cells():
-    from scarf.features.markers import resolve_marker_gene_batch_size
-    from scarf.storage.budget import ResourceBudget
-
-    sizes = []
-    for n_cells in (100_000, 1_000_000, 10_000_000):
-        sizes.append(
-            resolve_marker_gene_batch_size(
-                n_features=45_525,
-                n_cells=n_cells,
-                column_chunk=10_000,
-                resources=ResourceBudget(24 * 1024**3, 8),
-            )
-        )
-    assert sizes[0] > sizes[1] > sizes[2]
-    assert sizes[-1] >= 1
-    assert all(size <= 10_000 for size in sizes)
-
-
-def test_resolve_marker_gene_batch_size_rejects_one_feature_over_budget():
-    from scarf.features.markers import resolve_marker_gene_batch_size
-    from scarf.storage.budget import ResourceBudget
-
-    with pytest.raises(MemoryError, match="One marker feature batch"):
-        resolve_marker_gene_batch_size(
-            n_features=10,
-            n_cells=1_000,
-            column_chunk=10,
-            resources=ResourceBudget(63_999, 2),
-        )
-
-
-def test_explicit_marker_gene_batch_size_bypasses_resolver(
+def test_explicit_marker_gene_batch_size_reaches_search(
     datastore_ephemeral,
     monkeypatch,
 ):
@@ -554,17 +679,10 @@ def test_explicit_marker_gene_batch_size_bypasses_resolver(
     captured = {}
     expected = {"group": pd.DataFrame()}
 
-    def fail_resolver(**_kwargs):
-        raise AssertionError("automatic batch resolver must not run")
-
     def capture_marker_search(**kwargs):
         captured.update(kwargs)
         return expected
 
-    monkeypatch.setattr(
-        "scarf.datastore._operations.features.resolve_marker_gene_batch_size",
-        fail_resolver,
-    )
     monkeypatch.setattr(
         "scarf.features.markers.find_markers_by_rank",
         capture_marker_search,

@@ -3,6 +3,9 @@ from typing import Any
 
 import numpy as np
 
+from ..storage.geometry import array_geometry
+from ..storage.partition import row_band
+
 
 def array_hash(values: np.ndarray | list[Any]) -> str:
     """Return a stable content hash for numeric or identifier arrays."""
@@ -29,11 +32,10 @@ def array_store_hash(values: Any) -> str:
     if not shape:
         digest.update(np.asarray(values[...]).tobytes())
         return digest.hexdigest()
-    chunks = getattr(values, "chunks", None)
-    row_chunk = (
-        int(chunks[0])
-        if chunks is not None and len(chunks) > 0
-        else min(max(shape[0], 1), 10_000)
+    row_chunk = row_band(
+        array_geometry(values),
+        unit="chunk",
+        fallback=min(max(shape[0], 1), 10_000),
     )
     for start in range(0, shape[0], row_chunk):
         stop = min(start + row_chunk, shape[0])

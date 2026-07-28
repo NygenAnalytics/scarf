@@ -473,12 +473,14 @@ def _write_counts_t(
     *,
     storeUri: str,
     assayName: str,
+    featureMajorLayout: bool = False,
 ) -> Any:
     counts_t = write_counts_t(
         context.counts,
         context.group,
         profile="cloud" if storeUri.startswith("s3://") else "fast_local",
         resources=context.budget,
+        feature_major_layout=featureMajorLayout,
     )
     if counts_t is None:
         raise RuntimeError(
@@ -625,6 +627,9 @@ def run_stage(
                             counts_context,
                             storeUri=storeUri,
                             assayName=workflow.assayName,
+                            featureMajorLayout=(
+                                workflow.countsTLayout == "featureMajor"
+                            ),
                         )
                     with timer.validationPersistence():
                         assert counts_context is not None
@@ -1042,6 +1047,7 @@ def repair_counts_t(
     nCheckTiles: int = 3,
     seed: int = 0,
     sampleIntervalSeconds: float = 0.25,
+    featureMajorLayout: bool = False,
 ) -> dict[str, Any]:
     """Rewrite feature-major ``countsT`` and only then mark it complete."""
     context = _prepare_counts_t_write(
@@ -1057,6 +1063,7 @@ def repair_counts_t(
             context,
             storeUri=storeUri,
             assayName=assayName,
+            featureMajorLayout=featureMajorLayout,
         )
     finally:
         seconds = time.perf_counter() - started

@@ -43,6 +43,8 @@ from ...neighbors.stages import (
 )
 from ...storage.arrays import create_zarr_dataset
 from ...storage.ann_index import serialize_ann_index
+from ...storage.geometry import array_geometry
+from ...storage.partition import row_band
 from ...storage.artifact_writer import (
     ArrayRequirement,
     PlannedArtifact,
@@ -602,10 +604,11 @@ class _MappingOperationsMixin(_MappingOperationsBase):
 
     @staticmethod
     def _projection_block_size(indices: Any) -> int:
-        chunks = getattr(indices, "chunks", None)
-        if chunks is not None and len(chunks) > 0:
-            return int(chunks[0])
-        return min(max(int(indices.shape[0]), 1), 10_000)
+        return row_band(
+            array_geometry(indices),
+            unit="chunk",
+            fallback=min(max(int(indices.shape[0]), 1), 10_000),
+        )
 
     def _fingerprint_mapping_matrix(self, data: Any) -> str:
         shape = tuple(int(value) for value in data.shape)

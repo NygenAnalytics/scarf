@@ -5,10 +5,13 @@ import numpy as np
 import pandas as pd
 import zarr
 
-from ..storage.budget import READ_AHEAD
-from ..storage.types import as_zarr_array, as_zarr_group
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
+from ..storage.budget import admit_stream
+from ..storage.feature_stream import FeatureStreamPlan, plan_feature_stream
+from ..storage.geometry import array_geometry
+from ..storage.partition import IndexBlock, partition_indices, row_band
+from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.compute import show_dask_progress
 from ..utils.logging import logger
 from .base import Assay
@@ -135,8 +138,6 @@ class RNAassay(Assay):
         as_dataframe: bool = True,
         **norm_params: Any,
     ) -> Generator[pd.DataFrame | tuple[np.ndarray, np.ndarray], None, None]:
-        from ..features.markers.batching import resolve_feature_batch_size
-
         renormalize_subset = bool(norm_params.get("renormalize_subset", False))
         if not lib_size_feature_stream_eligible(
             self, renormalize_subset=renormalize_subset
@@ -164,20 +165,35 @@ class RNAassay(Assay):
 
         if msg is None:
             msg = ""
-        batch_size = resolve_feature_batch_size(
-            self,
-            n_features=len(feat_idx),
-            n_cells=len(cell_idx),
-            resources=self.resources,
-            requested=batch_size,
-        )
 
         sf = self.sf
         if sf is None:
             raise ValueError("RNA library-size normalization requires a size factor")
         scalar = self.cells.fetch_all(self.name + "_nCounts")[cell_idx]
         log_transform = bool(norm_params.get("log_transform", False))
-        for mat, cols in self.iter_raw_feature_columns(
+        zarr_arr, feature_axis, cell_axis = self._raw_feature_stream_source()
+        raw_itemsize = max(1, int(np.dtype(zarr_arr.dtype).itemsize))
+        n_cells = len(cell_idx)
+        plan = plan_feature_stream(
+            zarr_arr,
+            featureAxis=feature_axis,
+            cellAxis=cell_axis,
+            featureIndices=feat_idx,
+            cellIndices=cell_idx,
+            resources=self.resources,
+            blockBytes=lambda width: max(
+                1,
+                n_cells
+                * width
+                * (
+                    raw_itemsize
+                    + np.dtype(np.float32).itemsize
+                    + np.dtype(np.float64).itemsize
+                ),
+            ),
+            requestedBatchSize=batch_size,
+        )
+        for mat, cols in self._iter_raw_feature_columns(
             cell_idx=cell_idx,
             feat_idx=feat_idx,
             batch_size=batch_size,
@@ -185,6 +201,7 @@ class RNAassay(Assay):
             sf=float(sf),
             log_transform=log_transform,
             msg=msg,
+            plan=plan,
         ):
             mat64 = np.asarray(mat, dtype=np.float64)
             if as_dataframe:
@@ -357,12 +374,35 @@ class RNAassay(Assay):
             self.normMethod = norm_method_cache
             self.scalar = scalar_cache
 
+    def _raw_feature_stream_source(self) -> tuple[zarr.Array, int, int]:
+        """Return the preferred raw array and its feature and cell axes."""
+        if self.rawDataT is not None:
+            return self.rawDataT, 0, 1
+        return cast(zarr.Array, self.rawData._backing), 1, 0
+
     def iter_raw_column_blocks(
         self,
         cell_idx: np.ndarray,
         feat_idx: np.ndarray,
         batch_size: int,
         msg: str | None = None,
+    ) -> Generator[tuple[int, np.ndarray, np.ndarray, float, str], None, None]:
+        """Read raw count column batches with shallow read-ahead."""
+        yield from self._iter_raw_column_blocks(
+            cell_idx=cell_idx,
+            feat_idx=feat_idx,
+            batch_size=batch_size,
+            msg=msg,
+        )
+
+    def _iter_raw_column_blocks(
+        self,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
+        batch_size: int | None,
+        msg: str | None = None,
+        *,
+        plan: FeatureStreamPlan | None = None,
     ) -> Generator[tuple[int, np.ndarray, np.ndarray, float, str], None, None]:
         """Read raw count column batches with shallow read-ahead.
 
@@ -373,26 +413,37 @@ class RNAassay(Assay):
 
         cell_idx = np.asarray(cell_idx)
         feat_idx = np.asarray(feat_idx)
-        batch_size = max(1, batch_size)
-        batches = [
-            feat_idx[s : s + batch_size] for s in range(0, len(feat_idx), batch_size)
-        ]
-        n_blocks = len(batches)
+        zarr_arr, feature_axis, cell_axis = self._raw_feature_stream_source()
+        if plan is None:
+            raw_itemsize = max(1, int(np.dtype(zarr_arr.dtype).itemsize))
+            plan = plan_feature_stream(
+                zarr_arr,
+                featureAxis=feature_axis,
+                cellAxis=cell_axis,
+                featureIndices=feat_idx,
+                cellIndices=cell_idx,
+                resources=self.resources,
+                blockBytes=lambda width: max(
+                    1,
+                    len(cell_idx) * width * raw_itemsize,
+                ),
+                requestedBatchSize=batch_size,
+            )
+        batches = [block.indices for block in plan.blocks]
+        n_blocks = len(plan.blocks)
         if msg:
             logger.debug(
                 f"({self.name}) {msg}: {len(feat_idx)} features in "
-                f"{n_blocks} batches (width {batch_size})"
+                f"{n_blocks} geometry-planned blocks "
+                f"(repeated chunk decodes={plan.repeatedDecodeCount})"
             )
 
-        use_counts_t = self.rawDataT is not None
-        if use_counts_t:
-            zarr_arr = cast(zarr.Array, self.rawDataT)
+        if feature_axis == 0:
 
             def read_block(block_idx: int) -> np.ndarray:
                 return _read_facade_block(zarr_arr, batches[block_idx], cell_idx).T
 
         else:
-            zarr_arr = cast(zarr.Array, self.rawData._backing)
 
             def read_block(block_idx: int) -> np.ndarray:
                 return _read_facade_block(zarr_arr, cell_idx, batches[block_idx])
@@ -400,10 +451,62 @@ class RNAassay(Assay):
         for block_idx, raw, read_sec, source in iter_column_blocks(
             n_blocks,
             read_block,
-            workers=self.resources.workers,
+            workers=plan.readWorkers,
+            io_concurrency=plan.ioConcurrency,
             msg=msg,
         ):
             yield block_idx, raw, batches[block_idx], read_sec, source
+
+    def iter_raw_feature_major_blocks(
+        self,
+        cell_idx: np.ndarray,
+        plan: FeatureStreamPlan,
+        msg: str | None = None,
+    ) -> Generator[
+        tuple[IndexBlock, np.ndarray, float, str],
+        None,
+        None,
+    ]:
+        """Yield C-contiguous ``(features, cells)`` raw count blocks."""
+        from ..utils.prefetch import iter_column_blocks
+
+        cell_idx = np.asarray(cell_idx)
+        zarr_arr, feature_axis, _ = self._raw_feature_stream_source()
+        if feature_axis != plan.featureAxis:
+            raise ValueError("Feature stream plan does not match the raw source")
+        blocks = plan.blocks
+
+        if feature_axis == 0:
+
+            def read_block(block_idx: int) -> np.ndarray:
+                block = blocks[block_idx]
+                return np.ascontiguousarray(
+                    _read_facade_block(
+                        zarr_arr,
+                        block.indices,
+                        cell_idx,
+                    )
+                )
+
+        else:
+
+            def read_block(block_idx: int) -> np.ndarray:
+                block = blocks[block_idx]
+                raw = _read_facade_block(
+                    zarr_arr,
+                    cell_idx,
+                    block.indices,
+                )
+                return np.ascontiguousarray(raw.T)
+
+        for block_idx, raw, read_sec, source in iter_column_blocks(
+            len(blocks),
+            read_block,
+            workers=plan.readWorkers,
+            io_concurrency=plan.ioConcurrency,
+            msg=msg,
+        ):
+            yield blocks[block_idx], raw, read_sec, source
 
     def iter_raw_feature_columns(
         self,
@@ -414,6 +517,29 @@ class RNAassay(Assay):
         sf: float,
         log_transform: bool = False,
         msg: str | None = None,
+    ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
+        """Iterate library-size normalized feature columns."""
+        yield from self._iter_raw_feature_columns(
+            cell_idx=cell_idx,
+            feat_idx=feat_idx,
+            batch_size=batch_size,
+            scalar=scalar,
+            sf=sf,
+            log_transform=log_transform,
+            msg=msg,
+        )
+
+    def _iter_raw_feature_columns(
+        self,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
+        batch_size: int | None,
+        scalar: np.ndarray,
+        sf: float,
+        log_transform: bool = False,
+        msg: str | None = None,
+        *,
+        plan: FeatureStreamPlan | None = None,
     ) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
         """Iterate library-size normalized feature columns without streaming
         the full normalized matrix.
@@ -443,15 +569,36 @@ class RNAassay(Assay):
         scalar_col = np.asarray(scalar, dtype=np.float32).reshape(-1, 1)
         scalar_col[scalar_col == 0] = 1
         feat_idx = np.asarray(feat_idx)
-        n_batches = max(
-            1, (len(feat_idx) + max(1, batch_size) - 1) // max(1, batch_size)
-        )
+        if plan is None:
+            zarr_arr, feature_axis, cell_axis = self._raw_feature_stream_source()
+            raw_itemsize = max(1, int(np.dtype(zarr_arr.dtype).itemsize))
+            plan = plan_feature_stream(
+                zarr_arr,
+                featureAxis=feature_axis,
+                cellAxis=cell_axis,
+                featureIndices=feat_idx,
+                cellIndices=cell_idx,
+                resources=self.resources,
+                blockBytes=lambda width: max(
+                    1,
+                    len(cell_idx)
+                    * width
+                    * (
+                        raw_itemsize
+                        + np.dtype(np.float32).itemsize
+                        + np.dtype(np.float64).itemsize
+                    ),
+                ),
+                requestedBatchSize=batch_size,
+            )
+        n_batches = len(plan.blocks)
 
-        for block_idx, raw, cols, read_sec, source in self.iter_raw_column_blocks(
+        for block_idx, raw, cols, read_sec, source in self._iter_raw_column_blocks(
             cell_idx=cell_idx,
             feat_idx=feat_idx,
             batch_size=batch_size,
             msg=msg,
+            plan=plan,
         ):
             t0 = time.perf_counter()
             normed = (sf * raw.astype(np.float32)) / scalar_col
@@ -483,7 +630,6 @@ class RNAassay(Assay):
         parallel and accumulated as they arrive (each writes a disjoint row
         slice, so order does not matter).
         """
-        from ..storage.budget import admitted_worker_count
         from ..storage.parallel import stream_shards
 
         zarr_arr = cast(zarr.Array, self.rawData._backing)
@@ -511,9 +657,9 @@ class RNAassay(Assay):
         if n_cells == 0:
             return out
 
+        geometry = array_geometry(zarr_arr)
         if block_rows is None:
-            chunks = getattr(zarr_arr, "chunks", None)
-            block_rows = int(chunks[0]) if chunks else n_cells
+            block_rows = row_band(geometry, unit="chunk", fallback=n_cells)
         block_rows = max(1, int(block_rows))
 
         starts = range(0, n_cells, block_rows)
@@ -522,22 +668,30 @@ class RNAassay(Assay):
             rows = cell_idx[start : start + block_rows]
             return start, _read_facade_block(zarr_arr, rows, union)
 
-        task_bytes = (
+        block_bytes = (
             block_rows
             * max(1, len(union))
             * (np.dtype(zarr_arr.dtype).itemsize + np.dtype(np.float64).itemsize)
         )
-        workers = admitted_worker_count(
-            self.resources,
-            taskBytes=task_bytes,
-            requested=READ_AHEAD,
+        resident_bytes = (
+            scalar.nbytes
+            + union.nbytes
+            + sum(value.nbytes for value in out.values())
+            + sum(value.nbytes for value in local_pos.values())
         )
-        io_concurrency = max(1, self.resources.workers // workers)
+        admission = admit_stream(
+            self.resources,
+            nBlocks=self.resources.workers,
+            blockBytes=block_bytes,
+            decodeBytes=0 if geometry is None else geometry.nominalChunkBytes(),
+            residentBytes=resident_bytes,
+            requested=self.resources.workers,
+        )
         for start, raw in stream_shards(
             starts,
             read,
-            workers=workers,
-            io_concurrency=io_concurrency,
+            workers=admission.outerWorkers,
+            io_concurrency=admission.ioConcurrency,
         ):
             end = start + raw.shape[0]
             normed = (sf * raw.astype(np.float64)) / scalar[start:end, None]
@@ -584,54 +738,25 @@ class RNAassay(Assay):
         if n_cells == 0 or n_features == 0:
             return {"normed_tot": s1, "normed_n": nz, "sigmas": s2}
 
-        use_counts_t = self.rawDataT is not None
+        zarr_arr, feature_axis, cell_axis = self._raw_feature_stream_source()
+        use_counts_t = feature_axis == 0
+        geometry = array_geometry(zarr_arr)
+        if geometry is None:
+            raise ValueError("Feature stats require a chunked raw count array")
+        cell_tiles = partition_indices(geometry, cell_axis, cell_idx)
+        feat_tiles = partition_indices(geometry, feature_axis, feat_idx)
         if use_counts_t:
-            zarr_arr = cast(zarr.Array, self.rawDataT)
-            chunks = getattr(zarr_arr, "chunks", None)
-            feat_chunk = int(chunks[0]) if chunks and len(chunks) > 0 else n_features
-            cell_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else n_cells
+            tiles = [(cells, feats) for feats in feat_tiles for cells in cell_tiles]
         else:
-            zarr_arr = cast(zarr.Array, self.rawData._backing)
-            chunks = getattr(zarr_arr, "chunks", None)
-            cell_chunk = int(chunks[0]) if chunks and len(chunks) > 0 else n_cells
-            feat_chunk = int(chunks[1]) if chunks and len(chunks) > 1 else n_features
-        cell_chunk = max(1, cell_chunk)
-        feat_chunk = max(1, feat_chunk)
-
-        cell_pos = np.arange(n_cells, dtype=np.intp)
-        feat_pos = np.arange(n_features, dtype=np.intp)
-        cell_bins = np.asarray(cell_idx // cell_chunk, dtype=np.intp)
-        feat_bins = np.asarray(feat_idx // feat_chunk, dtype=np.intp)
-
-        tiles: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-        if use_counts_t:
-            for feat_bin in np.unique(feat_bins):
-                feat_mask = feat_bins == feat_bin
-                local_feats = feat_pos[feat_mask]
-                cols = feat_idx[feat_mask]
-                for cell_bin in np.unique(cell_bins):
-                    cell_mask = cell_bins == cell_bin
-                    local_cells = cell_pos[cell_mask]
-                    rows = cell_idx[cell_mask]
-                    tiles.append((local_cells, rows, local_feats, cols))
-        else:
-            for cell_bin in np.unique(cell_bins):
-                cell_mask = cell_bins == cell_bin
-                local_cells = cell_pos[cell_mask]
-                rows = cell_idx[cell_mask]
-                for feat_bin in np.unique(feat_bins):
-                    feat_mask = feat_bins == feat_bin
-                    local_feats = feat_pos[feat_mask]
-                    cols = feat_idx[feat_mask]
-                    tiles.append((local_cells, rows, local_feats, cols))
+            tiles = [(cells, feats) for cells in cell_tiles for feats in feat_tiles]
 
         n_blocks = len(tiles)
 
         def read_block(block_idx: int) -> np.ndarray:
-            _, rows, _, cols = tiles[block_idx]
+            cells, feats = tiles[block_idx]
             if use_counts_t:
-                return _read_facade_block(zarr_arr, cols, rows).T
-            return _read_facade_block(zarr_arr, rows, cols)
+                return _read_facade_block(zarr_arr, feats.indices, cells.indices).T
+            return _read_facade_block(zarr_arr, cells.indices, feats.indices)
 
         def accumulate_block(
             raw: np.ndarray,
@@ -646,15 +771,36 @@ class RNAassay(Assay):
             s1[local_feats] += scaled.sum(axis=0)
             s2[local_feats] += np.einsum("ij,ij->j", scaled, scaled)
 
+        raw_itemsize = max(1, int(np.dtype(zarr_arr.dtype).itemsize))
+        block_bytes = max(
+            (
+                cells.indices.size
+                * feats.indices.size
+                * (raw_itemsize + np.dtype(np.float64).itemsize)
+                for cells, feats in tiles
+            ),
+            default=1,
+        )
+        resident_bytes = (
+            scalar.nbytes + inv_scalar.nbytes + nz.nbytes + s1.nbytes + s2.nbytes
+        )
+        admission = admit_stream(
+            self.resources,
+            nBlocks=max(1, n_blocks),
+            blockBytes=block_bytes,
+            decodeBytes=geometry.nominalChunkBytes(),
+            residentBytes=resident_bytes,
+        )
         for block_idx, raw, read_sec, source in iter_column_blocks(
             n_blocks,
             read_block,
-            workers=self.resources.workers,
+            workers=admission.outerWorkers,
+            io_concurrency=admission.ioConcurrency,
             msg=f"({self.name}) Computing feature stats",
         ):
-            local_cells, _, local_feats, _ = tiles[block_idx]
+            cells, feats = tiles[block_idx]
             t_compute = time.perf_counter()
-            accumulate_block(raw, local_cells, local_feats)
+            accumulate_block(raw, cells.destinations, feats.destinations)
             compute_sec = time.perf_counter() - t_compute
             logger.info(
                 f"({self.name}) feature stats block {block_idx + 1}/{n_blocks}: "

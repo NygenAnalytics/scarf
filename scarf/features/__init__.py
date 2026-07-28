@@ -63,10 +63,7 @@ _LAZY_EXPORTS = {
     "get_ranges": (".genomic", "get_ranges"),
     "mannwhitneyu_from_ranks": (".markers", "mannwhitneyu_from_ranks"),
     "read_gmt": (".enrichment", "read_gmt"),
-    "resolve_marker_gene_batch_size": (
-        ".markers",
-        "resolve_marker_gene_batch_size",
-    ),
+    "resolve_marker_gene_batch_size": (".markers", "resolve_marker_gene_batch_size"),
     "select_highly_variable_features": (
         ".variability",
         "select_highly_variable_features",

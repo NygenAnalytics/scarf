@@ -404,7 +404,11 @@ def test_pca_and_lsi_implementations_live_under_embeddings():
 def test_extracted_domains_have_only_narrow_storage_dependencies():
     forbidden = {"datastore", "plotting", "readers", "writers"}
     storage_exceptions = {
-        "features": {"genomic/melding.py", "markers/batching.py"},
+        "features": {
+            "genomic/melding.py",
+            "markers/batching.py",
+            "markers/search.py",
+        },
         "neighbors": set(),
         "quality_control": {"doublets.py"},
     }
@@ -414,6 +418,46 @@ def test_extracted_domains_have_only_narrow_storage_dependencies():
             path for path, target in _upward_imports(package_name, {"storage"})
         }
         assert storage_importers == allowed_storage_importers
+
+
+def test_read_paths_take_chunk_geometry_only_from_the_storage_geometry_module():
+    # scarf/storage/geometry.py owns the one read of an array's chunk grid.
+    # Write-path chunk specs in layout.py and sharding.py are a separate concern
+    # and stay out of this guard.
+    read_path_modules = (
+        "assay/rna.py",
+        "datastore/_operations/graph.py",
+        "datastore/_operations/mapping.py",
+        "mapping/confidence.py",
+        "mapping/hashing.py",
+        "matrix/chunked.py",
+        "metadata/rows.py",
+        "storage/artifacts.py",
+        "storage/copy.py",
+        "storage/feature_stream.py",
+        "storage/partition.py",
+    )
+    offenders = set()
+    for relative_path in read_path_modules:
+        path = _SCARF_ROOT / relative_path
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            reads_subscript = (
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Attribute)
+                and node.value.attr in {"chunks", "shards"}
+            )
+            reads_getattr = (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) > 1
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in {"chunks", "shards"}
+            )
+            if reads_subscript or reads_getattr:
+                offenders.add((relative_path, node.lineno))
+
+    assert offenders == set()
 
 
 def test_mapping_does_not_import_orchestration_or_general_io():
@@ -427,7 +471,13 @@ def test_mapping_does_not_import_orchestration_or_general_io():
     storage_importers = {
         path for path, target in _upward_imports("mapping", {"storage"})
     }
-    assert storage_importers <= {"artifact.py", "coral.py", "features.py"}
+    assert storage_importers <= {
+        "artifact.py",
+        "confidence.py",
+        "coral.py",
+        "features.py",
+        "hashing.py",
+    }
 
 
 def test_internal_modules_use_canonical_storage_and_utility_paths():
@@ -576,7 +626,6 @@ import scarf.features as features
 assert "scarf.features.variability" not in sys.modules
 assert "scarf.features.genomic.gff" not in sys.modules
 assert "scarf.features.genomic.melding" not in sys.modules
-assert "scarf.features.markers.batching" not in sys.modules
 assert "scarf.features.markers.search" not in sys.modules
 assert "scarf.features.enrichment" not in sys.modules
 assert "scarf.features.enrichment.net" not in sys.modules
@@ -596,9 +645,9 @@ assert "scarf.features.enrichment.results" in sys.modules
 assert "scarf.features.enrichment.aucell" not in sys.modules
 assert "scarf.features.enrichment.waggr" not in sys.modules
 
-_ = features.resolve_marker_gene_batch_size
-assert "scarf.features.markers.batching" in sys.modules
-assert "scarf.features.markers.search" not in sys.modules
+_ = features.find_markers_by_rank
+assert "scarf.features.markers.search" in sys.modules
+assert "scarf.features.markers.batching" not in sys.modules
 
 _ = features.GffReader
 assert "scarf.features.genomic.gff" in sys.modules
