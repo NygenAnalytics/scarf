@@ -1632,11 +1632,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 resources=self.resources,
             )
             logger.info(
-                "Using materialized batch-correction coordinates from %s "
-                "(shape=%s x %s)",
-                status.path,
-                data.shape[0],
-                data.shape[1],
+                f"Using materialized batch-correction coordinates from "
+                f"{status.path} (shape={data.shape[0]} x {data.shape[1]})"
             )
             return (
                 ChunkedCoordinateStream(data, self.nthreads),
@@ -1666,11 +1663,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     resources=self.resources,
                 )
                 logger.info(
-                    "Using materialized %s coordinates from %s (shape=%s x %s)",
-                    method_label,
-                    status.path,
-                    data.shape[0],
-                    data.shape[1],
+                    f"Using materialized {method_label} coordinates from "
+                    f"{status.path} (shape={data.shape[0]} x {data.shape[1]})"
                 )
                 return (
                     ChunkedCoordinateStream(data, self.nthreads),
@@ -1678,12 +1672,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     int(data.shape[1]),
                 )
             logger.warning(
-                "Materialized %s coordinates missing at %s (no 'data' array); "
-                "falling back to on-the-fly projection from normalized data. "
-                "Downstream ANN, neighbors, and embedding init will re-read "
-                "normalized features instead of stored reduced coordinates.",
-                method_label,
-                status.path,
+                f"Materialized {method_label} coordinates missing at "
+                f"{status.path} (no 'data' array); falling back to on-the-fly "
+                f"projection from normalized data. Downstream ANN, neighbors, "
+                f"and embedding init will re-read normalized features instead "
+                f"of stored reduced coordinates."
             )
             transform, stream = self._load_reduction_stream(
                 coordinates,
