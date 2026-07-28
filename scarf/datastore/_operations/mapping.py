@@ -1074,7 +1074,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         cell_key: str | None = None,
         feat_key: str | None = None,
         save_k: int = 3,
-        batch_size: int = 1000,
         ref_mu: bool = True,
         ref_sigma: bool = True,
         run_coral: bool = False,
@@ -1101,8 +1100,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             feat_key:  Feature key. Should be same as the one that was used in the desired graph. By default, the latest
                        used feature for the given assay will be used.
             save_k: Number of the nearest neighbours to identify for each target cell (Default value: 3)
-            batch_size: Number of cells that will be projected as a batch. This used to decide the chunk size when
-                        normalized data for the target cells is saved to disk.
             ref_mu: Deprecated compatibility flag. Reference means are always used.
             ref_sigma: Deprecated compatibility flag. Reference scales are always used.
             run_coral: Deprecated experimental feature-space correction. If True,
@@ -1557,7 +1554,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 "target_name": target_name,
                 "target_feat_key": target_feat_key,
                 "target_cell_key": target_cell_key,
-                "batch_size": batch_size,
             },
             invalidate_cache=invalidate_cache,
             required_arrays=(
@@ -1587,8 +1583,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
             return None
         store = start_artifact(self.zw, projection_plan)
-        zi = create_zarr_dataset(store, "indices", (batch_size,), "u8", (nc, nk))
-        zd = create_zarr_dataset(store, "distances", (batch_size,), "f8", (nc, nk))
+        row_chunk = min(max(int(target_data.chunksize[0]), 1), max(nc, 1))
+        zi = create_zarr_dataset(store, "indices", (row_chunk,), "u8", (nc, nk))
+        zd = create_zarr_dataset(store, "distances", (row_chunk,), "f8", (nc, nk))
         feature_index_store = create_zarr_dataset(
             store,
             "reference_feature_indices",

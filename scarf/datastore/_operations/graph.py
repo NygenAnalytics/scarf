@@ -125,6 +125,41 @@ else:
     _GraphOperationsBase = object
 
 
+def _row_block(
+    array: zarr.Array,
+    requested: int | None,
+    *,
+    minimum: int | None = None,
+) -> int:
+    """Resolve a row block, defaulting to the array's own on-disk row band.
+
+    An explicit value that is not a whole number of row bands makes every
+    block straddle a band boundary, so each band is fetched and decoded more
+    than once.
+    """
+    band = max(1, array_shard_rows(array))
+    n_rows = max(1, int(array.shape[0]))
+    if requested is None:
+        resolved = min(band, n_rows)
+    else:
+        resolved = min(_positive_integer(requested, "batch_size"), n_rows)
+    if minimum is not None and resolved < minimum:
+        aligned = min(n_rows, ((minimum + band - 1) // band) * band)
+        if requested is not None:
+            logger.warning(
+                f"batch_size {resolved} is below the required minimum of "
+                f"{minimum}; using the aligned batch_size {aligned}."
+            )
+        resolved = aligned
+    if resolved % band and resolved < n_rows:
+        logger.warning(
+            f"batch_size {resolved} is not a multiple of the {band}-row band "
+            f"of {array.name}; blocks will straddle band boundaries and reread "
+            "them. Leave batch_size unset to follow the stored layout."
+        )
+    return resolved
+
+
 class _GraphOperationsMixin(_GraphOperationsBase):
     _annStreamPaths: WeakKeyDictionary[AnnStream, str]
     _annStreamNeighborPaths: WeakKeyDictionary[AnnStream, str]
@@ -1406,7 +1441,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         self,
         ref: ArtifactRef,
         *,
-        batch_size: int,
+        batch_size: int | None,
     ) -> ChunkedArray:
         try:
             cached = self._normalizedArtifactCache.get(ref)
@@ -1416,9 +1451,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             return cached
         status = self._require_complete_artifact(ref, "normalized")
         group = group_at(self.zw, status.path)
+        backing = as_zarr_array(group["data"], name="data")
         return ChunkedArray(
-            as_zarr_array(group["data"], name="data"),
-            block_size=batch_size,
+            backing,
+            block_size=_row_block(backing, batch_size),
             nthreads=self.nthreads,
             resources=self.resources,
         )
@@ -1428,7 +1464,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         self,
         ref: ArtifactRef,
         local_cache: bool | str,
-        batch_size: int,
+        batch_size: int | None,
     ) -> Iterator[None]:
         try:
             already_cached = ref in self._normalizedArtifactCache
@@ -1475,7 +1511,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             self._normalizedArtifactCache = cache
         cache[ref] = ChunkedArray(
             staged,
-            block_size=batch_size,
+            block_size=_row_block(staged, batch_size),
             nthreads=self.nthreads,
             resources=self.resources,
         )
@@ -1492,7 +1528,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         self,
         reduction_ref: ArtifactRef,
         *,
-        batch_size: int,
+        batch_size: int | None,
     ) -> tuple[ReductionTransform, LazyTransformStream]:
         status = self._require_complete_artifact(
             reduction_ref,
@@ -1525,6 +1561,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             normalized_ref,
             batch_size=batch_size,
         )
+        block_rows = int(normalized.chunksize[0])
         scaling_group = artifact_group(self.zw, scaling_ref)
         mu = np.asarray(as_zarr_array(scaling_group["mean"], name="mean")[:])
         sigma = np.asarray(as_zarr_array(scaling_group["scale"], name="scale")[:])
@@ -1555,7 +1592,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             use_for_pca=np.ones(normalized.shape[0], dtype=bool),
             mu=mu,
             sigma=sigma,
-            batch_size=batch_size,
+            batch_size=block_rows,
             nthreads=self.nthreads,
             rand_state=int(parameters.get("rand_state", 4466)),
             disable_scaling=not bool(parameters.get("feat_scaling", method == "pca")),
@@ -1571,7 +1608,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             data=normalized,
             transform=transform.transform,
             nthreads=self.nthreads,
-            batch_size=batch_size,
+            batch_size=block_rows,
         )
         return transform, stream
 
@@ -1587,9 +1624,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 "batch_correction",
             )
             group = group_at(self.zw, status.path)
+            backing = as_zarr_array(group["data"], name="data")
             data = ChunkedArray(
-                as_zarr_array(group["data"], name="data"),
-                block_size=batch_size,
+                backing,
+                block_size=_row_block(backing, batch_size),
                 nthreads=self.nthreads,
                 resources=self.resources,
             )
@@ -1620,9 +1658,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 str((status.parameters or {}).get("reduction_method", "reduction")),
             )
             if "data" in group:
+                backing = as_zarr_array(group["data"], name="data")
                 data = ChunkedArray(
-                    as_zarr_array(group["data"], name="data"),
-                    block_size=batch_size,
+                    backing,
+                    block_size=_row_block(backing, batch_size),
                     nthreads=self.nthreads,
                     resources=self.resources,
                 )
@@ -1648,9 +1687,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             )
             transform, stream = self._load_reduction_stream(
                 coordinates,
-                batch_size=int(
-                    batch_size or (status.parameters or {}).get("batch_size") or 1000
-                ),
+                batch_size=batch_size,
             )
             dims = (
                 int(transform.dims)
@@ -1712,7 +1749,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         *,
         log_transform: bool | None = None,
         renormalize_subset: bool | None = None,
-        batch_size: int | None = None,
         update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
@@ -1734,7 +1770,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             renormalize_subset: Whether to recompute size factors for the
                 selected feature subset. When omitted, reuse the selected
                 artifact setting or default to true.
-            batch_size: Number of selected cells processed per block.
             update_state: Publish the result as the assay's current normalized
                 artifact.
             invalidate_cache: Force a new artifact instead of reusing an
@@ -1767,12 +1802,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         n_features = int(feature_values.sum())
         if n_cells < 1 or n_features < 1:
             raise ValueError("Normalization requires selected cells and features")
-        requested_batch_size = (
-            assay.rawData.chunksize[0]
-            if batch_size is None
-            else _positive_integer(batch_size, "batch_size")
-        )
-        effective_batch_size = min(int(requested_batch_size), n_cells)
         state = read_assay_state(self.zw, assay_name)
         stored_parameters: dict[str, Any] = {}
         if (
@@ -1837,7 +1866,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             ),
             log_transform=log_transform,
             renormalize_subset=renormalize_subset,
-            batch_size=effective_batch_size,
             update_state=update_state,
             invalidate_cache=invalidate_cache,
         )
@@ -1870,7 +1898,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             assay.save_normalized_data(
                 cell_key,
                 feat_key,
-                effective_batch_size,
                 relative_path,
                 log_transform,
                 renormalize_subset,
@@ -1915,18 +1942,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         status = self._require_complete_artifact(normalized_ref, "normalized")
         group = group_at(self.zw, status.path)
         data = as_zarr_array(group["data"], name="data")
-        execution = status.execution_options or {}
-        stored_batch_size = execution.get("batch_size")
-        requested_batch_size = (
-            batch_size
-            if batch_size is not None
-            else stored_batch_size
-            if stored_batch_size is not None
-            else data.chunks[0]
-        )
-        effective_batch_size = min(
-            _positive_integer(requested_batch_size, "batch_size"),
-            int(data.shape[0]),
+        effective_batch_size = _row_block(
+            data,
+            batch_size,
+            minimum=(requested_dims + 1 if method == "pca" else None),
         )
         with self._artifact_execution_context({"local_cache": local_cache}):
             with self._cache_normalized_artifact(
@@ -2057,7 +2076,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         scaling_arguments = FeatureScalingArguments(
             normalized=normalized_ref,
             enabled=enabled_scaling,
-            calculation_batch_size=(effective_batch_size if enabled_scaling else None),
             batch_size=effective_batch_size,
             invalidate_cache=invalidate_cache,
         )
@@ -2294,8 +2312,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             pca_cell_key: Optional boolean cell column used to fit PCA while
                 projecting every selected cell.
             feat_scaling: Whether to standardize features before fitting PCA.
-            batch_size: Number of selected cells processed per block. This
-                affects PCA results and therefore participates in identity.
+            batch_size: Number of selected cells processed per block. When
+                omitted, whole stored row bands are combined as needed to fit
+                at least ``dims + 1`` rows. An explicit smaller value is
+                expanded to that aligned minimum with a warning.
             local_cache: Local staging policy for normalized data on remote
                 stores.
             show_elbow_plot: Whether to display explained variance after a new
@@ -3467,19 +3487,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     if state.batch_correction is not None
                     else state.reduction
                 )
-                coordinate_status = inspect_artifact(
-                    self.zw,
-                    coordinates_ref,
-                )
-                coordinate_parameters = coordinate_status.parameters or {}
-                batch_size = int(
-                    coordinate_parameters.get("batch_size")
-                    or (coordinate_status.execution_options or {}).get("batch_size")
-                    or 1000
-                )
                 coordinate_source, _n_cells, _dims = self._coordinate_source(
                     coordinates_ref,
-                    batch_size=batch_size,
+                    batch_size=None,
                 )
                 coordinates = np.vstack(
                     list(

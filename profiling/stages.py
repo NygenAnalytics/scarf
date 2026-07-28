@@ -708,7 +708,6 @@ def run_stage(
                             cell_key=workflow.cellKey,
                             feat_key=workflow.hvgKey,
                             save_k=workflow.mappingSaveK,
-                            batch_size=workflow.mappingBatchSize,
                             missing_feature_policy="zero",
                         )
                 finally:

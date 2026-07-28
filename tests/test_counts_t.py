@@ -309,6 +309,32 @@ def test_iter_normed_feature_wise_matches_with_and_without_counts_t():
     )
 
 
+def test_slow_feature_iterator_never_exceeds_batch_size():
+    values = np.arange(1, 29, dtype=np.uint32).reshape(4, 7)
+    root, cells = _small_rna_with_ptime(values)
+    assay = RNAassay(
+        root,
+        "RNA",
+        cells,
+        workspace=None,
+        nthreads=1,
+        min_cells_per_feature=1,
+    )
+    assay.sf = 1000.0
+
+    frames = list(
+        assay.iter_normed_feature_wise(
+            "I",
+            "I",
+            4,
+            None,
+            renormalize_subset=True,
+        )
+    )
+
+    assert [frame.shape[1] for frame in frames] == [4, 3]
+
+
 def test_regression_and_aggregation_match_with_and_without_counts_t():
     values = np.array(
         [

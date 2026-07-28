@@ -46,7 +46,6 @@ def build_atomic_graph(
         feat_key=feat_key,
         log_transform=log_transform,
         renormalize_subset=renormalize_subset,
-        batch_size=batch_size,
         update_state=False,
         invalidate_cache=invalidate_cache,
     )

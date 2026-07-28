@@ -290,7 +290,6 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             feat_key=feat_key,
             log_transform=graph_kwargs.pop("log_transform", None),
             renormalize_subset=graph_kwargs.pop("renormalize_subset", None),
-            batch_size=batch_size,
             update_state=False,
             invalidate_cache=invalidate_cache,
         )

@@ -340,7 +340,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         smoothing_t: int = 2,
         normalize_scores: bool = True,
         label: str = "doublet_score",
-        batch_size: int = 1000,
         random_seed: int = 4444,
         invalidate_cache: bool = False,
     ) -> str:
@@ -382,8 +381,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             label: Base name for the score column in cell metadata. The assay
                 name (and cell key when not ``'I'``) is prepended.
                 (Default value: 'doublet_score')
-            batch_size: Number of simulated doublets written per batch.
-                (Default value: 1000)
             random_seed: Seed for reproducible sampling. (Default value: 4444)
 
         Returns:
@@ -461,7 +458,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             cell_key=cell_key,
             feat_key=feat_key,
             label=label,
-            batch_size=batch_size,
             invalidate_cache=invalidate_cache,
         )
         record = arguments.to_record()
@@ -557,7 +553,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 cell_key=cell_key,
                 feat_key=feat_key,
                 save_k=save_k,
-                batch_size=batch_size,
             )
 
             raw_scores = None

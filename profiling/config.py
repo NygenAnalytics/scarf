@@ -140,7 +140,6 @@ class WorkflowParameters(BaseModel):
     mappingTargetName: str = "query25k"
     mappingTargetFeatKey: str = "hvgs_query25k"
     mappingSaveK: int = 3
-    mappingBatchSize: int = 1000
 
     @property
     def resolvedHvgKey(self) -> str:
@@ -169,8 +168,8 @@ class WorkflowParameters(BaseModel):
                 raise ValueError("parisMinClusterSize requires parisNClusters='auto'")
         if self.mappingQueryRows <= 0:
             raise ValueError("mappingQueryRows must be positive")
-        if self.mappingSaveK <= 0 or self.mappingBatchSize <= 0:
-            raise ValueError("mappingSaveK and mappingBatchSize must be positive")
+        if self.mappingSaveK <= 0:
+            raise ValueError("mappingSaveK must be positive")
         return self
 
 

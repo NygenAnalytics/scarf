@@ -25,6 +25,7 @@ from ...storage.selections import resolve_selection_artifact
 from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
 from ...features.enrichment.results import EnrichmentResult
 from ...features.markers import resolve_marker_gene_batch_size, sort_marker_results
+from ...features.markers.batching import feature_column_chunk
 from ...metadata.arguments import AucellArguments, MarkerTableArguments, WaggrArguments
 from ...metadata.artifacts import (
     categorical_display,
@@ -66,19 +67,7 @@ _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
 
 
 def _feature_column_chunk(assay: Assay, n_features: int) -> int:
-    # RNA feature-column streams (markers, HVG, pseudotime) prefer countsT
-    # when present; other assays keep cell-major batch sizing.
-    if isinstance(assay, RNAassay):
-        counts_t = getattr(assay, "rawDataT", None)
-        if counts_t is not None:
-            chunks = getattr(counts_t, "chunks", None)
-            if chunks and len(chunks) > 0:
-                return max(1, int(chunks[0]))
-    backing = getattr(assay.rawData, "_backing", None)
-    chunks = getattr(backing, "chunks", None)
-    if chunks and len(chunks) > 1:
-        return max(1, int(chunks[1]))
-    return max(1, int(n_features))
+    return feature_column_chunk(assay, n_features)
 
 
 def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray:

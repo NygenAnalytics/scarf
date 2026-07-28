@@ -279,10 +279,7 @@ Mann-Whitney U statistics (`p_value`). Scarf does not apply multiple-testing cor
 (see {doc}`pseudobulk_and_differential_expression`) and use an external tool.
 
 ```{code-cell} ipython3
-ds.run_marker_search(
-    group_key='RNA_leiden_cluster',
-    gene_batch_size=100
-)
+ds.run_marker_search(group_key='RNA_leiden_cluster')
 ```
 
 ```{code-cell} ipython3

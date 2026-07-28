@@ -101,7 +101,6 @@ _CONTRACTS = (
             "show_elbow_plot",
             "update_state",
         ),
-        model_only=_classified("derived", "calculation_batch_size"),
     ),
     OperationContract(
         DataStore.run_harmony,

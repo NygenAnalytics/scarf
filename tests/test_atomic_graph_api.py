@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 import pytest
+import zarr
+from zarr.storage import MemoryStore
 
 from scarf.datastore._operations import graph as graph_operations
 from scarf.embeddings.harmony import fit_harmony
@@ -145,7 +147,7 @@ def test_reduction_rejects_invalid_dimensions(datastore_ephemeral, dims) -> None
         datastore.run_pca(normalized, dims=dims, update_state=False)
 
 
-@pytest.mark.parametrize("batch_size", [0, -1, 1, 1.5, True])
+@pytest.mark.parametrize("batch_size", [0, -1, 1.5, True])
 def test_reduction_rejects_invalid_batch_sizes(
     datastore_ephemeral,
     batch_size,
@@ -164,6 +166,22 @@ def test_reduction_rejects_invalid_batch_sizes(
             batch_size=batch_size,
             update_state=False,
         )
+
+
+def test_row_block_expands_to_aligned_minimum(monkeypatch) -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    data = root.create_array(
+        "data",
+        shape=(20, 3),
+        chunks=(2, 3),
+        dtype=np.float32,
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(graph_operations.logger, "warning", warnings.append)
+
+    assert graph_operations._row_block(data, None, minimum=5) == 6
+    assert graph_operations._row_block(data, 3, minimum=5) == 6
+    assert any("below the required minimum of 5" in message for message in warnings)
 
 
 def test_pca_rejects_empty_fit_selection(datastore_ephemeral) -> None:
@@ -220,10 +238,10 @@ def test_atomic_graph_operations_reuse_persistent_local_cache(
     normalized = datastore.run_normalization(
         from_assay="RNA",
         feat_key="atomic_hvgs",
-        batch_size=100,
         update_state=False,
     )
-    assert datastore.load_artifact(normalized)["data"].chunks[0] == 100
+    normalized_data = datastore.load_artifact(normalized)["data"]
+    assert normalized_data.chunks[0] == normalized_data.shape[0]
     reduction = datastore.run_pca(
         normalized,
         dims=4,
@@ -249,7 +267,6 @@ def test_atomic_graph_operations_reuse_persistent_local_cache(
         "from_assay": "RNA",
         "cell_key": "I",
         "feat_key": "atomic_hvgs",
-        "batch_size": 100,
         "update_state": False,
         "invalidate_cache": False,
     }
@@ -272,7 +289,6 @@ def test_temporary_local_cache_is_removed_after_success(
     normalized = datastore.run_normalization(
         from_assay="RNA",
         feat_key="atomic_hvgs",
-        batch_size=100,
         update_state=False,
     )
     cache_root = tmp_path / str(local_cache).lower()
@@ -308,7 +324,6 @@ def test_temporary_local_cache_is_removed_after_failure(
     normalized = datastore.run_normalization(
         from_assay="RNA",
         feat_key="atomic_hvgs",
-        batch_size=100,
         update_state=False,
     )
     cache_root = tmp_path / "failed"

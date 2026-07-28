@@ -90,7 +90,9 @@ def align_features(
     norm_params: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """Aligns target features to source features."""
-    from ..storage.arrays import create_zarr_dataset
+    from ..storage.arrays import create_numeric_array
+    from ..storage.layout import bounded_row_sharded_array_spec
+    from ..storage.profiles import resolve_storage_profile
 
     if missing_feature_policy is None:
         missing_feature_policy = "intersection" if exclude_missing else "zero"
@@ -159,12 +161,15 @@ def align_features(
     # transform instead of materializing an aligned copy in the target assay.
     # Revisit mapping artifact ownership and cross-datastore provenance together.
     normed_loc = make_normalized_leaf_name(target_cell_key, target_feat_key)
-    og = create_zarr_dataset(
+    aligned_shape = (int(normed_data.shape[0]), len(t_idx))
+    og = create_numeric_array(
         target_assay.z,
         f"{normed_loc}/data",
-        (1000, len(t_idx)),
-        "float64",
-        (normed_data.shape[0], len(t_idx)),
+        bounded_row_sharded_array_spec(
+            aligned_shape,
+            "float64",
+            profile=resolve_storage_profile(target_assay.z.store),
+        ),
     )
     pos_start, pos_end = 0, 0
     unsorter_idx = np.argsort(np.argsort(t_idx[t_idx != -1]))

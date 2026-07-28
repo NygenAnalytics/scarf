@@ -76,7 +76,16 @@ element-count, and digest checks. Metadata-free ANN payloads from existing
 stores remain readable.
 
 `build_connectivity_map` no longer accepts `batch_size`; connectivity is built
-in memory and written once. New L2 neighbor artifacts store Euclidean
+in memory and written once. `run_normalization`, `Assay.save_normalized_data`,
+`run_mapping`, and `run_doublet_detection` no longer accept `batch_size`
+either. Normalized Zarr geometry now comes from the storage profile instead of
+the caller, so a batch size can no longer produce undersized or oversized
+chunks. `batch_size` also left PCA identity, so existing PCA artifacts are
+recomputed once on the first run after upgrading. Feature-column operations
+(`run_marker_search`, `run_pseudotime_marker_search`,
+`run_pseudotime_aggregation`, `find_markers_by_regression`) default to the
+stored feature chunk width capped by the operation memory budget when their
+batch argument is left unset. New L2 neighbor artifacts store Euclidean
 distances, rather than the squared values returned by HNSW. Inner-product ANN
 is no longer accepted for graph construction because it can produce negative
 values that are invalid for connectivity kernels. Existing graph artifacts

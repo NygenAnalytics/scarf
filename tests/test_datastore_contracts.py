@@ -94,9 +94,9 @@ _METHODS = {
 
 _SIGNATURE_DIGESTS = {
     BaseDataStore: "ba5c5e4e09f310114b2f7e09ac346bc759d87912e04d034153e5bc5b41e0f6a5",
-    GraphDataStore: "e919b40195887fd7befd39e7822059953ef0f94101522c135e14f80a5326007a",
-    MappingDatastore: "2ef564043bc620e6f4e18daec36e62cffe8130972be6eae31e16d5a41297d3d8",
-    DataStore: "5baeb2e039afc5d69e2ba70f11cde7fb0a5a1fed5932916691358d021c6e8cc1",
+    GraphDataStore: "814acfb79400225fcb98c3433a1dc8ea77c69ceeb01a11259325d2cfddd55c74",
+    MappingDatastore: "95a0fa2a277259c653db32d94b1334d94be4bbc8331145d614e72796b4871a0f",
+    DataStore: "a34511903e3214ec5a0dadadac3cc917dc5e96b2c37cb18dc20441d4b3667b35",
 }
 
 

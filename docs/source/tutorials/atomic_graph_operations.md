@@ -128,9 +128,10 @@ need to reproduce an older graph exactly.
 
 Artifact identity is operation-specific. `dims` and `k` are identity
 parameters, while `local_cache` is a reduction execution option. `batch_size`
-is part of identity for PCA and embedding initialization, but is execution-only
-for normalization and several later stages. See
-{doc}`../concepts/provenance` and {doc}`provenance_and_reuse`.
+is execution-only everywhere except `build_embedding_initialization`, where
+mini-batch k-means genuinely depends on it. Leave `batch_size` unset to follow
+the stored chunk layout. See {doc}`../concepts/provenance` and
+{doc}`provenance_and_reuse`.
 
 For Harmony, pass the `run_harmony` result to `build_ann_index` and
 `query_neighbors`. Call `build_mapping_reference` separately when query mapping

@@ -287,6 +287,63 @@ def row_sharded_array_spec(
     )
 
 
+def bounded_row_sharded_array_spec(
+    shape: tuple[int, ...],
+    dtype: Any,
+    *,
+    profile: StorageProfile,
+    target_chunk_bytes: int | None = None,
+    target_shard_bytes: int | None = None,
+    zarr_format: int = 3,
+    fill_value: Any | None = 0,
+) -> ZarrArraySpec:
+    """Build a full-width array with byte-bounded row shards."""
+    if not shape:
+        raise ValueError("Row-sharded arrays require at least one dimension")
+    dimensions = tuple(int(value) for value in shape)
+    if any(value < 0 for value in dimensions):
+        raise ValueError("Array dimensions cannot be negative")
+    trailing = dimensions[1:]
+    trailing_values = int(np.prod(trailing, dtype=np.int64)) if trailing else 1
+    row_bytes = trailing_values * int(np.dtype(dtype).itemsize)
+    chunk_target = (
+        DEFAULT_TARGET_CHUNK_BYTES
+        if target_chunk_bytes is None
+        else int(target_chunk_bytes)
+    )
+    shard_target = (
+        DEFAULT_TARGET_SHARD_BYTES
+        if target_shard_bytes is None
+        else int(target_shard_bytes)
+    )
+    if chunk_target < 1 or shard_target < 1:
+        raise ValueError("Chunk and shard targets must be positive")
+    n_rows = max(1, dimensions[0])
+    codec_rows = max(1, _CODEC_MAX_BYTES // max(1, row_bytes))
+    chunk_rows = max(
+        1,
+        min(
+            n_rows,
+            chunk_target // max(1, row_bytes),
+            codec_rows,
+        ),
+    )
+    chunks_per_shard = max(
+        1,
+        shard_target // max(1, chunk_rows * row_bytes),
+    )
+    band_rows = min(n_rows, chunk_rows * chunks_per_shard)
+    return row_sharded_array_spec(
+        dimensions,
+        dtype,
+        profile=profile,
+        band_rows=band_rows,
+        target_chunk_bytes=chunk_target,
+        zarr_format=zarr_format,
+        fill_value=fill_value,
+    )
+
+
 def array_shard_rows(array: zarr.Array) -> int:
     """Return the row extent of a shard, chunk, or full array."""
     shards_meta = array_metadata_shards(array)

@@ -136,7 +136,7 @@ def find_markers_by_regression(
     feat_key: str,
     regressor: np.ndarray,
     min_cells: int,
-    batch_size: int = 50,
+    batch_size: int | None = None,
     **norm_params: Any,
 ) -> pd.DataFrame:
     """Find features correlated with a continuous variable."""

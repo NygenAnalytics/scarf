@@ -66,7 +66,7 @@ ds.query_neighbors(k=11)
 ds.build_connectivity_map()
 ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
 ds.run_leiden_clustering(resolution=0.5)
-ds.run_marker_search(group_key='RNA_leiden_cluster', gene_batch_size=100)
+ds.run_marker_search(group_key='RNA_leiden_cluster')
 ```
 
 

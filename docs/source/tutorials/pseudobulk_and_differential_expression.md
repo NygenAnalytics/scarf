@@ -87,7 +87,7 @@ Leiden clusters on the catalog UMAP; these labels are the grouping key for `make
 ### 1. Inspect marker ranks separately from DE
 
 ```{code-cell} ipython3
-ds.run_marker_search(group_key='RNA_leiden_cluster', gene_batch_size=100)
+ds.run_marker_search(group_key='RNA_leiden_cluster')
 markers = ds.get_markers(
     group_key='RNA_leiden_cluster',
     group_id='1',

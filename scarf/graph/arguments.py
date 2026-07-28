@@ -173,7 +173,6 @@ class NormalizationArguments(OperationArguments):
     size_factor: float | None = parameter()
     log_transform: bool = parameter()
     renormalize_subset: bool = parameter()
-    batch_size: int = execution()
     update_state: bool = execution()
     invalidate_cache: bool = execution(False)
 
@@ -185,7 +184,6 @@ class FeatureScalingArguments(OperationArguments):
 
     normalized: ArtifactRef = artifact_input()
     enabled: bool = parameter()
-    calculation_batch_size: int | None = parameter()
     batch_size: int = execution()
     invalidate_cache: bool = execution(False)
 
@@ -201,7 +199,7 @@ class PcaArguments(OperationArguments):
     pca_cell_key: str = execution()
     dims: int = parameter()
     feat_scaling: bool = parameter()
-    batch_size: int = parameter()
+    batch_size: int = execution()
     show_elbow_plot: bool = execution()
     update_state: bool = execution()
     invalidate_cache: bool = execution(False)

@@ -490,7 +490,6 @@ class Assay:
         self,
         cell_key: str,
         feat_key: str,
-        batch_size: int,
         location: str,
         log_transform: bool,
         renormalize_subset: bool,
@@ -506,8 +505,6 @@ class Assay:
                       for only those cells that have a True value in this column.
             feat_key: Name of the key (column) from feature attribute table. The data will be saved
                       for only those features that have a True value in this column
-            batch_size: Number of cells to store in a single chunk. Higher values lead to larger
-                        memory consumption
             location: Zarr group wherein to save the normalized values
             log_transform: Whether to log transform the values. Is only used if the 'normed' method
                            takes this parameter, ex. RNAassay
@@ -565,7 +562,6 @@ class Assay:
                     if artifact_mode
                     else None
                 ),
-                batch_size=batch_size,
             )
             return ChunkedArray(
                 as_zarr_array(self.z[location + "/data"], name=location + "/data"),
@@ -607,7 +603,6 @@ class Assay:
             self.nthreads,
             mirror=mirror,
             resources=self.resources,
-            batch_size=batch_size,
         )
         self.z[location].attrs["subset_hash"] = subset_hash
         self.z[location].attrs["subset_params"] = subset_params
@@ -627,7 +622,7 @@ class Assay:
         self,
         cell_key: str | None,
         feat_key: str | None,
-        batch_size: int,
+        batch_size: int | None,
         msg: str | None,
         as_dataframe: bool = True,
         **norm_params: Any,
@@ -641,7 +636,8 @@ class Assay:
             feat_key: Name of the key (column) from feature attribute table. The data will be fetched
                       for only those features that have a True value in this column. If None then all the features are
                       used
-            batch_size: Number of genes to be loaded in the memory at a time.
+            batch_size: Number of genes to be loaded in the memory at a time. When
+                None, the stored feature chunk width capped by the memory budget is used.
             msg: Message to be displayed in the progress bar
             as_dataframe: If true (default) then the yielded matrices are pandas dataframe
             **norm_params: Extra keyword arguments forwarded to ``normed``.
@@ -649,6 +645,7 @@ class Assay:
         Returns:
             Generator yielding DataFrames or (matrix, feature index) tuples.
         """
+        from ..features.markers.batching import resolve_feature_batch_size
         from ..utils.progress import tqdmbar
 
         if cell_key is None:
@@ -662,6 +659,13 @@ class Assay:
             feat_idx = self.feats.active_index(feat_key)
         if msg is None:
             msg = ""
+        batch_size = resolve_feature_batch_size(
+            self,
+            n_features=len(feat_idx),
+            n_cells=len(cell_idx),
+            resources=self.resources,
+            requested=batch_size,
+        )
 
         data: ChunkedArray = self.normed(
             cell_idx=cell_idx,
@@ -669,10 +673,9 @@ class Assay:
             **norm_params,
         )
         logger.debug("Will iterate over data of shape: ", data.shape)
-        chunks = np.array_split(
-            np.arange(0, data.shape[1]), max(1, int(data.shape[1] / batch_size))
-        )
-        for chunk in tqdmbar(chunks, desc=msg, total=len(chunks)):
+        starts = range(0, data.shape[1], batch_size)
+        for start in tqdmbar(starts, desc=msg, total=len(starts)):
+            chunk = np.arange(start, min(start + batch_size, data.shape[1]))
             if as_dataframe:
                 yield pd.DataFrame(
                     controlled_compute(data[:, chunk], self.nthreads),
@@ -770,18 +773,24 @@ class Assay:
         effective_bins: int,
         smoothen: bool,
         z_scale: bool,
-        batch_size: int,
+        batch_size: int | None,
         norm_params: dict[str, Any],
     ) -> tuple[ChunkedArray, np.ndarray, np.ndarray]:
-        from ..storage.arrays import create_zarr_dataset
+        from ..storage.arrays import create_numeric_array, create_zarr_dataset
+        from ..storage.layout import row_sharded_array_spec
+        from ..storage.profiles import resolve_storage_profile
         from ..trajectory.feature_dynamics import aggregate_feature_profiles
 
-        data_array = create_zarr_dataset(
+        aggregated_shape = (int(feat_idx.shape[0]), int(effective_bins))
+        data_array = create_numeric_array(
             group,
             "data",
-            (batch_size,),
-            "float64",
-            (feat_idx.shape[0], effective_bins),
+            row_sharded_array_spec(
+                aggregated_shape,
+                "float64",
+                profile=resolve_storage_profile(group.store),
+                band_rows=max(1, aggregated_shape[0]),
+            ),
         )
         ordering_idx = np.argsort(cell_ordering, kind="stable")
         stored_feat_idx: list[int] = []
@@ -849,7 +858,7 @@ class Assay:
         chunk_size: int = 50,
         smoothen: bool = True,
         z_scale: bool = True,
-        batch_size: int = 100,
+        batch_size: int | None = None,
         **norm_params: Any,
     ) -> tuple[ChunkedArray, NDArray[Any]]:
         """Bin normalized expression along a cell ordering and cache the result.
@@ -863,7 +872,8 @@ class Assay:
             chunk_size: Number of ordering bins stored per feature row.
             smoothen: Whether to apply rolling-window smoothing.
             z_scale: Whether to z-scale values within each feature.
-            batch_size: Feature batch size for iteration.
+            batch_size: Feature batch size for iteration. When None (default), the
+                batch is the on-disk feature chunk width capped by the memory budget.
             **norm_params: Extra keyword arguments forwarded to ``normed``.
 
         Returns:

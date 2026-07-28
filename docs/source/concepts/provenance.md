@@ -19,10 +19,11 @@ complete artifact when these three fields match after canonical serialization:
 - `inputs`: upstream selections and artifact references the step consumed
 
 `execution_options` are stored on the artifact but are **not** part of identity.
-Argument roles are operation-specific. `local_cache` is a reduction execution
-option, while PCA `batch_size` is an identity parameter because it can change
-the fitted result. Changing only values recorded under `execution_options`
-still reuses a matching complete artifact unless you force a rebuild.
+Argument roles are operation-specific. `local_cache` and `batch_size` are
+reduction execution options, while `n_centroids` is an identity parameter
+because it changes the fitted result. Changing only values recorded under
+`execution_options` still reuses a matching complete artifact unless you force
+a rebuild.
 
 ## Completion contract
 

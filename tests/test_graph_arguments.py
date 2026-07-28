@@ -49,7 +49,6 @@ def test_normalization_arguments_partition_every_value() -> None:
         size_factor=1000.0,
         log_transform=True,
         renormalize_subset=False,
-        batch_size=100,
         update_state=True,
         invalidate_cache=False,
     )
@@ -66,7 +65,6 @@ def test_normalization_arguments_partition_every_value() -> None:
         "from_assay": "RNA",
         "cell_key": "I",
         "feat_key": "hvgs",
-        "batch_size": 100,
         "update_state": True,
         "invalidate_cache": False,
     }
@@ -86,22 +84,18 @@ def test_execution_options_do_not_change_provenance_hash() -> None:
         "update_state": True,
     }
     small_batch = NormalizationArguments(
-        batch_size=100,
         invalidate_cache=False,
         **common,
     )
     invalidated = NormalizationArguments(
-        batch_size=1000,
         invalidate_cache=True,
         **common,
     )
     changed_parameter = NormalizationArguments(
-        batch_size=100,
         invalidate_cache=False,
         **(common | {"log_transform": False}),
     )
     changed_size_factor = NormalizationArguments(
-        batch_size=100,
         invalidate_cache=False,
         **(common | {"size_factor": 2000.0}),
     )
@@ -140,7 +134,6 @@ def test_stage_models_chain_logical_artifact_refs() -> None:
     scaling = FeatureScalingArguments(
         normalized=_ref("normalized", "0"),
         enabled=True,
-        calculation_batch_size=100,
         batch_size=100,
     )
     harmony = HarmonyArguments(
@@ -165,10 +158,7 @@ def test_stage_models_chain_logical_artifact_refs() -> None:
     )
 
     assert harmony.to_record().parameters["batch_columns"] == ["donor", "sample"]
-    assert scaling.to_record().parameters == {
-        "enabled": True,
-        "calculation_batch_size": 100,
-    }
+    assert scaling.to_record().parameters == {"enabled": True}
     assert neighbors.to_record().inputs["ann_index"]["kind"] == "ann_index"
     assert connectivity.to_record().parameters == {
         "local_connectivity": 1.0,
@@ -176,18 +166,16 @@ def test_stage_models_chain_logical_artifact_refs() -> None:
     }
 
 
-def test_disabled_scaling_and_lsi_ignore_batch_size_for_reuse() -> None:
+def test_reduction_batch_size_does_not_change_reuse() -> None:
     normalized = _ref("normalized", "0")
     scaling_small = FeatureScalingArguments(
         normalized=normalized,
         enabled=False,
-        calculation_batch_size=None,
         batch_size=100,
     )
     scaling_large = FeatureScalingArguments(
         normalized=normalized,
         enabled=False,
-        calculation_batch_size=None,
         batch_size=500,
     )
     lsi_common = {
@@ -201,13 +189,6 @@ def test_disabled_scaling_and_lsi_ignore_batch_size_for_reuse() -> None:
     }
     lsi_small = LsiArguments(batch_size=100, **lsi_common)
     lsi_large = LsiArguments(batch_size=500, **lsi_common)
-
-    assert scaling_small.provenance_hash() == scaling_large.provenance_hash()
-    assert lsi_small.provenance_hash() == lsi_large.provenance_hash()
-
-
-def test_pca_and_embedding_initialization_include_batch_size_in_provenance() -> None:
-    normalized = _ref("normalized", "0")
     pca_common = {
         "normalized": normalized,
         "feature_scaling": _ref("feature_scaling", "1"),
@@ -221,6 +202,13 @@ def test_pca_and_embedding_initialization_include_batch_size_in_provenance() -> 
     }
     pca_small = PcaArguments(batch_size=100, **pca_common)
     pca_large = PcaArguments(batch_size=500, **pca_common)
+
+    assert scaling_small.provenance_hash() == scaling_large.provenance_hash()
+    assert lsi_small.provenance_hash() == lsi_large.provenance_hash()
+    assert pca_small.provenance_hash() == pca_large.provenance_hash()
+
+
+def test_embedding_initialization_includes_batch_size_in_provenance() -> None:
     initialization_common = {
         "reduction": _ref("reduction", "3"),
         "n_centroids": 20,
@@ -236,7 +224,6 @@ def test_pca_and_embedding_initialization_include_batch_size_in_provenance() -> 
         **initialization_common,
     )
 
-    assert pca_small.provenance_hash() != pca_large.provenance_hash()
     assert (
         initialization_small.provenance_hash() != initialization_large.provenance_hash()
     )
@@ -284,7 +271,6 @@ def test_dynamic_callable_requires_explicit_identity() -> None:
             size_factor=1000.0,
             log_transform=True,
             renormalize_subset=False,
-            batch_size=100,
             update_state=True,
         ).to_record()
 
@@ -307,7 +293,6 @@ def test_operation_arguments_plan_reuses_complete_artifact() -> None:
     arguments = FeatureScalingArguments(
         normalized=_ref("normalized", "1"),
         enabled=True,
-        calculation_batch_size=None,
         batch_size=100,
         invalidate_cache=False,
     )

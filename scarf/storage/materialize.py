@@ -67,7 +67,6 @@ def write_renorm_subset_to_zarr(
     msg: str | None = None,
     mirror: zarr.Array | None = None,
     stats_group: zarr.Group | None = None,
-    batch_size: int | None = None,
 ) -> None:
     counts = assay.rawData[:, feat_idx][cell_idx, :]
     if msg is None:
@@ -76,11 +75,6 @@ def write_renorm_subset_to_zarr(
         counts.shape[0],
         counts.shape[1],
         profile=resolve_storage_profile(root.store),
-        targetChunkBytes=(
-            int(batch_size) * counts.shape[1] * np.dtype(np.float32).itemsize
-            if batch_size is not None
-            else None
-        ),
     )
     output = create_numeric_array(root, loc, spec)
     scale_factor = assay.sf
@@ -117,7 +111,6 @@ def dask_to_zarr(
     mirror: zarr.Array | None = None,
     resources: ResourceBudget | None = None,
     stats_group: zarr.Group | None = None,
-    batch_size: int | None = None,
 ) -> None:
     if msg is None:
         msg = f"Writing data to {loc}"
@@ -125,11 +118,6 @@ def dask_to_zarr(
         data.shape[0],
         data.shape[1],
         profile=resolve_storage_profile(root.store),
-        targetChunkBytes=(
-            int(batch_size) * data.shape[1] * np.dtype(np.float32).itemsize
-            if batch_size is not None
-            else None
-        ),
     )
     output = create_numeric_array(root, loc, spec)
     summary = write_dense_in_shard_rows(

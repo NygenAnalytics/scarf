@@ -130,11 +130,13 @@ class RNAassay(Assay):
         self,
         cell_key: str | None,
         feat_key: str | None,
-        batch_size: int,
+        batch_size: int | None,
         msg: str | None,
         as_dataframe: bool = True,
         **norm_params: Any,
     ) -> Generator[pd.DataFrame | tuple[np.ndarray, np.ndarray], None, None]:
+        from ..features.markers.batching import resolve_feature_batch_size
+
         renormalize_subset = bool(norm_params.get("renormalize_subset", False))
         if not lib_size_feature_stream_eligible(
             self, renormalize_subset=renormalize_subset
@@ -162,6 +164,13 @@ class RNAassay(Assay):
 
         if msg is None:
             msg = ""
+        batch_size = resolve_feature_batch_size(
+            self,
+            n_features=len(feat_idx),
+            n_cells=len(cell_idx),
+            resources=self.resources,
+            requested=batch_size,
+        )
 
         sf = self.sf
         if sf is None:
@@ -187,7 +196,6 @@ class RNAassay(Assay):
         self,
         cell_key: str,
         feat_key: str,
-        batch_size: int,
         location: str,
         log_transform: bool,
         renormalize_subset: bool,
@@ -199,7 +207,6 @@ class RNAassay(Assay):
             return super().save_normalized_data(
                 cell_key,
                 feat_key,
-                batch_size,
                 location,
                 log_transform,
                 renormalize_subset,
@@ -239,7 +246,6 @@ class RNAassay(Assay):
                     if artifact_mode
                     else None
                 ),
-                batch_size=batch_size,
             )
             return ChunkedArray(
                 as_zarr_array(self.z[location + "/data"], name=location + "/data"),
@@ -281,7 +287,6 @@ class RNAassay(Assay):
             self.nthreads,
             log_transform=log_transform,
             mirror=mirror,
-            batch_size=batch_size,
         )
         self.z[location].attrs["subset_hash"] = subset_hash
         self.z[location].attrs["subset_params"] = subset_params

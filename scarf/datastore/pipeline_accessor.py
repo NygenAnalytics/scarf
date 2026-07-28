@@ -266,17 +266,11 @@ class PipelineAccessor:
         )
         artifacts["connectivity_map"] = graph
 
-        pca_parameters = store.inspect_artifact(reduction).parameters or {}
-        pca_execution = store.inspect_artifact(reduction).execution_options or {}
         initialization = store._build_embedding_initialization(
             reduction,
             n_centroids=n_centroids,
             rand_state=initialization_rand_state,
-            batch_size=int(
-                pca_parameters.get("batch_size")
-                or pca_execution.get("batch_size")
-                or 1000
-            ),
+            batch_size=None,
             invalidate_cache=False,
         )
         store._publish_current_artifact(

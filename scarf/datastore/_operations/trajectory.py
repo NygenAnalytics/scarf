@@ -906,7 +906,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         feat_key: str | None = None,
         pseudotime_key: str | None = None,
         min_cells: int = 10,
-        gene_batch_size: int = 50,
+        gene_batch_size: int | None = None,
         invalidate_cache: bool = False,
         **norm_params: Any,
     ) -> PseudotimeMarkerResult:
@@ -918,13 +918,15 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             feat_key: Boolean feature metadata column selecting features.
             pseudotime_key: Numeric cell metadata column containing pseudotime values.
             min_cells: Minimum number of expressing cells required for a feature.
-            gene_batch_size: Number of features loaded per batch.
+            gene_batch_size: Number of features loaded per batch. When None (default),
+                the batch is the on-disk feature chunk width capped by the memory budget.
             **norm_params: Extra keyword arguments forwarded to normalized expression.
 
         Returns:
             Correlation table and the feature metadata keys where it was saved.
         """
         from ...features.markers import find_markers_by_regression
+        from ...features.markers.batching import resolve_feature_batch_size
 
         if pseudotime_key is None:
             raise ValueError(
@@ -953,6 +955,13 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         n_cells = len(assay.cells.active_index(cell_key))
         feature_index = assay.feats.active_index(feat_key)
         n_feats = len(feature_index)
+        gene_batch_size = resolve_feature_batch_size(
+            assay,
+            n_features=n_feats,
+            n_cells=n_cells,
+            resources=self.resources,
+            requested=gene_batch_size,
+        )
         logger.info(
             f"Pseudotime markers: correlating features "
             f"(cells={n_cells}, features={n_feats}, batch_size={gene_batch_size})"
@@ -1140,7 +1149,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         z_scale: bool = True,
         n_neighbours: int = 11,
         n_clusters: int = 10,
-        batch_size: int = 100,
+        batch_size: int | None = None,
         ann_params: dict | None = None,
         nan_cluster_value: int = -1,
         invalidate_cache: bool = False,
@@ -1163,7 +1172,8 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             z_scale: Whether to standardize each retained feature.
             n_neighbours: Number of neighbors in the feature graph.
             n_clusters: Number of feature modules to create.
-            batch_size: Number of features processed per batch.
+            batch_size: Number of features processed per batch. When None (default),
+                the batch is the on-disk feature chunk width capped by the memory budget.
             ann_params: Parameters forwarded to the HNSW index.
             nan_cluster_value: Value assigned to features excluded from clustering.
             **norm_params: Extra keyword arguments forwarded to normalized expression.
@@ -1171,6 +1181,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         Returns:
             Lazy aggregated matrix with aligned feature indices and clusters.
         """
+        from ...features.markers.batching import resolve_feature_batch_size
         from ...trajectory.feature_dynamics import knn_clustering
 
         feat_key = feat_key or "I"
@@ -1209,6 +1220,13 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             ),
         }
         resolved_ann_params = {} if ann_params is None else dict(ann_params)
+        batch_size = resolve_feature_batch_size(
+            assay,
+            n_features=len(assay.feats.active_index(feat_key)),
+            n_cells=len(assay.cells.active_index(cell_key)),
+            resources=self.resources,
+            requested=batch_size,
+        )
         (
             cell_ordering,
             _cell_indices,

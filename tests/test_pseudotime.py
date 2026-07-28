@@ -215,6 +215,7 @@ class _MarkerAssay:
         self.name = "RNA"
         self.cells = _FakeCells(np.array([0.0, 1.0, 2.0, 3.0]))
         self.feats = _FakeFeatures()
+        self.resources = ResourceBudget(1024**3, 1)
 
     @staticmethod
     def iter_normed_feature_wise(**_kwargs):
@@ -229,6 +230,7 @@ class _MarkerAssay:
 class _MarkerStore:
     def __init__(self):
         self.assay = _MarkerAssay()
+        self.resources = ResourceBudget(1024**3, 1)
 
     def _get_assay(self, _from_assay: str):
         return self.assay

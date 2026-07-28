@@ -138,7 +138,6 @@ class DoubletScoreArguments(OperationArguments):
     cell_key: str = execution()
     feat_key: str = execution()
     label: str = execution()
-    batch_size: int = execution()
     invalidate_cache: bool = execution()
 
 

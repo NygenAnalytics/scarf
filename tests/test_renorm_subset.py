@@ -73,7 +73,6 @@ def test_save_normalized_data_renorm_uses_fused_path(toy_crdir_ds, monkeypatch):
     rna.save_normalized_data(
         cell_key="I",
         feat_key="I",
-        batch_size=256,
         location="normed_fused_test",
         log_transform=False,
         renormalize_subset=True,
@@ -114,7 +113,6 @@ def test_save_normalized_data_without_renorm_still_uses_normed(
     rna.save_normalized_data(
         cell_key="I",
         feat_key="I",
-        batch_size=256,
         location="normed_standard_test",
         log_transform=False,
         renormalize_subset=False,
@@ -150,7 +148,6 @@ def test_save_normalized_data_renorm_cache_hit(toy_crdir_ds, monkeypatch):
     kwargs = dict(
         cell_key="I",
         feat_key="I",
-        batch_size=256,
         location="normed_cache_test",
         log_transform=False,
         renormalize_subset=True,

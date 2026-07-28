@@ -16,6 +16,9 @@ from scarf.storage.copy import (
 )
 from scarf.storage.layout import (
     _CODEC_MAX_BYTES,
+    DEFAULT_TARGET_CHUNK_BYTES,
+    DEFAULT_TARGET_SHARD_BYTES,
+    bounded_row_sharded_array_spec,
     count_array_spec,
     normed_array_spec,
     row_sharded_array_spec,
@@ -267,6 +270,21 @@ def test_row_sharded_plan_uses_full_width_divisible_chunks():
     assert spec.chunks[1] == 100
     assert spec.shards[0] % spec.chunks[0] == 0
     assert np.prod(spec.chunks) * np.dtype(spec.dtype).itemsize <= 128 * 1024**2
+
+
+def test_bounded_row_sharded_plan_caps_wide_mapping_bands():
+    spec = bounded_row_sharded_array_spec(
+        (1_000_000, 4_000),
+        np.float64,
+        profile="cloud",
+    )
+
+    assert spec.shards is not None
+    assert spec.shards[0] < spec.shape[0]
+    assert spec.shards[0] % spec.chunks[0] == 0
+    itemsize = np.dtype(spec.dtype).itemsize
+    assert np.prod(spec.chunks) * itemsize <= DEFAULT_TARGET_CHUNK_BYTES
+    assert np.prod(spec.shards) * itemsize <= DEFAULT_TARGET_SHARD_BYTES
 
 
 def test_row_sharded_plan_uses_band_chunks_for_zarr_v2():
