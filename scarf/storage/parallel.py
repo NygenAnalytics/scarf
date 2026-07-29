@@ -113,7 +113,16 @@ def _progress(
         return
     from ..utils.progress import tqdmbar
 
-    yield from tqdmbar(iterator, desc=msg, total=total)
+    progress = tqdmbar(desc=msg, total=total)
+    try:
+        for item in iterator:
+            try:
+                yield item
+            finally:
+                del item
+            progress.update()
+    finally:
+        progress.close()
 
 
 def stream_shards(

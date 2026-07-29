@@ -507,6 +507,7 @@ class RNAassay(Assay):
             msg=msg,
         ):
             yield blocks[block_idx], raw, read_sec, source
+            del raw
 
     def iter_raw_feature_columns(
         self,

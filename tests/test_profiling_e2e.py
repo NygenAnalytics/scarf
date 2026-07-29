@@ -331,3 +331,49 @@ def test_run_e2e_cli_spawns_deployed_function_and_returns(
     assert payload["runTag"] == "e2e-test"
     assert n_rows == 10_000
     assert captured["label"] == "run_e2e_funnel_job 10000"
+
+
+def test_targeted_run_requires_force_to_overwrite_an_existing_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    captured: dict[str, Any] = {}
+
+    class _Target:
+        def with_options(self, **options: Any) -> "_Target":
+            captured["options"] = options
+            return self
+
+        def spawn(self, *args: Any) -> Any:
+            captured["spawnArgs"] = args
+            return SimpleNamespace(object_id="fc-force")
+
+    monkeypatch.setattr(modal_app, "_load_config", lambda _path: config)
+    monkeypatch.setattr(modal_app, "result_exists", lambda *_args: True)
+    monkeypatch.setattr(
+        modal_app,
+        "modal_function_options",
+        lambda *_args, **_kwargs: {"retries": 0},
+    )
+    monkeypatch.setattr(modal_app, "run_stage_job", _Target())
+    monkeypatch.setattr(modal_app, "_print_spawned", lambda *_args: None)
+
+    base_args = (
+        "run",
+        "--config",
+        "unused.toml",
+        "--size",
+        "10000",
+        "--stage",
+        "findMarkers",
+        "--ephemeral",
+    )
+    modal_app.main(*base_args)
+    assert "spawnArgs" not in captured
+
+    modal_app.main(*base_args, "--force")
+    payload, n_rows, stage, force = captured["spawnArgs"]
+    assert payload["runTag"] == "e2e-test"
+    assert n_rows == 10_000
+    assert stage == "findMarkers"
+    assert force is True

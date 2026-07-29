@@ -136,17 +136,36 @@ def test_atomic_profile_stage_publishes_state_and_preserves_parameters(
     assert store.calls == [(method, (), expected)]
 
 
+def test_forced_profile_stages_invalidate_reusable_artifacts() -> None:
+    workflow = WorkflowParameters()
+    for stage in (*ATOMIC_GRAPH_STAGE_ORDER, "makeGraph", "findMarkers"):
+        store = _RecordingStore()
+        _run_analysis(
+            stage,
+            store,
+            workflow,
+            _resources(),
+            invalidateCache=True,
+        )
+        assert all(
+            kwargs.get("invalidate_cache") is True
+            for _method, _args, kwargs in store.calls
+        )
+
+
 def test_run_stage_reports_store_open_as_input_setup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     store = object()
+    analysis_kwargs: dict[str, Any] = {}
 
     def open_store(*_args: Any, **_kwargs: Any) -> object:
         time.sleep(0.02)
         return store
 
-    def run_analysis(*_args: Any, **_kwargs: Any) -> None:
+    def run_analysis(*_args: Any, **kwargs: Any) -> None:
+        analysis_kwargs.update(kwargs)
         time.sleep(0.02)
 
     monkeypatch.setattr("profiling.stages._open_datastore", open_store)
@@ -159,6 +178,7 @@ def test_run_stage_reports_store_open_as_input_setup(
         workflow=WorkflowParameters(),
         resources=_resources(),
         sampleIntervalSeconds=0.005,
+        invalidateCache=True,
     )
 
     assert result.status == "ok"
@@ -171,6 +191,7 @@ def test_run_stage_reports_store_open_as_input_setup(
     assert result.modalMemoryMb == 4096
     assert result.modalCpuRequest == 1.0
     assert result.modalCpuLimit == 1.0
+    assert analysis_kwargs["invalidateCache"] is True
 
 
 @pytest.mark.slow

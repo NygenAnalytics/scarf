@@ -573,6 +573,7 @@ def run_stage(
     containerCpuRequest: float | None = None,
     containerCpuLimit: float | None = None,
     resetCgroupPeak: bool = True,
+    invalidateCache: bool = False,
 ) -> StageRunResult:
     timer = StageTimer()
     sampler = ResourceSampler(
@@ -714,6 +715,7 @@ def run_stage(
                             feat_key=workflow.hvgKey,
                             save_k=workflow.mappingSaveK,
                             missing_feature_policy="zero",
+                            invalidate_cache=invalidateCache,
                         )
                 finally:
                     query = None
@@ -758,6 +760,7 @@ def run_stage(
                             workflow,
                             resources,
                             workDir=workDir,
+                            invalidateCache=invalidateCache,
                         )
                         print(
                             f"[run_stage] analysis DONE stage={stage}",
@@ -826,12 +829,14 @@ def _build_profile_graph(
     workflow: WorkflowParameters,
     *,
     harmonize: bool,
+    invalidateCache: bool = False,
 ) -> None:
     normalized = store.run_normalization(
         from_assay=workflow.assayName,
         cell_key=workflow.cellKey,
         feat_key=workflow.hvgKey,
         update_state=False,
+        invalidate_cache=invalidateCache,
     )
     reduction = store.run_pca(
         normalized,
@@ -839,12 +844,14 @@ def _build_profile_graph(
         local_cache=workflow.graphLocalCache,
         show_elbow_plot=False,
         update_state=False,
+        invalidate_cache=invalidateCache,
     )
     coordinates = (
         store.run_harmony(
             [workflow.harmonyBatchColumn],
             reduction,
             update_state=False,
+            invalidate_cache=invalidateCache,
         )
         if harmonize
         else reduction
@@ -857,19 +864,26 @@ def _build_profile_graph(
         ann_parallel=workflow.annParallel,
         rand_state=workflow.graphSeed,
         update_state=False,
+        invalidate_cache=invalidateCache,
     )
     store.build_embedding_initialization(
         reduction,
         n_centroids=workflow.nCentroids,
         rand_state=workflow.graphSeed,
+        invalidate_cache=invalidateCache,
     )
     neighbors = store.query_neighbors(
         ann_index,
         coordinates=coordinates,
         k=workflow.k,
         update_state=False,
+        invalidate_cache=invalidateCache,
     )
-    store.build_connectivity_map(neighbors, update_state=True)
+    store.build_connectivity_map(
+        neighbors,
+        update_state=True,
+        invalidate_cache=invalidateCache,
+    )
 
 
 def _run_analysis(
@@ -879,6 +893,7 @@ def _run_analysis(
     resources: StageResources,
     *,
     workDir: Path | None = None,
+    invalidateCache: bool = False,
 ) -> None:
     if stage == "filterCells":
         store.auto_filter_cells(
@@ -886,6 +901,7 @@ def _run_analysis(
             min_p=workflow.filterMinQuantile,
             max_p=workflow.filterMaxQuantile,
             show_qc_plots=False,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "markHvgs":
@@ -896,6 +912,7 @@ def _run_analysis(
             top_n=workflow.topN,
             show_plot=False,
             hvg_key_name=workflow.hvgKey,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "runNormalization":
@@ -904,7 +921,7 @@ def _run_analysis(
             cell_key=workflow.cellKey,
             feat_key=workflow.hvgKey,
             update_state=True,
-            invalidate_cache=False,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "runPca":
@@ -914,7 +931,7 @@ def _run_analysis(
             local_cache=workflow.graphLocalCache,
             show_elbow_plot=False,
             update_state=True,
-            invalidate_cache=False,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "buildEmbeddingInitialization":
@@ -923,7 +940,7 @@ def _run_analysis(
             n_centroids=workflow.nCentroids,
             rand_state=workflow.graphSeed,
             update_state=True,
-            invalidate_cache=False,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "buildAnnIndex":
@@ -935,7 +952,7 @@ def _run_analysis(
             ann_parallel=workflow.annParallel,
             rand_state=workflow.graphSeed,
             update_state=True,
-            invalidate_cache=False,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "queryNeighbors":
@@ -943,18 +960,23 @@ def _run_analysis(
             from_assay=workflow.assayName,
             k=workflow.k,
             update_state=True,
-            invalidate_cache=False,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "buildConnectivityMap":
         store.build_connectivity_map(
             from_assay=workflow.assayName,
             update_state=True,
-            invalidate_cache=False,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "makeGraph":
-        _build_profile_graph(store, workflow, harmonize=False)
+        _build_profile_graph(
+            store,
+            workflow,
+            harmonize=False,
+            invalidateCache=invalidateCache,
+        )
         return
     if stage == "runUmap":
         store.run_umap(
@@ -966,6 +988,7 @@ def _run_analysis(
             label=workflow.umapLabel,
             parallel=workflow.umapParallel,
             nthreads=resources.workers,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "runLeiden":
@@ -979,6 +1002,7 @@ def _run_analysis(
             gene_batch_size=workflow.markerGeneBatchSize,
             n_threads=resources.workers,
             skip_save=False,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "getImputed":
@@ -990,6 +1014,7 @@ def _run_analysis(
                 feature_name=feature_name,
                 t=workflow.imputeDiffusionT,
                 cache_operator=True,
+                invalidate_cache=invalidateCache,
             )
         return
     if stage == "runClustering":
@@ -1005,11 +1030,17 @@ def _run_analysis(
             sinks=sinks,
             label=workflow.pseudotimeLabel,
             random_seed=workflow.leidenSeed,
+            invalidate_cache=invalidateCache,
         )
         return
     if stage == "makeGraphHarmony":
         _insert_synthetic_batches(store, workflow)
-        _build_profile_graph(store, workflow, harmonize=True)
+        _build_profile_graph(
+            store,
+            workflow,
+            harmonize=True,
+            invalidateCache=invalidateCache,
+        )
         return
     if stage == "subsetZarr":
         if workDir is None:

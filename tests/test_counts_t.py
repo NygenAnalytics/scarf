@@ -293,6 +293,64 @@ def test_marker_results_match_with_and_without_counts_t():
         )
 
 
+def test_marker_stream_releases_consumed_block_before_reading_next(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import gc
+    import weakref
+
+    import scarf.assay.rna as rna_module
+
+    root = _memory_root()
+    values = np.arange(1, 37, dtype=np.uint32).reshape(6, 6)
+    _write_small_assay(root, workspace=None, values=values)
+    cells = MetaData(root["cellData"])
+    cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
+    cells.insert("cluster", np.array(["a", "a", "a", "b", "b", "b"]), overwrite=True)
+    assay = RNAassay(
+        root,
+        "RNA",
+        cells,
+        workspace=None,
+        nthreads=1,
+        min_cells_per_feature=1,
+    )
+    assay.sf = 1_000.0
+
+    original_read = rna_module._read_facade_block
+    previous: weakref.ReferenceType[np.ndarray] | None = None
+    read_count = 0
+
+    def tracked_read(
+        array: zarr.Array,
+        rows: np.ndarray,
+        columns: np.ndarray,
+    ) -> np.ndarray:
+        nonlocal previous, read_count
+        gc.collect()
+        if previous is not None:
+            assert previous() is None
+        raw = np.ascontiguousarray(original_read(array, rows, columns))
+        previous = weakref.ref(raw)
+        read_count += 1
+        return raw
+
+    monkeypatch.setattr(rna_module, "_read_facade_block", tracked_read)
+    find_markers_by_rank(
+        assay,
+        group_key="cluster",
+        cell_key="I",
+        feat_key="I",
+        batch_size=2,
+        n_threads=1,
+    )
+
+    gc.collect()
+    assert read_count == 3
+    assert previous is not None
+    assert previous() is None
+
+
 def _small_rna_with_ptime(values: np.ndarray) -> tuple[zarr.Group, MetaData]:
     root = _memory_root()
     _write_small_assay(root, workspace=None, values=values)

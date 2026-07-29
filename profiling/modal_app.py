@@ -327,10 +327,18 @@ def run_stage_job(
     configDict: dict[str, Any],
     nRows: int,
     stage: StageName,
+    force: bool = False,
 ) -> dict[str, Any]:
     config = ProfilingConfig.model_validate(configDict)
     resources = config.resourcesFor(stage)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    if result_exists(config, nRows, stage) and not force:
+        return {
+            "nRows": nRows,
+            "stage": stage,
+            "status": "skipped",
+            "resultUri": config.resultUri(nRows, stage),
+        }
 
     work = _WORK / f"{nRows}-{stage}"
     if work.exists():
@@ -360,6 +368,7 @@ def run_stage_job(
         storageLayout=config.storageLayout,
         queryStoreUri=config.queryStoreUri(nRows),
         workDir=work,
+        invalidateCache=force,
     )
     write_result(config, result)
     return result.to_json()
@@ -934,6 +943,14 @@ def main(*arg_list: str) -> None:
     run_parser.add_argument("--size", type=int, required=True)
     run_parser.add_argument("--stage", choices=FULL_STAGE_ORDER, required=True)
     run_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Recompute an existing targeted stage, invalidate reusable artifacts, "
+            "and overwrite its stage result JSON."
+        ),
+    )
+    run_parser.add_argument(
         "--ephemeral",
         action="store_true",
         help="Spawn from this modal run app (no deploy). Prefer --detach.",
@@ -1049,7 +1066,7 @@ def main(*arg_list: str) -> None:
     if args.command == "run":
         if args.size not in config.targetSizes:
             raise SystemExit(f"size {args.size} is not in config.targetSizes")
-        if result_exists(config, args.size, args.stage):
+        if result_exists(config, args.size, args.stage) and not args.force:
             print(
                 {
                     "nRows": args.size,
@@ -1070,7 +1087,10 @@ def main(*arg_list: str) -> None:
             if args.ephemeral
             else _deployed_function(config, "run_stage_job")
         )
-        call = target.with_options(**options).spawn(payload, args.size, args.stage)
+        spawn_args: tuple[Any, ...] = (payload, args.size, args.stage)
+        if args.force:
+            spawn_args += (True,)
+        call = target.with_options(**options).spawn(*spawn_args)
         _print_spawned(f"run_stage_job {args.size}/{args.stage}", call)
         return
 

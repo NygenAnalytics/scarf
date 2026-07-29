@@ -141,6 +141,7 @@ def find_markers_by_rank(
                 block.destinations,
                 stats_matrix,
             )
+            del raw
         p_values = stats_matrix[:, :, 6]
         np.abs(p_values, out=p_values)
         np.negative(p_values, out=p_values)
