@@ -208,7 +208,7 @@ def test_reduction_batch_size_does_not_change_reuse() -> None:
     assert pca_small.provenance_hash() == pca_large.provenance_hash()
 
 
-def test_embedding_initialization_includes_batch_size_in_provenance() -> None:
+def test_embedding_initialization_parameters_change_provenance() -> None:
     initialization_common = {
         "reduction": _ref("reduction", "3"),
         "n_centroids": 20,
@@ -223,9 +223,36 @@ def test_embedding_initialization_includes_batch_size_in_provenance() -> None:
         batch_size=500,
         **initialization_common,
     )
+    initialization_sampled = EmbeddingInitializationArguments(
+        batch_size=100,
+        kmeans_sampling=0.2,
+        **initialization_common,
+    )
+    initialization_larger_minibatch = EmbeddingInitializationArguments(
+        batch_size=100,
+        kmeans_batch_size=20_000,
+        **initialization_common,
+    )
+    initialization_new_algorithm = EmbeddingInitializationArguments(
+        batch_size=100,
+        algorithm_version="minibatch_kmeans_v3",
+        **initialization_common,
+    )
 
     assert (
         initialization_small.provenance_hash() != initialization_large.provenance_hash()
+    )
+    assert (
+        initialization_small.provenance_hash()
+        != initialization_sampled.provenance_hash()
+    )
+    assert (
+        initialization_small.provenance_hash()
+        != initialization_larger_minibatch.provenance_hash()
+    )
+    assert (
+        initialization_small.provenance_hash()
+        != initialization_new_algorithm.provenance_hash()
     )
 
 

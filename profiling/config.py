@@ -1,3 +1,4 @@
+import math
 import tomllib
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -115,6 +116,8 @@ class WorkflowParameters(BaseModel):
     dims: int = 50
     nCentroids: int = 1000
     graphSeed: int = 4466
+    kmeansSampling: float = 0.1
+    kmeansBatchSize: int = 10_000
     annParallel: bool = False
     umapEpochs: int = 300
     umapSeed: int = 4444
@@ -154,6 +157,10 @@ class WorkflowParameters(BaseModel):
 
     @model_validator(mode="after")
     def _check_extras(self) -> Self:
+        if not math.isfinite(self.kmeansSampling) or not 0 < self.kmeansSampling <= 1:
+            raise ValueError("kmeansSampling must be greater than 0 and at most 1")
+        if self.kmeansBatchSize <= 0:
+            raise ValueError("kmeansBatchSize must be positive")
         if self.harmonyNBatches < 2:
             raise ValueError("harmonyNBatches must be >= 2")
         if self.imputeGeneCount <= 0:

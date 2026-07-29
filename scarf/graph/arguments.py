@@ -313,4 +313,7 @@ class EmbeddingInitializationArguments(OperationArguments):
     n_centroids: int = parameter()
     rand_state: int = parameter()
     batch_size: int = parameter()
+    kmeans_sampling: float = parameter(0.1)
+    kmeans_batch_size: int = parameter(10_000)
+    algorithm_version: str = parameter("minibatch_kmeans_v2")
     invalidate_cache: bool = execution(False)

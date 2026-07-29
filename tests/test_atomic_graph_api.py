@@ -394,11 +394,15 @@ def test_embedding_initialization_preserves_same_reduction_graph_state(
     initialization = datastore.build_embedding_initialization(
         reduction,
         n_centroids=5,
+        batch_size=2,
+        kmeans_batch_size=5,
     )
 
     after = datastore.get_assay_state("RNA")
     assert after is not None
-    assert datastore.load_artifact(initialization)["cluster_labels"].dtype == np.uint32
+    initialization_group = datastore.load_artifact(initialization)
+    assert initialization_group["cluster_centers"].shape == (5, 4)
+    assert initialization_group["cluster_labels"].dtype == np.uint32
     assert after.embedding_initialization == initialization
     assert after.batch_correction == before.batch_correction
     assert after.ann_index == ann

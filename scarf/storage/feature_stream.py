@@ -178,7 +178,16 @@ def plan_feature_stream(
             residentBytes=held,
         )
     except MemoryError:
-        pass
+        # A second materialized block may not fit, while the current block can
+        # still use the remaining budget for concurrent chunk decodes.
+        current_admission = admit_stream(
+            resources,
+            nBlocks=1,
+            blockBytes=block_bytes,
+            decodeBytes=decode_bytes,
+            residentBytes=resident,
+        )
+        io_concurrency = current_admission.ioConcurrency
     else:
         io_concurrency = admission.ioConcurrency
         if prefetchable:

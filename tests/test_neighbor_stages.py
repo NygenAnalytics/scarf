@@ -181,7 +181,7 @@ def test_lazy_coordinate_stages_do_not_hide_a_cross_stage_cache() -> None:
         enabled=True,
     )
 
-    assert data.read_count == 9
+    assert data.read_count == 12
     assert index.get_current_count() == values.shape[0]
     query = NeighborQueryStage(index, k=3, metric="l2")
     indices, distances = query.query(values.dot(loadings), k=3)
@@ -234,7 +234,117 @@ def test_kmeans_initialization_runs_on_demand_without_ann() -> None:
     )
     assert enabled.model is not None
     assert enabled.labels.shape == (values.shape[0],)
-    assert data.read_count == 6
+    assert data.read_count == 9
+
+
+def test_kmeans_initialization_uses_true_minibatches_for_one_full_block() -> None:
+    values, loadings = _custom_inputs()
+    data = _CountingChunkedArray(values, block_size=values.shape[0])
+    stream = LazyTransformStream(
+        data=data,
+        transform=lambda block: block.dot(loadings),
+        nthreads=1,
+        batch_size=values.shape[0],
+    )
+
+    result = KMeansInitializationStage.fit(
+        stream=stream,
+        n_clusters=3,
+        rand_state=4466,
+        nthreads=1,
+        enabled=True,
+        kmeans_sampling=0.5,
+        kmeans_batch_size=3,
+    )
+
+    assert result.model is not None
+    assert result.model.n_init == 1
+    assert result.model.init_size == 4
+    assert result.model.batch_size == 3
+    assert result.model.n_steps_ > 1
+    assert result.labels.shape == (values.shape[0],)
+    assert data.read_count == 1
+
+
+def test_kmeans_streaming_samples_all_blocks_and_coalesces_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sklearn.cluster import kmeans_plusplus as sklearn_kmeans_plusplus
+    from sklearn.utils.random import sample_without_replacement
+
+    values, loadings = _custom_inputs()
+    transformed = values.dot(loadings)
+    data = _CountingChunkedArray(values, block_size=2)
+    stream = LazyTransformStream(
+        data=data,
+        transform=lambda block: block.dot(loadings),
+        nthreads=1,
+        batch_size=2,
+    )
+    sampled: list[np.ndarray] = []
+
+    def capture_kmeans_plusplus(
+        values: np.ndarray,
+        *,
+        n_clusters: int,
+        random_state: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sampled.append(values.copy())
+        return sklearn_kmeans_plusplus(
+            values,
+            n_clusters=n_clusters,
+            random_state=random_state,
+        )
+
+    monkeypatch.setattr("sklearn.cluster.kmeans_plusplus", capture_kmeans_plusplus)
+    result = KMeansInitializationStage.fit(
+        stream=stream,
+        n_clusters=3,
+        rand_state=4466,
+        nthreads=1,
+        enabled=True,
+        kmeans_sampling=0.5,
+        kmeans_batch_size=5,
+    )
+
+    expected_indices = np.sort(
+        sample_without_replacement(
+            values.shape[0],
+            4,
+            method="reservoir_sampling",
+            random_state=4466,
+        )
+    )
+    np.testing.assert_allclose(sampled[0], transformed[expected_indices])
+    assert result.model is not None
+    assert result.model.n_clusters == 3
+    assert result.model.batch_size == 5
+    assert result.model.n_steps_ == 2
+    assert result.labels.shape == (values.shape[0],)
+    assert data.read_count == 12
+
+    other_data = _CountingChunkedArray(values, block_size=3)
+    other_result = KMeansInitializationStage.fit(
+        stream=LazyTransformStream(
+            data=other_data,
+            transform=lambda block: block.dot(loadings),
+            nthreads=1,
+            batch_size=3,
+        ),
+        n_clusters=3,
+        rand_state=4466,
+        nthreads=1,
+        enabled=True,
+        kmeans_sampling=0.5,
+        kmeans_batch_size=5,
+    )
+    assert other_result.model is not None
+    np.testing.assert_allclose(
+        result.model.cluster_centers_,
+        other_result.model.cluster_centers_,
+    )
+    np.testing.assert_array_equal(result.labels, other_result.labels)
+    assert other_data.read_count == 9
 
 
 def test_kmeans_initialization_rejects_single_row_and_empty_inputs() -> None:

@@ -365,6 +365,18 @@ def test_a_stream_that_cannot_be_admitted_reads_one_chunk_at_a_time() -> None:
     assert (plan.readWorkers, plan.ioConcurrency) == (1, 1)
 
 
+def test_a_stream_without_read_ahead_uses_current_decode_concurrency() -> None:
+    # A second block cannot fit, but the current block can afford two decoded
+    # chunks. Preserve that inner concurrency without admitting read-ahead.
+    plan = _plan_with(
+        resources=ResourceBudget(1_200, 8),
+        features=np.arange(32),
+    )
+
+    assert len(plan.blocks) == 8
+    assert (plan.readWorkers, plan.ioConcurrency) == (1, 2)
+
+
 def test_a_single_block_stream_budgets_its_own_decode_concurrency() -> None:
     plan = _plan_with(
         resources=ResourceBudget(1_600, 8),

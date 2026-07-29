@@ -1,3 +1,4 @@
+import time
 from typing import Any
 
 import numba
@@ -10,6 +11,7 @@ from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
 from ...storage.feature_stream import plan_feature_stream
 from ...utils.logging import logger
 from ...utils.numba import restore_numba_threads
+from ...utils.process import process_rss_mb
 from .rank import (
     _batch_stats,
     _marker_stats_gene_major,
@@ -125,11 +127,21 @@ def find_markers_by_rank(
             f"{n_groups} groups, {len(plan.blocks)} blocks, "
             f"repeated chunk decodes={plan.repeatedDecodeCount}"
         )
-        for block, raw, _read_sec, _source in assay.iter_raw_feature_major_blocks(
+        logger.info(
+            f"Marker search plan: features={len(feat_idx)} groups={n_groups} "
+            f"blocks={len(plan.blocks)} readWorkers={plan.readWorkers} "
+            f"ioConcurrency={plan.ioConcurrency} numbaThreads={active_threads} "
+            f"repeatedDecodes={plan.repeatedDecodeCount}"
+        )
+        block_idx = 0
+        for block, raw, read_sec, source in assay.iter_raw_feature_major_blocks(
             cell_idx=cell_idx,
             plan=plan,
             msg="Finding markers",
         ):
+            block_idx += 1
+            compute_started = time.perf_counter()
+            cpu_started = time.process_time()
             _marker_stats_gene_major(
                 raw,
                 scalar_values,
@@ -140,6 +152,18 @@ def find_markers_by_rank(
                 np.float32(n_total),
                 block.destinations,
                 stats_matrix,
+            )
+            compute_seconds = time.perf_counter() - compute_started
+            cpu_seconds = time.process_time() - cpu_started
+            effective_cores = (
+                cpu_seconds / compute_seconds if compute_seconds > 0 else 0.0
+            )
+            logger.info(
+                f"Marker block {block_idx}/{len(plan.blocks)}: "
+                f"width={block.indices.size} read={read_sec:.1f}s ({source}) "
+                f"compute={compute_seconds:.1f}s cpu={cpu_seconds:.1f}s "
+                f"effectiveCores={effective_cores:.2f} "
+                f"rss={process_rss_mb():.0f} MiB"
             )
             del raw
         p_values = stats_matrix[:, :, 6]

@@ -870,6 +870,8 @@ def _build_profile_graph(
         reduction,
         n_centroids=workflow.nCentroids,
         rand_state=workflow.graphSeed,
+        kmeans_sampling=workflow.kmeansSampling,
+        kmeans_batch_size=workflow.kmeansBatchSize,
         invalidate_cache=invalidateCache,
     )
     neighbors = store.query_neighbors(
@@ -939,6 +941,8 @@ def _run_analysis(
             from_assay=workflow.assayName,
             n_centroids=workflow.nCentroids,
             rand_state=workflow.graphSeed,
+            kmeans_sampling=workflow.kmeansSampling,
+            kmeans_batch_size=workflow.kmeansBatchSize,
             update_state=True,
             invalidate_cache=invalidateCache,
         )

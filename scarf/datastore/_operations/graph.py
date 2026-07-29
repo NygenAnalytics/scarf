@@ -1,3 +1,4 @@
+import math
 import os
 import tempfile
 from collections.abc import Callable, Iterator
@@ -157,6 +158,18 @@ def _row_block(
             f"of {array.name}; blocks will straddle band boundaries and reread "
             "them. Leave batch_size unset to follow the stored layout."
         )
+    return resolved
+
+
+def _sampling_fraction(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a number")
+    try:
+        resolved = float(value)
+    except (TypeError, ValueError):
+        raise TypeError(f"{name} must be a number") from None
+    if not math.isfinite(resolved) or not 0 < resolved <= 1:
+        raise ValueError(f"{name} must be greater than 0 and at most 1")
     return resolved
 
 
@@ -2628,6 +2641,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         rand_state: int,
         batch_size: int | None,
         invalidate_cache: bool,
+        kmeans_sampling: float = 0.1,
+        kmeans_batch_size: int = 10_000,
+        algorithm_version: str = "minibatch_kmeans_v2",
     ) -> ArtifactRef:
         if reduction.assay is None:
             raise ValueError("Reduction artifact has no assay")
@@ -2636,6 +2652,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         requested_clusters = _positive_integer(n_centroids, "n_centroids")
         resolved_rand_state = _positive_integer(rand_state, "rand_state")
+        resolved_kmeans_sampling = _sampling_fraction(
+            kmeans_sampling,
+            "kmeans_sampling",
+        )
+        requested_kmeans_batch_size = _positive_integer(
+            kmeans_batch_size,
+            "kmeans_batch_size",
+        )
         stream, n_cells, coordinate_dims = self._coordinate_source(
             reduction,
             batch_size=resolved_batch_size,
@@ -2648,21 +2672,26 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             source_batch_size if resolved_batch_size is None else resolved_batch_size
         )
         effective_batch_size = min(int(requested_batch_size), n_cells)
-        if requested_clusters < 2 or effective_batch_size < 2 or n_cells < 2:
+        if requested_clusters < 2 or n_cells < 2:
             raise ValueError(
-                "Embedding initialization requires at least two cells, "
-                "centroids, and rows per batch"
+                "Embedding initialization requires at least two cells and centroids"
             )
         effective_clusters = min(
             requested_clusters,
-            effective_batch_size,
             n_cells,
+        )
+        effective_kmeans_batch_size = min(
+            n_cells,
+            max(requested_kmeans_batch_size, effective_clusters),
         )
         arguments = EmbeddingInitializationArguments(
             reduction=reduction,
             n_centroids=effective_clusters,
             rand_state=resolved_rand_state,
             batch_size=effective_batch_size,
+            kmeans_sampling=resolved_kmeans_sampling,
+            kmeans_batch_size=effective_kmeans_batch_size,
+            algorithm_version=algorithm_version,
             invalidate_cache=invalidate_cache,
         )
         planned = self._plan_assay_artifact(
@@ -2691,6 +2720,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 rand_state=resolved_rand_state,
                 nthreads=self.nthreads,
                 enabled=True,
+                kmeans_sampling=resolved_kmeans_sampling,
+                kmeans_batch_size=effective_kmeans_batch_size,
             )
             if initialization.model is None:
                 raise RuntimeError("K-means initialization did not fit")
@@ -2722,6 +2753,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         n_centroids: int = 1000,
         rand_state: int = 4466,
         batch_size: int | None = None,
+        kmeans_sampling: float = 0.1,
+        kmeans_batch_size: int = 10_000,
         update_state: bool = True,
         invalidate_cache: bool = False,
     ) -> ArtifactRef:
@@ -2737,6 +2770,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             n_centroids: Requested number of K-means centroids.
             rand_state: K-means random seed.
             batch_size: Number of cells processed per block.
+            kmeans_sampling: Fraction of cells considered during centroid seeding.
+            kmeans_batch_size: Number of cells per internal K-means update.
             update_state: Publish the result as the current embedding
                 initialization.
             invalidate_cache: Force a new initialization artifact.
@@ -2758,6 +2793,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             rand_state=rand_state,
             batch_size=batch_size,
             invalidate_cache=invalidate_cache,
+            kmeans_sampling=kmeans_sampling,
+            kmeans_batch_size=kmeans_batch_size,
         )
         if update_state:
             if reduction.assay is None:
