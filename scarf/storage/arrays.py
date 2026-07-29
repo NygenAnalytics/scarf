@@ -12,6 +12,23 @@ from .layout import (
 from .profiles import StorageProfile, resolve_storage_profile
 
 
+def _checked_shards(
+    shards: tuple[int, ...],
+    chunks: tuple[int, ...],
+) -> tuple[int, ...]:
+    """Return shard extents that hold a whole number of the resolved chunks."""
+    resolved = tuple(max(1, int(value)) for value in shards)
+    if len(resolved) != len(chunks):
+        raise ValueError(f"Array shards {resolved} do not match chunks {chunks}")
+    for shard, chunk in zip(resolved, chunks, strict=True):
+        if shard < chunk or shard % chunk:
+            raise ValueError(
+                f"Array shards {resolved} must hold whole chunks {chunks}; "
+                f"shard extent {shard} is not a multiple of chunk extent {chunk}"
+            )
+    return resolved
+
+
 def create_numeric_array(
     group: zarr.Group,
     name: str,
@@ -35,7 +52,7 @@ def create_numeric_array(
         "overwrite": spec.overwrite,
     }
     if spec.shards is not None and zarrFormat >= 3:
-        kwargs["shards"] = spec.shards
+        kwargs["shards"] = _checked_shards(spec.shards, chunks)
     if spec.fillValue is not None:
         kwargs["fill_value"] = spec.fillValue
     return group.create_array(name, **kwargs)

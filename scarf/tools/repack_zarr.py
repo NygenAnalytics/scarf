@@ -18,7 +18,7 @@ from scarf.storage.layout import (
 from scarf.storage.profiles import StorageProfile
 from scarf.storage.sharding import write_counts_t, write_dense_in_shard_rows
 from scarf.storage.stores import open_store
-from scarf.storage.types import as_zarr_array, as_zarr_group
+from scarf.storage.types import array_metadata_shards, as_zarr_array, as_zarr_group
 
 
 def _location_identity(location: str) -> tuple[str, str]:
@@ -134,11 +134,12 @@ def _copy_group(
                 lambda start, end: np.asarray(node[start:end, :]),
                 msg=f"Repacking {child_path}",
             )
+            stored_shards = array_metadata_shards(dst_array)
             dst.attrs["scarf:zarr_spec"] = {
                 "profile": profile,
                 "dtype": np.dtype(node.dtype).str,
                 "chunks": list(dst_array.chunks),
-                "shards": None if spec.shards is None else list(spec.shards),
+                "shards": None if stored_shards is None else list(stored_shards),
                 "zarr_format": 3,
             }
         else:

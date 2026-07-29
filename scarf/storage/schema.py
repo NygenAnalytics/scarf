@@ -1,7 +1,7 @@
 import numpy as np
 import zarr
 
-from .types import as_zarr_array
+from .types import array_metadata_shards, as_zarr_array
 from .arrays import (
     create_numeric_array,
     create_zarr_obj_array,
@@ -81,11 +81,12 @@ def create_zarr_count_assay(
         zarrFormat=zarr_format,
     )
     counts = create_numeric_array(group, "counts", spec)
+    stored_shards = array_metadata_shards(counts)
     group.attrs["scarf:zarr_spec"] = {
         "profile": resolved_profile,
         "dtype": np.dtype(dtype).str,
         "chunks": list(counts.chunks),
-        "shards": None if spec.shards is None else list(spec.shards),
+        "shards": None if stored_shards is None else list(stored_shards),
         "zarr_format": zarr_format,
     }
     return counts

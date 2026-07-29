@@ -15,11 +15,13 @@ from scarf.storage.copy import (
     create_or_open_staged_normed_array,
 )
 from scarf.storage.layout import (
+    ZarrArraySpec,
     _CODEC_MAX_BYTES,
     DEFAULT_TARGET_CHUNK_BYTES,
     DEFAULT_TARGET_SHARD_BYTES,
     bounded_row_sharded_array_spec,
     count_array_spec,
+    get_compressors,
     normed_array_spec,
     row_sharded_array_spec,
 )
@@ -222,6 +224,55 @@ def test_numeric_array_adapts_codecs_to_zarr_format():
             assert array_metadata_shards(array) is None
         else:
             assert array_metadata_shards(array) == spec.shards
+
+
+@pytest.mark.parametrize(
+    ("shape", "chunks", "shards"),
+    [
+        # A shard extent that is not a whole number of chunks.
+        ((10, 9), (4, 4), (10, 9)),
+        # A chunk clamped to a narrower shape leaves the shard misaligned.
+        ((10, 3), (4, 8), (8, 8)),
+        # A shard smaller than its own chunk.
+        ((10, 8), (4, 8), (2, 8)),
+    ],
+)
+def test_numeric_array_rejects_a_shard_that_is_not_whole_chunks(shape, chunks, shards):
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    spec = ZarrArraySpec(
+        shape=shape,
+        chunks=chunks,
+        shards=shards,
+        dtype="uint16",
+        compressors=get_compressors("fast_local"),
+        fillValue=0,
+    )
+    with pytest.raises(ValueError, match="whole chunks"):
+        create_numeric_array(root, "counts", spec)
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_assay_records_the_metadata_the_stored_array_actually_has(zarr_format):
+    root = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=zarr_format)
+    counts = create_zarr_count_assay(
+        root,
+        "RNA",
+        None,
+        1_009,
+        [f"f{i}" for i in range(997)],
+        [f"g{i}" for i in range(997)],
+        profile="fast_local",
+    )
+    recorded = root["RNA"].attrs["scarf:zarr_spec"]
+    stored_shards = array_metadata_shards(counts)
+
+    assert recorded["chunks"] == list(counts.chunks)
+    assert recorded["shards"] == (
+        None if stored_shards is None else list(stored_shards)
+    )
+    assert recorded["zarr_format"] == zarr_format
+    if zarr_format == 2:
+        assert stored_shards is None
 
 
 def test_new_assay_in_zarr_v2_stays_chunk_only():
