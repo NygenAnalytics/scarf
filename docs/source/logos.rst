@@ -9,7 +9,6 @@
 `statsmodels <https://www.statsmodels.org>`_,
 `NetworkX <https://networkx.org>`_,
 `Numba <https://numba.pydata.org>`_,
-`Datashader <https://datashader.org>`_,
 `Matplotlib <https://matplotlib.org>`_,
 `seaborn <https://seaborn.pydata.org>`_,
 `Jupyter <https://jupyter.org>`_, and

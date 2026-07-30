@@ -4,6 +4,9 @@ import re
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any
+from weakref import WeakKeyDictionary
+
+import numpy as np
 
 from ._contracts import FrameStyle, LegendLoc
 
@@ -15,6 +18,30 @@ DEFAULT_PANEL_INCHES = 3.2
 MAX_FIGURE_WIDTH_INCHES = 7.5
 LEGEND_SIDE_MAX_CATEGORIES = 12
 LEGEND_ON_DATA_MAX_CATEGORIES = 40
+LEGEND_SIDE_ENTRIES_PER_COLUMN = 20
+LEGEND_SIDE_MAX_COLUMNS = 4
+LEGEND_SIDE_MAX_ENTRIES = LEGEND_SIDE_ENTRIES_PER_COLUMN * LEGEND_SIDE_MAX_COLUMNS
+
+_LAYOUT_POINT_SIZE_SPECS: WeakKeyDictionary[
+    Any,
+    tuple[int, float, float, float],
+] = WeakKeyDictionary()
+
+# Okabe-Ito plus four high-contrast extensions for categorical figures.
+COLORBLIND_PALETTE = [
+    "#0072B2",
+    "#E69F00",
+    "#009E73",
+    "#D55E00",
+    "#CC79A7",
+    "#56B4E9",
+    "#F0E442",
+    "#000000",
+    "#6F4E7C",
+    "#2E8B57",
+    "#A05195",
+    "#8C564B",
+]
 
 # Lifted from scanpy.plotting.palettes.
 CUSTOM_PALETTES: dict[int, list[str]] = {
@@ -267,28 +294,85 @@ THEMES: dict[str, dict[str, Any]] = {
 }
 
 
-def default_point_size(n_cells: int) -> float:
-    """Marker area that stays readable from small demos to atlas-scale clouds."""
-    n = max(0, int(n_cells))
-    if n < 500:
-        return 16.0
-    if n < 2_000:
-        return 12.0
-    if n < 10_000:
-        return 8.0
-    if n < 50_000:
-        return 4.0
-    return 2.0
+def default_point_size(
+    n_cells: int,
+    *,
+    panel_area: float = DEFAULT_PANEL_INCHES**2,
+    size_min: float = 1.0,
+    size_max: float = 28.0,
+) -> float:
+    """Marker area derived from selected cells and physical panel area."""
+    if panel_area <= 0:
+        raise ValueError("panel_area must be positive")
+    if size_min <= 0 or size_max < size_min:
+        raise ValueError("point-size bounds must satisfy 0 < size_min <= size_max")
+    n = max(1, int(n_cells))
+    reference_area = DEFAULT_PANEL_INCHES**2
+    area_factor = (float(panel_area) / reference_area) ** 0.72
+    population_factor = (1_000.0 / n) ** 0.5
+    return float(min(size_max, max(size_min, 16.0 * area_factor * population_factor)))
 
 
-def default_point_edgewidth(n_cells: int) -> float:
-    """Drop point edges once density would turn outlines into mud."""
-    n = max(0, int(n_cells))
-    if n < 2_000:
-        return 0.15
-    if n < 10_000:
+def default_point_edgewidth(
+    n_cells: int,
+    *,
+    point_size: float | None = None,
+) -> float:
+    """Tune point outlines to marker area and cloud density."""
+    n = max(1, int(n_cells))
+    area = point_size if point_size is not None else default_point_size(n)
+    if n >= 20_000 or area < 2.5:
+        return 0.0
+    if area < 7.0 or n >= 10_000:
         return 0.05
-    return 0.0
+    return 0.15
+
+
+def register_layout_point_size(
+    collection: Any,
+    *,
+    n_points: int,
+    size_min: float,
+    size_max: float,
+    multiplier: float = 1.0,
+) -> None:
+    _LAYOUT_POINT_SIZE_SPECS[collection] = (
+        int(n_points),
+        float(size_min),
+        float(size_max),
+        float(multiplier),
+    )
+
+
+def refresh_layout_point_sizes(figure: Any) -> None:
+    """Refresh marked scatter artists after figure layout is resolved."""
+    marked = [
+        (ax, collection, specification)
+        for ax in figure.axes
+        for collection in ax.collections
+        if (specification := _LAYOUT_POINT_SIZE_SPECS.get(collection)) is not None
+    ]
+    if not marked:
+        return
+    figure.canvas.draw()
+    for ax, collection, specification in marked:
+        bbox = ax.get_position()
+        width, height = figure.get_size_inches()
+        panel_area = float(bbox.width * width * bbox.height * height)
+        n_points, size_min, size_max, multiplier = specification
+        point_size = default_point_size(
+            n_points,
+            panel_area=panel_area,
+            size_min=size_min,
+            size_max=size_max,
+        )
+        collection.set_sizes(
+            np.full(
+                len(collection.get_offsets()),
+                point_size * multiplier,
+                dtype=np.float64,
+            )
+        )
 
 
 def resolve_legend_loc(n_categories: int, legend_loc: LegendLoc = "auto") -> LegendLoc:
@@ -303,17 +387,28 @@ def resolve_legend_loc(n_categories: int, legend_loc: LegendLoc = "auto") -> Leg
         return "right"
     if n_categories <= LEGEND_ON_DATA_MAX_CATEGORIES:
         return "on_data"
-    return "none"
+    return "right"
+
+
+def legend_side_columns(n_entries: int) -> int:
+    """Columns for a side legend, bounded so wide category sets stay readable."""
+    columns = int(np.ceil(max(int(n_entries), 1) / LEGEND_SIDE_ENTRIES_PER_COLUMN))
+    return max(1, min(columns, LEGEND_SIDE_MAX_COLUMNS))
 
 
 def capped_figsize(
     width: float,
     height: float,
     *,
-    max_width: float = MAX_FIGURE_WIDTH_INCHES,
+    max_width: float | None = MAX_FIGURE_WIDTH_INCHES,
 ) -> tuple[float, float]:
     """Clamp figure width so atlas-scale category counts stay page-sized."""
-    return (min(float(width), float(max_width)), float(height))
+    resolved_width = float(width)
+    if max_width is not None:
+        if max_width <= 0:
+            raise ValueError("max_width must be positive or None")
+        resolved_width = min(resolved_width, float(max_width))
+    return (resolved_width, float(height))
 
 
 def _category_sort_key(value: Any) -> tuple[Any, ...]:
@@ -357,7 +452,27 @@ def sort_categories(values: Sequence[Any]) -> list[Any]:
     return sorted(values, key=_category_sort_key)
 
 
-def palette_for_n(n: int) -> list[str]:
+def palette_for_n(
+    n: int,
+    *,
+    palette_name: str = "default",
+) -> list[str]:
+    if palette_name not in ("default", "colorblind"):
+        raise ValueError("palette_name must be 'default' or 'colorblind'")
+    if palette_name == "colorblind":
+        if n <= len(COLORBLIND_PALETTE):
+            return list(COLORBLIND_PALETTE[:n])
+        from ..utils.logging import logger
+        from ._deps import require_seaborn
+
+        logger.warning(
+            f"Requested {n} colorblind-safe colors but only "
+            f"{len(COLORBLIND_PALETTE)} are available; "
+            "falling back to evenly spaced hues that are distinct but not "
+            "guaranteed colorblind safe"
+        )
+        sns = require_seaborn()
+        return list(sns.color_palette("husl", n_colors=n).as_hex())
     if n <= 10:
         return list(CUSTOM_PALETTES[10][:n])
     if n <= 20:
@@ -369,13 +484,14 @@ def palette_for_n(n: int) -> list[str]:
     from ._deps import require_seaborn
 
     sns = require_seaborn()
-    return list(sns.color_palette(n_colors=n).as_hex())
+    return list(sns.color_palette("husl", n_colors=n).as_hex())
 
 
 def categorical_color_map(
     categories: list[Any],
     *,
     palette: Mapping[Any, str] | None = None,
+    palette_name: str = "default",
     missing_label: str | None = None,
     missing_color: str = "#bdbdbd",
 ) -> dict[Any, str]:
@@ -386,7 +502,7 @@ def categorical_color_map(
             if cat not in out:
                 raise KeyError(f"Category {cat!r} missing from palette")
     else:
-        colors = palette_for_n(len(cats))
+        colors = palette_for_n(len(cats), palette_name=palette_name)
         out = dict(zip(cats, colors))
     if missing_label is not None:
         out[missing_label] = missing_color
@@ -430,8 +546,14 @@ def square_axis_limits(
 def scatter_edgecolor(theme: str = "notebook") -> str:
     """Marker edge color that stays readable on light and dark themes."""
     if theme == "dark":
-        return "#f0f0f0"
+        # Mid grey keeps dark fills legible without turning markers into rings.
+        return "#8f8f8f"
     return "#333333"
+
+
+def foreground_color(theme: str = "notebook") -> str:
+    """High-contrast foreground for annotations and segment borders."""
+    return "#e8e8e8" if theme == "dark" else "#333333"
 
 
 def finish_embedding_axes(
@@ -474,14 +596,13 @@ def apply_figure_chrome(figure: Any, theme: str = "notebook") -> None:
         figure.patch.set_alpha(1.0)
     else:
         figure.patch.set_alpha(0)
-    hide_top_right = theme != "framed"
     for ax in figure.axes:
         if opaque:
             ax.patch.set_facecolor("white")
             ax.patch.set_alpha(1.0)
         else:
             ax.patch.set_alpha(0)
-        if hide_top_right and hasattr(ax, "spines"):
+        if hasattr(ax, "spines"):
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
 
@@ -495,3 +616,28 @@ def theme_context(name: str = "notebook") -> Iterator[None]:
     _, mpl = require_matplotlib()
     with mpl.rc_context(THEMES[name]):
         yield
+
+
+def register_theme(
+    name: str,
+    rcparams: Mapping[str, Any],
+    *,
+    base: str | None = "notebook",
+    overwrite: bool = False,
+) -> None:
+    """Register a Matplotlib rcParams theme for later plot calls."""
+    if not name:
+        raise ValueError("Theme name must be non-empty")
+    if name in THEMES and not overwrite:
+        raise ValueError(f"Theme {name!r} already exists")
+    if base is not None and base not in THEMES:
+        raise KeyError(f"Unknown base theme {base!r}")
+    from ._deps import require_matplotlib
+
+    _, mpl = require_matplotlib()
+    invalid = sorted(set(rcparams) - set(mpl.rcParams))
+    if invalid:
+        raise KeyError(f"Unknown Matplotlib rcParams: {invalid}")
+    values = dict(THEMES[base]) if base is not None else {}
+    values.update(dict(rcparams))
+    THEMES[name] = values

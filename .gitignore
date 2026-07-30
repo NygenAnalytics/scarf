@@ -56,3 +56,7 @@ profiling/config.toml
 # Generated / local-only run configs (machine grids). Keep LEARNINGS.md + examples.
 profiling/layouts/
 test_data
+# Generated plotting showcase outputs. Curated references live in tests/visual.
+/artifacts/
+/plotting_showcase/
+tests/visual/showcase/*.json

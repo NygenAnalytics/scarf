@@ -309,7 +309,7 @@ import sys
 
 from scarf.datastore.datastore import DataStore
 
-optional = ("matplotlib", "seaborn", "datashader")
+optional = ("matplotlib", "seaborn")
 assert not any(
     name == prefix or name.startswith(f"{prefix}.")
     for name in sys.modules

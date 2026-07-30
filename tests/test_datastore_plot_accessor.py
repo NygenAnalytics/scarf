@@ -15,6 +15,7 @@ from scarf.datastore.plot_accessor import DataStorePlotAccessor
 
 
 _STORE_PLOT_METHODS = (
+    "cluster_connectivity",
     "cluster_tree",
     "composition",
     "distribution",
@@ -22,8 +23,15 @@ _STORE_PLOT_METHODS = (
     "embedding",
     "embedding_raster",
     "marker_heatmap",
+    "mapping_calibration",
+    "mapping_confusion",
+    "mapping_correction",
+    "mapping_evidence",
+    "mapping_projection",
+    "mapping_score",
     "matrixplot",
     "pseudotime_heatmap",
+    "run_recipe",
     "unified_embedding",
 )
 
@@ -142,6 +150,57 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
         ("composition", (), {"category_by": "cluster", "kind": "per_sample"}),
         ("distribution", ("RNA_nCounts",), {"bins": 17}),
         ("marker_heatmap", (), {"topn": 7, "linewidths": 0.25}),
+        (
+            "mapping_calibration",
+            (),
+            {
+                "target_name": "atlas",
+                "reference_class_group": "label",
+                "known_labels": ["a"],
+            },
+        ),
+        (
+            "mapping_confusion",
+            (),
+            {
+                "target_name": "atlas",
+                "reference_class_group": "label",
+                "known_labels": ["a"],
+            },
+        ),
+        (
+            "mapping_correction",
+            (),
+            {"target_name": "atlas", "dimensions": (1, 2)},
+        ),
+        (
+            "mapping_evidence",
+            (),
+            {"target_name": "atlas", "reference_class_group": "label"},
+        ),
+        (
+            "mapping_projection",
+            (),
+            {"target_name": "atlas", "reference_layout_key": "RNA_UMAP"},
+        ),
+        (
+            "mapping_score",
+            (),
+            {
+                "target_name": "atlas",
+                "kind": "histogram",
+            },
+        ),
+        (
+            "cluster_connectivity",
+            (),
+            {
+                "group_by": "cluster",
+                "layout_key": "RNA_UMAP",
+                "minimum_edge_weight": 0.1,
+            },
+        ),
+        ("run_recipe", ("recipe.toml",), {"show": False}),
         ("cluster_tree", (), {"width": 2.5}),
         ("pseudotime_heatmap", (), {"vmax": 3.0}),
     ],
@@ -170,6 +229,8 @@ def test_plot_accessor_forwards_to_canonical_function(
     expected_args = [store]
     if name == "distribution":
         expected_args.append(expected_kwargs.pop("keys"))
+    elif name == "run_recipe":
+        expected_args.append(expected_kwargs.pop("recipe"))
 
     assert method(*args, **kwargs) is sentinel
     assert calls == [(tuple(expected_args), expected_kwargs)]

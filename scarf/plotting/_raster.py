@@ -22,6 +22,45 @@ class RasterCanvas:
     n_blocks: int
 
 
+def density_canvas_from_points(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    extent: tuple[float, float, float, float],
+    pixels: int,
+) -> RasterCanvas:
+    """Bin materialized coordinates into the shared raster canvas contract."""
+    if pixels < 8:
+        raise ValueError("pixels must be at least 8")
+    xx = np.asarray(x, dtype=np.float64)
+    yy = np.asarray(y, dtype=np.float64)
+    if len(xx) != len(yy):
+        raise ValueError("x and y lengths must match")
+    finite = np.isfinite(xx) & np.isfinite(yy)
+    xmin, xmax, ymin, ymax = map(float, extent)
+    if xmax <= xmin or ymax <= ymin:
+        raise ValueError("extent must have increasing coordinate limits")
+    counts_xy, _, _ = np.histogram2d(
+        xx[finite],
+        yy[finite],
+        bins=pixels,
+        range=((xmin, xmax), (ymin, ymax)),
+    )
+    counts = np.flipud(counts_xy.T).astype(np.int64, copy=False)
+    image = np.full(counts.shape, np.nan, dtype=np.float64)
+    occupied = counts > 0
+    image[occupied] = np.log1p(counts[occupied])
+    return RasterCanvas(
+        image=image,
+        counts=counts,
+        extent=(xmin, xmax, ymin, ymax),
+        vmin=0.0,
+        vmax=float(np.nanmax(image)) if occupied.any() else 1.0,
+        n_cells=int(finite.sum()),
+        n_blocks=1,
+    )
+
+
 def _finite_minmax(values: np.ndarray) -> tuple[float, float] | None:
     v = values[np.isfinite(values)]
     if len(v) == 0:

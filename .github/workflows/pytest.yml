@@ -71,6 +71,12 @@ jobs:
             --cov-report=xml \
             --cov-report=term
         fi
+    - name: Compare publication plotting references
+      if: matrix.resolution == 'locked' && matrix.python-version == '3.12'
+      env:
+        MPLBACKEND: Agg
+        SCARF_RUN_VISUAL_REGRESSION: "1"
+      run: uv run pytest -n 0 -m visual tests/test_plotting_showcase.py
     - name: Build and smoke-test wheel
       if: matrix.resolution == 'locked' && matrix.python-version == '3.14'
       run: |

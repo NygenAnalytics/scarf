@@ -17,8 +17,10 @@ import scarf.plotting as splt
 
 def test_import_plotting_exports():
     function_names = (
+        "cluster_connectivity",
         "cluster_tree",
         "collect_legends",
+        "compose_results",
         "composition",
         "distribution",
         "dotplot",
@@ -29,9 +31,17 @@ def test_import_plotting_exports():
         "highly_variable_features",
         "label_panels",
         "marker_heatmap",
+        "mapping_calibration",
+        "mapping_confusion",
+        "mapping_correction",
+        "mapping_evidence",
+        "mapping_projection",
+        "mapping_score",
         "matrixplot",
         "pseudotime_heatmap",
         "qc",
+        "register_theme",
+        "run_recipe",
         "theme_context",
         "unified_embedding",
     )
@@ -39,11 +49,19 @@ def test_import_plotting_exports():
         "CategoricalScale",
         "CellField",
         "ColorScale",
+        "DensityOverlay",
         "FeatureRef",
+        "Highlight",
         "LegendSpec",
         "NormalizationSpec",
         "PlotProvenance",
+        "PlotOutput",
+        "PlotOutputSettings",
+        "PlotPanelTarget",
+        "PlotRecipe",
+        "PlotRecipeResult",
         "PlotResult",
+        "PlotStep",
         "SizeScale",
         "StudyDesign",
     )
@@ -61,7 +79,7 @@ import pandas as pd
 original_import = builtins.__import__
 
 def block_plotting_dependencies(name, *args, **kwargs):
-    if name.split(".", 1)[0] in {"matplotlib", "seaborn", "datashader", "kneed"}:
+    if name.split(".", 1)[0] in {"matplotlib", "seaborn", "kneed"}:
         raise ModuleNotFoundError(name)
     return original_import(name, *args, **kwargs)
 
@@ -741,8 +759,15 @@ def test_multi_layout_multi_color_embedding(umap, datastore):
     assert result.provenance.extras["n_layouts"] == 2
     assert set(result.provenance.extras["layout_provenance"]) == set(layouts)
     assert "multi_layout" in result.provenance.notes
-    assert len(result.legends) == 4
-    assert len(result.scales) == 2
+    assert len(result.legends) == 2
+    assert len(result.scales) == 1
+    assert {legend.kind for legend in result.legends} == {"colorbar"}
+    assert {legend.label for legend in result.legends} == set(colors)
+    assert isinstance(result.scales[0], splt.ColorScale)
+    assert all(
+        np.isfinite([legend.extras["vmin"], legend.extras["vmax"]]).all()
+        for legend in result.legends
+    )
     result.close()
 
 

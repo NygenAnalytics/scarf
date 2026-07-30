@@ -45,6 +45,7 @@ def qc(
     sup_title_size: float = 12,
     scatter_size: float = 1.0,
     max_points: int = 10_000,
+    seed: int = 0,
     show_on_single_row: bool = True,
     show: bool = True,
     theme: str = "notebook",
@@ -150,7 +151,7 @@ def qc(
             elif len(metric_frame) > max_points:
                 display_frame = metric_frame.sample(
                     n=max_points,
-                    random_state=0,
+                    random_state=seed,
                 )
             else:
                 display_frame = metric_frame
@@ -219,6 +220,7 @@ def qc(
                 "metrics": [str(metric) for metric in metric_columns],
                 "groups": list(group_order),
                 "max_points": max_points,
+                "seed": seed,
                 "displayed_points": displayed_points,
                 "show_on_single_row": show_on_single_row,
             },

@@ -5,7 +5,6 @@ import builtins
 import pytest
 
 from scarf.plotting._deps import (
-    require_datashader,
     require_kneed,
     require_matplotlib,
     require_seaborn,
@@ -17,7 +16,6 @@ from scarf.plotting._deps import (
     [
         (require_matplotlib, "matplotlib", "matplotlib"),
         (require_seaborn, "seaborn", "seaborn"),
-        (require_datashader, "datashader", "datashader"),
         (require_kneed, "kneed", "kneed"),
     ],
 )

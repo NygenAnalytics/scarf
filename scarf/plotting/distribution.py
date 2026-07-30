@@ -1,6 +1,7 @@
 """Distribution plots for metadata and feature values."""
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from typing import Any, Hashable, Literal
 
 import numpy as np
@@ -13,6 +14,7 @@ from ._contracts import (
     FeatureRef,
     NormalizationSpec,
     PlotProvenance,
+    StudyDesign,
 )
 from ._data import (
     fetch_normalized_feature_matrix,
@@ -20,12 +22,14 @@ from ._data import (
     resolve_feature,
 )
 from ._deps import require_matplotlib, require_seaborn
+from ._display import resolve_categorical_scale
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
 from ._style import (
     MAX_FIGURE_WIDTH_INCHES,
     apply_figure_chrome,
     capped_figsize,
     categorical_color_map,
+    sort_categories,
     theme_context,
 )
 
@@ -101,8 +105,21 @@ def _group_palette(
     return categorical_color_map(
         order,
         palette=categorical_scale.palette if categorical_scale else None,
+        palette_name=(
+            categorical_scale.palette_name if categorical_scale else "default"
+        ),
         missing_label=None,
     )
+
+
+@contextmanager
+def _seed_legacy_numpy(rng: np.random.Generator) -> Iterator[None]:
+    state = np.random.get_state()
+    np.random.seed(int(rng.integers(0, np.iinfo(np.uint32).max)))
+    try:
+        yield
+    finally:
+        np.random.set_state(state)
 
 
 def _draw_violin_or_box(
@@ -117,63 +134,125 @@ def _draw_violin_or_box(
     rng: np.random.Generator,
     order: list[Any] | None = None,
     palette: dict[Any, str] | None = None,
+    orientation: Literal["vertical", "horizontal"] = "vertical",
+    violin_inner: str | None = "quartile",
+    linewidth: float = 0.8,
+    fill_alpha: float = 0.9,
+    point_alpha: float = 0.28,
+    split_order: list[Any] | None = None,
+    split_palette: dict[Any, str] | None = None,
+    show_legend: bool = True,
 ) -> bool:
     plot_kw: dict[str, Any] = {}
     if order is not None:
         plot_kw["order"] = order
+    split = (
+        split_order is not None and split_palette is not None and len(split_order) == 2
+    )
     grouped = order is not None and palette is not None and len(order) > 0
-    if grouped:
+    if split:
+        plot_kw["hue"] = "split"
+        plot_kw["hue_order"] = split_order
+        plot_kw["palette"] = split_palette
+        plot_kw["legend"] = show_legend
+    elif grouped:
         plot_kw["hue"] = "group"
         plot_kw["hue_order"] = order
         plot_kw["palette"] = palette
         plot_kw["legend"] = False
         plot_kw["dodge"] = False
 
+    x_key = "group" if orientation == "vertical" else "value"
+    y_key = "value" if orientation == "vertical" else "group"
+    collections_before = len(ax.collections)
     if kind == "violin":
         sns.violinplot(
             data=df,
-            x="group",
-            y="value",
+            x=x_key,
+            y=y_key,
             ax=ax,
             color=None if grouped else color,
-            inner="quartile",
+            inner=violin_inner,
             cut=0,
-            linewidth=0.8,
+            linewidth=linewidth,
             saturation=0.9,
+            split=split,
             **plot_kw,
         )
     else:
         sns.boxplot(
             data=df,
-            x="group",
-            y="value",
+            x=x_key,
+            y=y_key,
             ax=ax,
             color=None if grouped else color,
             showfliers=max_points <= 0,
-            linewidth=0.8,
+            linewidth=linewidth,
             fliersize=2,
             **plot_kw,
         )
+    for collection in ax.collections[collections_before:]:
+        collection.set_alpha(fill_alpha)
 
     subsampled = False
     if max_points > 0 and len(df) > 0:
         pts, subsampled = _subsample_frame(df, max_points=max_points, rng=rng)
         strip_kw = {k: v for k, v in plot_kw.items() if k != "legend"}
-        if "palette" in strip_kw:
+        if split:
+            strip_kw["legend"] = False
+            strip_kw["dodge"] = True
+        elif "palette" in strip_kw:
             strip_kw.pop("palette", None)
             strip_kw.pop("hue", None)
-        sns.stripplot(
-            data=pts,
-            x="group",
-            y="value",
-            ax=ax,
-            color="0.15",
-            size=point_size,
-            jitter=0.28,
-            alpha=0.28,
-            **{k: v for k, v in strip_kw.items() if k == "order"},
-        )
+        with _seed_legacy_numpy(rng):
+            sns.stripplot(
+                data=pts,
+                x=x_key,
+                y=y_key,
+                ax=ax,
+                color=None if split else "0.15",
+                size=point_size,
+                jitter=0.28,
+                alpha=point_alpha,
+                **(
+                    strip_kw
+                    if split
+                    else {k: v for k, v in strip_kw.items() if k == "order"}
+                ),
+            )
     return subsampled
+
+
+def _sample_aggregate(
+    frame: pd.DataFrame,
+    *,
+    statistic: Literal["mean", "median", "fraction"],
+    expression_cutoff: float,
+    split: bool,
+) -> pd.DataFrame:
+    valid_sample = pd.notna(frame["sample"]) & (frame["sample"].astype(str) != "")
+    frame = frame.loc[valid_sample].copy()
+    if frame.empty:
+        raise ValueError("No selected cells have a valid sample value")
+    columns = ["sample", "group"]
+    if split:
+        columns.append("split")
+    grouped = frame.groupby(columns, observed=False, dropna=False)["raw_value"]
+    if statistic == "mean":
+        values = grouped.mean()
+    elif statistic == "median":
+        values = grouped.median()
+    else:
+        values = grouped.apply(
+            lambda value: float(
+                np.mean(value.to_numpy(dtype=np.float64) > expression_cutoff)
+            )
+        )
+    counts = grouped.size().rename("nCells")
+    return pd.concat(
+        (values.rename("raw_value"), counts),
+        axis=1,
+    ).reset_index()
 
 
 def _draw_hist(
@@ -185,6 +264,7 @@ def _draw_hist(
     group_by: str | None,
     order: list[Any] | None,
     palette: dict[Any, str] | None,
+    show_legend: bool,
 ) -> None:
     if group_by is None:
         vals = df["value"].to_numpy(dtype=np.float64)
@@ -213,7 +293,8 @@ def _draw_hist(
             edgecolor="white",
             linewidth=0.3,
         )
-    ax.legend(frameon=False, fontsize=8)
+    if show_legend:
+        ax.legend(frameon=False, fontsize=8)
 
 
 def _ecdf_xy(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -234,6 +315,7 @@ def _draw_ecdf(
     group_by: str | None,
     order: list[Any] | None,
     palette: dict[Any, str] | None,
+    show_legend: bool,
 ) -> bool:
     """Draw ECDF. May subsample values for display; returns whether subsampled."""
     subsampled = False
@@ -265,7 +347,8 @@ def _draw_ecdf(
                 label=str(g),
                 color=line_color,
             )
-    ax.legend(frameon=False, fontsize=8)
+    if show_legend:
+        ax.legend(frameon=False, fontsize=8)
     ax.set_ylim(-0.02, 1.02)
     return subsampled
 
@@ -276,21 +359,37 @@ def distribution(
     *,
     group_by: str | None = None,
     groups: Sequence[Any] | None = None,
+    split_by: str | None = None,
+    sample_by: str | None = None,
+    study_design: StudyDesign | None = None,
+    sample_stat: Literal["mean", "median", "fraction"] = "mean",
+    expression_cutoff: float = 0.0,
     subset_by: str | None = None,
     cell_key: str | None = "I",
     from_assay: str | None = None,
     normalization: NormalizationSpec | None = None,
     categorical_scale: CategoricalScale | None = None,
+    split_scale: CategoricalScale | None = None,
     kind: DistKind = "violin",
     bins: int = 40,
     max_points: int = 10000,
     point_size: float = 0.8,
+    point_alpha: float = 0.28,
     seed: int = 0,
     color: str = "steelblue",
+    orientation: Literal["vertical", "horizontal"] = "vertical",
+    row_standardize: bool = False,
+    share_y: bool | None = None,
+    violin_inner: str | None = "quartile",
+    violin_linewidth: float = 0.8,
+    violin_alpha: float = 0.9,
+    italicize_features: bool = False,
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
+    max_figure_width: float | None = MAX_FIGURE_WIDTH_INCHES,
     title: str | None = None,
     theme: str = "notebook",
+    show_legend: bool = True,
     show: bool = True,
 ) -> PlotResult:
     """Compare value distributions for QC metrics or genes.
@@ -309,17 +408,48 @@ def distribution(
 
     For violins and boxes, Scarf can overlay a subsample of cells as points.
     ``max_points`` limits how many points are drawn (``0`` disables points).
-    Histograms always use every selected cell. When several gene keys are
-    passed, panels share a y-axis scale. Several keys wrap into a grid instead
-    of growing into a very wide figure.
+    Histograms always use every selected cell. Regular multi-gene violin and
+    box panels share their value scale by default. Stacked violins keep
+    independent scales unless ``share_y=True``. With horizontal orientation,
+    the same option shares the x-axis value scale.
+
+    Set ``sample_by`` or ``study_design`` to summarize cells within biological
+    samples before plotting. ``split_by`` draws two violin halves for a second
+    categorical variable.
     """
     require_matplotlib()
     normalization = normalization or NormalizationSpec()
-    if kind not in ("violin", "box", "hist", "ecdf"):
-        raise ValueError("kind must be 'violin', 'box', 'hist', or 'ecdf'")
+    if kind not in ("violin", "stacked_violin", "box", "hist", "ecdf"):
+        raise ValueError(
+            "kind must be 'violin', 'stacked_violin', 'box', 'hist', or 'ecdf'"
+        )
+    if orientation not in ("vertical", "horizontal"):
+        raise ValueError("orientation must be 'vertical' or 'horizontal'")
+    if kind in ("hist", "ecdf") and orientation != "vertical":
+        raise ValueError("orientation applies only to violin and box plots")
+    if row_standardize and kind != "stacked_violin":
+        raise ValueError("row_standardize is available only for stacked_violin")
+    if share_y is not None and kind not in ("violin", "stacked_violin", "box"):
+        raise ValueError("share_y applies only to violin and box plots")
+    if violin_linewidth < 0:
+        raise ValueError("violin_linewidth must be non-negative")
+    if not 0 <= violin_alpha <= 1 or not 0 <= point_alpha <= 1:
+        raise ValueError("violin and point alpha values must be between 0 and 1")
     if groups is not None and group_by is None:
         raise ValueError("groups requires group_by")
-    if kind in ("violin", "box"):
+    if split_by is not None and group_by is None:
+        raise ValueError("split_by requires group_by")
+    if split_by is not None and kind not in ("violin", "stacked_violin"):
+        raise ValueError("split_by is available only for violin plots")
+    if split_by == group_by and split_by is not None:
+        raise ValueError("split_by and group_by must refer to different columns")
+    if sample_stat not in ("mean", "median", "fraction"):
+        raise ValueError("sample_stat must be 'mean', 'median', or 'fraction'")
+    if study_design is not None:
+        if sample_by is not None and sample_by != study_design.sample_by:
+            raise ValueError("sample_by conflicts with study_design.sample_by")
+        sample_by = study_design.sample_by
+    if kind in ("violin", "stacked_violin", "box"):
         sns = require_seaborn()
     else:
         sns = None
@@ -332,6 +462,18 @@ def distribution(
         key_list = list(keys)
     if not key_list:
         raise ValueError("keys must be non-empty")
+    if group_by is not None:
+        categorical_scale = resolve_categorical_scale(
+            store,
+            group_by,
+            categorical_scale,
+        )
+    if split_by is not None:
+        split_scale = resolve_categorical_scale(
+            store,
+            split_by,
+            split_scale,
+        )
     feature_assays: set[str] = set()
     for key in key_list:
         if not (
@@ -363,6 +505,18 @@ def distribution(
             raise ValueError("group_by length does not match selected cells")
     else:
         groups_arr = np.zeros(n, dtype=int)
+    split_arr = (
+        _fetch_cell_column(store, split_by, cell_key) if split_by is not None else None
+    )
+    sample_arr = (
+        _fetch_cell_column(store, sample_by, cell_key)
+        if sample_by is not None
+        else None
+    )
+    if split_arr is not None and len(split_arr) != n:
+        raise ValueError("split_by length does not match selected cells")
+    if sample_arr is not None and len(sample_arr) != n:
+        raise ValueError("sample_by length does not match selected cells")
 
     subset_vals = (
         _fetch_cell_column(store, subset_by, cell_key)
@@ -376,14 +530,47 @@ def distribution(
         category_values=groups_arr if group_by is not None else None,
         groups=groups,
     )
+    dropped_sample_cells = 0
+    if sample_arr is not None:
+        valid_sample = pd.notna(sample_arr) & (np.asarray(sample_arr, dtype=str) != "")
+        dropped_sample_cells = int((selection_mask & ~valid_sample).sum())
+        selection_mask &= valid_sample
+    dropped_split_cells = 0
+    if split_arr is not None:
+        valid_split = pd.notna(split_arr) & (np.asarray(split_arr, dtype=str) != "")
+        dropped_split_cells = int((selection_mask & ~valid_split).sum())
+        selection_mask &= valid_split
+    if not selection_mask.any():
+        raise ValueError("No cells remain after distribution selections")
     if group_by is None:
         group_order = None
+    elif groups is None:
+        observed_values = list(pd.unique(groups_arr[selection_mask]))
+        if categorical_scale is not None and categorical_scale.order is not None:
+            observed = set(observed_values)
+            missing = [
+                value for value in observed if value not in categorical_scale.order
+            ]
+            if missing:
+                raise ValueError(
+                    "categorical_scale.order is missing observed values: "
+                    + ", ".join(map(str, missing[:10]))
+                )
+            group_order = [
+                value for value in categorical_scale.order if value in observed
+            ]
+        else:
+            group_order = sort_categories(observed_values)
 
     series_list = [
         (np.asarray(vals)[selection_mask], label, is_feature)
         for vals, label, is_feature in series_list
     ]
     groups_arr = groups_arr[selection_mask]
+    if split_arr is not None:
+        split_arr = split_arr[selection_mask]
+    if sample_arr is not None:
+        sample_arr = sample_arr[selection_mask]
     n = int(selection_mask.sum())
     any_feature = any(is_feature for _, _, is_feature in series_list)
 
@@ -398,16 +585,51 @@ def distribution(
         if group_by is not None and group_order is not None
         else None
     )
+    split_order: list[Any] | None = None
+    split_palette: dict[Any, str] | None = None
+    if split_arr is not None:
+        observed_split = list(pd.unique(split_arr))
+        if split_scale is not None and split_scale.order is not None:
+            missing_split = [
+                value for value in observed_split if value not in split_scale.order
+            ]
+            if missing_split:
+                raise ValueError(
+                    "split_scale.order is missing observed values: "
+                    + ", ".join(map(str, missing_split[:10]))
+                )
+            split_order = [
+                value for value in split_scale.order if value in set(observed_split)
+            ]
+        else:
+            split_order = sort_categories(observed_split)
+        if len(split_order) != 2:
+            raise ValueError(
+                "split_by must contain exactly two observed categories; "
+                f"found {len(split_order)}"
+            )
+        split_palette = _group_palette(split_order, split_scale)
     # Width scales with category count so rotated labels stay readable; wrap
     # to extra rows before exceeding the page width.
-    panel_width = min(MAX_FIGURE_WIDTH_INCHES, max(3.6, 0.55 * max(n_groups, 1) + 1.8))
+    width_cap = (
+        MAX_FIGURE_WIDTH_INCHES if max_figure_width is None else float(max_figure_width)
+    )
+    if width_cap <= 0:
+        raise ValueError("max_figure_width must be positive or None")
+    panel_width = min(width_cap, max(3.6, 0.55 * max(n_groups, 1) + 1.8))
     if figsize is None and target is None:
-        n_columns = max(
-            1,
-            min(n_panels, int(MAX_FIGURE_WIDTH_INCHES // panel_width) or 1),
+        n_columns = (
+            1
+            if kind == "stacked_violin"
+            else max(1, min(n_panels, int(width_cap // panel_width) or 1))
         )
         n_rows = int(np.ceil(n_panels / n_columns))
-        figsize = capped_figsize(panel_width * n_columns, 4.0 * n_rows)
+        row_height = 1.3 if kind == "stacked_violin" else 4.0
+        figsize = capped_figsize(
+            panel_width * n_columns,
+            max(2.4, row_height * n_rows + 0.8),
+            max_width=max_figure_width,
+        )
     else:
         n_columns = n_panels
 
@@ -421,30 +643,109 @@ def distribution(
     rng = np.random.default_rng(seed)
     any_subsampled = False
     y_limits: list[tuple[float, float]] = []
+    panel_tables: list[tuple[str, pd.DataFrame]] = []
     with theme_context(theme):
-        for (vals, label, _), panel_key in zip(series_list, panel_keys):
+        for panel_index, ((vals, label, is_feature), panel_key) in enumerate(
+            zip(series_list, panel_keys)
+        ):
             ax = axes[panel_key]
-            df = pd.DataFrame({"value": vals, "group": groups_arr})
-            if kind in ("violin", "box"):
+            cell_frame = pd.DataFrame(
+                {
+                    "raw_value": np.asarray(vals, dtype=np.float64),
+                    "group": groups_arr,
+                }
+            )
+            if split_arr is not None:
+                cell_frame["split"] = split_arr
+            if sample_arr is not None:
+                cell_frame["sample"] = sample_arr
+                df = _sample_aggregate(
+                    cell_frame,
+                    statistic=sample_stat,
+                    expression_cutoff=expression_cutoff,
+                    split=split_arr is not None,
+                )
+            else:
+                df = cell_frame
+            display_values = df["raw_value"].to_numpy(dtype=np.float64)
+            if row_standardize:
+                finite = np.isfinite(display_values)
+                mean = float(np.mean(display_values[finite])) if finite.any() else 0.0
+                std = float(np.std(display_values[finite])) if finite.any() else 0.0
+                display_values = (
+                    (display_values - mean) / std
+                    if std > 0
+                    else np.zeros_like(display_values)
+                )
+            df["value"] = display_values
+            table = df.rename(
+                columns={
+                    "raw_value": "value",
+                    "value": "display_value",
+                }
+            )
+            panel_tables.append((label, table))
+            if sample_arr is None:
+                value_axis_label = label
+            elif sample_stat == "fraction":
+                value_axis_label = f"Sample fraction > {expression_cutoff:g}"
+            else:
+                value_axis_label = f"Sample {sample_stat} {label}"
+            if kind in ("violin", "stacked_violin", "box"):
                 assert sns is not None
                 subsampled = _draw_violin_or_box(
                     ax,
                     sns,
                     df,
-                    kind=kind,  # type: ignore[arg-type]
+                    kind=("violin" if kind == "stacked_violin" else kind),  # type: ignore[arg-type]
                     color=color,
                     max_points=max_points,
                     point_size=point_size,
                     rng=rng,
                     order=None if group_by is None else list(group_order or []),
                     palette=palette,
+                    orientation=orientation,
+                    violin_inner=violin_inner,
+                    linewidth=violin_linewidth,
+                    fill_alpha=violin_alpha,
+                    point_alpha=point_alpha,
+                    split_order=split_order,
+                    split_palette=split_palette,
+                    show_legend=(
+                        show_legend
+                        and split_order is not None
+                        and panel_index == n_panels - 1
+                    ),
                 )
                 any_subsampled = any_subsampled or subsampled
+                if split_order is not None and show_legend:
+                    legend = ax.get_legend()
+                    if legend is not None:
+                        handles, labels = ax.get_legend_handles_labels()
+                        legend.remove()
+                        ax.legend(
+                            handles,
+                            labels,
+                            title=split_by or "split",
+                            frameon=False,
+                            loc="upper left",
+                            bbox_to_anchor=(1.02, 1),
+                            borderaxespad=0,
+                        )
                 if group_by is None:
-                    ax.set_xticks([])
+                    if orientation == "vertical":
+                        ax.set_xticks([])
+                    else:
+                        ax.set_yticks([])
                 else:
-                    ax.tick_params(axis="x", labelrotation=45)
-                    for tick in ax.get_xticklabels():
+                    category_axis = "x" if orientation == "vertical" else "y"
+                    ax.tick_params(axis=category_axis, labelrotation=45)
+                    ticks = (
+                        ax.get_xticklabels()
+                        if orientation == "vertical"
+                        else ax.get_yticklabels()
+                    )
+                    for tick in ticks:
                         tick.set_ha("right")
             elif kind == "hist":
                 _draw_hist(
@@ -455,6 +756,7 @@ def distribution(
                     group_by=group_by,
                     order=None if group_by is None else list(group_order or []),
                     palette=palette,
+                    show_legend=show_legend,
                 )
             else:
                 subsampled = _draw_ecdf(
@@ -466,29 +768,82 @@ def distribution(
                     group_by=group_by,
                     order=None if group_by is None else list(group_order or []),
                     palette=palette,
+                    show_legend=show_legend,
                 )
                 any_subsampled = any_subsampled or subsampled
                 ax.set_ylabel("ECDF")
 
-            ax.set_title(label)
+            ax.set_title(
+                "" if kind == "stacked_violin" and orientation == "vertical" else label,
+                fontstyle=("italic" if italicize_features and is_feature else "normal"),
+                loc=("left" if kind == "stacked_violin" else "center"),
+            )
             if kind in ("hist", "ecdf"):
-                ax.set_xlabel(label)
+                ax.set_xlabel(value_axis_label)
                 if kind == "hist":
                     ax.set_ylabel("count")
             else:
-                ax.set_xlabel(group_by or "")
-                ax.set_ylabel(label)
-            finite = vals[np.isfinite(vals)]
+                # Panel titles already name the key, so the value axis only
+                # repeats it when the title is suppressed or the values were
+                # aggregated per sample.
+                keeps_key_on_axis = kind == "stacked_violin" or sample_arr is not None
+                measurement_label = (
+                    "standardized value"
+                    if row_standardize
+                    else value_axis_label
+                    if keeps_key_on_axis
+                    else "value"
+                )
+                if orientation == "vertical":
+                    ax.set_xlabel(group_by or "")
+                    ax.set_ylabel(
+                        measurement_label,
+                        fontstyle=(
+                            "italic"
+                            if italicize_features
+                            and is_feature
+                            and not row_standardize
+                            and keeps_key_on_axis
+                            else "normal"
+                        ),
+                    )
+                else:
+                    ax.set_xlabel(
+                        measurement_label,
+                        fontstyle=(
+                            "italic"
+                            if italicize_features
+                            and is_feature
+                            and not row_standardize
+                            and keeps_key_on_axis
+                            else "normal"
+                        ),
+                    )
+                    ax.set_ylabel(group_by or "")
+            if kind == "stacked_violin" and panel_index < n_panels - 1:
+                if orientation == "vertical":
+                    ax.tick_params(axis="x", labelbottom=False)
+                    ax.set_xlabel("")
+                else:
+                    ax.tick_params(axis="y", labelleft=False)
+                    ax.set_ylabel("")
+            finite = display_values[np.isfinite(display_values)]
             if len(finite):
                 y_limits.append((float(finite.min()), float(finite.max())))
 
-        if any_feature and kind in ("violin", "box") and len(y_limits) > 1:
+        resolved_share_y = (
+            any_feature and kind in ("violin", "box") if share_y is None else share_y
+        )
+        if resolved_share_y and len(y_limits) > 1:
             ymin = min(lo for lo, _ in y_limits)
             ymax = max(hi for _, hi in y_limits)
             if ymax > ymin:
                 pad = 0.05 * (ymax - ymin)
                 for ax in axes.values():
-                    ax.set_ylim(ymin - pad, ymax + pad)
+                    if orientation == "vertical":
+                        ax.set_ylim(ymin - pad, ymax + pad)
+                    else:
+                        ax.set_xlim(ymin - pad, ymax + pad)
 
         if title is not None:
             fig.suptitle(title)
@@ -496,9 +851,9 @@ def distribution(
 
     label_counts = pd.Series([label for _, label, _ in series_list]).value_counts()
     tables = {}
-    for index, (vals, label, _) in enumerate(series_list):
+    for index, (label, table) in enumerate(panel_tables):
         table_name = label if label_counts[label] == 1 else f"{index}:{label}"
-        tables[table_name] = pd.DataFrame({"value": vals, "group": groups_arr})
+        tables[table_name] = table
     notes = ["distribution", kind]
     if any_subsampled:
         notes.append("subsampled_display")
@@ -507,13 +862,43 @@ def distribution(
         figure=fig,
         axes=axes,
         tables=tables,
-        legends=(LegendSpec(kind="distribution", label=kind),),
-        scales=(() if categorical_scale is None else (categorical_scale,)),
+        legends=(
+            (LegendSpec(kind="categorical", label=split_by or "split"),)
+            if split_order is not None
+            else (LegendSpec(kind="distribution", label=kind),)
+        ),
+        scales=(
+            (
+                CategoricalScale(
+                    order=tuple(split_order),
+                    palette=split_palette,
+                    labels=(split_scale.labels if split_scale is not None else None),
+                    missing_color=(
+                        split_scale.missing_color
+                        if split_scale is not None
+                        else "#bdbdbd"
+                    ),
+                    missing_label=(
+                        split_scale.missing_label if split_scale is not None else "NA"
+                    ),
+                    palette_name=(
+                        split_scale.palette_name
+                        if split_scale is not None
+                        else "default"
+                    ),
+                ),
+            )
+            if split_order is not None
+            else (() if categorical_scale is None else (categorical_scale,))
+        ),
         provenance=PlotProvenance(
             scarf_version=_scarf_version(),
             assay=(next(iter(feature_assays)) if len(feature_assays) == 1 else None),
             cell_key=cell_key,
             n_cells=n,
+            n_samples=(
+                int(pd.Series(sample_arr).nunique()) if sample_arr is not None else None
+            ),
             renderer="matplotlib",
             notes=tuple(notes),
             extras={
@@ -521,9 +906,25 @@ def distribution(
                 "seed": seed,
                 "group_by": group_by,
                 "groups": None if groups is None else list(groups),
+                "split_by": split_by,
+                "split_order": split_order,
+                "sample_by": sample_by,
+                "sample_stat": sample_stat if sample_by is not None else None,
+                "expression_cutoff": (
+                    expression_cutoff
+                    if sample_by is not None and sample_stat == "fraction"
+                    else None
+                ),
+                "dropped_sample_cells": dropped_sample_cells,
+                "dropped_split_cells": dropped_split_cells,
                 "subset_by": subset_by,
                 "bins": bins if kind == "hist" else None,
                 "title": title,
+                "orientation": orientation,
+                "row_standardize": row_standardize,
+                "share_y": resolved_share_y,
+                "violin_inner": violin_inner,
+                "italicize_features": italicize_features,
                 "approximate": any_subsampled,
                 "normalization": {
                     "source": normalization.source,

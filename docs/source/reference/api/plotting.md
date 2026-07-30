@@ -11,7 +11,7 @@ Plot functions return a `PlotResult` and render by default with `show=True`. Pas
 
 ```{eval-rst}
 .. automodule:: scarf.plotting
-    :members: embedding, embedding_raster, unified_embedding, dotplot, matrixplot, composition, distribution, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap
+    :members: embedding, embedding_raster, unified_embedding, dotplot, matrixplot, composition, distribution, cluster_connectivity, mapping_score, mapping_evidence, mapping_confusion, mapping_calibration, mapping_correction, mapping_projection, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, compose_results, register_theme, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap, run_recipe
     :imported-members:
     :undoc-members:
     :show-inheritance:
@@ -54,6 +54,36 @@ Plot functions return a `PlotResult` and render by default with `show=True`. Pas
 
 ```{eval-rst}
 .. autoclass:: scarf.plotting.SizeScale
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.DensityOverlay
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.Highlight
+    :members:
+```
+
+```{eval-rst}
+.. autoclass:: scarf.plotting.PlotRecipe
+    :members:
+
+.. autoclass:: scarf.plotting.PlotStep
+    :members:
+
+.. autoclass:: scarf.plotting.PlotPanelTarget
+    :members:
+
+.. autoclass:: scarf.plotting.PlotOutputSettings
+    :members:
+
+.. autoclass:: scarf.plotting.PlotOutput
+    :members:
+
+.. autoclass:: scarf.plotting.PlotRecipeResult
     :members:
 ```
 

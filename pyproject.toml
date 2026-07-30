@@ -60,7 +60,6 @@ extra = [
     "kneed>=0.8",
     "matplotlib>=3.9",
     "seaborn>=0.13",
-    "datashader>=0.18",
     "ipython-autotime>=0.3",
     "ipywidgets>=8",
 ]
@@ -108,6 +107,7 @@ addopts = "-ra -v -n auto --dist loadfile"
 markers = [
     "integration: live network tests",
     "slow: tests that build graphs or run iterative numerical workflows",
+    "visual: deterministic image comparison tests",
 ]
 testpaths = [
     "tests",

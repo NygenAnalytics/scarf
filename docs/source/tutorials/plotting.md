@@ -117,7 +117,7 @@ poor fit for your number of clusters or for the venue.
 
 - few categories: side legend
 - many categories: labels drawn on the clusters
-- very many categories: no legend (label offline or subset the categories)
+- very many categories: a wrapped side legend
 
 `frame="minimal"` keeps a simple L-shaped edge without UMAP axis titles.
 `frame="none"` removes the box for a Scanpy-like silhouette. `theme="paper"`
@@ -168,8 +168,9 @@ ds.plots.dotplot(
 );
 ```
 
-A matrixplot is a plain heatmap of mean or fraction. Gene and group order are
-left as you pass them; nothing is reclustered.
+A matrixplot is a heatmap of mean or fraction. Gene and group order are left as
+you pass them by default. Use `feature_order` or `group_order` for explicit
+orders, or `cluster_features=True` and `cluster_groups=True` to cluster them.
 
 ```{code-cell} ipython3
 ds.plots.matrixplot(
@@ -222,7 +223,8 @@ by cluster. Groups are colored distinctly. `max_points` limits how many
 individual cells are overlaid as points (`0` turns points off). Use the same
 selection knobs as embeddings: `subset_by` for a boolean cell column and
 `groups` to keep and order categories from `group_by`. Several gene keys share
-a y-axis scale and wrap into a grid.
+a y-axis scale and wrap into a grid. Pass `sample_by` to plot biological-sample
+summaries, or `split_by` for condition-split violins.
 
 ```{code-cell} ipython3
 cluster_ids = sorted(set(ds.cells.fetch("clusters")), key=str)[:6]

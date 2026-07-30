@@ -16,13 +16,15 @@ from scarf.plotting._contracts import CategoricalScale
 
 def _memory_layout_store(
     attrs: dict[str, object],
+    *,
+    n_rows: int = 3,
 ) -> MappingDatastore:
     store = MappingDatastore.__new__(MappingDatastore)
     store.z = zarr.open_group(store=MemoryStore(), mode="w")
     store.workspace = None
     store._defaultAssay = "RNA"
     projections = store.z.create_group("RNA/projections")
-    layout = projections.create_array("layout", data=np.zeros((3, 2)))
+    layout = projections.create_array("layout", data=np.zeros((n_rows, 2)))
     layout.attrs.update(attrs)
     return store
 
@@ -133,4 +135,29 @@ def test_unified_embedding_preserves_explicit_category_labels() -> None:
     assert returned.labels == scale.labels
     assert returned.missing_color == scale.missing_color
     assert returned.missing_label == scale.missing_label
+    result.close()
+
+
+def test_unified_embedding_caps_and_reports_on_data_labels() -> None:
+    store = _memory_layout_store(
+        {
+            "n_cells": [1, 50],
+            "target_names": ["query"],
+        },
+        n_rows=51,
+    )
+    groups = [f"group{index}" for index in range(50)]
+
+    result = splt.unified_embedding(
+        store,
+        layout_key="layout",
+        show_target_only=True,
+        target_groups=groups,
+        legend_loc="on_data",
+        max_on_data_labels=10,
+        show=False,
+    )
+
+    assert len(result.provenance.extras["omitted_labels"]) == 40
+    assert len(next(iter(result.axes.values())).texts) == 10
     result.close()

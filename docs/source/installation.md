@@ -17,7 +17,7 @@ With pip:
 pip install "scarf[extra]"
 ```
 
-The `extra` optional dependency group adds plotting (`matplotlib`, `seaborn`, `datashader`),
+The `extra` optional dependency group adds plotting (`matplotlib`, `seaborn`),
 AnnData support, and Jupyter helpers used by the tutorials.
 
 ```{note}

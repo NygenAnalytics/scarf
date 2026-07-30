@@ -20,6 +20,21 @@ def test_palette_for_n_returns_requested_colors(size):
     assert len(palette_for_n(size)) == size
 
 
+@pytest.mark.parametrize("palette_name", ["default", "colorblind"])
+@pytest.mark.parametrize("size", [8, 30, 110])
+def test_palette_for_n_never_recycles_colors(size, palette_name):
+    colors = palette_for_n(size, palette_name=palette_name)
+    assert len(set(colors)) == size
+
+
+def test_side_legend_columns_stay_page_sized():
+    from scarf.plotting._style import LEGEND_SIDE_MAX_COLUMNS, legend_side_columns
+
+    assert legend_side_columns(1) == 1
+    assert legend_side_columns(40) == 2
+    assert legend_side_columns(5_000) == LEGEND_SIDE_MAX_COLUMNS
+
+
 def test_categorical_color_map_validates_custom_palette():
     with pytest.raises(KeyError, match="missing from palette"):
         categorical_color_map(["a", "b"], palette={"a": "red"})
@@ -50,7 +65,7 @@ def test_square_axis_limits_and_dark_theme():
 
     xlim, ylim = square_axis_limits((0.0, 2.0), (-1.0, 0.0))
     assert xlim[1] - xlim[0] == pytest.approx(ylim[1] - ylim[0])
-    assert scatter_edgecolor("dark") == "#f0f0f0"
+    assert scatter_edgecolor("dark") == "#8f8f8f"
     assert THEMES["notebook"]["figure.facecolor"] == "white"
     assert THEMES["paper"]["savefig.transparent"] is False
     assert THEMES["dark"]["text.color"] == "#e8e8e8"
@@ -81,7 +96,7 @@ def test_density_and_legend_helpers():
     assert default_point_edgewidth(20_000) == 0.0
     assert resolve_legend_loc(8) == "right"
     assert resolve_legend_loc(20) == "on_data"
-    assert resolve_legend_loc(80) == "none"
+    assert resolve_legend_loc(80) == "right"
     assert resolve_legend_loc(20, "right") == "right"
     assert capped_figsize(20.0, 4.0)[0] == pytest.approx(7.5)
     assert sort_categories([1, 10, 2, "B", "A10", "A2"]) == [

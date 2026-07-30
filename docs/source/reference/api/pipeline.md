@@ -8,6 +8,7 @@ import path is `scarf.datastore.pipeline_accessor`.
    :nosignatures:
 
    scarf.datastore.pipeline_accessor.PipelineAccessor
+   scarf.datastore.pipeline_accessor.PipelineEvent
    scarf.datastore.pipeline_accessor.PipelineAccessor.run
 ```
 
@@ -16,6 +17,9 @@ import path is `scarf.datastore.pipeline_accessor`.
 ```{eval-rst}
 .. autoclass:: scarf.datastore.pipeline_accessor.PipelineAccessor
     :members: run
+
+.. autoclass:: scarf.datastore.pipeline_accessor.PipelineEvent
+    :members:
 ```
 
 ## Step options

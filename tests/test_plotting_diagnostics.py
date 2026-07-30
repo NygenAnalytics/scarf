@@ -83,7 +83,7 @@ def test_diagnostics_show_default_and_suppression(
 
 def test_qc_result_contains_tables_metadata_and_artists():
     data = _qc_data()
-    result = splt.qc(data, max_points=5, show=False)
+    result = splt.qc(data, max_points=5, seed=13, show=False)
 
     assert isinstance(result, PlotResult)
     assert result.owns_figure is True
@@ -96,6 +96,7 @@ def test_qc_result_contains_tables_metadata_and_artists():
         "nCounts": 5,
         "nFeatures": 5,
     }
+    assert result.provenance.extras["seed"] == 13
     assert result.legends[0].kind == "categorical"
     assert all(ax.collections for ax in result.axes.values())
     result.close()

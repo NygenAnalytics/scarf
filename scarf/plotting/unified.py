@@ -98,6 +98,7 @@ def unified_embedding(
     figsize: tuple[float, float] | None = None,
     theme: str = "notebook",
     legend_loc: LegendLoc = "auto",
+    max_on_data_labels: int = 40,
     frame: FrameStyle = "minimal",
     seed: int | None = None,
     rasterize_threshold: int = DEFAULT_RASTERIZE_THRESHOLD,
@@ -116,6 +117,8 @@ def unified_embedding(
     target cell). ``legend_loc`` and ``frame`` follow the same rules as
     :func:`embedding`.
     """
+    if max_on_data_labels < 1:
+        raise ValueError("max_on_data_labels must be positive")
     plt, mpl = require_matplotlib()
     _ = plt
     x, y, ref_n_cells, target_n_cells, target_names = _load_unified_layout(
@@ -219,8 +222,10 @@ def unified_embedding(
             title=layout_key,
             frame=frame,
         )
+        omitted_labels: list[Any] = []
+        omitted_legend_entries: list[Any] = []
         if resolved_legend == "on_data":
-            _add_on_data_labels(
+            omitted_labels = _add_on_data_labels(
                 ax,
                 x,
                 y,
@@ -228,9 +233,10 @@ def unified_embedding(
                 order=order,
                 labels=display_labels,
                 theme=theme,
+                max_labels=max_on_data_labels,
             )
         elif resolved_legend == "right":
-            _add_categorical_legend(
+            omitted_legend_entries = _add_categorical_legend(
                 ax,
                 fig,
                 mpl,
@@ -243,6 +249,7 @@ def unified_embedding(
                 missing_label=resolved_missing_label,
                 edgecolor=edgecolor,
                 figure_level=owns,
+                values=groups,
             )
         apply_figure_chrome(fig, theme)
 
@@ -280,6 +287,10 @@ def unified_embedding(
                 "target_names": target_names,
                 "ref_n_cells": ref_n_cells,
                 "target_n_cells": target_n_cells,
+                "omitted_labels": [str(value) for value in omitted_labels],
+                "omitted_legend_entries": [
+                    str(value) for value in omitted_legend_entries
+                ],
             },
         ),
         owns_figure=owns,

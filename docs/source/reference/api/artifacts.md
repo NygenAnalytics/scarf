@@ -14,6 +14,7 @@ See {doc}`../../concepts/provenance` and {doc}`../../concepts/graph_and_state`.
 
    scarf.ArtifactRef
    scarf.ArtifactStatus
+   scarf.ArtifactLineage
    scarf.AssayState
    scarf.storage.ARTIFACT_KINDS
 ```
@@ -23,6 +24,9 @@ See {doc}`../../concepts/provenance` and {doc}`../../concepts/graph_and_state`.
     :members:
 
 .. autoclass:: scarf.ArtifactStatus
+    :members:
+
+.. autoclass:: scarf.ArtifactLineage
     :members:
 
 .. autoclass:: scarf.AssayState

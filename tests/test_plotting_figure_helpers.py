@@ -8,9 +8,31 @@ import pytest
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+from matplotlib.legend import Legend
+from matplotlib.lines import Line2D
 
 import scarf.plotting as splt
-from scarf.plotting._figure import PlotResult, normalize_axes_target
+from scarf.plotting._figure import (
+    PlotResult,
+    _remove_child_legend_artists,
+    compose_results,
+    normalize_axes_target,
+)
+
+
+def _categorical_child(figure, axis, name: str, values: tuple[str, ...]) -> PlotResult:
+    palette = {
+        value: plt.get_cmap("tab20")(index % 20) for index, value in enumerate(values)
+    }
+    return PlotResult(
+        figure=figure,
+        axes={name: axis},
+        tables={},
+        legends=(splt.LegendSpec(kind="categorical", label=name),),
+        scales=(splt.CategoricalScale(order=values, palette=palette),),
+        provenance=splt.PlotProvenance(scarf_version="test"),
+        owns_figure=False,
+    )
 
 
 def _plot_result(*, owns_figure: bool = True) -> PlotResult:
@@ -109,6 +131,30 @@ def test_plot_result_show_closes_owned_figure_and_retains_metadata(monkeypatch):
     caller_owned.close()
     assert plt.fignum_exists(caller_owned.figure.number)
     plt.close(caller_owned.figure)
+
+
+def test_plot_result_can_save_after_show(monkeypatch, tmp_path):
+    result = _plot_result()
+    monkeypatch.setattr("IPython.get_ipython", lambda: object())
+    monkeypatch.setattr("IPython.display.display", lambda _: None)
+
+    result.show()
+    output = result.save(tmp_path / "after-show.png", dpi=80)
+
+    assert output.exists()
+    assert output.stat().st_size > 0
+
+
+def test_dark_plot_exports_with_readable_opaque_background(tmp_path):
+    result = _plot_result()
+    result.theme = "dark"
+
+    output = result.save(tmp_path / "dark.png", dpi=60)
+    pixels = plt.imread(output)
+
+    assert float(pixels[0, 0, :3].mean()) < 0.2
+    assert result.figure.patch.get_facecolor()[:3] == pytest.approx((1, 1, 1))
+    result.close()
 
 
 def test_plot_result_repr_is_compact_and_never_renders(monkeypatch):
@@ -212,6 +258,71 @@ def test_normalize_axes_target_rejects_invalid_ownership():
         )
     plt.close(fig_a)
     plt.close(fig_b)
+
+
+def test_shared_legends_stay_separated_beyond_three_scales():
+    figure, axes = plt.subplots(2, 2, figsize=(6, 5), layout="constrained")
+    flat = axes.ravel()
+    children = [
+        _categorical_child(figure, flat[index], f"scale{index}", ("a", "b", "c"))
+        for index in range(4)
+    ]
+
+    result = compose_results(figure, children, panel_labels=False)
+
+    assert len(figure.legends) == 3
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    boxes = [legend.get_window_extent(renderer) for legend in figure.legends]
+    assert not any(
+        boxes[first].overlaps(boxes[second])
+        for first in range(len(boxes))
+        for second in range(first + 1, len(boxes))
+    )
+    merged = [text.get_text() for text in figure.legends[-1].get_texts()]
+    assert merged[:2] == ["scale2: a", "scale2: b"]
+    assert "scale3: c" in merged
+    result.close()
+    plt.close(figure)
+
+
+def test_tall_shared_legends_merge_instead_of_overlapping():
+    figure, axes = plt.subplots(2, 2, figsize=(6, 5), layout="constrained")
+    values = tuple(f"value{index}" for index in range(18))
+    children = [
+        _categorical_child(figure, axis, f"scale{index}", values)
+        for index, axis in enumerate(axes.ravel()[:3])
+    ]
+
+    result = compose_results(figure, children, panel_labels=False)
+
+    assert len(figure.legends) == 1
+    assert not any(isinstance(artist, Legend) for artist in figure.artists)
+    labels = [text.get_text() for text in figure.legends[0].get_texts()]
+    assert labels[0] == "scale0: value0"
+    assert labels[-1] == "scale2: value17"
+    result.close()
+    plt.close(figure)
+
+
+def test_child_legend_removal_clears_all_axis_and_figure_legends():
+    figure, ax = plt.subplots()
+    first = ax.legend(
+        handles=[Line2D([], [], label="first")],
+        loc="upper left",
+    )
+    ax.add_artist(first)
+    ax.legend(
+        handles=[Line2D([], [], label="second")],
+        loc="lower left",
+    )
+    figure.legend(handles=[Line2D([], [], label="figure")])
+
+    _remove_child_legend_artists(figure, [ax])
+
+    assert not any(isinstance(artist, Legend) for artist in ax.get_children())
+    assert figure.legends == []
+    plt.close(figure)
 
 
 def test_panel_labels_and_legend_collection(umap, leiden_clustering, datastore):

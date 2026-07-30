@@ -14,7 +14,8 @@ NormTransform = Literal["none", "log1p"]
 Standardize = Literal["none", "feature"]
 LegendLoc = Literal["auto", "right", "on_data", "none"]
 FrameStyle = Literal["axes", "minimal", "none"]
-DistKind = Literal["violin", "box", "hist", "ecdf"]
+DistKind = Literal["violin", "stacked_violin", "box", "hist", "ecdf"]
+ContourKind = Literal["line", "filled"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +174,11 @@ class CategoricalScale:
     labels: dict[Any, str] | None = None
     missing_color: str = "#bdbdbd"
     missing_label: str = "NA"
+    palette_name: Literal["default", "colorblind"] = "default"
+
+    def __post_init__(self) -> None:
+        if self.palette_name not in ("default", "colorblind"):
+            raise ValueError("palette_name must be 'default' or 'colorblind'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +201,98 @@ class SizeScale:
             return np.full(v.shape, self.size_min, dtype=np.float64)
         t = np.clip((v - self.vmin) / span, 0.0, 1.0)
         return self.size_min + t * (self.size_max - self.size_min)
+
+
+@dataclass(frozen=True, slots=True)
+class DensityOverlay:
+    """Contours drawn over an embedding.
+
+    ``group_by`` and ``groups`` optionally restrict the cells used to estimate
+    the surface without changing the cells displayed underneath.
+    ``statistic="mean"`` contours a smoothed local mean of the continuous
+    panel values and attenuates pixels with less than ``min_support`` effective
+    support. ``max_hotspots`` can retain only the strongest connected regions
+    at the lowest contour level.
+    """
+
+    kind: ContourKind = "line"
+    statistic: Literal["density", "mean"] = "density"
+    pixels: int = 160
+    sigma: float = 2.0
+    min_support: float = 0.25
+    levels: int | tuple[float, ...] = 5
+    max_hotspots: int | None = None
+    group_by: str | None = None
+    groups: tuple[Any, ...] | None = None
+    color: str | None = None
+    cmap: str | None = None
+    alpha: float = 0.75
+    linewidth: float = 0.8
+    halo_color: str | None = None
+    halo_width: float = 0.0
+    zorder: float = 4.0
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("line", "filled"):
+            raise ValueError("kind must be 'line' or 'filled'")
+        if self.statistic not in ("density", "mean"):
+            raise ValueError("statistic must be 'density' or 'mean'")
+        if self.pixels < 16:
+            raise ValueError("pixels must be at least 16")
+        if self.sigma < 0:
+            raise ValueError("sigma must be non-negative")
+        if self.min_support <= 0:
+            raise ValueError("min_support must be positive")
+        if isinstance(self.levels, int):
+            if self.levels < 1:
+                raise ValueError("levels must be positive")
+        elif not self.levels or any(not np.isfinite(value) for value in self.levels):
+            raise ValueError("levels must contain finite values")
+        if self.max_hotspots is not None and (
+            isinstance(self.max_hotspots, bool)
+            or not isinstance(self.max_hotspots, int)
+            or self.max_hotspots < 1
+        ):
+            raise ValueError("max_hotspots must be a positive integer")
+        if self.groups is not None and self.group_by is None:
+            raise ValueError("groups requires group_by")
+        if not 0 <= self.alpha <= 1:
+            raise ValueError("alpha must be between 0 and 1")
+        if self.linewidth < 0:
+            raise ValueError("linewidth must be non-negative")
+        if self.halo_width < 0:
+            raise ValueError("halo_width must be non-negative")
+
+
+@dataclass(frozen=True, slots=True)
+class Highlight:
+    """Emphasize a metadata selection while retaining surrounding context."""
+
+    by: str | None = None
+    groups: tuple[Any, ...] | None = None
+    indices: tuple[int, ...] | None = None
+    color: str = "#d62728"
+    dim_alpha: float = 0.12
+    alpha: float = 1.0
+    size_multiplier: float = 1.5
+    halo_color: str | None = None
+    halo_width: float = 0.8
+
+    def __post_init__(self) -> None:
+        if (self.by is None) == (self.indices is None):
+            raise ValueError("Set exactly one of by or indices")
+        if self.by == "":
+            raise ValueError("by must be non-empty")
+        if self.indices is not None and any(index < 0 for index in self.indices):
+            raise ValueError("indices must be non-negative")
+        if self.groups is not None and self.by is None:
+            raise ValueError("groups requires by")
+        if not 0 <= self.dim_alpha <= 1 or not 0 <= self.alpha <= 1:
+            raise ValueError("highlight alpha values must be between 0 and 1")
+        if self.size_multiplier <= 0:
+            raise ValueError("size_multiplier must be positive")
+        if self.halo_width < 0:
+            raise ValueError("halo_width must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)

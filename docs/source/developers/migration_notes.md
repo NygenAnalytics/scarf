@@ -23,6 +23,79 @@ splt.embedding(ds, layout_key="RNA_UMAP", color_by="clusters")
 Plot functions render by default with `show=True`. Pass `show=False` when the returned
 `PlotResult` must remain available for figure access or saving.
 
+Embedding marker area now uses both the selected cell count and physical panel
+area. Automatic categorical legends no longer disappear above 40 categories;
+large legends wrap into columns. Continuous colorbars now carry the plotted
+feature or metadata label. Exact numeric marker sizes, legend placement, edge
+widths, and figure sizes remain available through explicit arguments.
+
+Publication plotting additions are source compatible with existing calls:
+
+- `DensityOverlay` and `Highlight` add contours and focused selections to
+  `embedding`.
+- `cluster_connectivity` summarizes the cell graph between groups at embedding
+  centroids.
+- Grouped `dotplot` calls render feature-set brackets, while
+  `distribution(kind="stacked_violin")` provides aligned multi-feature rows.
+- `compose_results` merges plots drawn into a Matplotlib mosaic and can render
+  shared legends.
+- `PlotRecipe`, `PlotStep`, and `run_recipe` support typed batch plotting plus
+  strict JSON or TOML configuration. Serialized plot keyword names use lower
+  camel case, such as `layoutKey` and `colorBy`.
+
+Automatic dotplot marker areas now fit the physical grid cells of each panel.
+Pass an explicit `SizeScale` to retain exact marker areas. Stacked violins use
+independent value axes by default; pass `share_y=True` when direct magnitudes
+must be compared on one scale. Embedding panel titles can be suppressed with
+`show_titles=False` when a labeled colorbar or shared legend already identifies
+the values.
+
+`DensityOverlay(statistic="mean")` draws contours from a smoothed local mean for
+continuous embedding panels. Regions below `min_support` effective support are
+attenuated before contouring. Set `max_hotspots=1` to retain only the strongest
+connected hotspot. `cluster_connectivity` accepts `cell_size`, `cell_alpha`, and
+`cell_color` for its reference-cell background.
+
+Distribution plots accept `sample_by` to aggregate biological samples before
+drawing boxes or violins, and `split_by` to compare conditions within each
+group. Composition summaries can display SD, SE, or 95% confidence intervals.
+Matrix, marker, and pseudotime heatmaps now expose explicit ordering, clustering,
+annotation scales, and caller-owned targets.
+
+Mapping diagnostics are available as `mapping_score`, `mapping_evidence`,
+`mapping_confusion`, `mapping_calibration`, `mapping_correction`, and
+`mapping_projection`. Mapping score is reference-side landing density.
+`mapping_calibration` plots held-out accuracy against retained coverage over an
+evidence threshold. It does not treat vote fraction as a calibrated
+probability, and it fails with a clear error when `known_labels` only match the
+transferred labels after string conversion. `mapping_projection` keeps the
+reference layout fixed.
+
+Legends and axis labels avoid repeating information. A continuous embedding
+panel drops its title when the colorbar already carries the same label. Side
+legends cap at four columns; when a categorical column has more entries than
+fit, the most populated categories are retained in their declared order. The
+legend title reports how many are shown and the omitted values are recorded in
+`PlotResult.provenance.extras["omitted_legend_entries"]`. `compose_results`
+merges legend blocks with scale-prefixed labels when separate right-side blocks
+would overlap. Violin and box panels label the value axis `value` unless the
+values were standardized or aggregated per sample. `matrixplot` rows follow the
+requested feature order, including the order implied by feature-set mappings.
+
+Requesting more colors than a palette provides no longer recycles them.
+`palette_name="colorblind"` warns and switches to evenly spaced hues beyond
+twelve categories.
+
+Dark-theme scatter outlines now use a mid-gray rather than a near-white edge.
+Multi-layout embeddings report one scale per unique color encoding and one
+legend specification per color variable instead of duplicating that metadata
+for every layout.
+
+The dark theme exports to an opaque charcoal background unless
+`transparent=True` is passed to `PlotResult.save`. Stacked composition bars now
+have visible segment boundaries by default. Pass `segmentLinewidth=0` in a
+serialized recipe, or `segment_linewidth=0` in Python, to remove them.
+
 `mark_hvgs(..., show_plot=True, **plot_kwargs)` now forwards keyword arguments to
 `splt.highly_variable_features`. Rename older mean-variance plot kwargs as follows:
 `ax_label_fs` to `label_size`, `fig_size` to `figsize`, `ss` to `point_sizes`, and

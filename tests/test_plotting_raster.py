@@ -230,6 +230,25 @@ def test_raster_without_color_encodes_log_density():
     assert canvas.vmax == pytest.approx(np.log1p(4))
 
 
+def test_density_canvas_from_points_uses_raster_contract():
+    from scarf.plotting._raster import density_canvas_from_points
+
+    canvas = density_canvas_from_points(
+        np.array([0.1, 0.1, 0.8]),
+        np.array([0.1, 0.1, 0.8]),
+        extent=(0, 1, 0, 1),
+        pixels=10,
+    )
+
+    assert canvas.counts.sum() == 3
+    assert canvas.counts.max() == 2
+    assert canvas.n_cells == 3
+    assert canvas.extent == (0, 1, 0, 1)
+    low_y_row = int(np.flatnonzero(canvas.counts[:, 1])[0])
+    high_y_row = int(np.flatnonzero(canvas.counts[:, 8])[0])
+    assert high_y_row < low_y_row
+
+
 def test_raster_is_block_size_invariant():
     from scarf.plotting._raster import raster_from_metadata
 

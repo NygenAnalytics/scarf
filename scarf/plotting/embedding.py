@@ -1,17 +1,18 @@
 """Embedding scatter plots."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import Any, Hashable
 
 import numpy as np
 import pandas as pd
 
-from ..metadata.artifacts import validate_display_metadata
 from ._contracts import (
     CategoricalScale,
     CellField,
     ColorScale,
+    DensityOverlay,
     FeatureRef,
+    Highlight,
     NormalizationSpec,
     PlotProvenance,
 )
@@ -21,11 +22,13 @@ from ._data import (
     resolve_feature,
 )
 from ._deps import require_matplotlib
+from ._display import stored_display_metadata
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
 from ._style import (
     DEFAULT_PANEL_INCHES,
     DEFAULT_POINT_EDGEWIDTH,
     DEFAULT_RASTERIZE_THRESHOLD,
+    LEGEND_SIDE_MAX_ENTRIES,
     FrameStyle,
     LegendLoc,
     apply_figure_chrome,
@@ -34,6 +37,7 @@ from ._style import (
     default_point_edgewidth,
     default_point_size,
     finish_embedding_axes,
+    legend_side_columns,
     resolve_legend_loc,
     scatter_edgecolor,
     sort_categories,
@@ -252,9 +256,15 @@ def _embedding_multiple_layouts(
     scales: list[Any] = []
     for layout, child in children:
         tables.update({f"{layout}:{key}": value for key, value in child.tables.items()})
-        legends.extend(child.legends)
-        if not scales:
-            scales.extend(child.scales)
+        for legend in child.legends:
+            if legend not in legends:
+                legends.append(legend)
+        for scale in child.scales:
+            if not any(
+                type(existing) is type(scale) and existing == scale
+                for existing in scales
+            ):
+                scales.append(scale)
 
     provenances = {layout: child.provenance for layout, child in children}
     first_provenance = children[0][1].provenance
@@ -424,6 +434,373 @@ def _scatter_edges(edgecolor: str, edgewidth: float) -> tuple[str | float, float
     return edgecolor, float(edgewidth)
 
 
+def _panel_area_inches(ax: Any) -> float:
+    bounds = ax.get_position()
+    width = max(float(bounds.width * ax.figure.get_figwidth()), 0.1)
+    height = max(float(bounds.height * ax.figure.get_figheight()), 0.1)
+    return width * height
+
+
+def _resolve_highlight_mask(
+    store: Any,
+    highlight: Highlight | None,
+    *,
+    cell_key: str,
+    n_cells: int,
+) -> np.ndarray | None:
+    if highlight is None:
+        return None
+    if highlight.indices is not None:
+        indices = np.asarray(highlight.indices, dtype=np.int64)
+        if len(indices) and int(indices.max()) >= n_cells:
+            raise IndexError("highlight index is outside the selected cell range")
+        mask = np.zeros(n_cells, dtype=bool)
+        mask[indices] = True
+        return mask
+    assert highlight.by is not None
+    values = np.asarray(store.cells.fetch(highlight.by, key=cell_key))
+    if len(values) != n_cells:
+        raise ValueError("highlight metadata length does not match selected cells")
+    if highlight.groups is None:
+        if values.dtype != bool:
+            raise TypeError(
+                "Highlight without groups requires a boolean metadata column"
+            )
+        return values.astype(bool, copy=False)
+    return np.isin(values, np.asarray(highlight.groups, dtype=object))
+
+
+def _density_selection_mask(
+    store: Any,
+    overlay: DensityOverlay | None,
+    *,
+    cell_key: str,
+    n_cells: int,
+) -> np.ndarray | None:
+    if overlay is None or overlay.group_by is None:
+        return None
+    values = np.asarray(store.cells.fetch(overlay.group_by, key=cell_key))
+    if len(values) != n_cells:
+        raise ValueError("density metadata length does not match selected cells")
+    if overlay.groups is None:
+        return np.asarray(pd.notna(values), dtype=bool)
+    return np.isin(values, np.asarray(overlay.groups, dtype=object))
+
+
+def _weighted_quantiles(
+    values: np.ndarray,
+    weights: np.ndarray,
+    quantiles: np.ndarray,
+) -> np.ndarray:
+    order = np.argsort(values)
+    sorted_values = values[order]
+    sorted_weights = weights[order]
+    cumulative = np.cumsum(sorted_weights)
+    if cumulative[-1] <= 0:
+        return np.asarray(
+            np.quantile(sorted_values, quantiles),
+            dtype=np.float64,
+        )
+    return np.asarray(
+        np.interp(quantiles * cumulative[-1], cumulative, sorted_values),
+        dtype=np.float64,
+    )
+
+
+def _smoothed_local_mean(
+    xx: np.ndarray,
+    yy: np.ndarray,
+    values: np.ndarray,
+    *,
+    grid_pixels: int,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    sigma: float,
+    min_support: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    from scipy.ndimage import gaussian_filter
+
+    numeric_values = np.asarray(values, dtype=np.float64)
+    if len(numeric_values) != len(xx):
+        raise ValueError("contour values must match the selected coordinates")
+    finite = np.isfinite(xx) & np.isfinite(yy) & np.isfinite(numeric_values)
+    sums_xy, _, _ = np.histogram2d(
+        xx[finite],
+        yy[finite],
+        bins=grid_pixels,
+        range=(x_range, y_range),
+        weights=numeric_values[finite],
+    )
+    counts_xy, _, _ = np.histogram2d(
+        xx[finite],
+        yy[finite],
+        bins=grid_pixels,
+        range=(x_range, y_range),
+    )
+    support = gaussian_filter(
+        counts_xy.T,
+        sigma=sigma,
+        mode="constant",
+    )
+    smoothed_sum = gaussian_filter(
+        sums_xy.T,
+        sigma=sigma,
+        mode="constant",
+    )
+    local_mean = np.zeros_like(smoothed_sum)
+    np.divide(
+        smoothed_sum,
+        support,
+        out=local_mean,
+        where=(support > 0) & np.isfinite(smoothed_sum),
+    )
+    support_taper = np.clip(support / min_support, 0.0, 1.0)
+    return local_mean * support_taper**2, support
+
+
+def _retain_strongest_hotspots(
+    surface: np.ndarray,
+    support: np.ndarray,
+    *,
+    level: float,
+    max_hotspots: int | None,
+) -> np.ndarray:
+    if max_hotspots is None:
+        return surface
+    from scipy.ndimage import binary_fill_holes
+    from scipy.ndimage import label as label_components
+
+    above_level = np.isfinite(surface) & (surface >= level)
+    component_ids, n_components = label_components(
+        above_level,
+        structure=np.ones((3, 3), dtype=np.uint8),
+    )
+    if n_components <= max_hotspots:
+        retained = set(range(1, n_components + 1))
+    else:
+        component_scores: list[tuple[float, int]] = []
+        for component_id in range(1, n_components + 1):
+            component_mask = component_ids == component_id
+            excess = np.maximum(surface[component_mask] - level, 0)
+            score = float(
+                np.sum(support[component_mask] * (excess + np.finfo(np.float64).eps))
+            )
+            component_scores.append((score, component_id))
+        component_scores.sort(reverse=True)
+        retained = {component_id for _, component_id in component_scores[:max_hotspots]}
+    remove = above_level & ~np.isin(component_ids, list(retained))
+    filtered = surface.copy()
+    filtered[remove] = np.nextafter(level, -np.inf)
+    filled_retained = np.zeros_like(above_level)
+    for component_id in retained:
+        filled_retained |= binary_fill_holes(component_ids == component_id)
+    holes = filled_retained & ~above_level
+    filtered[holes] = np.nextafter(level, np.inf)
+    return filtered
+
+
+def _draw_density_overlay(
+    ax: Any,
+    xx: np.ndarray,
+    yy: np.ndarray,
+    *,
+    overlay: DensityOverlay,
+    values: np.ndarray | None,
+    xlim: tuple[float, float],
+    ylim: tuple[float, float],
+    theme: str,
+) -> None:
+    if len(xx) < 3:
+        return
+    from scipy.ndimage import gaussian_filter
+
+    padding_pixels = max(2, int(np.ceil(4 * overlay.sigma)))
+    grid_pixels = overlay.pixels + 2 * padding_pixels
+    x_step = (xlim[1] - xlim[0]) / overlay.pixels
+    y_step = (ylim[1] - ylim[0]) / overlay.pixels
+    padded_xlim = (
+        xlim[0] - padding_pixels * x_step,
+        xlim[1] + padding_pixels * x_step,
+    )
+    padded_ylim = (
+        ylim[0] - padding_pixels * y_step,
+        ylim[1] + padding_pixels * y_step,
+    )
+    if overlay.statistic == "mean":
+        if values is None:
+            raise ValueError(
+                "DensityOverlay(statistic='mean') requires a continuous color panel"
+            )
+        surface, support = _smoothed_local_mean(
+            xx,
+            yy,
+            values,
+            grid_pixels=grid_pixels,
+            x_range=padded_xlim,
+            y_range=padded_ylim,
+            sigma=overlay.sigma,
+            min_support=overlay.min_support,
+        )
+        supported = support >= overlay.min_support
+        supported_values = surface[supported & np.isfinite(surface)]
+        if len(supported_values):
+            if np.all(supported_values >= 0):
+                positive_values = supported_values[
+                    supported_values
+                    > max(float(np.nanmax(supported_values)) * 1e-6, 1e-12)
+                ]
+                level_values = (
+                    positive_values if len(positive_values) else supported_values
+                )
+            else:
+                level_values = supported_values
+        else:
+            level_values = supported_values
+    else:
+        from ._raster import density_canvas_from_points
+
+        canvas = density_canvas_from_points(
+            xx,
+            yy,
+            extent=(padded_xlim[0], padded_xlim[1], padded_ylim[0], padded_ylim[1]),
+            pixels=grid_pixels,
+        )
+        support = gaussian_filter(
+            np.flipud(canvas.counts).astype(np.float64),
+            sigma=overlay.sigma,
+            mode="constant",
+        )
+        surface = support
+        level_values = surface[np.isfinite(surface)]
+    finite_surface = level_values
+    if overlay.statistic == "density":
+        finite_surface = finite_surface[finite_surface > 0]
+    if len(finite_surface) == 0:
+        return
+    level_weights: np.ndarray | None = None
+    if overlay.statistic == "mean":
+        level_mask = (support >= overlay.min_support) & np.isfinite(surface)
+        if np.all(finite_surface >= 0):
+            level_mask &= surface > max(
+                float(np.nanmax(finite_surface)) * 1e-6,
+                1e-12,
+            )
+        level_weights = support[level_mask]
+    if isinstance(overlay.levels, int):
+        quantiles = np.linspace(0.55, 0.97, overlay.levels)
+        levels = np.unique(
+            _weighted_quantiles(finite_surface, level_weights, quantiles)
+            if level_weights is not None
+            else np.quantile(finite_surface, quantiles)
+        )
+    else:
+        requested = np.asarray(overlay.levels, dtype=np.float64)
+        if np.all((0 < requested) & (requested < 1)):
+            levels = np.unique(
+                _weighted_quantiles(finite_surface, level_weights, requested)
+                if level_weights is not None
+                else np.quantile(finite_surface, requested)
+            )
+        else:
+            levels = np.unique(requested)
+    surface_min = float(np.nanmin(surface))
+    surface_max = float(np.nanmax(surface))
+    levels = levels[(levels > surface_min) & (levels < surface_max)]
+    if len(levels) == 0:
+        return
+    surface = _retain_strongest_hotspots(
+        surface,
+        support,
+        level=float(levels[0]),
+        max_hotspots=overlay.max_hotspots,
+    )
+    surface_max = float(np.nanmax(surface))
+    xcentres = np.linspace(
+        padded_xlim[0],
+        padded_xlim[1],
+        grid_pixels,
+        endpoint=False,
+    )
+    ycentres = np.linspace(
+        padded_ylim[0],
+        padded_ylim[1],
+        grid_pixels,
+        endpoint=False,
+    )
+    xcentres += (padded_xlim[1] - padded_xlim[0]) / (2 * grid_pixels)
+    ycentres += (padded_ylim[1] - padded_ylim[0]) / (2 * grid_pixels)
+    color = overlay.color or ("#f0f0f0" if theme == "dark" else "#202020")
+    contour_surface = np.ma.masked_invalid(surface)
+    if overlay.kind == "filled":
+        upper = np.nextafter(surface_max, np.inf)
+        fill_levels = np.unique(np.append(levels, upper))
+        if len(fill_levels) >= 2:
+            ax.contourf(
+                xcentres,
+                ycentres,
+                contour_surface,
+                levels=fill_levels,
+                cmap=overlay.cmap,
+                colors=None if overlay.cmap else [color],
+                alpha=overlay.alpha,
+                antialiased=True,
+                zorder=overlay.zorder,
+            )
+    else:
+        contours = ax.contour(
+            xcentres,
+            ycentres,
+            contour_surface,
+            levels=levels,
+            cmap=overlay.cmap,
+            colors=None if overlay.cmap else color,
+            alpha=overlay.alpha,
+            linewidths=overlay.linewidth,
+            zorder=overlay.zorder,
+        )
+        if overlay.halo_width > 0:
+            from matplotlib import patheffects
+
+            halo_color = overlay.halo_color or (
+                "#202020" if theme == "dark" else "#ffffff"
+            )
+            contours.set_path_effects(
+                [
+                    patheffects.withStroke(
+                        linewidth=overlay.linewidth + 2 * overlay.halo_width,
+                        foreground=halo_color,
+                    ),
+                    patheffects.Normal(),
+                ]
+            )
+
+
+def _draw_highlight(
+    ax: Any,
+    xx: np.ndarray,
+    yy: np.ndarray,
+    sizes: np.ndarray,
+    *,
+    highlight: Highlight,
+    edgecolor: str,
+    rasterized: bool,
+) -> Any:
+    if len(xx) == 0:
+        return
+    halo = highlight.halo_color or edgecolor
+    return ax.scatter(
+        xx,
+        yy,
+        s=sizes * highlight.size_multiplier,
+        c=highlight.color,
+        alpha=highlight.alpha,
+        edgecolors=halo,
+        linewidths=highlight.halo_width,
+        rasterized=rasterized,
+        zorder=5,
+    )
+
+
 def _draw_categorical(
     ax: Any,
     xx: np.ndarray,
@@ -436,20 +813,22 @@ def _draw_categorical(
     missing_color: str,
     edgecolor: str,
     edgewidth: float = DEFAULT_POINT_EDGEWIDTH,
+    alpha: float = 1.0,
     rasterized: bool,
-) -> None:
+) -> Any:
     colors = [
         missing_color if pd.isna(val) or val not in palette else palette[val]
         for val in vv
     ]
     edges, lw = _scatter_edges(edgecolor, edgewidth)
-    ax.scatter(
+    return ax.scatter(
         xx,
         yy,
         c=colors,
         s=ss,
         linewidths=lw,
         edgecolors=edges,
+        alpha=alpha,
         rasterized=rasterized,
     )
 
@@ -468,7 +847,21 @@ def _add_categorical_legend(
     missing_label: str,
     edgecolor: str,
     figure_level: bool,
-) -> None:
+    values: np.ndarray | None = None,
+    max_entries: int = LEGEND_SIDE_MAX_ENTRIES,
+) -> list[Any]:
+    if values is not None and len(order) > max_entries:
+        counts = pd.Series(np.asarray(values, dtype=object)).value_counts(dropna=True)
+        ranked = sorted(
+            enumerate(order),
+            key=lambda item: (-int(counts.get(item[1], 0)), item[0]),
+        )
+        selected = {index for index, _ in ranked[:max_entries]}
+        shown = [value for index, value in enumerate(order) if index in selected]
+        omitted = [value for index, value in enumerate(order) if index not in selected]
+    else:
+        shown = list(order[:max_entries])
+        omitted = list(order[max_entries:])
     handles = [
         mpl.lines.Line2D(
             [],
@@ -481,7 +874,7 @@ def _add_categorical_legend(
             markersize=5,
             label=(labels.get(value, str(value)) if labels is not None else str(value)),
         )
-        for value in order
+        for value in shown
     ]
     if missing:
         handles.append(
@@ -497,11 +890,16 @@ def _add_categorical_legend(
                 label=missing_label,
             )
         )
+    title = label or None
+    if omitted:
+        title = f"{label} ({len(shown)} of {len(order)})"
     legend_kwargs = {
         "handles": handles,
-        "title": label or None,
+        "title": title,
         "frameon": False,
         "borderaxespad": 0,
+        "ncols": legend_side_columns(len(handles)),
+        "columnspacing": 0.8,
     }
     if figure_level:
         # Outside legends participate in constrained layout and stay inside
@@ -523,6 +921,7 @@ def _add_categorical_legend(
             loc="upper left",
             bbox_to_anchor=(1.02, 1.0),
         )
+    return omitted
 
 
 def _add_on_data_labels(
@@ -534,18 +933,43 @@ def _add_on_data_labels(
     order: list[Any],
     labels: dict[Any, str] | None,
     theme: str,
-) -> None:
+    max_labels: int,
+) -> list[Any]:
     from matplotlib import patheffects
 
     text_color = "#f5f5f5" if theme == "dark" else "#222222"
     stroke = "#222222" if theme == "dark" else "#ffffff"
+    candidates: list[tuple[Any, float, float, int]] = []
     for value in order:
         mask = np.asarray([not pd.isna(v) and v == value for v in vv], dtype=bool)
         if not mask.any():
             continue
+        candidates.append(
+            (
+                value,
+                float(np.median(xx[mask])),
+                float(np.median(yy[mask])),
+                int(mask.sum()),
+            )
+        )
+    candidates.sort(key=lambda item: (-item[3], str(item[0])))
+    omitted = [value for value, _, _, _ in candidates[max_labels:]]
+    chosen = candidates[:max_labels]
+    if chosen:
+        yrange = max(float(np.ptp(yy)), 1e-12)
+        minimum_gap = 0.035 * yrange
+        ordered = sorted(chosen, key=lambda item: item[2])
+        adjusted: list[tuple[Any, float, float, int]] = []
+        previous_y = -np.inf
+        for value, xpos, ypos, count in ordered:
+            adjusted_y = max(ypos, previous_y + minimum_gap)
+            adjusted.append((value, xpos, adjusted_y, count))
+            previous_y = adjusted_y
+        chosen = adjusted
+    for value, xpos, ypos, _ in chosen:
         ax.text(
-            float(np.median(xx[mask])),
-            float(np.median(yy[mask])),
+            xpos,
+            ypos,
             (labels.get(value, str(value)) if labels is not None else str(value)),
             ha="center",
             va="center",
@@ -554,6 +978,7 @@ def _add_on_data_labels(
             path_effects=[patheffects.withStroke(linewidth=2.0, foreground=stroke)],
             zorder=5,
         )
+    return omitted
 
 
 def _draw_continuous(
@@ -572,6 +997,7 @@ def _draw_continuous(
     default_color: str,
     edgecolor: str,
     edgewidth: float = DEFAULT_POINT_EDGEWIDTH,
+    alpha: float,
     label: str,
     is_uniform: bool,
     sort_values: bool,
@@ -580,7 +1006,7 @@ def _draw_continuous(
     rasterized: bool,
     plt: Any,
     mpl: Any,
-) -> None:
+) -> Any:
     finite = np.isfinite(vnum)
     order_idx = np.arange(len(vnum))
     if sort_values and finite.any():
@@ -595,16 +1021,16 @@ def _draw_continuous(
     edges, lw = _scatter_edges(edgecolor, edgewidth)
 
     if is_uniform or len(xx) == 0:
-        ax.scatter(
+        return ax.scatter(
             xx,
             yy,
             c=[default_color] * len(xx),
             s=ss if len(ss) else 10,
             linewidths=lw,
             edgecolors=edges,
+            alpha=alpha,
             rasterized=rasterized,
         )
-        return
 
     vmin, vmax = limits
     if vmax == vmin:
@@ -631,13 +1057,14 @@ def _draw_continuous(
     face[:] = mpl.colors.to_rgba(missing_color)
     if finite.any():
         face[finite] = cmap(norm(vnum[finite]))
-    ax.scatter(
+    collection = ax.scatter(
         xx,
         yy,
         c=face,
         s=ss,
         linewidths=lw,
         edgecolors=edges,
+        alpha=alpha,
         rasterized=rasterized,
     )
     if add_colorbar:
@@ -654,9 +1081,8 @@ def _draw_continuous(
             fraction=0.06,
             pad=0.02,
         )
-        # Axis title carries the feature name; keep colorbar ticks uncluttered.
-        _ = label
-        cb.set_label("")
+        cb.set_label(label)
+    return collection
 
 
 def _soft_clip(values: np.ndarray, clip_fraction: float) -> np.ndarray:
@@ -691,6 +1117,10 @@ def embedding(
     normalization: NormalizationSpec | None = None,
     point_size: float | None = None,
     point_sizes: np.ndarray | Sequence[float] | None = None,
+    point_size_range: tuple[float, float] = (1.0, 28.0),
+    point_edgecolor: str | None = None,
+    point_edgewidth: float | None = None,
+    point_alpha: float = 1.0,
     sort_values: bool = False,
     color_scale: ColorScale | None = None,
     categorical_scale: CategoricalScale | None = None,
@@ -704,7 +1134,12 @@ def embedding(
     figsize: tuple[float, float] | None = None,
     theme: str = "notebook",
     legend_loc: LegendLoc = "auto",
+    max_on_data_labels: int = 40,
+    show_legend: bool = True,
+    show_titles: bool = True,
     frame: FrameStyle = "minimal",
+    density_overlay: DensityOverlay | None = None,
+    highlight: Highlight | None = None,
     seed: int | None = None,
     rasterize_threshold: int = DEFAULT_RASTERIZE_THRESHOLD,
     show: bool = True,
@@ -725,8 +1160,8 @@ def embedding(
       otherwise to the first categorical ``color_by`` column. Also sets legend
       order when ``categorical_scale.order`` is omitted.
     - ``legend_loc``: ``"auto"`` puts a side legend when there are few
-      categories, labels on the clusters when there are many, and hides the
-      legend when there are very many. Use ``"right"``, ``"on_data"``, or
+      categories, labels on the clusters for medium category counts, and a
+      wrapped side legend for larger sets. Use ``"right"``, ``"on_data"``, or
       ``"none"`` to force a placement.
     - ``frame``: ``"minimal"`` (default) keeps an L-shaped axes edge without
       UMAP tick labels. ``"none"`` removes the box. ``"axes"`` keeps UMAP1 /
@@ -763,6 +1198,10 @@ def embedding(
             child_kwargs={
                 "point_size": point_size,
                 "point_sizes": point_sizes,
+                "point_size_range": point_size_range,
+                "point_edgecolor": point_edgecolor,
+                "point_edgewidth": point_edgewidth,
+                "point_alpha": point_alpha,
                 "sort_values": sort_values,
                 "color_scale": color_scale,
                 "categorical_scale": categorical_scale,
@@ -770,7 +1209,11 @@ def embedding(
                 "missing_color": missing_color,
                 "clip_fraction": clip_fraction,
                 "legend_loc": legend_loc,
+                "max_on_data_labels": max_on_data_labels,
+                "show_legend": show_legend,
                 "frame": frame,
+                "density_overlay": density_overlay,
+                "highlight": highlight,
                 "seed": seed,
                 "rasterize_threshold": rasterize_threshold,
             },
@@ -780,6 +1223,14 @@ def embedding(
     plt, mpl = require_matplotlib()
     if rasterize_threshold < 0:
         raise ValueError("rasterize_threshold must be >= 0")
+    if point_size_range[0] <= 0 or point_size_range[1] < point_size_range[0]:
+        raise ValueError("point_size_range must satisfy 0 < minimum <= maximum")
+    if point_edgewidth is not None and point_edgewidth < 0:
+        raise ValueError("point_edgewidth must be non-negative")
+    if not 0 <= point_alpha <= 1:
+        raise ValueError("point_alpha must be between 0 and 1")
+    if max_on_data_labels < 1:
+        raise ValueError("max_on_data_labels must be positive")
     normalization = normalization or NormalizationSpec()
     color_scale_was_explicit = color_scale is not None
     categorical_scale_was_explicit = categorical_scale is not None
@@ -796,22 +1247,27 @@ def embedding(
         raise ValueError(f"Layout {layout_key!r} has no finite coordinates")
     if point_sizes is not None and len(point_sizes) != n:
         raise ValueError("point_sizes length must match number of selected cells")
+    if point_size is not None and (not np.isfinite(point_size) or point_size <= 0):
+        raise ValueError("point_size must be finite and positive")
+    auto_point_size = point_size is None and point_sizes is None
     resolved_point_size = (
-        float(point_size) if point_size is not None else default_point_size(n)
-    )
-    edgewidth = (
-        DEFAULT_POINT_EDGEWIDTH
-        if point_size is not None or point_sizes is not None
-        else default_point_edgewidth(n)
+        float(point_size)
+        if point_size is not None
+        else default_point_size(
+            n,
+            size_min=point_size_range[0],
+            size_max=point_size_range[1],
+        )
     )
     size_arr = (
         np.asarray(point_sizes, dtype=np.float64)
         if point_sizes is not None
         else np.full(n, resolved_point_size, dtype=np.float64)
     )
+    if not np.all(np.isfinite(size_arr)) or np.any(size_arr <= 0):
+        raise ValueError("point_sizes must contain finite positive values")
 
     color_items = _coerce_color_items(color_by)
-    cell_data = store.zw["cellData"]
     stored_displays: list[dict[str, Any] | None] = []
     for item in color_items:
         column = (
@@ -821,17 +1277,9 @@ def embedding(
             if isinstance(item, CellField)
             else None
         )
-        if column is None or column not in cell_data:
-            stored_displays.append(None)
-            continue
-        attrs = cell_data[column].attrs
-        if "display" not in attrs:
-            stored_displays.append(None)
-            continue
-        raw_display = attrs["display"]
-        if not isinstance(raw_display, Mapping):
-            raise TypeError("Display metadata must be a mapping")
-        stored_displays.append(validate_display_metadata(raw_display))
+        stored_displays.append(
+            None if column is None else stored_display_metadata(store, column)
+        )
     color_cache = _prefetch_colors(
         store,
         color_items,
@@ -904,6 +1352,18 @@ def embedding(
         if subset_by is not None
         else None
     )
+    highlight_mask = _resolve_highlight_mask(
+        store,
+        highlight,
+        cell_key=cell_key,
+        n_cells=n,
+    )
+    density_filter = _density_selection_mask(
+        store,
+        density_overlay,
+        cell_key=cell_key,
+        n_cells=n,
+    )
     facet_values: np.ndarray | None = None
     groups_category: np.ndarray | None = None
     groups_color_index: int | None = None
@@ -960,7 +1420,7 @@ def embedding(
     xlim = (float(selected_x.min() - xpad), float(selected_x.max() + xpad))
     ylim = (float(selected_y.min() - ypad), float(selected_y.max() + ypad))
     xlim, ylim = square_axis_limits(xlim, ylim)
-    edgecolor = scatter_edgecolor(theme)
+    edgecolor = point_edgecolor or scatter_edgecolor(theme)
 
     label_counts = pd.Series(labels).value_counts()
 
@@ -1038,6 +1498,11 @@ def embedding(
                     if active_categorical_scale
                     else None
                 ),
+                palette_name=(
+                    active_categorical_scale.palette_name
+                    if active_categorical_scale
+                    else "default"
+                ),
                 missing_label=None,
             )
             categorical_maps[color_index] = (order, palette)
@@ -1059,7 +1524,9 @@ def embedding(
             )
 
     legend_locs: dict[int, LegendLoc] = {
-        color_index: resolve_legend_loc(len(order), legend_loc)
+        color_index: (
+            resolve_legend_loc(len(order), legend_loc) if show_legend else "none"
+        )
         for color_index, (order, _) in categorical_maps.items()
     }
     needs_side_legend = any(loc == "right" for loc in legend_locs.values())
@@ -1070,7 +1537,17 @@ def embedding(
             for _, _, is_cat, is_uniform in color_cache
         )
         panel = DEFAULT_PANEL_INCHES
-        width = panel * n_columns + (1.35 if needs_side_legend else 0.25)
+        side_columns = max(
+            (
+                legend_side_columns(len(order))
+                for color_index, (order, _) in categorical_maps.items()
+                if legend_locs[color_index] == "right"
+            ),
+            default=0,
+        )
+        width = panel * n_columns + (
+            0.95 * side_columns + 0.4 if needs_side_legend else 0.25
+        )
         height = panel * nrows + (0.55 if needs_top_cbar else 0.2)
         figsize = (width, height)
 
@@ -1109,6 +1586,11 @@ def embedding(
                     if active_categorical_scale is not None
                     else "NA"
                 ),
+                palette_name=(
+                    active_categorical_scale.palette_name
+                    if active_categorical_scale is not None
+                    else "default"
+                ),
             )
         )
         legends.append(
@@ -1136,6 +1618,11 @@ def embedding(
 
     rng = np.random.default_rng(seed) if seed is not None else None
     panel_limit_map: dict[str, tuple[float, float]] = {}
+    panel_point_sizes: dict[str, float] = {}
+    panel_edgewidths: dict[str, float] = {}
+    omitted_labels: dict[str, list[Any]] = {}
+    omitted_legend_entries: dict[str, list[str]] = {}
+    auto_size_artists: list[tuple[Any, int, str, Any, Any | None]] = []
 
     with theme_context(theme):
         fig, axes, owns = normalize_axes_target(
@@ -1156,8 +1643,33 @@ def embedding(
                 xx = x[mask]
                 yy = y[mask]
                 vv = np.asarray(vals)[mask]
-                ss = size_arr[mask]
+                if auto_point_size:
+                    panel_size = default_point_size(
+                        int(mask.sum()),
+                        panel_area=_panel_area_inches(ax),
+                        size_min=point_size_range[0],
+                        size_max=point_size_range[1],
+                    )
+                    ss = np.full(int(mask.sum()), panel_size, dtype=np.float64)
+                else:
+                    ss = size_arr[mask]
+                    panel_size = (
+                        float(np.nanmedian(ss)) if len(ss) else resolved_point_size
+                    )
+                active_edgewidth = (
+                    float(point_edgewidth)
+                    if point_edgewidth is not None
+                    else default_point_edgewidth(
+                        int(mask.sum()),
+                        point_size=panel_size,
+                    )
+                )
+                panel_point_sizes[str(panel_key)] = panel_size
+                panel_edgewidths[str(panel_key)] = active_edgewidth
                 rasterized = len(xx) >= rasterize_threshold
+                base_alpha = (
+                    highlight.dim_alpha if highlight is not None else point_alpha
+                )
 
                 if mask.sum() == 0:
                     ax.set_axis_off()
@@ -1179,7 +1691,7 @@ def embedding(
                         if active_categorical_scale is not None
                         else resolved_missing_color
                     )
-                    _draw_categorical(
+                    base_artist = _draw_categorical(
                         ax,
                         xx,
                         yy,
@@ -1189,12 +1701,13 @@ def embedding(
                         palette=palette,
                         missing_color=category_missing_color,
                         edgecolor=edgecolor,
-                        edgewidth=edgewidth,
+                        edgewidth=active_edgewidth,
+                        alpha=base_alpha,
                         rasterized=rasterized,
                     )
                     panel_legend = legend_locs[color_index]
                     if panel_legend == "on_data":
-                        _add_on_data_labels(
+                        omitted = _add_on_data_labels(
                             ax,
                             xx,
                             yy,
@@ -1206,9 +1719,12 @@ def embedding(
                                 else None
                             ),
                             theme=theme,
+                            max_labels=max_on_data_labels,
                         )
+                        if omitted:
+                            omitted_labels[str(panel_key)] = omitted
                     elif panel_legend == "right" and fac_i == n_facets - 1:
-                        _add_categorical_legend(
+                        omitted = _add_categorical_legend(
                             ax,
                             fig,
                             mpl,
@@ -1229,7 +1745,12 @@ def embedding(
                             ),
                             edgecolor=edgecolor,
                             figure_level=owns,
+                            values=np.asarray(vals)[base_mask],
                         )
+                        if omitted:
+                            omitted_legend_entries[str(panel_key)] = [
+                                str(value) for value in omitted
+                            ]
                 else:
                     active_color_scale = resolved_color_scales.get(
                         color_index,
@@ -1248,12 +1769,16 @@ def embedding(
                         panel_limit_map[str(panel_key)] = limits
                     else:
                         limits = limit_map[color_index]
-                    add_cb = (not is_uniform) and (
-                        active_color_scale.scope == "panel"
-                        or facet_by is None
-                        or fac_i == n_facets - 1
+                    add_cb = (
+                        show_legend
+                        and (not is_uniform)
+                        and (
+                            active_color_scale.scope == "panel"
+                            or facet_by is None
+                            or fac_i == n_facets - 1
+                        )
                     )
-                    _draw_continuous(
+                    base_artist = _draw_continuous(
                         ax,
                         fig,
                         xx,
@@ -1267,7 +1792,8 @@ def embedding(
                         missing_color=active_color_scale.missing_color,
                         default_color=default_color,
                         edgecolor=edgecolor,
-                        edgewidth=edgewidth,
+                        edgewidth=active_edgewidth,
+                        alpha=base_alpha,
                         label=label,
                         is_uniform=is_uniform,
                         sort_values=sort_values,
@@ -1278,8 +1804,58 @@ def embedding(
                         mpl=mpl,
                     )
 
-                if fac is None:
-                    title = label
+                if density_overlay is not None:
+                    density_mask = mask.copy()
+                    if density_filter is not None:
+                        density_mask &= density_filter
+                    contour_values = None
+                    if density_overlay.statistic == "mean":
+                        if is_cat or is_uniform:
+                            raise ValueError(
+                                "Mean contours require a continuous color_by panel"
+                            )
+                        contour_values = pd.to_numeric(
+                            pd.Series(np.asarray(vals)[density_mask]),
+                            errors="coerce",
+                        ).to_numpy(dtype=np.float64)
+                    _draw_density_overlay(
+                        ax,
+                        x[density_mask],
+                        y[density_mask],
+                        overlay=density_overlay,
+                        values=contour_values,
+                        xlim=xlim,
+                        ylim=ylim,
+                        theme=theme,
+                    )
+                highlight_artist = None
+                if highlight is not None and highlight_mask is not None:
+                    panel_highlight = highlight_mask[mask]
+                    highlight_artist = _draw_highlight(
+                        ax,
+                        xx[panel_highlight],
+                        yy[panel_highlight],
+                        ss[panel_highlight],
+                        highlight=highlight,
+                        edgecolor=edgecolor,
+                        rasterized=rasterized,
+                    )
+                if auto_point_size:
+                    auto_size_artists.append(
+                        (
+                            ax,
+                            int(mask.sum()),
+                            str(panel_key),
+                            base_artist,
+                            highlight_artist,
+                        )
+                    )
+
+                if not show_titles:
+                    title = None
+                elif fac is None:
+                    # A labelled colorbar already names the panel.
+                    title = None if (not is_cat and add_cb) else label
                 else:
                     title = (
                         f"{label} | {facet_by}={fac}" if label else f"{facet_by}={fac}"
@@ -1298,6 +1874,42 @@ def embedding(
                 )
                 panel_i += 1
         apply_figure_chrome(fig, theme)
+        if auto_size_artists:
+            fig.canvas.draw()
+            fig.canvas.draw()
+            for ax, n_points, key, base_artist, highlight_artist in auto_size_artists:
+                panel_size = default_point_size(
+                    n_points,
+                    panel_area=_panel_area_inches(ax),
+                    size_min=point_size_range[0],
+                    size_max=point_size_range[1],
+                )
+                active_edgewidth = (
+                    float(point_edgewidth)
+                    if point_edgewidth is not None
+                    else default_point_edgewidth(
+                        n_points,
+                        point_size=panel_size,
+                    )
+                )
+                base_artist.set_sizes(
+                    np.full(
+                        len(base_artist.get_offsets()), panel_size, dtype=np.float64
+                    )
+                )
+                edges, linewidth = _scatter_edges(edgecolor, active_edgewidth)
+                base_artist.set_edgecolors(edges)
+                base_artist.set_linewidths(linewidth)
+                if highlight_artist is not None and highlight is not None:
+                    highlight_artist.set_sizes(
+                        np.full(
+                            len(highlight_artist.get_offsets()),
+                            panel_size * highlight.size_multiplier,
+                            dtype=np.float64,
+                        )
+                    )
+                panel_point_sizes[key] = panel_size
+                panel_edgewidths[key] = active_edgewidth
 
     if color_scale.scope == "panel":
         color_limits = panel_limit_map
@@ -1348,6 +1960,42 @@ def embedding(
                 "input_n_cells": n,
                 "invalid_coordinate_cells": int((~finite_coordinates).sum()),
                 "rasterize_threshold": rasterize_threshold,
+                "point_size_by_panel": panel_point_sizes,
+                "point_edgewidth_by_panel": panel_edgewidths,
+                "point_size_range": list(point_size_range),
+                "show_titles": show_titles,
+                "omitted_labels": omitted_labels,
+                "omitted_legend_entries": omitted_legend_entries,
+                "density_overlay": (
+                    None
+                    if density_overlay is None
+                    else {
+                        "kind": density_overlay.kind,
+                        "statistic": density_overlay.statistic,
+                        "pixels": density_overlay.pixels,
+                        "sigma": density_overlay.sigma,
+                        "min_support": density_overlay.min_support,
+                        "levels": density_overlay.levels,
+                        "max_hotspots": density_overlay.max_hotspots,
+                        "group_by": density_overlay.group_by,
+                        "groups": density_overlay.groups,
+                        "halo_width": density_overlay.halo_width,
+                    }
+                ),
+                "highlight": (
+                    None
+                    if highlight is None
+                    else {
+                        "by": highlight.by,
+                        "groups": highlight.groups,
+                        "indices": highlight.indices,
+                        "n_highlighted": int(
+                            (highlight_mask & base_mask).sum()
+                            if highlight_mask is not None
+                            else 0
+                        ),
+                    }
+                ),
                 "normalization": {
                     "source": normalization.source,
                     "transform": normalization.transform,

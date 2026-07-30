@@ -24,18 +24,6 @@ def require_seaborn() -> Any:
     return sns
 
 
-def require_datashader() -> tuple[Any, Any, Any]:
-    try:
-        import datashader as ds
-        import datashader.transfer_functions as tf
-        from datashader.mpl_ext import dsshow
-    except ImportError as exc:
-        raise ImportError(
-            "Scarf shading requires datashader. Install with: pip install 'scarf[extra]'"
-        ) from exc
-    return ds, dsshow, tf
-
-
 def require_kneed() -> Any:
     try:
         from kneed import KneeLocator

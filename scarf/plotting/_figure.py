@@ -9,9 +9,9 @@ from typing import Any, Hashable, cast
 import numpy as np
 import pandas as pd
 
-from ._contracts import PlotProvenance
+from ._contracts import CategoricalScale, ColorScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
-from ._style import theme_context
+from ._style import refresh_layout_point_sizes, theme_context
 
 
 def _json_ready(value: Any) -> Any:
@@ -187,9 +187,9 @@ class PlotResult:
     ) -> Path:
         """Write the figure to disk (PNG, PDF, SVG, TIFF, and other backends).
 
-        The default background is opaque white, which is what most journals
-        expect. Pass ``transparent=True`` if you need the figure to sit on a
-        dark notebook theme. ``exact_size=True`` keeps the inch size you set
+        The default background is opaque white for light themes and charcoal
+        for the dark theme. Pass ``transparent=True`` when the destination
+        supplies its own background. ``exact_size=True`` keeps the inch size you set
         when the figure was created; set it to False only when you want a tight
         crop for display. ``provenance_sidecar=True`` writes a sibling JSON
         file with the plot metadata.
@@ -229,12 +229,13 @@ class PlotResult:
             export_rc["savefig.transparent"] = True
             export_rc["savefig.facecolor"] = "none"
         else:
+            background = "#111111" if self.theme == "dark" else "white"
             export_rc["savefig.transparent"] = False
-            export_rc["savefig.facecolor"] = "white"
-            self.figure.patch.set_facecolor("white")
+            export_rc["savefig.facecolor"] = background
+            self.figure.patch.set_facecolor(background)
             self.figure.patch.set_alpha(1.0)
             for ax in self.figure.axes:
-                ax.patch.set_facecolor("white")
+                ax.patch.set_facecolor(background)
                 ax.patch.set_alpha(1.0)
         try:
             with theme_context(self.theme), mpl.rc_context(export_rc):
@@ -335,10 +336,15 @@ def label_panels(
     axes: Mapping[Hashable, Any] | Sequence[Any],
     *,
     labels: Sequence[str] | None = None,
-    fontsize: float = 11,
+    fontsize: float | str | None = None,
     fontweight: str = "bold",
+    x: float = -0.06,
+    y: float = 1.04,
 ) -> None:
     """Add A/B/C panel labels to axes in order."""
+    if fontsize is None:
+        _, mpl = require_matplotlib()
+        fontsize = mpl.rcParams["axes.titlesize"]
     if isinstance(axes, Mapping):
         ax_list = list(axes.values())
     else:
@@ -349,12 +355,12 @@ def label_panels(
         raise ValueError("labels length must match number of axes")
     for ax, lab in zip(ax_list, labels):
         ax.text(
-            0.02,
-            0.98,
+            x,
+            y,
             lab,
             transform=ax.transAxes,
             ha="left",
-            va="top",
+            va="bottom",
             fontsize=fontsize,
             fontweight=fontweight,
         )
@@ -371,3 +377,354 @@ def collect_legends(
     out = tuple(legends)
     figure._scarf_legends = out  # type: ignore[attr-defined]
     return out
+
+
+def _deduplicate_legend_specs(
+    legends: Sequence[LegendSpec],
+) -> tuple[LegendSpec, ...]:
+    seen: set[str] = set()
+    out: list[LegendSpec] = []
+    for legend in legends:
+        key = json.dumps(_json_ready(legend), sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(legend)
+    return tuple(out)
+
+
+_OUTSIDE_LEGEND_SLOTS = {
+    1: ("outside right center",),
+    2: ("outside right upper", "outside right lower"),
+    3: (
+        "outside right upper",
+        "outside right center",
+        "outside right lower",
+    ),
+}
+_MAX_OUTSIDE_LEGENDS = max(_OUTSIDE_LEGEND_SLOTS)
+
+
+def _merged_legend_block(
+    blocks: Sequence[tuple[str | None, list[Any], list[str]]],
+) -> tuple[str | None, list[Any], list[str]]:
+    merged_handles: list[Any] = []
+    merged_labels: list[str] = []
+    for title, handles, labels in blocks:
+        merged_handles.extend(handles)
+        merged_labels.extend(
+            f"{title}: {label}" if title else label for label in labels
+        )
+    return None, merged_handles, merged_labels
+
+
+def _legend_blocks_overlap(figure: Any, legends: Sequence[Any]) -> bool:
+    if len(legends) < 2:
+        return False
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    boxes = [legend.get_window_extent(renderer) for legend in legends]
+    return any(
+        boxes[first].overlaps(boxes[second])
+        for first in range(len(boxes))
+        for second in range(first + 1, len(boxes))
+    )
+
+
+def _place_legend_blocks(
+    figure: Any,
+    blocks: Sequence[tuple[str | None, list[Any], list[str]]],
+) -> None:
+    """Draw outside legend blocks, merging them when separate blocks collide."""
+    if not blocks:
+        return
+    placed = list(blocks)
+    if len(placed) > _MAX_OUTSIDE_LEGENDS:
+        keep = list(placed[: _MAX_OUTSIDE_LEGENDS - 1])
+        keep.append(_merged_legend_block(placed[_MAX_OUTSIDE_LEGENDS - 1 :]))
+        placed = keep
+    legends: list[Any] = []
+    for slot, (title, handles, labels) in zip(
+        _OUTSIDE_LEGEND_SLOTS[len(placed)], placed
+    ):
+        legends.append(
+            figure.legend(
+                handles=handles,
+                labels=labels,
+                title=title,
+                frameon=False,
+                loc=slot,
+                ncols=max(1, int(np.ceil(len(handles) / 20))),
+            )
+        )
+    if _legend_blocks_overlap(figure, legends):
+        for legend in legends:
+            legend.remove()
+        title, handles, labels = _merged_legend_block(placed)
+        figure.legend(
+            handles=handles,
+            labels=labels,
+            title=title,
+            frameon=False,
+            loc="outside right center",
+            ncols=max(1, int(np.ceil(len(handles) / 20))),
+        )
+
+
+def _render_shared_legends(
+    figure: Any,
+    results: Sequence[PlotResult],
+) -> None:
+    plt, mpl = require_matplotlib()
+    categorical_seen: set[tuple[Any, ...]] = set()
+    continuous_seen: set[tuple[Any, ...]] = set()
+    size_seen: set[tuple[Any, ...]] = set()
+    marker_seen: set[tuple[Any, ...]] = set()
+    blocks: list[tuple[str | None, list[Any], list[str]]] = []
+    for result in results:
+        categorical = [
+            scale for scale in result.scales if isinstance(scale, CategoricalScale)
+        ]
+        continuous = [scale for scale in result.scales if isinstance(scale, ColorScale)]
+        sizes = [scale for scale in result.scales if isinstance(scale, SizeScale)]
+        categorical_scale_index = 0
+        continuous_scale_index = 0
+        size_scale_index = 0
+        for legend in result.legends:
+            if legend.kind == "categorical" and categorical:
+                categorical_scale = categorical[
+                    min(categorical_scale_index, len(categorical) - 1)
+                ]
+                categorical_scale_index += 1
+                order = tuple(categorical_scale.order or ())
+                if not order or categorical_scale.palette is None:
+                    continue
+                categorical_key = (
+                    legend.label,
+                    order,
+                    tuple(
+                        (str(value), categorical_scale.palette[value])
+                        for value in order
+                    ),
+                )
+                if categorical_key in categorical_seen:
+                    continue
+                categorical_seen.add(categorical_key)
+                handles = [
+                    mpl.lines.Line2D(
+                        [],
+                        [],
+                        marker="o",
+                        linestyle="",
+                        markerfacecolor=categorical_scale.palette[value],
+                        markeredgecolor="none",
+                        markersize=5,
+                    )
+                    for value in order
+                ]
+                labels = [
+                    (
+                        categorical_scale.labels.get(value, str(value))
+                        if categorical_scale.labels is not None
+                        else str(value)
+                    )
+                    for value in order
+                ]
+                blocks.append((legend.label, handles, labels))
+            elif legend.kind == "colorbar" and continuous:
+                color_scale = continuous[
+                    min(continuous_scale_index, len(continuous) - 1)
+                ]
+                continuous_scale_index += 1
+                vmin = legend.extras.get("vmin", color_scale.vmin)
+                vmax = legend.extras.get("vmax", color_scale.vmax)
+                if vmin is None or vmax is None:
+                    continue
+                continuous_key = (
+                    legend.label,
+                    color_scale.cmap,
+                    float(vmin),
+                    float(vmax),
+                    color_scale.vcenter,
+                )
+                if continuous_key in continuous_seen:
+                    continue
+                continuous_seen.add(continuous_key)
+                if color_scale.vcenter is not None:
+                    norm = mpl.colors.TwoSlopeNorm(
+                        vmin=float(vmin),
+                        vcenter=float(color_scale.vcenter),
+                        vmax=float(vmax),
+                    )
+                else:
+                    norm = mpl.colors.Normalize(vmin=float(vmin), vmax=float(vmax))
+                mappable = plt.cm.ScalarMappable(
+                    cmap=color_scale.cmap or "viridis",
+                    norm=norm,
+                )
+                colorbar = figure.colorbar(
+                    mappable,
+                    ax=list(dict.fromkeys(result.axes.values())),
+                    location="bottom",
+                    orientation="horizontal",
+                    shrink=0.45,
+                    fraction=0.04,
+                    pad=0.04,
+                )
+                colorbar.set_label(legend.label or "")
+            elif legend.kind == "size" and sizes:
+                size_scale = sizes[min(size_scale_index, len(sizes) - 1)]
+                size_scale_index += 1
+                domain = legend.extras.get(
+                    "domain",
+                    [size_scale.vmin, size_scale.vmax],
+                )
+                low, high = float(domain[0]), float(domain[1])
+                size_key = (
+                    legend.label,
+                    low,
+                    high,
+                    size_scale.size_min,
+                    size_scale.size_max,
+                )
+                if size_key in size_seen:
+                    continue
+                size_seen.add(size_key)
+                values = np.linspace(low, high, 4)
+                areas = size_scale.areas(values)
+                area_factor = min(1.0, 180.0 / max(float(areas.max()), 1.0))
+                handles = [
+                    mpl.lines.Line2D(
+                        [],
+                        [],
+                        marker="o",
+                        linestyle="",
+                        markerfacecolor="#bdbdbd",
+                        markeredgecolor="#666666",
+                        markersize=float(np.sqrt(area * area_factor)),
+                    )
+                    for area in areas
+                ]
+                labels = (
+                    [f"{value:.0%}" for value in values]
+                    if low >= 0 and high <= 1
+                    else [f"{value:g}" for value in values]
+                )
+                blocks.append((legend.label, handles, labels))
+            elif legend.kind == "marker":
+                marker_values = list(legend.extras.get("values", ()))
+                markers = list(legend.extras.get("markers", ()))
+                marker_key = (
+                    legend.label,
+                    tuple(map(str, marker_values)),
+                    tuple(map(str, markers)),
+                )
+                if not marker_values or len(marker_values) != len(markers):
+                    continue
+                if marker_key in marker_seen:
+                    continue
+                marker_seen.add(marker_key)
+                handles = [
+                    mpl.lines.Line2D(
+                        [],
+                        [],
+                        marker=marker,
+                        linestyle="",
+                        markerfacecolor="#9e9e9e",
+                        markeredgecolor="#4d4d4d",
+                        markersize=5,
+                    )
+                    for marker in markers
+                ]
+                blocks.append(
+                    (legend.label, handles, [str(value) for value in marker_values])
+                )
+    _place_legend_blocks(figure, blocks)
+
+
+def _remove_child_legend_artists(figure: Any, axes: Sequence[Any]) -> None:
+    """Remove rendered child legends before drawing shared equivalents."""
+    from matplotlib.legend import Legend
+
+    main_axes = set(axes)
+    for ax in main_axes:
+        for artist in list(ax.get_children()):
+            if isinstance(artist, Legend):
+                artist.remove()
+    for legend in list(figure.legends):
+        legend.remove()
+    for ax in list(figure.axes):
+        if ax in main_axes:
+            continue
+        if getattr(ax, "_colorbar", None) is not None or ax.get_label() == "<colorbar>":
+            figure.delaxes(ax)
+
+
+def compose_results(
+    figure: Any,
+    results: Mapping[Hashable, PlotResult] | Sequence[PlotResult],
+    *,
+    panel_labels: bool | Sequence[str] = True,
+    shared_legends: bool = True,
+    owns_figure: bool = False,
+    theme: str | None = None,
+) -> PlotResult:
+    """Merge caller-targeted plot results into one inspectable figure result."""
+    if isinstance(results, Mapping):
+        named_results = list(results.items())
+    else:
+        named_results = list(enumerate(results))
+    if not named_results:
+        raise ValueError("results must be non-empty")
+    children = [result for _, result in named_results]
+    if any(result.figure is not figure for result in children):
+        raise ValueError("All child results must use the supplied figure")
+
+    axes: dict[Hashable, Any] = {}
+    tables: dict[str, pd.DataFrame] = {}
+    legends: list[LegendSpec] = []
+    scales: list[Any] = []
+    for namespace, result in named_results:
+        for key, ax in result.axes.items():
+            composite_key: Hashable = (namespace, key)
+            axes[composite_key] = ax
+        tables.update(
+            {
+                f"{namespace}:{table_name}": table
+                for table_name, table in result.tables.items()
+            }
+        )
+        legends.extend(result.legends)
+        scales.extend(result.scales)
+
+    resolved_theme = theme or children[0].theme
+    label_axes = list(dict.fromkeys(axes.values()))
+    with theme_context(resolved_theme):
+        if shared_legends:
+            _remove_child_legend_artists(figure, label_axes)
+        if panel_labels:
+            labels = None if panel_labels is True else list(panel_labels)
+            label_panels(label_axes, labels=labels)
+        if shared_legends:
+            _render_shared_legends(figure, children)
+        refresh_layout_point_sizes(figure)
+    provenance = PlotProvenance(
+        scarf_version=children[0].provenance.scarf_version,
+        n_cells=max(child.provenance.n_cells for child in children),
+        renderer="matplotlib",
+        notes=("composite",),
+        extras={
+            "children": {str(name): child.provenance for name, child in named_results},
+            "shared_legends": shared_legends,
+        },
+    )
+    return PlotResult(
+        figure=figure,
+        axes=axes,
+        tables=tables,
+        legends=_deduplicate_legend_specs(legends),
+        scales=tuple(scales),
+        provenance=provenance,
+        owns_figure=owns_figure,
+        theme=resolved_theme,
+    )
