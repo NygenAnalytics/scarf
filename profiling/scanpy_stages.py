@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -19,13 +19,6 @@ from profiling.scanpy_config import (
     ScanpyStageName,
     ScanpyWorkflowParameters,
 )
-
-if TYPE_CHECKING:
-    import anndata as ad
-    import h5py
-    from dask.distributed import Client, LocalCluster
-
-
 
 def _peak_cgroup_bytes(measurement: ResourceMeasurement | None) -> int | None:
     if measurement is None:

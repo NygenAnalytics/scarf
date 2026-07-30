@@ -3,7 +3,7 @@
 import math
 import tomllib
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
