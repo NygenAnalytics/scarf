@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from . import cytebase as cytebase
     from .datastore.datastore import DataStore as DataStore
     from .graph.state import AssayState as AssayState
+    from .lineage import ArtifactLineage as ArtifactLineage
     from .features.enrichment import (
         EnrichmentResult as EnrichmentResult,
         read_gmt as read_gmt,
@@ -127,6 +128,7 @@ except _PackageNotFoundError:
     )
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "ArtifactLineage": (".lineage", "ArtifactLineage"),
     "ArtifactRef": (".storage.artifacts", "ArtifactRef"),
     "ArtifactStatus": (".storage.artifacts", "ArtifactStatus"),
     "AssayMerge": (".merge", "AssayMerge"),

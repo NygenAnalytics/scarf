@@ -1,6 +1,6 @@
 import numpy as np
 import zarr
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 from ..storage.artifacts import (
@@ -35,6 +35,7 @@ from ..utils.logging import logger
 
 if TYPE_CHECKING:
     from ..graph.state import AssayState
+    from ..lineage import ArtifactLineage
 
 
 def sanitize_hierarchy(
@@ -178,6 +179,15 @@ class BaseDataStore:
     def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus:
         """Inspect a logical artifact without mutating the store."""
         return inspect_artifact(self.zw, ref)
+
+    def lineage(
+        self,
+        target: ArtifactRef | Mapping[str, ArtifactRef],
+    ) -> "ArtifactLineage":
+        """Build a read-only upstream lineage report for artifact outputs."""
+        from ..lineage import ArtifactLineage
+
+        return ArtifactLineage.from_store(self.zw, target)
 
     def load_artifact(self, ref: ArtifactRef) -> zarr.Group:
         """Open a complete artifact through a read-only Zarr group."""
