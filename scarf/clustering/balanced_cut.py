@@ -65,47 +65,55 @@ class BalancedCut:
         leaves: dict[int, None] = {node: None for node in range(n_leaves)}
         branchpoints: dict[int, list[int]] = {}
         progress = tqdmbar(total=len(leaves), desc="Identifying nodes to split")
-        while len(leaves) > 0:
-            leaf, _ = leaves.popitem()
-            progress.update(1)
-            logger.trace(f"FRESH STEP: Leaf {leaf} plucked as base leaf")
-            current = leaf
-            while True:
-                parent = next(self.graph.predecessors(current), None)
-                if parent is None:
-                    break
-                if parent in branchpoints:
-                    logger.trace(f"Will not climb to {parent} as already a branchpoint")
-                    break
-                if self.graph.nodes[parent]["nleaves"] > self.maxSize:
-                    logger.trace(
-                        f"Will not climb to {parent} because too many leaves exist"
-                    )
-                    break
-                successor1, successor2 = list(self.graph.successors(parent))
-                if not self._are_subtrees_mergeable(successor1, successor2):
-                    break
-                current = parent
-            logger.trace(f"Aggregating from branch {current} for leaf {leaf}")
-            branchpoints[current] = [leaf]
-            stack = [current]
-            while len(stack) > 0:
-                node = stack.pop()
-                if node in leaves:
-                    branchpoints[current].append(node)
-                    leaves.pop(node)
-                    logger.trace(f"Leaf {node} plucked in aggregation step")
-                    progress.update(1)
-                elif node in branchpoints and node != current:
-                    logger.trace(f"Skipping branch {node} because its already taken")
-                elif (
-                    self.graph.nodes[node]["nleaves"] >= self.maxSize
-                    and node != current
-                ):
-                    logger.trace(f"Skipping branch {node} to prevent greedy behaviour")
-                else:
-                    stack.extend(list(self.graph.successors(node)))
-        progress.close()
+        try:
+            while len(leaves) > 0:
+                leaf, _ = leaves.popitem()
+                progress.update(1)
+                logger.trace(f"FRESH STEP: Leaf {leaf} plucked as base leaf")
+                current = leaf
+                while True:
+                    parent = next(self.graph.predecessors(current), None)
+                    if parent is None:
+                        break
+                    if parent in branchpoints:
+                        logger.trace(
+                            f"Will not climb to {parent} as already a branchpoint"
+                        )
+                        break
+                    if self.graph.nodes[parent]["nleaves"] > self.maxSize:
+                        logger.trace(
+                            f"Will not climb to {parent} because too many leaves exist"
+                        )
+                        break
+                    successor1, successor2 = list(self.graph.successors(parent))
+                    if not self._are_subtrees_mergeable(successor1, successor2):
+                        break
+                    current = parent
+                logger.trace(f"Aggregating from branch {current} for leaf {leaf}")
+                branchpoints[current] = [leaf]
+                stack = [current]
+                while len(stack) > 0:
+                    node = stack.pop()
+                    if node in leaves:
+                        branchpoints[current].append(node)
+                        leaves.pop(node)
+                        logger.trace(f"Leaf {node} plucked in aggregation step")
+                        progress.update(1)
+                    elif node in branchpoints and node != current:
+                        logger.trace(
+                            f"Skipping branch {node} because its already taken"
+                        )
+                    elif (
+                        self.graph.nodes[node]["nleaves"] >= self.maxSize
+                        and node != current
+                    ):
+                        logger.trace(
+                            f"Skipping branch {node} to prevent greedy behaviour"
+                        )
+                    else:
+                        stack.extend(list(self.graph.successors(node)))
+        finally:
+            progress.close()
         return branchpoints
 
     def _valid_names_in_branchpoints(self) -> None:

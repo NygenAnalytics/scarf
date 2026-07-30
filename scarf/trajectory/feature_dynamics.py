@@ -164,17 +164,17 @@ def knn_clustering(
         k: int,
         threads: int,
     ) -> "csr_matrix":
-        logger.info("Pseudotime modules: fitting feature KNN")
-        for block in data.stream_blocks(nthreads=threads, msg="Fitting KNNs"):
+        logger.debug("Pseudotime modules: fitting feature KNN")
+        for block in data.stream_blocks(nthreads=threads, msg="Fitting feature KNN"):
             if not np.isfinite(block).all():
                 raise ValueError("Feature profiles must contain only finite values")
             ann_idx.add_items(block)
         start, end = 0, 0
         neighbor_indices: list[np.ndarray] = []
-        logger.info("Pseudotime modules: querying feature KNN")
+        logger.debug("Pseudotime modules: querying feature KNN")
         for block in data.stream_blocks(
             nthreads=threads,
-            msg="Identifying feature KNNs",
+            msg="Identifying feature neighbors",
         ):
             end += block.shape[0]
             indices, distances = ann_idx.knn_query(block, k=k + 1)
@@ -209,7 +209,7 @@ def knn_clustering(
             straight_cut,
         )
 
-        logger.info("Pseudotime modules: clustering modules")
+        logger.debug("Pseudotime modules: clustering modules")
         hierarchy = fit_paris_hierarchy(
             matrix,
             n_threads=n_threads,

@@ -301,6 +301,19 @@ def test_get_feature_mappings_keeps_features_without_peaks():
     assert mapping.getcol(1).nnz == 0
 
 
+def test_get_feature_mappings_rejects_zero_overlap():
+    peaks = create_bed_from_coord_ids(["chr1:100-200"])
+    features = _features_bed(
+        [
+            ("chr1", 300, 400, "a", "A", "+"),
+            ("chr2", 100, 200, "b", "B", "+"),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="None of the provided features overlap"):
+        get_feature_mappings(peaks, features)
+
+
 def test_get_feature_mappings_uniquifies_duplicate_ids():
     peaks = create_bed_from_coord_ids(["chr1:100-200"])
     features = _features_bed(

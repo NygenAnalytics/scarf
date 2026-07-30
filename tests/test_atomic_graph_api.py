@@ -8,6 +8,7 @@ from scarf.datastore._operations import graph as graph_operations
 from scarf.embeddings.harmony import fit_harmony
 from scarf.graph.state import stored_assay_graph_from_ref
 from scarf.storage.artifacts import ArtifactRef, artifact_path
+from scarf.utils import logger
 from tests import full_path
 
 pytestmark = pytest.mark.slow
@@ -132,6 +133,32 @@ def test_atomic_graph_methods_chain_refs_and_publish_current_results(
     loaded = datastore.load_graph(graph_loc=artifact_path(graph))
     assert loaded.shape[0] == int(datastore.cells.fetch_all("I").sum())
     assert np.isfinite(loaded.data).all()
+
+
+def test_ann_index_logs_rebuild_and_reuse_accurately(datastore_ephemeral) -> None:
+    datastore = datastore_ephemeral
+    _prepare_atomic_features(datastore)
+    normalized = datastore.run_normalization(
+        from_assay="RNA",
+        cell_key="I",
+        feat_key="atomic_hvgs",
+    )
+    reduction = datastore.run_pca(normalized, dims=3)
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="INFO",
+    )
+    try:
+        first = datastore.build_ann_index(reduction)
+        second = datastore.build_ann_index(reduction)
+    finally:
+        logger.remove(sink)
+
+    assert first == second
+    assert any(message.startswith("Stored ANN index") for message in messages)
+    assert any(message.startswith("Reused ANN index") for message in messages)
+    assert all("Loaded existing ANN stream" not in message for message in messages)
 
 
 @pytest.mark.parametrize("dims", [0, -1, 1.5, True])

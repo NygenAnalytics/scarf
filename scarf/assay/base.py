@@ -179,15 +179,13 @@ class Assay:
         Returns: A sparse matrix containing raw data.
 
         """
-        from ..utils.progress import tqdmbar
-
         sm = None
-        for i in tqdmbar(
-            self.rawData[self.cells.active_index(cell_key), :].blocks,
-            total=self.rawData.numblocks[0],
-            desc=f"INFO: Converting raw data from {self.name} assay into CSR format",
+        selected = self.rawData[self.cells.active_index(cell_key), :]
+        for values in selected.stream_blocks(
+            nthreads=self.nthreads,
+            msg=f"Converting {self.name} raw data to CSR",
         ):
-            s = csr_matrix(controlled_compute(i, self.nthreads))
+            s = csr_matrix(values)
             if sm is None:
                 sm = s
             else:
@@ -249,7 +247,7 @@ class Assay:
         row_start = 0
         for raw in self.rawData._stream_blocks(
             nthreads=self.nthreads,
-            msg=f"({self.name}) Computing initialization statistics",
+            msg=f"Computing {self.name} initialization statistics",
             prefetch=None,
             row_mask=None,
             resident_bytes=sum(value.nbytes for value in stats.values()),
@@ -288,7 +286,7 @@ class Assay:
         if name in percent_features:
             if percent_features[name] == feat_pattern:
                 return None
-            logger.info(f"Pattern for percentage feature {name} updated.")
+            logger.debug(f"Pattern for percentage feature {name} updated")
         self.attrs["percentFeatures"] = {
             **percent_features,
             **{name: feat_pattern},
@@ -576,7 +574,7 @@ class Assay:
                 attrs.get("subset_hash") == subset_hash
                 and attrs.get("subset_params") == subset_params
             ):
-                logger.info(
+                logger.debug(
                     f"Using existing normalized data with cell key {cell_key} and feat key {feat_key}"
                 )
                 if update_keys:
@@ -649,7 +647,7 @@ class Assay:
             Generator yielding DataFrames or (matrix, feature index) tuples.
         """
         from ..storage.feature_stream import plan_feature_stream
-        from ..utils.progress import tqdmbar
+        from ..utils.progress import iter_progress
 
         if cell_key is None:
             cell_idx = np.array(list(range(self.cells.N)))
@@ -688,7 +686,7 @@ class Assay:
             f"Will iterate over data of shape {data.shape} "
             f"in {len(plan.blocks)} feature blocks"
         )
-        for block in tqdmbar(plan.blocks, desc=msg, total=len(plan.blocks)):
+        for block in iter_progress(plan.blocks, desc=msg, total=len(plan.blocks)):
             chunk = block.destinations
             if as_dataframe:
                 yield pd.DataFrame(
@@ -949,7 +947,7 @@ class Assay:
             return True
 
         if _cached_aggregation_valid():
-            logger.info(f"Using existing aggregated data from {location}")
+            logger.debug(f"Using existing aggregated data from {location}")
         else:
             if location in self.z:
                 del self.z[location]

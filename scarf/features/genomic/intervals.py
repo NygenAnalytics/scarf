@@ -1,4 +1,3 @@
-import logging
 from collections.abc import Iterable
 
 import numpy as np
@@ -142,12 +141,16 @@ def get_feature_mappings(
     feats_names_arr = np.array(feats_names)
     n_features = feats_ids_arr.shape[0]
     if n_no_match == n_features:
-        logging.critical(
-            "None of the provided features overlap with the peak coordinates. "
-            "Melding has possibly failed."
+        raise ValueError(
+            "None of the provided features overlap with the peak coordinates"
         )
-    else:
-        logger.info(f"{n_no_match}/{n_features} features did not overlap with any peak")
+    if n_no_match:
+        logger.warning(
+            f"{n_no_match}/{n_features} features did not overlap with any peak"
+        )
+    logger.info(
+        f"Mapped {n_features - n_no_match}/{n_features} features to peak coordinates"
+    )
     if len(set(feats_ids_arr)) != n_features:
         raise ValueError(
             "ERROR: encountered an unexpected error. Somehow the feature ids are not unique "

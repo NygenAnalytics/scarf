@@ -142,7 +142,7 @@ def test_truncated_pba_logs_svd_stage_start():
     messages: list[str] = []
     sink = logger.add(
         lambda message: messages.append(message.record["message"]),
-        level="INFO",
+        level="DEBUG",
     )
     try:
         _truncated_pba_potential(laplacian_transpose, 3, 7, source_sink)

@@ -31,7 +31,7 @@ result to create a smaller Zarr store for workflows that do not need every cell.
 ```{code-cell} ipython3
 import scarf
 
-scarf.set_verbosity('WARNING')
+scarf.configure_output(level='WARNING', progress=False)
 ```
 
 ## Guided steps

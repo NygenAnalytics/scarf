@@ -280,7 +280,7 @@ class RNAassay(Assay):
                 attrs.get("subset_hash") == subset_hash
                 and attrs.get("subset_params") == subset_params
             ):
-                logger.info(
+                logger.debug(
                     f"Using existing normalized data with cell key {cell_key} and feat key {feat_key}"
                 )
                 if update_keys:
@@ -797,13 +797,13 @@ class RNAassay(Assay):
             read_block,
             workers=admission.outerWorkers,
             io_concurrency=admission.ioConcurrency,
-            msg=f"({self.name}) Computing feature stats",
+            msg=f"Computing {self.name} feature statistics",
         ):
             cells, feats = tiles[block_idx]
             t_compute = time.perf_counter()
             accumulate_block(raw, cells.destinations, feats.destinations)
             compute_sec = time.perf_counter() - t_compute
-            logger.info(
+            logger.debug(
                 f"({self.name}) feature stats block {block_idx + 1}/{n_blocks}: "
                 f"read {read_sec:.1f}s ({source}) compute {compute_sec:.1f}s "
                 f"rss {process_rss_mb():.0f} MiB"
@@ -827,7 +827,7 @@ class RNAassay(Assay):
         cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
         identifier, stats_loc = self._get_summary_stats_loc(cell_key)
         if self._validate_stats_loc(stats_loc, cell_idx, feat_idx) is True:
-            logger.info(f"Using cached feature stats for cell_key {cell_key}")
+            logger.debug(f"Using cached feature stats for cell_key {cell_key}")
             return None
         else:
             if identifier in self.feats.locations:
@@ -995,7 +995,7 @@ class RNAassay(Assay):
         self.set_feature_stats(cell_key)
         identifier = self._load_stats_loc(cell_key)
         if col_renamer(c_var_col) in self.feats.columns:
-            logger.info("Using existing corrected dispersion values")
+            logger.debug("Using existing corrected dispersion values")
         else:
             slots = ["normed_tot", "avg", "nz_mean", "sigmas", "normed_n"]
             for i in slots:
@@ -1163,15 +1163,12 @@ class RNAassay(Assay):
         def col_renamer(x: str) -> str:
             return f"{identifier}_{x}"
 
-        logger.info("Calculating summary statistics")
         identifier, c_var_col = self.set_summary_stats(
             cell_key,
             n_bins,
             lowess_frac,
             bin_strategy=bin_strategy,
         )
-        logger.info("Calculating HVGs")
-
         from ..features.variability import select_highly_variable_features
 
         hvgs = select_highly_variable_features(

@@ -16,6 +16,7 @@ from ..storage.profiles import (
 from ..storage.schema import create_zarr_count_assay
 from ..storage.sharding import write_dense_in_shard_rows
 from ..storage.stores import load_zarr
+from ..utils.logging import logger
 
 
 def subset_assay_zarr(
@@ -286,3 +287,7 @@ class SubsetZarr:
                 msg=f"Subsetting assay: {assay.name}",
                 resources=self.resources,
             )
+        logger.info(
+            f"Wrote a subset of {len(self.cellIdx)} cells across "
+            f"{len(self.assays)} assay(s)"
+        )

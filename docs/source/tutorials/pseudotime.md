@@ -34,7 +34,7 @@ For expression modules and comparisons to cluster markers, continue with
 ```{code-cell} ipython3
 import scarf
 
-scarf.set_verbosity('WARNING')
+scarf.configure_output(level='WARNING', progress=False)
 ```
 
 ---

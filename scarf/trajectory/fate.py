@@ -317,7 +317,7 @@ def _solve_fates(
             )
         probabilities[:, group] = solution
         last_probability -= solution
-        logger.info(
+        logger.debug(
             f"Fate mapping: sink {group + 1}/{n_sinks} converged "
             f"in {iterations} {iteration_unit}"
         )

@@ -38,7 +38,7 @@ import pandas as pd
 
 import scarf
 
-scarf.set_verbosity('WARNING')
+scarf.configure_output(level='WARNING', progress=False)
 ```
 
 ## 1. Load the preprocessed dataset

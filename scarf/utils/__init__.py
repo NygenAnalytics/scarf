@@ -14,6 +14,7 @@ if TYPE_CHECKING:
         show_dask_progress as show_dask_progress,
     )
     from .logging import (
+        configure_output as configure_output,
         get_log_level as get_log_level,
         logger as logger,
         set_verbosity as set_verbosity,
@@ -36,6 +37,7 @@ __all__ = [
     "logger",
     "tqdmbar",
     "tqdm_params",
+    "configure_output",
     "set_verbosity",
     "get_log_level",
     "system_call",
@@ -56,6 +58,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "logger": (".logging", "logger"),
     "tqdmbar": (".progress", "tqdmbar"),
     "tqdm_params": (".progress", "tqdm_params"),
+    "configure_output": (".logging", "configure_output"),
     "set_verbosity": (".logging", "set_verbosity"),
     "get_log_level": (".logging", "get_log_level"),
     "system_call": (".process", "system_call"),

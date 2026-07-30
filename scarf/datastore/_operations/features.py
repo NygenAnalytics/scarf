@@ -35,7 +35,7 @@ from ...metadata.artifacts import (
 from ...utils.arrays import array_digest
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
-from ...utils.progress import tqdmbar
+from ...utils.progress import iter_progress
 from .enrichment_store import (
     _ENRICHMENT_LAYOUT,
     _EnrichmentScorer,
@@ -339,7 +339,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 )
             else:
                 max_cells_int = int(candidate_max)
-                logger.info(
+                logger.debug(
                     f"Setting `max_cells` to {max_cells_int} "
                     f"(n_selected - {HVG_UBIQUITOUS_SLACK}). Genes detected in at "
                     "least this many cells are excluded as ubiquitous."
@@ -1163,10 +1163,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         )
         finish_artifact(remote_slot, planned)
         select_marker_artifact(planned.ref)
-        logger.info(
+        logger.info(f"Stored marker results for {len(markers)} clusters")
+        logger.debug(
             f"Saved marker results to {artifact_path(planned.ref)} "
-            f"in {time.perf_counter() - t_save:.1f}s "
-            f"({len(markers)} clusters)"
+            f"in {time.perf_counter() - t_save:.1f}s"
         )
         return None
 
@@ -1479,7 +1479,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         cell_idx = np.array(list(range(assay.cells.N)))
         n_groups = len(group_set)
         matrix = np.zeros((assay.cells.N, n_groups), dtype=np.float64)
-        for n, i in tqdmbar(
+        for n, i in iter_progress(
             enumerate(group_set), desc="Computing grouped means", total=len(group_set)
         ):
             feat_idx = np.where(groups == i)[0]
@@ -1688,7 +1688,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         all_feat_idx = np.arange(assay.feats.N)
         active_mask = np.zeros(self.cells.N, dtype=bool)
         active_mask[active_idx] = True
-        for g in tqdmbar(groups_set):
+        for g in iter_progress(
+            groups_set,
+            desc="Aggregating pseudo-replicates",
+            total=len(groups_set),
+        ):
             if g in null_vals:
                 continue
             for sg in sec_groups_set:  # type: ignore

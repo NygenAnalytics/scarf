@@ -227,10 +227,10 @@ class AnnStream:
         batch_size = self.data.chunksize[0]
         if self.dims is not None and self.dims >= batch_size:
             self.dims = batch_size - 1
-            logger.info(
+            logger.warning(
                 f"Number of PCA/LSI components reduced to batch size of {batch_size}"
             )
         if self.nClusters > batch_size:
             self.nClusters = batch_size
-            logger.info(f"Cluster number reduced to batch size of {batch_size}")
+            logger.warning(f"Cluster number reduced to batch size of {batch_size}")
         return batch_size

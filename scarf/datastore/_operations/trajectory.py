@@ -200,7 +200,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             if cached is not None:
                 diff_op = cast(coo_matrix, cached)
             else:
-                logger.info("Using existing MAGIC diffusion operator")
+                logger.debug("Using existing MAGIC diffusion operator")
                 n_cells, _ = self._get_graph_ncells_k(graph_loc)
                 diff_op = coo_matrix(
                     (
@@ -578,6 +578,9 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                     f"Unscored cells contain NaN pseudotime. Use cell key "
                     f"'{validity_column}' for downstream analysis"
                 )
+            logger.info(
+                f"Stored pseudotime scores for {int(valid.sum())}/{len(valid)} cells"
+            )
             return PseudotimeScoreResult(
                 pseudotime_key=output_column,
                 validity_key=validity_column,
@@ -596,7 +599,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 artifact_values(artifact_group, "valid").astype(bool),
             )
 
-        logger.info("Pseudotime scoring: constructing Laplacian")
+        logger.debug("Pseudotime scoring: constructing Laplacian")
         laplacian_transpose = _random_walk_laplacian_transpose_impl(retained_graph)
         retained_ptime = _truncated_pba_potential_impl(
             laplacian_transpose,
@@ -626,7 +629,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 "valid": retained_mask,
             },
         )
-        logger.info("Pseudotime scoring: saving pseudotime")
+        logger.debug("Pseudotime scoring: saving pseudotime")
         return publish_result(ptime, retained_mask)
 
     def run_fate_mapping(
@@ -849,7 +852,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                     },
                 )
 
-        logger.info("Fate mapping: saving probabilities")
+        logger.debug("Fate mapping: saving probabilities")
         for index, fate_key in enumerate(fate_keys):
             self.cells.insert(
                 fate_key,
@@ -883,6 +886,10 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 default_display=categorical_display(valid),
                 preserved_display=preserved_displays[validity_key],
             )
+        logger.info(
+            f"Stored fate probabilities for {len(fate_keys)} sinks "
+            f"across {int(valid.sum())}/{len(valid)} cells"
+        )
         return FateMappingResult(
             fate_keys=fate_keys,
             validity_key=validity_key,
@@ -1082,7 +1089,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                         "p_value": p_values,
                     },
                 )
-        logger.info("Pseudotime markers: saving marker scores")
+        logger.debug("Pseudotime markers: saving marker scores")
         assay.feats.insert(
             correlation_key,
             r_values,
@@ -1119,6 +1126,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             "feature_name",
             feature_names[table["feature_index"].to_numpy(dtype=np.int64)],
         )
+        logger.info(f"Stored pseudotime marker scores for {len(table)} features")
         return PseudotimeMarkerResult(
             table=table,
             correlation_key=correlation_key,
@@ -1417,7 +1425,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         df = full_data[valid_features]
         feat_ids = stored_feature_indices[valid_features]
         clusts = stored_feature_clusters[valid_features]
-        logger.info("Pseudotime modules: saving module labels")
+        logger.debug("Pseudotime modules: saving module labels")
         assay.feats.insert(
             cluster_label,
             cluster_values,
@@ -1456,6 +1464,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                     f"Grouped assay '{assay_name}' is stale after updating "
                     f"feature groups in '{cluster_label}'. Rerun add_grouped_assay"
                 )
+        logger.info(f"Stored {np.unique(clusts).size} pseudotime modules")
         return PseudotimeAggregationResult(
             data=df,
             feature_indices=np.asarray(feat_ids),

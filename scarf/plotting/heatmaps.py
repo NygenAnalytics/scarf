@@ -11,9 +11,7 @@ from ..storage.artifacts import ArtifactRef, inspect_artifact
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..matrix import ChunkedArray
 from ..utils.arrays import array_digest
-from ..utils.compute import controlled_compute
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance
 from ._deps import require_matplotlib, require_seaborn
 from ._figure import LegendSpec, PlotResult
@@ -124,12 +122,10 @@ def _prepare_marker_heatmap(
     group_sums: dict[Any, np.ndarray] = {}
     group_counts: dict[Any, int] = {}
     row_start = 0
-    for block in tqdmbar(
-        normalized.blocks,
-        total=normalized.numblocks[0],
-        desc="Aggregating marker values per group",
+    for values in normalized.stream_blocks(
+        nthreads=store.nthreads,
+        msg="Aggregating marker values per group",
     ):
-        values = controlled_compute(block, store.nthreads)
         block_groups = groups[row_start : row_start + values.shape[0]]
         row_start += values.shape[0]
         block_frame = pd.DataFrame(values)

@@ -234,7 +234,7 @@ def fit_incremental_pca(
     )
     if use_gram:
         accumulator_mib = n_features * n_features * 8 / (1024**2)
-        logger.info(
+        logger.debug(
             "Fitting PCA with the Gram covariance solver "
             f"({n_features} features, {block_rows} rows per block, "
             f"{accumulator_mib:.0f} MiB accumulator)"
@@ -248,7 +248,7 @@ def fit_incremental_pca(
             nthreads=nthreads,
         )
 
-    logger.info(
+    logger.debug(
         "Fitting PCA with the IncrementalPCA solver "
         f"({n_features} features, {block_rows} rows per block; "
         f"falling back because {fallback_reason})"

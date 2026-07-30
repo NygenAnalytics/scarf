@@ -39,7 +39,7 @@ Use the same 5K PBMC Zarr store. Rebuild a short analysis path so this page runs
 import numpy as np
 import scarf
 
-scarf.set_verbosity('WARNING')
+scarf.configure_output(level='WARNING', progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',

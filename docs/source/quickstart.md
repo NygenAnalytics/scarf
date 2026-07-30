@@ -31,7 +31,7 @@ uv pip install "scarf[extra]"
 ```{code-cell} ipython3
 import scarf
 
-scarf.set_verbosity("ERROR")
+scarf.configure_output(level="ERROR", progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",

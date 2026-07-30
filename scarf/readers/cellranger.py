@@ -11,7 +11,7 @@ from numpy.typing import DTypeLike
 from scipy.sparse import coo_matrix
 
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 from ._assay_names import (
     AUTO_ASSAY_NAMES,
     auto_name_feat_table,
@@ -315,9 +315,9 @@ class CrH5Reader(CrReader):
         valid_idx = []
         test_counter = 0
         indptr = self.grp["indptr"][:]
-        for s in tqdmbar(
+        for s in iter_progress(
             range(0, len(indptr) - 1, batch_size),
-            desc=f"Filtering out background barcodes",  # noqa: F541
+            desc="Filtering out background barcodes",
         ):
             idx = indptr[s : s + batch_size + 1]
             data = self.grp["data"][idx[0] : idx[-1]]
@@ -527,8 +527,8 @@ class CrDirReader(CrReader):
             ]
         except IndexError:
             logger.warning(
-                f"{key} extraction failed from {grp_entry[0]} in column {grp_entry[1]}",
-                flush=True,
+                f"Could not extract {key} from {grp_entry[0]} "
+                f"column {grp_entry[1]}"
             )
             vals = None
         return vals
@@ -600,7 +600,7 @@ class CrDirReader(CrReader):
         start = 1
 
         dfs = []
-        for chunk in tqdmbar(
+        for chunk in iter_progress(
             # range(nChunks),
             matrixIO,
             total=nChunks,

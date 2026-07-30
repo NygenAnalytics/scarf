@@ -33,7 +33,7 @@ counts or metadata to interoperable formats.
 ```{code-cell} ipython3
 import scarf
 
-scarf.set_verbosity('WARNING')
+scarf.configure_output(level='WARNING', progress=False)
 ```
 
 ### 1. Download datasets from Cytebase

@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import zarr
 
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 from ._types import ZarrArray
 
 _CONNECTIVITY_BATCH_ROWS = 100_000
@@ -93,7 +93,7 @@ def graph_connectivity(
 
     n_edges = edges.shape[0]
     total = (n_edges + chunk_rows - 1) // chunk_rows
-    for start in tqdmbar(
+    for start in iter_progress(
         range(0, n_edges, chunk_rows),
         total=total,
         desc="Computing graph connectivity",

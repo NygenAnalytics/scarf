@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from ...utils.logging import logger
-from ...utils.progress import tqdmbar
+from ...utils.progress import iter_progress
 
 __all__ = ["GffReader"]
 
@@ -99,7 +99,10 @@ class GffReader:
             raise ValueError(
                 "ERROR: The value of flavour must be one of either 'body' or 'promoter'"
             )
-        for df in tqdmbar(self.stream()):
+        for df in iter_progress(
+            self.stream(),
+            desc="Reading gene annotations",
+        ):
             df = df[df[2] == "gene"]
             if flavour == "promoter":
                 coords = self.d_apply(df, self.get_promoter)

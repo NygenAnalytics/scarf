@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 
 
 def make_digraph(
@@ -22,7 +22,11 @@ def make_digraph(
             )
     else:
         clust_info = np.ones(d.shape[0] + 1) * -1
-    for row_values in tqdmbar(d, desc="Constructing graph from dendrogram"):
+    for row_values in iter_progress(
+        d,
+        desc="Constructing graph from dendrogram",
+        total=d.shape[0],
+    ):
         distance = row_values[2]
         row = row_values.astype(int)
         graph.add_node(node, nleaves=row[3], dist=distance)
@@ -85,7 +89,7 @@ def CoalesceTree(graph: nx.DiGraph, clusters: np.ndarray) -> nx.DiGraph:
     def get_holding_nodes(g: nx.DiGraph, c: np.ndarray) -> dict[int, int]:
         holding_nodes: dict[int, int] = {}
         steps = calc_steps_to_top(g, c)
-        for cluster in tqdmbar(
+        for cluster in iter_progress(
             set(c),
             desc="Identifying the top node for cluster",
         ):

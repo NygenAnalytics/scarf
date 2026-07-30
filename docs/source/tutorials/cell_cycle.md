@@ -34,7 +34,7 @@ Score S-phase and G2M-phase gene sets to assign a cell-cycle phase to each cell.
 import scarf
 import scarf.plotting as splt
 
-scarf.set_verbosity('WARNING')
+scarf.configure_output(level='WARNING', progress=False)
 ```
 
 ## Guided steps

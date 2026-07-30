@@ -28,7 +28,7 @@ from ...storage.artifacts import (
     fingerprint_array,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
-from ...utils.logging import logger
+from ...utils.logging import logger, progress_enabled
 
 if TYPE_CHECKING:
     from .graph import _GraphOperationsMixin as _EmbeddingOperationsBase
@@ -323,6 +323,11 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 default_display=continuous_display(values[:, i]),
                 preserved_display=preserved_displays[i],
             )
+        action = "Reused" if planned.reused else "Stored"
+        logger.info(
+            f"{action} {tsne_dims}-dimensional t-SNE embedding "
+            f"for {len(values)} cells"
+        )
         return None
 
     def run_umap(
@@ -399,7 +404,6 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
         Returns:
         """
         from ...embeddings.umap import fit_transform
-        from ...utils.logging import get_log_level
 
         from_assay, cell_key, feat_key = self._get_latest_keys(
             from_assay, cell_key, feat_key
@@ -509,9 +513,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             arrays={"values": ((graph.shape[0], umap_dims), "f")},
             invalidate_cache=invalidate_cache,
         )
-        verbose = False
-        if get_log_level() <= 20:
-            verbose = True
+        verbose = progress_enabled()
 
         if use_density_map and integrated_graph is not None:
             logger.warning(
@@ -606,4 +608,8 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
                 default_display=continuous_display(t[:, i]),
                 preserved_display=preserved_displays[i],
             )
+        action = "Reused" if planned.reused else "Stored"
+        logger.info(
+            f"{action} {umap_dims}-dimensional UMAP embedding for {len(t)} cells"
+        )
         return None

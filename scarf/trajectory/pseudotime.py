@@ -135,7 +135,7 @@ def truncated_pba_potential(
 ) -> np.ndarray:
     random_state = np.random.RandomState(random_seed)
     initial_vector = random_state.rand(laplacian_transpose.shape[0])
-    logger.info(
+    logger.debug(
         f"Pseudotime scoring: calculating SVD "
         f"(shape={laplacian_transpose.shape}, nnz={laplacian_transpose.nnz}, "
         f"k={n_singular_vals})"

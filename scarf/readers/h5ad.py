@@ -7,7 +7,7 @@ import numpy as np
 from scipy.sparse import coo_matrix, csc_matrix, csr_matrix
 
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 from ._assay_names import auto_name_feat_table, make_feat_table_from_types
 from ._h5ad_inspect import H5adInspectResult, inspect_h5ad as inspect_h5ad
 
@@ -171,7 +171,7 @@ class H5adReader:
                 > 1
             ):
                 if sorted(self.h5[group].keys()) != ["data", "indices", "indptr"]:
-                    logger.info(
+                    logger.warning(
                         f"`{group}` slot in H5ad file has unequal sized child groups"
                     )
         return ret_val
@@ -259,7 +259,10 @@ class H5adReader:
             return self._replace_category_values(
                 values, self.cellIdsKey, self.cellAttrsKey
             ).astype(object)
-        logger.warning(f"Could not find cells ids key: {self.cellIdsKey} in `obs`.")
+        logger.warning(
+            f"Cell ID key {self.cellIdsKey!r} was not found in H5AD obs; "
+            "generated IDs will be used"
+        )
         return np.array([f"cell_{x}" for x in range(self.nCells)])
 
     # noinspection DuplicatedCode
@@ -271,7 +274,8 @@ class H5adReader:
                 values, self.featIdsKey, self.featureAttrsKey
             ).astype(object)
         logger.warning(
-            f"Could not find feature ids key: {self.featIdsKey} in {self.featureAttrsKey}."
+            f"Feature ID key {self.featIdsKey!r} was not found in "
+            f"{self.featureAttrsKey}; generated IDs will be used"
         )
         return np.array([f"feature_{x}" for x in range(self.nFeatures)])
 
@@ -284,7 +288,8 @@ class H5adReader:
                 values, self.featNamesKey, self.featureAttrsKey
             ).astype(object)
         logger.warning(
-            f"Could not find feature names key: {self.featNamesKey} in self.featureAttrsKey."
+            f"Feature name key {self.featNamesKey!r} was not found in "
+            f"{self.featureAttrsKey}; feature IDs will be used"
         )
         return self.feat_ids()
 
@@ -338,7 +343,7 @@ class H5adReader:
         self, group: str, ignore_keys: list[str]
     ) -> Generator[tuple[str, np.ndarray], None, None]:
         if self.groupCodes[group] == 1:
-            for i in tqdmbar(
+            for i in iter_progress(
                 self.h5[group].dtype.names,
                 desc=f"Reading attributes from group {group}",
             ):
@@ -346,7 +351,7 @@ class H5adReader:
                     continue
                 yield i, self._replace_category_values(self.h5[group][i][:], i, group)
         if self.groupCodes[group] == 2:
-            for i in tqdmbar(
+            for i in iter_progress(
                 self.h5[group].keys(), desc=f"Reading attributes from group {group}"
             ):
                 if i in ignore_keys:
@@ -367,14 +372,13 @@ class H5adReader:
         self, group: str
     ) -> Generator[tuple[str, np.ndarray], None, None]:
         if self.groupCodes[group] == 2:
-            for i in tqdmbar(
+            for i in iter_progress(
                 self.h5[group].keys(), desc=f"Reading attributes from group {group}"
             ):
                 g = self.h5[group][i]
                 if g.shape[0] != self.nCells:
-                    logger.error(
-                        f"Dimension of {i}({g.shape}) is not correct."
-                        f" Will not save this specific slot into Zarr."
+                    logger.warning(
+                        f"Skipping H5AD slot {i!r} with unexpected shape {g.shape}"
                     )
                     continue
                 if isinstance(g, h5py.Dataset):
@@ -382,7 +386,8 @@ class H5adReader:
                         yield f"{i}{j + 1}", g[:, j]
         else:
             logger.warning(
-                f"Reading of obsm failed because it either does not exist or is not in expected format"  # noqa: F541
+                "H5AD obsm is missing or has an unsupported format; "
+                "embeddings will be skipped"
             )
 
     def get_cell_columns(self) -> Generator[tuple[str, np.ndarray], None, None]:
@@ -524,7 +529,7 @@ class H5adReader:
             max(0, int(maxScanBytes)) // bytes_per_value,
         )
         if not self._sparse_indices_are_strictly_sorted(check_values):
-            logger.info(
+            logger.debug(
                 "Keeping the H5AD source dtype because sparse coordinates are "
                 "not canonical within the dtype-scan memory limit"
             )
@@ -559,7 +564,7 @@ class H5adReader:
                     break
 
         self.storageDtype = storage_dtype
-        logger.info(f"Resolved H5AD storage dtype={storage_dtype}")
+        logger.debug(f"Resolved H5AD storage dtype={storage_dtype}")
         return storage_dtype
 
     def csc_conversion_peak_bytes(self) -> int:
@@ -679,7 +684,7 @@ class H5adReader:
             self.storageDtype,
         )
         self._convertedCsr = canonical.tocsr()
-        logger.info(
+        logger.debug(
             f"Materialized H5AD CSR matrix for conversion with "
             f"dtype={self.storageDtype}"
         )

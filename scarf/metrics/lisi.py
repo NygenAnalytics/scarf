@@ -5,7 +5,7 @@ import pandas as pd
 import zarr
 
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 from ._types import ZarrArray
 
 _LISI_BATCH_SIZE = 10_000
@@ -164,7 +164,7 @@ def compute_lisi(
         if np.any(categorical.codes < 0):
             raise ValueError(f"Label column {label!r} contains missing values")
         categoricals.append(categorical)
-        logger.info(f"Computing LISI for {label}")
+        logger.debug(f"Preparing LISI labels from {label}")
 
     chunk_rows = _LISI_BATCH_SIZE
     if isinstance(distances, zarr.Array):
@@ -173,7 +173,7 @@ def compute_lisi(
     lisi_df = np.empty((n_cells, n_labels), dtype=np.float64)
     starts = range(0, n_cells, chunk_rows)
     total = int(np.ceil(n_cells / chunk_rows))
-    for start in tqdmbar(starts, total=total, desc="Computing LISI"):
+    for start in iter_progress(starts, total=total, desc="Computing LISI"):
         end = min(start + chunk_rows, n_cells)
         distance_block = np.asarray(distances[start:end])
         index_block = np.asarray(indices[start:end])

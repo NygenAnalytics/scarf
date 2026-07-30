@@ -52,9 +52,7 @@ class LoomToZarr:
         self.workspace = workspace
         self.storage_options = storage_options
         if assay_name is None:
-            logger.info(
-                "No value provided for assay names. Will use default value: 'RNA'"
-            )
+            logger.debug("Using RNA as the default assay name")
             self.assayName = "RNA"
         else:
             self.assayName = assay_name
@@ -163,9 +161,14 @@ class LoomToZarr:
                 value_bytes,
             )
             + dense_source_bytes,
+            msg="Writing Loom counts",
         )
         if total_cells_written != self.loom.nCells:
             raise AssertionError(
                 "ERROR: This is a bug in LoomToZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
+        logger.info(
+            f"Wrote {self.loom.nCells} cells and {self.loom.nFeatures} features "
+            f"from Loom to assay {self.assayName}"
+        )

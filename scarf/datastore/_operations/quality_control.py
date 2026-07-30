@@ -108,9 +108,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 if values.dtype.kind in {"O", "S", "U"}
                 else fingerprint_array(values)
             )
-            logger.info(
-                f"{len(x) - x.sum()} cells flagged for filtering out using attribute {i}"
-            )
             new_bool = new_bool & x
         if reset_previous:
             self.cells.reset_key(key="I")
@@ -128,6 +125,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             inputs={"metadata_fingerprints": input_fingerprints},
             invalidate_cache=invalidate_cache,
         )
+        remaining = int(np.asarray(self.cells.fetch_all("I"), dtype=bool).sum())
+        logger.info(f"Cell filtering retained {remaining}/{self.cells.N} cells")
 
     def auto_filter_cells(
         self,
@@ -165,6 +164,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                     attrs.append(i)
 
         attrs_used: list[str] = []
+        lower_bounds: list[int] = []
+        upper_bounds: list[int] = []
         resolved_bounds: dict[str, dict[str, float]] = {}
         for i in attrs:
             if i not in self.cells.columns:
@@ -175,13 +176,17 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             a = self.cells.fetch_all(i)
             low, high = gaussian_quantile_bounds(a, min_p, max_p)
             resolved_bounds[i] = {"low": float(low), "high": float(high)}
+            attrs_used.append(i)
+            lower_bounds.append(cast(int, low))
+            upper_bounds.append(cast(int, high))
+
+        if attrs_used:
             self.filter_cells(
-                attrs=[i],
-                lows=[cast(int, low)],
-                highs=[cast(int, high)],
+                attrs=attrs_used,
+                lows=lower_bounds,
+                highs=upper_bounds,
                 invalidate_cache=False,
             )
-            attrs_used.append(i)
 
         self._record_cell_selection(
             column="I",
@@ -507,7 +512,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         )
         pool_clusters = np.asarray(clusters)[pool_positions]
         pool_raw_rows = np.asarray(active_idx)[pool_positions]
-        logger.info(
+        logger.debug(
             f"Sampled {len(pool_positions)} cells across "
             f"{len(np.unique(pool_clusters))} clusters to seed doublet simulation"
         )
@@ -522,7 +527,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             pool_clusters, n_sim, heterotypic_fraction, rng
         )
         sim_counts = (pool_csr[left] + pool_csr[right]).tocsr()
-        logger.info(f"Simulated {n_sim} synthetic doublets")
+        logger.debug(f"Simulated {n_sim} synthetic doublets")
 
         temp_dir = tempfile.mkdtemp(prefix="scarf_doublet_")
         target_name = f"_doublet_sim_{from_assay}"
@@ -597,7 +602,10 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 default_display=continuous_display(scores),
                 preserved_display=preserved_display,
             )
-            logger.info(f"Doublet scores stored in cell metadata column '{final_col}'")
+            logger.info(
+                f"Stored doublet scores in '{final_col}' using "
+                f"{n_sim} synthetic doublets"
+            )
         finally:
             try:
                 self._delete_projection_artifact(

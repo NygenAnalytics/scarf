@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     )
     from .utils import (
         clean_array as clean_array,
+        configure_output as configure_output,
         controlled_compute as controlled_compute,
         get_log_level as get_log_level,
         load_zarr as load_zarr,
@@ -167,6 +168,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SparseToZarr": (".writers", "SparseToZarr"),
     "SubsetZarr": (".writers", "SubsetZarr"),
     "clean_array": (".utils", "clean_array"),
+    "configure_output": (".utils", "configure_output"),
     "controlled_compute": (".utils", "controlled_compute"),
     "coordinate_melding": (".features.genomic.melding", "coordinate_melding"),
     "create_zarr_count_assay": (".writers", "create_zarr_count_assay"),

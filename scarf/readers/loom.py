@@ -5,7 +5,7 @@ import numpy as np
 from scipy.sparse import coo_matrix
 
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 
 
 class LoomReader:
@@ -104,7 +104,10 @@ class LoomReader:
         else:
             ignored = {name for name in ignore if name is not None}
         if key in self.h5:
-            for i in tqdmbar(self.h5[key].keys(), desc=f"Reading {key} attributes"):
+            for i in iter_progress(
+                self.h5[key].keys(),
+                desc=f"Reading {key} attributes",
+            ):
                 if i in ignored:
                     continue
                 vals = self.h5[key][i][:]

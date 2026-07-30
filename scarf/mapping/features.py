@@ -131,7 +131,8 @@ def align_features(
         raise ValueError(
             f"Target data is missing {n_missing} required reference features"
         )
-    logger.info(f"{n_missing} features missing in target data")
+    if n_missing:
+        logger.warning(f"{n_missing} required features are missing in the target data")
     if missing_feature_values is not None:
         missing_feature_values = np.asarray(missing_feature_values)
         if missing_feature_values.shape != (len(t_idx),):

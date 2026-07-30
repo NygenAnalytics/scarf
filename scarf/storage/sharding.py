@@ -334,11 +334,18 @@ def write_sparse_bands(
     resources: ResourceBudget,
     residentBytes: int = 0,
     producerReserveBytes: int = 0,
+    msg: str | None = None,
+    total: int | None = None,
 ) -> None:
     """Densify and write complete sparse row bands within CPU and memory limits."""
     pending: deque[SparseWriteBand] = deque()
     source = iter(writes)
     exhausted = False
+    progress = None
+    if msg is not None:
+        from ..utils.progress import tqdmbar
+
+        progress = tqdmbar(desc=msg, total=total)
 
     def pull() -> SparseWriteBand:
         sparse_bytes = sum(write.band.sparseBytes for write in pending)
@@ -398,11 +405,14 @@ def write_sparse_bands(
                 within_block_threads=1,
                 io_concurrency=inner,
             ):
-                pass
+                if progress is not None:
+                    progress.update()
             del batch
             fill()
     finally:
         _close_iterator(source)
+        if progress is not None:
+            progress.close()
 
 
 def write_dense_from_row_batches(
@@ -570,6 +580,7 @@ def accumulate_sparse_to_shards(
     resources: ResourceBudget | None = None,
     residentBytes: int = 0,
     producerReserveBytes: int,
+    msg: str | None = None,
 ) -> int:
     """Write one complete dense row band per sparse destination object."""
     resources = resources or resolve_budget()
@@ -613,6 +624,11 @@ def accumulate_sparse_to_shards(
             resources=resources,
             residentBytes=residentBytes,
             producerReserveBytes=producerReserveBytes,
+            msg=msg,
+            total=(
+                int(dst.shape[0]) + array_shard_rows(dst) - 1
+            )
+            // array_shard_rows(dst),
         )
     finally:
         _close_iterator(source)
@@ -629,6 +645,7 @@ def write_counts_t(
 ) -> zarr.Array | None:
     """Write the optional feature-major count matrix using public Zarr APIs."""
     from ..utils.logging import logger
+    from ..utils.progress import tqdmbar
 
     if _group_zarr_format(group) < 3:
         return None
@@ -687,11 +704,12 @@ def write_counts_t(
             innerConcurrency=concurrency,
         ),
     )
-    logger.info(
+    logger.debug(
         f"Writing countsT shape=({n_feats}, {n_cells}) "
         f"chunks=({feature_chunk}, {cell_chunk}) "
         f"tasks={n_tasks} workers={workers}"
     )
+    progress = tqdmbar(desc="Writing transposed counts", total=n_tasks)
 
     def inner_chunk_values(
         task: tuple[int, int],
@@ -722,6 +740,7 @@ def write_counts_t(
                 )
                 await counts_t.async_array.setitem(selection, values)
                 del selection, values
+                progress.update()
 
         async with asyncio.TaskGroup() as group_tasks:
             for _ in range(workers):
@@ -734,5 +753,7 @@ def write_counts_t(
             if len(error.exceptions) == 1:
                 raise error.exceptions[0] from error
             raise
+        finally:
+            progress.close()
     counts_t.attrs["complete"] = True
     return counts_t

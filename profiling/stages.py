@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scarf import DataStore, H5adReader, H5adToZarr, SubsetZarr
+from scarf import DataStore, H5adReader, H5adToZarr, SubsetZarr, configure_output
 from scarf.storage.budget import resolve_budget
 from scarf.storage.sharding import write_counts_t
 from scarf.storage.stores import open_store
@@ -23,6 +23,8 @@ from profiling.config import (
 )
 from profiling.metrics import ResourceMeasurement, ResourceSampler, StageTimer
 from profiling.r2 import storage_options
+
+configure_output(progress=False, timestamps=True)
 
 LEIDEN_MONITOR_INTERVAL_SECONDS = 30.0
 LEIDEN_WARNING_SECONDS = 1_800.0

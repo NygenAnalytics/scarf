@@ -413,7 +413,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             Path of KNN graph in the Zarr hierarchy
         """
         if from_assay is None:
-            logger.info("Using default assay for KNN graph.")
+            logger.debug("Using the default assay for the KNN graph")
             from_assay = self._load_default_assay()
 
         if from_assay not in self.assay_names:
@@ -506,7 +506,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 expected_count=expected_count,
             )
 
-        logger.info(
+        logger.debug(
             "ANN index not found in store; will rebuild from normalized data and loadings"
         )
         return None
@@ -652,7 +652,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if need_mu and need_sigma:
             mu_raw, sigma_raw = data.mean_and_std(
                 nthreads=self.nthreads,
-                msg="Calculating mean and std. dev. of norm. data",
+                msg="Calculating normalization statistics",
             )
             mu = clean_array(mu_raw)
             sigma = clean_array(sigma_raw, 1)
@@ -1021,7 +1021,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         rebuilt_ann = ann_idx is None
 
         use_for_pca = self.cells.fetch(pca_cell_key, key=cell_key)
-        logger.info(f"Loaded existing ANN stream from {ann_loc}")
         ann_obj = AnnStream(
             data=data,
             k=k,
@@ -1058,6 +1057,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 dimensions=int(temp_dim),
                 element_count=int(data.shape[0]),
             )
+        if rebuilt_ann:
+            logger.info(f"Built ANN index for {data.shape[0]} cells")
+        else:
+            logger.info(f"Reused stored ANN index for {data.shape[0]} cells")
         return ann_obj
 
     def _get_graph_ncells_k(self, graph_loc: str) -> tuple[int, int]:
@@ -1103,7 +1106,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         logger.debug(f"Loading graph from location: {graph_loc}")
         store = as_zarr_group(self.zw[graph_loc], name=graph_loc)
         n_cells, k = self._get_graph_ncells_k(graph_loc)
-        # TODO: can we have a progress bar for graph loading. Append to coo matrix?
         if use_k is None:
             use_k = k
         if use_k > k:
@@ -1666,7 +1668,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 nthreads=self.nthreads,
                 resources=self.resources,
             )
-            logger.info(
+            logger.debug(
                 f"Using materialized batch-correction coordinates from "
                 f"{status.path} (shape={data.shape[0]} x {data.shape[1]})"
             )
@@ -1697,7 +1699,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     nthreads=self.nthreads,
                     resources=self.resources,
                 )
-                logger.info(
+                logger.debug(
                     f"Using materialized {method_label} coordinates from "
                     f"{status.path} (shape={data.shape[0]} x {data.shape[1]})"
                 )
@@ -1938,6 +1940,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             update_state=update_state,
             cell_key_override=cell_key,
             feat_key_override=feat_key,
+        )
+        action = "Reused" if planned.reused else "Stored"
+        logger.info(
+            f"{action} normalized data for {n_cells} cells and {n_features} features"
         )
         return planned.ref
 
@@ -2314,6 +2320,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             planned.ref,
             update_state=update_state,
         )
+        action = "Reused" if planned.reused else "Stored"
+        logger.info(
+            f"{action} {method.upper()} reduction for {n_cells} cells "
+            f"with {effective_dims} dimensions"
+        )
         return planned.ref
 
     def run_pca(
@@ -2653,6 +2664,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             planned.ref,
             update_state=update_state,
         )
+        action = "Reused" if planned.reused else "Stored"
+        logger.info(
+            f"{action} Harmony coordinates for {n_cells} cells "
+            f"with {dims} dimensions"
+        )
         return planned.ref
 
     def _build_embedding_initialization(
@@ -2765,6 +2781,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             )
             labels[:] = initialization.labels
             finish_artifact(group, planned)
+        action = "Reused" if planned.reused else "Stored"
+        logger.info(
+            f"{action} embedding initialization with "
+            f"{effective_clusters} centroids"
+        )
         return planned.ref
 
     def build_embedding_initialization(
@@ -2954,6 +2975,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             planned.ref,
             update_state=update_state,
         )
+        action = "Reused" if planned.reused else "Stored"
+        logger.info(f"{action} ANN index for {n_cells} cells")
         return planned.ref
 
     def query_neighbors(
@@ -3124,6 +3147,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             planned.ref,
             update_state=update_state,
         )
+        action = "Reused" if planned.reused else "Stored"
+        logger.info(
+            f"{action} {effective_k} neighbors for each of {n_cells} cells"
+        )
         return planned.ref
 
     def build_connectivity_map(
@@ -3248,6 +3275,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             planned.ref,
             update_state=update_state,
         )
+        action = "Reused" if planned.reused else "Stored"
+        logger.info(f"{action} connectivity map for {n_cells} cells")
         return planned.ref
 
     def load_graph(

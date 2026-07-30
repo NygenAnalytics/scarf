@@ -92,7 +92,7 @@ Fact-check before merging: method names and defaults against `scarf/`, dataset I
 The documentation uses [Sphinx], the [MyST] parser, and [myst_nb] for notebook execution.
 Sphinx reads the committed cache via `nb_execution_mode = "cache"` in `docs/source/conf.py`.
 
-Use `scarf.set_verbosity('DEBUG')` when debugging tutorial execution locally. Tutorials
+Use `scarf.configure_output(level='DEBUG', progress=True)` when debugging tutorial execution locally. Tutorials
 download datasets over the network. Timeout per page is 600 seconds (`nb_execution_timeout` in `conf.py`).
 
 # Acknowledgements

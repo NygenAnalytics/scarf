@@ -3,6 +3,7 @@ import pytest
 
 from scarf import ArtifactRef
 from scarf.storage.artifacts import parse_artifact_path
+from scarf.utils import configure_output
 from tests.fixtures_datastore import _has_graph, build_atomic_graph
 
 pytestmark = pytest.mark.slow
@@ -52,6 +53,40 @@ def test_run_umap_recomputes_coordinates(analyzed_datastore_ephemeral):
     umap2 = ds.cells.fetch("RNA_UMAP2")
     assert len(umap1) == _active_cell_count(ds)
     assert len(umap2) == _active_cell_count(ds)
+
+
+def test_run_umap_uses_explicit_progress_for_verbose_output(
+    analyzed_datastore_ephemeral,
+    monkeypatch,
+):
+    import scarf.embeddings.umap as umap_module
+
+    ds = analyzed_datastore_ephemeral
+    _ensure_graph(ds)
+    observed: list[bool] = []
+
+    def fake_fit_transform(*, graph, verbose, **_kwargs):
+        observed.append(verbose)
+        return np.zeros((graph.shape[0], 2)), None, None
+
+    monkeypatch.setattr(umap_module, "fit_transform", fake_fit_transform)
+    try:
+        configure_output(progress=False)
+        ds.run_umap(
+            n_epochs=10,
+            label="progress_off_umap",
+            invalidate_cache=True,
+        )
+        configure_output(progress=True)
+        ds.run_umap(
+            n_epochs=10,
+            label="progress_on_umap",
+            invalidate_cache=True,
+        )
+    finally:
+        configure_output(progress=False)
+
+    assert observed == [False, True]
 
 
 def test_run_leiden_writes_cluster_labels(analyzed_datastore_ephemeral):

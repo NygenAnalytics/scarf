@@ -14,7 +14,7 @@ from ..storage.profiles import (
     resolve_storage_profile,
 )
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 
 # Root group names the datastore layout reserves for cell metadata, matrices,
 # and plots. Assays must not collide with these or the store is corrupted.
@@ -107,9 +107,7 @@ class H5adToZarr:
             )
             self.assayNames = tuple(self.assayFeatures)
         elif assay_name is None:
-            logger.info(
-                "No value provided for assay names. Will use default value: 'RNA'"
-            )
+            logger.debug("Using RNA as the default assay name")
             self.assayName = "RNA"
             self.assayFeatures = None
             self.assayNames = (self.assayName,)
@@ -222,7 +220,7 @@ class H5adToZarr:
             assay_name: SparseShardBuffer(destination)
             for assay_name, destination in destinations.items()
         }
-        logger.info(
+        logger.debug(
             f"Writing counts with up to {self.resources.workers} row-band writer(s)"
         )
         started = time.perf_counter()
@@ -302,7 +300,11 @@ class H5adToZarr:
                 )
         # counts is the durable physical orientation for H5AD imports. Assay
         # readers use it directly when the optional derived countsT is absent.
-        logger.info(f"Counts written in {counts_seconds:.1f}s")
+        logger.debug(f"Counts written in {counts_seconds:.1f}s")
+        logger.info(
+            f"Wrote {self.h5ad.nCells} cells and {self.h5ad.nFeatures} features "
+            f"from H5AD to {len(destinations)} assay(s)"
+        )
 
     def _count_shard_tasks(
         self,
@@ -315,7 +317,7 @@ class H5adToZarr:
         from ..storage.sharding import SparseWriteBand, sparse_matrix_bytes
 
         n_batches = (self.h5ad.nCells + batch_size - 1) // batch_size
-        stream = tqdmbar(
+        stream = iter_progress(
             self.h5ad.consume(batch_size),
             total=n_batches,
             desc="Writing counts",

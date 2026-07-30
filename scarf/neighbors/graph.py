@@ -4,7 +4,7 @@ import numpy as np
 from numba import jit
 from scipy.sparse import coo_matrix, csr_matrix
 
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 
 
 def smooth_knn_chunk(
@@ -155,11 +155,11 @@ def merge_graphs(csr_mats: list[csr_matrix]) -> coo_matrix:
     if nk < 2:
         raise ValueError("SNN integration requires at least two neighbors per cell")
     snns = []
-    for matrix in tqdmbar(csr_mats, desc="Identifying SNNs in graphs"):
+    for matrix in iter_progress(csr_mats, desc="Identifying SNNs in graphs"):
         snns.append(calc_snn(matrix.indices.reshape((matrix.shape[0], nk))))
     columns: list[int] = []
     data: list[float] = []
-    for row_idx in tqdmbar(
+    for row_idx in iter_progress(
         range(csr_mats[0].shape[0]),
         desc="Merging graph edges",
     ):

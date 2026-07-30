@@ -2,7 +2,7 @@ import numpy as np
 from scipy.sparse import coo_matrix, csr_matrix
 
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 
 
 def wnn_integration(
@@ -99,7 +99,11 @@ def wnn_integration(
     column_parts: list[np.ndarray] = []
     data_parts: list[np.ndarray] = []
     with threadpool_limits(limits=n_threads):
-        for cell_idx in tqdmbar(range(n_cells), desc="Building WNN graph"):
+        for cell_idx in iter_progress(
+            range(n_cells),
+            desc="Building WNN graph",
+            total=n_cells,
+        ):
             neighbors1 = neighbor_indices1[cell_idx]
             neighbors2 = neighbor_indices2[cell_idx]
             mixed_k = np.union1d(neighbors1, neighbors2)

@@ -11,10 +11,8 @@ from threadpoolctl import threadpool_info, threadpool_limits
 
 from ..embeddings.harmony import HarmonyResult, fit_harmony
 from ..matrix import ChunkedArray
-from ..utils.compute import controlled_compute
 from ..utils.logging import logger
 from ..utils.process import process_rss_mb
-from ..utils.progress import tqdmbar
 from .index import fix_knn_query, instantiate_knn_index
 
 
@@ -245,12 +243,10 @@ class ChunkedCoordinateStream:
         self.nthreads = nthreads
 
     def iter_coordinate_blocks(self, message: str) -> Iterator[np.ndarray]:
-        for block in tqdmbar(
-            self.data.blocks,
-            desc=message,
-            total=self.data.numblocks[0],
-        ):
-            yield np.asarray(controlled_compute(block, self.nthreads))
+        yield from self.data.stream_blocks(
+            nthreads=self.nthreads,
+            msg=message,
+        )
 
 
 class AnnIndexStage:
@@ -473,7 +469,7 @@ class KMeansInitializationStage:
                 )
                 for pool in threadpool_info()
             )
-            logger.info(
+            logger.debug(
                 f"KMeans initialization plan: rows={n_rows} "
                 f"readBatchSize={batch_size} clusters={effective_clusters} "
                 f"samplingFraction={resolved_kmeans_sampling:.4f} "
@@ -499,7 +495,7 @@ class KMeansInitializationStage:
                 model.fit(block)
                 compute_seconds = time.perf_counter() - compute_started
                 compute_cpu_seconds = time.process_time() - compute_cpu_started
-                logger.info(
+                logger.debug(
                     f"KMeans minibatch fit block {block_idx}: rows={block.shape[0]} "
                     f"read={read_seconds:.3f}s readCpu={read_cpu_seconds:.3f}s "
                     f"readCores={read_cpu_seconds / max(read_seconds, 1e-12):.2f} "
@@ -569,7 +565,7 @@ class KMeansInitializationStage:
                 )
             sample_seconds = time.perf_counter() - sample_started
             sample_cpu_seconds = time.process_time() - sample_cpu_started
-            logger.info(
+            logger.debug(
                 f"KMeans sampling pass: blocks={sample_blocks} rows={rows_seen} "
                 f"sampleRows={init_size} wall={sample_seconds:.3f}s "
                 f"cpu={sample_cpu_seconds:.3f}s "
@@ -589,7 +585,7 @@ class KMeansInitializationStage:
             )
             seed_seconds = time.perf_counter() - seed_started
             seed_cpu_seconds = time.process_time() - seed_cpu_started
-            logger.info(
+            logger.debug(
                 f"KMeans centroid seeding: sampleRows={init_size} "
                 f"compute={seed_seconds:.3f}s cpu={seed_cpu_seconds:.3f}s "
                 f"effectiveCores="
@@ -659,7 +655,7 @@ class KMeansInitializationStage:
                 fit_compute_seconds += time.perf_counter() - compute_started
                 fit_compute_cpu_seconds += time.process_time() - compute_cpu_started
             del update_buffer
-            logger.info(
+            logger.debug(
                 f"KMeans streaming fit: blocks={fit_blocks} rows={fitted_rows} "
                 f"updates={update_count} read={fit_read_seconds:.3f}s "
                 f"readCpu={fit_read_cpu_seconds:.3f}s "
@@ -704,7 +700,7 @@ class KMeansInitializationStage:
                     f"K-means coordinate source contains {predicted_rows} rows, "
                     f"expected {n_rows}"
                 )
-            logger.info(
+            logger.debug(
                 f"KMeans prediction pass: blocks={predict_blocks} "
                 f"rows={predicted_rows} read={predict_read_seconds:.3f}s "
                 f"readCpu={predict_read_cpu_seconds:.3f}s "

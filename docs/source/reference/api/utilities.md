@@ -27,6 +27,20 @@
 
 ## Logging and progress
 
+Scarf starts with `INFO` logs and progress enabled, without timestamps. Notebook
+sessions do not need an output setup call. For a batch pipeline, configure the
+independent settings once at startup:
+
+```python
+scarf.configure_output(progress=False, timestamps=True)
+```
+
+Arguments that are omitted retain their current values.
+
+```{eval-rst}
+.. autofunction:: scarf.configure_output
+```
+
 ```{eval-rst}
 .. autofunction:: scarf.set_verbosity
 ```
@@ -39,7 +53,8 @@
 .. py:data:: scarf.logger
 
     Scarf's `loguru` logger. Library code logs through this object, so
-    :func:`scarf.set_verbosity` controls what user sessions see.
+    :func:`scarf.configure_output` controls the Scarf-owned sink while preserving
+    sinks added by callers.
 ```
 
 ```{eval-rst}
@@ -49,8 +64,8 @@
 ```{eval-rst}
 .. py:data:: scarf.tqdm_params
 
-    Default keyword arguments applied by :func:`scarf.tqdmbar` (bar format, width,
-    and colour). Override any of them per call.
+    Default keyword arguments applied by :func:`scarf.tqdmbar`, including bar
+    format, dynamic width, and colour. Override any of them per call.
 ```
 
 ```{eval-rst}

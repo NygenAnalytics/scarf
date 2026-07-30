@@ -1,7 +1,5 @@
 """Scanpy dask e2e stages for Modal profiling."""
 
-from __future__ import annotations
-
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -9,6 +7,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scarf import configure_output
 
 from profiling.metrics import ResourceMeasurement, ResourceSampler, StageTimer
 from profiling.scanpy_config import (
@@ -19,6 +18,9 @@ from profiling.scanpy_config import (
     ScanpyStageName,
     ScanpyWorkflowParameters,
 )
+
+configure_output(progress=False, timestamps=True)
+
 
 def _peak_cgroup_bytes(measurement: ResourceMeasurement | None) -> int | None:
     if measurement is None:

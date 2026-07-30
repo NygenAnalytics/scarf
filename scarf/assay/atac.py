@@ -106,7 +106,7 @@ class ATACassay(Assay):
         cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
         identifier, stats_loc = self._get_summary_stats_loc(cell_key)
         if self._validate_stats_loc(stats_loc, cell_idx, feat_idx) is True:
-            logger.info(f"Using cached feature stats for cell_key {cell_key}")
+            logger.debug(f"Using cached feature stats for cell_key {cell_key}")
             return None
         prevalence = show_dask_progress(
             self.normed(cell_idx, feat_idx).sum(axis=0),

@@ -7,6 +7,7 @@ from scipy.sparse import tril
 import scarf.datastore.pipeline_accessor as pipeline_accessor_module
 from scarf.datastore.pipeline_accessor import PipelineEvent
 from scarf.storage.artifacts import ArtifactRef
+from scarf.utils import logger
 
 
 def test_basic_rna_pipeline_returns_only_named_artifact_refs(
@@ -81,23 +82,31 @@ def test_pipeline_emits_ordered_events_and_omits_skipped_stages(
     datastore_ephemeral,
 ) -> None:
     events: list[PipelineEvent] = []
-
-    datastore_ephemeral.pipeline.run(
-        filtering=False,
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "top_n": 50,
-            "hvg_key_name": "pipeline_callback_hvgs",
-        },
-        pca={"dims": 3, "n_centroids": 5},
-        neighbors={"k": 3},
-        umap=False,
-        leiden={},
-        paris=False,
-        doublet_scoring=False,
-        markers=False,
-        callback=events.append,
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="INFO",
     )
+
+    try:
+        artifacts = datastore_ephemeral.pipeline.run(
+            filtering=False,
+            cell_cycle_scoring=False,
+            highly_variable_features={
+                "top_n": 50,
+                "hvg_key_name": "pipeline_callback_hvgs",
+            },
+            pca={"dims": 3, "n_centroids": 5},
+            neighbors={"k": 3},
+            umap=False,
+            leiden={},
+            paris=False,
+            doublet_scoring=False,
+            markers=False,
+            callback=events.append,
+        )
+    finally:
+        logger.remove(sink)
 
     expected_stages = [
         "highly_variable_features",
@@ -114,6 +123,24 @@ def test_pipeline_emits_ordered_events_and_omits_skipped_stages(
         for kind in ("stage_started", "stage_completed")
     ]
     assert all(event.error is None for event in events)
+    lifecycle_messages = [
+        message
+        for message in messages
+        if message.startswith("Running pipeline stage:")
+        or message.startswith("Completed pipeline stage:")
+        or message.startswith("Pipeline completed")
+    ]
+    assert lifecycle_messages == [
+        *[
+            message
+            for stage in expected_stages
+            for message in (
+                f"Running pipeline stage: {stage.replace('_', ' ')}",
+                f"Completed pipeline stage: {stage.replace('_', ' ')}",
+            )
+        ],
+        f"Pipeline completed with {len(artifacts)} artifacts",
+    ]
 
 
 def test_pipeline_emits_failed_stage_and_reraises_original_error(
@@ -161,6 +188,9 @@ def test_pipeline_logs_callback_errors_and_continues(
     callback_logs: list[str] = []
 
     class RecordingLogger:
+        def info(self, _message: str) -> None:
+            pass
+
         def exception(self, message: str) -> None:
             callback_logs.append(message)
 
@@ -425,6 +455,7 @@ def test_pipeline_overlaps_paris_compute_but_serializes_leiden_publish(
     original_publish = type(datastore)._publish_prepared_leiden
     callback_events: list[PipelineEvent] = []
     callback_threads: list[int] = []
+    messages: list[str] = []
     caller_thread = get_ident()
 
     def record_event(event: PipelineEvent) -> None:
@@ -463,23 +494,30 @@ def test_pipeline_overlaps_paris_compute_but_serializes_leiden_publish(
         observed_publish,
     )
 
-    datastore.pipeline.run(
-        filtering=False,
-        cell_cycle_scoring=False,
-        highly_variable_features={
-            "top_n": 100,
-            "hvg_key_name": "pipeline_concurrency_hvgs",
-        },
-        pca={"dims": 3, "n_centroids": 5},
-        neighbors={"k": 3},
-        umap=False,
-        leiden={0.5: {}},
-        paris={"n_clusters": 3, "label": "pipeline_concurrency_paris"},
-        clustering_concurrency=2,
-        doublet_scoring=False,
-        markers=False,
-        callback=record_event,
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]),
+        level="INFO",
     )
+    try:
+        datastore.pipeline.run(
+            filtering=False,
+            cell_cycle_scoring=False,
+            highly_variable_features={
+                "top_n": 100,
+                "hvg_key_name": "pipeline_concurrency_hvgs",
+            },
+            pca={"dims": 3, "n_centroids": 5},
+            neighbors={"k": 3},
+            umap=False,
+            leiden={0.5: {}},
+            paris={"n_clusters": 3, "label": "pipeline_concurrency_paris"},
+            clustering_concurrency=2,
+            doublet_scoring=False,
+            markers=False,
+            callback=record_event,
+        )
+    finally:
+        logger.remove(sink)
 
     assert paris_finished.is_set()
     assert set(callback_threads) == {caller_thread}
@@ -488,6 +526,14 @@ def test_pipeline_overlaps_paris_compute_but_serializes_leiden_publish(
             "stage_started",
             "stage_completed",
         ]
+        label = stage.replace("_", " ")
+        expected_messages = [
+            f"Running pipeline stage: {label}",
+            f"Completed pipeline stage: {label}",
+        ]
+        assert [message for message in messages if message in expected_messages] == (
+            expected_messages
+        )
 
 
 def test_pipeline_rejects_unsaved_markers_before_writes(

@@ -6,7 +6,6 @@ import warnings
 import numpy as np
 import pandas as pd
 import zarr
-from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 
 from ...graph.encoded_paths import (
@@ -54,8 +53,7 @@ from ...storage.artifact_writer import (
     start_artifact,
 )
 from ...utils.compute import controlled_compute
-from ...utils.logging import logger
-from ...utils.progress import tqdmbar
+from ...utils.logging import logger, progress_enabled
 
 if TYPE_CHECKING:
     from ..graph_datastore import GraphDataStore as _MappingOperationsBase
@@ -1170,7 +1168,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
         if isinstance(target_assay, RNAassay):
             if target_assay.sf != source_assay.sf:
-                logger.info(
+                logger.debug(
                     f"Resetting target assay's size factor from {target_assay.sf} to {source_assay.sf}"
                 )
                 target_assay.sf = source_assay.sf
@@ -1655,12 +1653,10 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             output[:] = values
         entry_start = 0
         try:
-            for i in tqdmbar(
-                target_data.blocks,
-                desc=f"Mapping cells from {target_name}",
-                total=target_data.numblocks[0],
+            for block in target_data.stream_blocks(
+                nthreads=self.nthreads,
+                msg=f"Mapping cells from {target_name}",
             ):
-                block: NDArray[Any] = controlled_compute(i, self.nthreads)
                 knn_query = ann_obj.transform_ann(
                     ann_obj.transform_query(block), k=save_k
                 )
@@ -1784,7 +1780,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             )
         source_assay = self._get_assay(reference.assay_name)
         if target_assay.sf != source_assay.sf and isinstance(target_assay, RNAassay):
-            logger.info(
+            logger.debug(
                 f"Resetting target assay's size factor from {target_assay.sf} to {source_assay.sf}"
             )
             target_assay.sf = source_assay.sf
@@ -2119,12 +2115,13 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             uninformative = np.empty(n_cells, dtype=bool)
         entry_start = 0
         try:
-            for block in tqdmbar(
-                target_data.blocks,
-                desc=f"Mapping cells from {target_name} with Symphony-style correction",
-                total=target_data.numblocks[0],
+            for values in target_data.stream_blocks(
+                nthreads=self.nthreads,
+                msg=(
+                    f"Mapping cells from {target_name} "
+                    "with Symphony-style correction"
+                ),
             ):
-                values = controlled_compute(block, self.nthreads)
                 coordinates = project_pca(values, reference.model)
                 assignments = soft_cluster_assignments(coordinates, reference.model)
                 uninformative_rows = zero_norm_rows(coordinates)
@@ -3208,7 +3205,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             None
         """
         from ...embeddings.umap import fit_transform
-        from ...utils.logging import get_log_level
 
         from_assay, cell_key, feat_key = self._get_latest_keys(
             from_assay, cell_key, feat_key
@@ -3263,9 +3259,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 target_names,
             )
             return None
-        verbose = False
-        if get_log_level() <= 20:
-            verbose = True
+        verbose = progress_enabled()
         t, a, b = fit_transform(
             graph=graph.tocoo(),
             ini_embed=ini_embed,

@@ -165,7 +165,7 @@ def test_pca_logs_selected_solver(monkeypatch):
 
     class RecordingLogger:
         @staticmethod
-        def info(message: str) -> None:
+        def debug(message: str) -> None:
             messages.append(message)
 
     monkeypatch.setattr(reduction_module, "logger", RecordingLogger())

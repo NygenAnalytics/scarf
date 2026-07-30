@@ -40,7 +40,7 @@ feature selection. Cell-level columns are shared across assays.
 ```{code-cell} ipython3
 import scarf
 
-scarf.set_verbosity('WARNING')
+scarf.configure_output(level='WARNING', progress=False)
 ```
 
 This page opens the pre-analyzed Bastidas-Ponce pancreas store also used in

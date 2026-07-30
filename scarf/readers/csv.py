@@ -4,8 +4,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 
 
 class CSVReader:
@@ -52,9 +51,8 @@ class CSVReader:
             )
         if pandas_kwargs is None:
             pandas_kwargs = {}
-        else:
-            if not isinstance(pandas_kwargs, dict):
-                logger.error("")
+        elif not isinstance(pandas_kwargs, dict):
+            raise TypeError("pandas_kwargs must be a dictionary")
         header_row: int | None
         if has_header is False:
             header_row = None
@@ -110,7 +108,10 @@ class CSVReader:
         collected_cell_ids: list[Any] | None = None
         if self.pandas_kwargs["index_col"] is not None:
             collected_cell_ids = []
-        for df in tqdmbar(stream, desc="Performing CSV file consistency check"):
+        for df in iter_progress(
+            stream,
+            desc="Checking CSV consistency",
+        ):
             n_cells += df.shape[0]
             if n_features == 0:
                 n_features = df.shape[1]

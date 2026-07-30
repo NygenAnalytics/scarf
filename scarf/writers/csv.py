@@ -11,6 +11,7 @@ from ..storage.profiles import (
     resolve_storage_profile,
 )
 from ..storage.sharding import write_dense_from_row_batches
+from ..utils.logging import logger
 
 
 class CSVtoZarr:
@@ -136,3 +137,7 @@ class CSVtoZarr:
                 "ERROR: This is a bug in CSVtoZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
+        logger.info(
+            f"Wrote {self.csvr.nCells} cells and {self.csvr.nFeatures} features "
+            f"from CSV to assay {self.assayName}"
+        )

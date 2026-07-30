@@ -13,7 +13,7 @@ from ..storage.profiles import (
 )
 from ..storage.sharding import accumulate_sparse_to_shards
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 
 
 class SparseToZarr:
@@ -69,9 +69,7 @@ class SparseToZarr:
         else:
             self.matrixDtype = matrix_dtype
         if assay_name is None:
-            logger.info(
-                "No value provided for assay names. Will use default value: 'RNA'"
-            )
+            logger.debug("Using RNA as the default assay name")
             self.assayName = "RNA"
         else:
             self.assayName = assay_name
@@ -174,12 +172,17 @@ class SparseToZarr:
                 source_nnz,
                 value_bytes,
             ),
+            msg="Writing sparse counts",
         )
         if e != self.nCells:
             raise AssertionError(
                 "ERROR: This is a bug in SparseToZarr. All cells might not have been successfully "
                 "written into the zarr file. Please report this issue"
             )
+        logger.info(
+            f"Wrote {self.nCells} cells and {self.nFeatures} features "
+            f"to assay {self.assayName}"
+        )
 
 
 def bed_to_sparse_array(
@@ -228,7 +231,12 @@ def bed_to_sparse_array(
         return x + "_"
 
     feat_idx: dict[str, int] = {}
-    for i in tqdmbar(chrom_sizes, disable=disable_tqdm, desc="Calculating bin indices"):
+    for i in iter_progress(
+        chrom_sizes,
+        disable=disable_tqdm,
+        desc="Calculating bin indices",
+        total=len(chrom_sizes),
+    ):
         for j in range((chrom_sizes[i] // bin_size) + 1):
             feat_idx[f"{i}_{j}"] = len(feat_idx)
     cell_idx: dict[Any, int] = {}
@@ -245,7 +253,7 @@ def bed_to_sparse_array(
         usecols=[chrom_col, start_col, end_col, barcode_col, count_col],
         chunksize=int(read_chunk_size),
     )
-    for df in tqdmbar(
+    for df in iter_progress(
         stream, disable=disable_tqdm, desc="Building in memory sparse matrix"
     ):
         df[chrom_col] = df[chrom_col].map(chrom_modifier) + (

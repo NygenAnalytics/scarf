@@ -204,15 +204,18 @@ class DatasetMerge:
         dummy_assay = DummyAssay(
             ds, dummy_counts, reference_assay.feats, reference_assay.name
         )
-        logger.info(f"Generated dummy {assay_name} assay for datastore {ds}")
+        logger.warning(
+            f"Generated an empty {assay_name} assay for a dataset missing that assay"
+        )
         return dummy_assay
 
     def dump(self) -> None:
         """
         Dump the merged data to the zarr file
         """
+        logger.info(f"Merging {len(self.merge_generators)} assays")
         for gen in self.merge_generators:
-            logger.info(f"Dumping {gen.merge_assay_name}")
+            logger.debug(f"Writing merged assay {gen.merge_assay_name}")
             gen.dump()
-        logger.info("Merging complete")
+        logger.info(f"Merged {len(self.merge_generators)} assays")
         return None

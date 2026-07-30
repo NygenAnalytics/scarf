@@ -8,7 +8,7 @@ import zarr
 from ..matrix import ChunkedArray
 from ..neighbors.stream import AnnStream
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 from ._types import MatrixData, NeighborMetric, ZarrArray
 from .graph import (
     calculate_knn_cluster_similarity,
@@ -191,10 +191,10 @@ def silhouette_scoring(
 
     rng = np.random.default_rng(random_seed)
     score: list[float] = []
-    for cluster_id, similarities in tqdmbar(
+    for cluster_id, similarities in iter_progress(
         enumerate(cluster_similarity),
         total=len(cluster_similarity),
-        desc="Calculating Silhouette Scores",
+        desc="Calculating silhouette scores",
     ):
         this_cluster_cells = cluster_cells[cluster_id]
         k = min(sample_size, len(this_cluster_cells) // 2)

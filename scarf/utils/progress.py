@@ -1,10 +1,11 @@
+from collections.abc import Iterable, Iterator
 from typing import Any
 
-from .logging import get_log_level, stdout_is_interactive
+from .logging import progress_enabled
 
 tqdm_params = {
     "bar_format": "{desc}: {percentage:3.0f}%| {bar} {n_fmt}/{total_fmt} [{elapsed}]",
-    "ncols": 500,
+    "dynamic_ncols": True,
     "colour": "#34abeb",
 }
 
@@ -28,14 +29,41 @@ def tqdmbar(*args: Any, **kwargs: Any) -> Any:
     for name in kwargs:
         if name in params:
             del params[name]
-    if "disable" not in kwargs and "disable" not in params:
-        params["disable"] = not (
-            get_log_level() <= 20 and (stdout_is_interactive() or is_notebook())
-        )
-    if is_notebook():
-        from tqdm import tqdm_notebook
-
-        return tqdm_notebook(*args, **kwargs, **params)
+    if "disable" in kwargs:
+        kwargs["disable"] = not progress_enabled() or bool(kwargs["disable"])
+    else:
+        params["disable"] = not progress_enabled()
     from tqdm.auto import tqdm
 
     return tqdm(*args, **kwargs, **params)
+
+
+def iter_progress[T](
+    iterable: Iterable[T],
+    *,
+    desc: str | None = None,
+    total: int | None = None,
+    disable: bool | None = None,
+) -> Iterator[T]:
+    """Yield values while updating and reliably closing a progress bar."""
+    iterator = iter(iterable)
+    kwargs: dict[str, Any] = {"desc": desc, "total": total}
+    if disable is not None:
+        kwargs["disable"] = disable
+    progress = tqdmbar(**kwargs)
+    try:
+        while True:
+            try:
+                item = next(iterator)
+            except StopIteration:
+                return
+            try:
+                yield item
+            finally:
+                del item
+            progress.update()
+    finally:
+        close = getattr(iterator, "close", None)
+        if callable(close):
+            close()
+        progress.close()

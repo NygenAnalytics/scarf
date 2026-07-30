@@ -5,8 +5,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from scarf import configure_output
+
 from profiling.config import StageResources, WorkflowParameters
 from profiling.stages import _open_datastore
+
+configure_output(progress=False, timestamps=True)
 
 
 def _write_status(statusPath: Path, payload: dict[str, Any]) -> None:

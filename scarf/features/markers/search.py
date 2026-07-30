@@ -123,11 +123,6 @@ def find_markers_by_rank(
             requestedBatchSize=batch_size,
         )
         logger.debug(
-            f"Marker search (fast): {len(feat_idx)} features, "
-            f"{n_groups} groups, {len(plan.blocks)} blocks, "
-            f"repeated chunk decodes={plan.repeatedDecodeCount}"
-        )
-        logger.info(
             f"Marker search plan: features={len(feat_idx)} groups={n_groups} "
             f"blocks={len(plan.blocks)} readWorkers={plan.readWorkers} "
             f"ioConcurrency={plan.ioConcurrency} numbaThreads={active_threads} "
@@ -158,7 +153,7 @@ def find_markers_by_rank(
             effective_cores = (
                 cpu_seconds / compute_seconds if compute_seconds > 0 else 0.0
             )
-            logger.info(
+            logger.debug(
                 f"Marker block {block_idx}/{len(plan.blocks)}: "
                 f"width={block.indices.size} read={read_sec:.1f}s ({source}) "
                 f"compute={compute_seconds:.1f}s cpu={cpu_seconds:.1f}s "

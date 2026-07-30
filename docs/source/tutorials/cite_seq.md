@@ -43,7 +43,7 @@ merges the two graphs with SNN and WNN.
 import numpy as np
 import scarf
 
-scarf.set_verbosity('WARNING')
+scarf.configure_output(level='WARNING', progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_8K_pbmc_citeseq',

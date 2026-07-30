@@ -51,15 +51,23 @@ class _PipelineEventEmitter:
                 f"Pipeline callback failed while handling {kind} for {stage}"
             )
 
+    def start(self, stage: str) -> None:
+        logger.info(f"Running pipeline stage: {stage.replace('_', ' ')}")
+        self.emit("stage_started", stage)
+
+    def complete(self, stage: str) -> None:
+        self.emit("stage_completed", stage)
+        logger.info(f"Completed pipeline stage: {stage.replace('_', ' ')}")
+
     @contextmanager
     def stage(self, stage: str) -> Iterator[None]:
-        self.emit("stage_started", stage)
+        self.start(stage)
         try:
             yield
         except Exception as error:
             self.emit("stage_failed", stage, error)
             raise
-        self.emit("stage_completed", stage)
+        self.complete(stage)
 
 
 _DEFAULT_LEIDEN: dict[float, dict[str, Any]] = {
@@ -234,11 +242,11 @@ class PipelineAccessor:
 
         def start_job(recipe_key: str) -> None:
             if recipe_key not in started_jobs:
-                events.emit("stage_started", recipe_key)
+                events.start(recipe_key)
                 started_jobs.add(recipe_key)
 
         def complete_job(recipe_key: str) -> None:
-            events.emit("stage_completed", recipe_key)
+            events.complete(recipe_key)
             terminal_jobs.add(recipe_key)
 
         def fail_job(recipe_key: str, error: Exception) -> None:
@@ -740,4 +748,5 @@ class PipelineAccessor:
                     cell_key,
                     group_key,
                 )
+        logger.info(f"Pipeline completed with {len(artifacts)} artifacts")
         return artifacts

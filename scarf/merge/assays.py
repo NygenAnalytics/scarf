@@ -33,7 +33,7 @@ from ..storage.stores import load_zarr as load_zarr
 from ..utils.arrays import canonicalize_sparse, permute_into_chunks
 from ..utils.compute import controlled_compute as controlled_compute
 from ..utils.logging import logger
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 
 
 # Creating a dummy Assay object
@@ -556,8 +556,10 @@ class AssayMerge:
             keys = np.array(list(dict_.keys()))
             values = np.array(list(dict_.values()))
             if np.equal(keys, values).all():
-                logger.info(
-                    f"Encountered same feature names and ids for feature {self.assays[i].name} in dataset {self.names[i]}. The feature ids will be updated with feature names."
+                logger.warning(
+                    f"Feature names and IDs are identical for assay "
+                    f"{self.assays[i].name} in dataset {self.names[i]}; "
+                    "feature names will be used as IDs"
                 )
                 isSame = True
                 break
@@ -682,7 +684,7 @@ class AssayMerge:
                 " are comparable across the assays"
             )
         if r > 0.9:
-            logger.warning("The number overlapping features is very low.")
+            logger.warning("Fewer than 10% of features overlap across the assays")
         return ret_val
 
     def _ref_order_feat_idx(self) -> list[np.ndarray]:
@@ -789,9 +791,7 @@ class AssayMerge:
                 vals = np.array(self.mergedCells[i])
                 create_zarr_obj_array(g, str(i), vals, vals.dtype, overwrite=True)
         else:
-            logger.info(
-                f"cellData already exists so skipping _ini_cell_data"  # noqa: F541
-            )
+            logger.debug("Cell metadata already exists; skipping initialization")
 
     def _dask_to_coo(
         self,
@@ -884,7 +884,7 @@ class AssayMerge:
 
         def block_stream() -> Iterator[coo_matrix]:
             blocks = map(convert_block, coordinates)
-            yield from tqdmbar(
+            yield from iter_progress(
                 blocks,
                 total=len(coordinates),
                 desc="Writing merged assay",

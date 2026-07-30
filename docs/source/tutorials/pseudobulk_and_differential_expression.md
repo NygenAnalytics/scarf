@@ -42,7 +42,7 @@ to `make_bulk`.
 ```{code-cell} ipython3
 import scarf
 
-scarf.set_verbosity('WARNING')
+scarf.configure_output(level='WARNING', progress=False)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'kang_15K_pbmc_rnaseq',

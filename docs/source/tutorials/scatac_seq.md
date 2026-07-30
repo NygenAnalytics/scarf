@@ -34,7 +34,7 @@ clustering accessible chromatin profiles. See {doc}`scrna_seq` for the RNA workf
 ```{code-cell} ipython3
 import scarf
 
-scarf.set_verbosity('WARNING')
+scarf.configure_output(level='WARNING', progress=False)
 ```
 
 ## Guided steps

@@ -9,7 +9,7 @@ from scipy.sparse import coo_matrix, csr_matrix
 
 from ..utils.logging import logger
 from ..utils.process import system_call
-from ..utils.progress import tqdmbar
+from ..utils.progress import iter_progress
 
 
 def export_knn_to_mtx(
@@ -25,7 +25,7 @@ def export_knn_to_mtx(
         )
         handle.write(f"{n_cells} {n_cells} {csr_graph.nnz}\n")
         start = 0
-        for end in tqdmbar(
+        for end in iter_progress(
             range(batch_size, n_cells + batch_size, batch_size),
             desc="Saving KNN matrix in MTX format",
         ):

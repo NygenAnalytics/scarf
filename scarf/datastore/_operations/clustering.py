@@ -368,6 +368,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             default_display=categorical_display(result.labels),
             preserved_display=preserved_display,
         )
+        action = "Reused" if cut_plan.reused else "Stored"
+        logger.info(f"{action} Paris clustering with {result.n_clusters} clusters")
         return replace(
             result,
             label_key=final_label_key,
@@ -547,6 +549,10 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             value_name="values",
             default_display=categorical_display(membership),
             preserved_display=preserved_display,
+        )
+        action = "Reused" if prepared.planned.reused else "Stored"
+        logger.info(
+            f"{action} Leiden clustering with {np.unique(membership).size} clusters"
         )
         return column
 

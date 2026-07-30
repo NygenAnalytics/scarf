@@ -1,3 +1,6 @@
+import gc
+import weakref
+
 import numpy as np
 import pytest
 import zarr
@@ -8,16 +11,18 @@ from scarf.storage.types import (
     as_zarr_array,
     as_zarr_group,
 )
-import scarf.utils.progress as progress_module
 from scarf.utils import (
     array_digest,
     clean_array,
+    configure_output,
     permute_into_chunks,
     rescale_array,
     rolling_window,
     set_verbosity,
+    show_dask_progress,
     tqdmbar,
 )
+from scarf.utils.progress import iter_progress
 
 
 def test_as_zarr_array_accepts_array():
@@ -77,56 +82,93 @@ def test_set_verbosity_accepts_valid_level():
     set_verbosity("INFO")
 
 
-def test_tqdmbar_enabled_for_tty_or_notebook(monkeypatch):
-    import tqdm
+def test_tqdmbar_uses_explicit_progress_independently_of_severity(monkeypatch):
     import tqdm.auto as tqdm_auto
 
-    captured: dict[str, bool] = {}
+    captured: list[bool] = []
 
     class FakeTqdm:
         def __init__(self, *args, **kwargs):
-            captured["disable"] = bool(kwargs.get("disable"))
-
-        def __iter__(self):
-            return iter(())
-
-    monkeypatch.setattr(progress_module, "get_log_level", lambda: 20)
-    monkeypatch.setattr(progress_module, "stdout_is_interactive", lambda: False)
-    monkeypatch.setattr(progress_module, "is_notebook", lambda: True)
-    monkeypatch.setattr(tqdm, "tqdm_notebook", FakeTqdm)
-    list(tqdmbar(range(1), desc="test"))
-    assert captured["disable"] is False
-
-    monkeypatch.setattr(progress_module, "is_notebook", lambda: False)
-    monkeypatch.setattr(progress_module, "stdout_is_interactive", lambda: True)
-    monkeypatch.setattr(tqdm_auto, "tqdm", FakeTqdm)
-    list(tqdmbar(range(1), desc="test"))
-    assert captured["disable"] is False
-
-
-def test_tqdmbar_disabled_when_redirected_or_quiet(monkeypatch):
-    import tqdm.auto as tqdm_auto
-
-    captured: dict[str, bool] = {}
-
-    class FakeTqdm:
-        def __init__(self, *args, **kwargs):
-            captured["disable"] = bool(kwargs.get("disable"))
+            captured.append(bool(kwargs.get("disable")))
 
         def __iter__(self):
             return iter(())
 
     monkeypatch.setattr(tqdm_auto, "tqdm", FakeTqdm)
-    monkeypatch.setattr(progress_module, "is_notebook", lambda: False)
-    monkeypatch.setattr(progress_module, "stdout_is_interactive", lambda: False)
-    monkeypatch.setattr(progress_module, "get_log_level", lambda: 20)
-    list(tqdmbar(range(1), desc="test"))
-    assert captured["disable"] is True
+    try:
+        configure_output(level="ERROR", progress=True)
+        list(tqdmbar(range(1), desc="test"))
+        set_verbosity("WARNING")
+        list(tqdmbar(range(1), desc="test"))
+        configure_output(level="DEBUG", progress=False)
+        list(tqdmbar(range(1), desc="test"))
+        list(tqdmbar(range(1), desc="test", disable=False))
+        configure_output(progress=True)
+        list(tqdmbar(range(1), desc="test", disable=True))
+    finally:
+        configure_output(level="INFO", progress=False, timestamps=False)
 
-    monkeypatch.setattr(progress_module, "stdout_is_interactive", lambda: True)
-    monkeypatch.setattr(progress_module, "get_log_level", lambda: 30)
-    list(tqdmbar(range(1), desc="test"))
-    assert captured["disable"] is True
+    assert captured == [False, False, True, True, True]
+
+
+def test_show_dask_progress_uses_explicit_progress_setting():
+    calls: list[tuple[int, str | None]] = []
+
+    class Deferred:
+        def compute(self, nthreads, msg):
+            calls.append((nthreads, msg))
+            return np.array([1])
+
+    try:
+        configure_output(progress=False)
+        show_dask_progress(Deferred(), "Computing", 2)
+        configure_output(progress=True)
+        show_dask_progress(Deferred(), "Computing", 3)
+    finally:
+        configure_output(progress=False)
+
+    assert calls == [(2, None), (3, "Computing")]
+
+
+def test_progress_iterator_releases_consumed_values():
+    references: list[weakref.ReferenceType[object]] = []
+
+    class Chunk:
+        pass
+
+    def source():
+        for _ in range(2):
+            chunk = Chunk()
+            references.append(weakref.ref(chunk))
+            yield chunk
+
+    stream = iter_progress(source(), total=2, disable=True)
+    first = next(stream)
+    second = next(stream)
+    del first
+    gc.collect()
+
+    assert references[0]() is None
+    assert references[1]() is second
+    stream.close()
+
+
+def test_progress_iterator_closes_source_on_early_exit():
+    closed = False
+
+    def source():
+        nonlocal closed
+        try:
+            yield object()
+            yield object()
+        finally:
+            closed = True
+
+    stream = iter_progress(source(), total=2, disable=True)
+    next(stream)
+    stream.close()
+
+    assert closed
 
 
 def test_rolling_window_smoothes_along_rows():

@@ -10,7 +10,8 @@ from ..storage.profiles import (
     ZarrLocation,
     resolve_storage_profile,
 )
-from ..utils.progress import tqdmbar
+from ..utils.logging import logger
+from ..utils.progress import iter_progress
 
 
 class CrToZarr:
@@ -143,7 +144,7 @@ class CrToZarr:
 
         def writes() -> Iterator[SparseWriteBand]:
             n_chunks = (self.cr.nCells + batch_size - 1) // batch_size
-            source = tqdmbar(
+            source = iter_progress(
                 self.cr.consume(batch_size, lines_in_mem),
                 total=n_chunks,
                 desc="Writing counts",
@@ -232,3 +233,8 @@ class CrToZarr:
             raise AssertionError(
                 "Cell Ranger conversion did not write every source row"
             )
+        logger.info(
+            f"Wrote {self.cr.nCells} cells and "
+            f"{sum(buffer.nColumns for buffer in buffers.values())} features "
+            f"from Cell Ranger to {len(stores)} assay(s)"
+        )

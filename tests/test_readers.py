@@ -964,3 +964,12 @@ def test_csv_reader_rejects_features_along_rows(tmp_path):
     path.write_text("g1,g2\n1,2\n")
     with pytest.raises(NotImplementedError, match="cells are along the rows"):
         CSVReader(str(path), rows_are_cells=False)
+
+
+def test_csv_reader_rejects_non_mapping_pandas_kwargs(tmp_path):
+    from scarf.readers import CSVReader
+
+    path = tmp_path / "counts.csv"
+    path.write_text("g1,g2\n1,2\n", encoding="utf-8")
+    with pytest.raises(TypeError, match="pandas_kwargs must be a dictionary"):
+        CSVReader(str(path), pandas_kwargs=["header"])

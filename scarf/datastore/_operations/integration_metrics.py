@@ -159,14 +159,14 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
         if use_latest_knn and knn_loc is None:
             resolved_knn_loc = self._get_latest_knn_loc(from_assay)
-            logger.info(f"Using the latest knn graph at location: {resolved_knn_loc}")
+            logger.debug(f"Using the latest KNN graph at {resolved_knn_loc}")
         else:
             if knn_loc is None:
                 raise ValueError("Please provide values for the KNN graph location.")
             if knn_loc not in self.zw:
                 raise ValueError(f"Could not find the knn graph at location: {knn_loc}")
             resolved_knn_loc = knn_loc
-            logger.info(f"Using the knn graph at location: {resolved_knn_loc}")
+            logger.debug(f"Using the KNN graph at {resolved_knn_loc}")
 
         cell_key, _ = self._keys_from_knn_path(from_assay, resolved_knn_loc)
         knn_grp = as_zarr_group(
@@ -236,7 +236,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
         if use_latest_knn and knn_loc is None:
             knn_loc = self._get_latest_knn_loc(from_assay)
-            logger.info(f"Using the latest knn graph at location: {knn_loc}")
+            logger.debug(f"Using the latest KNN graph at {knn_loc}")
 
         else:
             if knn_loc is None:
@@ -244,7 +244,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             if knn_loc not in self.zw:
                 raise ValueError(f"Could not find the knn graph at location: {knn_loc}")
 
-            logger.info(f"Using the knn graph at location: {knn_loc}")
+            logger.debug(f"Using the KNN graph at {knn_loc}")
 
         cell_key, feat_key = self._keys_from_knn_path(from_assay, knn_loc)
         knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
@@ -605,7 +605,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
         if use_latest_knn and knn_loc is None:
             knn_loc = self._get_latest_knn_loc(from_assay)
-            logger.info(
+            logger.debug(
                 f"Using the latest knn graph at location: {knn_loc} for assay: {from_assay}"
             )
 
@@ -614,7 +614,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
                 raise ValueError("Please provide values for the KNN graph location.")
             if knn_loc not in self.zw:
                 raise ValueError(f"Could not find the knn graph at location: {knn_loc}")
-            logger.info(f"Using the knn graph at location: {knn_loc}")
+            logger.debug(f"Using the KNN graph at {knn_loc}")
 
         from ...metrics import silhouette_scoring
 

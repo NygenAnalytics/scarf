@@ -16,7 +16,7 @@ def system_call(command: str) -> None:
         if process.poll() is not None:
             break
         if output:
-            logger.info(output.strip())
+            logger.debug(output.strip())
     process.poll()
 
 

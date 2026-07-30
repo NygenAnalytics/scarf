@@ -66,16 +66,14 @@ def _correlation_alignment(
         raise ValueError("CORAL source and target must have the same feature count")
     s_cov = _cov_diaged(s, nthreads, "CORAL: Computing source covariance")
     t_cov = _cov_diaged(t, nthreads, "CORAL: Computing target covariance")
-    logger.info(
-        "Calculating fractional power of covariance matrices. This might take a while... "
-    )
+    logger.info("Calculating the CORAL covariance transform")
     with threadpool_limits(limits=nthreads):
         a_coral = _symmetric_matrix_power(s_cov, -0.5) @ _symmetric_matrix_power(
             t_cov, 0.5
         )
     if not np.all(np.isfinite(a_coral)):
         raise ValueError("CORAL transform contains non-finite values")
-    logger.info("Fractional power calculation complete")
+    logger.info("Calculated the CORAL covariance transform")
     return s.dot(a_coral)
 
 
@@ -133,6 +131,6 @@ def coral(
         assay.z,
         f"{normed_loc}/data_coral",
         nthreads,
-        msg="Writing out coral corrected data",
+        msg="Writing CORAL-corrected data",
         resources=assay.resources,
     )
