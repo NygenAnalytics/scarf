@@ -5,6 +5,7 @@ import pytest
 import scarf.features.markers.search as marker_search_module
 from scarf.assay import norm_lib_size
 from scipy.stats import linregress
+from scipy.stats import mannwhitneyu
 
 from scarf.features.markers import (
     find_markers_by_rank,
@@ -28,9 +29,8 @@ from scarf.utils import controlled_compute
 def _reference_calc(
     vdf: pd.DataFrame, groups: np.ndarray, group_set: np.ndarray
 ) -> np.ndarray:
-    """Original pandas implementation used as the parity reference."""
+    """Independent pandas and SciPy implementation used as the parity reference."""
     ranked_vdf = vdf.rank(method="dense")
-    ranked_vdf_average = vdf.rank(method="average")
     r = ranked_vdf.groupby(groups).mean().reindex(group_set)
     r = r / r.sum()
     g = np.array([pd.Series(groups).value_counts().reindex(group_set).values]).T
@@ -42,7 +42,23 @@ def _reference_calc(
     e = s2 / g
     e_o = (s2.sum() - s2) / g_o
     fc = (m / m_o).fillna(0)
-    pvals = mannwhitneyu_from_ranks(ranked_vdf_average, groups, group_set)
+    pvals = pd.DataFrame(
+        np.vstack(
+            [
+                mannwhitneyu(
+                    vdf.loc[groups == group].to_numpy(),
+                    vdf.loc[groups != group].to_numpy(),
+                    axis=0,
+                    alternative="two-sided",
+                    method="asymptotic",
+                    use_continuity=True,
+                ).pvalue
+                for group in group_set
+            ]
+        ),
+        index=group_set,
+        columns=vdf.columns,
+    )
     return np.array(
         [r.values, m.values, m_o.values, e.values, e_o.values, fc.values, pvals.values]
     ).T
@@ -69,6 +85,97 @@ def test_batch_stats_matches_pandas_reference():
     assert np.allclose(got[:, :, 5][finite], ref[:, :, 5][finite], atol=1e-6)
     # two-sided p-values
     assert np.allclose(got[:, :, 6], ref[:, :, 6], atol=1e-6)
+
+
+def test_rank_paths_match_scipy_continuity_correction():
+    data = np.array(
+        [
+            [8, 0, 0],
+            [7, 1, 1],
+            [6, 1, 2],
+            [5, 2, 3],
+            [4, 3, 0],
+            [3, 3, 1],
+            [2, 4, 2],
+            [1, 5, 3],
+        ],
+        dtype=np.uint32,
+    )
+    groups = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    group_set = np.array([0, 1])
+    group_counts = np.bincount(groups)
+    expected = np.stack(
+        [
+            mannwhitneyu(
+                data[groups == group],
+                data[groups != group],
+                axis=0,
+                alternative="two-sided",
+                method="asymptotic",
+                use_continuity=True,
+            ).pvalue
+            for group in group_set
+        ],
+        axis=1,
+    )
+
+    ranked = pd.DataFrame(data).rank(method="average")
+    from_ranks = mannwhitneyu_from_ranks(ranked, groups, group_set).to_numpy().T
+    cell_major = _batch_stats(data, groups, group_counts, len(groups))[:, :, 6]
+    gene_major = _batch_stats_gene_major(
+        data.T,
+        np.ones(len(groups), dtype=np.float32),
+        1.0,
+        False,
+        groups,
+        group_counts,
+        len(groups),
+    )[:, :, 6]
+
+    np.testing.assert_allclose(from_ranks, expected, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(cell_major, expected, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(gene_major, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_tie_correction_survives_more_than_two_million_tied_values():
+    # A cubed int64 tie group wraps negative beyond roughly 2.08 million ties, which
+    # inflates the variance instead of collapsing it.
+    n_zeros = 2_200_000
+    values = np.concatenate([np.zeros(n_zeros), np.array([10.0, 20.0, 30.0, 40.0])])
+    groups = np.concatenate(
+        [np.ones(n_zeros, dtype=np.int64), np.zeros(4, dtype=np.int64)]
+    )
+    group_set = np.array([0, 1])
+    group_counts = np.bincount(groups)
+    n_total = values.size
+
+    ranked = pd.DataFrame({"feature": values}).rank(method="average")
+    from_ranks = mannwhitneyu_from_ranks(ranked, groups, group_set)["feature"]
+    cell_major = _batch_stats(values[:, None], groups, group_counts, n_total)[0, :, 6]
+    gene_major = _batch_stats_gene_major(
+        values.astype(np.uint32)[None, :],
+        np.ones(n_total, dtype=np.float32),
+        1.0,
+        False,
+        groups,
+        group_counts,
+        n_total,
+    )[0, :, 6]
+
+    # The feature is confined to one group's four cells, so separation is maximal.
+    assert (from_ranks.to_numpy() < 1e-100).all()
+    assert (cell_major < 1e-100).all()
+    assert (gene_major < 1e-100).all()
+
+
+def test_mannwhitneyu_from_ranks_returns_one_for_zero_variance():
+    ranked = pd.DataFrame({"constant": np.ones(4)}).rank(method="average")
+    groups = np.array([0, 0, 1, 1])
+
+    with np.errstate(divide="raise", invalid="raise"):
+        p_values = mannwhitneyu_from_ranks(ranked, groups, np.array([0, 1]))
+
+    np.testing.assert_array_equal(p_values["constant"], [1.0, 1.0])
 
 
 def test_batch_stats_distinguishes_zero_fold_change_from_zero_rest_sentinel():

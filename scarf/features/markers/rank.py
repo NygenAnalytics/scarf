@@ -46,7 +46,7 @@ def mannwhitneyu_from_ranks(
     for col_idx in range(ranked_df.shape[1]):
         ranks = ranked_df.iloc[:, col_idx].values
         _, counts = np.unique(ranks, return_counts=True)
-        tied_counts = counts[counts > 1]
+        tied_counts = counts[counts > 1].astype(np.float64)
         if len(tied_counts) > 0:
             tie_sum = np.sum(tied_counts**3 - tied_counts)
             tie_corrections[col_idx] = tie_sum / (n_total * (n_total - 1))
@@ -59,7 +59,14 @@ def mannwhitneyu_from_ranks(
         u1 = r1 - (n1 * (n1 + 1)) / 2
         mu_u = (n1 * n2) / 2
         sigma_u = np.sqrt((n1 * n2 / 12) * ((n_total + 1) - tie_corrections))
-        z = (u1 - mu_u - 0.5) / sigma_u
+        delta = u1 - mu_u
+        z = np.zeros_like(delta, dtype=float)
+        np.divide(
+            delta - 0.5 * np.sign(delta),
+            sigma_u,
+            out=z,
+            where=sigma_u > 0,
+        )
         pvals[cluster] = 2 * norm.sf(np.abs(z))
 
     return pd.DataFrame(pvals, index=ranked_df.columns).T
@@ -93,11 +100,12 @@ def _marker_stats_batch(
             avg = (i + j + 2) / 2.0
             rank += 1.0
             t = j - i + 1
+            t_float = float(t)
             for k in range(i, j + 1):
                 ar[order[k]] = avg
                 dr[order[k]] = rank
             if t > 1:
-                tie_sum += t * t * t - t
+                tie_sum += t_float * t_float * t_float - t_float
             i = j + 1
         sum_g = np.zeros(n_groups)
         nz_g = np.zeros(n_groups)
@@ -144,8 +152,9 @@ def _marker_stats_batch(
             u1 = r1 - (n1 * (n1 + 1.0)) / 2.0
             mu = (n1 * n2) / 2.0
             var = (n1 * n2 / 12.0) * ((n_total + 1.0) - tie_corr)
+            delta = u1 - mu
             if var > 0.0:
-                z = (u1 - mu - 0.5) / np.sqrt(var)
+                z = (delta - 0.5 * np.sign(delta)) / np.sqrt(var)
             else:
                 z = 0.0
             out[g, x, 0] = r
@@ -261,7 +270,12 @@ def _marker_stats_gene_major(
             u1 = rank_sum - (n1 * (n1 + 1.0)) / 2.0
             mu = (n1 * n2) / 2.0
             variance = (n1 * n2 / 12.0) * ((n_total + 1.0) - tie_correction)
-            z = (u1 - mu - 0.5) / np.sqrt(variance) if variance > 0.0 else 0.0
+            delta = u1 - mu
+            z = (
+                (delta - 0.5 * np.sign(delta)) / np.sqrt(variance)
+                if variance > 0.0
+                else 0.0
+            )
             out[row, x, 0] = score
             out[row, x, 1] = mean
             out[row, x, 2] = mean_rest
