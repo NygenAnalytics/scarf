@@ -984,10 +984,11 @@ class TestDataStore:
             atac_datastore.mark_hvgs()
 
     def test_mark_hvgs_default_max_cells_excludes_ubiquitous(
-        self, auto_filter_cells, datastore
+        self, datastore_ephemeral
     ):
         from unittest.mock import patch
 
+        datastore = datastore_ephemeral
         n_selected = int(np.asarray(datastore.cells.fetch_all("I"), dtype=bool).sum())
         expected_max = n_selected - 20
         assay = datastore.RNA

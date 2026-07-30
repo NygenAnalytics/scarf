@@ -568,7 +568,22 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             assert state.ann_index is not None
             ann_group = artifact_group(self.zw, state.ann_index)
             if not has_ann_index(ann_group):
-                return False
+                assert state.normalized is not None
+                assert state.feature_scaling is not None
+                assert state.reduction is not None
+                assert state.neighbors is not None
+                normalized_group = artifact_group(self.zw, state.normalized)
+                scaling_group = artifact_group(self.zw, state.feature_scaling)
+                reduction_group = artifact_group(self.zw, state.reduction)
+                neighbors_group = artifact_group(self.zw, state.neighbors)
+                if (
+                    "data" not in normalized_group
+                    or "mean" not in scaling_group
+                    or "scale" not in scaling_group
+                    or "loadings" not in reduction_group
+                    or "indices" not in neighbors_group
+                ):
+                    return False
             if feat_scaling is not None and state.reduction is not None:
                 reduction_status = inspect_artifact(self.zw, state.reduction)
                 cached_scaling = bool(
@@ -793,8 +808,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             dims if dims > 0 else data.shape[1],
             expected_count=int(data.shape[0]),
         )
-        if ann_idx is None:
-            raise RuntimeError("Selected ANN artifact has no readable index")
+        rebuilt_ann = ann_idx is None
         neighbor_indices = as_zarr_array(
             neighbors_group["indices"],
             name="indices",
@@ -854,6 +868,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             ann_obj,
             artifact_path(neighbors_ref),
         )
+        if rebuilt_ann and self.zarr_mode == "r+":
+            self._persist_ann_index(
+                artifact_path(ann_ref),
+                ann_obj.annIdx,
+                ann_metric=ann_metric,
+                dimensions=dims if dims > 0 else data.shape[1],
+                element_count=int(data.shape[0]),
+            )
         return ann_obj
 
     def _load_ann_stream(
