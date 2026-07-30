@@ -1,4 +1,7 @@
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
@@ -9,6 +12,55 @@ from ..utils.logging import logger
 
 
 type StepOptions = dict[str, Any] | Literal[False] | None
+type PipelineEventKind = Literal[
+    "stage_started",
+    "stage_completed",
+    "stage_failed",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PipelineEvent:
+    kind: PipelineEventKind
+    stage: str
+    error: Exception | None = None
+
+
+type PipelineCallback = Callable[[PipelineEvent], None]
+
+
+class _PipelineEventEmitter:
+    __slots__ = ("_callback",)
+
+    def __init__(self, callback: PipelineCallback | None) -> None:
+        self._callback = callback
+
+    def emit(
+        self,
+        kind: PipelineEventKind,
+        stage: str,
+        error: Exception | None = None,
+    ) -> None:
+        if self._callback is None:
+            return
+        event = PipelineEvent(kind=kind, stage=stage, error=error)
+        try:
+            self._callback(event)
+        except Exception:
+            logger.exception(
+                f"Pipeline callback failed while handling {kind} for {stage}"
+            )
+
+    @contextmanager
+    def stage(self, stage: str) -> Iterator[None]:
+        self.emit("stage_started", stage)
+        try:
+            yield
+        except Exception as error:
+            self.emit("stage_failed", stage, error)
+            raise
+        self.emit("stage_completed", stage)
+
 
 _DEFAULT_LEIDEN: dict[float, dict[str, Any]] = {
     0.5: {},
@@ -167,6 +219,7 @@ class PipelineAccessor:
         leiden_options: dict[float, dict[str, Any]],
         paris_options: dict[str, Any] | None,
         clustering_concurrency: int,
+        events: _PipelineEventEmitter,
     ) -> tuple[dict[str, str], dict[str, ArtifactRef]]:
         store = self._store
         cluster_columns: dict[str, str] = {}
@@ -176,6 +229,33 @@ class PipelineAccessor:
 
         job_order: list[str] = []
         prepared_leiden: dict[str, Any] = {}
+        started_jobs: set[str] = set()
+        terminal_jobs: set[str] = set()
+
+        def start_job(recipe_key: str) -> None:
+            if recipe_key not in started_jobs:
+                events.emit("stage_started", recipe_key)
+                started_jobs.add(recipe_key)
+
+        def complete_job(recipe_key: str) -> None:
+            events.emit("stage_completed", recipe_key)
+            terminal_jobs.add(recipe_key)
+
+        def fail_job(recipe_key: str, error: Exception) -> None:
+            start_job(recipe_key)
+            events.emit("stage_failed", recipe_key, error)
+            terminal_jobs.add(recipe_key)
+
+        def fail_unpublished_jobs() -> None:
+            for recipe_key in job_order:
+                if recipe_key in started_jobs and recipe_key not in terminal_jobs:
+                    fail_job(
+                        recipe_key,
+                        RuntimeError(
+                            f"Clustering job {recipe_key} was not published because "
+                            "another clustering job failed"
+                        ),
+                    )
 
         for raw_resolution, raw_options in leiden_options.items():
             resolution = float(raw_resolution)
@@ -185,14 +265,18 @@ class PipelineAccessor:
                 raise ValueError(f"Duplicate Leiden resolution {resolution}")
             label = str(options.pop("label", recipe_key))
             job_order.append(recipe_key)
-            prepared_leiden[recipe_key] = store._prepare_leiden_clustering(
-                from_assay=assay_name,
-                cell_key=cell_key,
-                feat_key=feat_key,
-                resolution=resolution,
-                label=label,
-                **options,
-            )
+            try:
+                prepared_leiden[recipe_key] = store._prepare_leiden_clustering(
+                    from_assay=assay_name,
+                    cell_key=cell_key,
+                    feat_key=feat_key,
+                    resolution=resolution,
+                    label=label,
+                    **options,
+                )
+            except Exception as error:
+                fail_job(recipe_key, error)
+                raise
 
         paris_job: dict[str, Any] | None = None
         if paris_options is not None:
@@ -205,15 +289,21 @@ class PipelineAccessor:
             }
 
         graph_cache: dict[tuple[str, bool, bool], Any] = {}
-        for prepared in prepared_leiden.values():
+        for recipe_key, prepared in prepared_leiden.items():
             if prepared.planned.reused or prepared.graph_key in graph_cache:
                 continue
-            graph_cache[prepared.graph_key] = store._load_prepared_leiden_graph(
-                prepared
-            )
+            try:
+                graph_cache[prepared.graph_key] = store._load_prepared_leiden_graph(
+                    prepared
+                )
+            except Exception as error:
+                fail_job(recipe_key, error)
+                raise
 
         compute_results: dict[str, np.ndarray] = {}
-        paris_result: Any = None
+        completed: dict[str, str] = {}
+        artifact_refs: dict[str, ArtifactRef] = {}
+        first_error: Exception | None = None
         runnable_jobs = sum(
             not prepared.planned.reused for prepared in prepared_leiden.values()
         ) + int(paris_job is not None)
@@ -224,47 +314,82 @@ class PipelineAccessor:
                 for recipe_key in job_order:
                     if recipe_key == "paris":
                         assert paris_job is not None
-                        future = executor.submit(
-                            store.run_paris_clustering,
-                            from_assay=assay_name,
-                            cell_key=cell_key,
-                            feat_key=feat_key,
-                            label=paris_job["label"],
-                            **paris_job["options"],
-                        )
+                        start_job(recipe_key)
+                        try:
+                            future = executor.submit(
+                                store.run_paris_clustering,
+                                from_assay=assay_name,
+                                cell_key=cell_key,
+                                feat_key=feat_key,
+                                label=paris_job["label"],
+                                **paris_job["options"],
+                            )
+                        except Exception as error:
+                            fail_job(recipe_key, error)
+                            if first_error is None:
+                                first_error = error
+                            continue
                     else:
                         prepared = prepared_leiden[recipe_key]
                         if prepared.planned.reused:
                             continue
-                        future = executor.submit(
-                            store._compute_prepared_leiden,
-                            prepared,
-                            graph_cache[prepared.graph_key],
-                        )
+                        start_job(recipe_key)
+                        try:
+                            future = executor.submit(
+                                store._compute_prepared_leiden,
+                                prepared,
+                                graph_cache[prepared.graph_key],
+                            )
+                        except Exception as error:
+                            fail_job(recipe_key, error)
+                            if first_error is None:
+                                first_error = error
+                            continue
                     futures[future] = recipe_key
                 for future in as_completed(futures):
                     recipe_key = futures[future]
-                    result = future.result()
-                    if recipe_key == "paris":
-                        paris_result = result
-                    else:
-                        compute_results[recipe_key] = result
+                    try:
+                        result = future.result()
+                        if recipe_key == "paris":
+                            if result is None or result.label_key is None:
+                                raise RuntimeError(
+                                    "Paris clustering did not publish labels"
+                                )
+                            completed[recipe_key] = result.label_key
+                            artifact_refs[recipe_key] = self._column_ref(
+                                result.label_key
+                            )
+                            complete_job(recipe_key)
+                        else:
+                            compute_results[recipe_key] = result
+                    except Exception as error:
+                        fail_job(recipe_key, error)
+                        if first_error is None:
+                            first_error = error
 
-        completed: dict[str, str] = {}
+        if first_error is not None:
+            fail_unpublished_jobs()
+            raise first_error
+
         for recipe_key, prepared in prepared_leiden.items():
-            completed[recipe_key] = store._publish_prepared_leiden(
-                prepared,
-                compute_results.get(recipe_key),
-            )
-        if paris_job is not None:
-            if paris_result is None or paris_result.label_key is None:
-                raise RuntimeError("Paris clustering did not publish labels")
-            completed["paris"] = paris_result.label_key
+            start_job(recipe_key)
+            try:
+                column = store._publish_prepared_leiden(
+                    prepared,
+                    compute_results.get(recipe_key),
+                )
+                completed[recipe_key] = column
+                artifact_refs[recipe_key] = self._column_ref(column)
+            except Exception as error:
+                fail_job(recipe_key, error)
+                fail_unpublished_jobs()
+                raise
+            complete_job(recipe_key)
 
         for recipe_key in job_order:
             column = completed[recipe_key]
             cluster_columns[recipe_key] = column
-            artifacts[recipe_key] = self._column_ref(column)
+            artifacts[recipe_key] = artifact_refs[recipe_key]
         return cluster_columns, artifacts
 
     def run(
@@ -288,6 +413,7 @@ class PipelineAccessor:
         clustering_concurrency: int = 2,
         doublet_scoring: StepOptions = None,
         markers: StepOptions = None,
+        callback: PipelineCallback | None = None,
     ) -> dict[str, ArtifactRef]:
         """Run the standard provenance-backed RNA analysis recipe.
 
@@ -299,7 +425,19 @@ class PipelineAccessor:
         ``clustering_concurrency`` while store publishes stay serialized. When
         doublets or markers omit ``clusters``, the partition with the highest
         silhouette score on PCA coordinates is selected. Highly variable
-        feature selection is mandatory.
+        feature selection is mandatory. When provided, ``callback`` receives
+        serialized stage events on the calling thread. Callback errors are
+        logged without interrupting the pipeline. Stable stage names are
+        ``filtering``, ``cell_cycle_scoring``, ``highly_variable_features``,
+        ``normalization``, ``pca``, ``harmony``, ``ann_index``, ``neighbors``,
+        ``connectivity``, ``embedding_initialization``, ``umap``,
+        ``cluster_selection``, ``doublet_scoring``, and ``markers``. Clustering
+        jobs use ``leiden_<resolution>`` and ``paris``. Skipped stages emit no
+        events. ``stage_completed`` means the expected output is published and
+        available, so Leiden completion follows its serialized publish. If one
+        clustering job fails, any started sibling that cannot be published
+        emits ``stage_failed`` with an abort error; the original job error is
+        re-raised.
 
         Args:
             pipeline_id: Recipe identifier. Only ``basic_rna_analysis`` is
@@ -328,6 +466,7 @@ class PipelineAccessor:
                 are serialized. Use ``1`` for a fully serial path.
             doublet_scoring: Doublet-scoring options or ``False``.
             markers: Marker-search options or ``False``.
+            callback: Optional callable receiving ``PipelineEvent`` values.
 
         Returns:
             Artifact references keyed by pipeline result name.
@@ -348,6 +487,8 @@ class PipelineAccessor:
             or clustering_concurrency < 1
         ):
             raise ValueError("clustering_concurrency must be an integer >= 1")
+        if callback is not None and not callable(callback):
+            raise TypeError("callback must be callable")
         store = self._store
         assay_name = from_assay or store._defaultAssay
         if assay_name is None:
@@ -364,149 +505,164 @@ class PipelineAccessor:
         if isinstance(markers, dict) and markers.get("skip_save") is True:
             raise ValueError("basic_rna_analysis markers cannot use skip_save=True")
         artifacts: dict[str, ArtifactRef] = {}
+        events = _PipelineEventEmitter(callback)
 
         if filtering is not False:
-            options = self._options(filtering)
-            method = options.pop("method", "auto")
-            if method == "auto":
-                options.setdefault("show_qc_plots", False)
-                if "attrs" not in options:
-                    options["attrs"] = [
-                        column
-                        for suffix in (
-                            "nCounts",
-                            "nFeatures",
-                            "percentMito",
-                            "percentRibo",
-                        )
-                        if (column := f"{assay_name}_{suffix}") in store.cells.columns
-                    ]
-                store.auto_filter_cells(**options)
-            elif method == "manual":
-                store.filter_cells(**options)
-            else:
-                raise ValueError("filtering method must be 'auto' or 'manual'")
-            artifacts["cell_selection"] = store._ensure_cell_selection(cell_key)
+            with events.stage("filtering"):
+                options = self._options(filtering)
+                method = options.pop("method", "auto")
+                if method == "auto":
+                    options.setdefault("show_qc_plots", False)
+                    if "attrs" not in options:
+                        options["attrs"] = [
+                            column
+                            for suffix in (
+                                "nCounts",
+                                "nFeatures",
+                                "percentMito",
+                                "percentRibo",
+                            )
+                            if (column := f"{assay_name}_{suffix}")
+                            in store.cells.columns
+                        ]
+                    store.auto_filter_cells(**options)
+                elif method == "manual":
+                    store.filter_cells(**options)
+                else:
+                    raise ValueError("filtering method must be 'auto' or 'manual'")
+                artifacts["cell_selection"] = store._ensure_cell_selection(cell_key)
 
         if cell_cycle_scoring is not False:
-            options = self._options(cell_cycle_scoring)
-            store.run_cell_cycle_scoring(
+            with events.stage("cell_cycle_scoring"):
+                options = self._options(cell_cycle_scoring)
+                store.run_cell_cycle_scoring(
+                    from_assay=assay_name,
+                    cell_key=cell_key,
+                    **options,
+                )
+                phase_label = options.get("phase_label", "cell_cycle_phase")
+                phase_column = store._col_renamer(
+                    assay_name,
+                    cell_key,
+                    phase_label,
+                )
+                artifacts["cell_cycle"] = self._column_ref(phase_column)
+
+        with events.stage("highly_variable_features"):
+            hvg_options = self._options(highly_variable_features)
+            hvg_name = str(hvg_options.get("hvg_key_name", "hvgs"))
+            hvg_options.setdefault("show_plot", False)
+            hvg_options.setdefault("top_n", 2000)
+            hvg_options.setdefault("min_cells", 20)
+            store.mark_hvgs(
                 from_assay=assay_name,
                 cell_key=cell_key,
-                **options,
+                **hvg_options,
             )
-            phase_label = options.get("phase_label", "cell_cycle_phase")
-            phase_column = store._col_renamer(
+            feature_column = f"{cell_key}__{hvg_name}"
+            artifacts["highly_variable_features"] = self._feature_ref(
                 assay_name,
-                cell_key,
-                phase_label,
+                feature_column,
             )
-            artifacts["cell_cycle"] = self._column_ref(phase_column)
 
-        hvg_options = self._options(highly_variable_features)
-        hvg_name = str(hvg_options.get("hvg_key_name", "hvgs"))
-        hvg_options.setdefault("show_plot", False)
-        hvg_options.setdefault("top_n", 2000)
-        hvg_options.setdefault("min_cells", 20)
-        store.mark_hvgs(
-            from_assay=assay_name,
-            cell_key=cell_key,
-            **hvg_options,
-        )
-        feature_column = f"{cell_key}__{hvg_name}"
-        artifacts["highly_variable_features"] = self._feature_ref(
-            assay_name,
-            feature_column,
-        )
-
-        normalization_options = self._options(normalization)
-        normalization_options.setdefault("log_transform", True)
-        normalization_options.setdefault("renormalize_subset", True)
-        normalized = store.run_normalization(
-            from_assay=assay_name,
-            cell_key=cell_key,
-            feat_key=hvg_name,
-            update_state=False,
-            **normalization_options,
-        )
-        artifacts["normalized"] = normalized
-
-        pca_options = self._options(pca)
-        n_centroids = int(pca_options.pop("n_centroids", 1000))
-        initialization_rand_state = int(pca_options.pop("rand_state", 4466))
-        pca_options.setdefault("dims", 25)
-        reduction = store.run_pca(
-            normalized,
-            update_state=False,
-            **pca_options,
-        )
-        artifacts["pca"] = reduction
-
-        coordinates = reduction
-        if harmony is not None:
-            harmony_options = dict(harmony)
-            batch_columns = harmony_options.pop("batch_columns", None)
-            if not isinstance(batch_columns, list) or not batch_columns:
-                raise ValueError("harmony requires a non-empty batch_columns list")
-            coordinates = store.run_harmony(
-                batch_columns,
-                reduction,
-                update_state=False,
-                **harmony_options,
-            )
-            artifacts["harmony"] = coordinates
-
-        ann = store.build_ann_index(
-            coordinates,
-            update_state=False,
-            **self._options(ann_index),
-        )
-        artifacts["ann_index"] = ann
-        neighbor_options = self._options(neighbors)
-        neighbor_options.setdefault("k", 17)
-        neighbor_ref = store.query_neighbors(
-            ann,
-            coordinates=coordinates,
-            update_state=False,
-            **neighbor_options,
-        )
-        artifacts["neighbors"] = neighbor_ref
-        graph = store.build_connectivity_map(
-            neighbor_ref,
-            update_state=False,
-            **self._options(connectivity),
-        )
-        artifacts["connectivity_map"] = graph
-
-        initialization = store._build_embedding_initialization(
-            reduction,
-            n_centroids=n_centroids,
-            rand_state=initialization_rand_state,
-            batch_size=None,
-            invalidate_cache=False,
-        )
-        store._publish_current_artifact(
-            graph,
-            update_state=True,
-            embedding_initialization=initialization,
-        )
-        artifacts["embedding_initialization"] = initialization
-
-        if umap is not False:
-            umap_options = self._options(umap)
-            umap_label = str(umap_options.get("label", "UMAP"))
-            store.run_umap(
+        with events.stage("normalization"):
+            normalization_options = self._options(normalization)
+            normalization_options.setdefault("log_transform", True)
+            normalization_options.setdefault("renormalize_subset", True)
+            normalized = store.run_normalization(
                 from_assay=assay_name,
                 cell_key=cell_key,
                 feat_key=hvg_name,
-                **umap_options,
+                update_state=False,
+                **normalization_options,
             )
-            umap_column = store._col_renamer(
-                assay_name,
-                cell_key,
-                f"{umap_label}1",
+            artifacts["normalized"] = normalized
+
+        with events.stage("pca"):
+            pca_options = self._options(pca)
+            n_centroids = int(pca_options.pop("n_centroids", 1000))
+            initialization_rand_state = int(pca_options.pop("rand_state", 4466))
+            pca_options.setdefault("dims", 25)
+            reduction = store.run_pca(
+                normalized,
+                update_state=False,
+                **pca_options,
             )
-            artifacts["umap"] = self._column_ref(umap_column)
+            artifacts["pca"] = reduction
+
+        coordinates = reduction
+        if harmony is not None:
+            with events.stage("harmony"):
+                harmony_options = dict(harmony)
+                batch_columns = harmony_options.pop("batch_columns", None)
+                if not isinstance(batch_columns, list) or not batch_columns:
+                    raise ValueError("harmony requires a non-empty batch_columns list")
+                coordinates = store.run_harmony(
+                    batch_columns,
+                    reduction,
+                    update_state=False,
+                    **harmony_options,
+                )
+                artifacts["harmony"] = coordinates
+
+        with events.stage("ann_index"):
+            ann = store.build_ann_index(
+                coordinates,
+                update_state=False,
+                **self._options(ann_index),
+            )
+            artifacts["ann_index"] = ann
+
+        with events.stage("neighbors"):
+            neighbor_options = self._options(neighbors)
+            neighbor_options.setdefault("k", 17)
+            neighbor_ref = store.query_neighbors(
+                ann,
+                coordinates=coordinates,
+                update_state=False,
+                **neighbor_options,
+            )
+            artifacts["neighbors"] = neighbor_ref
+
+        with events.stage("connectivity"):
+            graph = store.build_connectivity_map(
+                neighbor_ref,
+                update_state=False,
+                **self._options(connectivity),
+            )
+            artifacts["connectivity_map"] = graph
+
+        with events.stage("embedding_initialization"):
+            initialization = store._build_embedding_initialization(
+                reduction,
+                n_centroids=n_centroids,
+                rand_state=initialization_rand_state,
+                batch_size=None,
+                invalidate_cache=False,
+            )
+            store._publish_current_artifact(
+                graph,
+                update_state=True,
+                embedding_initialization=initialization,
+            )
+            artifacts["embedding_initialization"] = initialization
+
+        if umap is not False:
+            with events.stage("umap"):
+                umap_options = self._options(umap)
+                umap_label = str(umap_options.get("label", "UMAP"))
+                store.run_umap(
+                    from_assay=assay_name,
+                    cell_key=cell_key,
+                    feat_key=hvg_name,
+                    **umap_options,
+                )
+                umap_column = store._col_renamer(
+                    assay_name,
+                    cell_key,
+                    f"{umap_label}1",
+                )
+                artifacts["umap"] = self._column_ref(umap_column)
 
         leiden_options = dict(_DEFAULT_LEIDEN) if leiden is None else dict(leiden)
         paris_options = None if paris is False else self._options(paris)
@@ -517,6 +673,7 @@ class PipelineAccessor:
             leiden_options=leiden_options,
             paris_options=paris_options,
             clustering_concurrency=clustering_concurrency,
+            events=events,
         )
         artifacts.update(cluster_artifacts)
 
@@ -529,53 +686,58 @@ class PipelineAccessor:
         ) or (marker_options is not None and "clusters" not in marker_options)
         selected_recipe_key: str | None = None
         if needs_auto_clusters:
-            selected_recipe_key = self._select_clusters_by_pca_silhouette(
-                reduction=reduction,
-                cell_key=cell_key,
-                cluster_columns=cluster_columns,
-            )
-            artifacts["selected_clusters"] = artifacts[selected_recipe_key]
+            with events.stage("cluster_selection"):
+                selected_recipe_key = self._select_clusters_by_pca_silhouette(
+                    reduction=reduction,
+                    cell_key=cell_key,
+                    cluster_columns=cluster_columns,
+                )
+                artifacts["selected_clusters"] = artifacts[selected_recipe_key]
 
         if doublet_options is not None:
-            options = dict(doublet_options)
-            if "clusters" in options:
-                recipe_key = self._cluster_recipe_key(options.pop("clusters"))
-            else:
-                assert selected_recipe_key is not None
-                recipe_key = selected_recipe_key
-            if recipe_key not in cluster_columns:
-                raise ValueError(
-                    f"Doublet cluster result {recipe_key!r} is unavailable"
+            with events.stage("doublet_scoring"):
+                options = dict(doublet_options)
+                if "clusters" in options:
+                    recipe_key = self._cluster_recipe_key(options.pop("clusters"))
+                else:
+                    assert selected_recipe_key is not None
+                    recipe_key = selected_recipe_key
+                if recipe_key not in cluster_columns:
+                    raise ValueError(
+                        f"Doublet cluster result {recipe_key!r} is unavailable"
+                    )
+                score_column = store.run_doublet_detection(
+                    cluster_key=cluster_columns[recipe_key],
+                    from_assay=assay_name,
+                    cell_key=cell_key,
+                    feat_key=hvg_name,
+                    **options,
                 )
-            score_column = store.run_doublet_detection(
-                cluster_key=cluster_columns[recipe_key],
-                from_assay=assay_name,
-                cell_key=cell_key,
-                feat_key=hvg_name,
-                **options,
-            )
-            artifacts["doublets"] = self._column_ref(score_column)
+                artifacts["doublets"] = self._column_ref(score_column)
 
         if marker_options is not None:
-            options = dict(marker_options)
-            if "clusters" in options:
-                recipe_key = self._cluster_recipe_key(options.pop("clusters"))
-            else:
-                assert selected_recipe_key is not None
-                recipe_key = selected_recipe_key
-            if recipe_key not in cluster_columns:
-                raise ValueError(f"Marker cluster result {recipe_key!r} is unavailable")
-            group_key = cluster_columns[recipe_key]
-            options.setdefault("feat_key", "I")
-            store.run_marker_search(
-                from_assay=assay_name,
-                cell_key=cell_key,
-                group_key=group_key,
-                **options,
-            )
-            artifacts["markers"] = self._marker_ref(
-                assay_name,
-                cell_key,
-                group_key,
-            )
+            with events.stage("markers"):
+                options = dict(marker_options)
+                if "clusters" in options:
+                    recipe_key = self._cluster_recipe_key(options.pop("clusters"))
+                else:
+                    assert selected_recipe_key is not None
+                    recipe_key = selected_recipe_key
+                if recipe_key not in cluster_columns:
+                    raise ValueError(
+                        f"Marker cluster result {recipe_key!r} is unavailable"
+                    )
+                group_key = cluster_columns[recipe_key]
+                options.setdefault("feat_key", "I")
+                store.run_marker_search(
+                    from_assay=assay_name,
+                    cell_key=cell_key,
+                    group_key=group_key,
+                    **options,
+                )
+                artifacts["markers"] = self._marker_ref(
+                    assay_name,
+                    cell_key,
+                    group_key,
+                )
         return artifacts
