@@ -796,6 +796,7 @@ def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):
 
 def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
     import h5py
+    from loguru import logger
 
     from scarf.readers import H5adReader, inspect_h5ad
 
@@ -813,6 +814,10 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
         state = obs.create_group("state")
         state.create_dataset("codes", data=np.array([0, 1, 0], dtype=np.int8))
         state.create_dataset("categories", data=np.array([b"cycling", b"resting"]))
+        n_genes = obs.create_group("nGenes")
+        n_genes.attrs["encoding-type"] = "nullable-integer"
+        n_genes.create_dataset("values", data=np.array([5, 7, 0], dtype=np.int64))
+        n_genes.create_dataset("mask", data=np.array([False, False, True]))
 
         var = h5.create_group("var")
         var.create_dataset("_index", data=np.array([b"f1", b"f2"]))
@@ -829,6 +834,17 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
             "categories",
             data=np.array([b"Gene Expression", b"Antibody Capture"]),
         )
+        highly_variable = var.create_group("highly_variable")
+        highly_variable.attrs["encoding-type"] = "nullable-boolean"
+        highly_variable.create_dataset("values", data=np.array([True, False]))
+        highly_variable.create_dataset("mask", data=np.array([False, False]))
+        reviewed = var.create_group("reviewed")
+        reviewed.attrs["encoding-type"] = "nullable-boolean"
+        reviewed.create_dataset("values", data=np.array([True, False]))
+        reviewed.create_dataset("mask", data=np.array([False, True]))
+        unreadable = var.create_group("per_cell_counts")
+        unreadable.attrs["encoding-type"] = "dataframe"
+        unreadable.create_dataset("column", data=np.array([1, 2]))
 
         obsm = h5.create_group("obsm")
         obsm.create_dataset(
@@ -839,12 +855,21 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
             "bad_embed",
             data=np.array([[1, 2], [3, 4]], dtype=np.float32),
         )
+        _write_sparse_group(
+            obsm,
+            "sparse_embed",
+            np.array([[1, 0], [0, 2], [3, 0]], dtype=np.float32),
+        )
 
     inspection = inspect_h5ad(str(file_name))
     assert inspection.matrixKey == "X"
     assert inspection.matrixEncoding == "dense"
 
     reader = H5adReader(str(file_name))
+    messages: list[str] = []
+    sink = logger.add(
+        lambda message: messages.append(message.record["message"]), level="WARNING"
+    )
     try:
         assert reader.groupCodes == {"obs": 2, "var": 2, "obsm": 2, "X": 1}
         np.testing.assert_array_equal(reader.cell_ids(), [b"c1", b"c2", b"c3"])
@@ -852,21 +877,53 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
         np.testing.assert_array_equal(reader.feat_names(), [b"Gene B", b"Gene A"])
 
         cell_columns = dict(reader.get_cell_columns())
-        assert cell_columns.keys() == {"batch", "state", "X_embed1", "X_embed2"}
+        assert cell_columns.keys() == {
+            "batch",
+            "state",
+            "nGenes",
+            "X_embed1",
+            "X_embed2",
+        }
         np.testing.assert_array_equal(cell_columns["batch"], [b"A", b"B", b"A"])
         np.testing.assert_array_equal(
             cell_columns["state"],
             [b"cycling", b"resting", b"cycling"],
         )
+        # Numeric nullable columns stay numeric by representing missing values
+        # as NaN.
+        assert cell_columns["nGenes"].dtype == np.dtype(np.float64)
+        np.testing.assert_allclose(
+            cell_columns["nGenes"],
+            np.array([5, 7, np.nan]),
+            equal_nan=True,
+        )
         np.testing.assert_array_equal(cell_columns["X_embed2"], [2, 4, 6])
 
         feature_columns = dict(reader.get_feat_columns())
-        assert feature_columns.keys() == {"chromosome", "feature_type"}
+        assert feature_columns.keys() == {
+            "chromosome",
+            "feature_type",
+            "highly_variable",
+            "reviewed",
+        }
         np.testing.assert_array_equal(feature_columns["chromosome"], [b"1", b"2"])
         np.testing.assert_array_equal(
             feature_columns["feature_type"],
             [b"Gene Expression", b"Antibody Capture"],
         )
+        # Nothing is masked here, so the source dtype is preserved.
+        assert feature_columns["highly_variable"].dtype == np.dtype(bool)
+        np.testing.assert_array_equal(feature_columns["highly_variable"], [True, False])
+        np.testing.assert_array_equal(
+            feature_columns["reviewed"],
+            np.array([True, None], dtype=object),
+        )
+        assert any(
+            "per_cell_counts" in message and "dataframe" in message
+            for message in messages
+        )
+        assert any("sparse_embed" in message for message in messages)
+        assert not any("__categories" in message for message in messages)
         assert reader.feature_types("feature_type") == [
             "Gene Expression",
             "Antibody Capture",
@@ -876,6 +933,43 @@ def test_h5ad_reader_dense_matrix_and_group_metadata(tmp_path):
         assert len(chunks) == 2
         np.testing.assert_array_equal(chunks[0], [[1, 0], [0, 2]])
         np.testing.assert_array_equal(chunks[1], [[3, 4]])
+    finally:
+        logger.remove(sink)
+        reader.h5.close()
+
+
+def test_h5ad_reader_sizes_axes_from_nullable_columns(tmp_path):
+    import h5py
+
+    from scarf.readers import H5adReader
+
+    file_name = tmp_path / "nullable_only.h5ad"
+    with h5py.File(file_name, mode="w") as h5:
+        h5.create_dataset("X", data=np.ones((3, 2), dtype=np.float32))
+        obs = h5.create_group("obs")
+        n_genes = obs.create_group("nGenes")
+        n_genes.attrs["encoding-type"] = "nullable-integer"
+        n_genes.create_dataset("values", data=np.array([4, 5, 6], dtype=np.int64))
+        n_genes.create_dataset("mask", data=np.array([False, False, False]))
+        var = h5.create_group("var")
+        # A mask that does not line up with the values cannot be applied.
+        weight = var.create_group("weight")
+        weight.attrs["encoding-type"] = "nullable-integer"
+        weight.create_dataset("values", data=np.array([1, 2], dtype=np.int64))
+        weight.create_dataset("mask", data=np.array([False]))
+
+    reader = H5adReader(str(file_name))
+    try:
+        assert reader.nCells == 3
+        assert reader.nFeatures == 2
+        np.testing.assert_array_equal(reader.cell_ids(), ["cell_0", "cell_1", "cell_2"])
+        cell_columns = dict(reader.get_cell_columns())
+        assert cell_columns["nGenes"].dtype == np.dtype(np.int64)
+        np.testing.assert_array_equal(cell_columns["nGenes"], [4, 5, 6])
+        np.testing.assert_array_equal(
+            dict(reader.get_feat_columns())["weight"],
+            [1, 2],
+        )
     finally:
         reader.h5.close()
 

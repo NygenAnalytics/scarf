@@ -9,7 +9,23 @@ from scipy.sparse import coo_matrix, csc_matrix, csr_matrix
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
 from ._assay_names import auto_name_feat_table, make_feat_table_from_types
-from ._h5ad_inspect import H5adInspectResult, inspect_h5ad as inspect_h5ad
+from ._h5ad_inspect import H5adInspectResult, _as_text, inspect_h5ad as inspect_h5ad
+
+# AnnData writes a column as a group when it needs more than one array: a
+# categorical needs codes with categories, a pandas nullable dtype needs values
+# with a missingness mask.
+_CATEGORICAL_KEYS = frozenset({"codes", "categories"})
+_NULLABLE_KEYS = frozenset({"values", "mask"})
+
+
+def _column_encoding(node: h5py.Group) -> str:
+    encoding = node.attrs.get("encoding-type")
+    return "unknown" if encoding is None else _as_text(encoding)
+
+
+def _is_decodable_column(node: h5py.Group) -> bool:
+    keys = set(node.keys())
+    return _CATEGORICAL_KEYS.issubset(keys) or _NULLABLE_KEYS.issubset(keys)
 
 
 @dataclass(frozen=True)
@@ -240,13 +256,17 @@ class H5adReader:
             return int(self.h5[group].shape[0])
         else:
             for i in self.h5[group].keys():
-                if isinstance(self.h5[group][i], h5py.Dataset):
-                    return int(self.h5[group][i].shape[0])
-                if (
-                    isinstance(self.h5[group][i], h5py.Group)
-                    and "codes" in self.h5[group][i]
-                ):
-                    return int(self.h5[group][i]["codes"].shape[0])
+                node = self.h5[group][i]
+                if isinstance(node, h5py.Dataset):
+                    return int(node.shape[0])
+                if not isinstance(node, h5py.Group):
+                    continue
+                # Group encoded columns carry the axis length in their codes
+                # (categorical) or values (pandas nullable) array.
+                if "codes" in node:
+                    return int(node["codes"].shape[0])
+                if _NULLABLE_KEYS.issubset(node.keys()):
+                    return int(node["values"].shape[0])
             raise KeyError(
                 f"ERROR: `{group}` key doesn't contain any child node of Dataset type."
                 f"Aborting because unexpected H5ad format."
@@ -296,9 +316,8 @@ class H5adReader:
     def _replace_category_values(
         self, v: np.ndarray | h5py.Group | h5py.Dataset, key: str, group: str
     ) -> np.ndarray:
-        # check if v is a Group with codes + categories structure
         if isinstance(v, h5py.Group):
-            if "codes" in v and "categories" in v:
+            if _CATEGORICAL_KEYS.issubset(v.keys()):
                 codes = v["codes"][:]
                 categories = v["categories"][:]
                 valid = (codes >= 0) & (codes < len(categories))
@@ -306,7 +325,12 @@ class H5adReader:
                 decoded[valid] = categories[codes[valid]]
                 decoded[~valid] = None
                 return decoded
-            logger.warning(f"{key} is a Group but is not a categorical column")
+            if _NULLABLE_KEYS.issubset(v.keys()):
+                return self._decode_nullable(v, key)
+            logger.warning(
+                f"Column {key!r} in {group} uses the H5AD encoding "
+                f"{_column_encoding(v)!r}, which cannot be decoded"
+            )
             return np.array([], dtype=object)
 
         # if v is a Dataset
@@ -324,6 +348,30 @@ class H5adReader:
                 categories = self.h5["uns"][key + "_categories"][:]
                 return self._decode_legacy_categories(v, categories)
         return np.asarray(v)
+
+    @staticmethod
+    def _decode_nullable(v: h5py.Group, key: str) -> np.ndarray:
+        """Decode a pandas nullable column without losing numeric semantics."""
+        values = np.asarray(v["values"][:])
+        mask = np.asarray(v["mask"][:])
+        if mask.shape != values.shape:
+            logger.warning(
+                f"Column {key!r} has a missingness mask of shape {mask.shape} "
+                f"for {values.shape} values; the mask will be ignored"
+            )
+            return values
+        mask = mask.astype(bool, copy=False)
+        if not mask.any():
+            # Nothing is missing, so the native dtype survives the round trip.
+            return values
+        if values.dtype.kind in "iuf":
+            decoded = values.astype(np.float64)
+            decoded[mask] = np.nan
+            return decoded
+        decoded = np.empty(values.shape, dtype=object)
+        decoded[~mask] = values[~mask]
+        decoded[mask] = None
+        return decoded
 
     @staticmethod
     def _decode_legacy_categories(
@@ -357,16 +405,18 @@ class H5adReader:
                 if i in ignore_keys:
                     continue
                 values = self.h5[group][i]
-                if isinstance(values, h5py.Dataset | h5py.Group):
-                    if isinstance(values, h5py.Group) and not {
-                        "codes",
-                        "categories",
-                    }.issubset(values.keys()):
-                        continue
-                    yield (
-                        i,
-                        self._replace_category_values(values, i, group),
+                if not isinstance(values, h5py.Dataset | h5py.Group):
+                    continue
+                if isinstance(values, h5py.Group) and not _is_decodable_column(values):
+                    logger.warning(
+                        f"Skipping {group} column {i!r} because its H5AD encoding "
+                        f"{_column_encoding(values)!r} is not supported"
                     )
+                    continue
+                yield (
+                    i,
+                    self._replace_category_values(values, i, group),
+                )
 
     def _get_obsm_data(
         self, group: str
@@ -376,14 +426,19 @@ class H5adReader:
                 self.h5[group].keys(), desc=f"Reading attributes from group {group}"
             ):
                 g = self.h5[group][i]
+                if not isinstance(g, h5py.Dataset):
+                    logger.warning(
+                        f"Skipping H5AD slot {i!r} because only dense "
+                        f"{group} arrays can be imported"
+                    )
+                    continue
                 if g.shape[0] != self.nCells:
                     logger.warning(
                         f"Skipping H5AD slot {i!r} with unexpected shape {g.shape}"
                     )
                     continue
-                if isinstance(g, h5py.Dataset):
-                    for j in range(g.shape[1]):
-                        yield f"{i}{j + 1}", g[:, j]
+                for j in range(g.shape[1]):
+                    yield f"{i}{j + 1}", g[:, j]
         else:
             logger.warning(
                 "H5AD obsm is missing or has an unsupported format; "
@@ -392,7 +447,9 @@ class H5adReader:
 
     def get_cell_columns(self) -> Generator[tuple[str, np.ndarray], None, None]:
         """Creates a Generator that yields the cell columns."""
-        for i, j in self._get_col_data(self.cellAttrsKey, [self.cellIdsKey]):
+        for i, j in self._get_col_data(
+            self.cellAttrsKey, [self.cellIdsKey, self.catNamesKey]
+        ):
             yield i, j
         for i, j in self._get_obsm_data(self.obsmAttrsKey):
             yield i, j
@@ -400,7 +457,8 @@ class H5adReader:
     def get_feat_columns(self) -> Generator[tuple[str, np.ndarray], None, None]:
         """Creates a Generator that yields the feature columns."""
         for i, j in self._get_col_data(
-            self.featureAttrsKey, [self.featIdsKey, self.featNamesKey]
+            self.featureAttrsKey,
+            [self.featIdsKey, self.featNamesKey, self.catNamesKey],
         ):
             yield i, j
 
