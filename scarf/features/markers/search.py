@@ -12,15 +12,49 @@ from ...storage.feature_stream import plan_feature_stream
 from ...utils.logging import logger
 from ...utils.numba import restore_numba_threads
 from ...utils.process import process_rss_mb
+from .correction import _bh_adjusted_pvalues
 from .rank import (
     _batch_stats,
     _marker_stats_gene_major,
     gene_major_rank_scratch_bytes,
     sort_marker_results,
 )
-from .regression import _regression_batch_results
+from .regression import (
+    _REG_NONFINITE,
+    _REG_OK,
+    _REG_SENTINEL,
+    _regression_batch_results,
+)
+from .table import MARKER_STAT_COLUMNS_V2
 
 __all__ = ["find_markers_by_rank", "find_markers_by_regression"]
+
+_KERNEL_STAT_COLUMNS = (
+    "score",
+    "mean",
+    "mean_rest",
+    "frac_exp",
+    "frac_exp_rest",
+    "fold_change",
+    "p_value",
+    "auc",
+)
+
+
+def _validate_rank_marker_groups(group_counts: np.ndarray, n_total: int) -> None:
+    populated = np.asarray(group_counts, dtype=np.float64)
+    if populated.size < 2:
+        raise ValueError("Rank marker search requires at least two populated groups")
+    if np.any(populated < 2):
+        raise ValueError(
+            "Rank marker search requires at least two cells in every group"
+        )
+    reference = n_total - populated
+    if np.any(reference < 2):
+        raise ValueError(
+            "Rank marker search requires at least two cells in every "
+            "one-versus-rest reference complement"
+        )
 
 
 @restore_numba_threads
@@ -39,16 +73,7 @@ def find_markers_by_rank(
     n_groups = len(group_set)
     idx_map = dict(zip(group_set, range(n_groups)))
     int_indices = np.asarray([idx_map[x] for x in groups], dtype=np.int64)
-    out_cols = [
-        "feature_index",
-        "score",
-        "mean",
-        "mean_rest",
-        "frac_exp",
-        "frac_exp_rest",
-        "fold_change",
-        "p_value",
-    ]
+    out_cols = ["feature_index", *MARKER_STAT_COLUMNS_V2]
     results: dict[Any, pd.DataFrame] = {}
     worker_limit = getattr(
         getattr(assay, "resources", None),
@@ -64,6 +89,7 @@ def find_markers_by_rank(
     )
     group_counts = pd.Series(groups).value_counts().reindex(group_set).values
     n_total = len(groups)
+    _validate_rank_marker_groups(group_counts, n_total)
 
     renormalize_subset = bool(norm_params.get("renormalize_subset", False))
     log_transform = bool(norm_params.get("log_transform", False))
@@ -90,7 +116,7 @@ def find_markers_by_rank(
         scalar_values[scalar_values == 0] = 1
         group_counts32 = np.asarray(group_counts, dtype=np.float32)
         stats_matrix = np.zeros(
-            (len(feat_idx), n_groups, 7),
+            (len(feat_idx), n_groups, 8),
             dtype=np.float64,
         )
         raw_source, feature_axis, cell_axis = assay._raw_feature_stream_source()
@@ -161,11 +187,8 @@ def find_markers_by_rank(
                 f"rss={process_rss_mb():.0f} MiB"
             )
             del raw
-        p_values = stats_matrix[:, :, 6]
-        np.abs(p_values, out=p_values)
-        np.negative(p_values, out=p_values)
-        ndtr(p_values, out=p_values)
-        p_values *= 2.0
+        z_values = np.asarray(stats_matrix[:, :, 6], dtype=np.float64)
+        stats_matrix[:, :, 6] = 2.0 * ndtr(-np.abs(z_values))
     else:
         batch_stats = []
         iterator = iter(
@@ -182,24 +205,38 @@ def find_markers_by_rank(
                 mat = next(iterator)
             except StopIteration:
                 break
-            values = mat.to_numpy() if isinstance(mat, pd.DataFrame) else mat[0]
+            if isinstance(mat, pd.DataFrame):
+                values = mat.to_numpy()
+                feature_labels = np.asarray(mat.columns)
+            else:
+                feature_major, feature_labels = mat
+                values = np.asarray(feature_major).T
             stats = _batch_stats(
                 values,
                 int_indices,
                 group_counts,
                 n_total,
+                feature_labels=np.asarray(feature_labels),
             )
             batch_stats.append(stats)
         stats_matrix = np.vstack(batch_stats)
     feat_index = assay.feats.active_index(feat_key)
     pval_col = "p_value"
     for n, i in enumerate(group_set):
-        df = pd.DataFrame(
+        kernel = pd.DataFrame(
             stats_matrix[:, n, :],
-            columns=out_cols[1:],
+            columns=list(_KERNEL_STAT_COLUMNS),
             index=feat_index,
         )
-        cols_to_round = [col for col in df.columns if col != pval_col]
+        adjusted = _bh_adjusted_pvalues(
+            kernel[pval_col].to_numpy(dtype=np.float64, copy=False)
+        )
+        df = kernel.copy()
+        df["p_value_adjusted"] = adjusted
+        df = df.loc[:, list(MARKER_STAT_COLUMNS_V2)]
+        cols_to_round = [
+            col for col in df.columns if col not in {pval_col, "p_value_adjusted"}
+        ]
         df.loc[:, cols_to_round] = df.loc[:, cols_to_round].round(5)
         df["feature_index"] = df.index
         results[i] = sort_marker_results(df)[out_cols]
@@ -235,6 +272,7 @@ def find_markers_by_regression(
     labels: list[Any] = []
     r_parts: list[np.ndarray] = []
     p_parts: list[np.ndarray] = []
+    status_parts: list[np.ndarray] = []
     for feature_batch in assay.iter_normed_feature_wise(
         cell_key=cell_key,
         feat_key=feat_key,
@@ -250,7 +288,7 @@ def find_markers_by_regression(
             )
         data = np.ascontiguousarray(feature_batch.to_numpy(dtype=np.float64))
         feat_labels = np.asarray(feature_batch.columns)
-        r_vals, p_vals = _regression_batch_results(
+        r_vals, p_vals, status = _regression_batch_results(
             data,
             x_centered,
             ssxm,
@@ -261,13 +299,27 @@ def find_markers_by_regression(
         labels.extend(feat_labels.tolist())
         r_parts.append(r_vals)
         p_parts.append(p_vals)
+        status_parts.append(status)
 
     if not labels:
-        return pd.DataFrame(columns=["r_value", "p_value"])
+        return pd.DataFrame(columns=["r_value", "p_value", "p_value_adjusted"])
+    r_values = np.concatenate(r_parts)
+    p_values = np.concatenate(p_parts)
+    status = np.concatenate(status_parts)
+    if np.any(status == _REG_NONFINITE):
+        raise ValueError("Regression results contain non-finite feature status")
+    adjusted = np.full(p_values.shape, np.nan, dtype=np.float64)
+    tested = status == _REG_OK
+    if np.any(tested):
+        adjusted[tested] = _bh_adjusted_pvalues(p_values[tested])
+    untested = status == _REG_SENTINEL
+    p_values = p_values.astype(np.float64, copy=True)
+    p_values[untested] = np.nan
     return pd.DataFrame(
         {
-            "r_value": np.concatenate(r_parts),
-            "p_value": np.concatenate(p_parts),
+            "r_value": r_values,
+            "p_value": p_values,
+            "p_value_adjusted": adjusted,
         },
         index=labels,
     )

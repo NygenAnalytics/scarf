@@ -7,6 +7,7 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
+from ..features.markers.table import load_marker_table
 from ..storage.artifacts import ArtifactRef, inspect_artifact
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..matrix import ChunkedArray
@@ -127,50 +128,56 @@ def _prepare_marker_heatmap(
 
     feature_indices: list[int] = []
     marker_rows: list[dict[str, Any]] = []
-    if "feature_index" in marker_slot:
-        shared_index = np.asarray(
-            as_zarr_array(marker_slot["feature_index"], name="feature_index")[:]
+    feature_names = np.asarray(assay.feats.fetch_all("names"))
+    feature_ids = np.asarray(assay.feats.fetch_all("ids"))
+    for group_name in marker_slot.group_keys():
+        marker_group = as_zarr_group(marker_slot[group_name], name=group_name)
+        markers = load_marker_table(
+            marker_slot,
+            marker_group,
+            feature_names,
+            group_id=group_name,
+            feature_ids=feature_ids,
         )
-        for group_name in marker_slot.group_keys():
-            marker_group = as_zarr_group(marker_slot[group_name], name=group_name)
-            if "stats" not in marker_group:
-                continue
-            stats = np.asarray(as_zarr_array(marker_group["stats"], name="stats")[:])
-            top = np.argsort(-stats[:, 0])[:topn]
-            selected = shared_index[top].astype(int)
-            feature_indices.extend(selected.tolist())
-            marker_rows.extend(
-                {
-                    "group": group_name,
-                    "rank": rank,
-                    "feature_index": int(feature_index),
-                    "score": float(stats[stat_index, 0]),
-                }
-                for rank, (feature_index, stat_index) in enumerate(
-                    zip(selected, top), start=1
-                )
+        if markers.empty:
+            continue
+        unresolved = markers["feature_index"].isna()
+        if bool(unresolved.any()):
+            logger.warning(
+                f"Skipping {int(unresolved.sum())} unresolved legacy marker "
+                f"feature(s) for group '{group_name}'"
             )
-    else:
-        for group_name in marker_slot.group_keys():
-            marker_group = as_zarr_group(marker_slot[group_name], name=group_name)
-            if "feature_index" not in marker_group:
-                continue
-            selected = np.asarray(
-                as_zarr_array(marker_group["feature_index"], name="feature_index")[
-                    :topn
-                ],
-                dtype=int,
+            markers = markers.loc[~unresolved].copy()
+        if markers.empty:
+            continue
+        if "score" in markers.columns and markers["score"].notna().any():
+            ranked = markers.sort_values(
+                ["score", "feature_name"],
+                ascending=[False, True],
+                kind="mergesort",
+            ).head(topn)
+        else:
+            ranked = markers.head(topn)
+        selected = ranked["feature_index"].to_numpy(dtype=int)
+        feature_indices.extend(selected.tolist())
+        marker_rows.extend(
+            {
+                "group": group_name,
+                "rank": rank,
+                "feature_index": int(feature_index),
+                "score": float(score) if pd.notna(score) else np.nan,
+            }
+            for rank, (feature_index, score) in enumerate(
+                zip(
+                    selected,
+                    ranked["score"].to_numpy(dtype=float)
+                    if "score" in ranked.columns
+                    else np.full(len(selected), np.nan),
+                    strict=True,
+                ),
+                start=1,
             )
-            feature_indices.extend(selected.tolist())
-            marker_rows.extend(
-                {
-                    "group": group_name,
-                    "rank": rank,
-                    "feature_index": int(feature_index),
-                    "score": np.nan,
-                }
-                for rank, feature_index in enumerate(selected, start=1)
-            )
+        )
 
     if not feature_indices:
         raise ValueError("ERROR: Marker list is empty for all the groups")

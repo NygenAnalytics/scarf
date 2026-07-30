@@ -25,7 +25,18 @@ from ...storage.selections import resolve_selection_artifact
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...assay import RNAassay, lib_size_feature_stream_eligible
 from ...features.enrichment.results import EnrichmentResult
-from ...features.markers import sort_marker_results
+from ...features.markers.table import (
+    MARKER_ADJUSTMENT_METHOD,
+    MARKER_ADJUSTMENT_SCOPE,
+    MARKER_ALTERNATIVE,
+    MARKER_CONTINUITY_CORRECTION,
+    MARKER_METHOD,
+    MARKER_SCHEMA_VERSION,
+    MARKER_STAT_COLUMNS_V2,
+    MARKER_TIE_CORRECTION,
+    _validate_marker_slot_v2,
+    load_marker_table,
+)
 from ...metadata.arguments import AucellArguments, MarkerTableArguments, WaggrArguments
 from ...metadata.artifacts import (
     categorical_display,
@@ -54,30 +65,57 @@ if TYPE_CHECKING:
 else:
     _FeatureOperationsBase = object
 
-_MARKER_STAT_COLUMNS = (
-    "score",
-    "mean",
-    "mean_rest",
-    "frac_exp",
-    "frac_exp_rest",
-    "fold_change",
-    "p_value",
-)
+_MARKER_STAT_COLUMNS = MARKER_STAT_COLUMNS_V2
 _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
 
 
 def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray:
-    for vals in markers.values():
-        if len(vals) != 0:
-            return np.sort(np.asarray(vals.index.values, dtype=np.int32))
-    raise ValueError("Cannot save empty marker results")
+    shared: np.ndarray | None = None
+    populated_names: set[str] = set()
+    for cluster_id, vals in markers.items():
+        if len(vals) == 0:
+            continue
+        group_name = str(cluster_id)
+        if group_name in populated_names:
+            raise ValueError(
+                "Schema-v2 marker group labels must remain unique as strings"
+            )
+        populated_names.add(group_name)
+        raw_index = np.asarray(vals.index.values)
+        if raw_index.ndim != 1 or raw_index.dtype.kind not in {"i", "u"}:
+            raise ValueError(
+                "Schema-v2 marker feature indices must use a one-dimensional "
+                "integer index"
+            )
+        if not vals.index.is_unique:
+            raise ValueError(
+                "Schema-v2 marker feature indices must be unique within each group"
+            )
+        index = raw_index.astype(np.int64, copy=False)
+        if (index < 0).any() or (index > np.iinfo(np.int32).max).any():
+            raise ValueError(
+                "Schema-v2 marker feature indices must fit non-negative int32"
+            )
+        ordered = np.sort(index)
+        if shared is None:
+            shared = ordered
+        elif not np.array_equal(ordered, shared):
+            raise ValueError(
+                "Schema-v2 marker groups must contain identical feature index sets"
+            )
+    if shared is None:
+        raise ValueError("Cannot save empty marker results")
+    return shared.astype(np.int32)
 
 
 def _marker_stats_matrix(vals: pd.DataFrame, feature_index: np.ndarray) -> np.ndarray:
     aligned = vals.reindex(feature_index)
-    return np.asarray(
+    stats = np.asarray(
         aligned.loc[:, list(_MARKER_STAT_COLUMNS)].to_numpy(dtype=np.float64)
     )
+    if not np.isfinite(stats).all():
+        raise ValueError("Schema-v2 marker statistics must all be finite")
+    return stats
 
 
 def _write_compact_marker_stats(
@@ -87,12 +125,13 @@ def _write_compact_marker_stats(
     from ...storage.arrays import create_zarr_dataset
 
     n_features = int(stats.shape[0])
+    n_stats = int(stats.shape[1])
     arr = create_zarr_dataset(
         cluster_group,
         "stats",
-        (n_features, len(_MARKER_STAT_COLUMNS)),
+        (n_features, n_stats),
         "float64",
-        (n_features, len(_MARKER_STAT_COLUMNS)),
+        (n_features, n_stats),
     )
     arr[:] = stats
 
@@ -105,63 +144,14 @@ def _load_marker_cluster_frame(
     group_id: Any,
     feature_ids: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    out_cols = list(_MARKER_OUT_COLUMNS)
-    if "feature_index" in slot_group and "stats" in cluster_group:
-        feature_index = np.asarray(
-            as_zarr_array(slot_group["feature_index"], name="feature_index")[:]
-        )
-        stats = np.asarray(as_zarr_array(cluster_group["stats"], name="stats")[:])
-        df = pd.DataFrame(stats, columns=list(_MARKER_STAT_COLUMNS))
-        df["feature_index"] = feature_index
-        df["feature_name"] = feature_names[feature_index.astype(int)]
-        df["group_id"] = group_id
-        return sort_marker_results(df[["group_id", "feature_name", *out_cols[1:]]])
-
-    if "names" in cluster_group and "scores" in cluster_group:
-        stored_names = np.asarray(
-            as_zarr_array(cluster_group["names"], name="names")[:]
-        ).astype(str)
-        scores = np.asarray(
-            as_zarr_array(cluster_group["scores"], name="scores")[:],
-            dtype=np.float64,
-        )
-        lookup_values = feature_names if feature_ids is None else feature_ids
-        lookup = {str(value): index for index, value in enumerate(lookup_values)}
-        for index, value in enumerate(feature_names):
-            lookup.setdefault(str(value), index)
-        feature_index = np.asarray(
-            [lookup.get(value, -1) for value in stored_names],
-            dtype=np.int64,
-        )
-        display_names = stored_names.astype(object)
-        found = feature_index >= 0
-        display_names[found] = feature_names[feature_index[found]]
-        return (
-            pd.DataFrame(
-                {
-                    "group_id": group_id,
-                    "feature_name": display_names,
-                    "feature_index": feature_index,
-                    "score": scores,
-                }
-            )
-            .sort_values(
-                ["score", "feature_name"],
-                ascending=[False, True],
-            )
-            .reset_index(drop=True)
-        )
-
-    available_cols = [col for col in out_cols if col in cluster_group]
-    if not available_cols:
-        return pd.DataFrame([[] for _ in out_cols], index=out_cols).T
-    cols = [
-        np.asarray(as_zarr_array(cluster_group[x], name=x)[:]) for x in available_cols
-    ]
-    df = pd.DataFrame(cols, index=available_cols).T
-    df["group_id"] = group_id
-    df["feature_name"] = feature_names[df.feature_index.astype("int")]
-    return df[["group_id", "feature_name", *available_cols[1:]]]
+    """Thin wrapper around the shared version-aware marker reader."""
+    return load_marker_table(
+        slot_group,
+        cluster_group,
+        feature_names,
+        group_id=group_id,
+        feature_ids=feature_ids,
+    )
 
 
 def _group_assignment_digest(values: np.ndarray) -> str:
@@ -1044,6 +1034,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             f"batch_size={gene_batch_size if gene_batch_size is not None else 'auto'})"
         )
         planned = None
+        group_cell_counts: dict[Any, tuple[int, int]] = {}
         if not skip_save:
             assay_grp = as_zarr_group(self.zw[assay.name], name=assay.name)
             if "markers" not in assay_grp:
@@ -1083,6 +1074,55 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 default_display=categorical_display(feature_values),
                 preserved_display=preserved_feature_display,
             )
+            group_labels = assay.cells.fetch(group_key, cell_key)
+            group_sizes = pd.Series(group_labels).value_counts()
+            n_selected = int(len(group_labels))
+            group_cell_counts = {
+                group_id: (
+                    int(group_size),
+                    int(n_selected - group_size),
+                )
+                for group_id, group_size in group_sizes.items()
+            }
+            expected_group_cell_counts: dict[str, tuple[int, int]] = {}
+            for group_id, counts in group_cell_counts.items():
+                group_name = str(group_id)
+                if group_name in expected_group_cell_counts:
+                    raise ValueError(
+                        "Marker group labels must remain unique after string conversion"
+                    )
+                expected_group_cell_counts[group_name] = counts
+            feature_names_for_validation = np.asarray(assay.feats.fetch_all("names"))
+            expected_feature_index = np.flatnonzero(feature_values)
+
+            def marker_reuse_is_valid(
+                _ref: ArtifactRef,
+                candidate: zarr.Group,
+            ) -> bool:
+                try:
+                    stored_feature_index = np.asarray(
+                        as_zarr_array(
+                            candidate["feature_index"],
+                            name="feature_index",
+                        )[:]
+                    )
+                    if stored_feature_index.dtype.kind not in {
+                        "i",
+                        "u",
+                    } or not np.array_equal(
+                        stored_feature_index.astype(np.int64, copy=False),
+                        expected_feature_index,
+                    ):
+                        return False
+                    _validate_marker_slot_v2(
+                        candidate,
+                        feature_names_for_validation,
+                        expected_group_cell_counts=expected_group_cell_counts,
+                    )
+                except (IndexError, KeyError, TypeError, ValueError):
+                    return False
+                return True
+
             arguments = MarkerTableArguments(
                 cell_selection=cell_selection,
                 feature_selection=feature_selection,
@@ -1090,6 +1130,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 normalization=resolved_norm_params,
                 normalization_method=callable_identity(assay.normMethod),
                 size_factor=getattr(assay, "sf", None),
+                method=MARKER_METHOD,
+                alternative=MARKER_ALTERNATIVE,
+                tie_correction=MARKER_TIE_CORRECTION,
+                continuity_correction=MARKER_CONTINUITY_CORRECTION,
+                adjustment_method=MARKER_ADJUSTMENT_METHOD,
+                adjustment_scope=MARKER_ADJUSTMENT_SCOPE,
+                schema_version=MARKER_SCHEMA_VERSION,
                 group_key=group_key,
                 cell_key=cell_key,
                 feat_key=feat_key,
@@ -1105,6 +1152,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 required_arrays=(
                     ArrayRequirement(
                         "feature_index",
+                        shape=(int(feature_values.sum()),),
                         dtype_kind="i",
                     ),
                 ),
@@ -1113,7 +1161,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                         "stat_columns",
                         expected_types=(list, tuple),
                     ),
+                    AttributeRequirement(
+                        "schema_version",
+                        expected_types=(int,),
+                        predicate=lambda value: value == MARKER_SCHEMA_VERSION,
+                    ),
                 ),
+                reuse_validator=marker_reuse_is_valid,
             )
 
             def select_marker_artifact(ref: ArtifactRef) -> None:
@@ -1160,6 +1214,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             remote_slot,
             markers,
             workers=workers if remote else 1,
+            group_cell_counts=group_cell_counts,
         )
         finish_artifact(remote_slot, planned)
         select_marker_artifact(planned.ref)
@@ -1176,11 +1231,41 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         markers: dict[Any, pd.DataFrame],
         *,
         workers: int = 1,
+        group_cell_counts: dict[Any, tuple[int, int]],
     ) -> None:
         from ...storage.arrays import create_metadata_column
 
+        populated_groups = {
+            cluster_id for cluster_id, values in markers.items() if len(values)
+        }
+        missing_counts = populated_groups.difference(group_cell_counts)
+        if missing_counts:
+            raise ValueError(
+                "Schema-v2 marker writes require target and reference counts "
+                "for every populated group"
+            )
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 2
+            for cluster_id in populated_groups
+            for count in group_cell_counts[cluster_id]
+        ):
+            raise ValueError(
+                "Schema-v2 marker target and reference counts must be integers >= 2"
+            )
         feature_index = _shared_marker_feature_index(markers)
+        stats_by_group = {
+            cluster_id: _marker_stats_matrix(values, feature_index)
+            for cluster_id, values in markers.items()
+            if len(values)
+        }
+        group.attrs["schema_version"] = MARKER_SCHEMA_VERSION
         group.attrs["stat_columns"] = list(_MARKER_STAT_COLUMNS)
+        group.attrs["method"] = MARKER_METHOD
+        group.attrs["alternative"] = MARKER_ALTERNATIVE
+        group.attrs["tie_correction"] = MARKER_TIE_CORRECTION
+        group.attrs["continuity_correction"] = MARKER_CONTINUITY_CORRECTION
+        group.attrs["adjustment_method"] = MARKER_ADJUSTMENT_METHOD
+        group.attrs["adjustment_scope"] = MARKER_ADJUSTMENT_SCOPE
         create_metadata_column(
             group,
             "feature_index",
@@ -1194,11 +1279,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             if len(vals) == 0:
                 return
             cluster_group = group.create_group(str(cluster_id))
-            stats = _marker_stats_matrix(vals, feature_index)
             _write_compact_marker_stats(
                 cluster_group,
-                stats,
+                stats_by_group[cluster_id],
             )
+            n_group, n_reference = group_cell_counts[cluster_id]
+            cluster_group.attrs["n_group"] = n_group
+            cluster_group.attrs["n_reference"] = n_reference
 
         items = list(markers.items())
         if workers <= 1:
@@ -1346,12 +1433,17 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 )
             else:
                 logger.debug(f"No markers found for {gid} returning empty dataframe")
-                df = pd.DataFrame([[] for _ in out_cols], index=out_cols).T
-                df["group_id"] = []
-                df["feature_name"] = []
-                df = df[["group_id", "feature_name"] + list(out_cols[1:])]
+                empty_cols = [
+                    "group_id",
+                    "feature_name",
+                    "feature_index",
+                    *out_cols[1:],
+                ]
+                df = pd.DataFrame(
+                    {name: pd.Series(dtype=object) for name in empty_cols}
+                )
             dfs.append(df)
-        dfs = pd.concat(dfs)
+        dfs = pd.concat(dfs, ignore_index=True)
         keep = np.ones(len(dfs), dtype=bool)
         if "score" in dfs and dfs["score"].notna().any():
             keep &= dfs["score"].fillna(-np.inf).to_numpy() >= min_score
@@ -1643,7 +1735,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             return_fraction: Return the fraction of cells expressing a gene in each group. (Default value: False)
             feature_label: The column in feature metadata table to use as row labels. (Default value: 'index')
             pseudo_reps: Within each group, randomly split cells into this many
-                pseudo-replicates. (Default value: 1)
+                pseudo-replicates. Values greater than 1 produce descriptive
+                resamples of the same cells, not independent biological
+                replicates. (Default value: 1)
             remove_empty_features: Remove features that are not expressed in any cell. (Default value: True)
             null_vals: Values to be considered as missing values in the `group_key` column. These values will be skipped.
             secondary_null_vals: Values to be considered as missing values in the `secondary_group_key` column.
@@ -1664,6 +1758,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         if pseudo_reps < 1:
             pseudo_reps = 1
+        if pseudo_reps > 1:
+            logger.warning(
+                "make_bulk with pseudo_reps > 1 randomly splits cells within each "
+                "group into descriptive resamples. These are not independent "
+                "biological replicates and must not be used as such for "
+                "differential expression."
+            )
         if null_vals is None:
             null_vals = []
         if secondary_null_vals is None:

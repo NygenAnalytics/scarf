@@ -2,6 +2,13 @@
 
 import numpy as np
 
+from scarf.utils.logging import logger
+
+_PSEUDO_REP_WARNING = (
+    "make_bulk with pseudo_reps > 1 randomly splits cells within each "
+    "group into descriptive resamples"
+)
+
 
 def test_iter_row_blocks_matches_active_index_and_fetch(datastore):
     cells = datastore.cells
@@ -94,3 +101,57 @@ def test_make_bulk_respects_non_default_cell_key(leiden_clustering, datastore):
     idx_g = subset_idx[clusters[subset_idx] == g_val]
     expected = controlled_compute(ds.RNA.rawData[idx_g].sum(axis=0), ds.nthreads)
     np.testing.assert_allclose(sub[col].to_numpy(), expected, rtol=1e-5, atol=1e-6)
+
+
+def test_make_bulk_pseudo_reps_warns_without_changing_values(
+    leiden_clustering, datastore
+):
+    """Pseudo-replicate splits warn once; aggregation stays numerically identical."""
+    ds = datastore
+    kwargs = {
+        "group_key": "RNA_leiden_cluster",
+        "aggr_type": "sum",
+        "remove_empty_features": False,
+        "feature_label": "index",
+        "random_seed": 4466,
+    }
+
+    default_messages: list[str] = []
+    sink = logger.add(
+        lambda message: default_messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        default = ds.make_bulk(pseudo_reps=1, **kwargs)
+    finally:
+        logger.remove(sink)
+    assert not any(_PSEUDO_REP_WARNING in msg for msg in default_messages)
+
+    rep_messages: list[str] = []
+    sink = logger.add(
+        lambda message: rep_messages.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        with_reps = ds.make_bulk(pseudo_reps=2, **kwargs)
+        again = ds.make_bulk(pseudo_reps=2, **kwargs)
+    finally:
+        logger.remove(sink)
+
+    assert sum(_PSEUDO_REP_WARNING in msg for msg in rep_messages) == 2
+    assert any("not independent biological replicates" in msg for msg in rep_messages)
+    pd_values_equal = np.allclose(with_reps.to_numpy(), again.to_numpy())
+    assert pd_values_equal
+    assert with_reps.shape[1] == 2 * default.shape[1]
+    # Each group's two pseudo-reps partition the cells; their sums recover the
+    # unsplit group total (aggregation path unchanged by the warning).
+    for col in default.columns:
+        rep1 = f"{col}_Rep1"
+        rep2 = f"{col}_Rep2"
+        assert rep1 in with_reps.columns and rep2 in with_reps.columns
+        np.testing.assert_allclose(
+            with_reps[rep1].to_numpy() + with_reps[rep2].to_numpy(),
+            default[col].to_numpy(),
+            rtol=1e-5,
+            atol=1e-6,
+        )

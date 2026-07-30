@@ -70,13 +70,27 @@ class PseudotimeMarkerResult:
     pseudotime_key: str
 
     def __post_init__(self) -> None:
-        required = {"feature_index", "feature_name", "r_value", "p_value"}
+        required = {
+            "feature_index",
+            "feature_name",
+            "r_value",
+            "p_value",
+        }
         missing = required.difference(self.table.columns)
         if missing:
             raise ValueError(
                 "Pseudotime marker table is missing columns: "
                 + ", ".join(sorted(missing))
             )
+
+    @property
+    def p_value_adjusted_key(self) -> str | None:
+        if (
+            "p_value_adjusted" not in self.table.columns
+            or not self.p_value_key.endswith("__p")
+        ):
+            return None
+        return f"{self.p_value_key[:-3]}__padj"
 
 
 @dataclass(frozen=True, slots=True, eq=False)

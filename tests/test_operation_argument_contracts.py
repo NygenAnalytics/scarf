@@ -257,6 +257,16 @@ _CONTRACTS = (
             "feature_selection",
             "normalization_method",
             "size_factor",
+        )
+        | _classified(
+            "derived",
+            "method",
+            "alternative",
+            "tie_correction",
+            "continuity_correction",
+            "adjustment_method",
+            "adjustment_scope",
+            "schema_version",
         ),
     ),
     OperationContract(
@@ -312,6 +322,13 @@ _CONTRACTS = (
             "normalization_method",
             "pseudotime",
             "size_factor",
+        )
+        | _classified(
+            "derived",
+            "association_method",
+            "p_value_method",
+            "adjustment_method",
+            "adjustment_scope",
         )
         | _classified("execution", "n_threads"),
     ),

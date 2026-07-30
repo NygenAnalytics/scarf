@@ -273,10 +273,12 @@ Each colour is a Leiden partition on the same UMAP coordinates.
 
 ## 7) Marker genes
 
-`run_marker_search` ranks genes per group. Results include specificity-oriented scores and
-Mann-Whitney U statistics (`p_value`). Scarf does not apply multiple-testing correction
-(FDR). For condition-level differential expression with full DE workflows, export counts
-(see {doc}`pseudobulk_and_differential_expression`) and use an external tool.
+`run_marker_search` ranks genes per group. Results include specificity-oriented scores,
+Mann-Whitney U test p-values (`p_value`), AUC effect sizes, and within-group
+Benjamini-Hochberg adjusted values (`p_value_adjusted`). The adjusted column is a cell-level
+marker correction for that group, not replicate-aware differential expression. For
+condition-level DE with full workflows, export counts (see
+{doc}`pseudobulk_and_differential_expression`) and use an external tool.
 
 ```{code-cell} ipython3
 ds.run_marker_search(group_key='RNA_leiden_cluster')
@@ -347,7 +349,7 @@ expression or as evidence that a gene was detected in a cell.
 
 - Reusing QC thresholds from another dataset without inspecting distributions
 - Calling `run_umap` or clustering before building the neighbourhood graph
-- Treating marker `p_value` columns as FDR-corrected DE results
+- Treating marker `p_value` or within-group `p_value_adjusted` columns as replicate-aware DE results
 - Expecting filtered cells to disappear from `ds.cells` (they remain, with `I=False`)
 - Treating imputed expression as a replacement for observed counts
 

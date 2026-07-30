@@ -113,7 +113,7 @@ ds.plots.embedding(
 ---
 ## 3) Identify pseudotime correlated features
 
-`run_pseudotime_marker_search` calculates a correlation coefficient and p-value for each selected feature against the pseudotime ordering.
+`run_pseudotime_marker_search` calculates a correlation coefficient and p-value for each selected feature against the pseudotime ordering. Features that fail the minimum-cell or variance checks are left untested (`NaN` p-values). Benjamini-Hochberg adjustment (`p_value_adjusted`) runs only over tested features.
 
 ```{code-cell} ipython3
 markers = ds.run_pseudotime_marker_search(
@@ -122,7 +122,7 @@ markers = ds.run_pseudotime_marker_search(
 )
 ```
 
-The correlations and p-values are saved in feature metadata. Their generated column names are available as `markers.correlation_key` and `markers.p_value_key`. The same values, feature indices, and feature names are returned in `markers.table`.
+The correlations, raw p-values, and within-search adjusted p-values are saved in feature metadata. Their generated column names are available as `markers.correlation_key`, `markers.p_value_key`, and `markers.p_value_adjusted_key`. The same values, feature indices, and feature names are returned in `markers.table`.
 
 ```{code-cell} ipython3
 markers.table.head()

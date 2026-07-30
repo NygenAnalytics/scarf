@@ -969,6 +969,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         )
         correlation_key = f"{cell_key}__{pseudotime_key}__r"
         p_value_key = f"{cell_key}__{pseudotime_key}__p"
+        p_value_adjusted_key = f"{cell_key}__{pseudotime_key}__padj"
         storage_backed = all(
             hasattr(self, name)
             for name in (
@@ -978,6 +979,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             )
         ) and hasattr(assay, "z")
         planned = None
+        legacy_planned = None
         preserved_displays: dict[str, dict[str, Any] | None] = {}
         if storage_backed:
             cell_selection = self._ensure_cell_selection(cell_key)
@@ -1009,6 +1011,10 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 normalization=resolved_norm_params,
                 normalization_method=callable_identity(assay.normMethod),
                 size_factor=getattr(assay, "sf", None),
+                association_method="pearson",
+                p_value_method="student_t",
+                adjustment_method="fdr_bh",
+                adjustment_scope="tested_features",
                 min_cells=min_cells,
                 from_assay=assay.name,
                 cell_key=cell_key,
@@ -1024,6 +1030,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 ),
                 invalidate_cache=invalidate_cache,
             )
+            record = arguments.to_record()
             planned = arguments.plan(
                 self.zw,
                 scope="assay",
@@ -1040,8 +1047,48 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                         shape=(n_feats,),
                         dtype_kind="f",
                     ),
+                    ArrayRequirement(
+                        "p_value_adjusted",
+                        shape=(n_feats,),
+                        dtype_kind="f",
+                    ),
                 ),
             )
+            if not planned.reused and not invalidate_cache:
+                legacy_parameters = dict(record.parameters)
+                for field_name in (
+                    "association_method",
+                    "p_value_method",
+                    "adjustment_method",
+                    "adjustment_scope",
+                ):
+                    legacy_parameters.pop(field_name)
+                legacy_planned = plan_artifact(
+                    self.zw,
+                    scope="assay",
+                    assay=assay.name,
+                    kind=arguments.artifact_kind,
+                    operation=arguments.operation,
+                    parameters=legacy_parameters,
+                    inputs=record.inputs,
+                    execution_options=record.execution_options,
+                    required_arrays=(
+                        ArrayRequirement(
+                            "r_value",
+                            shape=(n_feats,),
+                            dtype_kind="f",
+                        ),
+                        ArrayRequirement(
+                            "p_value",
+                            shape=(n_feats,),
+                            dtype_kind="f",
+                        ),
+                    ),
+                )
+                if not legacy_planned.reused:
+                    legacy_planned = None
+            else:
+                legacy_planned = None
             preserved_displays = {
                 correlation_key: feature_column_display(
                     assay.z,
@@ -1051,18 +1098,52 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                     assay.z,
                     p_value_key,
                 ),
+                p_value_adjusted_key: feature_column_display(
+                    assay.z,
+                    p_value_adjusted_key,
+                ),
             }
         if planned is not None and planned.reused:
             artifact_group = reused_artifact_group(self.zw, planned)
             r_values = artifact_values(artifact_group, "r_value")
             p_values = artifact_values(artifact_group, "p_value")
+            p_values_adjusted = artifact_values(
+                artifact_group,
+                "p_value_adjusted",
+            )
             markers = pd.DataFrame(
                 {
                     "r_value": r_values,
                     "p_value": p_values,
+                    "p_value_adjusted": p_values_adjusted,
                 },
                 index=feature_index,
             )
+        elif legacy_planned is not None and legacy_planned.reused:
+            from ...features.markers.correction import _bh_adjusted_pvalues
+
+            artifact_group = reused_artifact_group(self.zw, legacy_planned)
+            r_values = artifact_values(artifact_group, "r_value")
+            p_values = artifact_values(artifact_group, "p_value")
+            p_values_adjusted = _bh_adjusted_pvalues(p_values)
+            markers = pd.DataFrame(
+                {
+                    "r_value": r_values,
+                    "p_value": p_values,
+                    "p_value_adjusted": p_values_adjusted,
+                },
+                index=feature_index,
+            )
+            if planned is not None and getattr(self, "zarr_mode", "r+") == "r+":
+                write_cell_data_artifact(
+                    self.zw,
+                    planned,
+                    {
+                        "r_value": r_values,
+                        "p_value": p_values,
+                        "p_value_adjusted": p_values_adjusted,
+                    },
+                )
         else:
             markers = find_markers_by_regression(
                 assay=assay,
@@ -1074,51 +1155,77 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 **resolved_norm_params,
             )
             markers = markers.reindex(feature_index)
-            if markers.isna().any(axis=None):
+            if markers["r_value"].isna().any():
                 raise ValueError(
                     "Pseudotime marker results are not aligned to feat_key"
                 )
             r_values = np.asarray(markers["r_value"].values)
             p_values = np.asarray(markers["p_value"].values)
-            if planned is not None:
+            p_values_adjusted = np.asarray(markers["p_value_adjusted"].values)
+            if planned is not None and getattr(self, "zarr_mode", "r+") == "r+":
                 write_cell_data_artifact(
                     self.zw,
                     planned,
                     {
                         "r_value": r_values,
                         "p_value": p_values,
+                        "p_value_adjusted": p_values_adjusted,
                     },
                 )
-        logger.debug("Pseudotime markers: saving marker scores")
-        assay.feats.insert(
-            correlation_key,
-            r_values,
-            key=feat_key,
-            overwrite=True,
+        publish_metadata = (
+            not storage_backed
+            or getattr(
+                self,
+                "zarr_mode",
+                "r+",
+            )
+            == "r+"
         )
-        assay.feats.insert(
-            p_value_key,
-            p_values,
-            key=feat_key,
-            overwrite=True,
-        )
-        if planned is not None:
-            link_feature_data_column(
-                assay.z,
+        if publish_metadata:
+            logger.debug("Pseudotime markers: saving marker scores")
+            assay.feats.insert(
                 correlation_key,
-                planned.ref,
-                value_name="r_value",
-                default_display=continuous_display(r_values),
-                preserved_display=preserved_displays[correlation_key],
+                r_values,
+                key=feat_key,
+                overwrite=True,
             )
-            link_feature_data_column(
-                assay.z,
+            assay.feats.insert(
                 p_value_key,
-                planned.ref,
-                value_name="p_value",
-                default_display=continuous_display(p_values),
-                preserved_display=preserved_displays[p_value_key],
+                p_values,
+                key=feat_key,
+                overwrite=True,
             )
+            assay.feats.insert(
+                p_value_adjusted_key,
+                p_values_adjusted,
+                key=feat_key,
+                overwrite=True,
+            )
+            if planned is not None:
+                link_feature_data_column(
+                    assay.z,
+                    correlation_key,
+                    planned.ref,
+                    value_name="r_value",
+                    default_display=continuous_display(r_values),
+                    preserved_display=preserved_displays[correlation_key],
+                )
+                link_feature_data_column(
+                    assay.z,
+                    p_value_key,
+                    planned.ref,
+                    value_name="p_value",
+                    default_display=continuous_display(p_values),
+                    preserved_display=preserved_displays[p_value_key],
+                )
+                link_feature_data_column(
+                    assay.z,
+                    p_value_adjusted_key,
+                    planned.ref,
+                    value_name="p_value_adjusted",
+                    default_display=continuous_display(p_values_adjusted),
+                    preserved_display=preserved_displays[p_value_adjusted_key],
+                )
         table = markers.rename_axis("feature_index").reset_index()
         feature_names = np.asarray(assay.feats.fetch_all("names"), dtype=object)
         table.insert(
@@ -1126,7 +1233,13 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             "feature_name",
             feature_names[table["feature_index"].to_numpy(dtype=np.int64)],
         )
-        logger.info(f"Stored pseudotime marker scores for {len(table)} features")
+        if publish_metadata:
+            logger.info(f"Stored pseudotime marker scores for {len(table)} features")
+        else:
+            logger.info(
+                f"Loaded pseudotime marker scores for {len(table)} features "
+                "without modifying the read-only store"
+            )
         return PseudotimeMarkerResult(
             table=table,
             correlation_key=correlation_key,

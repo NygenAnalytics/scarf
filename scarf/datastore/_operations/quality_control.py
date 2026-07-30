@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+from numbers import Real
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -7,7 +8,13 @@ import pandas as pd
 from ...assay import ATACassay, RNAassay
 from ...graph.state import read_assay_state
 from ...quality_control.cell_cycle import assign_cell_cycle_phase
-from ...quality_control.filtering import gaussian_quantile_bounds
+from ...quality_control.filtering import (
+    _metric_policy,
+    _sample_aware_mad_mask,
+    _validated_sample_labels,
+    _validated_work_scale,
+    gaussian_quantile_bounds,
+)
 from ...quality_control.hto import hto_demux
 from ...metadata.artifacts import (
     artifact_values,
@@ -28,6 +35,7 @@ from ...metadata.arguments import (
 )
 from ...storage.artifacts import (
     artifact_path,
+    canonical_bytes,
     callable_identity,
     fingerprint_array,
     fingerprint_stored_arrays,
@@ -135,21 +143,35 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         max_p: float = 0.99,
         show_qc_plots: bool = True,
         invalidate_cache: bool = False,
+        sample_column: str | None = None,
+        n_mads: float = 3.0,
+        min_cells_per_sample: int = 20,
     ) -> None:
         """Automatically filter cells based on columns of the cell metadata
         table.
 
-        This is a wrapper around ``filter_cells`` that determines the thresholds
-        for each column. It models a normal distribution centered on the column
-        median and using the column standard deviation, then evaluates its
-        quantiles at ``min_p`` and ``max_p``.
+        By default this is a wrapper around ``filter_cells`` that determines the
+        thresholds for each column. It models a normal distribution centered on
+        the column median and using the column standard deviation, then
+        evaluates its quantiles at ``min_p`` and ``max_p``.
+
+        When ``sample_column`` is supplied, thresholds are instead calculated
+        independently within each sample using median absolute deviation (MAD).
+        ``n_mads`` controls that path. ``min_p`` and ``max_p`` remain
+        global-Gaussian parameters and must stay at their defaults when
+        ``sample_column`` is set.
 
         Args:
             attrs: Column names to be used for filtering.
-            min_p: Quantile used for the lower threshold.
-            max_p: Quantile used for the upper threshold.
+            min_p: Quantile used for the lower threshold (Gaussian path only).
+            max_p: Quantile used for the upper threshold (Gaussian path only).
             show_qc_plots: Show pre-filtering and post-filtering distributions
                 for the columns used.
+            sample_column: Optional cell-metadata column with sample labels.
+                When set, MAD bounds are calculated within each sample.
+            n_mads: Number of scaled MADs used for per-sample bounds.
+            min_cells_per_sample: Samples with fewer active cells than this are
+                retained without MAD filtering and emit a warning.
 
         Returns:
             None
@@ -163,11 +185,25 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 if i in self.cells.columns:
                     attrs.append(i)
 
+        attrs_list = list(attrs)
+        if sample_column is not None:
+            self._auto_filter_cells_sample_mad(
+                attrs=attrs_list,
+                min_p=min_p,
+                max_p=max_p,
+                show_qc_plots=show_qc_plots,
+                invalidate_cache=invalidate_cache,
+                sample_column=sample_column,
+                n_mads=n_mads,
+                min_cells_per_sample=min_cells_per_sample,
+            )
+            return
+
         attrs_used: list[str] = []
         lower_bounds: list[int] = []
         upper_bounds: list[int] = []
         resolved_bounds: dict[str, dict[str, float]] = {}
-        for i in attrs:
+        for i in attrs_list:
             if i not in self.cells.columns:
                 logger.warning(
                     f"{i} not found in cell metadata. Will ignore {i} for filtering"
@@ -204,6 +240,158 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         if show_qc_plots and attrs_used:
             # Match the previous plot_cells_dists contract: pre uses every cell,
             # post uses the filtered active set under cell key I.
+            distribution(
+                self,
+                keys=attrs_used,
+                cell_key=None,
+                color="steelblue",
+                title="Pre-filtering distribution",
+                show=True,
+            )
+            distribution(
+                self,
+                keys=attrs_used,
+                cell_key="I",
+                color="coral",
+                title="Post-filtering distribution",
+                show=True,
+            )
+
+    def _auto_filter_cells_sample_mad(
+        self,
+        *,
+        attrs: list[str],
+        min_p: float,
+        max_p: float,
+        show_qc_plots: bool,
+        invalidate_cache: bool,
+        sample_column: str,
+        n_mads: float,
+        min_cells_per_sample: int,
+    ) -> None:
+        from ...plotting import distribution
+
+        if min_p != 0.01 or max_p != 0.99:
+            raise ValueError(
+                "min_p and max_p apply only to the global Gaussian path. "
+                "Leave them at their defaults (0.01 and 0.99) when "
+                "sample_column is set, and use n_mads to control MAD bounds"
+            )
+        if isinstance(n_mads, bool) or not isinstance(n_mads, Real):
+            raise TypeError("n_mads must be a positive number")
+        resolved_n_mads = float(n_mads)
+        if not np.isfinite(resolved_n_mads) or resolved_n_mads <= 0:
+            raise ValueError("n_mads must be finite and greater than 0")
+        if (
+            not isinstance(min_cells_per_sample, int)
+            or isinstance(min_cells_per_sample, bool)
+            or min_cells_per_sample < 2
+        ):
+            raise ValueError("min_cells_per_sample must be an integer >= 2")
+        if sample_column not in self.cells.columns:
+            raise ValueError(
+                f"sample_column '{sample_column}' not found in cell metadata"
+            )
+
+        active = np.asarray(self.cells.fetch_all("I"), dtype=bool)
+        sample_labels = np.asarray(self.cells.fetch_all(sample_column))
+        sample_labels = _validated_sample_labels(
+            sample_labels,
+            active,
+            label_name=f"sample_column '{sample_column}'",
+        )
+        active_labels = sample_labels[active]
+        if active_labels.size == 0:
+            raise ValueError("No active cells are available for sample-aware filtering")
+
+        attrs_used: list[str] = []
+        values_by_attr: dict[str, np.ndarray] = {}
+        for attr in attrs:
+            if attr not in self.cells.columns:
+                logger.warning(
+                    f"{attr} not found in cell metadata. Will ignore {attr} for filtering"
+                )
+                continue
+            values = np.asarray(self.cells.fetch_all(attr), dtype=float)
+            _validated_work_scale(
+                values[active],
+                attr=attr,
+                transform=_metric_policy(attr)["transform"],
+            )
+            attrs_used.append(attr)
+            values_by_attr[attr] = values
+
+        parameters: dict[str, Any] = {
+            "attrs": attrs_used,
+            "sample_column": sample_column,
+            "n_mads": resolved_n_mads,
+            "min_cells_per_sample": int(min_cells_per_sample),
+            "resolved_bounds": {},
+        }
+
+        mad_provenance = None
+        if attrs_used:
+            keep, mad_provenance = _sample_aware_mad_mask(
+                values_by_attr=values_by_attr,
+                sample_labels=sample_labels,
+                active=active,
+                n_mads=resolved_n_mads,
+                min_cells_per_sample=int(min_cells_per_sample),
+                attrs=attrs_used,
+            )
+            parameters.update(
+                {
+                    "mad_scale": mad_provenance["mad_scale"],
+                    "metric_policies": mad_provenance["metric_policies"],
+                    "sample_sizes": mad_provenance["sample_sizes"],
+                    "skip_reasons": mad_provenance["skip_reasons"],
+                    "resolved_bounds": mad_provenance["resolved_bounds"],
+                }
+            )
+        fingerprint_inputs: dict[str, Any] = {
+            "sample_assignments_fingerprint": fingerprint_strings(active_labels),
+            "qc_metric_fingerprints": {
+                attr: fingerprint_array(values_by_attr[attr][active])
+                for attr in attrs_used
+            },
+        }
+        canonical_bytes(
+            {
+                "operation": "auto_filter_cells",
+                "parameters": parameters,
+                "inputs": fingerprint_inputs,
+            }
+        )
+        prior_selection = self._ensure_cell_selection("I")
+        inputs: dict[str, Any] = {
+            "prior_cell_selection": prior_selection,
+            **fingerprint_inputs,
+        }
+        canonical_bytes(
+            {
+                "operation": "auto_filter_cells",
+                "parameters": parameters,
+                "inputs": inputs,
+            }
+        )
+
+        if attrs_used:
+            assert mad_provenance is not None
+            for message in mad_provenance["warnings"]:
+                logger.warning(message)
+            self.cells.update_key(keep, key="I")
+            remaining = int(np.asarray(self.cells.fetch_all("I"), dtype=bool).sum())
+            logger.info(f"Cell filtering retained {remaining}/{self.cells.N} cells")
+
+        self._record_cell_selection(
+            column="I",
+            operation="auto_filter_cells",
+            parameters=parameters,
+            inputs=inputs,
+            invalidate_cache=invalidate_cache,
+        )
+
+        if show_qc_plots and attrs_used:
             distribution(
                 self,
                 keys=attrs_used,

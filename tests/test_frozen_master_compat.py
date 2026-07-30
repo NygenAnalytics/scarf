@@ -213,6 +213,51 @@ def test_frozen_master_reads_and_recomputes_markers_without_mutation(
 
 
 @pytest.mark.integration
+def test_frozen_master_writable_copy_publishes_v2_markers_additively(
+    frozen_master_store: str,
+    tmp_path,
+) -> None:
+    from scarf.datastore.datastore import DataStore
+    from scarf.features.markers.table import MARKER_STAT_COLUMNS_V2
+
+    working_copy = str(tmp_path / "data.zarr")
+    shutil.copytree(frozen_master_store, working_copy)
+    legacy_subtree = os.path.join(
+        working_copy,
+        "RNA/markers/I__RNA_cluster",
+    )
+    legacy_before = _tree_digest(legacy_subtree)
+    datastore = DataStore(working_copy, default_assay=_ASSAY, zarr_mode="r+")
+
+    datastore.run_marker_search(
+        from_assay=_ASSAY,
+        cell_key=_CELL_KEY,
+        feat_key="I__hvgs",
+        group_key="RNA_cluster",
+        gene_batch_size=100,
+        n_threads=1,
+    )
+
+    assert _tree_digest(legacy_subtree) == legacy_before
+    published = datastore._resolve_marker_group(
+        _ASSAY,
+        _CELL_KEY,
+        "RNA_cluster",
+    )
+    assert published.attrs["schema_version"] == 2
+    assert list(published.attrs["stat_columns"]) == list(MARKER_STAT_COLUMNS_V2)
+    assert published.attrs["method"] == "mannwhitneyu"
+    assert published.attrs["alternative"] == "two-sided"
+    assert published.attrs["adjustment_method"] == "fdr_bh"
+    assert published.attrs["adjustment_scope"] == ("within_group_all_tested_features")
+    assert all(
+        published[group].attrs["n_group"] >= 2
+        and published[group].attrs["n_reference"] >= 2
+        for group in published.group_keys()
+    )
+
+
+@pytest.mark.integration
 def test_frozen_master_legacy_dendrogram_triggers_hierarchy_rebuild(
     frozen_master_store: str,
     tmp_path,

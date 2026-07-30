@@ -83,7 +83,7 @@ def _marker_stats_batch(
     n_cells = data.shape[0]
     n_genes = data.shape[1]
     n_groups = group_counts.shape[0]
-    out = np.zeros((n_genes, n_groups, 7))
+    out = np.zeros((n_genes, n_groups, 8))
     for g in prange(n_genes):
         v = data[:, g]
         order = np.argsort(v)
@@ -157,6 +157,10 @@ def _marker_stats_batch(
                 z = (delta - 0.5 * np.sign(delta)) / np.sqrt(var)
             else:
                 z = 0.0
+            if n1 > 0.0 and n2 > 0.0:
+                auc = u1 / (n1 * n2)
+            else:
+                auc = np.nan
             out[g, x, 0] = r
             out[g, x, 1] = m
             out[g, x, 2] = m_o
@@ -164,6 +168,7 @@ def _marker_stats_batch(
             out[g, x, 4] = e_o
             out[g, x, 5] = fc
             out[g, x, 6] = z
+            out[g, x, 7] = auc
     return out
 
 
@@ -276,6 +281,10 @@ def _marker_stats_gene_major(
                 if variance > 0.0
                 else 0.0
             )
+            if n1 > 0.0 and n2 > 0.0:
+                auc = u1 / (n1 * n2)
+            else:
+                auc = np.nan
             out[row, x, 0] = score
             out[row, x, 1] = mean
             out[row, x, 2] = mean_rest
@@ -283,6 +292,7 @@ def _marker_stats_gene_major(
             out[row, x, 4] = fraction_rest
             out[row, x, 5] = fold_change
             out[row, x, 6] = z
+            out[row, x, 7] = auc
 
 
 def gene_major_rank_scratch_bytes(
@@ -313,7 +323,7 @@ def _batch_stats_gene_major(
 ) -> np.ndarray:
     """Run the feature-major kernel and convert z statistics to p-values."""
     n_genes = int(raw.shape[0])
-    out = np.zeros((n_genes, len(group_counts), 7), dtype=np.float64)
+    out = np.zeros((n_genes, len(group_counts), 8), dtype=np.float64)
     _marker_stats_gene_major(
         np.ascontiguousarray(raw),
         np.asarray(scalar, dtype=np.float32),
@@ -334,10 +344,27 @@ def _batch_stats(
     int_indices: np.ndarray,
     group_counts: np.ndarray,
     n_total: int,
+    feature_labels: np.ndarray | None = None,
 ) -> np.ndarray:
     """Run the marker kernel and convert z statistics to p-values."""
+    values = np.asarray(data)
+    if values.ndim != 2:
+        raise ValueError("Marker data must be a two-dimensional array")
+    labels = (
+        np.arange(values.shape[1])
+        if feature_labels is None
+        else np.asarray(feature_labels)
+    )
+    if labels.shape != (values.shape[1],):
+        raise ValueError("Feature labels must match the marker data columns")
+    for column in range(values.shape[1]):
+        if not np.isfinite(values[:, column]).all():
+            raise ValueError(
+                f"Feature {labels[column]!r} contains non-finite normalized values"
+            )
+    kernel_dtype = np.float32 if values.dtype == np.float32 else np.float64
     out = _marker_stats_batch(
-        np.ascontiguousarray(data, dtype=np.float32),
+        np.ascontiguousarray(values, dtype=kernel_dtype),
         int_indices,
         group_counts.astype(np.float32),
         np.float32(n_total),

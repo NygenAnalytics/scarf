@@ -74,8 +74,9 @@ ds.run_marker_search(group_key='RNA_leiden_cluster')
 
 `get_markers` returns genes ranked by marker score. Pass a `group_id` for one cluster, or
 `group_id=None` for every cluster in one long table with a `group_id` column. Columns include
-scores, expression fractions, fold change, and Mann-Whitney `p_value`. These are not
-FDR-corrected DE results.
+scores, expression fractions, fold change, Mann-Whitney `p_value`, AUC, and within-group
+`p_value_adjusted` (Benjamini-Hochberg). The adjusted values are cell-level marker
+corrections, not replicate-aware DE results.
 
 ```{code-cell} ipython3
 markers = ds.get_markers(
@@ -84,7 +85,7 @@ markers = ds.get_markers(
     min_score=-1,
     min_frac_exp=-1,
 )
-markers[['feature_name', 'score', 'frac_exp', 'p_value']].head(10)
+markers[['feature_name', 'score', 'frac_exp', 'p_value', 'p_value_adjusted']].head(10)
 ```
 
 `markers.columns` lists the remaining columns, including mean expression inside and outside
@@ -229,7 +230,7 @@ The subset UMAP and Leiden labels apply only to cells marked in `focus_cells`.
 
 - Treating cluster IDs as biologically stable across resolutions
 - Overwriting annotation columns without keeping the clustering key you used
-- Claiming FDR-corrected DE from `run_marker_search` alone
+- Claiming replicate-aware DE from `run_marker_search` alone; use `p_value_adjusted` only as a within-group cell-level marker correction
 
 ## Summary of saved results
 

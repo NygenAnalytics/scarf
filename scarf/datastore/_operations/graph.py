@@ -1226,6 +1226,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                             ):
                                 ref = candidate
         if ref is None:
+            if getattr(self, "zarr_mode", "r+") != "r+":
+                raise PermissionError(
+                    f"Selection provenance for {column!r} is unavailable "
+                    "in the read-only store"
+                )
             ref = resolve_selection_artifact(
                 self.zw,
                 scope=scope,
@@ -1239,6 +1244,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 source_column=column,
                 invalidate_cache=invalidate_cache,
             )
+        if getattr(self, "zarr_mode", "r+") != "r+":
+            return ref
         if scope == "assay" and assay is not None:
             link_feature_data_column(
                 self._get_assay(assay).z,
@@ -2666,8 +2673,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         action = "Reused" if planned.reused else "Stored"
         logger.info(
-            f"{action} Harmony coordinates for {n_cells} cells "
-            f"with {dims} dimensions"
+            f"{action} Harmony coordinates for {n_cells} cells with {dims} dimensions"
         )
         return planned.ref
 
@@ -2783,8 +2789,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             finish_artifact(group, planned)
         action = "Reused" if planned.reused else "Stored"
         logger.info(
-            f"{action} embedding initialization with "
-            f"{effective_clusters} centroids"
+            f"{action} embedding initialization with {effective_clusters} centroids"
         )
         return planned.ref
 
@@ -3148,9 +3153,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             update_state=update_state,
         )
         action = "Reused" if planned.reused else "Stored"
-        logger.info(
-            f"{action} {effective_k} neighbors for each of {n_cells} cells"
-        )
+        logger.info(f"{action} {effective_k} neighbors for each of {n_cells} cells")
         return planned.ref
 
     def build_connectivity_map(

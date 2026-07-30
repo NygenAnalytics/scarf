@@ -10,6 +10,9 @@ _REG_SENTINEL = 1
 _REG_NONFINITE = 2
 
 __all__ = [
+    "_REG_NONFINITE",
+    "_REG_OK",
+    "_REG_SENTINEL",
     "_regression_batch_results",
     "_regression_p_values",
     "_regression_r_batch",
@@ -95,13 +98,14 @@ def _regression_batch_results(
     regressor: np.ndarray,
     min_cells: int,
     feature_labels: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Calculate r and p for one feature batch."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calculate r, p, and status for one feature batch."""
     n_cells = data.shape[0]
     eps = float(np.finfo(float).eps)
     if n_cells == 2:
         r_vals = np.empty(data.shape[1], dtype=np.float64)
-        p_vals = np.empty(data.shape[1], dtype=np.float64)
+        p_vals = np.full(data.shape[1], np.nan, dtype=np.float64)
+        status = np.full(data.shape[1], _REG_SENTINEL, dtype=np.int8)
         for g in range(data.shape[1]):
             v = data[:, g]
             if not np.isfinite(v).all():
@@ -112,11 +116,9 @@ def _regression_batch_results(
             if (v > 0).sum() >= min_cells and np.ptp(v) > eps:
                 lin_obj = linregress(regressor, v)
                 r_vals[g] = float(lin_obj.rvalue)
-                p_vals[g] = float(lin_obj.pvalue)
             else:
                 r_vals[g] = 0.0
-                p_vals[g] = 1.0
-        return r_vals, p_vals
+        return r_vals, p_vals, status
 
     r_vals, status = _regression_r_batch(data, x_centered, ssxm, int(min_cells), eps)
     bad = np.flatnonzero(status == _REG_NONFINITE)
@@ -124,9 +126,9 @@ def _regression_batch_results(
         raise ValueError(
             f"Feature {feature_labels[bad[0]]!r} contains non-finite normalized values"
         )
-    p_vals = np.ones(data.shape[1], dtype=np.float64)
+    p_vals = np.full(data.shape[1], np.nan, dtype=np.float64)
     ok = status == _REG_OK
     if np.any(ok):
         p_vals[ok] = _regression_p_values(r_vals[ok], n_cells)
     r_vals = np.where(ok, r_vals, 0.0)
-    return r_vals, p_vals
+    return r_vals, p_vals, status

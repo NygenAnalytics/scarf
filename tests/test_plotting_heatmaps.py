@@ -48,6 +48,129 @@ def test_marker_heatmap_returns_owned_result(
     result.close()
 
 
+def test_marker_heatmap_selects_features_by_named_score(
+    marker_search,
+    datastore,
+):
+    from scarf.features.markers.table import load_marker_table
+
+    assay = datastore.RNA
+    marker_slot = datastore._resolve_marker_group("RNA", "I", "RNA_cluster")
+    feature_names = np.asarray(assay.feats.fetch_all("names"))
+    feature_ids = np.asarray(assay.feats.fetch_all("ids"))
+    expected_by_group: dict[str, list[str]] = {}
+    for group_name in marker_slot.group_keys():
+        markers = load_marker_table(
+            marker_slot,
+            marker_slot[group_name],
+            feature_names,
+            group_id=group_name,
+            feature_ids=feature_ids,
+        )
+        ranked = markers.sort_values(
+            ["score", "feature_name"],
+            ascending=[False, True],
+            kind="mergesort",
+        ).head(2)
+        expected_by_group[group_name] = ranked["feature_name"].astype(str).tolist()
+
+    result = splt.marker_heatmap(
+        datastore,
+        group_key="RNA_cluster",
+        topn=2,
+        cluster_rows=False,
+        cluster_columns=False,
+        show=False,
+    )
+    selected = result.tables["markers"]
+    for group_name, expected_names in expected_by_group.items():
+        got = (
+            selected.loc[selected["group"].astype(str) == str(group_name)]
+            .sort_values("rank")["feature"]
+            .astype(str)
+            .tolist()
+        )
+        assert got == expected_names
+    result.close()
+
+
+def test_marker_heatmap_propagates_explicit_marker_schema_errors(
+    marker_search,
+    datastore,
+):
+    marker_slot = datastore._resolve_marker_group("RNA", "I", "RNA_cluster")
+    had_version = "schema_version" in marker_slot.attrs
+    original_version = marker_slot.attrs.get("schema_version")
+    marker_slot.attrs["schema_version"] = 99
+    try:
+        with pytest.raises(ValueError, match="Unsupported marker schema_version"):
+            splt.marker_heatmap(
+                datastore,
+                group_key="RNA_cluster",
+                topn=2,
+                show=False,
+            )
+    finally:
+        if had_version:
+            marker_slot.attrs["schema_version"] = original_version
+        else:
+            del marker_slot.attrs["schema_version"]
+
+
+def test_marker_heatmap_skips_unresolved_legacy_names_with_warning(
+    datastore_ephemeral,
+):
+    from scarf.utils import logger
+
+    assay = datastore_ephemeral.RNA
+    group_key = "legacy_heatmap_groups"
+    groups = np.arange(datastore_ephemeral.cells.N) % 2
+    datastore_ephemeral.cells.insert(group_key, groups, overwrite=True)
+    markers_group = (
+        assay.z["markers"] if "markers" in assay.z else assay.z.create_group("markers")
+    )
+    slot = markers_group.create_group(f"I__{group_key}")
+    feature_ids = np.asarray(assay.feats.fetch_all("ids")).astype(str)
+    for group_id, feature_index in enumerate((0, 1)):
+        cluster = slot.create_group(str(group_id))
+        cluster.create_array(
+            "names",
+            data=np.array(
+                [
+                    f"removed_feature_{group_id}",
+                    feature_ids[feature_index],
+                ]
+            ),
+        )
+        cluster.create_array("scores", data=np.array([1.0, 0.9]))
+
+    warnings: list[str] = []
+    sink = logger.add(
+        lambda message: warnings.append(message.record["message"]),
+        level="WARNING",
+    )
+    try:
+        result = splt.marker_heatmap(
+            datastore_ephemeral,
+            from_assay="RNA",
+            group_key=group_key,
+            cell_key="I",
+            topn=1,
+            cluster_rows=False,
+            cluster_columns=False,
+            show=False,
+        )
+    finally:
+        logger.remove(sink)
+
+    assert set(result.tables["markers"]["feature_index"]) == {0, 1}
+    assert all(
+        "removed_feature" not in value for value in result.tables["matrix"].index
+    )
+    assert any("unresolved legacy marker" in message for message in warnings)
+    result.close()
+
+
 def test_marker_heatmap_accepts_explicit_order_annotations_and_target(
     marker_search,
     datastore,

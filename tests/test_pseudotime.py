@@ -251,13 +251,250 @@ def test_marker_search_writes_strict_feature_subset_with_subset_key():
     assert [item[2] for item in store.assay.feats.insertions] == [
         "subset",
         "subset",
+        "subset",
     ]
     assert all(item[1].shape == (2,) for item in store.assay.feats.insertions)
     assert isinstance(result, PseudotimeMarkerResult)
     assert result.correlation_key == "I__ptime__r"
     assert result.p_value_key == "I__ptime__p"
+    assert result.p_value_adjusted_key == "I__ptime__padj"
     assert result.table["feature_index"].tolist() == [1, 3]
     assert result.table["feature_name"].tolist() == ["one", "three"]
+    assert "p_value_adjusted" in result.table.columns
+
+
+def test_incomplete_current_pseudotime_marker_artifact_is_recomputed(
+    datastore_ephemeral,
+    monkeypatch,
+):
+    import scarf.features.markers as marker_algorithms
+    from scarf.storage.artifacts import ArtifactRef, artifact_path
+
+    assay = datastore_ephemeral.RNA
+    datastore_ephemeral.cells.insert(
+        "current_ptime",
+        np.linspace(0.0, 1.0, datastore_ephemeral.cells.N),
+        overwrite=True,
+    )
+    feature_mask = np.zeros(assay.feats.N, dtype=bool)
+    feature_mask[:16] = True
+    assay.feats.insert(
+        "current_ptime_features",
+        feature_mask,
+        overwrite=True,
+    )
+    arguments = {
+        "from_assay": "RNA",
+        "cell_key": "I",
+        "feat_key": "current_ptime_features",
+        "pseudotime_key": "current_ptime",
+        "min_cells": 1,
+        "gene_batch_size": 8,
+    }
+    first = datastore_ephemeral.run_pseudotime_marker_search(**arguments)
+    old_ref = ArtifactRef.from_dict(
+        assay.z["featureData"][first.correlation_key].attrs["source_artifact"]
+    )
+    old_artifact = datastore_ephemeral.zw[artifact_path(old_ref)]
+    del old_artifact["p_value_adjusted"]
+
+    original = marker_algorithms.find_markers_by_regression
+    calls = 0
+
+    def tracked_marker_search(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        marker_algorithms,
+        "find_markers_by_regression",
+        tracked_marker_search,
+    )
+    second = datastore_ephemeral.run_pseudotime_marker_search(**arguments)
+
+    new_ref = ArtifactRef.from_dict(
+        assay.z["featureData"][second.correlation_key].attrs["source_artifact"]
+    )
+    assert calls == 1
+    assert new_ref != old_ref
+    assert "p_value_adjusted" not in old_artifact
+    assert "p_value_adjusted" in datastore_ephemeral.zw[artifact_path(new_ref)]
+
+
+def _prepare_legacy_pseudotime_marker_artifact(datastore_ephemeral):
+    from scarf.storage.artifacts import ArtifactRef, artifact_path
+
+    assay = datastore_ephemeral.RNA
+    n_cells = datastore_ephemeral.cells.N
+    datastore_ephemeral.cells.insert(
+        "legacy_ptime",
+        np.linspace(0.0, 1.0, n_cells),
+        overwrite=True,
+    )
+    feature_mask = np.zeros(assay.feats.N, dtype=bool)
+    feature_mask[:16] = True
+    assay.feats.insert(
+        "legacy_ptime_features",
+        feature_mask,
+        overwrite=True,
+    )
+    arguments = {
+        "from_assay": "RNA",
+        "cell_key": "I",
+        "feat_key": "legacy_ptime_features",
+        "pseudotime_key": "legacy_ptime",
+        "min_cells": 1,
+        "gene_batch_size": 8,
+    }
+    first = datastore_ephemeral.run_pseudotime_marker_search(**arguments)
+    ref = ArtifactRef.from_dict(
+        assay.z["featureData"][first.correlation_key].attrs["source_artifact"]
+    )
+    artifact = datastore_ephemeral.zw[artifact_path(ref)]
+    provenance = dict(artifact.attrs["provenance"])
+    parameters = dict(provenance["parameters"])
+    for field_name in (
+        "association_method",
+        "p_value_method",
+        "adjustment_method",
+        "adjustment_scope",
+    ):
+        parameters.pop(field_name)
+    provenance["parameters"] = parameters
+    artifact.attrs["provenance"] = provenance
+    raw_p_values = np.asarray(artifact["p_value"][:]).copy()
+    raw_r_values = np.asarray(artifact["r_value"][:]).copy()
+    assert np.isfinite(raw_p_values).any()
+    del artifact["p_value_adjusted"]
+    assay.feats.drop(first.p_value_adjusted_key)
+    return (
+        arguments,
+        first,
+        ref,
+        artifact,
+        raw_r_values,
+        raw_p_values,
+    )
+
+
+def test_legacy_pseudotime_marker_artifact_is_upgraded_additively(
+    datastore_ephemeral,
+    monkeypatch,
+):
+    import scarf.features.markers as marker_algorithms
+    from scarf.features.markers.correction import _bh_adjusted_pvalues
+    from scarf.storage.artifacts import ArtifactRef, artifact_path
+
+    (
+        arguments,
+        first,
+        ref,
+        artifact,
+        raw_r_values,
+        raw_p_values,
+    ) = _prepare_legacy_pseudotime_marker_artifact(datastore_ephemeral)
+    attrs_before = dict(artifact.attrs)
+    arrays_before = set(artifact.array_keys())
+
+    def fail_if_recomputed(*_args, **_kwargs):
+        raise AssertionError("legacy pseudotime markers should be reused")
+
+    monkeypatch.setattr(
+        marker_algorithms,
+        "find_markers_by_regression",
+        fail_if_recomputed,
+    )
+    reused = datastore_ephemeral.run_pseudotime_marker_search(**arguments)
+
+    reused_ref = ArtifactRef.from_dict(
+        datastore_ephemeral.RNA.z["featureData"][reused.correlation_key].attrs[
+            "source_artifact"
+        ]
+    )
+    published = datastore_ephemeral.zw[artifact_path(reused_ref)]
+    assert reused_ref != ref
+    assert set(artifact.array_keys()) == arrays_before
+    assert "p_value_adjusted" not in artifact
+    assert dict(artifact.attrs) == attrs_before
+    np.testing.assert_array_equal(artifact["r_value"][:], raw_r_values)
+    np.testing.assert_array_equal(artifact["p_value"][:], raw_p_values)
+    assert set(published.array_keys()) == {
+        "p_value",
+        "p_value_adjusted",
+        "r_value",
+    }
+    np.testing.assert_allclose(
+        reused.table["p_value_adjusted"].to_numpy(),
+        _bh_adjusted_pvalues(raw_p_values),
+        equal_nan=True,
+    )
+    adjusted_column = datastore_ephemeral.RNA.z["featureData"][
+        first.p_value_adjusted_key
+    ]
+    adjusted_ref = ArtifactRef.from_dict(adjusted_column.attrs["source_artifact"])
+    assert adjusted_ref == reused_ref
+    assert adjusted_column.attrs["source_value"] == "p_value_adjusted"
+    assert "p_value_adjusted" in published
+    status = datastore_ephemeral.inspect_artifact(reused_ref)
+    assert status.parameters["association_method"] == "pearson"
+    assert status.parameters["p_value_method"] == "student_t"
+    assert status.parameters["adjustment_method"] == "fdr_bh"
+    assert status.parameters["adjustment_scope"] == "tested_features"
+    assert "algorithm_version" not in status.parameters
+    assert "schema_version" not in status.parameters
+    assert "correction_method" not in status.parameters
+
+
+def test_read_only_legacy_pseudotime_marker_reuse_is_non_mutating(
+    datastore_ephemeral,
+    monkeypatch,
+):
+    import scarf.features.markers as marker_algorithms
+    from scarf.datastore.datastore import DataStore
+    from scarf.features.markers.correction import _bh_adjusted_pvalues
+
+    (
+        arguments,
+        first,
+        _ref,
+        artifact,
+        raw_r_values,
+        raw_p_values,
+    ) = _prepare_legacy_pseudotime_marker_artifact(datastore_ephemeral)
+    attrs_before = dict(artifact.attrs)
+    arrays_before = {
+        name: np.asarray(artifact[name][:]).copy() for name in artifact.array_keys()
+    }
+    feature_columns_before = set(datastore_ephemeral.RNA.z["featureData"].array_keys())
+
+    def fail_if_recomputed(*_args, **_kwargs):
+        raise AssertionError("legacy pseudotime markers should be reused")
+
+    monkeypatch.setattr(
+        marker_algorithms,
+        "find_markers_by_regression",
+        fail_if_recomputed,
+    )
+    read_only = DataStore(
+        datastore_ephemeral.zarr_loc,
+        default_assay="RNA",
+        zarr_mode="r",
+    )
+    reused = read_only.run_pseudotime_marker_search(**arguments)
+
+    np.testing.assert_allclose(
+        reused.table["p_value_adjusted"].to_numpy(),
+        _bh_adjusted_pvalues(raw_p_values),
+        equal_nan=True,
+    )
+    assert first.p_value_adjusted_key not in read_only.RNA.feats.columns
+    assert set(read_only.RNA.z["featureData"].array_keys()) == feature_columns_before
+    assert dict(artifact.attrs) == attrs_before
+    assert set(artifact.array_keys()) == set(arrays_before)
+    for name, expected in arrays_before.items():
+        np.testing.assert_array_equal(artifact[name][:], expected)
+    np.testing.assert_array_equal(artifact["r_value"][:], raw_r_values)
 
 
 def test_regressor_validation_points_to_component_validity_key():

@@ -19,8 +19,9 @@ kernelspec:
 Scarf stops at aggregation and export. Use `make_bulk` to build bulk-like count profiles, then
 export those counts (with sample-level metadata) for condition-level differential expression in
 an external tool such as edgeR or DESeq2. `run_marker_search` is separate: it returns
-Mann-Whitney `p_value` columns without multiple-testing correction and is for cluster
-interpretation, not FDR-controlled DE.
+Mann-Whitney `p_value` columns plus within-group `p_value_adjusted` (Benjamini-Hochberg) for
+cluster interpretation. Those adjusted values are still cell-level marker statistics, not
+replicate-aware FDR-controlled DE.
 
 ## Prerequisites
 
@@ -94,7 +95,7 @@ markers = ds.get_markers(
     min_score=-1,
     min_frac_exp=-1,
 )
-markers[['feature_name', 'score', 'frac_exp', 'p_value']].head()
+markers[['feature_name', 'score', 'frac_exp', 'p_value', 'p_value_adjusted']].head()
 ```
 
 ```{code-cell} ipython3
@@ -108,8 +109,8 @@ ds.plots.marker_heatmap(
 Rows are top markers per cluster for interpretation only, not exported DE results.
 
 ```{note}
-Use marker tables for cluster interpretation. Do not treat uncorrected `p_value` columns as
-FDR-controlled differential expression results.
+Use marker tables for cluster interpretation. Do not treat within-group `p_value_adjusted`
+columns as replicate-aware differential expression results.
 ```
 
 ### 2. Aggregate with make_bulk
@@ -124,6 +125,14 @@ bulk.iloc[:5, :5]
 ```
 
 Optional pseudo-replicates within each group:
+
+```{note}
+`pseudo_reps > 1` randomly splits cells within each group. These are descriptive
+resamples of the same cells, not independent biological replicates. Do not treat
+them as replicates in edgeR, DESeq2, or PyDESeq2. For replicate-aware differential
+expression, aggregate with a sample-aware `group_key` (for example sample nested
+with cell type) and keep true biological replicates in the exported metadata.
+```
 
 ```{code-cell} ipython3
 bulk_reps = ds.make_bulk(
@@ -153,6 +162,7 @@ nested with cell type), and keep biological replicates in the exported metadata.
 
 - Reporting Scarf marker p-values as FDR-corrected DE
 - Building pseudobulk without a sample (donor) covariate when the biological question is condition-level
+- Treating `pseudo_reps` splits as independent biological replicates
 - Expecting Scarf to run DESeq2/edgeR-style models in-process
 
 ## Saved results
