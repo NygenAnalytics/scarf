@@ -29,18 +29,26 @@ accept:
 
 Exceptions:
 
+- `highly_variable_features` is required. Pass options or omit the argument;
+  ``False`` is rejected.
 - `harmony` is skipped when omitted (`None`). Pass a dict that includes
   `batch_columns` to enable Harmony.
-- `leiden` defaults to one run at resolution `1.0`. Pass an empty mapping to run no
-  Leiden clustering, or a mapping such as `{0.5: {}}` for other resolutions.
+- `leiden` defaults to resolutions `0.5`, `0.75`, `1.0`, and `1.25`. Pass an
+  empty mapping to run no Leiden clustering.
+- `clustering_concurrency` defaults to `2`. Leiden membership can overlap across
+  workers while store publishes stay serialized; Paris joins the same queue.
+- When `doublet_scoring` or `markers` omit `clusters`, the Leiden or Paris
+  partition with the highest silhouette score on PCA coordinates is selected
+  (returned as `selected_clusters`).
 
 Only `pipeline_id="basic_rna_analysis"` is currently supported.
 
 ## Returned refs
 
 `run` returns `dict[str, ArtifactRef]` keyed by result name (for example
-`normalized`, `reduction`, `connectivity_map`, and any enabled embedding or cluster
-outputs). Capture the dict when you need to inspect or branch from a specific step.
+`normalized`, `pca`, `connectivity_map`, Leiden keys, and any enabled embedding
+or cluster outputs). Capture the dict when you need to inspect or branch from a
+specific step.
 
 ```python
 artifacts = ds.pipeline.run(

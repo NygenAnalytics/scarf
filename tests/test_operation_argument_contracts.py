@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields
 import pytest
 
 from scarf.datastore import _operations as operations_package
+from scarf.datastore._operations.clustering import _ClusteringOperationsMixin
 from scarf.datastore._operations.graph import _GraphOperationsMixin
 from scarf.datastore.datastore import DataStore
 from scarf.graph import arguments as graph_arguments
@@ -223,6 +224,7 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_leiden_clustering,
         metadata_arguments.LeidenArguments,
+        constructor=_ClusteringOperationsMixin._prepare_leiden_clustering,
         model_only=_classified("resolved_input", "graph"),
     ),
     OperationContract(

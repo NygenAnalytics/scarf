@@ -231,6 +231,9 @@ def analyzed_datastore_zarr_root(datastore_zarr_root, tmp_path_factory):
         top_n=100,
         show_plot=False,
         bin_strategy="fixed",
+        min_cells=int(0.01 * datastore.cells.N),
+        max_cells=np.inf,
+        blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
     )
     build_atomic_graph(
         datastore,
@@ -259,7 +262,14 @@ def auto_filter_cells(datastore):
 
 @pytest.fixture(scope="session")
 def mark_hvgs(auto_filter_cells, datastore):
-    datastore.mark_hvgs(top_n=100, show_plot=False, bin_strategy="fixed")
+    datastore.mark_hvgs(
+        top_n=100,
+        show_plot=False,
+        bin_strategy="fixed",
+        min_cells=int(0.01 * datastore.cells.N),
+        max_cells=np.inf,
+        blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
+    )
 
 
 @pytest.fixture(scope="session")

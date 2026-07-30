@@ -6,10 +6,22 @@ import pandas as pd
 
 from ..utils.logging import logger
 
-__all__ = ["fit_lowess", "select_highly_variable_features"]
+__all__ = [
+    "DEFAULT_HVG_BLACKLIST",
+    "HVG_UBIQUITOUS_SLACK",
+    "fit_lowess",
+    "select_highly_variable_features",
+]
 
 _ADAPTIVE_MIN_BIN_SIZE = 25
 _ADAPTIVE_ANCHOR_QUANTILE = 0.1
+
+# Case-insensitive via uppercasing in select_highly_variable_features / MetaData.grep.
+DEFAULT_HVG_BLACKLIST = (
+    "^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST|"
+    "^XIST$|^DDX3Y$|^USP9Y$|^EIF1AY$|^KDM5D$|^SRY$|^ZFY$|^UTY$|^TMSB4Y$|^NLGN4Y$"
+)
+HVG_UBIQUITOUS_SLACK = 20
 
 
 def _fit_lowess_adaptive(
@@ -224,13 +236,14 @@ def select_highly_variable_features(
     else:
         allowed = np.ones(size, dtype=bool)
 
+    cell_count_candidates = normalized_cell_counts >= min_cells
+    cell_count_candidates &= (
+        normalized_cell_counts <= max_cells
+        if keep_bounds
+        else normalized_cell_counts < max_cells
+    )
     candidates = (
-        _bounded(
-            normalized_cell_counts,
-            min_cells,
-            max_cells,
-            keep_bounds=keep_bounds,
-        )
+        cell_count_candidates
         & _bounded(mean_nonzero, min_mean, max_mean, keep_bounds=keep_bounds)
         & active_features
         & allowed

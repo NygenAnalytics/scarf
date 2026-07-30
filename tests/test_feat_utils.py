@@ -295,6 +295,30 @@ def test_highly_variable_feature_selection_applies_all_candidate_filters():
     )
 
 
+def test_hvg_cell_count_bounds_include_minimum_and_exclude_maximum():
+    selected = select_highly_variable_features(
+        corrected_variance=np.array([100.0, 10.0, 8.0, 100.0]),
+        normalized_cell_counts=np.array([19, 20, 21, 80]),
+        mean_nonzero=np.ones(4),
+        active_features=np.ones(4, dtype=bool),
+        feature_names=np.array(["below", "minimum", "inside", "maximum"]),
+        min_cells=20,
+        max_cells=80,
+        top_n=1,
+        min_var=-np.inf,
+        max_var=np.inf,
+        min_mean=-np.inf,
+        max_mean=np.inf,
+        blacklist="",
+        keep_bounds=False,
+    )
+
+    np.testing.assert_array_equal(
+        selected,
+        np.array([False, True, False, False]),
+    )
+
+
 def test_binned_sampling_excludes_query_genes():
     rng = np.random.default_rng(1)
     gene_names = [f"gene_{i}" for i in range(120)]

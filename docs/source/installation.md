@@ -20,6 +20,16 @@ pip install "scarf[extra]"
 The `extra` optional dependency group adds plotting (`matplotlib`, `seaborn`, `datashader`),
 AnnData support, and Jupyter helpers used by the tutorials.
 
+```{note}
+Scarf depends on `hnswlib` for KNN graph construction, and `hnswlib` is published only as a
+source distribution, so `pip` and `uv` compile it during installation. That step needs a C++
+compiler: `build-essential` on Debian and Ubuntu, the Xcode Command Line Tools on macOS
+(`xcode-select --install`), or
+[Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools) with the
+"Desktop development with C++" workload on Windows. A prebuilt binary is also available from
+conda-forge: run `conda install -c conda-forge hnswlib` before installing Scarf.
+```
+
 Verify the install:
 
 ```bash
@@ -33,9 +43,7 @@ uv pip install jupyterlab
 jupyter lab
 ```
 
-On Windows, install [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools)
-with the "Desktop development with C++" workload before building native wheels. Before the first
-Jupyter launch in a conda environment: `conda install -y pywin32`.
+On Windows, before the first Jupyter launch in a conda environment: `conda install -y pywin32`.
 
 ````{note}
 On Windows, enable long paths in PowerShell (run as Administrator):
@@ -55,23 +63,3 @@ conda create --name scarf_env python=3.12
 conda activate scarf_env
 uv pip install "scarf[extra]"
 ```
-
-## Memory tuning
-
-When opening a store you can bound streaming tile sizes:
-
-```python
-ds = scarf.DataStore("data.zarr", mem_budget="8G")
-```
-
-Existing Zarr v2 datasets can still be opened. New data written by Scarf uses Zarr v3 with
-sharding. Storage profiles and repacking are covered in {doc}`tutorials/data_organization`
-and the developers guide.
-
-## Next steps
-
-- {ref}`Quick start <quickstart>`
-- {doc}`whats_new_in_1_0`
-- {doc}`scarf_and_scanpy`
-- {doc}`concepts/scale_and_memory`
-- {doc}`tutorials/scrna_seq`

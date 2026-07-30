@@ -1,10 +1,21 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Literal
 
-from ..storage.artifacts import ArtifactRef
+import numpy as np
+
+from ..storage.artifacts import ArtifactRef, group_at
 from ..storage.types import as_zarr_array, as_zarr_group
+from ..utils.logging import logger
 
 
 type StepOptions = dict[str, Any] | Literal[False] | None
+
+_DEFAULT_LEIDEN: dict[float, dict[str, Any]] = {
+    0.5: {},
+    0.75: {},
+    1.0: {},
+    1.25: {},
+}
 
 
 class PipelineAccessor:
@@ -80,6 +91,182 @@ class PipelineAccessor:
             "clusters must be 'paris', a Leiden resolution, or {'leiden': resolution}"
         )
 
+    def _load_pca_coordinates(self, reduction: ArtifactRef) -> np.ndarray:
+        status = self._store.inspect_artifact(reduction)
+        group = group_at(self._store.zw, status.path)
+        if "data" not in group:
+            source, _n_cells, _dims = self._store._coordinate_source(
+                reduction,
+                batch_size=None,
+            )
+            blocks = list(source.iter_coordinate_blocks("Loading PCA for silhouette"))
+            if not blocks:
+                raise RuntimeError("PCA reduction produced no coordinate blocks")
+            return np.vstack(blocks)
+        return np.asarray(as_zarr_array(group["data"], name="data")[:], dtype=float)
+
+    def _select_clusters_by_pca_silhouette(
+        self,
+        *,
+        reduction: ArtifactRef,
+        cell_key: str,
+        cluster_columns: dict[str, str],
+    ) -> str:
+        from sklearn.metrics import silhouette_score
+
+        if not cluster_columns:
+            raise ValueError(
+                "Silhouette cluster selection requires at least one clustering result"
+            )
+        coordinates = self._load_pca_coordinates(reduction)
+        sample_size = min(10_000, coordinates.shape[0])
+        best_key: str | None = None
+        best_score = float("-inf")
+        scores: dict[str, float] = {}
+        for recipe_key, column in cluster_columns.items():
+            labels = np.asarray(self._store.cells.fetch(column, key=cell_key))
+            if labels.shape[0] != coordinates.shape[0]:
+                raise RuntimeError(
+                    "PCA coordinates and cluster labels cover different cells"
+                )
+            n_labels = len(np.unique(labels))
+            if n_labels < 2:
+                logger.warning(
+                    f"Skipping silhouette for {recipe_key}: fewer than two clusters"
+                )
+                continue
+            score = float(
+                silhouette_score(
+                    coordinates,
+                    labels,
+                    sample_size=sample_size if sample_size < labels.shape[0] else None,
+                    random_state=4466,
+                )
+            )
+            scores[recipe_key] = score
+            if score > best_score:
+                best_score = score
+                best_key = recipe_key
+        if best_key is None:
+            raise RuntimeError(
+                "Could not score any clustering partition with silhouette"
+            )
+        logger.info(
+            "Cluster silhouette scores on PCA: "
+            + ", ".join(f"{key}={value:.4f}" for key, value in scores.items())
+            + f"; selected {best_key}"
+        )
+        return best_key
+
+    def _run_clustering_jobs(
+        self,
+        *,
+        assay_name: str,
+        cell_key: str,
+        feat_key: str,
+        leiden_options: dict[float, dict[str, Any]],
+        paris_options: dict[str, Any] | None,
+        clustering_concurrency: int,
+    ) -> tuple[dict[str, str], dict[str, ArtifactRef]]:
+        store = self._store
+        cluster_columns: dict[str, str] = {}
+        artifacts: dict[str, ArtifactRef] = {}
+        if not leiden_options and paris_options is None:
+            return cluster_columns, artifacts
+
+        job_order: list[str] = []
+        prepared_leiden: dict[str, Any] = {}
+
+        for raw_resolution, raw_options in leiden_options.items():
+            resolution = float(raw_resolution)
+            options = dict(raw_options)
+            recipe_key = self._resolution_label(resolution)
+            if recipe_key in prepared_leiden:
+                raise ValueError(f"Duplicate Leiden resolution {resolution}")
+            label = str(options.pop("label", recipe_key))
+            job_order.append(recipe_key)
+            prepared_leiden[recipe_key] = store._prepare_leiden_clustering(
+                from_assay=assay_name,
+                cell_key=cell_key,
+                feat_key=feat_key,
+                resolution=resolution,
+                label=label,
+                **options,
+            )
+
+        paris_job: dict[str, Any] | None = None
+        if paris_options is not None:
+            options = dict(paris_options)
+            paris_label = str(options.pop("label", "paris_cluster"))
+            job_order.append("paris")
+            paris_job = {
+                "label": paris_label,
+                "options": options,
+            }
+
+        graph_cache: dict[tuple[str, bool, bool], Any] = {}
+        for prepared in prepared_leiden.values():
+            if prepared.planned.reused or prepared.graph_key in graph_cache:
+                continue
+            graph_cache[prepared.graph_key] = store._load_prepared_leiden_graph(
+                prepared
+            )
+
+        compute_results: dict[str, np.ndarray] = {}
+        paris_result: Any = None
+        runnable_jobs = sum(
+            not prepared.planned.reused for prepared in prepared_leiden.values()
+        ) + int(paris_job is not None)
+        if runnable_jobs:
+            workers = max(1, min(clustering_concurrency, runnable_jobs))
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures: dict[Any, str] = {}
+                for recipe_key in job_order:
+                    if recipe_key == "paris":
+                        assert paris_job is not None
+                        future = executor.submit(
+                            store.run_paris_clustering,
+                            from_assay=assay_name,
+                            cell_key=cell_key,
+                            feat_key=feat_key,
+                            label=paris_job["label"],
+                            **paris_job["options"],
+                        )
+                    else:
+                        prepared = prepared_leiden[recipe_key]
+                        if prepared.planned.reused:
+                            continue
+                        future = executor.submit(
+                            store._compute_prepared_leiden,
+                            prepared,
+                            graph_cache[prepared.graph_key],
+                        )
+                    futures[future] = recipe_key
+                for future in as_completed(futures):
+                    recipe_key = futures[future]
+                    result = future.result()
+                    if recipe_key == "paris":
+                        paris_result = result
+                    else:
+                        compute_results[recipe_key] = result
+
+        completed: dict[str, str] = {}
+        for recipe_key, prepared in prepared_leiden.items():
+            completed[recipe_key] = store._publish_prepared_leiden(
+                prepared,
+                compute_results.get(recipe_key),
+            )
+        if paris_job is not None:
+            if paris_result is None or paris_result.label_key is None:
+                raise RuntimeError("Paris clustering did not publish labels")
+            completed["paris"] = paris_result.label_key
+
+        for recipe_key in job_order:
+            column = completed[recipe_key]
+            cluster_columns[recipe_key] = column
+            artifacts[recipe_key] = self._column_ref(column)
+        return cluster_columns, artifacts
+
     def run(
         self,
         pipeline_id: str = "basic_rna_analysis",
@@ -98,6 +285,7 @@ class PipelineAccessor:
         umap: StepOptions = None,
         leiden: dict[float, dict[str, Any]] | None = None,
         paris: StepOptions = None,
+        clustering_concurrency: int = 2,
         doublet_scoring: StepOptions = None,
         markers: StepOptions = None,
     ) -> dict[str, ArtifactRef]:
@@ -106,7 +294,12 @@ class PipelineAccessor:
         Most step options accept ``None`` to run with defaults, ``False`` to
         skip, or a dictionary forwarded to the underlying operation. Harmony
         is skipped when omitted and requires a dictionary containing
-        ``batch_columns``. Leiden defaults to one run at resolution 1.0.
+        ``batch_columns``. Leiden defaults to resolutions 0.5, 0.75, 1.0, and
+        1.25. Leiden and Paris membership work can overlap under
+        ``clustering_concurrency`` while store publishes stay serialized. When
+        doublets or markers omit ``clusters``, the partition with the highest
+        silhouette score on PCA coordinates is selected. Highly variable
+        feature selection is mandatory.
 
         Args:
             pipeline_id: Recipe identifier. Only ``basic_rna_analysis`` is
@@ -117,7 +310,8 @@ class PipelineAccessor:
             filtering: Filtering options, including ``method="auto"`` or
                 ``method="manual"``.
             cell_cycle_scoring: Cell-cycle scoring options or ``False``.
-            highly_variable_features: HVG selection options or ``False``.
+            highly_variable_features: HVG selection options. Cannot be
+                ``False``.
             normalization: Normalization options.
             pca: PCA options. ``n_centroids`` is consumed by embedding
                 initialization.
@@ -129,6 +323,9 @@ class PipelineAccessor:
             leiden: Mapping from resolution to Leiden options. Use an empty
                 mapping to run no Leiden clustering.
             paris: Paris clustering options or ``False``.
+            clustering_concurrency: Maximum number of Leiden/Paris jobs that
+                may run at once. Membership compute can overlap; store writes
+                are serialized. Use ``1`` for a fully serial path.
             doublet_scoring: Doublet-scoring options or ``False``.
             markers: Marker-search options or ``False``.
 
@@ -145,6 +342,12 @@ class PipelineAccessor:
                 f"Unknown pipeline_id {pipeline_id!r}; "
                 "available pipelines: basic_rna_analysis"
             )
+        if (
+            isinstance(clustering_concurrency, bool)
+            or not isinstance(clustering_concurrency, int)
+            or clustering_concurrency < 1
+        ):
+            raise ValueError("clustering_concurrency must be an integer >= 1")
         store = self._store
         assay_name = from_assay or store._defaultAssay
         if assay_name is None:
@@ -152,6 +355,11 @@ class PipelineAccessor:
         if filtering is not False and cell_key != "I":
             raise ValueError(
                 "basic_rna_analysis filtering currently requires cell_key='I'"
+            )
+        if highly_variable_features is False:
+            raise ValueError(
+                "basic_rna_analysis requires highly_variable_features; "
+                "pass options or omit the argument to use defaults"
             )
         if isinstance(markers, dict) and markers.get("skip_save") is True:
             raise ValueError("basic_rna_analysis markers cannot use skip_save=True")
@@ -197,18 +405,19 @@ class PipelineAccessor:
 
         hvg_options = self._options(highly_variable_features)
         hvg_name = str(hvg_options.get("hvg_key_name", "hvgs"))
-        if highly_variable_features is not False:
-            hvg_options.setdefault("show_plot", False)
-            store.mark_hvgs(
-                from_assay=assay_name,
-                cell_key=cell_key,
-                **hvg_options,
-            )
-            feature_column = f"{cell_key}__{hvg_name}"
-            artifacts["highly_variable_features"] = self._feature_ref(
-                assay_name,
-                feature_column,
-            )
+        hvg_options.setdefault("show_plot", False)
+        hvg_options.setdefault("top_n", 2000)
+        hvg_options.setdefault("min_cells", 20)
+        store.mark_hvgs(
+            from_assay=assay_name,
+            cell_key=cell_key,
+            **hvg_options,
+        )
+        feature_column = f"{cell_key}__{hvg_name}"
+        artifacts["highly_variable_features"] = self._feature_ref(
+            assay_name,
+            feature_column,
+        )
 
         normalization_options = self._options(normalization)
         normalization_options.setdefault("log_transform", True)
@@ -225,6 +434,7 @@ class PipelineAccessor:
         pca_options = self._options(pca)
         n_centroids = int(pca_options.pop("n_centroids", 1000))
         initialization_rand_state = int(pca_options.pop("rand_state", 4466))
+        pca_options.setdefault("dims", 25)
         reduction = store.run_pca(
             normalized,
             update_state=False,
@@ -252,11 +462,13 @@ class PipelineAccessor:
             **self._options(ann_index),
         )
         artifacts["ann_index"] = ann
+        neighbor_options = self._options(neighbors)
+        neighbor_options.setdefault("k", 17)
         neighbor_ref = store.query_neighbors(
             ann,
             coordinates=coordinates,
             update_state=False,
-            **self._options(neighbors),
+            **neighbor_options,
         )
         artifacts["neighbors"] = neighbor_ref
         graph = store.build_connectivity_map(
@@ -296,60 +508,41 @@ class PipelineAccessor:
             )
             artifacts["umap"] = self._column_ref(umap_column)
 
-        cluster_columns: dict[str, str] = {}
-        leiden_options = {1.0: {}} if leiden is None else dict(leiden)
-        for raw_resolution, raw_options in leiden_options.items():
-            resolution = float(raw_resolution)
-            options = dict(raw_options)
-            recipe_key = self._resolution_label(resolution)
-            label = str(options.pop("label", recipe_key))
-            store.run_leiden_clustering(
-                from_assay=assay_name,
-                cell_key=cell_key,
-                feat_key=hvg_name,
-                resolution=resolution,
-                label=label,
-                **options,
-            )
-            column = store._col_renamer(
-                assay_name,
-                cell_key,
-                label,
-            )
-            cluster_columns[recipe_key] = column
-            artifacts[recipe_key] = self._column_ref(column)
+        leiden_options = dict(_DEFAULT_LEIDEN) if leiden is None else dict(leiden)
+        paris_options = None if paris is False else self._options(paris)
+        cluster_columns, cluster_artifacts = self._run_clustering_jobs(
+            assay_name=assay_name,
+            cell_key=cell_key,
+            feat_key=hvg_name,
+            leiden_options=leiden_options,
+            paris_options=paris_options,
+            clustering_concurrency=clustering_concurrency,
+        )
+        artifacts.update(cluster_artifacts)
 
-        if paris is not False:
-            paris_options = self._options(paris)
-            paris_label = str(paris_options.pop("label", "paris_cluster"))
-            result = store.run_paris_clustering(
-                from_assay=assay_name,
+        doublet_options = (
+            None if doublet_scoring is False else self._options(doublet_scoring)
+        )
+        marker_options = None if markers is False else self._options(markers)
+        needs_auto_clusters = (
+            doublet_options is not None and "clusters" not in doublet_options
+        ) or (marker_options is not None and "clusters" not in marker_options)
+        selected_recipe_key: str | None = None
+        if needs_auto_clusters:
+            selected_recipe_key = self._select_clusters_by_pca_silhouette(
+                reduction=reduction,
                 cell_key=cell_key,
-                feat_key=hvg_name,
-                label=paris_label,
-                **paris_options,
+                cluster_columns=cluster_columns,
             )
-            if result.label_key is None:
-                raise RuntimeError("Paris clustering did not publish labels")
-            cluster_columns["paris"] = result.label_key
-            artifacts["paris"] = self._column_ref(result.label_key)
+            artifacts["selected_clusters"] = artifacts[selected_recipe_key]
 
-        if doublet_scoring is not False:
-            options = self._options(doublet_scoring)
-            selector = options.pop(
-                "clusters",
-                "paris"
-                if "paris" in cluster_columns
-                else max(
-                    cluster_columns,
-                    key=lambda key: (
-                        float(key.removeprefix("leiden_"))
-                        if key.startswith("leiden_")
-                        else float("-inf")
-                    ),
-                ),
-            )
-            recipe_key = self._cluster_recipe_key(selector)
+        if doublet_options is not None:
+            options = dict(doublet_options)
+            if "clusters" in options:
+                recipe_key = self._cluster_recipe_key(options.pop("clusters"))
+            else:
+                assert selected_recipe_key is not None
+                recipe_key = selected_recipe_key
             if recipe_key not in cluster_columns:
                 raise ValueError(
                     f"Doublet cluster result {recipe_key!r} is unavailable"
@@ -363,21 +556,13 @@ class PipelineAccessor:
             )
             artifacts["doublets"] = self._column_ref(score_column)
 
-        if markers is not False:
-            options = self._options(markers)
-            default_marker_clusters: Any = (
-                "paris"
-                if "paris" in cluster_columns
-                else max(
-                    (key for key in cluster_columns if key.startswith("leiden_")),
-                    key=lambda key: float(key.removeprefix("leiden_")),
-                )
-            )
-            selector = options.pop(
-                "clusters",
-                default_marker_clusters,
-            )
-            recipe_key = self._cluster_recipe_key(selector)
+        if marker_options is not None:
+            options = dict(marker_options)
+            if "clusters" in options:
+                recipe_key = self._cluster_recipe_key(options.pop("clusters"))
+            else:
+                assert selected_recipe_key is not None
+                recipe_key = selected_recipe_key
             if recipe_key not in cluster_columns:
                 raise ValueError(f"Marker cluster result {recipe_key!r} is unavailable")
             group_key = cluster_columns[recipe_key]

@@ -1,4 +1,8 @@
+import inspect
+from threading import Event
+
 import pytest
+from scipy.sparse import tril
 
 from scarf.storage.artifacts import ArtifactRef
 
@@ -74,6 +78,213 @@ def test_basic_rna_pipeline_returns_only_named_artifact_refs(
 def test_pipeline_rejects_unknown_id(datastore_ephemeral) -> None:
     with pytest.raises(ValueError, match="basic_rna_analysis"):
         datastore_ephemeral.pipeline.run(pipeline_id="unknown")
+
+
+def test_pipeline_requires_highly_variable_features(datastore_ephemeral) -> None:
+    with pytest.raises(ValueError, match="highly_variable_features"):
+        datastore_ephemeral.pipeline.run(
+            highly_variable_features=False,
+            umap=False,
+            leiden={},
+            paris=False,
+            doublet_scoring=False,
+            markers=False,
+        )
+
+
+def test_pipeline_selects_clusters_by_pca_silhouette(datastore_ephemeral) -> None:
+    artifacts = datastore_ephemeral.pipeline.run(
+        filtering={},
+        cell_cycle_scoring=False,
+        highly_variable_features={
+            "top_n": 100,
+            "hvg_key_name": "pipeline_silhouette_hvgs",
+        },
+        pca={"dims": 5, "n_centroids": 10},
+        neighbors={"k": 3},
+        umap=False,
+        leiden={
+            0.5: {},
+            1.0: {},
+        },
+        paris={"n_clusters": 3, "label": "pipeline_silhouette_paris"},
+        clustering_concurrency=2,
+        doublet_scoring=False,
+        markers={
+            "gene_batch_size": 100,
+        },
+    )
+
+    assert "selected_clusters" in artifacts
+    assert artifacts["selected_clusters"] in {
+        artifacts["leiden_0.5"],
+        artifacts["leiden_1.0"],
+        artifacts["paris"],
+    }
+    assert artifacts["markers"].kind == "marker_table"
+
+
+def test_pipeline_rejects_invalid_clustering_concurrency(datastore_ephemeral) -> None:
+    with pytest.raises(ValueError, match="clustering_concurrency"):
+        datastore_ephemeral.pipeline.run(
+            clustering_concurrency=0,
+            umap=False,
+            leiden={},
+            paris=False,
+            doublet_scoring=False,
+            markers=False,
+        )
+
+
+def test_pipeline_reuses_leiden_without_recomputing(
+    datastore_ephemeral,
+    monkeypatch,
+) -> None:
+    datastore = datastore_ephemeral
+    options = {
+        "filtering": False,
+        "cell_cycle_scoring": False,
+        "highly_variable_features": {
+            "top_n": 100,
+            "hvg_key_name": "pipeline_cached_leiden_hvgs",
+        },
+        "pca": {"dims": 3, "n_centroids": 5},
+        "neighbors": {"k": 3},
+        "umap": False,
+        "leiden": {0.5: {}},
+        "paris": False,
+        "doublet_scoring": False,
+        "markers": False,
+    }
+    first = datastore.pipeline.run(**options)
+
+    def fail_compute(*_args, **_kwargs):
+        pytest.fail("A reusable Leiden artifact must not be recomputed")
+
+    monkeypatch.setattr(
+        type(datastore),
+        "_compute_prepared_leiden",
+        staticmethod(fail_compute),
+    )
+    second = datastore.pipeline.run(**options)
+
+    assert second["leiden_0.5"] == first["leiden_0.5"]
+
+
+def test_pipeline_computes_leiden_with_requested_graph_options(
+    datastore_ephemeral,
+    monkeypatch,
+) -> None:
+    datastore = datastore_ephemeral
+    original_compute = type(datastore)._compute_prepared_leiden
+    observed = False
+
+    def capture_graph(prepared, graph):
+        nonlocal observed
+        observed = True
+        assert prepared.symmetric_graph is True
+        assert prepared.graph_upper_only is True
+        assert tril(graph, k=-1).nnz == 0
+        return original_compute(prepared, graph)
+
+    monkeypatch.setattr(
+        type(datastore),
+        "_compute_prepared_leiden",
+        staticmethod(capture_graph),
+    )
+    datastore.pipeline.run(
+        filtering=False,
+        cell_cycle_scoring=False,
+        highly_variable_features={
+            "top_n": 100,
+            "hvg_key_name": "pipeline_graph_options_hvgs",
+        },
+        pca={"dims": 3, "n_centroids": 5},
+        neighbors={"k": 3},
+        umap=False,
+        leiden={
+            0.5: {
+                "symmetric_graph": True,
+                "graph_upper_only": True,
+            }
+        },
+        paris=False,
+        doublet_scoring=False,
+        markers=False,
+    )
+
+    assert observed is True
+
+
+def test_leiden_public_api_does_not_accept_precomputed_membership(
+    datastore_ephemeral,
+) -> None:
+    parameters = inspect.signature(datastore_ephemeral.run_leiden_clustering).parameters
+    assert "precomputed_membership" not in parameters
+
+
+def test_pipeline_overlaps_paris_compute_but_serializes_leiden_publish(
+    datastore_ephemeral,
+    monkeypatch,
+) -> None:
+    datastore = datastore_ephemeral
+    compute_started = Event()
+    paris_started = Event()
+    paris_finished = Event()
+    original_compute = type(datastore)._compute_prepared_leiden
+    original_paris = type(datastore).run_paris_clustering
+    original_publish = type(datastore)._publish_prepared_leiden
+
+    def observed_compute(prepared, graph):
+        compute_started.set()
+        assert paris_started.wait(timeout=5)
+        return original_compute(prepared, graph)
+
+    def observed_paris(self, *args, **kwargs):
+        paris_started.set()
+        assert compute_started.wait(timeout=5)
+        result = original_paris(self, *args, **kwargs)
+        paris_finished.set()
+        return result
+
+    def observed_publish(self, prepared, membership):
+        assert paris_finished.is_set()
+        return original_publish(self, prepared, membership)
+
+    monkeypatch.setattr(
+        type(datastore),
+        "_compute_prepared_leiden",
+        staticmethod(observed_compute),
+    )
+    monkeypatch.setattr(
+        type(datastore),
+        "run_paris_clustering",
+        observed_paris,
+    )
+    monkeypatch.setattr(
+        type(datastore),
+        "_publish_prepared_leiden",
+        observed_publish,
+    )
+
+    datastore.pipeline.run(
+        filtering=False,
+        cell_cycle_scoring=False,
+        highly_variable_features={
+            "top_n": 100,
+            "hvg_key_name": "pipeline_concurrency_hvgs",
+        },
+        pca={"dims": 3, "n_centroids": 5},
+        neighbors={"k": 3},
+        umap=False,
+        leiden={0.5: {}},
+        paris={"n_clusters": 3, "label": "pipeline_concurrency_paris"},
+        clustering_concurrency=2,
+        doublet_scoring=False,
+        markers=False,
+    )
+
+    assert paris_finished.is_set()
 
 
 def test_pipeline_rejects_unsaved_markers_before_writes(

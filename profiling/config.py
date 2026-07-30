@@ -112,7 +112,7 @@ class WorkflowParameters(BaseModel):
     topN: int = 2000
     hvgMinCells: int = 20
     hvgKey: str = "hvgs"
-    k: int = 11
+    k: int = 17
     dims: int = 50
     nCentroids: int = 1000
     graphSeed: int = 4466

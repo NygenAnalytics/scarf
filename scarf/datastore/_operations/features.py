@@ -8,6 +8,7 @@ import pandas as pd
 import zarr
 from numpy.typing import NDArray
 
+from ...features.variability import DEFAULT_HVG_BLACKLIST, HVG_UBIQUITOUS_SLACK
 from ...storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
@@ -258,15 +259,15 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         self,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        min_cells: int | None = None,
-        top_n: int = 500,
+        min_cells: int = 20,
+        top_n: int = 2000,
         min_var: float = -np.inf,
         max_var: float = np.inf,
         min_mean: float = -np.inf,
         max_mean: float = np.inf,
         n_bins: int = 200,
         lowess_frac: float = 0.1,
-        blacklist: str = "^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
+        blacklist: str = DEFAULT_HVG_BLACKLIST,
         keep_bounds: bool = False,
         show_plot: bool = True,
         hvg_key_name: str = "hvgs",
@@ -286,14 +287,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             min_cells: Minimum number of cells where a gene should have non-zero expression values for it to be
                        considered a candidate for HVG selection. Large values for this parameter might make it difficult
                        to identify rare populations of cells. Very small values might lead to a higher signal-to-noise
-                       ratio in the selected features. By default, a value is set assuming smallest population has no
-                       less than 1% of all cells. So for example, if you have 1000 cells (as per cell_key parameter)
-                       then `min_cells` will be set to 10.
+                       ratio in the selected features. (Default: 20)
             max_cells: Maximum number of cells where a gene should have non-zero expression values for it to be
-                       considered a candidate for HVG selection. This can be useful to filter out genes that are
-                       expressed in too many cells. Default value is infinity, meaning no upper limit.
+                       considered a candidate for HVG selection. When omitted, genes missing in at most
+                       ``HVG_UBIQUITOUS_SLACK`` selected cells are excluded (``n_selected - 20``). Pass
+                       ``inf`` to disable the ubiquitous-gene filter.
             top_n: Number of top most variable genes to be set as HVGs. This value is ignored if a value is provided
-                   for `min_var` parameter. (Default: 500)
+                   for `min_var` parameter. (Default: 2000)
             min_var: Minimum variance threshold for HVG selection. (Default: -Infinity)
             max_var: Maximum variance threshold for HVG selection. (Default: Infinity)
             min_mean: Minimum mean value of expression threshold for HVG selection. (Default: -Infinity)
@@ -303,10 +303,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                          variance. This is same as `frac` in statsmodels.nonparametric.smoothers_lowess.lowess
                          (Default: 0.1)
             bin_strategy: Strategy used to construct bins and variance anchors. (Default: 'adaptive')
-            blacklist: This is a regular expression (regex) string that can be used to exclude genes from being marked
-                       as HVGs. By default, we exclude mitochondrial, ribosomal, some cell-cycle related, histone and
-                       HLA genes. (Default: '^MT- | ^RPS | ^RPL | ^MRPS | ^MRPL | ^CCN | ^HLA- | ^H2- | ^HIST' )
-            keep_bounds: If True, then the boundary values are retained and not filtered out (Default value: False)
+            blacklist: Regex of gene names to exclude from HVGs. Matching is case-insensitive.
+                       Default excludes mitochondrial, ribosomal, cell-cycle (``CCN*``), HLA/H2, histone,
+                       and common human sex-linked genes (``XIST``, Y-chromosome markers).
+            keep_bounds: If True, retain upper cell-count and expression-statistic bounds.
+                         The ``min_cells`` boundary is always inclusive. (Default: False)
             show_plot: If True then a diagnostic scatter plot is shown with HVGs highlighted. (Default: True)
             hvg_key_name: Base label for HVGs in the features metadata column. The value for
                           'cell_key' parameter is prepended to this value. (Default value: 'hvgs')
@@ -325,14 +326,26 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 f"ERROR: This method of feature selection can only be applied to RNAassay type of assay. "
                 f"The provided assay is {type(assay)} type"
             )
-        if min_cells is None:
-            min_cells = int(0.01 * self.cells.N)
-            logger.info(
-                f"Setting `min_cells` to {min_cells}. Only those genes that are present in atleast this number "
-                f"of cells will be considered HVGs."
-            )
-        if max_cells is None or max_cells == np.inf:
-            max_cells_int: int | float = np.inf
+        n_selected = int(np.asarray(self.cells.fetch_all(cell_key), dtype=bool).sum())
+        if max_cells is None:
+            candidate_max = n_selected - HVG_UBIQUITOUS_SLACK
+            if candidate_max <= min_cells:
+                max_cells_int: int | float = np.inf
+                logger.info(
+                    "Skipping ubiquitous-gene HVG filter because too few cells are "
+                    f"selected ({n_selected}); need more than "
+                    f"{min_cells + HVG_UBIQUITOUS_SLACK} cells to apply "
+                    f"max_cells = n_selected - {HVG_UBIQUITOUS_SLACK}."
+                )
+            else:
+                max_cells_int = int(candidate_max)
+                logger.info(
+                    f"Setting `max_cells` to {max_cells_int} "
+                    f"(n_selected - {HVG_UBIQUITOUS_SLACK}). Genes detected in at "
+                    "least this many cells are excluded as ubiquitous."
+                )
+        elif max_cells == np.inf:
+            max_cells_int = np.inf
         else:
             max_cells_int = int(max_cells)
         stored_key = f"{cell_key}__{hvg_key_name}"

@@ -983,22 +983,39 @@ class TestDataStore:
         with pytest.raises(TypeError):
             atac_datastore.mark_hvgs()
 
-    def test_mark_hvgs_default_max_cells_unbounded(self, auto_filter_cells, datastore):
+    def test_mark_hvgs_default_max_cells_excludes_ubiquitous(
+        self, auto_filter_cells, datastore
+    ):
         from unittest.mock import patch
 
-        with patch.object(datastore.RNA, "mark_hvgs") as mock:
+        n_selected = int(np.asarray(datastore.cells.fetch_all("I"), dtype=bool).sum())
+        expected_max = n_selected - 20
+        assay = datastore.RNA
+
+        def _fake_mark_hvgs(*args, **kwargs):
+            assay.feats.insert(
+                "I__hvgs",
+                np.zeros(assay.feats.N, dtype=bool),
+                fill_value=False,
+                overwrite=True,
+            )
+
+        with patch.object(assay, "mark_hvgs", side_effect=_fake_mark_hvgs) as mock:
             datastore.mark_hvgs(show_plot=False, top_n=10)
-        assert mock.call_args.kwargs["max_cells"] == np.inf
+        assert mock.call_args.kwargs["max_cells"] == expected_max
+        assert mock.call_args.kwargs["min_cells"] == 20
+        assert mock.call_args.kwargs["top_n"] == 10
         assert mock.call_args.kwargs["bin_strategy"] == "adaptive"
 
-        with patch.object(datastore.RNA, "mark_hvgs") as mock:
+        with patch.object(assay, "mark_hvgs", side_effect=_fake_mark_hvgs) as mock:
             datastore.mark_hvgs(
                 show_plot=False,
                 top_n=10,
+                max_cells=np.inf,
                 bin_strategy="adaptive",
             )
+        assert mock.call_args.kwargs["max_cells"] == np.inf
         assert mock.call_args.kwargs["bin_strategy"] == "adaptive"
-
     def test_adaptive_hvg_stats_reuse_single_matrix_pass(
         self,
         auto_filter_cells,

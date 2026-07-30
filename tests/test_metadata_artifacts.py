@@ -24,6 +24,9 @@ def _ensure_graph(datastore) -> None:
             top_n=100,
             hvg_key_name="metadata_hvgs",
             show_plot=False,
+            min_cells=int(0.01 * datastore.cells.N),
+            max_cells=np.inf,
+            blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
         )
     build_atomic_graph(
         datastore,

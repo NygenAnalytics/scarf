@@ -1,5 +1,5 @@
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
-from dataclasses import asdict, replace
 
 import numpy as np
 import pandas as pd
@@ -24,6 +24,7 @@ from ...storage.artifacts import (
 )
 from ...storage.artifact_writer import (
     ArrayRequirement,
+    PlannedArtifact,
     finish_artifact,
     plan_artifact,
     reused_artifact_group,
@@ -38,6 +39,30 @@ if TYPE_CHECKING:
     from .graph import _GraphOperationsMixin as _ClusteringOperationsBase
 else:
     _ClusteringOperationsBase = object
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedLeidenClustering:
+    planned: PlannedArtifact
+    graph_loc: str
+    from_assay: str
+    label_assay: str
+    cell_key: str
+    feat_key: str
+    resolution: float
+    symmetric_graph: bool
+    graph_upper_only: bool
+    random_seed: int
+    label: str
+    n_cells: int
+
+    @property
+    def graph_key(self) -> tuple[str, bool, bool]:
+        return (
+            self.graph_loc,
+            self.symmetric_graph,
+            self.graph_upper_only,
+        )
 
 
 class _ClusteringOperationsMixin(_ClusteringOperationsBase):
@@ -349,7 +374,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             hierarchy_generation_id=hierarchy_plan.ref.artifact_id,
         )
 
-    def run_leiden_clustering(
+    def _prepare_leiden_clustering(
         self,
         from_assay: str | None = None,
         cell_key: str | None = None,
@@ -361,26 +386,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         label: str = "leiden_cluster",
         random_seed: int = 4444,
         invalidate_cache: bool = False,
-    ) -> None:
-        """Executes Leiden graph clustering algorithm on the cell-neighbourhood
-        graph and saves cluster identities in the cell metadata column.
-
-        Args:
-            from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
-            cell_key: Cell key. Should be same as the one that was used in the desired graph. (Default value: 'I')
-            feat_key:  Feature key. Should be same as the one that was used in the desired graph. By default, the latest
-                       used feature for the given assay will be used.
-            resolution: Resolution parameter for `RBConfigurationVertexPartition` configuration
-            integrated_graph:
-            symmetric_graph: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
-            graph_upper_only: This parameter is forwarded to `load_graph` and is same as there. (Default value: False)
-            label: base label for cluster identity in the cell metadata column (Default value: 'leiden_cluster')
-            random_seed: (Default value: 4444)
-
-        Returns:
-        """
-        from ...clustering.leiden import leiden_membership
-
+    ) -> _PreparedLeidenClustering:
         from_assay, cell_key, feat_key = self._get_latest_keys(
             from_assay, cell_key, feat_key
         )
@@ -391,14 +397,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 raise KeyError(
                     f"ERROR: An integrated graph with label: {integrated_graph} does not exist"
                 )
-        graph = self.load_graph(
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=feat_key,
-            symmetric=symmetric_graph,
-            upper_only=graph_upper_only,
-            graph_loc=graph_loc,
-        )
         resolved_graph_loc = (
             graph_loc
             if graph_loc is not None
@@ -408,6 +406,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 feat_key,
             )
         )
+        n_cells, _effective_k = self._get_graph_ncells_k(resolved_graph_loc)
         graph_input: object = resolve_stored_graph_input(
             self.zw,
             resolved_graph_loc,
@@ -455,45 +454,133 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             inputs=record.inputs,
             execution_options=record.execution_options,
             cell_selection=selection,
-            arrays={"values": ((graph.shape[0],), "i")},
+            arrays={"values": ((n_cells,), "i")},
             invalidate_cache=invalidate_cache,
         )
-        if integrated_graph is not None:
-            from_assay = integrated_graph
-        if planned.reused:
+        return _PreparedLeidenClustering(
+            planned=planned,
+            graph_loc=resolved_graph_loc,
+            from_assay=from_assay,
+            label_assay=integrated_graph or from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            resolution=resolution,
+            symmetric_graph=symmetric_graph,
+            graph_upper_only=graph_upper_only,
+            random_seed=random_seed,
+            label=label,
+            n_cells=n_cells,
+        )
+
+    def _load_prepared_leiden_graph(
+        self,
+        prepared: _PreparedLeidenClustering,
+    ) -> Any:
+        graph = self.load_graph(
+            from_assay=prepared.from_assay,
+            cell_key=prepared.cell_key,
+            feat_key=prepared.feat_key,
+            symmetric=prepared.symmetric_graph,
+            upper_only=prepared.graph_upper_only,
+            graph_loc=prepared.graph_loc,
+        )
+        return graph.tocsr()
+
+    @staticmethod
+    def _compute_prepared_leiden(
+        prepared: _PreparedLeidenClustering,
+        graph: Any,
+    ) -> np.ndarray:
+        from ...clustering.leiden import leiden_membership
+
+        if prepared.planned.reused:
+            raise ValueError("Cannot recompute a reusable Leiden artifact")
+        return leiden_membership(
+            graph,
+            prepared.resolution,
+            prepared.random_seed,
+        )
+
+    def _publish_prepared_leiden(
+        self,
+        prepared: _PreparedLeidenClustering,
+        membership: np.ndarray | None,
+    ) -> str:
+        if prepared.planned.reused:
             artifact_group = as_zarr_group(
-                self.zw[artifact_path(planned.ref)],
-                name=planned.ref.artifact_id,
+                self.zw[artifact_path(prepared.planned.ref)],
+                name=prepared.planned.ref.artifact_id,
             )
             membership = artifact_values(artifact_group, "values")
         else:
-            membership = leiden_membership(
-                graph,
-                resolution,
-                random_seed,
-            )
+            if membership is None:
+                raise ValueError("Leiden membership is required for a new artifact")
+            membership = np.asarray(membership)
+            if membership.shape != (prepared.n_cells,):
+                raise ValueError(
+                    "Leiden membership must contain one label per graph cell"
+                )
+            if membership.dtype.kind not in {"i", "u"}:
+                raise TypeError("Leiden membership must contain integer labels")
             write_cell_data_artifact(
                 self.zw,
-                planned,
+                prepared.planned,
                 {"values": membership},
             )
-        column = self._col_renamer(from_assay, cell_key, label)
+        column = self._col_renamer(
+            prepared.label_assay,
+            prepared.cell_key,
+            prepared.label,
+        )
         preserved_display = column_display(self.zw, column)
         self.cells.insert(
             column,
             membership,
             fill_value=-1,
-            key=cell_key,
+            key=prepared.cell_key,
             overwrite=True,
         )
         link_cell_data_column(
             self.zw,
             column,
-            planned.ref,
+            prepared.planned.ref,
             value_name="values",
             default_display=categorical_display(membership),
             preserved_display=preserved_display,
         )
+        return column
+
+    def run_leiden_clustering(
+        self,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        feat_key: str | None = None,
+        resolution: float = 1.0,
+        integrated_graph: str | None = None,
+        symmetric_graph: bool = False,
+        graph_upper_only: bool = False,
+        label: str = "leiden_cluster",
+        random_seed: int = 4444,
+        invalidate_cache: bool = False,
+    ) -> None:
+        """Execute Leiden clustering and save identities in cell metadata."""
+        prepared = self._prepare_leiden_clustering(
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            resolution=resolution,
+            integrated_graph=integrated_graph,
+            symmetric_graph=symmetric_graph,
+            graph_upper_only=graph_upper_only,
+            label=label,
+            random_seed=random_seed,
+            invalidate_cache=invalidate_cache,
+        )
+        membership = None
+        if not prepared.planned.reused:
+            graph = self._load_prepared_leiden_graph(prepared)
+            membership = self._compute_prepared_leiden(prepared, graph)
+        self._publish_prepared_leiden(prepared, membership)
         return None
 
     def run_paris_clustering(

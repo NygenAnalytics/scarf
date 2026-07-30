@@ -6,8 +6,6 @@ subtrees:
         title: Installation
       - file: quickstart
         title: Quick start
-      - file: whats_new_in_1_0
-        title: What is new in Scarf 1.0
       - file: scarf_and_scanpy
         title: Scarf for Scanpy and Seurat users
   - caption: Concepts

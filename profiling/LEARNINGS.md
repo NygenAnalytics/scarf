@@ -1,6 +1,6 @@
 # Scarf cloud profiling learnings (50k → 10M, countsT + Paris)
 
-Date range: 2026-07-14 to 2026-07-23
+Date range: 2026-07-14 to 2026-07-30
 Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`
 Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)
 Dataset source: nested CELLxGENE samples already prepared on R2
@@ -142,6 +142,8 @@ Long cloud jobs must survive a dead laptop Wi-Fi or WSL network drop. Treat loca
 | Guarded adaptive Paris profiling | `profiling/paris_profile.py`, `profiling/paris_quality_gate.py` | Measures the same persistence plus modularity cut shipped by `run_paris_clustering` |
 | `fixedResources` expands per stage | `profiling/config.py` `_normalize_raw_config` | One resource block applies to every selected stage |
 | `--ephemeral` spawn | `profiling/modal_app.py` `run` / `run-all` | Spawn from `modal run` app without deploy; prefer `--detach` |
+| Marker feature-stream fallback | `scarf/storage/feature_stream.py` | Re-admits one in-flight block so inner decode concurrency can be retained when the budget permits |
+| Versioned true-minibatch KMeans | `scarf/neighbors/stages.py`, graph arguments and operations | Uniformly samples all streamed rows for seeding, applies exact minibatch updates, and invalidates artifacts from the earlier algorithm |
 
 ## Machine sizes used (Modal hard limit vs Scarf budget)
 
@@ -172,6 +174,8 @@ Two different numbers matter:
 | `counts_t_c8_m64_10m` | 10M | 8 (Leiden 2) | right-sized 16–64 GiB | ~75% of Modal | countsT core; corrected wall **~22.8 h**; HVG JSON under-timed |
 | `core_paris_c2_m16_50k` | 50k | 2 | 16 GiB | 12 GiB | Full core + Paris; **693s**; max peak **6.5 GiB** (initializeStore) |
 | Paris-only (`paris_c2_m16_*`) | 100k–5M | 2 | 16 GiB | 12 GiB | Legacy balanced-cut runs retained as a historical baseline |
+| `e2e_r2_c8_m32_1m_20260729_r3` | 1M | 8 | 32 GiB | 24 GiB | Optimized same-container R2 funnel; **2458s**; max cgroup **28.5 GiB** |
+| `e2e_r2_c16_m128_10m_20260729_r1` | 10M | 16 | 128 GiB | 96 GiB | Optimized same-container R2 funnel; **37119s (10.31 h)**; max cgroup **105.0 GiB** |
 
 Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.md` as the durable record; recreate TOMLs from these rows when needed.
 
@@ -184,7 +188,11 @@ Local layout TOMLs under `profiling/layouts/` are gitignored. Treat `LEARNINGS.m
 
 ## How to quantify a future change
 
-1. Pick a fixed reference run tag (see tables below). Prefer `counts_t_c8_m32_100k` / `counts_t_c8_m32_500k` when comparing gene-wise IO. Use `auto_markers_c8_m32*` for row-major baselines.
+1. Pick a fixed reference run tag (see tables below). Use
+   `e2e_r2_c8_m32_1m_20260729_r3` and
+   `e2e_r2_c16_m128_10m_20260729_r1` for current-code large-N comparisons.
+   Prefer `counts_t_c8_m32_100k` / `counts_t_c8_m32_500k` for historical
+   gene-wise I/O and `auto_markers_c8_m32*` for row-major baselines.
 2. Change one variable (size, CPU, memory, parallel flags, or code). Keep workflow seeds fixed.
 3. Compare stage seconds and peak GiB. Also report total seconds and max peak.
 4. Result URIs: `{resultsUri}/results/{runTag}/{nRows}/{stage}.json`
@@ -214,6 +222,8 @@ paris_500k=fc-01KY4TKXM62KND6Y54H3FYYZDW
 paris_1m=fc-01KY4TMFKCCG7YP0D7QZ31AW6B
 paris_2_5m=fc-01KY4TN2DECFKJHZ57GP48DV8H
 paris_5m=fc-01KY4TNN5D4QTFHAY9DDYKRHJE
+e2e_r2_c8_m32_1m_20260729_r3=fc-01KYQA38EXP60KQQKBJY1Q91VE
+e2e_r2_c16_m128_10m_20260729_r1=fc-01KYQMET10M5CFAC79G25H7EWM
 ```
 
 ## Layout sweep @ 100k (4 CPU / 32 GiB)
@@ -317,6 +327,9 @@ Configs:
 | Cutting Modal RAM for its own sake | No for speed | 16G markers slower |
 | Raising `workers` for markers | Not shown; can hurt | 4→8 workers, markers +62s |
 | Feature-major `countsT` (Zarr v3) | **Yes** for HVG/markers | 100k/500k A/B below; createStore pays write cost |
+| Versioned true-minibatch KMeans | Yes | 1M embedding initialization 170.8s → 33.8s; 10M multi-block path 341.8s |
+| Aligning `h5adBatchSize` to 7,370 cells | No | 1M createStore write 323.9s → 396.6s in the measured samples |
+| More marker RAM by itself at 10M | Not enough | 96 GiB Scarf budget still planned `ioConcurrency=1`; peak reached 105.0 GiB |
 
 ## Ops notes (Modal)
 
@@ -333,14 +346,17 @@ Configs:
 | 100k | `counts_t_c8_m32_100k` | 8 CPU / 32 GiB | Fastest measured funnel (**881s**); row-major control `auto_markers_c8_m32` (1095s); Paris 42s |
 | 250k | `auto_markers_c8_m32_250k` | 8 CPU / 32 GiB | Row-major only so far; 2346s, max peak 14.6 GiB; Paris 68s |
 | 500k | `counts_t_c8_m32_500k` | 8 CPU / 32 GiB | Fastest measured (**2825s**); row-major control `auto_markers_c8_m32_500k` (3906s); Paris 140s |
-| 1M | `auto_markers_c8_m64_1m` | 8 CPU / 64 GiB | Row-major 9156s; countsT not measured yet; Paris 274s |
+| 1M | `e2e_r2_c8_m32_1m_20260729_r3` | 8 CPU / 32 GiB | Current full 16-stage reference; **2458s (41.0 min)**; max cgroup **28.5 GiB** |
 | 2.5M | `auto_markers_c8_m64_2_5m` | 8 CPU / 64 GiB | Row-major **15292s**; makeGraph peak 24.5 GiB; Paris 1408s |
 | 5M | `counts_t_c8_m64_5m` | right-sized 8–64 GiB | countsT core **29465s**; Paris 4492s / 14.8 GiB RSS |
-| 10M | `counts_t_c8_m64_10m` | right-sized 16–64 GiB | countsT core done; HVG JSON **under-timed** (see 10M section) |
+| 10M | `e2e_r2_c16_m128_10m_20260729_r1` | 16 CPU / 128 GiB | Current full 16-stage reference; **37119s (10.31 h)**; max cgroup **105.0 GiB** |
 
 For a pure markers comparison at 100k without parallel UMAP noise, use `auto_markers_c4_m32` (269s markers).
+The older 1M row-major and 10M staged countsT profiles remain below as
+historical lower-resource controls. Their stage boundaries and workflow code
+are not strict A/B matches for the current e2e references.
 
-## Scale summary (wall + max peak, speed pack)
+## Scale summary (wall + max peak)
 
 | Cells | Tag | Layout | Modal | Total wall | Max peak | Stage at max peak |
 |------:|-----|--------|------:|-----------:|---------:|-------------------|
@@ -350,9 +366,14 @@ For a pure markers comparison at 100k without parallel UMAP noise, use `auto_mar
 | 500k | `auto_markers_c8_m32_500k` | row | 32 GiB | 3906s | **23.0 GiB** | makeGraph |
 | 500k | `counts_t_c8_m32_500k` | **countsT** | 32 GiB | **2825s** | 16.6 GiB | makeGraph |
 | 1M | `auto_markers_c8_m64_1m` | row | 64 GiB | 9156s | **28.3 GiB** | makeGraph |
+| 1M | `e2e_r2_c8_m32_1m_20260729_r3` | **countsT e2e** | 32 GiB | **2458s** | **28.5 GiB cgroup** | findMarkers |
 | 2.5M | `auto_markers_c8_m64_2_5m` | row | 64 GiB | **15292s** | 24.5 GiB | makeGraph |
+| 10M | `e2e_r2_c16_m128_10m_20260729_r1` | **countsT e2e** | 128 GiB | **37119s** | **105.0 GiB cgroup** | findMarkers |
 
-Rough Modal RAM floor from peaks: 100k ≥8 GiB, 250k ≥16 GiB, 500k ≥24–32 GiB, 1M–2.5M ≥32–64 GiB.
+The current 1M profile shows that 32 GiB works but is tight. The 10M
+105.0 GiB marker peak follows the configured 96 GiB Scarf budget and should
+not be interpreted as an immutable 10M RAM floor. A lower software budget
+would force smaller marker blocks and would need a fresh wall-time measurement.
 
 ## Budget mismatch @ 100k: Modal 32 GiB, Scarf 16 GiB (done)
 
@@ -374,8 +395,9 @@ Tag `auto_markers_c4_m32_scarf16`. Matched to `c4_m32` (4 CPU, workers=4, UMAP/A
 
 1. Why scarf16 markers faster than c4_m32 despite smaller software budget?
 2. Why did 8 workers slow markers vs 4 at 100k?
-3. countsT at 1M / 2.5M: confirm createStore write cost vs gene-wise savings (estimates below; not measured).
-4. Can createStore / finalize overlap or stream `countsT` write to cut the growing createStore share?
+3. Can createStore / finalize overlap or stream `countsT` write to cut the growing createStore share?
+4. At 10M, can a smaller marker feature block preserve inner decode concurrency and avoid the measured 6,785 repeated decodes without materially increasing wall or memory?
+5. Which R2 object geometry or request pattern caused marker block-read time to scale 45.3× for 10× cells?
 
 ## Scale: 500k
 
@@ -539,11 +561,13 @@ Early fit from only 100k and 500k totals (`T ≈ 0.211 · N^0.724`) projected **
 
 500k → 5M is cells ×10 and wall ×10.4 (near-linear overall). 5M → 10M (corrected) is cells ×2 and wall ×~2.8 vs 5M.
 
-**Practical read:** countsT still wins vs row-major at small/mid N, but do not trust the old 100k/500k power law past 1M. Prefer measured 5M / corrected 10M as large-N anchors.
+**Practical read:** countsT still wins vs row-major at small/mid N, but do not trust the old 100k/500k power law past 1M. This table is the historical staged-workflow curve. Use the 2026-07-29/30 same-container section below for current-code 1M and 10M anchors.
 
 ## Peak RAM sizing (Modal cgroup)
 
-countsT does **not** change makeGraph RAM much. Size machines from **makeGraph `peakCgroupBytes`** (Modal OOM signal); RSS is often lower.
+The historical staged profiles below were usually sized by makeGraph
+`peakCgroupBytes`. The latest fixed-resource same-container profiles use a
+budget-aware marker plan that can make `findMarkers` the peak instead.
 
 ### Measured peaks (countsT speed pack)
 
@@ -556,7 +580,17 @@ countsT does **not** change makeGraph RAM much. Size machines from **makeGraph `
 
 Row-major makeGraph cgroup for mid sizes: 1M **28.3G**, 2.5M **32.6G**. 5M/10M countsT makeGraph cgroup stays in the ~33–36G band.
 
-### Suggested Modal RAM (countsT funnel, ~20% headroom)
+Latest same-container absolute cgroup peaks:
+
+| Cells | Modal / Scarf budget | Funnel peak | Driver | Atomic graph-chain max | Markers | Leiden |
+|------:|----------------------|------------:|--------|-----------------------:|--------:|-------:|
+| 1M | 32 / 24 GiB | **28.5 GiB** | findMarkers | 7.5 GiB | 28.4 GiB | 8.2 GiB |
+| 10M | 128 / 96 GiB | **105.0 GiB** | findMarkers | 23.0 GiB | 105.0 GiB | 34.6 GiB |
+
+The marker peaks track the configured software budget. They are throughput
+choices, not fixed algorithmic RAM requirements.
+
+### Suggested Modal RAM (countsT funnel)
 
 | Cells | Peak driver | Est. need | Recommend |
 |------:|-------------|----------:|----------:|
@@ -564,12 +598,14 @@ Row-major makeGraph cgroup for mid sizes: 1M **28.3G**, 2.5M **32.6G**. 5M/10M c
 | 100k | init 6.7G | 6.7G | 16–32 GiB |
 | 250k | makeGraph ~13G | ~13G | 16–32 GiB |
 | 500k | makeGraph 24.5G cgroup | 24.5G | **32 GiB** |
-| 1M | makeGraph 28.3G | ~28G | 48–64 GiB |
+| 1M | latest markers 28.5G | 28.5G | **32 GiB measured and tight; 48 GiB for headroom** |
 | 2.5M | makeGraph 32.6G | ~33G | 48–64 GiB |
 | 5M | makeGraph **33.0G** | 33G | **64 GiB** createStore/makeGraph; Leiden ≥16–32 GiB; Paris ≥16 GiB |
-| 10M | makeGraph **36.2G** | 36G | **64 GiB** makeGraph; Leiden ≥32 GiB; HVG ≥16–32 GiB (stream ~14G) |
+| 10M | 36.2G historical makeGraph; 105.0G latest markers | budget dependent | **64 GiB for the historical low-memory plan; 128 GiB for the latest measured plan** |
 
-Wall-time and RAM scale differently: gene-wise wall shrinks with countsT at small N; at 5M+, createStore + makeGraph + markers dominate wall, and makeGraph still sets the RAM floor.
+Wall-time and RAM scale differently. At 10M, a larger marker budget produced
+wide dense blocks but still fell back to `ioConcurrency=1`; more memory alone
+did not preserve read concurrency.
 
 ## Native guarded Paris local profile (2026-07-23)
 
@@ -739,7 +775,12 @@ Corrected funnel wall ≈ JSON total − 22 + 16000 ≈ **~22.8 h**.
 
 This campaign does **not** claim Scarf is uniquely able to touch multi-million-cell data. Several mature stacks reach large N under different assumptions. The useful claim is narrower and measured:
 
-**Scarf completed a full core funnel (createStore through findMarkers) at ~10M cells on CPU Modal with peak ~36 GiB, store on cloud R2 Zarr.** That combination (CPU, ~64 GiB class host, remote object store, full graph + markers on all cells) is uncommon in public writeups.
+**Scarf completed full core funnels at 10M input cells on CPU Modal with the
+store on cloud R2 Zarr.** The historical staged run used a corrected
+~22.8 hours and peaked at 36.2 GiB. The latest same-container run used
+10.31 hours and peaked at 105.0 GiB, with graph and markers operating on
+8,902,268 post-QC cells. These are measured memory and wall-time tradeoff
+points, not equivalent resource configurations.
 
 ### What other stacks optimize for
 
@@ -772,7 +813,7 @@ Community issues also show integration friction that is normal for a fast-moving
 
 Prefer:
 
-> Scarf can run an end-to-end analysis funnel at multi-million cell scale on modest CPU memory against cloud Zarr, with measured wall time and peaks through 10M.
+> Scarf has measured CPU-only end-to-end funnels against cloud Zarr through 10M input cells, including graph construction and marker search on 8.9M post-QC cells, with explicit wall-time and memory tradeoffs.
 
 Avoid:
 
@@ -930,3 +971,265 @@ Wall caveats at 1M:
    clean A/B; knobs and stage boundaries differ.
 3. Versus old countsT 100k/500k anchors, 1M markers at **1427s** sit between
    the small-N countsT curve and old row-major 1M markers (2379s).
+
+## Optimized same-container R2 e2e at 1M and 10M (2026-07-29/30)
+
+These are the current-code references after the marker feature-stream fix and
+the versioned true-minibatch KMeans change. Both used fresh R2 stores,
+`annParallel=true`, `umapParallel=true`, `kmeansSampling=0.1`, and
+`kmeansBatchSize=10000`. All 16 stages completed successfully.
+
+| Cells | Tag | Call | CPU | Modal / Scarf memory |
+|------:|-----|------|----:|---------------------:|
+| 1M | `e2e_r2_c8_m32_1m_20260729_r3` | `fc-01KYQA38EXP60KQQKBJY1Q91VE` | 8 | 32 / 24 GiB |
+| 10M | `e2e_r2_c16_m128_10m_20260729_r1` | `fc-01KYQMET10M5CFAC79G25H7EWM` | 16 | 128 / 96 GiB |
+
+Durable funnels:
+
+- `s3://scarf-tests/scarf-profiling/results/e2e_r2_c8_m32_1m_20260729_r3/1000000/funnel.json`
+- `s3://scarf-tests/scarf-profiling/results/e2e_r2_c16_m128_10m_20260729_r1/10000000/funnel.json`
+
+The prepared inputs contained exactly 1,000,000 and 10,000,000 cells. Filtering
+retained 889,974 (88.9974%) and 8,902,268 (89.02268%) cells respectively.
+The H5AD objects were 3.748 and 37.434 GiB, a 9.99× size ratio.
+
+### Current 1M to 10M scaling
+
+Times below use each stage's `wholeFunctionSeconds`, including its recorded
+input setup and validation. The funnel total also includes the initial H5AD
+download and about 6 seconds of orchestration overhead.
+
+| Stage | 1M seconds | 10M seconds | 10M / 1M |
+|-------|-----------:|------------:|---------:|
+| dataset download | 90.1 | 2992.2 | 33.2× |
+| createStore | 404.6 | 7316.0 | 18.1× |
+| writeCountsT | 180.1 | 2768.7 | 15.4× |
+| initializeStore | 101.1 | 1842.5 | 18.2× |
+| reopenStore | 8.1 | 10.4 | 1.3× |
+| filterCells | 77.5 | 124.4 | 1.6× |
+| markHvgs | 172.2 | 3444.5 | 20.0× |
+| runNormalization | 168.3 | 2201.2 | 13.1× |
+| runPca | 86.1 | 1135.9 | 13.2× |
+| buildEmbeddingInitialization | 33.8 | 341.8 | 10.1× |
+| buildAnnIndex | 95.7 | 1060.5 | 11.1× |
+| queryNeighbors | 51.9 | 311.7 | 6.0× |
+| buildConnectivityMap | 57.1 | 87.7 | 1.5× |
+| runUmap | 314.6 | 2051.6 | 6.5× |
+| runLeiden | 269.3 | 3446.5 | 12.8× |
+| runClustering | 114.0 | 793.3 | 7.0× |
+| findMarkers | 228.2 | 7183.1 | 31.5× |
+| **funnel total** | **2458.5** | **37118.9** | **15.1×** |
+
+The 1M funnel finished in 40m 58s. The 10M funnel finished in 10h 18m
+39s. Excluding dataset download, wall scaled 14.4×. This is not a same-machine
+curve because the 10M run had twice the CPUs and four times the Modal and Scarf
+memory.
+
+Download was independently variable. Object size grew 9.99×, but average
+download throughput fell from 42.6 to 12.8 MiB/s. That throughput difference
+made download wall grow 33.2× and added about 35 minutes beyond a 10×
+extrapolation.
+
+### Large-N marker behavior
+
+`findMarkers` was the main scaling failure and the 10M peak-memory driver:
+
+| Marker plan | 1M | 10M |
+|-------------|---:|----:|
+| active features | 32,695 | 38,994 |
+| Leiden groups | 50 | 61 |
+| feature blocks | 3 | 10 |
+| read workers | 1 | 1 |
+| inner I/O concurrency | 8 | 1 |
+| planned repeated decodes | 0 | 6,785 |
+| reported block-read wall | 143.1s | 6481.4s |
+| reported compute wall | 45.5s | 613.0s |
+| stage whole wall | 228.2s | 7183.1s |
+
+At 10M, block reads consumed about 90% of stage wall and scaled 45.3×.
+Compute scaled 13.5× and used roughly 9 to 12 effective cores when active.
+The problem is therefore the large-N stream plan and R2 reads, not the rank
+kernel. Wide dense blocks consumed the software budget, leaving no room for
+inner read concurrency. The source geometry then reported 6,785 repeated
+decodes across block boundaries.
+
+The 10M marker operation peaked at 105.0 GiB cgroup and released back to about
+11.1 GiB after the stage. The 128 GiB machine had about 23 GiB hard-limit
+headroom. A 64 GiB configuration cannot execute this exact 96 GiB software
+budget plan; it would need smaller blocks and a new timing measurement.
+
+### KMeans optimization validation
+
+At 1M, `buildEmbeddingInitialization` fell from 170.8s in the initial `r1`
+profile to 33.8s in `r3`, an 80.2% reduction. At 10M, the corrected multi-block
+path:
+
+- uniformly sampled 890,227 of 8,902,268 post-QC rows across 9 read blocks;
+- seeded 1,000 centers from that sample;
+- applied 891 updates of at most 10,000 rows;
+- predicted labels in a final complete pass.
+
+The 10M stage took 341.8s, only 0.9% of funnel wall, and scaled 10.1× from 1M.
+K-means++ seeding remained its largest component at 174.4s and 2.94 effective
+cores, but further work there has little end-to-end leverage.
+
+### 1M optimization sequence
+
+The initial same-resource `r1` and final `r3` runs provide one sample per code
+version:
+
+| Metric | `r1` | `r3` | Change |
+|--------|-----:|-----:|-------:|
+| funnel | 2975.8s | 2458.5s | -17.4% |
+| buildEmbeddingInitialization | 170.8s | 33.8s | -80.2% |
+| findMarkers | 357.5s | 228.2s | -36.2% |
+
+The interrupted `r2` run is not a funnel reference. Modal restarted the
+container during Leiden, and the retry correctly stopped at the fresh-tag
+guard. Other stage shifts between `r1` and `r3` include normal R2 and runtime
+variation, so only the targeted KMeans and marker direction should be
+attributed to their code changes without repeated A/B runs.
+
+### createStore batch experiment
+
+Aligning `h5adBatchSize` from 1,000 to the 7,370-cell destination width did not
+produce the required gain. The targeted 1M write took 396.6s versus 323.9s in
+the `r3` baseline, a 22.4% regression in operation wall. A later instrumented
+default-batch sample took 493.2s, confirming substantial run-to-run I/O
+variation and preventing a clean estimate of a smaller effect.
+
+Keep the 1,000-cell H5AD batch default. The temporary createStore telemetry was
+removed. Revisit source-production and write overlap only with matched
+repetitions and a credible large gain; this experiment did not support the
+risk of changing the writer pipeline.
+
+### Current decisions
+
+1. Use `e2e_r2_c8_m32_1m_20260729_r3` and
+   `e2e_r2_c16_m128_10m_20260729_r1` as current-code e2e references.
+2. Do not extrapolate the 41-minute 1M wall linearly to 10M. The observed
+   multiplier was 15.1×.
+3. Treat KMeans as solved for current funnel priorities. The multi-block
+   semantics are validated at 10M and the stage is below 1% of wall.
+4. If large-N optimization resumes, target marker stream geometry, repeated
+   decodes, and R2 read concurrency before changing the rank computation.
+5. Treat marker memory as software-budget-shaped. Report the Scarf budget with
+   every peak and wall measurement.
+
+## Scanpy Dask comparison at 1M (2026-07-29)
+
+This comparison used the same prepared 1,000,000-cell H5AD and 8 Modal CPUs.
+The Scarf reference is `e2e_r2_c8_m32_1m_20260729_r3` on a 32 GiB container
+with a 24 GiB Scarf budget. It completed all 16 stages. The final Scanpy
+attempt is `scanpy_dask_c8_m64_w1` on a 64 GiB container with one 50 GB Dask
+worker. It completed through Leiden, then failed in `rank_genes_groups`.
+
+Durable Scanpy result:
+
+- call: `fc-01KYQNJRXWE8W09VWWA7CZ0VTH`
+- funnel: `s3://scarf-tests/scarf-profiling/results/scanpy_dask_c8_m64_w1/1000000/funnel.json`
+- official recipe consulted: <https://scanpy.readthedocs.io/en/stable/tutorials/experimental/dask.html>
+
+### Scope and parity
+
+The Scanpy pipeline followed its documented sparse Dask path: lazy H5AD,
+`normalize_total`, `log1p`, HVG selection, Dask PCA followed by materializing
+`X_pca`, Annoy neighbors, UMAP, igraph Leiden, and Wilcoxon
+`rank_genes_groups`.
+
+The main aligned knobs were 2,000 HVGs, 50 PCs, 11 neighbors, 300 UMAP epochs,
+and Leiden resolution 1.0. The comparison is still not mathematically
+identical:
+
+- Scanpy used `target_sum=10000`; Scarf used its RNA size factor of 1,000.
+- Scanpy used the `seurat` HVG flavor and Annoy. Scarf used its own HVG method
+  and HNSW/connectivity stages.
+- Scanpy approximated Scarf's 1st/99th percentile QC filtering with Scanpy QC
+  columns. Scarf retained 889,974 cells; Scanpy retained 954,823. A strict
+  quality comparison needs one shared cell mask.
+- Scanpy Leiden used `flavor="igraph"` and `n_iterations=2`. Scarf used
+  `leidenalg.RBConfigurationVertexPartition` without a fixed iteration cap.
+  Their Leiden walls are not a same-algorithm comparison.
+- Scarf's funnel included both H5AD-to-Zarr conversion stages and Paris.
+  Scanpy opened H5AD lazily and had no Paris stage.
+- Scarf marker search completed. Scanpy Wilcoxon markers failed because
+  `rank_genes_groups` passed a Dask array into a Numba function that requires
+  an in-memory NumPy or SciPy array.
+
+### Dask memory tuning
+
+No tested 32 GiB configuration completed stock
+`scanpy.pp.calculate_qc_metrics` at 1M. This is a result for the tested worker
+and chunk configurations, not proof that every possible 32 GiB configuration
+must fail.
+
+| Tag | Modal box | Dask workers | Worker cap | Cell chunk | QC outcome |
+|-----|-----------|--------------|------------|------------|------------|
+| `scanpy_dask_c8_m32` | 8 CPU / 32 GiB | 4 | 6.5 GB | 50,000 | Failed: one finalize task had 12.72 GiB of dependencies versus a 6.05 GiB effective worker limit |
+| `scanpy_dask_c8_m32_w2` | 8 CPU / 32 GiB | 2 | 12 GB | 20,000 | Failed: the same 12.72 GiB dependency set exceeded the 11.18 GiB effective limit |
+| `scanpy_dask_c8_m32_w1` | 8 CPU / 32 GiB | 1 | 22 GB | 20,000 | Worker repeatedly died after 850.0s of QC; funnel cgroup peak 20.0 GiB |
+| `scanpy_dask_c8_m64_w2` | 8 CPU / 64 GiB | 2 | 24 GB | 20,000 | Worker repeatedly died after 526.6s of QC; funnel cgroup peak 21.9 GiB |
+| `scanpy_dask_c8_m64_w1` | 8 CPU / 64 GiB | 1 | 50 GB | 20,000 | QC completed in 703.4s; funnel peak 40.7 GiB |
+
+Splitting the 64 GiB host into two 24 GB workers still killed the QC finalize
+task. One larger worker completed it. The successful Scanpy run therefore used
+twice the Modal memory of the Scarf reference and peaked 12.2 GiB higher at
+the funnel level.
+
+### Stage comparison
+
+The stage rows below use each result's measured operation seconds. Funnel wall
+uses `wholeFunctionSeconds`, which also includes H5AD download, stage setup,
+validation, and orchestration. Scarf conversion deliberately counts both
+`createStore` and `writeCountsT`.
+
+| Peer operation | Scarf seconds | Scanpy seconds | Notes |
+|----------------|--------------:|---------------:|-------|
+| convert / lazy load | 499.1 | 6.6 | Scarf writes counts and countsT; Scanpy only opens local H5AD lazily |
+| QC metrics | 101.1 | 703.4 | Scanpy peak 40.7 GiB; Scarf stage peak 5.2 GiB |
+| filter cells/features | 69.5 | 456.2 | The resulting cell masks differed |
+| HVG 2,000 | 162.8 | 186.5 | Similar operation wall |
+| normalization and log | 161.1 | 0.8 | Scanpy calls were lazy; this is graph construction time, not completed compute |
+| PCA 50 | 78.1 | 343.5 | Scanpy materialized `X_pca` in this stage |
+| neighbors / graph | 207.7 | 61.1 | Scarf sum includes initialization, HNSW build/query, and connectivity |
+| UMAP 300 epochs | 307.4 | 1280.1 | Scanpy was 4.2 times slower in this run |
+| Leiden | 256.2 | 80.5 | Different backend, iteration policy, and graph |
+| markers | 220.0 | 420.2 then error | Scanpy did not produce marker results |
+| Paris | 101.5 | not run | Scarf-only stage |
+
+Scarf finished the full funnel in **2458.5s (41.0 min)**, including a 90.1s
+dataset download, conversion, countsT, Leiden, Paris, and marker search. Its
+funnel cgroup peak was **28.5 GiB**. Scanpy reached the marker error in
+**3638.6s (60.6 min)**, including a 93.4s download, and peaked at
+**40.7 GiB**. The Scanpy stages completed before markers summed to about
+3119s; the failed marker attempt added another 420s.
+
+### Interpretation
+
+For this measured CPU benchmark, Scarf completed the full 1M counts-to-markers
+funnel faster on half the provisioned memory, even after charging Scarf for
+both conversion stages. The clearest Scarf advantages were QC, filtering, PCA,
+UMAP, and completing marker search. Scanpy avoided conversion and had a faster
+neighbors stage and a faster, iteration-capped Leiden stage.
+
+Do not use this run to claim that Scanpy cannot process 1M cells or that every
+Scanpy pipeline requires 64 GiB. Its Dask support is documented as
+experimental, the QC mask differed, and the marker failure is an unsupported
+Dask path rather than evidence that marker calculation is fundamentally
+impossible. A publication-quality comparison still needs:
+
+1. a shared post-QC cell mask;
+2. matching Leiden convergence policy or clearly separated quality and speed
+   variants;
+3. a completed Scanpy marker stage after explicitly materializing the matrix
+   required by `rank_genes_groups`;
+4. output-quality checks for HVG overlap, PCA, neighborhoods, clusters, and
+   markers.
+
+Measured positioning:
+
+> On the same 1M-cell source and 8 CPUs, current Scarf completed the full
+> counts-to-markers funnel on a 32 GiB container in 41 minutes, including
+> H5AD-to-Zarr and countsT construction. The tested Scanpy Dask pipeline needed
+> a 64 GiB container to pass stock QC and reached an unsupported Dask marker
+> path after 61 minutes.
