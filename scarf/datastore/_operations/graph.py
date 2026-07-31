@@ -52,12 +52,16 @@ from ...graph.state import (
     validate_artifact_graph_selection,
     validate_cell_selection_artifact,
     validate_legacy_graph_selection,
+    validate_neighbors_artifact_selection,
     validate_normalized_artifact_selection,
     write_assay_state,
 )
 from ...matrix import ChunkedArray
 from ...metadata.artifacts import (
     categorical_display,
+    column_display,
+    continuous_display,
+    link_cell_data_column,
     link_feature_data_column,
 )
 from ...neighbors.stages import (
@@ -3389,21 +3393,28 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         method: str = "snn",
         chunk_size: int = 10000,
         invalidate_cache: bool = False,
+        l2_normalize: bool = True,
     ) -> None:
-        """Merges KNN graphs of two or more assays from within the same
-        DataStore. The input KNN graphs should have been constructed on the
-        same set of cells and should each have been constructed with equal
-        number of neighbours (parameter: k) The merged KNN graph has the same
-        size and shape as the input graphs.
+        """Integrate the latest neighbourhood graphs for selected assays.
+
+        SNN combines shared edge support across two or more assays. WNN accepts
+        exactly two assays and uses Hao-inspired per-cell modality weights.
+        Scarf WNN scores only the union of the existing self-free KNN rows and
+        uses a simple k-th-neighbour bandwidth, so it is not bit-identical to
+        Seurat's default wider search and SNN-far bandwidth.
 
         Args:
             assays: Name of the input assays. The latest constructed graph from each assay is used.
             label: Label for integrated graph
             method: Choose a method for modality integration. Available options: 'snn': Shared nearest neighbour
-                    approach and 'wnn': Weighted nearest neighbor approach based on Hao et. alm Cell 2022.
+                    approach and 'wnn': Hao-inspired weighted nearest neighbor integration.
             chunk_size: number of cells to be loaded at a time while reading and writing the graph
+            invalidate_cache: Force a new integrated-graph artifact.
+            l2_normalize: L2-normalize modality coordinates during WNN scoring.
+                This algorithmic setting is stored in artifact provenance.
 
-        Returns: None
+        WNN stores two modality-weight columns named
+        ``{label}_{assay}_weight`` in cell metadata.
         """
         from ...neighbors.graph import merge_graphs
         from ...neighbors.integration import wnn_integration
@@ -3416,45 +3427,103 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             raise ValueError(
                 "WNN integration in Scarf can currently be performed using only two assays"
             )
+        if method == "wnn" and not isinstance(l2_normalize, bool | np.bool_):
+            raise TypeError("l2_normalize must be a boolean")
+
+        def materialize_coordinate_blocks(
+            blocks: Iterator[np.ndarray],
+            n_cells: int,
+            *,
+            expected_dims: int | None = None,
+        ) -> np.ndarray:
+            coordinates: np.ndarray | None = None
+            start = 0
+            for values in blocks:
+                block = np.asarray(values)
+                if block.ndim != 2:
+                    raise ValueError("WNN coordinate blocks must be matrices")
+                if expected_dims is not None and block.shape[1] != expected_dims:
+                    raise ValueError("WNN coordinate dimensions changed between blocks")
+                if coordinates is None:
+                    coordinates = np.empty(
+                        (n_cells, block.shape[1]),
+                        dtype=block.dtype,
+                    )
+                stop = start + len(block)
+                if stop > n_cells:
+                    raise ValueError("WNN coordinate stream exceeded its cell count")
+                coordinates[start:stop] = block
+                start = stop
+            if coordinates is None or start != n_cells:
+                raise ValueError("WNN coordinate stream did not cover every cell")
+            return coordinates
+
+        def neighbor_coordinates_ref(neighbors: ArtifactRef) -> ArtifactRef:
+            raw_coordinates = (inspect_artifact(self.zw, neighbors).inputs or {}).get(
+                "coordinates"
+            )
+            if not isinstance(raw_coordinates, dict):
+                raise ValueError("Neighbors artifact has no coordinates input")
+            coordinates = ArtifactRef.from_dict(raw_coordinates)
+            if coordinates.kind not in {"reduction", "batch_correction"}:
+                raise ValueError(
+                    "Neighbor coordinates must be reduction or batch_correction"
+                )
+            self._require_complete_artifact(coordinates, coordinates.kind)
+            return coordinates
+
         source_inputs: dict[str, Any] = {}
         legacy_wnn_coordinates: dict[str, np.ndarray] = {}
+        legacy_wnn_neighbor_paths: dict[str, str] = {}
         shared_selection: ArtifactRef | None = None
+        shared_cell_key: str | None = None
         for assay_name in assays:
             if assay_name not in self.assay_names:
                 raise ValueError(f"ERROR: Assay {assay_name} was not found.")
             state = read_assay_state(self.zw, assay_name)
-            if state is not None and state.connectivity_map is not None:
+            artifact_source = state is not None and (
+                (method == "wnn" and state.neighbors is not None)
+                or (method == "snn" and state.connectivity_map is not None)
+            )
+            if artifact_source:
+                assert state is not None
                 if state.normalized is None:
                     raise ValueError(
                         f"Assay {assay_name!r} has no normalized graph input"
                     )
-                validate_artifact_graph_selection(
-                    self.zw,
-                    state.connectivity_map,
-                    state.cell_key,
-                    state.feat_key,
-                )
+                if method == "wnn":
+                    assert state.neighbors is not None
+                    self._require_complete_artifact(state.neighbors, "neighbors")
+                    validate_neighbors_artifact_selection(
+                        self.zw,
+                        state.neighbors,
+                        state.cell_key,
+                        state.feat_key,
+                    )
+                else:
+                    assert state.connectivity_map is not None
+                    validate_artifact_graph_selection(
+                        self.zw,
+                        state.connectivity_map,
+                        state.cell_key,
+                        state.feat_key,
+                    )
                 selection = self._artifact_input_ref(
                     state.normalized,
                     "cell_selection",
                     "cell_selection",
                 )
                 if method == "wnn":
-                    coordinates_ref = (
-                        state.batch_correction
-                        if state.batch_correction is not None
-                        else state.reduction
-                    )
-                    if coordinates_ref is None:
-                        raise ValueError(
-                            f"Assay {assay_name!r} has no selected coordinates"
-                        )
+                    assert state.neighbors is not None
+                    coordinates_ref = neighbor_coordinates_ref(state.neighbors)
                     source_inputs[assay_name] = {
-                        "connectivity_map": state.connectivity_map,
+                        "neighbors": state.neighbors,
                         "coordinates": coordinates_ref,
                     }
                 else:
+                    assert state.connectivity_map is not None
                     source_inputs[assay_name] = state.connectivity_map
+                cell_key = state.cell_key
             else:
                 legacy_graph_path = self.get_latest_graph_loc(
                     assay_name,
@@ -3465,17 +3534,23 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     self.zw[legacy_graph_path],
                     name=legacy_graph_path,
                 )
-                legacy_input: dict[str, Any] = {
-                    "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                        legacy_graph,
-                        ("edges", "weights"),
-                    ),
-                }
-                selection = self._ensure_cell_selection(
-                    self._get_latest_cell_key(assay_name)
-                )
+                cell_key = self._get_latest_cell_key(assay_name)
+                selection = self._ensure_cell_selection(cell_key)
                 if method == "wnn":
-                    cell_key = self._get_latest_cell_key(assay_name)
+                    neighbors_path = nearest_neighbors_group_path_from_cell_graph(
+                        legacy_graph_path
+                    )
+                    neighbors_group = as_zarr_group(
+                        self.zw[neighbors_path],
+                        name=neighbors_path,
+                    )
+                    legacy_wnn_neighbor_paths[assay_name] = neighbors_path
+                    legacy_input: dict[str, Any] = {
+                        "legacy_graph_fingerprint": fingerprint_stored_arrays(
+                            neighbors_group,
+                            ("indices",),
+                        ),
+                    }
                     feat_key = self._get_latest_feat_key(assay_name)
                     ann = self._load_ann_stream(
                         assay_name,
@@ -3483,28 +3558,38 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                         feat_key,
                     )
                     if ann.harmonizedData is not None:
-                        coordinates = np.vstack(
-                            [
+                        coordinates = materialize_coordinate_blocks(
+                            (
                                 np.asarray(block.compute())
                                 for block in ann.harmonizedData.blocks
-                            ]
+                            ),
+                            ann.nCells,
                         )
                     else:
-                        coordinates = np.vstack(
-                            [
+                        coordinates = materialize_coordinate_blocks(
+                            (
                                 ann.reducer(block)
                                 for block in ann.iter_blocks(
                                     f"Loading {assay_name} coordinates"
                                 )
-                            ]
+                            ),
+                            ann.nCells,
                         )
                     legacy_wnn_coordinates[assay_name] = coordinates
                     legacy_input["legacy_coordinates_fingerprint"] = fingerprint_array(
                         coordinates
                     )
+                else:
+                    legacy_input = {
+                        "legacy_graph_fingerprint": fingerprint_stored_arrays(
+                            legacy_graph,
+                            ("edges", "weights"),
+                        ),
+                    }
                 source_inputs[assay_name] = legacy_input
             if shared_selection is None:
                 shared_selection = selection
+                shared_cell_key = cell_key
             elif not self._selection_artifacts_match(
                 shared_selection,
                 selection,
@@ -3512,20 +3597,33 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 raise ValueError("Integrated graphs require one shared cell selection")
         if shared_selection is None:
             raise ValueError("No assay cell selection was resolved")
+        if shared_cell_key is None:
+            raise RuntimeError("No cell key was resolved for assay integration")
         source_inputs["cell_selection"] = shared_selection
+        parameters: dict[str, Any] = {"method": method, "assays": assays}
+        required_arrays: list[ArrayRequirement] = [
+            ArrayRequirement("edges"),
+            ArrayRequirement("weights", dtype_kind="f"),
+        ]
+        if method == "wnn":
+            parameters["l2_normalize"] = bool(l2_normalize)
+            required_arrays.append(
+                ArrayRequirement(
+                    "modality_weights",
+                    shape=(None, 2),
+                    dtype=np.float32,
+                )
+            )
         integrated_plan = plan_artifact(
             self.zw,
             scope="datastore",
             kind="integrated_graph",
             operation="integrate_assays",
-            parameters={"method": method, "assays": assays},
+            parameters=parameters,
             inputs=source_inputs,
             execution_options={"label": label, "chunk_size": chunk_size},
             invalidate_cache=invalidate_cache,
-            required_arrays=(
-                ArrayRequirement("edges"),
-                ArrayRequirement("weights", dtype_kind="f"),
-            ),
+            required_arrays=tuple(required_arrays),
         )
 
         def select_integrated_artifact() -> None:
@@ -3545,50 +3643,96 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             artifacts[label] = integrated_plan.ref.to_dict()
             index_group.attrs["artifacts"] = artifacts
 
+        weight_columns = (
+            [f"{label}_{assay_name}_weight" for assay_name in assays]
+            if method == "wnn"
+            else []
+        )
+        preserved_weight_displays = {
+            column: column_display(self.zw, column) for column in weight_columns
+        }
+
+        def publish_modality_weights() -> None:
+            if method != "wnn":
+                return
+            group = artifact_group(self.zw, integrated_plan.ref)
+            values = np.asarray(
+                as_zarr_array(
+                    group["modality_weights"],
+                    name="modality_weights",
+                )[:],
+                dtype=np.float32,
+            )
+            if values.shape != (int(group.attrs["n_cells"]), 2):
+                raise RuntimeError("Stored WNN modality weights have an invalid shape")
+            for index, column in enumerate(weight_columns):
+                column_values = values[:, index]
+                self.cells.insert(
+                    column,
+                    column_values,
+                    overwrite=True,
+                    key=shared_cell_key,
+                )
+                link_cell_data_column(
+                    self.zw,
+                    column,
+                    integrated_plan.ref,
+                    value_name="modality_weights",
+                    value_index=index,
+                    default_display=continuous_display(column_values),
+                    preserved_display=preserved_weight_displays[column],
+                )
+
         if integrated_plan.reused:
             select_integrated_artifact()
+            publish_modality_weights()
             return None
 
-        def load_pca_knn(assay_name: str) -> tuple[csr_matrix, NDArray[Any]]:
+        def load_wnn_inputs(assay_name: str) -> tuple[np.ndarray, NDArray[Any]]:
             state = read_assay_state(self.zw, assay_name)
-            if (
-                state is not None
-                and state.connectivity_map is not None
-                and state.reduction is not None
-            ):
-                graph = self.load_graph(
-                    graph_loc=artifact_path(state.connectivity_map),
-                    symmetric=False,
-                    upper_only=False,
-                ).tocsr()
-                coordinates_ref = (
-                    state.batch_correction
-                    if state.batch_correction is not None
-                    else state.reduction
+            if state is not None and state.neighbors is not None:
+                neighbors_group = artifact_group(self.zw, state.neighbors)
+                indices = np.asarray(
+                    as_zarr_array(
+                        neighbors_group["indices"],
+                        name="indices",
+                    )[:]
                 )
+                coordinates_ref = neighbor_coordinates_ref(state.neighbors)
                 coordinate_source, _n_cells, _dims = self._coordinate_source(
                     coordinates_ref,
                     batch_size=None,
                 )
-                coordinates = np.vstack(
-                    list(
-                        coordinate_source.iter_coordinate_blocks(
+                coordinates = materialize_coordinate_blocks(
+                    (
+                        np.asarray(block)
+                        for block in coordinate_source.iter_coordinate_blocks(
                             f"Loading {assay_name} coordinates",
                         )
-                    )
+                    ),
+                    _n_cells,
+                    expected_dims=_dims,
                 )
-                return graph, coordinates
-            cell_key = self._get_latest_cell_key(assay_name)
-            feat_key = self._get_latest_feat_key(assay_name)
-            graph = self.load_graph(
-                from_assay=assay_name,
-                cell_key=cell_key,
-                feat_key=feat_key,
-                symmetric=False,
-                upper_only=False,
-            ).tocsr()
-            return graph, legacy_wnn_coordinates[assay_name]
+                if indices.shape[0] != _n_cells:
+                    raise ValueError(
+                        f"WNN neighbors and coordinates for {assay_name} "
+                        "contain different cell counts"
+                    )
+                return indices, coordinates
+            neighbors_path = legacy_wnn_neighbor_paths[assay_name]
+            neighbors_group = as_zarr_group(
+                self.zw[neighbors_path],
+                name=neighbors_path,
+            )
+            indices = np.asarray(
+                as_zarr_array(
+                    neighbors_group["indices"],
+                    name="indices",
+                )[:]
+            )
+            return indices, legacy_wnn_coordinates[assay_name]
 
+        modality_weights: np.ndarray | None = None
         if method == "snn":
             graphs: list[csr_matrix] = []
             for assay in assays:
@@ -3605,10 +3749,17 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )
             merged_graph = merge_graphs(graphs)
         elif method == "wnn":
-            g1, ld1 = load_pca_knn(assays[0])
-            g2, ld2 = load_pca_knn(assays[1])
-            merged_graph = wnn_integration(
-                assays[0], g1, ld1, assays[1], g2, ld2, self.nthreads
+            indices1, ld1 = load_wnn_inputs(assays[0])
+            indices2, ld2 = load_wnn_inputs(assays[1])
+            merged_graph, modality_weights = wnn_integration(
+                assays[0],
+                indices1,
+                ld1,
+                assays[1],
+                indices2,
+                ld2,
+                self.nthreads,
+                l2_normalize=l2_normalize,
             )
         n_cells = merged_graph.shape[0]
         n_neighbors = int(merged_graph.size / n_cells)
@@ -3616,21 +3767,36 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         store = start_artifact(self.zw, integrated_plan)
         store.attrs["n_cells"] = n_cells
         store.attrs["n_neighbors"] = n_neighbors
+        store.attrs["assays"] = list(assays)
 
         edge_chunk = chunk_size * n_neighbors
         zge = create_zarr_dataset(
             store,
             "edges",
             (edge_chunk,),
-            ("u8", "u8"),
+            np.uint32,
             (n_cells * n_neighbors, 2),
         )
         zgw = create_zarr_dataset(
-            store, "weights", (edge_chunk,), "f8", (n_cells * n_neighbors,)
+            store,
+            "weights",
+            (edge_chunk,),
+            np.float32,
+            (n_cells * n_neighbors,),
         )
 
         zge[:, 0] = merged_graph.row
         zge[:, 1] = merged_graph.col
         zgw[:] = merged_graph.data
+        if modality_weights is not None:
+            stored_modality_weights = create_zarr_dataset(
+                store,
+                "modality_weights",
+                (min(chunk_size, n_cells), 2),
+                np.float32,
+                modality_weights.shape,
+            )
+            stored_modality_weights[:, :] = modality_weights
         finish_artifact(store, integrated_plan)
         select_integrated_artifact()
+        publish_modality_weights()

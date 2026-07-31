@@ -681,6 +681,24 @@ def validate_artifact_graph_selection(
         scope="assay",
         assay=assay,
     )
+    validate_neighbors_artifact_selection(root, neighbors, cell_key, feat_key)
+
+
+def validate_neighbors_artifact_selection(
+    root: zarr.Group,
+    neighbors: ArtifactRef,
+    cell_key: str,
+    feat_key: str,
+) -> None:
+    if neighbors.assay is None:
+        raise ValueError("Neighbors artifact has no assay")
+    assay = neighbors.assay
+    _require_artifact_ref(
+        neighbors,
+        kind="neighbors",
+        scope="assay",
+        assay=assay,
+    )
     ann_index = _input_ref(root, neighbors, "ann_index")
     _require_artifact_ref(
         ann_index,

@@ -318,13 +318,16 @@ the partition the merged graph supports.
 SNN treats both modalities equally and accepts two or more assays. Weighted nearest
 neighbors instead learns a per-cell weight for each modality, so cells whose identity is
 better resolved by protein lean on the ADT graph and the rest lean on RNA. WNN takes exactly
-two assays.
+two assays. Scarf implements the affinity and per-cell weighting equations from
+[Hao et al., Cell 2021](https://doi.org/10.1016/j.cell.2021.04.048), with the
+scaling choices described below.
 
 ```{code-cell} ipython3
 ds.integrate_assays(
     assays=['RNA', 'ADT'],
     label='RNA+ADT_wnn',
-    method='wnn'
+    method='wnn',
+    l2_normalize=True,
 )
 ds.run_umap(
     integrated_graph='RNA+ADT_wnn',
@@ -338,6 +341,44 @@ ds.run_leiden_clustering(
     resolution=1.75
 )
 ```
+
+The integrated artifact stores blended affinities as graph weights. It also publishes the
+per-cell columns `RNA+ADT_wnn_RNA_weight` and `RNA+ADT_wnn_ADT_weight`. The weights are
+non-negative and sum to one for each selected cell.
+
+Scarf WNN is Hao-inspired, but it is not bit-identical to Seurat's
+`FindMultiModalNeighbors`:
+
+- Scarf scores the union of the two existing KNN rows, at most `2k` candidates per cell,
+  and retains `min(k_RNA, k_ADT)` neighbours. Seurat normally obtains a wider candidate
+  pool with `knn.range=200`, then retains `k.nn=20`. Scarf therefore cannot tune candidate
+  pool size independently of final graph degree.
+- The wider search would require two more L2-space index builds and 20 million queries at
+  ten million cells. Materializing 200 candidates for each modality would hold 4 billion
+  neighbour records and scoring work would increase by roughly tenfold. Scarf keeps the
+  existing graphs to avoid that cost.
+- Scarf uses the distance from each cell to its `k`-th stored nonself neighbour as the
+  affinity bandwidth. This corresponds to Seurat's supported simple-bandwidth path, not
+  its default SNN-far bandwidth.
+- Scarf builds candidates in the PCA or Harmony geometry used by each source graph, then
+  scores them after row-wise L2 normalization by default. Distance after normalization is
+  monotone with cosine distance, but the candidate ordering is not guaranteed to match a
+  KNN index built directly in the normalized space. Set `l2_normalize=False` only when this
+  difference is intentional. The setting is part of artifact provenance.
+- Prediction means exclude the query cell in both implementations. Scarf's stored rows
+  contain `k` nonself cells, while Seurat's internal `k.nn` includes a self slot. Public
+  Seurat `k.nn=20` therefore averages 19 nonself neighbours, while Scarf `k=20` averages
+  20.
+- If the source graphs use different `k`, each modality predicts from its own row and the
+  integrated graph retains the smaller degree.
+
+At 100,000 cells with 20 neighbours per modality the corrected path measures 137 to 146
+microseconds per cell single-threaded, and peak memory grows by about 0.9 MB per 1,000
+cells. Extrapolating linearly, ten million cells need roughly 25 minutes and 9 to 10 GB.
+Reading neighbour-index arrays directly and preallocating outputs is what keeps memory at
+that level instead of the 25 to 35 GB the earlier full-graph path would have needed. Both
+figures come from synthetic benchmarks at 100,000 to 200,000 cells rather than a
+ten-million-cell run, so treat them as estimates.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))

@@ -1,4 +1,7 @@
+import functools
+import json
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -40,6 +43,19 @@ def _grouped_knn_graph(groups: list[list[int]]) -> csr_matrix:
     return csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n_cells, n_cells))
 
 
+def _simple_knn_indices(n: int, k: int = 3) -> np.ndarray:
+    return np.asarray(
+        [[(cell + offset + 1) % n for offset in range(k)] for cell in range(n)],
+        dtype=np.int64,
+    )
+
+
+def _grouped_knn_indices(groups: list[list[int]]) -> np.ndarray:
+    graph = _grouped_knn_graph(groups)
+    degree = int(graph.getnnz(axis=1)[0])
+    return graph.indices.reshape(graph.shape[0], degree)
+
+
 def test_leiden_membership_preserves_disconnected_partitions():
     graph = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]])
 
@@ -71,18 +87,138 @@ def test_diffusion_operator_matches_powered_row_normalization():
     )
 
 
-def _multimodal_wnn_inputs() -> tuple[csr_matrix, np.ndarray, csr_matrix, np.ndarray]:
-    g1 = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]])
-    g2 = _grouped_knn_graph([[0, 2, 4, 6], [1, 3, 5, 7]])
+def _multimodal_wnn_inputs() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    indices1 = _grouped_knn_indices([[0, 1, 2, 3], [4, 5, 6, 7]])
+    indices2 = _grouped_knn_indices([[0, 2, 4, 6], [1, 3, 5, 7]])
     ld1 = np.array(
-        [0, 101, -97, 2, 1e6, 1e6 + 101, 1e6 - 97, 1e6 + 2],
+        [
+            [0.0, 1.0, 0.2],
+            [0.1, 0.9, 0.3],
+            [-0.1, 1.1, 0.1],
+            [0.2, 0.8, 0.4],
+            [3.0, -1.0, 0.0],
+            [3.1, -0.9, 0.1],
+            [2.9, -1.1, -0.1],
+            [3.2, -0.8, 0.2],
+        ],
         dtype=np.float64,
-    ).reshape(-1, 1)
+    )
     ld2 = np.array(
-        [0, 1e6, 101, 1e6 + 101, -97, 1e6 - 97, 2, 1e6 + 2],
+        [
+            [1.0, 0.0],
+            [-1.0, 3.0],
+            [0.9, 0.1],
+            [-0.9, 3.1],
+            [1.1, -0.1],
+            [-1.1, 2.9],
+            [0.8, 0.2],
+            [-0.8, 3.2],
+        ],
         dtype=np.float64,
-    ).reshape(-1, 1)
-    return g1, ld1, g2, ld2
+    )
+    return indices1, ld1, indices2, ld2
+
+
+def _reference_wnn(
+    indices1: np.ndarray,
+    ld1: np.ndarray,
+    indices2: np.ndarray,
+    ld2: np.ndarray,
+    *,
+    l2_normalize: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def normalize(values: np.ndarray) -> np.ndarray:
+        output = np.asarray(values, dtype=np.float64).copy()
+        if not l2_normalize:
+            return output
+        norms = np.linalg.norm(output, axis=1)
+        np.divide(
+            output,
+            norms[:, np.newaxis],
+            out=output,
+            where=norms[:, np.newaxis] > 0,
+        )
+        return output
+
+    def kernel(
+        distances: np.ndarray,
+        nearest: float,
+        bandwidth: float,
+    ) -> np.ndarray:
+        adjusted = np.maximum(distances - nearest, 0)
+        tolerance = 8.0 * np.finfo(np.float64).eps * nearest
+        if bandwidth <= tolerance:
+            return (adjusted <= tolerance).astype(np.float64)
+        return np.exp(-(adjusted / bandwidth))
+
+    embedding1 = normalize(ld1)
+    embedding2 = normalize(ld2)
+    n_cells = len(indices1)
+    output_k = min(indices1.shape[1], indices2.shape[1])
+    selected_indices = np.empty((n_cells, output_k), dtype=np.int64)
+    selected_affinities = np.empty((n_cells, output_k), dtype=np.float64)
+    modality_weights = np.empty((n_cells, 2), dtype=np.float64)
+
+    for cell in range(n_cells):
+        neighbors1 = indices1[cell]
+        neighbors2 = indices2[cell]
+        candidates = np.union1d(neighbors1, neighbors2)
+        candidate1 = embedding1[candidates]
+        candidate2 = embedding2[candidates]
+        point1 = embedding1[cell]
+        point2 = embedding2[cell]
+        distances1 = np.linalg.norm(point1 - candidate1, axis=1)
+        distances2 = np.linalg.norm(point2 - candidate2, axis=1)
+        positions1 = np.searchsorted(candidates, neighbors1)
+        positions2 = np.searchsorted(candidates, neighbors2)
+        own1 = np.sort(distances1[positions1])
+        own2 = np.sort(distances2[positions2])
+        nearest1, nearest2 = float(own1[0]), float(own2[0])
+        bandwidth1 = float(own1[-1] - nearest1)
+        bandwidth2 = float(own2[-1] - nearest2)
+
+        within1 = kernel(
+            np.asarray([np.linalg.norm(point1 - candidate1[positions1].mean(axis=0))]),
+            nearest1,
+            bandwidth1,
+        )[0]
+        cross1 = kernel(
+            np.asarray([np.linalg.norm(point1 - candidate1[positions2].mean(axis=0))]),
+            nearest1,
+            bandwidth1,
+        )[0]
+        within2 = kernel(
+            np.asarray([np.linalg.norm(point2 - candidate2[positions2].mean(axis=0))]),
+            nearest2,
+            bandwidth2,
+        )[0]
+        cross2 = kernel(
+            np.asarray([np.linalg.norm(point2 - candidate2[positions1].mean(axis=0))]),
+            nearest2,
+            bandwidth2,
+        )[0]
+        score1 = np.clip(within1 / (cross1 + 1e-4), 0, 200)
+        score2 = np.clip(within2 / (cross2 + 1e-4), 0, 200)
+        score_max = max(score1, score2)
+        exp1, exp2 = np.exp(score1 - score_max), np.exp(score2 - score_max)
+        weight1 = exp1 / (exp1 + exp2)
+        weight2 = exp2 / (exp1 + exp2)
+        modality_weights[cell] = (weight1, weight2)
+
+        affinities = weight1 * kernel(
+            distances1,
+            nearest1,
+            bandwidth1,
+        ) + weight2 * kernel(
+            distances2,
+            nearest2,
+            bandwidth2,
+        )
+        selected = np.lexsort((candidates, -affinities))[:output_k]
+        selected_indices[cell] = candidates[selected]
+        selected_affinities[cell] = affinities[selected]
+
+    return selected_indices, selected_affinities, modality_weights
 
 
 def test_calc_snn_returns_normalized_overlap():
@@ -234,38 +370,59 @@ def test_connectivity_omits_zero_membership_edges():
 
 
 def test_wnn_integration_handles_extreme_affinities_without_runtime_warnings():
-    g1, ld1, g2, ld2 = _multimodal_wnn_inputs()
+    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        merged = wnn_integration("RNA", g1, ld1, "ADT", g2, ld2, n_threads=1)
+        merged, modality_weights = wnn_integration(
+            "RNA",
+            indices1,
+            ld1,
+            "ADT",
+            indices2,
+            ld2,
+            n_threads=1,
+        )
 
     assert isinstance(merged, coo_matrix)
-    assert merged.shape == g1.shape
-    assert merged.nnz == g1.nnz
+    assert merged.shape == (len(indices1), len(indices1))
+    assert merged.nnz == indices1.size
     np.testing.assert_array_equal(
-        np.bincount(merged.row, minlength=g1.shape[0]),
-        np.repeat(g1.getnnz(axis=1)[0], g1.shape[0]),
+        np.bincount(merged.row, minlength=len(indices1)),
+        np.repeat(indices1.shape[1], len(indices1)),
     )
     assert np.all(np.isfinite(merged.data))
     assert np.all(merged.data > 0)
     assert np.all(merged.data <= 1)
+    assert modality_weights.dtype == np.float32
+    assert np.all(np.isfinite(modality_weights))
+    assert np.all(modality_weights >= 0)
+    np.testing.assert_allclose(modality_weights.sum(axis=1), 1, rtol=1e-6)
 
 
 def test_wnn_integration_is_invariant_to_cell_order():
-    g1, _, g2, _ = _multimodal_wnn_inputs()
+    indices1, _, indices2, _ = _multimodal_wnn_inputs()
     rng = np.random.default_rng(42)
-    ld1 = rng.normal(size=(g1.shape[0], 3))
-    ld2 = rng.normal(size=(g2.shape[0], 4))
-    expected = wnn_integration("RNA", g1, ld1, "ADT", g2, ld2, n_threads=1)
+    ld1 = rng.normal(size=(len(indices1), 3))
+    ld2 = rng.normal(size=(len(indices2), 4))
+    expected, expected_weights = wnn_integration(
+        "RNA",
+        indices1,
+        ld1,
+        "ADT",
+        indices2,
+        ld2,
+        n_threads=1,
+    )
 
     permutation = np.array([5, 0, 7, 2, 6, 1, 4, 3])
-    permuted = wnn_integration(
+    old_to_new = np.argsort(permutation)
+    permuted, permuted_weights = wnn_integration(
         "RNA",
-        g1[permutation][:, permutation].tocsr(),
+        old_to_new[indices1[permutation]],
         ld1[permutation],
         "ADT",
-        g2[permutation][:, permutation].tocsr(),
+        old_to_new[indices2[permutation]],
         ld2[permutation],
         n_threads=1,
     )
@@ -273,34 +430,88 @@ def test_wnn_integration_is_invariant_to_cell_order():
     restored = permuted.tocsr()[inverse][:, inverse]
 
     np.testing.assert_allclose(expected.toarray(), restored.toarray())
+    np.testing.assert_allclose(expected_weights, permuted_weights[inverse])
 
 
-def test_wnn_integration_rejects_mismatched_graph_shapes():
-    g1 = _simple_knn_graph(6, k=3)
-    g2 = _simple_knn_graph(7, k=3)
+def test_wnn_integration_rejects_mismatched_neighbor_rows():
+    indices1 = _simple_knn_indices(6, k=3)
+    indices2 = _simple_knn_indices(7, k=3)
 
-    with pytest.raises(ValueError, match="same shape"):
+    with pytest.raises(ValueError, match="same number of cells"):
         wnn_integration(
             "RNA",
-            g1,
+            indices1,
             np.zeros((6, 2)),
             "ADT",
-            g2,
+            indices2,
             np.zeros((7, 2)),
             n_threads=1,
         )
 
 
-def test_wnn_integration_rejects_irregular_row_degree():
-    g1 = _simple_knn_graph(6, k=3).tolil()
-    g1[0, 1] = 0
-    g1 = g1.tocsr()
-    g1.eliminate_zeros()
-    g2 = _simple_knn_graph(6, k=3)
+@pytest.mark.parametrize(
+    ("indices", "error", "match"),
+    [
+        (np.arange(6), ValueError, "non-empty matrix"),
+        (np.zeros((6, 3), dtype=np.float64), TypeError, "integer indices"),
+        (
+            np.array(
+                [
+                    [1, 1, 2],
+                    [0, 2, 3],
+                    [0, 1, 3],
+                    [0, 1, 2],
+                    [0, 1, 2],
+                    [0, 1, 2],
+                ]
+            ),
+            ValueError,
+            "unique within each row",
+        ),
+        (
+            np.array(
+                [
+                    [0, 1, 2],
+                    [0, 2, 3],
+                    [0, 1, 3],
+                    [0, 1, 2],
+                    [0, 1, 2],
+                    [0, 1, 2],
+                ]
+            ),
+            ValueError,
+            "exclude self",
+        ),
+        (
+            np.array(
+                [
+                    [1, 2, 6],
+                    [0, 2, 3],
+                    [0, 1, 3],
+                    [0, 1, 2],
+                    [0, 1, 2],
+                    [0, 1, 2],
+                ]
+            ),
+            ValueError,
+            "outside cell range",
+        ),
+    ],
+)
+def test_wnn_integration_rejects_invalid_neighbor_matrices(indices, error, match):
+    valid = _simple_knn_indices(6, k=3)
     embeddings = np.arange(12, dtype=np.float64).reshape(6, 2)
 
-    with pytest.raises(ValueError, match="regular row degree"):
-        wnn_integration("RNA", g1, embeddings, "ADT", g2, embeddings, n_threads=1)
+    with pytest.raises(error, match=match):
+        wnn_integration(
+            "RNA",
+            indices,
+            embeddings,
+            "ADT",
+            valid,
+            embeddings,
+            n_threads=1,
+        )
 
 
 @pytest.mark.parametrize(
@@ -318,24 +529,24 @@ def test_wnn_integration_rejects_irregular_row_degree():
     ],
 )
 def test_wnn_integration_rejects_invalid_embeddings(embedding, match):
-    graph = _simple_knn_graph(6, k=3)
+    indices = _simple_knn_indices(6, k=3)
     valid_embedding = np.zeros((6, 2))
 
     with pytest.raises(ValueError, match=match):
         wnn_integration(
             "RNA",
-            graph,
+            indices,
             embedding,
             "ADT",
-            graph,
+            indices,
             valid_embedding,
             n_threads=1,
         )
 
 
 def test_wnn_integration_uses_minimum_neighbor_count_for_mismatched_graphs():
-    g1 = _simple_knn_graph(8, k=3)
-    g2 = _simple_knn_graph(8, k=2)
+    indices1 = _simple_knn_indices(8, k=3)
+    indices2 = _simple_knn_indices(8, k=2)
     rng = np.random.default_rng(7)
     ld1 = rng.normal(size=(8, 3))
     ld2 = rng.normal(size=(8, 2))
@@ -344,12 +555,405 @@ def test_wnn_integration_uses_minimum_neighbor_count_for_mismatched_graphs():
         lambda message: messages.append(message.record["message"]), level="WARNING"
     )
     try:
-        merged = wnn_integration("RNA", g1, ld1, "ADT", g2, ld2, n_threads=1)
-        swapped = wnn_integration("ADT", g2, ld2, "RNA", g1, ld1, n_threads=1)
+        merged, modality_weights = wnn_integration(
+            "RNA",
+            indices1,
+            ld1,
+            "ADT",
+            indices2,
+            ld2,
+            n_threads=1,
+        )
+        swapped, swapped_weights = wnn_integration(
+            "ADT",
+            indices2,
+            ld2,
+            "RNA",
+            indices1,
+            ld1,
+            n_threads=1,
+        )
     finally:
         logger.remove(sink)
 
     assert any("different neighbor counts" in message for message in messages)
-    assert merged.nnz == g1.shape[0] * 2
+    assert merged.nnz == len(indices1) * 2
     assert np.all(np.isfinite(merged.data))
     np.testing.assert_allclose(merged.toarray(), swapped.toarray())
+    np.testing.assert_allclose(modality_weights, swapped_weights[:, ::-1])
+
+
+@pytest.mark.parametrize("l2_normalize", [True, False])
+@pytest.mark.parametrize(("modality", "scale"), [(1, 1e8), (2, 1e-7)])
+def test_wnn_integration_is_invariant_to_per_modality_scale(
+    l2_normalize,
+    modality,
+    scale,
+):
+    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
+    expected, expected_weights = wnn_integration(
+        "RNA",
+        indices1,
+        ld1,
+        "ADT",
+        indices2,
+        ld2,
+        n_threads=1,
+        l2_normalize=l2_normalize,
+    )
+    if modality == 1:
+        ld1 = ld1 * scale
+    else:
+        ld2 = ld2 * scale
+
+    actual, actual_weights = wnn_integration(
+        "RNA",
+        indices1,
+        ld1,
+        "ADT",
+        indices2,
+        ld2,
+        n_threads=1,
+        l2_normalize=l2_normalize,
+    )
+
+    np.testing.assert_array_equal(actual.row, expected.row)
+    np.testing.assert_array_equal(actual.col, expected.col)
+    np.testing.assert_allclose(actual.data, expected.data, rtol=2e-6, atol=1e-7)
+    np.testing.assert_allclose(
+        actual_weights,
+        expected_weights,
+        rtol=2e-6,
+        atol=1e-7,
+    )
+
+
+def test_wnn_integration_uses_kth_nonself_neighbor_for_bandwidth():
+    indices = _simple_knn_indices(5, k=2)
+    embedding = np.arange(5, dtype=np.float64).reshape(-1, 1)
+
+    graph, _ = wnn_integration(
+        "RNA",
+        indices,
+        embedding,
+        "ADT",
+        indices,
+        embedding,
+        n_threads=1,
+        l2_normalize=False,
+    )
+    row_zero = graph.data[graph.row == 0]
+
+    np.testing.assert_allclose(
+        row_zero,
+        np.array([1.0, np.exp(-1)], dtype=np.float32),
+        rtol=1e-6,
+        atol=1e-7,
+    )
+
+
+def test_wnn_integration_handles_degenerate_bandwidth_deterministically():
+    indices1, _, indices2, _ = _multimodal_wnn_inputs()
+    embedding1 = np.zeros((len(indices1), 3))
+    embedding2 = np.zeros((len(indices2), 2))
+
+    first, first_weights = wnn_integration(
+        "RNA",
+        indices1,
+        embedding1,
+        "ADT",
+        indices2,
+        embedding2,
+        n_threads=1,
+    )
+    second, second_weights = wnn_integration(
+        "RNA",
+        indices1,
+        embedding1,
+        "ADT",
+        indices2,
+        embedding2,
+        n_threads=1,
+    )
+
+    np.testing.assert_array_equal(first.row, second.row)
+    np.testing.assert_array_equal(first.col, second.col)
+    np.testing.assert_array_equal(first.data, np.ones(first.nnz, dtype=np.float32))
+    np.testing.assert_array_equal(first.data, second.data)
+    np.testing.assert_allclose(first_weights, 0.5)
+    np.testing.assert_array_equal(first_weights, second_weights)
+
+
+def test_wnn_integration_matches_scalar_affinity_reference():
+    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
+    expected_indices, expected_affinities, expected_weights = _reference_wnn(
+        indices1,
+        ld1,
+        indices2,
+        ld2,
+        l2_normalize=True,
+    )
+
+    actual, actual_weights = wnn_integration(
+        "RNA",
+        indices1,
+        ld1,
+        "ADT",
+        indices2,
+        ld2,
+        n_threads=1,
+    )
+
+    np.testing.assert_array_equal(
+        actual.col.reshape(expected_indices.shape),
+        expected_indices,
+    )
+    np.testing.assert_allclose(
+        actual.data.reshape(expected_affinities.shape),
+        expected_affinities,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(
+        actual_weights,
+        expected_weights,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+
+
+def test_wnn_integration_follows_informative_modality_across_numeric_scales():
+    indices1 = _grouped_knn_indices([[0, 1, 2], [3, 4, 5]])
+    indices2 = _grouped_knn_indices([[0, 3, 4], [1, 2, 5]])
+    informative = np.array(
+        [
+            [1.0, 0.0],
+            [0.9, 0.1],
+            [1.1, -0.1],
+            [-1.0, 0.0],
+            [-0.9, 0.1],
+            [-1.1, -0.1],
+        ]
+    )
+    noisy = (
+        np.array(
+            [
+                [0.0, 0.0],
+                [4.0, 1.0],
+                [-3.0, 2.0],
+                [1.0, -4.0],
+                [-2.0, -3.0],
+                [3.0, 4.0],
+            ]
+        )
+        * 1e9
+    )
+
+    graph, modality_weights = wnn_integration(
+        "RNA",
+        indices1,
+        informative,
+        "ADT",
+        indices2,
+        noisy,
+        n_threads=1,
+        l2_normalize=False,
+    )
+    selected = graph.col.reshape(len(indices1), -1)
+    informative_overlap = np.mean(
+        [
+            len(set(row).intersection(neighbors)) / len(row)
+            for row, neighbors in zip(selected, indices1, strict=True)
+        ]
+    )
+    noisy_overlap = np.mean(
+        [
+            len(set(row).intersection(neighbors)) / len(row)
+            for row, neighbors in zip(selected, indices2, strict=True)
+        ]
+    )
+
+    assert np.mean(modality_weights[:, 0]) > 0.5
+    assert informative_overlap > noisy_overlap
+    assert all(
+        set(row).issubset(set(informative_neighbors))
+        for row, informative_neighbors in zip(selected, indices1, strict=True)
+    )
+
+
+def test_wnn_integration_is_scale_invariant_at_near_degenerate_bandwidth():
+    indices1 = _grouped_knn_indices([[0, 1, 2], [3, 4, 5]])
+    indices2 = _grouped_knn_indices([[0, 3, 4], [1, 2, 5]])
+    ld1 = np.array(
+        [
+            [1.0, 0.0],
+            [0.9, 0.1],
+            [1.1, -0.1],
+            [-1.0, 0.0],
+            [-0.9, 0.1],
+            [-1.1, -0.1],
+        ]
+    )
+    ld2 = (
+        np.array(
+            [
+                [0.0, 0.0],
+                [4.0, 1.0],
+                [-3.0, 2.0],
+                [1.0, -4.0],
+                [-2.0, -3.0],
+                [3.0, 4.0],
+            ]
+        )
+        * 1e9
+    )
+
+    results = [
+        wnn_integration(
+            "RNA",
+            indices1,
+            ld1 * scale,
+            "ADT",
+            indices2,
+            ld2,
+            n_threads=1,
+            l2_normalize=False,
+        )
+        for scale in (1.0, 1e6, 1e9)
+    ]
+    baseline, baseline_weights = results[0]
+
+    # Equidistant neighbours differ only by rounding noise in the distance
+    # reduction, so neither may be demoted below an unrelated candidate.
+    np.testing.assert_array_equal(
+        baseline.col.reshape(len(indices1), -1),
+        indices1,
+    )
+    for graph, weights in results[1:]:
+        np.testing.assert_array_equal(graph.col, baseline.col)
+        np.testing.assert_allclose(graph.data, baseline.data, rtol=1e-6, atol=1e-7)
+        np.testing.assert_allclose(weights, baseline_weights, rtol=1e-6, atol=1e-7)
+
+
+@functools.cache
+def _seurat_golden() -> dict:
+    path = Path(__file__).parent / "seurat_wnn_5_5_1_golden.json"
+    return json.loads(path.read_text())
+
+
+def _seurat_golden_wnn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run Scarf on the fixture inputs and reshape the graph to one row per cell."""
+    fixture = _seurat_golden()
+    inputs = fixture["inputs"]
+    indices1 = np.asarray(inputs["rnaIndices"], dtype=np.uint32)
+    indices2 = np.asarray(inputs["adtIndices"], dtype=np.uint32)
+    graph, weights = wnn_integration(
+        "RNA",
+        indices1,
+        np.asarray(inputs["rnaEmbedding"], dtype=np.float64),
+        "ADT",
+        indices2,
+        np.asarray(inputs["adtEmbedding"], dtype=np.float64),
+        n_threads=1,
+        l2_normalize=fixture["provenance"]["l2Normalize"],
+    )
+    shape = indices1.shape
+    return (
+        graph.col.reshape(shape),
+        graph.data.reshape(shape).astype(np.float64),
+        weights.astype(np.float64),
+    )
+
+
+def test_seurat_wnn_golden_fixture_pins_its_provenance():
+    provenance = _seurat_golden()["provenance"]
+
+    assert provenance["package"] == "Seurat"
+    assert provenance["packageVersion"] == "5.5.1"
+    assert provenance["dataset"] == "tenx_8K_pbmc_citeseq"
+    assert provenance["l2Normalize"] is True
+    assert "Seurat:::PredictAssay" in provenance["matchedFunctions"]
+    assert provenance["defaultFunction"] == "Seurat::FindMultiModalNeighbors"
+
+
+def test_wnn_integration_matches_seurat_matched_equations():
+    """Seurat's own routines on Scarf's candidate pool and bandwidth.
+
+    Residual disagreement sits at the float32 resolution of the returned graph,
+    so the tolerance is set just above it. Any error in the affinity kernel,
+    the bandwidth index, the row normalization or the weight softmax moves the
+    result by several orders of magnitude more than this.
+    """
+    expected = _seurat_golden()["matched"]
+    selected, affinities, weights = _seurat_golden_wnn()
+
+    np.testing.assert_array_equal(
+        selected,
+        np.asarray(expected["neighborIndices"], dtype=selected.dtype),
+    )
+    np.testing.assert_allclose(
+        weights,
+        np.asarray(expected["modalityWeights"]),
+        rtol=0,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        affinities,
+        np.asarray(expected["neighborAffinities"]),
+        rtol=0,
+        atol=1e-6,
+    )
+
+
+def test_wnn_integration_stays_close_to_seurat_defaults():
+    """Bound on how far Scarf's documented deviations move the result.
+
+    Seurat's defaults search a wider pool and use an SNN-far bandwidth, so exact
+    agreement is not expected. The floors sit below the values measured when the
+    fixture was written (0.89 neighbour overlap, 0.76 weight correlation) and
+    exist to catch the gap widening.
+    """
+    expected = _seurat_golden()["seuratDefault"]
+    selected, _affinities, weights = _seurat_golden_wnn()
+    k = selected.shape[1]
+    seurat_indices = np.asarray(expected["neighborIndices"])
+    seurat_weights = np.asarray(expected["modalityWeights"])
+
+    overlap = np.mean(
+        [
+            len(set(row.tolist()).intersection(reference.tolist())) / k
+            for row, reference in zip(selected, seurat_indices, strict=True)
+        ]
+    )
+    correlation = np.corrcoef(weights[:, 0], seurat_weights[:, 0])[0, 1]
+
+    assert overlap > 0.80
+    assert correlation > 0.65
+    assert abs(weights[:, 0].mean() - seurat_weights[:, 0].mean()) < 0.05
+
+
+def test_wnn_integration_output_contract():
+    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
+
+    graph, modality_weights = wnn_integration(
+        "RNA",
+        indices1,
+        ld1,
+        "ADT",
+        indices2,
+        ld2,
+        n_threads=1,
+    )
+
+    assert not np.any(graph.row == graph.col)
+    np.testing.assert_array_equal(
+        np.bincount(graph.row, minlength=len(indices1)),
+        np.full(len(indices1), min(indices1.shape[1], indices2.shape[1])),
+    )
+    assert graph.data.dtype == np.float32
+    assert np.all(np.isfinite(graph.data))
+    assert np.all((graph.data > 0) & (graph.data <= 1))
+    assert modality_weights.shape == (len(indices1), 2)
+    assert np.all(np.isfinite(modality_weights))
+    assert np.all(modality_weights >= 0)
+    np.testing.assert_allclose(modality_weights.sum(axis=1), 1, rtol=1e-6)

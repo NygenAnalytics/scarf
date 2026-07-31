@@ -307,6 +307,7 @@ def test_integrated_graphs_use_random_artifacts_and_label_index(
 
 def test_wnn_uses_exact_nondefault_cell_selection(
     datastore_ephemeral,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
@@ -346,6 +347,12 @@ def test_wnn_uses_exact_nondefault_cell_selection(
         local_cache=False,
     )
 
+    load_graph = datastore.load_graph
+
+    def reject_load_graph(*_args, **_kwargs):
+        raise AssertionError("WNN integration must read neighbors indices directly")
+
+    monkeypatch.setattr(datastore, "load_graph", reject_load_graph)
     datastore.integrate_assays(
         ["RNA", "assay2"],
         label="artifact_wnn",
@@ -354,5 +361,89 @@ def test_wnn_uses_exact_nondefault_cell_selection(
 
     path = datastore._resolve_integrated_graph_path("artifact_wnn")
     assert path.startswith("artifacts/integrated_graph/")
-    graph = datastore.load_graph(graph_loc=path)
+    ref = parse_artifact_path(path)
+    group = datastore.zw[path]
+    graph = load_graph(graph_loc=path)
     assert graph.shape[0] == int(cells.sum())
+    assert group["edges"].dtype == np.dtype(np.uint32)
+    assert group["weights"].dtype == np.dtype(np.float32)
+    assert group["modality_weights"].dtype == np.dtype(np.float32)
+    assert group["modality_weights"].shape == (int(cells.sum()), 2)
+    assert group.attrs["assays"] == ["RNA", "assay2"]
+    np.testing.assert_allclose(
+        np.asarray(group["modality_weights"][:]).sum(axis=1),
+        1,
+        rtol=1e-6,
+    )
+
+    status = datastore.inspect_artifact(ref)
+    assert status.parameters == {
+        "method": "wnn",
+        "assays": ["RNA", "assay2"],
+        "l2_normalize": True,
+    }
+    assert set(status.inputs["RNA"]) == {"neighbors", "coordinates"}
+    assert set(status.inputs["assay2"]) == {"neighbors", "coordinates"}
+
+    weight_columns = [
+        "artifact_wnn_RNA_weight",
+        "artifact_wnn_assay2_weight",
+    ]
+    for index, column in enumerate(weight_columns):
+        assert column in datastore.cells.columns
+        np.testing.assert_allclose(
+            datastore.cells.fetch(column, "wnn_cells"),
+            np.asarray(group["modality_weights"][:, index]),
+        )
+        attrs = datastore.zw["cellData"][column].attrs
+        assert attrs["source_artifact"] == ref.to_dict()
+        assert attrs["source_value"] == "modality_weights"
+        assert attrs["value_index"] == index
+
+    for column in weight_columns:
+        datastore.cells.drop(column)
+    datastore.integrate_assays(
+        ["RNA", "assay2"],
+        label="artifact_wnn",
+        method="wnn",
+    )
+    assert datastore._resolve_integrated_graph_path("artifact_wnn") == path
+    assert all(column in datastore.cells.columns for column in weight_columns)
+
+    datastore.integrate_assays(
+        ["RNA", "assay2"],
+        label="artifact_wnn_raw",
+        method="wnn",
+        l2_normalize=False,
+    )
+    raw_path = datastore._resolve_integrated_graph_path("artifact_wnn_raw")
+    assert raw_path != path
+    raw_ref = parse_artifact_path(raw_path)
+    assert datastore.inspect_artifact(raw_ref).parameters["l2_normalize"] is False
+    datastore.integrate_assays(
+        ["RNA", "assay2"],
+        label="artifact_wnn_raw",
+        method="wnn",
+        l2_normalize=False,
+    )
+    assert datastore._resolve_integrated_graph_path("artifact_wnn_raw") == raw_path
+
+    expected_edges = np.asarray(group["edges"][:])
+    expected_weights = np.asarray(group["weights"][:])
+    expected_modality_weights = np.asarray(group["modality_weights"][:])
+    datastore.integrate_assays(
+        ["RNA", "assay2"],
+        label="artifact_wnn_rechunked",
+        method="wnn",
+        chunk_size=17,
+        invalidate_cache=True,
+    )
+    rechunked_path = datastore._resolve_integrated_graph_path("artifact_wnn_rechunked")
+    assert rechunked_path != path
+    rechunked = datastore.zw[rechunked_path]
+    np.testing.assert_array_equal(rechunked["edges"][:], expected_edges)
+    np.testing.assert_array_equal(rechunked["weights"][:], expected_weights)
+    np.testing.assert_array_equal(
+        rechunked["modality_weights"][:],
+        expected_modality_weights,
+    )

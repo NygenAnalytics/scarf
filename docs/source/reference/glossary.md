@@ -63,7 +63,12 @@ SNN integration
   Shared-nearest-neighbor merge of modality-specific KNN graphs via `integrate_assays(method='snn')`.
 
 WNN integration
-  Weighted nearest-neighbor merge for exactly two modalities via `integrate_assays(method='wnn')`.
+  Hao-inspired weighted nearest-neighbor merge for exactly two modalities via
+  `integrate_assays(method='wnn')`. Scarf scores the union of the two existing,
+  self-free KNN rows with L2-normalized affinity and a simple `k`-th-neighbour
+  bandwidth. Unlike Seurat defaults, it does not build a wider 200-neighbour
+  candidate pool or use SNN-far bandwidth, which keeps memory and query cost
+  practical for millions of cells.
 
 TopACeDo
   Manifold-preserving cell subsampling using the KNN graph (`run_topacedo_sampler`).
