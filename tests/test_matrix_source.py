@@ -17,7 +17,7 @@ from scarf.storage.stores import (
     is_remote_datastore,
     resolve_matrix_source,
 )
-from tests.fixtures_datastore import build_atomic_graph
+from tests.fixtures_datastore import build_neighbourhood_graph
 from scarf.writers import (
     create_cell_data,
     create_zarr_count_assay,
@@ -552,7 +552,7 @@ def test_mounted_store_normalization_and_graph(tmp_path):
     feature_mask = np.zeros(ds.RNA.feats.N, dtype=bool)
     feature_mask[:12] = True
     ds.RNA.feats.insert("I__hvgs", feature_mask, overwrite=True)
-    build_atomic_graph(
+    build_neighbourhood_graph(
         ds,
         feat_key="hvgs",
         k=3,

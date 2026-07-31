@@ -12,7 +12,7 @@ from scarf.plotting._contracts import CategoricalScale, ColorScale
 from scarf.plotting.embedding import _continuous_limits
 from scarf.storage.artifacts import ArtifactRef, artifact_path
 from scarf.storage.selections import resolve_selection_artifact
-from tests.fixtures_datastore import build_atomic_graph
+from tests.fixtures_datastore import build_neighbourhood_graph
 
 
 def _ensure_graph(datastore) -> None:
@@ -28,7 +28,7 @@ def _ensure_graph(datastore) -> None:
             max_cells=np.inf,
             blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
         )
-    build_atomic_graph(
+    build_neighbourhood_graph(
         datastore,
         from_assay="RNA",
         feat_key="metadata_hvgs",

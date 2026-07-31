@@ -126,7 +126,7 @@ class PipelineAccessor:
             raise RuntimeError("Marker artifact index is invalid")
         raw_ref = raw_artifacts.get(f"{cell_key}__{group_key}")
         if not isinstance(raw_ref, dict):
-            raise RuntimeError("Marker search did not publish an artifact")
+            raise RuntimeError("Marker search did not write an artifact")
         return ArtifactRef.from_dict(raw_ref)
 
     @staticmethod
@@ -260,7 +260,7 @@ class PipelineAccessor:
                     fail_job(
                         recipe_key,
                         RuntimeError(
-                            f"Clustering job {recipe_key} was not published because "
+                            f"Clustering job {recipe_key} was not written because "
                             "another clustering job failed"
                         ),
                     )
@@ -361,7 +361,7 @@ class PipelineAccessor:
                         if recipe_key == "paris":
                             if result is None or result.label_key is None:
                                 raise RuntimeError(
-                                    "Paris clustering did not publish labels"
+                                    "Paris clustering did not write labels"
                                 )
                             completed[recipe_key] = result.label_key
                             artifact_refs[recipe_key] = self._column_ref(
@@ -430,7 +430,7 @@ class PipelineAccessor:
         is skipped when omitted and requires a dictionary containing
         ``batch_columns``. Leiden defaults to resolutions 0.5, 0.75, 1.0, and
         1.25. Leiden and Paris membership work can overlap under
-        ``clustering_concurrency`` while store publishes stay serialized. When
+        ``clustering_concurrency`` while store writes stay serialized. When
         doublets or markers omit ``clusters``, the partition with the highest
         silhouette score on PCA coordinates is selected. Highly variable
         feature selection is mandatory. When provided, ``callback`` receives
@@ -441,9 +441,9 @@ class PipelineAccessor:
         ``connectivity``, ``embedding_initialization``, ``umap``,
         ``cluster_selection``, ``doublet_scoring``, and ``markers``. Clustering
         jobs use ``leiden_<resolution>`` and ``paris``. Skipped stages emit no
-        events. ``stage_completed`` means the expected output is published and
-        available, so Leiden completion follows its serialized publish. If one
-        clustering job fails, any started sibling that cannot be published
+        events. ``stage_completed`` means the expected output has finished
+        writing and is available. If one clustering job fails, any started
+        sibling that cannot finish writing
         emits ``stage_failed`` with an abort error; the original job error is
         re-raised.
 
@@ -482,7 +482,7 @@ class PipelineAccessor:
         Raises:
             ValueError: If the recipe identifier or dependent step options are
                 invalid.
-            RuntimeError: If a step does not publish its expected artifact.
+            RuntimeError: If a step does not write its expected artifact.
         """
         if pipeline_id != "basic_rna_analysis":
             raise ValueError(

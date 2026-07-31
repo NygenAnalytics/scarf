@@ -1,4 +1,5 @@
 ---
+description: Group genes with shared expression dynamics along pseudotime and summarize them as an assay.
 jupytext:
   formats: ipynb,md:myst
   text_representation:
@@ -12,10 +13,10 @@ kernelspec:
   name: python3
 ---
 
-# Pseudotime modules
+# Expression dynamics along pseudotime
 
 Group features with similar pseudotime expression patterns, store module means as a new
-assay, and compare those modules with classical cluster markers.
+assay, and inspect where those programs are active.
 
 ## Prerequisites
 
@@ -28,7 +29,7 @@ assay, and compare those modules with classical cluster markers.
 
 - Aggregate features into pseudotime expression modules
 - Create a grouped assay from module means with `add_grouped_assay`
-- Compare pseudotime modules with cluster marker genes
+- Inspect module activity on the original embedding
 
 ## Dataset
 
@@ -37,10 +38,7 @@ is standalone: it downloads the store, opens a `DataStore`, and runs pseudotime 
 when needed.
 
 ```{code-cell} ipython3
-import pandas as pd
-
 import scarf
-import scarf.plotting as splt
 
 scarf.configure_output(level='WARNING', progress=False)
 
@@ -65,12 +63,10 @@ pseudotime_key = pseudotime.pseudotime_key
 validity_key = pseudotime.validity_key
 ```
 
-The sources and sinks come from the published `clusters` annotation, the same choice made in
+The sources and sinks come from the provided `clusters` annotation, the same choice made in
 {doc}`pseudotime`.
 
-## Guided steps
-
-### 1. Identify feature modules based on pseudotime
+## 1. Identify feature modules
 
 `run_pseudotime_marker_search` identifies features with a linear relationship to pseudotime. It does not capture every dynamic pattern. Some genes, for example, may peak only in the middle of a trajectory or along one branch.
 
@@ -87,37 +83,24 @@ modules = ds.run_pseudotime_aggregation(
 )
 ```
 
-The returned result contains the lazy binned matrix in `modules.data`, the aligned physical feature indices, and their cluster assignments. It also exposes the saved feature column as `modules.cluster_key` and the Zarr location as `modules.storage_path`.
+The returned result contains the lazy binned matrix in `modules.data`, the
+aligned physical feature indices, and their cluster assignments. It also
+exposes the feature column as `modules.cluster_key`.
 
 Features with mean expression below `min_exp` or with no variation along the ordering are treated as invalid. They are excluded from the clustering and from the heatmap below, and they receive the unassigned cluster value (`-1`) in the feature table.
-
-```{code-cell} ipython3
-# Number of retained features and pseudotime bins
-modules.data.shape
-```
-
-`modules.feature_clusters` holds one cluster assignment per retained feature. Counting them
-shows how the genes are distributed across modules.
-
-```{code-cell} ipython3
-pd.Series(modules.feature_clusters).value_counts().sort_index()
-```
 
 `ds.plots.pseudotime_heatmap` visualizes the binned matrix along with the feature clusters.
 
 ```{code-cell} ipython3
-# One representative gene per retained module, derived from the aggregation result
 ptime_feat = ds.RNA.feats.to_pandas_dataframe(
     columns=['names', modules.cluster_key]
 )
 assigned = ptime_feat[ptime_feat[modules.cluster_key] != -1]
-genes_to_label = (
+representatives = (
     assigned.groupby(modules.cluster_key, sort=True)['names']
     .first()
-    .head(10)
-    .tolist()
 )
-genes_to_label
+genes_to_label = representatives.iloc[::3].tolist()
 
 ds.plots.pseudotime_heatmap(
     cell_key=modules.cell_key,
@@ -128,20 +111,13 @@ ds.plots.pseudotime_heatmap(
 )
 ```
 
-The heatmap above shows the gene expression dynamics as the cells progress through the pseudotime. Each block of rows is one feature module. Some modules capture genes that peak early in the pseudotime while others peak later. The module numbers are assigned by the clustering step and do not follow the pseudotime order.
+The heatmap shows expression dynamics as cells progress through pseudotime. Each
+row block is one feature module. A useful result contains coherent early,
+intermediate, and late patterns rather than one block dominated by uniformly
+expressed genes. Module numbers are clustering labels and do not encode temporal
+order.
 
-We can visualize the expression of the above selected genes on UMAP to check whether their cluster identity corroborates their expression pattern.
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=genes_to_label,
-    n_columns=5,
-    sort_values=True,
-)
-```
-
-### 2. Merging pseudotime-based feature modules into a new assay
+## 2. Create a module assay
 
 The pseudotime-based feature clusters can seed a new assay. `add_grouped_assay` takes the
 mean expression of genes in each cluster and stores those means as features in a new assay.
@@ -158,127 +134,28 @@ ds.add_grouped_assay(
 The new assay has one feature per module.
 
 ```{code-cell} ipython3
-ds
-```
-
-The mean values from each cluster are saved within the assay and tagged with names like `group_1`, `group_2`, etc
-
-```{code-cell} ipython3
-ds.PTIME_MODULES.feats.head()
-```
-
-We can visualize these cluster mean values directly on the UMAP like this:
-
-```{code-cell} ipython3
 module_features = ds.PTIME_MODULES.feats.fetch_all('names').tolist()
+{"module count": len(module_features), "first modules": module_features[:5]}
+```
+
+Inspect a spaced subset of modules on the original UMAP. These are mean
+expression summaries, so a sequential colour scale is appropriate.
+
+```{code-cell} ipython3
+selected_modules = [
+    f"group_{module_id}" for module_id in representatives.iloc[::3].index
+]
 ds.plots.embedding(
     from_assay='PTIME_MODULES',
     layout_key='RNA_UMAP',
-    color_by=module_features,
-    n_columns=5,
-    color_scale=splt.ColorScale(cmap='coolwarm'),
+    color_by=selected_modules,
+    n_columns=3,
+    sort_values=True,
 )
 ```
 
-This figure complements the earlier heatmap. Several modules are restricted to parts of the
-pseudotime and differentiation trajectory.
-
-### 3. Comparing pseudotime based feature modules with cluster markers
-
-Compare the pseudotime-based feature modules with classical cluster markers.
-
-```{code-cell} ipython3
-ds.run_marker_search(group_key='clusters')
-```
-
-The Beta cells are one endpoint of this trajectory, so their markers are a natural
-comparison for the modules that rise late in pseudotime.
-
-```{code-cell} ipython3
-cell_cluster_markers = ds.get_markers(
-    group_key='clusters',
-    group_id='Beta',
-).feature_name
-
-cell_cluster_markers.head()
-```
-
-Next we pick the pseudotime feature module that shares the most genes with these Beta cell markers. The module numbering is assigned by clustering and can change between runs, so we select the module in a data-driven way instead of hard-coding a cluster id.
-
-```{code-cell} ipython3
-ptime_feat_clusts = ds.RNA.feats.to_pandas_dataframe(
-    columns=['names', 'pseudotime_clusters']
-)
-
-beta_marker_names = set(cell_cluster_markers)
-assigned = ptime_feat_clusts[ptime_feat_clusts.pseudotime_clusters != -1]
-module_overlap = assigned.groupby('pseudotime_clusters')['names'].apply(
-    lambda names: len(set(names) & beta_marker_names)
-)
-beta_module = int(module_overlap.idxmax())
-beta_module
-```
-
-The genes belonging to this Beta associated module are:
-
-```{code-cell} ipython3
-ptime_based_markers = ptime_feat_clusts.names[
-    ptime_feat_clusts.pseudotime_clusters == beta_module
-]
-ptime_based_markers.head()
-```
-
-```{code-cell} ipython3
-# Number of genes captured by each approach
-ptime_based_markers.shape, cell_cluster_markers.shape
-```
-
-```{code-cell} ipython3
-# Number of genes shared by both approaches, compared by gene name
-len(set(ptime_based_markers) & set(cell_cluster_markers))
-```
-
-Visualize the cumulative expression of genes present only in the cluster-marker set:
-
-```{code-cell} ipython3
-available_names = set(ptime_feat_clusts.names)
-cell_only = sorted(
-    (set(cell_cluster_markers) - set(ptime_based_markers)) & available_names
-)
-ds.cells.insert(
-    column_name='Cell cluster based markers',
-    values=ds.RNA.mean_features(cell_only),
-    overwrite=True,
-)
-
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='Cell cluster based markers',
-    color_scale=splt.ColorScale(cmap='coolwarm'),
-)
-```
-
-Do the reverse comparison for genes present only in the pseudotime-based module:
-
-```{code-cell} ipython3
-ptime_only = sorted(
-    (set(ptime_based_markers) - set(cell_cluster_markers)) & available_names
-)
-ds.cells.insert(
-    column_name='Pseudotime based markers',
-    values=ds.RNA.mean_features(ptime_only),
-    overwrite=True,
-)
-
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='Pseudotime based markers',
-    color_scale=splt.ColorScale(cmap='coolwarm'),
-)
-```
-
-The two approaches overlap but are not identical. Genes unique to the pseudotime module can
-highlight trajectory signal that cluster markers alone miss.
+This figure complements the heatmap by showing where selected module programs
+are active in the original cell layout.
 
 ## Common mistakes and limitations
 
@@ -286,18 +163,7 @@ highlight trajectory signal that cluster markers alone miss.
 - Treating module numbers as ordered along pseudotime (they are clustering labels)
 - Comparing module gene lists to cluster markers without accounting for unassigned features (`-1`)
 
-## Saved results
-
-Feature module labels are stored under `pseudotime_clusters` in feature metadata.
-`PTIME_MODULES` holds mean expression per module.
-
-## Further reading
-
-- Weinreb et al. 2018, population balance analysis (PBA): https://doi.org/10.1073/pnas.1714723115
-- [PBA reference implementation](https://github.com/AllonKleinLab/PBA)
-
-## Next steps
-
-- {doc}`fate_mapping`
-- {doc}`annotation`
-- {doc}`plotting`
+Feature labels are stored under `modules.cluster_key`, and `PTIME_MODULES`
+contains one mean-expression feature per assigned module. Parameter diagnostics
+and comparison with cluster marker genes are covered in
+{doc}`trajectory_analysis`.

@@ -6,7 +6,7 @@ import pytest
 from scarf import ArtifactRef
 from scarf.storage.artifacts import parse_artifact_path
 from scarf.graph.state import AssayState
-from tests.fixtures_datastore import build_atomic_graph
+from tests.fixtures_datastore import build_neighbourhood_graph
 
 pytestmark = pytest.mark.slow
 
@@ -44,13 +44,13 @@ def _state_refs(state: AssayState) -> dict[str, str]:
     }
 
 
-def test_atomic_graph_chain_writes_only_artifacts_and_state(
+def test_graph_construction_chain_writes_only_artifacts_and_state(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
     assay_attrs_before = dict(datastore.get_assay("RNA").attrs)
-    build_atomic_graph(datastore, **_graph_kwargs())
+    build_neighbourhood_graph(datastore, **_graph_kwargs())
     state = datastore.get_assay_state("RNA")
 
     assert state is not None
@@ -129,24 +129,24 @@ def test_atomic_graph_chain_writes_only_artifacts_and_state(
     assert lisi is not None
 
 
-def test_atomic_graph_chain_reuses_provenance(
+def test_graph_construction_chain_reuses_provenance(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
     kwargs = _graph_kwargs()
-    build_atomic_graph(datastore, **kwargs)
+    build_neighbourhood_graph(datastore, **kwargs)
     first = datastore.get_assay_state("RNA")
     assert first is not None
     first_refs = _state_refs(first)
 
-    build_atomic_graph(datastore, **kwargs)
+    build_neighbourhood_graph(datastore, **kwargs)
     reused = datastore.get_assay_state("RNA")
     assert reused is not None
     assert _state_refs(reused) == first_refs
 
 
-def test_atomic_graph_chain_records_pca_selection(
+def test_graph_construction_chain_records_pca_selection(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
@@ -156,7 +156,7 @@ def test_atomic_graph_chain_records_pca_selection(
     datastore.cells.insert("pca_cells", pca_cells, overwrite=True)
     kwargs = _graph_kwargs() | {"pca_cell_key": "pca_cells"}
 
-    build_atomic_graph(datastore, **kwargs)
+    build_neighbourhood_graph(datastore, **kwargs)
     first = datastore.get_assay_state("RNA")
     assert first is not None
 
@@ -175,7 +175,7 @@ def test_lsi_artifact_replay_keeps_requested_dimensions(
         "feat_scaling": False,
         "lsi_skip_first": True,
     }
-    build_atomic_graph(datastore, **kwargs)
+    build_neighbourhood_graph(datastore, **kwargs)
 
     state = datastore.get_assay_state("RNA")
     assert state is not None and state.reduction is not None
@@ -188,19 +188,19 @@ def test_lsi_artifact_replay_keeps_requested_dimensions(
     assert stored.feat_scaling is False
 
 
-def test_atomic_graph_chain_treats_structurally_invalid_cache_as_missing(
+def test_graph_construction_chain_treats_structurally_invalid_cache_as_missing(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
     kwargs = _graph_kwargs()
-    build_atomic_graph(datastore, **kwargs)
+    build_neighbourhood_graph(datastore, **kwargs)
     first = datastore.get_assay_state("RNA")
     assert first is not None and first.normalized is not None
     normalized_path = datastore.inspect_artifact(first.normalized).path
     del datastore.zw[normalized_path]["data"]
 
-    build_atomic_graph(datastore, **kwargs)
+    build_neighbourhood_graph(datastore, **kwargs)
     repaired = datastore.get_assay_state("RNA")
 
     assert repaired is not None and repaired.normalized is not None
@@ -214,7 +214,7 @@ def test_paris_writes_hierarchy_cut_and_dendrogram_artifacts(
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
-    build_atomic_graph(datastore, **_graph_kwargs())
+    build_neighbourhood_graph(datastore, **_graph_kwargs())
 
     result = datastore.run_paris_clustering(
         from_assay="RNA",
@@ -261,8 +261,8 @@ def test_integrated_graphs_use_random_artifacts_and_label_index(
 ) -> None:
     datastore = datastore_ephemeral
     _prepare_features(datastore)
-    build_atomic_graph(datastore, **_graph_kwargs())
-    build_atomic_graph(
+    build_neighbourhood_graph(datastore, **_graph_kwargs())
+    build_neighbourhood_graph(
         datastore,
         from_assay="assay2",
         cell_key="I",
@@ -322,7 +322,7 @@ def test_wnn_uses_exact_nondefault_cell_selection(
         datastore.RNA.feats.fetch_all("I__artifact_hvgs"),
         overwrite=True,
     )
-    build_atomic_graph(
+    build_neighbourhood_graph(
         datastore,
         from_assay="RNA",
         cell_key="wnn_cells",
@@ -335,7 +335,7 @@ def test_wnn_uses_exact_nondefault_cell_selection(
         harmony_params={"nclust": 5},
         local_cache=False,
     )
-    build_atomic_graph(
+    build_neighbourhood_graph(
         datastore,
         from_assay="assay2",
         cell_key="wnn_cells",

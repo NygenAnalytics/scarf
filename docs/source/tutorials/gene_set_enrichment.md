@@ -1,4 +1,5 @@
 ---
+description: Calculate per-cell gene-set activity with WAGGR or AUCell.
 jupytext:
   text_representation:
     extension: .md
@@ -13,10 +14,11 @@ kernelspec:
 
 (gene_set_enrichment)=
 
-# Gene-set enrichment
+# Gene-set activity scoring
 
 Score pathway or cell-state signatures per cell with WAGGR or AUCell. Both methods stream
-RNA counts from the Zarr store and persist their score matrices for later use.
+RNA counts from the Zarr store and persist activity scores for later use. These
+methods do not calculate enrichment p-values.
 
 ## Prerequisites
 
@@ -226,24 +228,6 @@ one aggregates weighted expression and the other measures within-cell rank recov
 - Reusing a label for different inputs without `overwrite=True`
 - Editing the count matrix outside Scarf after a result has been cached
 
-## Saved results
-
-Results are stored below `<assay>/enrichment/<label>`. Repeating an identical call returns
-the cached result. `overwrite=True` keeps the previous complete result available until its
-replacement has finished writing.
-
-```{code-cell} ipython3
-ds.get_enrichment('pbmc_waggr').storage_path
-```
-
-## Further reading
-
-- Aibar et al. 2017, SCENIC / AUCell: https://doi.org/10.1038/nmeth.4463
-- [Bioconductor AUCell vignette](https://bioconductor.org/packages/release/bioc/vignettes/AUCell/inst/doc/AUCell.html)
-
-## Next steps
-
-- {doc}`annotation`
-- {doc}`cell_cycle`
-- {doc}`data_organization`
-- {doc}`../reference/api/datastore`
+Scarf persists each score matrix. Repeating an identical call reuses its
+completed result; `overwrite=True` keeps the previous complete result available
+until replacement finishes.

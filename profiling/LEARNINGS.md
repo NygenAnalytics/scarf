@@ -582,7 +582,7 @@ Row-major makeGraph cgroup for mid sizes: 1M **28.3G**, 2.5M **32.6G**. 5M/10M c
 
 Latest same-container absolute cgroup peaks:
 
-| Cells | Modal / Scarf budget | Funnel peak | Driver | Atomic graph-chain max | Markers | Leiden |
+| Cells | Modal / Scarf budget | Funnel peak | Driver | Graph-construction chain max | Markers | Leiden |
 |------:|----------------------|------------:|--------|-----------------------:|--------:|-------:|
 | 1M | 32 / 24 GiB | **28.5 GiB** | findMarkers | 7.5 GiB | 28.4 GiB | 8.2 GiB |
 | 10M | 128 / 96 GiB | **105.0 GiB** | findMarkers | 23.0 GiB | 105.0 GiB | 34.6 GiB |
@@ -693,7 +693,7 @@ Tag `counts_t_extras_c8_m32_250k`. Config `profiling/layouts/250k_counts_t_extra
 | `runPseudotime` | PBA using Leiden first/last cluster as source/sink |
 | `prepareMappingQuery` | Build 25k query Zarr (prep cost) |
 | `runMapping` | Project 25k onto 250k reference (mapping cost only) |
-| `makeGraphHarmony` | Synthetic 4 batches plus the atomic Harmony graph chain |
+| `makeGraphHarmony` | Synthetic 4 batches plus the Harmony graph-construction chain |
 | `subsetZarr` | Export active cells to local Zarr |
 | `toH5ad` | Export assay to local H5AD |
 
@@ -837,8 +837,8 @@ from acquiring the same tag. Completed stage JSON files and a final
 
 The default graph path is now timed as separate operations:
 `runNormalization`, `runPca`, `buildEmbeddingInitialization`, `buildAnnIndex`,
-`queryNeighbors`, and `buildConnectivityMap`. Each operation publishes its
-artifact to assay state before the next DataStore reopen. The historical
+`queryNeighbors`, and `buildConnectivityMap`. Each operation selects its
+artifact in assay state before the next DataStore reopen. The historical
 `makeGraph` and `makeGraphHarmony` handlers remain selectable for old controls,
 but they are not part of the e2e funnel.
 
@@ -853,7 +853,7 @@ the value after normal object release. No forced garbage collection occurs
 between stages. `funnel.json` records the whole-invocation peak and final
 memory. Inner stage samplers preserve the outer sampler's cgroup peak and use
 sampled `memory.current` for stage attribution. Historical `makeGraph` timings
-above remain unchanged; sums of the new atomic stages include separate R2
+above remain unchanged; sums of the new graph-construction stages include separate R2
 reopens and are not strict equivalents.
 
 ## Same-container R2 e2e baseline (2026-07-27)

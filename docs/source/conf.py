@@ -20,6 +20,8 @@ extensions = [
     "sphinx_external_toc",
     "sphinx_copybutton",
     "sphinx_tabs.tabs",
+    "sphinx_reredirects",
+    "sphinxcontrib.mermaid",
     "myst_nb",
 ]
 # Explicit autosummary/autodoc on reference pages only. Do not enable recursive
@@ -40,11 +42,6 @@ exclude_patterns = [
     "**.ipynb_checkpoints",
     "vignettes/dev",
     "tutorials/dev",
-    # Retired tutorial stubs (anchors preserved on destination pages).
-    "tutorials/choosing_integration_methods.md",
-    "tutorials/imputation.md",
-    "tutorials/integration_metrics.md",
-    "tutorials/multimodal_integration.md",
     "scarf_datasets",
     "**/scarf_datasets",
 ]
@@ -54,6 +51,14 @@ language = "en"
 
 external_toc_path = "toctree.yml"
 external_toc_exclude_missing = False
+redirects = {
+    "tutorials/atomic_graph_operations": "custom_graph_construction.html",
+    "concepts/graph_and_state": "../tutorials/custom_graph_construction.html",
+    "reference/api/graph_ops": "graph_construction.html",
+    "tutorials/dimensionality_reduction_and_clustering": (
+        "dimensionality_reduction.html"
+    ),
+}
 myst_enable_extensions = [
     "colon_fence",
 ]
@@ -66,7 +71,7 @@ html_title = "Scarf documentation"
 html_baseurl = "https://scarf.readthedocs.io/en/latest/"
 html_theme_options = {
     "repository_url": "https://github.com/parashardhapola/scarf",
-    "home_page_in_toc": True,
+    "home_page_in_toc": False,
     "path_to_docs": "docs/source",
     "show_navbar_depth": 2,
     "use_repository_button": True,
@@ -118,6 +123,7 @@ nitpick_ignore = [
     ("py:class", "collections.abc.Sequence"),
     ("py:class", "collections.abc.Generator"),
     ("py:class", "scarf.matrix.ChunkedArray"),
+    ("py:class", "scarf.storage.partition.IndexBlock"),
     ("py:class", "scarf.neighbors.stream.AnnStream"),
     ("py:class", "scarf.merge.DummyAssay"),
     ("py:class", "scarf.readers.CrReader"),

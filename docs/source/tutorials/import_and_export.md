@@ -1,4 +1,5 @@
 ---
+description: Inspect and convert common count formats, then export complete or selected data.
 jupytext:
   text_representation:
     extension: .md
@@ -33,7 +34,7 @@ counts or metadata to interoperable formats.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='ERROR', progress=False)
 ```
 
 ### 1. Download datasets from Cytebase
@@ -114,15 +115,22 @@ writer.dump()
 
 #### From AnnData H5AD file format
 
+H5AD files vary in where they store counts, feature names, metadata, and
+layers. Inspect the file before conversion rather than assuming `X`, `obs`, and
+`var` contain the intended values.
+
 ```{code-cell} ipython3
-# H5adReader takes the path to the .h5ad file directly.
-# In this catalog file, the feature index contains the gene names.
-reader = scarf.H5adReader(
-    f'{h5ad_dir}/data.h5ad',
-    cell_ids_key='index',
-    feature_ids_key='index',
-    feature_name_key='index',
-)
+h5ad_path = f'{h5ad_dir}/data.h5ad'
+inspection = scarf.inspect_h5ad(h5ad_path)
+inspection
+```
+
+`H5adReader.from_inspect` uses the discovered matrix and metadata keys. Override
+the inspection only after confirming that another layer contains the raw count
+matrix required by the analysis.
+
+```{code-cell} ipython3
+reader = scarf.H5adReader.from_inspect(inspection)
 
 # change value of `zarr_loc` to your choice of filename and path
 writer = scarf.H5adToZarr(
@@ -131,6 +139,15 @@ writer = scarf.H5adToZarr(
 )
 writer.dump()
 ```
+
+Categorical columns are decoded from category codes. Missing categorical or
+object values become `None`; missing numeric nullable values become `NaN`.
+Unsupported group-encoded columns are skipped with a warning rather than
+treated as valid metadata.
+
+Supported dense `obsm` arrays with one row per cell are flattened into numbered
+cell columns. For example, a two-column `X_umap` array becomes `X_umap1` and
+`X_umap2`. Sparse or row-mismatched `obsm` entries are warned about and skipped.
 
 Conversion from [Loom](https://loompy.org/) file formats is also supported using `scarf.LoomReader` and `scarf.LoomToZarr` which can be used in similar fashion as other readers and writers.
 
@@ -146,6 +163,20 @@ Conversion from [Loom](https://loompy.org/) file formats is also supported using
 ds = scarf.DataStore('scarf_datasets/differentiating_pancreatic_cells.zarr')
 
 ds
+```
+
+Check the imported cell columns before relying on transferred labels or
+embeddings:
+
+```{code-cell} ipython3
+{
+    "cellColumns": ds.cells.columns[:12],
+    "embeddingColumns": [
+        name
+        for name in ds.cells.columns
+        if str(name).startswith(("X_umap", "X_tsne"))
+    ],
+}
 ```
 
 ```{code-cell} ipython3
@@ -167,6 +198,56 @@ scarf.writers.to_h5ad(
     assay=ds.RNA,
     h5ad_filename='scarf_datasets/diff_pancreas.h5ad'
 )
+```
+
+Full-assay export can require enough memory and disk for the selected cell by
+feature matrix. When only a marker panel is needed, select features before
+materializing AnnData:
+
+```{code-cell} ipython3
+all_names = ds.RNA.feats.fetch_all("names").astype(str)
+name_lookup = {name.upper(): name for name in all_names}
+panel = [
+    name_lookup[gene]
+    for gene in ["GCG", "INS", "SST", "KRT19"]
+    if gene in name_lookup
+]
+if not panel:
+    panel = all_names[:4].tolist()
+selected = ds.to_anndata(
+    from_assay="RNA",
+    cell_key="I",
+    matrix="raw",
+    feature_names=panel,
+)
+selected.shape, selected.var_names.tolist()
+```
+
+Use `feature_indexes` instead when stable feature rows are already available.
+`feature_names` and `feature_indexes` are mutually exclusive, preserve the
+requested order, and reject duplicate or unknown selections.
+
+`to_h5ad` writes recognized UMAP and t-SNE coordinate pairs to `obsm`.
+`DataStore.to_anndata` currently leaves layout coordinates as ordinary `obs`
+columns. This distinction matters when another tool expects `obsm["X_umap"]`.
+
+Writers also accept remote Zarr locations. Choose the `cloud` profile for an
+object-store destination and pass credentials through the environment or
+runtime configuration:
+
+```python
+import os
+
+writer = scarf.H5adToZarr(
+    reader,
+    zarr_loc="s3://my-bucket/project/data.zarr",
+    storage_options={
+        "access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
+        "secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
+    },
+    profile="cloud",
+)
+writer.dump()
 ```
 
 ### 4. Convert a CSV matrix to Zarr
@@ -288,20 +369,10 @@ page does not execute a Loom example.
 - Reusing an existing Zarr output path without confirming that it can be overwritten
 - Exporting normalized values when a downstream method requires raw counts
 - Using `DatasetMerge` when you only need one assay from each store (`AssayMerge` is enough)
+- Assuming an H5AD file uses `X` for raw counts without inspecting its layers
+- Expecting sparse or malformed `obsm` arrays to be imported as embeddings
+- Materializing a full AnnData object when a feature panel would answer the export question
 
-## Saved results
-
-Conversion writes a Zarr directory at `zarr_loc`. Export commands write the requested MTX or
-H5AD file at the supplied destination. `DatasetMerge` writes the merged store at `zarr_path`.
-
-## Further reading
-
-- [AnnData / H5AD](https://anndata.readthedocs.io/)
-- [Loom](https://loompy.org/)
-- [scverse](https://scverse.org/)
-
-## Next steps
-
-- {doc}`data_organization`
-- {doc}`scatac_seq`
-- {doc}`cite_seq`
+Conversion writes the requested Zarr target. Export commands write MTX or H5AD
+at the supplied destination, and `DatasetMerge` writes its merged store at
+`zarr_path`.

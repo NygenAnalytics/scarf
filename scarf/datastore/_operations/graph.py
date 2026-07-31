@@ -1357,7 +1357,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         elif current.kind == "normalized":
             normalized = current
         else:
-            raise ValueError(f"Cannot publish graph state from {terminal.kind!r}")
+            raise ValueError(f"Cannot select graph state from {terminal.kind!r}")
         assert normalized is not None
         normalized_status = self._require_complete_artifact(
             normalized,
@@ -1808,7 +1808,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             renormalize_subset: Whether to recompute size factors for the
                 selected feature subset. When omitted, reuse the selected
                 artifact setting or default to true.
-            update_state: Publish the result as the assay's current normalized
+            update_state: Select the result as the assay's current normalized
                 artifact.
             invalidate_cache: Force a new artifact instead of reusing an
                 identical complete result.
@@ -2367,7 +2367,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 stores.
             show_elbow_plot: Whether to display explained variance after a new
                 PCA fit.
-            update_state: Publish the result as the current reduction.
+            update_state: Select the result as the current reduction.
             invalidate_cache: Force a new reduction artifact.
 
         Returns:
@@ -2415,7 +2415,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size: Number of selected cells processed per block.
             local_cache: Local staging policy for normalized data on remote
                 stores.
-            update_state: Publish the result as the current reduction.
+            update_state: Select the result as the current reduction.
             invalidate_cache: Force a new reduction artifact.
 
         Returns:
@@ -2460,7 +2460,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size: Number of selected cells processed per block.
             local_cache: Local staging policy for normalized data on remote
                 stores.
-            update_state: Publish the result as the current reduction.
+            update_state: Select the result as the current reduction.
             invalidate_cache: Force a new reduction artifact.
 
         Returns:
@@ -2821,7 +2821,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size: Number of cells processed per block.
             kmeans_sampling: Fraction of cells considered during centroid seeding.
             kmeans_batch_size: Number of cells per internal K-means update.
-            update_state: Publish the result as the current embedding
+            update_state: Select the result as the current embedding
                 initialization.
             invalidate_cache: Force a new initialization artifact.
 
@@ -3178,7 +3178,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             from_assay: Assay used to resolve current neighbors.
             local_connectivity: UMAP-style local-connectivity adjustment.
             bandwidth: Distance-kernel bandwidth multiplier.
-            update_state: Publish the result as the current connectivity map.
+            update_state: Select the result as the current connectivity map.
             invalidate_cache: Force a new connectivity artifact.
 
         Returns:

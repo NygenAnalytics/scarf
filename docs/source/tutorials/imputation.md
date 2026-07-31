@@ -1,8 +1,114 @@
 ---
-description: Graph-based imputation moved into the scRNA-seq tutorial.
+description: Smooth sparse expression over a neighbourhood graph and compare it with observed values.
+jupytext:
+  text_representation:
+    extension: .md
+    format_name: myst
+    format_version: 0.13
+    jupytext_version: 1.14.1
+kernelspec:
+  display_name: Python 3 (ipykernel)
+  language: python
+  name: python3
 ---
+
+(imputation)=
 
 # Imputation
 
-Graph diffusion imputation with `get_imputed` is covered in
-{ref}`Feature imputation <imputation>` on the scRNA-seq tutorial.
+Dropout makes observed single-cell expression sparse. Scarf can diffuse a
+feature over the neighbourhood graph to reveal coherent regional patterns.
+Imputation is a visualization and exploratory-analysis aid. It does not create
+new molecular observations and should not replace counts in differential
+expression.
+
+## Build the graph
+
+```{code-cell} ipython3
+import scarf
+import scarf.plotting as splt
+
+scarf.configure_output(level="WARNING", progress=False)
+
+dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
+    "tenx_5K_pbmc_rnaseq",
+    destination="scarf_datasets",
+    zarr=True,
+)
+ds = scarf.DataStore(
+    f"{dataset}/data.zarr",
+    nthreads=4,
+    min_features_per_cell=10,
+)
+ds.filter_cells(
+    attrs=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
+    highs=[15000, 4000, 15],
+    lows=[1000, 500, 0],
+    reset_previous=True,
+)
+if "I__hvgs" not in ds.RNA.feats.columns:
+    ds.mark_hvgs(
+        min_cells=20,
+        top_n=500,
+        show_plot=False,
+    )
+ds.run_normalization(feat_key="hvgs")
+ds.run_pca(dims=15)
+ds.build_embedding_initialization()
+ds.build_ann_index()
+ds.query_neighbors(k=11)
+ds.build_connectivity_map()
+ds.run_umap(
+    n_epochs=150,
+    spread=5,
+    min_dist=1,
+    parallel=True,
+)
+```
+
+## Diffuse one feature
+
+`t` controls diffusion depth. A larger value mixes information over more graph
+steps and can erase real boundaries.
+
+```{code-cell} ipython3
+for t in (1, 2, 4):
+    ds.cells.insert(
+        f"CD4_imputed_t{t}",
+        ds.get_imputed(feature_name="CD4", t=t),
+        overwrite=True,
+    )
+```
+
+```{code-cell} ipython3
+imputation_comparison = ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by=[
+        "CD4",
+        "CD4_imputed_t1",
+        "CD4_imputed_t2",
+        "CD4_imputed_t4",
+    ],
+    n_columns=4,
+    color_scale=splt.ColorScale(scope="shared"),
+    sort_values=True,
+    show_titles=False,
+    show=False,
+)
+for axis, title in zip(
+    imputation_comparison.axes.values(),
+    ("Observed CD4", "Diffusion t=1", "Diffusion t=2", "Diffusion t=4"),
+    strict=True,
+):
+    axis.set_title(title)
+```
+
+The imputed panels should fill gaps inside the same high-expression
+neighbourhoods visible in the observed panel. Signal spreading across unrelated
+populations indicates excessive diffusion or a graph that does not represent
+the intended biology.
+
+The diffusion operator is cached with the graph, while inserted columns such as
+`CD4_imputed_t2` are explicit cell metadata. Do not interpret a nonzero imputed
+value as detection in that cell, use it for marker significance, or feed it to
+replicate-aware differential expression.

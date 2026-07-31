@@ -1,5 +1,5 @@
 ---
-description: Figures through the DataStore plotting namespace.
+description: Build, combine, and save analysis figures with Scarf's plotting API.
 jupytext:
   text_representation:
     extension: .md
@@ -28,13 +28,16 @@ such as color and normalization scales.
 ## What you will learn
 
 - Draw embedding, dotplot, matrixplot, composition, and distribution figures
-- Control legends, themes, and point size
-- Save figures to PNG, PDF, SVG, or TIFF
+- Focus embedding regions with facets, highlights, and density contours
+- Compose caller-owned panels with shared scales and legends
+- Save figures with exact dimensions and provenance
 
 ## Dataset
 
 ```{code-cell} ipython3
 from pathlib import Path
+
+import matplotlib.pyplot as plt
 
 import scarf
 import scarf.plotting as splt
@@ -102,6 +105,75 @@ ds.plots.embedding_raster(
     pixels=400,
 );
 ```
+
+### Facets and coordinated layouts
+
+`facet_by` separates one layout by a categorical cell column. Use it when each
+panel answers the same question for a defined group, and keep the colour scale
+shared so intensities remain comparable.
+
+```{code-cell} ipython3
+shared_expression_scale = splt.ColorScale(
+    cmap="magma",
+    quantiles=(0.0, 0.99),
+)
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="Ins2",
+    facet_by="clusters",
+    groups=["Alpha", "Beta", "Delta"],
+    color_scale=shared_expression_scale,
+    sort_values=True,
+    n_columns=3,
+);
+```
+
+Pass several layout keys when the same values need to be compared across
+embeddings. The panels remain coordinated views of one cell table, not
+independent analyses.
+
+### Highlights and density contours
+
+`Highlight` keeps context cells visible while emphasizing a selected group.
+`DensityOverlay(statistic="mean")` adds contours around regions with high local
+continuous signal.
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by=None,
+    default_color="#bdbdbd",
+    point_alpha=0.4,
+    highlight=splt.Highlight(
+        by="clusters",
+        groups=("Beta",),
+        color="#d62728",
+        dim_alpha=0.12,
+        size_multiplier=1.35,
+        halo_width=0.4,
+    ),
+);
+```
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="Ins2",
+    color_scale=shared_expression_scale,
+    sort_values=True,
+    density_overlay=splt.DensityOverlay(
+        statistic="mean",
+        pixels=60,
+        sigma=4.2,
+        min_support=0.35,
+        levels=(0.9,),
+        max_hotspots=1,
+    ),
+);
+```
+
+Contours summarize a smoothed display layer. They do not alter stored values or
+define a cluster boundary.
 
 ---
 
@@ -238,6 +310,25 @@ ds.plots.distribution(
 );
 ```
 
+Stacked violins align several marker distributions on one categorical axis.
+This is useful when the question is whether a small marker panel separates the
+annotated populations.
+
+```{code-cell} ipython3
+ds.plots.distribution(
+    keys=["Gcg", "Ins2", "Sst"],
+    group_by="clusters",
+    groups=["Alpha", "Beta", "Delta"],
+    normalization=splt.NormalizationSpec(transform="log1p"),
+    kind="stacked_violin",
+    share_y=True,
+    max_points=600,
+);
+```
+
+For replicated studies, add `sample_by` to summarize biological samples rather
+than displaying every cell as an independent replicate.
+
 ---
 
 ### 6. Save figures
@@ -257,9 +348,81 @@ result = ds.plots.embedding(
     color_by="clusters",
     show=False,
 )
-result.save(out, dpi=200)
+result.save(
+    out,
+    dpi=200,
+    exact_size=True,
+    provenance_sidecar=True,
+)
 assert out.exists()
+assert out.with_suffix(out.suffix + ".json").exists()
 result.close()
+```
+
+`exact_size=True` preserves the figure's physical inch size. Set it to `False`
+only when a tight crop is more important than exact dimensions.
+`provenance_sidecar=True` writes the data selection, renderer, scales, and plot
+settings to a sibling JSON file.
+
+### Compose a publication-style figure
+
+`target=` draws a plot into caller-owned Matplotlib axes. `compose_results`
+collects the child results, can consolidate legends, and retains their
+provenance. Here both continuous panels use the same `ColorScale`.
+
+```{code-cell} ipython3
+with splt.theme_context("paper"):
+    figure, axes = plt.subplots(
+        1,
+        2,
+        figsize=(7.2, 3.2),
+        layout="constrained",
+    )
+    children = {
+        "annotation": ds.plots.embedding(
+            layout_key="RNA_UMAP",
+            color_by="clusters",
+            legend_loc="on_data",
+            show_legend=False,
+            show_titles=False,
+            target=axes[0],
+            theme="paper",
+            show=False,
+        ),
+        "expression": ds.plots.embedding(
+            layout_key="RNA_UMAP",
+            color_by="Ins2",
+            color_scale=shared_expression_scale,
+            sort_values=True,
+            show_titles=False,
+            target=axes[1],
+            theme="paper",
+            show=False,
+        ),
+    }
+    composite = splt.compose_results(
+        figure,
+        children,
+        panel_labels=False,
+        shared_legends=True,
+    )
+    splt.label_panels(axes, labels=("A", "B"))
+figure
+```
+
+The figure belongs to the caller because Matplotlib created it. Save through
+`composite.save(...)` when provenance is needed, then close it explicitly.
+
+```{code-cell} ipython3
+composite_out = (
+    Path("scarf_datasets") / "plotting_publication_composite.svg"
+)
+composite.save(
+    composite_out,
+    exact_size=True,
+    provenance_sidecar=True,
+)
+plt.close(figure)
 ```
 
 ```{note}
@@ -278,7 +441,11 @@ Workflow chapters call a few standalone diagnostics:
 - `mark_hvgs(..., show_plot=True)` or `scarf.plotting.highly_variable_features` shows the
   mean-variance relationship used for HVG selection
 
-See {doc}`dimensionality_reduction_and_clustering` and {doc}`scrna_seq` for executable
+`marker_heatmap` chooses each group's top features by stored marker `score`,
+with feature name as a deterministic tie-breaker. Adjusted p-values support
+interpretation but do not control top-N selection.
+
+See {doc}`dimensionality_reduction`, {doc}`clustering`, and {doc}`scrna_seq` for executable
 examples. Keep diagnostic plots next to the analysis step that produces the values they
 inspect.
 
@@ -287,14 +454,4 @@ inspect.
 - Passing a layout key or metadata column that is not present in the store
 - Using a continuous color scale for categorical labels
 - Calling `save` without closing figures in a long-running batch workflow
-
-## Saved results
-
-Plot functions return a `PlotResult`. `PlotResult.save` writes the requested file; plot calls do
-not modify the Zarr store unless the preceding analysis code inserts metadata columns.
-
-## Next steps
-
-- {doc}`annotation`
-- {doc}`data_organization`
-- {doc}`import_and_export`
+- Adding repeated UMAP panels that differ only by decoration and answer no new question

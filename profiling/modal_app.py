@@ -13,7 +13,7 @@ disconnects:
 prepare / run / run-all / run-local / run-e2e spawn and return immediately.
 run-all fans out one size pipeline per container (stages stay sequential on R2).
 run-local runs the full funnel in one container on ephemeral-disk Zarr (fast_local).
-run-e2e runs the atomic core in one container while keeping Zarr on R2.
+run-e2e runs the graph-construction core in one container while keeping Zarr on R2.
 Watch progress with: modal app logs scarf-profiling --env scarf_profiling
 """
 
@@ -580,7 +580,7 @@ def run_e2e_funnel_body(
     configDict: dict[str, Any],
     nRows: int,
 ) -> dict[str, Any]:
-    """Run the atomic core once in one container against a fresh R2 store."""
+    """Run the graph-construction core once in one container against a fresh R2 store."""
     config = ProfilingConfig.model_validate(configDict)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     if nRows not in config.targetSizes:
@@ -983,7 +983,7 @@ def main(*arg_list: str) -> None:
 
     e2e_parser = sub.add_parser(
         "run-e2e",
-        help="One-container atomic funnel with a fresh R2 Zarr store",
+        help="One-container graph-construction funnel with a fresh R2 Zarr store",
     )
     e2e_parser.add_argument("--config", required=True)
     e2e_parser.add_argument("--size", type=int, required=True)

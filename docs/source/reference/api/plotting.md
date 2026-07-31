@@ -1,4 +1,4 @@
-# Plotting
+# Plotting API reference
 
 `scarf.plotting` is Scarf's plotting API. Import it as `splt` and call functions such as
 `splt.embedding(...)`, `splt.dotplot(...)`, and `splt.cluster_tree(...)`.

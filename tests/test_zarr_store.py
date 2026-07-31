@@ -124,6 +124,34 @@ def test_remote_store_uses_obstore_without_mutating_profile(monkeypatch):
     assert resolve_storage_profile("/tmp/data.zarr") == "fast_local"
 
 
+def test_hugging_face_store_uses_fsspec(monkeypatch):
+    sentinel = object()
+    captured = {}
+
+    def from_url(url, *, storage_options=None, read_only=False):
+        captured.update(
+            url=url,
+            storageOptions=storage_options,
+            readOnly=read_only,
+        )
+        return sentinel
+
+    monkeypatch.setattr("zarr.storage.FsspecStore.from_url", from_url)
+
+    store = make_store(
+        "hf://buckets/Nygen/cytebase/demo/data.zarr",
+        storage_options={"token": False},
+        read_only=True,
+    )
+
+    assert store is sentinel
+    assert captured == {
+        "url": "hf://buckets/Nygen/cytebase/demo/data.zarr",
+        "storageOptions": {"token": False},
+        "readOnly": True,
+    }
+
+
 def test_count_plan_uses_aligned_five_chunk_shards():
     spec = count_array_spec(
         250_000,

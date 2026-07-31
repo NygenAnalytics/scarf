@@ -9,7 +9,9 @@ highly variable genes
   Features selected with `mark_hvgs` for neighbourhood-graph construction.
 
 neighbourhood graph
-  KNN graph of cells built by atomic graph operations or `ds.pipeline.run`. Embeddings, clustering, mapping, and multimodal integration reuse this graph.
+  KNN graph of cells built by individual graph-construction methods or
+  `ds.pipeline.run`. Embeddings, clustering, mapping, and multimodal integration
+  reuse this graph.
 
 
 cell key

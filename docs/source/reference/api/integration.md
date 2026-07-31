@@ -1,7 +1,33 @@
-# Integration and metrics
+# Integration and metrics API reference
 
-Prefer `DataStore.metric_*` in analysis code. The functions below are the underlying
-implementations.
+Prefer the `DataStore` methods below in analysis code.
+
+## DataStore methods
+
+```{eval-rst}
+.. autosummary::
+   :nosignatures:
+
+   scarf.DataStore.integrate_assays
+   scarf.DataStore.metric_lisi
+   scarf.DataStore.metric_ilisi
+   scarf.DataStore.metric_clisi
+   scarf.DataStore.metric_proportional_batch_mixing
+   scarf.DataStore.metric_graph_connectivity
+   scarf.DataStore.metric_graph_silhouette
+   scarf.DataStore.metric_label_concordance
+```
+
+```{eval-rst}
+.. automethod:: scarf.DataStore.integrate_assays
+.. automethod:: scarf.DataStore.metric_lisi
+.. automethod:: scarf.DataStore.metric_ilisi
+.. automethod:: scarf.DataStore.metric_clisi
+.. automethod:: scarf.DataStore.metric_proportional_batch_mixing
+.. automethod:: scarf.DataStore.metric_graph_connectivity
+.. automethod:: scarf.DataStore.metric_graph_silhouette
+.. automethod:: scarf.DataStore.metric_label_concordance
+```
 
 ## Harmony
 
@@ -25,10 +51,6 @@ implementations.
     :members: compute_lisi, ilisi_knn, clisi_knn, graph_connectivity, silhouette_scoring, label_concordance_score, lisi_batch_mixing_score
     :imported-members:
 ```
-
-See also `DataStore.metric_lisi`, `metric_ilisi`, `metric_clisi`,
-`metric_proportional_batch_mixing`, `metric_graph_connectivity`,
-`metric_graph_silhouette`, and `metric_label_concordance` on {doc}`datastore`.
 
 Scarf's iLISI and cLISI use the scIB median and scaling definitions over
 Scarf's self-free persisted KNN arrays. Graph connectivity follows the

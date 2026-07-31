@@ -1,5 +1,5 @@
 ---
-description: Reuse upstream artifacts, invalidate downstream steps, and walk provenance inputs.
+description: Reuse upstream artifacts, branch parameters, and inspect lineage reports.
 jupytext:
   text_representation:
     extension: .md
@@ -28,7 +28,7 @@ ones. Read {doc}`../concepts/provenance` for the identity rules.
 - Reuse normalization, PCA, and ANN when only neighbor `k` changes
 - Rebuild reduction and everything downstream when `dims` changes
 - Force a new artifact with `invalidate_cache=True`
-- Walk `inputs` from a connectivity artifact back to selections
+- Compare upstream lineage for several connectivity artifacts
 
 ## Dataset
 
@@ -59,8 +59,8 @@ if 'I__hvgs' not in ds.RNA.feats.columns:
 
 ## Build a baseline chain
 
-Keep `update_state=False` so side comparisons do not move the published state
-until you choose a winner.
+Keep `update_state=False` so side comparisons do not replace the current
+analysis chain until you choose a branch.
 
 ```{code-cell} ipython3
 normalized = ds.run_normalization(
@@ -124,29 +124,28 @@ print('complete:', status.complete)
 print('operation:', status.operation)
 ```
 
-## Walk inputs
+## Compare lineage
 
-There is no package lineage helper yet. Recurse through `status.inputs`:
+Build one read-only report from both neighbour-count branches. The report
+shares their common normalization, PCA, and ANN nodes instead of repeating
+them:
 
 ```{code-cell} ipython3
-def walk_inputs(store, ref, prefix=''):
-    status = store.inspect_artifact(ref)
-    print(f'{prefix}{ref.kind} ({status.operation})')
-    for name, value in (status.inputs or {}).items():
-        if isinstance(value, dict) and value.get('type') == 'artifact':
-            walk_inputs(
-                store,
-                scarf.ArtifactRef.from_dict(value),
-                prefix=prefix + '  ',
-            )
-        else:
-            print(f'{prefix}  {name}: {value}')
-
-walk_inputs(ds, graph_k11)
+lineage = ds.lineage(
+    {
+        'k11 graph': graph_k11,
+        'k15 graph': graph_k15,
+    }
+)
+print(lineage)
 ```
 
-## Next steps
+The graph should branch after the ANN index because only `k` changed. Export
+the same report when it needs to travel with an analysis:
 
-- {doc}`../concepts/provenance`
-- {doc}`atomic_graph_operations`
-- {doc}`data_organization`
+```{code-cell} ipython3
+print(lineage.to_mermaid())
+```
+
+`lineage.to_markdown()` adds artifact details below the Mermaid source. It is
+suited to a notebook, issue, or analysis record that supports Mermaid.

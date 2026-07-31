@@ -1,5 +1,5 @@
 ---
-description: CITE-seq analysis in Scarf covering per-assay processing and multimodal graph integration.
+description: Process RNA and ADT assays, then integrate their neighbourhood graphs.
 jupytext:
   text_representation:
     extension: .md
@@ -12,14 +12,15 @@ kernelspec:
   name: python3
 ---
 
-# CITE-seq analysis
+# RNA and protein integration with CITE-seq
 
 CITE-seq measures RNA counts and antibody-derived tags (ADT) in the same cells. Scarf keeps
 both as separate assays in one store, so each modality is processed with its own
 normalization and graph, and the two can then be compared or merged.
 
-This chapter processes RNA and ADT independently, compares what each modality sees, and
-merges the two graphs with SNN and WNN.
+This tutorial processes RNA and ADT independently, then builds one integrated
+graph. It shows SNN and WNN because combining modalities is the central outcome,
+while method comparison and tuning remain in {doc}`multimodal_integration`.
 
 ## Prerequisites
 
@@ -31,8 +32,8 @@ merges the two graphs with SNN and WNN.
 - Open a store holding two assays and filter cells on the default assay
 - Drop control antibodies from an ADT panel
 - Build an ADT graph without dimension reduction
-- Compare RNA and ADT clusters against each other
-- Merge both graphs with shared nearest neighbors (SNN) and weighted nearest neighbors (WNN)
+- Inspect one coordinated RNA and ADT checkpoint
+- Integrate both graphs with shared nearest neighbours (SNN) and weighted nearest neighbours (WNN)
 
 ## Dataset
 
@@ -40,6 +41,7 @@ merges the two graphs with SNN and WNN.
 `RNA` and `ADT`.
 
 ```{code-cell} ipython3
+import matplotlib.pyplot as plt
 import numpy as np
 import scarf
 
@@ -52,7 +54,7 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 )
 ```
 
-## 1) Open the multimodal store
+## 1. Open and filter the multimodal store
 
 `default_assay` decides which assay unqualified calls act on. Cell filtering and QC always
 run on the default assay, so set it to `RNA` here.
@@ -81,7 +83,7 @@ ds.auto_filter_cells()
 the QC distributions before and after that filter. Because the key is shared, the ADT assay
 analyzes the same cells.
 
-## 2) Process the RNA assay
+## 2. Process the RNA assay
 
 These are the steps from {doc}`scrna_seq`, so the narrative here is brief.
 
@@ -124,7 +126,10 @@ ds.plots.embedding(
 )
 ```
 
-## 3) Process the ADT assay
+The RNA layout should recover broad PBMC structure. A dominant region aligned
+with low counts suggests the shared cell selection needs more inspection.
+
+## 3. Process the ADT assay
 
 ADT panels hold tens of antibodies rather than thousands of genes, which changes two things:
 there is no feature selection step, and control antibodies have to be removed by hand.
@@ -142,7 +147,7 @@ inspect the names before choosing a pattern.
 ```{code-cell} ipython3
 adt_panel = ds.ADT.feats.to_pandas_dataframe(['names'])
 adt_panel['is_control'] = adt_panel['names'].str.contains('control')
-adt_panel
+adt_panel[adt_panel['is_control']]
 ```
 
 `update_key` takes a boolean array and marks features `False` as inactive, so pass the
@@ -176,7 +181,6 @@ ds.build_embedding_initialization(from_assay='ADT', n_centroids=100)
 ds.build_ann_index(from_assay='ADT')
 ds.query_neighbors(from_assay='ADT', k=21)
 ds.build_connectivity_map(from_assay='ADT')
-ds.load_graph(from_assay='ADT')
 ```
 
 ```{note}
@@ -199,7 +203,6 @@ ds.run_leiden_clustering(
     from_assay='ADT',
     resolution=1
 )
-sorted(c for c in ds.cells.columns if c.startswith('ADT_'))
 ```
 
 ```{code-cell} ipython3
@@ -209,71 +212,47 @@ ds.plots.embedding(
 )
 ```
 
-## 4) Compare the two modalities
+The ADT layout should resolve protein-defined populations without being
+dominated by control antibodies.
+
+## 4. Integrate the modalities
 
 Each modality now has its own embedding and its own clusters over the same cells. Plotting
 one modality's clusters on the other's layout shows where they agree.
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key=['RNA_UMAP', 'ADT_UMAP'],
-    color_by=['ADT_leiden_cluster', 'RNA_leiden_cluster'],
-    n_columns=2,
-    point_size=5,
-    legend_loc='on_data',
+figure, axes = plt.subplots(2, 2, figsize=(9, 8))
+modality_panels = (
+    ("RNA layout, RNA clusters", "RNA_UMAP", "RNA_leiden_cluster"),
+    ("RNA layout, ADT clusters", "RNA_UMAP", "ADT_leiden_cluster"),
+    ("ADT layout, RNA clusters", "ADT_UMAP", "RNA_leiden_cluster"),
+    ("ADT layout, ADT clusters", "ADT_UMAP", "ADT_leiden_cluster"),
 )
+for axis, (title, layout_key, color_by) in zip(
+    axes.flat, modality_panels, strict=True
+):
+    ds.plots.embedding(
+        layout_key=layout_key,
+        color_by=color_by,
+        point_size=5,
+        legend_loc="on_data",
+        show_titles=False,
+        target=axis,
+        show=False,
+    )
+    axis.set_title(title)
+figure.tight_layout()
 ```
 
-A cross tabulation counts cells shared by each pair of clusters, with RNA clusters on rows
-and ADT clusters on columns.
-
-```{code-cell} ipython3
-import pandas as pd
-
-overlap = pd.crosstab(
-    ds.cells.fetch('RNA_leiden_cluster'),
-    ds.cells.fetch('ADT_leiden_cluster')
-)
-overlap
-```
-
-One way to summarize that table is to ask, for each ADT cluster, what share of its cells
-fall in a single RNA cluster. Values near 100 mean the ADT cluster maps onto one
-transcriptional population.
-
-```{code-cell} ipython3
-(100 * overlap.max() / overlap.sum()).round(1).sort_values(ascending=False)
-```
-
-Individual antibodies and their coding genes can be placed on either layout. CD16 protein
-and its gene `FCGR3A` are a useful pair to check.
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key=['RNA_UMAP', 'ADT_UMAP'],
-    color_by='CD16_TotalSeqB',
-    from_assay='ADT',
-    n_columns=2,
-    point_size=5,
-)
-```
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key=['RNA_UMAP', 'ADT_UMAP'],
-    color_by='FCGR3A',
-    from_assay='RNA',
-    n_columns=2,
-    point_size=5,
-)
-```
-
-Protein signal is usually smoother than the matching transcript, which is one reason to
-combine the modalities rather than pick one.
+The panels need not match one-to-one. They should nevertheless show related
+broad populations. A modality split that is completely absent from the other
+can reflect real complementarity, assay noise, or a graph mismatch. The
+{doc}`multimodal_integration` guide evaluates those possibilities with
+normalized overlap and protein-versus-RNA checks.
 
 (multimodal_integration)=
 
-## 5) Merge the graphs with SNN
+### Shared nearest neighbours
 
 Comparing clusters is descriptive. Integration goes further and produces a single graph, so
 one embedding and one set of clusters describe both modalities.
@@ -305,11 +284,10 @@ ds.run_leiden_clustering(
     integrated_graph='RNA+ADT',
     resolution=1.75
 )
-sorted(c for c in ds.cells.columns if c.startswith('RNA+ADT'))
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
+snn_comparison = ds.plots.embedding(
     layout_key='RNA+ADT_UMAP',
     color_by=[
         'RNA_leiden_cluster',
@@ -318,7 +296,16 @@ ds.plots.embedding(
     ],
     legend_loc='on_data',
     n_columns=3,
+    show_titles=False,
+    show=False,
 )
+for axis, title in zip(
+    snn_comparison.axes.values(),
+    ("RNA clusters", "ADT clusters", "SNN clusters"),
+    strict=True,
+):
+    axis.set_title(title)
+snn_comparison.figure.tight_layout()
 ```
 
 The first two panels show where each modality alone would split these cells; the third shows
@@ -326,7 +313,7 @@ the partition the merged graph supports.
 
 (wnn_integration)=
 
-## 6) Merge the graphs with WNN
+### Weighted nearest neighbours
 
 SNN treats both modalities equally and accepts two or more assays. Weighted nearest
 neighbors instead learns a per-cell weight for each modality, so cells whose identity is
@@ -353,22 +340,37 @@ ds.run_leiden_clustering(
 ```
 
 ```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key=['RNA+ADT_UMAP', 'RNA+ADT_wnn_UMAP'],
-    color_by=['RNA+ADT_leiden_cluster', 'RNA+ADT_wnn_leiden_cluster'],
-    n_columns=2,
-    legend_loc='on_data',
+figure, axes = plt.subplots(1, 2, figsize=(9, 4))
+integration_panels = (
+    ("SNN", "RNA+ADT_UMAP", "RNA+ADT_leiden_cluster"),
+    ("WNN", "RNA+ADT_wnn_UMAP", "RNA+ADT_wnn_leiden_cluster"),
 )
+for axis, (title, layout_key, color_by) in zip(
+    axes, integration_panels, strict=True
+):
+    ds.plots.embedding(
+        layout_key=layout_key,
+        color_by=color_by,
+        legend_loc="on_data",
+        show_titles=False,
+        target=axis,
+        show=False,
+    )
+    axis.set_title(title)
+figure.tight_layout()
 ```
 
-Reach for WNN when one modality is noticeably sparser or noisier than the other, and for SNN
-when the modalities are comparable or when more than two are involved.
+SNN merges edge support across two or more assays. WNN accepts exactly two
+assays and adjusts their contributions cell by cell. In this dataset, both
+integrated layouts should preserve broad PBMC populations while resolving
+differences supported by the protein panel. Use the advanced guide to compare
+them quantitatively rather than choosing from UMAP appearance alone.
 
+(hto_demultiplexing)=
 ## HTO demultiplexing
 
-`DataStore.mark_hto_identities` assigns hashtag identities when an HTO assay is present
-(default assay name `HTO`). No public HTO dataset is in the Scarf catalog yet, so this page
-cannot demonstrate it; see {doc}`../reference/api/datastore` for the signature.
+Hashtag assignment is a separate sample-identification task, not part of the
+RNA/ADT integration path. See {doc}`hto_demultiplexing`.
 
 ## Common mistakes and limitations
 
@@ -377,26 +379,3 @@ cannot demonstrate it; see {doc}`../reference/api/datastore` for the signature.
 - Leaving control antibodies active in the ADT panel
 - Using WNN with anything other than two assays
 - Reading RNA and ADT clusters as interchangeable labels for the same populations
-
-## Summary of saved results
-
-| Kind | Keys / location |
-|---|---|
-| RNA embedding and clusters | `RNA_UMAP1`, `RNA_UMAP2`, `RNA_leiden_cluster` |
-| ADT embedding and clusters | `ADT_UMAP1`, `ADT_UMAP2`, `ADT_leiden_cluster` |
-| Active ADT antibodies | feature key `I` in `ds.ADT.feats` |
-| SNN integration | `RNA+ADT_UMAP1/2`, `RNA+ADT_leiden_cluster` |
-| WNN integration | `RNA+ADT_wnn_UMAP1/2`, `RNA+ADT_wnn_leiden_cluster` |
-
-## Further reading
-
-- Stoeckius et al. 2017, CITE-seq: https://doi.org/10.1038/nmeth.4380
-- Hao et al. 2021, weighted nearest neighbor analysis: https://doi.org/10.1016/j.cell.2021.04.048
-- [Seurat WNN vignette](https://satijalab.org/seurat/articles/weighted_nearest_neighbor_analysis)
-
-## Next steps
-
-- {doc}`plotting`
-- {doc}`annotation`
-- {doc}`data_organization`
-- {doc}`data_integration`

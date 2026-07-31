@@ -1,11 +1,13 @@
-# DataStore
+# DataStore API reference
 
 `DataStore` is the primary analyst-facing object. It inherits graph, mapping, and assay
 helpers from the classes below. Prefer this page over the inheritance appendix unless you
 are extending Scarf.
 
-The atomic graph methods are documented on {doc}`graph_ops` and the artifact inspection
-methods on {doc}`artifacts`, so they are excluded here rather than repeated.
+Graph-construction methods are documented on {doc}`graph_construction` and
+artifact inspection methods on {doc}`artifacts`. Mapping methods are on
+{doc}`mapping`, and integration metrics are on {doc}`integration`. Those
+methods are excluded here rather than repeated.
 
 ## Mounting shared count matrices
 
@@ -22,8 +24,15 @@ artifacts should write to a separate target. See {doc}`../../tutorials/remote_st
     :inherited-members:
     :exclude-members: run_normalization, run_pca, run_lsi, run_custom_reduction,
         run_harmony, build_embedding_initialization, build_ann_index, query_neighbors,
-        build_connectivity_map, list_artifacts, inspect_artifact, load_artifact,
-        get_assay_state
+        build_connectivity_map, load_graph, list_artifacts, inspect_artifact, load_artifact,
+        lineage,
+        get_assay_state, build_mapping_reference, get_mapping_reference, run_mapping,
+        get_mapping_result, get_mapping_score, get_target_classes,
+        get_target_label_evidence, calibrate_label_transfer_threshold,
+        project_mapping_layout, load_unified_graph, run_unified_umap, run_unified_tsne,
+        integrate_assays, metric_lisi, metric_ilisi, metric_clisi,
+        metric_proportional_batch_mixing, metric_graph_connectivity,
+        metric_graph_silhouette, metric_label_concordance
 ```
 
 ## Store-bound plotting
@@ -36,6 +45,26 @@ functions in `scarf.plotting`. Array and DataFrame diagnostics such as
 .. autoclass:: scarf.datastore.plot_accessor.DataStorePlotAccessor
     :members:
 ```
+
+## Selected analysis contracts
+
+{py:meth}`scarf.datastore.datastore.DataStore.auto_filter_cells` uses pooled Gaussian bounds by
+default. Supplying `sample_column` selects per-sample MAD bounds with
+`n_mads` and `min_cells_per_sample`; `min_p` and `max_p` do not configure that
+path.
+
+Fresh {py:meth}`scarf.datastore.datastore.DataStore.run_marker_search` results include score,
+expression fractions, fold change, AUC, two-sided Mann-Whitney p-values, and
+Benjamini-Hochberg values adjusted within each one-versus-rest group over
+tested features. These are cell-level marker statistics, not replicate-aware
+differential expression.
+
+{py:meth}`scarf.datastore.datastore.DataStore.run_pseudotime_marker_search` stores `NaN` for
+features that were not tested and adjusts p-values over tested features only.
+
+{py:meth}`~scarf.DataStore.integrate_assays` is the public SNN/WNN graph
+integration entry point. Its workflow and assumptions are covered in
+{doc}`../../tutorials/multimodal_integration`.
 
 ## Analysis results
 

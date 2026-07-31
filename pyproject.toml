@@ -85,6 +85,8 @@ docs = [
     "topacedo",
     "nbclient",
     "jupyter-cache>=1.0.1",
+    "sphinx-reredirects>=1.1.0",
+    "sphinxcontrib-mermaid>=2.1.0",
 ]
 
 [project.urls]

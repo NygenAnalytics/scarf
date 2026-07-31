@@ -1,4 +1,5 @@
 ---
+description: Order cells along a supervised trajectory and identify genes that change with progression.
 jupytext:
   formats: ipynb,md:myst
   text_representation:
@@ -12,11 +13,12 @@ kernelspec:
   name: python3
 ---
 
-# Estimating pseudotime ordering and expression dynamics
+# Pseudotime ordering
 
-Order cells along a supervised trajectory and find genes correlated with that ordering.
-For expression modules and comparisons to cluster markers, continue with
-{doc}`pseudotime_modules`.
+Pseudotime represents progress through a continuous biological process. This
+tutorial uses annotated start and terminal populations to orient one reliable
+trajectory, then identifies genes that change with that ordering. It does not
+infer terminal states or prove lineage relationships.
 
 ## Prerequisites
 
@@ -27,7 +29,7 @@ For expression modules and comparisons to cluster markers, continue with
 
 - Score supervised pseudotime with source and sink clusters
 - Find features correlated with the ordering
-- Continue to pseudotime modules in {doc}`pseudotime_modules`
+- Interpret one expression checkpoint on the embedding
 
 ## Dataset
 
@@ -57,10 +59,9 @@ ds = scarf.DataStore(
     nthreads=4,
     default_assay='RNA'
 )
-ds
 ```
 
-The store ships the published cell-type annotations in the `clusters` column:
+The store includes cell-type annotations in the `clusters` column:
 
 ```{code-cell} ipython3
 ds.cells.to_pandas_dataframe(
@@ -82,10 +83,10 @@ ds.plots.embedding(
 
 Scarf uses a memory-efficient implementation of the [PBA algorithm](https://github.com/AllonKleinLab/PBA) ([Weinreb et al. 2018, PNAS](https://doi.org/10.1073/pnas.1714723115)) to estimate a pseudotime ordering. `run_pseudotime_scoring` works with any assay that has a neighborhood graph.
 
-The method is supervised: you name the groups that start the trajectory (sources) and the
-groups that end it (sinks), and those choices set the direction of the ordering. Here the
-annotations make the choice explicit. Ductal cells are the progenitor pool of this
-developmental stage, and the hormone-expressing states are its endpoints.
+The method is supervised: the source groups define the beginning and the sink
+groups define the end. Those choices orient the result. Here, ductal cells
+represent the progenitor pool and the hormone-expressing states represent the
+endpoints.
 
 ```{code-cell} ipython3
 pseudotime = ds.run_pseudotime_scoring(
@@ -96,12 +97,17 @@ pseudotime = ds.run_pseudotime_scoring(
 ```
 
 Any cell metadata column with group labels works for `source_sink_key`, including a Scarf
-clustering such as `RNA_leiden_cluster`. Without published annotations, read the cluster
+clustering such as `RNA_leiden_cluster`. Without provided annotations, read the cluster
 labels off the embedding and pick the ones at each end of the trajectory. Every group named
 in `sources` or `sinks` has to be present among the scored cells, otherwise the call fails
 rather than guessing.
 
-By default, the calculated values are saved under **'RNA_pseudotime'**, where 'RNA' is replaced by the assay name. A companion boolean column **'RNA_pseudotime__valid'** is also written. The returned result exposes both names as `pseudotime_key` and `validity_key`. When the selected graph is fully connected, every cell is valid. If the graph has multiple components, only the largest one is scored by default. The remaining cells hold `NaN`, and downstream steps should use the validity column as `cell_key`. The UMAP below shows progression from 0 to 1.
+The scores are stored in `RNA_pseudotime`, with the actual generated name
+available as `pseudotime.pseudotime_key`. The companion key returned as
+`pseudotime.validity_key` identifies cells that were scored. Values should
+progress from the ductal region toward the endocrine endpoints. A disconnected
+or internally reversed pattern is a reason to revisit the graph and endpoint
+choices.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -113,7 +119,10 @@ ds.plots.embedding(
 ---
 ## 3) Identify pseudotime correlated features
 
-`run_pseudotime_marker_search` calculates a correlation coefficient and p-value for each selected feature against the pseudotime ordering. Features that fail the minimum-cell or variance checks are left untested (`NaN` p-values). Benjamini-Hochberg adjustment (`p_value_adjusted`) runs only over tested features.
+`run_pseudotime_marker_search` calculates a correlation coefficient and p-value
+for each selected feature against the ordering. Features that fail the
+minimum-cell or variance checks remain untested with `NaN` p-values.
+Benjamini-Hochberg adjustment runs only over tested features.
 
 ```{code-cell} ipython3
 markers = ds.run_pseudotime_marker_search(
@@ -122,56 +131,41 @@ markers = ds.run_pseudotime_marker_search(
 )
 ```
 
-The correlations, raw p-values, and within-search adjusted p-values are saved in feature metadata. Their generated column names are available as `markers.correlation_key`, `markers.p_value_key`, and `markers.p_value_adjusted_key`. The same values, feature indices, and feature names are returned in `markers.table`.
-
-```{code-cell} ipython3
-markers.table.head()
-```
+The correlations, raw p-values, and adjusted p-values are saved in feature
+metadata. Their generated column names are available as
+`markers.correlation_key`, `markers.p_value_key`, and
+`markers.p_value_adjusted_key`. The returned `markers.table` contains the same
+values with feature names.
 
 ---
 ## 4) Visualize pseudotime correlated features
 
-`markers.table` can be sorted and filtered directly. Genes with a negative correlation
-decrease in expression as pseudotime progresses.
+Use one decreasing ductal-associated gene and one increasing
+endocrine-associated gene as a biological checkpoint. The table confirms that
+their correlations point in opposite directions and that both pass the
+adjusted significance threshold.
 
 ```{code-cell} ipython3
-markers.table.sort_values('r_value')[:15]
+checkpoint_genes = ["Spp1", "Cpe"]
+checkpoint = (
+    markers.table.set_index("feature_name")
+    .loc[checkpoint_genes, ["r_value", "p_value_adjusted"]]
+)
+checkpoint
 ```
 
-Visualize a few of these genes on the UMAP plot. Gene symbols come from the
-correlation table above, not from a fixed list.
-
 ```{code-cell} ipython3
-neg_genes = (
-    markers.table.sort_values('r_value')['feature_name']
-    .head(3)
-    .tolist()
-)
 ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=neg_genes,
+    layout_key="RNA_UMAP",
+    color_by=checkpoint_genes,
+    n_columns=2,
     sort_values=True,
 )
 ```
 
-Genes with a positive correlation increase in expression as pseudotime progresses.
-
-```{code-cell} ipython3
-markers.table.sort_values('r_value', ascending=False)[:10]
-```
-
-```{code-cell} ipython3
-pos_genes = (
-    markers.table.sort_values('r_value', ascending=False)['feature_name']
-    .head(3)
-    .tolist()
-)
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=pos_genes,
-    sort_values=True,
-)
-```
+`Spp1` should be strongest near the ductal source, while `Cpe` should increase
+toward endocrine states. This agreement is a useful checkpoint, not proof of a
+causal lineage or evidence that every dynamic gene changes monotonically.
 
 ## Common mistakes and limitations
 
@@ -179,19 +173,6 @@ ds.plots.embedding(
 - Interpreting linear correlation as the only form of expression dynamics along pseudotime
 - Ignoring `RNA_pseudotime__valid` when the graph has more than one connected component
 
-## Saved results
-
-Pseudotime and validity columns are written to cell metadata. Feature correlations and
-p-values are stored in feature metadata.
-
-## Further reading
-
-- Weinreb et al. 2018, population balance analysis (PBA): https://doi.org/10.1073/pnas.1714723115
-- [PBA reference implementation](https://github.com/AllonKleinLab/PBA)
-
-## Next steps
-
-- {doc}`pseudotime_modules`
-- {doc}`fate_mapping`
-- {doc}`annotation`
-- {doc}`plotting`
+Use {doc}`pseudotime_modules` to group nonlinear expression patterns and
+{doc}`trajectory_analysis` for component policy, marker-testing assumptions,
+module diagnostics, and fate-probability validation.

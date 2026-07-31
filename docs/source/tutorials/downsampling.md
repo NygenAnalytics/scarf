@@ -1,4 +1,5 @@
 ---
+description: Select representative cells with TopACeDo and write any cell subset to Zarr.
 jupytext:
   text_representation:
     extension: .md
@@ -148,8 +149,10 @@ Higher `RNA_snn_value` marks more tightly connected neighbourhoods.
 
 +++
 
-TopACeDo marks representative cells but leaves the source store unchanged. Use `SubsetZarr`
-to create a new Zarr store containing only the selected cells.
+TopACeDo marks representative cells but leaves the source store unchanged.
+`SubsetZarr` accepts any boolean cell-metadata column, not only a TopACeDo
+result. Use it for a manually annotated population, a QC selection, or the
+`RNA_sketched` selection below.
 
 ```{code-cell} ipython3
 subset_path = f'{dataset}/subset.zarr'
@@ -163,12 +166,21 @@ writer = scarf.SubsetZarr(
 writer.dump()
 ```
 
+The output contains selected cells from every assay listed in `assays`.
+`SubsetZarr` retains all features in those assays; it is cell-selective, not
+feature-selective. Use `to_anndata(feature_names=...)` when both axes need to
+be reduced before disk export.
+
 Open the downsampled store as a new `DataStore`:
 
 ```{code-cell} ipython3
 ds2 = scarf.DataStore(subset_path)
-
-ds2
+{
+    "source cells": ds.cells.N,
+    "subset cells": ds2.cells.N,
+    "source RNA features": ds.RNA.feats.N,
+    "subset RNA features": ds2.RNA.feats.N,
+}
 ```
 
 When the subset fits in memory, export to AnnData for tools in the
@@ -176,8 +188,7 @@ When the subset fits in memory, export to AnnData for tools in the
 
 ```{code-cell} ipython3
 adata = ds2.to_anndata()
-
-adata
+adata.shape
 ```
 
 ## Common mistakes
@@ -185,19 +196,7 @@ adata
 - Calling `run_topacedo_sampler` before clustering; pass a `cluster_key` column with cell partitions
 - Passing a cluster column that was created from a different cell subset than the graph
 - Treating the sampled cells as a replacement for the full dataset in quantitative analysis
+- Expecting `SubsetZarr` to remove unselected features
 
-## Saved results
-
-TopACeDo writes `RNA_sketched`, `RNA_sketch_seeds`, `RNA_cell_density`, and `RNA_snn_value` to
-cell metadata. `SubsetZarr` writes the selected cells to `subset.zarr`.
-
-## Further reading
-
-- [TopACeDo](https://github.com/parashardhapola/topacedo)
-- [Seurat sketch-based analysis](https://satijalab.org/seurat/articles/seurat5_sketch_analysis) (analogous practice for large datasets; not equivalent to TopACeDo)
-
-## Next steps
-
-- {doc}`import_and_export`
-- {doc}`data_organization`
-- {doc}`plotting`
+TopACeDo writes its selection and diagnostic columns to cell metadata.
+`SubsetZarr` writes the selected cells to the requested destination.

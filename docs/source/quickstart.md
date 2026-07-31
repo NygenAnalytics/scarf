@@ -47,6 +47,10 @@ scarf.CrToZarr(
 
 The same reader and writer work with a Cell Ranger H5 file from your own dataset.
 Scarf converts the counts to Zarr so later steps can stream data from disk.
+Scarf normally uses INFO logging with progress enabled. This page suppresses both
+to keep its cached output compact. Log level and progress are independent; batch
+runs can use `scarf.configure_output(progress=False, timestamps=True)`. See the
+{doc}`reference/api/utilities` for file logging and the full output contract.
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(
@@ -57,13 +61,28 @@ ds = scarf.DataStore(
 
 ## Run the RNA pipeline
 
-The default pipeline filters cells, selects highly variable genes, normalizes
-counts, builds a neighbourhood graph, and calculates embeddings, clusters,
-doublet scores, and marker genes.
+The default pipeline filters cells, scores cell cycle, selects highly variable
+genes, normalizes counts, runs PCA, builds a neighbourhood graph, and calculates
+UMAP. It also runs Leiden at resolutions 0.5, 0.75, 1.0, and 1.25, plus Paris
+clustering. The partition with the highest PCA silhouette is used for doublet
+scoring and marker search unless you choose one explicitly.
 
 ```{code-cell} ipython3
 artifacts = ds.pipeline.run()
 ```
+
+The return value maps result names to `ArtifactRef` objects, which identify the
+persisted outputs and their provenance:
+
+```{code-cell} ipython3
+sorted(artifacts)
+```
+
+Most optional stages accept `False`. For example, cell-cycle scoring, UMAP,
+Paris, doublet scoring, and marker search can be disabled separately; pass an
+empty `leiden` mapping to skip Leiden. Highly variable feature selection remains
+required. Use {doc}`tutorials/custom_graph_construction` for stage-by-stage
+control and {doc}`tutorials/clustering` for choosing a partition.
 
 ## Plot the result
 
@@ -75,11 +94,12 @@ ds.plots.embedding(
 ```
 
 Each colour is a Leiden cluster. The Zarr store now contains the UMAP
-coordinates, cluster labels, marker genes, and intermediate results.
+coordinates, cluster labels, marker genes, and intermediate results. Several
+broad PBMC populations should separate without every group becoming an isolated
+island. A tiny group dominated by low-count cells is a reason to revisit quality
+control before assigning a cell type.
 
-## Next steps
-
-- Inspect quality control and tune the analysis for your data:
-  {doc}`tutorials/scrna_seq`
-- See pipeline options and returned results: {doc}`reference/api/pipeline`
-- Translate a Scanpy or Seurat workflow: {doc}`scarf_and_scanpy`
+Continue with the complete {doc}`tutorials/scrna_seq` workflow or translate an
+existing workflow with {doc}`scarf_and_scanpy`. The
+{doc}`reference/api/pipeline` documents every option, returned artifact, and the
+callback contract for advanced automation.

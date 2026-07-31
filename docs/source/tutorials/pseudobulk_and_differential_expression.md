@@ -54,7 +54,6 @@ ds = scarf.DataStore(
     f'{dataset}/data.zarr',
     nthreads=4,
 )
-ds
 ```
 
 ```{code-cell} ipython3
@@ -72,7 +71,7 @@ if 'RNA_leiden_cluster' not in ds.cells.columns:
 
 
 The catalog Kang store already includes a UMAP. Leiden groups used for `make_bulk` below may
-differ from the published `cluster_labels` column.
+differ from the provided `cluster_labels` column.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -95,14 +94,23 @@ markers = ds.get_markers(
     min_score=-1,
     min_frac_exp=-1,
 )
-markers[['feature_name', 'score', 'frac_exp', 'p_value', 'p_value_adjusted']].head()
+markers[
+    [
+        'feature_name',
+        'score',
+        'frac_exp',
+        'auc',
+        'p_value',
+        'p_value_adjusted',
+    ]
+].head()
 ```
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
     group_key='RNA_leiden_cluster',
-    topn=3,
-    figsize=(5, 7),
+    topn=2,
+    figsize=(8, 8),
 )
 ```
 
@@ -160,23 +168,7 @@ nested with cell type), and keep biological replicates in the exported metadata.
 
 ## Common mistakes
 
-- Reporting Scarf marker p-values as FDR-corrected DE
+- Reporting Scarf's within-group marker adjustment as replicate-aware DE
 - Building pseudobulk without a sample (donor) covariate when the biological question is condition-level
 - Treating `pseudo_reps` splits as independent biological replicates
 - Expecting Scarf to run DESeq2/edgeR-style models in-process
-
-## Saved results
-
-`make_bulk` returns a pandas DataFrame. The example exports it to
-`scarf_datasets/kang_pseudobulk_counts.csv`. Marker-search results are stored under the assay's
-`markers` group in the Zarr store.
-
-## Further reading
-
-- [Single-cell best practices: differential gene expression](https://www.sc-best-practices.org/conditions/differential_gene_expression.html)
-
-## Next steps
-
-- {doc}`annotation`
-- {doc}`import_and_export`
-- {doc}`../scarf_and_scanpy`

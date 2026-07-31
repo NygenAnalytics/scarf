@@ -1,4 +1,4 @@
-# Analysis pipeline
+# Analysis pipeline API reference
 
 `DataStore.pipeline` exposes the standard provenance-backed RNA recipe. The public
 import path is `scarf.datastore.pipeline_accessor`.
@@ -40,7 +40,7 @@ Exceptions:
 - `leiden` defaults to resolutions `0.5`, `0.75`, `1.0`, and `1.25`. Pass an
   empty mapping to run no Leiden clustering.
 - `clustering_concurrency` defaults to `2`. Leiden membership can overlap across
-  workers while store publishes stay serialized; Paris joins the same queue.
+  workers while store writes stay serialized; Paris joins the same queue.
 - When `doublet_scoring` or `markers` omit `clusters`, the Leiden or Paris
   partition with the highest silhouette score on PCA coordinates is selected
   (returned as `selected_clusters`).
@@ -75,5 +75,36 @@ artifacts = ds.pipeline.run(
 )
 ```
 
+## Pipeline callbacks
+
+Callbacks can update an external progress record without changing pipeline
+control flow:
+
+```python
+from scarf.datastore.pipeline_accessor import PipelineEvent
+
+events: list[tuple[str, str]] = []
+
+
+def record_event(event: PipelineEvent) -> None:
+    events.append((event.kind, event.stage))
+
+
+artifacts = ds.pipeline.run(
+    highly_variable_features={
+        "min_cells": 20,
+        "top_n": 500,
+        "show_plot": False,
+    },
+    callback=record_event,
+)
+```
+
+Events are serialized on the calling thread. A skipped stage emits no event,
+and `stage_completed` means its expected output has finished writing and is
+available. Callback exceptions are logged without interrupting the pipeline.
+The stable stage-name inventory is part of
+{py:meth}`~scarf.datastore.pipeline_accessor.PipelineAccessor.run`.
+
 See {ref}`Quick start <quickstart>` for a short executable example and
-{doc}`graph_ops` for the underlying atomic methods.
+{doc}`graph_construction` for the individual graph-construction methods.

@@ -1,4 +1,4 @@
-# Assays and metadata
+# Assays and metadata API reference
 
 ```{eval-rst}
 .. autoclass:: scarf.assay.Assay

@@ -229,3 +229,9 @@ Rejected:
 - Restoring forwarding modules for retired private import paths.
 - Restoring legacy plotting modules or datastore plotting methods.
 - Moving storage-aware algorithms into datastore orchestration.
+
+## Implementation references
+
+Read {doc}`zarr_internals` for the on-disk implementation boundary and
+{doc}`migration_notes` for public contract changes. Use {doc}`contributing` for
+the test, documentation, and review workflow before making a change.

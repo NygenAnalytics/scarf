@@ -21,7 +21,7 @@ from scarf.trajectory.results import (
 )
 from scarf.utils.arrays import array_digest
 from scarf.writers import create_cell_data, create_zarr_count_assay
-from tests.fixtures_datastore import build_atomic_graph
+from tests.fixtures_datastore import build_neighbourhood_graph
 from tests.store_probes import RecordingStore
 
 from . import full_path
@@ -658,7 +658,7 @@ class TestDataStore:
             show_plot=False,
             bin_strategy="fixed",
         )
-        build_atomic_graph(
+        build_neighbourhood_graph(
             datastore_ephemeral,
             feat_key="hvgs",
             local_cache=False,

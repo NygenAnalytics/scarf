@@ -65,7 +65,7 @@ Same path with more explanation: [docs quick start](https://scarf.readthedocs.io
 
 - **Measured multi-million-cell scale**: the core funnel from store creation through markers completed against cloud Zarr through 10M cells. The largest run peaked at about 36 GiB and took about 23 hours. Memory and wall time both depend on dataset size and stage.
 - **Remote-first Zarr**: keep the store on S3-compatible object storage and analyze it in place, without a local full copy.
-- **Reusable graph state**: atomic stages persist reductions, ANN indexes, neighbour queries, and connectivity maps for embedding, clustering, and mapping. SNN/WNN combines modality-specific graphs into a separate integrated graph.
+- **Reusable graph state**: graph-construction stages persist reductions, ANN indexes, neighbour queries, and connectivity maps for embedding, clustering, and mapping. SNN/WNN combines modality-specific graphs into a separate integrated graph.
 - **Persistent results**: every step writes back into the store, so you can stop, inspect, and resume without recomputing. Filtering marks cells inactive rather than deleting them.
 
 | Cells | Peak memory | Core funnel wall |

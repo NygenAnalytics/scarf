@@ -32,7 +32,7 @@ uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_l
 the documentation executor (`SCARF_MEM_BUDGET`, `SCARF_WORKERS`, …) are also useful for local
 large runs.
 
-## Next steps
+## Related guides
 
 - {doc}`../tutorials/data_organization`
 - {doc}`contributing`

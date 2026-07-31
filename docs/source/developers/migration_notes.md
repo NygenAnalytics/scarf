@@ -168,6 +168,38 @@ The neighbor artifact attribute formerly named `recall` measured only whether
 the ANN query returned each cell itself. New artifacts store that diagnostic as
 `self_hit_rate`.
 
+## Marker statistics
+
+Fresh marker tables use schema v2. They add AUC and
+`p_value_adjusted`, calculated with Benjamini-Hochberg correction within each
+one-versus-rest group over all tested features. The Mann-Whitney calculation is
+two-sided and now applies continuity and large-tie correction consistently.
+Recomputed raw and adjusted p-values can therefore differ from older tables.
+
+Legacy marker tables remain readable. Rerun marker search when the new columns
+or corrected statistics are required. Neither schema represents
+replicate-aware differential expression.
+
+## Logging and progress
+
+Progress is no longer inferred from log severity. Code that expected a quiet
+log level to hide progress bars should migrate to:
+
+```python
+scarf.configure_output(level="WARNING", progress=False)
+```
+
+`set_verbosity(level=..., filepath=...)` still selects a level and optional
+file sink.
+
+## H5AD import
+
+H5AD import now decodes categorical and pandas-nullable metadata and imports
+supported dense `obsm` arrays as numbered cell-metadata columns. Unsupported
+group encodings, sparse `obsm` slots, and row-mismatched embeddings are skipped
+with warnings. Review imported metadata names if downstream code previously
+assumed those columns were unavailable.
+
 ## Paris clustering
 
 Use `run_paris_clustering` for Paris clustering. Its default

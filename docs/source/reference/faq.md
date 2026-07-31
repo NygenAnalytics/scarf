@@ -39,6 +39,17 @@ Scarf does not include Scanorama, BBKNN, scVI, ComBat, or other external
 integration packages. Export with `to_anndata` or `SubsetZarr` when you need those
 tools.
 
+## How do I reduce log noise or disable progress?
+
+Configure the two settings independently:
+
+```python
+scarf.configure_output(level="WARNING", progress=False)
+```
+
+For a timestamped batch log, use `set_verbosity(..., filepath=...)`. See
+{doc}`api/utilities` for all output settings and their defaults.
+
 ## What is the difference between SNN and WNN integration?
 
 Both merge modality-specific KNN graphs with `integrate_assays`. SNN (default) supports two or more assays. WNN (`method='wnn'`) requires exactly two assays and can weight modalities differently. See {ref}`WNN integration <wnn_integration>`.

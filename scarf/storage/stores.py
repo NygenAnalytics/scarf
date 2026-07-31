@@ -69,6 +69,14 @@ def make_store(
 
     if isinstance(location, str):
         if is_remote_zarr_location(location):
+            if location.startswith("hf://"):
+                from zarr.storage import FsspecStore
+
+                return FsspecStore.from_url(
+                    location,
+                    storage_options=storage_options,
+                    read_only=read_only,
+                )
             try:
                 from obstore.store import from_url as obstore_from_url
                 from zarr.storage import ObjectStore

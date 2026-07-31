@@ -427,7 +427,7 @@ def test_pipeline_reports_failed_and_aborted_clustering_jobs(
     }
     assert failed_events["leiden_0.5"].error is expected_error
     assert isinstance(failed_events["leiden_1.0"].error, RuntimeError)
-    assert "was not published" in str(failed_events["leiden_1.0"].error)
+    assert "was not written" in str(failed_events["leiden_1.0"].error)
     for stage in ("leiden_0.5", "leiden_1.0"):
         assert [event.kind for event in events if event.stage == stage] == [
             "stage_started",

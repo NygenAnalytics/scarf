@@ -1,5 +1,5 @@
 ---
-description: Cell quality control, filtering thresholds, auto_filter_cells, and doublet scores in Scarf.
+description: Inspect and filter cell quality across RNA, ATAC, and multimodal assays.
 jupytext:
   text_representation:
     extension: .md
@@ -14,11 +14,13 @@ kernelspec:
 
 (quality_control)=
 
-# Quality control
+# Quality control across assays
 
-This chapter covers cell QC distributions, choosing filter thresholds, `auto_filter_cells`,
-and doublet scoring. The recommended one-path QC in {doc}`scrna_seq` stays short; use this
-page when you need more control.
+Quality control defines the cells and features that downstream analyses can
+use. Scarf stores selections as boolean metadata rather than deleting data, so
+thresholds can be inspected, reset, and replaced. This guide covers manual,
+global automatic, and sample-aware filtering, followed by assay-specific
+checks.
 
 ## Prerequisites
 
@@ -29,12 +31,15 @@ page when you need more control.
 
 - Inspect per-cell QC columns
 - Set manual thresholds with `filter_cells`
-- Use `auto_filter_cells` for percentile-based bounds
+- Compare global Gaussian and per-sample MAD bounds
 - Compute doublet scores after an initial clustering
+- Recognize current RNA, ATAC, and ADT support boundaries
 
 ## Dataset
 
 ```{code-cell} ipython3
+import numpy as np
+
 import scarf
 
 scarf.configure_output(level='WARNING', progress=False)
@@ -49,8 +54,11 @@ ds = scarf.DataStore(
     nthreads=4,
     min_features_per_cell=10,
 )
-ds
 ```
+
+The `I` cell key is the active selection used by most methods. Filtering updates
+that key and leaves all rows in the datastore. Feature selections work the same
+way within each assay.
 
 ## 1) Inspect QC distributions
 
@@ -138,7 +146,72 @@ ds.auto_filter_cells(show_qc_plots=True)
 
 The plots show fitted density bounds on each QC column used for the automatic cutoffs.
 
-## 5) Doublet scores
+## 5) Per-sample MAD filtering
+
+Global bounds can penalize a sample whose count-depth distribution differs from
+the pooled distribution. With `sample_column`, Scarf calculates robust bounds
+within each sample using the median absolute deviation (MAD).
+
+The PBMC teaching dataset has no biological sample column. The balanced
+`qc_sample` labels below make the API executable but must not be interpreted as
+a real sample-aware result.
+
+```{code-cell} ipython3
+ds.cells.insert(
+    "qc_sample",
+    np.asarray(
+        [f"sample_{index % 4}" for index in range(ds.cells.N)]
+    ),
+    overwrite=True,
+)
+ds.cells.reset_key(key="I")
+ds.auto_filter_cells(
+    attrs=qc_cols,
+    sample_column="qc_sample",
+    n_mads=3.0,
+    min_cells_per_sample=20,
+    show_qc_plots=False,
+)
+```
+
+Plot output is disabled because the balanced labels above are synthetic and do
+not support a meaningful sample comparison. Set `show_qc_plots=True` when using
+a real sample column.
+
+Count-like metrics such as `nCounts` and `nFeatures` use log1p values and
+two-sided bounds. Percentage metrics such as `percentMito` and `percentRibo`
+use their original scale and an upper bound only. Samples with fewer than
+`min_cells_per_sample` active cells are retained with a warning because stable
+within-sample bounds cannot be estimated. `min_p` and `max_p` apply only to the
+global Gaussian path and must remain at their defaults when `sample_column` is
+used.
+
+The same options can be forwarded through the standard pipeline:
+
+```python
+ds.pipeline.run(
+    filtering={
+        "method": "auto",
+        "sample_column": "sample_id",
+        "n_mads": 3.0,
+        "min_cells_per_sample": 20,
+    },
+    clustering_concurrency=1,
+)
+```
+
+## 6) RNA percentages and feature exclusions
+
+`add_percent_feature` measures the fraction of each cell's counts matching a
+gene-name pattern. High mitochondrial, ribosomal, or hemoglobin fractions can
+indicate damaged cells or study-specific biology. Inspect their distributions
+before applying upper thresholds.
+
+Gene families excluded from the graph are a separate feature-selection
+decision. See {doc}`feature_selection` for the default HVG blacklist and
+supported overrides.
+
+## 7) Doublet scores
 
 `run_doublet_detection` simulates doublets, maps them onto the existing neighbourhood
 graph, and writes a per-cell score (default base label `doublet_score`). It does not
@@ -169,31 +242,40 @@ Higher doublet scores mark cells that map near simulated doublets. Inspect the s
 distribution before applying a cutoff:
 
 ```{code-cell} ipython3
-ds.cells.to_pandas_dataframe(columns=[score_col], key='I').describe()
+ds.plots.distribution(
+    keys=score_col,
+    kind="ecdf",
+)
 ```
+
+The score distribution and embedding should be reviewed together. A threshold
+is study-dependent, and `run_doublet_detection` does not remove cells. Insert a
+new boolean cell key or update `I` only after deciding how doublets should be
+handled.
+
+## 8) ATAC quality control
+
+Scarf initializes per-cell ATAC fragment or cut-site counts and accessible-peak
+counts, and it records per-peak prevalence for feature filtering.
+`mark_prevalent_peaks` selects peaks for LSI and graph construction. Scarf does
+not currently calculate FRiP or TSS enrichment, so those metrics must be
+imported as metadata or computed with an external tool rather than implied by
+the available columns.
+
+## 9) ADT and multimodal quality control
+
+ADT panels often include control antibodies that should be marked inactive in
+feature metadata after their names are inspected. RNA, ADT, and HTO assays
+share one cell table, so changing `I` applies the same cell selection across
+modalities. Check whether an RNA-driven filter is appropriate for the protein
+question before reusing it automatically. Hashtag demultiplexing is covered
+separately in {doc}`hto_demultiplexing`.
 
 ## Common mistakes and limitations
 
 - Copying thresholds from another dataset without checking distributions
+- Pooling samples with different depth distributions and then applying one global bound
+- Passing `min_p` or `max_p` to the sample-aware MAD path
 - Expecting `run_doublet_detection` to drop cells (it only scores)
 - Running doublet detection before building the neighbourhood graph and clustering
-
-
-## Summary of saved results
-
-| Kind | Keys |
-|---|---|
-| QC | `RNA_nCounts`, `RNA_nFeatures`, `RNA_percentMito`, … |
-| Active cells | `I` |
-| Doublets | `*doublet_score` (assay-prefixed) |
-
-## Further reading
-
-- [Single-cell best practices: quality control](https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html)
-- [Scanpy clustering tutorial](https://scanpy.readthedocs.io/en/stable/tutorials/basics/clustering.html)
-
-## Next steps
-
-- {doc}`dimensionality_reduction_and_clustering`
-- {doc}`annotation`
-- {doc}`data_organization`
+- Claiming FRiP or TSS enrichment from the ATAC metrics Scarf currently provides

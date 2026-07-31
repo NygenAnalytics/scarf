@@ -102,7 +102,7 @@ def _mock_e2e_dependencies(
     return funnel_payloads, stage_results
 
 
-def test_e2e_funnel_runs_atomic_core_once_on_r2(
+def test_e2e_funnel_runs_graph_construction_core_once_on_r2(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:

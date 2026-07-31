@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from scarf.writers import create_zarr_dataset
-from tests.fixtures_datastore import build_atomic_graph
+from tests.fixtures_datastore import build_neighbourhood_graph
 
 
 def _ensure_graph(datastore) -> None:
@@ -11,7 +11,7 @@ def _ensure_graph(datastore) -> None:
     except KeyError:
         datastore.auto_filter_cells(show_qc_plots=False)
         datastore.mark_hvgs(top_n=100, show_plot=False, bin_strategy="fixed")
-        build_atomic_graph(datastore, feat_key="hvgs")
+        build_neighbourhood_graph(datastore, feat_key="hvgs")
 
 
 def _projection_store(datastore, name: str, indices: np.ndarray, distances: np.ndarray):

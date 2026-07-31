@@ -33,14 +33,14 @@ conda-forge: run `conda install -c conda-forge hnswlib` before installing Scarf.
 Verify the install:
 
 ```bash
-python -c "import scarf; print(scarf.__version__)"
+uv run python -c "import scarf; print(scarf.__version__)"
 ```
 
 ## Jupyter
 
 ```bash
 uv pip install jupyterlab
-jupyter lab
+uv run jupyter lab
 ```
 
 On Windows, before the first Jupyter launch in a conda environment: `conda install -y pywin32`.
@@ -63,3 +63,5 @@ conda create --name scarf_env python=3.12
 conda activate scarf_env
 uv pip install "scarf[extra]"
 ```
+
+After the import check succeeds, continue with the {ref}`Quick start <quickstart>`.

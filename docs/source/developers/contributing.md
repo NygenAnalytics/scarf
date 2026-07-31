@@ -1,4 +1,4 @@
-# How to contribute
+# Contributing
 
 ## Contributions through pull requests
 
@@ -84,8 +84,6 @@ Suggested chapter outline:
 4. Dataset
 5. Guided analysis (numbered steps)
 6. Common mistakes and limitations
-7. Summary of saved results
-8. Next steps
 
 Fact-check before merging: method names and defaults against `scarf/`, dataset IDs against the `scarf_docs` Cytebase repository, metadata keys against executed output, and no claims for methods Scarf does not ship.
 
@@ -95,9 +93,9 @@ Sphinx reads the committed cache via `nb_execution_mode = "cache"` in `docs/sour
 Use `scarf.configure_output(level='DEBUG', progress=True)` when debugging tutorial execution locally. Tutorials
 download datasets over the network. Timeout per page is 600 seconds (`nb_execution_timeout` in `conf.py`).
 
-# Acknowledgements
+## Acknowledgements
 
-## Contributors
+### Contributors
 
 Contributors to the Scarf repository. Thank you everyone!
 
@@ -105,7 +103,7 @@ Contributors to the Scarf repository. Thank you everyone!
 .. include:: ../contributors.rst
 ```
 
-## Open-source stack
+### Open-source stack
 
 A diverse number of open-source packages in Python scientific stack are being used to build Scarf.
 Here we acknowledge some of them (at least those with pretty logos).

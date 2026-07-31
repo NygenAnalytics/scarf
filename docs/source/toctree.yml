@@ -2,74 +2,92 @@ root: index
 subtrees:
   - caption: Get started
     entries:
+      - file: about
+        title: About Scarf
       - file: installation
         title: Installation
       - file: quickstart
         title: Quick start
       - file: scarf_and_scanpy
-        title: Scarf for Scanpy and Seurat users
-  - caption: Concepts
-    entries:
-      - file: concepts/provenance
-        title: Provenance and artifacts
-      - file: concepts/graph_and_state
-        title: Graph construction and published state
-      - file: concepts/scale_and_memory
-        title: Scale, memory, and execution
+        title: Scanpy and Seurat users
   - caption: Core workflows
     entries:
       - file: tutorials/scrna_seq
-        title: scRNA-seq analysis
-        entries:
-          - file: tutorials/atomic_graph_operations
-            title: Atomic graph operations
+        title: scRNA-seq heterogeneity
+      - file: tutorials/pseudotime
+        title: Pseudotime
+      - file: tutorials/pseudotime_modules
+        title: Expression dynamics
+      - file: tutorials/fate_mapping
+        title: Fate mapping
       - file: tutorials/scatac_seq
-        title: scATAC-seq analysis
+        title: scATAC-seq
       - file: tutorials/cite_seq
-        title: CITE-seq analysis
-  - caption: Analysis essentials
-    entries:
-      - file: tutorials/quality_control
-        title: Quality control
-      - file: tutorials/dimensionality_reduction_and_clustering
-        title: Dimensionality reduction and clustering
-      - file: tutorials/annotation
-        title: Annotation
-      - file: tutorials/plotting
-        title: Plotting
-  - caption: Data management and scaling
-    entries:
-      - file: tutorials/data_organization
-        title: Data organization
-      - file: tutorials/import_and_export
-        title: Import and export
-      - file: tutorials/remote_stores
-        title: Remote Zarr stores
-      - file: tutorials/provenance_and_reuse
-        title: Provenance and reuse
-      - file: tutorials/downsampling
-        title: Cell downsampling
+        title: CITE-seq
   - caption: Integration and mapping
     entries:
+      - file: tutorials/choosing_integration_methods
+        title: Integration vs. mapping
       - file: tutorials/data_integration
-        title: Merge, Harmony, and partial PCA
+        title: Dataset merging
+      - file: tutorials/batch_correction
+        title: Batch correction
+      - file: tutorials/integration_metrics
+        title: Integration metrics
+      - file: tutorials/multimodal_integration
+        title: Multimodal integration
       - file: tutorials/mapping_and_label_transfer
-        title: Mapping, label transfer, and reference atlases
-  - caption: Specialized analyses
+        title: Mapping and label transfer
+      - file: tutorials/reference_atlases
+        title: Reference atlases
+  - caption: Downstream analysis
     entries:
-      - file: tutorials/gene_set_enrichment
-        title: Gene-set enrichment
+      - file: tutorials/annotation
+        title: Cell type annotation
       - file: tutorials/cell_cycle
         title: Cell cycle
+      - file: tutorials/gene_set_enrichment
+        title: Gene-set scoring
       - file: tutorials/pseudobulk_and_differential_expression
-        title: Pseudobulk export for differential expression
-      - file: tutorials/pseudotime
-        title: Pseudotime and expression dynamics
-        entries:
-          - file: tutorials/pseudotime_modules
-            title: Pseudotime modules
-          - file: tutorials/fate_mapping
-            title: Multi-sink fate mapping
+        title: Pseudobulk and DE
+  - caption: Deep dives
+    entries:
+      - file: tutorials/plotting
+        title: Plotting
+      - file: tutorials/quality_control
+        title: Quality control
+      - file: tutorials/feature_selection
+        title: Feature selection
+      - file: tutorials/custom_graph_construction
+        title: Graph construction
+      - file: tutorials/dimensionality_reduction
+        title: Dimensionality reduction
+      - file: tutorials/clustering
+        title: Clustering
+      - file: tutorials/imputation
+        title: Imputation
+      - file: tutorials/downsampling
+        title: Cell downsampling
+      - file: tutorials/trajectory_analysis
+        title: Trajectory analysis
+      - file: tutorials/hto_demultiplexing
+        title: HTO demultiplexing
+      - file: tutorials/custom_analyses
+        title: Custom analyses
+  - caption: Data management and scaling
+    entries:
+      - file: tutorials/import_and_export
+        title: Import and export
+      - file: tutorials/data_organization
+        title: Data organization
+      - file: tutorials/remote_stores
+        title: Remote stores
+      - file: concepts/provenance
+        title: Provenance
+      - file: tutorials/provenance_and_reuse
+        title: Reuse and tracing
+      - file: concepts/scale_and_memory
+        title: Memory and execution
   - caption: Reference and support
     entries:
       - file: reference/api
@@ -77,12 +95,12 @@ subtrees:
         entries:
           - file: reference/api/datastore
             title: DataStore
-          - file: reference/api/graph_ops
-            title: Atomic graph operations
+          - file: reference/api/graph_construction
+            title: Graph construction
           - file: reference/api/artifacts
-            title: Artifacts and assay state
+            title: Artifacts and state
           - file: reference/api/pipeline
-            title: Analysis pipeline
+            title: Pipeline
           - file: reference/api/import_export
             title: Import and export
           - file: reference/api/assays
@@ -94,7 +112,7 @@ subtrees:
           - file: reference/api/plotting
             title: Plotting
           - file: reference/api/utilities
-            title: Dataset catalog and utilities
+            title: Datasets and utilities
       - file: reference/faq
         title: FAQ
       - file: reference/glossary

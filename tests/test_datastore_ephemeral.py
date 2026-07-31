@@ -4,7 +4,7 @@ import pytest
 from scarf import ArtifactRef
 from scarf.storage.artifacts import parse_artifact_path
 from scarf.utils import configure_output
-from tests.fixtures_datastore import _has_graph, build_atomic_graph
+from tests.fixtures_datastore import _has_graph, build_neighbourhood_graph
 
 pytestmark = pytest.mark.slow
 
@@ -147,7 +147,7 @@ def test_mapping_projection_reuses_and_explicitly_invalidates(
 def test_run_mapping_supports_all_features_key(datastore_ephemeral):
     ds = datastore_ephemeral
     ds.auto_filter_cells(show_qc_plots=False)
-    build_atomic_graph(ds, feat_key="I", dims=5, k=3, n_centroids=10)
+    build_neighbourhood_graph(ds, feat_key="I", dims=5, k=3, n_centroids=10)
 
     ds.run_mapping(
         target_assay=ds.RNA,
@@ -675,7 +675,7 @@ def test_mapping_reference_rebuilds_unscaled_state_with_pca_scaling(
 ) -> None:
     ds = analyzed_datastore_ephemeral
     _ensure_graph(ds)
-    build_atomic_graph(
+    build_neighbourhood_graph(
         ds,
         feat_key="hvgs",
         feat_scaling=False,
@@ -744,7 +744,7 @@ def test_projection_uses_stored_feature_key_and_rejects_stale_provenance(
         save_k=3,
     )
     projection = _projection_group(ds, "provenance_map")
-    build_atomic_graph(
+    build_neighbourhood_graph(
         ds,
         feat_key="I",
         dims=5,

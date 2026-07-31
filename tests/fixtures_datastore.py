@@ -9,7 +9,7 @@ import pytest
 from . import full_path, remove, dask_total_sum
 
 
-def build_atomic_graph(
+def build_neighbourhood_graph(
     datastore,
     *,
     from_assay: str | None = None,
@@ -235,7 +235,7 @@ def analyzed_datastore_zarr_root(datastore_zarr_root, tmp_path_factory):
         max_cells=np.inf,
         blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
     )
-    build_atomic_graph(
+    build_neighbourhood_graph(
         datastore,
         feat_key="hvgs",
         local_cache=False,
@@ -274,7 +274,7 @@ def mark_hvgs(auto_filter_cells, datastore):
 
 @pytest.fixture(scope="session")
 def graph_artifacts(mark_hvgs, datastore):
-    build_atomic_graph(datastore, feat_key="hvgs")
+    build_neighbourhood_graph(datastore, feat_key="hvgs")
     state = datastore.get_assay_state("RNA")
     assert state is not None and state.neighbors is not None
     yield datastore.inspect_artifact(state.neighbors).path
@@ -438,7 +438,7 @@ def mark_prevalent_peaks(atac_datastore):
 
 @pytest.fixture(scope="session")
 def make_atac_graph(mark_prevalent_peaks, atac_datastore):
-    build_atomic_graph(
+    build_neighbourhood_graph(
         atac_datastore,
         feat_key="prevalent_peaks",
         reduction_method="lsi",

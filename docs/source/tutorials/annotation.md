@@ -1,5 +1,5 @@
 ---
-description: Marker tables, known markers, cell labels, and subclustering with cell keys in Scarf.
+description: Interpret marker statistics, inspect known markers, and assign cell labels.
 jupytext:
   text_representation:
     extension: .md
@@ -14,10 +14,10 @@ kernelspec:
 
 (annotation)=
 
-# Annotation
+# Interpreting markers and assigning cell types
 
 This chapter starts from a clustered PBMC store and shows how to read marker tables,
-plot known markers, assign labels, and recluster a subset with a custom cell key.
+plot known markers, and assign labels without treating cluster IDs as cell types.
 
 ## Prerequisites
 
@@ -29,7 +29,7 @@ plot known markers, assign labels, and recluster a subset with a custom cell key
 - Retrieve markers with `get_markers`
 - Color embeddings by gene expression
 - Write annotation columns into cell metadata
-- Subset cells with a custom `cell_key` and recluster
+- Distinguish cell-level marker evidence from replicate-aware differential expression
 
 ## Dataset
 
@@ -74,9 +74,8 @@ ds.run_marker_search(group_key='RNA_leiden_cluster')
 
 `get_markers` returns genes ranked by marker score. Pass a `group_id` for one cluster, or
 `group_id=None` for every cluster in one long table with a `group_id` column. Columns include
-scores, expression fractions, fold change, Mann-Whitney `p_value`, AUC, and within-group
-`p_value_adjusted` (Benjamini-Hochberg). The adjusted values are cell-level marker
-corrections, not replicate-aware DE results.
+scores, expression fractions, fold change, a two-sided Mann-Whitney `p_value`,
+AUC, and `p_value_adjusted`.
 
 ```{code-cell} ipython3
 markers = ds.get_markers(
@@ -85,11 +84,36 @@ markers = ds.get_markers(
     min_score=-1,
     min_frac_exp=-1,
 )
-markers[['feature_name', 'score', 'frac_exp', 'p_value', 'p_value_adjusted']].head(10)
+markers[
+    [
+        'feature_name',
+        'score',
+        'frac_exp',
+        'fold_change',
+        'auc',
+        'p_value',
+        'p_value_adjusted',
+    ]
+].head(10)
 ```
 
-`markers.columns` lists the remaining columns, including mean expression inside and outside
-the group and the fold change.
+Interpret the columns together:
+
+- `score` ranks marker specificity using expression inside and outside the group.
+- `frac_exp` is the fraction of target-group cells with detected expression.
+- `fold_change` compares average expression in the target and reference cells.
+- `auc` is the probability that a randomly selected target cell has a higher
+  value than a randomly selected reference cell. Values near 0.5 provide little
+  separation.
+- `p_value` is the two-sided Mann-Whitney result.
+- `p_value_adjusted` applies Benjamini-Hochberg correction within this
+  one-versus-rest group over all tested features.
+
+Both p-value columns treat cells as observations. They are useful for marker
+ranking but are not replicate-aware differential expression. Groups need at
+least two target and two reference cells; smaller comparisons fail rather than
+returning unstable statistics. Older marker tables remain readable and may not
+contain the newer AUC and adjusted-p-value columns until marker search is rerun.
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
@@ -176,79 +200,54 @@ ds.plots.embedding(
 
 `leiden_by_type` is a convenience labeling of clusters, not an automated ontology annotation.
 
-## 5) Subset and recluster
+## 5) Annotate scATAC-seq with gene scores
 
-Create a boolean cell key for one population, then recompute the graph with that key.
+Peak IDs are difficult to interpret directly. `add_melded_assay` can combine
+ATAC peaks that overlap gene bodies and promoter regions into a `GeneScores`
+assay, which can then be plotted like RNA features.
 
-```{code-cell} ipython3
-clusters = ds.cells.to_pandas_dataframe(
-    columns=['RNA_leiden_cluster'],
-    key='I',
-)['RNA_leiden_cluster'].astype(str)
-focus = str(clusters.value_counts().index[0])
-subset = np.array([str(c) == focus for c in ds.cells.fetch_all('RNA_leiden_cluster')])
-active = ds.cells.fetch_all('I').astype(bool)
-ds.cells.insert('focus_cells', active & subset, overwrite=True)
-# Feature keys are resolved as <cell_key>__<feat_key>. Recompute HVGs for the subset.
-ds.mark_hvgs(
-    cell_key='focus_cells',
-    min_cells=10,
-    top_n=500,
-    show_plot=False,
-)
+The external BED file has no header and uses tab-separated columns in this
+order: chromosome, start, end, gene ID, gene name, and optional strand. Its
+genome build must match the peak coordinates. Promoter offsets should be chosen
+before melding and reported with the annotation source.
 
-ds.run_normalization(cell_key='focus_cells', feat_key='hvgs')
-ds.run_pca(dims=15)
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=11)
-ds.build_connectivity_map()
-ds.run_umap(
-    cell_key='focus_cells',
-    n_epochs=100,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-    label='UMAP',
-)
-ds.run_leiden_clustering(
-    cell_key='focus_cells',
-    resolution=0.4,
-    label='leiden_cluster',
-)
-# With cell_key != 'I', columns are RNA_<cell_key>_<label>
-ds.plots.embedding(
-    layout_key='RNA_focus_cells_UMAP',
-    color_by='RNA_focus_cells_leiden_cluster',
-    cell_key='focus_cells',
+```python
+ds.add_melded_assay(
+    from_assay="ATAC",
+    external_bed_fn="genes_with_promoters.bed.gz",
+    peaks_col="ids",
+    renormalization=False,
+    assay_label="GeneScores",
+    assay_type="RNA",
 )
 ```
 
-The subset UMAP and Leiden labels apply only to cells marked in `focus_cells`.
+`renormalization=False` retains the summed TF-IDF-normalized peak signal before
+the resulting RNA-like assay applies its own normalization. Set it differently
+only when a constant total across melded features matches the intended
+interpretation. Features with no overlapping peaks remain present but invalid.
+
+Gene scores are accessibility summaries, not measured RNA expression. Confirm
+cell identities with several loci, known chromatin biology, and the coordinate
+overlap rate. A flat marker panel can indicate a genome-build mismatch or
+insufficient peak overlap.
+
+```{raw} html
+<span id="subset-and-recluster"></span>
+```
+
+## 6) Subset and recluster
+
+Subset graph construction and validation now live in {doc}`clustering`. This
+page keeps annotation focused on evidence and label assignment.
 
 ## Common mistakes and limitations
 
 - Treating cluster IDs as biologically stable across resolutions
 - Overwriting annotation columns without keeping the clustering key you used
 - Claiming replicate-aware DE from `run_marker_search` alone; use `p_value_adjusted` only as a within-group cell-level marker correction
+- Assigning a cell type from one marker gene or one cluster statistic
+- Interpreting ATAC gene scores as measured transcript abundance
 
-## Summary of saved results
-
-| Kind | Keys |
-|---|---|
-| Markers | from `run_marker_search` / `get_markers` |
-| Labels | user columns such as `cell_type`, `leiden_by_type` |
-| Subset key | e.g. `focus_cells` |
-| Subcluster results | e.g. `RNA_focus_cells_UMAP*`, `RNA_focus_cells_leiden_cluster` |
-
-## Further reading
-
-- [Single-cell best practices: cell-type annotation](https://www.sc-best-practices.org/cellular_structure/annotation.html)
-- Scarf does not ship automated ontology annotators; labels here are assigned from markers and known genes
-
-## Next steps
-
-- {doc}`gene_set_enrichment`
-- {doc}`pseudobulk_and_differential_expression`
-- {doc}`mapping_and_label_transfer`
-- {doc}`plotting`
+Scarf does not ship an automated ontology annotator. Labels here are assigned
+from marker evidence and must be reviewed against the study context.

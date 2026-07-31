@@ -1,10 +1,10 @@
 (api)=
-# API
+# API reference
 
 Public Scarf surfaces for analysts:
 
 - `DataStore` and its documented methods
-- Atomic graph operations and `ds.pipeline.run`
+- Graph-construction methods and `ds.pipeline.run`
 - `ArtifactRef`, `ArtifactStatus`, and `AssayState`
 - `EnrichmentResult` and `read_gmt` for gene-set scoring
 - Readers and writers that create or export Zarr stores
@@ -21,7 +21,7 @@ Inheritance helpers (`BaseDataStore`, `GraphDataStore`, `MappingDatastore`) are 
 |---|---|
 | Import and export | {doc}`api/import_export` |
 | DataStore (all stages) | {doc}`api/datastore` |
-| Atomic graph operations | {doc}`api/graph_ops` |
+| Graph construction | {doc}`api/graph_construction` |
 | Artifacts and assay state | {doc}`api/artifacts` |
 | Analysis pipeline | {doc}`api/pipeline` |
 | Assays and metadata | {doc}`api/assays` |

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate current-format Scarf tutorial stores with artifact provenance.
 
-This builds a small analyzed Zarr store using the atomic / pipeline API so
+This builds a small analyzed Zarr store using the graph-construction and pipeline APIs so
 documentation and local demos can show list_artifacts / inspect_artifact
 without relying on master-era archives.
 
@@ -105,7 +105,7 @@ def build_analyzed_store(
     )
     state = ds.get_assay_state("RNA")
     if state is None or state.connectivity_map is None:
-        raise RuntimeError("Pipeline did not publish a connectivity map")
+        raise RuntimeError("Pipeline did not write a connectivity map")
 
     inventory = _artifact_inventory(ds)
     manifest = {

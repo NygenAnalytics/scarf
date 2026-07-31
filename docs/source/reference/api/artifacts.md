@@ -1,10 +1,12 @@
-# Artifacts and assay state
+# Artifacts and assay state API reference
 
-Logical artifacts are content-addressed results stored under the Zarr hierarchy. Analysis
-code usually talks to them through `DataStore` methods. The types below are the public
-contracts for references, status records, and the published assay pointer set.
+Logical artifacts are persisted results with provenance-backed reuse. Analysis
+code usually reaches them through `DataStore` methods. The types below are the
+public contracts for references, status records, lineage, and the assay's
+current analysis chain.
 
-See {doc}`../../concepts/provenance` and {doc}`../../concepts/graph_and_state`.
+See {doc}`../../concepts/provenance` and
+{doc}`../../tutorials/custom_graph_construction`.
 
 ## Types
 
@@ -52,6 +54,7 @@ Prefer these store-bound methods over calling the storage helpers with a raw Zar
    scarf.DataStore.list_artifacts
    scarf.DataStore.inspect_artifact
    scarf.DataStore.load_artifact
+   scarf.DataStore.lineage
    scarf.DataStore.get_assay_state
 ```
 
@@ -59,6 +62,7 @@ Prefer these store-bound methods over calling the storage helpers with a raw Zar
 .. automethod:: scarf.DataStore.list_artifacts
 .. automethod:: scarf.DataStore.inspect_artifact
 .. automethod:: scarf.DataStore.load_artifact
+.. automethod:: scarf.DataStore.lineage
 .. automethod:: scarf.DataStore.get_assay_state
 ```
 

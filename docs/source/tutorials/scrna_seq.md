@@ -15,12 +15,12 @@ kernelspec:
 
 (scrna_seq_workflow)=
 
-# scRNA-seq analysis
+# Cellular heterogeneity with scRNA-seq
 
-This chapter runs a full scRNA-seq workflow on a 5K PBMC dataset: import, quality control,
-highly variable genes, neighbourhood graph, UMAP, clustering, and marker genes. For a
-minimal pipeline see {ref}`Quick start <quickstart>`. For Scanpy equivalents see
-{doc}`../scarf_and_scanpy`.
+This tutorial follows one recommended path from a 5K PBMC count matrix to broad
+cellular populations and marker genes. The dataset is small enough for teaching
+and has familiar immune-cell structure. It is not evidence for Scarf's scaling
+claims; see {doc}`../concepts/scale_and_memory` for measured resource profiles.
 
 ## Prerequisites
 
@@ -31,10 +31,10 @@ minimal pipeline see {ref}`Quick start <quickstart>`. For Scanpy equivalents see
 
 - Convert Cell Ranger H5 to Zarr and open a `DataStore`
 - Filter cells without deleting them from the store
-- Select highly variable genes and build a neighbourhood graph with atomic ops
+- Select informative genes and build a neighbourhood graph step by step
 - Run UMAP and Leiden clustering on that graph
-- Rank marker genes per cluster and plot them
-- Optionally impute sparse features with graph diffusion
+- Compare the Leiden result with Scarf's hierarchical Paris alternative
+- Rank marker genes per cluster and inspect known immune markers
 
 
 ## Dataset
@@ -44,7 +44,6 @@ minimal pipeline see {ref}`Quick start <quickstart>`. For Scanpy equivalents see
 
 ```{code-cell} ipython3
 import scarf
-import scarf.plotting as splt
 
 scarf.configure_output(level='WARNING', progress=False)
 
@@ -92,7 +91,6 @@ ds = scarf.DataStore(
     nthreads=4,
     min_features_per_cell=10
 )
-ds
 ```
 
 ## 2) Quality control
@@ -148,16 +146,18 @@ After filtering, the same metrics are restricted to active cells (`I=True`).
 
 ## 3) Feature selection
 
-Library-size normalization for RNA assays uses a scalar factor (`ds.RNA.sf`, default 1000).
-Because cells with `RNA_nCounts` below 1000 were filtered out, that default is safe here.
-
-```{code-cell} ipython3
-ds.RNA.sf
-```
-
 `mark_hvgs` ranks genes by corrected variance and marks highly variable genes. The feature
 column is named with the cell key prefix (here `I__hvgs`). Pass `feat_key='hvgs'` later;
 Scarf resolves the prefix.
+
+By default, Scarf excludes common mitochondrial, ribosomal, cell-cycle,
+HLA/H2, histone, and sex-linked gene-name patterns, together with genes detected
+in nearly every selected cell. These defaults reduce technical and broadly
+shared signals in this teaching workflow. Use `blacklist=""` to keep all names,
+pass a custom regular expression for a dataset-specific exclusion, or set
+`max_cells=np.inf` to disable the ubiquitous-gene filter. The
+{doc}`feature_selection` guide explains the exact patterns and how to compare
+feature sets.
 
 ```{code-cell} ipython3
 ds.mark_hvgs(
@@ -169,27 +169,44 @@ ds.mark_hvgs(
     show_plot=True,
 )
 print('Selected genes:', int(ds.RNA.feats.fetch_all('I__hvgs').sum()))
-ds.RNA.feats.to_pandas_dataframe(
-    ['names', 'nCells', 'I__hvgs']
-).head()
 ```
 
-## 4) Neighbourhood graph
+The selected genes should span the fitted mean-variance trend rather than being
+concentrated among only the most abundant genes. Very few retained genes or a
+selection dominated by one gene family warrants inspection before continuing.
 
-Cells are linked into a k-nearest-neighbour graph in five steps: normalize the selected
-genes, reduce them with PCA, index the reduced coordinates, query each cell's neighbours,
-and turn those neighbours into a weighted graph. Every step reads the previous result from
-the store, so run them in this order.
+## 4) Normalization
 
-Important parameters:
-
-- `feat_key`: feature column to use (`hvgs` here)
-- `dims`: PCA dimensions
-- `k`: neighbours per cell
+RNA normalization divides each selected cell profile by its library size, scales
+it to `ds.RNA.sf`, and applies the assay's transformation. The default size
+factor is 1000, and the earlier filter removes cells below that count.
 
 ```{code-cell} ipython3
 ds.run_normalization(feat_key='hvgs')
+```
+
+The normalized artifact records both the active cell selection and the `hvgs`
+feature selection.
+
+## 5) PCA
+
+PCA represents the dominant axes of variation among the selected genes. Fifteen
+components are sufficient for this controlled PBMC example.
+
+```{code-cell} ipython3
 ds.run_pca(dims=15)
+```
+
+Choosing a component count is a scientific decision on new data. The
+{doc}`dimensionality_reduction` guide shows how to compare choices.
+
+## 6) Graph construction
+
+The remaining steps index the PCA coordinates, find nearby cells, and turn
+those neighbours into a weighted graph. Downstream layouts and clusters consume
+this graph rather than the count matrix directly.
+
+```{code-cell} ipython3
 ds.build_embedding_initialization()
 ds.build_ann_index()
 ds.query_neighbors(k=11)
@@ -202,15 +219,13 @@ ds.load_graph()
 confirm the graph covers the active cells.
 
 ```{seealso}
-Each step also returns a reference to the artifact it wrote. Capturing those references
-lets you branch the chain, for example to compare two values of `k` or to insert Harmony
-batch correction between PCA and the neighbour index. That style is covered in
-{doc}`atomic_graph_operations`. To run the whole recipe in one call, see
-{ref}`Quick start <quickstart>`.
+Each step also returns a reference to the artifact it wrote. Capturing those
+references allows branches and partial recomputation without changing the
+recommended path here. See {doc}`custom_graph_construction`.
 ```
 
 
-## 5) Dimensionality reduction
+## 7) UMAP
 
 Run UMAP on the latest graph. Results are stored as `RNA_UMAP1` and `RNA_UMAP2`.
 
@@ -221,10 +236,6 @@ ds.run_umap(
     min_dist=1,
     parallel=True
 )
-ds.cells.to_pandas_dataframe(
-    columns=['RNA_UMAP1', 'RNA_UMAP2'],
-    key='I'
-).head()
 ```
 
 ```{code-cell} ipython3
@@ -237,16 +248,16 @@ Cells are placed by neighbourhood-graph proximity on the UMAP.
 ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_nCounts',
-    color_scale=splt.ColorScale(cmap='coolwarm'),
 )
 ```
 
 Library size varies across the embedding; check whether high-count cells dominate one region.
 
-Alternatives (densMAP, tSNE, Paris trees) are covered in
-{doc}`dimensionality_reduction_and_clustering`.
+UMAP preserves local neighbourhood evidence but its global distances and empty
+space are not quantitative measurements. Parameter choice, densMAP, and t-SNE
+are covered in {doc}`dimensionality_reduction`.
 
-## 6) Clustering
+## 8) Clustering
 
 Leiden clustering runs on the same neighbourhood graph. Cluster labels are saved as
 `RNA_leiden_cluster`.
@@ -271,7 +282,23 @@ ds.plots.embedding(
 
 Each colour is a Leiden partition on the same UMAP coordinates.
 
-## 7) Marker genes
+Paris provides a hierarchical view of the same graph. Its automatic cut is a
+useful second checkpoint, not a replacement for biological validation.
+
+```{code-cell} ipython3
+paris = ds.run_paris_clustering()
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by=paris.label_key,
+)
+```
+
+Both partitions should preserve broad monocyte, B-cell, and T-cell structure.
+Tiny isolated clusters dominated by low-count cells are a reason to revisit QC
+before interpreting markers. Resolution sweeps, cluster confidence, graph
+connectivity, and the Paris tree are covered in {doc}`clustering`.
+
+## 9) Marker genes
 
 `run_marker_search` ranks genes per group. Results include specificity-oriented scores,
 Mann-Whitney U test p-values (`p_value`), AUC effect sizes, and within-group
@@ -319,66 +346,24 @@ are present.
 Annotation from markers, known gene panels, and subclustering is covered in
 {doc}`annotation`.
 
-(imputation)=
-
-## 8) Feature imputation
-
-Scarf can impute feature values by diffusing expression along the KNN graph
-(MAGIC-style). Use `get_imputed` after the neighbourhood graph exists.
-
-
-```{code-cell} ipython3
-imputed_cd4 = ds.get_imputed(feature_name='CD4', t=2)
-ds.cells.insert('CD4_imputed', imputed_cd4, overwrite=True)
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by=['CD4', 'CD4_imputed'],
-    n_columns=2,
-    sort_values=True,
-)
+```{raw} html
+<span id="imputation"></span>
 ```
 
-The `t` parameter controls diffusion depth. Higher values smooth more. The diffusion
-operator is cached under the graph location in the Zarr store.
+## Feature imputation
 
-Raw CD4 is sparse; the imputed panel should keep the same high-expression neighborhoods
-while filling gaps inside them. Do not use imputed values as input counts for differential
-expression or as evidence that a gene was detected in a cell.
+Graph diffusion is optional and is not part of this default workflow. See
+{doc}`imputation` for a focused comparison of observed and imputed expression,
+including the limits on interpretation.
 
 ## Common mistakes and limitations
 
 - Reusing QC thresholds from another dataset without inspecting distributions
-- Calling `run_umap` or clustering before building the neighbourhood graph
+- Selecting too few genes to represent rare populations, or so many that technical variation dominates
+- Choosing PCA dimensions or neighbours without checking whether the resulting graph is connected and biologically plausible
+- Interpreting UMAP distances or empty space as measured biological distances
+- Treating every extra cluster at a higher resolution as a distinct cell type
+- Requesting marker tests for groups with fewer than two target or reference cells
 - Treating marker `p_value` or within-group `p_value_adjusted` columns as replicate-aware DE results
 - Expecting filtered cells to disappear from `ds.cells` (they remain, with `I=False`)
-- Treating imputed expression as a replacement for observed counts
-
-
-## Summary of saved results
-
-| Kind | Keys / location |
-|---|---|
-| QC columns | `RNA_nCounts`, `RNA_nFeatures`, `RNA_percentMito`, … |
-| Active cells | cell key `I` |
-| HVGs | feature column `I__hvgs` (pass as `hvgs`) |
-| Embedding | `RNA_UMAP1`, `RNA_UMAP2` |
-| Clusters | `RNA_leiden_cluster` |
-| Markers | marker tables from `run_marker_search` / `get_markers` |
-| Imputed values | cell columns such as `CD4_imputed` after `insert` |
-
-## Further reading
-
-- [Single-cell best practices: quality control](https://www.sc-best-practices.org/preprocessing_visualization/quality_control.html)
-- [Single-cell best practices: clustering](https://www.sc-best-practices.org/cellular_structure/clustering.html)
-- [Scanpy clustering tutorial](https://scanpy.readthedocs.io/en/stable/tutorials/basics/clustering.html)
-- van Dijk et al. 2018, MAGIC (algorithmic ancestry for graph diffusion imputation; not feature parity with Scarf): https://doi.org/10.1016/j.cell.2018.05.061
-- Scarf paper: https://doi.org/10.1038/s41467-022-32097-3
-
-## Next steps
-
-- {doc}`quality_control`
-- {doc}`annotation`
-- {doc}`gene_set_enrichment`
-- {doc}`plotting`
-- {doc}`data_integration`
 

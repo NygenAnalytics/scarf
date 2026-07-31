@@ -416,7 +416,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         invalidate_cache: bool,
         scorer: _EnrichmentScorer,
     ) -> EnrichmentResult:
-        """Shared artifact plan, reuse, write, and publish path for enrichment."""
+        """Shared artifact plan, reuse, write, and selection path for enrichment."""
         cell_index = scorer.cell_index
         cell_digest = array_digest(cell_index)
         feature_digest = array_digest(scorer.feature_index)

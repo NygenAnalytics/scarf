@@ -1,4 +1,5 @@
 ---
+description: Score S and G2M gene programs and assign cell-cycle phases.
 jupytext:
   text_representation:
     extension: .md
@@ -86,6 +87,10 @@ Cell cycle phase is assigned as follows (cells default to S, then rules override
 ```{code-cell} ipython3
 ds.run_cell_cycle_scoring()
 ```
+
+The bundled list contains one marker that is absent from this assay. The warning
+about one unmatched name is expected, and Scarf scores the cells with the
+remaining markers.
 
 ---
 ### 3. Visualize cell-cycle phases
@@ -190,17 +195,6 @@ High correlation coefficients indicate a large degree of concordance between the
 - Interpreting a phase score as evidence of cell proliferation without checking the underlying genes
 - Comparing scores across workflows with different gene sets or normalization
 
-## Saved results
-
-Scarf stores `RNA_cell_cycle_phase`, `RNA_S_score`, and `RNA_G2M_score` in cell metadata.
-
-## Further reading
-
-- [Scanpy `score_genes_cell_cycle`](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.score_genes_cell_cycle.html)
-
-## Next steps
-
-- {doc}`gene_set_enrichment`
-- {doc}`plotting`
-- {doc}`annotation`
-- {doc}`data_organization`
+`run_cell_cycle_scoring` stores `RNA_cell_cycle_phase`, `RNA_S_score`, and
+`RNA_G2M_score` beside the scoring step so they can be reused by plots and
+downstream metadata queries.

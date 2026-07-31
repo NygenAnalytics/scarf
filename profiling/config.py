@@ -34,7 +34,7 @@ StageName = Literal[
     "toH5ad",
 ]
 
-ATOMIC_GRAPH_STAGE_ORDER: tuple[StageName, ...] = (
+GRAPH_CONSTRUCTION_STAGE_ORDER: tuple[StageName, ...] = (
     "runNormalization",
     "runPca",
     "buildEmbeddingInitialization",
@@ -50,7 +50,7 @@ CORE_STAGE_ORDER: tuple[StageName, ...] = (
     "reopenStore",
     "filterCells",
     "markHvgs",
-    *ATOMIC_GRAPH_STAGE_ORDER,
+    *GRAPH_CONSTRUCTION_STAGE_ORDER,
     "runUmap",
     "runLeiden",
     "runClustering",
