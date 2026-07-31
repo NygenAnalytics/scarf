@@ -1273,6 +1273,20 @@ panel, which makes feature selection an important part of the comparison.
    barcode. Compare both the final identity and the global
    singlet/doublet/negative classification.
 
+The compact CI fixture uses a deterministic 1,000-cell subset of
+`TNC-1-2-1`. Regenerate it with:
+
+```bash
+uv run python scripts/export_seurat_hto_golden.py \
+  --h5 /path/to/GSE245108_TNC-1-2-1_filtered_feature_bc_matrix.h5 \
+  --rscript /path/to/seurat-environment/bin/Rscript
+```
+
+The Python wrapper records the source-file hash, selected raw counts, sampling
+seed, settings, and package versions in
+`tests/seurat_hto_5_5_1_golden.json`. Normal CI reads that fixture and does not
+require R, Seurat, network access, or the full GEO matrix.
+
 ### Results
 
 | Matrix | Cells | Exact identity matches | Agreement |
