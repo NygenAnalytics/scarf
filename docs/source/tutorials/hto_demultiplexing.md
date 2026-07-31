@@ -16,13 +16,14 @@ biological assays. `mark_hto_identities` normalizes the hashtag counts, estimate
 background, and writes the resulting identity to shared cell metadata.
 
 ```python
-result = ds.mark_hto_identities(
+identity_key = ds.mark_hto_identities(
     from_assay="HTO",
     label="sample_id",
 )
 ```
 
-Inspect the returned metadata key and compare identity counts with the
+The returned value is the cell metadata key, `sample_id` in this example.
+Inspect that column and compare identity counts with the
 experiment's expected loading. Singlet labels can define sample-aware QC or
 pseudobulk groups. Negative cells do not have a confident hashtag assignment.
 Doublets carry evidence for more than one hashtag and should not be silently

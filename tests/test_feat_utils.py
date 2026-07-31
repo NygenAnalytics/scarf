@@ -4,7 +4,16 @@ import pytest
 
 from scarf.features.scoring import binned_sampling
 from scarf.features.variability import fit_lowess, select_highly_variable_features
-from scarf.quality_control.hto import hto_demux
+from scarf.quality_control.hto import (
+    _background_clusters,
+    _classify_hto_identities,
+    _cluster_labels,
+    _clr_normalize,
+    _fit_negative_binomial_parameters,
+    _negative_binomial_cutoff,
+    _positive_hto_calls,
+    hto_demux,
+)
 
 
 def test_fit_lowess_returns_per_feature_corrections():
@@ -338,10 +347,62 @@ def test_binned_sampling_excludes_query_genes():
     assert all(name in gene_names for name in controls)
 
 
+def test_hto_negative_binomial_cutoff_is_unshifted(monkeypatch):
+    assert _negative_binomial_cutoff(mu=1, alpha=1) == 6
+
+    counts = pd.DataFrame({"HTO_A": [1, 2, 6, 7]})
+    monkeypatch.setattr(
+        "scarf.quality_control.hto._fit_negative_binomial_parameters",
+        lambda values, hto_name: (1, 1),
+    )
+
+    positive = _positive_hto_calls(counts, np.asarray([0, 0, 1, 1]))
+
+    assert positive["HTO_A"].tolist() == [False, False, False, True]
+
+
+def test_hto_background_cluster_uses_raw_means():
+    counts = pd.DataFrame({"HTO_A": [0, 100, 40, 40]})
+    cluster_labels = np.asarray([0, 0, 1, 1])
+
+    background = _background_clusters(counts, cluster_labels)
+    normalized_means = _clr_normalize(counts).groupby(cluster_labels).mean()
+
+    assert background["HTO_A"] == 1
+    assert normalized_means["HTO_A"].idxmin() == 0
+
+
+def test_hto_classification_uses_clr_argmax_for_singlets():
+    index = ["negative", "singlet", "doublet", "tie"]
+    normalized = pd.DataFrame(
+        {
+            "HTO_A": [0.2, 0.2, 1.0, 0.5],
+            "HTO_B": [0.1, 1.5, 0.9, 0.5],
+        },
+        index=index,
+    )
+    positive = pd.DataFrame(
+        {
+            "HTO_A": [False, True, True, True],
+            "HTO_B": [False, False, True, False],
+        },
+        index=index,
+    )
+
+    identities = _classify_hto_identities(normalized, positive)
+
+    assert identities.to_dict() == {
+        "negative": "Negative",
+        "singlet": "HTO_B",
+        "doublet": "Doublet",
+        "tie": "HTO_A",
+    }
+
+
 def test_hto_demux_assigns_singlet_and_negative_labels():
     rng = np.random.default_rng(2)
     n_cells = 60
-    hto_names = ["HTO_A", "HTO_B", "HTO_C"]
+    hto_names = ["cluster", "HTO_B", "HTO_C"]
 
     background = rng.poisson(2, size=(n_cells, len(hto_names)))
     counts = background.astype(float)
@@ -349,27 +410,228 @@ def test_hto_demux_assigns_singlet_and_negative_labels():
         dominant = i % len(hto_names)
         counts[i, dominant] += rng.integers(30, 80)
 
-    hto_counts = pd.DataFrame(counts, columns=hto_names)
+    hto_counts = pd.DataFrame(
+        counts,
+        columns=hto_names,
+        index=[f"cell_{index}" for index in range(n_cells)],
+    )
+    original = hto_counts.copy(deep=True)
     assignments = hto_demux(hto_counts)
     repeated = hto_demux(hto_counts)
 
     assert len(assignments) == n_cells
     pd.testing.assert_series_equal(assignments, repeated)
     assert assignments.index.equals(hto_counts.index)
+    pd.testing.assert_frame_equal(hto_counts, original)
     allowed = {"Negative", "Singlet", "Doublet", *hto_names}
     assert set(assignments.unique()).issubset(allowed)
     assert set(assignments.unique()) & set(hto_names)
 
 
-def test_hto_demux_rejects_empty_cluster_means():
+@pytest.mark.parametrize(
+    ("hto_counts", "error", "message"),
+    [
+        (
+            np.asarray([[1], [2]]),
+            TypeError,
+            "must be a pandas DataFrame",
+        ),
+        (
+            pd.DataFrame(index=range(2)),
+            ValueError,
+            "at least one HTO",
+        ),
+        (
+            pd.DataFrame(np.ones((3, 2)), columns=["HTO_A", "HTO_A"]),
+            ValueError,
+            "HTO IDs must be unique",
+        ),
+        (
+            pd.DataFrame({" ": [1, 2]}),
+            ValueError,
+            "non-empty strings",
+        ),
+        (
+            pd.DataFrame({"Negative": [1, 2]}),
+            ValueError,
+            "reserved identity labels",
+        ),
+        (
+            pd.DataFrame({"HTO_A": [1, 2]}, index=["cell", "cell"]),
+            ValueError,
+            "cell index must be unique",
+        ),
+        (
+            pd.DataFrame({"HTO_A": ["1", "2"]}),
+            TypeError,
+            "only numeric raw counts",
+        ),
+        (
+            pd.DataFrame({"HTO_A": [1, np.nan]}),
+            ValueError,
+            "only finite raw counts",
+        ),
+        (
+            pd.DataFrame({"HTO_A": [1, -1]}),
+            ValueError,
+            "only nonnegative raw counts",
+        ),
+        (
+            pd.DataFrame({"HTO_A": [1, 1.5]}),
+            ValueError,
+            "integer-valued raw counts",
+        ),
+        (
+            pd.DataFrame({"HTO_A": [0, 0]}),
+            ValueError,
+            "no positive counts",
+        ),
+    ],
+    ids=[
+        "not-dataframe",
+        "no-htos",
+        "duplicate-htos",
+        "empty-hto",
+        "reserved-hto",
+        "duplicate-cells",
+        "nonnumeric",
+        "nonfinite",
+        "negative",
+        "fractional",
+        "all-zero-hto",
+    ],
+)
+def test_hto_demux_rejects_invalid_input(hto_counts, error, message):
+    with pytest.raises(error, match=message):
+        hto_demux(hto_counts)
+
+
+def test_hto_demux_rejects_insufficiently_distinct_profiles():
     hto_counts = pd.DataFrame(
         {
-            "HTO_A": [0, 0, 0],
-            "HTO_B": [0, 0, 0],
+            "HTO_A": [1, 1, 1],
+            "HTO_B": [2, 2, 2],
         }
     )
-    with pytest.raises(AssertionError):
+
+    with pytest.raises(ValueError, match="3 distinct normalized cell profiles"):
         hto_demux(hto_counts)
+
+
+def test_hto_cluster_labels_rejects_collapsed_kmeans(monkeypatch):
+    class CollapsedKMeans:
+        def __init__(self, **kwargs):
+            pass
+
+        def fit_predict(self, values):
+            return np.asarray([0, 0, 1])
+
+    monkeypatch.setattr("sklearn.cluster.KMeans", CollapsedKMeans)
+    normalized = pd.DataFrame(
+        {
+            "HTO_A": [0.0, 1.0, 2.0],
+            "HTO_B": [2.0, 1.0, 0.0],
+        }
+    )
+
+    with pytest.raises(ValueError, match="2 occupied clusters; expected 3"):
+        _cluster_labels(normalized, random_seed=0)
+
+
+@pytest.mark.parametrize(
+    ("counts", "labels", "message"),
+    [
+        (
+            pd.DataFrame({"HTO_A": [1, 10, 20]}),
+            np.asarray([0, 1, 2]),
+            "at least two cells",
+        ),
+        (
+            pd.DataFrame({"HTO_A": [0, 0, 10, 20]}),
+            np.asarray([0, 0, 1, 1]),
+            "contains only zero counts",
+        ),
+    ],
+    ids=["single-cell", "all-zero"],
+)
+def test_hto_positive_calls_rejects_invalid_backgrounds(counts, labels, message):
+    with pytest.raises(ValueError, match=message):
+        _positive_hto_calls(counts, labels)
+
+
+def test_hto_negative_binomial_fit_rejects_nonconvergence(monkeypatch):
+    class FitResult:
+        mle_retvals = {"converged": False}
+        params = np.asarray([0.0, 1.0])
+
+    class NonconvergedModel:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fit(self, **kwargs):
+            return FitResult()
+
+    monkeypatch.setattr(
+        "statsmodels.discrete.discrete_model.NegativeBinomial",
+        NonconvergedModel,
+    )
+
+    with pytest.raises(ValueError, match="did not converge for HTO 'HTO_A'"):
+        _fit_negative_binomial_parameters(np.asarray([1, 2]), "HTO_A")
+
+
+def test_hto_negative_binomial_fit_wraps_optimizer_errors(monkeypatch):
+    class FailingModel:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("optimizer failed")
+
+    monkeypatch.setattr(
+        "statsmodels.discrete.discrete_model.NegativeBinomial",
+        FailingModel,
+    )
+
+    with pytest.raises(ValueError, match="fit failed for HTO 'HTO_A'"):
+        _fit_negative_binomial_parameters(np.asarray([1, 2]), "HTO_A")
+
+
+@pytest.mark.parametrize(
+    ("parameters", "message"),
+    [
+        (np.asarray([np.inf, 1.0]), "invalid mean"),
+        (np.asarray([0.0, 0.0]), "invalid dispersion"),
+    ],
+    ids=["mean", "dispersion"],
+)
+def test_hto_negative_binomial_fit_rejects_invalid_parameters(
+    monkeypatch,
+    parameters,
+    message,
+):
+    class FitResult:
+        mle_retvals = {"converged": True}
+        params = parameters
+
+    class InvalidModel:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fit(self, **kwargs):
+            return FitResult()
+
+    monkeypatch.setattr(
+        "statsmodels.discrete.discrete_model.NegativeBinomial",
+        InvalidModel,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        _fit_negative_binomial_parameters(np.asarray([1, 2]), "HTO_A")
+
+
+def test_hto_negative_binomial_cutoff_rejects_nonfinite_ppf(monkeypatch):
+    monkeypatch.setattr("scipy.stats.nbinom.ppf", lambda *args, **kwargs: np.inf)
+
+    with pytest.raises(ValueError, match="cutoff must be a finite integer"):
+        _negative_binomial_cutoff(mu=1, alpha=1)
 
 
 def test_hto_demux_rejects_too_few_cells():

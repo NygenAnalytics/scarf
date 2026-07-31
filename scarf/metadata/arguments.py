@@ -351,7 +351,7 @@ class HtoIdentityArguments(OperationArguments):
 
     cell_selection: ArtifactRef = artifact_input()
     feature_ids_fingerprint: str = artifact_input()
-    algorithm_version: int = parameter()
+    method: dict[str, object] = parameter()
     random_seed: int = parameter()
     from_assay: str = execution()
     cell_key: str = execution()

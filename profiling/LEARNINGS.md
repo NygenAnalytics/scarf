@@ -1,6 +1,6 @@
 # Scarf cloud profiling learnings (50k → 10M, countsT + Paris)
 
-Date range: 2026-07-14 to 2026-07-30
+Date range: 2026-07-14 to 2026-07-31
 Environment: Modal `scarf_profiling`, app `scarf-profiling`, region `eu` (was `eu-west-1`; broadened for capacity), secret `scarf-r2`
 Data: `s3://scarf-tests/scarf-profiling/` (datasets / stores / results)
 Dataset source: nested CELLxGENE samples already prepared on R2
@@ -1233,3 +1233,70 @@ Measured positioning:
 > H5AD-to-Zarr and countsT construction. The tested Scanpy Dask pipeline needed
 > a 64 GiB container to pass stock QC and reached an unsupported Dask marker
 > path after 61 minutes.
+
+## HTO demultiplexing validation against Seurat (2026-07-31)
+
+The corrected HTO demultiplexing implementation was checked against Seurat on
+four filtered matrices from
+[GSE245108](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE245108).
+These matrices contain ten concentration-specific HTOs and a much larger ADT
+panel, which makes feature selection an important part of the comparison.
+
+### Reference environment and settings
+
+- Python 3.14.4, pandas 2.3.3, SciPy 1.18.0, scikit-learn 1.9.0, and
+  statsmodels 0.14.6.
+- R 4.4.3, Seurat 5.5.1, and fitdistrplus 1.2.6.
+- Raw HTO counts with CLR normalization across cells for each HTO. The matching
+  Seurat setting is `NormalizeData(normalization.method = "CLR", margin = 1)`.
+- Eleven initial clusters, which is ten HTOs plus one negative cluster.
+- K-means with 100 random starts and seed 0.
+- Negative-binomial background cutoff at the 0.99 quantile, with counts strictly
+  greater than the cutoff considered positive.
+
+### Reproduction outline
+
+1. Download the four filtered feature-barcode matrices named
+   `GSE245108_TNC-1-2-1`, `GSE245108_TNC-1-2-2`,
+   `GSE245108_TNC-3-4-1`, and `GSE245108_TNC-3-4-2`, each ending in
+   `_filtered_feature_bc_matrix.h5`.
+2. Use `GSE245108_TNC_12_antibody_features.csv.gz` and
+   `GSE245108_TNC_34_antibody_features.csv.gz` to identify the antibody
+   features. Select only the ten `Antibody Capture` features whose names begin
+   with `TNC_`. Do not include the regular ADTs.
+3. Preserve the 10x cell barcodes and construct a cells-by-HTOs raw count
+   dataframe. Run Scarf `hto_demux` with `random_seed=0`.
+4. Load the same counts into a Seurat HTO assay, apply CLR normalization with
+   `margin=1`, and run `HTODemux` with `positive.quantile=0.99`, `init=11`,
+   `nstarts=100`, `kfunc="kmeans"`, and `seed=0`.
+5. Join Scarf identities and Seurat `hash.ID` values by the original cell
+   barcode. Compare both the final identity and the global
+   singlet/doublet/negative classification.
+
+### Results
+
+| Matrix | Cells | Exact identity matches | Agreement |
+|--------|------:|-----------------------:|----------:|
+| TNC-1-2-1 | 8,438 | 8,438 | 100% |
+| TNC-1-2-2 | 8,912 | 8,896 | 99.8205% |
+| TNC-3-4-1 | 10,599 | 10,599 | 100% |
+| TNC-3-4-2 | 10,250 | 10,250 | 100% |
+| **Total** | **38,199** | **38,183** | **99.9581%** |
+
+Scarf classified 33,190 cells as singlets, 4,706 as doublets, and 303 as
+negative. Seurat classified 33,206 as singlets, 4,690 as doublets, and 303 as
+negative.
+
+All 16 differences occurred in `TNC-1-2-2`. Scarf called these cells doublets,
+while Seurat called them singlets. Each cell had exactly 17 counts for
+`TNC_1_0_5x`. The Python and R K-means implementations placed three
+cluster-boundary cells differently, changing that HTO's inferred background
+cutoff from 17 in Seurat to 16 in Scarf. When both negative-binomial
+implementations received the same background cells, their fitted parameters
+were effectively identical and produced the same integer cutoff.
+
+This validates numerical agreement with Seurat for the corrected
+normalization, background selection, negative-binomial cutoff, and identity
+classification. It does not provide independent biological ground truth.
+Small differences at exact cutoff boundaries remain expected when different
+K-means implementations choose slightly different initial partitions.

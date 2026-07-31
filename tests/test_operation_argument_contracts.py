@@ -213,7 +213,7 @@ _CONTRACTS = (
         DataStore.mark_hto_identities,
         metadata_arguments.HtoIdentityArguments,
         model_only={
-            **_classified("algorithm_version", "algorithm_version"),
+            **_classified("derived", "method"),
             **_classified(
                 "resolved_input",
                 "cell_selection",

@@ -239,6 +239,12 @@ removed in 2.0:
 
 Recomputed results can differ from earlier Scarf releases. Recalibrate downstream thresholds after rebuilding.
 
+## HTO demultiplexing
+
+`mark_hto_identities` now returns the cell metadata column name. Legacy HTO
+identity artifacts are not reused because provenance records the corrected
+normalization, clustering, background, cutoff, and singlet-assignment methods.
+
 ## Metric names
 
 Use `metric_label_concordance` for ARI or NMI label agreement.

@@ -15,7 +15,7 @@ from ...quality_control.filtering import (
     _validated_work_scale,
     gaussian_quantile_bounds,
 )
-from ...quality_control.hto import hto_demux
+from ...quality_control.hto import _hto_demux_method, hto_demux
 from ...metadata.artifacts import (
     artifact_values,
     categorical_display,
@@ -416,7 +416,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         label: str = "Hashtag_identity",
         random_seed: int = 0,
         invalidate_cache: bool = False,
-    ) -> None:
+    ) -> str:
         """Assign HTO hashtag identities to cells using demultiplexing.
 
         Args:
@@ -427,7 +427,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             invalidate_cache: Recompute even when matching provenance exists.
 
         Returns:
-            None
+            Name of the cell metadata column containing HTO identities.
         """
         if from_assay is None:
             from_assay = "HTO"
@@ -448,7 +448,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             feature_ids_fingerprint=fingerprint_strings(
                 np.asarray(assay.feats.fetch_all("ids"))
             ),
-            algorithm_version=2,
+            method=_hto_demux_method(),
             random_seed=random_seed,
             from_assay=from_assay,
             cell_key=cell_key,
@@ -490,7 +490,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 default_display=categorical_display(values),
                 preserved_display=preserved_display,
             )
-            return
+            return label
         counts = controlled_compute(
             assay.rawData[self.cells.fetch_all(cell_key)], self.nthreads
         )
@@ -518,6 +518,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             default_display=categorical_display(values),
             preserved_display=preserved_display,
         )
+        return label
 
     def run_doublet_detection(
         self,

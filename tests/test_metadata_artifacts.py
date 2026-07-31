@@ -253,6 +253,7 @@ def test_hto_identity_is_artifact_backed(
 ) -> None:
     datastore = datastore_ephemeral
     n_active = len(datastore.cells.active_index("I"))
+    column_name = "sample_id"
     expected = np.asarray(
         ["negative" if index % 2 else "tag" for index in range(n_active)]
     )
@@ -261,12 +262,37 @@ def test_hto_identity_is_artifact_backed(
         lambda counts, **kwargs: pd.Series(expected[: len(counts)]),
     )
 
-    datastore.mark_hto_identities(from_assay="assay2", cell_key="I")
+    returned_label = datastore.mark_hto_identities(
+        from_assay="assay2",
+        cell_key="I",
+        label=column_name,
+    )
 
-    ref = _column_ref(datastore, "Hashtag_identity")
+    assert returned_label == column_name
+    ref = _column_ref(datastore, column_name)
     assert ref.kind == "hto_identity"
+    parameters = datastore.inspect_artifact(ref).parameters
+    assert parameters is not None
+    assert parameters["method"] == {
+        "normalization": "clr_per_hto",
+        "clustering": {
+            "method": "kmeans",
+            "init": "random",
+            "n_starts": 100,
+            "cluster_count": "n_htos_plus_one",
+        },
+        "background": "raw_mean",
+        "cutoff": {
+            "distribution": "negative_binomial_nb2",
+            "quantile": 0.99,
+            "location": 0,
+            "comparison": "strictly_greater",
+        },
+        "singlet_assignment": "clr_argmax",
+    }
+    assert "algorithm_version" not in parameters
     np.testing.assert_array_equal(
-        datastore.cells.fetch("Hashtag_identity", key="I"),
+        datastore.cells.fetch(column_name, key="I"),
         expected,
     )
     monkeypatch.setattr(
@@ -275,8 +301,13 @@ def test_hto_identity_is_artifact_backed(
             AssertionError("cached HTO identities were recomputed")
         ),
     )
-    datastore.mark_hto_identities(from_assay="assay2", cell_key="I")
-    assert _column_ref(datastore, "Hashtag_identity") == ref
+    cached_label = datastore.mark_hto_identities(
+        from_assay="assay2",
+        cell_key="I",
+        label=column_name,
+    )
+    assert cached_label == column_name
+    assert _column_ref(datastore, column_name) == ref
 
 
 def test_user_display_metadata_survives_column_refresh(
