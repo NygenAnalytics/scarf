@@ -14,14 +14,14 @@ kernelspec:
 
 (trajectory_analysis)=
 
-# Tuning and validating trajectory analyses
+# Trajectory validation
 
 Trajectory results depend on the selected graph, the source and sink
 annotations, and the features used for downstream tests. This guide checks those
 dependencies on the Bastidas-Ponce pancreas dataset after the recommended path
 in {doc}`pseudotime`, {doc}`pseudotime_modules`, and {doc}`fate_mapping`.
 
-## Set up an independent analysis
+## Standalone setup
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -29,9 +29,8 @@ import numpy as np
 import pandas as pd
 
 import scarf
-import scarf.plotting as splt
 
-scarf.configure_output(level="WARNING", progress=False)
+scarf.configure_output(level="WARNING", progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name="bastidas-ponce_4K_pancreas-d15_rnaseq",
@@ -45,57 +44,141 @@ ds = scarf.DataStore(
 )
 ```
 
-The prepared store contains a neighbourhood graph, UMAP coordinates, and the
-provided `clusters` annotation. A trajectory from ductal cells toward Alpha,
-Beta, and Delta states is biologically directed rather than discovered without
-supervision.
-
-## Check graph coverage and direction
-
-Population balance analysis treats movement on the graph as a directed process
-between selected boundaries. The graph must connect the populations of interest.
-By default, Scarf scores the largest connected component and marks other cells
-invalid rather than assigning unsupported values.
+This section opens the prepared datastore used by {doc}`pseudotime` and fits the
+same multi-sink baseline so the page can run independently.
 
 ```{code-cell} ipython3
-pseudotime = ds.run_pseudotime_scoring(
+multi_sink = ds.run_pseudotime_scoring(
     source_sink_key="clusters",
     sources=["Ductal"],
     sinks=["Alpha", "Beta", "Delta"],
-    label="validated_pseudotime",
+    label="multi_sink_pseudotime",
 )
+```
 
-coverage = pd.Series(
-    {
-        "selected cells": int(ds.cells.fetch_all("I").sum()),
-        "valid pseudotime cells": int(
-            ds.cells.fetch_all(pseudotime.validity_key).sum()
-        ),
-    }
+## Compare boundary choices
+
+Population balance analysis directs movement between the selected boundaries.
+Changing those boundaries changes the scientific question. Compare the
+multi-sink baseline with a narrower ductal-to-Beta question.
+
+```{code-cell} ipython3
+beta_sink = ds.run_pseudotime_scoring(
+    source_sink_key="clusters",
+    sources=["Ductal"],
+    sinks=["Beta"],
+    label="beta_sink_pseudotime",
 )
+```
+
+```{code-cell} ipython3
+boundary_results = {
+    "Alpha, Beta, and Delta sinks": multi_sink,
+    "Beta sink": beta_sink,
+}
+selected_cells = int(ds.cells.fetch_all("I").sum())
+coverage = pd.DataFrame(
+    {
+        name: {
+            "valid cells": int(
+                ds.cells.fetch_all(result.validity_key).sum()
+            ),
+            "valid fraction": float(
+                ds.cells.fetch_all(result.validity_key).sum()
+                / selected_cells
+            ),
+        }
+        for name, result in boundary_results.items()
+    }
+).T
 coverage
 ```
 
 ```{code-cell} ipython3
-coverage_plot = ds.plots.embedding(
-    layout_key="RNA_UMAP",
-    color_by=[pseudotime.pseudotime_key, "clusters"],
-    n_columns=2,
-    show_titles=False,
-    show=False,
+multi_valid = ds.cells.fetch_all(multi_sink.validity_key).astype(bool)
+beta_valid = ds.cells.fetch_all(beta_sink.validity_key).astype(bool)
+shared_valid = multi_valid & beta_valid
+if int(shared_valid.sum()) < 2:
+    raise RuntimeError(
+        "Boundary comparison needs at least two jointly valid cells"
+    )
+
+multi_values = ds.cells.fetch_all(multi_sink.pseudotime_key)
+beta_values = ds.cells.fetch_all(beta_sink.pseudotime_key)
+rank_agreement = pd.Series(
+    multi_values[shared_valid]
+).corr(
+    pd.Series(beta_values[shared_valid]),
+    method="spearman",
 )
-for axis, title in zip(
-    coverage_plot.axes.values(),
-    ("Pseudotime", "Cell type"),
-    strict=True,
-):
-    axis.set_title(title)
+pd.Series(
+    {
+        "jointly valid cells": int(shared_valid.sum()),
+        "Spearman rank agreement": rank_agreement,
+    }
+)
 ```
 
-The valid fraction should cover the annotated endocrine trajectory, and the
-score should increase from the source toward all three sinks. Changing source
-and sink labels to force a preferred orientation is not a substitute for fixing
-a disconnected or biologically unsuitable graph.
+```{code-cell} ipython3
+figure, axis = plt.subplots(figsize=(5, 4))
+density = axis.hexbin(
+    multi_values[shared_valid],
+    beta_values[shared_valid],
+    gridsize=35,
+    mincnt=1,
+    cmap="viridis",
+)
+comparison_min = min(
+    multi_values[shared_valid].min(),
+    beta_values[shared_valid].min(),
+)
+comparison_max = max(
+    multi_values[shared_valid].max(),
+    beta_values[shared_valid].max(),
+)
+axis.plot(
+    [comparison_min, comparison_max],
+    [comparison_min, comparison_max],
+    color="black",
+    linestyle="--",
+    linewidth=1,
+)
+axis.set(
+    xlabel="Multi-sink pseudotime",
+    ylabel="Beta-sink pseudotime",
+    title=f"Spearman agreement: {rank_agreement:.3f}",
+)
+figure.colorbar(density, ax=axis, label="Cells per bin")
+figure.tight_layout()
+plt.show()
+```
+
+```{code-cell} ipython3
+population_summary = pd.DataFrame(
+    {
+        "population": ds.cells.fetch_all("clusters"),
+        "multi-sink pseudotime": np.where(
+            multi_valid,
+            multi_values,
+            np.nan,
+        ),
+        "Beta-sink pseudotime": np.where(
+            beta_valid,
+            beta_values,
+            np.nan,
+        ),
+    }
+).groupby("population").agg(["count", "median"])
+population_summary
+```
+
+A narrow diagonal band means the boundary change largely preserves cell order;
+systematic departures identify cells whose position depends on the selected
+terminal states. Disagreement does not show that one ordering is true. Low
+coverage can instead indicate disconnected populations or a graph that does not
+support the proposed trajectory. Use
+{doc}`custom_graph_construction` when the graph itself needs a controlled
+sensitivity analysis.
 
 ## Validate pseudotime marker tests
 
@@ -106,8 +189,8 @@ features in this search.
 
 ```{code-cell} ipython3
 markers = ds.run_pseudotime_marker_search(
-    cell_key=pseudotime.validity_key,
-    pseudotime_key=pseudotime.pseudotime_key,
+    cell_key=multi_sink.validity_key,
+    pseudotime_key=multi_sink.pseudotime_key,
 )
 
 markers.table[
@@ -131,23 +214,63 @@ the requested module granularity. Compare results for coherent patterns and
 reasonable module sizes rather than selecting a value from the heatmap alone.
 
 ```{code-cell} ipython3
-modules = ds.run_pseudotime_aggregation(
-    cell_key=pseudotime.validity_key,
-    pseudotime_key=pseudotime.pseudotime_key,
-    cluster_label="trajectory_modules",
-    n_clusters=12,
-    window_size=200,
-    chunk_size=100,
-)
-
-pd.Series(modules.feature_clusters).value_counts().sort_index()
+module_results = {}
+module_rows = []
+for name, n_clusters in {"coarse": 6, "fine": 12}.items():
+    result = ds.run_pseudotime_aggregation(
+        cell_key=multi_sink.validity_key,
+        pseudotime_key=multi_sink.pseudotime_key,
+        cluster_label=f"trajectory_modules_{name}",
+        n_clusters=n_clusters,
+        window_size=200,
+        chunk_size=100,
+    )
+    module_results[name] = result
+    assignments = pd.Series(result.feature_clusters)
+    module_sizes = assignments[assignments != -1].value_counts()
+    module_rows.append(
+        {
+            "setting": name,
+            "requested modules": n_clusters,
+            "assigned features": int(module_sizes.sum()),
+            "observed modules": int(len(module_sizes)),
+            "smallest module": int(module_sizes.min()),
+            "largest module": int(module_sizes.max()),
+        }
+    )
+pd.DataFrame(module_rows).set_index("setting")
 ```
 
 ```{code-cell} ipython3
+coarse_modules = module_results["coarse"]
+fine_modules = module_results["fine"]
 module_features = ds.RNA.feats.to_pandas_dataframe(
-    ["names", modules.cluster_key]
+    [
+        "names",
+        coarse_modules.cluster_key,
+        fine_modules.cluster_key,
+    ]
 )
-assigned = module_features[module_features[modules.cluster_key] != -1]
+assigned_both = module_features[
+    (module_features[coarse_modules.cluster_key] != -1)
+    & (module_features[fine_modules.cluster_key] != -1)
+]
+pd.crosstab(
+    assigned_both[coarse_modules.cluster_key],
+    assigned_both[fine_modules.cluster_key],
+    normalize="index",
+).round(2)
+```
+
+The cross-tabulation shows how each coarse module divides at finer
+granularity. A split can reveal distinct profiles, but a fragmented row with
+very small groups can also indicate an unstable setting.
+
+```{code-cell} ipython3
+modules = fine_modules
+assigned = module_features[
+    module_features[modules.cluster_key] != -1
+]
 representatives = (
     assigned.groupby(modules.cluster_key, sort=True)["names"]
     .first()
@@ -193,8 +316,8 @@ fate.
 ```{code-cell} ipython3
 fate = ds.run_fate_mapping(
     cell_key="I",
-    subset_cell_key=pseudotime.validity_key,
-    pseudotime_key=pseudotime.pseudotime_key,
+    subset_cell_key=multi_sink.validity_key,
+    pseudotime_key=multi_sink.pseudotime_key,
     sink_key="clusters",
     sinks=["Alpha", "Beta", "Delta"],
 )
@@ -204,28 +327,6 @@ simplex_error = float(
     np.max(np.abs(valid_probabilities.sum(axis=1) - 1.0))
 )
 simplex_error
-```
-
-```{code-cell} ipython3
-figure, axes = plt.subplots(1, 3, figsize=(11, 4))
-probability_scale = splt.ColorScale(vmin=0, vmax=1)
-for index, (axis, sink, fate_key) in enumerate(
-    zip(axes, fate.sink_labels, fate.fate_keys, strict=True)
-):
-    ds.plots.embedding(
-        layout_key="RNA_UMAP",
-        color_by=fate_key,
-        subset_by=fate.validity_key,
-        color_scale=probability_scale,
-        sort_values=True,
-        show_legend=index == 2,
-        show_titles=False,
-        target=axis,
-        show=False,
-    )
-    axis.set_title(f"{sink} fate probability")
-figure.tight_layout()
-figure
 ```
 
 ```{code-cell} ipython3

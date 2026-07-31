@@ -44,7 +44,9 @@ Arguments that are omitted retain their current values.
 
 Progress is independent of log level. Setting a quiet level such as `WARNING`
 does not disable progress. Code that previously relied on log level to suppress
-bars should call `configure_output(progress=False)` explicitly.
+bars should call `configure_output(progress=False)` explicitly. Interactive
+notebooks animate these bars. Read the Docs shows deterministic completed
+snapshots from the committed notebook cache instead of replaying an animation.
 
 ```{eval-rst}
 .. autofunction:: scarf.configure_output

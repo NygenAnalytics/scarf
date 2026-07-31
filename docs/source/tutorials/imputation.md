@@ -14,7 +14,7 @@ kernelspec:
 
 (imputation)=
 
-# Imputation
+# Imputation by graph diffusion
 
 Dropout makes observed single-cell expression sparse. Scarf can diffuse a
 feature over the neighbourhood graph to reveal coherent regional patterns.
@@ -22,13 +22,16 @@ Imputation is a visualization and exploratory-analysis aid. It does not create
 new molecular observations and should not replace counts in differential
 expression.
 
-## Build the graph
+## Standalone setup
+
+This section reconstructs the graph from {doc}`scrna_seq` so the page can run
+independently.
 
 ```{code-cell} ipython3
 import scarf
 import scarf.plotting as splt
 
-scarf.configure_output(level="WARNING", progress=False)
+scarf.configure_output(level="WARNING", progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
@@ -108,7 +111,10 @@ neighbourhoods visible in the observed panel. Signal spreading across unrelated
 populations indicates excessive diffusion or a graph that does not represent
 the intended biology.
 
-The diffusion operator is cached with the graph, while inserted columns such as
-`CD4_imputed_t2` are explicit cell metadata. Do not interpret a nonzero imputed
-value as detection in that cell, use it for marker significance, or feed it to
-replicate-aware differential expression.
+The result depends on the active cell selection, feature selection, and graph.
+By default, each diffusion operator remains cached in memory for reuse across
+features. Set `cache_operator=False` when memory matters more than repeated
+feature speed. Inserted columns such as `CD4_imputed_t2` are explicit cell
+metadata. Do not interpret a nonzero imputed value as detection in that cell,
+use it for marker significance, or feed it to replicate-aware differential
+expression.

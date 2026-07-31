@@ -36,20 +36,25 @@ without re-running notebooks on every build.
 
 After editing a tutorial or quickstart page:
 
-    uv sync --extra docs --extra extra
-    cd docs && make execute-page PAGE=scrna_seq
+    uv sync --group docs-modal --extra docs --extra extra
+    make -C docs execute-docs-modal PAGES="scrna_seq"
 
-The page runs in an isolated cache. The runner preserves matching outputs for all other current
-sources, validates a complete candidate, and then publishes it through a recoverable
-backup-and-rename sequence. If execution, import, validation, or publication fails, the committed
-cache remains unchanged.
+The Make target uses the `scarf_profiling` Modal environment and starts an
+ephemeral container for each requested page. The local process preserves
+matching outputs for other current sources, validates a complete candidate, and
+publishes it through a recoverable backup-and-rename sequence. If execution,
+import, validation, or publication fails, the committed cache remains unchanged.
 
-Use `make execute-docs` to force every executable page. The default is one worker because each
-page can use several GB of memory. A failed run retains successful staged pages. Resume it
-explicitly with `make resume-docs`; staged outputs are reused only while their source hash and
-execution fingerprint still match.
+Omit `PAGES` to force every executable page. A failed run retains successful
+staged pages. Resume the same scope with
+`make -C docs resume-docs-modal`; staged outputs are reused only while their
+source hash, execution fingerprint, and Modal runner identity still match.
+`make -C docs execute-page PAGE=scrna_seq` remains available when Modal access
+is not configured.
 
-Commit both the edited `.md` files and `docs/.jupyter_cache/`.
+The executor converts completed live progress widgets into static, accessible
+bars before caching them. Commit both the edited `.md` files and
+`docs/.jupyter_cache/`.
 
 ### Other doc commands
 
@@ -73,7 +78,7 @@ Force every page and run a strict Sphinx build:
 
 1. Add `docs/source/tutorials/your_tutorial.md` with MyST `{code-cell}` blocks (or convert from Jupyter with [Jupytext]).
 2. Register it in `docs/source/toctree.yml`.
-3. Run `cd docs && make execute-page PAGE=your_tutorial`.
+3. Run `make -C docs execute-docs-modal PAGES="your_tutorial"`.
 4. Commit the `.md` file and `docs/.jupyter_cache/`.
 
 Suggested chapter outline:
@@ -90,8 +95,9 @@ Fact-check before merging: method names and defaults against `scarf/`, dataset I
 The documentation uses [Sphinx], the [MyST] parser, and [myst_nb] for notebook execution.
 Sphinx reads the committed cache via `nb_execution_mode = "cache"` in `docs/source/conf.py`.
 
-Use `scarf.configure_output(level='DEBUG', progress=True)` when debugging tutorial execution locally. Tutorials
-download datasets over the network. Timeout per page is 600 seconds (`nb_execution_timeout` in `conf.py`).
+Use `scarf.configure_output(level='DEBUG', progress=True)` when debugging
+tutorial execution. Tutorials download datasets over the network. Timeout per
+page is 600 seconds (`nb_execution_timeout` in `conf.py`).
 
 ## Acknowledgements
 

@@ -32,7 +32,8 @@ artifacts should write to a separate target. See {doc}`../../tutorials/remote_st
         project_mapping_layout, load_unified_graph, run_unified_umap, run_unified_tsne,
         integrate_assays, metric_lisi, metric_ilisi, metric_clisi,
         metric_proportional_batch_mixing, metric_graph_connectivity,
-        metric_graph_silhouette, metric_label_concordance
+        metric_graph_silhouette, metric_label_concordance,
+        metric_cluster_separability
 ```
 
 ## Store-bound plotting
@@ -63,7 +64,8 @@ differential expression.
 features that were not tested and adjusts p-values over tested features only.
 
 {py:meth}`~scarf.DataStore.integrate_assays` is the public SNN/WNN graph
-integration entry point. Its workflow and assumptions are covered in
+integration entry point. The recommended workflow is in
+{doc}`../../tutorials/cite_seq`; method comparison and diagnostics are in
 {doc}`../../tutorials/multimodal_integration`.
 
 ## Analysis results

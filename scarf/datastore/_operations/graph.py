@@ -3774,6 +3774,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if method != "wnn":
                 return
             group = artifact_group(self.zw, integrated_plan.ref)
+            try:
+                stored_n_cells = _positive_integer(
+                    group.attrs.get("n_cells"),
+                    "stored n_cells",
+                )
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "Stored WNN modality weights have invalid cell metadata"
+                ) from error
             values = np.asarray(
                 as_zarr_array(
                     group["modality_weights"],
@@ -3781,7 +3790,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )[:],
                 dtype=np.float32,
             )
-            if values.shape != (int(group.attrs["n_cells"]), 2):
+            if values.shape != (stored_n_cells, 2):
                 raise RuntimeError("Stored WNN modality weights have an invalid shape")
             for index, column in enumerate(weight_columns):
                 column_values = values[:, index]

@@ -39,7 +39,7 @@ import matplotlib.pyplot as plt
 import scarf
 import scarf.plotting as splt
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 ```
 
 ## 1. Load the preprocessed dataset
@@ -143,6 +143,10 @@ for index, (axis, sink, fate_key) in enumerate(
         show=False,
     )
     axis.set_title(f"{sink} fate probability")
+for colorbar_axis in set(figure.axes) - set(axes):
+    colorbar_axis.set_title(f"{fate.sink_labels[-1]} fate probability")
+    colorbar_axis.set_xlabel("")
+    colorbar_axis.set_ylabel("")
 figure.tight_layout()
 figure
 ```

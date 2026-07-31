@@ -32,7 +32,8 @@ After PCA, call `ds.run_harmony(['batch_column'], pca)` then continue with
 - Separate scRNA-seq batches: merge with `AssayMerge`, then Harmony or partial PCA
   ({doc}`../tutorials/data_integration`).
 - Multiple assays in the same cells (CITE-seq): SNN or WNN
-  ({ref}`multimodal integration <multimodal_integration>`).
+  ({ref}`recommended workflow <multimodal_integration>` and
+  {doc}`../tutorials/multimodal_integration` for diagnostics).
 - Map onto an existing reference: {doc}`../tutorials/mapping_and_label_transfer`.
 
 Scarf does not include Scanorama, BBKNN, scVI, ComBat, or other external
@@ -48,7 +49,9 @@ scarf.configure_output(level="WARNING", progress=False)
 ```
 
 For a timestamped batch log, use `set_verbosity(..., filepath=...)`. See
-{doc}`api/utilities` for all output settings and their defaults.
+{doc}`api/utilities` for all output settings and their defaults. Tutorial pages
+show completed snapshots from their cached execution; live notebooks animate the
+same operations.
 
 ## What is the difference between SNN and WNN integration?
 

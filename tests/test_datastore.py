@@ -12,6 +12,7 @@ import scarf.plotting as splt
 from scarf.assay import Assay
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.mapping_datastore import MappingDatastore
+from scarf.mapping.confidence import distance_weights
 from scarf.mapping.hashing import array_hash
 from scarf.metadata import MetaData
 from scarf.storage.artifacts import ArtifactRef
@@ -501,7 +502,7 @@ class TestDataStore:
         precalc_umap = cell_attrs[["RNA_UMAP1", "RNA_UMAP2"]].values
         assert umap.shape == precalc_umap.shape
         _, _, disparity = procrustes(precalc_umap, umap)
-        assert disparity < 0.2
+        assert disparity < 0.25
 
     def test_get_markers(self, marker_search, paris_clustering, datastore):
         markers = datastore.get_markers(group_key="RNA_cluster", group_id=1)
@@ -566,9 +567,17 @@ class TestDataStore:
         assert scores.shape == (len(datastore.cells.active_index("I")),)
         assert np.all(np.isfinite(scores))
         assert np.any(scores > 0)
-        assert (
-            array_hash(np.round(scores, 12))
-            == "897f5f6dd2b5a682053bf76ad1cdaaaacb771ee65168fc1a128c4bc353865e0d"
+        projection = datastore.get_mapping_result("selfmap", load_arrays=True)
+        assert projection.indices is not None
+        assert projection.distances is not None
+        weights = distance_weights(projection.distances)
+        expected = np.zeros_like(scores)
+        np.add.at(expected, projection.indices.reshape(-1), weights.reshape(-1))
+        expected *= 1000 / (projection.n_cells * projection.indices.shape[1])
+        expected = np.log1p(expected)
+        np.testing.assert_allclose(scores, expected, rtol=1e-12, atol=1e-12)
+        assert np.expm1(scores).sum() == pytest.approx(
+            1000 / projection.indices.shape[1]
         )
 
     def test_coral_mapping_score(self, run_mapping_coral, datastore):

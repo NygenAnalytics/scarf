@@ -90,6 +90,45 @@ def test_harmony_keeps_an_independent_original_coordinate_snapshot():
     assert result.corrected.dtype == np.dtype(np.float64)
 
 
+def test_harmony_progress_completes_when_optimization_converges(monkeypatch):
+    closed: list[tuple[int, int]] = []
+
+    class Progress:
+        def __init__(self, total: int) -> None:
+            self.n = 0
+            self.total = total
+
+        def update(self) -> None:
+            self.n += 1
+
+        def refresh(self) -> None:
+            pass
+
+        def close(self) -> None:
+            closed.append((self.n, self.total))
+
+    monkeypatch.setattr(
+        "scarf.embeddings.harmony.optimizer.tqdmbar",
+        lambda *_, total, **__: Progress(total),
+    )
+    values = np.random.default_rng(5).normal(size=(3, 12))
+    metadata = pd.DataFrame({"batch": ["a", "b"] * 6})
+
+    harmony.fit_harmony(
+        values,
+        metadata,
+        nclust=2,
+        max_iter_harmony=50,
+        max_iter_kmeans=1,
+        epsilon_harmony=1e9,
+    )
+
+    assert len(closed) == 1
+    completed, total = closed[0]
+    assert completed == total
+    assert completed < 50
+
+
 def test_harmony_supports_numeric_batch_columns_without_global_rng_changes():
     values = np.random.default_rng(9).normal(size=(3, 12))
     metadata = pd.DataFrame({"batch": [0, 1] * 6})

@@ -253,6 +253,15 @@ for global batch proportions, and `metric_ilisi` for the scIB median-scaled
 batch metric. These two summaries are intentionally different.
 Use `metric_graph_silhouette` for the sampled graph-guided silhouette score.
 
+`metric_lisi` now accepts `label_columns` and returns one per-cell array for
+each requested column in a dictionary. It no longer accepts `label_colnames`,
+`save_result`, or `return_lisi`, and it no longer writes `lisi__*` cell
+metadata columns. Store a returned array explicitly when persistence is needed.
+
+Use `metric_cluster_separability` to evaluate cluster labels in coordinates
+from a completed `run_pca` artifact. The result keeps aggregate clustering
+scores, per-cluster F1 scores, and confusion tables separate.
+
 The former aliases `metric_integration`, `metric_batch_mixing`,
 `metric_silhouette`, and `scarf.metrics.integration_score` have been removed.
 

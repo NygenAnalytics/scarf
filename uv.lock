@@ -3392,6 +3392,9 @@ dev = [
     { name = "mypy" },
     { name = "ruff" },
 ]
+docs-modal = [
+    { name = "modal" },
+]
 profiling = [
     { name = "anndata" },
     { name = "modal" },
@@ -3469,6 +3472,7 @@ dev = [
     { name = "mypy", specifier = ">=2.1.0" },
     { name = "ruff", specifier = ">=0.15.20" },
 ]
+docs-modal = [{ name = "modal", specifier = ">=1.5.2" }]
 profiling = [
     { name = "anndata", specifier = ">=0.12.18" },
     { name = "modal", specifier = ">=1.5.2" },

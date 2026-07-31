@@ -32,7 +32,7 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="WARNING", progress=False)
+scarf.configure_output(level="WARNING", progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
@@ -153,9 +153,30 @@ pd.Series(
 )
 ```
 
+```{code-cell} ipython3
+feature_set_partitions = [
+    "RNA_hvgs_300_clusters",
+    "RNA_hvgs_1000_clusters",
+]
+pd.Series(
+    {
+        "adjusted Rand index": ds.metric_label_concordance(
+            feature_set_partitions,
+            metric="ari",
+        ),
+        "normalized mutual information": ds.metric_label_concordance(
+            feature_set_partitions,
+            metric="nmi",
+        ),
+    },
+    name="300 vs 1,000 selected genes",
+)
+```
+
 A larger set can recover weaker populations, but it can also restore unwanted
-programs. Compare cluster stability, marker specificity, and known biology
-instead of choosing the layout that appears most separated.
+programs. ARI and NMI quantify partition agreement but do not identify which
+feature set is more biologically useful. Compare marker specificity and known
+biology instead of choosing the layout that appears most separated.
 
 ## Install an externally chosen feature set
 

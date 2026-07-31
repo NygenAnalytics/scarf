@@ -31,7 +31,7 @@ uv pip install "scarf[extra]"
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level="ERROR", progress=False)
+scarf.configure_output(level="ERROR", progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
@@ -47,9 +47,10 @@ scarf.CrToZarr(
 
 The same reader and writer work with a Cell Ranger H5 file from your own dataset.
 Scarf converts the counts to Zarr so later steps can stream data from disk.
-Scarf normally uses INFO logging with progress enabled. This page suppresses both
-to keep its cached output compact. Log level and progress are independent; batch
-runs can use `scarf.configure_output(progress=False, timestamps=True)`. See the
+Scarf normally uses INFO logging with progress enabled. Read the completed bars
+in this cached page as a record of the work performed during execution. Log level
+and progress are independent; batch runs can use
+`scarf.configure_output(progress=False, timestamps=True)`. See the
 {doc}`reference/api/utilities` for file logging and the full output contract.
 
 ```{code-cell} ipython3

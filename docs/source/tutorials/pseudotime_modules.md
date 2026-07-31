@@ -40,7 +40,7 @@ when needed.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name='bastidas-ponce_4K_pancreas-d15_rnaseq',

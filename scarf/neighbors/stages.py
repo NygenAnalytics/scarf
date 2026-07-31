@@ -488,7 +488,15 @@ class KMeansInitializationStage:
             if block.ndim != 2:
                 raise ValueError("K-means coordinate blocks must be two-dimensional")
             if block.shape[0] == n_rows:
-                coordinate_blocks.close()
+                try:
+                    next(coordinate_blocks)
+                except StopIteration:
+                    pass
+                else:
+                    coordinate_blocks.close()
+                    raise ValueError(
+                        "K-means coordinate source yielded rows after a complete block"
+                    )
                 model = make_model()
                 compute_started = time.perf_counter()
                 compute_cpu_started = time.process_time()

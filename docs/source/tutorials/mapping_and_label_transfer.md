@@ -32,7 +32,7 @@ do not need their own graph.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level="WARNING", progress=False)
+scarf.configure_output(level="WARNING", progress=True)
 
 repository = scarf.cytebase.connect("scarf_docs")
 ctrl_path = repository.download_dataset(
@@ -118,7 +118,14 @@ ds_stim.cells.insert(
     transferred_labels.to_numpy(),
     overwrite=True,
 )
+accepted = transferred_labels.notna() & transferred_labels.ne("NA")
+accepted.value_counts().rename(
+    index={True: "accepted", False: "abstained"}
+).rename("query cells")
 ```
+
+The accepted and abstained counts make the coverage cost of the chosen
+threshold explicit before inspecting class-specific errors.
 
 `mapping_evidence` summarizes vote fraction, top-two margin, entropy, and
 reference-distance percentile. Low vote fraction, a small margin, or a large

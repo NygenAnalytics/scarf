@@ -51,8 +51,9 @@ more control.
 
 ```{code-cell} ipython3
 import scarf
+import scarf.plotting as splt
 
-scarf.configure_output(level="WARNING", progress=False)
+scarf.configure_output(level="WARNING", progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
@@ -100,6 +101,10 @@ custom graph analyses.
 ```{code-cell} ipython3
 loaded_graph = ds.load_graph()
 loaded_graph.shape, loaded_graph.nnz
+```
+
+```{code-cell} ipython3
+splt.graph_qc(loaded_graph)
 ```
 
 The graph should include every active cell and have finite nonzero

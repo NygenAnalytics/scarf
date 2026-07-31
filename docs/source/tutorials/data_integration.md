@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 
 import scarf
 
-scarf.configure_output(level="ERROR", progress=False)
+scarf.configure_output(level="ERROR", progress=True)
 
 repository = scarf.cytebase.connect("scarf_docs")
 ctrl_path = repository.download_dataset(
@@ -88,6 +88,10 @@ ds.cells.to_pandas_dataframe(
     ["ids", "sample_id", "orig_cluster_labels", "I"]
 ).head()
 ```
+
+Rows with `I=False` remain in the merged metadata but are inactive. An inactive
+row can therefore show a missing imported label without indicating a failed
+merge.
 
 ```{code-cell} ipython3
 ds.cells.to_pandas_dataframe(

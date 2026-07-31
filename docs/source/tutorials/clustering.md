@@ -32,7 +32,7 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="WARNING", progress=False)
+scarf.configure_output(level="WARNING", progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
@@ -57,7 +57,7 @@ if "I__hvgs" not in ds.RNA.feats.columns:
         show_plot=False,
     )
 ds.run_normalization(feat_key="hvgs")
-ds.run_pca(dims=15)
+pca = ds.run_pca(dims=15)
 ds.build_embedding_initialization()
 ds.build_ann_index()
 ds.query_neighbors(k=11)
@@ -164,6 +164,27 @@ for label in leiden_candidates.values():
     )
 pd.DataFrame(silhouette_rows)
 ```
+
+Coordinate separability asks whether the PCA values can recover each partition.
+Macro F1 gives each cluster equal influence, weighted F1 follows cluster size,
+and coordinate silhouette compares within-cluster and between-cluster
+distances.
+
+```{code-cell} ipython3
+separability = ds.metric_cluster_separability(
+    pca,
+    cluster_columns=[
+        f"RNA_{label}" for label in leiden_candidates.values()
+    ],
+)
+separability.clustering_scores
+```
+
+Graph silhouette evaluates the neighbourhood graph, while these scores evaluate
+the PCA coordinates. The labels were derived from a graph built from the same
+PCA, so strong separability supports internal coherence but is not independent
+biological validation. Use `separability.cluster_scores` and
+`separability.confusion` to investigate a weak aggregate score.
 
 The standard pipeline compares several Leiden resolutions and uses PCA
 silhouette as one heuristic when it needs a partition for markers or doublet
@@ -285,6 +306,7 @@ markers = ds.get_markers(
     group_key=chosen_key,
     group_id=largest_group,
 )
+print(f"Largest group: {largest_group}")
 markers[
     [
         "feature_name",

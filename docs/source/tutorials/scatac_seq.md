@@ -34,7 +34,7 @@ chromatin-accessibility populations and interpretable gene scores.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 ```
 
 ## 1. Import the peak-count matrix

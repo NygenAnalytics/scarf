@@ -27,14 +27,17 @@ view. They are visual summaries, not alternative cluster assignments.
 Clustering guidance from the former combined page now lives in
 {doc}`clustering`.
 
-## Build a graph and inspect PCA
+## Standalone setup
 
 ```{code-cell} ipython3
+from itertools import combinations
+
 import matplotlib.pyplot as plt
+import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="WARNING", progress=False)
+scarf.configure_output(level="WARNING", progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
@@ -58,13 +61,37 @@ if "I__hvgs" not in ds.RNA.feats.columns:
         top_n=500,
         show_plot=False,
     )
-ds.run_normalization(feat_key="hvgs")
-ds.run_pca(dims=15, show_elbow_plot=True)
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=11)
-ds.build_connectivity_map()
-ds.run_leiden_clustering(resolution=0.5)
+normalized = ds.run_normalization(feat_key="hvgs")
+```
+
+This section reconstructs the selected cells, features, and normalization from
+{doc}`scrna_seq` so the page can run independently.
+
+## Compare PCA dimension counts
+
+Build each candidate from the same normalized data. The 15-component graph runs
+last and remains selected for the layout comparisons below.
+
+```{code-cell} ipython3
+cluster_keys = {}
+for dimensions in (10, 30, 15):
+    pca = ds.run_pca(
+        normalized,
+        dims=dimensions,
+        show_elbow_plot=dimensions == 30,
+    )
+    if dimensions == 15:
+        ds.build_embedding_initialization(pca)
+    ann = ds.build_ann_index(pca)
+    neighbors = ds.query_neighbors(ann, k=11)
+    ds.build_connectivity_map(neighbors)
+
+    label = f"leiden_pca_{dimensions}"
+    ds.run_leiden_clustering(
+        resolution=0.5,
+        label=label,
+    )
+    cluster_keys[dimensions] = f"RNA_{label}"
 ```
 
 PCA axes represent decreasing amounts of variation in the selected genes.
@@ -73,6 +100,44 @@ less variance, but it does not define one correct dimension count. Too few axes
 can merge distinct populations; too many can restore technical variation and
 noise. Compare graph connectivity, cluster stability, and marker coherence when
 the choice is uncertain.
+
+```{code-cell} ipython3
+cluster_counts = pd.Series(
+    {
+        dimensions: pd.Series(
+            ds.cells.fetch(cluster_key, key="I")
+        ).nunique()
+        for dimensions, cluster_key in cluster_keys.items()
+    },
+    name="n_clusters",
+).rename_axis("pca_dimensions")
+cluster_counts
+```
+
+```{code-cell} ipython3
+agreement_rows = []
+for first, second in combinations(cluster_keys, 2):
+    columns = [cluster_keys[first], cluster_keys[second]]
+    agreement_rows.append(
+        {
+            "comparison": f"{first} vs {second} dimensions",
+            "ARI": ds.metric_label_concordance(
+                columns,
+                metric="ari",
+            ),
+            "NMI": ds.metric_label_concordance(
+                columns,
+                metric="nmi",
+            ),
+        }
+    )
+pd.DataFrame(agreement_rows)
+```
+
+ARI and NMI measure agreement between partitions but do not identify the
+biologically correct dimension count. Investigate a low-agreement arm through
+markers, technical covariates, and graph diagnostics before choosing it or
+discarding it.
 
 ## Run UMAP
 
@@ -136,7 +201,7 @@ for index, (axis, (title, layout_key)) in enumerate(
 ):
     ds.plots.embedding(
         layout_key=layout_key,
-        color_by="RNA_leiden_cluster",
+        color_by=cluster_keys[15],
         legend_loc="right",
         show_legend=index == 2,
         show_titles=False,

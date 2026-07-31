@@ -1,6 +1,9 @@
 import copy
+import io
 import shutil
+import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +14,7 @@ try:
     from jupyter_cache.cache.main import NbArtifacts
 
     import docs.execute_vignette as cache_tools
+    import docs.modal_cache as modal_cache
     from docs.execute_all_vignettes import (
         ExecutionBatchError,
         _prepare_resume,
@@ -22,11 +26,22 @@ try:
     from docs.execute_vignette import (
         CacheBuildError,
         CacheValidationError,
+        ProgressRenderError,
         build_candidate,
         close_cache,
         discover_sources,
+        execution_fingerprint,
+        freeze_progress_outputs,
         publish_candidate,
         validate_cache,
+        validate_progress_outputs,
+    )
+    from docs.modal_cache import (
+        CacheTransportError,
+        SpawnedPageRunner,
+        await_page_cache,
+        pack_page_cache,
+        restore_page_cache,
     )
 except ImportError:
     pytest.skip("documentation dependencies are not installed", allow_module_level=True)
@@ -98,6 +113,76 @@ def _executed_notebook(
     return notebook
 
 
+def _first_code_cell(notebook: nbformat.NotebookNode) -> nbformat.NotebookNode:
+    return next(cell for cell in notebook.cells if cell.cell_type == "code")
+
+
+def _widget_progress_notebook(
+    source,
+    *,
+    value: float = 1.0,
+    maximum: float = 1.0,
+    root_model: str = "HBoxModel",
+    bar_style: str = "success",
+) -> nbformat.NotebookNode:
+    notebook = _executed_notebook(source)
+    root_id = "root"
+    label_id = "label"
+    progress_id = "progress"
+    detail_id = "detail"
+    digest = "a" * 64
+    label = f"<b>Writing data</b> to artifacts/normalized/{digest}/data: 100%| "
+    _first_code_cell(notebook).outputs = [
+        nbformat.v4.new_output(
+            "display_data",
+            data={
+                "application/vnd.jupyter.widget-view+json": {
+                    "model_id": root_id,
+                    "version_major": 2,
+                    "version_minor": 0,
+                },
+                "text/plain": "widget progress",
+            },
+        )
+    ]
+    notebook.metadata["widgets"] = {
+        "application/vnd.jupyter.widget-state+json": {
+            "state": {
+                root_id: {
+                    "model_name": root_model,
+                    "state": {
+                        "children": [
+                            f"IPY_MODEL_{label_id}",
+                            f"IPY_MODEL_{progress_id}",
+                            f"IPY_MODEL_{detail_id}",
+                        ]
+                    },
+                },
+                label_id: {
+                    "model_name": "HTMLModel",
+                    "state": {"value": label},
+                },
+                progress_id: {
+                    "model_name": "FloatProgressModel",
+                    "state": {
+                        "bar_style": bar_style,
+                        "max": maximum,
+                        "min": 0.0,
+                        "value": value,
+                    },
+                },
+                detail_id: {
+                    "model_name": "HTMLModel",
+                    "state": {"value": "1/1"},
+                },
+            },
+            "version_major": 2,
+            "version_minor": 0,
+        }
+    }
+    return notebook
+
+
 def _cache_output(
     cache_path: Path,
     source,
@@ -106,6 +191,7 @@ def _cache_output(
     error: bool = False,
     uri: str | None = None,
     artifact_root: Path | None = None,
+    notebook: nbformat.NotebookNode | None = None,
 ) -> None:
     artifacts = None
     if artifact_root is not None:
@@ -118,7 +204,7 @@ def _cache_output(
     try:
         cache.cache_notebook_bundle(
             CacheBundleIn(
-                _executed_notebook(source, text=text, error=error),
+                notebook or _executed_notebook(source, text=text, error=error),
                 uri or source.uri,
                 artifacts=artifacts,
                 data={"execution_seconds": 0.01},
@@ -316,6 +402,276 @@ def test_bundle_import_preserves_nested_artifacts(tmp_path: Path) -> None:
     assert artifact.read_text(encoding="utf-8") == "artifact"
 
 
+def test_completed_widget_progress_freezes_to_static_html(tmp_path: Path) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+    notebook = _widget_progress_notebook(source, value=0.8)
+
+    assert freeze_progress_outputs(notebook, source.uri) == 1
+
+    output = _first_code_cell(notebook).outputs[0]
+    assert "widgets" not in notebook.metadata
+    assert "application/vnd.jupyter.widget-view+json" not in output.data
+    assert '<progress value="1" max="1"' in output.data["text/html"]
+    assert "Writing data: 1 / 1 complete" == output.data["text/plain"]
+    assert "artifacts/" not in output.data["text/html"]
+    assert "a" * 64 not in output.data["text/html"]
+    validate_progress_outputs(notebook, source.uri)
+
+
+def test_incomplete_or_unknown_widget_progress_is_rejected(tmp_path: Path) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+
+    with pytest.raises(ProgressRenderError, match="incomplete"):
+        freeze_progress_outputs(
+            _widget_progress_notebook(
+                source,
+                value=9,
+                maximum=10,
+                bar_style="",
+            ),
+            source.uri,
+        )
+    with pytest.raises(ProgressRenderError, match="unsupported root model"):
+        freeze_progress_outputs(
+            _widget_progress_notebook(source, root_model="ButtonModel"),
+            source.uri,
+        )
+
+
+def test_fragmented_terminal_progress_preserves_regular_streams(
+    tmp_path: Path,
+) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+    notebook = _executed_notebook(source)
+    _first_code_cell(notebook).outputs = [
+        nbformat.v4.new_output(
+            "stream",
+            name="stderr",
+            text="Working: 0%| 0/2 [00:00]\rWork",
+        ),
+        nbformat.v4.new_output("stream", name="stdout", text="keep this\n"),
+        nbformat.v4.new_output(
+            "stream",
+            name="stderr",
+            text="ing: 100%|##| 2/2 [00:01]\n",
+        ),
+    ]
+
+    assert freeze_progress_outputs(notebook, source.uri) == 1
+
+    outputs = _first_code_cell(notebook).outputs
+    assert outputs[0].output_type == "stream"
+    assert outputs[0].name == "stdout"
+    assert outputs[0].text == "keep this\n"
+    assert outputs[1].output_type == "display_data"
+    assert outputs[1].data["text/plain"] == "Working: 2 / 2 complete"
+
+
+def test_terminal_progress_applies_backspace_and_ansi_controls(
+    tmp_path: Path,
+) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+    notebook = _executed_notebook(source)
+    _first_code_cell(notebook).outputs = [
+        nbformat.v4.new_output(
+            "stream",
+            name="stderr",
+            text="\x1b[32mTask: 10X\b0%|##| 2/2\x1b[0m\n",
+        )
+    ]
+
+    assert freeze_progress_outputs(notebook, source.uri) == 1
+    assert _first_code_cell(notebook).outputs[0].data["text/plain"] == (
+        "Task: 2 / 2 complete"
+    )
+
+
+def test_incomplete_terminal_progress_is_rejected(tmp_path: Path) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+    notebook = _executed_notebook(source)
+    _first_code_cell(notebook).outputs = [
+        nbformat.v4.new_output(
+            "stream",
+            name="stderr",
+            text="Working: 75%|###| 3/4\r",
+        )
+    ]
+
+    with pytest.raises(ProgressRenderError, match="incomplete"):
+        freeze_progress_outputs(notebook, source.uri)
+
+
+def test_progress_validation_rejects_raw_widget_state(tmp_path: Path) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+
+    with pytest.raises(ProgressRenderError, match="widget state remains"):
+        validate_progress_outputs(_widget_progress_notebook(source), source.uri)
+
+
+def test_frozen_progress_survives_modal_cache_transport(tmp_path: Path) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+    notebook = _widget_progress_notebook(source)
+    freeze_progress_outputs(notebook, source.uri)
+    original = tmp_path / "original"
+    restored = docs_root / ".jupyter_cache"
+    _cache_output(original, source, notebook=notebook)
+
+    restore_page_cache(
+        (source.uri, source.hashkey, pack_page_cache(original)),
+        restored,
+        expected_uri=source.uri,
+        expected_hashkey=source.hashkey,
+    )
+
+    validate_cache(
+        restored,
+        source_dir=docs_root / "source",
+        docs_root=docs_root,
+    )
+
+
+def test_modal_page_cache_archive_round_trip(tmp_path: Path) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+    original = tmp_path / "original"
+    restored = docs_root / ".jupyter_cache"
+    _cache_output(
+        original,
+        source,
+        artifact_root=tmp_path / "artifact-source",
+    )
+
+    payload = (source.uri, source.hashkey, pack_page_cache(original))
+    restore_page_cache(
+        payload,
+        restored,
+        expected_uri=source.uri,
+        expected_hashkey=source.hashkey,
+    )
+
+    validate_cache(
+        restored,
+        source_dir=docs_root / "source",
+        docs_root=docs_root,
+    )
+    artifact = (
+        restored / "executed" / source.hashkey / "artifacts" / "nested" / "result.txt"
+    )
+    assert artifact.read_text(encoding="utf-8") == "artifact"
+
+
+def test_modal_page_cache_rejects_mismatched_identity(tmp_path: Path) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+    original = tmp_path / "original"
+    _cache_output(original, source)
+    archive = pack_page_cache(original)
+
+    with pytest.raises(CacheTransportError, match="does not match"):
+        restore_page_cache(
+            ("source/other.md", source.hashkey, archive),
+            tmp_path / "wrong-uri",
+            expected_uri=source.uri,
+            expected_hashkey=source.hashkey,
+        )
+    with pytest.raises(CacheTransportError, match="does not match"):
+        restore_page_cache(
+            (source.uri, "wrong-hash", archive),
+            tmp_path / "wrong-hash",
+            expected_uri=source.uri,
+            expected_hashkey=source.hashkey,
+        )
+
+    assert not (tmp_path / "wrong-uri").exists()
+    assert not (tmp_path / "wrong-hash").exists()
+
+
+def test_modal_page_cache_rejects_unsafe_archive_member(tmp_path: Path) -> None:
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w:gz") as archive:
+        member = tarfile.TarInfo("../outside")
+        member.size = 1
+        archive.addfile(member, io.BytesIO(b"x"))
+
+    with pytest.raises(CacheTransportError, match="unsafe path"):
+        restore_page_cache(
+            ("source/page.md", "hash", stream.getvalue()),
+            tmp_path / "restored",
+            expected_uri="source/page.md",
+            expected_hashkey="hash",
+        )
+
+    assert not (tmp_path / "outside").exists()
+    assert not (tmp_path / "restored").exists()
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["FAILURE", "INIT_FAILURE", "TERMINATED", "TIMEOUT"],
+)
+def test_modal_wait_rejects_terminal_failure_status(status: str) -> None:
+    class FailedCall:
+        object_id = "fc-test"
+
+        def get(self, timeout: float):
+            raise TimeoutError
+
+        def get_call_graph(self):
+            return [
+                SimpleNamespace(
+                    function_call_id=self.object_id,
+                    status=SimpleNamespace(name=status),
+                    children=[],
+                )
+            ]
+
+    with pytest.raises(RuntimeError, match=f"status={status}"):
+        await_page_cache(
+            FailedCall(),
+            poll_seconds=1,
+            deadline_seconds=10,
+        )
+
+
+def test_modal_wait_honors_polling_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_timeouts: list[float] = []
+
+    class PendingCall:
+        def get(self, timeout: float):
+            observed_timeouts.append(timeout)
+            raise TimeoutError
+
+    times = iter([0.0, 0.0, 0.0, 2.0])
+    monkeypatch.setattr(modal_cache.time, "monotonic", lambda: next(times))
+
+    with pytest.raises(TimeoutError, match="within 1 seconds"):
+        await_page_cache(
+            PendingCall(),
+            poll_seconds=0.25,
+            deadline_seconds=1,
+        )
+
+    assert observed_timeouts == [0.25]
+
+
 @pytest.mark.parametrize("corruption", ["stale", "orphan", "journal"])
 def test_validation_detects_stale_and_orphan_state(
     tmp_path: Path,
@@ -506,6 +862,7 @@ def test_resume_invalidates_source_and_execution_fingerprints(
         "fingerprint-one",
         {source.uri},
         use_resume=False,
+        runner_identity="local",
     )
     _record_result(source, page_cache, resume_dir, manifest)
     assert _valid_resume_uris(
@@ -529,9 +886,56 @@ def test_resume_invalidates_source_and_execution_fingerprints(
         "fingerprint-two",
         {changed.uri},
         use_resume=True,
+        runner_identity="local",
     )
     assert replaced["entries"] == {}
     assert not (resume_dir / "cache").exists()
+
+
+def test_resume_invalidates_runner_identity(tmp_path: Path) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+    resume_dir = docs_root / ".jupyter_cache.resume"
+    page_cache = tmp_path / "page-cache"
+    _cache_output(page_cache, source)
+    manifest = _prepare_resume(
+        resume_dir,
+        "shared-fingerprint",
+        {source.uri},
+        use_resume=False,
+        runner_identity="local",
+    )
+    _record_result(source, page_cache, resume_dir, manifest)
+
+    replaced = _prepare_resume(
+        resume_dir,
+        "shared-fingerprint",
+        {source.uri},
+        use_resume=True,
+        runner_identity="modal-python-3.14",
+    )
+
+    assert replaced["runnerIdentity"] == "modal-python-3.14"
+    assert replaced["entries"] == {}
+    assert not (resume_dir / "cache").exists()
+
+
+@pytest.mark.parametrize("filename", ["modal_cache.py", "modal_docs.py"])
+def test_modal_runner_files_participate_in_execution_fingerprint(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    repo_root = tmp_path / "repo"
+    docs_root = repo_root / "docs"
+    docs_root.mkdir(parents=True)
+    for runner_file in ("modal_cache.py", "modal_docs.py"):
+        (docs_root / runner_file).write_text("original\n", encoding="utf-8")
+    before = execution_fingerprint(repo_root, docs_root)
+
+    (docs_root / filename).write_text("changed\n", encoding="utf-8")
+
+    assert execution_fingerprint(repo_root, docs_root) != before
 
 
 def test_explicit_resume_reuses_matching_successes(tmp_path: Path) -> None:
@@ -573,6 +977,135 @@ def test_explicit_resume_reuses_matching_successes(tmp_path: Path) -> None:
     assert resumed_calls == [second.uri]
     assert _output_text(target, first) == "new first\n"
     assert _output_text(target, second) == "new second\n"
+
+
+def test_modal_fanout_spawns_before_wait_and_resumes_failures(
+    tmp_path: Path,
+) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "first", code="first = 1")
+    _write_source(docs_root, "second", code="second = 2")
+    first, second = discover_sources(docs_root / "source", docs_root)
+    target = docs_root / ".jupyter_cache"
+    _cache_output(target, first, text="old first\n")
+    _cache_output(target, second, text="old second\n")
+    before = _tree_bytes(target)
+
+    first_cache = tmp_path / "first-cache"
+    second_cache = tmp_path / "second-cache"
+    _cache_output(first_cache, first, text="new first\n")
+    _cache_output(second_cache, second, text="new second\n")
+    payloads = {
+        first.uri: (first.uri, first.hashkey, pack_page_cache(first_cache)),
+        second.uri: (second.uri, second.hashkey, pack_page_cache(second_cache)),
+    }
+
+    class FakeCall:
+        def __init__(
+            self,
+            outcome,
+            spawned: list[str],
+            observed_spawn_counts: list[int],
+        ) -> None:
+            self.outcome = outcome
+            self.spawned = spawned
+            self.observed_spawn_counts = observed_spawn_counts
+            self.cancelled = False
+
+        def get(self, timeout: float):
+            assert timeout > 0
+            self.observed_spawn_counts.append(len(self.spawned))
+            if isinstance(self.outcome, BaseException):
+                raise self.outcome
+            return self.outcome
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    first_run_spawned: list[str] = []
+    observed_spawn_counts: list[int] = []
+
+    def first_run_spawn(source):
+        first_run_spawned.append(source.uri)
+        outcome = (
+            RuntimeError("second failed")
+            if source.uri == second.uri
+            else payloads[source.uri]
+        )
+        return FakeCall(outcome, first_run_spawned, observed_spawn_counts)
+
+    first_launcher = SpawnedPageRunner(first_run_spawn)
+    try:
+        with pytest.raises(ExecutionBatchError):
+            execute_and_publish(
+                ["first", "second"],
+                jobs=2,
+                docs_root=docs_root,
+                page_runner_factory=first_launcher.prepare,
+                warn_parallel_memory=False,
+            )
+    finally:
+        first_launcher.cancel_unclaimed()
+
+    assert first_run_spawned == [first.uri, second.uri]
+    assert observed_spawn_counts == [2, 2]
+    assert _tree_bytes(target) == before
+
+    resumed_spawned: list[str] = []
+    resumed_observed_counts: list[int] = []
+
+    def resumed_spawn(source):
+        resumed_spawned.append(source.uri)
+        return FakeCall(
+            payloads[source.uri],
+            resumed_spawned,
+            resumed_observed_counts,
+        )
+
+    resumed_launcher = SpawnedPageRunner(resumed_spawn)
+    try:
+        execute_and_publish(
+            ["first", "second"],
+            jobs=2,
+            resume=True,
+            docs_root=docs_root,
+            page_runner_factory=resumed_launcher.prepare,
+            warn_parallel_memory=False,
+        )
+    finally:
+        resumed_launcher.cancel_unclaimed()
+
+    assert resumed_spawned == [second.uri]
+    assert resumed_observed_counts == [1]
+    assert _output_text(target, first) == "new first\n"
+    assert _output_text(target, second) == "new second\n"
+
+
+def test_modal_submission_failure_cancels_submitted_calls(tmp_path: Path) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "first", code="first = 1")
+    _write_source(docs_root, "second", code="second = 2")
+    first, second = discover_sources(docs_root / "source", docs_root)
+
+    class FakeCall:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    first_call = FakeCall()
+
+    def spawn(source):
+        if source.uri == second.uri:
+            raise RuntimeError("submission failed")
+        return first_call
+
+    launcher = SpawnedPageRunner(spawn)
+    with pytest.raises(RuntimeError, match="submission failed"):
+        launcher.prepare([first, second])
+
+    assert first_call.cancelled
 
 
 def test_resume_without_a_staged_run_fails(tmp_path: Path) -> None:

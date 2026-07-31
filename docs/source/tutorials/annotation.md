@@ -31,15 +31,16 @@ plot known markers, and assign labels without treating cluster IDs as cell types
 - Write annotation columns into cell metadata
 - Distinguish cell-level marker evidence from replicate-aware differential expression
 
-## Dataset
+## Standalone setup
 
-Use the same 5K PBMC Zarr store. Rebuild a short analysis path so this page runs alone.
+This section reconstructs the clustered 5K PBMC analysis from {doc}`scrna_seq`
+so the page can run independently.
 
 ```{code-cell} ipython3
 import numpy as np
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',
@@ -240,6 +241,14 @@ insufficient peak overlap.
 
 Subset graph construction and validation now live in {doc}`clustering`. This
 page keeps annotation focused on evidence and label assignment.
+
+## Choose an annotation path
+
+Use the marker workflow above when assigning labels within the store being
+analysed. Use {doc}`mapping_and_label_transfer` when query cells should inherit
+evidence or labels from a fixed external reference. Use {doc}`reference_atlases`
+when that reference must be built, serialized, reloaded, and checked for
+repeated mapping.
 
 ## Common mistakes and limitations
 

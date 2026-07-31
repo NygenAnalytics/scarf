@@ -237,7 +237,9 @@ def test_kmeans_initialization_runs_on_demand_without_ann() -> None:
     assert data.read_count == 9
 
 
-def test_kmeans_initialization_uses_true_minibatches_for_one_full_block() -> None:
+def test_kmeans_initialization_uses_true_minibatches_for_one_full_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     values, loadings = _custom_inputs()
     data = _CountingChunkedArray(values, block_size=values.shape[0])
     stream = LazyTransformStream(
@@ -245,6 +247,23 @@ def test_kmeans_initialization_uses_true_minibatches_for_one_full_block() -> Non
         transform=lambda block: block.dot(loadings),
         nthreads=1,
         batch_size=values.shape[0],
+    )
+    closed_progress: list[tuple[int, int]] = []
+
+    class Progress:
+        def __init__(self, total: int) -> None:
+            self.total = total
+            self.value = 0
+
+        def update(self) -> None:
+            self.value += 1
+
+        def close(self) -> None:
+            closed_progress.append((self.value, self.total))
+
+    monkeypatch.setattr(
+        "scarf.utils.progress.tqdmbar",
+        lambda *args, total, **kwargs: Progress(total),
     )
 
     result = KMeansInitializationStage.fit(
@@ -264,6 +283,7 @@ def test_kmeans_initialization_uses_true_minibatches_for_one_full_block() -> Non
     assert result.model.n_steps_ > 1
     assert result.labels.shape == (values.shape[0],)
     assert data.read_count == 1
+    assert closed_progress == [(1, 1)]
 
 
 def test_kmeans_streaming_samples_all_blocks_and_coalesces_updates(

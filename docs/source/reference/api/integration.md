@@ -16,6 +16,7 @@ Prefer the `DataStore` methods below in analysis code.
    scarf.DataStore.metric_graph_connectivity
    scarf.DataStore.metric_graph_silhouette
    scarf.DataStore.metric_label_concordance
+   scarf.DataStore.metric_cluster_separability
 ```
 
 ```{eval-rst}
@@ -27,6 +28,7 @@ Prefer the `DataStore` methods below in analysis code.
 .. automethod:: scarf.DataStore.metric_graph_connectivity
 .. automethod:: scarf.DataStore.metric_graph_silhouette
 .. automethod:: scarf.DataStore.metric_label_concordance
+.. automethod:: scarf.DataStore.metric_cluster_separability
 ```
 
 ## Harmony
@@ -48,7 +50,7 @@ Prefer the `DataStore` methods below in analysis code.
 
 ```{eval-rst}
 .. automodule:: scarf.metrics
-    :members: compute_lisi, ilisi_knn, clisi_knn, graph_connectivity, silhouette_scoring, label_concordance_score, lisi_batch_mixing_score
+    :members: compute_lisi, ilisi_knn, clisi_knn, graph_connectivity, silhouette_scoring, label_concordance_score, lisi_batch_mixing_score, ClusterSeparabilityResult
     :imported-members:
 ```
 

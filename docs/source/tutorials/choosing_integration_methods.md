@@ -43,10 +43,12 @@ serialized, reloaded, and validated for repeated mapping.
 
 ## Combine modalities measured in the same cells
 
-Use {doc}`multimodal_integration` for RNA and ADT or another paired-modality
-design. SNN merges edge support from two or more assays. WNN accepts exactly two
-assays and varies their relative contribution by cell. These methods combine
-modalities, not batches of independent cells.
+Use {doc}`cite_seq` for the recommended RNA and ADT workflow or another
+paired-modality design. SNN merges edge support from two or more assays. WNN
+accepts exactly two assays and varies their relative contribution by cell.
+After building the integrated graph, use {doc}`multimodal_integration` to
+diagnose modality agreement and compare the resulting partitions. These methods
+combine modalities, not batches of independent cells.
 
 Scarf does not provide Scanorama, BBKNN, scVI, or ComBat. Export a suitable
 selection through `to_anndata` or another supported format when an external

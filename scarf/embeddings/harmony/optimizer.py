@@ -5,7 +5,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 from ...utils.logging import logger
-from ...utils.progress import iter_progress
+from ...utils.progress import tqdmbar
 from .models import ClusterFn
 
 
@@ -130,24 +130,30 @@ class Harmony:
 
     def harmonize(self, iter_harmony: int = 10) -> int:
         converged = False
-        for _ in iter_progress(
-            range(1, iter_harmony + 1),
+        progress = tqdmbar(
             desc="Harmonizing batches",
             total=iter_harmony,
-        ):
-            self.cluster()
-            self.Z_cos, self.Z_corr, self.W, self.Phi_Rk = moe_correct_ridge(
-                self.Z_orig,
-                self.R,
-                self.W,
-                self.K,
-                self.Phi_Rk,
-                self.Phi_moe,
-                self.lamb,
-            )
-            converged = self.check_convergence(1)
-            if converged:
-                break
+        )
+        try:
+            for _ in range(1, iter_harmony + 1):
+                self.cluster()
+                self.Z_cos, self.Z_corr, self.W, self.Phi_Rk = moe_correct_ridge(
+                    self.Z_orig,
+                    self.R,
+                    self.W,
+                    self.K,
+                    self.Phi_Rk,
+                    self.Phi_moe,
+                    self.lamb,
+                )
+                progress.update()
+                converged = self.check_convergence(1)
+                if converged:
+                    progress.total = progress.n
+                    progress.refresh()
+                    break
+        finally:
+            progress.close()
         self.Y = _normalize_columns(np.dot(self.Z_cos, self.R.T))
         self.dist_mat = 2 * (1 - np.dot(self.Y.T, self.Z_cos))
         if not converged:

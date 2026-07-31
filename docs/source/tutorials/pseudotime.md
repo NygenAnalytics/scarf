@@ -36,7 +36,7 @@ infer terminal states or prove lineage relationships.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 ```
 
 ---
@@ -129,13 +129,24 @@ markers = ds.run_pseudotime_marker_search(
     cell_key=pseudotime.validity_key,
     pseudotime_key=pseudotime.pseudotime_key,
 )
+(
+    markers.table.loc[
+        markers.table["p_value_adjusted"].notna(),
+        ["feature_name", "r_value", "p_value_adjusted"],
+    ]
+    .assign(abs_r_value=lambda frame: frame["r_value"].abs())
+    .sort_values("abs_r_value", ascending=False)
+    .drop(columns="abs_r_value")
+    .head(10)
+)
 ```
 
 The correlations, raw p-values, and adjusted p-values are saved in feature
 metadata. Their generated column names are available as
 `markers.correlation_key`, `markers.p_value_key`, and
 `markers.p_value_adjusted_key`. The returned `markers.table` contains the same
-values with feature names.
+values with feature names. The table above ranks the strongest tested linear
+associations in either direction.
 
 ---
 ## 4) Visualize pseudotime correlated features

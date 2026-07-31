@@ -39,8 +39,12 @@ from docs.execute_vignette import (  # noqa: E402
     validate_cache,
 )
 
+type PageRunner = Callable[[ParsedSource, Path], Path]
+type PageRunnerFactory = Callable[[list[ParsedSource]], PageRunner]
+
 EXECUTE_SCRIPT = DOCS_ROOT / "execute_vignette.py"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
+LOCAL_RUNNER_IDENTITY = "local"
 
 
 class ExecutionBatchError(CacheToolError):
@@ -77,13 +81,19 @@ def _prepare_resume(
     requested_uris: set[str],
     *,
     use_resume: bool,
+    runner_identity: str,
 ) -> dict[str, object]:
     existing = _load_manifest(resume_dir) if use_resume else None
-    if existing is None or existing.get("executionFingerprint") != fingerprint:
+    if (
+        existing is None
+        or existing.get("executionFingerprint") != fingerprint
+        or existing.get("runnerIdentity") != runner_identity
+    ):
         _remove_path(resume_dir)
         manifest: dict[str, object] = {
             "version": MANIFEST_VERSION,
             "executionFingerprint": fingerprint,
+            "runnerIdentity": runner_identity,
             "entries": {},
         }
     else:
@@ -222,10 +232,17 @@ def execute_and_publish(
     full: bool = False,
     resume: bool = False,
     docs_root: Path = DOCS_ROOT,
-    page_runner: Callable[[ParsedSource, Path], Path] | None = None,
+    page_runner: PageRunner | None = None,
+    page_runner_factory: PageRunnerFactory | None = None,
+    warn_parallel_memory: bool = True,
+    runner_identity: str = LOCAL_RUNNER_IDENTITY,
 ) -> ValidationReport:
     if jobs < 1:
         raise ValueError("jobs must be at least 1")
+    if not runner_identity.strip():
+        raise ValueError("runner_identity must not be empty")
+    if page_runner is not None and page_runner_factory is not None:
+        raise ValueError("page_runner and page_runner_factory are mutually exclusive")
     docs_root = docs_root.resolve()
     source_dir = docs_root / "source"
     target_path = docs_root / ".jupyter_cache"
@@ -264,6 +281,7 @@ def execute_and_publish(
                 fingerprint,
                 requested_uris,
                 use_resume=resume,
+                runner_identity=runner_identity,
             )
             resumed = _valid_resume_uris(
                 sources,
@@ -276,7 +294,7 @@ def execute_and_publish(
                 f"Executing {len(pending)} page(s), reusing {len(resumed)} staged result(s)",
                 flush=True,
             )
-            if jobs > 1:
+            if jobs > 1 and warn_parallel_memory:
                 print(
                     "WARNING: Each page can use several GB. Prefer one worker on WSL.",
                     flush=True,
@@ -292,6 +310,8 @@ def execute_and_publish(
                 )
 
             runner = page_runner or default_runner
+            if page_runner_factory is not None:
+                runner = page_runner_factory(pending)
             with ThreadPoolExecutor(max_workers=jobs) as pool:
                 futures = {
                     pool.submit(

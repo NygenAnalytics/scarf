@@ -32,7 +32,7 @@ result to create a smaller Zarr store for workflows that do not need every cell.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 ```
 
 ## Guided steps
@@ -71,8 +71,6 @@ Paris clusters on the full UMAP before downsampling.
 
 ---
 ### 2. Run the TopACeDo downsampler
-
-+++
 
 Some downstream steps remain expensive on every cell. TopACeDo selects a topology-preserving
 subset from Scarf's KNN graph while keeping heterogeneous regions.
@@ -118,8 +116,6 @@ Seed cells are a smaller set used to initialize the sampler.
 ---
 ### 3. Inspect downsampling parameters
 
-+++
-
 To place seed cells, the sampler estimates density from neighbourhood degree. Dense regions
 get a sampling penalty. Per-cell values are stored in `RNA_cell_density`.
 
@@ -146,8 +142,6 @@ Higher `RNA_snn_value` marks more tightly connected neighbourhoods.
 
 ---
 ### 4. Export downsampled data
-
-+++
 
 TopACeDo marks representative cells but leaves the source store unchanged.
 `SubsetZarr` accepts any boolean cell-metadata column, not only a TopACeDo

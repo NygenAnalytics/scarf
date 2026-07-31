@@ -57,7 +57,7 @@ does not merge assay-specific feature tables or results.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 ```
 
 This page opens the pre-analyzed Bastidas-Ponce pancreas store also used in
@@ -171,8 +171,8 @@ try:
         column_name='is_first_cluster',
         values=is_first_cluster,
     )
-except ValueError as error:
-    print(error)
+except ValueError:
+    print("Expected validation: use overwrite=True to replace an existing column.")
 ```
 
 ### 3. Query metadata without materializing a DataFrame

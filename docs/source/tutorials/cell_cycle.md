@@ -35,7 +35,7 @@ Score S-phase and G2M-phase gene sets to assign a cell-cycle phase to each cell.
 import scarf
 import scarf.plotting as splt
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 ```
 
 ## Guided steps
@@ -95,17 +95,9 @@ remaining markers.
 ---
 ### 3. Visualize cell-cycle phases
 
-By default the cell cycle phase information in stored under cell attribute table under column/key `RNA_cell_cycle_phase`.
-We can color the UMAP plot based on these values.
-
-```{code-cell} ipython3
-ds.plots.embedding(
-    layout_key='RNA_UMAP',
-    color_by='RNA_cell_cycle_phase',
-)
-```
-
-Cycling cells are concentrated in the ductal group. Custom colors can be supplied like this:
+By default, the cell-cycle phase is stored in the cell metadata column
+`RNA_cell_cycle_phase`. Explicit colors keep the phase encoding consistent with
+the composition plot below:
 
 ```{code-cell} ipython3
 color_key = {
@@ -120,6 +112,9 @@ ds.plots.embedding(
     categorical_scale=splt.CategoricalScale(palette=color_key),
 )
 ```
+
+Cycling cells should be concentrated in the ductal region rather than spread
+uniformly across the embedding.
 
 Phase composition per cluster shows which groups are enriched for S or G2M relative to G1:
 
@@ -186,8 +181,6 @@ plt.show()
 ```
 
 High correlation coefficients indicate a large degree of concordance between the scores obtained using Scanpy and Scarf
-
-+++
 
 ## Common mistakes and limitations
 

@@ -12,7 +12,7 @@ kernelspec:
   name: python3
 ---
 
-# Multimodal integration
+# Multimodal diagnostics
 
 RNA and ADT can agree on broad cell populations while resolving different local
 structure. This guide builds both graphs independently, measures their
@@ -20,16 +20,18 @@ concordance, and compares Scarf's SNN and WNN integration methods. It assumes
 the reader already understands the recommended CITE-seq path in
 {doc}`cite_seq`.
 
-## Build independent RNA and ADT graphs
+## Standalone setup
 
 ```{code-cell} ipython3
+from itertools import combinations
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="WARNING", progress=False)
+scarf.configure_output(level="WARNING", progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_8K_pbmc_citeseq",
@@ -44,9 +46,9 @@ ds = scarf.DataStore(
 ds.auto_filter_cells()
 ```
 
-Each modality needs a graph built over the same active cell selection and with
-the same neighbour count. RNA uses HVGs and PCA. ADT uses active antibodies and
-an identity reduction because the panel is already low-dimensional.
+This section reconstructs the independent RNA and ADT graphs from
+{doc}`cite_seq` so the page can run independently. Both use the same active
+cells and neighbour count.
 
 ```{code-cell} ipython3
 ds.mark_hvgs(
@@ -106,30 +108,6 @@ ds.run_leiden_clustering(from_assay="ADT", resolution=1)
 First compare the cluster partitions on the two layouts. Agreement at broad
 scales supports a shared biological signal. Local disagreement can be useful
 when one modality resolves a population more clearly.
-
-```{code-cell} ipython3
-figure, axes = plt.subplots(2, 2, figsize=(9, 8))
-modality_panels = (
-    ("RNA layout, RNA clusters", "RNA_UMAP", "RNA_leiden_cluster"),
-    ("RNA layout, ADT clusters", "RNA_UMAP", "ADT_leiden_cluster"),
-    ("ADT layout, RNA clusters", "ADT_UMAP", "RNA_leiden_cluster"),
-    ("ADT layout, ADT clusters", "ADT_UMAP", "ADT_leiden_cluster"),
-)
-for axis, (title, layout_key, color_by) in zip(
-    axes.flat, modality_panels, strict=True
-):
-    ds.plots.embedding(
-        layout_key=layout_key,
-        color_by=color_by,
-        point_size=5,
-        legend_loc="on_data",
-        show_titles=False,
-        target=axis,
-        show=False,
-    )
-    axis.set_title(title)
-figure.tight_layout()
-```
 
 A normalized cross-tabulation shows which RNA populations contribute to each
 ADT cluster without letting large clusters dominate the comparison.
@@ -238,6 +216,8 @@ ds.run_leiden_clustering(
 )
 ```
 
+## Compare integrated partitions
+
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
 integration_panels = (
@@ -258,6 +238,93 @@ for axis, (title, layout_key, color_by) in zip(
     axis.set_title(title)
 figure.tight_layout()
 ```
+
+```{code-cell} ipython3
+partition_columns = {
+    "RNA": "RNA_leiden_cluster",
+    "ADT": "ADT_leiden_cluster",
+    "SNN": "RNA+ADT_snn_leiden_cluster",
+    "WNN": "RNA+ADT_wnn_leiden_cluster",
+}
+concordance_rows = []
+for first, second in combinations(partition_columns, 2):
+    columns = [
+        partition_columns[first],
+        partition_columns[second],
+    ]
+    concordance_rows.append(
+        {
+            "comparison": f"{first} vs {second}",
+            "ARI": ds.metric_label_concordance(
+                columns,
+                metric="ari",
+            ),
+            "NMI": ds.metric_label_concordance(
+                columns,
+                metric="nmi",
+            ),
+        }
+    )
+pd.DataFrame(concordance_rows)
+```
+
+ARI and NMI quantify partition agreement without choosing which modality or
+integration method is correct. Compare them with marker coherence and the
+overlap structure above instead of selecting the cleanest layout.
+
+## Inspect WNN modality weights
+
+WNN records how much each cell relies on each modality. First check the weight
+constraints directly.
+
+```{code-cell} ipython3
+weight_columns = {
+    "RNA weight": "RNA+ADT_wnn_RNA_weight",
+    "ADT weight": "RNA+ADT_wnn_ADT_weight",
+}
+weight_frame = pd.DataFrame(
+    {
+        label: ds.cells.fetch(column, key="I")
+        for label, column in weight_columns.items()
+    }
+)
+weight_values = weight_frame.to_numpy(dtype=np.float64)
+pd.Series(
+    {
+        "all finite": bool(np.isfinite(weight_values).all()),
+        "all non-negative": bool((weight_values >= 0).all()),
+        "maximum row-sum error": float(
+            np.max(np.abs(weight_values.sum(axis=1) - 1))
+        ),
+    }
+)
+```
+
+Use the earlier overlap table to distinguish cells in the dominant RNA cluster
+for each ADT cluster from other RNA and ADT combinations.
+
+```{code-cell} ipython3
+rna_clusters = pd.Series(
+    ds.cells.fetch("RNA_leiden_cluster", key="I")
+)
+adt_clusters = pd.Series(
+    ds.cells.fetch("ADT_leiden_cluster", key="I")
+)
+dominant_rna_by_adt = overlap.idxmax(axis=0)
+weight_frame["RNA-ADT overlap"] = np.where(
+    rna_clusters == adt_clusters.map(dominant_rna_by_adt),
+    "dominant overlap",
+    "other overlap",
+)
+weight_frame.groupby("RNA-ADT overlap")[
+    list(weight_columns)
+].agg(["count", "mean", "median"])
+```
+
+The dominant-overlap grouping is descriptive, not a reference annotation.
+Weight shifts can identify cells whose local structure is better resolved by
+one modality, but they can also expose noise or a graph mismatch. The
+{doc}`cite_seq` workflow covers how SNN and WNN construct the integrated graph.
 
 Choose between methods from the assay design and evidence, not from the layout
 that looks cleaner. SNN is the available choice for more than two modalities.

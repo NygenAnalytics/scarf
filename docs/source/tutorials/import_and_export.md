@@ -34,7 +34,7 @@ counts or metadata to interoperable formats.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level='ERROR', progress=False)
+scarf.configure_output(level='ERROR', progress=True)
 ```
 
 ### 1. Download datasets from Cytebase
@@ -80,8 +80,6 @@ The downloads land under `scarf_datasets` in the current working directory unles
 
 Scarf stores data as dense, compressed chunks in Zarr. `scarf.readers` and `scarf.writers`
 provide complementary classes that convert common count formats into that layout.
-
-+++
 
 #### From 10x's HDF5 file format
 
@@ -151,11 +149,7 @@ cell columns. For example, a two-column `X_umap` array becomes `X_umap1` and
 
 Conversion from [Loom](https://loompy.org/) file formats is also supported using `scarf.LoomReader` and `scarf.LoomToZarr` which can be used in similar fashion as other readers and writers.
 
-+++
-
 ### 3. Export data from a Zarr store
-
-+++
 
 #### To Cellranger (10x) MTX format
 

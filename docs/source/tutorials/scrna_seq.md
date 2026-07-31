@@ -45,7 +45,7 @@ claims; see {doc}`../concepts/scale_and_memory` for measured resource profiles.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',

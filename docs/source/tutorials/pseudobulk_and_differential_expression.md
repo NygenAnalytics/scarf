@@ -43,7 +43,7 @@ to `make_bulk`.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'kang_15K_pbmc_rnaseq',

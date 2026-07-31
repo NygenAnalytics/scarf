@@ -2,13 +2,16 @@
 
 import argparse
 import hashlib
+import html
 import json
+import math
 import os
 import platform
+import re
 import shutil
 import sqlite3
 import sys
-from collections.abc import Iterator, MutableMapping
+from collections.abc import Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -29,7 +32,7 @@ SOURCE_DIR = DOCS_ROOT / "source"
 DEFAULT_CACHE = DOCS_ROOT / ".jupyter_cache"
 DEFAULT_PAGE = "scrna_seq"
 CACHE_VERSION = jupyter_cache_version
-FINGERPRINT_VERSION = 1
+FINGERPRINT_VERSION = 2
 
 _SKIP_DIR_NAMES = {
     "_build",
@@ -39,6 +42,43 @@ _SKIP_DIR_NAMES = {
     "scarf_datasets",
 }
 _JOURNAL_SUFFIXES = ("-journal", "-shm", "-wal")
+_WIDGET_VIEW_MIME = "application/vnd.jupyter.widget-view+json"
+_WIDGET_STATE_MIME = "application/vnd.jupyter.widget-state+json"
+_MODEL_REFERENCE_PREFIX = "IPY_MODEL_"
+_STATIC_PROGRESS_MARKER = 'class="scarf-static-progress"'
+_HTML_TAG_RE = re.compile(r"<[^>]*>")
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_TQDM_PROGRESS_RE = re.compile(
+    r"^(?P<label>.*?)\s*(?P<percent>\d{1,3}(?:\.\d+)?)%\|"
+    r".*?(?P<value>\d[\d.,]*(?:[kMGTPE]?))\s*/\s*"
+    r"(?P<total>\d[\d.,]*(?:[kMGTPE]?))",
+    re.IGNORECASE,
+)
+_DASK_PROGRESS_RE = re.compile(
+    r"^(?P<label>.*?)\[[#=\-\s]+\]\s*\|\s*"
+    r"(?P<percent>\d{1,3}(?:\.\d+)?)%\s+(?:Completed|complete)\b",
+    re.IGNORECASE,
+)
+_PROGRESS_LIKE_RE = re.compile(
+    r"(?:\d{1,3}(?:\.\d+)?%\||\|\s*\d{1,3}(?:\.\d+)?%\s+"
+    r"(?:Completed|complete)\b)",
+    re.IGNORECASE,
+)
+_PROGRESS_PERCENT_RE = re.compile(r"(?P<percent>\d{1,3}(?:\.\d+)?)%")
+_LONG_HEX_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32,}(?![0-9a-f])", re.IGNORECASE)
+_OUTPUT_CONTROL_RE = re.compile(r"[\r\b\x1b]")
+_ALLOWED_TQDM_WIDGET_MODELS = frozenset(
+    {
+        "FloatProgressModel",
+        "HBoxModel",
+        "HTMLModel",
+        "HTMLStyleModel",
+        "IntProgressModel",
+        "LayoutModel",
+        "ProgressStyleModel",
+        "VBoxModel",
+    }
+)
 
 os.environ.setdefault("IPYTHONDIR", str(DOCS_ROOT / ".ipython"))
 
@@ -52,6 +92,10 @@ class CacheValidationError(CacheToolError):
 
 
 class CacheBuildError(CacheToolError):
+    pass
+
+
+class ProgressRenderError(CacheToolError):
     pass
 
 
@@ -70,6 +114,15 @@ class ValidationReport:
     unique_hash_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class ProgressSnapshot:
+    label: str
+    value: float
+    total: float
+    value_text: str
+    total_text: str
+
+
 def configure_doc_execution_env(
     env: MutableMapping[str, str] | None = None,
 ) -> MutableMapping[str, str]:
@@ -82,10 +135,9 @@ def configure_doc_execution_env(
             "MKL_NUM_THREADS": "2",
             "OPENBLAS_NUM_THREADS": "2",
             "NUMEXPR_NUM_THREADS": "2",
-            # Widget-based download bars freeze at 0% in published HTML.
-            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
         }
     )
+    target.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
     return target
 
 
@@ -116,6 +168,521 @@ def notebook_hash(notebook: nbformat.NotebookNode) -> str:
     cache = get_cache(DEFAULT_CACHE)
     _, hashkey = cache.create_hashed_notebook(notebook)
     return str(hashkey)
+
+
+def _coerce_output_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return "".join(value)
+    raise ProgressRenderError("Progress output text is not a string")
+
+
+def _clean_progress_label(value: str) -> str:
+    label = html.unescape(_HTML_TAG_RE.sub("", value))
+    label = label.replace("\u2007", " ").replace("\u200b", " ")
+    label = re.sub(r"\s+", " ", label).strip()
+    label = re.sub(
+        r"\s*:?\s*\d{1,3}(?:\.\d+)?%\s*(?:\|.*)?$",
+        "",
+        label,
+    )
+    label = re.sub(
+        r"\s+to\s+(?:(?:/|[A-Za-z]:[\\/])\S+|artifacts(?:[/\\]\S+)?)$",
+        "",
+        label,
+        flags=re.IGNORECASE,
+    )
+    label = _LONG_HEX_RE.sub("", label)
+    label = re.sub(r"\s+", " ", label).strip(" :|")
+    if not label:
+        return "Progress"
+    return label[:160].rstrip()
+
+
+def _finite_number(value: object, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ProgressRenderError(f"Progress {field} is not numeric")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ProgressRenderError(f"Progress {field} is not finite")
+    return result
+
+
+def _format_progress_number(value: float) -> str:
+    if value == 0:
+        return "0"
+    return format(value, ".12g")
+
+
+def _completed_snapshot(
+    *,
+    label: str,
+    value: float,
+    total: float,
+    value_text: str | None = None,
+    total_text: str | None = None,
+) -> ProgressSnapshot:
+    if total <= 0:
+        raise ProgressRenderError("Progress total must be positive")
+    tolerance = max(1.0, abs(total)) * 1e-9
+    if abs(value - total) > tolerance:
+        raise ProgressRenderError(
+            f"Progress output is incomplete: {_format_progress_number(value)} "
+            f"of {_format_progress_number(total)}"
+        )
+    return ProgressSnapshot(
+        label=_clean_progress_label(label),
+        value=total,
+        total=total,
+        value_text=value_text or _format_progress_number(total),
+        total_text=total_text or _format_progress_number(total),
+    )
+
+
+def _static_progress_output(
+    snapshot: ProgressSnapshot,
+) -> nbformat.NotebookNode:
+    value = _format_progress_number(snapshot.value)
+    total = _format_progress_number(snapshot.total)
+    detail = f"{snapshot.value_text} / {snapshot.total_text} complete"
+    plain = f"{snapshot.label}: {detail}"
+    escaped_label = html.escape(snapshot.label, quote=True)
+    escaped_detail = html.escape(detail, quote=True)
+    escaped_plain = html.escape(plain, quote=True)
+    rendered = (
+        '<div class="scarf-static-progress">'
+        f'<span class="scarf-static-progress__label">{escaped_label}</span>'
+        f'<progress value="{value}" max="{total}" '
+        f'aria-label="{escaped_plain}">{escaped_detail}</progress>'
+        f'<span class="scarf-static-progress__detail">{escaped_detail}</span>'
+        "</div>"
+    )
+    return nbformat.v4.new_output(
+        "display_data",
+        data={
+            "text/html": rendered,
+            "text/plain": plain,
+        },
+        metadata={},
+    )
+
+
+def _widget_state_models(
+    notebook: nbformat.NotebookNode,
+) -> Mapping[str, object] | None:
+    widgets = notebook.metadata.get("widgets")
+    if widgets is None:
+        return None
+    if not isinstance(widgets, Mapping):
+        raise ProgressRenderError("Notebook widget metadata is invalid")
+    if set(widgets) != {_WIDGET_STATE_MIME}:
+        raise ProgressRenderError("Notebook contains unsupported widget metadata")
+    payload = widgets.get(_WIDGET_STATE_MIME)
+    if not isinstance(payload, Mapping):
+        raise ProgressRenderError("Notebook widget state payload is invalid")
+    state = payload.get("state")
+    if not isinstance(state, Mapping) or not all(
+        isinstance(model_id, str) for model_id in state
+    ):
+        raise ProgressRenderError("Notebook widget model state is invalid")
+    return state
+
+
+def _iter_model_references(value: object) -> Iterator[str]:
+    if isinstance(value, str):
+        if value.startswith(_MODEL_REFERENCE_PREFIX):
+            yield value.removeprefix(_MODEL_REFERENCE_PREFIX)
+        return
+    if isinstance(value, Mapping):
+        for nested in value.values():
+            yield from _iter_model_references(nested)
+        return
+    if isinstance(value, list | tuple):
+        for nested in value:
+            yield from _iter_model_references(nested)
+
+
+def _reachable_widget_models(
+    root_id: str,
+    models: Mapping[str, object],
+) -> list[str]:
+    ordered: list[str] = []
+    visited: set[str] = set()
+
+    def visit(model_id: str) -> None:
+        if model_id in visited:
+            return
+        entry = models.get(model_id)
+        if not isinstance(entry, Mapping):
+            raise ProgressRenderError(
+                f"Widget model {model_id!r} is missing from notebook state"
+            )
+        visited.add(model_id)
+        ordered.append(model_id)
+        for reference in _iter_model_references(entry):
+            visit(reference)
+
+    visit(root_id)
+    return ordered
+
+
+def _widget_model_parts(
+    model_id: str,
+    models: Mapping[str, object],
+) -> tuple[str, Mapping[str, object]]:
+    entry = models.get(model_id)
+    if not isinstance(entry, Mapping):
+        raise ProgressRenderError(f"Widget model {model_id!r} is invalid")
+    if entry.get("buffers"):
+        raise ProgressRenderError("Buffered widget state is not supported")
+    state = entry.get("state")
+    if not isinstance(state, Mapping):
+        raise ProgressRenderError(f"Widget model {model_id!r} has no state")
+    model_name = entry.get("model_name", state.get("_model_name"))
+    if not isinstance(model_name, str):
+        raise ProgressRenderError(f"Widget model {model_id!r} has no model name")
+    return model_name, state
+
+
+def _widget_progress_snapshot(
+    root_id: str,
+    models: Mapping[str, object],
+) -> tuple[ProgressSnapshot, set[str]]:
+    reachable = _reachable_widget_models(root_id, models)
+    root_name, _ = _widget_model_parts(root_id, models)
+    if root_name not in {"HBoxModel", "VBoxModel"}:
+        raise ProgressRenderError(
+            f"Widget output uses unsupported root model {root_name!r}"
+        )
+
+    progress_states: list[Mapping[str, object]] = []
+    html_values: list[str] = []
+    for model_id in reachable:
+        model_name, state = _widget_model_parts(model_id, models)
+        if model_name not in _ALLOWED_TQDM_WIDGET_MODELS:
+            raise ProgressRenderError(
+                f"Widget output uses unsupported model {model_name!r}"
+            )
+        if model_name in {"FloatProgressModel", "IntProgressModel"}:
+            progress_states.append(state)
+        elif model_name == "HTMLModel":
+            value = state.get("value")
+            if isinstance(value, str) and value.strip():
+                html_values.append(value)
+
+    if len(progress_states) != 1:
+        raise ProgressRenderError(
+            "Progress widget must contain exactly one progress model"
+        )
+    progress = progress_states[0]
+    minimum = _finite_number(progress.get("min"), "minimum")
+    value = _finite_number(progress.get("value"), "value")
+    maximum = _finite_number(progress.get("max"), "maximum")
+    if minimum != 0:
+        raise ProgressRenderError("Progress widget minimum must be zero")
+
+    label_source = next(
+        (candidate for candidate in html_values if "%" in candidate),
+        html_values[0] if html_values else "",
+    )
+    if not label_source:
+        raise ProgressRenderError("Progress widget has no readable label")
+    bar_style = progress.get("bar_style")
+    if bar_style == "danger":
+        label = _clean_progress_label(label_source)
+        raise ProgressRenderError(
+            f"Progress widget {label!r} finished in an error state at "
+            f"{_format_progress_number(value)} of "
+            f"{_format_progress_number(maximum)}"
+        )
+    if bar_style == "success":
+        value = maximum
+    return (
+        _completed_snapshot(
+            label=label_source,
+            value=value,
+            total=maximum,
+        ),
+        set(reachable),
+    )
+
+
+def _terminal_lines(text: str) -> list[tuple[str, bool]]:
+    text = _ANSI_ESCAPE_RE.sub("", text)
+    lines: list[tuple[str, bool]] = []
+    current: list[str] = []
+    cursor = 0
+    for character in text:
+        if character == "\r":
+            cursor = 0
+            continue
+        if character == "\b":
+            cursor = max(0, cursor - 1)
+            continue
+        if character == "\n":
+            lines.append(("".join(current), True))
+            current = []
+            cursor = 0
+            continue
+        if ord(character) < 32 and character != "\t":
+            raise ProgressRenderError(
+                f"Progress stream contains unsupported control U+{ord(character):04X}"
+            )
+        if cursor < len(current):
+            current[cursor] = character
+        else:
+            current.extend(" " * (cursor - len(current)))
+            current.append(character)
+        cursor += 1
+    if current or (text and not text.endswith("\n")):
+        lines.append(("".join(current), False))
+    return lines
+
+
+def _terminal_progress_snapshot(line: str) -> ProgressSnapshot | None:
+    match = _TQDM_PROGRESS_RE.match(line.strip())
+    if match is not None:
+        percent = float(match.group("percent"))
+        return _completed_snapshot(
+            label=match.group("label"),
+            value=percent,
+            total=100.0,
+            value_text=match.group("value"),
+            total_text=match.group("total"),
+        )
+
+    match = _DASK_PROGRESS_RE.match(line.strip())
+    if match is not None:
+        percent = float(match.group("percent"))
+        return _completed_snapshot(
+            label=match.group("label"),
+            value=percent,
+            total=100.0,
+            value_text="100",
+            total_text="100",
+        )
+
+    if not _PROGRESS_LIKE_RE.search(line):
+        return None
+    percent_match = _PROGRESS_PERCENT_RE.search(line)
+    if percent_match is None:
+        raise ProgressRenderError("Progress stream has no readable percentage")
+    percent = float(percent_match.group("percent"))
+    return _completed_snapshot(
+        label=line[: percent_match.start()],
+        value=percent,
+        total=100.0,
+        value_text="100",
+        total_text="100",
+    )
+
+
+def _render_terminal_stream(name: str, text: str) -> tuple[list[object], int]:
+    rendered: list[object] = []
+    stream_parts: list[str] = []
+    progress_count = 0
+    previous_snapshot: ProgressSnapshot | None = None
+
+    def flush_stream() -> None:
+        if not stream_parts:
+            return
+        rendered.append(
+            nbformat.v4.new_output(
+                "stream",
+                name=name,
+                text="".join(stream_parts),
+            )
+        )
+        stream_parts.clear()
+
+    for line, terminated in _terminal_lines(text):
+        snapshot = _terminal_progress_snapshot(line)
+        if snapshot is None:
+            stream_parts.append(line)
+            if terminated:
+                stream_parts.append("\n")
+            previous_snapshot = None
+            continue
+        flush_stream()
+        if snapshot != previous_snapshot:
+            rendered.append(_static_progress_output(snapshot))
+            progress_count += 1
+        previous_snapshot = snapshot
+    flush_stream()
+    return rendered, progress_count
+
+
+def _freeze_cell_streams(cell: nbformat.NotebookNode) -> int:
+    outputs = list(cell.get("outputs", []))
+    grouped: dict[str, list[str]] = {}
+    last_index: dict[str, int] = {}
+    for index, output in enumerate(outputs):
+        if output.get("output_type") != "stream":
+            continue
+        name = output.get("name")
+        if name not in {"stdout", "stderr"}:
+            raise ProgressRenderError(f"Unsupported notebook stream name: {name!r}")
+        grouped.setdefault(name, []).append(_coerce_output_text(output.get("text")))
+        last_index[name] = index
+
+    transformed: dict[str, list[object]] = {}
+    progress_count = 0
+    for name, fragments in grouped.items():
+        combined = "".join(fragments)
+        if not _OUTPUT_CONTROL_RE.search(combined) and not _PROGRESS_LIKE_RE.search(
+            combined
+        ):
+            continue
+        replacement, count = _render_terminal_stream(name, combined)
+        transformed[name] = replacement
+        progress_count += count
+
+    if not transformed:
+        return 0
+    rewritten: list[object] = []
+    for index, output in enumerate(outputs):
+        if output.get("output_type") != "stream":
+            rewritten.append(output)
+            continue
+        name = output.get("name")
+        if name not in transformed:
+            rewritten.append(output)
+        elif index == last_index[name]:
+            rewritten.extend(transformed[name])
+    cell.outputs = rewritten
+    return progress_count
+
+
+def _progress_integrity_issue(
+    notebook: nbformat.NotebookNode,
+) -> str | None:
+    if "widgets" in notebook.metadata:
+        return "notebook widget state remains after progress rendering"
+    for cell_index, cell in enumerate(notebook.cells):
+        if cell.cell_type != "code":
+            continue
+        for output in cell.get("outputs", []):
+            data = output.get("data")
+            if isinstance(data, Mapping):
+                widget_mimes = [
+                    mime
+                    for mime in data
+                    if isinstance(mime, str)
+                    and mime.startswith("application/vnd.jupyter.widget")
+                ]
+                if widget_mimes:
+                    return f"code cell {cell_index} contains a raw widget output"
+                rendered_html = data.get("text/html")
+                if rendered_html is not None:
+                    try:
+                        rendered_html = _coerce_output_text(rendered_html)
+                    except ProgressRenderError as exc:
+                        return f"code cell {cell_index}: {exc}"
+                    if _STATIC_PROGRESS_MARKER in rendered_html and (
+                        "<progress " not in rendered_html
+                        or "</progress>" not in rendered_html
+                        or "<script" in rendered_html.lower()
+                        or "text/plain" not in data
+                    ):
+                        return (
+                            f"code cell {cell_index} has invalid static progress HTML"
+                        )
+            if output.get("output_type") != "stream":
+                continue
+            try:
+                text = _coerce_output_text(output.get("text"))
+            except ProgressRenderError as exc:
+                return f"code cell {cell_index}: {exc}"
+            if _OUTPUT_CONTROL_RE.search(text):
+                return f"code cell {cell_index} contains terminal controls"
+            if _PROGRESS_LIKE_RE.search(text):
+                return f"code cell {cell_index} contains raw progress output"
+    return None
+
+
+def validate_progress_outputs(
+    notebook: nbformat.NotebookNode,
+    source_uri: str = "<notebook>",
+) -> None:
+    issue = _progress_integrity_issue(notebook)
+    if issue is not None:
+        raise ProgressRenderError(f"{source_uri}: {issue}")
+
+
+def freeze_progress_outputs(
+    notebook: nbformat.NotebookNode,
+    source_uri: str = "<notebook>",
+) -> int:
+    try:
+        models = _widget_state_models(notebook)
+        used_model_ids: set[str] = set()
+        progress_count = 0
+        for cell in notebook.cells:
+            if cell.cell_type != "code":
+                continue
+            rewritten: list[object] = []
+            for output in cell.get("outputs", []):
+                data = output.get("data")
+                if not isinstance(data, Mapping):
+                    rewritten.append(output)
+                    continue
+                widget_mimes = {
+                    mime
+                    for mime in data
+                    if isinstance(mime, str)
+                    and mime.startswith("application/vnd.jupyter.widget")
+                }
+                if not widget_mimes:
+                    rewritten.append(output)
+                    continue
+                if widget_mimes != {_WIDGET_VIEW_MIME}:
+                    raise ProgressRenderError(
+                        "Notebook contains an unsupported widget output"
+                    )
+                if output.get("output_type") != "display_data":
+                    raise ProgressRenderError(
+                        "Progress widget is not a display-data output"
+                    )
+                if set(data) - {_WIDGET_VIEW_MIME, "text/plain"}:
+                    raise ProgressRenderError(
+                        "Progress widget contains unsupported MIME data"
+                    )
+                view = data.get(_WIDGET_VIEW_MIME)
+                if not isinstance(view, Mapping):
+                    raise ProgressRenderError("Progress widget view is invalid")
+                root_id = view.get("model_id")
+                if not isinstance(root_id, str) or not root_id:
+                    raise ProgressRenderError("Progress widget has no model ID")
+                if models is None:
+                    raise ProgressRenderError(
+                        "Progress widget has no saved notebook state"
+                    )
+                snapshot, reachable = _widget_progress_snapshot(root_id, models)
+                used_model_ids.update(reachable)
+                rewritten.append(_static_progress_output(snapshot))
+                progress_count += 1
+            cell.outputs = rewritten
+            progress_count += _freeze_cell_streams(cell)
+
+        if models is not None:
+            if not used_model_ids:
+                raise ProgressRenderError(
+                    "Notebook widget state has no rendered progress view"
+                )
+            unused = set(models) - used_model_ids
+            if unused:
+                raise ProgressRenderError(
+                    "Notebook contains widget state unrelated to progress"
+                )
+            notebook.metadata.pop("widgets", None)
+        validate_progress_outputs(notebook, source_uri)
+        return progress_count
+    except ProgressRenderError as exc:
+        message = str(exc)
+        if message.startswith(f"{source_uri}:"):
+            raise
+        raise ProgressRenderError(f"{source_uri}: {message}") from exc
 
 
 def _parser_configs() -> tuple[MdParserConfig, NbParserConfig]:
@@ -513,6 +1080,9 @@ def validate_cache(
             raise CacheValidationError(
                 f"Unexpected error output in {source.uri} code cell(s): {cells}"
             )
+        progress_issue = _progress_integrity_issue(executed)
+        if progress_issue is not None:
+            raise CacheValidationError(f"{source.uri}: {progress_issue}")
 
     return ValidationReport(
         source_count=len(sources),
@@ -547,6 +1117,8 @@ def execution_fingerprint(
         repo_root / "VERSION",
         docs_root / "execute_vignette.py",
         docs_root / "execute_all_vignettes.py",
+        docs_root / "modal_cache.py",
+        docs_root / "modal_docs.py",
         docs_root / "Makefile",
         docs_root / "source" / "conf.py",
     ]
@@ -709,6 +1281,7 @@ def execute_page(
         execution_cache = get_cache(execution_cache_path)
         record = execution_cache.match_cache_notebook(notebook)
         bundle = execution_cache.get_cache_bundle(record.pk)
+        freeze_progress_outputs(bundle.nb, source.uri)
         output_cache = get_cache(cache_path)
         output_cache.cache_notebook_bundle(
             CacheBundleIn(

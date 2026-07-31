@@ -33,7 +33,7 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="WARNING", progress=False)
+scarf.configure_output(level="WARNING", progress=True)
 
 repository = scarf.cytebase.connect("scarf_docs")
 ctrl_path = repository.download_dataset(
@@ -206,6 +206,9 @@ The projected query should land near compatible reference regions while the
 reference layout remains unchanged. Systematic off-diagonal confusion or large
 unmapped regions is a reason to inspect feature coverage, batch design, and
 whether the query contains populations absent from the atlas.
+Compare the confusion pattern with the direct KNN workflow in
+{doc}`mapping_and_label_transfer`; different off-diagonal errors show how the
+reference model and correction assumptions affect transfer.
 
 Split-conformal prediction sets are available for label transfer, but their
 coverage claim requires calibration examples exchangeable with future queries.

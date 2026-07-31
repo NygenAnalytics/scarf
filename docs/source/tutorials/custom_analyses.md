@@ -36,7 +36,7 @@ This setup uses the PBMC teaching dataset and constructs a small RNA graph.
 import numpy as np
 import scarf
 
-scarf.configure_output(level="WARNING", progress=False)
+scarf.configure_output(level="WARNING", progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     "tenx_5K_pbmc_rnaseq",
@@ -150,6 +150,19 @@ ds.cells.insert(
     overwrite=True,
 )
 ```
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_customAnalysisUMAP",
+    color_by=["customDetectedHVGs", "wellConnected"],
+    n_columns=2,
+    sort_values=True,
+)
+```
+
+The first panel checks where the streamed count statistic varies. The second
+shows the lower-quartile graph-strength exclusion created from the same active
+cell order.
 
 Install a supplied RNA feature mask with `set_hvgs`. This records the
 cell-selection relationship and produces the feature key

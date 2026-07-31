@@ -35,14 +35,14 @@ checks.
 - Compute doublet scores after an initial clustering
 - Recognize current RNA, ATAC, and ADT support boundaries
 
-## Dataset
+## Standalone setup
 
 ```{code-cell} ipython3
 import numpy as np
 
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_5K_pbmc_rnaseq',
@@ -252,6 +252,22 @@ The score distribution and embedding should be reviewed together. A threshold
 is study-dependent, and `run_doublet_detection` does not remove cells. Insert a
 new boolean cell key or update `I` only after deciding how doublets should be
 handled.
+
+After reviewing the score distribution, apply the chosen upper bound as an
+additional filter:
+
+```python
+ds.filter_cells(
+    attrs=[score_col],
+    lows=[None],
+    highs=[reviewed_doublet_threshold],
+    reset_previous=False,
+)
+```
+
+Define `reviewed_doublet_threshold` from the study-specific evidence first.
+With `reset_previous=False`, this call intersects the threshold with the current
+selection and does not reactivate cells removed by earlier QC.
 
 ## 8) ATAC quality control
 

@@ -45,7 +45,7 @@ returns a read-only Zarr group; pass its store to `DataStore`.
 ```{code-cell} ipython3
 import scarf
 
-scarf.configure_output(level="ERROR", progress=False)
+scarf.configure_output(level="ERROR", progress=True)
 
 repository = scarf.cytebase.connect('scarf_docs')
 remote_group = repository.open_zarr('tenx_5K_pbmc_rnaseq/data.zarr')

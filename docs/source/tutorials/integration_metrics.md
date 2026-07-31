@@ -1,5 +1,5 @@
 ---
-description: Measure batch mixing and biological preservation on uncorrected and corrected graphs.
+description: Compare batch mixing and biological preservation on uncorrected, partial-PCA, and Harmony graphs.
 jupytext:
   text_representation:
     extension: .md
@@ -19,10 +19,13 @@ kernelspec:
 
 An integration method can improve batch mixing while erasing biological
 structure. This guide measures both sides of that trade-off on an uncorrected
-graph and a Harmony graph. No single score determines whether an integration is
-scientifically valid.
+graph, a partial-PCA graph, and a Harmony graph. No single score determines
+whether an integration is scientifically valid.
 
-## Prepare the merged dataset
+## Standalone setup
+
+This section reconstructs the merged Kang datastore from
+{doc}`data_integration` so the page can run independently.
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -31,7 +34,7 @@ import pandas as pd
 
 import scarf
 
-scarf.configure_output(level="ERROR", progress=False)
+scarf.configure_output(level="ERROR", progress=True)
 
 repository = scarf.cytebase.connect("scarf_docs")
 ctrl_path = repository.download_dataset(
@@ -129,17 +132,9 @@ def evaluate_graph(cluster_label):
 ## Measure the uncorrected graph
 
 ```{code-cell} ipython3
-ds.build_embedding_initialization(pca)
 ann = ds.build_ann_index(pca)
 neighbors = ds.query_neighbors(ann, k=21)
 ds.build_connectivity_map(neighbors)
-ds.run_umap(
-    n_epochs=250,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-    label="metrics_uncorrected_UMAP",
-)
 ds.run_leiden_clustering(
     resolution=1.0,
     label="metrics_uncorrected_clusters",
@@ -147,6 +142,32 @@ ds.run_leiden_clustering(
 uncorrected_metrics = evaluate_graph(
     "metrics_uncorrected_clusters"
 )
+```
+
+## Measure the partial-PCA graph
+
+Partial PCA learns its loading basis from the control cells and projects every
+active cell into that basis. The graph is evaluated without adding a layout.
+
+```{code-cell} ipython3
+ds.cells.insert(
+    column_name="is_ctrl",
+    values=ds.cells.fetch_all("sample_id") == "ctrl",
+    overwrite=True,
+)
+pca_partial = ds.run_pca(
+    normalized,
+    dims=25,
+    pca_cell_key="is_ctrl",
+)
+ann = ds.build_ann_index(pca_partial)
+neighbors = ds.query_neighbors(ann, k=21)
+ds.build_connectivity_map(neighbors)
+ds.run_leiden_clustering(
+    resolution=1.0,
+    label="metrics_partial_clusters",
+)
+partial_metrics = evaluate_graph("metrics_partial_clusters")
 ```
 
 ## Measure the Harmony graph
@@ -177,6 +198,7 @@ harmony_metrics = evaluate_graph("metrics_harmony_clusters")
 metric_frame = pd.DataFrame(
     {
         "uncorrected": uncorrected_metrics,
+        "partial PCA": partial_metrics,
         "Harmony": harmony_metrics,
     }
 ).T

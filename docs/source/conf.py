@@ -98,9 +98,7 @@ nb_execution_cache_path = os.path.join(
     os.path.dirname(__file__), "..", ".jupyter_cache"
 )
 nb_execution_timeout = 600
-
-# Widget-based download bars freeze at 0% in published HTML.
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+nb_merge_streams = True
 
 matplotlib.use("agg")
 

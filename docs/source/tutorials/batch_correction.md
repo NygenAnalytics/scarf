@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 
 import scarf
 
-scarf.configure_output(level="ERROR", progress=False)
+scarf.configure_output(level="ERROR", progress=True)
 
 repository = scarf.cytebase.connect("scarf_docs")
 ctrl_path = repository.download_dataset(

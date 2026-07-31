@@ -35,7 +35,7 @@ subtrees:
       - file: tutorials/integration_metrics
         title: Integration metrics
       - file: tutorials/multimodal_integration
-        title: Multimodal integration
+        title: Multimodal diagnostics
       - file: tutorials/mapping_and_label_transfer
         title: Mapping and label transfer
       - file: tutorials/reference_atlases
@@ -50,7 +50,7 @@ subtrees:
         title: Gene-set scoring
       - file: tutorials/pseudobulk_and_differential_expression
         title: Pseudobulk and DE
-  - caption: Deep dives
+  - caption: Methods and diagnostics
     entries:
       - file: tutorials/plotting
         title: Plotting
@@ -65,13 +65,11 @@ subtrees:
       - file: tutorials/clustering
         title: Clustering
       - file: tutorials/imputation
-        title: Imputation
+        title: Imputation by graph diffusion
       - file: tutorials/downsampling
         title: Cell downsampling
       - file: tutorials/trajectory_analysis
-        title: Trajectory analysis
-      - file: tutorials/hto_demultiplexing
-        title: HTO demultiplexing
+        title: Trajectory validation
       - file: tutorials/custom_analyses
         title: Custom analyses
   - caption: Data management and scaling
@@ -90,6 +88,8 @@ subtrees:
         title: Memory and execution
   - caption: Reference and support
     entries:
+      - file: tutorials/hto_demultiplexing
+        title: HTO demultiplexing
       - file: reference/api
         title: API reference
         entries:

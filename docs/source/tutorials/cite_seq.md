@@ -45,7 +45,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scarf
 
-scarf.configure_output(level='WARNING', progress=False)
+scarf.configure_output(level='WARNING', progress=True)
 
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     'tenx_8K_pbmc_citeseq',
