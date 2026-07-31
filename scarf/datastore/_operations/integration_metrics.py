@@ -8,6 +8,7 @@ from ...graph.encoded_paths import (
     is_integrated_graph_path,
     parse_assay_keys_from_nearest_neighbors_path,
 )
+from ...graph.distances import validate_distance_provenance
 from ...graph.paths import StoredAssayGraph
 from ...graph.state import (
     read_assay_state,
@@ -169,6 +170,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             logger.debug(f"Using the KNN graph at {resolved_knn_loc}")
 
         cell_key, _ = self._keys_from_knn_path(from_assay, resolved_knn_loc)
+        validate_distance_provenance(self.zw, resolved_knn_loc)
         knn_grp = as_zarr_group(
             self.zw[resolved_knn_loc],
             name=resolved_knn_loc,
@@ -247,6 +249,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             logger.debug(f"Using the KNN graph at {knn_loc}")
 
         cell_key, feat_key = self._keys_from_knn_path(from_assay, knn_loc)
+        validate_distance_provenance(self.zw, knn_loc)
         knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
         try:
             neighbors_ref = parse_artifact_path(knn_loc)
@@ -626,6 +629,7 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             knn_loc=knn_loc,
         )
 
+        validate_distance_provenance(self.zw, knn_loc)
         knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
         neighbor_indices = as_zarr_array(knn_grp["indices"], name="indices")
         neighbor_distances = as_zarr_array(knn_grp["distances"], name="distances")

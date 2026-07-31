@@ -831,7 +831,7 @@ def test_compact_marker_save_roundtrip():
 
     from scarf.datastore._operations.features import _load_marker_cluster_frame
     from scarf.datastore.datastore import DataStore
-    from scarf.features.markers.table import MARKER_STAT_COLUMNS_V2
+    from scarf.features.markers.table import MARKER_STAT_COLUMNS
 
     index = np.array([10, 5, 7], dtype=np.int32)
     source = pd.DataFrame(
@@ -865,8 +865,8 @@ def test_compact_marker_save_roundtrip():
         feature_names,
         group_id=1,
     )
-    assert slot.attrs["schema_version"] == 2
-    assert list(slot.attrs["stat_columns"]) == list(MARKER_STAT_COLUMNS_V2)
+    assert "schema_version" not in slot.attrs
+    assert list(slot.attrs["stat_columns"]) == list(MARKER_STAT_COLUMNS)
     assert slot["1"].attrs["n_group"] == 10
     assert slot["1"].attrs["n_reference"] == 40
     assert "feature_index" in slot
@@ -878,15 +878,12 @@ def test_compact_marker_save_roundtrip():
     assert loaded.iloc[0]["p_value_adjusted"] == 0.03
 
 
-def _schema_v2_marker_frame(feature_indices):
-    from scarf.features.markers.table import MARKER_STAT_COLUMNS_V2
+def _canonical_marker_frame(feature_indices):
+    from scarf.features.markers.table import MARKER_STAT_COLUMNS
 
     index = np.asarray(feature_indices)
     frame = pd.DataFrame(
-        {
-            column: np.linspace(0.1, 0.2, len(index))
-            for column in MARKER_STAT_COLUMNS_V2
-        },
+        {column: np.linspace(0.1, 0.2, len(index)) for column in MARKER_STAT_COLUMNS},
         index=index,
     )
     frame["feature_index"] = index
@@ -898,21 +895,21 @@ def _schema_v2_marker_frame(feature_indices):
     [
         (
             {
-                0: _schema_v2_marker_frame([0, 1]),
-                1: _schema_v2_marker_frame([0, 2]),
+                0: _canonical_marker_frame([0, 1]),
+                1: _canonical_marker_frame([0, 2]),
             },
             "identical feature index sets",
         ),
         (
             {
-                0: _schema_v2_marker_frame([0, 0]),
-                1: _schema_v2_marker_frame([0, 0]),
+                0: _canonical_marker_frame([0, 0]),
+                1: _canonical_marker_frame([0, 0]),
             },
             "unique",
         ),
     ],
 )
-def test_v2_marker_writer_rejects_invalid_indices_before_publication(
+def test_marker_writer_rejects_invalid_indices_before_publication(
     markers,
     message,
 ):
@@ -936,7 +933,7 @@ def test_v2_marker_writer_rejects_invalid_indices_before_publication(
     assert list(slot.group_keys()) == []
 
 
-def test_v2_marker_publication_preserves_legacy_marker_subtree():
+def test_marker_publication_preserves_legacy_marker_subtree():
     import zarr
     from zarr.storage import MemoryStore
 
@@ -976,9 +973,8 @@ def test_v2_marker_publication_preserves_legacy_marker_subtree():
         required_arrays=(ArrayRequirement("feature_index", dtype_kind="i"),),
         required_attributes=(
             AttributeRequirement(
-                "schema_version",
-                expected_types=(int,),
-                predicate=lambda value: value == 2,
+                "stat_columns",
+                expected_types=(list, tuple),
             ),
         ),
     )
@@ -1018,7 +1014,7 @@ def test_v2_marker_publication_preserves_legacy_marker_subtree():
         group_id=1,
     )
     assert loaded["feature_name"].tolist() == ["g1", "g0"]
-    assert artifact.attrs["schema_version"] == 2
+    assert "schema_version" not in artifact.attrs
 
 
 def test_legacy_marker_names_and_scores_are_readable():
@@ -1090,23 +1086,19 @@ def test_get_markers_preserves_unresolved_legacy_names(datastore_ephemeral):
     assert pd.isna(loaded.iloc[1]["feature_index"])
 
 
-def test_load_marker_table_rejects_unknown_schema_version():
-    import zarr
-    from zarr.storage import MemoryStore
-
+def test_load_marker_table_ignores_stale_schema_version_attribute():
     from scarf.features.markers.table import load_marker_table
 
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    slot = root.create_group("slot")
+    slot, cluster = _make_canonical_marker_slot()
     slot.attrs["schema_version"] = 99
-    cluster = slot.create_group("1")
-    with pytest.raises(ValueError, match="Unsupported marker schema_version"):
-        load_marker_table(
-            slot,
-            cluster,
-            np.array(["g0"]),
-            group_id=1,
-        )
+    loaded = load_marker_table(
+        slot,
+        cluster,
+        np.array(["g0", "g1"]),
+        group_id=1,
+    )
+
+    assert loaded["feature_name"].tolist() == ["g1", "g0"]
 
 
 def test_legacy_compact_marker_uses_stored_stat_columns():
@@ -1155,7 +1147,7 @@ def test_unversioned_compact_marker_roundtrip_preserves_reordered_named_stats():
     from zarr.storage import MemoryStore
 
     from scarf.features.markers.table import (
-        MARKER_STAT_COLUMNS_V2,
+        MARKER_STAT_COLUMNS,
         load_marker_table,
     )
 
@@ -1172,7 +1164,7 @@ def test_unversioned_compact_marker_roundtrip_preserves_reordered_named_stats():
             "p_value_adjusted": [0.04, 0.02],
         }
     )
-    stored_columns = tuple(reversed(MARKER_STAT_COLUMNS_V2))
+    stored_columns = tuple(reversed(MARKER_STAT_COLUMNS))
     root = zarr.open_group(store=MemoryStore(), mode="w")
     slot = root.create_group("slot")
     slot.attrs["stat_columns"] = list(stored_columns)
@@ -1193,18 +1185,18 @@ def test_unversioned_compact_marker_roundtrip_preserves_reordered_named_stats():
     assert "schema_version" not in slot.attrs
     assert loaded["feature_index"].tolist() == [1, 0]
     expected = source.iloc[[1, 0]]
-    for column in MARKER_STAT_COLUMNS_V2:
+    for column in MARKER_STAT_COLUMNS:
         np.testing.assert_allclose(loaded[column], expected[column])
 
 
-def _make_schema_v2_marker_slot(columns=None):
+def _make_canonical_marker_slot(columns=None):
     import zarr
     from zarr.storage import MemoryStore
 
-    from scarf.features.markers.table import MARKER_STAT_COLUMNS_V2
+    from scarf.features.markers.table import MARKER_STAT_COLUMNS
 
     if columns is None:
-        columns = MARKER_STAT_COLUMNS_V2
+        columns = MARKER_STAT_COLUMNS
     values = {
         "score": np.array([0.4, 0.8]),
         "mean": np.array([0.5, 1.0]),
@@ -1220,7 +1212,6 @@ def _make_schema_v2_marker_slot(columns=None):
     slot = root.create_group("slot")
     slot.attrs.update(
         {
-            "schema_version": 2,
             "stat_columns": list(columns),
             "method": "mannwhitneyu",
             "alternative": "two-sided",
@@ -1240,14 +1231,14 @@ def _make_schema_v2_marker_slot(columns=None):
     return slot, cluster
 
 
-def test_schema_v2_marker_reader_accepts_reordered_named_columns():
+def test_canonical_marker_reader_accepts_reordered_named_columns():
     from scarf.features.markers.table import (
-        MARKER_STAT_COLUMNS_V2,
+        MARKER_STAT_COLUMNS,
         load_marker_table,
     )
 
-    columns = tuple(reversed(MARKER_STAT_COLUMNS_V2))
-    slot, cluster = _make_schema_v2_marker_slot(columns)
+    columns = tuple(reversed(MARKER_STAT_COLUMNS))
+    slot, cluster = _make_canonical_marker_slot(columns)
     loaded = load_marker_table(
         slot,
         cluster,
@@ -1261,15 +1252,50 @@ def test_schema_v2_marker_reader_accepts_reordered_named_columns():
     assert loaded["p_value_adjusted"].tolist() == pytest.approx([0.02, 0.04])
 
 
-def test_schema_v2_marker_reader_rejects_all_nan_adjusted_values():
+def test_canonical_marker_reader_rejects_missing_stats_array():
+    from scarf.features.markers.table import load_marker_table
+
+    slot, cluster = _make_canonical_marker_slot()
+    del cluster["stats"]
+
+    with pytest.raises(ValueError, match="require feature_index and stats"):
+        load_marker_table(
+            slot,
+            cluster,
+            np.array(["g0", "g1"]),
+            group_id=1,
+        )
+
+
+def test_canonical_marker_reader_rejects_non_finite_statistics():
     from scarf.features.markers.table import (
-        MARKER_STAT_COLUMNS_V2,
+        MARKER_STAT_COLUMNS,
         load_marker_table,
     )
 
-    slot, cluster = _make_schema_v2_marker_slot()
+    slot, cluster = _make_canonical_marker_slot()
     stats = np.asarray(cluster["stats"][:])
-    stats[:, MARKER_STAT_COLUMNS_V2.index("p_value_adjusted")] = np.nan
+    stats[0, MARKER_STAT_COLUMNS.index("fold_change")] = np.inf
+    cluster["stats"][:] = stats
+
+    with pytest.raises(ValueError, match="statistics must all be finite"):
+        load_marker_table(
+            slot,
+            cluster,
+            np.array(["g0", "g1"]),
+            group_id=1,
+        )
+
+
+def test_canonical_marker_reader_rejects_all_nan_adjusted_values():
+    from scarf.features.markers.table import (
+        MARKER_STAT_COLUMNS,
+        load_marker_table,
+    )
+
+    slot, cluster = _make_canonical_marker_slot()
+    stats = np.asarray(cluster["stats"][:])
+    stats[:, MARKER_STAT_COLUMNS.index("p_value_adjusted")] = np.nan
     cluster["stats"][:] = stats
 
     with pytest.raises(ValueError, match="p_value_adjusted.*finite"):
@@ -1284,21 +1310,23 @@ def test_schema_v2_marker_reader_rejects_all_nan_adjusted_values():
 @pytest.mark.parametrize(
     "corruption",
     [
-        "legacy_provenance",
+        "incomplete_provenance",
         "feature_identity",
         "slot_metadata",
         "group_metadata",
         "stats_shape",
+        "missing_stats",
+        "stat_values",
         "adjusted_values",
     ],
 )
-def test_marker_cache_reuse_revalidates_full_v2_payload(
+def test_marker_cache_reuse_revalidates_canonical_payload(
     datastore_ephemeral,
     monkeypatch,
     corruption,
 ):
     import scarf.features.markers as marker_algorithms
-    from scarf.features.markers.table import MARKER_STAT_COLUMNS_V2
+    from scarf.features.markers.table import MARKER_STAT_COLUMNS
     from scarf.storage.artifacts import ArtifactRef, artifact_path
 
     assay = datastore_ephemeral.RNA
@@ -1326,7 +1354,7 @@ def test_marker_cache_reuse_revalidates_full_v2_payload(
     old_artifact = datastore_ephemeral.zw[artifact_path(old_ref)]
     first_group_name = sorted(old_artifact.group_keys())[0]
     first_group = old_artifact[first_group_name]
-    if corruption == "legacy_provenance":
+    if corruption == "incomplete_provenance":
         provenance = dict(old_artifact.attrs["provenance"])
         parameters = dict(provenance["parameters"])
         for field_name in (
@@ -1336,7 +1364,6 @@ def test_marker_cache_reuse_revalidates_full_v2_payload(
             "continuity_correction",
             "adjustment_method",
             "adjustment_scope",
-            "schema_version",
         ):
             parameters.pop(field_name)
         provenance["parameters"] = parameters
@@ -1353,9 +1380,15 @@ def test_marker_cache_reuse_revalidates_full_v2_payload(
         stats = np.asarray(first_group["stats"][:, :-1])
         del first_group["stats"]
         first_group.create_array("stats", data=stats)
+    elif corruption == "missing_stats":
+        del first_group["stats"]
+    elif corruption == "stat_values":
+        stats = np.asarray(first_group["stats"][:])
+        stats[0, MARKER_STAT_COLUMNS.index("fold_change")] = np.inf
+        first_group["stats"][:] = stats
     else:
         stats = np.asarray(first_group["stats"][:])
-        stats[:, MARKER_STAT_COLUMNS_V2.index("p_value_adjusted")] = np.nan
+        stats[:, MARKER_STAT_COLUMNS.index("p_value_adjusted")] = np.nan
         first_group["stats"][:] = stats
 
     original = marker_algorithms.find_markers_by_rank
@@ -1385,7 +1418,7 @@ def test_marker_cache_reuse_revalidates_full_v2_payload(
     assert status.parameters["continuity_correction"] is True
     assert status.parameters["adjustment_method"] == "fdr_bh"
     assert status.parameters["adjustment_scope"] == "within_group_all_tested_features"
-    assert status.parameters["schema_version"] == 2
+    assert "schema_version" not in status.parameters
     assert "algorithm_version" not in status.parameters
     assert "correction_method" not in status.parameters
 
@@ -1404,13 +1437,13 @@ def test_marker_cache_reuse_revalidates_full_v2_payload(
         ("cluster", "n_reference"),
     ],
 )
-def test_schema_v2_marker_reader_rejects_incomplete_metadata(
+def test_canonical_marker_reader_rejects_incomplete_metadata(
     owner,
     metadata_name,
 ):
     from scarf.features.markers.table import load_marker_table
 
-    slot, cluster = _make_schema_v2_marker_slot()
+    slot, cluster = _make_canonical_marker_slot()
     target = slot if owner == "slot" else cluster
     del target.attrs[metadata_name]
 
@@ -1436,14 +1469,14 @@ def test_schema_v2_marker_reader_rejects_incomplete_metadata(
         ("cluster", "n_reference", 1),
     ],
 )
-def test_schema_v2_marker_reader_rejects_invalid_metadata(
+def test_canonical_marker_reader_rejects_invalid_metadata(
     owner,
     metadata_name,
     value,
 ):
     from scarf.features.markers.table import load_marker_table
 
-    slot, cluster = _make_schema_v2_marker_slot()
+    slot, cluster = _make_canonical_marker_slot()
     target = slot if owner == "slot" else cluster
     target.attrs[metadata_name] = value
 
@@ -1456,16 +1489,16 @@ def test_schema_v2_marker_reader_rejects_invalid_metadata(
         )
 
 
-def test_schema_v2_marker_reader_rejects_malformed_stat_columns():
+def test_canonical_marker_reader_rejects_malformed_stat_columns():
     from scarf.features.markers.table import (
-        MARKER_STAT_COLUMNS_V2,
+        MARKER_STAT_COLUMNS,
         load_marker_table,
     )
 
-    slot, cluster = _make_schema_v2_marker_slot()
+    slot, cluster = _make_canonical_marker_slot()
     slot.attrs["stat_columns"] = [
-        *MARKER_STAT_COLUMNS_V2[:-1],
-        MARKER_STAT_COLUMNS_V2[0],
+        *MARKER_STAT_COLUMNS[:-1],
+        MARKER_STAT_COLUMNS[0],
     ]
 
     with pytest.raises(ValueError, match="duplicate"):

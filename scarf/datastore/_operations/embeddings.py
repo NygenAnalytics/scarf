@@ -6,6 +6,7 @@ from scipy.sparse import csr_matrix
 from ...graph.encoded_paths import (
     lookup_latest_kmeans_path,
 )
+from ...graph.distances import validate_distance_provenance
 from ...graph.paths import StoredAssayGraph
 from ...graph.state import (
     embedding_initialization_path_from_state,
@@ -526,6 +527,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             graph_loc = stored.paths.cell_graph_group_path
             knn_loc = stored.paths.nearest_neighbors_group_path
             logger.trace(f"Loading KNN dists and indices from {knn_loc}")
+            validate_distance_provenance(self.zw, knn_loc)
             knn_group = as_zarr_group(self.zw[knn_loc], name=knn_loc)
             dists = np.asarray(
                 as_zarr_array(knn_group["distances"], name="distances")[:]

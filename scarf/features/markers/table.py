@@ -1,4 +1,4 @@
-"""Version-aware readers for persisted marker statistics."""
+"""Readers for persisted marker statistics."""
 
 from collections.abc import Sequence
 from typing import Any
@@ -18,12 +18,11 @@ LEGACY_STAT_COLUMNS = (
     "fold_change",
     "p_value",
 )
-MARKER_STAT_COLUMNS_V2 = (
+MARKER_STAT_COLUMNS = (
     *LEGACY_STAT_COLUMNS,
     "auc",
     "p_value_adjusted",
 )
-MARKER_SCHEMA_VERSION = 2
 MARKER_METHOD = "mannwhitneyu"
 MARKER_ALTERNATIVE = "two-sided"
 MARKER_TIE_CORRECTION = True
@@ -31,7 +30,7 @@ MARKER_CONTINUITY_CORRECTION = True
 MARKER_ADJUSTMENT_METHOD = "fdr_bh"
 MARKER_ADJUSTMENT_SCOPE = "within_group_all_tested_features"
 _MARKER_INDEX_COLUMN = "feature_index"
-_SCHEMA_V2_METADATA = {
+_MARKER_METADATA = {
     "method": MARKER_METHOD,
     "alternative": MARKER_ALTERNATIVE,
     "tie_correction": MARKER_TIE_CORRECTION,
@@ -42,11 +41,9 @@ _SCHEMA_V2_METADATA = {
 
 __all__ = [
     "LEGACY_STAT_COLUMNS",
-    "MARKER_SCHEMA_VERSION",
-    "MARKER_STAT_COLUMNS_V2",
+    "MARKER_STAT_COLUMNS",
     "load_marker_table",
     "read_legacy_marker_table",
-    "read_marker_table_v2",
 ]
 
 
@@ -69,7 +66,7 @@ def _stored_stat_columns(
     stored = slot_group.attrs.get("stat_columns")
     if stored is None:
         if required:
-            raise ValueError("Schema-v2 marker tables require stat_columns metadata")
+            raise ValueError("Canonical marker tables require stat_columns metadata")
         return None
     if isinstance(stored, str) or not isinstance(stored, Sequence):
         raise ValueError("Marker stat_columns metadata must be a sequence of names")
@@ -80,7 +77,7 @@ def _stored_stat_columns(
         columns.append(name)
     if len(columns) != len(set(columns)):
         raise ValueError("Marker stat_columns metadata contains duplicate names")
-    unknown = set(columns).difference(MARKER_STAT_COLUMNS_V2)
+    unknown = set(columns).difference(MARKER_STAT_COLUMNS)
     if unknown:
         raise ValueError(
             "Marker stat_columns metadata contains unknown columns: "
@@ -100,7 +97,7 @@ def _validated_feature_indices(
     if raw.ndim != 1:
         raise ValueError("Marker feature_index must be one-dimensional")
     if require_integer_dtype and raw.dtype.kind not in {"i", "u"}:
-        raise ValueError("Schema-v2 marker feature_index must use an integer dtype")
+        raise ValueError("Canonical marker feature_index must use an integer dtype")
     try:
         numeric = np.asarray(raw, dtype=np.float64)
     except (TypeError, ValueError) as exc:
@@ -116,7 +113,7 @@ def _validated_feature_indices(
             + unresolved
         )
     if require_unique and np.unique(indices).size != indices.size:
-        raise ValueError("Schema-v2 marker feature_index must contain unique values")
+        raise ValueError("Canonical marker feature_index must contain unique values")
     return indices
 
 
@@ -163,8 +160,6 @@ def _resolve_compact_stat_columns(
         return stored
     if n_columns == len(LEGACY_STAT_COLUMNS):
         return list(LEGACY_STAT_COLUMNS)
-    if n_columns == len(MARKER_STAT_COLUMNS_V2):
-        return list(MARKER_STAT_COLUMNS_V2)
     raise ValueError(
         "Compact marker stats lack stat_columns and do not match a known layout"
     )
@@ -212,7 +207,7 @@ def read_legacy_marker_table(
             if column not in df.columns:
                 df[column] = np.nan
         display_columns = (
-            MARKER_STAT_COLUMNS_V2
+            MARKER_STAT_COLUMNS
             if {"auc", "p_value_adjusted"}.intersection(columns)
             else LEGACY_STAT_COLUMNS
         )
@@ -291,40 +286,28 @@ def read_legacy_marker_table(
     )
 
 
-def read_marker_table_v2(
+def _read_canonical_marker_table(
     slot_group: zarr.Group,
     cluster_group: zarr.Group,
     feature_names: np.ndarray,
     *,
     group_id: Any,
-    feature_ids: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """Read schema-v2 compact marker tables with validated metadata."""
-    del feature_ids  # feature identity comes from the shared feature_index
-    version = slot_group.attrs.get("schema_version")
-    if (
-        isinstance(version, bool)
-        or not isinstance(version, int | np.integer)
-        or int(version) != MARKER_SCHEMA_VERSION
-    ):
-        raise ValueError(
-            "read_marker_table_v2 requires "
-            f"schema_version == {MARKER_SCHEMA_VERSION}; got {version!r}"
-        )
+    """Read canonical compact marker tables with validated metadata."""
     if "feature_index" not in slot_group or "stats" not in cluster_group:
-        raise ValueError("Schema-v2 marker tables require feature_index and stats")
-    for name, expected in _SCHEMA_V2_METADATA.items():
+        raise ValueError("Canonical marker tables require feature_index and stats")
+    for name, expected in _MARKER_METADATA.items():
         if name not in slot_group.attrs:
-            raise ValueError(f"Schema-v2 marker tables require {name} metadata")
+            raise ValueError(f"Canonical marker tables require {name} metadata")
         value = slot_group.attrs[name]
         if type(value) is not type(expected) or value != expected:
-            raise ValueError(f"Schema-v2 marker metadata {name!r} must be {expected!r}")
+            raise ValueError(f"Canonical marker metadata {name!r} must be {expected!r}")
     columns = _stored_stat_columns(slot_group, required=True)
     assert columns is not None
-    required = set(MARKER_STAT_COLUMNS_V2)
+    required = set(MARKER_STAT_COLUMNS)
     if set(columns) != required:
         raise ValueError(
-            "Schema-v2 marker tables must store the complete named stat_columns"
+            "Canonical marker tables must store the complete named stat_columns"
         )
     for name in ("n_group", "n_reference"):
         value = cluster_group.attrs.get(name)
@@ -334,35 +317,37 @@ def read_marker_table_v2(
             or int(value) < 2
         ):
             raise ValueError(
-                f"Schema-v2 marker groups require integer {name} metadata >= 2"
+                f"Canonical marker groups require integer {name} metadata >= 2"
             )
     feature_index = _array_values(slot_group, "feature_index")
     stats = _array_values(cluster_group, "stats")
     if stats.ndim != 2 or stats.shape[1] != len(columns):
-        raise ValueError("Schema-v2 marker stats do not match stat_columns")
+        raise ValueError("Canonical marker stats do not match stat_columns")
     if stats.shape[0] != feature_index.shape[0]:
-        raise ValueError("Schema-v2 marker stats do not align with feature_index")
+        raise ValueError("Canonical marker stats do not align with feature_index")
     if stats.shape[0] == 0:
-        raise ValueError("Schema-v2 marker groups must contain marker rows")
+        raise ValueError("Canonical marker groups must contain marker rows")
     if stats.dtype.kind != "f":
-        raise ValueError("Schema-v2 marker stats must use a floating dtype")
+        raise ValueError("Canonical marker stats must use a floating dtype")
     adjusted = stats[:, columns.index("p_value_adjusted")]
     if not np.isfinite(adjusted).all():
-        raise ValueError("Schema-v2 marker p_value_adjusted values must all be finite")
+        raise ValueError("Canonical marker p_value_adjusted values must all be finite")
+    if not np.isfinite(stats).all():
+        raise ValueError("Canonical marker statistics must all be finite")
     df = pd.DataFrame(stats, columns=columns)
     df["feature_index"] = feature_index
     displayed = _display_frame(
         df,
         group_id=group_id,
         feature_names=feature_names,
-        out_stat_columns=MARKER_STAT_COLUMNS_V2,
+        out_stat_columns=MARKER_STAT_COLUMNS,
         require_integer_indices=True,
         require_unique_indices=True,
     )
     return sort_marker_results(displayed)
 
 
-def _validate_marker_slot_v2(
+def _validate_marker_slot(
     slot_group: zarr.Group,
     feature_names: np.ndarray,
     *,
@@ -370,16 +355,16 @@ def _validate_marker_slot_v2(
 ) -> None:
     group_names = sorted(slot_group.group_keys())
     if not group_names:
-        raise ValueError("Schema-v2 marker tables must contain populated groups")
+        raise ValueError("Canonical marker tables must contain populated groups")
     if expected_group_cell_counts is not None and set(group_names) != set(
         expected_group_cell_counts
     ):
-        raise ValueError("Schema-v2 marker groups do not match the requested groups")
+        raise ValueError("Canonical marker groups do not match the requested groups")
     for group_name in group_names:
         cluster_group = slot_group[group_name]
         if not isinstance(cluster_group, zarr.Group):
             raise TypeError(f"Marker group {group_name!r} must be a group")
-        read_marker_table_v2(
+        _read_canonical_marker_table(
             slot_group,
             cluster_group,
             feature_names,
@@ -393,7 +378,7 @@ def _validate_marker_slot_v2(
             or cluster_group.attrs.get("n_reference") != expected_reference
         ):
             raise ValueError(
-                f"Schema-v2 marker group {group_name!r} has stale cell counts"
+                f"Canonical marker group {group_name!r} has stale cell counts"
             )
 
 
@@ -405,22 +390,17 @@ def load_marker_table(
     group_id: Any,
     feature_ids: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """Dispatch marker reading by schema version or legacy structure."""
-    if "schema_version" in slot_group.attrs:
-        version = slot_group.attrs["schema_version"]
-        if (
-            not isinstance(version, bool)
-            and isinstance(version, int | np.integer)
-            and int(version) == MARKER_SCHEMA_VERSION
-        ):
-            return read_marker_table_v2(
-                slot_group,
-                cluster_group,
-                feature_names,
-                group_id=group_id,
-                feature_ids=feature_ids,
-            )
-        raise ValueError(f"Unsupported marker schema_version: {version!r}")
+    """Dispatch marker reading by structural layout."""
+    canonical_metadata = any(
+        name in slot_group.attrs for name in _MARKER_METADATA
+    ) or any(name in cluster_group.attrs for name in ("n_group", "n_reference"))
+    if canonical_metadata:
+        return _read_canonical_marker_table(
+            slot_group,
+            cluster_group,
+            feature_names,
+            group_id=group_id,
+        )
 
     frame = read_legacy_marker_table(
         slot_group,

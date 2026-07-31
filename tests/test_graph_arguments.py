@@ -148,7 +148,7 @@ def test_stage_models_chain_logical_artifact_refs() -> None:
         ann_index=_ref("ann_index", "3"),
         coordinates=_ref("batch_correction", "4"),
         k=15,
-        distance_convention="euclidean_v1",
+        distance_metric="l2",
         batch_size=100,
     )
     connectivity = ConnectivityMapArguments(

@@ -213,12 +213,12 @@ def test_frozen_master_reads_and_recomputes_markers_without_mutation(
 
 
 @pytest.mark.integration
-def test_frozen_master_writable_copy_publishes_v2_markers_additively(
+def test_frozen_master_writable_copy_publishes_canonical_markers_additively(
     frozen_master_store: str,
     tmp_path,
 ) -> None:
     from scarf.datastore.datastore import DataStore
-    from scarf.features.markers.table import MARKER_STAT_COLUMNS_V2
+    from scarf.features.markers.table import MARKER_STAT_COLUMNS
 
     working_copy = str(tmp_path / "data.zarr")
     shutil.copytree(frozen_master_store, working_copy)
@@ -244,8 +244,8 @@ def test_frozen_master_writable_copy_publishes_v2_markers_additively(
         _CELL_KEY,
         "RNA_cluster",
     )
-    assert published.attrs["schema_version"] == 2
-    assert list(published.attrs["stat_columns"]) == list(MARKER_STAT_COLUMNS_V2)
+    assert "schema_version" not in published.attrs
+    assert list(published.attrs["stat_columns"]) == list(MARKER_STAT_COLUMNS)
     assert published.attrs["method"] == "mannwhitneyu"
     assert published.attrs["alternative"] == "two-sided"
     assert published.attrs["adjustment_method"] == "fdr_bh"

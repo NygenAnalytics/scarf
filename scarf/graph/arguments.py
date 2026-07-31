@@ -278,7 +278,7 @@ class NeighborQueryArguments(OperationArguments):
     ann_index: ArtifactRef = artifact_input()
     coordinates: ArtifactRef = artifact_input()
     k: int = parameter()
-    distance_convention: str = parameter()
+    distance_metric: str = parameter()
     batch_size: int = execution()
     invalidate_cache: bool = execution(False)
 

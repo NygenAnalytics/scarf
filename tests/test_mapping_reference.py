@@ -119,6 +119,18 @@ def test_mapping_reference_roundtrip(tmp_path):
     assert repeated_path == artifact_path
     assert len(reduction[MAPPING_REFERENCES_GROUP]) == 1
 
+    reduction[artifact_path].attrs["schemaVersion"] = 2
+    with pytest.raises(ValueError, match="artifact hash"):
+        load_mapping_reference(
+            SimpleNamespace(zw=root),
+            "RNA",
+            "I",
+            "hvgs",
+            "RNA/reduction",
+            "RNA/reduction/ann",
+        )
+    del reduction[artifact_path].attrs["schemaVersion"]
+
     reduction[artifact_path]["loadings"][0, 0] = 2.0
     with pytest.raises(ValueError, match="artifact hash"):
         load_mapping_reference(

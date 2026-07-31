@@ -17,6 +17,7 @@ from ...graph.encoded_paths import (
     parse_neighbor_index_group_path,
     reduction_group_path_from_neighbor_index,
 )
+from ...graph.distances import validate_distance_provenance
 from ...graph.state import read_assay_state
 from ...storage.artifacts import (
     ArtifactRef,
@@ -1612,6 +1613,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         store.attrs["save_k"] = int(save_k)
         from ...mapping.confidence import _distance_quantile_summary
 
+        validate_distance_provenance(self.zw, neighbors_path)
         neighbors_group = as_zarr_group(
             self.zw[neighbors_path],
             name=neighbors_path,
@@ -2654,6 +2656,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                 and state.matches(cell_key, feat_key)
                 and state.neighbors is not None
             ):
+                validate_distance_provenance(self.zw, artifact_path(state.neighbors))
                 neighbors_group = as_zarr_group(
                     self.zw[artifact_path(state.neighbors)],
                     name=artifact_path(state.neighbors),
@@ -2707,6 +2710,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             if state is None or state.neighbors is None:
                 raise ValueError("Artifact graph state has no neighbors artifact")
             knn_path = artifact_path(state.neighbors)
+        validate_distance_provenance(self.zw, knn_path)
         knn = as_zarr_group(self.zw[knn_path], name=knn_path)
         reference_distances = as_zarr_array(knn["distances"], name="referenceDistances")
         return _distance_quantile_summary(reference_distances)

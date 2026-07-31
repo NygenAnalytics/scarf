@@ -133,7 +133,7 @@ _CONTRACTS = (
             **_classified("routing", "from_assay"),
             **_classified("publication", "update_state"),
         },
-        model_only=_classified("algorithm_version", "distance_convention"),
+        model_only=_classified("derived", "distance_metric"),
     ),
     OperationContract(
         DataStore.run_normalization,
@@ -266,7 +266,6 @@ _CONTRACTS = (
             "continuity_correction",
             "adjustment_method",
             "adjustment_scope",
-            "schema_version",
         ),
     ),
     OperationContract(

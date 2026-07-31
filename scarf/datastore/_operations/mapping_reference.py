@@ -10,6 +10,7 @@ from ...graph.encoded_paths import (
     parse_neighbor_index_group_path,
 )
 from ...graph.arguments import _positive_integer
+from ...graph.distances import validate_distance_provenance
 from ...graph.state import read_assay_state
 from ...mapping.artifact import (
     load_artifact_mapping_reference,
@@ -30,6 +31,7 @@ from ...storage.artifact_writer import (
 from ...storage.artifacts import (
     ArtifactRef,
     artifact_group,
+    artifact_path,
     inspect_artifact,
 )
 from ...storage.types import as_zarr_array, as_zarr_group
@@ -596,6 +598,7 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
                 inspect_artifact(self.zw, normalized).parameters or {}
             ),
         }
+        validate_distance_provenance(self.zw, artifact_path(neighbors))
         neighbors_group = artifact_group(self.zw, neighbors)
         distance_quantiles, distance_values = _distance_quantile_summary(
             as_zarr_array(

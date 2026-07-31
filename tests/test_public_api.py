@@ -338,10 +338,9 @@ def test_marker_facade_does_not_export_layout_internals():
     markers = import_module("scarf.features.markers")
     internal_names = {
         "LEGACY_STAT_COLUMNS",
-        "MARKER_STAT_COLUMNS_V2",
+        "MARKER_STAT_COLUMNS",
         "load_marker_table",
         "read_legacy_marker_table",
-        "read_marker_table_v2",
     }
 
     assert internal_names.isdisjoint(markers.__all__)

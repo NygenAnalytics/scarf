@@ -31,10 +31,9 @@ from ...features.markers.table import (
     MARKER_ALTERNATIVE,
     MARKER_CONTINUITY_CORRECTION,
     MARKER_METHOD,
-    MARKER_SCHEMA_VERSION,
-    MARKER_STAT_COLUMNS_V2,
+    MARKER_STAT_COLUMNS,
     MARKER_TIE_CORRECTION,
-    _validate_marker_slot_v2,
+    _validate_marker_slot,
     load_marker_table,
 )
 from ...metadata.arguments import AucellArguments, MarkerTableArguments, WaggrArguments
@@ -65,7 +64,7 @@ if TYPE_CHECKING:
 else:
     _FeatureOperationsBase = object
 
-_MARKER_STAT_COLUMNS = MARKER_STAT_COLUMNS_V2
+_MARKER_STAT_COLUMNS = MARKER_STAT_COLUMNS
 _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
 
 
@@ -78,30 +77,30 @@ def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray
         group_name = str(cluster_id)
         if group_name in populated_names:
             raise ValueError(
-                "Schema-v2 marker group labels must remain unique as strings"
+                "Marker group labels must remain unique as strings"
             )
         populated_names.add(group_name)
         raw_index = np.asarray(vals.index.values)
         if raw_index.ndim != 1 or raw_index.dtype.kind not in {"i", "u"}:
             raise ValueError(
-                "Schema-v2 marker feature indices must use a one-dimensional "
+                "Marker feature indices must use a one-dimensional "
                 "integer index"
             )
         if not vals.index.is_unique:
             raise ValueError(
-                "Schema-v2 marker feature indices must be unique within each group"
+                "Marker feature indices must be unique within each group"
             )
         index = raw_index.astype(np.int64, copy=False)
         if (index < 0).any() or (index > np.iinfo(np.int32).max).any():
             raise ValueError(
-                "Schema-v2 marker feature indices must fit non-negative int32"
+                "Marker feature indices must fit non-negative int32"
             )
         ordered = np.sort(index)
         if shared is None:
             shared = ordered
         elif not np.array_equal(ordered, shared):
             raise ValueError(
-                "Schema-v2 marker groups must contain identical feature index sets"
+                "Marker groups must contain identical feature index sets"
             )
     if shared is None:
         raise ValueError("Cannot save empty marker results")
@@ -114,7 +113,7 @@ def _marker_stats_matrix(vals: pd.DataFrame, feature_index: np.ndarray) -> np.nd
         aligned.loc[:, list(_MARKER_STAT_COLUMNS)].to_numpy(dtype=np.float64)
     )
     if not np.isfinite(stats).all():
-        raise ValueError("Schema-v2 marker statistics must all be finite")
+        raise ValueError("Marker statistics must all be finite")
     return stats
 
 
@@ -1114,7 +1113,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                         expected_feature_index,
                     ):
                         return False
-                    _validate_marker_slot_v2(
+                    _validate_marker_slot(
                         candidate,
                         feature_names_for_validation,
                         expected_group_cell_counts=expected_group_cell_counts,
@@ -1136,7 +1135,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 continuity_correction=MARKER_CONTINUITY_CORRECTION,
                 adjustment_method=MARKER_ADJUSTMENT_METHOD,
                 adjustment_scope=MARKER_ADJUSTMENT_SCOPE,
-                schema_version=MARKER_SCHEMA_VERSION,
                 group_key=group_key,
                 cell_key=cell_key,
                 feat_key=feat_key,
@@ -1160,11 +1158,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                     AttributeRequirement(
                         "stat_columns",
                         expected_types=(list, tuple),
-                    ),
-                    AttributeRequirement(
-                        "schema_version",
-                        expected_types=(int,),
-                        predicate=lambda value: value == MARKER_SCHEMA_VERSION,
                     ),
                 ),
                 reuse_validator=marker_reuse_is_valid,
@@ -1241,7 +1234,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         missing_counts = populated_groups.difference(group_cell_counts)
         if missing_counts:
             raise ValueError(
-                "Schema-v2 marker writes require target and reference counts "
+                "Marker writes require target and reference counts "
                 "for every populated group"
             )
         if any(
@@ -1250,7 +1243,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             for count in group_cell_counts[cluster_id]
         ):
             raise ValueError(
-                "Schema-v2 marker target and reference counts must be integers >= 2"
+                "Marker target and reference counts must be integers >= 2"
             )
         feature_index = _shared_marker_feature_index(markers)
         stats_by_group = {
@@ -1258,7 +1251,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             for cluster_id, values in markers.items()
             if len(values)
         }
-        group.attrs["schema_version"] = MARKER_SCHEMA_VERSION
         group.attrs["stat_columns"] = list(_MARKER_STAT_COLUMNS)
         group.attrs["method"] = MARKER_METHOD
         group.attrs["alternative"] = MARKER_ALTERNATIVE

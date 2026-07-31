@@ -606,7 +606,7 @@ def test_cache_identity_distinguishes_parameters_from_execution_options(
     assert invalidated_reduction != state.reduction
     assert datastore.inspect_artifact(changed_neighbors).parameters == {
         "k": 3,
-        "distance_convention": "euclidean_v1",
+        "distance_metric": "l2",
     }
 
 
@@ -1017,7 +1017,7 @@ def test_atomic_chain_matches_released_knn_golden(
     )
 
 
-def test_connectivity_rebuild_supports_legacy_squared_l2_neighbors(
+def test_connectivity_rebuild_requires_named_distance_metric(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
@@ -1029,35 +1029,38 @@ def test_connectivity_rebuild_supports_legacy_squared_l2_neighbors(
     reduction = datastore.run_pca(normalized, dims=4)
     ann = datastore.build_ann_index(reduction)
     neighbors = datastore.query_neighbors(ann, k=3)
-    expected = datastore.build_connectivity_map(
-        neighbors,
-        update_state=False,
-        invalidate_cache=True,
-    )
-    expected_group = datastore.load_artifact(expected)
-    expected_edges = expected_group["edges"][:]
-    expected_weights = expected_group["weights"][:]
 
     neighbor_group = datastore.zw[artifact_path(neighbors)]
-    distances = neighbor_group["distances"][:]
-    neighbor_group["distances"][:] = distances * distances
     provenance = dict(neighbor_group.attrs["provenance"])
+    parameters = dict(provenance["parameters"])
+    assert parameters["distance_metric"] == "l2"
+
     provenance["parameters"] = {"k": 3}
     neighbor_group.attrs["provenance"] = provenance
-    legacy = datastore.build_connectivity_map(
+    with pytest.raises(ValueError, match="does not name the metric"):
+        datastore.build_connectivity_map(
+            neighbors,
+            update_state=False,
+            invalidate_cache=True,
+        )
+
+    provenance["parameters"] = {**parameters, "distance_metric": "cosine"}
+    neighbor_group.attrs["provenance"] = provenance
+    with pytest.raises(ValueError, match="does not match its ANN index input"):
+        datastore.build_connectivity_map(
+            neighbors,
+            update_state=False,
+            invalidate_cache=True,
+        )
+
+    provenance["parameters"] = parameters
+    neighbor_group.attrs["provenance"] = provenance
+    rebuilt = datastore.build_connectivity_map(
         neighbors,
         update_state=False,
         invalidate_cache=True,
     )
-    legacy_group = datastore.load_artifact(legacy)
-
-    np.testing.assert_array_equal(legacy_group["edges"][:], expected_edges)
-    np.testing.assert_allclose(
-        legacy_group["weights"][:],
-        expected_weights,
-        rtol=1e-6,
-        atol=1e-7,
-    )
+    assert datastore.inspect_artifact(rebuilt).complete
 
 
 def test_corrupt_ann_bytes_are_not_reused(

@@ -178,7 +178,6 @@ class MarkerTableArguments(OperationArguments):
     continuity_correction: bool = parameter()
     adjustment_method: str = parameter()
     adjustment_scope: str = parameter()
-    schema_version: int = parameter()
     group_key: str = execution()
     cell_key: str = execution()
     feat_key: str = execution()

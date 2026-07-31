@@ -94,16 +94,15 @@ def test_marker_heatmap_selects_features_by_named_score(
     result.close()
 
 
-def test_marker_heatmap_propagates_explicit_marker_schema_errors(
+def test_marker_heatmap_propagates_marker_metadata_errors(
     marker_search,
     datastore,
 ):
     marker_slot = datastore._resolve_marker_group("RNA", "I", "RNA_cluster")
-    had_version = "schema_version" in marker_slot.attrs
-    original_version = marker_slot.attrs.get("schema_version")
-    marker_slot.attrs["schema_version"] = 99
+    original_method = marker_slot.attrs["method"]
+    marker_slot.attrs["method"] = "ttest"
     try:
-        with pytest.raises(ValueError, match="Unsupported marker schema_version"):
+        with pytest.raises(ValueError, match="Canonical marker metadata 'method'"):
             splt.marker_heatmap(
                 datastore,
                 group_key="RNA_cluster",
@@ -111,10 +110,7 @@ def test_marker_heatmap_propagates_explicit_marker_schema_errors(
                 show=False,
             )
     finally:
-        if had_version:
-            marker_slot.attrs["schema_version"] = original_version
-        else:
-            del marker_slot.attrs["schema_version"]
+        marker_slot.attrs["method"] = original_method
 
 
 def test_marker_heatmap_skips_unresolved_legacy_names_with_warning(

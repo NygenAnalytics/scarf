@@ -9,6 +9,7 @@ from typing import Any, cast
 import numpy as np
 import zarr
 
+from ..graph.distances import validate_distance_provenance
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..storage.arrays import create_zarr_dataset, create_zarr_obj_array
 from .hashing import array_hash
@@ -95,6 +96,7 @@ def load_artifact_mapping_reference(
     correction_ref = input_ref("batch_correction", "batch_correction")
     ann_ref = input_ref("ann_index", "ann_index")
     neighbors_ref = input_ref("neighbors", "neighbors")
+    validate_distance_provenance(datastore.zw, artifact_path(neighbors_ref))
     correction_inputs = inspect_artifact(datastore.zw, correction_ref).inputs or {}
     ann_inputs = inspect_artifact(datastore.zw, ann_ref).inputs or {}
     neighbors_inputs = inspect_artifact(datastore.zw, neighbors_ref).inputs or {}
@@ -471,7 +473,6 @@ def _validate_mapping_reference_hash(group: zarr.Group, expected_hash: str) -> N
             "artifactHash",
             "complete",
             "correctionRidge",
-            "schemaVersion",
         }
     }
     actual_hash = mapping_reference_hash(

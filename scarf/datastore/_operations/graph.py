@@ -41,6 +41,7 @@ from ...graph.encoded_paths import (
     parse_neighbor_index_group_path,
     parse_reduction_group_path,
 )
+from ...graph.distances import validate_distance_provenance
 from ...graph.paths import StoredAssayGraph, StoredGraph
 from ...graph.state import (
     AssayState,
@@ -3043,11 +3044,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             source_batch_size if resolved_batch_size is None else resolved_batch_size
         )
         effective_batch_size = min(int(requested_batch_size), n_cells)
+        ann_parameters = ann_status.parameters or {}
+        ann_metric = ann_parameters.get("ann_metric")
+        if ann_metric not in {"l2", "cosine"}:
+            raise ValueError("ANN artifact has no supported distance metric")
         arguments = NeighborQueryArguments(
             ann_index=ann_ref,
             coordinates=stored_coordinates,
             k=effective_k,
-            distance_convention="euclidean_v1",
+            distance_metric=str(ann_metric),
             batch_size=effective_batch_size,
             invalidate_cache=invalidate_cache,
         )
@@ -3069,10 +3074,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         if not planned.reused:
-            ann_parameters = ann_status.parameters or {}
             ann_idx = self._resolve_ann_index(
                 ann_status.path,
-                str(ann_parameters.get("ann_metric", "l2")),
+                str(ann_metric),
                 dims,
                 expected_count=n_cells,
             )
@@ -3086,7 +3090,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             query = NeighborQueryStage(
                 ann_idx,
                 effective_k,
-                str(ann_parameters.get("ann_metric", "l2")),
+                str(ann_metric),
             )
             indices = np.empty((n_cells, effective_k), dtype=np.uint32)
             distances = np.empty((n_cells, effective_k), dtype=np.float32)
@@ -3194,6 +3198,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         group = group_at(self.zw, status.path)
         indices = as_zarr_array(group["indices"], name="indices")
         n_cells, n_neighbors = map(int, indices.shape)
+        validate_distance_provenance(self.zw, status.path)
         arguments = ConnectivityMapArguments(
             neighbors=neighbors_ref,
             local_connectivity=local_connectivity,
@@ -3226,16 +3231,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     name="distances",
                 )[:]
             )
-            if "distance_convention" not in (status.parameters or {}):
-                raw_ann_ref = (status.inputs or {}).get("ann_index")
-                if isinstance(raw_ann_ref, dict):
-                    legacy_ann = ArtifactRef.from_dict(raw_ann_ref)
-                    legacy_ann_metric = (
-                        inspect_artifact(self.zw, legacy_ann).parameters or {}
-                    ).get("ann_metric")
-                    if legacy_ann_metric == "l2":
-                        np.maximum(distance_values, 0, out=distance_values)
-                        np.sqrt(distance_values, out=distance_values)
             edge_values, weight_values = build_connectivity_arrays(
                 np.asarray(indices[:]),
                 distance_values,

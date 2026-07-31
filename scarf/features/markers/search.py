@@ -25,7 +25,7 @@ from .regression import (
     _REG_SENTINEL,
     _regression_batch_results,
 )
-from .table import MARKER_STAT_COLUMNS_V2
+from .table import MARKER_STAT_COLUMNS
 
 __all__ = ["find_markers_by_rank", "find_markers_by_regression"]
 
@@ -73,7 +73,7 @@ def find_markers_by_rank(
     n_groups = len(group_set)
     idx_map = dict(zip(group_set, range(n_groups)))
     int_indices = np.asarray([idx_map[x] for x in groups], dtype=np.int64)
-    out_cols = ["feature_index", *MARKER_STAT_COLUMNS_V2]
+    out_cols = ["feature_index", *MARKER_STAT_COLUMNS]
     results: dict[Any, pd.DataFrame] = {}
     worker_limit = getattr(
         getattr(assay, "resources", None),
@@ -233,7 +233,7 @@ def find_markers_by_rank(
         )
         df = kernel.copy()
         df["p_value_adjusted"] = adjusted
-        df = df.loc[:, list(MARKER_STAT_COLUMNS_V2)]
+        df = df.loc[:, list(MARKER_STAT_COLUMNS)]
         cols_to_round = [
             col for col in df.columns if col not in {pval_col, "p_value_adjusted"}
         ]
