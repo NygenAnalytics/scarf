@@ -8,10 +8,44 @@ from scarf.datastore._operations import graph as graph_operations
 from scarf.embeddings.harmony import fit_harmony
 from scarf.graph.state import stored_assay_graph_from_ref
 from scarf.storage.artifacts import ArtifactRef, artifact_path
+from scarf.storage.budget import ResourceBudget
 from scarf.utils import logger
 from tests import full_path
 
 pytestmark = pytest.mark.slow
+
+
+def test_streaming_lsi_block_rows_respect_memory_budget() -> None:
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    array = group.create_array(
+        "normalized",
+        shape=(100, 20),
+        chunks=(10, 20),
+        dtype=np.float32,
+    )
+
+    constrained = graph_operations._streaming_lsi_block_rows(
+        array,
+        ResourceBudget(memoryBytes=5_000, workers=1),
+        n_components=3,
+        n_oversamples=2,
+    )
+    roomy = graph_operations._streaming_lsi_block_rows(
+        array,
+        ResourceBudget(memoryBytes=1_000_000, workers=1),
+        n_components=3,
+        n_oversamples=2,
+    )
+
+    assert 1 <= constrained < roomy
+    assert roomy == array.shape[0]
+    with pytest.raises(MemoryError, match="Streaming LSI needs about"):
+        graph_operations._streaming_lsi_block_rows(
+            array,
+            ResourceBudget(memoryBytes=1_000, workers=1),
+            n_components=3,
+            n_oversamples=2,
+        )
 
 
 def _prepare_graph_features(datastore) -> None:
@@ -951,7 +985,20 @@ def test_lsi_and_custom_reduction_have_distinct_public_methods(
         from_assay="RNA",
         feat_key="graph_hvgs",
     )
-    lsi = datastore.run_lsi(normalized, dims=3)
+    lsi = datastore.run_lsi(
+        normalized,
+        dims=3,
+        n_iter=1,
+        n_oversamples=2,
+    )
+    materialized_lsi = datastore.run_lsi(
+        normalized,
+        dims=3,
+        solver="materialized",
+        n_iter=1,
+        n_oversamples=2,
+        update_state=False,
+    )
     n_features = datastore.load_artifact(normalized)["data"].shape[1]
     loadings = np.eye(n_features, 2, dtype=np.float64)
     custom = datastore.run_custom_reduction(
@@ -960,7 +1007,15 @@ def test_lsi_and_custom_reduction_have_distinct_public_methods(
         update_state=False,
     )
 
-    assert datastore.inspect_artifact(lsi).operation == "run_lsi"
+    lsi_status = datastore.inspect_artifact(lsi)
+    assert lsi_status.operation == "run_lsi"
+    assert lsi_status.parameters["solver"] == "streaming"
+    assert lsi_status.parameters["n_iter"] == 1
+    assert lsi_status.parameters["n_oversamples"] == 2
+    assert datastore.inspect_artifact(materialized_lsi).parameters["solver"] == (
+        "materialized"
+    )
+    assert materialized_lsi != lsi
     assert datastore.inspect_artifact(custom).operation == "run_custom_reduction"
     ann = datastore.build_ann_index(custom, update_state=False)
     neighbors = datastore.query_neighbors(ann, k=3, update_state=False)

@@ -594,8 +594,10 @@ def test_coordinate_melding_leaves_counts_t_on_demand():
     root["ATAC/counts"][:] = values
     cells = MetaData(root["cellData"])
     n_features = (values > 0).sum(axis=1).astype(np.float64)
+    n_counts = values.sum(axis=1, dtype=np.float64)
     n_cells_per_peak = (values > 0).sum(axis=0).astype(np.float64)
     cells.insert("ATAC_nFeatures", n_features, overwrite=True)
+    cells.insert("ATAC_nCounts", n_counts, overwrite=True)
     assay = Assay(root, None, "ATAC", cells, nthreads=1, min_cells_per_feature=1)
     assay.feats.insert("nCells", n_cells_per_peak, overwrite=True)
 

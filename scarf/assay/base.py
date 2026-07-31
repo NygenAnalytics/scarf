@@ -528,10 +528,13 @@ class Assay:
             feat_key = cell_key + "__" + feat_key
         cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
         subset_hash = self._create_subset_hash(cell_idx, feat_idx)
-        subset_params = {
+        subset_params: dict[str, Any] = {
             "log_transform": log_transform,
             "renormalize_subset": renormalize_subset,
         }
+        normalization_identity = getattr(self.normMethod, "artifact_identity", None)
+        if normalization_identity is not None:
+            subset_params["normalization_identity"] = str(normalization_identity)
         if artifact_mode:
             if location not in self.z:
                 raise KeyError(f"Artifact group does not exist at {location}")

@@ -5,6 +5,7 @@ import pytest
 import zarr
 from zarr.storage import MemoryStore
 
+from scarf.assay import norm_lib_size, norm_tf_idf
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.base_datastore import BaseDataStore
 from scarf.storage.artifact_writer import (
@@ -58,6 +59,16 @@ def test_callable_identity_requires_dynamic_explicit_identity() -> None:
 
     configured.artifact_identity = "configured"  # type: ignore[attr-defined]
     assert callable_identity(configured) == {"identity": "configured"}
+
+
+def test_tfidf_uses_semantic_artifact_identity_only_for_atac() -> None:
+    assert callable_identity(norm_tf_idf) == {
+        "identity": "scarf.assay.norm_tf_idf:selected-cell-df:total-count-tf"
+    }
+    assert callable_identity(norm_lib_size) == {
+        "module": "scarf.assay",
+        "qualname": "norm_lib_size",
+    }
 
 
 def test_datastore_load_artifact_resolves_workspace_path() -> None:

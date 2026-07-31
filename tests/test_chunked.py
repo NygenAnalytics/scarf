@@ -108,6 +108,17 @@ class TestChunkedArrayParity:
         cols = np.array([3, 10, 25, 40])
         assert np.allclose(normed[:, cols].compute(), ref[:, cols])
 
+    def test_column_subset_after_two_dimensional_row_broadcast(self, backed_pair):
+        ca, dense = backed_pair
+        row_values = np.linspace(1.0, 2.0, dense.shape[1]).reshape(1, -1)
+        transformed = ca * row_values
+        cols = np.array([3, 10, 25, 40])
+
+        np.testing.assert_allclose(
+            transformed[:, cols].compute(),
+            (dense * row_values)[:, cols],
+        )
+
     def test_dot(self, backed_pair):
         ca, dense = backed_pair
         rng = np.random.default_rng(3)

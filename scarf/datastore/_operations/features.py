@@ -1606,6 +1606,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         scalar_coeff: float = 1e5,
         renormalization: bool = True,
         assay_type: str = "Assay",
+        cell_key: str = "I",
     ) -> None:
         """This method performs "assay melding" and can be only be used for
         assay's wherein features have genomic coordinates. In the process of
@@ -1634,6 +1635,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             assay_type: The new assay (melded assay) is saved as this type. This can be any type of Assay class from
                         `assay` module. Please provide string representation of class. By default, the assay is assigned
                         a generic class and has a dummy normalization function (Default value: 'Assay')
+            cell_key: Cells used to learn peak document frequency. Every cell is
+                      still scored so the new assay remains row-aligned.
 
         Returns:
             None
@@ -1653,6 +1656,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             )
 
         assay = self._get_assay(from_assay)
+        idf_cell_idx = assay.cells.active_index(cell_key)
+        if len(idf_cell_idx) == 0:
+            raise ValueError("Gene-score IDF requires at least one selected cell")
         feature_bed = pd.read_csv(external_bed_fn, header=None, sep="\t").sort_values(
             by=[0, 1]  # type: ignore
         )
@@ -1684,6 +1690,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             scalar_coeff=scalar_coeff,
             renormalization=renormalization,
             peaks_coords=peaks_coords,
+            idf_cell_idx=idf_cell_idx,
         )
 
         self._load_assays(min_cells=10, custom_assay_types={assay_label: assay_type})

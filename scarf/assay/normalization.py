@@ -98,4 +98,9 @@ def norm_tf_idf(assay: "Assay", counts: ChunkedArray) -> ChunkedArray:
     t_f = counts / assay.n_term_per_doc.reshape(-1, 1)
     # TODO: Split TF and IDF functionality to make it similar to norml_lib and zscaling
     idf = np.log2(1 + (assay.n_docs / (assay.n_docs_per_term + 1)))
-    return t_f * idf
+    return t_f * idf.reshape(1, -1)
+
+
+norm_tf_idf.artifact_identity = (  # type: ignore[attr-defined]
+    "scarf.assay.norm_tf_idf:selected-cell-df:total-count-tf"
+)

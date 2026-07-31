@@ -53,10 +53,11 @@ class _Op:
         if self.kind == "matmul":
             raise NotImplementedError("Column-indexing after .dot is not supported")
         if self.kind == "binary" and self.btype == "row":
+            operand = np.asarray(self.operand)
             return _Op(
                 "binary",
                 self.func,
-                np.asarray(self.operand)[col_idx],
+                operand[col_idx] if operand.ndim == 1 else operand[:, col_idx],
                 self.side,
                 "row",
             )

@@ -272,20 +272,63 @@ def fit_lsi(
     random_state: int,
     nthreads: int,
 ) -> np.ndarray:
-    """Fit LSI loadings over materialized matrix blocks."""
-    from sklearn.decomposition import TruncatedSVD
-
+    """Fit uncentered LSI loadings with a streamed or materialized solver."""
     reserved = {"n_components", "random_state"}
     for key in list(params):
         if key in reserved:
             del params[key]
             logger.warning(f"Provided parameter, {key}, for LSI model will not be used")
 
+    n_components = dims + int(skip_first)
+    if n_components > min(data.shape):
+        raise ValueError("LSI components cannot exceed the input matrix rank")
+    solver_params = dict(params)
+    solver = solver_params.pop("solver", "streaming")
+    if solver == "streaming":
+        allowed = {"n_iter", "n_oversamples"}
+        unsupported = sorted(set(solver_params) - allowed)
+        if unsupported:
+            joined = ", ".join(unsupported)
+            raise ValueError(f"Streaming LSI does not support parameters: {joined}")
+        return _fit_streaming_lsi(
+            data,
+            n_components=n_components,
+            skip_first=skip_first,
+            n_iter=solver_params.get("n_iter", 5),
+            n_oversamples=solver_params.get("n_oversamples", 10),
+            random_state=random_state,
+            nthreads=nthreads,
+        )
+    if solver != "materialized":
+        raise ValueError("LSI solver must be 'streaming' or 'materialized'")
+    return _fit_materialized_lsi(
+        data,
+        n_components=n_components,
+        skip_first=skip_first,
+        params=solver_params,
+        random_state=random_state,
+        nthreads=nthreads,
+    )
+
+
+def _fit_materialized_lsi(
+    data: ChunkedArray,
+    *,
+    n_components: int,
+    skip_first: bool,
+    params: dict[str, Any],
+    random_state: int,
+    nthreads: int,
+) -> np.ndarray:
+    from sklearn.decomposition import TruncatedSVD
+
     matrix = np.vstack(
-        list(data.stream_blocks(nthreads=nthreads, msg="Fitting LSI model"))
+        list(
+            data.stream_blocks(nthreads=nthreads, msg="Fitting materialized LSI model")
+        )
     )
     model = TruncatedSVD(
-        n_components=dims + int(skip_first),
+        n_components=n_components,
         random_state=random_state,
         **params,
     )
@@ -294,3 +337,111 @@ def fit_lsi(
     if skip_first:
         return np.asarray(components[:, 1:])
     return np.asarray(components)
+
+
+def _nonnegative_integer(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{name} must be an integer")
+    resolved = int(value)
+    if resolved < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    return resolved
+
+
+def _streaming_lsi_accumulator_bytes(n_features: int, width: int) -> int:
+    itemsize = np.dtype(np.float64).itemsize
+    return 3 * n_features * width * itemsize + 2 * width * width * itemsize
+
+
+def _streaming_lsi_resident_bytes(data: ChunkedArray, width: int) -> int:
+    block_rows = min(int(data.chunksize[0]), int(data.shape[0]))
+    block_temporaries = (
+        block_rows * (int(data.shape[1]) + width) * np.dtype(np.float64).itemsize
+    )
+    return (
+        _streaming_lsi_accumulator_bytes(int(data.shape[1]), width) + block_temporaries
+    )
+
+
+def _stream_lsi_gram_action(
+    data: ChunkedArray,
+    basis: np.ndarray,
+    *,
+    nthreads: int,
+    message: str,
+) -> np.ndarray:
+    result = np.zeros_like(basis, dtype=np.float64)
+    rows_seen = 0
+    resident_bytes = _streaming_lsi_resident_bytes(data, basis.shape[1])
+    for block in data._stream_blocks(
+        nthreads=nthreads,
+        msg=message,
+        prefetch=1,
+        row_mask=None,
+        resident_bytes=resident_bytes,
+    ):
+        values = np.asarray(block)
+        projected = values @ basis
+        result += values.T @ projected
+        rows_seen += len(values)
+    if rows_seen != data.shape[0]:
+        raise RuntimeError(f"LSI streamed {rows_seen} rows, expected {data.shape[0]}")
+    if not np.isfinite(result).all():
+        raise ValueError("LSI input must contain only finite values")
+    return result
+
+
+def _fit_streaming_lsi(
+    data: ChunkedArray,
+    *,
+    n_components: int,
+    skip_first: bool,
+    n_iter: Any,
+    n_oversamples: Any,
+    random_state: int,
+    nthreads: int,
+) -> np.ndarray:
+    iterations = _nonnegative_integer(n_iter, "n_iter")
+    oversamples = _nonnegative_integer(n_oversamples, "n_oversamples")
+    width = min(min(data.shape), n_components + oversamples)
+    rng = np.random.default_rng(random_state)
+    basis = rng.standard_normal((data.shape[1], width), dtype=np.float64)
+    basis, _ = np.linalg.qr(basis, mode="reduced")
+
+    for iteration in range(iterations + 1):
+        basis = _stream_lsi_gram_action(
+            data,
+            basis,
+            nthreads=nthreads,
+            message=f"Fitting streaming LSI model ({iteration + 1}/{iterations + 2})",
+        )
+        basis, _ = np.linalg.qr(basis, mode="reduced")
+
+    projected_gram = np.zeros((width, width), dtype=np.float64)
+    rows_seen = 0
+    resident_bytes = _streaming_lsi_resident_bytes(data, width)
+    for block in data._stream_blocks(
+        nthreads=nthreads,
+        msg=f"Fitting streaming LSI model ({iterations + 2}/{iterations + 2})",
+        prefetch=1,
+        row_mask=None,
+        resident_bytes=resident_bytes,
+    ):
+        projected = np.asarray(block) @ basis
+        projected_gram += projected.T @ projected
+        rows_seen += len(projected)
+    if rows_seen != data.shape[0]:
+        raise RuntimeError(f"LSI streamed {rows_seen} rows, expected {data.shape[0]}")
+    if not np.isfinite(projected_gram).all():
+        raise ValueError("LSI input must contain only finite values")
+
+    eigenvalues, rotations = np.linalg.eigh(projected_gram)
+    order = np.argsort(eigenvalues)[::-1][:n_components]
+    loadings = np.asarray(basis @ rotations[:, order], dtype=np.float64)
+    largest = np.argmax(np.abs(loadings), axis=0)
+    signs = np.sign(loadings[largest, np.arange(loadings.shape[1])])
+    signs[signs == 0] = 1
+    loadings *= signs
+    if skip_first:
+        return loadings[:, 1:]
+    return loadings

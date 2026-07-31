@@ -1160,12 +1160,18 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             from_assay, cell_key, feat_key
         )
         source_assay = self._get_assay(from_assay)
-
         if type(target_assay) is not type(source_assay):
             raise TypeError(
                 f"ERROR: Source assay ({type(source_assay)}) and target assay "
                 f"({type(target_assay)}) are of different types. "
                 f"Mapping can only be performed between same assay types"
+            )
+        if isinstance(source_assay, ATACassay):
+            raise NotImplementedError(
+                "ATAC query mapping requires the reference TF-IDF document "
+                "frequencies. The current mapping format does not persist them, "
+                "and target-derived IDF would make coordinates depend on query "
+                "composition."
             )
         if isinstance(target_assay, RNAassay):
             if target_assay.sf != source_assay.sf:

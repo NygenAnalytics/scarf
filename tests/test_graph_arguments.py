@@ -184,6 +184,9 @@ def test_reduction_batch_size_does_not_change_reuse() -> None:
         "dims": 5,
         "skip_first": True,
         "rand_state": 4466,
+        "solver": "streaming",
+        "n_iter": 5,
+        "n_oversamples": 10,
         "update_state": False,
         "invalidate_cache": False,
     }

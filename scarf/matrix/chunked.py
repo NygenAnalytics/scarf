@@ -365,6 +365,21 @@ class ChunkedArray:
             is_numpy=self._is_numpy,
         )
 
+    def _with_block_size(self, block_size: int) -> "ChunkedArray":
+        if block_size < 1:
+            raise ValueError("block_size must be greater than zero")
+        return ChunkedArray(
+            self._backing,
+            rows=self._rows,
+            cols=self._cols,
+            ops=self._ops,
+            out_cols=self._out_cols,
+            block_size=block_size,
+            nthreads=self._nthreads,
+            resources=self._resources,
+            is_numpy=self._is_numpy,
+        )
+
     def _unary(self, func: Callable[..., NDArray[Any]]) -> "ChunkedArray":
         return self._with_op(_unary_op(func))
 

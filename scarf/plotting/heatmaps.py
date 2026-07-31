@@ -7,6 +7,7 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
+from ..assay import ATACassay
 from ..features.markers.table import load_marker_table
 from ..storage.artifacts import ArtifactRef, inspect_artifact
 from ..storage.types import as_zarr_array, as_zarr_group
@@ -36,6 +37,14 @@ def _scarf_version() -> str:
         return version("scarf")
     except Exception:
         return "unknown"
+
+
+def _marker_log_transform(assay: Any, value: bool | None) -> bool:
+    if value is None:
+        return not isinstance(assay, ATACassay)
+    if not isinstance(value, (bool, np.bool_)):
+        raise TypeError("log_transform must be a boolean or None")
+    return bool(value)
 
 
 def _place_clustermap_annotation_legend(
@@ -101,7 +110,7 @@ def _prepare_marker_heatmap(
     group_key: str | None,
     cell_key: str | None,
     topn: int,
-    log_transform: bool,
+    log_transform: bool | None,
     vmin: float,
     vmax: float,
 ) -> dict[str, Any]:
@@ -183,10 +192,11 @@ def _prepare_marker_heatmap(
         raise ValueError("ERROR: Marker list is empty for all the groups")
     feature_index = np.asarray(sorted(set(feature_indices)), dtype=int)
     cell_index = np.asarray(assay.cells.active_index(cell_key))
+    resolved_log_transform = _marker_log_transform(assay, log_transform)
     normalized = assay.normed(
         cell_idx=cell_index,
         feat_idx=feature_index,
-        log_transform=log_transform,
+        log_transform=resolved_log_transform,
     )
     groups = np.asarray(assay.cells.fetch(group_key, cell_key))
 
@@ -249,7 +259,7 @@ def marker_heatmap(
     group_key: str | None = None,
     cell_key: str | None = None,
     topn: int = 5,
-    log_transform: bool = True,
+    log_transform: bool | None = None,
     vmin: float = -1,
     vmax: float = 2,
     figsize: tuple[float, float] | None = None,

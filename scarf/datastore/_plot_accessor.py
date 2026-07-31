@@ -760,7 +760,7 @@ class DataStorePlotAccessor:
         group_key: str | None = None,
         cell_key: str | None = None,
         topn: int = 5,
-        log_transform: bool = True,
+        log_transform: bool | None = None,
         vmin: float = -1,
         vmax: float = 2,
         figsize: tuple[float, float] | None = None,

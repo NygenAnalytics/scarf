@@ -4,7 +4,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from weakref import WeakKeyDictionary
 
 import numpy as np
@@ -13,6 +13,7 @@ import zarr
 from numpy.typing import NDArray
 from scipy.sparse import coo_matrix, csr_matrix
 
+from ...embeddings.reduction import _streaming_lsi_accumulator_bytes
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...graph.arguments import (
     AnnIndexArguments,
@@ -103,11 +104,14 @@ from ...storage.artifacts import (
     inspect_artifact,
     parse_artifact_path,
     require_complete_artifact,
+    serialize_artifact_value,
 )
 from ...storage.copy import (
     copy_zarr_array,
     create_or_open_staged_normed_array,
 )
+from ...storage.budget import ResourceBudget
+from ...storage.geometry import array_geometry
 from ...storage.layout import (
     _group_zarr_format,
     array_shard_rows,
@@ -164,6 +168,33 @@ def _row_block(
             "them. Leave batch_size unset to follow the stored layout."
         )
     return resolved
+
+
+def _streaming_lsi_block_rows(
+    array: zarr.Array,
+    resources: ResourceBudget,
+    *,
+    n_components: int,
+    n_oversamples: int,
+) -> int:
+    n_rows, n_features = map(int, array.shape)
+    width = min(n_rows, n_features, n_components + n_oversamples)
+    accumulator_bytes = _streaming_lsi_accumulator_bytes(n_features, width)
+    geometry = array_geometry(array)
+    decode_bytes = 0 if geometry is None else geometry.nominalChunkBytes()
+    available = resources.memoryBytes - accumulator_bytes - decode_bytes
+    input_itemsize = max(int(np.dtype(array.dtype).itemsize), 1)
+    row_bytes = (
+        n_features * (input_itemsize + np.dtype(np.float64).itemsize)
+        + width * np.dtype(np.float64).itemsize
+    )
+    if available < row_bytes:
+        required = accumulator_bytes + decode_bytes + row_bytes
+        raise MemoryError(
+            f"Streaming LSI needs about {required} bytes for one row block, "
+            f"but the operation limit is {resources.memoryBytes} bytes"
+        )
+    return max(1, min(n_rows, available // row_bytes))
 
 
 def _sampling_fraction(value: Any, name: str) -> float:
@@ -1808,10 +1839,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 ``{cell_key}__{feat_key}``.
             log_transform: Whether to apply the assay log transform. When
                 omitted, reuse the selected artifact setting or default to
-                true.
-            renormalize_subset: Whether to recompute size factors for the
-                selected feature subset. When omitted, reuse the selected
-                artifact setting or default to true.
+                true. ATAC defaults to false and rejects true.
+            renormalize_subset: Whether to recompute the normalization
+                denominator from selected features. When omitted, reuse the
+                selected setting. ATAC defaults to false; other assays default
+                to true.
             update_state: Select the result as the assay's current normalized
                 artifact.
             invalidate_cache: Force a new artifact instead of reusing an
@@ -1854,10 +1886,43 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             stored_parameters = (
                 inspect_artifact(self.zw, state.normalized).parameters or {}
             )
-        if log_transform is None:
-            log_transform = bool(stored_parameters.get("log_transform", True))
-        if renormalize_subset is None:
-            renormalize_subset = bool(stored_parameters.get("renormalize_subset", True))
+        from ...assay import ATACassay
+
+        if isinstance(assay, ATACassay):
+            stored_method_is_current = stored_parameters.get(
+                "normalization_method"
+            ) == serialize_artifact_value(assay.normMethod)
+            if log_transform is None:
+                log_transform = (
+                    bool(stored_parameters.get("log_transform", False))
+                    if stored_method_is_current
+                    else False
+                )
+            elif not isinstance(log_transform, (bool, np.bool_)):
+                raise TypeError("log_transform must be a boolean")
+            if log_transform:
+                raise ValueError(
+                    "ATAC TF-IDF does not support log_transform; use False"
+                )
+            else:
+                log_transform = False
+            if renormalize_subset is None:
+                renormalize_subset = (
+                    bool(stored_parameters.get("renormalize_subset", False))
+                    if stored_method_is_current
+                    else False
+                )
+            elif not isinstance(renormalize_subset, (bool, np.bool_)):
+                raise TypeError("renormalize_subset must be a boolean")
+            else:
+                renormalize_subset = bool(renormalize_subset)
+        else:
+            if log_transform is None:
+                log_transform = bool(stored_parameters.get("log_transform", True))
+            if renormalize_subset is None:
+                renormalize_subset = bool(
+                    stored_parameters.get("renormalize_subset", True)
+                )
         cell_data = as_zarr_group(self.zw["cellData"], name="cellData")
         feature_data = as_zarr_group(
             assay.z["featureData"],
@@ -1976,6 +2041,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         show_elbow_plot: bool,
         update_state: bool,
         invalidate_cache: bool,
+        lsi_solver: Literal["streaming", "materialized"] = "streaming",
+        lsi_n_iter: int = 5,
+        lsi_n_oversamples: int = 10,
     ) -> ArtifactRef:
         requested_dims = _positive_integer(dims, "dims")
         if batch_size is not None:
@@ -1993,6 +2061,19 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             batch_size,
             minimum=(requested_dims + 1 if method == "pca" else None),
         )
+        if method == "lsi" and lsi_solver == "streaming":
+            memory_limited_rows = _streaming_lsi_block_rows(
+                data,
+                self.resources,
+                n_components=requested_dims + int(lsi_skip_first),
+                n_oversamples=lsi_n_oversamples,
+            )
+            if effective_batch_size > memory_limited_rows:
+                logger.warning(
+                    f"Reducing LSI batch_size from {effective_batch_size} to "
+                    f"{memory_limited_rows} rows to honor the memory budget"
+                )
+                effective_batch_size = memory_limited_rows
         with self._artifact_execution_context({"local_cache": local_cache}):
             with self._cache_normalized_artifact(
                 normalized_ref,
@@ -2013,6 +2094,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     show_elbow_plot=show_elbow_plot,
                     update_state=update_state,
                     invalidate_cache=invalidate_cache,
+                    lsi_solver=lsi_solver,
+                    lsi_n_iter=lsi_n_iter,
+                    lsi_n_oversamples=lsi_n_oversamples,
                 )
 
     def _run_reduction_artifact_impl(
@@ -2031,6 +2115,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         show_elbow_plot: bool,
         update_state: bool,
         invalidate_cache: bool,
+        lsi_solver: Literal["streaming", "materialized"] = "streaming",
+        lsi_n_iter: int = 5,
+        lsi_n_oversamples: int = 10,
     ) -> ArtifactRef:
         normalized_ref = normalized or self._selected_artifact(
             from_assay,
@@ -2223,6 +2310,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 dims=effective_dims,
                 skip_first=lsi_skip_first,
                 rand_state=rand_state,
+                solver=lsi_solver,
+                n_iter=lsi_n_iter,
+                n_oversamples=lsi_n_oversamples,
                 batch_size=effective_batch_size,
                 update_state=update_state,
                 invalidate_cache=invalidate_cache,
@@ -2274,7 +2364,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 rand_state=rand_state,
                 disable_scaling=not feat_scaling,
                 lsi_skip_first=lsi_skip_first,
-                lsi_params={},
+                lsi_params={
+                    "solver": lsi_solver,
+                    "n_iter": lsi_n_iter,
+                    "n_oversamples": lsi_n_oversamples,
+                },
             )
             reduction_group = start_artifact(self.zw, planned)
             if transform.loadings is not None:
@@ -2402,6 +2496,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         dims: int = 11,
         skip_first: bool = True,
         rand_state: int = 4466,
+        solver: Literal["streaming", "materialized"] = "streaming",
+        n_iter: int = 5,
+        n_oversamples: int = 10,
         batch_size: int | None = None,
         local_cache: bool | str = "auto",
         update_state: bool = True,
@@ -2416,6 +2513,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             dims: Requested number of retained LSI dimensions.
             skip_first: Whether to omit the first singular component.
             rand_state: Seed used by the randomized decomposition.
+            solver: Memory-bounded streaming solver or materialized compatibility
+                solver.
+            n_iter: Power iterations used by randomized LSI.
+            n_oversamples: Extra random vectors used to stabilize the fitted
+                singular subspace.
             batch_size: Number of selected cells processed per block.
             local_cache: Local staging policy for normalized data on remote
                 stores.
@@ -2425,6 +2527,19 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         Returns:
             Reference to the LSI reduction artifact.
         """
+        if solver not in {"streaming", "materialized"}:
+            raise ValueError("solver must be 'streaming' or 'materialized'")
+        if isinstance(n_iter, bool) or not isinstance(n_iter, (int, np.integer)):
+            raise TypeError("n_iter must be an integer")
+        if isinstance(n_oversamples, bool) or not isinstance(
+            n_oversamples,
+            (int, np.integer),
+        ):
+            raise TypeError("n_oversamples must be an integer")
+        if n_iter < 0:
+            raise ValueError("n_iter must be nonnegative")
+        if n_oversamples < 0:
+            raise ValueError("n_oversamples must be nonnegative")
         return self._run_reduction_artifact(
             method="lsi",
             normalized=normalized,
@@ -2440,6 +2555,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             show_elbow_plot=False,
             update_state=update_state,
             invalidate_cache=invalidate_cache,
+            lsi_solver=solver,
+            lsi_n_iter=int(n_iter),
+            lsi_n_oversamples=int(n_oversamples),
         )
 
     def run_custom_reduction(

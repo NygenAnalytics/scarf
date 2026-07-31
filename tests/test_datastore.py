@@ -459,9 +459,18 @@ class TestDataStore:
         assert np.isfinite(observed).all()
         assert np.all(observed > 0)
         assert np.all(np.diff(observed, axis=1) >= 0)
-        assert spearmanr(expected.ravel(), observed.ravel()).statistic >= 0.7
-        relative_mae = np.mean(np.abs(expected - observed)) / np.mean(expected)
-        assert relative_mae < 0.3
+        # Total-count TF changes cell-specific scale, so compare each local
+        # distance profile after removing that scale.
+        expected_profile = expected / expected.mean(axis=1, keepdims=True)
+        observed_profile = observed / observed.mean(axis=1, keepdims=True)
+        assert (
+            spearmanr(expected_profile.ravel(), observed_profile.ravel()).statistic
+            >= 0.8
+        )
+        relative_mae = np.mean(np.abs(expected_profile - observed_profile)) / np.mean(
+            expected_profile
+        )
+        assert relative_mae < 0.1
 
     def test_leiden_values(self, leiden_clustering, cell_attrs):
         assert len(set(leiden_clustering)) == 10

@@ -2,8 +2,10 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
+from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
+from scarf.datastore.datastore import DataStore
 from scarf.matrix import ChunkedArray
 from scarf.features.genomic.gff import GffReader
 from scarf.features.genomic.intervals import (
@@ -13,7 +15,8 @@ from scarf.features.genomic.intervals import (
 )
 from scarf.features.genomic.melding import create_counts_mat
 from scarf.storage.budget import ResourceBudget
-from scarf.writers import create_zarr_dataset
+from scarf.storage.sharding import sparse_matrix_bytes
+from scarf.writers import SparseToZarr, create_zarr_dataset
 
 
 def _features_bed(rows):
@@ -33,6 +36,7 @@ class _FakeMeta:
 class _FakeRawData:
     def __init__(self, blocks):
         self.blocks = blocks
+        self.resident_bytes: list[int] = []
         self.numblocks = (len(blocks),)
         self.shape = (sum(b.shape[0] for b in blocks), blocks[0].shape[1])
         self.dtype = np.asarray(blocks[0]).dtype
@@ -43,7 +47,40 @@ class _FakeRawData:
 
     def stream_blocks(self, nthreads=None, msg=None, prefetch=None):
         # Mirrors ChunkedArray.stream_blocks: yields materialized, in-order blocks.
-        yield from (np.asarray(b) for b in self.blocks)
+        yield from self._stream_blocks(
+            nthreads=nthreads,
+            msg=msg,
+            prefetch=prefetch,
+            row_mask=None,
+            resident_bytes=0,
+        )
+
+    def _stream_blocks(
+        self,
+        *,
+        nthreads=None,
+        msg=None,
+        prefetch=None,
+        row_mask=None,
+        resident_bytes=0,
+    ):
+        assert row_mask is None
+        self.resident_bytes.append(resident_bytes)
+        yield from (np.asarray(block) for block in self.blocks)
+
+    def _max_decode_bytes(self):
+        return 0
+
+    def _with_block_size(self, block_size):
+        values = np.vstack(self.blocks)
+        resized = _FakeRawData(
+            [
+                values[start : start + block_size]
+                for start in range(0, len(values), block_size)
+            ]
+        )
+        resized.resident_bytes = self.resident_bytes
+        return resized
 
 
 class _FakeAssay:
@@ -58,11 +95,22 @@ class _FakeAssay:
 
 
 def _reference_melded(
-    raw, n_features_per_cell, n_cells_per_peak, mapping_dense, scalar_coeff, renorm
+    raw,
+    n_counts_per_cell,
+    n_cells_per_peak,
+    mapping_dense,
+    scalar_coeff,
+    renorm,
+    idf_cell_idx=None,
 ):
-    n_docs = raw.shape[0]
-    idf = np.log2(1 + (n_docs / (n_cells_per_peak + 1)))
-    tf = raw / n_features_per_cell.reshape(-1, 1)
+    if idf_cell_idx is None:
+        n_docs = raw.shape[0]
+        document_frequency = n_cells_per_peak
+    else:
+        n_docs = len(idf_cell_idx)
+        document_frequency = np.count_nonzero(raw[idf_cell_idx], axis=0)
+    idf = np.log2(1 + (n_docs / (document_frequency + 1)))
+    tf = raw / n_counts_per_cell.reshape(-1, 1)
     tfidf = tf * idf
     melded = tfidf @ mapping_dense
     if not renorm:
@@ -76,7 +124,7 @@ def _reference_melded(
 
 def _old_style_melded(
     raw,
-    n_features_per_cell,
+    n_counts_per_cell,
     n_cells_per_peak,
     feature_to_peaks,
     scalar_coeff,
@@ -84,7 +132,7 @@ def _old_style_melded(
 ):
     n_docs = raw.shape[0]
     idf = np.log2(1 + (n_docs / (n_cells_per_peak + 1)))
-    tf = raw / n_features_per_cell.reshape(-1, 1)
+    tf = raw / n_counts_per_cell.reshape(-1, 1)
     tfidf = tf * idf
 
     idx = np.array([i for i, peaks in enumerate(feature_to_peaks) if len(peaks)])
@@ -145,17 +193,23 @@ def _build_melding_scenario():
             ],  # only peak 2, which maps to no feature -> melded row is all zero
         ]
     )
-    n_features_per_cell = np.array([3.0, 1.0, 1.0])
+    n_counts_per_cell = raw.sum(axis=1)
     n_cells_per_peak = np.array([1.0, 1.0, 2.0, 1.0])
 
-    cells = _FakeMeta({"ATAC_nFeatures": n_features_per_cell})
+    cells = _FakeMeta({"ATAC_nCounts": n_counts_per_cell})
     feats = _FakeMeta({"nCells": n_cells_per_peak})
     raw_data = _FakeRawData([raw[0:2], raw[2:3]])
     assay = _FakeAssay(cells, feats, raw_data)
-    return assay, mapping, raw, n_features_per_cell, n_cells_per_peak
+    return assay, mapping, raw, n_counts_per_cell, n_cells_per_peak
 
 
-def _run_create_counts_mat(assay, mapping, scalar_coeff, renormalization):
+def _run_create_counts_mat(
+    assay,
+    mapping,
+    scalar_coeff,
+    renormalization,
+    idf_cell_idx=None,
+):
     n_features = mapping.shape[1]
     n_cells = assay.rawData.shape[0]
     group = zarr.open_group(store=MemoryStore(), mode="w")
@@ -168,6 +222,7 @@ def _run_create_counts_mat(assay, mapping, scalar_coeff, renormalization):
         mapping=mapping,
         scalar_coeff=scalar_coeff,
         renormalization=renormalization,
+        idf_cell_idx=idf_cell_idx,
     )
     return store[:]
 
@@ -388,16 +443,16 @@ def test_create_counts_mat_matches_old_groupby_oracle():
             [0.0, 0.0, 7.0, 3.0],
         ]
     )
-    n_feat = np.array([2.0, 2.0, 2.0, 2.0])
+    n_counts = raw.sum(axis=1)
     n_cells_peak = np.array([2.0, 2.0, 2.0, 2.0])
     assay = _FakeAssay(
-        _FakeMeta({"ATAC_nFeatures": n_feat}),
+        _FakeMeta({"ATAC_nCounts": n_counts}),
         _FakeMeta({"nCells": n_cells_peak}),
         _FakeRawData([raw[:2], raw[2:]]),
     )
     old_oracle = _old_style_melded(
         raw,
-        n_feat,
+        n_counts,
         n_cells_peak,
         _feature_to_peaks_from_intervals(peaks, features),
         scalar_coeff=1e4,
@@ -410,7 +465,7 @@ def test_create_counts_mat_matches_old_groupby_oracle():
 
 
 def test_create_counts_mat_reads_real_chunked_array_stream_blocks():
-    assay, mapping, raw, n_feat, n_cells_peak = _build_melding_scenario()
+    assay, mapping, raw, n_counts, n_cells_peak = _build_melding_scenario()
     group = zarr.open_group(store=MemoryStore(), mode="w")
     counts = create_zarr_dataset(group, "raw", (2, raw.shape[1]), "float", raw.shape)
     counts[:] = raw
@@ -420,29 +475,160 @@ def test_create_counts_mat_reads_real_chunked_array_stream_blocks():
         assay, mapping, scalar_coeff=1e4, renormalization=True
     )
     expected = _reference_melded(
-        raw, n_feat, n_cells_peak, mapping.toarray(), scalar_coeff=1e4, renorm=True
+        raw,
+        n_counts,
+        n_cells_peak,
+        mapping.toarray(),
+        scalar_coeff=1e4,
+        renorm=True,
     )
     np.testing.assert_allclose(written, expected)
 
 
 def test_create_counts_mat_without_renormalization():
-    assay, mapping, raw, n_feat, n_cells_peak = _build_melding_scenario()
+    assay, mapping, raw, n_counts, n_cells_peak = _build_melding_scenario()
     written = _run_create_counts_mat(
         assay, mapping, scalar_coeff=1e4, renormalization=False
     )
     expected = _reference_melded(
-        raw, n_feat, n_cells_peak, mapping.toarray(), scalar_coeff=1e4, renorm=False
+        raw,
+        n_counts,
+        n_cells_peak,
+        mapping.toarray(),
+        scalar_coeff=1e4,
+        renorm=False,
     )
     np.testing.assert_allclose(written, expected)
 
 
+def test_create_counts_mat_learns_idf_from_selected_cells_and_scores_all_rows():
+    assay, mapping, raw, n_counts, n_cells_peak = _build_melding_scenario()
+    idf_cell_idx = np.array([1, 2], dtype=np.int64)
+
+    written = _run_create_counts_mat(
+        assay,
+        mapping,
+        scalar_coeff=1e4,
+        renormalization=False,
+        idf_cell_idx=idf_cell_idx,
+    )
+    expected = _reference_melded(
+        raw,
+        n_counts,
+        n_cells_peak,
+        mapping.toarray(),
+        scalar_coeff=1e4,
+        renorm=False,
+        idf_cell_idx=idf_cell_idx,
+    )
+    full_corpus = _reference_melded(
+        raw,
+        n_counts,
+        n_cells_peak,
+        mapping.toarray(),
+        scalar_coeff=1e4,
+        renorm=False,
+    )
+
+    np.testing.assert_allclose(written, expected)
+    assert not np.allclose(written, full_corpus)
+    assert written.shape[0] == raw.shape[0]
+    assert written[0].sum() > 0
+    minimum_df_resident = (
+        sparse_matrix_bytes(mapping)
+        + idf_cell_idx.nbytes
+        + raw.shape[0] * np.dtype(bool).itemsize
+        + n_counts.nbytes
+        + 2 * raw.shape[1] * np.dtype(np.int64).itemsize
+        + assay.rawData.chunksize[0] * raw.shape[1] * raw.dtype.itemsize
+    )
+    assert len(assay.rawData.resident_bytes) == 2
+    assert assay.rawData.resident_bytes[0] >= minimum_df_resident
+    assert assay.rawData.resident_bytes[1] > 0
+
+
+def test_add_melded_assay_uses_cell_key_for_idf_and_keeps_all_rows(tmp_path):
+    raw = np.array(
+        [
+            [2, 0, 1],
+            [0, 3, 0],
+            [1, 0, 4],
+        ],
+        dtype=np.uint32,
+    )
+    peak_ids = ["chr1:100-200", "chr1:250-350", "chr2:100-200"]
+    store_path = tmp_path / "atac_melding.zarr"
+    SparseToZarr(
+        csr_matrix(raw),
+        zarr_loc=str(store_path),
+        cell_ids=["cell_0", "cell_1", "cell_2"],
+        feature_ids=peak_ids,
+        assay_name="ATAC",
+        nthreads=1,
+    ).dump(batch_size=2)
+    store = DataStore(
+        str(store_path),
+        default_assay="ATAC",
+        min_features_per_cell=0,
+        min_cells_per_feature=0,
+        nthreads=1,
+    )
+    train_mask = np.array([False, True, True])
+    store.cells.insert("train", train_mask, overwrite=True)
+    feature_bed = _features_bed(
+        [
+            ("chr1", 120, 300, "gene_a", "GENE_A", "+"),
+            ("chr2", 120, 180, "gene_b", "GENE_B", "+"),
+        ]
+    )
+    bed_path = tmp_path / "genes.bed"
+    feature_bed.to_csv(bed_path, sep="\t", header=False, index=False)
+
+    store.add_melded_assay(
+        from_assay="ATAC",
+        external_bed_fn=str(bed_path),
+        assay_label="GeneScores",
+        renormalization=False,
+        cell_key="train",
+    )
+
+    _, _, mapping = get_feature_mappings(
+        create_bed_from_coord_ids(peak_ids),
+        feature_bed,
+    )
+    expected = _reference_melded(
+        raw,
+        raw.sum(axis=1, dtype=np.float64),
+        np.count_nonzero(raw, axis=0),
+        mapping.toarray(),
+        scalar_coeff=1e5,
+        renorm=False,
+        idf_cell_idx=np.flatnonzero(train_mask),
+    )
+    observed = np.vstack(
+        list(store.GeneScores.rawData.stream_blocks(nthreads=1, msg=None))
+    )
+
+    np.testing.assert_allclose(observed, expected, rtol=1e-6, atol=1e-7)
+    assert observed.shape[0] == raw.shape[0]
+    assert observed[0].sum() > 0
+    assert store.GeneScores.z.attrs["idfCellCount"] == int(train_mask.sum())
+    assert store.GeneScores.z.attrs["sourceAssay"] == "ATAC"
+    assert store.GeneScores.z.attrs["tfDenominator"] == "total_counts"
+
+
 def test_create_counts_mat_with_renormalization_and_zero_sum_cell():
-    assay, mapping, raw, n_feat, n_cells_peak = _build_melding_scenario()
+    assay, mapping, raw, n_counts, n_cells_peak = _build_melding_scenario()
     written = _run_create_counts_mat(
         assay, mapping, scalar_coeff=1e4, renormalization=True
     )
     expected = _reference_melded(
-        raw, n_feat, n_cells_peak, mapping.toarray(), scalar_coeff=1e4, renorm=True
+        raw,
+        n_counts,
+        n_cells_peak,
+        mapping.toarray(),
+        scalar_coeff=1e4,
+        renorm=True,
     )
     np.testing.assert_allclose(written, expected)
 
