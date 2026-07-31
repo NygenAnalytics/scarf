@@ -625,9 +625,7 @@ def accumulate_sparse_to_shards(
             residentBytes=residentBytes,
             producerReserveBytes=producerReserveBytes,
             msg=msg,
-            total=(
-                int(dst.shape[0]) + array_shard_rows(dst) - 1
-            )
+            total=(int(dst.shape[0]) + array_shard_rows(dst) - 1)
             // array_shard_rows(dst),
         )
     finally:

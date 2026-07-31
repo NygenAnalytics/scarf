@@ -29,10 +29,7 @@ def _flushing_stdout_sink(message: Any) -> None:
 
 def _log_format() -> str:
     if _config.timestamps:
-        return (
-            "{time:YYYY-MM-DDTHH:mm:ss.SSSZ} | "
-            "<level>{level}</level> | {message}"
-        )
+        return "{time:YYYY-MM-DDTHH:mm:ss.SSSZ} | <level>{level}</level> | {message}"
     return "<level>{level}</level>: {message}"
 
 

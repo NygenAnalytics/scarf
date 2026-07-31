@@ -19,9 +19,7 @@ from profiling.scanpy_stages import (
     run_scanpy_e2e_funnel_body,
 )
 
-_EXAMPLE_CONFIG = (
-    Path(__file__).parents[1] / "profiling" / "config.scanpy.example.toml"
-)
+_EXAMPLE_CONFIG = Path(__file__).parents[1] / "profiling" / "config.scanpy.example.toml"
 
 
 def _config(*, runTag: str = "scanpy-e2e-test") -> ScanpyProfilingConfig:

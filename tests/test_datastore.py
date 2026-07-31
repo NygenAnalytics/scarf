@@ -983,9 +983,7 @@ class TestDataStore:
         with pytest.raises(TypeError):
             atac_datastore.mark_hvgs()
 
-    def test_mark_hvgs_default_max_cells_excludes_ubiquitous(
-        self, datastore_ephemeral
-    ):
+    def test_mark_hvgs_default_max_cells_excludes_ubiquitous(self, datastore_ephemeral):
         from unittest.mock import patch
 
         datastore = datastore_ephemeral
@@ -1017,6 +1015,7 @@ class TestDataStore:
             )
         assert mock.call_args.kwargs["max_cells"] == np.inf
         assert mock.call_args.kwargs["bin_strategy"] == "adaptive"
+
     def test_adaptive_hvg_stats_reuse_single_matrix_pass(
         self,
         auto_filter_cells,

@@ -166,9 +166,7 @@ class ScanpyProfilingConfig(BaseModel):
     resultsUri: str
     runTag: str = ""
     targetSizes: tuple[int, ...] = Field(default_factory=lambda: DEFAULT_TARGET_SIZES)
-    workflow: ScanpyWorkflowParameters = Field(
-        default_factory=ScanpyWorkflowParameters
-    )
+    workflow: ScanpyWorkflowParameters = Field(default_factory=ScanpyWorkflowParameters)
     dask: ScanpyDaskParameters = Field(default_factory=ScanpyDaskParameters)
     resources: ScanpyModalResources = Field(default_factory=ScanpyModalResources)
 

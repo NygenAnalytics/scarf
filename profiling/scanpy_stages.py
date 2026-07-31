@@ -281,8 +281,7 @@ def _run_stage_body(
         missing = [col for col in qc_cols if col not in adata.obs.columns]
         if missing:
             raise RuntimeError(
-                "calculateQc must run before filterCells; missing "
-                + ", ".join(missing)
+                "calculateQc must run before filterCells; missing " + ", ".join(missing)
             )
         keep = _quantile_cell_mask(
             adata.obs,
@@ -453,7 +452,9 @@ def run_scanpy_stage(
     )
 
 
-def write_scanpy_result(config: ScanpyProfilingConfig, result: ScanpyStageRunResult) -> str:
+def write_scanpy_result(
+    config: ScanpyProfilingConfig, result: ScanpyStageRunResult
+) -> str:
     from profiling.r2 import put_json
 
     uri = config.resultUri(result.nRows, result.stage)
@@ -535,7 +536,9 @@ def run_scanpy_e2e_funnel_body(
     failed_stage: ScanpyStageName | None = None
     try:
         download_started = time.perf_counter()
-        print(f"scanpy e2e dataset download start: {config.datasetUri(nRows)}", flush=True)
+        print(
+            f"scanpy e2e dataset download start: {config.datasetUri(nRows)}", flush=True
+        )
         download_file(config.datasetUri(nRows), local_h5ad)
         download_seconds = time.perf_counter() - download_started
         print(

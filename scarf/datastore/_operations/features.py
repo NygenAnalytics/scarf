@@ -76,32 +76,23 @@ def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray
             continue
         group_name = str(cluster_id)
         if group_name in populated_names:
-            raise ValueError(
-                "Marker group labels must remain unique as strings"
-            )
+            raise ValueError("Marker group labels must remain unique as strings")
         populated_names.add(group_name)
         raw_index = np.asarray(vals.index.values)
         if raw_index.ndim != 1 or raw_index.dtype.kind not in {"i", "u"}:
             raise ValueError(
-                "Marker feature indices must use a one-dimensional "
-                "integer index"
+                "Marker feature indices must use a one-dimensional integer index"
             )
         if not vals.index.is_unique:
-            raise ValueError(
-                "Marker feature indices must be unique within each group"
-            )
+            raise ValueError("Marker feature indices must be unique within each group")
         index = raw_index.astype(np.int64, copy=False)
         if (index < 0).any() or (index > np.iinfo(np.int32).max).any():
-            raise ValueError(
-                "Marker feature indices must fit non-negative int32"
-            )
+            raise ValueError("Marker feature indices must fit non-negative int32")
         ordered = np.sort(index)
         if shared is None:
             shared = ordered
         elif not np.array_equal(ordered, shared):
-            raise ValueError(
-                "Marker groups must contain identical feature index sets"
-            )
+            raise ValueError("Marker groups must contain identical feature index sets")
     if shared is None:
         raise ValueError("Cannot save empty marker results")
     return shared.astype(np.int32)
@@ -1242,9 +1233,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             for cluster_id in populated_groups
             for count in group_cell_counts[cluster_id]
         ):
-            raise ValueError(
-                "Marker target and reference counts must be integers >= 2"
-            )
+            raise ValueError("Marker target and reference counts must be integers >= 2")
         feature_index = _shared_marker_feature_index(markers)
         stats_by_group = {
             cluster_id: _marker_stats_matrix(values, feature_index)

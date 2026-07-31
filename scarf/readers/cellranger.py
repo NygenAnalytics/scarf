@@ -527,8 +527,7 @@ class CrDirReader(CrReader):
             ]
         except IndexError:
             logger.warning(
-                f"Could not extract {key} from {grp_entry[0]} "
-                f"column {grp_entry[1]}"
+                f"Could not extract {key} from {grp_entry[0]} column {grp_entry[1]}"
             )
             vals = None
         return vals

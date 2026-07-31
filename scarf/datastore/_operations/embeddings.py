@@ -326,8 +326,7 @@ class _EmbeddingOperationsMixin(_EmbeddingOperationsBase):
             )
         action = "Reused" if planned.reused else "Stored"
         logger.info(
-            f"{action} {tsne_dims}-dimensional t-SNE embedding "
-            f"for {len(values)} cells"
+            f"{action} {tsne_dims}-dimensional t-SNE embedding for {len(values)} cells"
         )
         return None
 

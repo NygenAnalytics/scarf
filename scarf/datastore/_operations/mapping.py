@@ -2120,8 +2120,7 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             for values in target_data.stream_blocks(
                 nthreads=self.nthreads,
                 msg=(
-                    f"Mapping cells from {target_name} "
-                    "with Symphony-style correction"
+                    f"Mapping cells from {target_name} with Symphony-style correction"
                 ),
             ):
                 coordinates = project_pca(values, reference.model)
