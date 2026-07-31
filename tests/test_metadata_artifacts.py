@@ -140,7 +140,7 @@ def test_umap_matrix_and_leiden_columns_link_authoritative_artifacts(
     grouped.close()
 
 
-def test_membership_lisi_and_smart_labels_are_artifact_backed(
+def test_membership_and_smart_labels_are_artifact_backed_and_lisi_is_read_only(
     datastore_ephemeral,
     monkeypatch,
 ) -> None:
@@ -173,37 +173,14 @@ def test_membership_lisi_and_smart_labels_are_artifact_backed(
         expected_membership,
     )
 
-    lisi = datastore.metric_lisi(
-        [cluster_key],
-        save_result=True,
-        perplexity=1,
-    )
-    assert lisi is not None
-    lisi_key = next(
-        column
-        for column in datastore.cells.columns
-        if column.startswith(f"lisi__{cluster_key}__")
-    )
-    lisi_ref = _column_ref(datastore, lisi_key)
-    assert lisi_ref.kind == "lisi"
+    columns_before = set(datastore.cells.columns)
+    artifacts_before = set(datastore.list_artifacts())
+    lisi = datastore.metric_lisi([cluster_key], perplexity=1)
+    repeated_lisi = datastore.metric_lisi([cluster_key], perplexity=1)
+    np.testing.assert_allclose(lisi[cluster_key], repeated_lisi[cluster_key])
+    assert set(datastore.cells.columns) == columns_before
+    assert set(datastore.list_artifacts()) == artifacts_before
 
-    import scarf.metrics
-
-    with monkeypatch.context() as cached:
-        cached.setattr(
-            scarf.metrics,
-            "compute_lisi",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                AssertionError("cached LISI was recomputed")
-            ),
-        )
-        reused = datastore.metric_lisi(
-            [cluster_key],
-            save_result=True,
-            perplexity=1,
-        )
-    assert reused is not None
-    assert _column_ref(datastore, lisi_key) == lisi_ref
     read_only = DataStore(
         datastore.zarr_loc,
         default_assay="RNA",
@@ -211,10 +188,9 @@ def test_membership_lisi_and_smart_labels_are_artifact_backed(
     )
     read_only_lisi = read_only.metric_lisi(
         [cluster_key],
-        save_result=False,
         perplexity=1,
     )
-    assert read_only_lisi is not None
+    np.testing.assert_allclose(read_only_lisi[cluster_key], lisi[cluster_key])
 
     unsaved_smart = datastore.smart_label(
         cluster_key,
@@ -634,7 +610,6 @@ def test_graph_outputs_reject_equal_size_different_cell_selection(
     with pytest.raises(ValueError, match="no longer matches"):
         datastore.metric_lisi(
             ["names"],
-            save_result=False,
             perplexity=1,
         )
 
@@ -680,25 +655,10 @@ def test_lisi_rejects_incomplete_ann_dependency(
                 ["names"],
                 use_latest_knn=False,
                 knn_loc=artifact_path(state.neighbors),
-                save_result=False,
                 perplexity=1,
             )
     finally:
         ann_group.attrs["complete"] = True
-
-
-def test_legacy_lisi_graph_labels_distinguish_same_k_paths() -> None:
-    first = DataStore._lisi_graph_label(
-        "RNA/normed__I__a/reduction__pca__5__I/ann__l2__50__50__16__1/knn__3",
-        None,
-    )
-    second = DataStore._lisi_graph_label(
-        "RNA/normed__I__b/reduction__pca__5__I/ann__l2__50__50__16__1/knn__3",
-        None,
-    )
-
-    assert first != second
-    assert first.startswith("legacy_knn__3_")
 
 
 def test_unedited_paris_column_retains_cluster_cut_ref(

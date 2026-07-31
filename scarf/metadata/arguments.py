@@ -392,21 +392,3 @@ class SmartLabelArguments(OperationArguments):
     cell_key: str = execution()
     new_col_name: str = execution()
     invalidate_cache: bool = execution()
-
-
-@dataclass(frozen=True, slots=True)
-class LisiArguments(OperationArguments):
-    operation: ClassVar[str] = "metric_lisi"
-    artifact_kind: ClassVar[str] = "lisi"
-
-    neighbors: Any = artifact_input()
-    labels: tuple[Any, ...] = artifact_input()
-    cell_selection: ArtifactRef = artifact_input()
-    algorithm_version: int = parameter()
-    perplexity: float = parameter()
-    from_assay: str = execution()
-    cell_key: str = execution()
-    label_colnames: tuple[str, ...] = execution()
-    save_result: bool = execution()
-    return_lisi: bool = execution()
-    invalidate_cache: bool = execution()

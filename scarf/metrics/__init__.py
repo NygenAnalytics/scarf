@@ -3,6 +3,10 @@ Methods and classes for evaluation
 """
 
 from ._types import MatrixData, NeighborMetric, ZarrArray
+from .cluster_separability import (
+    ClusterSeparabilityResult,
+    evaluate_cluster_separability,
+)
 from .connectivity import graph_connectivity
 from .concordance import label_concordance_score
 from .graph import (
@@ -21,6 +25,7 @@ from .lisi import (
 from .silhouette import process_cluster, silhouette_scoring
 
 __all__ = [
+    "ClusterSeparabilityResult",
     "MatrixData",
     "NeighborMetric",
     "ZarrArray",
@@ -30,6 +35,7 @@ __all__ = [
     "clisi_knn",
     "compute_lisi",
     "compute_simpson",
+    "evaluate_cluster_separability",
     "graph_connectivity",
     "ilisi_knn",
     "knn_to_csr_matrix",

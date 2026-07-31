@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
@@ -15,20 +15,9 @@ from ...graph.state import (
     validate_legacy_graph_selection,
     validate_normalized_artifact_selection,
 )
-from ...metadata.arguments import LisiArguments
-from ...metadata.artifacts import (
-    artifact_values,
-    column_display,
-    continuous_display,
-    link_cell_data_column,
-    plan_cell_data_artifact,
-    write_cell_data_artifact,
-)
 from ...storage.artifacts import (
     ArtifactRef,
-    artifact_path,
-    fingerprint_stored_arrays,
-    fingerprint_strings,
+    group_at,
     inspect_artifact,
     parse_artifact_path,
 )
@@ -36,6 +25,7 @@ from ...storage.types import as_zarr_array, as_zarr_group
 from ...utils.logging import logger
 
 if TYPE_CHECKING:
+    from ...metrics import ClusterSeparabilityResult
     from ..mapping_datastore import MappingDatastore as _IntegrationMetricsBase
 else:
     _IntegrationMetricsBase = object
@@ -138,17 +128,6 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         )
         return selected_cell_key, selected_feature_key
 
-    @staticmethod
-    def _lisi_graph_label(
-        knn_loc: str,
-        neighbors_ref: ArtifactRef | None,
-    ) -> str:
-        if neighbors_ref is not None:
-            return neighbors_ref.artifact_id
-        leaf = knn_loc.rsplit("/", 1)[-1]
-        graph_id = fingerprint_strings(np.asarray([knn_loc], dtype=str))[:12]
-        return f"legacy_{leaf}_{graph_id}"
-
     def _load_metric_knn(
         self,
         use_latest_knn: bool,
@@ -181,38 +160,28 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
 
     def metric_lisi(
         self,
-        label_colnames: Iterable[str],
+        label_columns: Sequence[str],
         use_latest_knn: bool = True,
         from_assay: str | None = None,
         knn_loc: str | None = None,
-        save_result: bool = False,
-        return_lisi: bool = True,
         perplexity: float = 30,
-        invalidate_cache: bool = False,
-    ) -> list[tuple[str, np.ndarray]] | None:
+    ) -> dict[str, np.ndarray]:
         """Calculate Local Inverse Simpson Index (LISI) scores for cell populations.
 
         LISI measures how well mixed different cell populations are in the local neighborhood
         of each cell. Higher scores indicate better mixing of different populations.
 
         Args:
-            label_colnames: Column names from cell metadata containing population labels
+            label_columns: Column names from cell metadata containing population labels
             use_latest_knn: Whether to use the most recent KNN graph (default: True)
             from_assay: Name of assay to use if not using latest KNN
             knn_loc: Location of KNN graph if not using latest (default: None)
-            save_result: Whether to save LISI scores to cell metadata (default: False)
-            return_lisi: Whether to return LISI scores (default: True)
             perplexity: Effective neighborhood size used by LISI. It is reduced
                 with a warning when the graph has fewer than three times this
                 many neighbors.
 
         Returns:
-            If return_lisi is True, returns list of tuples containing:
-
-            - Label column name
-            - numpy array of LISI scores for that label
-
-            If return_lisi is False, returns None
+            A mapping from each label column to its per-cell LISI scores.
 
         Raises:
             ValueError: If KNN inputs, perplexity, or labels are invalid
@@ -224,126 +193,21 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             Higher scores indicate more mixing between different labels.
         """
 
-        if isinstance(label_colnames, str):
-            raise TypeError("label_colnames must be an iterable of column names")
-        label_cols = list(label_colnames)
+        if isinstance(label_columns, str):
+            raise TypeError("label_columns must be a sequence of column names")
+        label_cols = list(label_columns)
         if not label_cols:
-            raise ValueError("label_colnames must be non-empty")
+            raise ValueError("label_columns must be non-empty")
         if not all(isinstance(column, str) for column in label_cols):
-            raise TypeError("label_colnames must contain only strings")
+            raise TypeError("label_columns must contain only strings")
         if len(set(label_cols)) != len(label_cols):
-            raise ValueError("label_colnames contains duplicate names")
-        if from_assay is None:
-            from_assay = self._load_default_assay()
+            raise ValueError("label_columns contains duplicate names")
 
-        if use_latest_knn and knn_loc is None:
-            knn_loc = self._get_latest_knn_loc(from_assay)
-            logger.debug(f"Using the latest KNN graph at {knn_loc}")
-
-        else:
-            if knn_loc is None:
-                raise ValueError("Please provide values for the KNN graph location.")
-            if knn_loc not in self.zw:
-                raise ValueError(f"Could not find the knn graph at location: {knn_loc}")
-
-            logger.debug(f"Using the KNN graph at {knn_loc}")
-
-        cell_key, feat_key = self._keys_from_knn_path(from_assay, knn_loc)
-        validate_distance_provenance(self.zw, knn_loc)
-        knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
-        try:
-            neighbors_ref = parse_artifact_path(knn_loc)
-        except ValueError:
-            neighbors_ref = None
-
-        distances = as_zarr_array(knn_grp["distances"], name="distances")
-        indices = as_zarr_array(knn_grp["indices"], name="indices")
-        planned = None
-        graph_label = self._lisi_graph_label(knn_loc, neighbors_ref)
-        output_columns = [f"lisi__{column}__{graph_label}" for column in label_cols]
-        preserved_displays: dict[str, dict[str, Any] | None] = {}
-        if save_result:
-            selection = self._ensure_cell_selection(cell_key)
-            neighbors_input: object
-            if neighbors_ref is None:
-                neighbors_input = {
-                    "legacy_neighbors_fingerprint": fingerprint_stored_arrays(
-                        knn_grp,
-                        ("indices", "distances"),
-                    )
-                }
-            else:
-                neighbors_input = neighbors_ref
-            label_inputs = tuple(
-                self._resolve_cell_data_provenance_input(
-                    column,
-                    cell_key=cell_key,
-                )
-                for column in label_cols
-            )
-            arguments = LisiArguments(
-                neighbors=neighbors_input,
-                labels=label_inputs,
-                cell_selection=selection,
-                algorithm_version=1,
-                perplexity=perplexity,
-                from_assay=from_assay,
-                cell_key=cell_key,
-                label_colnames=tuple(label_cols),
-                save_result=save_result,
-                return_lisi=return_lisi,
-                invalidate_cache=invalidate_cache,
-            )
-            record = arguments.to_record()
-            planned = plan_cell_data_artifact(
-                self.zw,
-                scope="assay",
-                assay=from_assay,
-                kind=arguments.artifact_kind,
-                operation=arguments.operation,
-                parameters=record.parameters,
-                inputs=record.inputs,
-                execution_options=record.execution_options,
-                cell_selection=selection,
-                arrays={
-                    "values": (
-                        (distances.shape[0], len(label_cols)),
-                        "f",
-                    )
-                },
-                invalidate_cache=invalidate_cache,
-            )
-            preserved_displays = {
-                column: column_display(self.zw, column) for column in output_columns
-            }
-            if planned.reused:
-                artifact_group = as_zarr_group(
-                    self.zw[artifact_path(planned.ref)],
-                    name=planned.ref.artifact_id,
-                )
-                lisi_scores = artifact_values(artifact_group, "values")
-                for index, (column, values) in enumerate(
-                    zip(output_columns, lisi_scores.T, strict=True)
-                ):
-                    self.cells.insert(
-                        column_name=column,
-                        values=values,
-                        overwrite=True,
-                        key=cell_key,
-                    )
-                    link_cell_data_column(
-                        self.zw,
-                        column,
-                        planned.ref,
-                        value_name="values",
-                        value_index=index,
-                        default_display=continuous_display(values),
-                        preserved_display=preserved_displays[column],
-                    )
-                if return_lisi:
-                    return list(zip(label_cols, lisi_scores.T, strict=True))
-                return None
-
+        _, _, cell_key, distances, indices = self._load_metric_knn(
+            use_latest_knn,
+            from_assay,
+            knn_loc,
+        )
         try:
             metadata = self.cells.to_pandas_dataframe(columns=label_cols + [cell_key])
             metadata = metadata[metadata[cell_key]]
@@ -361,34 +225,10 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             label_cols,
             perplexity=perplexity,
         )
-        # lisi_scores Shape -> (n_cells, n_labels)
-        if save_result:
-            assert planned is not None
-            write_cell_data_artifact(
-                self.zw,
-                planned,
-                {"values": lisi_scores},
-            )
-            for index, (col_name, vals) in enumerate(
-                zip(output_columns, lisi_scores.T, strict=True)
-            ):
-                self.cells.insert(
-                    column_name=col_name, values=vals, overwrite=True, key=cell_key
-                )
-                link_cell_data_column(
-                    self.zw,
-                    col_name,
-                    planned.ref,
-                    value_name="values",
-                    value_index=index,
-                    default_display=continuous_display(vals),
-                    preserved_display=preserved_displays[col_name],
-                )
-
-        if return_lisi:
-            return list(zip(label_cols, lisi_scores.T, strict=True))
-        else:
-            return None
+        return {
+            column: scores
+            for column, scores in zip(label_cols, lisi_scores.T, strict=True)
+        }
 
     def metric_ilisi(
         self,
@@ -658,6 +498,98 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
         )
         return scores
 
+    def _validate_reduction_cell_selection(
+        self,
+        reduction: ArtifactRef,
+        cell_key: str,
+    ) -> None:
+        normalized = self._artifact_input_ref(reduction, "normalized", "normalized")
+        execution = (
+            self._require_complete_artifact(normalized, "normalized").execution_options
+            or {}
+        )
+        selected_cell_key = execution.get("cell_key")
+        selected_feat_key = execution.get("feat_key")
+        state = (
+            read_assay_state(self.zw, reduction.assay)
+            if reduction.assay is not None
+            else None
+        )
+        if state is not None and state.normalized == normalized:
+            selected_cell_key = state.cell_key
+            selected_feat_key = state.feat_key
+        if not isinstance(selected_cell_key, str) or not isinstance(
+            selected_feat_key,
+            str,
+        ):
+            raise ValueError("Reduction selection source columns are missing")
+        if cell_key != selected_cell_key:
+            raise ValueError(
+                f"cell_key {cell_key!r} does not match the cell selection "
+                f"{selected_cell_key!r} used to build the reduction"
+            )
+        validate_normalized_artifact_selection(
+            self.zw,
+            normalized,
+            selected_cell_key,
+            selected_feat_key,
+        )
+
+    def metric_cluster_separability(
+        self,
+        pca: ArtifactRef,
+        cluster_columns: Sequence[str],
+        *,
+        cell_key: str = "I",
+        n_folds: int = 5,
+        max_sample_cells: int = 50_000,
+        max_silhouette_cells: int = 10_000,
+        random_seed: int = 4444,
+        svm_c: float = 1.0,
+        svm_max_iter: int = 10_000,
+    ) -> "ClusterSeparabilityResult":
+        """Evaluate cluster-label separability in PCA coordinates."""
+        from ...metrics import evaluate_cluster_separability
+
+        if isinstance(cluster_columns, str):
+            raise TypeError("cluster_columns must be a sequence of column names")
+        columns = list(cluster_columns)
+        if not columns:
+            raise ValueError("cluster_columns must be non-empty")
+        if not all(isinstance(column, str) and column for column in columns):
+            raise TypeError("cluster_columns must contain non-empty strings")
+        if len(set(columns)) != len(columns):
+            raise ValueError("cluster_columns contains duplicate names")
+
+        status = self._require_complete_artifact(pca, "reduction")
+        if status.operation != "run_pca":
+            raise ValueError("pca must reference a PCA reduction artifact")
+        self._validate_reduction_cell_selection(pca, cell_key)
+        group = group_at(self.zw, status.path)
+        if "data" not in group:
+            raise ValueError("PCA reduction coordinates are missing")
+        coordinates = as_zarr_array(group["data"], name="PCA coordinates")
+        clusterings = {
+            column: np.asarray(self.cells.fetch(column, key=cell_key))
+            for column in columns
+        }
+        for column, labels in clusterings.items():
+            if len(labels) != coordinates.shape[0]:
+                raise ValueError(
+                    f"Cluster column {column!r} does not align with PCA rows"
+                )
+
+        return evaluate_cluster_separability(
+            coordinates,
+            clusterings,
+            n_folds=n_folds,
+            max_sample_cells=max_sample_cells,
+            max_silhouette_cells=max_silhouette_cells,
+            random_seed=random_seed,
+            svm_c=svm_c,
+            svm_max_iter=svm_max_iter,
+        )
+
     def metric_label_concordance(
         self,
         label_columns: Sequence[str],
@@ -737,20 +669,16 @@ class _IntegrationMetricsOperationsMixin(_IntegrationMetricsBase):
             raise ValueError("Please provide values for the KNN graph location.")
 
         lisi_result = self.metric_lisi(
-            label_colnames=[label_colname],
+            label_columns=[label_colname],
             use_latest_knn=use_latest_knn,
             from_assay=from_assay,
             knn_loc=resolved_knn_loc,
-            save_result=False,
-            return_lisi=True,
             perplexity=perplexity,
         )
-        if lisi_result is None:
-            raise RuntimeError("LISI computation did not return scores")
 
         cell_key, _ = self._keys_from_knn_path(
             from_assay,
             resolved_knn_loc,
         )
         batch_labels = self.cells.fetch(label_colname, key=cell_key)
-        return lisi_batch_mixing_score(lisi_result[0][1], batch_labels)
+        return lisi_batch_mixing_score(lisi_result[label_colname], batch_labels)

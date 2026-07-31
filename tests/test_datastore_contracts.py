@@ -72,6 +72,7 @@ _METHODS = {
         "mark_hvgs",
         "mark_prevalent_peaks",
         "metric_clisi",
+        "metric_cluster_separability",
         "metric_graph_connectivity",
         "metric_graph_silhouette",
         "metric_ilisi",
@@ -96,7 +97,7 @@ _SIGNATURE_DIGESTS = {
     BaseDataStore: "ba5c5e4e09f310114b2f7e09ac346bc759d87912e04d034153e5bc5b41e0f6a5",
     GraphDataStore: "c5fcbd3e669535041a60b7447cdd5de72593f596716c30dab3906c7c8d4a34a1",
     MappingDatastore: "95a0fa2a277259c653db32d94b1334d94be4bbc8331145d614e72796b4871a0f",
-    DataStore: "ab976409c53de3f62302968a58511731c87d013ff927c174c86c43b67293b291",
+    DataStore: "3da2164eafb9ac1ea17d9faa3ad8be10850a38b5d137f0773a7c9b306943574c",
 }
 
 

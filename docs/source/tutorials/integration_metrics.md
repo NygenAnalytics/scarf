@@ -86,11 +86,9 @@ over-correction.
 
 ```{code-cell} ipython3
 def evaluate_graph(cluster_label):
-    lisi = dict(
-        ds.metric_lisi(
-            label_colnames=["sample_id", "orig_cluster_labels"],
-            perplexity=7,
-        )
+    lisi = ds.metric_lisi(
+        label_columns=["sample_id", "orig_cluster_labels"],
+        perplexity=7,
     )
     silhouette = ds.metric_graph_silhouette(
         res_label=cluster_label,
@@ -225,11 +223,9 @@ Per-cell LISI can reveal where mixing succeeds or fails even when a median looks
 acceptable.
 
 ```{code-cell} ipython3
-harmony_lisi = dict(
-    ds.metric_lisi(
-        label_colnames=["sample_id"],
-        perplexity=7,
-    )
+harmony_lisi = ds.metric_lisi(
+    label_columns=["sample_id"],
+    perplexity=7,
 )["sample_id"]
 ds.cells.insert(
     "harmony_sample_lisi",

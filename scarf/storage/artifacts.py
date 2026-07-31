@@ -46,7 +46,6 @@ ARTIFACT_KINDS = frozenset(
         "hto_identity",
         "integrated_graph",
         "intersection_ann_index",
-        "lisi",
         "mapping_reference",
         "marker_table",
         "membership_strength",

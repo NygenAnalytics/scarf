@@ -336,13 +336,10 @@ def test_metric_lisi_single_category_is_one(datastore, graph_artifacts):
         overwrite=True,
     )
     lisi = datastore.metric_lisi(
-        label_colnames=(name for name in ["single_batch"]),
-        save_result=False,
-        return_lisi=True,
+        label_columns=["single_batch"],
     )
 
-    assert lisi is not None
-    assert np.allclose(lisi[0][1], 1)
+    assert np.allclose(lisi["single_batch"], 1)
 
 
 def test_knn_without_affinities_preserves_distances():

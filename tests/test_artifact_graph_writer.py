@@ -122,11 +122,14 @@ def test_graph_construction_chain_writes_only_artifacts_and_state(
     lisi = datastore.metric_lisi(
         ["RNA_artifact_leiden"],
         perplexity=1,
-        save_result=False,
     )
     assert "RNA_artifact_umap1" in datastore.cells.columns
     assert "RNA_artifact_leiden" in datastore.cells.columns
-    assert lisi is not None
+    assert set(lisi) == {"RNA_artifact_leiden"}
+    scores = lisi["RNA_artifact_leiden"]
+    assert len(scores) == len(datastore.cells.fetch("RNA_artifact_leiden", key="I"))
+    assert np.isfinite(scores).all()
+    assert (scores >= 1).all()
 
 
 def test_graph_construction_chain_reuses_provenance(

@@ -231,21 +231,6 @@ _CONTRACTS = (
         model_only=_classified("resolved_input", "graph"),
     ),
     OperationContract(
-        DataStore.metric_lisi,
-        metadata_arguments.LisiArguments,
-        aliases={"knn_loc": "neighbors"},
-        signature_only=_classified("routing", "use_latest_knn"),
-        model_only={
-            **_classified("algorithm_version", "algorithm_version"),
-            **_classified(
-                "resolved_input",
-                "cell_key",
-                "cell_selection",
-                "labels",
-            ),
-        },
-    ),
-    OperationContract(
         DataStore.run_marker_search,
         metadata_arguments.MarkerTableArguments,
         aliases={"norm_params": "normalization"},

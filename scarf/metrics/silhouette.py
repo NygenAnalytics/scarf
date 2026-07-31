@@ -3,12 +3,11 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
-import zarr
 
-from ..matrix import ChunkedArray
 from ..neighbors.stream import AnnStream
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
+from ._rows import read_matrix_rows
 from ._types import MatrixData, NeighborMetric, ZarrArray
 from .graph import (
     calculate_knn_cluster_similarity,
@@ -20,15 +19,6 @@ if TYPE_CHECKING:
     from ..datastore.datastore import DataStore
 
 
-def _read_rows(data: MatrixData, row_indices: np.ndarray) -> np.ndarray:
-    row_indices = np.asarray(row_indices, dtype=np.int64)
-    if isinstance(data, ChunkedArray):
-        return data[row_indices].compute()
-    if isinstance(data, zarr.Array):
-        return np.asarray(data.get_orthogonal_selection((row_indices, slice(None))))
-    return np.asarray(data[row_indices])
-
-
 def _embed_rows(
     row_indices: np.ndarray,
     data: MatrixData,
@@ -36,7 +26,7 @@ def _embed_rows(
     *,
     data_is_reduced: bool,
 ) -> np.ndarray:
-    rows = _read_rows(data, np.sort(row_indices))
+    rows = read_matrix_rows(data, np.sort(row_indices))
     if data_is_reduced:
         return np.asarray(rows)
     return np.asarray(ann_obj.reducer(rows))

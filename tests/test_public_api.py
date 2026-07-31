@@ -379,8 +379,16 @@ def test_domain_packages_export_canonical_objects():
             "find_markers_by_rank",
         ): "scarf.features.markers.search",
         ("scarf.matrix", "ChunkedArray"): "scarf.matrix.chunked",
+        (
+            "scarf.metrics",
+            "ClusterSeparabilityResult",
+        ): "scarf.metrics.cluster_separability",
         ("scarf.metrics", "clisi_knn"): "scarf.metrics.lisi",
         ("scarf.metrics", "compute_lisi"): "scarf.metrics.lisi",
+        (
+            "scarf.metrics",
+            "evaluate_cluster_separability",
+        ): "scarf.metrics.cluster_separability",
         ("scarf.metrics", "graph_connectivity"): "scarf.metrics.connectivity",
         ("scarf.metrics", "ilisi_knn"): "scarf.metrics.lisi",
         ("scarf.metrics", "silhouette_scoring"): "scarf.metrics.silhouette",
