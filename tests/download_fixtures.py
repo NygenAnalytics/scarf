@@ -2,6 +2,7 @@
 
 import argparse
 import gzip
+import hashlib
 import sys
 import tarfile
 import tempfile
@@ -17,6 +18,18 @@ from scipy.sparse import csr_matrix
 _H5AD_DOWNLOAD_ATTEMPTS = 3
 
 _FIXTURES_BASE_URL = "https://raw.githubusercontent.com/parashardhapola/scarf/master/scarf/tests/datasets"
+_EXTERNAL_FIXTURES = {
+    "seurat_assay5_synthetic.rds": (
+        "https://raw.githubusercontent.com/harryhaller001/readseurat/"
+        "8a688b47df27f90e98a4c57ddd9e47c0e5ded01e/tests/data/synthetic.rds",
+        "f1e6f6fd3e1959452a9ef7e72571a86e1b27a061d8cf00cd28932d8757cdac7c",
+    ),
+    "seurat_v4_1_3_pbmc_mye.rds": (
+        "https://zenodo.org/api/records/10944066/files/"
+        "pbmc10k_mye_small_velocyto.rds/content",
+        "f84adf523a78aeb6e6681cf09e06a2a2fcd4e3fe857fdd89b17e90a1782fac3d",
+    ),
+}
 
 FIXTURE_FILES = (
     "1K_pbmc_citeseq.h5",
@@ -38,11 +51,21 @@ FIXTURE_FILES = (
     "aggregated_df_top_10.npy",
     "pseudotime_clusters.npy",
     "ptime_modules_group_1.npy",
+    "seurat_assay5_synthetic.rds",
+    "seurat_v4_1_3_pbmc_mye.rds",
 )
 
 
 def datasets_dir() -> Path:
     return Path(__file__).resolve().parent / "datasets"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def download_fixtures(*, force: bool = False) -> None:
@@ -52,13 +75,24 @@ def download_fixtures(*, force: bool = False) -> None:
     missing: list[tuple[str, urllib.error.HTTPError]] = []
     for name in FIXTURE_FILES:
         dest = target / name
+        external = _EXTERNAL_FIXTURES.get(name)
         if dest.is_file() and not force:
-            continue
-        url = f"{_FIXTURES_BASE_URL}/{name}"
+            if external is None or _sha256(dest) == external[1]:
+                continue
+            dest.unlink()
+        url = f"{_FIXTURES_BASE_URL}/{name}" if external is None else external[0]
         try:
             urllib.request.urlretrieve(url, dest)
         except urllib.error.HTTPError as exc:
             missing.append((name, exc))
+            continue
+        if external is not None:
+            digest = _sha256(dest)
+            if digest != external[1]:
+                dest.unlink()
+                raise RuntimeError(
+                    f"Fixture {name} has SHA-256 {digest}, expected {external[1]}"
+                )
 
     if missing:
         details = "\n".join(f"  {name}: HTTP {exc.code}" for name, exc in missing)

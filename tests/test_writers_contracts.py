@@ -20,6 +20,8 @@ from scarf.writers import (
     H5adToZarr,
     LoomToZarr,
     MtxToZarr,
+    SeuratImportResult,
+    SeuratToZarr,
     SparseToZarr,
     SubsetZarr,
 )
@@ -51,6 +53,10 @@ _PUBLIC_CLASS_METHODS = {
         "__init__",
         "dump",
     ),
+    SeuratToZarr: (
+        "__init__",
+        "dump",
+    ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     CrToZarr: "6ddc400f3edcce221a338b60bc528a83f086409ee59b7d3e6baebfa0980f8f75",
@@ -59,6 +65,7 @@ _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     SparseToZarr: "78dcbc0d0d7d48a3d971ba0654260be39fd69157a5d3cb87f4d7191f0dee450d",
     CSVtoZarr: "30b241f964ead70d6a44e0f09be571ea88d227cd78335651b3f1a38cadf3268e",
     SubsetZarr: "ae6eb9a73c50d32b3716ea33002993bcd005461c68e0e784aec87a66ac3061e5",
+    SeuratToZarr: "824c0169d8b921397643c54fd57b8d238720669da376e02c21d226be87adb86f",
 }
 _MODULE_FUNCTIONS = (
     "create_zarr_count_assay",
@@ -88,6 +95,8 @@ def test_writers_facade_surface_is_stable():
         "MtxToZarr",
         "H5adToZarr",
         "LoomToZarr",
+        "SeuratImportResult",
+        "SeuratToZarr",
         "SparseToZarr",
         "to_h5ad",
         "to_mtx",
@@ -130,6 +139,7 @@ def test_writer_public_metadata_remains_on_facade():
 
     for name in _MODULE_FUNCTIONS:
         assert getattr(writers_module, name).__module__ == "scarf.writers"
+    assert SeuratImportResult.__module__ == "scarf.writers"
 
 
 def test_writer_static_method_contracts_are_stable():
@@ -256,11 +266,13 @@ def test_writer_type_hints_resolve_from_facade_objects():
             assert get_type_hints(getattr(cls, name))
     for name in _MODULE_FUNCTIONS:
         assert get_type_hints(getattr(writers_module, name))
+    assert get_type_hints(SeuratImportResult)
 
 
 def test_writer_facade_objects_remain_pickle_resolvable():
     for cls in _PUBLIC_CLASS_METHODS:
         assert pickle.loads(pickle.dumps(cls)) is cls
+    assert pickle.loads(pickle.dumps(SeuratImportResult)) is SeuratImportResult
     for name in _MODULE_FUNCTIONS:
         function = getattr(writers_module, name)
         assert pickle.loads(pickle.dumps(function)) is function
@@ -284,12 +296,14 @@ writer_formats = {
     "scarf.writers.loom",
     "scarf.writers.sparse",
     "scarf.writers.subset",
+    "scarf.writers.seurat",
 }
 reader_formats = {
     "scarf.readers.cellranger",
     "scarf.readers.csv",
     "scarf.readers.h5ad",
     "scarf.readers.loom",
+    "scarf.readers.seurat",
 }
 assert not {
     name for name in sys.modules if name.startswith("scarf.writers.")
@@ -307,6 +321,30 @@ method = inspect.getattr_static(writer_class, "__init__")
 assert method.__module__ == "scarf.writers"
 assert method.__qualname__ == "CSVtoZarr.__init__"
 assert writers.CSVtoZarr is writer_class
+""",
+        ],
+        check=True,
+    )
+
+
+def test_seurat_writer_exports_load_together_lazily():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+
+import scarf.writers as writers
+
+assert "scarf.writers.seurat" not in sys.modules
+writer = writers.SeuratToZarr
+assert writer.__module__ == "scarf.writers"
+assert writers.SeuratImportResult.__module__ == "scarf.writers"
+assert "scarf.writers.seurat" in sys.modules
+assert "scarf.readers.seurat" in sys.modules
+assert "scarf.datastore.datastore" not in sys.modules
+assert "scarf.writers.h5ad" not in sys.modules
 """,
         ],
         check=True,

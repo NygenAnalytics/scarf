@@ -9,6 +9,11 @@ if TYPE_CHECKING:
         run_harmony as run_harmony,
     )
     from .initialization import initial_embedding as initial_embedding
+    from .imported import (
+        validate_imported_embedding_artifact as validate_imported_embedding_artifact,
+        write_imported_coordinates as write_imported_coordinates,
+        write_imported_embedding as write_imported_embedding,
+    )
     from .sgtsne import (
         export_knn_to_mtx as export_knn_to_mtx,
         run_sgtsne as run_sgtsne,
@@ -32,6 +37,9 @@ __all__ = [
     "run_harmony",
     "run_sgtsne",
     "simplicial_set_embedding",
+    "validate_imported_embedding_artifact",
+    "write_imported_coordinates",
+    "write_imported_embedding",
 ]
 
 _LAZY_EXPORTS = {
@@ -43,6 +51,12 @@ _LAZY_EXPORTS = {
     "fit_transform": (".umap", "fit_transform"),
     "fuzzy_simplicial_set": (".umap", "fuzzy_simplicial_set"),
     "initial_embedding": (".initialization", "initial_embedding"),
+    "validate_imported_embedding_artifact": (
+        ".imported",
+        "validate_imported_embedding_artifact",
+    ),
+    "write_imported_coordinates": (".imported", "write_imported_coordinates"),
+    "write_imported_embedding": (".imported", "write_imported_embedding"),
     "run_harmony": (".harmony", "run_harmony"),
     "run_sgtsne": (".sgtsne", "run_sgtsne"),
     "simplicial_set_embedding": (".umap", "simplicial_set_embedding"),

@@ -52,6 +52,7 @@ from ...graph.state import (
     stored_assay_graph_from_state,
     validate_artifact_graph_selection,
     validate_cell_selection_artifact,
+    validate_imported_coordinates_artifact,
     validate_legacy_graph_selection,
     validate_neighbors_artifact_selection,
     validate_normalized_artifact_selection,
@@ -1354,9 +1355,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if not isinstance(raw_coordinates, dict):
                 raise ValueError("Neighbors artifact has no coordinates input")
             current = ArtifactRef.from_dict(raw_coordinates)
-            if current.kind not in {"reduction", "batch_correction"}:
+            if current.kind not in {
+                "reduction",
+                "batch_correction",
+                "imported_coordinates",
+            }:
                 raise ValueError(
-                    "Neighbor coordinates must be reduction or batch_correction"
+                    "Neighbor coordinates must be reduction, batch_correction, "
+                    "or imported_coordinates"
                 )
             self._require_complete_artifact(current, current.kind)
             ann_coordinates = self._artifact_input_ref(
@@ -1373,6 +1379,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if not isinstance(raw_coordinates, dict):
                 raise ValueError("ANN artifact has no coordinates input")
             current = ArtifactRef.from_dict(raw_coordinates)
+        if current.kind == "imported_coordinates":
+            raise ValueError(
+                "Imported coordinates are not part of the normalized AssayState "
+                "graph chain; pass update_state=False"
+            )
         if current.kind == "batch_correction":
             batch_correction = current
             current = self._artifact_input_ref(
@@ -1713,6 +1724,39 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         *,
         batch_size: int | None,
     ) -> tuple[CoordinateSource, int, int]:
+        if coordinates.kind == "imported_coordinates":
+            status = self._require_complete_artifact(
+                coordinates,
+                "imported_coordinates",
+            )
+            execution = status.execution_options or {}
+            cell_key = execution.get("cell_key")
+            if not isinstance(cell_key, str) or not cell_key:
+                raise ValueError(
+                    "Imported-coordinate artifact has no cell selection key"
+                )
+            validate_imported_coordinates_artifact(
+                self.zw,
+                coordinates,
+                cell_key=cell_key,
+            )
+            group = group_at(self.zw, status.path)
+            backing = as_zarr_array(group["data"], name="data")
+            data = ChunkedArray(
+                backing,
+                block_size=_row_block(backing, batch_size),
+                nthreads=self.nthreads,
+                resources=self.resources,
+            )
+            logger.debug(
+                f"Using imported coordinates from {status.path} "
+                f"(shape={data.shape[0]} x {data.shape[1]})"
+            )
+            return (
+                ChunkedCoordinateStream(data, self.nthreads),
+                int(data.shape[0]),
+                int(data.shape[1]),
+            )
         if coordinates.kind == "batch_correction":
             status = self._require_complete_artifact(
                 coordinates,
@@ -1783,7 +1827,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 else int(stream.data.shape[1])
             )
             return stream, int(stream.data.shape[0]), dims
-        raise ValueError("Coordinates must reference reduction or batch_correction")
+        raise ValueError(
+            "Coordinates must reference reduction, batch_correction, "
+            "or imported_coordinates"
+        )
 
     def _plan_assay_artifact(
         self,
@@ -3032,6 +3079,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             )
         if coordinates.assay is None:
             raise ValueError("Coordinate artifact has no assay")
+        if coordinates.kind == "imported_coordinates" and update_state:
+            raise ValueError(
+                "Imported coordinates cannot activate AssayState; "
+                "pass update_state=False"
+            )
         if ann_metric not in {"l2", "cosine"}:
             raise ValueError("ann_metric must be one of: l2, cosine")
         resolved_ann_efc = _positive_integer(ann_efc, "ann_efc")
@@ -3152,14 +3204,23 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if stored_coordinates.kind not in {
             "reduction",
             "batch_correction",
+            "imported_coordinates",
         }:
-            raise ValueError("ANN coordinates must be reduction or batch_correction")
+            raise ValueError(
+                "ANN coordinates must be reduction, batch_correction, "
+                "or imported_coordinates"
+            )
         self._require_complete_artifact(
             stored_coordinates,
             stored_coordinates.kind,
         )
         if coordinates is not None and coordinates != stored_coordinates:
             raise ValueError("coordinates do not match the ANN artifact input")
+        if stored_coordinates.kind == "imported_coordinates" and update_state:
+            raise ValueError(
+                "Neighbors from imported coordinates cannot activate AssayState; "
+                "pass update_state=False"
+            )
         requested_k = _positive_integer(k, "k")
         resolved_batch_size = (
             None if batch_size is None else _positive_integer(batch_size, "batch_size")

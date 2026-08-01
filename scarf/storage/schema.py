@@ -1,8 +1,11 @@
+from typing import Any
+
 import numpy as np
 import zarr
 
 from .types import array_metadata_shards, as_zarr_array
 from .arrays import (
+    create_metadata_column,
     create_numeric_array,
     create_zarr_obj_array,
 )
@@ -100,6 +103,83 @@ def create_zarr_count_assay(
     return counts
 
 
+def create_empty_zarr_count_assay(
+    z: zarr.Group,
+    assay_name: str,
+    workspace: str | None,
+    n_cells: int,
+    n_features: int,
+    feature_id_dtype: Any,
+    feature_name_dtype: Any,
+    dtype: Any = "uint32",
+    *,
+    profile: StorageProfile | None = None,
+    targetChunkBytes: int | None = None,
+    targetShardBytes: int | None = None,
+) -> tuple[zarr.Array, zarr.Group]:
+    """Create an assay whose feature metadata can be filled blockwise."""
+    validate_assay_name(assay_name)
+    if n_cells < 0 or n_features < 0:
+        raise ValueError("Assay dimensions must be non-negative")
+    assay_path = assay_name if workspace is None else f"{workspace}/{assay_name}"
+    assay_group = z.create_group(assay_path, overwrite=True)
+    assay_group.attrs["is_assay"] = True
+    assay_group.attrs["misc"] = {}
+    resolved_profile = profile or resolve_storage_profile(assay_group.store)
+    feature_group = assay_group.create_group("featureData")
+    create_metadata_column(
+        feature_group,
+        "ids",
+        dtype=feature_id_dtype,
+        shape=n_features,
+        chunkSize=100_000,
+        profile=resolved_profile,
+    )
+    create_metadata_column(
+        feature_group,
+        "names",
+        dtype=feature_name_dtype,
+        shape=n_features,
+        chunkSize=100_000,
+        profile=resolved_profile,
+    )
+    included = create_metadata_column(
+        feature_group,
+        "I",
+        dtype=bool,
+        shape=n_features,
+        chunkSize=100_000,
+        profile=resolved_profile,
+    )
+    included[:] = True
+
+    matrix_group = (
+        assay_group
+        if workspace is None
+        else z.create_group(f"matrices/{assay_name}", overwrite=True)
+    )
+    zarr_format = _group_zarr_format(matrix_group)
+    spec = count_array_spec(
+        n_cells,
+        n_features,
+        dtype=dtype,
+        profile=resolved_profile,
+        targetChunkBytes=targetChunkBytes,
+        targetShardBytes=targetShardBytes,
+        zarrFormat=zarr_format,
+    )
+    counts = create_numeric_array(matrix_group, "counts", spec)
+    stored_shards = array_metadata_shards(counts)
+    matrix_group.attrs["scarf:zarr_spec"] = {
+        "profile": resolved_profile,
+        "dtype": np.dtype(dtype).str,
+        "chunks": list(counts.chunks),
+        "shards": None if stored_shards is None else list(stored_shards),
+        "zarr_format": zarr_format,
+    }
+    return counts, feature_group
+
+
 def load_count_array(
     root: zarr.Group,
     assay_name: str,
@@ -136,4 +216,45 @@ def create_cell_data(
         "bool",
         profile=profile,
     )
+    return group
+
+
+def create_empty_cell_data(
+    root: zarr.Group,
+    workspace: str | None,
+    n_cells: int,
+    id_dtype: Any,
+    name_dtype: Any,
+    profile: StorageProfile | None = None,
+) -> zarr.Group:
+    """Create cell metadata columns that can be filled blockwise."""
+    if n_cells < 0:
+        raise ValueError("n_cells must be non-negative")
+    path = "cellData" if workspace is None else f"{workspace}/cellData"
+    group = root.create_group(path)
+    create_metadata_column(
+        group,
+        "ids",
+        dtype=id_dtype,
+        shape=n_cells,
+        chunkSize=100_000,
+        profile=profile,
+    )
+    create_metadata_column(
+        group,
+        "names",
+        dtype=name_dtype,
+        shape=n_cells,
+        chunkSize=100_000,
+        profile=profile,
+    )
+    included = create_metadata_column(
+        group,
+        "I",
+        dtype=bool,
+        shape=n_cells,
+        chunkSize=100_000,
+        profile=profile,
+    )
+    included[:] = True
     return group

@@ -24,6 +24,7 @@ from .rows import (
 )
 
 zarrGroup = zarr.Group
+_INTERNAL_METADATA_PREFIX = "__scarf_missing__"
 
 
 class MetaData:
@@ -70,6 +71,8 @@ class MetaData:
         }
         for location, group in self.locations.items():
             for column in group.keys():
+                if column.startswith(_INTERNAL_METADATA_PREFIX):
+                    continue
                 public_name = self._col_renamer(location, column)
                 if public_name in col_map and public_name not in reserved_cols:
                     logger.warning(

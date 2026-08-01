@@ -1,5 +1,5 @@
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
@@ -7,17 +7,32 @@ from typing import Any
 import numpy as np
 import zarr
 
+from ..storage.arrays import create_metadata_column, create_numeric_array
+from ..storage.artifact_writer import (
+    ArrayRequirement,
+    PlannedArtifact,
+    finish_artifact,
+    plan_artifact,
+    start_artifact,
+)
 from ..storage.artifacts import (
     ArtifactRef,
+    ValueFingerprintBuilder,
     artifact_group,
     artifact_path,
     fingerprint_stored_arrays,
+    fingerprint_stored_strings,
     fingerprint_strings,
     group_at,
     inspect_artifact,
     parse_artifact_path,
     require_complete_artifact,
 )
+from ..storage.geometry import array_geometry
+from ..storage.layout import _group_zarr_format, row_sharded_array_spec
+from ..storage.partition import row_band
+from ..storage.profiles import resolve_storage_profile
+from ..storage.selections import fingerprint_selected_stored_strings
 from ..storage.types import as_zarr_array, as_zarr_group
 from .paths import AssayGraphPaths, StoredAssayGraph
 
@@ -66,6 +81,125 @@ def _restore_artifact_selection_error(
     context: Mapping[str, _SelectionContextValue],
 ) -> ArtifactSelectionError:
     return error_type(message, code=code, context=context)
+
+
+@dataclass(frozen=True, slots=True)
+class ImportedArtifactStorage:
+    """Narrow storage adapter for imported embedding-domain artifacts."""
+
+    root: zarr.Group
+
+    @staticmethod
+    def requirement(
+        name: str,
+        *,
+        shape: tuple[int, ...],
+        dtype_kind: str | None,
+    ) -> ArrayRequirement:
+        return ArrayRequirement(name, shape=shape, dtype_kind=dtype_kind)
+
+    def plan(
+        self,
+        *,
+        assay: str,
+        kind: str,
+        parameters: dict[str, Any],
+        inputs: dict[str, Any],
+        execution_options: dict[str, Any],
+        invalidate_cache: bool,
+        required_arrays: tuple[ArrayRequirement, ...],
+        reuse_validator: Callable[[ArtifactRef, zarr.Group], bool],
+    ) -> PlannedArtifact:
+        return plan_artifact(
+            self.root,
+            scope="assay",
+            assay=assay,
+            kind=kind,
+            operation="import_dimreduc",
+            parameters=parameters,
+            inputs=inputs,
+            execution_options=execution_options,
+            invalidate_cache=invalidate_cache,
+            required_arrays=required_arrays,
+            reuse_validator=reuse_validator,
+        )
+
+    def start(self, planned: PlannedArtifact) -> zarr.Group:
+        return start_artifact(self.root, planned)
+
+    @staticmethod
+    def finish(group: zarr.Group, planned: PlannedArtifact) -> None:
+        finish_artifact(group, planned)
+
+    def artifact_group(self, ref: ArtifactRef) -> zarr.Group:
+        return artifact_group(self.root, ref)
+
+    def require_complete(self, ref: ArtifactRef) -> Any:
+        return require_complete_artifact(self.root, ref)
+
+    @staticmethod
+    def as_array(node: zarr.Array | zarr.Group, name: str) -> zarr.Array:
+        return as_zarr_array(node, name=name)
+
+    @staticmethod
+    def as_group(node: zarr.Array | zarr.Group, name: str) -> zarr.Group:
+        return as_zarr_group(node, name=name)
+
+    @staticmethod
+    def fingerprint_builder() -> ValueFingerprintBuilder:
+        return ValueFingerprintBuilder()
+
+    @staticmethod
+    def fingerprint_strings(values: np.ndarray) -> str:
+        return fingerprint_strings(values)
+
+    @staticmethod
+    def fingerprint_stored_strings(array: zarr.Array) -> str:
+        return fingerprint_stored_strings(array)
+
+    @staticmethod
+    def block_rows(array: zarr.Array) -> int:
+        return row_band(array_geometry(array), unit="chunk", fallback=1)
+
+    @staticmethod
+    def create_numeric(
+        group: zarr.Group,
+        name: str,
+        *,
+        shape: tuple[int, ...],
+        dtype: Any,
+        block_rows: int,
+    ) -> zarr.Array:
+        return create_numeric_array(
+            group,
+            name,
+            row_sharded_array_spec(
+                shape,
+                dtype,
+                profile=resolve_storage_profile(group.store),
+                band_rows=min(max(shape[0], 1), block_rows),
+                zarr_format=_group_zarr_format(group),
+                fill_value=0.0,
+            ),
+        )
+
+    @staticmethod
+    def create_metadata(
+        group: zarr.Group,
+        name: str,
+        *,
+        dtype: Any,
+        shape: int,
+        block_rows: int,
+    ) -> zarr.Array:
+        return create_metadata_column(
+            group,
+            name,
+            dtype=dtype,
+            shape=shape,
+            chunkSize=min(max(shape, 1), block_rows),
+            overwrite=True,
+        )
 
 
 def _legacy_subset_hash(
@@ -274,6 +408,8 @@ def write_assay_state(root: zarr.Group, state: AssayState) -> None:
         require_complete_artifact(root, ref)
     for name, ref in state.named_results.items():
         status = require_complete_artifact(root, ref)
+        if ref.kind == "imported_coordinates":
+            validate_imported_coordinates_artifact(root, ref)
         if name == "mapping_reference":
             expected = {
                 "reduction": state.reduction,
@@ -838,15 +974,13 @@ def _validate_selection_artifact(
             code="selection_values_missing",
             context=context,
         )
-    stored_values = np.asarray(
-        as_zarr_array(selection_group["values"], name="values")[:]
-    )
-    current_values = np.asarray(as_zarr_array(table[column], name=column)[:])
-    row_ids = np.asarray(as_zarr_array(table["ids"], name="ids")[:])
+    stored_values = as_zarr_array(selection_group["values"], name="values")
+    current_values = as_zarr_array(table[column], name=column)
+    row_ids = as_zarr_array(table["ids"], name="ids")
     expected_row_ids = (status.inputs or {}).get("ordered_row_ids_fingerprint")
-    if not isinstance(expected_row_ids, str) or expected_row_ids != fingerprint_strings(
-        row_ids
-    ):
+    if not isinstance(
+        expected_row_ids, str
+    ) or expected_row_ids != fingerprint_stored_strings(row_ids):
         raise ArtifactSelectionError(
             f"{kind} row identity does not match its metadata table",
             code="row_identity_mismatch",
@@ -854,17 +988,31 @@ def _validate_selection_artifact(
         )
     if (
         stored_values.ndim != 1
-        or stored_values.dtype != np.dtype(bool)
+        or np.dtype(stored_values.dtype) != np.dtype(bool)
         or current_values.ndim != 1
-        or current_values.dtype != np.dtype(bool)
+        or np.dtype(current_values.dtype) != np.dtype(bool)
         or stored_values.shape != current_values.shape
-        or not np.array_equal(stored_values, current_values)
     ):
         raise ArtifactSelectionError(
             f"Selection source column {column!r} no longer matches its artifact",
             code="selection_values_changed",
             context=context,
         )
+    block_rows = min(
+        row_band(array_geometry(stored_values), unit="chunk", fallback=1),
+        row_band(array_geometry(current_values), unit="chunk", fallback=1),
+    )
+    for start in range(0, int(stored_values.shape[0]), block_rows):
+        stop = min(start + block_rows, int(stored_values.shape[0]))
+        if not np.array_equal(
+            np.asarray(stored_values[start:stop], dtype=bool),
+            np.asarray(current_values[start:stop], dtype=bool),
+        ):
+            raise ArtifactSelectionError(
+                f"Selection source column {column!r} no longer matches its artifact",
+                code="selection_values_changed",
+                context=context,
+            )
 
 
 def validate_cell_selection_artifact(
@@ -881,6 +1029,202 @@ def validate_cell_selection_artifact(
         table_path="cellData",
         column=cell_key,
     )
+
+
+def _stored_value_fingerprint(array: zarr.Array) -> str:
+    builder = ValueFingerprintBuilder()
+    builder.begin_array("values", array.shape, array.dtype)
+    block_rows = row_band(array_geometry(array), unit="chunk", fallback=1)
+    for start in range(0, int(array.shape[0]), block_rows):
+        stop = min(start + block_rows, int(array.shape[0]))
+        block = np.asarray(array[start:stop])
+        builder.update_array_block(
+            "values",
+            (start,) + (0,) * (array.ndim - 1),
+            block,
+        )
+    builder.end_array("values")
+    return builder.hexdigest()
+
+
+def _payload_fingerprint(group: zarr.Group, name: str) -> str:
+    array = as_zarr_array(group[name], name=name)
+    if name == "feature_ids":
+        return fingerprint_stored_strings(array)
+    return _stored_value_fingerprint(array)
+
+
+def validate_imported_coordinates_artifact(
+    root: zarr.Group,
+    coordinates: ArtifactRef,
+    *,
+    cell_key: str | None = None,
+) -> None:
+    if coordinates.assay is None:
+        raise ValueError("Imported-coordinate artifact has no assay")
+    _require_artifact_ref(
+        coordinates,
+        kind="imported_coordinates",
+        scope="assay",
+        assay=coordinates.assay,
+    )
+    status = require_complete_artifact(root, coordinates)
+    if status.operation != "import_dimreduc":
+        raise ValueError(
+            "Imported-coordinate artifact operation must be 'import_dimreduc'"
+        )
+    execution = status.execution_options or {}
+    stored_cell_key = execution.get("cell_key")
+    if not isinstance(stored_cell_key, str) or not stored_cell_key:
+        raise ValueError("Imported-coordinate artifact has no cell selection key")
+    if cell_key is not None and cell_key != stored_cell_key:
+        raise ValueError(
+            f"cell_key {cell_key!r} does not match imported coordinates "
+            f"built for {stored_cell_key!r}"
+        )
+    block_rows = execution.get("block_rows")
+    if (
+        isinstance(block_rows, bool)
+        or not isinstance(block_rows, int | np.integer)
+        or int(block_rows) < 1
+    ):
+        raise ValueError("Imported-coordinate block_rows is invalid")
+    selection = _input_ref(
+        root,
+        coordinates,
+        "cell_selection",
+        require_input_complete=False,
+    )
+    validate_cell_selection_artifact(root, selection, stored_cell_key)
+
+    inputs = status.inputs or {}
+    source_digest = inputs.get("source_digest")
+    if (
+        not isinstance(source_digest, Mapping)
+        or set(source_digest) != {"bytes_hex"}
+        or not isinstance(source_digest.get("bytes_hex"), str)
+        or len(source_digest["bytes_hex"]) != 64
+        or source_digest["bytes_hex"].lower() != source_digest["bytes_hex"]
+    ):
+        raise ValueError("Imported-coordinate source digest is missing")
+    try:
+        bytes.fromhex(source_digest["bytes_hex"])
+    except ValueError as exc:
+        raise ValueError(
+            "Imported-coordinate source digest is not hexadecimal"
+        ) from exc
+
+    payload_fingerprints = inputs.get("payload_fingerprints")
+    if not isinstance(payload_fingerprints, Mapping) or not all(
+        isinstance(name, str)
+        and isinstance(fingerprint, str)
+        and len(fingerprint) == 64
+        for name, fingerprint in payload_fingerprints.items()
+    ):
+        raise ValueError("Imported-coordinate payload fingerprints are malformed")
+
+    group = artifact_group(root, coordinates)
+    if "data" not in group:
+        raise ValueError("Imported-coordinate artifact has no data array")
+    data = as_zarr_array(group["data"], name="data")
+    if data.ndim != 2 or int(data.shape[0]) < 1 or np.dtype(data.dtype).kind != "f":
+        raise ValueError("Imported-coordinate data must be a floating-point matrix")
+
+    parameters = status.parameters or {}
+    dimreduc_key = parameters.get("dimreduc_key")
+    if not isinstance(dimreduc_key, str) or not dimreduc_key:
+        raise ValueError("Imported-coordinate source key is missing")
+    dims = parameters.get("dims")
+    if isinstance(dims, bool) or not isinstance(dims, int | np.integer):
+        raise ValueError("Imported-coordinate dimensions are missing")
+    if int(dims) < 1 or int(data.shape[1]) != int(dims):
+        raise ValueError("Imported-coordinate dimensions do not match data")
+    role = parameters.get("role")
+    if (
+        not isinstance(role, str)
+        or not role
+        or role.lower() != role
+        or role in {"umap", "tsne"}
+    ):
+        raise ValueError("Imported-coordinate role is invalid")
+
+    selection_group = artifact_group(root, selection)
+    mask = as_zarr_array(selection_group["values"], name="values")
+    cell_data = group_at(root, "cellData")
+    row_ids = as_zarr_array(cell_data["ids"], name="ids")
+    selected_fingerprint, selected_count = fingerprint_selected_stored_strings(
+        row_ids,
+        mask,
+    )
+    if int(data.shape[0]) != selected_count:
+        raise ValueError(
+            "Imported-coordinate rows do not match the exact cell selection"
+        )
+    ordered_fingerprint = inputs.get("ordered_cell_ids_fingerprint")
+    if (
+        not isinstance(ordered_fingerprint, str)
+        or ordered_fingerprint != selected_fingerprint
+    ):
+        raise ValueError(
+            "Imported-coordinate cell IDs do not match the selected cell order"
+        )
+
+    optional = {
+        "loadings": parameters.get("loadings_stored"),
+        "feature_ids": parameters.get("feature_ids_stored"),
+        "stdev": parameters.get("stdev_stored"),
+    }
+    for name, stored in optional.items():
+        if not isinstance(stored, bool) or stored != (name in group):
+            raise ValueError(
+                f"Imported-coordinate {name!r} storage flag does not match payload"
+            )
+    if optional["loadings"] != optional["feature_ids"]:
+        raise ValueError(
+            "Imported-coordinate loadings and feature IDs must be stored together"
+        )
+    if "loadings" in group:
+        loadings = as_zarr_array(group["loadings"], name="loadings")
+        feature_ids = as_zarr_array(group["feature_ids"], name="feature_ids")
+        if (
+            loadings.ndim != 2
+            or np.dtype(loadings.dtype).kind != "f"
+            or int(loadings.shape[0]) < 1
+            or int(loadings.shape[1]) != int(dims)
+            or feature_ids.ndim != 1
+            or np.dtype(feature_ids.dtype).kind not in {"O", "S", "U"}
+            or int(feature_ids.shape[0]) != int(loadings.shape[0])
+        ):
+            raise ValueError(
+                "Imported-coordinate loadings and feature IDs are misaligned"
+            )
+    if "stdev" in group:
+        stdev = as_zarr_array(group["stdev"], name="stdev")
+        if (
+            stdev.ndim != 1
+            or np.dtype(stdev.dtype).kind != "f"
+            or tuple(stdev.shape) != (int(dims),)
+        ):
+            raise ValueError("Imported-coordinate stdev does not match dimensions")
+
+    payload_names = ("data", "loadings", "feature_ids", "stdev")
+    stored_payloads = {name for name in payload_names if name in group}
+    if set(payload_fingerprints) != stored_payloads:
+        raise ValueError(
+            "Imported-coordinate payload fingerprints do not match stored payloads"
+        )
+    for name in payload_names:
+        if name not in group:
+            continue
+        expected = payload_fingerprints.get(name)
+        if not isinstance(expected, str):
+            raise ValueError(
+                f"Imported-coordinate payload fingerprint for {name!r} is missing"
+            )
+        if _payload_fingerprint(group, name) != expected:
+            raise ValueError(
+                f"Imported-coordinate payload fingerprint for {name!r} does not match"
+            )
 
 
 def validate_artifact_graph_selection(
@@ -941,16 +1285,34 @@ def validate_neighbors_artifact_selection(
         reduction = _input_ref(root, coordinates, "reduction")
     elif coordinates.kind == "reduction":
         reduction = coordinates
+    elif coordinates.kind == "imported_coordinates":
+        _require_artifact_ref(
+            coordinates,
+            kind="imported_coordinates",
+            scope="assay",
+            assay=assay,
+        )
+        validate_imported_coordinates_artifact(
+            root,
+            coordinates,
+            cell_key=cell_key,
+        )
+        reduction = None
     else:
-        raise ValueError("Neighbor coordinates must be reduction or batch_correction")
+        raise ValueError(
+            "Neighbor coordinates must be reduction, batch_correction, "
+            "or imported_coordinates"
+        )
+    if _input_ref(root, ann_index, "coordinates") != coordinates:
+        raise ValueError("ANN index and neighbors use different coordinates")
+    if reduction is None:
+        return
     _require_artifact_ref(
         reduction,
         kind="reduction",
         scope="assay",
         assay=assay,
     )
-    if _input_ref(root, ann_index, "coordinates") != coordinates:
-        raise ValueError("ANN index and neighbors use different coordinates")
     normalized = _input_ref(root, reduction, "normalized")
     _require_artifact_ref(
         normalized,

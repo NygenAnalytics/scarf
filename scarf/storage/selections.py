@@ -14,10 +14,141 @@ from .artifact_writer import (
 from .artifacts import (
     ArtifactRef,
     ArtifactScope,
+    ValueFingerprintBuilder,
     fingerprint_array,
+    fingerprint_stored_strings,
     fingerprint_strings,
 )
-from .types import as_zarr_array
+from .geometry import array_geometry
+from .partition import row_band
+from .types import as_zarr_array, as_zarr_group
+
+
+def _stored_selection_fingerprint(array: zarr.Array) -> str:
+    if array.ndim != 1 or np.dtype(array.dtype) != np.dtype(bool):
+        raise TypeError("Stored selection columns must be one-dimensional booleans")
+    builder = ValueFingerprintBuilder()
+    builder.begin_array("values", array.shape, array.dtype)
+    block_rows = row_band(array_geometry(array), unit="chunk", fallback=1)
+    for start in range(0, int(array.shape[0]), block_rows):
+        stop = min(start + block_rows, int(array.shape[0]))
+        builder.update_array_block(
+            "values",
+            (start,),
+            np.asarray(array[start:stop], dtype=bool),
+        )
+    builder.end_array("values")
+    return builder.hexdigest()
+
+
+def fingerprint_selected_stored_strings(
+    ids: zarr.Array,
+    selection: zarr.Array,
+) -> tuple[str, int]:
+    """Fingerprint selected row IDs without materializing the selection."""
+    if ids.ndim != 1 or selection.ndim != 1 or ids.shape != selection.shape:
+        raise ValueError("Stored row IDs and selection must be aligned vectors")
+    if np.dtype(selection.dtype) != np.dtype(bool):
+        raise TypeError("Stored selection values must be booleans")
+    source_dtype = np.dtype(ids.dtype)
+    if source_dtype.kind not in {"O", "S", "U"}:
+        raise TypeError("Stored row IDs must contain strings")
+
+    block_rows = min(
+        row_band(array_geometry(ids), unit="chunk", fallback=1),
+        row_band(array_geometry(selection), unit="chunk", fallback=1),
+    )
+    selected_count = 0
+    if source_dtype.hasobject:
+        max_length = 1
+        for start in range(0, int(ids.shape[0]), block_rows):
+            stop = min(start + block_rows, int(ids.shape[0]))
+            mask = np.asarray(selection[start:stop], dtype=bool)
+            values = np.asarray(ids[start:stop])[mask]
+            selected_count += len(values)
+            if values.size:
+                max_length = max(max_length, max(len(str(value)) for value in values))
+        string_dtype = np.dtype(f"U{max_length}")
+    else:
+        for start in range(0, int(ids.shape[0]), block_rows):
+            stop = min(start + block_rows, int(ids.shape[0]))
+            selected_count += int(
+                np.count_nonzero(np.asarray(selection[start:stop], dtype=bool))
+            )
+        string_dtype = np.empty(0, dtype=source_dtype).astype(str).dtype
+
+    builder = ValueFingerprintBuilder()
+    builder.begin_array("values", (selected_count,), string_dtype)
+    selected_start = 0
+    for start in range(0, int(ids.shape[0]), block_rows):
+        stop = min(start + block_rows, int(ids.shape[0]))
+        mask = np.asarray(selection[start:stop], dtype=bool)
+        values = np.asarray(ids[start:stop])[mask].astype(string_dtype)
+        if values.size:
+            builder.update_array_block("values", (selected_start,), values)
+            selected_start += len(values)
+    builder.end_array("values")
+    return builder.hexdigest(), selected_count
+
+
+def resolve_stored_selection_artifact(
+    root: zarr.Group,
+    *,
+    table_path: str,
+    id_column: str,
+    source_column: str,
+    scope: ArtifactScope,
+    kind: str,
+    operation: str,
+    parameters: dict[str, Any],
+    inputs: dict[str, Any],
+    assay: str | None = None,
+    invalidate_cache: bool = False,
+) -> ArtifactRef:
+    """Create a selection artifact by copying a stored column blockwise."""
+    table = as_zarr_group(root[table_path], name=table_path)
+    source = as_zarr_array(table[source_column], name=source_column)
+    ids = as_zarr_array(table[id_column], name=id_column)
+    if source.ndim != 1 or np.dtype(source.dtype) != np.dtype(bool):
+        raise TypeError("Selection source column must be one-dimensional booleans")
+    if ids.ndim != 1 or ids.shape != source.shape:
+        raise ValueError("Selection row IDs must align with source values")
+    selection_inputs = dict(inputs)
+    selection_inputs.update(
+        {
+            "ordered_row_ids_fingerprint": fingerprint_stored_strings(ids),
+            "values_fingerprint": _stored_selection_fingerprint(source),
+        }
+    )
+    planned = plan_artifact(
+        root,
+        scope=scope,
+        assay=assay,
+        kind=kind,
+        operation=operation,
+        parameters=parameters,
+        inputs=selection_inputs,
+        execution_options={"source_column": source_column},
+        invalidate_cache=invalidate_cache,
+        required_arrays=(ArrayRequirement("values", shape=source.shape, dtype=bool),),
+    )
+    if planned.reused:
+        return planned.ref
+    group = start_artifact(root, planned)
+    output = create_metadata_column(
+        group,
+        "values",
+        dtype=bool,
+        shape=int(source.shape[0]),
+        chunkSize=row_band(array_geometry(source), unit="chunk", fallback=1),
+        overwrite=True,
+    )
+    block_rows = row_band(array_geometry(source), unit="chunk", fallback=1)
+    for start in range(0, int(source.shape[0]), block_rows):
+        stop = min(start + block_rows, int(source.shape[0]))
+        output[start:stop] = source[start:stop]
+    finish_artifact(group, planned)
+    return planned.ref
 
 
 def resolve_selection_artifact(

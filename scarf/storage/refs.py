@@ -32,6 +32,7 @@ ARTIFACT_KINDS = frozenset(
         "hto_identity",
         "integrated_graph",
         "intersection_ann_index",
+        "imported_coordinates",
         "mapping_reference",
         "marker_table",
         "membership_strength",
@@ -80,6 +81,8 @@ class ArtifactRef:
                 raise ValueError("assay-scoped artifact references require an assay")
         elif self.assay is not None:
             raise ValueError("datastore-scoped artifact references cannot set assay")
+        if self.kind == "imported_coordinates" and self.scope != "assay":
+            raise ValueError("imported_coordinates artifacts must be assay-scoped")
 
     def __repr__(self) -> str:
         location = f"assay={self.assay!r}" if self.assay is not None else "datastore"

@@ -200,6 +200,7 @@ def test_artifact_kinds_cover_the_reviewed_taxonomy() -> None:
         "mapping_reference",
         "projection",
         "integrated_graph",
+        "imported_coordinates",
         "wnn_coordinates",
     } <= ARTIFACT_KINDS
 

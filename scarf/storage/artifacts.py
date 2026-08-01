@@ -4,7 +4,7 @@ import json
 import math
 import secrets
 import struct
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -291,6 +291,36 @@ def fingerprint_stored_strings(array: zarr.Array) -> str:
 def fingerprint_strings(values: np.ndarray) -> str:
     strings = np.asarray(values).astype(str)
     return fingerprint_array(strings)
+
+
+def fingerprint_string_blocks(
+    blocks: Iterable[tuple[int, np.ndarray]],
+    *,
+    length: int,
+    max_length: int,
+) -> str:
+    """Fingerprint ordered strings without collecting the full column."""
+    if length < 0:
+        raise ValueError("length must be non-negative")
+    if max_length < 1:
+        raise ValueError("max_length must be positive")
+    dtype = np.dtype(f"U{max_length}")
+    builder = ValueFingerprintBuilder()
+    builder.begin_array("values", (length,), dtype)
+    next_row = 0
+    for start, raw_values in blocks:
+        if int(start) != next_row:
+            raise ValueError(
+                f"String blocks must be contiguous; expected {next_row}, "
+                f"received {start}"
+            )
+        values = np.asarray(raw_values).astype(dtype)
+        if values.ndim != 1:
+            raise ValueError("String blocks must be one-dimensional")
+        builder.update_array_block("values", (next_row,), values)
+        next_row += len(values)
+    builder.end_array("values")
+    return builder.hexdigest()
 
 
 def callable_identity(value: Any) -> dict[str, str]:

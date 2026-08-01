@@ -151,6 +151,11 @@ class BaseDataStore:
                 )
             else:
                 self.workspace = workspace
+        import_source = self.zw.attrs.get("scarf:import_source")
+        if import_source is not None and not bool(
+            self.zw.attrs.get("scarf:import_complete", False)
+        ):
+            raise RuntimeError(f"{import_source} import is incomplete")
         self.resources = resources
         self.nthreads = self.resources.workers
         self.memoryBytes = self.resources.memoryBytes

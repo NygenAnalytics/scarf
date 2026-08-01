@@ -1,3 +1,5 @@
+from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -10,6 +12,17 @@ from .layout import (
     normalize_chunks,
 )
 from .profiles import StorageProfile, resolve_storage_profile
+
+_MISSING_COLUMN_PREFIX = "__scarf_missing__"
+
+
+@dataclass(frozen=True, slots=True)
+class MetadataBlock:
+    """A contiguous block for one metadata column."""
+
+    start: int
+    values: np.ndarray
+    missing: np.ndarray | None = None
 
 
 def _checked_shards(
@@ -118,6 +131,81 @@ def create_metadata_column(
         overwrite=overwrite,
         compressors=compressors,
     )
+
+
+def create_streamed_metadata_column(
+    group: zarr.Group,
+    name: str,
+    *,
+    shape: int,
+    dtype: Any,
+    blocks: Iterable[MetadataBlock],
+    overwrite: bool = True,
+    chunkSize: int = 100_000,
+    hasMissing: bool = False,
+    profile: StorageProfile | None = None,
+) -> zarr.Array:
+    """Create and fill a metadata column from bounded contiguous blocks."""
+    if shape < 0:
+        raise ValueError("shape must be non-negative")
+    if chunkSize < 1:
+        raise ValueError("chunkSize must be positive")
+    output = create_metadata_column(
+        group,
+        name,
+        dtype=dtype,
+        overwrite=overwrite,
+        chunkSize=chunkSize,
+        shape=shape,
+        profile=profile,
+    )
+    missing_output: zarr.Array | None = None
+    if hasMissing:
+        missing_name = f"{_MISSING_COLUMN_PREFIX}{name}"
+        missing_output = create_metadata_column(
+            group,
+            missing_name,
+            dtype=bool,
+            overwrite=overwrite,
+            chunkSize=chunkSize,
+            shape=shape,
+            profile=profile,
+        )
+        output.attrs["missing_mask"] = missing_name
+
+    next_row = 0
+    for block in blocks:
+        if block.start != next_row:
+            raise ValueError(
+                f"Metadata blocks must be contiguous; expected {next_row}, "
+                f"received {block.start}"
+            )
+        values = np.asarray(block.values)
+        if values.ndim != 1:
+            raise ValueError("Metadata blocks must be one-dimensional")
+        stop = block.start + len(values)
+        if stop > shape:
+            raise ValueError("Metadata block exceeds declared shape")
+        if values.dtype != np.dtype(dtype):
+            values = values.astype(dtype)
+        output[block.start : stop] = values
+
+        if block.missing is not None:
+            if missing_output is None:
+                raise ValueError("A missing mask was supplied but hasMissing is false")
+            missing = np.asarray(block.missing, dtype=bool)
+            if missing.shape != values.shape:
+                raise ValueError("Missing mask must align with metadata values")
+            missing_output[block.start : stop] = missing
+        elif missing_output is not None:
+            missing_output[block.start : stop] = False
+        next_row = stop
+
+    if next_row != shape:
+        raise ValueError(
+            f"Metadata column is incomplete: wrote {next_row} of {shape} rows"
+        )
+    return output
 
 
 def _normalize_chunks(chunks: tuple[int, ...] | int) -> tuple[int, ...]:

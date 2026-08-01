@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from .export import to_h5ad, to_mtx
     from .h5ad import H5adToZarr
     from .loom import LoomToZarr
+    from .seurat import SeuratImportResult, SeuratToZarr
     from .sparse import SparseToZarr, bed_to_sparse_array as bed_to_sparse_array
     from .subset import SubsetZarr, subset_assay_zarr
 
@@ -33,6 +34,8 @@ __all__ = [
     "MtxToZarr",
     "H5adToZarr",
     "LoomToZarr",
+    "SeuratImportResult",
+    "SeuratToZarr",
     "SparseToZarr",
     "to_h5ad",
     "to_mtx",
@@ -55,6 +58,8 @@ _LAZY_EXPORTS = {
     "to_mtx": "export",
     "H5adToZarr": "h5ad",
     "LoomToZarr": "loom",
+    "SeuratImportResult": "seurat",
+    "SeuratToZarr": "seurat",
     "SparseToZarr": "sparse",
     "bed_to_sparse_array": "sparse",
     "SubsetZarr": "subset",

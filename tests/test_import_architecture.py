@@ -774,6 +774,7 @@ def test_reader_implementations_are_runtime_isolated():
         "h5ad.py",
         "loom.py",
         "mtx.py",
+        "seurat.py",
     }
     assert required_files.issubset(path.name for path in readers_root.glob("*.py"))
     assert _runtime_import_modules(
@@ -788,10 +789,12 @@ def test_reader_implementations_are_runtime_isolated():
         "readers.h5ad",
         "readers.loom",
         "readers.mtx",
+        "readers.seurat",
     }
     reader_edges = {
         "readers.cellranger": {"readers.mtx"},
         "readers.mtx": {"readers.cellranger"},
+        "readers.seurat": {"readers._rds", "readers._seurat"},
     }
     format_names = {name.rsplit(".", 1)[-1] for name in format_modules}
     implementation_paths = [
@@ -858,6 +861,7 @@ def test_writer_implementations_are_runtime_isolated():
         "loom.py",
         "sparse.py",
         "subset.py",
+        "seurat.py",
     }
     assert {path.name for path in writers_root.glob("*.py")} == required_files
     assert (
@@ -876,6 +880,7 @@ def test_writer_implementations_are_runtime_isolated():
         "writers.loom",
         "writers.sparse",
         "writers.subset",
+        "writers.seurat",
     }
     format_names = {name.rsplit(".", 1)[-1] for name in format_modules}
     facade_edges = {
@@ -891,6 +896,7 @@ def test_writer_implementations_are_runtime_isolated():
         "csv.py": {"CSVReader"},
         "h5ad.py": {"H5adReader"},
         "loom.py": {"LoomReader"},
+        "seurat.py": {"SeuratReader"},
     }
 
     for path in writers_root.glob("*.py"):

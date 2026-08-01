@@ -108,6 +108,8 @@ from scarf.readers import (
     CrReader,
     H5adReader,
     LoomReader,
+    SeuratReader,
+    inspect_seurat,
 )
 from scarf.trajectory.feature_dynamics import knn_clustering
 from scarf.writers import (
@@ -115,6 +117,8 @@ from scarf.writers import (
     CrToZarr,
     H5adToZarr,
     LoomToZarr,
+    SeuratImportResult,
+    SeuratToZarr,
     SparseToZarr,
     SubsetZarr,
     create_zarr_count_assay,
@@ -164,6 +168,7 @@ for reader_class in (
     CrReader,
     H5adReader,
     LoomReader,
+    SeuratReader,
     CSVReader,
 ):
     assert reader_class.__module__ == "scarf.readers"
@@ -171,11 +176,14 @@ for writer_class in (
     CrToZarr,
     H5adToZarr,
     LoomToZarr,
+    SeuratToZarr,
     SparseToZarr,
     SubsetZarr,
     CSVtoZarr,
 ):
     assert writer_class.__module__ == "scarf.writers"
+assert SeuratImportResult.__module__ == "scarf.writers"
+assert inspect_seurat.__module__ == "scarf.readers"
 for writer_function in (
     create_zarr_dataset,
     create_zarr_obj_array,

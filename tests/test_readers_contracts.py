@@ -1,8 +1,10 @@
 import gzip
 import io
 import inspect
+import pickle
 import subprocess
 import sys
+from typing import get_type_hints
 
 import h5py
 import numpy as np
@@ -20,6 +22,8 @@ from scarf.readers import (
     LoomReader,
     MtxCandidate,
     MtxReader,
+    SeuratInspectResult,
+    SeuratReader,
 )
 from tests.signature_contracts import signature_digest
 
@@ -85,6 +89,13 @@ _PUBLIC_CLASS_METHODS = {
         "consume",
         "close",
     ),
+    SeuratReader: (
+        "__init__",
+        "close",
+        "get_assay",
+        "get_reduction",
+        "inspect",
+    ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     CrReader: "cfeac7ccf7bc316f1db1d9e177d6556b37a0169b3cbb2800a92e561b75f4fc4a",
@@ -94,9 +105,10 @@ _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     LoomReader: "85c3ff965cb94a4fa201915b9d43890081e1f26e931327fcda6531bee4c3782a",
     CSVReader: "8aa6c17c876afb62765584fc7ff64d2838c66ef53095da10d7198ca60ab83851",
     MtxReader: "06376a32ff98ff0153ae1cc35f327509c88784ce027cb045bf9833b45dbccf2a",
+    SeuratReader: "f90ad28ab745692321245b3fd48e66273cbbe52795a9711f0cf17fb171820d3f",
 }
 _MODULE_SIGNATURE_DIGEST = (
-    "af8954ed185ca2dd9b7eb8f9c606f8480cbe0da2794f42125b434ef3af61ffbc"
+    "39b02f54928358aa8d3367a4f17f4a9b35c49bc8739e2dbb2f37038b6251f288"
 )
 
 
@@ -135,6 +147,9 @@ def test_readers_facade_surface_is_stable():
         "MtxCandidate",
         "MtxReader",
         "inspect_mtx",
+        "SeuratInspectResult",
+        "SeuratReader",
+        "inspect_seurat",
         "LoomReader",
         "CSVReader",
     ]
@@ -148,9 +163,12 @@ def test_readers_facade_surface_is_stable():
         "LoomReader",
         "MtxCandidate",
         "MtxReader",
+        "SeuratInspectResult",
+        "SeuratReader",
         "get_file_handle",
         "inspect_h5ad",
         "inspect_mtx",
+        "inspect_seurat",
         "read_file",
     }
     assert expected.issubset(vars(readers_module))
@@ -168,6 +186,7 @@ def test_readers_facade_loads_format_modules_lazily():
                 "assert 'scarf.readers.h5ad' not in sys.modules; "
                 "assert 'scarf.readers.loom' not in sys.modules; "
                 "assert 'scarf.readers.mtx' not in sys.modules; "
+                "assert 'scarf.readers.seurat' not in sys.modules; "
                 "assert 'h5py' not in sys.modules; "
                 "assert 'pandas' not in sys.modules; "
                 "assert 'scipy' not in sys.modules; "
@@ -179,6 +198,7 @@ def test_readers_facade_loads_format_modules_lazily():
                 "assert 'scarf.readers.h5ad' not in sys.modules; "
                 "assert 'scarf.readers.loom' not in sys.modules; "
                 "assert 'scarf.readers.mtx' not in sys.modules; "
+                "assert 'scarf.readers.seurat' not in sys.modules; "
                 "assert 'pandas' in sys.modules; "
                 "assert 'h5py' not in sys.modules; "
                 "assert 'scipy' not in sys.modules"
@@ -209,6 +229,37 @@ def test_matrix_market_exports_load_together_lazily():
     )
 
 
+def test_seurat_exports_load_together_without_loading_the_writer():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import scarf.readers as readers; "
+                "assert 'scarf.readers.seurat' not in sys.modules; "
+                "reader = readers.SeuratReader; "
+                "assert reader.__module__ == 'scarf.readers'; "
+                "assert readers.SeuratInspectResult.__module__ == 'scarf.readers'; "
+                "assert readers.inspect_seurat.__module__ == 'scarf.readers'; "
+                "assert 'scarf.readers.seurat' in sys.modules; "
+                "assert 'scarf.writers.seurat' not in sys.modules"
+            ),
+        ],
+        check=True,
+    )
+
+
+def test_seurat_reader_facade_objects_resolve_annotations_and_pickle():
+    for name in ("__init__", "get_assay", "get_reduction", "inspect"):
+        assert get_type_hints(getattr(SeuratReader, name))
+    for value in (
+        SeuratReader,
+        SeuratInspectResult,
+        readers_module.inspect_seurat,
+    ):
+        assert pickle.loads(pickle.dumps(value)) is value
+
+
 def test_reader_class_and_method_signatures_are_stable():
     for cls, names in _PUBLIC_CLASS_METHODS.items():
         methods = {name: getattr(cls, name) for name in names}
@@ -218,7 +269,13 @@ def test_reader_class_and_method_signatures_are_stable():
 def test_reader_module_function_signatures_are_stable():
     methods = {
         name: getattr(readers_module, name)
-        for name in ("get_file_handle", "inspect_h5ad", "inspect_mtx", "read_file")
+        for name in (
+            "get_file_handle",
+            "inspect_h5ad",
+            "inspect_mtx",
+            "inspect_seurat",
+            "read_file",
+        )
     }
     assert signature_digest(methods) == _MODULE_SIGNATURE_DIGEST
 
@@ -238,7 +295,14 @@ def test_reader_public_metadata_remains_on_facade():
 
     assert H5adInspectResult.__module__ == "scarf.readers"
     assert MtxCandidate.__module__ == "scarf.readers"
-    for name in ("get_file_handle", "inspect_h5ad", "inspect_mtx", "read_file"):
+    assert SeuratInspectResult.__module__ == "scarf.readers"
+    for name in (
+        "get_file_handle",
+        "inspect_h5ad",
+        "inspect_mtx",
+        "inspect_seurat",
+        "read_file",
+    ):
         assert getattr(readers_module, name).__module__ == "scarf.readers"
 
 
