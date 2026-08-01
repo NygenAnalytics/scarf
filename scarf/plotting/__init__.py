@@ -63,6 +63,9 @@ if TYPE_CHECKING:
     from .summary import dotplot as dotplot
     from .summary import matrixplot as matrixplot
     from .unified import unified_embedding as unified_embedding
+    from .scarf_expression_plots import boxplot as boxplot
+    from .scarf_expression_plots import violinplot as violinplot
+    from .scarf_expression_plots import stacked_violin as stacked_violin
 
 __all__ = [
     "CategoricalScale",
@@ -112,6 +115,9 @@ __all__ = [
     "run_recipe",
     "theme_context",
     "unified_embedding",
+    "boxplot",
+    "violinplot",
+    "stacked_violin",
 ]
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
@@ -162,6 +168,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "run_recipe": (".recipes", "run_recipe"),
     "theme_context": ("._style", "theme_context"),
     "unified_embedding": (".unified", "unified_embedding"),
+    "boxplot": (".scarf_expression_plots", "boxplot"),
+    "violinplot": (".scarf_expression_plots", "violinplot"),
+    "stacked_violin": (".scarf_expression_plots", "stacked_violin"),
 }
 
 for _export_name in _LAZY_EXPORTS:
