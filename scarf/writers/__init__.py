@@ -13,7 +13,7 @@ if TYPE_CHECKING:
         load_count_store as load_count_store,
         load_zarr as load_zarr,
     )
-    from .cellranger import CrToZarr
+    from .cellranger import CrToZarr, MtxToZarr
     from .csv import CSVtoZarr
     from .export import to_h5ad, to_mtx
     from .h5ad import H5adToZarr
@@ -30,6 +30,7 @@ __all__ = [
     "write_renorm_subset_to_zarr",
     "SubsetZarr",
     "CrToZarr",
+    "MtxToZarr",
     "H5adToZarr",
     "LoomToZarr",
     "SparseToZarr",
@@ -48,6 +49,7 @@ _LAZY_EXPORTS = {
     "dask_to_zarr": "_materialize",
     "write_renorm_subset_to_zarr": "_materialize",
     "CrToZarr": "cellranger",
+    "MtxToZarr": "cellranger",
     "CSVtoZarr": "csv",
     "to_h5ad": "export",
     "to_mtx": "export",

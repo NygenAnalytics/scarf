@@ -179,11 +179,12 @@ class H5adToZarr:
                     profile=self.profile,
                 )
 
-    def dump(self, batch_size: int = 1000) -> None:
+    def dump(self, batch_size: int | None = None) -> None:
         """Write h5ad matrix data into the Zarr counts array.
 
         Args:
-            batch_size: Number of cells read from the source per batch.
+            batch_size: Number of source cells per batch. By default, a
+                        destination-aligned value is selected within the memory budget.
 
         Raises:
             AssertionError: If written cell count does not match expected nCells.
@@ -191,15 +192,14 @@ class H5adToZarr:
         Returns:
             None
         """
-        from ..storage.budget import admitted_worker_count
         from ..storage.sharding import (
             SparseShardBuffer,
-            sparse_producer_peak_bytes,
+            resolve_sparse_import_batch,
             write_sparse_bands,
         )
         from ..storage.schema import load_count_array
 
-        if batch_size <= 0:
+        if batch_size is not None and batch_size <= 0:
             raise ValueError("batch_size must be positive")
 
         destinations = {
@@ -214,53 +214,12 @@ class H5adToZarr:
             f"Writing counts with up to {self.resources.workers} row-band writer(s)"
         )
         started = time.perf_counter()
-        batch_rows = min(batch_size, self.h5ad.nCells)
         resident_source_bytes = self.h5ad.materialized_csr_bytes()
         if self.assayFeatures is None:
             feature_index_bytes = 0
-            projection_bytes = 0
-            projection_scratch_bytes = 0
         else:
             feature_index_bytes = sum(
                 assay.featureIndexes.nbytes for assay in self.assayFeatures.values()
-            )
-            projection_bytes = 2 * self.h5ad.nFeatures * np.dtype(np.int64).itemsize
-            projection_scratch_bytes = (
-                max(assay.featureIndexes.size for assay in self.assayFeatures.values())
-                * np.dtype(np.int64).itemsize
-            )
-        admitted_worker_count(
-            self.resources,
-            taskBytes=max(
-                1,
-                self.h5ad.max_batch_nnz_peak_bytes(),
-                projection_scratch_bytes,
-            ),
-            residentBytes=(
-                resident_source_bytes + feature_index_bytes + projection_bytes
-            ),
-            requested=1,
-        )
-        source_nnz = self.h5ad.max_batch_nnz(batch_size)
-        producer_rows = batch_size + max(
-            buffer.shardRows for buffer in buffers.values()
-        )
-        buffered_nnz = self.h5ad.max_batch_nnz(producer_rows)
-        value_bytes = max(
-            np.dtype(self.h5ad.sourceMatrixDtype).itemsize,
-            np.dtype(self.h5ad.matrixDtype).itemsize,
-            np.dtype(self.storageDtype).itemsize,
-        )
-        producer_reserve_bytes = sparse_producer_peak_bytes(
-            buffered_nnz,
-            source_nnz,
-            value_bytes,
-        ) + self.h5ad.producer_batch_staging_bytes(batch_size)
-        if self.h5ad.matrixOrientation == "dense":
-            producer_reserve_bytes += (
-                batch_rows
-                * self.h5ad.nFeatures
-                * np.dtype(self.h5ad.sourceMatrixDtype).itemsize
             )
         projection = (
             None if self.assayFeatures is None else self._assay_feature_projection()
@@ -268,16 +227,66 @@ class H5adToZarr:
         if projection is not None:
             resident_source_bytes += sum(array.nbytes for array in projection)
         resident_source_bytes += feature_index_bytes
+        prepare = getattr(self.h5ad, "_prepare_sparse_import", None)
+        if callable(prepare):
+            prepare()
+        reader_resident = getattr(
+            self.h5ad,
+            "_sparse_import_resident_bytes",
+            None,
+        )
+        if callable(reader_resident):
+            resident_source_bytes += max(0, int(reader_resident()))
+        source_itemsize = np.dtype(self.h5ad.sourceMatrixDtype).itemsize
+        projection_value_bytes = max(
+            source_itemsize,
+            *(destination.dtype.itemsize for destination in destinations.values()),
+        )
+
+        def extra_producer_bytes(rows: int) -> int:
+            source_rows = min(rows, self.h5ad.nCells)
+            extra = (
+                source_rows * self.h5ad.nFeatures * source_itemsize
+                if self.h5ad.matrixOrientation == "dense"
+                else 0
+            )
+            if self.assayFeatures is not None:
+                source_values = max(0, int(self.h5ad.max_batch_nnz(rows)))
+                extra += source_values * (
+                    projection_value_bytes
+                    + 4 * np.dtype(np.int64).itemsize
+                    + np.dtype(np.bool_).itemsize
+                )
+            return extra
+
+        plan = resolve_sparse_import_batch(
+            tuple(destinations.values()),
+            nRows=self.h5ad.nCells,
+            resources=self.resources,
+            maxWindowNnz=self.h5ad.max_batch_nnz,
+            sourceDtype=self.h5ad.sourceMatrixDtype,
+            batchRows=batch_size,
+            residentBytes=resident_source_bytes,
+            producerStagingBytes=self.h5ad.producer_batch_staging_bytes,
+            extraProducerBytes=extra_producer_bytes,
+        )
+        self._lastImportPlan = plan
+        resolved_batch_rows = plan.batchRows
+        logger.debug(
+            f"Resolved H5AD source batch rows={resolved_batch_rows} "
+            f"write_tasks={plan.writeTasks}"
+        )
         write_sparse_bands(
             self._count_shard_tasks(
-                batch_size,
+                resolved_batch_rows,
                 buffers,
                 destinations,
                 projection,
             ),
             resources=self.resources,
             residentBytes=resident_source_bytes,
-            producerReserveBytes=producer_reserve_bytes,
+            producerReserveBytes=plan.producerReserveBytes,
+            total=plan.writeTasks,
         )
         counts_seconds = time.perf_counter() - started
 

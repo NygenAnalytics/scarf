@@ -2,7 +2,7 @@ import asyncio
 import contextvars
 import threading
 from collections import deque
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,6 +23,7 @@ from .layout import (
     iter_shard_row_slices,
 )
 from .parallel import _close_iterator, stream_shards
+from .partition import affordable_width
 from .profiles import StorageProfile, resolve_storage_profile
 from ..utils.arrays import canonicalize_sparse, checked_sparse_cast
 
@@ -87,6 +88,13 @@ class SparseWriteBand:
     producerBytes: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class SparseImportPlan:
+    batchRows: int
+    producerReserveBytes: int
+    writeTasks: int
+
+
 def sparse_matrix_bytes(*matrices: Any) -> int:
     """Return unique array bytes owned by SciPy sparse matrices."""
     arrays = (
@@ -120,6 +128,163 @@ def sparse_producer_peak_bytes(
         4 * canonical_value_bytes + 6 * index_bytes + 4
     )
     return buffered_bytes + source_bytes + source_indexes + canonicalization_bytes
+
+
+def sparse_write_task_count(
+    destinations: Sequence[zarr.Array],
+    nRows: int,
+) -> int:
+    """Return the exact number of destination row bands an import will write."""
+    rows = max(0, int(nRows))
+    if rows == 0:
+        return 0
+    return int(
+        sum(
+            (rows + array_shard_rows(destination) - 1) // array_shard_rows(destination)
+            for destination in destinations
+        )
+    )
+
+
+def resolve_sparse_import_batch(
+    destinations: Sequence[zarr.Array],
+    *,
+    nRows: int,
+    resources: ResourceBudget,
+    maxWindowNnz: Callable[[int], int],
+    sourceDtype: Any,
+    batchRows: int | None = None,
+    residentBytes: int = 0,
+    producerStagingBytes: Callable[[int], int] | None = None,
+    extraProducerBytes: Callable[[int], int] | None = None,
+) -> SparseImportPlan:
+    """Resolve source rows while admitting one complete destination write band."""
+    destination_list = tuple(destinations)
+    if not destination_list:
+        raise ValueError("At least one sparse import destination is required")
+    rows = int(nRows)
+    if rows < 0:
+        raise ValueError("nRows cannot be negative")
+    for destination in destination_list:
+        if int(destination.shape[0]) != rows:
+            raise ValueError(
+                "Sparse import destinations must match the source row count"
+            )
+    if batchRows is not None and int(batchRows) <= 0:
+        raise ValueError("batch_size must be positive")
+
+    source_dtype = np.dtype(sourceDtype)
+    value_itemsize = max(
+        source_dtype.itemsize,
+        *(np.dtype(destination.dtype).itemsize for destination in destination_list),
+    )
+    staging_bytes = producerStagingBytes or (lambda _: 0)
+    extra_bytes = extraProducerBytes or (lambda _: 0)
+    maximum_shard_rows = max(
+        array_shard_rows(destination) for destination in destination_list
+    )
+    write_tasks = sparse_write_task_count(destination_list, rows)
+
+    band_requirements: list[tuple[zarr.Array, int, int]] = []
+    if rows:
+        for destination in destination_list:
+            band_rows = min(rows, array_shard_rows(destination))
+            band_values = max(0, int(maxWindowNnz(band_rows)))
+            band_sparse_bytes = band_values * (
+                source_dtype.itemsize + 2 * np.dtype(np.int64).itemsize
+            )
+            band_requirements.append((destination, band_values, band_sparse_bytes))
+
+    def reserve(width: int) -> int:
+        source_values = max(0, int(maxWindowNnz(width)))
+        buffered_values = max(
+            0,
+            int(maxWindowNnz(width + maximum_shard_rows)),
+        )
+        return int(
+            sparse_producer_peak_bytes(
+                buffered_values,
+                source_values,
+                value_itemsize,
+            )
+            + max(0, int(staging_bytes(width)))
+            + max(0, int(extra_bytes(width)))
+        )
+
+    def admit(width: int) -> int:
+        producer_reserve = reserve(width)
+        for destination, band_values, band_sparse_bytes in band_requirements:
+            dense_bytes, inner_bytes, n_chunks = _band_geometry(destination)
+            destination_dtype = np.dtype(destination.dtype)
+            conversion_bytes = (
+                band_values * destination_dtype.itemsize
+                if source_dtype != destination_dtype
+                else 0
+            )
+            if source_dtype.kind == "f" and destination_dtype.kind in "biu":
+                conversion_bytes += band_values * (source_dtype.itemsize + 1)
+            admitted_worker_split(
+                resources,
+                nTasks=1,
+                residentBytes=(
+                    max(0, int(residentBytes)) + producer_reserve + band_sparse_bytes
+                ),
+                taskBytes=lambda inner: _row_band_task_peak(
+                    sourceBytes=conversion_bytes,
+                    denseBytes=dense_bytes,
+                    innerChunkBytes=inner_bytes,
+                    nChunks=n_chunks,
+                    innerConcurrency=inner,
+                ),
+                requested=1,
+            )
+        if not band_requirements:
+            admitted_worker_split(
+                resources,
+                nTasks=1,
+                residentBytes=max(0, int(residentBytes)) + producer_reserve,
+                taskBytes=lambda _: 1,
+                requested=1,
+            )
+        return producer_reserve
+
+    if batchRows is not None:
+        resolved_rows = int(batchRows)
+        producer_reserve = admit(resolved_rows)
+    elif rows == 0:
+        resolved_rows = 1
+        producer_reserve = admit(resolved_rows)
+    else:
+        preferred_rows = min(
+            rows,
+            min(array_shard_rows(destination) for destination in destination_list),
+        )
+
+        def fits(width: int) -> bool:
+            try:
+                admit(width)
+            except MemoryError:
+                return False
+            return True
+
+        resolved_rows = affordable_width(fits, preferred_rows)
+        if resolved_rows < 1:
+            try:
+                admit(1)
+            except MemoryError as exc:
+                raise MemoryError(
+                    "Automatic sparse import cannot fit one source row and one "
+                    "complete destination row band. Increase mem_budget or use "
+                    "smaller target chunk and shard byte limits."
+                ) from exc
+            raise RuntimeError("Sparse import admission failed unexpectedly")
+        producer_reserve = reserve(resolved_rows)
+
+    return SparseImportPlan(
+        batchRows=resolved_rows,
+        producerReserveBytes=producer_reserve,
+        writeTasks=write_tasks,
+    )
 
 
 class SparseShardBuffer:

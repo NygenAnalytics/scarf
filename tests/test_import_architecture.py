@@ -773,6 +773,7 @@ def test_reader_implementations_are_runtime_isolated():
         "csv.py",
         "h5ad.py",
         "loom.py",
+        "mtx.py",
     }
     assert required_files.issubset(path.name for path in readers_root.glob("*.py"))
     assert _runtime_import_modules(
@@ -786,6 +787,11 @@ def test_reader_implementations_are_runtime_isolated():
         "readers.csv",
         "readers.h5ad",
         "readers.loom",
+        "readers.mtx",
+    }
+    reader_edges = {
+        "readers.cellranger": {"readers.mtx"},
+        "readers.mtx": {"readers.cellranger"},
     }
     format_names = {name.rsplit(".", 1)[-1] for name in format_modules}
     implementation_paths = [
@@ -818,10 +824,11 @@ def test_reader_implementations_are_runtime_isolated():
                 if module_name.startswith("readers")
             } <= {"readers.get_file_handle"}
             continue
-        sibling_modules = format_modules - {current_module}
+        allowed_edges = reader_edges.get(current_module, set())
+        sibling_modules = format_modules - {current_module} - allowed_edges
         assert runtime_imports.isdisjoint(sibling_modules)
 
-        allowed_reader_imports: set[str] = set()
+        allowed_reader_imports: set[str] = set(allowed_edges)
         if path.name == "cellranger.py":
             allowed_reader_imports.update({"readers._assay_names", "readers.read_file"})
         elif path.name == "h5ad.py":

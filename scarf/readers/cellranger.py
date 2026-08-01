@@ -1,7 +1,6 @@
 import math
-import os
 from abc import ABC, abstractmethod
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Iterator, Sequence
 from typing import Any
 
 import h5py
@@ -85,6 +84,16 @@ class CrReader(ABC):
         """Return source-reader bytes retained while a matrix batch is yielded."""
         valid_idx = getattr(self, "validBarcodeIdx", None)
         return int(valid_idx.nbytes) if isinstance(valid_idx, np.ndarray) else 0
+
+    def _prepare_sparse_import(self) -> None:
+        """Prepare optional reader-owned state used by import planning."""
+
+    def _release_sparse_import(self) -> None:
+        """Release optional reader-owned state created for one import."""
+
+    def _sparse_import_resident_bytes(self) -> int:
+        """Return reader arrays retained for the duration of an import."""
+        return 0
 
     def _subset_by_assay(self, v: list[Any], assay: str | None) -> list[Any]:
         if assay is None:
@@ -254,6 +263,14 @@ class CrReader(ABC):
             return []
         return vals
 
+    def get_cell_columns(self) -> Iterator[tuple[str, np.ndarray]]:
+        """Yield optional cell metadata columns supplied by the reader."""
+        yield from ()
+
+    def get_feature_columns(self) -> Iterator[tuple[str, np.ndarray]]:
+        """Yield source feature types and optional feature metadata."""
+        yield "feature_type", np.asarray(self.feature_types(), dtype=object)
+
 
 class CrH5Reader(CrReader):
     # noinspection PyUnresolvedReferences
@@ -283,6 +300,8 @@ class CrH5Reader(CrReader):
         self.h5obj: h5py.File = h5py.File(h5_fn, mode="r")
         self.grp: h5py.Group
         self.validBarcodeIdx: np.ndarray | None = None
+        self._indptrCache: np.ndarray | None = None
+        self._cumulativeRowNnz: np.ndarray | None = None
         super().__init__(self._handle_version())
         if is_filtered:
             self.validBarcodeIdx = np.array(range(self.nCells))
@@ -314,7 +333,7 @@ class CrH5Reader(CrReader):
     ) -> np.ndarray:
         valid_idx = []
         test_counter = 0
-        indptr = self.grp["indptr"][:]
+        indptr = self._source_indptr()
         for s in iter_progress(
             range(0, len(indptr) - 1, batch_size),
             desc="Filtering out background barcodes",
@@ -331,6 +350,22 @@ class CrH5Reader(CrReader):
         assert test_counter == self.grp["data"].shape[0]
         assert len(indptr) == (s + len(idx))
         return np.where(np.hstack(valid_idx))[0]
+
+    def _source_indptr(self) -> np.ndarray:
+        if self._indptrCache is None:
+            self._indptrCache = np.asarray(self.grp["indptr"][:])
+        return self._indptrCache
+
+    def _selected_cumulative_nnz(self) -> np.ndarray:
+        if self._cumulativeRowNnz is None:
+            valid_idx = self.validBarcodeIdx
+            assert valid_idx is not None
+            row_nnz = np.diff(self._source_indptr())[valid_idx]
+            cumulative = np.empty(row_nnz.size + 1, dtype=np.int64)
+            cumulative[0] = 0
+            np.cumsum(row_nnz, dtype=np.int64, out=cumulative[1:])
+            self._cumulativeRowNnz = cumulative
+        return self._cumulativeRowNnz
 
     @property
     def matrix_dtype(self) -> np.dtype[Any]:
@@ -350,6 +385,32 @@ class CrH5Reader(CrReader):
             vals = vals[self.validBarcodeIdx]
         return list(vals)
 
+    def get_feature_columns(self) -> Iterator[tuple[str, np.ndarray]]:
+        yield from super().get_feature_columns()
+        if "features" not in self.grp:
+            return
+        features = self.grp["features"]
+        if not isinstance(features, h5py.Group) or "_all_tag_keys" not in features:
+            return
+        raw_keys = np.asarray(features["_all_tag_keys"][:]).reshape(-1)
+        for raw_key in raw_keys:
+            key = (
+                raw_key.decode("utf-8")
+                if isinstance(raw_key, bytes | np.bytes_)
+                else str(raw_key)
+            )
+            if key in {"id", "name", "feature_type"} or key not in features:
+                continue
+            values = features[key]
+            if not isinstance(values, h5py.Dataset):
+                continue
+            if values.ndim != 1 or int(values.shape[0]) != self.nFeatures:
+                raise ValueError(
+                    f"10x feature tag {key!r} has shape {values.shape}; "
+                    f"expected ({self.nFeatures},)"
+                )
+            yield key, np.asarray(values[:])
+
     # noinspection DuplicatedCode
     def consume(
         self, batch_size: int, lines_in_mem: int | None = None
@@ -362,7 +423,7 @@ class CrH5Reader(CrReader):
         """
         valid_idx = self.validBarcodeIdx
         assert valid_idx is not None
-        indptr = self.grp["indptr"][:]
+        indptr = self._source_indptr()
         for s in range(0, len(valid_idx), batch_size):
             v_pos = valid_idx[s : s + batch_size]
             starts = indptr[v_pos]
@@ -400,11 +461,7 @@ class CrH5Reader(CrReader):
         width = min(window_rows, len(valid_idx))
         if width == 0:
             return 0
-        indptr = np.asarray(self.grp["indptr"])
-        row_nnz = np.diff(indptr)[valid_idx]
-        cumulative = np.empty(row_nnz.size + 1, dtype=np.int64)
-        cumulative[0] = 0
-        np.cumsum(row_nnz, dtype=np.int64, out=cumulative[1:])
+        cumulative = self._selected_cumulative_nnz()
         return int(np.max(cumulative[width:] - cumulative[:-width]))
 
     def producer_staging_bytes(
@@ -412,12 +469,25 @@ class CrH5Reader(CrReader):
         batch_size: int,
         lines_in_mem: int,
     ) -> int:
-        """Count selected-cell indexes and the CSR row pointer loaded by consume."""
-        indptr = self.grp["indptr"]
-        indptr_bytes = int(indptr.size * indptr.dtype.itemsize)
-        planning_arrays = 3 * (self.nCells + 1) * np.dtype(np.int64).itemsize
-        return super().producer_staging_bytes(batch_size, lines_in_mem) + int(
-            2 * indptr_bytes + planning_arrays
+        """Count row-pointer arrays created while one H5 batch is produced."""
+        rows = min(max(1, int(batch_size)), self.nCells)
+        if rows == 0:
+            return 0
+        itemsize = self._source_indptr().dtype.itemsize
+        return int(rows * (3 * itemsize + np.dtype(np.int64).itemsize))
+
+    def _prepare_sparse_import(self) -> None:
+        self._source_indptr()
+        self._selected_cumulative_nnz()
+
+    def _sparse_import_resident_bytes(self) -> int:
+        arrays = (
+            self.validBarcodeIdx,
+            self._indptrCache,
+            self._cumulativeRowNnz,
+        )
+        return int(
+            sum(array.nbytes for array in arrays if isinstance(array, np.ndarray))
         )
 
     def close(self) -> None:
@@ -450,110 +520,73 @@ class CrDirReader(CrReader):
         is_filtered: bool = True,
         filtering_cutoff: int = 500,
     ) -> None:
+        from .mtx import _MtxEngine, inspect_mtx
+
         self.loc: str = loc.rstrip("/") + "/"
-        self.matFn: str
         self.sep = mtx_separator
         self.indexOffset = index_offset
-        self.validBarcodeIdx: np.ndarray | None = None
-        super().__init__(self._handle_version())
-        self.matrixEntryCount = (
-            0 if self.nCells == 0 else int(self.read_header().iloc[0]["nCounts"])
-        )
-        if is_filtered:
-            self.validBarcodeIdx = np.array(range(self.nCells))
-            self.validBarcodeIdx -= self.indexOffset
-        else:
-            self.validBarcodeIdx = self._get_valid_barcodes(filtering_cutoff)
-        self.nCells = len(self.validBarcodeIdx)
-
-    def _handle_version(self) -> dict[str, tuple[str, int] | None]:
-        show_error = False
-        mat_fn: str | None = None
-        feat_fn: str | None = None
-        cell_fn: str | None = None
-        if os.path.isfile(self.loc + "matrix.mtx.gz"):
-            mat_fn = self.loc + "matrix.mtx.gz"
-        elif os.path.isfile(self.loc + "matrix.mtx"):
-            mat_fn = self.loc + "matrix.mtx"
-        else:
-            show_error = True
-        if os.path.isfile(self.loc + "features.tsv.gz"):
-            feat_fn = "features.tsv.gz"
-        elif os.path.isfile(self.loc + "features.tsv"):
-            feat_fn = "features.tsv"
-        elif os.path.isfile(self.loc + "genes.tsv.gz"):
-            feat_fn = "genes.tsv.gz"
-        elif os.path.isfile(self.loc + "genes.tsv"):
-            feat_fn = "genes.tsv"
-        elif os.path.isfile(self.loc + "peaks.bed"):
-            feat_fn = "peaks.bed"
-        elif os.path.isfile(self.loc + "peaks.bed.gz"):
-            feat_fn = "peaks.bed.gz"
-        else:
-            feat_fn = None
-            show_error = True
-        if os.path.isfile(self.loc + "barcodes.tsv.gz"):
-            cell_fn = "barcodes.tsv.gz"
-        elif os.path.isfile(self.loc + "barcodes.tsv"):
-            cell_fn = "barcodes.tsv"
-        else:
-            cell_fn = None
-            show_error = True
-        if show_error or mat_fn is None or feat_fn is None or cell_fn is None:
-            raise OSError(
-                "ERROR: Couldn't find either of these expected combinations of files:\n"
-                "\t- matrix.mtx, barcodes.tsv and genes.tsv\n"
-                "\t- matrix.mtx.gz, barcodes.tsv.gz and features.tsv.gz\n"
-                "Please make sure that you have not compressed or uncompressed the Cellranger output files "
-                "manually"
+        candidates = inspect_mtx(loc)
+        if len(candidates) != 1:
+            raise ValueError(
+                "CrDirReader requires one complete Matrix Market triplet; "
+                "use inspect_mtx and MtxReader to select among candidates"
             )
-        self.matFn = mat_fn
+        self._engine = _MtxEngine(
+            candidates[0],
+            cell_id_key=None,
+            separator=mtx_separator,
+            index_offset=index_offset,
+            is_filtered=is_filtered,
+            filtering_cutoff=filtering_cutoff,
+            temp_dir=None,
+            dtype=np.uint32,
+        )
+        self.matFn = self._engine.matrixPath
+        self.validBarcodeIdx = self._engine.validCellIndexes - self.indexOffset
+        self.matrixEntryCount = self._engine.matrixEntryCount
+        self.coordinateOrder = self._engine.coordinateOrder
+        CrReader.__init__(
+            self,
+            {
+                "feature_ids": "feature_ids",
+                "feature_names": "feature_names",
+                "feature_types": "feature_types",
+                "cell_names": "cell_names",
+            },
+        )
+        self.nCells = self._engine.nCells
+
+    def _handle_version(self) -> dict[str, str]:
         return {
-            "feature_ids": (feat_fn, 0),
-            "feature_names": (feat_fn, 1),
-            "feature_types": (feat_fn, 2),
-            "cell_names": (cell_fn, 0),
+            "feature_ids": "feature_ids",
+            "feature_names": "feature_names",
+            "feature_types": "feature_types",
+            "cell_names": "cell_names",
         }
 
-    def _read_dataset(self, key: str | None = None) -> list[str] | None:
+    def _read_dataset(self, key: str | None = None) -> list[str]:
         if key is None:
             raise ValueError("Dataset key must be provided")
-        from . import read_file
-
-        grp_entry = self.grpNames[key]
-        try:
-            vals = [
-                x.split("\t")[grp_entry[1]] for x in read_file(self.loc + grp_entry[0])
-            ]
-        except IndexError:
-            logger.warning(
-                f"Could not extract {key} from {grp_entry[0]} column {grp_entry[1]}"
-            )
-            vals = None
-        return vals
+        values = {
+            "feature_ids": self._engine.feature_ids,
+            "feature_names": self._engine.feature_names,
+            "feature_types": self._engine.feature_types,
+            "cell_names": self._engine.cell_names,
+        }
+        if key not in values:
+            raise KeyError(key)
+        return values[key]()
 
     def read_header(self) -> pd.DataFrame:
-        header = pd.read_csv(
-            self.matFn,
-            comment="%",
-            sep=self.sep,
-            header=None,
-            nrows=1,
-            names=["nFeatures", "nCells", "nCounts"],
+        return pd.DataFrame(
+            [
+                {
+                    "nFeatures": self._engine.nFeatures,
+                    "nCells": self._engine.rawCellCount,
+                    "nCounts": self._engine.matrixEntryCount,
+                }
+            ]
         )
-        if header["nCells"][0] == 0 and self.nCells > 0:
-            raise ValueError(
-                "ERROR: Barcode count in MTX header is 0 but barcodes are present in the barcodes file"
-            )
-        if header["nCells"][0] > 0 and self.nCells == 0:
-            raise ValueError(
-                "ERROR: Barcode count in MTX header is greater than 0 but no barcodes are present in the barcodes file"
-            )
-        if header["nCells"][0] == 0 and self.nCells == 0:
-            raise ValueError(
-                "ERROR: Barcode count in MTX header and barcodes file is 0. No data to read"
-            )
-        return header
 
     def process_batch(
         self, dfs: list[pd.DataFrame], filtering_cutoff: int
@@ -660,10 +693,7 @@ class CrDirReader(CrReader):
 
     def cell_names(self) -> list[str]:
         """Returns a list of names of the cells in the dataset."""
-        vals = np.array(self._read_dataset("cell_names"))
-        if self.validBarcodeIdx is not None:
-            vals = vals[(self.validBarcodeIdx + self.indexOffset)]
-        return list(vals)
+        return self._engine.cell_names()
 
     def rename_batches(self, collect: list[pd.DataFrame]) -> np.ndarray:
         df = pd.concat(collect, ignore_index=True)
@@ -681,32 +711,17 @@ class CrDirReader(CrReader):
         batch_size: int,
         lines_in_mem: int,
     ) -> int:
-        """Bound pandas input and split state retained across a yielded batch."""
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        if lines_in_mem <= 0:
-            raise ValueError("lines_in_mem must be positive")
-        integer_bytes = np.dtype(np.int64).itemsize
-        mask_bytes = np.dtype(np.bool_).itemsize
-        frame_and_index = 3 * integer_bytes + integer_bytes
-        grouping_scratch = 4 * integer_bytes
-        pending_entries = min(
-            min(batch_size, self.nCells) * self.nFeatures,
-            self.matrixEntryCount,
-        )
-        pending_bytes = pending_entries * (
-            3 * frame_and_index + grouping_scratch + mask_bytes
-        )
-        return super().producer_staging_bytes(batch_size, lines_in_mem) + int(
-            lines_in_mem * (4 * frame_and_index + grouping_scratch + mask_bytes)
-            + pending_bytes
+        return self._engine.producer_staging_bytes(
+            batch_size,
+            lines_in_mem,
         )
 
     def max_window_nnz(self, window_rows: int) -> int:
-        return min(
-            super().max_window_nnz(window_rows),
-            self.matrixEntryCount,
-        )
+        return self._engine.max_window_nnz(window_rows)
+
+    @property
+    def matrix_dtype(self) -> np.dtype[Any]:
+        return self._engine.matrixDtype
 
     # noinspection DuplicatedCode
     def consume(
@@ -722,48 +737,25 @@ class CrDirReader(CrReader):
             lines_in_mem: The number of lines to read into memory.
             dtype: The data type of the matrix.
         """
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        matrixIO = pd.read_csv(
-            self.matFn,
-            comment="%",
-            sep=self.sep,
-            header=0,
-            chunksize=lines_in_mem,
-            names=["gene", "barcode", "count"],
-        )
-        pending: pd.DataFrame | None = None
-        for chunk in matrixIO:
-            chunk = chunk[chunk["barcode"].isin(self.validBarcodeIdx)]
-            if chunk.empty:
-                continue
-            pending = (
-                chunk.reset_index(drop=True)
-                if pending is None
-                else pd.concat((pending, chunk), ignore_index=True)
-            )
-            pending = (
-                pending.groupby(
-                    ["gene", "barcode"],
-                    sort=False,
-                    as_index=False,
-                )["count"]
-                .sum()
-                .reset_index(drop=True)
-            )
-            barcodes = pending["barcode"].to_numpy()
-            if np.any(barcodes[1:] < barcodes[:-1]):
-                raise ValueError("Cell Ranger MTX entries must be sorted by barcode")
-            unique_barcodes = np.unique(barcodes)
-            complete = (len(unique_barcodes) - 1) // batch_size
-            consumed = 0
-            for boundary in range(batch_size, complete * batch_size + 1, batch_size):
-                end = int(np.searchsorted(barcodes, unique_barcodes[boundary]))
-                batch_arr = self.rename_batches([pending.iloc[consumed:end]])
-                yield self.to_sparse(batch_arr, dtype=dtype)
-                consumed = end
-            if consumed:
-                pending = pending.iloc[consumed:].reset_index(drop=True)
-        if pending is not None and not pending.empty:
-            batch_arr = self.rename_batches([pending])
-            yield self.to_sparse(batch_arr, dtype=dtype)
+        yield from self._engine.consume(batch_size, lines_in_mem, dtype)
+
+    def get_cell_columns(self) -> Iterator[tuple[str, np.ndarray]]:
+        yield from self._engine.cell_columns()
+
+    def get_feature_columns(self) -> Iterator[tuple[str, np.ndarray]]:
+        yield from self._engine.feature_columns()
+
+    def _set_sparse_import_lines_in_mem(self, lines_in_mem: int) -> None:
+        self._engine.configure_import_lines(lines_in_mem)
+
+    def _prepare_sparse_import(self) -> None:
+        self._engine.prepare()
+
+    def _release_sparse_import(self) -> None:
+        self._engine.release()
+
+    def _sparse_import_resident_bytes(self) -> int:
+        return self._engine.resident_bytes()
+
+    def close(self) -> None:
+        self._engine.release()

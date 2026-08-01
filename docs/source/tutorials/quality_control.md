@@ -57,7 +57,7 @@ reader = scarf.CrH5Reader(str(counts))
 scarf.CrToZarr(
     reader,
     zarr_loc=str(store),
-).dump(batch_size=1000)
+).dump()
 
 ds = scarf.DataStore(
     str(store),

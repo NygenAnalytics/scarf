@@ -96,6 +96,8 @@ class H5adReader:
         }
         self.matrixOrientation = self._validate_sparse_matrix()
         self._convertedCsr: csr_matrix | None = None
+        self._indptrCache: np.ndarray | None = None
+        self._cumulativeRowNnz: np.ndarray | None = None
         self.nCells, self.nFeatures = (
             self._get_n(self.cellAttrsKey),
             self._get_n(self.featureAttrsKey),
@@ -674,6 +676,39 @@ class H5adReader:
             + self._convertedCsr.indptr.nbytes
         )
 
+    def _csr_indptr(self) -> np.ndarray | None:
+        if self.matrixOrientation == "dense":
+            return None
+        if self._convertedCsr is not None:
+            return np.asarray(self._convertedCsr.indptr)
+        if self.matrixOrientation != "csr":
+            return None
+        if self._indptrCache is None:
+            self._indptrCache = np.asarray(self.h5[self.matrixKey]["indptr"][:])
+        return self._indptrCache
+
+    def _row_nnz_cumulative(self) -> np.ndarray | None:
+        indptr = self._csr_indptr()
+        if indptr is None:
+            return None
+        if self._cumulativeRowNnz is None:
+            cumulative = np.empty(self.nCells + 1, dtype=np.int64)
+            cumulative[0] = 0
+            np.cumsum(np.diff(indptr), dtype=np.int64, out=cumulative[1:])
+            self._cumulativeRowNnz = cumulative
+        return self._cumulativeRowNnz
+
+    def _prepare_sparse_import(self) -> None:
+        self._row_nnz_cumulative()
+
+    def _sparse_import_resident_bytes(self) -> int:
+        total = (
+            0 if self._cumulativeRowNnz is None else int(self._cumulativeRowNnz.nbytes)
+        )
+        if self._convertedCsr is None and self._indptrCache is not None:
+            total += int(self._indptrCache.nbytes)
+        return total
+
     def max_batch_nnz(self, batch_size: int) -> int:
         """Return the largest contiguous row-window nnz without loading values."""
         if batch_size <= 0:
@@ -681,28 +716,20 @@ class H5adReader:
         batch_rows = min(batch_size, self.nCells)
         if self.matrixOrientation == "dense":
             return int(batch_rows * self.nFeatures)
-        if self._convertedCsr is not None:
-            indptr = np.asarray(self._convertedCsr.indptr)
-        elif self.matrixOrientation == "csr":
-            indptr = np.asarray(self.h5[self.matrixKey]["indptr"])
-        else:
+        cumulative = self._row_nnz_cumulative()
+        if cumulative is None:
             return int(batch_rows * self.nFeatures)
 
         if self.nCells == 0:
             return 0
-        return int(np.max(indptr[batch_rows:] - indptr[:-batch_rows]))
+        return int(np.max(cumulative[batch_rows:] - cumulative[:-batch_rows]))
 
     def max_batch_nnz_peak_bytes(self) -> int:
         """Bound temporary row-pointer arrays used to plan sparse batches."""
         if self.matrixOrientation == "dense":
             return 0
-        if self._convertedCsr is not None:
-            itemsize = np.asarray(self._convertedCsr.indptr).dtype.itemsize
-            return int(self.nCells * itemsize)
-        if self.matrixOrientation == "csr":
-            indptr = self.h5[self.matrixKey]["indptr"]
-            return int((2 * self.nCells + 1) * indptr.dtype.itemsize)
-        return 0
+        self._prepare_sparse_import()
+        return self._sparse_import_resident_bytes()
 
     def producer_batch_staging_bytes(self, batch_size: int) -> int:
         """Bound sparse row pointers retained while one batch is produced."""
@@ -757,9 +784,12 @@ class H5adReader:
             return
 
         grp = self.h5[self.matrixKey]
+        source_indptr = self._csr_indptr()
+        if source_indptr is None:
+            raise RuntimeError("CSR row pointers are unavailable")
         for row_start in range(0, self.nCells, batch_size):
             row_end = min(row_start + batch_size, self.nCells)
-            indptr = np.asarray(grp["indptr"][row_start : row_end + 1])
+            indptr = source_indptr[row_start : row_end + 1]
             data_start = int(indptr[0])
             data_end = int(indptr[-1])
             local_indptr = indptr - data_start

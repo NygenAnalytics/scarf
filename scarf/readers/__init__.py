@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from .csv import CSVReader
     from .h5ad import H5adInspectResult, H5adReader, inspect_h5ad
     from .loom import LoomReader
+    from .mtx import MtxCandidate, MtxReader, inspect_mtx
 
 __all__ = [
     "CrH5Reader",
@@ -27,6 +28,9 @@ __all__ = [
     "H5adInspectResult",
     "H5adReader",
     "inspect_h5ad",
+    "MtxCandidate",
+    "MtxReader",
+    "inspect_mtx",
     "LoomReader",
     "CSVReader",
 ]
@@ -39,6 +43,9 @@ _LAZY_EXPORTS = {
     "H5adInspectResult": "h5ad",
     "H5adReader": "h5ad",
     "inspect_h5ad": "h5ad",
+    "MtxCandidate": "mtx",
+    "MtxReader": "mtx",
+    "inspect_mtx": "mtx",
     "LoomReader": "loom",
 }
 

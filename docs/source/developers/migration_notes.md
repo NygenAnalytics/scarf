@@ -276,6 +276,28 @@ group encodings, sparse `obsm` slots, and row-mismatched embeddings are skipped
 with warnings. Review imported metadata names if downstream code previously
 assumed those columns were unavailable.
 
+## Import batching and Matrix Market
+
+`CrToZarr.dump`, `H5adToZarr.dump`, and `SparseToZarr.dump` now choose source
+batch rows automatically when `batch_size` is omitted. The selected rows follow
+destination shard geometry when memory permits, but source reads remain
+separate from physical shard-aligned writes. Existing explicit positive values
+remain supported.
+
+Use `inspect_mtx`, `MtxReader`, and `MtxToZarr` for generic Matrix Market
+sources, Parse DGE directories, prefixed triplets, and direct MEX ZIP files.
+Feature-major sources use temporary disk-backed CSR arrays. `CrDirReader`
+retains its existing API as the Cell Ranger directory compatibility path.
+CSV remains a small-data compatibility importer and Loom remains a legacy
+compatibility importer.
+
+New multimodal imports use stable assay names for CRISPR, multiplexing,
+antigen, and custom features. BD `mRNA` and `AbSeq` map to RNA and ADT. These
+names change the persisted assay layout for sources that previously produced
+`ASSAYn`. 10x feature tags and validated feature-reference columns are now
+retained as feature metadata. Guide-call tables are only reported by
+inspection and are not imported.
+
 ## Paris clustering
 
 Use `run_paris_clustering` for Paris clustering. Its default

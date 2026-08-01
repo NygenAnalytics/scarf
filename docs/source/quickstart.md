@@ -40,7 +40,7 @@ reader = scarf.CrH5Reader(str(counts))
 scarf.CrToZarr(
     reader,
     zarr_loc=str(store),
-).dump(batch_size=1000)
+).dump()
 ```
 
 The same reader and writer work with a Cell Ranger H5 file from your own dataset.

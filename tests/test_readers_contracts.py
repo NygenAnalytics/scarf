@@ -18,6 +18,8 @@ from scarf.readers import (
     H5adInspectResult,
     H5adReader,
     LoomReader,
+    MtxCandidate,
+    MtxReader,
 )
 from tests.signature_contracts import signature_digest
 
@@ -78,6 +80,11 @@ _PUBLIC_CLASS_METHODS = {
         "feature_ids",
         "consume",
     ),
+    MtxReader: (
+        "__init__",
+        "consume",
+        "close",
+    ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     CrReader: "cfeac7ccf7bc316f1db1d9e177d6556b37a0169b3cbb2800a92e561b75f4fc4a",
@@ -86,9 +93,10 @@ _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
     H5adReader: "aa4d19ec019beed92009edfd8b65a0a36fc6dbd66b19a887632862d770c4a3da",
     LoomReader: "85c3ff965cb94a4fa201915b9d43890081e1f26e931327fcda6531bee4c3782a",
     CSVReader: "8aa6c17c876afb62765584fc7ff64d2838c66ef53095da10d7198ca60ab83851",
+    MtxReader: "06376a32ff98ff0153ae1cc35f327509c88784ce027cb045bf9833b45dbccf2a",
 }
 _MODULE_SIGNATURE_DIGEST = (
-    "d0ea3ab7abdc2416a0059a564d7aec9683c1a6dfcd8acf3108995e9f38e38b15"
+    "af8954ed185ca2dd9b7eb8f9c606f8480cbe0da2794f42125b434ef3af61ffbc"
 )
 
 
@@ -124,6 +132,9 @@ def test_readers_facade_surface_is_stable():
         "H5adInspectResult",
         "H5adReader",
         "inspect_h5ad",
+        "MtxCandidate",
+        "MtxReader",
+        "inspect_mtx",
         "LoomReader",
         "CSVReader",
     ]
@@ -135,8 +146,11 @@ def test_readers_facade_surface_is_stable():
         "H5adInspectResult",
         "H5adReader",
         "LoomReader",
+        "MtxCandidate",
+        "MtxReader",
         "get_file_handle",
         "inspect_h5ad",
+        "inspect_mtx",
         "read_file",
     }
     assert expected.issubset(vars(readers_module))
@@ -153,6 +167,7 @@ def test_readers_facade_loads_format_modules_lazily():
                 "assert 'scarf.readers.csv' not in sys.modules; "
                 "assert 'scarf.readers.h5ad' not in sys.modules; "
                 "assert 'scarf.readers.loom' not in sys.modules; "
+                "assert 'scarf.readers.mtx' not in sys.modules; "
                 "assert 'h5py' not in sys.modules; "
                 "assert 'pandas' not in sys.modules; "
                 "assert 'scipy' not in sys.modules; "
@@ -163,9 +178,31 @@ def test_readers_facade_loads_format_modules_lazily():
                 "assert 'scarf.readers.cellranger' not in sys.modules; "
                 "assert 'scarf.readers.h5ad' not in sys.modules; "
                 "assert 'scarf.readers.loom' not in sys.modules; "
+                "assert 'scarf.readers.mtx' not in sys.modules; "
                 "assert 'pandas' in sys.modules; "
                 "assert 'h5py' not in sys.modules; "
                 "assert 'scipy' not in sys.modules"
+            ),
+        ],
+        check=True,
+    )
+
+
+def test_matrix_market_exports_load_together_lazily():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import scarf.readers as readers; "
+                "assert 'scarf.readers.mtx' not in sys.modules; "
+                "reader = readers.MtxReader; "
+                "assert reader.__module__ == 'scarf.readers'; "
+                "assert readers.MtxCandidate.__module__ == 'scarf.readers'; "
+                "assert readers.inspect_mtx.__module__ == 'scarf.readers'; "
+                "assert 'scarf.readers.mtx' in sys.modules; "
+                "assert 'scarf.readers.h5ad' not in sys.modules; "
+                "assert 'scarf.readers.loom' not in sys.modules"
             ),
         ],
         check=True,
@@ -181,7 +218,7 @@ def test_reader_class_and_method_signatures_are_stable():
 def test_reader_module_function_signatures_are_stable():
     methods = {
         name: getattr(readers_module, name)
-        for name in ("get_file_handle", "inspect_h5ad", "read_file")
+        for name in ("get_file_handle", "inspect_h5ad", "inspect_mtx", "read_file")
     }
     assert signature_digest(methods) == _MODULE_SIGNATURE_DIGEST
 
@@ -200,7 +237,8 @@ def test_reader_public_metadata_remains_on_facade():
             assert method.__qualname__.startswith(f"{cls.__name__}.")
 
     assert H5adInspectResult.__module__ == "scarf.readers"
-    for name in ("get_file_handle", "inspect_h5ad", "read_file"):
+    assert MtxCandidate.__module__ == "scarf.readers"
+    for name in ("get_file_handle", "inspect_h5ad", "inspect_mtx", "read_file"):
         assert getattr(readers_module, name).__module__ == "scarf.readers"
 
 
@@ -241,26 +279,6 @@ def test_get_file_handle_facade_remains_patchable_by_read_file(monkeypatch):
 
     assert list(readers_module.read_file("virtual.txt")) == ["one", "two"]
     assert handle.closed
-
-
-def test_read_file_facade_remains_patchable_by_cellranger_reader(
-    tmp_path,
-    monkeypatch,
-):
-    _write_minimal_cellranger_directory(tmp_path)
-    original = readers_module.read_file
-    calls = []
-
-    def tracked_read_file(filename):
-        calls.append(filename)
-        yield from original(filename)
-
-    monkeypatch.setattr(readers_module, "read_file", tracked_read_file)
-    reader = CrDirReader(str(tmp_path))
-
-    assert reader.feature_names() == ["g1", "g2"]
-    assert any(filename.endswith("features.tsv") for filename in calls)
-    assert any(filename.endswith("barcodes.tsv") for filename in calls)
 
 
 def test_crreader_reclassifies_noncontiguous_features_atomically(tmp_path):

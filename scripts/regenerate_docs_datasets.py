@@ -40,14 +40,14 @@ def _convert_cellranger_h5(source: Path, store: Path) -> None:
     import scarf
 
     reader = scarf.CrH5Reader(str(source / "data.h5"))
-    scarf.CrToZarr(reader, zarr_loc=str(store)).dump(batch_size=1000)
+    scarf.CrToZarr(reader, zarr_loc=str(store)).dump()
 
 
 def _convert_cellranger_mtx(source: Path, store: Path) -> None:
     import scarf
 
     reader = scarf.CrDirReader(str(source))
-    scarf.CrToZarr(reader, zarr_loc=str(store)).dump(batch_size=1000)
+    scarf.CrToZarr(reader, zarr_loc=str(store)).dump()
 
 
 def _convert_h5ad(source: Path, store: Path) -> None:
@@ -55,7 +55,7 @@ def _convert_h5ad(source: Path, store: Path) -> None:
 
     inspection = scarf.inspect_h5ad(str(source / "data.h5ad"))
     reader = scarf.H5adReader.from_inspect(inspection)
-    scarf.H5adToZarr(reader, zarr_loc=str(store)).dump(batch_size=1000)
+    scarf.H5adToZarr(reader, zarr_loc=str(store)).dump()
 
 
 def _analyze_pbmc(store: Any) -> None:

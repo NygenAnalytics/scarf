@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import coo_matrix, csr_matrix
 
-from ..storage.layout import array_shard_rows
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -115,8 +114,8 @@ class SparseToZarr:
         """Write out the data matrix into the Zarr hierarchy.
 
         Args:
-            batch_size: Number of cells to be written in one go. By default, this value will automatically be chosen
-                        based on the chunk size in the cell dimension.
+            batch_size: Number of source cells per batch. By default, a
+                        destination-aligned value is selected within the memory budget.
 
          Raises:
             ValueError: Raised if there is any unexpected errors when writing to the Zarr hierarchy.
@@ -125,24 +124,17 @@ class SparseToZarr:
         Returns:
             None
         """
-        from ..storage.budget import admitted_worker_count
         from ..storage.schema import load_count_array
         from ..storage.sharding import (
+            resolve_sparse_import_batch,
             sparse_matrix_bytes,
-            sparse_producer_peak_bytes,
         )
 
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         store = load_count_array(self.z, self.assayName, self.workspace)
-        if batch_size is None:
-            batch_size = array_shard_rows(store)
         resident_bytes = sparse_matrix_bytes(self.mat)
         indptr = np.asarray(self.mat.indptr)
-        admitted_worker_count(
-            self.resources,
-            taskBytes=max(1, self.nCells * indptr.dtype.itemsize),
-            residentBytes=resident_bytes,
-            requested=1,
-        )
 
         def max_window_nnz(window_rows: int) -> int:
             width = min(window_rows, self.nCells)
@@ -150,16 +142,29 @@ class SparseToZarr:
                 return 0
             return int(np.max(indptr[width:] - indptr[:-width]))
 
-        source_nnz = max_window_nnz(batch_size)
-        buffered_nnz = max_window_nnz(batch_size + array_shard_rows(store))
-        value_bytes = max(
-            np.dtype(self.mat.dtype).itemsize,
-            np.dtype(self.matrixDtype).itemsize,
+        plan = resolve_sparse_import_batch(
+            (store,),
+            nRows=self.nCells,
+            resources=self.resources,
+            maxWindowNnz=max_window_nnz,
+            sourceDtype=self.mat.dtype,
+            batchRows=batch_size,
+            residentBytes=resident_bytes,
+        )
+        self._lastImportPlan = plan
+        resolved_batch_rows = plan.batchRows
+        logger.debug(
+            f"Resolved sparse source batch rows={resolved_batch_rows} "
+            f"write_tasks={plan.writeTasks}"
         )
 
         def row_batches() -> Iterator[coo_matrix]:
             s = 0
-            for end in range(batch_size, self.nCells + batch_size, batch_size):
+            for end in range(
+                resolved_batch_rows,
+                self.nCells + resolved_batch_rows,
+                resolved_batch_rows,
+            ):
                 if s == self.nCells:
                     break
                 if end > self.nCells:
@@ -172,11 +177,7 @@ class SparseToZarr:
             row_batches(),
             resources=self.resources,
             residentBytes=resident_bytes,
-            producerReserveBytes=sparse_producer_peak_bytes(
-                buffered_nnz,
-                source_nnz,
-                value_bytes,
-            ),
+            producerReserveBytes=plan.producerReserveBytes,
             msg="Writing sparse counts",
         )
         if e != self.nCells:

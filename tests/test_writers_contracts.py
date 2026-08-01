@@ -19,6 +19,7 @@ from scarf.writers import (
     CrToZarr,
     H5adToZarr,
     LoomToZarr,
+    MtxToZarr,
     SparseToZarr,
     SubsetZarr,
 )
@@ -52,8 +53,8 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    CrToZarr: "2b793bfd94fd2d4e9cf49e47db0a2af9d3dec0ab9008a87c67076edf1349d21c",
-    H5adToZarr: "9d15d8b78b69ba5d8d86b192711d90df439dfa4e889be159386c6b25e93210f0",
+    CrToZarr: "6ddc400f3edcce221a338b60bc528a83f086409ee59b7d3e6baebfa0980f8f75",
+    H5adToZarr: "c1993f1caa8cdb973c1bee9969cf107a3f39dbf2a2269d3e0a86f6c5f0b1d94b",
     LoomToZarr: "a840271f303b73a2187148efb1e4651a6671b4283af83c0f28251d449f5754dd",
     SparseToZarr: "78dcbc0d0d7d48a3d971ba0654260be39fd69157a5d3cb87f4d7191f0dee450d",
     CSVtoZarr: "30b241f964ead70d6a44e0f09be571ea88d227cd78335651b3f1a38cadf3268e",
@@ -84,6 +85,7 @@ def test_writers_facade_surface_is_stable():
         "write_renorm_subset_to_zarr",
         "SubsetZarr",
         "CrToZarr",
+        "MtxToZarr",
         "H5adToZarr",
         "LoomToZarr",
         "SparseToZarr",
@@ -100,6 +102,7 @@ def test_writers_facade_surface_is_stable():
     assert expected.issubset(dir(writers_module))
     assert all(getattr(writers_module, name) is not None for name in expected)
     assert not hasattr(writers_module, "sparse_writer")
+    assert MtxToZarr is CrToZarr
 
 
 def test_writer_class_and_method_signatures_are_stable():

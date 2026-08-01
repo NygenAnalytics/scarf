@@ -62,7 +62,7 @@ print(reader.assayFeats)
 scarf.CrToZarr(
     reader,
     zarr_loc=str(store),
-).dump(batch_size=1000)
+).dump()
 ```
 
 ## 1. Open and filter the multimodal store

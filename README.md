@@ -34,7 +34,7 @@ Detailed installation instructions [here](https://scarf.readthedocs.io/en/latest
 import scarf
 
 reader = scarf.CrH5Reader("filtered_feature_bc_matrix.h5")
-scarf.CrToZarr(reader, zarr_loc="data.zarr").dump(batch_size=1000)
+scarf.CrToZarr(reader, zarr_loc="data.zarr").dump()
 
 ds = scarf.DataStore("data.zarr", nthreads=4)
 ds.pipeline.run()

@@ -5,8 +5,18 @@ import pandas as pd
 
 AUTO_ASSAY_NAMES: dict[str, str] = {
     "Gene Expression": "RNA",
+    "mRNA": "RNA",
     "Peaks": "ATAC",
     "Antibody Capture": "ADT",
+    "AbSeq": "ADT",
+    "CRISPR Guide Capture": "CRISPR",
+    "CRISPR": "CRISPR",
+    "CRISPR Direct Capture": "CRISPR",
+    "Multiplexing Capture": "HTO",
+    "Antigen Capture": "ANTIGEN",
+    "ANTIGEN": "ANTIGEN",
+    "Custom": "CUSTOM",
+    "CUSTOM": "CUSTOM",
     "RNA": "RNA",
     "ADT": "ADT",
     "HTO": "HTO",

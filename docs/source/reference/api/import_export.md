@@ -18,6 +18,11 @@
 ```
 
 ```{eval-rst}
+.. autoclass:: scarf.readers.MtxReader
+    :members:
+```
+
+```{eval-rst}
 .. autoclass:: scarf.readers.H5adReader
     :members:
 ```
@@ -54,10 +59,30 @@ arrays with an unexpected row count are warned about and skipped.
     :members:
 ```
 
+## Matrix Market inspection
+
+`inspect_mtx` reports every complete matrix, feature, and cell triplet in a
+supported source. Pass one returned candidate to `MtxReader`.
+
+```{eval-rst}
+.. autofunction:: scarf.inspect_mtx
+```
+
+```{eval-rst}
+.. autoclass:: scarf.readers.MtxCandidate
+```
+
 ## Writers
 
 ```{eval-rst}
 .. autoclass:: scarf.writers.CrToZarr
+    :members:
+```
+
+`MtxToZarr` is an alias of `CrToZarr` for use with `MtxReader`.
+
+```{eval-rst}
+.. autoclass:: scarf.writers.MtxToZarr
     :members:
 ```
 
@@ -131,6 +156,11 @@ export, call `to_anndata` and use AnnData's writer.
 H5AD export recognizes UMAP and t-SNE coordinate pairs and writes them to
 `obsm`. H5AD import flattens supported dense `obsm` arrays into cell metadata;
 it does not preserve an AnnData-style `obsm` container inside `DataStore`.
+
+`CrToZarr`, `MtxToZarr`, `H5adToZarr`, and `SparseToZarr` select source batch
+rows automatically when `batch_size` is omitted. The selection starts from the
+smallest destination row-shard height and shrinks only when required by the
+operation memory budget. Explicit positive values remain supported.
 
 ## Merge
 

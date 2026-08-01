@@ -64,7 +64,7 @@ class CrToZarr:
         for assay_name in assay_names:
             validate_assay_name(assay_name)
         self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
-        create_cell_data(
+        cell_group = create_cell_data(
             root=self.z,
             workspace=self.workspace,
             ids=np.array(self.cr.cell_names()),
@@ -84,6 +84,74 @@ class CrToZarr:
                 targetChunkBytes=targetChunkBytes,
                 targetShardBytes=targetShardBytes,
             )
+        self._write_reader_metadata(cell_group, assay_names)
+
+    def _write_reader_metadata(
+        self,
+        cell_group: Any,
+        assay_names: tuple[str, ...],
+    ) -> None:
+        from ..storage.arrays import create_zarr_obj_array
+        from ..storage.types import as_zarr_group
+
+        cell_columns = getattr(self.cr, "get_cell_columns", None)
+        if callable(cell_columns):
+            for name, raw_values in cell_columns():
+                if name in {"I", "ids", "names"} or name in cell_group:
+                    continue
+                values = np.asarray(raw_values)
+                if values.ndim != 1 or values.size != self.cr.nCells:
+                    raise ValueError(
+                        f"Cell metadata column {name!r} has shape {values.shape}; "
+                        f"expected ({self.cr.nCells},)"
+                    )
+                create_zarr_obj_array(
+                    cell_group,
+                    name,
+                    values,
+                    values.dtype,
+                    profile=self.profile,
+                )
+
+        feature_columns = getattr(self.cr, "get_feature_columns", None)
+        if not callable(feature_columns):
+            return
+        ranges = self._prep_assay_input_ranges(self.cr.assayFeats)
+        targets: dict[str, tuple[Any, np.ndarray]] = {}
+        for assay_name in assay_names:
+            indexes = np.concatenate(
+                [
+                    np.arange(start, end, dtype=np.int64)
+                    for start, end in ranges[assay_name]
+                ]
+            )
+            group_path = (
+                f"{assay_name}/featureData"
+                if self.workspace is None
+                else f"{self.workspace}/{assay_name}/featureData"
+            )
+            targets[assay_name] = (
+                as_zarr_group(self.z[group_path], name=group_path),
+                indexes,
+            )
+        for name, raw_values in feature_columns():
+            values = np.asarray(raw_values)
+            if values.ndim != 1 or values.size != self.cr.nFeatures:
+                raise ValueError(
+                    f"Feature metadata column {name!r} has shape {values.shape}; "
+                    f"expected ({self.cr.nFeatures},)"
+                )
+            for group, indexes in targets.values():
+                if name in {"I", "ids", "names"} or name in group:
+                    continue
+                selected = values[indexes]
+                create_zarr_obj_array(
+                    group,
+                    name,
+                    selected,
+                    selected.dtype,
+                    profile=self.profile,
+                )
 
     @staticmethod
     def _prep_assay_input_ranges(af: pd.DataFrame) -> dict[str, list[list[int]]]:
@@ -115,11 +183,16 @@ class CrToZarr:
                 lv += j[1] - j[0]
         return feat_offset
 
-    def dump(self, batch_size: int = 1000, lines_in_mem: int = 100000) -> None:
+    def dump(
+        self,
+        batch_size: int | None = None,
+        lines_in_mem: int = 100000,
+    ) -> None:
         """Writes the count values into the Zarr matrix.
 
         Args:
-            batch_size: Number of cells to save at a time. (Default value: 1000)
+            batch_size: Number of source cells per batch. By default, a
+                        destination-aligned value is selected within the memory budget.
             lines_in_mem: Number of lines to read at a time from MTX file (only used for CrDirReader)
                           (Default value: 100000)
 
@@ -131,16 +204,19 @@ class CrToZarr:
         """
         from scipy.sparse import coo_matrix
 
-        from ..storage.budget import admitted_worker_count
         from ..storage.schema import load_count_array
         from ..storage.sharding import (
             SparseShardBuffer,
             SparseWriteBand,
+            resolve_sparse_import_batch,
             sparse_matrix_bytes,
-            sparse_producer_peak_bytes,
             write_sparse_bands,
         )
 
+        if batch_size is not None and batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if lines_in_mem <= 0:
+            raise ValueError("lines_in_mem must be positive")
         input_ranges = self._prep_assay_input_ranges(self.cr.assayFeats)
         stores = {
             assay: load_count_array(self.z, assay, self.workspace)
@@ -148,100 +224,136 @@ class CrToZarr:
         }
         buffers = {assay: SparseShardBuffer(store) for assay, store in stores.items()}
         feat_offset = self._prep_feat_index_offset(input_ranges)
+        configure_lines = getattr(
+            self.cr,
+            "_set_sparse_import_lines_in_mem",
+            None,
+        )
+        prepare = getattr(self.cr, "_prepare_sparse_import", None)
+        release = getattr(self.cr, "_release_sparse_import", None)
 
-        def writes() -> Iterator[SparseWriteBand]:
-            n_chunks = (self.cr.nCells + batch_size - 1) // batch_size
-            source = iter_progress(
-                self.cr.consume(batch_size, lines_in_mem),
-                total=n_chunks,
-                desc="Writing counts",
+        try:
+            if callable(configure_lines):
+                configure_lines(lines_in_mem)
+            if callable(prepare):
+                prepare()
+            resident_reader_bytes = 0
+            reader_resident = getattr(
+                self.cr,
+                "_sparse_import_resident_bytes",
+                None,
             )
-            for matrix in source:
-                chunk = matrix.tocoo(copy=False)
-                source_bytes = sparse_matrix_bytes(matrix, chunk)
-                for assay in input_ranges:
-                    selected = np.zeros(chunk.col.shape[0], dtype=bool)
-                    columns = chunk.col.copy()
-                    for bounds, offset in zip(
-                        input_ranges[assay],
-                        feat_offset[assay],
-                        strict=True,
-                    ):
-                        inside = (chunk.col >= bounds[0]) & (chunk.col < bounds[1])
-                        columns[inside] += offset
-                        selected |= inside
-                    projected = coo_matrix(
-                        (
-                            chunk.data[selected],
-                            (chunk.row[selected], columns[selected]),
-                        ),
-                        shape=(chunk.shape[0], buffers[assay].nColumns),
-                    )
-                    for band in buffers[assay].add(projected):
-                        producer_bytes = (
-                            source_bytes
-                            + selected.nbytes
-                            + columns.nbytes
-                            + inside.nbytes
-                            + sparse_matrix_bytes(projected)
-                            + sum(item.residentBytes for item in buffers.values())
+            if callable(reader_resident):
+                resident_reader_bytes = max(0, int(reader_resident()))
+            projection_value_bytes = max(
+                self.cr.matrix_dtype.itemsize,
+                *(store.dtype.itemsize for store in stores.values()),
+            )
+
+            def projection_staging_bytes(rows: int) -> int:
+                source_values = max(0, int(self.cr.max_window_nnz(rows)))
+                return source_values * (
+                    projection_value_bytes
+                    + 3 * np.dtype(np.int64).itemsize
+                    + 2 * np.dtype(np.bool_).itemsize
+                )
+
+            plan = resolve_sparse_import_batch(
+                tuple(stores.values()),
+                nRows=self.cr.nCells,
+                resources=self.resources,
+                maxWindowNnz=self.cr.max_window_nnz,
+                sourceDtype=self.cr.matrix_dtype,
+                batchRows=batch_size,
+                residentBytes=resident_reader_bytes,
+                producerStagingBytes=lambda rows: self.cr.producer_staging_bytes(
+                    rows,
+                    lines_in_mem,
+                ),
+                extraProducerBytes=projection_staging_bytes,
+            )
+            self._lastImportPlan = plan
+            resolved_batch_rows = plan.batchRows
+            logger.debug(
+                f"Resolved Cell Ranger source batch rows={resolved_batch_rows} "
+                f"write_tasks={plan.writeTasks}"
+            )
+
+            def writes() -> Iterator[SparseWriteBand]:
+                n_chunks = (
+                    self.cr.nCells + resolved_batch_rows - 1
+                ) // resolved_batch_rows
+                source = iter_progress(
+                    self.cr.consume(resolved_batch_rows, lines_in_mem),
+                    total=n_chunks,
+                    desc="Writing counts",
+                )
+                for matrix in source:
+                    chunk = matrix.tocoo(copy=False)
+                    source_bytes = sparse_matrix_bytes(matrix, chunk)
+                    for assay in input_ranges:
+                        selected = np.zeros(chunk.col.shape[0], dtype=bool)
+                        columns = chunk.col.copy()
+                        for bounds, offset in zip(
+                            input_ranges[assay],
+                            feat_offset[assay],
+                            strict=True,
+                        ):
+                            inside = (chunk.col >= bounds[0]) & (chunk.col < bounds[1])
+                            columns[inside] += offset
+                            selected |= inside
+                        projected = coo_matrix(
+                            (
+                                chunk.data[selected],
+                                (chunk.row[selected], columns[selected]),
+                            ),
+                            shape=(chunk.shape[0], buffers[assay].nColumns),
+                        )
+                        for band in buffers[assay].add(projected):
+                            producer_bytes = (
+                                source_bytes
+                                + columns.nbytes
+                                + 2 * selected.nbytes
+                                + sparse_matrix_bytes(projected)
+                                + sum(item.residentBytes for item in buffers.values())
+                            )
+                            yield SparseWriteBand(
+                                stores[assay],
+                                band,
+                                producer_bytes,
+                            )
+                if self.cr.nCells:
+                    del matrix, chunk, selected, columns, inside, projected
+                for assay, buffer in buffers.items():
+                    for band in buffer.finish():
+                        producer_bytes = sum(
+                            item.residentBytes for item in buffers.values()
                         )
                         yield SparseWriteBand(
                             stores[assay],
                             band,
                             producer_bytes,
                         )
-            if self.cr.nCells:
-                del matrix, chunk, selected, columns, inside, projected
-            for assay, buffer in buffers.items():
-                for band in buffer.finish():
-                    producer_bytes = sum(
-                        item.residentBytes for item in buffers.values()
-                    )
-                    yield SparseWriteBand(
-                        stores[assay],
-                        band,
-                        producer_bytes,
-                    )
 
-        staging_bytes = self.cr.producer_staging_bytes(
-            batch_size,
-            lines_in_mem,
-        )
-        admitted_worker_count(
-            self.resources,
-            taskBytes=1,
-            residentBytes=staging_bytes,
-            requested=1,
-        )
-        source_nnz = self.cr.max_window_nnz(batch_size)
-        producer_rows = batch_size + max(
-            buffer.shardRows for buffer in buffers.values()
-        )
-        buffered_nnz = self.cr.max_window_nnz(producer_rows)
-        value_bytes = max(
-            np.dtype(self.cr.matrix_dtype).itemsize,
-            *(np.dtype(store.dtype).itemsize for store in stores.values()),
-        )
-        producer_reserve_bytes = (
-            sparse_producer_peak_bytes(
-                buffered_nnz,
-                source_nnz,
-                value_bytes,
+            write_sparse_bands(
+                writes(),
+                resources=self.resources,
+                residentBytes=resident_reader_bytes,
+                producerReserveBytes=plan.producerReserveBytes,
+                total=plan.writeTasks,
             )
-            + staging_bytes
-        )
-        write_sparse_bands(
-            writes(),
-            resources=self.resources,
-            producerReserveBytes=producer_reserve_bytes,
-        )
-        if any(buffer.rows != self.cr.nCells for buffer in buffers.values()):
-            raise AssertionError(
-                "Cell Ranger conversion did not write every source row"
+            if any(buffer.rows != self.cr.nCells for buffer in buffers.values()):
+                raise AssertionError(
+                    "Cell Ranger conversion did not write every source row"
+                )
+            logger.info(
+                f"Wrote {self.cr.nCells} cells and "
+                f"{sum(buffer.nColumns for buffer in buffers.values())} features "
+                f"from Cell Ranger to {len(stores)} assay(s)"
             )
-        logger.info(
-            f"Wrote {self.cr.nCells} cells and "
-            f"{sum(buffer.nColumns for buffer in buffers.values())} features "
-            f"from Cell Ranger to {len(stores)} assay(s)"
-        )
+        finally:
+            if callable(release):
+                release()
+
+
+MtxToZarr = CrToZarr

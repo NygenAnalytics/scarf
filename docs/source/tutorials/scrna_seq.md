@@ -71,7 +71,7 @@ writer = scarf.CrToZarr(
     reader,
     zarr_loc=f'{dataset}/data.zarr',
 )
-writer.dump(batch_size=1000)
+writer.dump()
 ```
 
 Open a `DataStore`. On first open Scarf streams the count matrix once to compute
