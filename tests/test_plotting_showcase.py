@@ -61,6 +61,7 @@ def test_showcase_generator_has_offline_fixture_cli():
 
     assert completed.returncode == 0, completed.stderr
     assert "--fixture" in completed.stdout
+    assert "--layout-fixture" in completed.stdout
     assert "--output-dir" in completed.stdout
 
 

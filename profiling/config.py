@@ -20,18 +20,10 @@ StageName = Literal[
     "buildAnnIndex",
     "queryNeighbors",
     "buildConnectivityMap",
-    "makeGraph",
     "runUmap",
     "runLeiden",
-    "findMarkers",
-    "getImputed",
     "runClustering",
-    "runPseudotime",
-    "prepareMappingQuery",
-    "runMapping",
-    "makeGraphHarmony",
-    "subsetZarr",
-    "toH5ad",
+    "findMarkers",
 ]
 
 GRAPH_CONSTRUCTION_STAGE_ORDER: tuple[StageName, ...] = (
@@ -55,39 +47,6 @@ CORE_STAGE_ORDER: tuple[StageName, ...] = (
     "runLeiden",
     "runClustering",
     "findMarkers",
-)
-
-LEGACY_CORE_STAGE_ORDER: tuple[StageName, ...] = (
-    "createStore",
-    "initializeStore",
-    "reopenStore",
-    "filterCells",
-    "markHvgs",
-    "makeGraph",
-    "runUmap",
-    "runLeiden",
-    "findMarkers",
-)
-
-OPTIONAL_STAGE_ORDER: tuple[StageName, ...] = (
-    "getImputed",
-    "runPseudotime",
-    "prepareMappingQuery",
-    "runMapping",
-    "subsetZarr",
-    "toH5ad",
-)
-
-LEGACY_STAGE_ORDER: tuple[StageName, ...] = (
-    "makeGraph",
-    "makeGraphHarmony",
-)
-
-# Default when config.stages is unset.
-STAGE_ORDER: tuple[StageName, ...] = CORE_STAGE_ORDER
-
-FULL_STAGE_ORDER: tuple[StageName, ...] = (
-    CORE_STAGE_ORDER + OPTIONAL_STAGE_ORDER + LEGACY_STAGE_ORDER
 )
 
 MAX_TIMEOUT_SECONDS = 86_400
@@ -130,20 +89,9 @@ class WorkflowParameters(BaseModel):
     markerGeneBatchSize: int | None = None
     countsTLayout: Literal["source", "featureMajor"] = "source"
     graphLocalCache: bool | str = "auto"
-    # Optional analysis stages.
-    harmonyBatchColumn: str = "synth_batch"
-    harmonyNBatches: int = 4
-    harmonyBatchSeed: int = 1234
-    imputeGeneCount: int = 25
-    imputeDiffusionT: int = 2
     parisNClusters: int | Literal["auto"] = "auto"
     parisLabel: str = "paris_cluster"
     parisMinClusterSize: int | None = None
-    pseudotimeLabel: str = "pseudotime"
-    mappingQueryRows: int = 25_000
-    mappingTargetName: str = "query25k"
-    mappingTargetFeatKey: str = "hvgs_query25k"
-    mappingSaveK: int = 3
 
     @property
     def resolvedHvgKey(self) -> str:
@@ -156,17 +104,11 @@ class WorkflowParameters(BaseModel):
         return f"{self.assayName}_{self.cellKey}_{self.leidenLabel}"
 
     @model_validator(mode="after")
-    def _check_extras(self) -> Self:
+    def _check_workflow(self) -> Self:
         if not math.isfinite(self.kmeansSampling) or not 0 < self.kmeansSampling <= 1:
             raise ValueError("kmeansSampling must be greater than 0 and at most 1")
         if self.kmeansBatchSize <= 0:
             raise ValueError("kmeansBatchSize must be positive")
-        if self.harmonyNBatches < 2:
-            raise ValueError("harmonyNBatches must be >= 2")
-        if self.imputeGeneCount <= 0:
-            raise ValueError("imputeGeneCount must be positive")
-        if self.imputeDiffusionT <= 0:
-            raise ValueError("imputeDiffusionT must be positive")
         if self.parisNClusters != "auto" and self.parisNClusters <= 1:
             raise ValueError("parisNClusters must be > 1")
         if self.parisMinClusterSize is not None:
@@ -174,10 +116,6 @@ class WorkflowParameters(BaseModel):
                 raise ValueError("parisMinClusterSize must be >= 2")
             if self.parisNClusters != "auto":
                 raise ValueError("parisMinClusterSize requires parisNClusters='auto'")
-        if self.mappingQueryRows <= 0:
-            raise ValueError("mappingQueryRows must be positive")
-        if self.mappingSaveK <= 0:
-            raise ValueError("mappingSaveK must be positive")
         return self
 
 
@@ -275,7 +213,7 @@ class ProfilingConfig(BaseModel):
     workflow: WorkflowParameters = Field(default_factory=WorkflowParameters)
     prepareResources: PrepareResources = Field(default_factory=PrepareResources)
     stageResources: dict[StageName, StageResources]
-    # If unset, only CORE_STAGE_ORDER runs. Extras layouts set the full list.
+    # If unset, the complete current funnel runs.
     stages: tuple[StageName, ...] | None = None
 
     @property
@@ -308,12 +246,6 @@ class ProfilingConfig(BaseModel):
         missing = [stage for stage in selected if stage not in self.stageResources]
         if missing:
             raise ValueError(f"Missing stageResources for: {', '.join(missing)}")
-        if "prepareMappingQuery" in selected or "runMapping" in selected:
-            query_rows = self.workflow.mappingQueryRows
-            if query_rows >= min(self.targetSizes):
-                raise ValueError(
-                    "mappingQueryRows must be smaller than every targetSizes entry"
-                )
         return self
 
     def datasetUri(self, nRows: int) -> str:
@@ -330,10 +262,6 @@ class ProfilingConfig(BaseModel):
 
     def storeUri(self, nRows: int) -> str:
         return f"{self._tagged_prefix('stores')}/{nRows}.zarr"
-
-    def queryStoreUri(self, nRows: int) -> str:
-        q = self.workflow.mappingQueryRows
-        return f"{self._tagged_prefix('stores')}/{nRows}_query_{q}.zarr"
 
     def resultUri(self, nRows: int, stage: StageName) -> str:
         return f"{self._tagged_prefix('results')}/{nRows}/{stage}.json"
@@ -361,15 +289,4 @@ def _normalize_raw_config(raw: dict[str, Any]) -> dict[str, Any]:
         stages = payload.get("stages")
         selected = tuple(stages) if stages is not None else CORE_STAGE_ORDER
         payload["stageResources"] = {stage: fixed for stage in selected}
-    stage_resources = payload.get("stageResources")
-    if (
-        "stages" not in payload
-        and isinstance(stage_resources, dict)
-        and all(stage in stage_resources for stage in LEGACY_CORE_STAGE_ORDER)
-        and not all(stage in stage_resources for stage in CORE_STAGE_ORDER)
-    ):
-        payload["stages"] = LEGACY_CORE_STAGE_ORDER
-    payload.pop("sourceProvenance", None)
-    payload.pop("capacityCases", None)
-    payload.pop("blockSeeds", None)
     return payload

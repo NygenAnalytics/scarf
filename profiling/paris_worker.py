@@ -1,3 +1,13 @@
+"""Run Paris clustering in a child process, matching the Leiden stage.
+
+Modal's runner heartbeat interval is about 900 seconds and is not configurable,
+and the earlier scikit-network implementation could block the parent for longer
+than that. Scarf's Numba kernels release the GIL, so this isolation is no longer
+strictly required, but profiling keeps it so both clustering stages report
+progress and failures the same way. ``profiling.stages`` polls this child every
+30 seconds and warns at 1800 seconds without killing it.
+"""
+
 import argparse
 import json
 import time

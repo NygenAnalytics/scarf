@@ -82,26 +82,10 @@ See {doc}`../reference/api/utilities` for the exact output contract.
 ## Measured scaling references
 
 The following measurements are empirical references, not hardware guarantees.
-They cover all active cells through store preparation, QC, HVGs, graph, UMAP,
-Leiden, and markers. Dataset sparsity, selected features, graph parameters,
-storage latency, software version, and cache state all affect the result.
-
-One staged object-storage series used feature-major `countsT` and right-sized
-resources for each stage:
-
-| Cells | End-to-end wall time | Peak process or cgroup memory |
-|---:|---:|---:|
-| 100,000 | 881 s | 6.7 GiB |
-| 500,000 | 2,825 s | 16.6 GiB |
-| 5,000,000 | 29,465 s (8.2 h) | 33.0 GiB |
-| 10,000,000 | about 22.8 h | 36.2 GiB |
-
-The 10-million-cell total replaces one cached HVG timing with a full-compute
-estimate. The series used staged, right-sized resources and should not be read
-as a fixed-machine benchmark.
-
-More recent same-container, current-code references used different resource
-envelopes:
+They cover all active cells through store preparation, QC, HVGs, graph
+construction, UMAP, Leiden, Paris, and markers against object storage.
+Dataset sparsity, selected features, graph parameters, storage latency, software
+version, and cache state all affect the result.
 
 | Cells | CPU | Host memory | Scarf budget | Wall time | Peak cgroup memory |
 |---:|---:|---:|---:|---:|---:|
@@ -111,9 +95,8 @@ envelopes:
 The marker stage drove both peaks and tracks the configured software budget.
 The 105 GiB result is therefore not a fixed memory floor for ten million cells.
 Reducing the budget should shrink marker batches but can increase wall time.
-These rows must not be combined with the staged series as one scaling curve.
-
-For one bounded storage comparison at 100,000 cells, the same 8-CPU,
-32-GiB-host, 24-GiB-budget workflow took 421 seconds on ephemeral local disk and
-735 seconds against the prepared object-store layout. Local disk is a useful
-ceiling for that experiment, not a promise for a cloud service or network.
+The rows used different machine sizes and must not be read as one scaling curve.
+The
+[profiling benchmark record](https://github.com/parashardhapola/scarf/blob/master/profiling/BENCHMARKS.md)
+contains the source revision, workflow settings, per-stage timings, and storage
+caveats.

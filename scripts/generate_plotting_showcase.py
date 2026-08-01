@@ -16,6 +16,7 @@ import scarf.plotting as splt
 
 
 _FIXTURE = Path("tests/datasets/1K_pbmc_citeseq.zarr.tar.gz")
+_LAYOUT_FIXTURE = Path("tests/visual/showcase/plotting_showcase_layout.npz")
 _MARKER_SETS = {
     "T cells": ("CD3D", "IL7R", "LTB"),
     "B cells": ("MS4A1", "CD79A", "CD37"),
@@ -90,7 +91,44 @@ def _build_graph(store: DataStore) -> None:
     store.build_connectivity_map(neighbors)
 
 
-def _prepare_store(source: Path, work_directory: Path) -> DataStore:
+def _apply_fixed_layout(store: DataStore, source: Path) -> None:
+    with np.load(source, allow_pickle=False) as fixture:
+        cell_ids = fixture["cellIds"].astype(str)
+        umap = fixture["umap"]
+
+    fixture_index = pd.Index(cell_ids)
+    current_ids = np.asarray(store.cells.fetch("ids")).astype(str)
+    positions = fixture_index.get_indexer(current_ids)
+    if (
+        not fixture_index.is_unique
+        or len(fixture_index) != len(current_ids)
+        or np.any(positions < 0)
+    ):
+        raise ValueError(
+            f"Layout fixture at {source} does not match the selected datastore cells"
+        )
+    if umap.shape != (len(fixture_index), 2):
+        raise ValueError(f"Layout fixture at {source} must contain two UMAP columns")
+
+    store.cells.insert(
+        "RNA_UMAP1",
+        umap[positions, 0],
+        key="I",
+        overwrite=True,
+    )
+    store.cells.insert(
+        "RNA_UMAP2",
+        umap[positions, 1],
+        key="I",
+        overwrite=True,
+    )
+
+
+def _prepare_store(
+    source: Path,
+    work_directory: Path,
+    layout_fixture: Path = _LAYOUT_FIXTURE,
+) -> DataStore:
     store = DataStore(str(_copy_fixture(source, work_directory)), default_assay="RNA")
     store.auto_filter_cells(show_qc_plots=False)
     if "hvgs" not in store._get_assay("RNA").feats.columns:
@@ -112,8 +150,7 @@ def _prepare_store(source: Path, work_directory: Path) -> DataStore:
         _build_graph(store)
     if _CLUSTER_KEY not in store.cells.columns:
         store.run_leiden_clustering()
-    if "RNA_UMAP1" not in store.cells.columns:
-        store.run_umap(n_epochs=50)
+    _apply_fixed_layout(store, layout_fixture)
     return store
 
 
@@ -505,6 +542,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture", type=Path, default=_FIXTURE)
     parser.add_argument(
+        "--layout-fixture",
+        type=Path,
+        default=_LAYOUT_FIXTURE,
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("plotting_showcase"),
@@ -515,7 +557,11 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     with tempfile.TemporaryDirectory(prefix="scarf_plot_showcase_") as temporary:
-        store = _prepare_store(arguments.fixture, Path(temporary))
+        store = _prepare_store(
+            arguments.fixture,
+            Path(temporary),
+            arguments.layout_fixture,
+        )
         outputs = generate_showcase(store, arguments.output_dir)
     print("\n".join(str(path) for path in outputs))
     return 0

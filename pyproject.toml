@@ -157,19 +157,6 @@ profiling = [
     "modal>=1.5.2",
     "pydantic>=2.13.4",
 ]
-profiling-scanpy = [
-    "anndata[dask]>=0.12.18",
-    "annoy>=1.17",
-    "dask[distributed,diagnostics]>=2024.8.0",
-    "h5py>=3.11",
-    "igraph>=0.11",
-    "leidenalg>=0.10",
-    "modal>=1.5.2",
-    "obstore>=0.5.1",
-    "pydantic>=2.13.4",
-    "scanpy[dask,leiden]>=1.11",
-    "sklearn-ann>=0.1.2",
-]
 dev = [
     "mypy>=2.1.0",
     "ruff>=0.15.20",

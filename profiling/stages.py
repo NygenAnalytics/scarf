@@ -8,12 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scarf import DataStore, H5adReader, H5adToZarr, SubsetZarr, configure_output
+from scarf import DataStore, H5adReader, H5adToZarr, configure_output
 from scarf.storage.budget import resolve_budget
 from scarf.storage.sharding import write_counts_t
 from scarf.storage.stores import open_store
 from scarf.storage.types import as_zarr_array, as_zarr_group
-from scarf.writers import to_h5ad
 
 from profiling.config import (
     StageName,
@@ -26,9 +25,9 @@ from profiling.r2 import storage_options
 
 configure_output(progress=False, timestamps=True)
 
-LEIDEN_MONITOR_INTERVAL_SECONDS = 30.0
-LEIDEN_WARNING_SECONDS = 1_800.0
-LEIDEN_STOP_GRACE_SECONDS = 30.0
+CHILD_MONITOR_INTERVAL_SECONDS = 30.0
+CHILD_WARNING_SECONDS = 1_800.0
+CHILD_STOP_GRACE_SECONDS = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,61 +135,12 @@ def _prepare_create_store(
     return reader, writer
 
 
-def run_create_store(
-    *,
-    localH5adPath: Path,
-    storeUri: str,
-    workflow: WorkflowParameters,
-    resources: StageResources,
-    storageLayout: StorageLayout | None = None,
-) -> None:
-    reader, writer = _prepare_create_store(
-        localH5adPath=localH5adPath,
-        storeUri=storeUri,
-        workflow=workflow,
-        resources=resources,
-        storageLayout=storageLayout,
-    )
-    try:
-        writer.dump(batch_size=workflow.h5adBatchSize)
-    finally:
-        del writer
-        _close_h5ad_reader(reader)
-
-
-def _assay(store: DataStore, workflow: WorkflowParameters) -> Any:
-    return getattr(store, workflow.assayName)
-
-
-def _insert_synthetic_batches(store: DataStore, workflow: WorkflowParameters) -> None:
-    n_active = int(store.cells.fetch(workflow.cellKey).sum())
-    rng = np.random.default_rng(workflow.harmonyBatchSeed)
-    batch_ids = rng.integers(0, workflow.harmonyNBatches, size=n_active)
-    labels = np.array([f"b{int(i)}" for i in batch_ids], dtype=object)
-    store.cells.insert(
-        workflow.harmonyBatchColumn,
-        labels,
-        key=workflow.cellKey,
-        overwrite=True,
-    )
-
-
-def _impute_feature_names(store: DataStore, workflow: WorkflowParameters) -> list[str]:
-    assay = _assay(store, workflow)
-    names = np.asarray(assay.feats.fetch_all("names"))
-    keep = np.asarray(assay.feats.fetch_all("I"), dtype=bool)
-    candidates = [str(name) for name, ok in zip(names, keep, strict=True) if ok]
-    if not candidates:
-        raise ValueError("No active features available for imputation")
-    return candidates[: workflow.imputeGeneCount]
-
-
 def _monitor_child_process(
     process: subprocess.Popen[bytes],
     *,
     stageLabel: str,
-    warningSeconds: float = LEIDEN_WARNING_SECONDS,
-    pollSeconds: float = LEIDEN_MONITOR_INTERVAL_SECONDS,
+    warningSeconds: float = CHILD_WARNING_SECONDS,
+    pollSeconds: float = CHILD_MONITOR_INTERVAL_SECONDS,
 ) -> int:
     if warningSeconds <= 0:
         raise ValueError("warningSeconds must be positive")
@@ -218,33 +168,15 @@ def _monitor_child_process(
                 warned = True
 
 
-def _monitor_leiden_process(
-    process: subprocess.Popen[bytes],
-    *,
-    warningSeconds: float = LEIDEN_WARNING_SECONDS,
-    pollSeconds: float = LEIDEN_MONITOR_INTERVAL_SECONDS,
-) -> int:
-    return _monitor_child_process(
-        process,
-        stageLabel="runLeiden",
-        warningSeconds=warningSeconds,
-        pollSeconds=pollSeconds,
-    )
-
-
 def _stop_child_process(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
     process.terminate()
     try:
-        process.wait(timeout=LEIDEN_STOP_GRACE_SECONDS)
+        process.wait(timeout=CHILD_STOP_GRACE_SECONDS)
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
-
-
-def _stop_leiden_process(process: subprocess.Popen[bytes]) -> None:
-    _stop_child_process(process)
 
 
 def _read_worker_status(statusPath: Path, *, workerName: str) -> dict[str, Any] | None:
@@ -254,10 +186,6 @@ def _read_worker_status(statusPath: Path, *, workerName: str) -> dict[str, Any] 
     if not isinstance(payload, dict):
         raise RuntimeError(f"{workerName} status must be a JSON object")
     return payload
-
-
-def _read_leiden_worker_status(statusPath: Path) -> dict[str, Any] | None:
-    return _read_worker_status(statusPath, workerName="Leiden worker")
 
 
 def _run_worker_in_subprocess(
@@ -299,7 +227,7 @@ def _run_worker_in_subprocess(
     process = subprocess.Popen(command)
     print(
         f"[{stageLabel}] child started pid={process.pid} module={workerModule} "
-        f"warningSeconds={LEIDEN_WARNING_SECONDS:.0f}",
+        f"warningSeconds={CHILD_WARNING_SECONDS:.0f}",
         flush=True,
     )
     try:
@@ -355,24 +283,6 @@ def _run_paris_in_subprocess(
         workDir=workDir,
         workDirPrefix="scarf-paris-",
     )
-
-
-def _pseudotime_sources_sinks(
-    store: DataStore, workflow: WorkflowParameters
-) -> tuple[list[Any], list[Any]]:
-    group_key = workflow.resolvedMarkerGroupKey
-    labels = np.asarray(store.cells.fetch(group_key, key=workflow.cellKey))
-    # Keep native label values (Leiden membership is int). Prefer the two
-    # largest clusters so both usually sit in the retained graph component.
-    values, counts = np.unique(labels, return_counts=True)
-    if values.size < 2:
-        raise ValueError(
-            f"Need >=2 clusters in {group_key} for pseudotime; found {values.tolist()}"
-        )
-    order = np.argsort(-counts)
-    source = values[order[0]].item()
-    sink = values[order[1]].item()
-    return [source], [sink]
 
 
 def _peak_cgroup_bytes(measurement: ResourceMeasurement | None) -> int | None:
@@ -568,7 +478,6 @@ def run_stage(
     resources: StageResources,
     localH5adPath: Path | None = None,
     storageLayout: StorageLayout | None = None,
-    queryStoreUri: str | None = None,
     workDir: Path | None = None,
     sampleIntervalSeconds: float = 0.25,
     containerMemoryMb: int | None = None,
@@ -585,7 +494,6 @@ def run_stage(
     error: str | None = None
     status = "ok"
     measurement: ResourceMeasurement | None = None
-    result_store_uri = storeUri
     details: dict[str, Any] | None = None
     worker_timings: dict[str, Any] | None = None
 
@@ -648,31 +556,6 @@ def run_stage(
                 finally:
                     counts_t = None
                     counts_context = None
-            elif stage == "prepareMappingQuery":
-                if localH5adPath is None:
-                    raise ValueError("prepareMappingQuery requires localH5adPath")
-                if queryStoreUri is None:
-                    raise ValueError("prepareMappingQuery requires queryStoreUri")
-                result_store_uri = queryStoreUri
-                reader = None
-                writer = None
-                try:
-                    with timer.inputSetup():
-                        reader, writer = _prepare_create_store(
-                            localH5adPath=localH5adPath,
-                            storeUri=queryStoreUri,
-                            workflow=workflow,
-                            resources=resources,
-                            storageLayout=storageLayout,
-                        )
-                    with timer.operation():
-                        assert writer is not None
-                        writer.dump(batch_size=workflow.h5adBatchSize)
-                finally:
-                    writer = None
-                    if reader is not None:
-                        _close_h5ad_reader(reader)
-                        reader = None
             elif stage == "initializeStore":
                 store: DataStore | None = None
                 try:
@@ -691,37 +574,6 @@ def run_stage(
                         )
                 finally:
                     store = None
-            elif stage == "runMapping":
-                if queryStoreUri is None:
-                    raise ValueError("runMapping requires queryStoreUri")
-                ref: DataStore | None = None
-                query: DataStore | None = None
-                try:
-                    with timer.inputSetup():
-                        ref = _open_datastore(
-                            storeUri, workflow, resources, initialize=False
-                        )
-                        query = _open_datastore(
-                            queryStoreUri, workflow, resources, initialize=True
-                        )
-                    with timer.operation():
-                        assert ref is not None
-                        assert query is not None
-                        ref.run_mapping(
-                            target_assay=_assay(query, workflow),
-                            target_name=workflow.mappingTargetName,
-                            target_feat_key=workflow.mappingTargetFeatKey,
-                            target_cell_key=workflow.cellKey,
-                            from_assay=workflow.assayName,
-                            cell_key=workflow.cellKey,
-                            feat_key=workflow.hvgKey,
-                            save_k=workflow.mappingSaveK,
-                            missing_feature_policy="zero",
-                            invalidate_cache=invalidateCache,
-                        )
-                finally:
-                    query = None
-                    ref = None
             elif stage == "runLeiden":
                 with timer.operation():
                     worker_timings = _run_leiden_in_subprocess(
@@ -761,7 +613,6 @@ def run_stage(
                             store,
                             workflow,
                             resources,
-                            workDir=workDir,
                             invalidateCache=invalidateCache,
                         )
                         print(
@@ -816,7 +667,7 @@ def run_stage(
             resources.modalCpuLimit if containerCpuLimit is None else containerCpuLimit
         ),
         scarfMemoryBudget=resources.scarfMemoryBudget,
-        storeUri=result_store_uri,
+        storeUri=storeUri,
         error=error,
         inputSetupSeconds=input_setup_seconds,
         validationPersistenceSeconds=timings.validationPersistenceSeconds,
@@ -826,77 +677,12 @@ def run_stage(
     )
 
 
-def _build_profile_graph(
-    store: DataStore,
-    workflow: WorkflowParameters,
-    *,
-    harmonize: bool,
-    invalidateCache: bool = False,
-) -> None:
-    normalized = store.run_normalization(
-        from_assay=workflow.assayName,
-        cell_key=workflow.cellKey,
-        feat_key=workflow.hvgKey,
-        update_state=False,
-        invalidate_cache=invalidateCache,
-    )
-    reduction = store.run_pca(
-        normalized,
-        dims=workflow.dims,
-        local_cache=workflow.graphLocalCache,
-        show_elbow_plot=False,
-        update_state=False,
-        invalidate_cache=invalidateCache,
-    )
-    coordinates = (
-        store.run_harmony(
-            [workflow.harmonyBatchColumn],
-            reduction,
-            update_state=False,
-            invalidate_cache=invalidateCache,
-        )
-        if harmonize
-        else reduction
-    )
-    ann_index = store.build_ann_index(
-        coordinates,
-        ann_efc=min(100, max(workflow.k * 3, 50)),
-        ann_ef=min(100, max(workflow.k * 3, 50)),
-        ann_m=min(max(48, int(workflow.dims * 1.5)), 64),
-        ann_parallel=workflow.annParallel,
-        rand_state=workflow.graphSeed,
-        update_state=False,
-        invalidate_cache=invalidateCache,
-    )
-    store.build_embedding_initialization(
-        reduction,
-        n_centroids=workflow.nCentroids,
-        rand_state=workflow.graphSeed,
-        kmeans_sampling=workflow.kmeansSampling,
-        kmeans_batch_size=workflow.kmeansBatchSize,
-        invalidate_cache=invalidateCache,
-    )
-    neighbors = store.query_neighbors(
-        ann_index,
-        coordinates=coordinates,
-        k=workflow.k,
-        update_state=False,
-        invalidate_cache=invalidateCache,
-    )
-    store.build_connectivity_map(
-        neighbors,
-        update_state=True,
-        invalidate_cache=invalidateCache,
-    )
-
-
 def _run_analysis(
     stage: StageName,
     store: DataStore,
     workflow: WorkflowParameters,
     resources: StageResources,
     *,
-    workDir: Path | None = None,
     invalidateCache: bool = False,
 ) -> None:
     if stage == "filterCells":
@@ -976,14 +762,6 @@ def _run_analysis(
             invalidate_cache=invalidateCache,
         )
         return
-    if stage == "makeGraph":
-        _build_profile_graph(
-            store,
-            workflow,
-            harmonize=False,
-            invalidateCache=invalidateCache,
-        )
-        return
     if stage == "runUmap":
         store.run_umap(
             from_assay=workflow.assayName,
@@ -1011,115 +789,6 @@ def _run_analysis(
             invalidate_cache=invalidateCache,
         )
         return
-    if stage == "getImputed":
-        for feature_name in _impute_feature_names(store, workflow):
-            store.get_imputed(
-                from_assay=workflow.assayName,
-                cell_key=workflow.cellKey,
-                feat_key=workflow.hvgKey,
-                feature_name=feature_name,
-                t=workflow.imputeDiffusionT,
-                cache_operator=True,
-                invalidate_cache=invalidateCache,
-            )
-        return
     if stage == "runClustering":
         raise AssertionError("runClustering must execute in its child process")
-    if stage == "runPseudotime":
-        sources, sinks = _pseudotime_sources_sinks(store, workflow)
-        store.run_pseudotime_scoring(
-            from_assay=workflow.assayName,
-            cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
-            source_sink_key=workflow.resolvedMarkerGroupKey,
-            sources=sources,
-            sinks=sinks,
-            label=workflow.pseudotimeLabel,
-            random_seed=workflow.leidenSeed,
-            invalidate_cache=invalidateCache,
-        )
-        return
-    if stage == "makeGraphHarmony":
-        _insert_synthetic_batches(store, workflow)
-        _build_profile_graph(
-            store,
-            workflow,
-            harmonize=True,
-            invalidateCache=invalidateCache,
-        )
-        return
-    if stage == "subsetZarr":
-        if workDir is None:
-            raise ValueError("subsetZarr requires workDir")
-        out = workDir / "subset.zarr"
-        writer = SubsetZarr(
-            zarr_loc=str(out),
-            assays=[_assay(store, workflow)],
-            cell_key=workflow.cellKey,
-            overwrite_existing_file=True,
-            overwrite_cell_data=True,
-        )
-        writer.dump()
-        return
-    if stage == "toH5ad":
-        if workDir is None:
-            raise ValueError("toH5ad requires workDir")
-        out = workDir / "export.h5ad"
-        to_h5ad(
-            _assay(store, workflow),
-            str(out),
-            embeddings_cols=[workflow.umapLabel],
-            skip_recalc_nfeats=True,
-            n_threads=resources.workers,
-        )
-        return
     raise ValueError(f"No analysis operation for {stage}")
-
-
-def repair_counts_t(
-    *,
-    storeUri: str,
-    assayName: str,
-    resources: StageResources,
-    nCheckTiles: int = 3,
-    seed: int = 0,
-    sampleIntervalSeconds: float = 0.25,
-    featureMajorLayout: bool = False,
-) -> dict[str, Any]:
-    """Rewrite feature-major ``countsT`` and only then mark it complete."""
-    context = _prepare_counts_t_write(
-        storeUri=storeUri,
-        assayName=assayName,
-        resources=resources,
-    )
-    sampler = ResourceSampler(sampleIntervalSeconds=sampleIntervalSeconds)
-    sampler.start()
-    started = time.perf_counter()
-    try:
-        counts_t = _write_counts_t(
-            context,
-            storeUri=storeUri,
-            assayName=assayName,
-            featureMajorLayout=featureMajorLayout,
-        )
-    finally:
-        seconds = time.perf_counter() - started
-        measurement = sampler.stop()
-    details = _validate_counts_t(
-        context,
-        counts_t,
-        storeUri=storeUri,
-        assayName=assayName,
-        resources=resources,
-        nCheckTiles=nCheckTiles,
-        seed=seed,
-    )
-
-    return {
-        "storeUri": storeUri,
-        "status": "ok",
-        "seconds": seconds,
-        "peakRssBytes": measurement.processTreeRssPeakBytes if measurement else None,
-        "peakCgroupBytes": _peak_cgroup_bytes(measurement),
-        **details,
-    }

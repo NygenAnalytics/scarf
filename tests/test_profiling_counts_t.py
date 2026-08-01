@@ -4,7 +4,7 @@ import zarr
 
 from profiling import stages as profiling_stages
 from profiling.config import StageResources, WorkflowParameters
-from profiling.stages import repair_counts_t, run_stage
+from profiling.stages import run_stage
 from scarf.storage.sharding import write_counts_t
 
 
@@ -21,7 +21,7 @@ def _resources() -> StageResources:
     )
 
 
-def test_repair_counts_t_rewrites_incomplete_array(tmp_path):
+def test_write_counts_t_rewrites_incomplete_array(tmp_path):
     root_path = tmp_path / "store.zarr"
     root = zarr.open_group(str(root_path), mode="w")
     group = root.create_group("RNA")
@@ -33,16 +33,19 @@ def test_repair_counts_t_rewrites_incomplete_array(tmp_path):
     counts_t.attrs["complete"] = False
     counts_t[0, 0] = 999
 
-    result = repair_counts_t(
+    result = run_stage(
+        "writeCountsT",
+        nRows=6,
         storeUri=str(root_path),
-        assayName="RNA",
+        workflow=WorkflowParameters(),
         resources=_resources(),
-        nCheckTiles=2,
-        seed=1,
+        sampleIntervalSeconds=0.01,
     )
-    assert result["status"] == "ok"
-    assert result["complete"] is True
-    assert result["beforeComplete"] is False
+
+    assert result.status == "ok"
+    assert result.details is not None
+    assert result.details["complete"] is True
+    assert result.details["beforeComplete"] is False
     reopened = zarr.open_group(str(root_path), mode="r")
     fixed = reopened["RNA/countsT"]
     assert fixed.attrs["complete"] is True

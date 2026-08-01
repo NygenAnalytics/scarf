@@ -1,13 +1,12 @@
-"""R2 IO baseline for the finished 1M profiling store.
+"""R2 I/O baseline for a completed profiling store.
 
-Streams the same access patterns as HVG / markers / makeGraph without compute.
-Uses the same Modal shape as the 1M stages (8 CPU / 64 GiB, region eu).
+Streams the same access patterns as HVG, markers, and graph construction without
+compute.
 
 Spawn via the deployed app (survives local network drop):
 
-  modal deploy --env scarf_profiling -m profiling.modal_app
   uv run --group profiling modal run --env scarf_profiling -m profiling.modal_app -- \\
-    io-baseline --config profiling/layouts/1m_auto_markers_c8_m64.toml
+    io-baseline --config profiling/config.toml --size 1000000
 """
 
 import os
@@ -27,8 +26,6 @@ from scarf.storage.feature_stream import FeatureStreamPlan, plan_feature_stream
 from scarf.storage.types import as_zarr_array
 from scarf.utils import iter_column_blocks
 
-_CONFIG_PATH = "profiling/layouts/1m_auto_markers_c8_m64.toml"
-_N_ROWS = 1_000_000
 _LOG_EVERY_BLOCKS = 25
 
 
@@ -254,19 +251,19 @@ def _stream_marker_batches(
     }
 
 
-def _stream_makegraph_raw_cell_bands(
+def _stream_graph_raw_cell_bands(
     assay: Any,
     cellIdx: np.ndarray,
     hvgIdx: np.ndarray,
 ) -> dict[str, Any]:
-    """Selected cells × HVG columns in row bands (makeGraph normalize read shape)."""
+    """Selected cells by HVG columns in normalization row bands."""
     zarr_arr = assay.rawData._backing
     chunks = getattr(zarr_arr, "chunks", None)
     row_chunk = int(chunks[0]) if chunks and len(chunks) > 0 else len(cellIdx)
     row_chunk = max(1, row_chunk)
     n_blocks = int(np.ceil(len(cellIdx) / row_chunk))
     _log(
-        f"[plan] makeGraphRawCellBands cells={len(cellIdx)} hvgs={len(hvgIdx)} "
+        f"[plan] graphRawCellBands cells={len(cellIdx)} hvgs={len(hvgIdx)} "
         f"rowChunk={row_chunk} bands={n_blocks}"
     )
     bytes_read = 0
@@ -277,7 +274,7 @@ def _stream_makegraph_raw_cell_bands(
         raw = _read_block(zarr_arr, cellIdx[start:end], hvgIdx)
         bytes_read += int(raw.nbytes)
         n_done += 1
-        _progress("makeGraphRawCellBands", n_done - 1, n_blocks, bytes_read, t0)
+        _progress("graphRawCellBands", n_done - 1, n_blocks, bytes_read, t0)
         del raw
     return {
         "nCells": int(len(cellIdx)),
@@ -288,10 +285,8 @@ def _stream_makegraph_raw_cell_bands(
     }
 
 
-def _stream_makegraph_normed_cell_bands(
-    store: DataStore, assayName: str
-) -> dict[str, Any]:
-    """Row chunks of dense HVG-normed matrix (makeGraph ANN/PCA read shape)."""
+def _stream_graph_normed_cell_bands(store: DataStore, assayName: str) -> dict[str, Any]:
+    """Row chunks of the dense normalized-HVG matrix."""
     assay = store.get_assay(assayName)
     cell_key = assay.attrs.get("latest_cell_key", "I")
     feat_key = assay.attrs["latest_feat_key"]
@@ -303,7 +298,7 @@ def _stream_makegraph_normed_cell_bands(
     row_chunk = max(1, row_chunk)
     n_blocks = int(np.ceil(n_rows / row_chunk))
     _log(
-        f"[plan] makeGraphNormedCellBands path={loc} shape=({n_rows},{n_cols}) "
+        f"[plan] graphNormedCellBands path={loc} shape=({n_rows},{n_cols}) "
         f"rowChunk={row_chunk} bands={n_blocks} dtype={arr.dtype}"
     )
     bytes_read = 0
@@ -314,7 +309,7 @@ def _stream_makegraph_normed_cell_bands(
         block = np.asarray(arr[start:end, :])
         bytes_read += int(block.nbytes)
         n_done += 1
-        _progress("makeGraphNormedCellBands", n_done - 1, n_blocks, bytes_read, t0)
+        _progress("graphNormedCellBands", n_done - 1, n_blocks, bytes_read, t0)
         del block
     return {
         "arrayPath": loc,
@@ -330,7 +325,7 @@ def _stream_makegraph_normed_cell_bands(
 def run_io_baseline_body(
     config: ProfilingConfig,
     *,
-    nRows: int = _N_ROWS,
+    nRows: int = 1_000_000,
     resultLabel: str | None = None,
     columnOnly: bool = False,
 ) -> dict[str, Any]:
@@ -422,14 +417,14 @@ def run_io_baseline_body(
     if not columnOnly:
         results.append(
             _measure(
-                "makeGraphRawCellBands",
-                lambda: _stream_makegraph_raw_cell_bands(assay, cell_idx, hvg_idx),
+                "graphRawCellBands",
+                lambda: _stream_graph_raw_cell_bands(assay, cell_idx, hvg_idx),
             )
         )
         results.append(
             _measure(
-                "makeGraphNormedCellBands",
-                lambda: _stream_makegraph_normed_cell_bands(
+                "graphNormedCellBands",
+                lambda: _stream_graph_normed_cell_bands(
                     store, config.workflow.assayName
                 ),
             )

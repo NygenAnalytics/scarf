@@ -2,8 +2,6 @@ from pathlib import Path
 
 from profiling.config import (
     CORE_STAGE_ORDER,
-    FULL_STAGE_ORDER,
-    LEGACY_CORE_STAGE_ORDER,
     StorageLayout,
     WorkflowParameters,
     _normalize_raw_config,
@@ -20,8 +18,6 @@ def test_example_config_loads():
     assert config.modalEnvironmentName == "scarf_profiling"
     assert set(config.stageResources) == set(CORE_STAGE_ORDER)
     assert config.effectiveStages == CORE_STAGE_ORDER
-    assert "makeGraph" not in CORE_STAGE_ORDER
-    assert "makeGraph" in FULL_STAGE_ORDER
     assert "writeCountsT" in CORE_STAGE_ORDER
     assert "runClustering" in CORE_STAGE_ORDER
     assert config.datasetUri(10_000).endswith("/10000.h5ad")
@@ -51,16 +47,15 @@ def test_run_tag_isolates_store_and_result_uris():
     )
 
 
-def test_legacy_resource_map_keeps_the_legacy_default_funnel():
+def test_fixed_resource_map_expands_the_current_funnel():
+    fixed = {"placeholder": "fixed"}
     normalized = _normalize_raw_config(
         {
-            "stageResources": {
-                stage: {"placeholder": stage} for stage in LEGACY_CORE_STAGE_ORDER
-            }
+            "fixedResources": fixed,
         }
     )
 
-    assert normalized["stages"] == LEGACY_CORE_STAGE_ORDER
+    assert normalized["stageResources"] == {stage: fixed for stage in CORE_STAGE_ORDER}
 
 
 def test_marker_group_key_matches_leiden_column():

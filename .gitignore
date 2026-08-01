@@ -52,8 +52,10 @@ benchmarks/.env.*
 profiling/.env
 profiling/.env.*
 !profiling/.env.example
-profiling/config.toml
-# Generated / local-only run configs (machine grids). Keep LEARNINGS.md + examples.
+/profiling/config.toml
+/profiling/config.*.toml
+!/profiling/config.example.toml
+# Generated and machine-specific profiling configs.
 profiling/layouts/
 test_data
 # Generated plotting showcase outputs. Curated references live in tests/visual.

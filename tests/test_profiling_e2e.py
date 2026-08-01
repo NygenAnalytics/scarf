@@ -7,7 +7,6 @@ import pytest
 from profiling import modal_app
 from profiling.config import (
     CORE_STAGE_ORDER,
-    FULL_STAGE_ORDER,
     ProfilingConfig,
     StageName,
     load_profiling_config,
@@ -234,7 +233,7 @@ def test_e2e_freshness_checks_store_and_all_results(
     assert f"{config.storeUri(10_000)}/.zgroup" in checked
     assert config.e2eClaimUri() in checked
     assert config.funnelResultUri(10_000) in checked
-    assert {config.resultUri(10_000, stage) for stage in FULL_STAGE_ORDER}.issubset(
+    assert {config.resultUri(10_000, stage) for stage in CORE_STAGE_ORDER}.issubset(
         checked
     )
 

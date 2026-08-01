@@ -1,5 +1,5 @@
 ---
-description: What Scarf is designed for, the workflows it supports, and its current boundaries.
+description: What Scarf is designed for, how it works, the methods it implements, and its current boundaries.
 ---
 
 # About Scarf
@@ -37,48 +37,185 @@ Scarf provides complete workflows for:
 - cell-cycle scoring, gene-set activity, imputation, downsampling, and
   pseudobulk export
 
-## Why Scarf uses a persistent store
+## Local, remote, and mounted data
+
+Downloading and maintaining local copies of large collections can become a
+substantial part of a project. Object storage is often used for distribution and
+archiving, with a full local copy required before analysis begins.
+
+A Scarf datastore can live on local disk, S3-compatible object storage, Google
+Cloud Storage, or Hugging Face, and be analysed in place. When the source is
+read-only, `mount_datastore` creates a writable analysis layer: counts stay in
+the source while new cell metadata, feature metadata, and results are written to
+a target you control. This is a logical mount rather than a filesystem symbolic
+link, and it does not copy the count matrices into each project.
+
+Operations that scan normalized expression repeatedly, such as PCA and LSI, can
+stage the blocks they need in local scratch space through `local_cache`. Scratch
+is temporary I/O acceleration, not a second persistent datastore, and it does not
+download the complete source store. Credentials are supplied when the store is
+opened and are not persisted inside it.
+
+See {doc}`tutorials/remote_stores`.
+
+## Planning memory, compute, and I/O
+
+Scarf treats memory, CPU time, storage layout, and network access as one
+planning problem rather than optimising memory alone. Counts are streamed in
+blocks; an optional feature-major `countsT` orientation speeds up gene-wise
+stages such as highly variable feature selection and marker search; and
+`mem_budget` shapes block geometry, write concurrency, and automatically sized
+feature batches.
+
+`mem_budget` is a planning input, not a hard cap on process memory. Graph
+structures, native libraries, Python objects, and allocator overhead consume
+memory in addition to the streamed blocks, so leave host headroom. A smaller
+budget generally reduces peak memory and increases wall time.
+
+### Measured scale
+
+The current reference runs used fresh object-store-backed Zarr and completed the
+same sixteen-stage workflow, covering conversion, `countsT`, quality control,
+normalization, PCA, graph construction, UMAP, Leiden, Paris, and marker search.
+
+| Input cells | Cells after QC | CPU | Host memory | Scarf budget | Wall time | Peak memory |
+| ----------: | -------------: | --: | ----------: | -----------: | --------: | ----------: |
+| 1,000,000   | 889,974        | 8   | 32 GiB      | 24 GiB       | 41.0 min  | 28.5 GiB    |
+| 10,000,000  | 8,902,268      | 16  | 128 GiB     | 96 GiB       | 10.31 h   | 105.0 GiB   |
+
+These runs show that the complete workflow can run on every active cell at these
+scales on CPU. They are not a same-machine scaling curve: the ten-million-cell
+run had twice the CPUs and four times the host memory. Marker search set the
+peak in both, and its memory use follows the configured budget rather than a
+fixed algorithmic requirement.
+
+Runtime and peak memory also depend on the selected features, graph parameters,
+compression, storage latency, and whether `countsT` is present. The benchmark
+demonstrates execution and resource use, not biological correctness. Full
+settings and stage timings are in the
+[profiling benchmark record](https://github.com/parashardhapola/scarf/blob/master/profiling/BENCHMARKS.md).
+The resource controls and measurement caveats are explained in
+{doc}`concepts/scale_and_memory`.
+
+## Provenance and reuse
 
 Single-cell analysis is a chain of dependent operations. Changing a cell filter
 can change feature selection, PCA, neighbours, clustering, and markers. Scarf
 records each persisted result, or {term}`artifact`, with its operation,
-scientific parameters, and upstream inputs. Related branches can coexist in one
-datastore, and an identical request can {term}`reuse` a valid result rather than
-recomputing it.
+scientific parameters, and upstream inputs. A clustering therefore names the
+graph it used, that graph names its neighbour query and reduction, and the
+reduction names its normalization and selected data.
 
-Filtering is reversible: cells and features are marked by boolean selections
-rather than deleted. Persisted outputs remain available between sessions, so an
-analysis can stop after an expensive stage and continue later.
+Related branches can coexist in one datastore, and an identical request can
+{term}`reuse` a valid result rather than recomputing it. Execution choices such
+as thread count or local scratch are recorded separately and do not change the
+scientific identity of a result.
 
-## Local, remote, and mounted data
+This record is useful whenever the analysis is long-running, revisited after a
+gap, or executed through a pipeline or software agent, because the dependency
+chain can be inspected independently of the code or description that produced
+it. See {doc}`concepts/provenance` and {doc}`tutorials/provenance_and_reuse`.
 
-A datastore can live on local disk or S3-compatible object storage. When a
-remote source is read-only, `mount_datastore` creates a writable analysis layer
-whose counts remain in the source while new metadata and results are stored in a
-target you control. Multi-pass operations can use local scratch space without
-turning that scratch cache into a second persistent datastore.
+## Selections and multi-scale analysis
 
-## Performance framing
+Detailed work usually moves from a whole dataset to tissues, lineages, clusters,
+and smaller subpopulations. Keeping a separate in-memory object for each subset
+makes it easy to lose track of which cells produced which result.
 
-Scarf is intended for laptops and single servers, including analyses with
-millions of cells. Runtime and peak process memory depend on the selected
-features, graph parameters, CPU count, compression, storage latency, and whether
-feature-major `countsT` data is available. The public scaling guide reports
-benchmarks with those resource envelopes rather than treating one result as a
-universal expectation. See {doc}`concepts/scale_and_memory`.
+In Scarf, cell and feature selections are boolean masks stored in the datastore,
+and filtering marks cells inactive rather than deleting them. Whole-dataset and
+subpopulation analyses can therefore share one object and one set of count
+matrices, while each stored result stays tied to the exact {term}`cell key` and
+{term}`feat_key` used to produce it. Persisted outputs remain available between
+sessions, so an analysis can stop after an expensive stage and continue later.
+
+## Implemented methods
+
+Scarf implements a computational stage itself when an external implementation
+would require materializing the full matrix or would detach the result from its
+inputs. It uses established libraries where they fit the streaming and
+provenance model. The aim is one coherent execution path, not reimplementation
+for its own sake.
+
+- **Reduction and graph construction:** streamed normalization, covariance
+  (Gram-matrix) PCA with an incremental fallback, randomized streaming
+  {term}`LSI`, approximate nearest-neighbour search, UMAP, {term}`densMAP`, and
+  graph-based t-SNE.
+- **Batch correction and mapping:** Scarf implementations of
+  [Harmony](https://doi.org/10.1038/s41592-019-0619-0) and
+  [Symphony-style](https://doi.org/10.1038/s41467-021-25957-x) fixed-reference
+  mapping, with label transfer and mapping diagnostics.
+- **Matched multi-omics:** {term}`SNN integration` for two or more assays and a
+  [Hao-inspired WNN](https://doi.org/10.1016/j.cell.2021.04.048) implementation
+  for exactly two modalities, reporting per-cell modality weights.
+- **Clustering and sampling:**
+  [Leiden](https://doi.org/10.1038/s41598-019-41695-z), a native implementation
+  of [Paris hierarchical clustering](https://doi.org/10.48550/arXiv.1806.01664)
+  with fixed and branch-adaptive cuts, and manifold-preserving
+  {term}`TopACeDo` downsampling described in the
+  [Scarf paper](https://doi.org/10.1038/s41467-022-32097-3).
+- **Trajectory analysis:** memory-aware
+  [Population Balance Analysis](https://doi.org/10.1073/pnas.1714723115),
+  supervised terminal-state fate probabilities, pseudotime aggregation and
+  modules, and
+  [MAGIC-style graph diffusion](https://doi.org/10.1016/j.cell.2018.05.061) for
+  imputation.
+- **Statistics and diagnostics:** marker AUC, the
+  [Mann-Whitney U test](https://doi.org/10.1214/aoms/1177730491) with
+  [Benjamini-Hochberg](https://doi.org/10.1111/j.2517-6161.1995.tb02031.x)
+  correction, doublet scores, cluster separability, and integration metrics
+  informed by the [scIB benchmark](https://doi.org/10.1038/s41592-021-01336-8).
+- **Gene sets, protein, and sample tags:**
+  [AUCell](https://doi.org/10.1038/nmeth.4463) and
+  [WAGGR](https://doi.org/10.1093/bioadv/vbac016) activity scores, CITE-seq
+  processing, and [cell-hashing](https://doi.org/10.1186/s13059-018-1603-1)
+  demultiplexing.
+
+## Validation
+
+Validation is method-specific. Agreement measured for one method is not evidence
+of equivalence for the rest of the package, and none of these comparisons
+establish biological ground truth.
+
+- HTO demultiplexing was compared with Seurat 5.5.1 on four GSE245108 matrices
+  and matched 38,183 of 38,199 identities (99.9581%). All sixteen differences
+  were k-means boundary cases at a single background cutoff.
+- Symphony-style query correction is checked against a golden fixture generated
+  with the R Symphony 0.1.3 `mapQuery` implementation, including a case with
+  nonzero correction.
+- Marker statistics are checked against SciPy, including continuity and
+  large-tie corrections.
+- Paris hierarchies are compared with the scikit-network reference
+  implementation on tie-free graphs.
+- WNN is checked against scalar reference calculations and for modality-order
+  symmetry, row-order invariance, and degenerate bandwidths. It follows the
+  published weighting equations but is not bit-identical to Seurat defaults, as
+  described in {ref}`the FAQ <faq>`.
+- AUCell and WAGGR scores are checked against frozen decoupler 2.2 fixtures.
+- Fate probabilities are checked against dense Dirichlet solutions on controlled
+  graphs.
 
 ## Current boundaries
 
 Scarf starts from count matrices; it does not process FASTQ files or perform
 alignment. Use tools such as Cell Ranger, STARsolo, or alevin-fry first.
 
+Provenance covers supported store-backed operations. It does not capture
+arbitrary Python calculations, the full software environment, hardware, or
+study-level experimental records, and it describes computational relationships
+rather than scientific validity.
+
 Scarf does not ship every method in the single-cell ecosystem. It does not
-provide scVI, Scanorama, RNA velocity, FRiP/TSS APIs, or a complete
-replicate-aware differential-expression framework. Marker searches include
-cell-level Mann-Whitney statistics, AUC, and within-group multiple-testing
-correction, but those values are not a substitute for inference across
-biological replicates. Export selected data to AnnData or another supported
-format when a downstream method is outside Scarf.
+provide scVI, Scanorama, RNA velocity, peak calling, FRiP/TSS APIs, or a
+complete replicate-aware differential-expression framework. Marker searches
+report cell-level Mann-Whitney statistics, AUC, and within-group multiple-testing
+correction, which are not a substitute for inference across biological
+replicates. {term}`WNN integration` requires exactly two cell-aligned
+modalities, and Scarf does not align unpaired modalities. Fate mapping needs
+user-supplied terminal states and does not infer them or use RNA velocity.
+Imputation is intended for exploratory visualization rather than differential
+expression. Export selected data to AnnData or another supported format when a
+downstream method is outside Scarf.
 
 ## Citation
 

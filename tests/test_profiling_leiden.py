@@ -7,7 +7,7 @@ import pytest
 from profiling import leiden_worker
 from profiling.config import StageResources, WorkflowParameters
 from profiling.stages import (
-    _monitor_leiden_process,
+    _monitor_child_process,
     _run_leiden_in_subprocess,
     run_stage,
 )
@@ -58,7 +58,7 @@ def _request(
     return request_path, status_path
 
 
-def test_worker_runs_historical_leiden(
+def test_worker_runs_leiden(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -149,8 +149,9 @@ def test_monitor_warns_without_terminating(
     process = Process()
 
     assert (
-        _monitor_leiden_process(
+        _monitor_child_process(
             process,  # type: ignore[arg-type]
+            stageLabel="runLeiden",
             warningSeconds=1_800.0,
             pollSeconds=30.0,
         )

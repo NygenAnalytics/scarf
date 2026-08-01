@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 from scipy.sparse import csr_matrix
 
-from profiling.paris_quality_gate import (
+from tests.paris_quality_gate import (
     MAX_ADAPTIVE_CLUSTERS,
     MIN_RARE_CLUSTER_F1,
     ORACLE_ARI_TOLERANCE,

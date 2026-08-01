@@ -142,7 +142,7 @@ def test_graph_construction_profile_stage_selects_state_and_preserves_parameters
 
 def test_forced_profile_stages_invalidate_reusable_artifacts() -> None:
     workflow = WorkflowParameters()
-    for stage in (*GRAPH_CONSTRUCTION_STAGE_ORDER, "makeGraph", "findMarkers"):
+    for stage in (*GRAPH_CONSTRUCTION_STAGE_ORDER, "findMarkers"):
         store = _RecordingStore()
         _run_analysis(
             stage,

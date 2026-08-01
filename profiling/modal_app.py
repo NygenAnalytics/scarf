@@ -3,18 +3,19 @@
 Deploy once (you run this), then trigger jobs that keep running if your laptop
 disconnects:
 
-  modal deploy --env scarf_profiling -m profiling.modal_app
+  uv run --group profiling modal deploy --env scarf_profiling -m profiling.modal_app
 
-  modal run --env scarf_profiling -m profiling.modal_app -- prepare-fixture --config profiling/config.toml --sizes 10000
-  modal run --env scarf_profiling -m profiling.modal_app -- prepare --config profiling/config.toml
-  modal run --env scarf_profiling -m profiling.modal_app -- run --config profiling/config.toml --size 10000 --stage createStore
-  modal run --env scarf_profiling -m profiling.modal_app -- run-all --config profiling/config.toml --sizes 10000
+  uv run --group profiling modal run --env scarf_profiling \\
+    -m profiling.modal_app -- prepare --config profiling/config.toml
+  uv run --group profiling modal run --env scarf_profiling \\
+    -m profiling.modal_app -- run-e2e --config profiling/config.toml --size 1000000
 
 prepare / run / run-all / run-local / run-e2e spawn and return immediately.
 run-all fans out one size pipeline per container (stages stay sequential on R2).
 run-local runs the full funnel in one container on ephemeral-disk Zarr (fast_local).
-run-e2e runs the graph-construction core in one container while keeping Zarr on R2.
-Watch progress with: modal app logs scarf-profiling --env scarf_profiling
+run-e2e runs the current core funnel in one container while keeping Zarr on R2.
+Watch progress with:
+  uv run --group profiling modal app logs scarf-profiling --env scarf_profiling
 """
 
 import argparse
@@ -27,7 +28,6 @@ import modal
 
 from profiling.config import (
     CORE_STAGE_ORDER,
-    FULL_STAGE_ORDER,
     MAX_TIMEOUT_SECONDS,
     ProfilingConfig,
     StageName,
@@ -70,7 +70,6 @@ from profiling.spawn_wait import (
 )
 from profiling.metrics import ResourceSampler
 from profiling.stages import (
-    repair_counts_t,
     run_stage,
     summarize_resource_measurement,
 )
@@ -88,7 +87,7 @@ def _e2e_conflicting_uris(
         f"{store_uri}/.zgroup",
         config.e2eClaimUri(),
         config.funnelResultUri(nRows),
-        *(config.resultUri(nRows, stage) for stage in FULL_STAGE_ORDER),
+        *(config.resultUri(nRows, stage) for stage in CORE_STAGE_ORDER),
     ]
     return [uri for uri in candidates if object_exists(uri)]
 
@@ -305,7 +304,7 @@ def io_baseline_job(
     resultLabel: str | None = None,
     columnOnly: bool = False,
 ) -> dict[str, Any]:
-    """No-compute R2 stream of HVG / marker / makeGraph read patterns."""
+    """No-compute R2 stream of HVG, marker, and graph read patterns."""
     config = ProfilingConfig.model_validate(configDict)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
     return run_io_baseline_body(
@@ -353,10 +352,6 @@ def run_stage_job(
     if stage == "createStore":
         local_h5ad = work / f"{nRows}.h5ad"
         download_file(config.datasetUri(nRows), local_h5ad)
-    elif stage == "prepareMappingQuery":
-        query_rows = config.workflow.mappingQueryRows
-        local_h5ad = work / f"{query_rows}.h5ad"
-        download_file(config.datasetUri(query_rows), local_h5ad)
 
     result = run_stage(
         stage,
@@ -366,109 +361,11 @@ def run_stage_job(
         resources=resources,
         localH5adPath=local_h5ad,
         storageLayout=config.storageLayout,
-        queryStoreUri=config.queryStoreUri(nRows),
         workDir=work,
         invalidateCache=force,
     )
     write_result(config, result)
     return result.to_json()
-
-
-@app.function(
-    **COMMON_FUNCTION_OPTIONS,
-    timeout=86_400,
-    memory=65_536,
-    cpu=8.0,
-    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
-)
-def repair_counts_t_job(
-    configDict: dict[str, Any],
-    nRows: int,
-) -> dict[str, Any]:
-    """Rewrite incomplete ``countsT`` for an existing store (no createStore)."""
-    config = ProfilingConfig.model_validate(configDict)
-    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
-    if nRows not in config.targetSizes:
-        raise ValueError(f"size {nRows} is not in config.targetSizes")
-    resources = config.resourcesFor("writeCountsT")
-    store_uri = config.storeUri(nRows)
-    print(
-        f"[repair_counts_t] store={store_uri} memMb={resources.modalMemoryLimitMb} "
-        f"workers={resources.workers}",
-        flush=True,
-    )
-    result = repair_counts_t(
-        storeUri=store_uri,
-        assayName=config.workflow.assayName,
-        resources=resources,
-    )
-    print(
-        f"[repair_counts_t] DONE status={result['status']} "
-        f"seconds={result['seconds']} complete={result['complete']} "
-        f"workers={result['workers']} peakRss={result['peakRssBytes']}",
-        flush=True,
-    )
-    return {
-        "runTag": config.runTag,
-        "nRows": nRows,
-        **result,
-    }
-
-
-@app.function(
-    **COMMON_FUNCTION_OPTIONS,
-    timeout=86_400,
-    memory=32_768,
-    cpu=2.0,
-    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
-)
-def probe_leiden_job(
-    configDict: dict[str, Any],
-    nRows: int,
-) -> dict[str, Any]:
-    """Run historical Leiden with flushed worker and parent-process probes."""
-    import sys
-
-    def _probe(msg: str) -> None:
-        print(f"[probe_leiden] {msg}", flush=True)
-        sys.stdout.flush()
-
-    _probe("WORKER_START")
-    config = ProfilingConfig.model_validate(configDict)
-    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
-    if nRows not in config.targetSizes:
-        raise ValueError(f"size {nRows} is not in config.targetSizes")
-    if result_exists(config, nRows, "runLeiden"):
-        _probe("result already exists; skipping")
-        return {
-            "nRows": nRows,
-            "stage": "runLeiden",
-            "status": "skipped",
-            "resultUri": config.resultUri(nRows, "runLeiden"),
-        }
-
-    resources = config.resourcesFor("runLeiden")
-    work = _WORK / f"probe-leiden-{nRows}"
-    work.mkdir(parents=True, exist_ok=True)
-    store_uri = config.storeUri(nRows)
-    _probe(f"store={store_uri} memMb={resources.modalMemoryLimitMb}")
-    _probe("ENTER run_stage(runLeiden)")
-    result = run_stage(
-        "runLeiden",
-        nRows=nRows,
-        storeUri=store_uri,
-        workflow=config.workflow,
-        resources=resources,
-        storageLayout=config.storageLayout,
-        workDir=work,
-    )
-    write_result(config, result)
-    _probe(
-        f"DONE status={result.status} seconds={result.seconds} error={result.error!r}"
-    )
-    payload = result.to_json()
-    payload["probe"] = True
-    return payload
 
 
 @app.function(
@@ -908,7 +805,8 @@ def _deployed_function(config: ProfilingConfig, name: str) -> modal.Function:
         raise SystemExit(
             f"Could not find deployed function {config.modalAppName}/{name}. "
             "Deploy first with:\n"
-            f"  modal deploy --env {config.modalEnvironmentName} -m profiling.modal_app\n"
+            "  uv run --group profiling modal deploy "
+            f"--env {config.modalEnvironmentName} -m profiling.modal_app\n"
             f"Original error: {exc}"
         ) from exc
 
@@ -919,7 +817,10 @@ def _print_spawned(label: str, call: Any) -> None:
     )
     print(f"spawned {label}: {call_id}")
     print("disconnect is safe; watch with:")
-    print("  modal app logs scarf-profiling --env scarf_profiling")
+    print(
+        "  uv run --group profiling modal app logs "
+        "scarf-profiling --env scarf_profiling"
+    )
 
 
 @app.local_entrypoint()
@@ -941,7 +842,7 @@ def main(*arg_list: str) -> None:
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--config", required=True)
     run_parser.add_argument("--size", type=int, required=True)
-    run_parser.add_argument("--stage", choices=FULL_STAGE_ORDER, required=True)
+    run_parser.add_argument("--stage", choices=CORE_STAGE_ORDER, required=True)
     run_parser.add_argument(
         "--force",
         action="store_true",
@@ -960,7 +861,7 @@ def main(*arg_list: str) -> None:
     all_parser.add_argument("--config", required=True)
     all_parser.add_argument("--sizes", nargs="*", type=int, default=None)
     all_parser.add_argument(
-        "--stages", nargs="*", choices=FULL_STAGE_ORDER, default=None
+        "--stages", nargs="*", choices=CORE_STAGE_ORDER, default=None
     )
     all_parser.add_argument(
         "--ephemeral",
@@ -978,7 +879,7 @@ def main(*arg_list: str) -> None:
     local_parser.add_argument("--config", required=True)
     local_parser.add_argument("--size", type=int, required=True)
     local_parser.add_argument(
-        "--stages", nargs="*", choices=FULL_STAGE_ORDER, default=None
+        "--stages", nargs="*", choices=CORE_STAGE_ORDER, default=None
     )
 
     e2e_parser = sub.add_parser(
@@ -987,25 +888,6 @@ def main(*arg_list: str) -> None:
     )
     e2e_parser.add_argument("--config", required=True)
     e2e_parser.add_argument("--size", type=int, required=True)
-
-    probe_parser = sub.add_parser(
-        "probe-leiden",
-        help="Run historical Leiden in a monitored child process",
-    )
-    probe_parser.add_argument("--config", required=True)
-    probe_parser.add_argument("--size", type=int, required=True)
-
-    repair_parser = sub.add_parser(
-        "repair-counts-t",
-        help=(
-            "Rewrite countsT for an existing store and mark complete=True. "
-            "Use: modal run --detach --env scarf_profiling -m profiling.modal_app "
-            "-- repair-counts-t --config ... --size ..."
-        ),
-    )
-    repair_parser.add_argument("--config", required=True)
-    repair_parser.add_argument("--size", type=int, required=True)
-    repair_parser.add_argument("--wait", action="store_true")
 
     io_parser = sub.add_parser("io-baseline")
     io_parser.add_argument("--config", required=True)
@@ -1077,6 +959,8 @@ def main(*arg_list: str) -> None:
             )
             return
         resources = config.resourcesFor(args.stage)
+        # retries=0 for writeCountsT: a retry that overlaps the original write
+        # leaves countsT marked incomplete again.
         options = (
             modal_function_options(config, resources, retries=0)
             if args.stage == "writeCountsT"
@@ -1147,53 +1031,6 @@ def main(*arg_list: str) -> None:
             .spawn(payload, args.size, stages)
         )
         _print_spawned(f"run_local_funnel_job {args.size}", call)
-        return
-
-    if args.command == "probe-leiden":
-        if args.size not in config.targetSizes:
-            raise SystemExit(f"size {args.size} is not in config.targetSizes")
-        # Use the runLeiden resource block and do not narrow Modal capacity.
-        options = modal_function_options(
-            config,
-            config.resourcesFor("runLeiden"),
-            maxContainers=1,
-        )
-        options.pop("region", None)
-        call = (
-            _deployed_function(config, "probe_leiden_job")
-            .with_options(**options)
-            .spawn(payload, args.size)
-        )
-        _print_spawned(f"probe_leiden_job {args.size}", call)
-        print("Watch for parent and child runLeiden progress in logs.")
-        return
-
-    if args.command == "repair-counts-t":
-        if args.size not in config.targetSizes:
-            raise SystemExit(f"size {args.size} is not in config.targetSizes")
-        # retries=0: overlapping rewrites leave complete=False again.
-        options = modal_function_options(
-            config,
-            config.resourcesFor("writeCountsT"),
-            maxContainers=1,
-            retries=0,
-        )
-        # Ephemeral under `modal run` (prefer --detach). No deploy required.
-        call = repair_counts_t_job.with_options(**options).spawn(
-            payload,
-            args.size,
-        )
-        _print_spawned(f"repair_counts_t_job {args.size}", call)
-        if args.wait:
-            print(
-                await_function_call(
-                    call,
-                    deadlineSeconds=float(
-                        config.resourcesFor("writeCountsT").timeoutSeconds
-                    ),
-                )
-            )
-        print("Prefer: modal run --detach ... so the rewrite survives disconnect.")
         return
 
     if args.command == "io-baseline":
