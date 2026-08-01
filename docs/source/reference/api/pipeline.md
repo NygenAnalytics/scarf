@@ -41,9 +41,12 @@ Exceptions:
   empty mapping to run no Leiden clustering.
 - `clustering_concurrency` defaults to `2`. Leiden membership can overlap across
   workers while store writes stay serialized; Paris joins the same queue.
-- When `doublet_scoring` or `markers` omit `clusters`, the Leiden or Paris
-  partition with the highest silhouette score on PCA coordinates is selected
-  (returned as `selected_clusters`).
+- Whenever at least one Leiden or Paris partition is available, the one with the
+  highest silhouette score on PCA coordinates is selected. Its labels are copied
+  to `{assay}_clusters` and linked to the same artifact, which is also returned
+  as `selected_clusters`. A single partition is taken without scoring.
+  `doublet_scoring` and `markers` group by that column unless they name a
+  partition through `clusters`.
 
 Only `pipeline_id="basic_rna_analysis"` is currently supported.
 

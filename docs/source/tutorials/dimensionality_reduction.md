@@ -69,8 +69,10 @@ This section reconstructs the selected cells, features, and normalization from
 
 ## Compare PCA dimension counts
 
-Build each candidate from the same normalized data. The 15-component graph runs
-last and remains selected for the layout comparisons below.
+Build each candidate from the same normalized data and cluster each graph by
+passing it explicitly. The 15-component chain runs last, so it is the one left
+in the assay's {term}`analysis chain`, and the layout comparisons below pick it
+up when no graph is named.
 
 ```{code-cell} ipython3
 cluster_keys = {}
@@ -84,10 +86,11 @@ for dimensions in (10, 30, 15):
         ds.build_embedding_initialization(pca)
     ann = ds.build_ann_index(pca)
     neighbors = ds.query_neighbors(ann, k=11)
-    ds.build_connectivity_map(neighbors)
+    graph = ds.build_connectivity_map(neighbors)
 
     label = f"leiden_pca_{dimensions}"
     ds.run_leiden_clustering(
+        graph,
         resolution=0.5,
         label=label,
     )

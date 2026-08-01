@@ -73,7 +73,7 @@ reference = ds_ctrl.build_mapping_reference(
 reference
 ```
 
-The artifact records the active cells, selected features, normalization, PCA
+The {term}`artifact` records the active cells, selected features, normalization, PCA
 loadings, corrected latent coordinates, ANN contract, and batch metadata.
 Building a different contract creates another artifact rather than mutating the
 completed reference.

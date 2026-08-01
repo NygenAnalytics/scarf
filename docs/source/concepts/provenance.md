@@ -7,10 +7,10 @@ particular cell set, feature set, normalization, and reduction. When several
 parameter branches live in one datastore, filenames and cluster labels alone
 do not explain which choices produced a result.
 
-Scarf persists each substantial result as an **artifact** and records what
+Scarf persists each substantial result as an {term}`artifact` and records what
 produced it. This lets a user inspect an inherited datastore, compare branches,
-and reuse upstream work without maintaining a separate datastore for every
-parameter choice.
+and {term}`reuse` upstream work without maintaining a separate datastore for
+every parameter choice.
 
 ```{mermaid}
 flowchart LR
@@ -33,7 +33,8 @@ downstream graphs remain distinct because their inputs differ.
 
 ## What Scarf records
 
-An artifact has a stable reference, its stored payload, and a provenance record:
+An artifact has a stable reference, its stored payload, and a {term}`provenance`
+record:
 
 - the operation that produced it, such as `run_pca`
 - scientific parameters that can change the result
@@ -43,8 +44,8 @@ An artifact has a stable reference, its stored payload, and a provenance record:
 - whether the write completed successfully
 
 Downstream methods receive these references directly or resolve them from the
-assay's current analysis chain. A completed result with the same operation,
-parameters, and inputs can be reused. Changing PCA dimensions creates a new
+assay's current {term}`analysis chain`. A completed result with the same
+operation, parameters, and inputs can be reused. Changing PCA dimensions creates a new
 reduction and new dependent results, while the matching normalization can still
 be reused.
 

@@ -1,9 +1,9 @@
 # Artifacts and assay state API reference
 
-Logical artifacts are persisted results with provenance-backed reuse. Analysis
-code usually reaches them through `DataStore` methods. The types below are the
-public contracts for references, status records, lineage, and the assay's
-current analysis chain.
+An {term}`artifact` is a persisted result, and its {term}`provenance` is what
+allows Scarf to {term}`reuse` it. Analysis code usually reaches artifacts through
+`DataStore` methods. The types below are the public contracts for references,
+status records, lineage, and the assay's current {term}`analysis chain`.
 
 See {doc}`../../concepts/provenance` and
 {doc}`../../tutorials/custom_graph_construction`.

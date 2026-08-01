@@ -33,15 +33,16 @@ import scarf
 
 scarf.configure_output(level="ERROR", progress=True)
 
-dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    "tenx_5K_pbmc_rnaseq",
+counts = scarf.cytebase.connect("scarf_docs").download(
+    "tenx_5K_pbmc_rnaseq/data.h5",
     destination="scarf_datasets",
-)
+)[0]
 
-reader = scarf.CrH5Reader(f"{dataset}/data.h5")
+store = counts.with_name("data.zarr")
+reader = scarf.CrH5Reader(str(counts))
 scarf.CrToZarr(
     reader,
-    zarr_loc=f"{dataset}/data.zarr",
+    zarr_loc=str(store),
 ).dump(batch_size=1000)
 ```
 
@@ -55,7 +56,7 @@ and progress are independent; batch runs can use
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(
-    f"{dataset}/data.zarr",
+    str(store),
     nthreads=4,
 )
 ```
@@ -65,15 +66,18 @@ ds = scarf.DataStore(
 The default pipeline filters cells, scores cell cycle, selects highly variable
 genes, normalizes counts, runs PCA, builds a neighbourhood graph, and calculates
 UMAP. It also runs Leiden at resolutions 0.5, 0.75, 1.0, and 1.25, plus Paris
-clustering. The partition with the highest PCA silhouette is used for doublet
-scoring and marker search unless you choose one explicitly.
+clustering. The partition with the highest PCA silhouette is copied to
+`RNA_clusters` and used for doublet scoring and marker search unless you choose
+one explicitly.
 
 ```{code-cell} ipython3
 artifacts = ds.pipeline.run()
 ```
 
-The return value maps result names to `ArtifactRef` objects, which identify the
-persisted outputs and their provenance:
+The return value maps each result name to an {term}`ArtifactRef`: a handle on a
+stored result that names it without loading it. Every result the pipeline wrote
+is an {term}`artifact` in the Zarr store, saved together with the
+{term}`provenance` record of what produced it.
 
 ```{code-cell} ipython3
 sorted(artifacts)
@@ -87,18 +91,42 @@ control and {doc}`tutorials/clustering` for choosing a partition.
 
 ## Plot the result
 
+Colour the embedding by `RNA_clusters` to see the partition the pipeline chose.
+The resolution-specific columns, such as `RNA_leiden_0.5`, stay available for
+comparison.
+
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key="RNA_UMAP",
-    color_by="RNA_leiden_1.0",
+    color_by="RNA_clusters",
 )
 ```
 
-Each colour is a Leiden cluster. The Zarr store now contains the UMAP
-coordinates, cluster labels, marker genes, and intermediate results. Several
-broad PBMC populations should separate without every group becoming an isolated
-island. A tiny group dominated by low-count cells is a reason to revisit quality
-control before assigning a cell type.
+Several broad PBMC populations should separate without every group becoming an
+isolated island. A tiny group dominated by low-count cells is a reason to
+revisit quality control before assigning a cell type.
+
+Marker search ran on the same partition, so its table is already in the store:
+
+```{code-cell} ipython3
+ds.plots.marker_heatmap(
+    group_key="RNA_clusters",
+    topn=5,
+    figsize=(5, 9),
+)
+```
+
+Each column is a cluster and each row one of its top-scoring genes. The clean
+block structure is the signal that the partition tracks real populations, and
+recognisable PBMC markers name most of them: `CD14` and `FPR1` for monocytes,
+`CD8A` and `GZMK` for cytotoxic T cells, `KLRF1` and `FGFBP2` for NK cells,
+`TCL1A` and `IGHD` for naive B cells, `IGHG1` and `IGHA1` for plasma cells,
+`PPBP` and `GNG11` for platelets, `LILRA4` and `IL3RA` for plasmacytoid
+dendritic cells. Read one cluster's full table with
+`ds.get_markers(group_key="RNA_clusters", group_id=...)`.
+
+The Zarr store now holds the UMAP coordinates, cluster labels, marker tables,
+and every intermediate result.
 
 Continue with the complete {doc}`tutorials/scrna_seq` workflow or translate an
 existing workflow with {doc}`scarf_and_scanpy`. The

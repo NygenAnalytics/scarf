@@ -53,14 +53,16 @@ def test_umap_matrix_and_leiden_columns_link_authoritative_artifacts(
         datastore.RNA.z["featureData"]["I__metadata_hvgs"].attrs["display"]
     )
     assert hvg_display["kind"] == "categorical"
-    datastore.run_umap(n_epochs=10, label="metadata_umap")
-    datastore.run_leiden_clustering(label="metadata_leiden")
+    returned_umap = datastore.run_umap(n_epochs=10, label="metadata_umap")
+    returned_leiden = datastore.run_leiden_clustering(label="metadata_leiden")
 
     umap1 = datastore.zw["cellData"]["RNA_metadata_umap1"]
     umap2 = datastore.zw["cellData"]["RNA_metadata_umap2"]
     umap_ref = ArtifactRef.from_dict(umap1.attrs["source_artifact"])
     leiden_ref = _column_ref(datastore, "RNA_metadata_leiden")
 
+    assert returned_umap == umap_ref
+    assert returned_leiden == leiden_ref
     assert ArtifactRef.from_dict(umap2.attrs["source_artifact"]) == umap_ref
     assert umap1.attrs["value_index"] == 0
     assert umap2.attrs["value_index"] == 1
@@ -635,6 +637,50 @@ def test_graph_outputs_accept_content_equivalent_selection_artifacts(
 
     datastore.run_leiden_clustering(label="equivalent_selection")
     assert "RNA_equivalent_selection" in datastore.cells.columns
+
+
+def test_graph_consumers_accept_an_explicit_connectivity_map(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    _ensure_graph(datastore)
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    graph = state.connectivity_map
+    assert graph is not None
+
+    implicit = datastore.run_leiden_clustering(label="implicit_leiden")
+    explicit = datastore.run_leiden_clustering(graph, label="explicit_leiden")
+
+    assert explicit == implicit
+    np.testing.assert_array_equal(
+        datastore.cells.fetch("RNA_implicit_leiden", key="I"),
+        datastore.cells.fetch("RNA_explicit_leiden", key="I"),
+    )
+    umap_ref = datastore.run_umap(graph, n_epochs=10, label="explicit_umap")
+    assert umap_ref.kind == "embedding"
+    assert "RNA_explicit_umap1" in datastore.cells.columns
+
+    side_neighbors = datastore.query_neighbors(
+        state.ann_index,
+        k=5,
+        update_state=False,
+    )
+    side_graph = datastore.build_connectivity_map(
+        side_neighbors,
+        update_state=False,
+    )
+    side = datastore.run_leiden_clustering(side_graph, label="side_leiden")
+    assert side != implicit
+    assert "RNA_side_leiden" in datastore.cells.columns
+    assert datastore.get_assay_state("RNA").connectivity_map == graph
+
+    with pytest.raises(ValueError, match="does not match the graph"):
+        datastore.run_leiden_clustering(graph, feat_key="I", label="mismatched")
+    with pytest.raises(TypeError, match="artifact reference"):
+        datastore.run_umap("RNA/graph", n_epochs=10, label="not_a_ref")
+    with pytest.raises(ValueError, match="connectivity map"):
+        datastore.run_umap(state.reduction, n_epochs=10, label="wrong_kind")
 
 
 def test_lisi_rejects_incomplete_ann_dependency(

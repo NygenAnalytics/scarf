@@ -56,40 +56,27 @@ ds = scarf.DataStore(
 )
 ```
 
-```{code-cell} ipython3
-# Ensure a clustering column exists for aggregation demos.
-if 'RNA_leiden_cluster' not in ds.cells.columns:
-    ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-    ds.run_normalization(feat_key='hvgs')
-    ds.run_pca(dims=15)
-    ds.build_embedding_initialization()
-    ds.build_ann_index()
-    ds.query_neighbors(k=11)
-    ds.build_connectivity_map()
-    ds.run_leiden_clustering(resolution=0.5)
-```
-
-
-The catalog Kang store already includes a UMAP. Leiden groups used for `make_bulk` below may
-differ from the provided `cluster_labels` column.
+The published Kang store carries a UMAP and a Leiden partition under
+`RNA_clusters`. Those groups are the aggregation key below, and they may differ
+from the author-provided `cluster_labels` column.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_leiden_cluster',
+    color_by='RNA_clusters',
 )
 ```
 
-Leiden clusters on the catalog UMAP; these labels are the grouping key for `make_bulk` below.
+Leiden clusters on the published UMAP; these labels are the grouping key for `make_bulk` below.
 
 ## Guided steps
 
 ### 1. Inspect marker ranks separately from DE
 
 ```{code-cell} ipython3
-ds.run_marker_search(group_key='RNA_leiden_cluster')
+ds.run_marker_search(group_key='RNA_clusters')
 markers = ds.get_markers(
-    group_key='RNA_leiden_cluster',
+    group_key='RNA_clusters',
     group_id='1',
     min_score=-1,
     min_frac_exp=-1,
@@ -108,7 +95,7 @@ markers[
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
-    group_key='RNA_leiden_cluster',
+    group_key='RNA_clusters',
     topn=2,
     figsize=(8, 8),
 )
@@ -125,7 +112,7 @@ columns as replicate-aware differential expression results.
 
 ```{code-cell} ipython3
 bulk = ds.make_bulk(
-    group_key='RNA_leiden_cluster',
+    group_key='RNA_clusters',
     aggr_type='sum',
     feature_label='name',
 )
@@ -144,7 +131,7 @@ with cell type) and keep true biological replicates in the exported metadata.
 
 ```{code-cell} ipython3
 bulk_reps = ds.make_bulk(
-    group_key='RNA_leiden_cluster',
+    group_key='RNA_clusters',
     aggr_type='sum',
     feature_label='name',
     pseudo_reps=2,

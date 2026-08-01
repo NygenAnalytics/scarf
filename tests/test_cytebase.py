@@ -394,7 +394,17 @@ def test_live_bucket_catalog_is_public():
 
     assert "scarf_docs" in cytebase.list_repositories()
     repository = cytebase.connect("scarf_docs")
-    assert len(repository.list_datasets()) == 22
+    datasets = set(repository.list_datasets())
+    assert {
+        "annotations",
+        "bastidas-ponce_4K_pancreas-d15_rnaseq",
+        "kang_14K_ifnb-pbmc_rnaseq",
+        "kang_15K_pbmc_rnaseq",
+        "tenx_10K_pbmc-v1_atacseq",
+        "tenx_5K_pbmc_rnaseq",
+        "tenx_8K_pbmc_citeseq",
+    } <= datasets
+    assert "tenx_5K_pbmc_rnaseq_legacy_master" in datasets
     files = repository.list_files("tenx_5K_pbmc_rnaseq")
     assert {
         "tenx_5K_pbmc_rnaseq/data.h5",

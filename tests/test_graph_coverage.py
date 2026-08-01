@@ -730,7 +730,7 @@ def test_run_tsne_orchestration_and_error_paths(
     )
     monkeypatch.setattr("scarf.embeddings.sgtsne.run_sgtsne", runner)
 
-    store.run_tsne(
+    tsne_ref = store.run_tsne(
         symmetric_graph=True,
         graph_upper_only=True,
         parallel=True,
@@ -750,6 +750,7 @@ def test_run_tsne_orchestration_and_error_paths(
     first_ref = ArtifactRef.from_dict(
         store.zw["cellData/RNA_coverageTsne1"].attrs["source_artifact"]
     )
+    assert first_ref == tsne_ref
     assert first_ref.kind == "embedding"
     assert (
         ArtifactRef.from_dict(
@@ -781,12 +782,13 @@ def test_run_tsne_orchestration_and_error_paths(
         )
 
     runner.side_effect = FileNotFoundError("sgtsne missing")
-    store.run_tsne(
-        ini_embed=initial,
-        parallel=True,
-        nthreads=2,
-        label="missingTsne",
-    )
+    with pytest.raises(RuntimeError, match="SG-tSNE failed"):
+        store.run_tsne(
+            ini_embed=initial,
+            parallel=True,
+            nthreads=2,
+            label="missingTsne",
+        )
     assert runner.call_args.kwargs["nthreads"] == 2
 
     runner_calls = runner.call_count
@@ -800,7 +802,7 @@ def test_run_tsne_orchestration_and_error_paths(
             max_iter=20,
             label="cachedTsne",
         )
-        is None
+        == first_ref
     )
     assert runner.call_count == runner_calls
     np.testing.assert_allclose(
@@ -855,20 +857,23 @@ def test_integrate_assays_snn_writes_and_overwrites_graph(
         side_effect=lambda assay, *_args: source_paths[assay]
     )
 
-    store.integrate_assays(
+    first_ref = store.integrate_assays(
         assays=["RNA", "ADT"],
         label="joint",
         method="snn",
         chunk_size=2,
     )
-    store.integrate_assays(
+    second_ref = store.integrate_assays(
         assays=["RNA", "ADT"],
         label="joint",
         method="snn",
         chunk_size=2,
     )
 
+    assert first_ref.kind == "integrated_graph"
+    assert second_ref == first_ref
     integrated_path = store._resolve_integrated_graph_path("joint")
+    assert artifact_path(first_ref) == integrated_path
     integrated_group = store.zw[integrated_path]
     assert integrated_group.attrs["n_cells"] == 3
     assert integrated_group.attrs["n_neighbors"] == 2

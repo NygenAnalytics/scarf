@@ -7,6 +7,11 @@ graph loading, initial embedding, and Paris recompute from a legacy dendrogram.
 They also assert that a read-only open does not mutate the store on disk.
 They are marked ``integration`` because they require network access, but the
 project's default test command includes integration tests.
+
+The corpus lives under a ``_legacy_master`` dataset. Cytebase publishes the
+current-format store under the plain dataset name, and the archive it replaced
+is preserved alongside it so this frozen layout stays reachable. See
+``scripts/publish_docs_datasets.py``.
 """
 
 import hashlib
@@ -16,7 +21,7 @@ import shutil
 import numpy as np
 import pytest
 
-_FROZEN_DATASET = "tenx_5K_pbmc_rnaseq"
+_FROZEN_DATASET = "tenx_5K_pbmc_rnaseq_legacy_master"
 _ASSAY = "RNA"
 _CELL_KEY = "I"
 _FEAT_KEY = "hvgs"

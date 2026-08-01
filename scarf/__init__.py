@@ -55,10 +55,8 @@ if TYPE_CHECKING:
     )
     from .mapping.models import MappingResult as MappingResult
     from .mapping.reference import MappingReference as MappingReference
-    from .storage.artifacts import (
-        ArtifactRef as ArtifactRef,
-        ArtifactStatus as ArtifactStatus,
-    )
+    from .storage.artifacts import ArtifactStatus as ArtifactStatus
+    from .storage.refs import ArtifactRef as ArtifactRef
     from .features.genomic.gff import GffReader as GffReader
     from .features.genomic.melding import coordinate_melding as coordinate_melding
     from .merge import (
@@ -130,7 +128,7 @@ except _PackageNotFoundError:
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ArtifactLineage": (".lineage", "ArtifactLineage"),
-    "ArtifactRef": (".storage.artifacts", "ArtifactRef"),
+    "ArtifactRef": (".storage.refs", "ArtifactRef"),
     "ArtifactStatus": (".storage.artifacts", "ArtifactStatus"),
     "AssayMerge": (".merge", "AssayMerge"),
     "AssayState": (".graph.state", "AssayState"),

@@ -57,8 +57,8 @@ Opening a store over object storage costs many small metadata requests, so expec
 this step to take a few minutes on a home connection. Nothing but metadata is read
 until you touch the counts.
 
-The store already carries a full analysis, so its artifacts and current
-analysis chain are readable straight away:
+The store already carries a full analysis, so its {term}`artifacts <artifact>`
+and current {term}`analysis chain` are readable straight away:
 
 ```{code-cell} ipython3
 state = ds.get_assay_state('RNA')

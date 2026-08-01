@@ -33,8 +33,9 @@ plot known markers, and assign labels without treating cluster IDs as cell types
 
 ## Standalone setup
 
-This section reconstructs the clustered 5K PBMC analysis from {doc}`scrna_seq`
-so the page can run independently.
+Annotation starts from clusters and a marker table. The published PBMC store
+has both, so this page opens it and goes straight to reading the evidence.
+{doc}`clustering` covers how the partition is chosen and scored.
 
 ```{code-cell} ipython3
 import numpy as np
@@ -50,25 +51,11 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 ds = scarf.DataStore(
     f'{dataset}/data.zarr',
     nthreads=4,
-    min_features_per_cell=10,
 )
-ds.filter_cells(
-    attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
-    highs=[15000, 4000, 15],
-    lows=[1000, 500, 0],
-    reset_previous=True,
-)
-ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-ds.run_normalization(feat_key='hvgs')
-ds.run_pca(dims=15)
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=11)
-ds.build_connectivity_map()
-ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
-ds.run_leiden_clustering(resolution=0.5)
-ds.run_marker_search(group_key='RNA_leiden_cluster')
 ```
+
+`RNA_clusters` holds the partition the pipeline selected, and the marker table
+is indexed under the same column.
 
 
 ## 1) Marker tables
@@ -80,7 +67,7 @@ AUC, and `p_value_adjusted`.
 
 ```{code-cell} ipython3
 markers = ds.get_markers(
-    group_key='RNA_leiden_cluster',
+    group_key='RNA_clusters',
     group_id='1',
     min_score=-1,
     min_frac_exp=-1,
@@ -118,7 +105,7 @@ contain the newer AUC and adjusted-p-value columns until marker search is rerun.
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
-    group_key='RNA_leiden_cluster',
+    group_key='RNA_clusters',
     topn=5,
     figsize=(5, 9),
 )
@@ -149,14 +136,14 @@ stable across parameter changes, so this cell picks the cluster where each linea
 ranks highest among markers, then leaves other clusters as `Cluster_<id>`.
 
 ```{code-cell} ipython3
-cluster_ids = ds.cells.fetch_all('RNA_leiden_cluster')
+cluster_ids = ds.cells.fetch_all('RNA_clusters')
 unique = sorted(
     {str(c) for c in cluster_ids},
     key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
 )
 
 markers = ds.get_markers(
-    group_key='RNA_leiden_cluster',
+    group_key='RNA_clusters',
     group_id=None,
     min_score=-1,
     min_frac_exp=-1,
@@ -189,7 +176,7 @@ the same type.
 
 ```{code-cell} ipython3
 ds.smart_label(
-    to_relabel='RNA_leiden_cluster',
+    to_relabel='RNA_clusters',
     base_label='cell_type',
     new_col_name='leiden_by_type',
 )

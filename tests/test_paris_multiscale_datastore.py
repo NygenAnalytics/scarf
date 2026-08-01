@@ -284,8 +284,13 @@ def test_auto_cut_persists_typed_hierarchy_and_reuses_diagnostics() -> None:
     assert store.cells.data["RNA_paris_cluster"][-2:].tolist() == [-1, -1]
     assert set(store.cells.data["RNA_paris_cluster"][:-2]) == {1, 2}
     assert store.cells.writes == ["RNA_paris_cluster"]
+    assert first.ref is not None
+    assert first.ref == ArtifactRef.from_dict(
+        store.zw["cellData/RNA_paris_cluster"].attrs["source_artifact"]
+    )
 
     second = store.run_paris_clustering(min_cluster_size=2)
+    assert second.ref == first.ref
     assert second.hierarchy_generation_id == generation_id
     assert np.array_equal(second.labels, first.labels)
     assert second.diagnostics == first.diagnostics
@@ -794,12 +799,8 @@ def test_topacedo_uses_the_generation_recorded_for_adaptive_labels(
         "scarf.datastore._operations.clustering.validate_legacy_graph_selection",
         lambda *_args, **_kwargs: None,
     )
-    edges = store.run_topacedo_sampler(
-        cluster_key=result.label_key,
-        return_edges=True,
-    )
+    sampling_ref = store.run_topacedo_sampler(cluster_key=result.label_key)
 
-    assert edges == [(0, 1)]
     output_columns = [
         "RNA_sketched",
         "RNA_cell_density",
@@ -810,8 +811,7 @@ def test_topacedo_uses_the_generation_recorded_for_adaptive_labels(
         ArtifactRef.from_dict(store.zw[f"cellData/{column}"].attrs["source_artifact"])
         for column in output_columns
     }
-    assert len(output_refs) == 1
-    sampling_ref = output_refs.pop()
+    assert output_refs == {sampling_ref}
     assert sampling_ref.kind == "sampling"
     sampling_group = store.zw[artifact_path(sampling_ref)]
     assert set(sampling_group.array_keys()) == {
@@ -823,40 +823,23 @@ def test_topacedo_uses_the_generation_recorded_for_adaptive_labels(
     }
     np.testing.assert_array_equal(sampling_group["edges"][:], [[0, 1]])
     monkeypatch.setitem(sys.modules, "topacedo", None)
-    assert store.run_topacedo_sampler(
-        cluster_key=result.label_key,
-        return_edges=True,
-    ) == [(0, 1)]
+    assert store.run_topacedo_sampler(cluster_key=result.label_key) == sampling_ref
     monkeypatch.setitem(
         sys.modules,
         "topacedo",
         SimpleNamespace(TopacedoSampler=Sampler),
     )
-    assert (
-        store.run_topacedo_sampler(
-            cluster_key=result.label_key,
-            rand_state=99,
-            return_edges=True,
-        )
-        == []
+    empty_ref = store.run_topacedo_sampler(
+        cluster_key=result.label_key,
+        rand_state=99,
     )
-    sampling_refs = list_artifacts(
-        store.zw,
-        scope="assay",
-        assay="RNA",
-        kind="sampling",
-    )
-    empty_group = next(
-        store.zw[artifact_path(ref)]
-        for ref in sampling_refs
-        if store.zw[artifact_path(ref)]["edges"].shape == (0, 2)
-    )
+    empty_group = store.zw[artifact_path(empty_ref)]
+    assert empty_group["edges"].shape == (0, 2)
     assert empty_group["edges"].chunks == (1, 2)
     with pytest.raises(ValueError, match="edge endpoints"):
         store.run_topacedo_sampler(
             cluster_key=result.label_key,
             rand_state=100,
-            return_edges=True,
         )
     assert captured["dendrogram"].shape == (13, 4)
     dendrogram_ref = list_artifacts(

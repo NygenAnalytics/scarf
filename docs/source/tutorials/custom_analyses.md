@@ -30,7 +30,8 @@ depending on private storage internals.
 
 ## Prepare a graph
 
-This setup uses the PBMC teaching dataset and constructs a small RNA graph.
+Every technique on this page reads an existing graph, so the published PBMC
+store is enough. See {doc}`custom_graph_construction` to build one by hand.
 
 ```{code-cell} ipython3
 import numpy as np
@@ -46,27 +47,6 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 ds = scarf.DataStore(
     f"{dataset}/data.zarr",
     nthreads=4,
-    min_features_per_cell=10,
-)
-ds.filter_cells(
-    attrs=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
-    highs=[15000, 4000, 15],
-    lows=[1000, 500, 0],
-    reset_previous=True,
-)
-ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-normalized = ds.run_normalization(feat_key="hvgs")
-reduction = ds.run_pca(normalized, dims=15)
-ds.build_embedding_initialization(reduction)
-ds.build_ann_index(reduction)
-ds.query_neighbors(k=11)
-ds.build_connectivity_map()
-ds.run_umap(
-    n_epochs=100,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-    label="customAnalysisUMAP",
 )
 ```
 
@@ -95,7 +75,7 @@ ds.cells.insert(
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_customAnalysisUMAP",
+    layout_key="RNA_UMAP",
     color_by="customGraphStrength",
     sort_values=True,
 )
@@ -153,7 +133,7 @@ ds.cells.insert(
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_customAnalysisUMAP",
+    layout_key="RNA_UMAP",
     color_by=["customDetectedHVGs", "wellConnected"],
     n_columns=2,
     sort_values=True,
@@ -209,7 +189,8 @@ custom_ann = ds.build_ann_index(
 )
 ```
 
-`update_state=False` keeps this experiment as a side branch. Pass returned
+`update_state=False` keeps this experiment as a side branch, outside the assay's
+{term}`analysis chain`. Pass returned
 references explicitly through later graph-construction steps. Select a branch
 as current only after checking its outputs.
 

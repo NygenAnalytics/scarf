@@ -356,6 +356,123 @@ def resolve_stored_graph_input(
         }
 
 
+@dataclass(frozen=True, slots=True)
+class GraphSelection:
+    """A resolved graph and the keys that name the columns written from it."""
+
+    graph_loc: str
+    graph_input: ArtifactRef | dict[str, str]
+    from_assay: str
+    cell_key: str
+    feat_key: str
+    integrated_label: str | None
+
+    @property
+    def output_assay(self) -> str:
+        """Prefix used for cell-metadata columns written from this graph."""
+        return self.integrated_label or self.from_assay
+
+
+def integrated_graph_label(store: Any, ref: ArtifactRef) -> str:
+    """Return the label an integrated-graph artifact is registered under."""
+    index_path = store._integratedGraphsLoc
+    labels: list[str] = []
+    if index_path in store.zw:
+        index_group = as_zarr_group(store.zw[index_path], name=index_path)
+        raw_artifacts = index_group.attrs.get("artifacts", {})
+        if "artifacts" in index_group.attrs and not isinstance(raw_artifacts, dict):
+            raise RuntimeError("Integrated graph artifact index is invalid")
+        if isinstance(raw_artifacts, dict):
+            for label, raw_ref in raw_artifacts.items():
+                if not isinstance(raw_ref, dict):
+                    raise RuntimeError(
+                        f"Integrated graph index for {label!r} is invalid"
+                    )
+                if ArtifactRef.from_dict(raw_ref) == ref:
+                    labels.append(str(label))
+    if not labels:
+        raise KeyError("Integrated graph artifact is not registered under a label")
+    if len(labels) > 1:
+        raise ValueError(
+            "Integrated graph artifact is shared by labels "
+            f"{', '.join(sorted(labels))}; pass integrated_graph to choose one"
+        )
+    return labels[0]
+
+
+def resolve_graph_selection(
+    store: Any,
+    graph: ArtifactRef | None,
+    *,
+    from_assay: str | None,
+    cell_key: str | None,
+    feat_key: str | None,
+    integrated_graph: str | None = None,
+) -> GraphSelection:
+    """Resolve which graph an operation reads and how it names its outputs.
+
+    Omitting ``graph`` keeps the implicit contract: the current analysis chain
+    of the assay, or the integrated graph named by ``integrated_graph``.
+    Passing ``graph`` reads that connectivity map or integrated graph instead
+    and takes the assay, cell key, and feature key from the artifact.
+    """
+    if graph is not None and integrated_graph is not None:
+        raise ValueError("Pass either graph or integrated_graph, not both")
+    integrated_label = integrated_graph
+    if graph is None:
+        resolved_assay, resolved_cell_key, resolved_feat_key = store._get_latest_keys(
+            from_assay, cell_key, feat_key
+        )
+        if integrated_graph is None:
+            graph_loc = store.get_latest_graph_loc(
+                resolved_assay,
+                resolved_cell_key,
+                resolved_feat_key,
+            )
+        else:
+            graph_loc = store._resolve_integrated_graph_path(integrated_graph)
+            if graph_loc not in store.zw:
+                raise KeyError(
+                    f"An integrated graph with label {integrated_graph!r} does not exist"
+                )
+    elif not isinstance(graph, ArtifactRef):
+        raise TypeError("graph must be an artifact reference")
+    elif graph.kind == "integrated_graph":
+        graph_loc = str(require_complete_artifact(store.zw, graph).path)
+        integrated_label = integrated_graph_label(store, graph)
+        resolved_assay, resolved_cell_key, resolved_feat_key = store._get_latest_keys(
+            from_assay, cell_key, feat_key
+        )
+    elif graph.kind == "connectivity_map":
+        stored = stored_assay_graph_from_ref(store.zw, graph)
+        for name, requested, resolved in (
+            ("from_assay", from_assay, stored.from_assay),
+            ("cell_key", cell_key, stored.cell_key),
+            ("feat_key", feat_key, stored.feat_key),
+        ):
+            if requested is not None and requested != resolved:
+                raise ValueError(
+                    f"{name} {requested!r} does not match the graph, "
+                    f"which was built with {resolved!r}"
+                )
+        resolved_assay = stored.from_assay
+        resolved_cell_key = stored.cell_key
+        resolved_feat_key = stored.feat_key
+        graph_loc = stored.paths.cell_graph_group_path
+    else:
+        raise ValueError(
+            "graph must reference a connectivity map or an integrated graph"
+        )
+    return GraphSelection(
+        graph_loc=graph_loc,
+        graph_input=resolve_stored_graph_input(store.zw, graph_loc),
+        from_assay=resolved_assay,
+        cell_key=resolved_cell_key,
+        feat_key=resolved_feat_key,
+        integrated_label=integrated_label,
+    )
+
+
 def _require_input(
     root: zarr.Group,
     ref: ArtifactRef,

@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 
 from ...graph.paths import StoredAssayGraph
-from ...graph.state import resolve_stored_graph_input, validate_legacy_graph_selection
+from ...graph.state import resolve_graph_selection, validate_legacy_graph_selection
 from ...metadata.artifacts import (
     artifact_values,
     categorical_display,
@@ -374,10 +374,13 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             result,
             label_key=final_label_key,
             hierarchy_generation_id=hierarchy_plan.ref.artifact_id,
+            ref=cut_plan.ref,
         )
 
     def _prepare_leiden_clustering(
         self,
+        graph: ArtifactRef | None = None,
+        *,
         from_assay: str | None = None,
         cell_key: str | None = None,
         feat_key: str | None = None,
@@ -389,30 +392,20 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         random_seed: int = 4444,
         invalidate_cache: bool = False,
     ) -> _PreparedLeidenClustering:
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay, cell_key, feat_key
+        graph_selection = resolve_graph_selection(
+            self,
+            graph,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            integrated_graph=integrated_graph,
         )
-        graph_loc = None
-        if integrated_graph is not None:
-            graph_loc = self._resolve_integrated_graph_path(integrated_graph)
-            if graph_loc not in self.zw:
-                raise KeyError(
-                    f"ERROR: An integrated graph with label: {integrated_graph} does not exist"
-                )
-        resolved_graph_loc = (
-            graph_loc
-            if graph_loc is not None
-            else self.get_latest_graph_loc(
-                from_assay,
-                cell_key,
-                feat_key,
-            )
-        )
-        n_cells, _effective_k = self._get_graph_ncells_k(resolved_graph_loc)
-        graph_input: object = resolve_stored_graph_input(
-            self.zw,
-            resolved_graph_loc,
-        )
+        from_assay = graph_selection.from_assay
+        cell_key = graph_selection.cell_key
+        feat_key = graph_selection.feat_key
+        integrated_graph = graph_selection.integrated_label
+        n_cells, _effective_k = self._get_graph_ncells_k(graph_selection.graph_loc)
+        graph_input: object = graph_selection.graph_input
         artifact_scope = (
             graph_input.scope
             if isinstance(graph_input, ArtifactRef)
@@ -422,10 +415,10 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         )
         selection = self._ensure_cell_selection(cell_key)
         if isinstance(graph_input, ArtifactRef):
-            graph_selection = self._graph_cell_selection(graph_input)
-            if not self._selection_artifacts_match(graph_selection, selection):
+            graph_cell_selection = self._graph_cell_selection(graph_input)
+            if not self._selection_artifacts_match(graph_cell_selection, selection):
                 raise ValueError("cell_key does not match the graph cell selection")
-            selection = graph_selection
+            selection = graph_cell_selection
         arguments = LeidenArguments(
             graph=graph_input,
             resolution=resolution,
@@ -461,9 +454,9 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         )
         return _PreparedLeidenClustering(
             planned=planned,
-            graph_loc=resolved_graph_loc,
+            graph_loc=graph_selection.graph_loc,
             from_assay=from_assay,
-            label_assay=integrated_graph or from_assay,
+            label_assay=graph_selection.output_assay,
             cell_key=cell_key,
             feat_key=feat_key,
             resolution=resolution,
@@ -507,7 +500,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         self,
         prepared: _PreparedLeidenClustering,
         membership: np.ndarray | None,
-    ) -> str:
+    ) -> tuple[str, ArtifactRef]:
         if prepared.planned.reused:
             artifact_group = as_zarr_group(
                 self.zw[artifact_path(prepared.planned.ref)],
@@ -554,10 +547,12 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         logger.info(
             f"{action} Leiden clustering with {np.unique(membership).size} clusters"
         )
-        return column
+        return column, prepared.planned.ref
 
     def run_leiden_clustering(
         self,
+        graph: ArtifactRef | None = None,
+        *,
         from_assay: str | None = None,
         cell_key: str | None = None,
         feat_key: str | None = None,
@@ -568,9 +563,28 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         label: str = "leiden_cluster",
         random_seed: int = 4444,
         invalidate_cache: bool = False,
-    ) -> None:
-        """Execute Leiden clustering and save identities in cell metadata."""
+    ) -> ArtifactRef:
+        """Execute Leiden clustering and save identities in cell metadata.
+
+        Args:
+            graph: Connectivity map or integrated graph to partition. The
+                current analysis chain of the assay is used when omitted.
+            from_assay: Assay whose current graph should be used.
+            cell_key: Cell key of the graph.
+            feat_key: Feature key of the graph.
+            resolution: Leiden resolution parameter.
+            integrated_graph: Label of an integrated graph to partition.
+            symmetric_graph: Forwarded to `load_graph`.
+            graph_upper_only: Forwarded to `load_graph`.
+            label: Base name of the cell-metadata column that receives labels.
+            random_seed: Seed for the Leiden optimizer.
+            invalidate_cache: Force a new cluster-labels artifact.
+
+        Returns:
+            Reference to the cluster-labels artifact backing the label column.
+        """
         prepared = self._prepare_leiden_clustering(
+            graph,
             from_assay=from_assay,
             cell_key=cell_key,
             feat_key=feat_key,
@@ -584,13 +598,15 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         )
         membership = None
         if not prepared.planned.reused:
-            graph = self._load_prepared_leiden_graph(prepared)
-            membership = self._compute_prepared_leiden(prepared, graph)
-        self._publish_prepared_leiden(prepared, membership)
-        return None
+            graph_matrix = self._load_prepared_leiden_graph(prepared)
+            membership = self._compute_prepared_leiden(prepared, graph_matrix)
+        _column, ref = self._publish_prepared_leiden(prepared, membership)
+        return ref
 
     def run_paris_clustering(
         self,
+        graph: ArtifactRef | None = None,
+        *,
         from_assay: str | None = None,
         cell_key: str | None = None,
         feat_key: str | None = None,
@@ -601,7 +617,12 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         invalidate_cache: bool = False,
         label: str = "paris_cluster",
     ) -> "ParisClusteringResult":
-        """Fit the canonical Paris hierarchy and write a fixed or adaptive cut."""
+        """Fit the canonical Paris hierarchy and write a fixed or adaptive cut.
+
+        Pass ``graph`` to partition an explicit connectivity map or integrated
+        graph. The returned result carries the cut artifact in its ``ref``
+        field alongside the labels and diagnostics.
+        """
         if isinstance(n_clusters, (bool, np.bool_)):
             raise TypeError("n_clusters must be an integer or 'auto'")
         if isinstance(n_clusters, str):
@@ -618,25 +639,22 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             raise ValueError("min_cluster_size is only valid when n_clusters='auto'")
         invalidate_artifacts = force_recalc or invalidate_cache
 
-        if integrated_graph is not None:
-            graph_loc = self._resolve_integrated_graph_path(integrated_graph)
-            if graph_loc not in self.zw:
-                raise KeyError(
-                    f"An integrated graph with label {integrated_graph!r} does not exist"
-                )
-        else:
-            graph_loc = None
-
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay,
-            cell_key,
-            feat_key,
+        graph_selection = resolve_graph_selection(
+            self,
+            graph,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            integrated_graph=integrated_graph,
         )
-        if graph_loc is None:
-            stored = self._lookup_stored_graph(from_assay, cell_key, feat_key)
-            if not isinstance(stored, StoredAssayGraph):
-                raise TypeError("Paris clustering requires an assay graph")
-            graph_loc = stored.paths.cell_graph_group_path
+        from_assay = graph_selection.from_assay
+        cell_key = graph_selection.cell_key
+        graph_loc = graph_selection.graph_loc
+        if graph_selection.integrated_label is None and not isinstance(
+            self._lookup_stored_graph(graph_loc=graph_loc),
+            StoredAssayGraph,
+        ):
+            raise TypeError("Paris clustering requires an assay graph")
 
         n_cells, effective_k = self._get_graph_ncells_k(graph_loc)
         active_cell_count = int(np.count_nonzero(self.cells.fetch_all(cell_key)))
@@ -663,14 +681,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         else:
             effective_min_cluster_size = None
 
-        graph_ref = resolve_stored_graph_input(self.zw, graph_loc)
         return self._run_paris_from_artifacts(
-            graph_ref=graph_ref,
+            graph_ref=graph_selection.graph_input,
             graph_loc=graph_loc,
             from_assay=from_assay,
-            label_assay=(
-                integrated_graph if integrated_graph is not None else from_assay
-            ),
+            label_assay=graph_selection.output_assay,
             cell_key=cell_key,
             fixed_cluster_count=fixed_cluster_count,
             effective_min_cluster_size=effective_min_cluster_size,
@@ -680,6 +695,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
 
     def run_topacedo_sampler(
         self,
+        graph: ArtifactRef | None = None,
+        *,
         from_assay: str | None = None,
         cell_key: str | None = None,
         feat_key: str | None = None,
@@ -701,9 +718,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         save_mean_snn_key: str = "snn_value",
         save_seeds_key: str = "sketch_seeds",
         rand_state: int = 4466,
-        return_edges: bool = False,
         invalidate_cache: bool = False,
-    ) -> None | list[Any]:
+    ) -> ArtifactRef:
         """Perform sub-sampling (aka sketching) of cells using TopACeDo
         algorithm. Sub-sampling required that cells are partitioned in cluster
         already. Since, sub-sampling is dependent on cluster information,
@@ -711,6 +727,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         sub-sampling results.
 
         Args:
+            graph: Connectivity map or integrated graph to sample. The current
+                   analysis chain of the assay is used when omitted.
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
             cell_key: Cell key. Should be same as the one that was used in the desired graph. (Default value: 'I')
             feat_key: Feature key. Should be same as the one that was used in the desired graph. By default, the latest
@@ -745,31 +763,36 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             save_seeds_key: base label for saving the seed cells (identified by topacedo sampler) into a cell
                             metadata column (Default value: 'sketch_seeds')
             rand_state: A random values to set seed while sampling cells from a cluster randomly. (Default value: 4466)
-            return_edges: If True, then steiner nodes and edges are returned. (Default value: False)
 
         Returns:
+            Reference to the sampling artifact. Open it with ``load_artifact``
+            to read the ``edges`` array of Steiner tree edges over graph row
+            indices.
         """
 
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay, cell_key, feat_key
+        graph_selection = resolve_graph_selection(
+            self,
+            graph,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            feat_key=feat_key,
+            integrated_graph=integrated_graph,
         )
+        from_assay = graph_selection.from_assay
+        cell_key = graph_selection.cell_key
+        feat_key = graph_selection.feat_key
+        integrated_graph = graph_selection.integrated_label
+        graph_loc = graph_selection.graph_loc
+        output_assay = graph_selection.output_assay
         if cluster_key is None:
             raise ValueError("ERROR: Please provide a value for cluster key")
         clusters = pd.Series(self.cells.fetch(cluster_key, key=cell_key))
-        if integrated_graph is None:
-            stored = self._lookup_stored_graph(from_assay, cell_key, feat_key)
-            if not isinstance(stored, StoredAssayGraph):
-                raise TypeError("TopACeDo sampling requires an assay graph")
-            graph_loc = stored.paths.cell_graph_group_path
-            output_assay = from_assay
-        else:
-            graph_loc = self._resolve_integrated_graph_path(integrated_graph)
-            if graph_loc not in self.zw:
-                raise KeyError(
-                    f"An integrated graph with label {integrated_graph!r} does not exist"
-                )
-            output_assay = integrated_graph
-        graph_input: object = resolve_stored_graph_input(self.zw, graph_loc)
+        if integrated_graph is None and not isinstance(
+            self._lookup_stored_graph(graph_loc=graph_loc),
+            StoredAssayGraph,
+        ):
+            raise TypeError("TopACeDo sampling requires an assay graph")
+        graph_input: object = graph_selection.graph_input
         if not isinstance(graph_input, ArtifactRef) and integrated_graph is None:
             validate_legacy_graph_selection(
                 self,
@@ -778,7 +801,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 cell_key,
                 feat_key,
             )
-        graph = self.load_graph(
+        graph_matrix = self.load_graph(
             from_assay=from_assay,
             cell_key=cell_key,
             feat_key=feat_key,
@@ -891,17 +914,17 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 "value_fingerprint": fingerprint_array(dendrogram),
             }
 
-        if len(clusters) != graph.shape[0]:
+        if len(clusters) != graph_matrix.shape[0]:
             raise ValueError(
                 f"ERROR: cluster information exists for {len(clusters)} cells while graph has "
-                f"{graph.shape[0]} cells."
+                f"{graph_matrix.shape[0]} cells."
             )
         selection = self._ensure_cell_selection(cell_key)
         if isinstance(graph_input, ArtifactRef):
-            graph_selection = self._graph_cell_selection(graph_input)
-            if not self._selection_artifacts_match(graph_selection, selection):
+            graph_cell_selection = self._graph_cell_selection(graph_input)
+            if not self._selection_artifacts_match(graph_cell_selection, selection):
                 raise ValueError("cell_key does not match the graph cell selection")
-            selection = graph_selection
+            selection = graph_cell_selection
         artifact_scope = (
             graph_input.scope
             if isinstance(graph_input, ArtifactRef)
@@ -935,7 +958,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             save_density_key=save_density_key,
             save_mean_snn_key=save_mean_snn_key,
             save_seeds_key=save_seeds_key,
-            return_edges=return_edges,
             invalidate_cache=invalidate_cache,
         )
         planned = arguments.plan(
@@ -952,22 +974,22 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             required_arrays=(
                 ArrayRequirement(
                     "sampled",
-                    shape=(graph.shape[0],),
+                    shape=(graph_matrix.shape[0],),
                     dtype_kind="b",
                 ),
                 ArrayRequirement(
                     "density",
-                    shape=(graph.shape[0],),
+                    shape=(graph_matrix.shape[0],),
                     dtype_kind="f",
                 ),
                 ArrayRequirement(
                     "mean_snn",
-                    shape=(graph.shape[0],),
+                    shape=(graph_matrix.shape[0],),
                     dtype_kind="f",
                 ),
                 ArrayRequirement(
                     "seeds",
-                    shape=(graph.shape[0],),
+                    shape=(graph_matrix.shape[0],),
                     dtype_kind="b",
                 ),
                 ArrayRequirement(
@@ -1008,16 +1030,13 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             density = artifact_values(artifact_group, "density")
             mean_snn = artifact_values(artifact_group, "mean_snn")
             seeds = artifact_values(artifact_group, "seeds").astype(bool)
-            edge_values = artifact_values(artifact_group, "edges")
-            edges = [(int(edge[0]), int(edge[1])) for edge in np.asarray(edge_values)]
         else:
             try:
                 from topacedo import TopacedoSampler
-            except ImportError:
-                logger.error("Could not find topacedo package")
-                return None
+            except ImportError as error:
+                raise ImportError("Could not find topacedo package") from error
             sampler = TopacedoSampler(
-                graph,
+                graph_matrix,
                 clusters.values,
                 dendrogram,
                 density_depth,
@@ -1038,26 +1057,26 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 raise ValueError("TopACeDo returned non-integer sampled-cell indices")
             node_indices = raw_node_indices.astype(np.int64, copy=False)
             if node_indices.ndim != 1 or np.any(
-                (node_indices < 0) | (node_indices >= graph.shape[0])
+                (node_indices < 0) | (node_indices >= graph_matrix.shape[0])
             ):
                 raise ValueError("TopACeDo returned invalid sampled-cell indices")
-            sampled = np.zeros(graph.shape[0], dtype=bool)
+            sampled = np.zeros(graph_matrix.shape[0], dtype=bool)
             sampled[node_indices] = True
             density = np.asarray(sampler.densities, dtype=np.float64)
             mean_snn = np.asarray(sampler.meanSnn, dtype=np.float64)
-            if density.shape != (graph.shape[0],):
+            if density.shape != (graph_matrix.shape[0],):
                 raise ValueError("TopACeDo returned invalid cell-density values")
-            if mean_snn.shape != (graph.shape[0],):
+            if mean_snn.shape != (graph_matrix.shape[0],):
                 raise ValueError("TopACeDo returned invalid mean-SNN values")
             raw_seed_indices = np.asarray(sampler.seeds)
             if raw_seed_indices.dtype.kind not in {"i", "u"}:
                 raise ValueError("TopACeDo returned non-integer seed-cell indices")
             seed_indices = raw_seed_indices.astype(np.int64, copy=False)
             if seed_indices.ndim != 1 or np.any(
-                (seed_indices < 0) | (seed_indices >= graph.shape[0])
+                (seed_indices < 0) | (seed_indices >= graph_matrix.shape[0])
             ):
                 raise ValueError("TopACeDo returned invalid seed-cell indices")
-            seeds = np.zeros(graph.shape[0], dtype=bool)
+            seeds = np.zeros(graph_matrix.shape[0], dtype=bool)
             seeds[seed_indices] = True
             raw_edge_values = np.asarray(edges)
             if raw_edge_values.size and raw_edge_values.dtype.kind not in {"i", "u"}:
@@ -1067,9 +1086,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 edge_values = edge_values.reshape(0, 2)
             elif edge_values.ndim != 2 or edge_values.shape[1] != 2:
                 raise ValueError("TopACeDo returned invalid edge pairs")
-            if np.any((edge_values < 0) | (edge_values >= graph.shape[0])):
+            if np.any((edge_values < 0) | (edge_values >= graph_matrix.shape[0])):
                 raise ValueError("TopACeDo returned out-of-range edge endpoints")
-            edges = [(int(edge[0]), int(edge[1])) for edge in edge_values]
             write_cell_data_artifact(
                 self.zw,
                 planned,
@@ -1116,6 +1134,4 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         )
         logger.debug(f"Mean SNN values saved under column: '{columns['mean_snn']}'")
         logger.debug(f"Seed cells saved under column: '{columns['seeds']}'")
-        if return_edges:
-            return cast(list[Any], edges)
-        return None
+        return planned.ref

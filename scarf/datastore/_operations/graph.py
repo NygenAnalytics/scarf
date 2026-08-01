@@ -3512,7 +3512,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         chunk_size: int = 10000,
         invalidate_cache: bool = False,
         l2_normalize: bool = True,
-    ) -> None:
+    ) -> ArtifactRef:
         """Integrate the latest neighbourhood graphs for selected assays.
 
         SNN combines shared edge support across two or more assays. WNN accepts
@@ -3530,6 +3530,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             invalidate_cache: Force a new integrated-graph artifact.
             l2_normalize: L2-normalize modality coordinates during WNN scoring.
                 This algorithmic setting is stored in artifact provenance.
+
+        Returns:
+            Reference to the integrated-graph artifact. Pass it to `run_umap`,
+            `run_tsne`, or the clustering methods as their ``graph`` argument,
+            or keep using ``integrated_graph=label``.
 
         WNN stores two modality-weight columns named
         ``{label}_{assay}_weight`` in cell metadata.
@@ -3813,7 +3818,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if integrated_plan.reused:
             select_integrated_artifact()
             publish_modality_weights()
-            return None
+            return integrated_plan.ref
 
         def load_wnn_inputs(assay_name: str) -> tuple[np.ndarray, NDArray[Any]]:
             state = read_assay_state(self.zw, assay_name)
@@ -3927,3 +3932,4 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         finish_artifact(store, integrated_plan)
         select_integrated_artifact()
         publish_modality_weights()
+        return integrated_plan.ref

@@ -10,9 +10,9 @@ valuable to duplicate for every branch of an analysis.
 
 Scarf stores counts, metadata, and persisted results in Zarr. Operations stream
 bounded blocks instead of loading a complete matrix into memory. The same
-`DataStore` can hold alternative cell selections, feature selections, graph
-chains, clustering resolutions, and mappings while recording which inputs and
-parameters produced each result.
+`DataStore` can hold alternative cell selections, feature selections,
+{term}`analysis chains <analysis chain>`, clustering resolutions, and mappings
+while recording which inputs and parameters produced each result.
 
 :::{image} _static/overview.svg
 :width: 75%
@@ -41,9 +41,10 @@ Scarf provides complete workflows for:
 
 Single-cell analysis is a chain of dependent operations. Changing a cell filter
 can change feature selection, PCA, neighbours, clustering, and markers. Scarf
-records persisted results with their operation, scientific parameters, and
-upstream inputs. Related branches can coexist in one datastore, and an identical
-request can reuse a valid result rather than recomputing it.
+records each persisted result, or {term}`artifact`, with its operation,
+scientific parameters, and upstream inputs. Related branches can coexist in one
+datastore, and an identical request can {term}`reuse` a valid result rather than
+recomputing it.
 
 Filtering is reversible: cells and features are marked by boolean selections
 rather than deleted. Persisted outputs remain available between sessions, so an

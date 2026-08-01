@@ -51,6 +51,7 @@ def test_basic_rna_pipeline_returns_only_named_artifact_refs(
         "leiden_0.5",
         "leiden_1.0",
         "paris",
+        "selected_clusters",
         "markers",
     ]
     assert all(isinstance(ref, ArtifactRef) for ref in artifacts.values())
@@ -268,17 +269,76 @@ def test_pipeline_selects_clusters_by_pca_silhouette(datastore_ephemeral) -> Non
     )
 
     assert "selected_clusters" in artifacts
-    assert artifacts["selected_clusters"] in {
-        artifacts["leiden_0.5"],
-        artifacts["leiden_1.0"],
-        artifacts["paris"],
+    selected = artifacts["selected_clusters"]
+    candidates = {
+        artifacts["leiden_0.5"]: "RNA_leiden_0.5",
+        artifacts["leiden_1.0"]: "RNA_leiden_1.0",
+        artifacts["paris"]: "RNA_pipeline_silhouette_paris",
     }
+    assert selected in candidates
     assert artifacts["markers"].kind == "marker_table"
     for stage in ("cluster_selection", "markers"):
         assert [event.kind for event in events if event.stage == stage] == [
             "stage_started",
             "stage_completed",
         ]
+
+    store = datastore_ephemeral
+    labels = store.cells.fetch("RNA_clusters")
+    assert (labels == store.cells.fetch(candidates[selected])).all()
+    column = store.zw["cellData"]["RNA_clusters"]
+    assert ArtifactRef.from_dict(column.attrs["source_artifact"]) == selected
+    assert store.get_markers(group_key="RNA_clusters", group_id=labels[0]) is not None
+
+
+def test_pipeline_names_a_single_partition_without_silhouette(
+    datastore_ephemeral,
+    monkeypatch,
+) -> None:
+    def fail(*args, **kwargs):
+        raise AssertionError("silhouette selection is unnecessary for one partition")
+
+    monkeypatch.setattr(
+        pipeline_accessor_module.PipelineAccessor,
+        "_select_clusters_by_pca_silhouette",
+        fail,
+    )
+    artifacts = datastore_ephemeral.pipeline.run(
+        filtering={},
+        cell_cycle_scoring=False,
+        highly_variable_features={"top_n": 100, "hvg_key_name": "pipeline_single_hvgs"},
+        pca={"dims": 5, "n_centroids": 10},
+        neighbors={"k": 3},
+        umap=False,
+        leiden={1.0: {}},
+        paris=False,
+        doublet_scoring=False,
+        markers=False,
+    )
+
+    assert artifacts["selected_clusters"] == artifacts["leiden_1.0"]
+    store = datastore_ephemeral
+    assert (
+        store.cells.fetch("RNA_clusters") == store.cells.fetch("RNA_leiden_1.0")
+    ).all()
+
+
+def test_pipeline_rejects_downstream_steps_without_clustering(
+    datastore_ephemeral,
+) -> None:
+    with pytest.raises(ValueError, match="Marker needs a clustering result"):
+        datastore_ephemeral.pipeline.run(
+            filtering={},
+            cell_cycle_scoring=False,
+            highly_variable_features={"top_n": 100, "hvg_key_name": "pipeline_no_hvgs"},
+            pca={"dims": 5, "n_centroids": 10},
+            neighbors={"k": 3},
+            umap=False,
+            leiden={},
+            paris=False,
+            doublet_scoring=False,
+            markers={"gene_batch_size": 100},
+        )
 
 
 def test_pipeline_rejects_invalid_clustering_concurrency(datastore_ephemeral) -> None:

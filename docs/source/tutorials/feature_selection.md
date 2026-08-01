@@ -181,8 +181,8 @@ biology instead of choosing the layout that appears most separated.
 ## Install an externally chosen feature set
 
 `set_hvgs` accepts either a boolean mask aligned to feature metadata or physical
-feature indexes. It records the supplied selection so downstream artifacts can
-trace which genes were used.
+feature indexes. It records the supplied selection so downstream
+{term}`artifacts <artifact>` can trace which genes were used.
 
 ```python
 manual_mask = np.isin(

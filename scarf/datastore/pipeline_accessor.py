@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 import numpy as np
 
+from ..metadata.artifacts import column_display, link_cell_data_column
 from ..storage.artifacts import ArtifactRef, group_at
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.logging import logger
@@ -77,6 +78,8 @@ _DEFAULT_LEIDEN: dict[float, dict[str, Any]] = {
     1.25: {},
 }
 
+_SELECTED_CLUSTER_LABEL = "clusters"
+
 
 class PipelineAccessor:
     __slots__ = ("_store",)
@@ -96,6 +99,21 @@ class PipelineAccessor:
         if not isinstance(raw_ref, dict):
             raise RuntimeError(f"Pipeline output column {column!r} has no artifact ref")
         return ArtifactRef.from_dict(raw_ref)
+
+    def _column_source_value(self, column: str) -> str:
+        cell_data = as_zarr_group(
+            self._store.zw["cellData"],
+            name="cellData",
+        )
+        value_name = as_zarr_array(
+            cell_data[column],
+            name=column,
+        ).attrs.get("source_value")
+        if not isinstance(value_name, str):
+            raise RuntimeError(
+                f"Cluster column {column!r} is not linked to an artifact value"
+            )
+        return value_name
 
     def _feature_ref(self, assay_name: str, column: str) -> ArtifactRef:
         assay = self._store._get_assay(assay_name)
@@ -218,9 +236,40 @@ class PipelineAccessor:
         )
         return best_key
 
+    def _publish_selected_clusters(
+        self,
+        *,
+        assay_name: str,
+        cell_key: str,
+        source_column: str,
+        ref: ArtifactRef,
+    ) -> str:
+        store = self._store
+        column: str = store._col_renamer(assay_name, cell_key, _SELECTED_CLUSTER_LABEL)
+        if column == source_column:
+            return column
+        labels = np.asarray(store.cells.fetch(source_column, key=cell_key))
+        store.cells.insert(
+            column,
+            labels,
+            fill_value=-1,
+            key=cell_key,
+            overwrite=True,
+        )
+        link_cell_data_column(
+            store.zw,
+            column,
+            ref,
+            value_name=self._column_source_value(source_column),
+            default_display=column_display(store.zw, source_column),
+        )
+        logger.info(f"Selected {source_column} as {column}")
+        return column
+
     def _run_clustering_jobs(
         self,
         *,
+        graph: ArtifactRef,
         assay_name: str,
         cell_key: str,
         feat_key: str,
@@ -275,6 +324,7 @@ class PipelineAccessor:
             job_order.append(recipe_key)
             try:
                 prepared_leiden[recipe_key] = store._prepare_leiden_clustering(
+                    graph,
                     from_assay=assay_name,
                     cell_key=cell_key,
                     feat_key=feat_key,
@@ -326,6 +376,7 @@ class PipelineAccessor:
                         try:
                             future = executor.submit(
                                 store.run_paris_clustering,
+                                graph,
                                 from_assay=assay_name,
                                 cell_key=cell_key,
                                 feat_key=feat_key,
@@ -363,10 +414,12 @@ class PipelineAccessor:
                                 raise RuntimeError(
                                     "Paris clustering did not write labels"
                                 )
+                            if result.ref is None:
+                                raise RuntimeError(
+                                    "Paris clustering did not record an artifact"
+                                )
                             completed[recipe_key] = result.label_key
-                            artifact_refs[recipe_key] = self._column_ref(
-                                result.label_key
-                            )
+                            artifact_refs[recipe_key] = result.ref
                             complete_job(recipe_key)
                         else:
                             compute_results[recipe_key] = result
@@ -382,12 +435,12 @@ class PipelineAccessor:
         for recipe_key, prepared in prepared_leiden.items():
             start_job(recipe_key)
             try:
-                column = store._publish_prepared_leiden(
+                column, ref = store._publish_prepared_leiden(
                     prepared,
                     compute_results.get(recipe_key),
                 )
                 completed[recipe_key] = column
-                artifact_refs[recipe_key] = self._column_ref(column)
+                artifact_refs[recipe_key] = ref
             except Exception as error:
                 fail_job(recipe_key, error)
                 fail_unpublished_jobs()
@@ -431,9 +484,12 @@ class PipelineAccessor:
         ``batch_columns``. Leiden defaults to resolutions 0.5, 0.75, 1.0, and
         1.25. Leiden and Paris membership work can overlap under
         ``clustering_concurrency`` while store writes stay serialized. When
-        doublets or markers omit ``clusters``, the partition with the highest
-        silhouette score on PCA coordinates is selected. Highly variable
-        feature selection is mandatory. When provided, ``callback`` receives
+        more than one partition is available, the one with the highest
+        silhouette score on PCA coordinates is selected. Its labels are copied
+        to ``{assay}_clusters``, linked to the same artifact, and used by
+        doublet scoring and marker search unless those steps name a partition
+        through ``clusters``. Highly variable feature selection is mandatory.
+        When provided, ``callback`` receives
         serialized stage events on the calling thread. Callback errors are
         logged without interrupting the pipeline. Stable stage names are
         ``filtering``, ``cell_cycle_scoring``, ``highly_variable_features``,
@@ -658,23 +714,18 @@ class PipelineAccessor:
         if umap is not False:
             with events.stage("umap"):
                 umap_options = self._options(umap)
-                umap_label = str(umap_options.get("label", "UMAP"))
-                store.run_umap(
+                artifacts["umap"] = store.run_umap(
+                    graph,
                     from_assay=assay_name,
                     cell_key=cell_key,
                     feat_key=hvg_name,
                     **umap_options,
                 )
-                umap_column = store._col_renamer(
-                    assay_name,
-                    cell_key,
-                    f"{umap_label}1",
-                )
-                artifacts["umap"] = self._column_ref(umap_column)
 
         leiden_options = dict(_DEFAULT_LEIDEN) if leiden is None else dict(leiden)
         paris_options = None if paris is False else self._options(paris)
         cluster_columns, cluster_artifacts = self._run_clustering_jobs(
+            graph=graph,
             assay_name=assay_name,
             cell_key=cell_key,
             feat_key=hvg_name,
@@ -689,33 +740,45 @@ class PipelineAccessor:
             None if doublet_scoring is False else self._options(doublet_scoring)
         )
         marker_options = None if markers is False else self._options(markers)
-        needs_auto_clusters = (
-            doublet_options is not None and "clusters" not in doublet_options
-        ) or (marker_options is not None and "clusters" not in marker_options)
-        selected_recipe_key: str | None = None
-        if needs_auto_clusters:
+        selected_column: str | None = None
+        if cluster_columns:
             with events.stage("cluster_selection"):
-                selected_recipe_key = self._select_clusters_by_pca_silhouette(
-                    reduction=reduction,
-                    cell_key=cell_key,
-                    cluster_columns=cluster_columns,
-                )
+                if len(cluster_columns) == 1:
+                    selected_recipe_key = next(iter(cluster_columns))
+                else:
+                    selected_recipe_key = self._select_clusters_by_pca_silhouette(
+                        reduction=reduction,
+                        cell_key=cell_key,
+                        cluster_columns=cluster_columns,
+                    )
                 artifacts["selected_clusters"] = artifacts[selected_recipe_key]
+                selected_column = self._publish_selected_clusters(
+                    assay_name=assay_name,
+                    cell_key=cell_key,
+                    source_column=cluster_columns[selected_recipe_key],
+                    ref=artifacts[selected_recipe_key],
+                )
+
+        def _cluster_column(options: dict[str, Any], step: str) -> str:
+            if "clusters" in options:
+                recipe_key = self._cluster_recipe_key(options.pop("clusters"))
+                if recipe_key not in cluster_columns:
+                    raise ValueError(
+                        f"{step} cluster result {recipe_key!r} is unavailable"
+                    )
+                return cluster_columns[recipe_key]
+            if selected_column is None:
+                raise ValueError(
+                    f"{step} needs a clustering result; run Leiden or Paris, "
+                    "or disable this step"
+                )
+            return selected_column
 
         if doublet_options is not None:
             with events.stage("doublet_scoring"):
                 options = dict(doublet_options)
-                if "clusters" in options:
-                    recipe_key = self._cluster_recipe_key(options.pop("clusters"))
-                else:
-                    assert selected_recipe_key is not None
-                    recipe_key = selected_recipe_key
-                if recipe_key not in cluster_columns:
-                    raise ValueError(
-                        f"Doublet cluster result {recipe_key!r} is unavailable"
-                    )
                 score_column = store.run_doublet_detection(
-                    cluster_key=cluster_columns[recipe_key],
+                    cluster_key=_cluster_column(options, "Doublet"),
                     from_assay=assay_name,
                     cell_key=cell_key,
                     feat_key=hvg_name,
@@ -726,16 +789,7 @@ class PipelineAccessor:
         if marker_options is not None:
             with events.stage("markers"):
                 options = dict(marker_options)
-                if "clusters" in options:
-                    recipe_key = self._cluster_recipe_key(options.pop("clusters"))
-                else:
-                    assert selected_recipe_key is not None
-                    recipe_key = selected_recipe_key
-                if recipe_key not in cluster_columns:
-                    raise ValueError(
-                        f"Marker cluster result {recipe_key!r} is unavailable"
-                    )
-                group_key = cluster_columns[recipe_key]
+                group_key = _cluster_column(options, "Marker")
                 options.setdefault("feat_key", "I")
                 store.run_marker_search(
                     from_assay=assay_name,

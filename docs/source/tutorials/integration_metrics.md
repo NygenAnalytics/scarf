@@ -134,8 +134,9 @@ def evaluate_graph(cluster_label):
 ```{code-cell} ipython3
 ann = ds.build_ann_index(pca)
 neighbors = ds.query_neighbors(ann, k=21)
-ds.build_connectivity_map(neighbors)
+graph = ds.build_connectivity_map(neighbors)
 ds.run_leiden_clustering(
+    graph,
     resolution=1.0,
     label="metrics_uncorrected_clusters",
 )
@@ -162,8 +163,9 @@ pca_partial = ds.run_pca(
 )
 ann = ds.build_ann_index(pca_partial)
 neighbors = ds.query_neighbors(ann, k=21)
-ds.build_connectivity_map(neighbors)
+partial_graph = ds.build_connectivity_map(neighbors)
 ds.run_leiden_clustering(
+    partial_graph,
     resolution=1.0,
     label="metrics_partial_clusters",
 )
@@ -177,8 +179,9 @@ corrected = ds.run_harmony(["sample_id"], pca)
 ds.build_embedding_initialization(pca)
 ann = ds.build_ann_index(corrected)
 neighbors = ds.query_neighbors(ann, k=21)
-ds.build_connectivity_map(neighbors)
+harmony_graph = ds.build_connectivity_map(neighbors)
 ds.run_umap(
+    harmony_graph,
     n_epochs=250,
     spread=5,
     min_dist=1,
@@ -186,6 +189,7 @@ ds.run_umap(
     label="metrics_harmony_UMAP",
 )
 ds.run_leiden_clustering(
+    harmony_graph,
     resolution=1.0,
     label="metrics_harmony_clusters",
 )

@@ -168,6 +168,70 @@ The neighbor artifact attribute formerly named `recall` measured only whether
 the ANN query returned each cell itself. New artifacts store that diagnostic as
 `self_hit_rate`.
 
+## Graph consumers
+
+`run_umap`, `run_tsne`, `run_leiden_clustering`, `run_topacedo_sampler`, and
+`integrate_assays` now return the artifact reference they wrote, and
+`run_paris_clustering` carries the same reference on the `ref` field of its
+result. Cell metadata is still written on every call, so code that reads
+columns such as `RNA_UMAP1` or `RNA_leiden_cluster` is unaffected.
+
+These calls also accept a graph artifact as their first argument, following the
+chain convention already used by `run_pca(normalized, ...)`:
+
+```python
+graph = ds.build_connectivity_map(neighbors)
+umap = ds.run_umap(graph, n_epochs=300)
+clusters = ds.run_leiden_clustering(graph, resolution=1.0)
+```
+
+Omitting the graph keeps the implicit behaviour: the current analysis chain of
+the assay is used, or the integrated graph named by `integrated_graph`. Passing
+both a graph artifact and `integrated_graph` raises. When a connectivity map is
+passed, the assay, cell key, and feature key are read from the artifact.
+
+`from_assay`, `cell_key`, and `feat_key` are keyword-only on these calls.
+Positional calls such as `ds.run_umap("RNA", "I", "hvgs")` must become
+`ds.run_umap(from_assay="RNA", cell_key="I", feat_key="hvgs")`.
+
+`run_topacedo_sampler` no longer accepts `return_edges`. The Steiner tree edges
+live in the sampling artifact:
+
+```python
+sampling = ds.run_topacedo_sampler(cluster_key="RNA_paris_cluster")
+edges = ds.load_artifact(sampling)["edges"][:]
+```
+
+`run_tsne` raises `RuntimeError` on unsupported platforms and when the SG-tSNE
+executable or `sgtsnepi` package is missing. It previously logged the failure
+and returned `None`.
+
+## Pipeline cluster selection
+
+`ds.pipeline.run` now copies the labels of the partition it selects to
+`{assay}_clusters`, for example `RNA_clusters`, and links that column to the
+same artifact as the resolution-specific column. Selection runs whenever any
+clustering ran, not only when doublet scoring or marker search need it, so the
+column and the `selected_clusters` ref are always available afterwards. A single
+partition is taken directly instead of being scored.
+
+Doublet scoring and marker search now group by that column, so marker tables are
+indexed under `RNA_clusters` rather than the winning resolution:
+
+```python
+ds.pipeline.run()
+ds.plots.embedding(layout_key="RNA_UMAP", color_by="RNA_clusters")
+ds.plots.marker_heatmap(group_key="RNA_clusters", topn=5)
+```
+
+Naming a partition explicitly keeps the old behaviour, and the marker table is
+then indexed under that partition's own column:
+
+```python
+ds.pipeline.run(markers={"clusters": {"leiden": 1.0}})
+ds.plots.marker_heatmap(group_key="RNA_leiden_1.0", topn=5)
+```
+
 ## Marker statistics
 
 Fresh marker tables use schema v2. They add AUC and

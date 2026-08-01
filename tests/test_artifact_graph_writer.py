@@ -277,23 +277,32 @@ def test_integrated_graphs_use_random_artifacts_and_label_index(
         local_cache=False,
     )
 
-    datastore.integrate_assays(
+    integrated = datastore.integrate_assays(
         ["RNA", "assay2"],
         label="artifact_snn",
         method="snn",
     )
     path = datastore._resolve_integrated_graph_path("artifact_snn")
     ref = parse_artifact_path(path)
+    assert integrated == ref
     assert ref.kind == "integrated_graph"
     assert datastore.inspect_artifact(ref).complete
     assert "integratedGraphs/artifact_snn" not in datastore.zw
 
-    datastore.run_umap(
+    umap_ref = datastore.run_umap(
         integrated_graph="artifact_snn",
         n_epochs=10,
         label="UMAP",
     )
     assert "artifact_snn_UMAP1" in datastore.cells.columns
+    assert datastore.run_umap(integrated, n_epochs=10, label="UMAP") == umap_ref
+    with pytest.raises(ValueError, match="not both"):
+        datastore.run_umap(
+            integrated,
+            integrated_graph="artifact_snn",
+            n_epochs=10,
+            label="UMAP",
+        )
     datastore.run_paris_clustering(
         integrated_graph="artifact_snn",
         n_clusters=3,
@@ -306,6 +315,15 @@ def test_integrated_graphs_use_random_artifacts_and_label_index(
     assert tree["coalesced_location"].startswith(
         "artifacts/coalesced_tree/",
     )
+
+    alias = datastore.integrate_assays(
+        ["RNA", "assay2"],
+        label="artifact_snn_alias",
+        method="snn",
+    )
+    assert alias == integrated
+    with pytest.raises(ValueError, match="shared by labels"):
+        datastore.run_umap(integrated, n_epochs=10, label="UMAP")
 
 
 def test_wnn_uses_exact_nondefault_cell_selection(

@@ -3,6 +3,7 @@ from typing import Literal
 
 import numpy as np
 
+from ..storage.refs import ArtifactRef
 from ._paris_core import ParisHierarchy
 
 _INFEASIBLE = np.uint8(0)
@@ -32,7 +33,11 @@ class ParisClusterDiagnostic:
 
 @dataclass(frozen=True)
 class ParisClusteringResult:
-    """Labels and diagnostics returned by a Paris cut."""
+    """Labels and diagnostics returned by a Paris cut.
+
+    ``ref`` and ``label_key`` are set when the cut was written to a store, and
+    stay ``None`` for cuts produced directly from a hierarchy.
+    """
 
     labels: np.ndarray
     mode: Literal["auto", "fixed"]
@@ -41,6 +46,7 @@ class ParisClusteringResult:
     min_cluster_size: int | None = None
     label_key: str | None = None
     hierarchy_generation_id: str | None = None
+    ref: ArtifactRef | None = None
 
     def __post_init__(self) -> None:
         if self.labels.ndim != 1 or self.labels.dtype != np.int32:

@@ -16,8 +16,9 @@ kernelspec:
 
 # Provenance and reuse
 
-This tutorial shows when Scarf reuses complete artifacts and when it builds new
-ones. Read {doc}`../concepts/provenance` for the identity rules.
+This tutorial shows when Scarf will {term}`reuse` a completed {term}`artifact`
+and when it builds a new one. Read {doc}`../concepts/provenance` for the rules
+that decide which of the two happens.
 
 ## Prerequisites
 
@@ -60,7 +61,7 @@ if 'I__hvgs' not in ds.RNA.feats.columns:
 ## Build a baseline chain
 
 Keep `update_state=False` so side comparisons do not replace the current
-analysis chain until you choose a branch.
+{term}`analysis chain` until you choose a branch.
 
 ```{code-cell} ipython3
 normalized = ds.run_normalization(
@@ -75,8 +76,8 @@ graph_k11 = ds.build_connectivity_map(neighbors_k11, update_state=False)
 
 ## Vary `k`: reuse upstream
 
-A new neighbor count changes only neighbors and connectivity provenance.
-Normalization, PCA, and ANN refs stay the same object.
+A new neighbor count changes only the neighbors and connectivity
+{term}`provenance`. The normalization, PCA, and ANN references are unchanged.
 
 ```{code-cell} ipython3
 neighbors_k15 = ds.query_neighbors(ann, k=15, update_state=False)
@@ -109,8 +110,8 @@ print('normalization reused:', ds.run_normalization(feat_key='hvgs', update_stat
 
 ## Force recompute
 
-`invalidate_cache=True` skips provenance reuse even when parameters match.
-Previous complete artifacts remain on disk.
+`invalidate_cache=True` skips {term}`reuse` even when the parameters match.
+Previously completed artifacts remain on disk.
 
 ```{code-cell} ipython3
 forced = ds.run_normalization(

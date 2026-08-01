@@ -35,7 +35,9 @@ methods do not calculate enrichment p-values.
 
 ## Dataset
 
-This page uses the 5K PBMC dataset from {doc}`scrna_seq`. The setup below is standalone.
+This page opens the published 5K PBMC store, which already carries the UMAP the
+score plots are drawn on. Signature scoring itself reads normalized counts, not
+the graph.
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -52,24 +54,7 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 ds = scarf.DataStore(
     f'{dataset}/data.zarr',
     nthreads=4,
-    min_features_per_cell=10,
 )
-ds.filter_cells(
-    attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
-    highs=[15000, 4000, 15],
-    lows=[1000, 500, 0],
-    reset_previous=True,
-)
-
-if 'RNA_UMAP1' not in ds.cells.columns:
-    ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-    ds.run_normalization(feat_key='hvgs')
-    ds.run_pca(dims=15)
-    ds.build_embedding_initialization()
-    ds.build_ann_index()
-    ds.query_neighbors(k=11)
-    ds.build_connectivity_map()
-    ds.run_umap(n_epochs=150, spread=5, min_dist=1, parallel=True)
 ```
 
 
@@ -137,7 +122,7 @@ apply `log1p` before aggregation.
 AUCell ranks the selected RNA features within each cell and measures how early a source's
 targets are recovered. Scores range from zero to one. Network weights are ignored.
 
-`feat_key` defines the ranking universe. Here the default `I` feature key ranks all active
+The {term}`feat_key` defines the ranking universe. Here the default `I` feature key ranks all active
 features. `n_up=500` evaluates recovery within the top 500 ranks.
 
 ```{code-cell} ipython3

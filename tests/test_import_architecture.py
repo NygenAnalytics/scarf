@@ -46,6 +46,7 @@ _MOVED_SYMBOLS = {
 def _upward_imports(
     package_name: str,
     forbidden_packages: set[str],
+    allowed_modules: frozenset[str] = frozenset(),
 ) -> set[tuple[str, str]]:
     package_root = _SCARF_ROOT / package_name
     violations: set[tuple[str, str]] = set()
@@ -58,25 +59,25 @@ def _upward_imports(
                 for alias in node.names:
                     parts = alias.name.split(".")
                     if len(parts) > 1 and parts[0] == "scarf":
-                        targets.add(parts[1])
+                        targets.add(".".join(parts[1:]))
             elif isinstance(node, ast.ImportFrom):
                 if node.level >= 2:
                     if node.module:
-                        targets.add(node.module.split(".")[0])
+                        targets.add(node.module)
                     else:
-                        targets.update(alias.name.split(".")[0] for alias in node.names)
+                        targets.update(alias.name for alias in node.names)
                 elif node.level == 0 and node.module:
                     parts = node.module.split(".")
                     if parts[0] == "scarf":
                         if len(parts) > 1:
-                            targets.add(parts[1])
+                            targets.add(".".join(parts[1:]))
                         else:
-                            targets.update(
-                                alias.name.split(".")[0] for alias in node.names
-                            )
+                            targets.update(alias.name for alias in node.names)
 
-            for target in targets.intersection(forbidden_packages):
-                violations.add((path.relative_to(package_root).as_posix(), target))
+            for target in targets - allowed_modules:
+                root = target.split(".")[0]
+                if root in forbidden_packages:
+                    violations.add((path.relative_to(package_root).as_posix(), root))
 
     return violations
 
@@ -363,11 +364,33 @@ def test_unified_plotting_uses_datastore_layout_adapter():
 
 
 def test_algorithm_domains_do_not_import_orchestration_or_io():
+    # storage.refs holds the artifact reference value type and reads no store,
+    # so results that a caller persists may name it.
     forbidden = {"datastore", "plotting", "readers", "storage", "writers"}
+    allowed = frozenset({"storage.refs"})
     for package_name in ("clustering", "embeddings", "trajectory"):
         package_root = _SCARF_ROOT / package_name
         if package_root.is_dir():
-            assert _upward_imports(package_name, forbidden) == set()
+            assert _upward_imports(package_name, forbidden, allowed) == set()
+    assert {path for path, _target in _upward_imports("clustering", {"storage"})} == {
+        "paris_multiscale.py"
+    }
+
+
+def test_artifact_reference_module_has_no_storage_dependencies():
+    path = _SCARF_ROOT / "storage" / "refs.py"
+    tree = ast.parse(path.read_text(), filename=str(path))
+    imported = {
+        alias.name.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        node.module.split(".")[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert imported <= {"re", "collections", "dataclasses", "typing"}
 
 
 def test_metrics_and_embedding_harmony_avoid_runtime_orchestration_and_io_imports():

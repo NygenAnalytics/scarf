@@ -20,7 +20,7 @@ kernelspec:
 Embeddings, clustering, imputation, and trajectories consume a cell graph.
 Scarf builds that graph from a selected cell population and feature set through
 separate persisted stages. Calling the stages directly is useful when you need
-to branch one parameter, insert batch correction, or reuse an expensive
+to branch one parameter, insert batch correction, or {term}`reuse` an expensive
 reduction.
 
 Feature selection is covered in {doc}`feature_selection`. This guide begins once
@@ -50,6 +50,8 @@ more control.
 ## Build an RNA graph explicitly
 
 ```{code-cell} ipython3
+import pandas as pd
+
 import scarf
 import scarf.plotting as splt
 
@@ -79,8 +81,8 @@ if "I__hvgs" not in ds.RNA.feats.columns:
     )
 ```
 
-Each method returns an `ArtifactRef`. Passing it to the next method makes the
-dependency explicit.
+Each method returns an {term}`ArtifactRef`. Passing it to the next method makes
+the dependency explicit.
 
 ```{code-cell} ipython3
 normalized = ds.run_normalization(feat_key="hvgs")
@@ -114,8 +116,9 @@ driven by a QC metric warrants revisiting features, PCA dimensions, or `k`.
 ## Understand the current analysis chain
 
 Successful stages normally update a small pointer set for the assay. In plain
-language, this is the chain that downstream calls should use when no explicit
-input is supplied. The public class representing it is `AssayState`.
+language, this is the {term}`analysis chain` that downstream calls should use
+when no explicit input is supplied. The public class representing it is
+`AssayState`.
 
 ```{code-cell} ipython3
 state = ds.get_assay_state("RNA")
@@ -130,18 +133,24 @@ state = ds.get_assay_state("RNA")
 ```
 
 `run_umap`, Leiden, and Paris resolve the current connectivity and
-initialization from this chain.
+initialization from this chain. They write their cell-metadata columns as usual
+and return the artifact they wrote, so a result can be inspected or reused
+without looking the column up first.
 
 ```{code-cell} ipython3
-ds.run_umap(
+umap = ds.run_umap(
     n_epochs=100,
     parallel=True,
 )
-ds.run_leiden_clustering(resolution=0.5)
+clusters = ds.run_leiden_clustering(resolution=0.5)
 ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by="RNA_leiden_cluster",
 )
+```
+
+```{code-cell} ipython3
+ds.inspect_artifact(clusters).parameters
 ```
 
 ## Branch without changing the current chain
@@ -167,6 +176,25 @@ current_state.connectivity_map == graph, graph_k21 != graph
 The side branch remains a complete, addressable artifact, while downstream
 calls without explicit inputs still use the `k=11` graph. This prevents a
 parameter experiment from silently replacing the selected chain.
+
+To analyse the side branch, pass its graph as the first argument. The current
+chain is untouched, so both partitions stay available for comparison.
+
+```{code-cell} ipython3
+ds.run_leiden_clustering(
+    graph_k21,
+    resolution=0.5,
+    label="leiden_k21",
+)
+pd.crosstab(
+    pd.Series(ds.cells.fetch("RNA_leiden_cluster"), name="k=11"),
+    pd.Series(ds.cells.fetch("RNA_leiden_k21"), name="k=21"),
+)
+```
+
+Most cells keep their group. The off-diagonal mass shows which splits depend on
+`k`: the smallest `k=11` clusters are absorbed once every cell sees more
+neighbours, so treat those boundaries as provisional.
 
 ## Recompute only what changed
 

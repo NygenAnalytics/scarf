@@ -115,7 +115,6 @@ class TopacedoArguments(OperationArguments):
     save_density_key: str = execution()
     save_mean_snn_key: str = execution()
     save_seeds_key: str = execution()
-    return_edges: bool = execution()
     invalidate_cache: bool = execution()
 
 

@@ -79,8 +79,9 @@ pca_full = ds.run_pca(normalized, dims=25)
 ds.build_embedding_initialization(pca_full)
 ann = ds.build_ann_index(pca_full)
 neighbors = ds.query_neighbors(ann, k=21)
-ds.build_connectivity_map(neighbors)
+graph = ds.build_connectivity_map(neighbors)
 ds.run_umap(
+    graph,
     n_epochs=250,
     spread=5,
     min_dist=1,
@@ -114,8 +115,9 @@ pca_partial = ds.run_pca(
 ds.build_embedding_initialization(pca_partial)
 ann = ds.build_ann_index(pca_partial)
 neighbors = ds.query_neighbors(ann, k=21)
-ds.build_connectivity_map(neighbors)
+partial_graph = ds.build_connectivity_map(neighbors)
 ds.run_umap(
+    partial_graph,
     n_epochs=250,
     spread=5,
     min_dist=1,
@@ -136,8 +138,9 @@ corrected = ds.run_harmony(["sample_id"], pca_full)
 ds.build_embedding_initialization(pca_full)
 ann = ds.build_ann_index(corrected)
 neighbors = ds.query_neighbors(ann, k=21)
-ds.build_connectivity_map(neighbors)
+harmony_graph = ds.build_connectivity_map(neighbors)
 ds.run_umap(
+    harmony_graph,
     n_epochs=250,
     spread=5,
     min_dist=1,

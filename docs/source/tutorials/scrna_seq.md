@@ -147,8 +147,8 @@ After filtering, the same metrics are restricted to active cells (`I=True`).
 ## 3) Feature selection
 
 `mark_hvgs` ranks genes by corrected variance and marks highly variable genes. The feature
-column is named with the cell key prefix (here `I__hvgs`). Pass `feat_key='hvgs'` later;
-Scarf resolves the prefix.
+column is named with the {term}`cell key` prefix (here `I__hvgs`). Pass
+`feat_key='hvgs'` later; Scarf resolves the prefix. See {term}`feat_key`.
 
 By default, Scarf excludes common mitochondrial, ribosomal, cell-cycle,
 HLA/H2, histone, and sex-linked gene-name patterns, together with genes detected
@@ -185,8 +185,8 @@ factor is 1000, and the earlier filter removes cells below that count.
 ds.run_normalization(feat_key='hvgs')
 ```
 
-The normalized artifact records both the active cell selection and the `hvgs`
-feature selection.
+The normalized {term}`artifact` records both the active cell selection and the
+`hvgs` feature selection.
 
 ## 5) PCA
 

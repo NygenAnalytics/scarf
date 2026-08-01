@@ -37,6 +37,9 @@ checks.
 
 ## Standalone setup
 
+Quality control has to see the population it is judging, so this page builds its
+store from raw counts rather than opening one that has already been filtered.
+
 ```{code-cell} ipython3
 import numpy as np
 
@@ -44,21 +47,28 @@ import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
 
-dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    'tenx_5K_pbmc_rnaseq',
+counts = scarf.cytebase.connect("scarf_docs").download(
+    'tenx_5K_pbmc_rnaseq/data.h5',
     destination='scarf_datasets',
-    zarr=True,
-)
+)[0]
+
+store = counts.with_name('data.zarr')
+reader = scarf.CrH5Reader(str(counts))
+scarf.CrToZarr(
+    reader,
+    zarr_loc=str(store),
+).dump(batch_size=1000)
+
 ds = scarf.DataStore(
-    f'{dataset}/data.zarr',
+    str(store),
     nthreads=4,
     min_features_per_cell=10,
 )
 ```
 
-The `I` cell key is the active selection used by most methods. Filtering updates
-that key and leaves all rows in the datastore. Feature selections work the same
-way within each assay.
+The `I` {term}`cell key` is the active selection used by most methods. Filtering
+updates that key and leaves all rows in the datastore. Feature selections work
+the same way within each assay.
 
 ## 1) Inspect QC distributions
 
@@ -89,8 +99,6 @@ Thresholds are dataset-specific. The values below match the PBMC example in
 {doc}`scrna_seq`. Filtered cells are marked inactive in cell key `I`.
 
 ```{code-cell} ipython3
-# Prepared stores may already have an `I` filter. Reset so before/after counts are meaningful.
-ds.cells.reset_key(key='I')
 n_before = int(ds.cells.fetch_all('I').sum())
 ds.filter_cells(
     attrs=['RNA_nCounts', 'RNA_nFeatures', 'RNA_percentMito'],
@@ -109,9 +117,11 @@ ds.plots.distribution(
 )
 ```
 
-After filtering, the same metrics are restricted to active cells (`I=True`). If
-`n_before` and `n_after` are equal, the thresholds did not remove additional cells on
-this store; inspect the violins and adjust the cutoffs.
+After filtering, the same metrics are restricted to active cells (`I=True`), so
+the coral violins are visibly tighter than the ones above: the long low-count
+tail and the high-mito shoulder are both gone. Roughly a fifth of the barcodes
+drop out here, which is typical for this dataset and is the number worth
+sanity-checking against your own expectations before continuing.
 
 ## 3) Custom percent-feature columns
 

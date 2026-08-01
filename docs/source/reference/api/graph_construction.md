@@ -21,7 +21,15 @@ See {doc}`../../tutorials/custom_graph_construction`.
 6. {py:meth}`~scarf.DataStore.query_neighbors`
 7. {py:meth}`~scarf.DataStore.build_connectivity_map`
 
-Downstream UMAP and clustering read the current analysis chain.
+Downstream UMAP, t-SNE, clustering, and sampling read the current analysis
+chain when they are called without a graph. Each also accepts a connectivity
+map or integrated graph as its first argument and returns the artifact it
+wrote, so a side branch can be analysed without changing the selected chain:
+
+```python
+graph_k21 = ds.build_connectivity_map(neighbors_k21, update_state=False)
+ds.run_leiden_clustering(graph_k21, resolution=0.5, label="leiden_k21")
+```
 
 ## Methods
 

@@ -19,6 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
+from scarf.storage.types import as_zarr_array
+
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_STORE = (
     REPO / "docs/source/tutorials/scarf_datasets/tenx_8K_pbmc_citeseq/data.zarr"
@@ -50,7 +52,7 @@ def load_embeddings(store: Path, assays: tuple[str, str]) -> dict[str, np.ndarra
             raise RuntimeError(f"Assay {assay!r} has no reduction artifact")
         reference = state.batch_correction or state.reduction
         group = datastore.load_artifact(reference)
-        embeddings[assay] = np.asarray(group["data"][:])
+        embeddings[assay] = np.asarray(as_zarr_array(group["data"])[:])
     return embeddings
 
 

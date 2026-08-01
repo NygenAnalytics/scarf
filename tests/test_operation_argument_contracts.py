@@ -228,7 +228,6 @@ _CONTRACTS = (
         DataStore.run_leiden_clustering,
         metadata_arguments.LeidenArguments,
         constructor=_ClusteringOperationsMixin._prepare_leiden_clustering,
-        model_only=_classified("resolved_input", "graph"),
     ),
     OperationContract(
         DataStore.run_marker_search,
@@ -356,7 +355,6 @@ _CONTRACTS = (
             "cell_selection",
             "clusters",
             "dendrogram",
-            "graph",
         ),
     ),
     OperationContract(
@@ -366,7 +364,6 @@ _CONTRACTS = (
             "ini_embed": "initialization",
             "nthreads": "parallel_threads",
         },
-        model_only=_classified("resolved_input", "graph"),
     ),
     OperationContract(
         DataStore.run_umap,
@@ -375,7 +372,6 @@ _CONTRACTS = (
             "ini_embed": "initialization",
             "nthreads": "parallel_threads",
         },
-        model_only=_classified("resolved_input", "graph"),
     ),
     OperationContract(
         DataStore.run_waggr,

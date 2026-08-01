@@ -1,47 +1,281 @@
 #!/usr/bin/env python3
-"""Regenerate current-format Scarf tutorial stores with artifact provenance.
+"""Rebuild the analyzed Zarr stores that Cytebase publishes for the documentation.
 
-This builds a small analyzed Zarr store using the graph-construction and pipeline APIs so
-documentation and local demos can show list_artifacts / inspect_artifact
-without relying on master-era archives.
-
-Publishing the resulting store to Cytebase / Hugging Face is intentionally
-manual: upload the unpacked directory (for Repository.open_zarr) and optionally
-a .zarr.tar.gz (for download_dataset(zarr=True)).
+Each store is built from the dataset's raw counts, so the result uses the
+current Zarr layout and carries artifact provenance. This script only writes to
+`build/cytebase`; `scripts/publish_docs_datasets.py` uploads the result.
 
 Example:
-    uv run python scripts/regenerate_docs_datasets.py \\
-        --dataset tenx_5K_pbmc_rnaseq \\
-        --destination /tmp/scarf_docs_datasets
+    uv run python scripts/regenerate_docs_datasets.py tenx_5K_pbmc_rnaseq
+    uv run python scripts/regenerate_docs_datasets.py --all
 """
 
-from __future__ import annotations
-
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
 import sys
 import tarfile
-from datetime import datetime, timezone
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+MANIFEST_DIR = REPO_ROOT / "docs/source/developers/dataset_manifests"
+STORE_NAME = "data.zarr"
+ARCHIVE_NAME = f"{STORE_NAME}.tar.gz"
+
+PBMC_FILTERS = {
+    "method": "manual",
+    "attrs": ["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
+    "highs": [15000, 4000, 15],
+    "lows": [1000, 500, 0],
+}
 
 
-def _git_commit(repo_root: Path) -> str:
+def _convert_cellranger_h5(source: Path, store: Path) -> None:
+    import scarf
+
+    reader = scarf.CrH5Reader(str(source / "data.h5"))
+    scarf.CrToZarr(reader, zarr_loc=str(store)).dump(batch_size=1000)
+
+
+def _convert_cellranger_mtx(source: Path, store: Path) -> None:
+    import scarf
+
+    reader = scarf.CrDirReader(str(source))
+    scarf.CrToZarr(reader, zarr_loc=str(store)).dump(batch_size=1000)
+
+
+def _convert_h5ad(source: Path, store: Path) -> None:
+    import scarf
+
+    inspection = scarf.inspect_h5ad(str(source / "data.h5ad"))
+    reader = scarf.H5adReader.from_inspect(inspection)
+    scarf.H5adToZarr(reader, zarr_loc=str(store)).dump(batch_size=1000)
+
+
+def _analyze_pbmc(store: Any) -> None:
+    store.pipeline.run(
+        filtering=PBMC_FILTERS,
+        highly_variable_features={
+            "min_cells": 20,
+            "top_n": 500,
+            "min_mean": -3,
+            "max_mean": 2,
+            "max_var": 6,
+        },
+        pca={"dims": 15, "n_centroids": 100},
+        neighbors={"k": 11},
+        umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
+        leiden={0.5: {"label": "leiden_cluster"}},
+        paris=False,
+        markers={},
+    )
+    store.run_paris_clustering(n_clusters=15)
+
+
+def _analyze_pancreas(store: Any) -> None:
+    store.pipeline.run(
+        filtering=False,
+        cell_cycle_scoring=False,
+        highly_variable_features={"min_cells": 20, "top_n": 2000},
+        pca={"dims": 15, "n_centroids": 100},
+        neighbors={"k": 11},
+        umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
+        leiden={0.5: {"label": "leiden_cluster"}},
+        paris=False,
+        doublet_scoring=False,
+        markers=False,
+    )
+    store.run_marker_search(group_key="clusters")
+
+
+def _analyze_kang(store: Any) -> None:
+    store.pipeline.run(
+        filtering={
+            "method": "manual",
+            "attrs": ["RNA_nCounts", "RNA_nFeatures"],
+            "highs": [15000, 4000],
+            "lows": [500, 200],
+        },
+        cell_cycle_scoring=False,
+        highly_variable_features={
+            "min_cells": 10,
+            "top_n": 2000,
+            "min_mean": -3,
+            "max_mean": 2,
+            "max_var": 6,
+        },
+        pca={"dims": 25, "n_centroids": 100},
+        neighbors={"k": 21},
+        umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
+        leiden={1.0: {"label": "leiden_cluster"}},
+        paris=False,
+        doublet_scoring=False,
+        markers=False,
+    )
+
+
+def _analyze_citeseq(store: Any) -> None:
+    import numpy as np
+
+    store.auto_filter_cells(show_qc_plots=False)
+    store.pipeline.run(
+        filtering=False,
+        cell_cycle_scoring=False,
+        highly_variable_features={
+            "min_cells": 20,
+            "top_n": 1000,
+            "min_mean": -3,
+            "max_mean": 2,
+            "max_var": 6,
+        },
+        pca={"dims": 15, "n_centroids": 100},
+        neighbors={"k": 21},
+        umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
+        leiden={1.0: {"label": "leiden_cluster"}},
+        paris=False,
+        doublet_scoring=False,
+        markers=False,
+    )
+
+    names = np.asarray(store.ADT.feats.fetch_all("names")).astype(str)
+    is_control = np.char.find(np.char.lower(names), "control") >= 0
+    store.ADT.feats.update_key(~is_control, "I")
+
+    normalized = store.run_normalization(from_assay="ADT", feat_key="I")
+    n_features = int(store.load_artifact(normalized)["data"].shape[1])
+    reduction = store.run_custom_reduction(
+        np.eye(n_features, dtype=np.float64),
+        normalized,
+        from_assay="ADT",
+    )
+    store.build_embedding_initialization(reduction, n_centroids=100)
+    ann = store.build_ann_index(reduction)
+    neighbors = store.query_neighbors(ann, k=21)
+    graph = store.build_connectivity_map(neighbors)
+    store.run_umap(graph, n_epochs=250, spread=5, min_dist=1, parallel=True)
+    store.run_leiden_clustering(graph, resolution=1.0, label="leiden_cluster")
+
+    for label, method in (("RNA+ADT", "snn"), ("RNA+ADT_wnn", "wnn")):
+        integrated = store.integrate_assays(
+            assays=["RNA", "ADT"],
+            label=label,
+            method=method,
+        )
+        store.run_umap(integrated, n_epochs=250, spread=5, min_dist=1, parallel=True)
+        store.run_leiden_clustering(integrated, resolution=1.75, label="leiden_cluster")
+
+
+def _analyze_atac(store: Any) -> None:
+    store.auto_filter_cells(show_qc_plots=False)
+    store.mark_prevalent_peaks(top_n=25000)
+    normalized = store.run_normalization(feat_key="prevalent_peaks")
+    reduction = store.run_lsi(normalized, dims=50, skip_first=True)
+    store.build_embedding_initialization(reduction)
+    ann = store.build_ann_index(reduction)
+    neighbors = store.query_neighbors(ann, k=21)
+    graph = store.build_connectivity_map(neighbors)
+    store.run_umap(graph, n_epochs=500, min_dist=0.1, spread=1, parallel=True)
+    store.run_leiden_clustering(graph, resolution=0.6, label="leiden_cluster")
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetRecipe:
+    """One publishable store: where its counts come from and how it is analyzed."""
+
+    sources: tuple[str, ...]
+    convert: Callable[[Path, Path], None]
+    analyze: Callable[[Any], None]
+    summary: str
+    default_assay: str = "RNA"
+    carry_columns: tuple[str, ...] = ()
+    drop_columns: tuple[str, ...] = ()
+
+
+RECIPES: dict[str, DatasetRecipe] = {
+    "tenx_5K_pbmc_rnaseq": DatasetRecipe(
+        sources=("data.h5",),
+        convert=_convert_cellranger_h5,
+        analyze=_analyze_pbmc,
+        summary=(
+            "Manual QC filter, 500 HVGs, PCA 15, k=11 graph, UMAP, "
+            "Leiden 0.5, Paris, doublet scores, markers"
+        ),
+    ),
+    "bastidas-ponce_4K_pancreas-d15_rnaseq": DatasetRecipe(
+        sources=("data.h5ad",),
+        convert=_convert_h5ad,
+        analyze=_analyze_pancreas,
+        summary=(
+            "2000 HVGs, PCA 15, k=11 graph, UMAP, Leiden 0.5, markers on the "
+            "published cell-type annotations"
+        ),
+        drop_columns=("X_pca*",),
+    ),
+    "tenx_8K_pbmc_citeseq": DatasetRecipe(
+        sources=("data.h5",),
+        convert=_convert_cellranger_h5,
+        analyze=_analyze_citeseq,
+        summary=(
+            "RNA and ADT chains with UMAP and Leiden, plus SNN and WNN "
+            "integrated graphs"
+        ),
+    ),
+    "kang_15K_pbmc_rnaseq": DatasetRecipe(
+        sources=("matrix.mtx.gz", "features.tsv.gz", "barcodes.tsv.gz"),
+        convert=_convert_cellranger_mtx,
+        analyze=_analyze_kang,
+        summary="2000 HVGs, PCA 25, k=21 graph, UMAP, Leiden 1.0",
+        carry_columns=("cluster_labels",),
+    ),
+    "kang_14K_ifnb-pbmc_rnaseq": DatasetRecipe(
+        sources=("matrix.mtx.gz", "features.tsv.gz", "barcodes.tsv.gz"),
+        convert=_convert_cellranger_mtx,
+        analyze=_analyze_kang,
+        summary="2000 HVGs, PCA 25, k=21 graph, UMAP, Leiden 1.0",
+        carry_columns=("cluster_labels",),
+    ),
+    "tenx_10K_pbmc-v1_atacseq": DatasetRecipe(
+        sources=("data.h5",),
+        convert=_convert_cellranger_h5,
+        analyze=_analyze_atac,
+        summary=(
+            "25000 prevalent peaks, TF-IDF normalization, LSI 50, k=21 graph, "
+            "UMAP, Leiden 0.6"
+        ),
+        default_assay="ATAC",
+    ),
+}
+
+
+def _git_commit() -> str:
     try:
         return subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
+            cwd=REPO_ROOT,
             text=True,
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
 
 
-def _artifact_inventory(datastore) -> list[dict[str, object]]:
+def _artifact_inventory(store: Any) -> list[dict[str, object]]:
+    refs = list(store.list_artifacts(scope="datastore", complete_only=True))
+    for assay in store.assay_names:
+        refs.extend(
+            store.list_artifacts(
+                from_assay=assay,
+                complete_only=True,
+            )
+        )
     inventory: list[dict[str, object]] = []
-    for ref in datastore.list_artifacts(complete_only=True):
-        status = datastore.inspect_artifact(ref)
+    for ref in refs:
+        status = store.inspect_artifact(ref)
         inventory.append(
             {
                 "kind": ref.kind,
@@ -55,114 +289,212 @@ def _artifact_inventory(datastore) -> list[dict[str, object]]:
     return inventory
 
 
-def build_analyzed_store(
+def _directory_bytes(path: Path) -> int:
+    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _drop_columns(
+    *,
+    store: Path,
+    patterns: Sequence[str],
+    default_assay: str,
+) -> None:
+    """Remove imported columns that would only add noise to metadata tables."""
+    from fnmatch import fnmatch
+
+    from scarf import DataStore
+
+    target = DataStore(str(store), default_assay=default_assay, nthreads=1)
+    dropped = [
+        column
+        for column in target.cells.columns
+        if any(fnmatch(column, pattern) for pattern in patterns)
+    ]
+    for column in dropped:
+        target.cells.drop(column)
+    print(f"Dropped {len(dropped)} imported column(s) from {store}")
+
+
+def _carry_columns(
+    *,
+    repository: Any,
+    dataset: str,
+    store: Path,
+    columns: Sequence[str],
+    work: Path,
+    default_assay: str,
+) -> None:
+    """Copy author-provided annotations that only exist in the published store."""
+    import numpy as np
+    import zarr
+
+    from scarf import DataStore
+    from scarf.storage.types import as_zarr_array, as_zarr_group
+
+    repository.download_dataset(dataset, destination=str(work), zarr=True)
+    legacy = zarr.open_group(str(work / dataset / STORE_NAME), mode="r")
+    legacy_cells = as_zarr_group(legacy["cellData"], name="cellData")
+    legacy_ids = np.asarray(as_zarr_array(legacy_cells["ids"], name="ids")[:]).astype(
+        str
+    )
+    positions = {value: index for index, value in enumerate(legacy_ids)}
+
+    target = DataStore(str(store), default_assay=default_assay, nthreads=1)
+    target_ids = np.asarray(target.cells.fetch_all("ids")).astype(str)
+    missing = [value for value in target_ids if value not in positions]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} cells of {dataset} are absent from the published "
+            f"store, first missing id {missing[0]!r}"
+        )
+    order = np.array([positions[value] for value in target_ids])
+    for column in columns:
+        if column not in legacy_cells:
+            raise RuntimeError(f"{dataset} has no published column {column!r}")
+        source = as_zarr_array(legacy_cells[column], name=column)
+        values = np.asarray(source[:])[order]
+        target.cells.insert(column, values, overwrite=True)
+    print(f"Carried {len(columns)} published column(s) into {store}")
+
+
+def build_store(
     *,
     dataset: str,
+    recipe: DatasetRecipe,
     destination: Path,
-    repository: str,
+    repository_name: str,
 ) -> Path:
     import scarf
     from scarf import DataStore
 
-    work = destination / "_download"
-    work.mkdir(parents=True, exist_ok=True)
-    scarf.cytebase.connect(repository).download_dataset(
-        dataset,
-        destination=str(work),
-        zarr=True,
-    )
-    preferred = (
-        work / dataset / "data.zarr",
-        work / f"{dataset}.zarr",
-        work / dataset,
-    )
-    source = next((path for path in preferred if path.exists()), None)
-    if source is None:
-        matches = [
-            path
-            for path in work.rglob("*")
-            if path.is_dir()
-            and ((path / "zarr.json").exists() or (path / ".zgroup").exists())
-        ]
-        if not matches:
-            raise FileNotFoundError(f"No extracted Zarr found under {work}")
-        source = matches[0]
+    started = datetime.now(UTC)
+    work = destination / "_source"
+    repository = scarf.cytebase.connect(repository_name)
+    for name in recipe.sources:
+        repository.download(f"{dataset}/{name}", destination=str(work))
 
-    output = destination / f"{dataset}_analyzed.zarr"
-    if output.exists():
-        shutil.rmtree(output)
-    shutil.copytree(source, output)
+    output = destination / dataset
+    output.mkdir(parents=True, exist_ok=True)
+    store = output / STORE_NAME
+    if store.exists():
+        shutil.rmtree(store)
+    recipe.convert(work / dataset, store)
 
-    ds = DataStore(str(output), default_assay="RNA")
-    refs = ds.pipeline.run(
-        filtering={"method": "auto"},
-        cell_cycle_scoring=False,
-        highly_variable_features={"top_n": 100, "show_plot": False},
-        paris=False,
-        doublet_scoring=False,
-        markers=False,
-        leiden={1.0: {}},
+    if recipe.drop_columns:
+        _drop_columns(
+            store=store,
+            patterns=recipe.drop_columns,
+            default_assay=recipe.default_assay,
+        )
+
+    if recipe.carry_columns:
+        _carry_columns(
+            repository=repository,
+            dataset=dataset,
+            store=store,
+            columns=recipe.carry_columns,
+            work=work,
+            default_assay=recipe.default_assay,
+        )
+
+    datastore = DataStore(
+        str(store),
+        default_assay=recipe.default_assay,
+        nthreads=4,
     )
-    state = ds.get_assay_state("RNA")
-    if state is None or state.connectivity_map is None:
-        raise RuntimeError("Pipeline did not write a connectivity map")
+    recipe.analyze(datastore)
 
-    inventory = _artifact_inventory(ds)
+    archive = output / ARCHIVE_NAME
+    with tarfile.open(archive, "w:gz") as handle:
+        handle.add(store, arcname=STORE_NAME)
+
+    store_bytes = _directory_bytes(store)
+    archive_bytes = archive.stat().st_size
+    cells_total = int(datastore.cells.N)
+    cells_active = int(datastore.cells.active_index("I").size)
+    artifacts = _artifact_inventory(datastore)
+
     manifest = {
         "dataset": dataset,
-        "repository": repository,
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "generatorCommit": _git_commit(Path(__file__).resolve().parents[1]),
+        "repository": repository_name,
+        "recipe": recipe.summary,
+        "generatedAt": started.isoformat(),
+        "generatorCommit": _git_commit(),
         "scarfVersion": getattr(scarf, "__version__", "unknown"),
-        "outputPath": str(output),
-        "nCellsActive": int(ds.cells.active_index("I").size),
-        "pipelineRefs": {name: ref.to_dict() for name, ref in refs.items()},
-        "artifacts": inventory,
+        "sourceFiles": list(recipe.sources),
+        "carriedColumns": list(recipe.carry_columns),
+        "nCellsTotal": cells_total,
+        "nCellsActive": cells_active,
+        "storeBytes": store_bytes,
+        "archiveBytes": archive_bytes,
+        "archiveSha256": _file_digest(archive),
+        "cellColumns": sorted(datastore.cells.columns),
+        "artifacts": artifacts,
         "publishNotes": [
-            "Upload the unpacked *.zarr directory for Repository.open_zarr demos.",
-            "Optionally pack a .zarr.tar.gz for download_dataset(zarr=True).",
-            "Do not overwrite the frozen 0.32.3 compatibility corpus with this store.",
+            f"Publish with: uv run python scripts/publish_docs_datasets.py {dataset}",
+            f"That preserves the published archive as {dataset}_legacy_master "
+            f"and swaps {ARCHIVE_NAME} in place.",
         ],
     }
-    manifest_path = destination / f"{dataset}_analyzed_manifest.json"
+    MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
+    manifest_path = MANIFEST_DIR / f"{dataset}_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 
-    archive_path = destination / f"{dataset}_analyzed.zarr.tar.gz"
-    with tarfile.open(archive_path, "w:gz") as archive:
-        archive.add(output, arcname=output.name)
-
-    print(f"Wrote analyzed store: {output}")
-    print(f"Wrote archive:        {archive_path}")
-    print(f"Wrote manifest:       {manifest_path}")
-    print(f"Complete artifacts:   {len(inventory)}")
-    return output
+    elapsed = (datetime.now(UTC) - started).total_seconds()
+    print(f"Built {dataset} in {elapsed:.0f}s")
+    print(f"  store    {store} ({store_bytes / 1e6:.1f} MB)")
+    print(f"  archive  {archive} ({archive_bytes / 1e6:.1f} MB)")
+    print(f"  manifest {manifest_path}")
+    print(f"  cells    {cells_active} of {cells_total} active")
+    print(f"  results  {len(artifacts)} complete artifact(s)")
+    return store
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--dataset",
-        default="tenx_5K_pbmc_rnaseq",
-        help="Cytebase dataset name to regenerate",
+        "datasets",
+        nargs="*",
+        choices=[*RECIPES, []],
+        help="Datasets to rebuild",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Rebuild every dataset in the recipe table",
     )
     parser.add_argument(
         "--repository",
         default="scarf_docs",
-        help="Cytebase repository name",
+        help="Cytebase repository holding the raw counts",
     )
     parser.add_argument(
         "--destination",
         type=Path,
-        default=Path("docs/source/scarf_datasets/regenerated"),
-        help="Output directory for analyzed store, archive, and manifest",
+        default=REPO_ROOT / "build/cytebase",
+        help="Output directory for stores, archives, and downloads",
     )
     args = parser.parse_args(argv)
+
+    selected = list(RECIPES) if args.all else list(args.datasets)
+    if not selected:
+        parser.error("name at least one dataset or pass --all")
     args.destination.mkdir(parents=True, exist_ok=True)
-    build_analyzed_store(
-        dataset=args.dataset,
-        destination=args.destination,
-        repository=args.repository,
-    )
+    for dataset in selected:
+        build_store(
+            dataset=dataset,
+            recipe=RECIPES[dataset],
+            destination=args.destination,
+            repository_name=args.repository,
+        )
     return 0
 
 

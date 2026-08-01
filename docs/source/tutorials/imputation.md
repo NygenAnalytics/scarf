@@ -24,8 +24,9 @@ expression.
 
 ## Standalone setup
 
-This section reconstructs the graph from {doc}`scrna_seq` so the page can run
-independently.
+Diffusion needs a neighbourhood graph, and the published PBMC store already
+carries one along with its UMAP. Opening it is the whole setup. Building the
+same {term}`analysis chain` from counts is covered in {doc}`scrna_seq`.
 
 ```{code-cell} ipython3
 import scarf
@@ -41,31 +42,6 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 ds = scarf.DataStore(
     f"{dataset}/data.zarr",
     nthreads=4,
-    min_features_per_cell=10,
-)
-ds.filter_cells(
-    attrs=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
-    highs=[15000, 4000, 15],
-    lows=[1000, 500, 0],
-    reset_previous=True,
-)
-if "I__hvgs" not in ds.RNA.feats.columns:
-    ds.mark_hvgs(
-        min_cells=20,
-        top_n=500,
-        show_plot=False,
-    )
-ds.run_normalization(feat_key="hvgs")
-ds.run_pca(dims=15)
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=11)
-ds.build_connectivity_map()
-ds.run_umap(
-    n_epochs=150,
-    spread=5,
-    min_dist=1,
-    parallel=True,
 )
 ```
 

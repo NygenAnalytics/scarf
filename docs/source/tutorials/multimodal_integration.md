@@ -15,12 +15,17 @@ kernelspec:
 # Multimodal diagnostics
 
 RNA and ADT can agree on broad cell populations while resolving different local
-structure. This guide builds both graphs independently, measures their
-concordance, and compares Scarf's SNN and WNN integration methods. It assumes
-the reader already understands the recommended CITE-seq path in
-{doc}`cite_seq`.
+structure. This guide measures that concordance and compares Scarf's SNN and
+WNN integration methods. It assumes the reader already understands the
+recommended CITE-seq path in {doc}`cite_seq`.
 
 ## Standalone setup
+
+The published CITE-seq store carries the independent RNA and ADT
+{term}`analysis chains <analysis chain>` and
+both integrated graphs, built exactly as {doc}`cite_seq` describes: matched
+active cells, `k=21` for each modality, control antibodies already marked
+inactive. This page reads those results rather than reproducing them.
 
 ```{code-cell} ipython3
 from itertools import combinations
@@ -43,64 +48,25 @@ ds = scarf.DataStore(
     default_assay="RNA",
     nthreads=4,
 )
-ds.auto_filter_cells()
 ```
 
-This section reconstructs the independent RNA and ADT graphs from
-{doc}`cite_seq` so the page can run independently. Both use the same active
-cells and neighbour count.
+The SNN graph is stored under `RNA+ADT` and the WNN graph under
+`RNA+ADT_wnn`, each with its own UMAP and Leiden partition. The method is a
+parameter, because it changes the result, while the label is an execution
+option, because renaming a graph does not.
 
 ```{code-cell} ipython3
-ds.mark_hvgs(
-    min_cells=20,
-    top_n=1000,
-    min_mean=-3,
-    max_mean=2,
-    max_var=6,
-    show_plot=False,
-)
-ds.run_normalization(feat_key="hvgs")
-ds.run_pca(dims=15)
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=21)
-ds.build_connectivity_map()
-ds.run_umap(n_epochs=250, spread=5, min_dist=1, parallel=True)
-ds.run_leiden_clustering(resolution=1)
-```
-
-```{code-cell} ipython3
-adt_panel = ds.ADT.feats.to_pandas_dataframe(["names"])
-is_control = adt_panel["names"].str.contains("control")
-ds.ADT.feats.update_key(~is_control.values, "I")
-
-normalized_adt = ds.run_normalization(
-    from_assay="ADT",
-    feat_key="I",
-)
-n_adt_features = int(
-    ds.load_artifact(normalized_adt)["data"].shape[1]
-)
-ds.run_custom_reduction(
-    np.eye(n_adt_features, dtype=np.float64),
-    normalized_adt,
-    from_assay="ADT",
-)
-ds.build_embedding_initialization(
-    from_assay="ADT",
-    n_centroids=100,
-)
-ds.build_ann_index(from_assay="ADT")
-ds.query_neighbors(from_assay="ADT", k=21)
-ds.build_connectivity_map(from_assay="ADT")
-ds.run_umap(
-    from_assay="ADT",
-    n_epochs=250,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-)
-ds.run_leiden_clustering(from_assay="ADT", resolution=1)
+integrated = []
+for ref in ds.list_artifacts(scope="datastore", kind="integrated_graph"):
+    status = ds.inspect_artifact(ref)
+    integrated.append(
+        {
+            "label": status.execution_options["label"],
+            "method": status.parameters["method"],
+            "artifact": ref.artifact_id[:12],
+        }
+    )
+pd.DataFrame(integrated).sort_values("label", ignore_index=True)
 ```
 
 ## Measure modality concordance
@@ -176,52 +142,15 @@ need inspection before integration.
 
 SNN combines shared edge support and can integrate two or more assays. WNN
 accepts exactly two assays and learns how strongly each cell should rely on each
-modality. Both methods consume the latest graph for each named assay.
-
-```{code-cell} ipython3
-ds.integrate_assays(
-    assays=["RNA", "ADT"],
-    label="RNA+ADT_snn",
-    method="snn",
-)
-ds.run_umap(
-    integrated_graph="RNA+ADT_snn",
-    n_epochs=500,
-    spread=5,
-    min_dist=0.5,
-    parallel=True,
-)
-ds.run_leiden_clustering(
-    integrated_graph="RNA+ADT_snn",
-    resolution=1.75,
-)
-```
-
-```{code-cell} ipython3
-ds.integrate_assays(
-    assays=["RNA", "ADT"],
-    label="RNA+ADT_wnn",
-    method="wnn",
-)
-ds.run_umap(
-    integrated_graph="RNA+ADT_wnn",
-    n_epochs=500,
-    spread=5,
-    min_dist=0.5,
-    parallel=True,
-)
-ds.run_leiden_clustering(
-    integrated_graph="RNA+ADT_wnn",
-    resolution=1.75,
-)
-```
+modality. Both consume one graph per named assay, which is why the two chains
+above had to use matched cells and neighbour counts.
 
 ## Compare integrated partitions
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
 integration_panels = (
-    ("SNN", "RNA+ADT_snn_UMAP", "RNA+ADT_snn_leiden_cluster"),
+    ("SNN", "RNA+ADT_UMAP", "RNA+ADT_leiden_cluster"),
     ("WNN", "RNA+ADT_wnn_UMAP", "RNA+ADT_wnn_leiden_cluster"),
 )
 for axis, (title, layout_key, color_by) in zip(
@@ -243,7 +172,7 @@ figure.tight_layout()
 partition_columns = {
     "RNA": "RNA_leiden_cluster",
     "ADT": "ADT_leiden_cluster",
-    "SNN": "RNA+ADT_snn_leiden_cluster",
+    "SNN": "RNA+ADT_leiden_cluster",
     "WNN": "RNA+ADT_wnn_leiden_cluster",
 }
 concordance_rows = []

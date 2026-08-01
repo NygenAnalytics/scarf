@@ -37,8 +37,9 @@ while method comparison and tuning remain in {doc}`multimodal_integration`.
 
 ## Dataset
 
-`tenx_8K_pbmc_citeseq` is distributed as a prepared Zarr store with the assays already named
-`RNA` and `ADT`.
+This page builds the multimodal store from CellRanger counts so every step is
+visible. `CrH5Reader` reports both libraries in the file, and `CrToZarr` writes
+them as separate assays named `RNA` and `ADT`.
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -47,11 +48,21 @@ import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
 
-dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
-    'tenx_8K_pbmc_citeseq',
+counts = scarf.cytebase.connect("scarf_docs").download(
+    'tenx_8K_pbmc_citeseq/data.h5',
     destination='scarf_datasets',
-    zarr=True,
-)
+)[0]
+
+store = counts.with_name('data.zarr')
+reader = scarf.CrH5Reader(str(counts))
+print(reader.assayFeats)
+```
+
+```{code-cell} ipython3
+scarf.CrToZarr(
+    reader,
+    zarr_loc=str(store),
+).dump(batch_size=1000)
 ```
 
 ## 1. Open and filter the multimodal store
@@ -61,7 +72,7 @@ run on the default assay, so set it to `RNA` here.
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(
-    f'{dataset}/data.zarr',
+    str(store),
     default_assay='RNA',
     nthreads=4
 )
@@ -69,17 +80,17 @@ ds
 ```
 
 The summary lists both assays with their own feature counts, and the cell count reads as
-active followed by total in brackets. This prepared store already carries a cell selection
-and previously computed columns, which is why the two numbers differ before any filtering
-happens here. Cell metadata is shared across assays: one row per cell, whichever assay wrote
-the column.
+active followed by total in brackets. Every barcode is still active here because no filter
+has run yet, while the RNA feature count is already reduced: opening a store drops features
+detected in too few cells. Cell metadata is shared across assays: one row per cell, whichever
+assay wrote the column.
 
 ```{code-cell} ipython3
 ds.auto_filter_cells()
 ```
 
 `auto_filter_cells` models each RNA QC column as a normal distribution, takes its 1st and
-99th percentiles as bounds, and marks outliers inactive in cell key `I`. The two figures are
+99th percentiles as bounds, and marks outliers inactive in {term}`cell key` `I`. The two figures are
 the QC distributions before and after that filter. Because the key is shared, the ADT assay
 analyzes the same cells.
 

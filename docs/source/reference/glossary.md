@@ -2,6 +2,48 @@
 # Glossary
 
 ```{glossary}
+:sorted:
+
+analysis chain
+  Record, kept per assay, of which results a workflow is currently building on:
+  the active normalization, reduction, neighbour index, and connectivity graph.
+  A method called without an explicit input takes its input from this chain,
+  which is what lets `ds.run_umap()` know which graph to lay out. Exposed as
+  `AssayState`.
+
+artifact
+  A persisted analysis result such as a normalization, PCA, neighbourhood graph,
+  or marker table. Scarf writes each one into the Zarr store next to a record of
+  what produced it, so results outlive the session that computed them and can be
+  inspected, compared, or reused later.
+
+ArtifactRef
+  Reference to an artifact, returned by the method that wrote it. It identifies a
+  stored result without loading it, so it can be passed to the next step or held
+  for later comparison. Read the data with `load_artifact`, and the parameters
+  and status with `inspect_artifact`.
+
+feat_key
+  Argument naming which feature selection a step should use. Selections are
+  stored per cell key, so `mark_hvgs` under cell key `I` writes the column
+  `I__hvgs` and later calls pass `feat_key='hvgs'`. Scarf supplies the prefix.
+
+provenance
+  Record stored with every artifact naming the operation that produced it, the
+  scientific parameters it used, and the artifacts it consumed. It is what lets
+  Scarf recognise that a new request describes a result the store already holds.
+
+reuse
+  Returning an existing artifact instead of recomputing it, when the requested
+  operation, parameters, and inputs match its provenance. Changing a parameter
+  produces a new artifact, and the steps that depended on the previous one are
+  recomputed rather than reused.
+
+update_state
+  Keyword on graph-construction methods deciding whether their result joins the
+  assay's analysis chain. Leave it at `True` for a linear workflow. Pass `False`
+  to try a parameter without changing what later calls default to.
+
 count matrix
   Sparse matrix of features (genes, peaks, or ADTs) by cells. Scarf stores counts in a Zarr assay group.
 

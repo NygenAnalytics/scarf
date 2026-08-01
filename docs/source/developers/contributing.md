@@ -99,6 +99,30 @@ Use `scarf.configure_output(level='DEBUG', progress=True)` when debugging
 tutorial execution. Tutorials download datasets over the network. Timeout per
 page is 600 seconds (`nb_execution_timeout` in `conf.py`).
 
+### Republishing the example stores
+
+Pages that are not about building an analysis chain open a pre-analyzed store
+with `download_dataset(..., zarr=True)`. Those stores are rebuilt from each
+dataset's raw counts by `scripts/regenerate_docs_datasets.py`, which also writes
+a manifest under `docs/source/developers/dataset_manifests/` recording the
+recipe, the cell counts, the artifact inventory, and the archive checksum:
+
+    uv run python scripts/regenerate_docs_datasets.py --all
+
+Rebuild a store whenever its recipe changes, or whenever the stored layout
+changes in a way that would stop the published artifacts from being reused.
+Nothing leaves `build/cytebase` until you publish:
+
+    uv run python scripts/publish_docs_datasets.py            # print the plan
+    uv run python scripts/publish_docs_datasets.py --apply    # needs a write token
+
+Publishing swaps `<dataset>/data.zarr.tar.gz` in place and first preserves the
+archive it replaces as `<dataset>_legacy_master/data.zarr.tar.gz`. Preservation
+is a server-side copy by content hash, and it never overwrites a legacy
+snapshot that already exists. Those snapshots are the pre-1.0 Zarr v2 corpus
+that `tests/test_frozen_master_compat.py` reads; no documentation page opens
+them.
+
 ## Acknowledgements
 
 ### Contributors

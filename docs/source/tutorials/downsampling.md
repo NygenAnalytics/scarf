@@ -39,6 +39,12 @@ scarf.configure_output(level='WARNING', progress=True)
 
 ### 1. Fetch prepared data
 
+TopACeDo samples from a KNN graph and needs cluster labels to balance across.
+The published PBMC store carries both, so nothing has to be recomputed here.
+{doc}`scrna_seq` shows how the {term}`analysis chain` is built, and
+{doc}`clustering` covers the
+Paris cut.
+
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     name='tenx_5K_pbmc_rnaseq',
@@ -49,17 +55,6 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(f'{dataset}/data.zarr')
-
-ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-ds.run_normalization(feat_key='hvgs')
-ds.run_pca(dims=15)
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=11)
-ds.build_connectivity_map()
-ds.run_paris_clustering(n_clusters=15)
-
-ds.run_umap(n_epochs=250, parallel=True)
 
 ds.plots.embedding(
     layout_key='RNA_UMAP',

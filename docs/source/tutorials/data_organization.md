@@ -61,9 +61,9 @@ scarf.configure_output(level='WARNING', progress=True)
 ```
 
 This page opens the pre-analyzed Bastidas-Ponce pancreas store also used in
-{doc}`plotting` and {doc}`cell_cycle`. The store already includes HVGs, a
-neighbourhood graph, UMAP coordinates, and cluster labels, so no graph or
-clustering bootstrap is required here.
+{doc}`plotting` and {doc}`cell_cycle`. It already includes HVGs, a
+neighbourhood graph, UMAP coordinates, cluster labels, and a marker table, so
+every group shown below is one a real analysis produced.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -113,12 +113,12 @@ prefix (`RNA_…`, `ADT_…`).
 ds.show_zarr_tree(start='cellData')
 ```
 
-**The `I` column** tracks active cells. Values are boolean: filtered-out cells are `False`.
-Most `DataStore` methods take `cell_key` (default `I`) and operate only on cells marked `True`.
+**The `I` column** is the default {term}`cell key`, tracking which cells are active.
+Values are boolean: filtered-out cells are `False`. Most `DataStore` methods take
+`cell_key` (default `I`) and operate only on cells marked `True`.
 
-Each assay group holds `counts`, `featureData`, optional `markers`, and persisted
-analysis outputs. Current results are stored under `{assay}/artifacts/...`.
-Scarf can also read compatible results from older encoded layouts.
+Each assay group holds `counts`, `featureData`, optional `markers`, and its
+persisted analysis outputs.
 
 ```{code-cell} ipython3
 ds.show_zarr_tree(start='RNA', depth=1)
@@ -127,6 +127,20 @@ ds.show_zarr_tree(start='RNA', depth=1)
 ```{code-cell} ipython3
 ds.show_zarr_tree(start='RNA/featureData', depth=1)
 ```
+
+Each persisted result is an {term}`artifact`, living under
+`{assay}/artifacts/{kind}/{artifact_id}`. The kind names the operation family and
+the identifier is derived from the inputs and parameters, which is what lets
+Scarf recognise an equivalent result instead of recomputing it. Nothing here encodes parameters in the path, so a second PCA at different
+dimensionality becomes a sibling entry rather than a new branch of the tree.
+
+```{code-cell} ipython3
+ds.show_zarr_tree(start='RNA/artifacts', depth=1)
+```
+
+Stores written before this layout encoded the whole chain into nested group
+names such as `RNA/normed__I__hvgs/reduction__pca__15__I/...`. Scarf still reads
+those, and {doc}`../developers/zarr_internals` covers repacking them.
 
 ### 2. Inspect cell and feature attributes
 
@@ -227,11 +241,11 @@ print('Current method:', ds.RNA.normMethod.__name__)
 ### 5. Inspect persisted analysis results
 
 Analysis methods return lightweight references to results stored in Zarr.
-Create a normalization result using a feature key already present in the store:
+Asking for the normalization the store already holds returns a reference to it
+rather than recomputing:
 
 ```{code-cell} ipython3
-feat_key = 'hvgs' if 'I__hvgs' in ds.RNA.feats.columns else 'I'
-normalized = ds.run_normalization(feat_key=feat_key)
+normalized = ds.run_normalization(feat_key='hvgs')
 normalized
 ```
 
@@ -248,27 +262,30 @@ group = ds.load_artifact(normalized)
 print('Arrays:', list(group.array_keys())[:5])
 ```
 
-Identical inputs and parameters reuse a complete result. Branching, invalidation,
-lineage, and the current analysis chain are covered in
+Identical inputs and parameters {term}`reuse` a complete result. Branching,
+invalidation, lineage, and the current {term}`analysis chain` are covered in
 {doc}`provenance_and_reuse`.
 
 ### 6. Marker features
 
-`run_marker_search` writes a `marker_table` artifact. The assay keeps a small
-index under `{assay}/markers` whose `artifacts` attribute maps
-`{cell_key}__{group_key}` slots to those refs. Fetch one group with
-`get_markers`, or export all groups with `export_markers_to_csv`.
-
-```{code-cell} ipython3
-if 'RNA/markers' not in ds.z:
-    ds.run_marker_search(group_key='clusters')
-ds.show_zarr_tree(start='RNA/markers', depth=2)
-```
+`run_marker_search` writes a `marker_table` artifact like any other result. The
+assay also keeps an index under `{assay}/markers`, holding no arrays of its own,
+whose `artifacts` attribute maps `{cell_key}__{group_key}` slots to those refs.
+That indirection is what lets `get_markers` find a table from a group key
+without knowing an artifact identifier.
 
 ```{code-cell} ipython3
 index = dict(ds.z['RNA/markers'].attrs.get('artifacts', {}))
 index
 ```
+
+```{code-cell} ipython3
+table = scarf.ArtifactRef.from_dict(index['I__clusters'])
+print('Stored at:', ds.inspect_artifact(table).path)
+```
+
+Fetch one group with `get_markers`, or export all groups with
+`export_markers_to_csv`.
 
 ```{code-cell} ipython3
 ds.get_markers(

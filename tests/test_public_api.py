@@ -7,7 +7,7 @@ from typing import cast
 
 _EXPECTED_EXPORTS = {
     "ArtifactLineage": "scarf.lineage",
-    "ArtifactRef": "scarf.storage.artifacts",
+    "ArtifactRef": "scarf.storage.refs",
     "ArtifactStatus": "scarf.storage.artifacts",
     "AssayMerge": "scarf.merge",
     "AssayState": "scarf.graph.state",
