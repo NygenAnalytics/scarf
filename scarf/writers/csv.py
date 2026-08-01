@@ -44,11 +44,16 @@ class CSVtoZarr:
         targetShardBytes: int | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
-        from ..storage.schema import create_cell_data, create_zarr_count_assay
+        from ..storage.schema import (
+            create_cell_data,
+            create_zarr_count_assay,
+            validate_assay_name,
+        )
         from ..storage.stores import load_zarr
 
         self.csvr = cr
         self.assayName = assay_name
+        validate_assay_name(self.assayName)
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
         self.workspace = workspace

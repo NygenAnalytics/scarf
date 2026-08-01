@@ -1201,13 +1201,16 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         ref: ArtifactRef,
         name: str,
         kind: str,
+        *,
+        require_input_complete: bool = True,
     ) -> ArtifactRef:
         status = self._require_complete_artifact(ref, ref.kind)
         raw_ref = (status.inputs or {}).get(name)
         if not isinstance(raw_ref, dict):
             raise ValueError(f"{ref.kind} artifact has no {name!r} input")
         input_ref = ArtifactRef.from_dict(raw_ref)
-        self._require_complete_artifact(input_ref, kind)
+        if require_input_complete:
+            self._require_complete_artifact(input_ref, kind)
         return input_ref
 
     def _resolve_selection_input(
@@ -1496,11 +1499,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             state = self._artifact_chain_state(graph_ref)
             if state.normalized is None:
                 raise ValueError("Graph has no normalized input")
-            return self._artifact_input_ref(
+            selection = self._artifact_input_ref(
                 state.normalized,
                 "cell_selection",
                 "cell_selection",
+                require_input_complete=False,
             )
+            validate_cell_selection_artifact(self.zw, selection, state.cell_key)
+            return selection
         if graph_ref.kind == "integrated_graph":
             status = self._require_complete_artifact(
                 graph_ref,
@@ -1510,9 +1516,18 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if not isinstance(raw_selection, dict):
                 raise ValueError("Integrated graph has no shared cell selection")
             selection = ArtifactRef.from_dict(raw_selection)
-            self._require_complete_artifact(
+            selection_status = inspect_artifact(self.zw, selection)
+            source_column = (selection_status.execution_options or {}).get(
+                "source_column"
+            )
+            if not isinstance(source_column, str):
+                if not selection_status.exists or not selection_status.complete:
+                    validate_cell_selection_artifact(self.zw, selection, "")
+                raise ValueError("Integrated graph cell selection key is unavailable")
+            validate_cell_selection_artifact(
+                self.zw,
                 selection,
-                "cell_selection",
+                source_column,
             )
             return selection
         raise ValueError("Graph ref must be connectivity_map or integrated_graph")

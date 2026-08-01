@@ -35,6 +35,39 @@ _RESULT_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 _NAMED_RESULT_KINDS = {"mapping_reference": "mapping_reference"}
 
 
+type _SelectionContextValue = str | int | float | bool | None
+
+
+class ArtifactSelectionError(ValueError):
+    """A machine-readable failure to validate an artifact's stored selection."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        context: Mapping[str, _SelectionContextValue],
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.context = dict(context)
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        return (
+            _restore_artifact_selection_error,
+            (type(self), str(self), self.code, self.context),
+        )
+
+
+def _restore_artifact_selection_error(
+    error_type: type[ArtifactSelectionError],
+    message: str,
+    code: str,
+    context: Mapping[str, _SelectionContextValue],
+) -> ArtifactSelectionError:
+    return error_type(message, code=code, context=context)
+
+
 def _legacy_subset_hash(
     cell_indices: np.ndarray,
     feature_indices: np.ndarray,
@@ -329,14 +362,21 @@ def _parameters(root: zarr.Group, ref: ArtifactRef | None) -> dict[str, Any]:
     return status.parameters or {}
 
 
-def _input_ref(root: zarr.Group, ref: ArtifactRef, name: str) -> ArtifactRef:
+def _input_ref(
+    root: zarr.Group,
+    ref: ArtifactRef,
+    name: str,
+    *,
+    require_input_complete: bool = True,
+) -> ArtifactRef:
     status = require_complete_artifact(root, ref)
     inputs = status.inputs or {}
     value = inputs.get(name)
     if not isinstance(value, Mapping):
         raise ValueError(f"{ref.kind} artifact has no {name!r} artifact input")
     input_ref = ArtifactRef.from_dict(value)
-    require_complete_artifact(root, input_ref)
+    if require_input_complete:
+        require_complete_artifact(root, input_ref)
     return input_ref
 
 
@@ -707,7 +747,35 @@ def _require_artifact_ref(
     assay: str | None,
 ) -> None:
     if ref.kind != kind or ref.scope != scope or ref.assay != assay:
-        raise ValueError(f"Expected {scope}-scoped {kind} artifact")
+        raise ArtifactSelectionError(
+            f"Expected {scope}-scoped {kind} artifact",
+            code="artifact_reference_mismatch",
+            context={
+                "expected_scope": scope,
+                "expected_assay": assay,
+                "expected_kind": kind,
+                "actual_scope": ref.scope,
+                "actual_assay": ref.assay,
+                "actual_kind": ref.kind,
+                "artifact_id": ref.artifact_id,
+            },
+        )
+
+
+def _selection_error_context(
+    ref: ArtifactRef,
+    *,
+    table_path: str,
+    column: str,
+) -> dict[str, _SelectionContextValue]:
+    return {
+        "scope": ref.scope,
+        "assay": ref.assay,
+        "kind": ref.kind,
+        "artifact_id": ref.artifact_id,
+        "table": table_path,
+        "column": column,
+    }
 
 
 def _validate_selection_artifact(
@@ -727,16 +795,49 @@ def _validate_selection_artifact(
         assay=assay,
     )
     status = inspect_artifact(root, ref)
-    if not status.exists or not status.complete:
-        raise ValueError(f"{kind} artifact is incomplete")
+    context = _selection_error_context(
+        ref,
+        table_path=table_path,
+        column=column,
+    )
+    if not status.exists:
+        raise ArtifactSelectionError(
+            f"{kind} artifact does not exist",
+            code="artifact_missing",
+            context=context,
+        )
+    if not status.complete:
+        raise ArtifactSelectionError(
+            f"{kind} artifact is incomplete",
+            code="artifact_incomplete",
+            context=context,
+        )
     if table_path not in root:
-        raise ValueError(f"Selection table {table_path!r} is unavailable")
+        raise ArtifactSelectionError(
+            f"Selection table {table_path!r} is unavailable",
+            code="selection_table_missing",
+            context=context,
+        )
     table = group_at(root, table_path)
-    if column not in table or "ids" not in table:
-        raise ValueError(f"Selection source column {column!r} is unavailable")
+    if column not in table:
+        raise ArtifactSelectionError(
+            f"Selection source column {column!r} is unavailable",
+            code="selection_column_missing",
+            context=context,
+        )
+    if "ids" not in table:
+        raise ArtifactSelectionError(
+            "Selection row identifier column 'ids' is unavailable",
+            code="selection_row_ids_missing",
+            context=context,
+        )
     selection_group = artifact_group(root, ref)
     if "values" not in selection_group:
-        raise ValueError(f"{kind} artifact has no values")
+        raise ArtifactSelectionError(
+            f"{kind} artifact has no values",
+            code="selection_values_missing",
+            context=context,
+        )
     stored_values = np.asarray(
         as_zarr_array(selection_group["values"], name="values")[:]
     )
@@ -746,7 +847,11 @@ def _validate_selection_artifact(
     if not isinstance(expected_row_ids, str) or expected_row_ids != fingerprint_strings(
         row_ids
     ):
-        raise ValueError(f"{kind} row identity does not match its metadata table")
+        raise ArtifactSelectionError(
+            f"{kind} row identity does not match its metadata table",
+            code="row_identity_mismatch",
+            context=context,
+        )
     if (
         stored_values.ndim != 1
         or stored_values.dtype != np.dtype(bool)
@@ -755,8 +860,10 @@ def _validate_selection_artifact(
         or stored_values.shape != current_values.shape
         or not np.array_equal(stored_values, current_values)
     ):
-        raise ValueError(
-            f"Selection source column {column!r} no longer matches its artifact"
+        raise ArtifactSelectionError(
+            f"Selection source column {column!r} no longer matches its artifact",
+            code="selection_values_changed",
+            context=context,
         )
 
 
@@ -874,8 +981,18 @@ def validate_normalized_artifact_selection(
         scope="assay",
         assay=assay,
     )
-    cell_selection = _input_ref(root, normalized, "cell_selection")
-    feature_selection = _input_ref(root, normalized, "feature_selection")
+    cell_selection = _input_ref(
+        root,
+        normalized,
+        "cell_selection",
+        require_input_complete=False,
+    )
+    feature_selection = _input_ref(
+        root,
+        normalized,
+        "feature_selection",
+        require_input_complete=False,
+    )
     feature_column = "I" if feat_key == "I" else f"{cell_key}__{feat_key}"
     validate_cell_selection_artifact(root, cell_selection, cell_key)
     _validate_selection_artifact(

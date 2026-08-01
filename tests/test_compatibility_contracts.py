@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import scarf
+import scarf.datastore.summary as datastore_summary
 import scarf.features as feature_algorithms
 import scarf.mapping as mapping
 import scarf.trajectory as trajectory
@@ -28,6 +29,38 @@ _EXPECTED_TRAJECTORY_EXPORTS = (
 )
 
 _EXPECTED_RESULT_FIELDS = {
+    datastore_summary.ResourceSummary: (
+        "memory_bytes",
+        "workers",
+        "storage_profile",
+    ),
+    datastore_summary.ArtifactSummary: (
+        "ref",
+        "operation",
+        "complete",
+    ),
+    datastore_summary.AssaySummary: (
+        "name",
+        "assay_type",
+        "total_features",
+        "active_features",
+        "feature_columns",
+        "dataset_fingerprint",
+        "state",
+        "artifacts",
+    ),
+    datastore_summary.DataStoreSummary: (
+        "zarr_mode",
+        "workspace",
+        "default_assay",
+        "scarf_version",
+        "resources",
+        "total_cells",
+        "active_cells",
+        "cell_columns",
+        "assays",
+        "artifacts",
+    ),
     feature_algorithms.EnrichmentResult: (
         "data",
         "source_names",
@@ -98,6 +131,7 @@ _EXPECTED_RESULT_FIELDS = {
 
 
 def test_result_facades_and_constructor_fields_are_stable():
+    assert scarf.DataStoreSummary is datastore_summary.DataStoreSummary
     assert scarf.EnrichmentResult is feature_algorithms.EnrichmentResult
     assert scarf.MappingResult is mapping.MappingResult
     assert tuple(trajectory.__all__) == _EXPECTED_TRAJECTORY_EXPORTS

@@ -1,7 +1,6 @@
 (faq)=
 # FAQ
 
-
 ## How to cite Scarf?
 
 See {doc}`citation`.
@@ -16,8 +15,13 @@ feature requests for the Python package belong on
 
 ## How does Scarf compare to Scanpy?
 
-See {doc}`../scarf_and_scanpy` for a stage-by-stage mapping, round-trip notes, and a short
-Seurat subsection.
+See {doc}`../scarf_and_scanpy` for a stage-by-stage mapping, round-trip notes, and a short Seurat subsection.
+
+## How should an AI agent use Scarf?
+
+Start with {doc}`../analysis_with_agents`. It explains how to inspect and resume a datastore, create
+reversible branches, compare scientific evidence, route to the granular APIs, and report
+uncertainty without treating defaults or one metric as biological truth.
 
 ## How do I run Harmony batch correction in Scarf?
 
@@ -36,9 +40,8 @@ After PCA, call `ds.run_harmony(['batch_column'], pca)` then continue with
   {doc}`../tutorials/multimodal_integration` for diagnostics).
 - Map onto an existing reference: {doc}`../tutorials/mapping_and_label_transfer`.
 
-Scarf does not include Scanorama, BBKNN, scVI, ComBat, or other external
-integration packages. Export with `to_anndata` or `SubsetZarr` when you need those
-tools.
+Scarf does not include Scanorama, BBKNN, scVI, ComBat, or other external integration packages.
+Export with `to_anndata` or `SubsetZarr` when you need those tools.
 
 ## How do I reduce log noise or disable progress?
 
@@ -48,10 +51,9 @@ Configure the two settings independently:
 scarf.configure_output(level="WARNING", progress=False)
 ```
 
-For a timestamped batch log, use `set_verbosity(..., filepath=...)`. See
-{doc}`api/utilities` for all output settings and their defaults. Tutorial pages
-show completed snapshots from their cached execution; live notebooks animate the
-same operations.
+For a timestamped batch log, use `set_verbosity(..., filepath=...)`. See {doc}`api/utilities` for
+all output settings and their defaults. Tutorial pages show completed snapshots from their cached
+execution; live notebooks animate the same operations.
 
 ## What is the difference between SNN and WNN integration?
 
@@ -68,27 +70,23 @@ L2-normalizes rows only during scoring. Seurat normally searches a wider
 additional index builds, 20 million queries, and 4 billion materialized candidate
 records at ten million cells.
 
-Both differences are measured rather than assumed. Given the same candidate pool
-and bandwidth, Scarf reproduces Seurat 5.5.1 to the float32 resolution of the
-stored graph. Against Seurat's shipped defaults on a CITE-seq subset, Scarf
-selects 89 percent of the same neighbours and its per-cell RNA weight correlates
-at 0.76. The reference values ship with the test suite, so both numbers are
-checked on every run.
+Both differences are measured rather than assumed. Given the same candidate pool and bandwidth,
+Scarf reproduces Seurat 5.5.1 to the float32 resolution of the stored graph. Against Seurat's
+shipped defaults on a CITE-seq subset, Scarf selects 89 percent of the same neighbours and its
+per-cell RNA weight correlates at 0.76. The reference values ship with the test suite, so both
+numbers are checked on every run.
 
-At 100,000 cells with 20 neighbours per modality the corrected path measures 137
-to 146 microseconds per cell single-threaded, which extrapolates to roughly 25
-minutes at ten million cells. Peak memory grows by about 0.9 MB per 1,000 cells,
-so ten million cells need roughly 9 to 10 GB. Both figures come from synthetic
-benchmarks at 100,000 to 200,000 cells rather than a ten-million-cell run. See
-{ref}`WNN integration <wnn_integration>` for all deviations and their
-trade-offs.
+At 100,000 cells with 20 neighbours per modality the corrected path measures 137 to 146
+microseconds per cell single-threaded, which extrapolates to roughly 25 minutes at ten million
+cells. Peak memory grows by about 0.9 MB per 1,000 cells, so ten million cells need roughly 9 to 10
+GB. Both figures come from synthetic benchmarks at 100,000 to 200,000 cells rather than a
+ten-million-cell run. See {ref}`WNN integration <wnn_integration>` for deviations and trade-offs.
 
 ## How do I compute LISI in Scarf?
 
 Use `metric_lisi` for raw per-cell LISI values. Use `metric_ilisi` for a
 single scIB-scaled batch-mixing score and `metric_clisi` for a scIB-scaled
 biological-label conservation score. See {ref}`LISI metrics <lisi_metrics>`.
-
 
 ## Should I use tSNE or UMAP?
 

@@ -24,7 +24,7 @@ from ..storage.profiles import (
     is_local_zarr_path,
     resolve_storage_profile,
 )
-from ..storage.schema import create_zarr_count_assay
+from ..storage.schema import create_zarr_count_assay, validate_assay_name
 from ..storage.sharding import (
     accumulate_sparse_to_shards,
     sparse_producer_peak_bytes,
@@ -143,6 +143,7 @@ class AssayMerge:
         _row_plan: _RowPlan | None = None,
         _row_chunk_sizes: list[int] | None = None,
     ) -> None:
+        validate_assay_name(merge_assay_name)
         self.assays = assays
         self.names = names
         self.inWorkspaces = in_workspaces

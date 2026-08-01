@@ -47,7 +47,11 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from . import cytebase as cytebase
     from .datastore.datastore import DataStore as DataStore
-    from .graph.state import AssayState as AssayState
+    from .datastore.summary import DataStoreSummary as DataStoreSummary
+    from .graph.state import (
+        ArtifactSelectionError as ArtifactSelectionError,
+        AssayState as AssayState,
+    )
     from .lineage import ArtifactLineage as ArtifactLineage
     from .features.enrichment import (
         EnrichmentResult as EnrichmentResult,
@@ -129,6 +133,7 @@ except _PackageNotFoundError:
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ArtifactLineage": (".lineage", "ArtifactLineage"),
     "ArtifactRef": (".storage.refs", "ArtifactRef"),
+    "ArtifactSelectionError": (".graph.state", "ArtifactSelectionError"),
     "ArtifactStatus": (".storage.artifacts", "ArtifactStatus"),
     "AssayMerge": (".merge", "AssayMerge"),
     "AssayState": (".graph.state", "AssayState"),
@@ -139,6 +144,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "CrReader": (".readers", "CrReader"),
     "CrToZarr": (".writers", "CrToZarr"),
     "DataStore": (".datastore.datastore", "DataStore"),
+    "DataStoreSummary": (".datastore.summary", "DataStoreSummary"),
     "DatasetMerge": (".merge", "DatasetMerge"),
     "EnrichmentResult": (".features.enrichment", "EnrichmentResult"),
     "FateMappingResult": (".trajectory.results", "FateMappingResult"),

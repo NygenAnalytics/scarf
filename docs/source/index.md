@@ -14,6 +14,7 @@ and records how persisted analysis results were produced.
 
 - {ref}`Install Scarf <installation>`
 - Follow the {ref}`Quick start <quickstart>`
+- Use {doc}`analysis_with_agents` to route an autonomous or AI-assisted analysis
 - Read {doc}`scarf_and_scanpy` if you already use Scanpy or Seurat
 - Learn {doc}`about` for supported workflows, design choices, and limitations
 

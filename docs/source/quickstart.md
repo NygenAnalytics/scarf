@@ -20,11 +20,8 @@ Go from a Cell Ranger count matrix to a clustered UMAP with Scarf's default RNA
 pipeline. This example uses a public 5K PBMC dataset and writes the analysis to
 `scarf_datasets/tenx_5K_pbmc_rnaseq/data.zarr`.
 
-Install Scarf with the plotting dependencies before you begin:
-
-```bash
-uv pip install "scarf[extra]"
-```
+Complete the {ref}`installation <installation>` with the `extra` dependencies before you begin.
+Run this notebook from the same environment so its kernel imports that Scarf installation.
 
 ## Download and convert the counts
 

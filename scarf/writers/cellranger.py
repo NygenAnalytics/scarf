@@ -45,7 +45,11 @@ class CrToZarr:
         targetShardBytes: int | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
-        from ..storage.schema import create_cell_data, create_zarr_count_assay
+        from ..storage.schema import (
+            create_cell_data,
+            create_zarr_count_assay,
+            validate_assay_name,
+        )
         from ..storage.stores import load_zarr
 
         self.resources = resolve_budget(mem_budget, nthreads)
@@ -56,6 +60,9 @@ class CrToZarr:
             mark_schema_captured()
         self.workspace = workspace
         self.storage_options = storage_options
+        assay_names = tuple(dict.fromkeys(self.cr.assayFeats.columns))
+        for assay_name in assay_names:
+            validate_assay_name(assay_name)
         self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
         create_cell_data(
             root=self.z,
@@ -64,7 +71,7 @@ class CrToZarr:
             names=np.array(self.cr.cell_names()),
             profile=self.profile,
         )
-        for assay_name in dict.fromkeys(self.cr.assayFeats.columns):
+        for assay_name in assay_names:
             create_zarr_count_assay(
                 z=self.z,
                 assay_name=assay_name,

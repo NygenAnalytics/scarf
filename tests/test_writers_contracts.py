@@ -5,6 +5,7 @@ import subprocess
 import sys
 from typing import get_type_hints
 
+import numpy as np
 import pytest
 import zarr
 from zarr.storage import MemoryStore
@@ -169,6 +170,18 @@ def test_writer_rejects_reserved_assay_name_before_mutation():
 
     assert list(root.group_keys()) == []
 
+    with pytest.raises(ValueError, match=r"reserved for DataStore\.summary"):
+        writers_module.create_zarr_count_assay(
+            root,
+            "summary",
+            None,
+            2,
+            ["g1", "g2"],
+            ["Gene 1", "Gene 2"],
+        )
+
+    assert list(root.group_keys()) == []
+
     with pytest.raises(ValueError, match="artifact storage"):
         writers_module.create_zarr_count_assay(
             root,
@@ -180,6 +193,58 @@ def test_writer_rejects_reserved_assay_name_before_mutation():
         )
 
     assert list(root.group_keys()) == []
+
+
+def test_conversion_writers_reject_summary_before_truncating_destination():
+    import pandas as pd
+    from scipy.sparse import csr_matrix
+
+    class SummaryCellRangerReader:
+        assayFeats = pd.DataFrame({"summary": [0, 1]})
+
+    constructors = {
+        "cellranger": lambda store: CrToZarr(
+            SummaryCellRangerReader(),
+            zarr_loc=store,
+        ),
+        "csv": lambda store: CSVtoZarr(
+            object(),
+            zarr_loc=store,
+            assay_name="summary",
+            dtype=np.dtype("uint32"),
+        ),
+        "h5ad": lambda store: H5adToZarr(
+            object(),
+            zarr_loc=store,
+            assay_name="summary",
+        ),
+        "loom": lambda store: LoomToZarr(
+            object(),
+            zarr_loc=store,
+            assay_name="summary",
+        ),
+        "sparse": lambda store: SparseToZarr(
+            csr_matrix((1, 1), dtype=np.uint32),
+            zarr_loc=store,
+            cell_ids=["c1"],
+            feature_ids=["g1"],
+            assay_name="summary",
+        ),
+    }
+
+    for writer_name, construct in constructors.items():
+        store = MemoryStore()
+        root = zarr.open_group(store=store, mode="w")
+        root.create_group("sentinel")
+
+        with pytest.raises(
+            ValueError,
+            match=r"reserved for DataStore\.summary",
+        ):
+            construct(store)
+
+        preserved = zarr.open_group(store=store, mode="r")
+        assert set(preserved.group_keys()) == {"sentinel"}, writer_name
 
 
 def test_writer_type_hints_resolve_from_facade_objects():

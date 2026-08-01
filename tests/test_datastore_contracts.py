@@ -16,6 +16,7 @@ _METHODS = {
         "list_artifacts",
         "load_artifact",
         "set_default_assay",
+        "summary",
     ),
     GraphDataStore: (
         "__init__",
@@ -94,7 +95,7 @@ _METHODS = {
 }
 
 _SIGNATURE_DIGESTS = {
-    BaseDataStore: "ba5c5e4e09f310114b2f7e09ac346bc759d87912e04d034153e5bc5b41e0f6a5",
+    BaseDataStore: "bf6861589597bee509cfc22bbb3fbe6bfba1691ebdd5a8bbc1172bd520f191e0",
     GraphDataStore: "b3d90325a0a6839df1f62371ed05a9f3ba639514b70697919308cae67df342fa",
     MappingDatastore: "95a0fa2a277259c653db32d94b1334d94be4bbc8331145d614e72796b4871a0f",
     DataStore: "3da2164eafb9ac1ea17d9faa3ad8be10850a38b5d137f0773a7c9b306943574c",

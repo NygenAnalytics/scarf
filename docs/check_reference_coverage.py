@@ -80,8 +80,8 @@ def main() -> None:
         raise SystemExit("\n".join(problems))
 
     print(
-        "Reference coverage complete: every public DataStore method and "
-        "scarf.__all__ symbol is documented exactly once"
+        "Reference coverage complete: every public DataStore method is documented "
+        "exactly once and every scarf.__all__ symbol is documented"
     )
 
 

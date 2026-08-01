@@ -52,6 +52,7 @@ language = "en"
 external_toc_path = "toctree.yml"
 external_toc_exclude_missing = False
 redirects = {
+    "install": "installation.html",
     "tutorials/atomic_graph_operations": "custom_graph_construction.html",
     "concepts/graph_and_state": "../tutorials/custom_graph_construction.html",
     "reference/api/graph_ops": "graph_construction.html",
@@ -85,6 +86,7 @@ html_theme_options = {
     },
 }
 html_static_path = ["_static"]
+html_extra_path = ["llms.txt"]
 html_css_files = ["styles.css"]
 
 htmlhelp_basename = "Scarf Documentation"
@@ -133,5 +135,6 @@ nitpick_ignore = [
     ("py:data", "typing.Any"),
     ("py:data", "typing.Literal"),
     ("py:data", "typing.Optional"),
+    ("py:data", "typing.Union"),
     ("py:data", "Ellipsis"),
 ]

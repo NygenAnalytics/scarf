@@ -42,7 +42,7 @@ class LoomToZarr:
         targetShardBytes: int | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
-        from ..storage.schema import create_zarr_count_assay
+        from ..storage.schema import create_zarr_count_assay, validate_assay_name
         from ..storage.stores import load_zarr
 
         # TODO: support for multiple assay. Data from within individual layers can be treated as separate assays
@@ -56,6 +56,7 @@ class LoomToZarr:
             self.assayName = "RNA"
         else:
             self.assayName = assay_name
+        validate_assay_name(self.assayName)
         self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
         self._ini_cell_data()
         create_zarr_count_assay(

@@ -55,7 +55,11 @@ class SparseToZarr:
         targetShardBytes: int | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
-        from ..storage.schema import create_cell_data, create_zarr_count_assay
+        from ..storage.schema import (
+            create_cell_data,
+            create_zarr_count_assay,
+            validate_assay_name,
+        )
         from ..storage.stores import load_zarr
 
         self.mat = csr_mat
@@ -73,6 +77,7 @@ class SparseToZarr:
             self.assayName = "RNA"
         else:
             self.assayName = assay_name
+        validate_assay_name(self.assayName)
         self.nCells, self.nFeatures = self.mat.shape
         if len(cell_ids) != self.nCells:
             raise ValueError(

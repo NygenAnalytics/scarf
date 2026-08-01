@@ -91,6 +91,9 @@ docs = [
 
 [project.urls]
 Homepage = "https://github.com/parashardhapola/scarf"
+Documentation = "https://scarf.readthedocs.io/en/latest/"
+Installation = "https://scarf.readthedocs.io/en/latest/installation.html"
+Issues = "https://github.com/parashardhapola/scarf/issues"
 
 [tool.setuptools]
 include-package-data = false

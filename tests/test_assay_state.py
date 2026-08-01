@@ -19,6 +19,7 @@ from scarf.graph.encoded_paths import (
 )
 from scarf.graph.paths import AssayGraphPaths, StoredAssayGraph, StoredIntegratedGraph
 from scarf.graph.state import (
+    ArtifactSelectionError,
     AssayState,
     _legacy_subset_hash,
     read_assay_state,
@@ -697,6 +698,44 @@ def test_explicit_integrated_artifact_loads_without_legacy_slot() -> None:
     assert stored.n_neighbors == 2
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("missing", "artifact_missing"),
+        ("incomplete", "artifact_incomplete"),
+    ],
+)
+def test_integrated_graph_selection_failures_are_structured(
+    failure: str,
+    expected_code: str,
+) -> None:
+    datastore, state = _state_store()
+    assert state.normalized is not None
+    normalized_inputs = inspect_artifact(datastore.zw, state.normalized).inputs or {}
+    raw_selection = normalized_inputs.get("cell_selection")
+    assert isinstance(raw_selection, dict)
+    selection = ArtifactRef.from_dict(raw_selection)
+    graph_ref, _group = _add_artifact(
+        datastore.z,
+        kind="integrated_graph",
+        operation="integrate_assays",
+        inputs={"cell_selection": selection},
+        scope="datastore",
+    )
+    if failure == "missing":
+        del datastore.z[artifact_path(selection)]
+    else:
+        datastore.z[artifact_path(selection)].attrs["complete"] = False
+    before = _store_digest(datastore.z)
+
+    with pytest.raises(ArtifactSelectionError) as caught:
+        datastore.load_graph(graph_loc=artifact_path(graph_ref))
+
+    assert caught.value.code == expected_code
+    assert caught.value.context["artifact_id"] == selection.artifact_id
+    assert _store_digest(datastore.z) == before
+
+
 def test_artifact_embedding_initialization_is_state_resolved() -> None:
     datastore, _state = _state_store()
     embedding = datastore._get_ini_embed("RNA", "I", "hvgs", 2)
@@ -746,6 +785,37 @@ def test_incomplete_selected_artifact_is_not_silently_used() -> None:
     datastore.z[artifact_path(state.connectivity_map)].attrs["complete"] = False
     with pytest.raises(RuntimeError, match="Graph artifact is incomplete"):
         datastore.load_graph(graph_loc=artifact_path(state.connectivity_map))
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("missing", "artifact_missing"),
+        ("incomplete", "artifact_incomplete"),
+    ],
+)
+def test_selection_artifact_failures_are_structured_through_state_lookup(
+    failure: str,
+    expected_code: str,
+) -> None:
+    datastore, state = _state_store()
+    assert state.normalized is not None
+    inputs = inspect_artifact(datastore.zw, state.normalized).inputs or {}
+    raw_selection = inputs.get("cell_selection")
+    assert isinstance(raw_selection, dict)
+    selection = ArtifactRef.from_dict(raw_selection)
+    if failure == "missing":
+        del datastore.z[artifact_path(selection)]
+    else:
+        datastore.z[artifact_path(selection)].attrs["complete"] = False
+    before = _store_digest(datastore.z)
+
+    with pytest.raises(ArtifactSelectionError) as caught:
+        datastore.load_graph(from_assay="RNA", cell_key="I", feat_key="hvgs")
+
+    assert caught.value.code == expected_code
+    assert caught.value.context["artifact_id"] == selection.artifact_id
+    assert _store_digest(datastore.z) == before
 
 
 def test_matching_state_does_not_fall_back_to_stale_legacy_paths() -> None:

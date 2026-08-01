@@ -9,21 +9,29 @@ from .arrays import (
 from .layout import _group_zarr_format, count_array_spec
 from .profiles import StorageProfile, resolve_storage_profile
 
-RESERVED_ASSAY_NAMES = frozenset({"artifacts", "pipeline", "plots"})
+_ASSAY_NAME_OWNERS = {
+    "artifacts": "datastore artifact storage",
+    "cellData": "datastore cell metadata",
+    "matrices": "workspace matrix storage",
+    "pipeline": "DataStore.pipeline",
+    "plots": "DataStore.plots",
+    "summary": "DataStore.summary",
+}
+RESERVED_ASSAY_NAMES = frozenset(_ASSAY_NAME_OWNERS)
 
 
 def validate_assay_name(assay_name: str) -> None:
-    """Reject assay names reserved by the datastore API."""
+    """Reject invalid assay names and names reserved by the datastore layout."""
+    if not assay_name or not assay_name.strip():
+        raise ValueError("Assay names must be non-empty")
+    if "/" in assay_name or "\\" in assay_name:
+        raise ValueError(f"Assay name {assay_name!r} must not contain path separators")
     if assay_name in RESERVED_ASSAY_NAMES:
-        owner = (
-            "datastore artifact storage"
-            if assay_name == "artifacts"
-            else f"DataStore.{assay_name}"
-        )
+        owner = _ASSAY_NAME_OWNERS[assay_name]
         raise ValueError(
             f"Assay name {assay_name!r} is reserved for {owner}. "
-            "Choose another name, or rename the assay in the Zarr store before "
-            "opening it with Scarf."
+            "Choose another name, or explicitly migrate an existing assay before "
+            "opening the store with Scarf."
         )
 
 

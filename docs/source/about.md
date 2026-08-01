@@ -60,12 +60,11 @@ See {doc}`tutorials/remote_stores`.
 
 ## Planning memory, compute, and I/O
 
-Scarf treats memory, CPU time, storage layout, and network access as one
-planning problem rather than optimising memory alone. Counts are streamed in
-blocks; an optional feature-major `countsT` orientation speeds up gene-wise
-stages such as highly variable feature selection and marker search; and
-`mem_budget` shapes block geometry, write concurrency, and automatically sized
-feature batches.
+Scarf treats memory, CPU time, storage layout, and network access as one planning problem rather
+than optimising memory alone. Counts are streamed in blocks; an optional feature-major `countsT`
+orientation speeds up gene-wise stages such as highly variable feature selection and marker
+search; and `mem_budget` shapes block geometry, write concurrency, and automatically sized feature
+batches.
 
 `mem_budget` is a planning input, not a hard cap on process memory. Graph
 structures, native libraries, Python objects, and allocator overhead consume
@@ -111,10 +110,11 @@ Related branches can coexist in one datastore, and an identical request can
 as thread count or local scratch are recorded separately and do not change the
 scientific identity of a result.
 
-This record is useful whenever the analysis is long-running, revisited after a
-gap, or executed through a pipeline or software agent, because the dependency
-chain can be inspected independently of the code or description that produced
-it. See {doc}`concepts/provenance` and {doc}`tutorials/provenance_and_reuse`.
+This record is useful whenever the analysis is long-running, revisited after a gap, or executed
+through a pipeline or software agent, because the dependency chain can be inspected independently
+of the code or description that produced it. See {doc}`analysis_with_agents` for the scientific
+decision and troubleshooting framework, {doc}`concepts/provenance` for the data model, and
+{doc}`tutorials/provenance_and_reuse` for an executable example.
 
 ## Selections and multi-scale analysis
 
@@ -131,11 +131,10 @@ sessions, so an analysis can stop after an expensive stage and continue later.
 
 ## Implemented methods
 
-Scarf implements a computational stage itself when an external implementation
-would require materializing the full matrix or would detach the result from its
-inputs. It uses established libraries where they fit the streaming and
-provenance model. The aim is one coherent execution path, not reimplementation
-for its own sake.
+Scarf implements a computational stage itself when an external implementation would require
+materializing the full matrix or would detach the result from its inputs. It uses established
+libraries where they fit the streaming and provenance model. The aim is one coherent execution
+path, not reimplementation for its own sake.
 
 - **Reduction and graph construction:** streamed normalization, covariance
   (Gram-matrix) PCA with an incremental fallback, randomized streaming
@@ -228,6 +227,5 @@ Communications* 13, 4616 (2022).
 
 ## Feedback and contributions
 
-Use [GitHub issues](https://github.com/parashardhapola/scarf/issues) for bugs and
-feature requests. See {doc}`developers/contributing` for development and
-documentation checks.
+Use [GitHub issues](https://github.com/parashardhapola/scarf/issues) for bugs and feature requests.
+See {doc}`developers/contributing` for development and documentation checks.

@@ -26,18 +26,16 @@ budget, not a hard cap on total process resident memory. Python, native
 libraries, graph structures, and allocator overhead can take total RSS above
 the configured value, so leave host headroom.
 
-`nthreads` controls I/O and compute concurrency used by methods that support it.
-More workers can increase throughput when storage and CPU have capacity, but
-they can also increase concurrent buffers or contend for a slow remote store.
-Measure the complete workflow rather than assuming that the largest value is
-best.
+`nthreads` controls I/O and compute concurrency used by methods that support it. More workers can
+increase throughput when storage and CPU have capacity, but they can also increase concurrent
+buffers or contend for a slow remote store. Measure the complete workflow rather than assuming the
+largest value is best.
 
 ## Count orientations
 
-`counts` is the primary cell-major count array. It supports cell-wise scans used
-by normalization and graph construction. A store may also contain `countsT`, a
-derived feature-major orientation used by gene-wise stages such as HVG and
-marker calculations.
+`counts` is the primary cell-major count array. It supports cell-wise scans used by normalization
+and graph construction. A store may also contain `countsT`, a derived feature-major orientation
+used by gene-wise stages such as HVG and marker calculations.
 
 These are two orientations of the same assay matrix, not independent
 datastores. Writing `countsT` costs time and storage during conversion, but can
@@ -70,8 +68,7 @@ import scarf
 scarf.configure_output(progress=False, timestamps=True)
 ```
 
-Progress rendering and log severity are independent. To also select a log level
-or file:
+Progress rendering and log severity are independent. To also select a log level or file:
 
 ```python
 scarf.set_verbosity(level="INFO", filepath="scarf-run.log")
@@ -96,7 +93,5 @@ The marker stage drove both peaks and tracks the configured software budget.
 The 105 GiB result is therefore not a fixed memory floor for ten million cells.
 Reducing the budget should shrink marker batches but can increase wall time.
 The rows used different machine sizes and must not be read as one scaling curve.
-The
-[profiling benchmark record](https://github.com/parashardhapola/scarf/blob/master/profiling/BENCHMARKS.md)
-contains the source revision, workflow settings, per-stage timings, and storage
-caveats.
+The [profiling benchmark record](https://github.com/parashardhapola/scarf/blob/master/profiling/BENCHMARKS.md)
+contains the source revision, workflow settings, per-stage timings, and storage caveats.

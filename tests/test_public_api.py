@@ -8,6 +8,7 @@ from typing import cast
 _EXPECTED_EXPORTS = {
     "ArtifactLineage": "scarf.lineage",
     "ArtifactRef": "scarf.storage.refs",
+    "ArtifactSelectionError": "scarf.graph.state",
     "ArtifactStatus": "scarf.storage.artifacts",
     "AssayMerge": "scarf.merge",
     "AssayState": "scarf.graph.state",
@@ -18,6 +19,7 @@ _EXPECTED_EXPORTS = {
     "CrReader": "scarf.readers",
     "CrToZarr": "scarf.writers",
     "DataStore": "scarf.datastore.datastore",
+    "DataStoreSummary": "scarf.datastore.summary",
     "DatasetMerge": "scarf.merge",
     "EnrichmentResult": "scarf.features.enrichment.results",
     "FateMappingResult": "scarf.trajectory.results",

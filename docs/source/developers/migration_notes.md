@@ -111,6 +111,18 @@ removed; construct `AssayMerge` directly.
 Filtering still marks cells inactive via boolean cell keys (default `I`) rather than
 deleting rows. Custom keys remain the supported way to subset for reclustering and mapping.
 
+## DataStore summaries and assay names
+
+`DataStore.summary()` reserves `summary` as an assay name. New writers reject that name before
+opening or changing their destination, and `DataStore` rejects an existing `summary` assay before
+changing store-level state.
+
+This is a clean break. Scarf does not silently rename existing assays because the assay name can
+also appear in `defaultAssay`, `assayTypes`, artifact paths, provenance, and dependent metadata.
+Prefer recreating the datastore from its source with another assay name and recomputing dependent
+artifacts. Any manual migration must update every such reference before the store is opened with
+the current Scarf release.
+
 ## Graph construction
 
 `DataStore.make_graph` has been removed. Existing datastores remain readable,

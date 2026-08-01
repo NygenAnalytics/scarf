@@ -662,6 +662,24 @@ def test_write_doublet_target_zarr_skips_counts_t(tmp_path):
     assert "countsT" not in root["RNA"]
 
 
+def test_write_doublet_target_rejects_summary_before_truncating_destination():
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    root.create_group("sentinel")
+
+    with pytest.raises(ValueError, match=r"reserved for DataStore\.summary"):
+        write_doublet_target_zarr(
+            zarr_loc=store,
+            assay_name="summary",
+            sim_counts=csr_matrix(np.ones((1, 1), dtype=np.uint32)),
+            feat_ids=np.array(["f0"]),
+            feat_names=np.array(["g0"]),
+        )
+
+    preserved = zarr.open_group(store=store, mode="r")
+    assert set(preserved.group_keys()) == {"sentinel"}
+
+
 def _counts_array(
     values: np.ndarray,
     *,

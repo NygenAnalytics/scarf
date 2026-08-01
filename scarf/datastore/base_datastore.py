@@ -36,6 +36,7 @@ from ..utils.logging import logger
 if TYPE_CHECKING:
     from ..graph.state import AssayState
     from ..lineage import ArtifactLineage
+    from .summary import DataStoreSummary
 
 
 def sanitize_hierarchy(
@@ -233,6 +234,13 @@ class BaseDataStore:
             kind=kind,
             complete_only=complete_only,
         )
+
+    def summary(self) -> "DataStoreSummary":
+        """Return a read-only, metadata-only summary of this datastore."""
+        from .. import __version__
+        from .summary import build_datastore_summary
+
+        return build_datastore_summary(self, scarf_version=__version__)
 
     def _load_cells(self) -> MetaData:
         """This convenience function loads cellData level from the Zarr

@@ -22,10 +22,11 @@ Scarf is a Python framework for analysing single-cell RNA, ATAC, protein, and mu
 Python 3.12+.
 
 ```bash
-uv pip install "scarf[extra]"
+uv venv --python 3.12
+uv pip install --python .venv "scarf[extra]"
 ```
 
-Detailed installation instructions [here](https://scarf.readthedocs.io/en/latest/installation)
+Detailed installation instructions [here](https://scarf.readthedocs.io/en/latest/installation.html)
 
 ## Quick start
 
@@ -52,7 +53,6 @@ Read the [scRNA-seq tutorial](https://scarf.readthedocs.io/en/latest/tutorials/s
   <img src="https://raw.githubusercontent.com/parashardhapola/scarf/master/docs/source/_static/overview.png" alt="Compressed count chunks feed incremental algorithms and a neighbourhood graph that serves embedding, clustering, mapping, imputation, downsampling, and pseudotime" width="520">
 </p>
 
-
 | Area | Methods |
 | :-- | :-- |
 | Modalities | scRNA-seq, scATAC-seq, CITE-seq, matched multi-omics |
@@ -65,6 +65,8 @@ Read the [scRNA-seq tutorial](https://scarf.readthedocs.io/en/latest/tutorials/s
 ## Documentation
 
 Read workflow vignettes and API references on **[Read The Docs 📖](https://scarf.readthedocs.io/en/latest/)**
+
+AI-assisted and autonomous workflows should start with **[Analysis with AI agents](https://scarf.readthedocs.io/en/latest/analysis_with_agents.html)**.
 
 ## Citation
 

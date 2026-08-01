@@ -60,6 +60,23 @@ class _MergeDataStore:
         return self._assays[name]
 
 
+def test_assay_merge_rejects_summary_before_truncating_destination():
+    store = MemoryStore()
+    root = zarr.open_group(store=store, mode="w")
+    root.create_group("sentinel")
+
+    with pytest.raises(ValueError, match=r"reserved for DataStore\.summary"):
+        AssayMerge(
+            zarr_path=store,
+            assays=[],
+            names=[],
+            merge_assay_name="summary",
+        )
+
+    preserved = zarr.open_group(store=store, mode="r")
+    assert set(preserved.group_keys()) == {"sentinel"}
+
+
 def test_assay_merge(datastore, rna_raw_total, tmp_path):
     fn = str(tmp_path / "merged.zarr")
     writer = AssayMerge(

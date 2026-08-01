@@ -73,12 +73,14 @@ def write_doublet_target_zarr(
         create_cell_data,
         create_zarr_count_assay,
         load_count_array,
+        validate_assay_name,
     )
     from ..storage.sharding import write_dense_in_shard_rows
     from ..storage.budget import resolve_budget
     from ..storage.profiles import resolve_storage_profile
     from ..storage.stores import load_zarr
 
+    validate_assay_name(assay_name)
     resources = resolve_budget(mem_budget, nthreads)
     resolved_profile = resolve_storage_profile(zarr_loc, profile)
     n_sim = sim_counts.shape[0]

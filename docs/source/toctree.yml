@@ -8,6 +8,8 @@ subtrees:
         title: Installation
       - file: quickstart
         title: Quick start
+      - file: analysis_with_agents
+        title: Analysis with AI agents
       - file: scarf_and_scanpy
         title: Scanpy and Seurat users
   - caption: Core workflows

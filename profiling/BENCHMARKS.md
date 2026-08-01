@@ -101,10 +101,9 @@ The planned feature blocks consumed enough of the 96 GiB software budget that
 inner read concurrency fell to one. The measured 105.0 GiB peak is therefore a
 throughput choice, not a fixed memory requirement for ten million cells.
 
-Storage throughput also varied. The input size grew by 9.99 times, while
-download wall time grew by 33.2 times because average throughput fell from
-42.6 MiB/s to 12.8 MiB/s. Excluding download, total wall time scaled by 14.4
-times.
+Storage throughput also varied. The input size grew by 9.99 times, while download wall time grew by
+33.2 times because average throughput fell from 42.6 MiB/s to 12.8 MiB/s. Excluding download, total
+wall time scaled by 14.4 times.
 
 These results establish execution and resource use for the recorded dataset,
 code revision, settings, and cloud conditions. They do not establish biological

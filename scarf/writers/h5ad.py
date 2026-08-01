@@ -16,22 +16,12 @@ from ..storage.profiles import (
 from ..utils.logging import logger
 from ..utils.progress import iter_progress
 
-# Root group names the datastore layout reserves for cell metadata, matrices,
-# and plots. Assays must not collide with these or the store is corrupted.
-_RESERVED_ASSAY_NAMES = frozenset({"cellData", "matrices", "plots"})
-
 
 def _validate_assay_names(names: tuple[str, ...]) -> None:
+    from ..storage.schema import validate_assay_name
+
     for name in names:
-        if not name or not name.strip():
-            raise ValueError("Assay names must be non-empty")
-        if "/" in name or "\\" in name:
-            raise ValueError(f"Assay name {name!r} must not contain path separators")
-        if name in _RESERVED_ASSAY_NAMES:
-            raise ValueError(
-                f"Assay name {name!r} is reserved by the datastore layout. "
-                "Choose another name or provide a different assay_name_map."
-            )
+        validate_assay_name(name)
 
 
 class H5adToZarr:
@@ -73,23 +63,7 @@ class H5adToZarr:
         from ..storage.schema import create_zarr_count_assay
         from ..storage.stores import load_zarr
 
-        self.resources = resolve_budget(mem_budget, nthreads)
-        self.profile = resolve_storage_profile(zarr_loc, profile)
         self.h5ad = h5ad
-        self.h5ad.infer_storage_dtype(self.resources.memoryBytes)
-        csc_peak = self.h5ad.csc_conversion_peak_bytes()
-        if csc_peak > self.resources.memoryBytes:
-            raise MemoryError(
-                f"CSC to CSR conversion needs about {csc_peak} bytes, but the "
-                f"conversion memory limit is {self.resources.memoryBytes} bytes"
-            )
-        if csc_peak:
-            self.h5ad.materialize_csc()
-        self.storageDtype = getattr(
-            self.h5ad,
-            "storageDtype",
-            self.h5ad.matrixDtype,
-        )
         self.workspace = workspace
         self.storage_options = storage_options
         self.assaySplitKey = assay_split_key
@@ -116,6 +90,22 @@ class H5adToZarr:
             self.assayFeatures = None
             self.assayNames = (self.assayName,)
         _validate_assay_names(self.assayNames)
+        self.resources = resolve_budget(mem_budget, nthreads)
+        self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.h5ad.infer_storage_dtype(self.resources.memoryBytes)
+        csc_peak = self.h5ad.csc_conversion_peak_bytes()
+        if csc_peak > self.resources.memoryBytes:
+            raise MemoryError(
+                f"CSC to CSR conversion needs about {csc_peak} bytes, but the "
+                f"conversion memory limit is {self.resources.memoryBytes} bytes"
+            )
+        if csc_peak:
+            self.h5ad.materialize_csc()
+        self.storageDtype = getattr(
+            self.h5ad,
+            "storageDtype",
+            self.h5ad.matrixDtype,
+        )
         self.z = load_zarr(zarr_loc=zarr_loc, mode="w", storage_options=storage_options)
         self._ini_cell_data()
         for resolved_assay_name in self.assayNames:

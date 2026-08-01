@@ -261,19 +261,24 @@ def test_shallow_copy_gets_an_accessor_bound_to_the_copy():
 
 
 @pytest.mark.parametrize("workspace", [None, "analysis"])
+@pytest.mark.parametrize("assay_name", ["plots", "summary"])
 def test_datastore_rejects_reserved_assay_before_store_mutation(
     workspace: str | None,
+    assay_name: str,
 ):
     memory_store = MemoryStore()
     root = zarr.open_group(store=memory_store, mode="w")
     active = root if workspace is None else root.create_group(workspace)
-    assay = active.create_group("plots")
+    assay = active.create_group(assay_name)
     assay.attrs["is_assay"] = True
 
-    with pytest.raises(ValueError, match="reserved for DataStore.plots"):
+    with pytest.raises(
+        ValueError,
+        match=rf"reserved for DataStore\.{assay_name}",
+    ):
         DataStore(
             memory_store,
-            default_assay="plots",
+            default_assay=assay_name,
             workspace=workspace,
             min_features_per_cell=0,
             min_cells_per_feature=0,

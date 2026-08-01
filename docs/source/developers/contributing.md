@@ -2,16 +2,29 @@
 
 ## Contributions through pull requests
 
-If you would like to add a new feature, fix a bug or make some improvements please
-follow this [guideline]. Usually when planning to add a new feature it is a good
-idea to introduce the proposed feature and discuss it on the [discussion page].
-The project uses [Ruff] for formatting and linting. Before opening a pull request, run
-`uv run ruff format .` and `uv run ruff check .`.
+If you would like to add a new feature, fix a bug or make some improvements, please follow this
+[guideline]. When planning a new feature, introduce the proposal and discuss it on the
+[discussion page]. Automated contributors must also follow the repository `AGENTS.md` and any
+instructions scoped to the directory being changed.
+
+The project uses [Ruff] for formatting and linting. Before opening a pull
+request, run the same static checks as CI:
+
+```bash
+uv run ruff check scarf profiling tests
+uv run ruff format --check scarf profiling tests
+uv run mypy scarf profiling
+```
 
 ## Testing locally
 
 You can run the tests locally on your branch with [pytest]. Configurations are in `pyproject.toml`.
-Install dependencies with `uv sync --extra test --extra extra`, then run `uv run pytest`.
+Install the development, profiling, and test dependencies with:
+
+```bash
+uv sync --group dev --group profiling --extra test --extra extra
+```
+
 Python 3.12 or newer is required (`requires-python >=3.12`).
 
 Two markers select the expensive parts of the suite: `slow` for tests that build
@@ -25,7 +38,8 @@ CI runs the whole suite, so run `uv run pytest` before opening a pull request.
 ## Contributions to the documentation
 
 You may contribute to the documentation by either adding new sections or modifying existing
-sections. Install doc dependencies with `uv sync --extra docs --extra extra`.
+sections. Install the documentation and test dependencies with
+`uv sync --extra docs --extra test --extra extra`.
 
 Executable docs are MyST markdown files with `{code-cell}` blocks, not standalone `.ipynb` files.
 Sources live in `docs/source/quickstart.md` and `docs/source/tutorials/`. Executed outputs
@@ -34,23 +48,28 @@ without re-running notebooks on every build.
 
 ### Refresh the docs cache
 
-After editing a tutorial or quickstart page:
+Prose-only edits do not change the notebook execution hash. Refresh affected pages after changing
+a code cell or another execution input. The execution fingerprint includes `scarf/`, `uv.lock`,
+`pyproject.toml`, `docs/source/conf.py`, and the documentation runner. `validate-cache` compares
+executable source hashes, so it can pass for outputs made stale by another execution input.
+
+Execute one affected page locally with one worker:
+
+    make -C docs execute-page PAGE=scrna_seq JOBS=1
+
+Modal can execute pages in parallel when authentication and the
+`scarf_profiling` environment are available:
 
     uv sync --group docs-modal --extra docs --extra extra
     make -C docs execute-docs-modal PAGES="scrna_seq"
 
-The Make target uses the `scarf_profiling` Modal environment and starts an
-ephemeral container for each requested page. The local process preserves
-matching outputs for other current sources, validates a complete candidate, and
-publishes it through a recoverable backup-and-rename sequence. If execution,
-import, validation, or publication fails, the committed cache remains unchanged.
+Both paths preserve matching outputs for other sources, validate a complete
+candidate, and publish through a recoverable backup-and-rename sequence. If
+execution, import, validation, or publication fails, the committed cache remains
+unchanged. Resume a failed run with the matching `resume-docs` or
+`resume-docs-modal` target and the same scope.
 
-Omit `PAGES` to force every executable page. A failed run retains successful
-staged pages. Resume the same scope with
-`make -C docs resume-docs-modal`; staged outputs are reused only while their
-source hash, execution fingerprint, and Modal runner identity still match.
-`make -C docs execute-page PAGE=scrna_seq` remains available when Modal access
-is not configured.
+Never run two execute, resume, prune, or publication commands concurrently.
 
 The executor converts completed live progress widgets into static, accessible
 bars before caching them. Commit both the edited `.md` files and
@@ -60,25 +79,27 @@ bars before caching them. Commit both the edited `.md` files and
 
 Validate the committed cache without changing it:
 
-    cd docs && make validate-cache
+    make -C docs validate-cache
 
 Build HTML locally after cache validation:
 
-    cd docs && make html
+    make -C docs html
 
 Rebuild the cache from outputs that still match current sources:
 
-    cd docs && make prune-stale-cache
+    make -C docs prune-stale-cache
 
 Force every page and run a strict Sphinx build:
 
-    cd docs && make execute-notebooks-all
+    make -C docs execute-notebooks-all JOBS=1
 
 ### Adding a new tutorial
 
-1. Add `docs/source/tutorials/your_tutorial.md` with MyST `{code-cell}` blocks (or convert from Jupyter with [Jupytext]).
+1. Add `docs/source/tutorials/your_tutorial.md` with MyST `{code-cell}` blocks, or convert from
+   Jupyter with [Jupytext].
 2. Register it in `docs/source/toctree.yml`.
-3. Run `make -C docs execute-docs-modal PAGES="your_tutorial"`.
+3. Execute the page locally with `JOBS=1`, or use the optional Modal target when
+   its environment is available.
 4. Commit the `.md` file and `docs/.jupyter_cache/`.
 
 Suggested chapter outline:
@@ -90,7 +111,9 @@ Suggested chapter outline:
 5. Guided analysis (numbered steps)
 6. Common mistakes and limitations
 
-Fact-check before merging: method names and defaults against `scarf/`, dataset IDs against the `scarf_docs` Cytebase repository, metadata keys against executed output, and no claims for methods Scarf does not ship.
+Fact-check before merging: method names and defaults against `scarf/`, dataset IDs against the
+`scarf_docs` Cytebase repository, metadata keys against executed output, and method claims against
+the capabilities Scarf ships.
 
 The documentation uses [Sphinx], the [MyST] parser, and [myst_nb] for notebook execution.
 Sphinx reads the committed cache via `nb_execution_mode = "cache"` in `docs/source/conf.py`.
@@ -116,12 +139,10 @@ Nothing leaves `build/cytebase` until you publish:
     uv run python scripts/publish_docs_datasets.py            # print the plan
     uv run python scripts/publish_docs_datasets.py --apply    # needs a write token
 
-Publishing swaps `<dataset>/data.zarr.tar.gz` in place and first preserves the
-archive it replaces as `<dataset>_legacy_master/data.zarr.tar.gz`. Preservation
-is a server-side copy by content hash, and it never overwrites a legacy
-snapshot that already exists. Those snapshots are the pre-1.0 Zarr v2 corpus
-that `tests/test_frozen_master_compat.py` reads; no documentation page opens
-them.
+Publishing swaps `<dataset>/data.zarr.tar.gz` in place and first preserves the archive it replaces
+as `<dataset>_legacy_master/data.zarr.tar.gz`. Preservation is a server-side copy by content hash,
+and it never overwrites a legacy snapshot that already exists. Those snapshots are the pre-1.0
+Zarr v2 corpus that `tests/test_frozen_master_compat.py` reads; no documentation page opens them.
 
 ## Acknowledgements
 
