@@ -177,8 +177,7 @@ Now build the ADT graph. Arguments differ from the RNA chain:
 - `from_assay='ADT'` targets the non-default assay on every step
 - `feat_key='I'` uses every active antibody, since there is no feature selection column
 - `run_custom_reduction` with an identity loading matrix keeps neighbours in the
-  normalized antibody space (the former `make_graph(..., dims=0)` behaviour).
-  `run_pca` no longer accepts `dims=0`
+  normalized antibody space
 
 ```{code-cell} ipython3
 normalized_adt = ds.run_normalization(from_assay='ADT', feat_key='I')

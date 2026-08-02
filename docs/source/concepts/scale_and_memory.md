@@ -78,20 +78,8 @@ See {doc}`../reference/api/utilities` for the exact output contract.
 
 ## Measured scaling references
 
-The following measurements are empirical references, not hardware guarantees.
-They cover all active cells through store preparation, QC, HVGs, graph
-construction, UMAP, Leiden, Paris, and markers against object storage.
+Measured end-to-end wall times, peak memory, machine classes, and per-stage
+timings for a fixed object-store workflow are published in {doc}`benchmarks`.
 Dataset sparsity, selected features, graph parameters, storage latency, software
-version, and cache state all affect the result.
-
-| Cells | CPU | Host memory | Scarf budget | Wall time | Peak cgroup memory |
-|---:|---:|---:|---:|---:|---:|
-| 1,000,000 | 8 | 32 GiB | 24 GiB | 2,458 s (41.0 min) | 28.5 GiB |
-| 10,000,000 | 16 | 128 GiB | 96 GiB | 37,119 s (10.31 h) | 105.0 GiB |
-
-The marker stage drove both peaks and tracks the configured software budget.
-The 105 GiB result is therefore not a fixed memory floor for ten million cells.
-Reducing the budget should shrink marker batches but can increase wall time.
-The rows used different machine sizes and must not be read as one scaling curve.
-The [profiling benchmark record](https://github.com/parashardhapola/scarf/blob/master/profiling/BENCHMARKS.md)
-contains the source revision, workflow settings, per-stage timings, and storage caveats.
+version, and cache state all affect the result. Those rows use different machine
+sizes and must not be read as one same-machine scaling curve.

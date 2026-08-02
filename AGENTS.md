@@ -78,8 +78,8 @@ MPLBACKEND=Agg SCARF_RUN_VISUAL_REGRESSION=1 \
   `uv run pytest -n 0 tests/test_import_architecture.py`.
 - Missing, stale, or incompatible result: inspect `AssayState`, artifact status, and lineage before
   reading private Zarr paths.
-- Public API or persisted contract: inspect migration notes and the public, compatibility,
-  signature, and frozen-store tests.
+- Public API or persisted contract: inspect the public API reference and the public,
+  compatibility, signature, and frozen-store tests.
 - On-disk layout: read `docs/source/developers/zarr_internals.md`.
 - Documentation cache or build: follow `docs/AGENTS.md`.
 - Profiling, Modal, or benchmark interpretation: follow `profiling/AGENTS.md`.

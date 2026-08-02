@@ -45,7 +45,6 @@ def test_agent_guide_is_linked_from_discovery_routes() -> None:
         _REPOSITORY_ROOT / "README.md": (
             "https://scarf.readthedocs.io/en/latest/analysis_with_agents.html"
         ),
-        _DOCS_SOURCE / "about.md": "{doc}`analysis_with_agents`",
         _DOCS_SOURCE / "index.md": "{doc}`analysis_with_agents`",
         _DOCS_SOURCE / "reference" / "faq.md": "{doc}`../analysis_with_agents`",
     }

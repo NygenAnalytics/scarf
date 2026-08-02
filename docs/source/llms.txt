@@ -4,8 +4,8 @@
 
 ## Start here
 
+- [Home](index.html): design, implemented methods, validation, and current boundaries
 - [Analysis with AI agents](analysis_with_agents.html): scientific decision loop, state inspection, task routing, troubleshooting, and handoff
-- [About Scarf](about.html): design, implemented methods, validation, and current boundaries
 - [Quick start](quickstart.html): minimal count-to-cluster workflow
 - [API reference](reference/api.html): exact public signatures and result contracts
 
@@ -39,6 +39,7 @@
 - [Provenance](concepts/provenance.html): artifacts, reuse, lineage, and limits
 - [Reuse and tracing](tutorials/provenance_and_reuse.html): executable branching example
 - [Memory and execution](concepts/scale_and_memory.html): resource budgets and scale
+- [Benchmarks](concepts/benchmarks.html): measured end-to-end timings and peak memory
 - [Remote stores](tutorials/remote_stores.html): object-storage execution
 - [Custom analyses](tutorials/custom_analyses.html): public extension and export boundaries
 - [FAQ](reference/faq.html): concise method and interoperability answers

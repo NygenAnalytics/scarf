@@ -305,8 +305,8 @@ uv run python -m scarf.tools.repack_zarr \
   input.zarr output.zarr --profile cloud
 ```
 
-Point `DataStore` at the output URI afterward. Repacking is a layout migration
-tool, not an analysis step.
+Point `DataStore` at the output URI afterward. Repacking rewrites layout for a
+storage profile; it is not an analysis step.
 
 For custom statistics over mounted graphs or count blocks, followed by a
 supported selective export, continue with {doc}`custom_analyses`.

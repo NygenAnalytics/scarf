@@ -199,8 +199,8 @@ Classify the problem before retrying:
   keys, and lineage. `ArtifactSelectionError.code` distinguishes missing, incomplete, or changed
   selection inputs. Do not consume incomplete artifacts.
 - **Resource or I/O:** inspect the configured memory budget, worker count, storage profile, remote
-  latency, and `countsT` availability. See {doc}`concepts/scale_and_memory` and
-  {doc}`tutorials/remote_stores`.
+  latency, and `countsT` availability. See {doc}`concepts/scale_and_memory`,
+  {doc}`concepts/benchmarks`, and {doc}`tutorials/remote_stores`.
 - **Numerical or graph:** check dimensions, graph components, neighbour count, convergence,
   validity masks, and method-specific diagnostics.
 - **Scientific ambiguity:** preserve branches, seek another independent form of evidence, narrow
@@ -233,4 +233,4 @@ A useful handoff reports:
 - exported files or external methods that continue the analysis.
 
 Artifact provenance records how Scarf produced a result. It does not replace this study-level
-reasoning record. See {doc}`about` for the implemented methods and current boundaries.
+reasoning record. See {doc}`index` for the implemented methods and current boundaries.

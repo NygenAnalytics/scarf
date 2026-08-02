@@ -52,6 +52,7 @@ language = "en"
 external_toc_path = "toctree.yml"
 external_toc_exclude_missing = False
 redirects = {
+    "about": "index.html",
     "install": "installation.html",
     "tutorials/atomic_graph_operations": "custom_graph_construction.html",
     "concepts/graph_and_state": "../tutorials/custom_graph_construction.html",

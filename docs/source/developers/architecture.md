@@ -161,14 +161,15 @@ implementation directly unless it intentionally needs a public patch seam.
 
 Compatibility policy for the 1.x series:
 
-- Mapping references and query projections use the hard-break contract
-  documented in {doc}`migration_notes`.
-- Specific older file schemas named in the migration notes remain readable
-  while their compatibility tests are maintained. This is not a blanket
-  guarantee for every historical artifact.
+- Mapping references and query projections follow a hard-break contract.
+  Incompatible artifacts fail with an explicit error rather than a silent
+  upgrade. Read the current mapping and graph APIs for the supported paths.
+- Specific older file schemas remain readable only while their compatibility
+  tests are maintained. This is not a blanket guarantee for every historical
+  artifact.
 
-Retired flat internal modules do not have forwarding shims. Their focused
-replacement paths are listed in {doc}`migration_notes`.
+Retired flat internal modules do not have forwarding shims. Import the focused
+modules that own the current implementation.
 
 ## Placement rules
 
@@ -231,6 +232,6 @@ Rejected:
 
 ## Implementation references
 
-Read {doc}`zarr_internals` for the on-disk implementation boundary and
-{doc}`migration_notes` for public contract changes. Use {doc}`contributing` for
-the test, documentation, and review workflow before making a change.
+Read {doc}`zarr_internals` for the on-disk implementation boundary and the
+public API reference for current contracts. Use {doc}`contributing` for the
+test, documentation, and review workflow before making a change.

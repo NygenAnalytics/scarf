@@ -3,12 +3,19 @@
 This file records the latest completed full-scale Scarf measurements. It does
 not preserve superseded experiments or operational call identifiers.
 
+Where a configuration has multiple completed replicates, the main tables report
+the mean and a Student-t 95% confidence interval, with `n` shown explicitly.
+Until additional replicates finish, every row below is `n = 1`, so the reported
+value is the single completed run and no confidence interval is shown. A compact
+replicate summary holds individual totals so run-to-run drift remains visible as
+more measurements arrive.
+
 ## Scope
 
-The measurements were completed on 2026-07-29 and 2026-07-30 from commit
-`ce50bbced52e3f8177ebfb492a04ef474dff6918`. Both runs downloaded an H5AD,
-used a fresh object-store-backed Zarr v3 store, and completed the same
-sixteen-stage CPU workflow:
+The measurements were completed on 2026-08-02 from commit
+`ba6dc04d7f4e18e441e07d1f503722ef1018f1ff`. Each run downloaded an H5AD, used a
+fresh object-store-backed Zarr v3 store, and completed the same sixteen-stage CPU
+workflow:
 
 1. cell-major count conversion
 2. `countsT` construction
@@ -30,8 +37,7 @@ sixteen-stage CPU workflow:
 The source was the public CELLxGENE H5AD with dataset ID
 `dcfd4feb-18a3-4b30-81d7-1b0c544a8ab3` and version ID
 `1bc30289-9565-4099-abf9-3326328c11ac`. The profiler selected deterministic,
-nested samples with seed 0. The prepared inputs contained exactly 1,000,000 and
-10,000,000 cells.
+nested samples with seed 0 for every target size.
 
 ## Settings
 
@@ -49,61 +55,98 @@ evolving operational template and is not an exact reproduction of these runs.
 - minimum 10 features per cell and 20 cells per feature
 - 1,000-cell H5AD conversion batches
 - S3-compatible object storage in the Modal EU region
+- Scarf memory budget set to 75% of the container memory limit
 
 The Scarf memory budget controls planned block sizes and concurrency. It is not
 a hard process-memory limit.
 
+Machine classes differed by size, so the rows are not a same-machine scaling
+curve:
+
+| Input cells | CPU | Container memory | Scarf budget |
+| ---: | ---: | ---: | ---: |
+| 10,000 to 100,000 | 4 | 16 GiB | 12 GiB |
+| 500,000 to 1,000,000 | 8 | 32 GiB | 24 GiB |
+| 5,000,000 to 10,000,000 | 16 | 64 GiB | 48 GiB |
+
 ## End-to-end results
 
-| Input cells | Cells after QC | CPU | Container memory | Scarf budget | Wall time | Peak cgroup memory |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1,000,000 | 889,974 | 8 | 32 GiB | 24 GiB | 2,458.5 s (41.0 min) | 28.5 GiB |
-| 10,000,000 | 8,902,268 | 16 | 128 GiB | 96 GiB | 37,118.9 s (10.31 h) | 105.0 GiB |
+Peak memory uses sampled `memory.current` (`peakCgroupBytes`). Modal did not
+expose a cgroup peak scope for these runs, so short spikes may be missed.
 
-The source H5AD files were 3.748 GiB and 37.434 GiB. The ten-million-cell run
-used twice the CPUs and four times the container and software memory, so these
-rows are not a same-machine scaling curve.
+| Input cells | CPU | Container memory | Scarf budget | n | Wall time | Peak cgroup memory | Peak RSS |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 4 | 16 GiB | 12 GiB | 2 | 854.1 s (14.2 min), 95% CI ±1,577.7 s | 2.6 GiB ±0.7 | 2.6 GiB ±0.4 |
+| 50,000 | 4 | 16 GiB | 12 GiB | 1 | 580.1 s (9.7 min) | 5.2 GiB | 5.3 GiB |
+| 100,000 | 4 | 16 GiB | 12 GiB | 1 | 989.1 s (16.5 min) | 6.8 GiB | 7.0 GiB |
+| 500,000 | 8 | 32 GiB | 24 GiB | 1 | 1,617.9 s (27.0 min) | 26.6 GiB | 27.0 GiB |
+| 1,000,000 | 8 | 32 GiB | 24 GiB | 1 | 2,712.0 s (45.2 min) | 28.8 GiB | 29.2 GiB |
+| 5,000,000 | 16 | 64 GiB | 48 GiB | 1 | 10,308.9 s (2.86 h) | 57.3 GiB | 57.4 GiB |
+| 10,000,000 | 16 | 64 GiB | 48 GiB | 1 | 25,897.9 s (7.19 h) | 56.4 GiB | 56.6 GiB |
 
-Stage values below use `wholeFunctionSeconds`, which includes recorded stage
-setup and validation. The funnel total also includes the initial download and
-about six seconds of orchestration.
+### Replicate totals
 
-| Stage | 1M seconds | 10M seconds | 10M / 1M |
-| --- | ---: | ---: | ---: |
-| Dataset download | 90.1 | 2,992.2 | 33.2 |
-| Create count store | 404.6 | 7,316.0 | 18.1 |
-| Write `countsT` | 180.1 | 2,768.7 | 15.4 |
-| Initialize datastore | 101.1 | 1,842.5 | 18.2 |
-| Reopen datastore | 8.1 | 10.4 | 1.3 |
-| Filter cells | 77.5 | 124.4 | 1.6 |
-| Mark HVGs | 172.2 | 3,444.5 | 20.0 |
-| Normalize | 168.3 | 2,201.2 | 13.1 |
-| PCA | 86.1 | 1,135.9 | 13.2 |
-| Build embedding initialization | 33.8 | 341.8 | 10.1 |
-| Build ANN index | 95.7 | 1,060.5 | 11.1 |
-| Query neighbours | 51.9 | 311.7 | 6.0 |
-| Build connectivity map | 57.1 | 87.7 | 1.5 |
-| UMAP | 314.6 | 2,051.6 | 6.5 |
-| Leiden | 269.3 | 3,446.5 | 12.8 |
-| Paris | 114.0 | 793.3 | 7.0 |
-| Marker search | 228.2 | 7,183.1 | 31.5 |
-| **Funnel total** | **2,458.5** | **37,118.9** | **15.1** |
+Individual completed totals for matching configurations. Second replicates for
+50k through 5M are still running or queued; 10M remains `n = 1`. With `n = 2`,
+the Student-t 95% CI is provisional and can be very wide.
+
+| Input cells | Replicate | Wall time (s) | Peak cgroup (GiB) | Peak RSS (GiB) |
+| ---: | --- | ---: | ---: | ---: |
+| 10,000 | r1 | 729.9 | 2.7 | 2.7 |
+| 10,000 | r2 | 978.3 | 2.6 | 2.6 |
+| 50,000 | r1 | 580.1 | 5.2 | 5.3 |
+| 100,000 | r1 | 989.1 | 6.8 | 7.0 |
+| 500,000 | r1 | 1,617.9 | 26.6 | 27.0 |
+| 1,000,000 | r1 | 2,712.0 | 28.8 | 29.2 |
+| 5,000,000 | r1 | 10,308.9 | 57.3 | 57.4 |
+| 10,000,000 | r1 | 25,897.9 | 56.4 | 56.6 |
+
+Stage values below use stage `seconds`, which includes recorded stage work but
+excludes the shared funnel download and orchestration. The funnel total includes
+the initial download and a few seconds of orchestration.
+
+| Stage | 10k | 50k | 100k | 500k | 1M | 5M | 10M |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Dataset download | 2.4 | 12.4 | 26.4 | 118.8 | 59.2 | 1,123.8 | 2,174.9 |
+| Create count store | 5.6 | 17.7 | 47.1 | 206.8 | 613.8 | 1,300.9 | 3,481.2 |
+| Write `countsT` | 8.2 | 16.8 | 39.3 | 72.7 | 144.9 | 512.7 | 1,384.8 |
+| Initialize datastore | 30.4 | 18.7 | 39.9 | 59.6 | 83.6 | 311.8 | 683.0 |
+| Reopen datastore | 10.1 | 5.8 | 7.3 | 8.1 | 6.2 | 5.4 | 10.3 |
+| Filter cells | 30.7 | 14.1 | 28.5 | 25.6 | 20.4 | 25.0 | 54.0 |
+| Mark HVGs | 61.0 | 38.0 | 71.8 | 95.5 | 183.5 | 619.4 | 1,366.9 |
+| Normalize | 36.6 | 25.9 | 62.9 | 134.6 | 166.4 | 926.1 | 1,296.4 |
+| PCA | 43.8 | 23.7 | 44.7 | 60.8 | 79.1 | 223.2 | 570.9 |
+| Build embedding initialization | 12.8 | 7.2 | 12.9 | 17.0 | 26.2 | 109.1 | 246.5 |
+| Build ANN index | 23.3 | 12.4 | 27.4 | 56.8 | 86.5 | 341.4 | 831.5 |
+| Query neighbours | 26.8 | 12.6 | 21.6 | 30.7 | 45.4 | 108.2 | 299.8 |
+| Build connectivity map | 53.1 | 49.0 | 49.1 | 43.0 | 51.1 | 43.0 | 101.8 |
+| UMAP | 66.0 | 52.4 | 102.4 | 137.4 | 284.4 | 699.3 | 1,772.2 |
+| Leiden | 55.6 | 34.9 | 57.7 | 128.7 | 259.6 | 1,348.4 | 3,486.5 |
+| Paris | 112.8 | 65.7 | 106.7 | 115.2 | 132.8 | 261.1 | 769.2 |
+| Marker search | 115.4 | 78.5 | 105.3 | 150.0 | 293.0 | 1,712.7 | 6,117.9 |
+| **Funnel total** | **854.1** | **580.1** | **989.1** | **1,617.9** | **2,712.0** | **10,308.9** | **25,897.9** |
+
+The 10k stage column is the mean of two replicates. End-to-end 10k wall time
+95% CI half-width is ±1,577.7 s; stage-level half-widths are omitted from the
+table because `n = 2` intervals are too wide to be useful at a glance.
 
 ## Interpretation
 
-Each row is one completed run, not a median of repeated runs. Peak cgroup values
-were sampled from `memory.current`, so very short spikes may be missed. The
-profiler did not force garbage collection between stages.
+Most published rows are still one completed run (`n = 1`). The 10k row now has
+two replicates and reports mean wall time with a Student-t 95% confidence
+interval. With `n = 2`, that interval remains wide and should be treated as
+provisional drift capture rather than a tight uncertainty bound.
 
-Marker search set the peak-memory value in both runs. At ten million cells, its
-block reads took 6,481.4 seconds and its rank computation took 613.0 seconds.
-The planned feature blocks consumed enough of the 96 GiB software budget that
-inner read concurrency fell to one. The measured 105.0 GiB peak is therefore a
-throughput choice, not a fixed memory requirement for ten million cells.
+These runs replace the previous July 2026 1M and 10M reference rows. The older
+10M measurement used 16 CPU and 128 GiB; the current 10M measurement uses 16 CPU
+and 64 GiB with a 48 GiB Scarf budget, so the totals are not directly comparable
+as a software regression check.
 
-Storage throughput also varied. The input size grew by 9.99 times, while download wall time grew by
-33.2 times because average throughput fell from 42.6 MiB/s to 12.8 MiB/s. Excluding download, total
-wall time scaled by 14.4 times.
+Peak values come from sampled `memory.current`, so very short spikes may be
+missed. The profiler did not force garbage collection between stages. At 5M and
+10M, marker search and Leiden dominate wall time. At 10k, fixed overheads are
+large relative to useful work, which is why that row can look slower than 50k
+even on the same machine class.
 
 These results establish execution and resource use for the recorded dataset,
 code revision, settings, and cloud conditions. They do not establish biological

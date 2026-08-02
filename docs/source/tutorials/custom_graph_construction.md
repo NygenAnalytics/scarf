@@ -214,6 +214,4 @@ corrected_graph = ds.build_connectivity_map(corrected_neighbors)
 ```
 
 Use {doc}`../concepts/provenance` to inspect complete lineage and
-{doc}`provenance_and_reuse` for reuse and invalidation patterns. Migration from
-the removed `make_graph` method is documented in
-{doc}`../developers/migration_notes`.
+{doc}`provenance_and_reuse` for reuse and invalidation patterns.
