@@ -617,17 +617,15 @@ class _MappingOperationsMixin(_MappingOperationsBase):
                     ),
                 }
             )
-            return load_projection(
-                self.zw,
-                projection_plan.ref,
-                reference=reference,
-            )
         except BaseException:
-            if writer.finished:
-                artifact_group(self.zw, writer.ref).attrs["complete"] = False
-            else:
+            if not writer.finished:
                 writer.abort()
             raise
+        return load_projection(
+            self.zw,
+            projection_plan.ref,
+            reference=reference,
+        )
 
     @staticmethod
     def _query_batch_codes(

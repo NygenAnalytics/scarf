@@ -77,7 +77,7 @@ expose a cgroup peak scope for these runs, so short spikes may be missed.
 | Input cells | CPU | Container memory | Scarf budget | n | Wall time | Peak cgroup memory | Peak RSS |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 10,000 | 4 | 16 GiB | 12 GiB | 2 | 854.1 s (14.2 min), 95% CI ±1,577.7 s | 2.6 GiB ±0.7 | 2.6 GiB ±0.4 |
-| 50,000 | 4 | 16 GiB | 12 GiB | 1 | 580.1 s (9.7 min) | 5.2 GiB | 5.3 GiB |
+| 50,000 | 4 | 16 GiB | 12 GiB | 2 | 930.6 s (15.5 min), 95% CI ±4,453.8 s | 5.2 GiB ±0.4 | 5.2 GiB ±0.7 |
 | 100,000 | 4 | 16 GiB | 12 GiB | 1 | 989.1 s (16.5 min) | 6.8 GiB | 7.0 GiB |
 | 500,000 | 8 | 32 GiB | 24 GiB | 1 | 1,617.9 s (27.0 min) | 26.6 GiB | 27.0 GiB |
 | 1,000,000 | 8 | 32 GiB | 24 GiB | 1 | 2,712.0 s (45.2 min) | 28.8 GiB | 29.2 GiB |
@@ -87,7 +87,7 @@ expose a cgroup peak scope for these runs, so short spikes may be missed.
 ### Replicate totals
 
 Individual completed totals for matching configurations. Second replicates for
-50k through 5M are still running or queued; 10M remains `n = 1`. With `n = 2`,
+100k through 5M are still running or queued; 10M remains `n = 1`. With `n = 2`,
 the Student-t 95% CI is provisional and can be very wide.
 
 | Input cells | Replicate | Wall time (s) | Peak cgroup (GiB) | Peak RSS (GiB) |
@@ -95,6 +95,7 @@ the Student-t 95% CI is provisional and can be very wide.
 | 10,000 | r1 | 729.9 | 2.7 | 2.7 |
 | 10,000 | r2 | 978.3 | 2.6 | 2.6 |
 | 50,000 | r1 | 580.1 | 5.2 | 5.3 |
+| 50,000 | r2 | 1,281.1 | 5.2 | 5.1 |
 | 100,000 | r1 | 989.1 | 6.8 | 7.0 |
 | 500,000 | r1 | 1,617.9 | 26.6 | 27.0 |
 | 1,000,000 | r1 | 2,712.0 | 28.8 | 29.2 |
@@ -107,35 +108,37 @@ the initial download and a few seconds of orchestration.
 
 | Stage | 10k | 50k | 100k | 500k | 1M | 5M | 10M |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Dataset download | 2.4 | 12.4 | 26.4 | 118.8 | 59.2 | 1,123.8 | 2,174.9 |
-| Create count store | 5.6 | 17.7 | 47.1 | 206.8 | 613.8 | 1,300.9 | 3,481.2 |
-| Write `countsT` | 8.2 | 16.8 | 39.3 | 72.7 | 144.9 | 512.7 | 1,384.8 |
-| Initialize datastore | 30.4 | 18.7 | 39.9 | 59.6 | 83.6 | 311.8 | 683.0 |
-| Reopen datastore | 10.1 | 5.8 | 7.3 | 8.1 | 6.2 | 5.4 | 10.3 |
-| Filter cells | 30.7 | 14.1 | 28.5 | 25.6 | 20.4 | 25.0 | 54.0 |
-| Mark HVGs | 61.0 | 38.0 | 71.8 | 95.5 | 183.5 | 619.4 | 1,366.9 |
-| Normalize | 36.6 | 25.9 | 62.9 | 134.6 | 166.4 | 926.1 | 1,296.4 |
-| PCA | 43.8 | 23.7 | 44.7 | 60.8 | 79.1 | 223.2 | 570.9 |
-| Build embedding initialization | 12.8 | 7.2 | 12.9 | 17.0 | 26.2 | 109.1 | 246.5 |
-| Build ANN index | 23.3 | 12.4 | 27.4 | 56.8 | 86.5 | 341.4 | 831.5 |
-| Query neighbours | 26.8 | 12.6 | 21.6 | 30.7 | 45.4 | 108.2 | 299.8 |
-| Build connectivity map | 53.1 | 49.0 | 49.1 | 43.0 | 51.1 | 43.0 | 101.8 |
-| UMAP | 66.0 | 52.4 | 102.4 | 137.4 | 284.4 | 699.3 | 1,772.2 |
-| Leiden | 55.6 | 34.9 | 57.7 | 128.7 | 259.6 | 1,348.4 | 3,486.5 |
-| Paris | 112.8 | 65.7 | 106.7 | 115.2 | 132.8 | 261.1 | 769.2 |
-| Marker search | 115.4 | 78.5 | 105.3 | 150.0 | 293.0 | 1,712.7 | 6,117.9 |
-| **Funnel total** | **854.1** | **580.1** | **989.1** | **1,617.9** | **2,712.0** | **10,308.9** | **25,897.9** |
+| Dataset download | 2.4 | 95.3 | 26.4 | 118.8 | 59.2 | 1,123.8 | 2,174.9 |
+| Create count store | 5.6 | 18.0 | 47.1 | 206.8 | 613.8 | 1,300.9 | 3,481.2 |
+| Write `countsT` | 8.2 | 19.4 | 39.3 | 72.7 | 144.9 | 512.7 | 1,384.8 |
+| Initialize datastore | 30.4 | 29.5 | 39.9 | 59.6 | 83.6 | 311.8 | 683.0 |
+| Reopen datastore | 10.1 | 8.8 | 7.3 | 8.1 | 6.2 | 5.4 | 10.3 |
+| Filter cells | 30.7 | 25.5 | 28.5 | 25.6 | 20.4 | 25.0 | 54.0 |
+| Mark HVGs | 61.0 | 60.4 | 71.8 | 95.5 | 183.5 | 619.4 | 1,366.9 |
+| Normalize | 36.6 | 38.5 | 62.9 | 134.6 | 166.4 | 926.1 | 1,296.4 |
+| PCA | 43.8 | 35.4 | 44.7 | 60.8 | 79.1 | 223.2 | 570.9 |
+| Build embedding initialization | 12.8 | 11.0 | 12.9 | 17.0 | 26.2 | 109.1 | 246.5 |
+| Build ANN index | 23.3 | 21.6 | 27.4 | 56.8 | 86.5 | 341.4 | 831.5 |
+| Query neighbours | 26.8 | 21.2 | 21.6 | 30.7 | 45.4 | 108.2 | 299.8 |
+| Build connectivity map | 53.1 | 55.7 | 49.1 | 43.0 | 51.1 | 43.0 | 101.8 |
+| UMAP | 66.0 | 72.9 | 102.4 | 137.4 | 284.4 | 699.3 | 1,772.2 |
+| Leiden | 55.6 | 55.5 | 57.7 | 128.7 | 259.6 | 1,348.4 | 3,486.5 |
+| Paris | 112.8 | 98.8 | 106.7 | 115.2 | 132.8 | 261.1 | 769.2 |
+| Marker search | 115.4 | 118.4 | 105.3 | 150.0 | 293.0 | 1,712.7 | 6,117.9 |
+| **Funnel total** | **854.1** | **930.6** | **989.1** | **1,617.9** | **2,712.0** | **10,308.9** | **25,897.9** |
 
-The 10k stage column is the mean of two replicates. End-to-end 10k wall time
-95% CI half-width is ±1,577.7 s; stage-level half-widths are omitted from the
-table because `n = 2` intervals are too wide to be useful at a glance.
+The 10k and 50k stage columns are means of two replicates. End-to-end wall-time
+95% CI half-widths are ±1,577.7 s (10k) and ±4,453.8 s (50k). Stage-level
+half-widths are omitted because `n = 2` intervals are too wide to be useful at a
+glance. The large 50k interval is dominated by download drift (12.4 s vs
+178.3 s).
 
 ## Interpretation
 
-Most published rows are still one completed run (`n = 1`). The 10k row now has
-two replicates and reports mean wall time with a Student-t 95% confidence
-interval. With `n = 2`, that interval remains wide and should be treated as
-provisional drift capture rather than a tight uncertainty bound.
+Most published rows are still one completed run (`n = 1`). The 10k and 50k rows
+now have two replicates and report mean wall time with a Student-t 95%
+confidence interval. With `n = 2`, that interval remains wide and should be
+treated as provisional drift capture rather than a tight uncertainty bound.
 
 These runs replace the previous July 2026 1M and 10M reference rows. The older
 10M measurement used 16 CPU and 128 GiB; the current 10M measurement uses 16 CPU

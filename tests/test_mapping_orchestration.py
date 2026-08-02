@@ -280,6 +280,54 @@ def test_mapping_failure_leaves_projection_incomplete(
     assert not failed.complete
 
 
+def test_mapping_load_failure_after_finish_keeps_projection_complete(
+    analyzed_datastore_ephemeral,
+    tmp_path,
+    monkeypatch,
+):
+    reference_store = analyzed_datastore_ephemeral
+    reference = _plain_reference(reference_store)
+    query = _copied_query(reference_store, tmp_path / "query-load-fail.zarr")
+    before = set(
+        list_artifacts(
+            query.zw,
+            scope="assay",
+            assay="RNA",
+            kind="projection",
+        )
+    )
+
+    def fail_load(*_args, **_kwargs):
+        raise RuntimeError("injected load_projection failure")
+
+    monkeypatch.setattr(mapping_operations, "load_projection", fail_load)
+    with pytest.raises(RuntimeError, match="injected load_projection failure"):
+        query.run_mapping(reference, "load_failure")
+
+    created = (
+        set(
+            list_artifacts(
+                query.zw,
+                scope="assay",
+                assay="RNA",
+                kind="projection",
+            )
+        )
+        - before
+    )
+    assert len(created) == 1
+    finished = created.pop()
+    status = query.inspect_artifact(finished)
+    assert status.exists
+    assert status.complete
+
+    monkeypatch.undo()
+    loaded = query.get_mapping_result(finished, reference=reference)
+    assert loaded.ref == finished
+    reused = query.run_mapping(reference, "load_failure")
+    assert reused.ref == finished
+
+
 def test_mapping_guards_precede_query_writes(
     analyzed_datastore_ephemeral,
     tmp_path,

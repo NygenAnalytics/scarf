@@ -25,6 +25,7 @@ from scarf.graph.state import (
     read_assay_state,
     stored_assay_graph_from_state,
     validate_legacy_graph_selection,
+    write_assay_state,
 )
 from scarf.storage.artifacts import (
     ArtifactRef,
@@ -864,6 +865,27 @@ def test_state_rejects_incomplete_or_missing_graph_inputs() -> None:
     datastore.z[artifact_path(state.batch_correction)].attrs["complete"] = False
     with pytest.raises(RuntimeError, match="Artifact is incomplete"):
         datastore.get_latest_graph_loc("RNA", "I", "hvgs")
+
+
+def test_build_mapping_reference_preserves_existing_named_results(
+    analyzed_datastore_ephemeral,
+) -> None:
+    datastore = analyzed_datastore_ephemeral
+    start = datastore.get_assay_state("RNA")
+    assert start is not None
+    assert start.reduction is not None and start.neighbors is not None
+
+    planted = replace(
+        start,
+        named_results={**dict(start.named_results), "pca": start.reduction},
+    )
+    write_assay_state(datastore.zw, planted)
+
+    reference = datastore.build_mapping_reference(start.neighbors)
+    after = datastore.get_assay_state("RNA")
+    assert after is not None
+    assert after.named_results["pca"] == start.reduction
+    assert after.named_results["mapping_reference"] == reference.ref
 
 
 def test_mapping_reference_and_graph_do_not_clear_each_other(

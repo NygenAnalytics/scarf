@@ -434,10 +434,13 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
                 distance_values,
             )
             finish_artifact(group, planned)
+        previous = read_assay_state(self.zw, assay_name)
+        named = dict(previous.named_results) if previous is not None else {}
+        named["mapping_reference"] = planned.ref
         self._publish_current_artifact(
             neighbors,
             update_state=True,
-            named_results={"mapping_reference": planned.ref},
+            named_results=named,
         )
         return load_artifact_mapping_reference(self, planned.ref)
 
