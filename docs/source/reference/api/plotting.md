@@ -2,9 +2,6 @@
 
 `scarf.plotting` is Scarf's plotting API. Import it as `splt` and call functions such as
 `splt.embedding(...)`, `splt.dotplot(...)`, and `splt.cluster_tree(...)`.
-`boxplot`, `stacked_violin`, and `violinplot` plot per-gene expression values — a single box
-plot per gene (or a faceted grid), a minimalist stacked violin per gene coloured by mean
-expression, and grouped violins respectively — reading directly from a `DataStore`.
 For functions whose first argument is a datastore, `ds.plots.embedding(...)`
 and related accessor methods provide the same behavior with that argument
 already bound. Array and DataFrame diagnostics remain standalone.
@@ -14,7 +11,7 @@ Plot functions return a `PlotResult` and render by default with `show=True`. Pas
 
 ```{eval-rst}
 .. automodule:: scarf.plotting
-    :members: embedding, embedding_raster, unified_embedding, dotplot, matrixplot, composition, distribution, boxplot, stacked_violin, violinplot, cluster_connectivity, mapping_score, mapping_evidence, mapping_confusion, mapping_calibration, mapping_correction, mapping_projection, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, compose_results, register_theme, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap, run_recipe
+    :members: embedding, embedding_raster, unified_embedding, dotplot, matrixplot, composition, distribution, cluster_connectivity, mapping_score, mapping_evidence, mapping_confusion, mapping_calibration, mapping_correction, mapping_projection, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, compose_results, register_theme, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap, run_recipe
     :imported-members:
     :undoc-members:
     :show-inheritance:

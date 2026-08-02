@@ -15,7 +15,6 @@ from scarf.datastore.plot_accessor import DataStorePlotAccessor
 
 
 _STORE_PLOT_METHODS = (
-    "boxplot",
     "cluster_connectivity",
     "cluster_tree",
     "composition",
@@ -33,9 +32,7 @@ _STORE_PLOT_METHODS = (
     "matrixplot",
     "pseudotime_heatmap",
     "run_recipe",
-    "stacked_violin",
     "unified_embedding",
-    "violinplot",
 )
 
 
@@ -206,17 +203,6 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
         ("run_recipe", ("recipe.toml",), {"show": False}),
         ("cluster_tree", (), {"width": 2.5}),
         ("pseudotime_heatmap", (), {"vmax": 3.0}),
-        ("violinplot", (["GeneA"],), {"group_by": "cluster", "max_points": 17}),
-        (
-            "boxplot",
-            (["GeneA"],),
-            {"group_by": "cluster", "facet_by": "dataset", "n_cols": 2},
-        ),
-        (
-            "stacked_violin",
-            (["GeneA"],),
-            {"group_by": "cluster", "row_height": 1.2, "scale": "area"},
-        ),
     ],
 )
 def test_plot_accessor_forwards_to_canonical_function(
