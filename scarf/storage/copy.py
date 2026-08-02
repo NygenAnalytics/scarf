@@ -10,6 +10,7 @@ from .budget import ResourceBudget
 from .geometry import array_geometry
 from .layout import PROFILE_METADATA_CHUNK, normed_array_spec
 from .partition import row_band
+from .profiles import StorageProfile
 from .sharding import write_dense_in_shard_rows
 
 
@@ -70,6 +71,7 @@ def _copy_metadata_array(
     name: str,
     *,
     overwrite: bool,
+    profile: StorageProfile | None = None,
 ) -> None:
     if src.ndim != 1:
         create_metadata_column(
@@ -79,6 +81,7 @@ def _copy_metadata_array(
             dtype=src.dtype,
             overwrite=overwrite,
             chunkSize=PROFILE_METADATA_CHUNK,
+            profile=profile,
         )
         target = as_zarr_array(dst[name], name=name)
     else:
@@ -92,6 +95,7 @@ def _copy_metadata_array(
             overwrite=overwrite,
             chunkSize=PROFILE_METADATA_CHUNK,
             shape=int(src.shape[0]),
+            profile=profile,
         )
         n_rows = int(src.shape[0])
         for start in range(0, n_rows, block_rows):

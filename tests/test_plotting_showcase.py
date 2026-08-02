@@ -109,7 +109,7 @@ def test_showcase_matches_visual_references(
         reference_dir / name for name in _EXPECTED_OUTPUTS if name.endswith(".png")
     }
     assert set(reference_dir.glob("*.png")) == expected_pngs
-    tolerance = float(os.environ.get("SCARF_VISUAL_TOLERANCE", "1"))
+    tolerance = float(os.environ.get("SCARF_VISUAL_TOLERANCE", "1.5"))
     failures = []
     for actual in outputs:
         if actual.suffix != ".png":

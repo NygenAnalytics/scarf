@@ -4,11 +4,12 @@ This file records the latest completed full-scale Scarf measurements. It does
 not preserve superseded experiments or operational call identifiers.
 
 Where a configuration has multiple completed replicates, the main tables report
-the mean and a Student-t 95% confidence interval, with `n` shown explicitly.
-Until additional replicates finish, every row below is `n = 1`, so the reported
-value is the single completed run and no confidence interval is shown. A compact
-replicate summary holds individual totals so run-to-run drift remains visible as
-more measurements arrive.
+the mean and sample standard deviation, with `n` shown explicitly. Individual
+replicate totals are kept in a compact summary so run-to-run drift stays
+visible. Student-t 95% confidence intervals are not shown at `n = 2`: with one
+degree of freedom the critical value is about 12.7, so even modest drift
+produces an interval wider than the mean. Prefer `n >= 3` before publishing a
+t-based CI.
 
 ## Scope
 
@@ -76,19 +77,20 @@ expose a cgroup peak scope for these runs, so short spikes may be missed.
 
 | Input cells | CPU | Container memory | Scarf budget | n | Wall time | Peak cgroup memory | Peak RSS |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 | 4 | 16 GiB | 12 GiB | 2 | 854.1 s (14.2 min), 95% CI ±1,577.7 s | 2.6 GiB ±0.7 | 2.6 GiB ±0.4 |
-| 50,000 | 4 | 16 GiB | 12 GiB | 2 | 930.6 s (15.5 min), 95% CI ±4,453.8 s | 5.2 GiB ±0.4 | 5.2 GiB ±0.7 |
-| 100,000 | 4 | 16 GiB | 12 GiB | 1 | 989.1 s (16.5 min) | 6.8 GiB | 7.0 GiB |
-| 500,000 | 8 | 32 GiB | 24 GiB | 1 | 1,617.9 s (27.0 min) | 26.6 GiB | 27.0 GiB |
-| 1,000,000 | 8 | 32 GiB | 24 GiB | 1 | 2,712.0 s (45.2 min) | 28.8 GiB | 29.2 GiB |
+| 10,000 | 4 | 16 GiB | 12 GiB | 2 | 854.1 ± 175.6 s (14.2 min); range 729.9–978.3 | 2.6 GiB | 2.6 GiB |
+| 50,000 | 4 | 16 GiB | 12 GiB | 2 | 930.6 ± 495.7 s (15.5 min); range 580.1–1,281.1 | 5.2 GiB | 5.2 GiB |
+| 100,000 | 4 | 16 GiB | 12 GiB | 2 | 1,107.9 ± 168.0 s (18.5 min); range 989.1–1,226.7 | 6.9 GiB | 7.0 GiB |
+| 500,000 | 8 | 32 GiB | 24 GiB | 2 | 1,838.6 ± 312.1 s (30.6 min); range 1,617.9–2,059.3 | 26.8 GiB | 27.0 GiB |
+| 1,000,000 | 8 | 32 GiB | 24 GiB | 2 | 3,157.8 ± 630.4 s (52.6 min); range 2,712.0–3,603.5 | 28.9 GiB | 29.1 GiB |
 | 5,000,000 | 16 | 64 GiB | 48 GiB | 1 | 10,308.9 s (2.86 h) | 57.3 GiB | 57.4 GiB |
 | 10,000,000 | 16 | 64 GiB | 48 GiB | 1 | 25,897.9 s (7.19 h) | 56.4 GiB | 56.6 GiB |
+
+Wall-time `±` values are sample standard deviations, not confidence intervals.
 
 ### Replicate totals
 
 Individual completed totals for matching configurations. Second replicates for
-100k through 5M are still running or queued; 10M remains `n = 1`. With `n = 2`,
-the Student-t 95% CI is provisional and can be very wide.
+5M and 10M are still running.
 
 | Input cells | Replicate | Wall time (s) | Peak cgroup (GiB) | Peak RSS (GiB) |
 | ---: | --- | ---: | ---: | ---: |
@@ -97,8 +99,11 @@ the Student-t 95% CI is provisional and can be very wide.
 | 50,000 | r1 | 580.1 | 5.2 | 5.3 |
 | 50,000 | r2 | 1,281.1 | 5.2 | 5.1 |
 | 100,000 | r1 | 989.1 | 6.8 | 7.0 |
+| 100,000 | r2 | 1,226.7 | 7.0 | 7.0 |
 | 500,000 | r1 | 1,617.9 | 26.6 | 27.0 |
+| 500,000 | r2 | 2,059.3 | 27.0 | 27.0 |
 | 1,000,000 | r1 | 2,712.0 | 28.8 | 29.2 |
+| 1,000,000 | r2 | 3,603.5 | 29.0 | 29.1 |
 | 5,000,000 | r1 | 10,308.9 | 57.3 | 57.4 |
 | 10,000,000 | r1 | 25,897.9 | 56.4 | 56.6 |
 
@@ -108,37 +113,36 @@ the initial download and a few seconds of orchestration.
 
 | Stage | 10k | 50k | 100k | 500k | 1M | 5M | 10M |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Dataset download | 2.4 | 95.3 | 26.4 | 118.8 | 59.2 | 1,123.8 | 2,174.9 |
-| Create count store | 5.6 | 18.0 | 47.1 | 206.8 | 613.8 | 1,300.9 | 3,481.2 |
-| Write `countsT` | 8.2 | 19.4 | 39.3 | 72.7 | 144.9 | 512.7 | 1,384.8 |
-| Initialize datastore | 30.4 | 29.5 | 39.9 | 59.6 | 83.6 | 311.8 | 683.0 |
-| Reopen datastore | 10.1 | 8.8 | 7.3 | 8.1 | 6.2 | 5.4 | 10.3 |
-| Filter cells | 30.7 | 25.5 | 28.5 | 25.6 | 20.4 | 25.0 | 54.0 |
-| Mark HVGs | 61.0 | 60.4 | 71.8 | 95.5 | 183.5 | 619.4 | 1,366.9 |
-| Normalize | 36.6 | 38.5 | 62.9 | 134.6 | 166.4 | 926.1 | 1,296.4 |
-| PCA | 43.8 | 35.4 | 44.7 | 60.8 | 79.1 | 223.2 | 570.9 |
-| Build embedding initialization | 12.8 | 11.0 | 12.9 | 17.0 | 26.2 | 109.1 | 246.5 |
-| Build ANN index | 23.3 | 21.6 | 27.4 | 56.8 | 86.5 | 341.4 | 831.5 |
-| Query neighbours | 26.8 | 21.2 | 21.6 | 30.7 | 45.4 | 108.2 | 299.8 |
-| Build connectivity map | 53.1 | 55.7 | 49.1 | 43.0 | 51.1 | 43.0 | 101.8 |
-| UMAP | 66.0 | 72.9 | 102.4 | 137.4 | 284.4 | 699.3 | 1,772.2 |
-| Leiden | 55.6 | 55.5 | 57.7 | 128.7 | 259.6 | 1,348.4 | 3,486.5 |
-| Paris | 112.8 | 98.8 | 106.7 | 115.2 | 132.8 | 261.1 | 769.2 |
-| Marker search | 115.4 | 118.4 | 105.3 | 150.0 | 293.0 | 1,712.7 | 6,117.9 |
-| **Funnel total** | **854.1** | **930.6** | **989.1** | **1,617.9** | **2,712.0** | **10,308.9** | **25,897.9** |
+| Dataset download | 2.4 | 95.3 | 31.8 | 92.5 | 242.1 | 1,123.8 | 2,174.9 |
+| Create count store | 5.6 | 18.0 | 40.4 | 178.8 | 521.7 | 1,300.9 | 3,481.2 |
+| Write `countsT` | 8.2 | 19.4 | 40.5 | 100.2 | 190.4 | 512.7 | 1,384.8 |
+| Initialize datastore | 30.4 | 29.5 | 40.1 | 63.5 | 99.8 | 311.8 | 683.0 |
+| Reopen datastore | 10.1 | 8.8 | 9.7 | 10.5 | 9.2 | 5.4 | 10.3 |
+| Filter cells | 30.7 | 25.5 | 31.4 | 30.3 | 30.4 | 25.0 | 54.0 |
+| Mark HVGs | 61.0 | 60.4 | 89.3 | 142.9 | 246.1 | 619.4 | 1,366.9 |
+| Normalize | 36.6 | 38.5 | 63.2 | 135.7 | 218.2 | 926.1 | 1,296.4 |
+| PCA | 43.8 | 35.4 | 49.4 | 70.7 | 101.9 | 223.2 | 570.9 |
+| Build embedding initialization | 12.8 | 11.0 | 14.2 | 18.5 | 27.8 | 109.1 | 246.5 |
+| Build ANN index | 23.3 | 21.6 | 30.6 | 74.0 | 125.1 | 341.4 | 831.5 |
+| Query neighbours | 26.8 | 21.2 | 24.5 | 37.0 | 53.0 | 108.2 | 299.8 |
+| Build connectivity map | 53.1 | 55.7 | 51.6 | 52.4 | 55.8 | 43.0 | 101.8 |
+| UMAP | 66.0 | 72.9 | 104.8 | 182.9 | 323.7 | 699.3 | 1,772.2 |
+| Leiden | 55.6 | 55.5 | 65.3 | 143.1 | 257.6 | 1,348.4 | 3,486.5 |
+| Paris | 112.8 | 98.8 | 116.2 | 133.6 | 156.5 | 261.1 | 769.2 |
+| Marker search | 115.4 | 118.4 | 139.0 | 181.2 | 282.2 | 1,712.7 | 6,117.9 |
+| **Funnel total** | **854.1** | **930.6** | **1,107.9** | **1,838.6** | **3,157.8** | **10,308.9** | **25,897.9** |
 
-The 10k and 50k stage columns are means of two replicates. End-to-end wall-time
-95% CI half-widths are ±1,577.7 s (10k) and ±4,453.8 s (50k). Stage-level
-half-widths are omitted because `n = 2` intervals are too wide to be useful at a
-glance. The large 50k interval is dominated by download drift (12.4 s vs
-178.3 s).
+The 10k through 1M stage columns are means of two replicates. The large 50k
+and 1M wall-time SDs are dominated by download drift (50k: 12.4 s vs 178.3 s;
+1M: 59.2 s vs 425.0 s), not by a proportional slowdown across every pipeline
+stage.
 
 ## Interpretation
 
-Most published rows are still one completed run (`n = 1`). The 10k and 50k rows
-now have two replicates and report mean wall time with a Student-t 95%
-confidence interval. With `n = 2`, that interval remains wide and should be
-treated as provisional drift capture rather than a tight uncertainty bound.
+The 5M and 10M rows are still one completed run (`n = 1`) while their second
+replicates run. The 10k through 1M rows have two replicates and report mean ±
+sample SD plus the observed range. That is enough to show drift at `n = 2`. A
+Student-t 95% CI will wait until there are at least three matching replicates.
 
 These runs replace the previous July 2026 1M and 10M reference rows. The older
 10M measurement used 16 CPU and 128 GiB; the current 10M measurement uses 16 CPU

@@ -926,7 +926,7 @@ def test_write_counts_t_rejects_oversized_tile():
         )
 
 
-def test_repack_preserves_counts_t_attrs(tmp_path):
+def test_repack_rebuilds_complete_counts_t(tmp_path):
     from scarf.tools.repack_zarr import repack_store
 
     src_path = tmp_path / "src.zarr"
@@ -936,7 +936,7 @@ def test_repack_preserves_counts_t_attrs(tmp_path):
     _write_small_assay(root, workspace=None, values=values)
     assert root["RNA/countsT"].attrs["complete"] is True
 
-    repack_store(str(src_path), str(dst_path), profile="fast_local", shard_counts=False)
+    repack_store(str(src_path), str(dst_path), profile="fast_local")
     dst = zarr.open_group(str(dst_path), mode="r")
     assert "countsT" in dst["RNA"]
     assert dst["RNA/countsT"].attrs["complete"] is True

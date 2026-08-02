@@ -196,7 +196,7 @@ For an S3 or GCS source, pass the URI directly. The target can remain local:
 mounted = scarf.mount_datastore(
     's3://shared-bucket/atlas.zarr',
     at='my-analysis.zarr',
-    storage_options={'anon': True},
+    storage_options={'skip_signature': True},
     zarrProfile='fast_local',
 )
 ```
@@ -221,7 +221,7 @@ ds = scarf.DataStore(
     "s3://example-bucket/path/to/data.zarr",
     zarr_mode="r",
     zarrProfile="cloud",
-    storage_options={"anon": True},
+    storage_options={"skip_signature": True},
     mem_budget="16G",
     nthreads=8,
 )
@@ -302,11 +302,16 @@ counts:
 
 ```bash
 uv run python -m scarf.tools.repack_zarr \
-  input.zarr output.zarr --profile cloud
+  s3://bucket/input.zarr s3://bucket/output.zarr \
+  --profile cloud \
+  --mem-budget 8G \
+  --storage-options '{"skip_signature": true}'
 ```
 
-Point `DataStore` at the output URI afterward. Repacking rewrites layout for a
-storage profile; it is not an analysis step.
+Paths stay as URIs (do not pass them through `pathlib.Path`). Use
+`--storage-options` for backend credentials or public reads (`skip_signature`
+for anonymous S3/GCS). Point `DataStore` at the output URI afterward. Repacking
+rewrites layout for a storage profile; it is not an analysis step.
 
 For custom statistics over mounted graphs or count blocks, followed by a
 supported selective export, continue with {doc}`custom_analyses`.

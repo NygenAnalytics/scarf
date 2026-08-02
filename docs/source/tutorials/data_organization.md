@@ -140,7 +140,8 @@ ds.show_zarr_tree(start='RNA/artifacts', depth=1)
 
 Stores written before this layout encoded the whole chain into nested group
 names such as `RNA/normed__I__hvgs/reduction__pca__15__I/...`. Scarf still reads
-those, and {doc}`../developers/zarr_internals` covers repacking them.
+those. {doc}`../developers/zarr_internals` covers repacking older stores to Zarr
+v3 with sharded counts; that does not migrate nested path trees into artifacts.
 
 ### 2. Inspect cell and feature attributes
 

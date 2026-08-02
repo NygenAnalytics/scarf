@@ -6,7 +6,7 @@ description: What Scarf is designed for, how it works, the methods it implements
 
 # Scarf
 
-Scarf stands for Single Cell Analysis on Remote File Systems. It is a Python
+Scarf stands for **S**ingle **C**ell **A**nalysis on **R**emote **F**ilesystems. It is a Python
 package for memory-efficient analysis of single-cell RNA, ATAC, and multimodal
 data. It is designed for analyses where the count matrix is too large, too
 remote, or too valuable to duplicate for every branch of an analysis.
