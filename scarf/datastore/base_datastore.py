@@ -1,6 +1,6 @@
 import numpy as np
 import zarr
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from ..storage.artifacts import (
@@ -36,6 +36,7 @@ from ..utils.logging import logger
 if TYPE_CHECKING:
     from ..graph.state import AssayState
     from ..lineage import ArtifactLineage
+    from ..mapping.reference import MappingReference
     from .summary import DataStoreSummary
 
 
@@ -189,11 +190,49 @@ class BaseDataStore:
     def lineage(
         self,
         target: ArtifactRef | Mapping[str, ArtifactRef],
+        *,
+        references: "MappingReference | Sequence[MappingReference] | None" = None,
     ) -> "ArtifactLineage":
         """Build a read-only upstream lineage report for artifact outputs."""
         from ..lineage import ArtifactLineage
+        from ..mapping.reference import MappingReference
 
-        return ArtifactLineage.from_store(self.zw, target)
+        if references is None:
+            resolved_references: Sequence[MappingReference] = ()
+        elif isinstance(references, MappingReference):
+            resolved_references = (references,)
+        elif isinstance(references, Sequence) and not isinstance(
+            references, str | bytes
+        ):
+            resolved_references = references
+        else:
+            raise TypeError(
+                "references must be a MappingReference, a sequence of "
+                "MappingReference values, or None"
+            )
+
+        external_roots: dict[str, zarr.Group] = {}
+        for index, reference in enumerate(resolved_references):
+            if not isinstance(reference, MappingReference):
+                raise TypeError(f"references[{index}] must be a MappingReference")
+            reference.validate_dataset_fingerprint()
+            fingerprint = reference.external_ref.dataset_fingerprint
+            root = reference.datastore.zw
+            existing = external_roots.get(fingerprint)
+            if existing is not None and str(existing.store_path) != str(
+                root.store_path
+            ):
+                raise ValueError(
+                    "References contain duplicate dataset fingerprint "
+                    f"{fingerprint!r} for conflicting roots"
+                )
+            external_roots[fingerprint] = root
+
+        return ArtifactLineage.from_store(
+            self.zw,
+            target,
+            external_roots=external_roots,
+        )
 
     def load_artifact(self, ref: ArtifactRef) -> zarr.Group:
         """Open a complete artifact through a read-only Zarr group."""

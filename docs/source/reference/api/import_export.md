@@ -72,6 +72,24 @@ supported source. Pass one returned candidate to `MtxReader`.
 .. autoclass:: scarf.readers.MtxCandidate
 ```
 
+## Seurat import
+
+```{eval-rst}
+.. autoclass:: scarf.SeuratReader
+    :members:
+
+.. autofunction:: scarf.inspect_seurat
+
+.. autoclass:: scarf.SeuratInspectResult
+    :members:
+
+.. autoclass:: scarf.SeuratImportResult
+    :members:
+
+.. autoclass:: scarf.SeuratToZarr
+    :members:
+```
+
 ## Writers
 
 ```{eval-rst}

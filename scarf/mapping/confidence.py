@@ -42,8 +42,7 @@ def _distance_quantile_summary(
     return quantiles, np.quantile(values, quantiles)
 
 
-def distance_weights(distances: np.ndarray) -> np.ndarray:
-    """Convert HNSW squared-L2 distances into normalized inverse-L2 weights."""
+def _validated_distances(distances: np.ndarray) -> np.ndarray:
     values = np.asarray(distances, dtype=np.float64)
     if values.ndim != 2:
         raise ValueError("Expected a two-dimensional distance array")
@@ -51,10 +50,28 @@ def distance_weights(distances: np.ndarray) -> np.ndarray:
         raise ValueError("Neighbor distances must be finite")
     if np.any(values < 0):
         raise ValueError("Neighbor distances must be non-negative")
+    return values
 
-    l2_distances = np.sqrt(values)
-    weights = np.zeros_like(l2_distances)
-    zero_mask = l2_distances == 0
+
+def mapping_score_weights(distances: np.ndarray) -> np.ndarray:
+    """Return absolute neighbor weights for reference-side mapping scores.
+
+    The weight of one reference neighbor is ``1 / (log(distance + 1) + 1)``.
+    Weights are not normalized per query cell, so a query cell that sits far
+    from the reference contributes less total weight than one that lands on the
+    reference manifold. Normalizing per row would erase that contrast and make
+    the score a plain neighbor count.
+    """
+    weights: np.ndarray = 1.0 / (np.log1p(_validated_distances(distances)) + 1.0)
+    return weights
+
+
+def distance_weights(distances: np.ndarray) -> np.ndarray:
+    """Convert metric distances into normalized inverse-distance weights."""
+    values = _validated_distances(distances)
+
+    weights = np.zeros_like(values)
+    zero_mask = values == 0
     zero_count = zero_mask.sum(axis=1)
     rows_with_zero = zero_count > 0
     if rows_with_zero.any():
@@ -63,8 +80,13 @@ def distance_weights(distances: np.ndarray) -> np.ndarray:
         )
     rows_without_zero = ~rows_with_zero
     if rows_without_zero.any():
-        inverse = 1.0 / l2_distances[rows_without_zero]
-        weights[rows_without_zero] = inverse / inverse.sum(axis=1, keepdims=True)
+        positive = values[rows_without_zero]
+        minimum = positive.min(axis=1, keepdims=True)
+        inverse_ratios = minimum / positive
+        weights[rows_without_zero] = inverse_ratios / inverse_ratios.sum(
+            axis=1,
+            keepdims=True,
+        )
     return weights
 
 

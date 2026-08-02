@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
+from ..mapping.models import MappingResult
+from ..mapping.reference import MappingReference
 from ..plotting._contracts import (
     CategoricalScale,
     CellField,
@@ -22,6 +24,7 @@ from ..plotting._contracts import (
 )
 from ..plotting._figure import PlotResult
 from ..plotting.recipes import PlotRecipe, PlotRecipeResult
+from ..storage.refs import ArtifactRef
 
 if TYPE_CHECKING:
     from .datastore import DataStore
@@ -159,60 +162,15 @@ class DataStorePlotAccessor:
             show=show,
         )
 
-    def unified_embedding(
-        self,
-        *,
-        layout_key: str,
-        from_assay: str | None = None,
-        show_target_only: bool = False,
-        ref_name: str = "reference",
-        target_groups: Sequence[Any] | None = None,
-        point_size: float | None = None,
-        categorical_scale: "CategoricalScale | None" = None,
-        missing_color: str = "#bdbdbd",
-        figsize: tuple[float, float] | None = None,
-        theme: str = "notebook",
-        legend_loc: "LegendLoc" = "auto",
-        max_on_data_labels: int = 40,
-        frame: "FrameStyle" = "minimal",
-        seed: int | None = None,
-        rasterize_threshold: int = 50_000,
-        target: Any | None = None,
-        show: bool = True,
-    ) -> "PlotResult":
-        """Plot a unified reference and query embedding."""
-        from ..plotting import unified_embedding
-
-        return unified_embedding(
-            self._store,
-            layout_key=layout_key,
-            from_assay=from_assay,
-            show_target_only=show_target_only,
-            ref_name=ref_name,
-            target_groups=target_groups,
-            point_size=point_size,
-            categorical_scale=categorical_scale,
-            missing_color=missing_color,
-            figsize=figsize,
-            theme=theme,
-            legend_loc=legend_loc,
-            max_on_data_labels=max_on_data_labels,
-            frame=frame,
-            seed=seed,
-            rasterize_threshold=rasterize_threshold,
-            target=target,
-            show=show,
-        )
-
     def mapping_score(
         self,
+        result: MappingResult | ArtifactRef | str,
         *,
-        target_name: str,
+        reference: MappingReference | None = None,
         target_groups: Sequence[Any] | np.ndarray | None = None,
         layout_key: str | None = None,
         kind: Literal["embedding", "histogram"] = "embedding",
-        from_assay: str | None = None,
-        cell_key: str | None = None,
+        query_assay: str | None = None,
         log_transform: bool = True,
         multiplier: float = 1000,
         weighted: bool = True,
@@ -232,12 +190,12 @@ class DataStorePlotAccessor:
 
         return mapping_score(
             self._store,
-            target_name=target_name,
+            result,
+            reference=reference,
             target_groups=target_groups,
             layout_key=layout_key,
             kind=kind,
-            from_assay=from_assay,
-            cell_key=cell_key,
+            query_assay=query_assay,
             log_transform=log_transform,
             multiplier=multiplier,
             weighted=weighted,
@@ -255,8 +213,9 @@ class DataStorePlotAccessor:
 
     def mapping_evidence(
         self,
+        result: MappingResult | ArtifactRef | str,
         *,
-        target_name: str,
+        reference: MappingReference | None = None,
         reference_class_group: str,
         target_groups: Sequence[Any] | np.ndarray | None = None,
         metrics: Sequence[str] = (
@@ -268,8 +227,7 @@ class DataStorePlotAccessor:
         kind: Literal["histogram", "box", "embedding"] = "histogram",
         reference_layout_key: str | None = None,
         bins: int = 30,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
+        query_assay: str | None = None,
         threshold_fraction: float = 0.5,
         na_val: str = "NA",
         max_distance: float | None = None,
@@ -288,15 +246,15 @@ class DataStorePlotAccessor:
 
         return mapping_evidence(
             self._store,
-            target_name=target_name,
+            result,
+            reference=reference,
             reference_class_group=reference_class_group,
             target_groups=target_groups,
             metrics=metrics,
             kind=kind,
             reference_layout_key=reference_layout_key,
             bins=bins,
-            from_assay=from_assay,
-            cell_key=cell_key,
+            query_assay=query_assay,
             threshold_fraction=threshold_fraction,
             na_val=na_val,
             max_distance=max_distance,
@@ -313,15 +271,15 @@ class DataStorePlotAccessor:
 
     def mapping_confusion(
         self,
+        result: MappingResult | ArtifactRef | str,
         *,
-        target_name: str,
+        reference: MappingReference | None = None,
         reference_class_group: str,
         known_labels: Sequence[Any] | np.ndarray,
         normalize: Literal["none", "true", "predicted", "all"] = "true",
         known_order: Sequence[Any] | None = None,
         predicted_order: Sequence[Any] | None = None,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
+        query_assay: str | None = None,
         threshold_fraction: float = 0.5,
         na_val: str = "NA",
         max_distance: float | None = None,
@@ -337,14 +295,14 @@ class DataStorePlotAccessor:
 
         return mapping_confusion(
             self._store,
-            target_name=target_name,
+            result,
+            reference=reference,
             reference_class_group=reference_class_group,
             known_labels=known_labels,
             normalize=normalize,
             known_order=known_order,
             predicted_order=predicted_order,
-            from_assay=from_assay,
-            cell_key=cell_key,
+            query_assay=query_assay,
             threshold_fraction=threshold_fraction,
             na_val=na_val,
             max_distance=max_distance,
@@ -358,8 +316,9 @@ class DataStorePlotAccessor:
 
     def mapping_calibration(
         self,
+        result: MappingResult | ArtifactRef | str,
         *,
-        target_name: str,
+        reference: MappingReference | None = None,
         reference_class_group: str,
         known_labels: Sequence[Any] | np.ndarray,
         metric: str = "voteFraction",
@@ -367,8 +326,7 @@ class DataStorePlotAccessor:
         thresholds: Sequence[float] | np.ndarray | None = None,
         n_thresholds: int = 50,
         chosen_threshold: float | None = None,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
+        query_assay: str | None = None,
         na_val: str = "NA",
         max_distance: float | None = None,
         target: Any | None = None,
@@ -381,7 +339,8 @@ class DataStorePlotAccessor:
 
         return mapping_calibration(
             self._store,
-            target_name=target_name,
+            result,
+            reference=reference,
             reference_class_group=reference_class_group,
             known_labels=known_labels,
             metric=metric,
@@ -389,8 +348,7 @@ class DataStorePlotAccessor:
             thresholds=thresholds,
             n_thresholds=n_thresholds,
             chosen_threshold=chosen_threshold,
-            from_assay=from_assay,
-            cell_key=cell_key,
+            query_assay=query_assay,
             na_val=na_val,
             max_distance=max_distance,
             target=target,
@@ -399,58 +357,24 @@ class DataStorePlotAccessor:
             show=show,
         )
 
-    def mapping_correction(
-        self,
-        *,
-        target_name: str,
-        batch_labels: Sequence[Any] | np.ndarray | None = None,
-        dimensions: tuple[int, int] = (0, 1),
-        from_assay: str | None = None,
-        cell_key: str | None = None,
-        categorical_scale: CategoricalScale | None = None,
-        point_size: float | None = None,
-        target: Any | None = None,
-        figsize: tuple[float, float] | None = None,
-        theme: str = "notebook",
-        show_legend: bool = True,
-        show: bool = True,
-    ) -> PlotResult:
-        """Compare query latent coordinates before and after mapping correction."""
-        from ..plotting import mapping_correction
-
-        return mapping_correction(
-            self._store,
-            target_name=target_name,
-            batch_labels=batch_labels,
-            dimensions=dimensions,
-            from_assay=from_assay,
-            cell_key=cell_key,
-            categorical_scale=categorical_scale,
-            point_size=point_size,
-            target=target,
-            figsize=figsize,
-            theme=theme,
-            show_legend=show_legend,
-            show=show,
-        )
-
     def mapping_projection(
         self,
+        result: MappingResult | ArtifactRef | str,
         *,
-        target_name: str,
+        reference: MappingReference | None = None,
         reference_layout_key: str,
         reference_groups: str | Sequence[Any] | np.ndarray | None = None,
         target_groups: Sequence[Any] | np.ndarray | None = None,
         reference_class_group: str | None = None,
         threshold_fraction: float = 0.5,
         na_val: str = "NA",
-        from_assay: str | None = None,
-        cell_key: str | None = None,
+        query_assay: str | None = None,
         ref_name: str = "reference",
+        reference_mode: Literal["background", "groups"] = "background",
         categorical_scale: CategoricalScale | None = None,
         point_size: float | None = None,
-        reference_alpha: float = 0.35,
-        target_alpha: float = 0.9,
+        reference_alpha: float = 0.22,
+        target_alpha: float = 0.95,
         target: Any | None = None,
         figsize: tuple[float, float] | None = None,
         theme: str = "notebook",
@@ -462,16 +386,17 @@ class DataStorePlotAccessor:
 
         return mapping_projection(
             self._store,
-            target_name=target_name,
+            result,
+            reference=reference,
             reference_layout_key=reference_layout_key,
             reference_groups=reference_groups,
             target_groups=target_groups,
             reference_class_group=reference_class_group,
             threshold_fraction=threshold_fraction,
             na_val=na_val,
-            from_assay=from_assay,
-            cell_key=cell_key,
+            query_assay=query_assay,
             ref_name=ref_name,
+            reference_mode=reference_mode,
             categorical_scale=categorical_scale,
             point_size=point_size,
             reference_alpha=reference_alpha,

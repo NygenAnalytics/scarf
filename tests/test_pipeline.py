@@ -1,4 +1,5 @@
 import inspect
+from pathlib import Path
 from threading import Event, get_ident
 
 import pytest
@@ -647,9 +648,25 @@ def test_basic_rna_pipeline_supports_optional_harmony(
 
 def test_basic_rna_pipeline_runs_score_steps_after_clustering(
     datastore_ephemeral,
+    monkeypatch,
 ) -> None:
+    datastore = datastore_ephemeral
     events: list[PipelineEvent] = []
-    artifacts = datastore_ephemeral.pipeline.run(
+    temporary_paths: list[Path] = []
+    original_run_mapping = type(datastore).run_mapping
+
+    def observe_mapping(query, reference, mapping_name, **kwargs):
+        assert query is not datastore
+        temporary_paths.append(Path(query.zarr_loc))
+        return original_run_mapping(
+            query,
+            reference,
+            mapping_name,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(type(datastore), "run_mapping", observe_mapping)
+    artifacts = datastore.pipeline.run(
         filtering={},
         cell_cycle_scoring={},
         highly_variable_features={
@@ -681,6 +698,17 @@ def test_basic_rna_pipeline_runs_score_steps_after_clustering(
     assert artifacts["doublets"].kind == "doublet_score"
     assert artifacts["markers"].kind == "marker_table"
     assert list(artifacts).index("doublets") > list(artifacts).index("paris")
+    assert temporary_paths and all(not path.exists() for path in temporary_paths)
+    assert not datastore.list_artifacts(
+        kind="projection",
+        from_assay="RNA",
+    )
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    assert state.connectivity_map == artifacts["connectivity_map"]
+    reference = datastore.get_mapping_reference()
+    assert reference.neighbors == artifacts["neighbors"]
+    assert reference.symphony_state is None
     for stage in (
         "cell_cycle_scoring",
         "umap",

@@ -376,30 +376,35 @@ def test_current_reader_loads_master_derived_results(
     )
     assert imputed.shape == datastore.cells.fetch_all("I").shape
 
-    with pytest.warns(DeprecationWarning, match="predates projection provenance"):
-        classes = datastore.get_target_classes(
-            target_name="compat_self",
+    with pytest.raises(
+        ValueError,
+        match=r"build_mapping_reference\(neighbors\)",
+    ):
+        datastore.get_mapping_reference(from_assay="RNA")
+
+    assert (
+        datastore.list_artifacts(
+            kind="projection",
             from_assay="RNA",
-            cell_key="I",
+        )
+        == []
+    )
+    for legacy_name in ("compat_self", "compat_unified_umap"):
+        with pytest.raises(ValueError, match="MappingReference is required"):
+            datastore.get_mapping_result(legacy_name)
+
+    with pytest.raises(ValueError, match="MappingReference is required"):
+        datastore.get_target_classes(
+            "compat_self",
             reference_class_group="RNA_compat_leiden_1",
         )
-    assert classes.shape[0] == int(datastore.cells.fetch_all("I").sum())
+    with pytest.raises(ValueError, match="MappingReference is required"):
+        list(datastore.get_mapping_score("compat_self"))
 
-    with pytest.warns(DeprecationWarning, match="predates projection provenance"):
-        mapping_scores = list(
-            datastore.get_mapping_score(
-                target_name="compat_self",
-                from_assay="RNA",
-                cell_key="I",
-            )
-        )
-    assert mapping_scores
-
-    layout, _edges, n_cells, target_counts, target_names = (
+    with pytest.raises(AttributeError, match="_load_unified_layout_data"):
         datastore._load_unified_layout_data("compat_unified_umap", "RNA")
-    )
-    assert layout.shape[0] == n_cells + sum(target_counts)
-    assert target_names == ["compat_self"]
+    with pytest.raises(AttributeError, match="unified_embedding"):
+        datastore.plots.unified_embedding()
 
 
 @pytest.mark.integration

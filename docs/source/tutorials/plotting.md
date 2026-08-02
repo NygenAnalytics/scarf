@@ -179,9 +179,9 @@ define a cluster boundary.
 
 ### 2. Choose a style
 
-These options apply to embeddings (and to `unified_embedding` for mapping
-layouts). Defaults aim at compact figures. Override them when the default is a
-poor fit for your number of clusters or for the venue.
+These options apply to embeddings. Defaults aim at compact figures. Override
+them when the default is a poor fit for your number of clusters or for the
+venue.
 
 ### Legends, frame, and theme
 
@@ -426,8 +426,10 @@ plt.close(figure)
 ```
 
 ```{note}
-For unified reference and query layouts from mapping, use
-`ds.plots.unified_embedding` (see {doc}`mapping_and_label_transfer`).
+For a fixed-reference mapping view, first persist query coordinates with
+`query_ds.project_reference_embedding(...)`, then use
+`query_ds.plots.mapping_projection(...)`. See
+{doc}`mapping_and_label_transfer`.
 ```
 
 ### 7. Diagnostic plots used in workflow pages

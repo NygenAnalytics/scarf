@@ -110,6 +110,29 @@ def build_connectivity_arrays(
     return edges[positive], weights[positive]
 
 
+def take_nearest_per_row(
+    weights: np.ndarray,
+    edges: np.ndarray,
+    n_cells: int,
+    use_k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep the ``use_k`` nearest stored edges of every cell.
+
+    Edges are stored row major and ordered by increasing distance inside a cell,
+    so a row's leading entries are its nearest neighbors. Row widths are counted
+    rather than assumed, because zero-weight edges are dropped before storage and
+    can leave a cell with fewer than ``k`` edges.
+    """
+    sources = np.asarray(edges[:, 0], dtype=np.intp)
+    if np.any(np.diff(sources) < 0):
+        raise ValueError("Graph edges are not grouped by source cell")
+    counts = np.bincount(sources, minlength=n_cells)
+    row_starts = np.repeat(np.cumsum(counts) - counts, counts)
+    rank_in_row = np.arange(sources.size, dtype=np.intp) - row_starts
+    keep = rank_in_row < use_k
+    return weights[keep], edges[keep]
+
+
 @jit(nopython=True)
 def calc_snn(indices: np.ndarray) -> np.ndarray:
     """Calculate shared-neighbor fractions for a KNN index matrix."""

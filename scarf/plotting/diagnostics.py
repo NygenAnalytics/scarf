@@ -11,15 +11,6 @@ from ._figure import LegendSpec, PlotResult, normalize_axes_target
 from ._style import apply_figure_chrome, sort_categories, theme_context
 
 
-def _scarf_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("scarf")
-    except Exception:
-        return "unknown"
-
-
 def _clean_axis(ax: Any, *, tick_size: float = 10.0) -> None:
     ax.tick_params(axis="both", labelsize=tick_size)
     for spine in ax.spines.values():
@@ -212,7 +203,6 @@ def qc(
             ),
         ),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             n_cells=len(data),
             renderer="matplotlib",
             notes=("qc",),
@@ -309,7 +299,6 @@ def elbow(
         ),
         scales=(),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             n_cells=0,
             renderer="matplotlib",
             notes=("elbow",),
@@ -413,7 +402,6 @@ def graph_qc(
         ),
         scales=(),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             n_cells=len(degrees),
             renderer="matplotlib",
             notes=("graph_qc",),
@@ -519,7 +507,6 @@ def highly_variable_features(
         ),
         scales=(),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             n_cells=0,
             renderer="matplotlib",
             notes=("highly_variable_features",),

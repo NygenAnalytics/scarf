@@ -1,6 +1,5 @@
 from math import prod
 from typing import Literal, cast
-from uuid import uuid4
 
 import numpy as np
 import zarr
@@ -307,21 +306,6 @@ def _write_array(group: zarr.Group, name: str, values: np.ndarray) -> None:
         values.shape,
     )
     target[:] = values
-
-
-def write_hierarchy_generation(
-    root: zarr.Group,
-    graph_loc: str,
-    hierarchy: ParisHierarchy,
-    plateau_forest: PlateauForest,
-) -> tuple[str, str]:
-    """Write an immutable hierarchy generation and mark it complete."""
-    generation_id = uuid4().hex
-    location = generation_location(graph_loc, generation_id)
-    generation = root.create_group(location, overwrite=False)
-    write_hierarchy_group(generation, hierarchy, plateau_forest)
-    generation.attrs["complete"] = True
-    return generation_id, location
 
 
 def write_hierarchy_group(

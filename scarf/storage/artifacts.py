@@ -18,6 +18,7 @@ from .refs import (
     ARTIFACT_KINDS as ARTIFACT_KINDS,
     ArtifactRef as ArtifactRef,
     ArtifactScope as ArtifactScope,
+    ExternalArtifactRef as ExternalArtifactRef,
     _validate_artifact_kind,
     _validate_name,
     artifact_path as artifact_path,
@@ -39,7 +40,7 @@ def artifact_group(root: zarr.Group, ref: ArtifactRef) -> zarr.Group:
 
 
 def _canonical_node(value: Any) -> Any:
-    if isinstance(value, ArtifactRef):
+    if isinstance(value, ArtifactRef | ExternalArtifactRef):
         return _canonical_node(value.to_dict())
     if isinstance(value, np.generic):
         return _canonical_node(value.item())
@@ -342,7 +343,7 @@ def callable_identity(value: Any) -> dict[str, str]:
 
 
 def serialize_artifact_value(value: Any) -> Any:
-    if isinstance(value, ArtifactRef):
+    if isinstance(value, ArtifactRef | ExternalArtifactRef):
         return value.to_dict()
     if isinstance(value, np.ndarray):
         return {"value_fingerprint": fingerprint_array(value)}

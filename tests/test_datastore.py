@@ -12,8 +12,6 @@ import scarf.plotting as splt
 from scarf.assay import Assay
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.mapping_datastore import MappingDatastore
-from scarf.mapping.confidence import distance_weights
-from scarf.mapping.hashing import array_hash
 from scarf.metadata import MetaData
 from scarf.storage.artifacts import ArtifactRef
 from scarf.trajectory.results import (
@@ -541,50 +539,6 @@ class TestDataStore:
             actual = markers[str(group)].dropna().reset_index(drop=True)
             assert actual.equals(expected)
 
-    def test_run_unified_umap(self, run_unified_umap, datastore):
-        x, y, _reference_count, _target_counts, _target_names = (
-            datastore._load_unified_layout_data("unified_UMAP", "RNA")
-        )
-        coords = np.column_stack((x, y))
-        precalc_coords = np.load(full_path("unified_UMAP_coords.npy"))
-        assert coords.shape == precalc_coords.shape
-        _, _, disparity = procrustes(precalc_coords, coords)
-        assert disparity < 0.2
-
-    def test_get_target_classes(self, run_mapping, paris_clustering, datastore):
-        classes = datastore.get_target_classes(
-            target_name="selfmap", reference_class_group="RNA_cluster"
-        )
-        assert len(classes) == len(datastore.cells.active_index("I"))
-        assert classes.notna().all()
-        assert (
-            array_hash(classes.astype(str).to_numpy())
-            == "eef16b17c475877ab932cabd6f7b4e41bdbae80a9e21578866ac7c7d31db1061"
-        )
-
-    def test_get_mapping_score(self, run_mapping, datastore):
-        scores = next(datastore.get_mapping_score(target_name="selfmap"))[1]
-        assert scores.shape == (len(datastore.cells.active_index("I")),)
-        assert np.all(np.isfinite(scores))
-        assert np.any(scores > 0)
-        projection = datastore.get_mapping_result("selfmap", load_arrays=True)
-        assert projection.indices is not None
-        assert projection.distances is not None
-        weights = distance_weights(projection.distances)
-        expected = np.zeros_like(scores)
-        np.add.at(expected, projection.indices.reshape(-1), weights.reshape(-1))
-        expected *= 1000 / (projection.n_cells * projection.indices.shape[1])
-        expected = np.log1p(expected)
-        np.testing.assert_allclose(scores, expected, rtol=1e-12, atol=1e-12)
-        assert np.expm1(scores).sum() == pytest.approx(
-            1000 / projection.indices.shape[1]
-        )
-
-    def test_coral_mapping_score(self, run_mapping_coral, datastore):
-        scores = next(datastore.get_mapping_score(target_name="selfmap_coral"))[1]
-        assert np.all(np.isfinite(scores))
-        assert np.any(scores > 0)
-
     def test_repr(self, datastore):
         # TODO: Test if the expected values are printed
         print(datastore)
@@ -622,8 +576,6 @@ class TestDataStore:
         paris_clustering,
         datastore,
     ):
-        from scarf.storage.artifacts import ArtifactRef
-
         score_col = datastore.run_doublet_detection(
             cluster_key="RNA_cluster", simulation_ratio=0.5, random_seed=1
         )
@@ -639,13 +591,17 @@ class TestDataStore:
         assert ArtifactRef.from_dict(raw_ref).kind == "doublet_score"
         # scratch column used for smoothing should be removed
         assert "RNA_doublet_score__raw" not in datastore.cells.columns
-        # temporary simulated-doublet projection should be cleaned up
-        projections = datastore.z["RNA"].get("projections", None)
-        if projections is not None:
-            assert "_doublet_sim_RNA" not in projections
-            assert "_doublet_sim_RNA" not in dict(
-                projections.attrs.get("artifacts", {})
-            )
+        # the temporary query owns and removes its projection
+        assert not datastore.list_artifacts(
+            kind="projection",
+            from_assay="RNA",
+        )
+        state = datastore.get_assay_state("RNA")
+        assert state is not None
+        assert state.connectivity_map is not None
+        reference = datastore.get_mapping_reference()
+        assert reference.neighbors == state.neighbors
+        assert reference.symphony_state is None
 
     def test_run_doublet_detection_bad_cluster_key(
         self,
@@ -927,36 +883,6 @@ class TestDataStore:
         )
         assert isinstance(result, splt.PlotResult)
         assert "matrix" in result.tables
-        result.close()
-
-    def test_plot_unified_embedding(self, run_unified_umap, datastore):
-        result = splt.unified_embedding(
-            datastore,
-            layout_key="unified_UMAP",
-            show=False,
-        )
-        assert isinstance(result, splt.PlotResult)
-        assert "cells" in result.tables
-        result.close()
-
-    def test_plot_unified_embedding_target_groups(
-        self, run_unified_umap, paris_clustering, datastore
-    ):
-        _x, _y, _reference_count, target_counts, _target_names = (
-            datastore._load_unified_layout_data("unified_UMAP", "RNA")
-        )
-        n_target_cells = target_counts[0]
-        target_groups = paris_clustering[:n_target_cells]
-        result = splt.unified_embedding(
-            datastore,
-            layout_key="unified_UMAP",
-            show_target_only=True,
-            legend_loc="on_data",
-            target_groups=target_groups,
-            show=False,
-        )
-        assert result.provenance.n_cells == n_target_cells
-        assert set(result.tables["cells"]["group"]) == set(target_groups)
         result.close()
 
     def test_plot_pseudotime_heatmap(self, pseudotime_aggregation, datastore):

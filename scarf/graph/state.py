@@ -400,6 +400,43 @@ def read_assay_state(root: zarr.Group, assay: str) -> AssayState | None:
     return state
 
 
+def named_result_mismatch(
+    root: zarr.Group,
+    name: str,
+    ref: ArtifactRef,
+    state: AssayState,
+) -> str | None:
+    """Report why a named result cannot belong to ``state``.
+
+    Returns None when the handle fits the chain. Both the write path and the
+    carry-forward in ``_artifact_chain_state`` consult this, so a handle can
+    never be preserved into a state that the write would then reject.
+    """
+    if name != "mapping_reference":
+        return None
+    status = require_complete_artifact(root, ref)
+    expected = {
+        "reduction": state.reduction,
+        "ann_index": state.ann_index,
+        "neighbors": state.neighbors,
+    }
+    inputs = status.inputs or {}
+    if "batch_correction" in inputs:
+        expected["batch_correction"] = state.batch_correction
+    elif state.batch_correction is not None:
+        return "Plain PCA mapping reference cannot select batch correction"
+    missing = [
+        input_name for input_name, input_ref in expected.items() if input_ref is None
+    ]
+    if missing:
+        return "Mapping reference state is missing " + ", ".join(missing)
+    for input_name, input_ref in expected.items():
+        assert input_ref is not None
+        if inputs.get(input_name) != input_ref.to_dict():
+            return f"Mapping reference input {input_name!r} does not match AssayState"
+    return None
+
+
 def write_assay_state(root: zarr.Group, state: AssayState) -> None:
     for field_name in _GRAPH_REF_KINDS:
         ref = getattr(state, field_name)
@@ -407,33 +444,12 @@ def write_assay_state(root: zarr.Group, state: AssayState) -> None:
             continue
         require_complete_artifact(root, ref)
     for name, ref in state.named_results.items():
-        status = require_complete_artifact(root, ref)
+        require_complete_artifact(root, ref)
         if ref.kind == "imported_coordinates":
             validate_imported_coordinates_artifact(root, ref)
-        if name == "mapping_reference":
-            expected = {
-                "reduction": state.reduction,
-                "batch_correction": state.batch_correction,
-                "ann_index": state.ann_index,
-                "neighbors": state.neighbors,
-            }
-            missing = [
-                input_name
-                for input_name, input_ref in expected.items()
-                if input_ref is None
-            ]
-            if missing:
-                raise ValueError(
-                    "Mapping reference state is missing " + ", ".join(missing)
-                )
-            inputs = status.inputs or {}
-            for input_name, input_ref in expected.items():
-                assert input_ref is not None
-                if inputs.get(input_name) != input_ref.to_dict():
-                    raise ValueError(
-                        "Mapping reference input "
-                        f"{input_name!r} does not match AssayState"
-                    )
+        reason = named_result_mismatch(root, name, ref, state)
+        if reason is not None:
+            raise ValueError(reason)
     if state.connectivity_map is not None:
         _stored_assay_graph(root, state)
     path = assay_state_path(state.assay)
@@ -1439,17 +1455,6 @@ def _optional_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
         raise TypeError("Optional provenance value must be an integer")
     return int(value)
-
-
-def _optional_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(
-        value,
-        (int, float, np.integer, np.floating),
-    ):
-        raise TypeError("Optional provenance value must be numeric")
-    return float(value)
 
 
 def _optional_bool(value: Any) -> bool | None:

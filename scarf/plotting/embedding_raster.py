@@ -12,15 +12,6 @@ from ._raster import draw_raster_canvas, raster_from_metadata
 from ._style import apply_figure_chrome, square_axis_limits, theme_context
 
 
-def _scarf_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("scarf")
-    except Exception:
-        return "unknown"
-
-
 def _is_categorical_column(
     cells: Any,
     *,
@@ -212,7 +203,6 @@ def embedding_raster(
         ),
         scales=(color_scale,),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             cell_key=cell_key,
             n_cells=canvas.n_cells,
             renderer="matplotlib-raster",

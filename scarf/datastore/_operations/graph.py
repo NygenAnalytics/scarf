@@ -46,6 +46,7 @@ from ...graph.distances import validate_distance_provenance
 from ...graph.paths import StoredAssayGraph, StoredGraph
 from ...graph.state import (
     AssayState,
+    named_result_mismatch,
     normalized_path_from_state,
     read_assay_state,
     stored_assay_graph_from_ref,
@@ -236,21 +237,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             self._annStreamPaths = paths
         paths[ann_obj] = path
 
-    def _ann_stream_path(self, ann_obj: object) -> str | None:
-        try:
-            paths = self._annStreamPaths
-        except AttributeError:
-            paths = None
-        path = (
-            paths.get(ann_obj)
-            if paths is not None and isinstance(ann_obj, AnnStream)
-            else None
-        )
-        if path is not None:
-            return path
-        legacy_path: object = getattr(ann_obj, "annPath", None)
-        return legacy_path if isinstance(legacy_path, str) else None
-
     def _remember_ann_stream_neighbors(
         self,
         ann_obj: AnnStream,
@@ -262,13 +248,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             paths = WeakKeyDictionary()
             self._annStreamNeighborPaths = paths
         paths[ann_obj] = path
-
-    def _ann_stream_neighbors_path(self, ann_obj: object) -> str | None:
-        try:
-            paths = self._annStreamNeighborPaths
-        except AttributeError:
-            return None
-        return paths.get(ann_obj) if isinstance(ann_obj, AnnStream) else None
 
     def _get_latest_keys(
         self,
@@ -489,29 +468,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             raise ValueError(f"ERROR: PCA Reduction not found in {reduction_loc}")
         return paths.nearest_neighbors_group_path
 
-    def _ann_stream_recoverable(
-        self,
-        ann_loc: str,
-        reduction_loc: str,
-        normed_loc: str,
-    ) -> bool:
-        """Return True when an ANN stream can be loaded from stored graph artifacts."""
-        if ann_loc in self.zw and has_ann_index(
-            as_zarr_group(self.zw[ann_loc], name=ann_loc)
-        ):
-            return True
-        legacy = legacy_ann_index_path(zarr_root_path(self.zw), ann_loc)
-        if legacy is not None and os.path.exists(legacy):
-            return True
-        if reduction_loc in self.zw:
-            reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
-            if "reduction" in reduction_grp:
-                if normed_loc in self.zw:
-                    normed_grp = as_zarr_group(self.zw[normed_loc], name=normed_loc)
-                    if "data" in normed_grp:
-                        return True
-        return False
-
     def _resolve_ann_index(
         self,
         ann_loc: str,
@@ -571,104 +527,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             dimensions=dimensions,
             element_count=element_count,
         )
-
-    def _has_ann_stream_cache(
-        self,
-        from_assay: str,
-        cell_key: str,
-        feat_key: str,
-        knn_loc: str | None = None,
-        feat_scaling: bool | None = None,
-    ) -> bool:
-        state = read_assay_state(self.zw, from_assay)
-        if state is not None and state.matches(cell_key, feat_key):
-            if state.normalized is None:
-                return False
-            try:
-                validate_normalized_artifact_selection(
-                    self.zw,
-                    state.normalized,
-                    cell_key,
-                    feat_key,
-                )
-            except (KeyError, RuntimeError, TypeError, ValueError):
-                return False
-            required = (
-                state.normalized,
-                state.feature_scaling,
-                state.reduction,
-                state.ann_index,
-                state.neighbors,
-            )
-            if any(ref is None for ref in required):
-                return False
-            assert state.ann_index is not None
-            ann_group = artifact_group(self.zw, state.ann_index)
-            if not has_ann_index(ann_group):
-                assert state.normalized is not None
-                assert state.feature_scaling is not None
-                assert state.reduction is not None
-                assert state.neighbors is not None
-                normalized_group = artifact_group(self.zw, state.normalized)
-                scaling_group = artifact_group(self.zw, state.feature_scaling)
-                reduction_group = artifact_group(self.zw, state.reduction)
-                neighbors_group = artifact_group(self.zw, state.neighbors)
-                if (
-                    "data" not in normalized_group
-                    or "mean" not in scaling_group
-                    or "scale" not in scaling_group
-                    or "loadings" not in reduction_group
-                    or "indices" not in neighbors_group
-                ):
-                    return False
-            if feat_scaling is not None and state.reduction is not None:
-                reduction_status = inspect_artifact(self.zw, state.reduction)
-                cached_scaling = bool(
-                    (reduction_status.parameters or {}).get("feat_scaling", True)
-                )
-                if cached_scaling != feat_scaling:
-                    return False
-            return True
-        try:
-            if knn_loc is None:
-                chain = lookup_latest_nearest_neighbor_paths(
-                    self.zw,
-                    from_assay,
-                    cell_key,
-                    feat_key,
-                )
-                knn_loc = chain.nearest_neighbors_group_path
-                ann_loc = chain.neighbor_index_group_path
-                reduction_loc = chain.reduction_group_path
-                normed_loc = chain.normalized_group_path
-            else:
-                chain = nearest_neighbor_paths_from_loc(knn_loc)
-                ann_loc = chain.neighbor_index_group_path
-                reduction_loc = chain.reduction_group_path
-                normed_loc = chain.normalized_group_path
-
-            if knn_loc not in self.zw:
-                return False
-            if ann_loc not in self.zw:
-                return False
-            try:
-                validate_legacy_graph_selection(
-                    self,
-                    knn_loc,
-                    from_assay,
-                    cell_key,
-                    feat_key,
-                )
-            except (KeyError, RuntimeError, TypeError, ValueError):
-                return False
-            if feat_scaling is not None:
-                ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
-                cached_scaling = bool(ann_grp.attrs.get("featureScaling", True))
-                if cached_scaling != feat_scaling:
-                    return False
-            return self._ann_stream_recoverable(ann_loc, reduction_loc, normed_loc)
-        except KeyError:
-            return False
 
     def _load_or_compute_norm_stats(
         self,
@@ -1149,14 +1007,12 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             use_k = k
         if use_k < 1:
             use_k = 1
-        if use_k != k:
-            indexer = np.tile([True] * use_k + [False] * (k - use_k), n_cells)
-        else:
-            indexer = None
         w = np.asarray(as_zarr_array(store["weights"], name="weights")[:])
         e = np.asarray(as_zarr_array(store["edges"], name="edges")[:])
-        if indexer is not None:
-            w, e = w[indexer], e[indexer]
+        if use_k != k:
+            from ...neighbors.graph import take_nearest_per_row
+
+            w, e = take_nearest_per_row(w, e, n_cells, use_k)
         if sparse_format == "csr":
             return n_cells, csr_matrix(
                 (w, (e[:, 0], e[:, 1])), shape=(n_cells, n_cells)
@@ -1445,7 +1301,21 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )
                 if previous_reduction == reduction:
                     embedding_initialization = previous.embedding_initialization
-        return AssayState(
+        if connectivity_map is None and neighbors is not None:
+            if previous is not None and previous.connectivity_map is not None:
+                try:
+                    previous_neighbors = self._artifact_input_ref(
+                        previous.connectivity_map,
+                        "neighbors",
+                        "neighbors",
+                    )
+                except (KeyError, RuntimeError, ValueError):
+                    # Publishing a new chain is how a store recovers from a graph
+                    # artifact that was removed, so a stale ref cannot block it.
+                    previous_neighbors = None
+                if previous_neighbors == neighbors:
+                    connectivity_map = previous.connectivity_map
+        state = AssayState(
             assay=normalized.assay,
             cell_key=cell_key,
             feat_key=feat_key,
@@ -1459,6 +1329,18 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             connectivity_map=connectivity_map,
             named_results=named_results or {},
         )
+        if named_results is None and previous is not None and previous.named_results:
+            carried = {}
+            for name, ref in previous.named_results.items():
+                try:
+                    fits = named_result_mismatch(self.zw, name, ref, state) is None
+                except (KeyError, RuntimeError, TypeError, ValueError):
+                    continue
+                if fits:
+                    carried[name] = ref
+            if carried:
+                state = replace(state, named_results=carried)
+        return state
 
     def _publish_current_artifact(
         self,

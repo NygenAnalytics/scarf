@@ -55,14 +55,12 @@ if TYPE_CHECKING:
     from .mapping import (
         mapping_calibration as mapping_calibration,
         mapping_confusion as mapping_confusion,
-        mapping_correction as mapping_correction,
         mapping_evidence as mapping_evidence,
         mapping_projection as mapping_projection,
         mapping_score as mapping_score,
     )
     from .summary import dotplot as dotplot
     from .summary import matrixplot as matrixplot
-    from .unified import unified_embedding as unified_embedding
 
 __all__ = [
     "CategoricalScale",
@@ -101,7 +99,6 @@ __all__ = [
     "marker_heatmap",
     "mapping_calibration",
     "mapping_confusion",
-    "mapping_correction",
     "mapping_evidence",
     "mapping_projection",
     "mapping_score",
@@ -111,7 +108,6 @@ __all__ = [
     "register_theme",
     "run_recipe",
     "theme_context",
-    "unified_embedding",
 ]
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
@@ -151,7 +147,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "marker_heatmap": (".heatmaps", "marker_heatmap"),
     "mapping_calibration": (".mapping", "mapping_calibration"),
     "mapping_confusion": (".mapping", "mapping_confusion"),
-    "mapping_correction": (".mapping", "mapping_correction"),
     "mapping_evidence": (".mapping", "mapping_evidence"),
     "mapping_projection": (".mapping", "mapping_projection"),
     "mapping_score": (".mapping", "mapping_score"),
@@ -161,7 +156,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "register_theme": ("._style", "register_theme"),
     "run_recipe": (".recipes", "run_recipe"),
     "theme_context": ("._style", "theme_context"),
-    "unified_embedding": (".unified", "unified_embedding"),
 }
 
 for _export_name in _LAZY_EXPORTS:

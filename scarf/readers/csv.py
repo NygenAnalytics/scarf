@@ -156,9 +156,6 @@ class CSVReader:
             cell_data_idx,
         )
 
-    def _n_features(self) -> np.ndarray:
-        return np.array([f"feature_{x}" for x in range(self.nFeatures)])
-
     def cell_ids(self) -> np.ndarray:
         """Returns a list of cell IDs."""
         if self.cellIds is None:

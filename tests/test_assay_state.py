@@ -866,6 +866,79 @@ def test_state_rejects_incomplete_or_missing_graph_inputs() -> None:
         datastore.get_latest_graph_loc("RNA", "I", "hvgs")
 
 
+def test_mapping_reference_and_graph_do_not_clear_each_other(
+    analyzed_datastore_ephemeral,
+) -> None:
+    datastore = analyzed_datastore_ephemeral
+    start = datastore.get_assay_state("RNA")
+    assert start is not None
+    neighbors = start.neighbors
+    graph = start.connectivity_map
+    assert neighbors is not None and graph is not None
+
+    reference = datastore.build_mapping_reference(neighbors)
+    after_reference = datastore.get_assay_state("RNA")
+    assert after_reference is not None
+    assert after_reference.named_results["mapping_reference"] == reference.ref
+    # Publishing a mapping reference walks up to neighbors, so the graph is not
+    # in that lineage and used to be dropped.
+    assert after_reference.connectivity_map == graph
+    assert after_reference.embedding_initialization is not None
+
+    rebuilt = datastore.build_connectivity_map(neighbors, bandwidth=1.25)
+    assert rebuilt != graph
+    after_graph = datastore.get_assay_state("RNA")
+    assert after_graph is not None
+    assert after_graph.connectivity_map == rebuilt
+    # The named handle is not derived from the graph, so rebuilding the graph
+    # must leave it selectable.
+    assert after_graph.named_results["mapping_reference"] == reference.ref
+    assert datastore.get_mapping_reference().ref == reference.ref
+
+
+def test_publishing_recovers_from_an_incomplete_graph_artifact(
+    analyzed_datastore_ephemeral,
+) -> None:
+    datastore = analyzed_datastore_ephemeral
+    start = datastore.get_assay_state("RNA")
+    assert start is not None
+    assert start.neighbors is not None and start.connectivity_map is not None
+    datastore.z[artifact_path(start.connectivity_map)].attrs["complete"] = False
+
+    datastore.build_mapping_reference(start.neighbors)
+
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    assert "mapping_reference" in state.named_results
+    assert state.connectivity_map is None
+
+
+def test_named_result_is_dropped_when_the_chain_moves_underneath_it(
+    analyzed_datastore_ephemeral,
+) -> None:
+    datastore = analyzed_datastore_ephemeral
+    start = datastore.get_assay_state("RNA")
+    assert start is not None and start.neighbors is not None
+    datastore.build_mapping_reference(start.neighbors)
+
+    normalized = datastore.run_normalization(
+        cell_key="I",
+        feat_key="hvgs",
+        update_state=False,
+    )
+    reduction = datastore.run_pca(normalized, dims=5, update_state=False)
+    ann_index = datastore.build_ann_index(reduction, update_state=False)
+    moved = datastore.query_neighbors(ann_index, coordinates=reduction, k=3)
+
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    assert state.neighbors == moved
+    # Carrying the handle here would describe a chain that no longer exists, so
+    # it is dropped rather than preserved into an inconsistent state.
+    assert "mapping_reference" not in state.named_results
+    assert state.connectivity_map is None
+
+
 def test_derived_writers_do_not_mutate_graph_artifacts() -> None:
     datastore, state = _state_store()
     graph_path = artifact_path(state.connectivity_map)

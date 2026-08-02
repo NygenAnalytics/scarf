@@ -212,20 +212,21 @@ def test_atac_marker_heatmap_defaults_to_unlogged_tfidf(
         )
 
 
-def test_atac_mapping_fails_before_query_dependent_idf(atac_tfidf_store):
+def test_atac_mapping_requires_rna_query(
+    atac_tfidf_store,
+    analyzed_datastore_ephemeral,
+):
     store, _ = atac_tfidf_store
+    state = analyzed_datastore_ephemeral.get_assay_state("RNA")
+    assert state is not None
+    assert state.neighbors is not None
+    reference = analyzed_datastore_ephemeral.build_mapping_reference(state.neighbors)
 
-    with pytest.raises(
-        NotImplementedError,
-        match="reference TF-IDF document frequencies",
-    ):
+    with pytest.raises(TypeError, match="RNA query assays"):
         store.run_mapping(
-            target_assay=store.ATAC,
-            target_name="unsupported_atac_mapping",
-            target_feat_key="I",
-            from_assay="ATAC",
-            cell_key="I",
-            feat_key="I",
+            reference,
+            "unsupported_atac_mapping",
+            query_assay="ATAC",
         )
 
 

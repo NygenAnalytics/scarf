@@ -148,7 +148,6 @@ _EXPECTED_PLOTTING_EXPORTS = (
     "marker_heatmap",
     "mapping_calibration",
     "mapping_confusion",
-    "mapping_correction",
     "mapping_evidence",
     "mapping_projection",
     "mapping_score",
@@ -158,7 +157,6 @@ _EXPECTED_PLOTTING_EXPORTS = (
     "register_theme",
     "run_recipe",
     "theme_context",
-    "unified_embedding",
 )
 
 
@@ -296,9 +294,8 @@ concrete = (
     "scarf.plotting.embedding_raster",
     "scarf.plotting.heatmaps",
     "scarf.plotting.mapping",
-        "scarf.plotting.recipes",
+    "scarf.plotting.recipes",
     "scarf.plotting.summary",
-    "scarf.plotting.unified",
 )
 print(json.dumps({{
     "advertised": sorted(name for name in exports if name in dir(plotting)),
@@ -567,12 +564,17 @@ def test_legacy_plotting_surface_remains_absent():
     from scarf import DataStore
     from scarf.datastore.plot_accessor import DataStorePlotAccessor
 
+    plotting = import_module("scarf.plotting")
+
     assert hasattr(DataStore, "plots")
     assert DataStorePlotAccessor.__module__ == "scarf.datastore.plot_accessor"
     assert not hasattr(import_module("scarf"), "DataStorePlotAccessor")
     assert not [name for name in dir(DataStore) if name.startswith("plot_")]
+    assert "unified_embedding" not in plotting.__all__
+    assert not hasattr(plotting, "unified_embedding")
     assert find_spec("scarf.plots") is None
     assert find_spec("scarf.plotting._legacy") is None
+    assert find_spec("scarf.plotting.unified") is None
 
 
 def test_pipeline_accessor_has_a_public_import_path():

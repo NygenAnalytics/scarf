@@ -38,13 +38,11 @@ ALLOWED_PLOTS = frozenset(
         "marker_heatmap",
         "mapping_calibration",
         "mapping_confusion",
-        "mapping_correction",
         "mapping_evidence",
         "mapping_projection",
         "mapping_score",
         "matrixplot",
         "pseudotime_heatmap",
-        "unified_embedding",
     }
 )
 ALLOWED_OUTPUT_FORMATS = frozenset({"pdf", "png", "svg", "tif", "tiff"})

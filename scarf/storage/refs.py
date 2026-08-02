@@ -31,7 +31,6 @@ ARTIFACT_KINDS = frozenset(
         "feature_summary",
         "hto_identity",
         "integrated_graph",
-        "intersection_ann_index",
         "imported_coordinates",
         "mapping_reference",
         "marker_table",
@@ -122,6 +121,63 @@ class ArtifactRef:
             kind=kind,
             artifact_id=artifact_id,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalArtifactRef:
+    dataset_fingerprint: str
+    ref: ArtifactRef
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dataset_fingerprint, str):
+            raise TypeError("dataset_fingerprint must be a string")
+        if not self.dataset_fingerprint:
+            raise ValueError("dataset_fingerprint must be non-empty")
+        if not isinstance(self.ref, ArtifactRef):
+            raise TypeError("ref must be an ArtifactRef")
+        if self.ref.scope != "assay" or self.ref.assay is None:
+            raise ValueError(
+                "External artifact references require an assay-scoped ArtifactRef"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "external_artifact",
+            "dataset_fingerprint": self.dataset_fingerprint,
+            "ref": self.ref.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ExternalArtifactRef":
+        if not isinstance(value, Mapping):
+            raise TypeError("External artifact reference must be a mapping")
+        expected_keys = {"type", "dataset_fingerprint", "ref"}
+        if set(value) != expected_keys:
+            raise ValueError(
+                "External artifact reference must contain exactly "
+                "'type', 'dataset_fingerprint', and 'ref'"
+            )
+        if value["type"] != "external_artifact":
+            raise ValueError(
+                "External artifact reference type must be 'external_artifact'"
+            )
+        dataset_fingerprint = value["dataset_fingerprint"]
+        if not isinstance(dataset_fingerprint, str):
+            raise TypeError("dataset_fingerprint must be a string")
+        raw_ref = value["ref"]
+        if not isinstance(raw_ref, Mapping):
+            raise TypeError("External artifact ref must be a mapping")
+        if set(raw_ref) != {"type", "scope", "kind", "artifact_id", "assay"}:
+            raise ValueError(
+                "External artifact ref must be a complete assay artifact reference"
+            )
+        return cls(
+            dataset_fingerprint=dataset_fingerprint,
+            ref=ArtifactRef.from_dict(raw_ref),
+        )
+
+
+type ArtifactLocator = ArtifactRef | ExternalArtifactRef
 
 
 def artifact_path(ref: ArtifactRef) -> str:

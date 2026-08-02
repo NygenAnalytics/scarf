@@ -74,15 +74,15 @@ _EXPECTED_RESULT_FIELDS = {
         "method",
     ),
     mapping.MappingResult: (
-        "projection_path",
+        "ref",
+        "mapping_name",
         "n_cells",
         "correction_method",
         "diagnostics",
         "indices",
         "distances",
-        "uncorrected_latent",
-        "corrected_latent",
         "uninformative",
+        "reference",
     ),
     trajectory.FateMappingResult: (
         "fate_keys",
@@ -152,9 +152,8 @@ def test_result_facades_and_constructor_fields_are_stable():
     for name in (
         "indices",
         "distances",
-        "uncorrected_latent",
-        "corrected_latent",
         "uninformative",
+        "reference",
     ):
         assert mapping_parameters[name].default is None
 
@@ -173,7 +172,18 @@ def test_result_records_reject_attribute_assignment():
             "I",
             "waggr",
         ),
-        mapping.MappingResult("projection", 2, "none", {}),
+        mapping.MappingResult(
+            scarf.ArtifactRef(
+                scope="assay",
+                assay="RNA",
+                kind="projection",
+                artifact_id="a" * 64,
+            ),
+            "projection",
+            2,
+            "none",
+            {},
+        ),
         trajectory.FateMappingResult(
             ("fate_A", "fate_B"),
             "fate__valid",
@@ -285,28 +295,41 @@ def test_pseudotime_result_shape_validation_is_stable():
         )
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    [
-        ({"ref_mu": False}, "ref_mu"),
-        ({"run_coral": True}, "CORAL"),
-        ({"exclude_missing": True}, "exclude_missing"),
-    ],
-)
-def test_mapping_deprecations_warn_before_validation(kwargs, message):
-    class Store:
-        @staticmethod
-        def _get_latest_keys(*args):
-            raise RuntimeError("stop after compatibility warnings")
+def test_mapping_execution_contract_is_query_owned():
+    signature = inspect.signature(scarf.DataStore.run_mapping)
+    assert str(signature) == (
+        "(self, reference: scarf.mapping.reference.MappingReference, "
+        "mapping_name: str, *, query_assay: str | None = None, "
+        "cell_key: str = 'I', save_k: int = 3, "
+        "missing_feature_policy: str = 'reference_mean', "
+        "query_batches: pandas.core.frame.DataFrame | None = None, "
+        "invalidate_cache: bool = False) -> scarf.mapping.models.MappingResult"
+    )
+    assert tuple(signature.parameters) == (
+        "self",
+        "reference",
+        "mapping_name",
+        "query_assay",
+        "cell_key",
+        "save_k",
+        "missing_feature_policy",
+        "query_batches",
+        "invalidate_cache",
+    )
+    with pytest.raises(TypeError, match="unexpected keyword argument 'target_assay'"):
+        scarf.DataStore.run_mapping(
+            object(),
+            object(),
+            "legacy",
+            target_assay=object(),
+        )
 
-    with pytest.warns(DeprecationWarning, match=message) as caught:
-        with pytest.raises(RuntimeError, match="stop after"):
-            scarf.DataStore.run_mapping(
-                Store(),
-                target_assay=object(),
-                target_name="query",
-                target_feat_key="I",
-                **kwargs,
-            )
 
-    assert caught[0].filename == __file__
+def test_retired_unified_mapping_contract_is_absent():
+    for name in (
+        "_load_unified_layout_data",
+        "load_unified_graph",
+        "run_unified_tsne",
+        "run_unified_umap",
+    ):
+        assert not hasattr(scarf.DataStore, name)

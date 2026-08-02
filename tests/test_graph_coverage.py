@@ -236,15 +236,8 @@ def test_load_graph_latest_location_formats_and_errors(
         )
 
 
-def test_latest_knn_and_ann_stream_cache_paths(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_latest_knn_loc_resolves_the_encoded_graph_chain() -> None:
     store = _memory_graph_store(["RNA"])
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.validate_legacy_graph_selection",
-        lambda *_args, **_kwargs: None,
-    )
     assay_group = store.zw.create_group("RNA")
     assay_group.attrs["latest_cell_key"] = "I"
     assay_group.attrs["latest_feat_key"] = "I"
@@ -260,7 +253,6 @@ def test_latest_knn_and_ann_stream_cache_paths(
     reduction_group.attrs["latest_ann"] = ann_loc
     ann_group.attrs["latest_knn"] = knn_loc
     reduction_group.create_array("reduction", data=np.eye(2))
-    normed_group.create_array("data", data=np.eye(3, 2))
     store._load_default_assay = Mock(return_value="RNA")
 
     assert store._get_latest_knn_loc() == knn_loc
@@ -272,42 +264,6 @@ def test_latest_knn_and_ann_stream_cache_paths(
     del reduction_group["reduction"]
     with pytest.raises(ValueError, match="PCA Reduction not found"):
         store._get_latest_knn_loc("RNA")
-    reduction_group.create_array("reduction", data=np.eye(2))
-
-    assert store._has_ann_stream_cache("RNA", "I", "I") is True
-    assert store._has_ann_stream_cache("RNA", "I", "I", knn_loc=knn_loc) is True
-    assert store._has_ann_stream_cache("RNA", "I", "missing") is False
-    assert (
-        store._has_ann_stream_cache("RNA", "I", "I", knn_loc=f"{ann_loc}/knn__99")
-        is False
-    )
-
-    store.zw.create_group("RNA/normed__I__broken")
-    assert store._has_ann_stream_cache("RNA", "I", "broken") is False
-
-    legacy_path = tmp_path / "ann_idx"
-    legacy_path.write_bytes(b"index")
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.legacy_ann_index_path",
-        lambda *_: str(legacy_path),
-    )
-    assert (
-        store._ann_stream_recoverable(
-            "missing/ann", "missing/reduction", "missing/normed"
-        )
-        is True
-    )
-
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.legacy_ann_index_path",
-        lambda *_: None,
-    )
-    assert (
-        store._ann_stream_recoverable(
-            "missing/ann", "missing/reduction", "missing/normed"
-        )
-        is False
-    )
 
 
 def test_corrupt_zarr_ann_does_not_fall_back_to_legacy(

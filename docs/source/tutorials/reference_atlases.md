@@ -46,8 +46,16 @@ stim_path = repository.download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds_ctrl = scarf.DataStore(f"{ctrl_path}/data.zarr", nthreads=4)
-ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
+ds_ctrl = scarf.DataStore(
+    f"{ctrl_path}/data.zarr",
+    nthreads=4,
+    zarr_mode="r+",
+)
+ds_stim = scarf.DataStore(
+    f"{stim_path}/data.zarr",
+    nthreads=4,
+    zarr_mode="r+",
+)
 ```
 
 `reference_batch` must represent technical structure such as donor,
@@ -66,10 +74,12 @@ ds_ctrl.cells.insert(
 ## Build and reload the reference
 
 ```{code-cell} ipython3
-reference = ds_ctrl.build_mapping_reference(
-    feat_key="hvgs",
-    batch_columns=["reference_batch"],
-)
+normalized = ds_ctrl.run_normalization(feat_key="hvgs")
+pca = ds_ctrl.run_pca(normalized, dims=25, feat_scaling=True)
+corrected = ds_ctrl.run_harmony(["reference_batch"], pca)
+ann_index = ds_ctrl.build_ann_index(corrected)
+neighbors = ds_ctrl.query_neighbors(ann_index, k=17)
+reference = ds_ctrl.build_mapping_reference(neighbors)
 reference
 ```
 
@@ -79,11 +89,15 @@ Building a different contract creates another artifact rather than mutating the
 completed reference.
 
 ```{code-cell} ipython3
-reference = ds_ctrl.get_mapping_reference(feat_key="hvgs")
+reference = ds_ctrl.get_mapping_reference(reference.ref)
 ```
 
 Reloading validates that the stored inputs still match the datastore. This is
-the normal entry point in later sessions.
+the normal entry point in later sessions, and the prepared reference datastore
+may be opened read-only. Mapping still requires a separate writable query
+datastore. Use `mount_datastore` to create that writable analysis layer when
+the query counts come from a read-only source or from the same source used to
+prepare the reference.
 
 ## Map and inspect a shifted query
 
@@ -100,78 +114,39 @@ query_batches = pd.DataFrame(
         )
     }
 )
-reference.map_query(
-    target_assay=ds_stim.RNA,
-    target_name="stim_atlas",
-    target_feat_key="hvgs_stim_atlas",
+mapping = ds_stim.run_mapping(
+    reference,
+    "stim_atlas",
+    query_assay="RNA",
     save_k=5,
     query_batches=query_batches,
 )
+mapping
 ```
 
-`mapping_correction` compares query latent coordinates before and after
-fixed-reference correction. A nonzero shift is expected for this deliberately
-confounded example.
+The projection is stored in `ds_stim`. The reference model and reference
+coordinates remain unchanged.
 
 ```{code-cell} ipython3
-ds_ctrl.plots.mapping_correction(
-    target_name="stim_atlas",
-    batch_labels=ds_stim.cells.fetch("cluster_labels"),
-)
-```
-
-```{code-cell} ipython3
-mapped = ds_ctrl.get_mapping_result(
+mapped = ds_stim.get_mapping_result(
     "stim_atlas",
+    reference=reference,
+    query_assay="RNA",
     load_arrays=True,
 )
 mapped.diagnostics
 ```
 
-Diagnostics should report finite corrected coordinates, valid neighbour
-indices, and the requested feature coverage. A large correction is not
-automatically good; it must be assessed with label evidence and an
-uncorrected control.
-
-## Self-map as a control
-
-The reference can map its own cells through the same contract. With matching
-batch labels, self-map correction should remain close to zero and reference
-coordinates must stay unchanged.
-
-```{code-cell} ipython3
-reference.map_query(
-    target_assay=ds_ctrl.RNA,
-    target_name="control_self_map",
-    target_feat_key="hvgs_control_self_map",
-    save_k=5,
-    query_batches=pd.DataFrame(
-        {
-            "reference_batch": ds_ctrl.cells.fetch(
-                "reference_batch",
-                key="I",
-            )
-        }
-    ),
-)
-self_mapped = ds_ctrl.get_mapping_result(
-    "control_self_map",
-    load_arrays=True,
-)
-float(
-    np.linalg.norm(
-        self_mapped.corrected_latent
-        - self_mapped.uncorrected_latent,
-        axis=1,
-    ).max()
-)
-```
+Diagnostics report feature coverage, query batch count, the mapping algorithm,
+and uninformative-cell count. Mapping rejects using the same physical datastore
+as both query and reference. Use a separate writable query datastore for
+controls.
 
 ## Transfer labels and retain abstention
 
 ```{code-cell} ipython3
-transferred = ds_ctrl.get_target_classes(
-    target_name="stim_atlas",
+transferred = ds_stim.get_target_classes(
+    mapped,
     reference_class_group="cluster_labels",
     threshold_fraction=0.6,
 )
@@ -183,8 +158,8 @@ ds_stim.cells.insert(
 ```
 
 ```{code-cell} ipython3
-ds_ctrl.plots.mapping_confusion(
-    target_name="stim_atlas",
+ds_stim.plots.mapping_confusion(
+    mapped,
     reference_class_group="cluster_labels",
     known_labels=ds_stim.cells.fetch("cluster_labels"),
     normalize="true",
@@ -193,19 +168,34 @@ ds_ctrl.plots.mapping_confusion(
 ```
 
 ```{code-cell} ipython3
-ds_ctrl.plots.mapping_projection(
-    target_name="stim_atlas",
+projected_embedding = ds_stim.project_reference_embedding(
+    mapped,
     reference_layout_key="RNA_UMAP",
-    reference_groups="cluster_labels",
+    label="atlas_UMAP",
+)
+projected_embedding
+```
+
+The call above persists an embedding artifact in the query datastore and links
+`RNA_atlas_UMAP1` and `RNA_atlas_UMAP2` into query cell metadata. Cells with
+uninformative projected PCA coordinates receive `NaN` embedding coordinates
+and retain an abstained label.
+
+```{code-cell} ipython3
+ds_stim.plots.mapping_projection(
+    mapped,
+    reference_layout_key="RNA_UMAP",
     target_groups=transferred.to_numpy(),
     ref_name="control atlas",
+    reference_mode="background",
+    figsize=(7.2, 5.2),
 )
 ```
 
 The projected query should land near compatible reference regions while the
-reference layout remains unchanged. Systematic off-diagonal confusion or large
-unmapped regions is a reason to inspect feature coverage, batch design, and
-whether the query contains populations absent from the atlas.
+reference stays as a light background. Systematic off-diagonal confusion or
+large unmapped regions is a reason to inspect feature coverage, batch design,
+and whether the query contains populations absent from the atlas.
 Compare the confusion pattern with the direct KNN workflow in
 {doc}`mapping_and_label_transfer`; different off-diagonal errors show how the
 reference model and correction assumptions affect transfer.

@@ -31,6 +31,7 @@ _RETIRED_MODULES = {
     "scarf/genomics/reference.py",
     "scarf/graph/build.py",
     "scarf/knn_utils.py",
+    "scarf/mapping/coral.py",
     "scarf/mapping_reference.py",
     "scarf/mapping_utils.py",
     "scarf/markers.py",
@@ -51,6 +52,7 @@ _RETIRED_MODULES = {
     "scarf/plots/__init__.py",
     "scarf/plotting/_legacy.py",
     "scarf/plotting/_legacy/__init__.py",
+    "scarf/plotting/unified.py",
     "scarf/readers.py",
     "scarf/readers/datasets.py",
     "scarf/results.py",
@@ -76,6 +78,7 @@ import importlib.util
 from pathlib import Path
 
 import scarf
+import scarf.plotting as plotting
 import scarf.cytebase
 import scarf.embeddings.harmony
 import scarf.features.genomic
@@ -203,9 +206,16 @@ for method in (
     "run_pseudotime_aggregation",
     "run_pseudotime_marker_search",
     "metric_lisi",
-    "_load_unified_layout_data",
 ):
     assert callable(getattr(DataStore, method))
+for method in (
+    "_load_unified_layout_data",
+    "load_unified_graph",
+    "run_unified_tsne",
+    "run_unified_umap",
+):
+    assert not hasattr(DataStore, method)
+assert not hasattr(plotting, "unified_embedding")
 for name in (
     "scarf._types",
     "scarf.bio_data",
@@ -216,10 +226,12 @@ for name in (
     "scarf.harmony",
     "scarf.genomics",
     "scarf.knn_utils",
+    "scarf.mapping.coral",
     "scarf.mapping_reference",
     "scarf.mapping_utils",
     "scarf.markers",
     "scarf.meld_assay",
+    "scarf.plotting.unified",
     "scarf.symphony",
 ):
     assert importlib.util.find_spec(name) is None, name

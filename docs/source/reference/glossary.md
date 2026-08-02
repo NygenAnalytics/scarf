@@ -91,7 +91,9 @@ batch correction
   Adjusting embeddings or graphs so technical sample batches mix while biological structure is preserved.
 
 mapping reference
-  Content-addressed RNA/PCA artifact from `build_mapping_reference` used for Symphony-style query mapping.
+  Immutable RNA mapping artifact built from a scaled PCA or Symphony neighbour
+  chain with `build_mapping_reference(neighbors)`. A writable query datastore
+  uses it to create query-owned projections without changing the reference.
 
 Paris clustering
   Hierarchical graph clustering in Scarf (`run_paris_clustering`). Supports

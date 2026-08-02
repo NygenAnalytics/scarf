@@ -34,15 +34,6 @@ from ._style import (
 )
 
 
-def _scarf_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("scarf")
-    except Exception:
-        return "unknown"
-
-
 def _cell_index(store: Any, cell_key: str | None) -> np.ndarray:
     if cell_key is None:
         return np.arange(store.cells.N, dtype=np.int64)
@@ -892,7 +883,6 @@ def distribution(
             else (() if categorical_scale is None else (categorical_scale,))
         ),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             assay=(next(iter(feature_assays)) if len(feature_assays) == 1 else None),
             cell_key=cell_key,
             n_cells=n,

@@ -5,7 +5,6 @@ from typing import Any, cast
 
 import numpy as np
 import pandas as pd
-from importlib.metadata import version
 
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
@@ -16,13 +15,6 @@ from ._style import (
     sort_categories,
     theme_context,
 )
-
-
-def _scarf_version() -> str:
-    try:
-        return version("scarf")
-    except Exception:
-        return "unknown"
 
 
 def _hierarchy_positions(
@@ -457,7 +449,6 @@ def cluster_tree(
         legends=(legend,),
         scales=(color_scale, size_scale),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             assay=cast(str, prepared["from_assay"]),
             cell_key=cast(str, prepared["cell_key"]),
             n_cells=len(clusters),

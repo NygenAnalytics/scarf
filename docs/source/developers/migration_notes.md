@@ -63,8 +63,8 @@ Matrix, marker, and pseudotime heatmaps now expose explicit ordering, clustering
 annotation scales, and caller-owned targets.
 
 Mapping diagnostics are available as `mapping_score`, `mapping_evidence`,
-`mapping_confusion`, `mapping_calibration`, `mapping_correction`, and
-`mapping_projection`. Mapping score is reference-side landing density.
+`mapping_confusion`, `mapping_calibration`, and `mapping_projection`. Mapping
+score is reference-side landing density.
 `mapping_calibration` plots held-out accuracy against retained coverage over an
 evidence threshold. It does not treat vote fraction as a calibrated
 probability, and it fails with a clear error when `known_labels` only match the
@@ -326,16 +326,96 @@ applications that import it directly must declare it themselves.
 
 ## Mapping calls
 
-The following compatibility paths remain accepted through Scarf 1.x and may be
-removed in 2.0:
+Mapping now has a hard boundary between reference preparation and query
+analysis. Build a scaled PCA chain in a writable reference datastore. A plain
+PCA chain can feed the ANN index directly. A Symphony reference instead runs
+`run_harmony` after PCA and builds its ANN index and neighbours from the
+corrected coordinates. Package either chain with
+`reference_ds.build_mapping_reference(neighbors)`.
 
-- Projection groups written before provenance schemas remain readable when their neighbor arrays are structurally valid. Scarf emits `DeprecationWarning`; rerun `run_mapping` to write full provenance.
-- A writable legacy Harmony graph without a mapping artifact is rebuilt automatically the first time `run_mapping` needs it. For a read-only store, reopen it with `zarr_mode='r+'` and call `build_mapping_reference(..., batch_columns=[...])` once.
-- `ref_mu=False` and `ref_sigma=False` no longer select query-derived statistics. They emit `DeprecationWarning` and use reference statistics. Remove these arguments.
-- `exclude_missing=True` remains an alias for `missing_feature_policy='intersection'`.
-- `run_coral=True` remains available with `DeprecationWarning`.
+After preparation, the reference may be reopened read-only. The query must be
+a different physical store and must remain writable. To map a dataset against a
+reference prepared from the same source counts, create a separate writable
+analysis layer with `mount_datastore` and use that mounted datastore as the
+query. Mapping currently accepts RNA queries only; ATAC query mapping remains
+unsupported.
 
-Recomputed results can differ from earlier Scarf releases. Recalibrate downstream thresholds after rebuilding.
+Run mapping from the writable query datastore:
+
+```python
+mapping = query_ds.run_mapping(
+    reference,
+    "atlas",
+    query_assay="RNA",
+)
+```
+
+The returned `MappingResult` and its `ArtifactRef` identify an immutable
+projection stored in the query datastore. Mapping consumers accept a
+`MappingResult`, projection `ArtifactRef`, or mapping name. Pass the
+`MappingReference` explicitly when an `ArtifactRef` or name does not carry the
+in-session reference handle:
+
+```python
+mapping = query_ds.get_mapping_result(
+    "atlas",
+    reference=reference,
+    query_assay="RNA",
+)
+labels = query_ds.get_target_classes(
+    mapping,
+    reference_class_group="cell_type",
+)
+```
+
+The only missing-feature policies are `reference_mean`, `zero`, and `error`.
+`reference_mean` is the default. CORAL, `missing_feature_policy="intersection"`,
+`exclude_missing`, `ref_mu`, `ref_sigma`, `MappingReference.map_query`,
+`project_mapping_layout`, `load_unified_graph`, `run_unified_umap`,
+`run_unified_tsne`, `unified_embedding`, and `mapping_correction` have been
+removed.
+
+Legacy projection groups are rejected by current loaders and consumers. Rerun
+`run_mapping` against a prepared reference. References embedded in an older
+graph or reduction are also rejected and must be rebuilt with
+`build_mapping_reference(neighbors)`.
+
+`SymphonyCorrectionModel` no longer carries `correction_ridge`, and Symphony
+mapping references no longer store a `correction_ridge` attribute. The query
+correction always applied the fixed unit penalty that upstream Symphony uses,
+so the field described a setting that never changed the result. Code that
+constructed the model directly should drop the argument. Symphony references
+written before this change keep an unused attribute and are otherwise valid.
+
+L2 projection distances are true Euclidean distances rather than squared HNSW
+distances. Recalibrate thresholds based on distance-weighted mapping scores or
+projection distances after rerunning a projection. Query cells whose projected
+PCA vector has zero norm are marked uninformative. Label transfer abstains for
+those cells, mapping scores exclude them, and their projected reference
+coordinates are `NaN`.
+
+`get_mapping_score` weights each neighbour by `1 / (log(distance + 1) + 1)`,
+matching the published definition. Weights are absolute rather than normalised
+per query cell, so a query population that sits far from the reference deposits
+less total score than one that lands on it. Under the previous normalised
+weights the total score of any query group was fixed at `multiplier / save_k`
+regardless of how well that group matched. Absolute score values change, so
+rescale any saved thresholds.
+
+Label transfer, label evidence and embedding projection use weights normalised
+per query cell, which is what a vote fraction and a coordinate average require.
+This is not the same kernel as the released 0.x line, which weighted a neighbour
+by `1 - distance / max(distance)` and therefore gave the furthest of the `save_k`
+neighbours a weight of exactly zero. Votes are now spread across all `save_k`
+neighbours instead of `save_k - 1`, so a single near neighbour no longer decides
+a label on its own and near ties abstain more often. Recheck
+`threshold_fraction` and `save_k` against a labelled holdout rather than reusing
+0.x settings.
+
+Call `query_ds.project_reference_embedding(...)` before
+`mapping_projection`. It writes an immutable query embedding artifact and
+links its two coordinate columns into query cell metadata. Reference
+coordinates remain unchanged.
 
 ## HTO demultiplexing
 
@@ -457,13 +537,11 @@ Scarf 2.0; supported user code should prefer top-level `scarf` exports.
 ### Mapping internals
 
 - Private mapping orchestration now lives at `scarf.datastore._operations.mapping`.
-- Unified plotting reads persisted layouts through
-  `MappingDatastore._load_unified_layout_data`; plotting no longer resolves
-  projection Zarr paths directly.
 - `scarf.mapping_reference.MappingReference` moved to `scarf.mapping.reference.MappingReference`.
 - `scarf.mapping_reference.MappingResult` moved to `scarf.mapping.models.MappingResult`.
 - Symphony models moved from `scarf.symphony` to `scarf.mapping.models`; numerical functions moved to `scarf.mapping.symphony`.
-- Helpers from `scarf.mapping_utils` moved to `scarf.mapping.hashing`, `scarf.mapping.confidence`, `scarf.mapping.coral`, and `scarf.mapping.features`.
+- Helpers from `scarf.mapping_utils` moved to `scarf.mapping.hashing`,
+  `scarf.mapping.confidence`, and `scarf.mapping.features`.
 
 ### DataStore internals
 

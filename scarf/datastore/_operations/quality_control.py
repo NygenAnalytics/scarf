@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from ...assay import ATACassay, RNAassay
-from ...graph.state import read_assay_state
+from ...graph.state import read_assay_state, validate_artifact_graph_selection
 from ...quality_control.cell_cycle import assign_cell_cycle_phase
 from ...quality_control.filtering import (
     _metric_policy,
@@ -38,9 +38,9 @@ from ...storage.artifacts import (
     canonical_bytes,
     callable_identity,
     fingerprint_array,
-    fingerprint_stored_arrays,
     fingerprint_strings,
 )
+from ...storage.refs import ArtifactRef
 from ...storage.selections import resolve_generated_selection_artifact
 from ...storage.types import as_zarr_group
 from ...utils.compute import controlled_compute
@@ -612,34 +612,69 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         )
         state = read_assay_state(self.zw, from_assay)
         if (
-            state is not None
-            and state.matches(cell_key, feat_key)
-            and state.connectivity_map is not None
+            state is None
+            or not state.matches(cell_key, feat_key)
+            or state.connectivity_map is None
         ):
-            graph_input: object = state.connectivity_map
-            graph_selection = self._graph_cell_selection(state.connectivity_map)
-            if not self._selection_artifacts_match(graph_selection, selection):
-                raise ValueError("cell_key does not match the graph cell selection")
-        else:
-            graph_path = self.get_latest_graph_loc(
-                from_assay,
-                cell_key,
-                feat_key,
+            raise ValueError(
+                "Doublet detection requires the selected RNA graph to be an "
+                "artifact-backed connectivity chain. Rebuild and select the graph "
+                "with query_neighbors(...) and build_connectivity_map(...)."
             )
-            graph_group = as_zarr_group(
-                self.zw[graph_path],
-                name=graph_path,
+        connectivity = state.connectivity_map
+        connectivity_status = self._require_complete_artifact(
+            connectivity,
+            "connectivity_map",
+            assay=from_assay,
+        )
+        if connectivity_status.operation != "build_connectivity_map":
+            raise ValueError(
+                "Doublet detection requires a build_connectivity_map artifact. "
+                "Rebuild and select the RNA graph before running doublet detection."
             )
-            graph_input = {
-                "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                    graph_group,
-                    ("edges", "weights"),
-                )
-            }
+        validate_artifact_graph_selection(
+            self.zw,
+            connectivity,
+            cell_key,
+            feat_key,
+        )
+        neighbors = self._artifact_input_ref(
+            connectivity,
+            "neighbors",
+            "neighbors",
+        )
+        if (
+            neighbors.scope != "assay"
+            or neighbors.assay != from_assay
+            or state.neighbors != neighbors
+        ):
+            raise ValueError(
+                "The selected connectivity artifact does not match the selected "
+                "RNA neighbors chain. Rebuild and select the graph before running "
+                "doublet detection."
+            )
+        graph_selection = self._graph_cell_selection(connectivity)
+        if not self._selection_artifacts_match(graph_selection, selection):
+            raise ValueError("cell_key does not match the graph cell selection")
+        neighbors_status = self._require_complete_artifact(
+            neighbors,
+            "neighbors",
+            assay=from_assay,
+        )
+        raw_coordinates = (neighbors_status.inputs or {}).get("coordinates")
+        if not isinstance(raw_coordinates, dict):
+            raise ValueError("The selected neighbors have no coordinate provenance")
+        coordinates = ArtifactRef.from_dict(raw_coordinates)
+        if coordinates.kind != "reduction":
+            raise ValueError(
+                "Doublet detection requires a plain scaled-PCA mapping reference. "
+                "The selected neighbors use batch-corrected or Symphony coordinates. "
+                "Rebuild and select an uncorrected scaled-PCA connectivity graph first."
+            )
         n_active = len(self.cells.active_index(cell_key))
         arguments = DoubletScoreArguments(
             clusters=cluster_input,
-            connectivity_map=graph_input,
+            connectivity_map=connectivity,
             cluster_sample_fraction=cluster_sample_fraction,
             max_cells_per_cluster=max_cells_per_cluster,
             simulation_ratio=simulation_ratio,
@@ -692,6 +727,50 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             )
             return final_col
 
+        reference = None
+        named_reference = state.named_results.get("mapping_reference")
+        if named_reference is not None:
+            try:
+                candidate = self.get_mapping_reference(
+                    named_reference,
+                    from_assay=from_assay,
+                )
+            except (KeyError, RuntimeError, TypeError, ValueError):
+                pass
+            else:
+                if (
+                    candidate.neighbors == neighbors
+                    and candidate.assay_name == from_assay
+                    and candidate.cell_key == cell_key
+                    and candidate.feature_key == feat_key
+                    and candidate.method == "pca"
+                    and candidate.batch_correction is None
+                    and candidate.symphony_state is None
+                ):
+                    reference = candidate
+        if reference is None:
+            reference = self.build_mapping_reference(neighbors)
+            named_results = dict(state.named_results)
+            named_results["mapping_reference"] = reference.ref
+            self._publish_current_artifact(
+                connectivity,
+                update_state=True,
+                named_results=named_results,
+            )
+        if (
+            reference.neighbors != neighbors
+            or reference.assay_name != from_assay
+            or reference.cell_key != cell_key
+            or reference.feature_key != feat_key
+            or reference.method != "pca"
+            or reference.batch_correction is not None
+            or reference.symphony_state is not None
+        ):
+            raise RuntimeError(
+                "The prepared plain mapping reference does not match the selected "
+                "RNA graph chain"
+            )
+
         rng = np.random.default_rng(random_seed)
         active_idx = self.cells.active_index(cell_key)
         clusters = self.cells.fetch(cluster_key, key=cell_key)
@@ -720,7 +799,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         temp_dir = tempfile.mkdtemp(prefix="scarf_doublet_")
         target_name = f"_doublet_sim_{from_assay}"
-        target_feat_key = f"{feat_key}_doublet"
         try:
             write_doublet_target_zarr(
                 zarr_loc=temp_dir,
@@ -739,39 +817,43 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 assay_types={from_assay: "RNA"},
                 nthreads=self.nthreads,
             )
-            self.run_mapping(
-                target_assay=target_ds._get_assay(from_assay),
-                target_name=target_name,
-                target_feat_key=target_feat_key,
-                from_assay=from_assay,
-                cell_key=cell_key,
-                feat_key=feat_key,
+            result = target_ds.run_mapping(
+                reference,
+                mapping_name=target_name,
+                query_assay=from_assay,
                 save_k=save_k,
             )
 
-            raw_scores = None
-            for _, score in self.get_mapping_score(
-                target_name=target_name,
-                from_assay=from_assay,
-                cell_key=cell_key,
-                log_transform=True,
-            ):
-                raw_scores = score
-            if raw_scores is None:
+            try:
+                _, raw_scores = next(
+                    target_ds.get_mapping_score(
+                        result,
+                        reference=reference,
+                        log_transform=True,
+                    )
+                )
+            except StopIteration:
                 raise RuntimeError(
                     "ERROR: Mapping scores could not be computed for simulated doublets"
+                ) from None
+            raw_scores = np.asarray(raw_scores)
+            if raw_scores.shape != (n_active,):
+                raise RuntimeError(
+                    "Doublet mapping scores do not match the selected reference cells"
                 )
 
             temp_col = self._col_renamer(from_assay, cell_key, f"{label}__raw")
             self.cells.insert(temp_col, raw_scores, key=cell_key, overwrite=True)
-            smoothed = self.get_imputed(
-                from_assay=from_assay,
-                cell_key=cell_key,
-                feature_name=temp_col,
-                feat_key=feat_key,
-                t=smoothing_t,
-            )
-            self.cells.drop(temp_col)
+            try:
+                smoothed = self.get_imputed(
+                    from_assay=from_assay,
+                    cell_key=cell_key,
+                    feature_name=temp_col,
+                    feat_key=feat_key,
+                    t=smoothing_t,
+                )
+            finally:
+                self.cells.drop(temp_col)
 
             scores = np.asarray(smoothed, dtype=float)
             if normalize_scores:
@@ -796,19 +878,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 f"{n_sim} synthetic doublets"
             )
         finally:
-            try:
-                self._delete_projection_artifact(
-                    from_assay,
-                    target_name,
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Could not remove temporary projection artifact: {e}")
-            store_loc = f"{from_assay}/projections/{target_name}"
-            try:
-                if store_loc in self.zw:
-                    del self.zw[store_loc]
-            except Exception as e:  # noqa: BLE001
-                logger.debug(f"Could not remove temporary projection group: {e}")
             shutil.rmtree(temp_dir, ignore_errors=True)
         return final_col
 

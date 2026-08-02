@@ -17,6 +17,7 @@ from scarf.storage.artifacts import (
     ARTIFACT_KINDS,
     ArtifactRef,
     ArtifactScope,
+    ExternalArtifactRef,
     ValueFingerprintBuilder,
     artifact_exists,
     artifact_group,
@@ -35,6 +36,7 @@ from scarf.storage.artifacts import (
     parse_artifact_path,
     provenance_hash,
     require_complete_artifact,
+    serialize_artifact_value,
 )
 
 
@@ -264,6 +266,120 @@ def test_artifact_ref_rejects_malformed_values() -> None:
     del missing_type["type"]
     with pytest.raises(ValueError, match="type must be"):
         ArtifactRef.from_dict(missing_type)
+
+
+def test_external_artifact_ref_round_trips_strictly() -> None:
+    ref = _ref(kind="embedding", artifact_id="b" * 64)
+    external = ExternalArtifactRef(
+        dataset_fingerprint="reference-dataset",
+        ref=ref,
+    )
+    serialized = {
+        "type": "external_artifact",
+        "dataset_fingerprint": "reference-dataset",
+        "ref": ref.to_dict(),
+    }
+
+    assert external.to_dict() == serialized
+    assert ExternalArtifactRef.from_dict(serialized) == external
+    assert serialize_artifact_value(external) == serialized
+    assert canonical_bytes(external) == canonical_bytes(serialized)
+    assert not {
+        "path",
+        "uri",
+        "workspace",
+        "storage_options",
+        "credentials",
+        "schema",
+        "version",
+    } & set(serialized)
+
+
+def test_external_artifact_ref_rejects_malformed_values() -> None:
+    assay_ref = _ref()
+    datastore_ref = ArtifactRef(
+        scope="datastore",
+        kind="integrated_graph",
+        artifact_id="c" * 64,
+    )
+    with pytest.raises(ValueError, match="non-empty"):
+        ExternalArtifactRef(dataset_fingerprint="", ref=assay_ref)
+    with pytest.raises(ValueError, match="assay-scoped"):
+        ExternalArtifactRef(
+            dataset_fingerprint="reference-dataset",
+            ref=datastore_ref,
+        )
+
+    serialized = ExternalArtifactRef(
+        dataset_fingerprint="reference-dataset",
+        ref=assay_ref,
+    ).to_dict()
+    with pytest.raises(ValueError, match="contain exactly"):
+        ExternalArtifactRef.from_dict({**serialized, "path": "/tmp/reference"})
+    with pytest.raises(ValueError, match="contain exactly"):
+        ExternalArtifactRef.from_dict(
+            {
+                "type": "external_artifact",
+                "dataset_fingerprint": "reference-dataset",
+            }
+        )
+    with pytest.raises(ValueError, match="type must be"):
+        ExternalArtifactRef.from_dict({**serialized, "type": "artifact"})
+    with pytest.raises(ValueError, match="complete assay artifact"):
+        ExternalArtifactRef.from_dict(
+            {
+                **serialized,
+                "ref": {**assay_ref.to_dict(), "path": "reference.zarr"},
+            }
+        )
+    with pytest.raises(ValueError, match="assay-scoped"):
+        ExternalArtifactRef.from_dict(
+            {
+                **serialized,
+                "ref": {**datastore_ref.to_dict(), "assay": None},
+            }
+        )
+
+
+def test_external_artifact_ref_has_stable_provenance_identity() -> None:
+    ref = _ref(kind="mapping_reference", artifact_id="d" * 64)
+    external = ExternalArtifactRef("reference-dataset", ref)
+    round_tripped = ExternalArtifactRef.from_dict(external.to_dict())
+    same = make_provenance(
+        operation="map_query",
+        parameters={},
+        inputs={"mapping_reference": round_tripped},
+    )
+    original = make_provenance(
+        operation="map_query",
+        parameters={},
+        inputs={"mapping_reference": external},
+    )
+    other_dataset = make_provenance(
+        operation="map_query",
+        parameters={},
+        inputs={
+            "mapping_reference": ExternalArtifactRef(
+                "other-dataset",
+                ref,
+            )
+        },
+    )
+    other_artifact = make_provenance(
+        operation="map_query",
+        parameters={},
+        inputs={
+            "mapping_reference": ExternalArtifactRef(
+                "reference-dataset",
+                _ref(kind="mapping_reference", artifact_id="e" * 64),
+            )
+        },
+    )
+
+    assert original["inputs"]["mapping_reference"] == external.to_dict()
+    assert provenance_hash(original) == provenance_hash(same)
+    assert provenance_hash(original) != provenance_hash(other_dataset)
+    assert provenance_hash(original) != provenance_hash(other_artifact)
 
 
 def test_provenance_hash_is_typed_order_independent_and_not_persisted() -> None:

@@ -329,7 +329,6 @@ concrete_modules = {
     "scarf.plotting.embedding_raster",
     "scarf.plotting.heatmaps",
     "scarf.plotting.summary",
-    "scarf.plotting.unified",
 }
 assert concrete_modules.isdisjoint(sys.modules)
 assert not any(
@@ -351,16 +350,6 @@ assert not any(
         ],
         check=True,
     )
-
-
-def test_unified_plotting_uses_datastore_layout_adapter():
-    path = _SCARF_ROOT / "plotting" / "unified.py"
-    source = path.read_text()
-    tree = ast.parse(source, filename=str(path))
-    assert not any(
-        isinstance(node, ast.Attribute) and node.attr == "zw" for node in ast.walk(tree)
-    )
-    assert "_load_unified_layout_data" in source
 
 
 def test_algorithm_domains_do_not_import_orchestration_or_io():
@@ -497,9 +486,11 @@ def test_mapping_does_not_import_orchestration_or_general_io():
     assert storage_importers <= {
         "artifact.py",
         "confidence.py",
-        "coral.py",
         "features.py",
         "hashing.py",
+        "models.py",
+        "projection.py",
+        "reference.py",
     }
 
 
@@ -549,6 +540,7 @@ def test_compatibility_only_modules_are_removed():
         _SCARF_ROOT / "genomics" / "melding.py",
         _SCARF_ROOT / "genomics" / "reference.py",
         _SCARF_ROOT / "knn_utils.py",
+        _SCARF_ROOT / "mapping" / "coral.py",
         _SCARF_ROOT / "mapping_reference.py",
         _SCARF_ROOT / "mapping_utils.py",
         _SCARF_ROOT / "markers.py",
@@ -566,6 +558,7 @@ def test_compatibility_only_modules_are_removed():
         _SCARF_ROOT / "clustering" / "feature_graph.py",
         _SCARF_ROOT / "clustering" / "hierarchy.py",
         _SCARF_ROOT / "parallel.py",
+        _SCARF_ROOT / "plotting" / "unified.py",
         _SCARF_ROOT / "results.py",
         _SCARF_ROOT / "storage" / "zarr_store.py",
         _SCARF_ROOT / "trajectory" / "aggregation.py",
@@ -585,7 +578,9 @@ def test_retired_root_import_paths_do_not_resolve():
         "scarf.harmony",
         "scarf.genomics",
         "scarf.knn_utils",
+        "scarf.mapping.coral",
         "scarf.markers",
+        "scarf.plotting.unified",
         "scarf.clustering._paris_mdl",
         "scarf.clustering.feature_graph",
         "scarf.clustering.hierarchy",

@@ -63,15 +63,6 @@ def _is_categorical(values: pd.Series, kind: str) -> bool:
     return False
 
 
-def _scarf_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("scarf")
-    except Exception:
-        return "unknown"
-
-
 def _coerce_color_items(
     color_by: str
     | FeatureRef
@@ -1940,7 +1931,6 @@ def embedding(
         legends=tuple(legends),
         scales=tuple(scales_out),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             assay=next(iter(feature_assays)) if len(feature_assays) == 1 else None,
             cell_key=cell_key,
             n_cells=int(base_mask.sum()),

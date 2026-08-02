@@ -13,6 +13,7 @@ from scarf.neighbors.graph import (
     build_connectivity_arrays,
     calc_snn,
     merge_graphs,
+    take_nearest_per_row,
     weight_sort_indices,
 )
 from scarf.neighbors.diffusion import diffusion_operator
@@ -367,6 +368,43 @@ def test_connectivity_omits_zero_membership_edges():
     )
     assert len(edges) == n_cells * 4
     np.testing.assert_allclose(weights, expected, rtol=1e-6, atol=1e-7)
+
+
+def test_take_nearest_per_row_handles_rows_that_lost_zero_weight_edges():
+    # Row 1 kept two edges instead of three because a zero-weight edge was
+    # dropped. Assuming a fixed row width here selects the wrong neighbors.
+    edges = np.array(
+        [[0, 5], [0, 6], [0, 7], [1, 8], [1, 9], [2, 1], [2, 2], [2, 3]],
+        dtype=np.uint32,
+    )
+    weights = np.arange(1, 9, dtype=np.float32)
+
+    kept_weights, kept_edges = take_nearest_per_row(weights, edges, 3, 2)
+
+    np.testing.assert_array_equal(kept_edges[:, 1], [5, 6, 8, 9, 1, 2])
+    np.testing.assert_allclose(kept_weights, [1.0, 2.0, 4.0, 5.0, 6.0, 7.0])
+
+    full_weights, full_edges = take_nearest_per_row(weights, edges, 3, 3)
+    np.testing.assert_array_equal(full_edges, edges)
+    np.testing.assert_allclose(full_weights, weights)
+
+    with pytest.raises(ValueError, match="grouped by source cell"):
+        take_nearest_per_row(
+            np.ones(2, dtype=np.float32),
+            np.array([[1, 0], [0, 1]], dtype=np.uint32),
+            2,
+            1,
+        )
+
+
+def test_take_nearest_per_row_keeps_every_cell_when_a_row_is_empty():
+    edges = np.array([[0, 1], [0, 2], [2, 0]], dtype=np.uint32)
+    weights = np.array([0.5, 0.25, 0.75], dtype=np.float32)
+
+    kept_weights, kept_edges = take_nearest_per_row(weights, edges, 3, 1)
+
+    np.testing.assert_array_equal(kept_edges[:, 0], [0, 2])
+    np.testing.assert_allclose(kept_weights, [0.5, 0.75])
 
 
 def test_wnn_integration_handles_extreme_affinities_without_runtime_warnings():

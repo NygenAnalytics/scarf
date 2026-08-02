@@ -568,13 +568,6 @@ def dotplot(
     )
     assays = _feature_assays(store, features, from_assay)
 
-    from importlib.metadata import version
-
-    try:
-        scarf_version = version("scarf")
-    except Exception:
-        scarf_version = "unknown"
-
     result = PlotResult(
         figure=fig,
         axes=axes,
@@ -622,7 +615,6 @@ def dotplot(
             ),
         ),
         provenance=PlotProvenance(
-            scarf_version=scarf_version,
             assay=next(iter(assays)) if len(assays) == 1 else None,
             cell_key=cell_key,
             n_cells=len(store.cells.active_index(cell_key)),
@@ -913,13 +905,6 @@ def matrixplot(
     )
     assays = _feature_assays(store, features, from_assay)
 
-    from importlib.metadata import version
-
-    try:
-        scarf_version = version("scarf")
-    except Exception:
-        scarf_version = "unknown"
-
     result = PlotResult(
         figure=fig,
         axes=axes,
@@ -938,7 +923,6 @@ def matrixplot(
         ),
         scales=(color_scale, *resolved_annotation_scales),
         provenance=PlotProvenance(
-            scarf_version=scarf_version,
             assay=next(iter(assays)) if len(assays) == 1 else None,
             cell_key=cell_key,
             n_cells=len(store.cells.active_index(cell_key)),

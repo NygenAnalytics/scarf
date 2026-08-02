@@ -3,7 +3,7 @@
 from typing import Any
 
 from ..metadata.artifacts import column_display
-from ._contracts import CategoricalScale, ColorScale
+from ._contracts import CategoricalScale
 
 
 def stored_display_metadata(store: Any, column: str) -> dict[str, Any] | None:
@@ -27,19 +27,6 @@ def stored_categorical_scale(store: Any, column: str) -> CategoricalScale | None
         labels={category["value"]: str(category["label"]) for category in categories},
         missing_color=str(display.get("missing_color", "#bdbdbd")),
         missing_label=str(display.get("missing_label", "NA")),
-    )
-
-
-def stored_color_scale(store: Any, column: str) -> ColorScale | None:
-    """Resolve a stored continuous display contract for one cell column."""
-    display = stored_display_metadata(store, column)
-    if display is None or display["kind"] != "continuous":
-        return None
-    return ColorScale(
-        cmap=str(display["colormap"]),
-        vmin=(float(display["minimum"]) if display["minimum"] is not None else None),
-        vmax=(float(display["maximum"]) if display["maximum"] is not None else None),
-        scale=str(display["scale"]),  # type: ignore[arg-type]
     )
 
 

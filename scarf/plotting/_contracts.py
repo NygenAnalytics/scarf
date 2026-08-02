@@ -1,10 +1,22 @@
 """Public contracts for scarf.plotting."""
 
 from dataclasses import dataclass, field
+from functools import cache
+from importlib.metadata import version
 from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+
+
+@cache
+def installed_scarf_version() -> str:
+    """Return the installed scarf version, or "unknown" when it cannot be read."""
+    try:
+        return version("scarf")
+    except Exception:
+        return "unknown"
+
 
 LookupBy = Literal["name", "id", "index"]
 FeatureReduction = Literal["mean", "sum"]
@@ -297,7 +309,7 @@ class Highlight:
 
 @dataclass(frozen=True, slots=True)
 class PlotProvenance:
-    scarf_version: str
+    scarf_version: str = field(default_factory=installed_scarf_version)
     assay: str | None = None
     cell_key: str | None = None
     n_cells: int = 0

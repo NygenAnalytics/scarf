@@ -1,15 +1,28 @@
 import json
 from collections import defaultdict
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, cast
 
 import networkx as nx
 import zarr
 
-from .storage.artifacts import ArtifactRef, ArtifactStatus, inspect_artifact
+from .storage.artifacts import ArtifactStatus, inspect_artifact
+from .storage.refs import ArtifactLocator, ArtifactRef, ExternalArtifactRef
 
 type LineageTarget = ArtifactRef | Mapping[str, ArtifactRef]
+
+
+@dataclass(frozen=True, slots=True)
+class _ExternalLineageRef:
+    dataset_fingerprint: str
+    source_assay: str
+    ref: ArtifactRef
+
+
+type _LineageLocator = ArtifactLocator | _ExternalLineageRef
+
 
 _DETAIL_ITEM_LIMIT = 12
 _DETAIL_VALUE_LIMIT = 160
@@ -18,6 +31,18 @@ _OMITTED = object()
 
 def _ref_sort_key(ref: ArtifactRef) -> tuple[str, str, str, str]:
     return (ref.scope, ref.assay or "", ref.kind, ref.artifact_id)
+
+
+def _locator_sort_key(
+    locator: _LineageLocator,
+) -> tuple[str, str, str, str, str, str]:
+    if isinstance(locator, ExternalArtifactRef | _ExternalLineageRef):
+        return (
+            "external",
+            locator.dataset_fingerprint,
+            *_ref_sort_key(locator.ref),
+        )
+    return ("local", "", *_ref_sort_key(locator))
 
 
 def _input_path(parts: tuple[str, ...]) -> str:
@@ -35,20 +60,33 @@ def _input_path(parts: tuple[str, ...]) -> str:
 def _artifact_inputs(
     value: Any,
     path: tuple[str, ...] = (),
-) -> Iterator[tuple[str, ArtifactRef]]:
+) -> Iterator[tuple[str, ArtifactLocator]]:
+    if isinstance(value, ExternalArtifactRef):
+        yield _input_path(path), value
+        return
     if isinstance(value, ArtifactRef):
         yield _input_path(path), value
         return
     if isinstance(value, Mapping):
+        if value.get("type") == "external_artifact":
+            try:
+                external_ref = ExternalArtifactRef.from_dict(value)
+            except (TypeError, ValueError) as exc:
+                location = _input_path(path)
+                raise ValueError(
+                    f"Invalid external artifact reference at lineage input {location!r}"
+                ) from exc
+            yield _input_path(path), external_ref
+            return
         if value.get("type") == "artifact":
             try:
-                ref = ArtifactRef.from_dict(value)
+                artifact_ref = ArtifactRef.from_dict(value)
             except (TypeError, ValueError) as exc:
                 location = _input_path(path)
                 raise ValueError(
                     f"Invalid artifact reference at lineage input {location!r}"
                 ) from exc
-            yield _input_path(path), ref
+            yield _input_path(path), artifact_ref
             return
         for key in sorted(value):
             yield from _artifact_inputs(value[key], (*path, str(key)))
@@ -59,10 +97,10 @@ def _artifact_inputs(
 
 
 def _external_value(value: Any) -> Any:
-    if isinstance(value, ArtifactRef):
+    if isinstance(value, ArtifactRef | ExternalArtifactRef):
         return _OMITTED
     if isinstance(value, Mapping):
-        if value.get("type") == "artifact":
+        if value.get("type") in ("artifact", "external_artifact"):
             return _OMITTED
         result = {}
         for key in sorted(value):
@@ -104,31 +142,117 @@ def _normalize_outputs(target: LineageTarget) -> dict[str, ArtifactRef]:
     return dict(sorted(outputs.items()))
 
 
+def _normalize_external_roots(
+    external_roots: Mapping[str, zarr.Group] | None,
+) -> dict[str, zarr.Group]:
+    if external_roots is None:
+        return {}
+    if not isinstance(external_roots, Mapping):
+        raise TypeError("external_roots must be a mapping or None")
+    roots = {}
+    for fingerprint, root in external_roots.items():
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise ValueError("External root fingerprints must be non-empty strings")
+        if not isinstance(root, zarr.Group):
+            raise TypeError(
+                f"External root for fingerprint {fingerprint!r} must be a Zarr group"
+            )
+        roots[fingerprint] = root
+    return roots
+
+
+def _inspect_external_artifact(
+    root: zarr.Group,
+    locator: ExternalArtifactRef | _ExternalLineageRef,
+) -> ArtifactStatus:
+    assay_name = (
+        locator.ref.assay
+        if isinstance(locator, ExternalArtifactRef)
+        else locator.source_assay
+    )
+    assert assay_name is not None
+    if assay_name not in root or not isinstance(root[assay_name], zarr.Group):
+        raise ValueError(
+            f"External root for dataset fingerprint "
+            f"{locator.dataset_fingerprint!r} is missing assay group "
+            f"{assay_name!r}"
+        )
+    assay = root[assay_name]
+    received = assay.attrs.get("dataset_fingerprint")
+    if received is None:
+        raise ValueError(
+            f"External root assay {assay_name!r} has no stored "
+            f"dataset_fingerprint; expected {locator.dataset_fingerprint!r}"
+        )
+    if received != locator.dataset_fingerprint:
+        raise ValueError(
+            f"External root assay {assay_name!r} dataset fingerprint mismatch. "
+            f"Expected {locator.dataset_fingerprint!r}, received {received!r}"
+        )
+    return inspect_artifact(root, locator.ref)
+
+
 def _build_graph(
     root: zarr.Group,
     outputs: Mapping[str, ArtifactRef],
+    external_roots: Mapping[str, zarr.Group],
 ) -> nx.DiGraph:
     graph = nx.DiGraph()
-    visited: set[ArtifactRef] = set()
+    visited: set[_LineageLocator] = set()
 
-    def visit(ref: ArtifactRef) -> None:
-        if ref in visited:
+    def visit(locator: _LineageLocator) -> None:
+        if locator in visited:
             return
-        visited.add(ref)
-        status = inspect_artifact(root, ref)
-        graph.add_node(ref, status=status, outputs=())
+        visited.add(locator)
+        if isinstance(locator, ExternalArtifactRef | _ExternalLineageRef):
+            external_root = external_roots.get(locator.dataset_fingerprint)
+            status = (
+                None
+                if external_root is None
+                else _inspect_external_artifact(external_root, locator)
+            )
+        else:
+            status = inspect_artifact(root, locator)
+        graph.add_node(locator, status=status, outputs=())
+        if status is None:
+            return
         dependencies = sorted(
             _artifact_inputs(status.inputs),
-            key=lambda item: (item[0], _ref_sort_key(item[1])),
+            key=lambda item: (item[0], _locator_sort_key(item[1])),
         )
-        for input_name, input_ref in dependencies:
-            if graph.has_edge(input_ref, ref):
-                labels = set(graph.edges[input_ref, ref]["inputs"])
+        for input_name, input_locator in dependencies:
+            dependency: _LineageLocator = input_locator
+            if isinstance(
+                locator,
+                ExternalArtifactRef | _ExternalLineageRef,
+            ) and isinstance(input_locator, ArtifactRef):
+                source_assay = (
+                    locator.ref.assay
+                    if isinstance(locator, ExternalArtifactRef)
+                    else locator.source_assay
+                )
+                assert source_assay is not None
+                if (
+                    input_locator.scope == "assay"
+                    and input_locator.assay == source_assay
+                ):
+                    dependency = ExternalArtifactRef(
+                        dataset_fingerprint=locator.dataset_fingerprint,
+                        ref=input_locator,
+                    )
+                else:
+                    dependency = _ExternalLineageRef(
+                        dataset_fingerprint=locator.dataset_fingerprint,
+                        source_assay=source_assay,
+                        ref=input_locator,
+                    )
+            if graph.has_edge(dependency, locator):
+                labels = set(graph.edges[dependency, locator]["inputs"])
                 labels.add(input_name)
-                graph.edges[input_ref, ref]["inputs"] = tuple(sorted(labels))
+                graph.edges[dependency, locator]["inputs"] = tuple(sorted(labels))
             else:
-                graph.add_edge(input_ref, ref, inputs=(input_name,))
-            visit(input_ref)
+                graph.add_edge(dependency, locator, inputs=(input_name,))
+            visit(dependency)
 
     for ref in sorted(set(outputs.values()), key=_ref_sort_key):
         visit(ref)
@@ -136,15 +260,18 @@ def _build_graph(
     output_names: dict[ArtifactRef, list[str]] = defaultdict(list)
     for name, ref in outputs.items():
         output_names[ref].append(name)
-    for ref in graph:
-        graph.nodes[ref]["outputs"] = tuple(sorted(output_names[ref]))
+    for locator in graph:
+        names = output_names[locator] if isinstance(locator, ArtifactRef) else []
+        graph.nodes[locator]["outputs"] = tuple(sorted(names))
 
     if not nx.is_directed_acyclic_graph(graph):
         raise ValueError("Artifact provenance contains a dependency cycle")
     return nx.freeze(graph)
 
 
-def _status_label(status: ArtifactStatus) -> str:
+def _status_label(status: ArtifactStatus | None) -> str:
+    if status is None:
+        return "unresolved external"
     if not status.exists:
         return "missing"
     if not status.complete:
@@ -152,7 +279,17 @@ def _status_label(status: ArtifactStatus) -> str:
     return "complete"
 
 
-def _display_scope(ref: ArtifactRef) -> str:
+def _located_ref(locator: _LineageLocator) -> ArtifactRef:
+    if isinstance(locator, ExternalArtifactRef | _ExternalLineageRef):
+        return locator.ref
+    return locator
+
+
+def _display_scope(locator: _LineageLocator) -> str:
+    ref = _located_ref(locator)
+    scope = ref.assay if ref.assay is not None else "datastore"
+    if isinstance(locator, ExternalArtifactRef | _ExternalLineageRef):
+        return f"external {locator.dataset_fingerprint[:12]} / {scope}"
     return ref.assay if ref.assay is not None else "datastore"
 
 
@@ -201,9 +338,12 @@ class ArtifactLineage:
         cls,
         root: zarr.Group,
         target: LineageTarget,
+        *,
+        external_roots: Mapping[str, zarr.Group] | None = None,
     ) -> "ArtifactLineage":
         outputs = _normalize_outputs(target)
-        return cls(_build_graph(root, outputs), outputs)
+        roots = _normalize_external_roots(external_roots)
+        return cls(_build_graph(root, outputs, roots), outputs)
 
     @property
     def graph(self) -> nx.DiGraph:
@@ -213,33 +353,46 @@ class ArtifactLineage:
     def outputs(self) -> Mapping[str, ArtifactRef]:
         return self._outputs
 
-    def _ordered_refs(self) -> list[ArtifactRef]:
+    def _ordered_refs(self) -> list[_LineageLocator]:
         return list(
             nx.lexicographical_topological_sort(
                 self._graph,
-                key=_ref_sort_key,
+                key=_locator_sort_key,
             )
         )
 
     def to_mermaid(self) -> str:
-        refs = self._ordered_refs()
-        node_ids = {ref: f"artifact{index}" for index, ref in enumerate(refs)}
+        locators = self._ordered_refs()
+        node_ids = {
+            locator: f"artifact{index}" for index, locator in enumerate(locators)
+        }
         lines = ["flowchart LR"]
-        for ref in refs:
-            status = cast(ArtifactStatus, self._graph.nodes[ref]["status"])
+        for locator in locators:
+            status = cast(
+                ArtifactStatus | None,
+                self._graph.nodes[locator]["status"],
+            )
+            ref = _located_ref(locator)
             label_parts = [
-                f"{_display_scope(ref)} / {ref.kind}",
-                status.operation or "operation unavailable",
+                f"{_display_scope(locator)} / {ref.kind}",
+                (
+                    status.operation or "operation unavailable"
+                    if status is not None
+                    else "external source unresolved"
+                ),
                 ref.artifact_id[:12],
             ]
-            output_names = cast(tuple[str, ...], self._graph.nodes[ref]["outputs"])
+            output_names = cast(
+                tuple[str, ...],
+                self._graph.nodes[locator]["outputs"],
+            )
             if output_names:
                 label_parts.append(f"outputs: {', '.join(output_names)}")
             status_name = _status_label(status)
             if status_name != "complete":
                 label_parts.append(f"status: {status_name}")
             label = _mermaid_text(" | ".join(label_parts))
-            lines.append(f'    {node_ids[ref]}["{label}"]')
+            lines.append(f'    {node_ids[locator]}["{label}"]')
 
         edges = sorted(
             self._graph.edges,
@@ -262,22 +415,34 @@ class ArtifactLineage:
             "",
             "### Artifact details",
         ]
-        for ref in self._ordered_refs():
-            status = cast(ArtifactStatus, self._graph.nodes[ref]["status"])
+        for locator in self._ordered_refs():
+            status = cast(
+                ArtifactStatus | None,
+                self._graph.nodes[locator]["status"],
+            )
+            ref = _located_ref(locator)
             lines.extend(
                 [
                     "",
                     (
-                        f"#### {_display_scope(ref)} / {ref.kind} / "
+                        f"#### {_display_scope(locator)} / {ref.kind} / "
                         f"{ref.artifact_id[:12]}"
                     ),
                     f"- Status: `{_status_label(status)}`",
-                    f"- Path: `{status.path}`",
                 ]
             )
+            if isinstance(locator, ExternalArtifactRef | _ExternalLineageRef):
+                lines.append(f"- Dataset fingerprint: `{locator.dataset_fingerprint}`")
+            if status is None:
+                lines.append("- Resolution: `No matching external root was supplied`")
+                continue
+            lines.append(f"- Path: `{status.path}`")
             if status.operation is not None:
                 lines.append(f"- Operation: `{status.operation}`")
-            output_names = cast(tuple[str, ...], self._graph.nodes[ref]["outputs"])
+            output_names = cast(
+                tuple[str, ...],
+                self._graph.nodes[locator]["outputs"],
+            )
             if output_names:
                 lines.append(
                     "- Outputs: "

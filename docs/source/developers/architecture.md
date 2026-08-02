@@ -79,7 +79,7 @@ They must not import those packages at module load time.
 - `quality_control/` owns filtering, HTO demultiplexing, doublet processing,
   cell-cycle assignment, and the default cell-cycle gene references.
 - `mapping/` owns reference artifacts, feature alignment, confidence,
-  Symphony-style correction, CORAL compatibility, and mapping results.
+  Symphony-style correction, and mapping results.
 
 Domain algorithm packages must not import `datastore`, `plotting`, or general
 import/export packages at module load time. A domain that persists an artifact
@@ -161,9 +161,8 @@ implementation directly unless it intentionally needs a public patch seam.
 
 Compatibility policy for the 1.x series:
 
-- Deprecated `run_mapping` flags remain accepted with `DeprecationWarning`.
-- These Python API compatibility paths are retained through 1.x and may be
-  removed in 2.0.
+- Mapping references and query projections use the hard-break contract
+  documented in {doc}`migration_notes`.
 - Specific older file schemas named in the migration notes remain readable
   while their compatibility tests are maintained. This is not a blanket
   guarantee for every historical artifact.

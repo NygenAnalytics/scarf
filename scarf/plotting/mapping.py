@@ -1,13 +1,15 @@
 """Diagnostics for reference mapping and label transfer."""
 
 from collections.abc import Sequence
-from importlib.metadata import version
 from typing import Any, Hashable, Literal
 import warnings
 
 import numpy as np
 import pandas as pd
 
+from ..mapping.models import MappingResult
+from ..mapping.reference import MappingReference
+from ..storage.refs import ArtifactRef
 from ._contracts import (
     CategoricalScale,
     ColorScale,
@@ -19,7 +21,6 @@ from ._style import (
     apply_figure_chrome,
     categorical_color_map,
     continuous_norm,
-    default_point_edgewidth,
     default_point_size,
     finish_embedding_axes,
     scatter_edgecolor,
@@ -29,72 +30,69 @@ from ._style import (
 )
 
 
-def _scarf_version() -> str:
-    try:
-        return version("scarf")
-    except Exception:
-        return "unknown"
-
-
-def _resolved_mapping_keys(
-    store: Any,
-    from_assay: str | None,
-    cell_key: str | None,
-) -> tuple[str, str]:
-    assay = from_assay or getattr(store, "_defaultAssay", None)
-    if assay is None:
-        raise ValueError("No default assay is configured")
-    if cell_key is None:
-        resolver = getattr(store, "_get_latest_cell_key", None)
-        cell_key = resolver(assay) if callable(resolver) else "I"
-    return str(assay), str(cell_key)
-
-
 def _mapping_result(
     store: Any,
+    result: MappingResult | ArtifactRef | str,
     *,
-    target_name: str,
-    from_assay: str | None,
-    cell_key: str | None,
-) -> Any:
-    result = store.get_mapping_result(
-        target_name,
-        from_assay=from_assay,
-        cell_key=cell_key,
-        load_arrays=True,
+    reference: MappingReference | None,
+    query_assay: str | None,
+) -> MappingResult:
+    loader = getattr(store, "get_mapping_result", None)
+    if not callable(loader):
+        raise TypeError("store does not provide mapping result data")
+    loaded = loader(
+        result,
+        reference=reference,
+        query_assay=query_assay,
+        load_arrays=False,
     )
-    if result.indices is None or result.distances is None:
-        raise ValueError(f"Mapping {target_name!r} has no saved neighbor arrays")
-    return result
+    if not isinstance(loaded, MappingResult):
+        raise TypeError("store returned an invalid mapping result")
+    if loaded.reference is None:
+        raise ValueError("Resolved mapping result has no MappingReference")
+    return loaded
 
 
-def _projected_mapping_coordinates(
+def _mapping_reference_embedding(
     store: Any,
-    result: Any,
+    result: MappingResult | ArtifactRef | str,
     *,
+    reference: MappingReference | None,
     reference_layout_key: str,
-    cell_key: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    reference_x = np.asarray(
-        store.cells.fetch(f"{reference_layout_key}1", key=cell_key),
+    query_assay: str | None,
+) -> np.ndarray:
+    loader = getattr(store, "_load_mapping_reference_embedding", None)
+    if not callable(loader):
+        raise TypeError("store does not provide persisted mapping embedding data")
+    coordinates = np.asarray(
+        loader(
+            result,
+            reference_layout_key,
+            reference=reference,
+            query_assay=query_assay,
+        ),
         dtype=np.float64,
     )
-    reference_y = np.asarray(
-        store.cells.fetch(f"{reference_layout_key}2", key=cell_key),
-        dtype=np.float64,
-    )
-    reference_layout = np.column_stack((reference_x, reference_y))
-    indices = np.asarray(result.indices)
-    distances = np.asarray(result.distances)
-    if indices.ndim != 2 or distances.shape != indices.shape:
-        raise ValueError("Mapping neighbor arrays have incompatible shapes")
-    if len(indices) and int(indices.max()) >= len(reference_layout):
-        raise ValueError("Mapping neighbor indices exceed the reference layout")
-    from ..mapping.confidence import distance_weights
+    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+        raise ValueError("Persisted mapping embedding must have two coordinate columns")
+    if not np.all(np.isfinite(coordinates) | np.isnan(coordinates)):
+        raise ValueError("Persisted mapping embedding contains infinite coordinates")
+    return coordinates
 
-    weights = distance_weights(distances)
-    projected = np.einsum("nk,nkd->nd", weights, reference_layout[indices])
-    return reference_layout, projected
+
+def _reference_layout(
+    reference: MappingReference,
+    layout_key: str,
+) -> np.ndarray:
+    layout = np.asarray(reference.fetch_layout(layout_key), dtype=np.float64)
+    if layout.shape != (reference.selected_cell_count, 2):
+        raise ValueError(
+            "Reference layout must have two columns and one row per selected "
+            "reference cell"
+        )
+    if not np.all(np.isfinite(layout) | np.isnan(layout)):
+        raise ValueError("Reference layout contains infinite coordinates")
+    return layout
 
 
 def _external_groups(
@@ -149,23 +147,30 @@ def _categorical_contract(
 
 
 def _axis_limits(x: np.ndarray, y: np.ndarray) -> tuple[Any, Any]:
-    xpad = 0.05 * (float(np.ptp(x)) or 1.0)
-    ypad = 0.05 * (float(np.ptp(y)) or 1.0)
+    if x.shape != y.shape:
+        raise ValueError("Coordinate columns must have matching shapes")
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not finite.any():
+        raise ValueError("No finite coordinates are available to plot")
+    finite_x = x[finite]
+    finite_y = y[finite]
+    xpad = 0.05 * (float(np.ptp(finite_x)) or 1.0)
+    ypad = 0.05 * (float(np.ptp(finite_y)) or 1.0)
     return square_axis_limits(
-        (float(np.min(x) - xpad), float(np.max(x) + xpad)),
-        (float(np.min(y) - ypad), float(np.max(y) + ypad)),
+        (float(np.min(finite_x) - xpad), float(np.max(finite_x) + xpad)),
+        (float(np.min(finite_y) - ypad), float(np.max(finite_y) + ypad)),
     )
 
 
 def mapping_score(
     store: Any,
+    result: MappingResult | ArtifactRef | str,
     *,
-    target_name: str,
+    reference: MappingReference | None = None,
     target_groups: Sequence[Any] | np.ndarray | None = None,
     layout_key: str | None = None,
     kind: Literal["embedding", "histogram"] = "embedding",
-    from_assay: str | None = None,
-    cell_key: str | None = None,
+    query_assay: str | None = None,
     log_transform: bool = True,
     multiplier: float = 1000,
     weighted: bool = True,
@@ -187,14 +192,21 @@ def mapping_score(
         raise ValueError("layout_key is required for an embedding mapping score")
     if bins < 1:
         raise ValueError("bins must be positive")
+    mapping = _mapping_result(
+        store,
+        result,
+        reference=reference,
+        query_assay=query_assay,
+    )
+    score_loader = getattr(store, "get_mapping_score", None)
+    if not callable(score_loader):
+        raise TypeError("store does not provide mapping score data")
     score_rows = list(
-        store.get_mapping_score(
-            target_name,
+        score_loader(
+            mapping,
             target_groups=(
                 None if target_groups is None else np.asarray(target_groups)
             ),
-            from_assay=from_assay,
-            cell_key=cell_key,
             log_transform=log_transform,
             multiplier=multiplier,
             weighted=weighted,
@@ -202,15 +214,18 @@ def mapping_score(
         )
     )
     if not score_rows:
-        raise ValueError(f"Mapping {target_name!r} produced no score groups")
+        raise ValueError(f"Mapping {mapping.mapping_name!r} produced no score groups")
     labels = [row[0] for row in score_rows]
     display_labels = {label: str(label) for label in labels}
     if target_groups is None and len(labels) == 1:
-        display_labels[labels[0]] = target_name
+        display_labels[labels[0]] = mapping.mapping_name
     score_arrays = [np.asarray(row[1], dtype=np.float64) for row in score_rows]
     n_reference = len(score_arrays[0])
     if any(values.shape != (n_reference,) for values in score_arrays):
         raise ValueError("Mapping score groups have incompatible lengths")
+    assert mapping.reference is not None
+    if n_reference != mapping.reference.selected_cell_count:
+        raise ValueError("Mapping scores do not match the selected reference cells")
     score_table = pd.concat(
         (
             pd.DataFrame(
@@ -225,12 +240,18 @@ def mapping_score(
         ignore_index=True,
     )
     _, mpl = require_matplotlib()
-    color_scale = color_scale or ColorScale(cmap="viridis")
+    # Sparse mapping scores are mostly zero. Clip the color ceiling to the upper
+    # tail so the few reference cells that received query weight remain visible.
+    color_scale = color_scale or ColorScale(
+        cmap="magma",
+        vmin=0.0,
+        quantiles=(0.0, 0.995),
+    )
     panel_keys: list[Hashable] = (
         list(labels) if kind == "embedding" else ["mapping_score"]
     )
     if figsize is None and target is None:
-        figsize = (3.4 * len(panel_keys), 3.2) if kind == "embedding" else (5.0, 3.6)
+        figsize = (3.6 * len(panel_keys), 3.4) if kind == "embedding" else (5.0, 3.6)
     legends: list[LegendSpec] = []
     scales: list[Any] = []
     with theme_context(theme):
@@ -241,23 +262,15 @@ def mapping_score(
         )
         if kind == "embedding":
             assert layout_key is not None
-            _, resolved_cell_key = _resolved_mapping_keys(
-                store,
-                from_assay,
-                cell_key,
-            )
-            x = np.asarray(
-                store.cells.fetch(f"{layout_key}1", key=resolved_cell_key),
-                dtype=np.float64,
-            )
-            y = np.asarray(
-                store.cells.fetch(f"{layout_key}2", key=resolved_cell_key),
-                dtype=np.float64,
-            )
-            if len(x) != n_reference or len(y) != n_reference:
-                raise ValueError("Reference layout does not match mapping scores")
+            layout = _reference_layout(mapping.reference, layout_key)
+            x = layout[:, 0]
+            y = layout[:, 1]
             xlim, ylim = _axis_limits(x, y)
-            shared_values = np.concatenate(score_arrays)
+            shared_values = np.concatenate(
+                [values[np.isfinite(values) & (values > 0)] for values in score_arrays]
+            )
+            if shared_values.size == 0:
+                shared_values = np.concatenate(score_arrays)
             shared_limits = (
                 _continuous_limits(shared_values, color_scale)
                 if color_scale.scope == "shared"
@@ -268,31 +281,44 @@ def mapping_score(
                 if point_size is not None
                 else default_point_size(n_reference)
             )
-            edgewidth = default_point_edgewidth(
-                n_reference,
-                point_size=resolved_point_size,
-            )
-            edgecolor = scatter_edgecolor(theme)
             for label, values in zip(labels, score_arrays, strict=True):
                 ax = axes[label]
-                limits = shared_limits or _continuous_limits(values, color_scale)
+                positive = values[np.isfinite(values) & (values > 0)]
+                limits = shared_limits or _continuous_limits(
+                    positive if positive.size else values,
+                    color_scale,
+                )
                 norm = continuous_norm(
                     mpl,
                     vmin=limits[0],
                     vmax=limits[1],
                     vcenter=color_scale.vcenter,
                 )
-                order_index = np.argsort(values)
+                visible = np.isfinite(x) & np.isfinite(y) & np.isfinite(values)
+                # Draw the full reference cloud first so zero-score cells stay
+                # readable as context, then overlay the cells that received weight.
+                ax.scatter(
+                    x[visible],
+                    y[visible],
+                    c=color_scale.missing_color,
+                    s=resolved_point_size,
+                    edgecolors="none",
+                    rasterized=n_reference >= 50_000,
+                    zorder=0,
+                )
+                highlighted = visible & (values > 0)
+                order_index = np.flatnonzero(highlighted)
+                order_index = order_index[np.argsort(values[order_index])]
                 artist = ax.scatter(
                     x[order_index],
                     y[order_index],
                     c=values[order_index],
-                    s=resolved_point_size,
-                    cmap=color_scale.cmap or "viridis",
+                    s=resolved_point_size * 1.35,
+                    cmap=color_scale.cmap or "magma",
                     norm=norm,
-                    edgecolors=edgecolor if edgewidth > 0 else "none",
-                    linewidths=edgewidth,
+                    edgecolors="none",
                     rasterized=n_reference >= 50_000,
+                    zorder=1,
                 )
                 finish_embedding_axes(
                     ax,
@@ -350,21 +376,20 @@ def mapping_score(
             legends.append(LegendSpec(kind="categorical", label="Query group"))
             scales.append(resolved_categorical)
         apply_figure_chrome(figure, theme)
-    result = PlotResult(
+    plot_result = PlotResult(
         figure=figure,
         axes=axes,
         tables={"scores": score_table},
         legends=tuple(legends),
         scales=tuple(scales),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
-            assay=from_assay or getattr(store, "_defaultAssay", None),
-            cell_key=cell_key,
+            assay=mapping.ref.assay,
+            cell_key=None,
             n_cells=n_reference,
             renderer="matplotlib",
             notes=("mapping_score", kind),
             extras={
-                "target_name": target_name,
+                "mapping_name": mapping.mapping_name,
                 "layout_key": layout_key,
                 "groups": list(labels),
                 "log_transform": log_transform,
@@ -376,8 +401,8 @@ def mapping_score(
         theme=theme,
     )
     if show:
-        result.show()
-    return result
+        plot_result.show()
+    return plot_result
 
 
 def _continuous_limits(
@@ -402,20 +427,23 @@ def _continuous_limits(
 
 def _label_evidence(
     store: Any,
+    result: MappingResult | ArtifactRef | str,
     *,
-    target_name: str,
+    reference: MappingReference | None,
     reference_class_group: str,
-    from_assay: str | None,
-    cell_key: str | None,
+    query_assay: str | None,
     threshold_fraction: float,
     na_val: str,
     max_distance: float | None,
 ) -> pd.DataFrame:
-    return store.get_target_label_evidence(
-        target_name,
+    loader = getattr(store, "get_target_label_evidence", None)
+    if not callable(loader):
+        raise TypeError("store does not provide mapping evidence data")
+    return loader(
+        result,
         reference_class_group=reference_class_group,
-        from_assay=from_assay,
-        cell_key=cell_key,
+        reference=reference,
+        query_assay=query_assay,
         threshold_fraction=threshold_fraction,
         na_val=na_val,
         max_distance=max_distance,
@@ -424,8 +452,9 @@ def _label_evidence(
 
 def mapping_evidence(
     store: Any,
+    result: MappingResult | ArtifactRef | str,
     *,
-    target_name: str,
+    reference: MappingReference | None = None,
     reference_class_group: str,
     target_groups: Sequence[Any] | np.ndarray | None = None,
     metrics: Sequence[str] = (
@@ -437,8 +466,7 @@ def mapping_evidence(
     kind: Literal["histogram", "box", "embedding"] = "histogram",
     reference_layout_key: str | None = None,
     bins: int = 30,
-    from_assay: str | None = None,
-    cell_key: str | None = None,
+    query_assay: str | None = None,
     threshold_fraction: float = 0.5,
     na_val: str = "NA",
     max_distance: float | None = None,
@@ -459,12 +487,19 @@ def mapping_evidence(
         raise ValueError("reference_layout_key is required for an evidence embedding")
     if bins < 1:
         raise ValueError("bins must be positive")
+    mapping = _mapping_result(
+        store,
+        result,
+        reference=reference,
+        query_assay=query_assay,
+    )
+    assert mapping.reference is not None
     evidence = _label_evidence(
         store,
-        target_name=target_name,
+        mapping,
+        reference=mapping.reference,
         reference_class_group=reference_class_group,
-        from_assay=from_assay,
-        cell_key=cell_key,
+        query_assay=None,
         threshold_fraction=threshold_fraction,
         na_val=na_val,
         max_distance=max_distance,
@@ -472,7 +507,7 @@ def mapping_evidence(
     groups = _external_groups(
         target_groups,
         len(evidence),
-        default=target_name,
+        default=mapping.mapping_name,
         argument_name="target_groups",
     )
     evidence["group"] = groups
@@ -489,24 +524,19 @@ def mapping_evidence(
     resolved_categorical: CategoricalScale | None = None
     reference_layout: np.ndarray | None = None
     projected: np.ndarray | None = None
-    resolved_assay, resolved_cell_key = _resolved_mapping_keys(
-        store,
-        from_assay,
-        cell_key,
-    )
+    visible_unknown: np.ndarray | None = None
     if kind == "embedding":
         assert reference_layout_key is not None
-        mapping_result = _mapping_result(
-            store,
-            target_name=target_name,
-            from_assay=resolved_assay,
-            cell_key=resolved_cell_key,
+        reference_layout = _reference_layout(
+            mapping.reference,
+            reference_layout_key,
         )
-        reference_layout, projected = _projected_mapping_coordinates(
+        projected = _mapping_reference_embedding(
             store,
-            mapping_result,
+            mapping,
+            reference=mapping.reference,
             reference_layout_key=reference_layout_key,
-            cell_key=resolved_cell_key,
+            query_assay=None,
         )
         if len(projected) != len(evidence):
             raise ValueError("Projected coordinates do not match label evidence")
@@ -550,10 +580,14 @@ def mapping_evidence(
                 else default_point_size(len(projected))
             )
             unknown = evidence["isUnknown"].to_numpy(dtype=bool)
+            projected_finite = np.isfinite(projected).all(axis=1)
+            reference_finite = np.isfinite(reference_layout).all(axis=1)
+            visible_unknown = unknown & projected_finite
         for metric_index, metric in enumerate(requested_metrics):
             ax = axes[metric]
             if kind == "embedding":
                 assert reference_layout is not None and projected is not None
+                assert visible_unknown is not None
                 assert color_scale is not None
                 values = evidence[metric].to_numpy(dtype=np.float64)
                 limits = shared_limits or _continuous_limits(values, color_scale)
@@ -564,18 +598,18 @@ def mapping_evidence(
                     vcenter=color_scale.vcenter,
                 )
                 ax.scatter(
-                    reference_layout[:, 0],
-                    reference_layout[:, 1],
+                    reference_layout[reference_finite, 0],
+                    reference_layout[reference_finite, 1],
                     s=resolved_point_size * 0.55,
                     c="#bdbdbd",
                     alpha=0.2,
                     linewidths=0,
-                    rasterized=len(reference_layout) >= 50_000,
+                    rasterized=int(reference_finite.sum()) >= 50_000,
                     zorder=0,
                 )
-                draw_order = np.argsort(
-                    np.nan_to_num(values, nan=-np.inf),
-                )
+                visible = projected_finite & np.isfinite(values)
+                draw_order = np.flatnonzero(visible)
+                draw_order = draw_order[np.argsort(values[draw_order])]
                 artist = ax.scatter(
                     projected[draw_order, 0],
                     projected[draw_order, 1],
@@ -587,10 +621,10 @@ def mapping_evidence(
                     rasterized=len(projected) >= 50_000,
                     zorder=1,
                 )
-                if show_unknown and unknown.any():
+                if show_unknown and visible_unknown.any():
                     ax.scatter(
-                        projected[unknown, 0],
-                        projected[unknown, 1],
+                        projected[visible_unknown, 0],
+                        projected[visible_unknown, 1],
                         s=resolved_point_size * 1.6,
                         marker="x",
                         c=scatter_edgecolor(theme),
@@ -674,7 +708,7 @@ def mapping_evidence(
         apply_figure_chrome(figure, theme)
     if kind != "embedding":
         legend_specs.append(LegendSpec(kind="categorical", label="Query group"))
-    elif show_unknown and evidence["isUnknown"].any():
+    elif show_unknown and visible_unknown is not None and visible_unknown.any():
         legend_specs.append(
             LegendSpec(
                 kind="marker",
@@ -688,21 +722,20 @@ def mapping_evidence(
     else:
         assert resolved_categorical is not None
         result_scales = (resolved_categorical,)
-    result = PlotResult(
+    plot_result = PlotResult(
         figure=figure,
         axes=axes,
         tables={"evidence": evidence},
         legends=tuple(legend_specs),
         scales=result_scales,
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
-            assay=from_assay or getattr(store, "_defaultAssay", None),
-            cell_key=cell_key,
+            assay=mapping.ref.assay,
+            cell_key=None,
             n_cells=len(evidence),
             renderer="matplotlib",
             notes=("mapping_evidence", kind),
             extras={
-                "target_name": target_name,
+                "mapping_name": mapping.mapping_name,
                 "reference_class_group": reference_class_group,
                 "metrics": requested_metrics,
                 "reference_layout_key": reference_layout_key,
@@ -714,21 +747,21 @@ def mapping_evidence(
         theme=theme,
     )
     if show:
-        result.show()
-    return result
+        plot_result.show()
+    return plot_result
 
 
 def mapping_confusion(
     store: Any,
+    result: MappingResult | ArtifactRef | str,
     *,
-    target_name: str,
+    reference: MappingReference | None = None,
     reference_class_group: str,
     known_labels: Sequence[Any] | np.ndarray,
     normalize: Literal["none", "true", "predicted", "all"] = "true",
     known_order: Sequence[Any] | None = None,
     predicted_order: Sequence[Any] | None = None,
-    from_assay: str | None = None,
-    cell_key: str | None = None,
+    query_assay: str | None = None,
     threshold_fraction: float = 0.5,
     na_val: str = "NA",
     max_distance: float | None = None,
@@ -742,12 +775,19 @@ def mapping_confusion(
     """Plot known query labels against transferred labels."""
     if normalize not in ("none", "true", "predicted", "all"):
         raise ValueError("normalize must be 'none', 'true', 'predicted', or 'all'")
+    mapping = _mapping_result(
+        store,
+        result,
+        reference=reference,
+        query_assay=query_assay,
+    )
+    assert mapping.reference is not None
     evidence = _label_evidence(
         store,
-        target_name=target_name,
+        mapping,
+        reference=mapping.reference,
         reference_class_group=reference_class_group,
-        from_assay=from_assay,
-        cell_key=cell_key,
+        query_assay=None,
         threshold_fraction=threshold_fraction,
         na_val=na_val,
         max_distance=max_distance,
@@ -856,7 +896,7 @@ def mapping_confusion(
             )
             colorbar.set_label("Cells" if normalize == "none" else "Fraction of cells")
         apply_figure_chrome(figure, theme)
-    result = PlotResult(
+    plot_result = PlotResult(
         figure=figure,
         axes=axes,
         tables={
@@ -874,14 +914,13 @@ def mapping_confusion(
         ),
         scales=(color_scale,),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
-            assay=from_assay or getattr(store, "_defaultAssay", None),
-            cell_key=cell_key,
+            assay=mapping.ref.assay,
+            cell_key=None,
             n_cells=int(valid.sum()),
             renderer="matplotlib",
             notes=("mapping_confusion",),
             extras={
-                "target_name": target_name,
+                "mapping_name": mapping.mapping_name,
                 "reference_class_group": reference_class_group,
                 "normalize": normalize,
                 "threshold_fraction": threshold_fraction,
@@ -892,14 +931,15 @@ def mapping_confusion(
         theme=theme,
     )
     if show:
-        result.show()
-    return result
+        plot_result.show()
+    return plot_result
 
 
 def mapping_calibration(
     store: Any,
+    result: MappingResult | ArtifactRef | str,
     *,
-    target_name: str,
+    reference: MappingReference | None = None,
     reference_class_group: str,
     known_labels: Sequence[Any] | np.ndarray,
     metric: str = "voteFraction",
@@ -907,8 +947,7 @@ def mapping_calibration(
     thresholds: Sequence[float] | np.ndarray | None = None,
     n_thresholds: int = 50,
     chosen_threshold: float | None = None,
-    from_assay: str | None = None,
-    cell_key: str | None = None,
+    query_assay: str | None = None,
     na_val: str = "NA",
     max_distance: float | None = None,
     target: Any | None = None,
@@ -937,12 +976,19 @@ def mapping_calibration(
             )
     else:
         resolved_direction = direction
+    mapping = _mapping_result(
+        store,
+        result,
+        reference=reference,
+        query_assay=query_assay,
+    )
+    assert mapping.reference is not None
     evidence = _label_evidence(
         store,
-        target_name=target_name,
+        mapping,
+        reference=mapping.reference,
         reference_class_group=reference_class_group,
-        from_assay=from_assay,
-        cell_key=cell_key,
+        query_assay=None,
         threshold_fraction=0.0,
         na_val=na_val,
         max_distance=max_distance,
@@ -1112,7 +1158,7 @@ def mapping_calibration(
         ax.set_ylabel("Held-out label accuracy")
         ax.set_title(f"Threshold trade-off: {metric}")
         apply_figure_chrome(figure, theme)
-    result = PlotResult(
+    plot_result = PlotResult(
         figure=figure,
         axes=axes,
         tables={
@@ -1125,14 +1171,13 @@ def mapping_calibration(
         legends=(),
         scales=(),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
-            assay=from_assay or getattr(store, "_defaultAssay", None),
-            cell_key=cell_key,
+            assay=mapping.ref.assay,
+            cell_key=None,
             n_cells=int(valid.sum()),
             renderer="matplotlib",
             notes=("mapping_calibration",),
             extras={
-                "target_name": target_name,
+                "mapping_name": mapping.mapping_name,
                 "reference_class_group": reference_class_group,
                 "metric": metric,
                 "direction": resolved_direction,
@@ -1144,193 +1189,61 @@ def mapping_calibration(
         theme=theme,
     )
     if show:
-        result.show()
-    return result
-
-
-def mapping_correction(
-    store: Any,
-    *,
-    target_name: str,
-    batch_labels: Sequence[Any] | np.ndarray | None = None,
-    dimensions: tuple[int, int] = (0, 1),
-    from_assay: str | None = None,
-    cell_key: str | None = None,
-    categorical_scale: CategoricalScale | None = None,
-    point_size: float | None = None,
-    target: Any | None = None,
-    figsize: tuple[float, float] | None = None,
-    theme: str = "notebook",
-    show_legend: bool = True,
-    show: bool = True,
-) -> PlotResult:
-    """Compare query latent coordinates before and after mapping correction."""
-    result_data = _mapping_result(
-        store,
-        target_name=target_name,
-        from_assay=from_assay,
-        cell_key=cell_key,
-    )
-    before = result_data.uncorrected_latent
-    after = result_data.corrected_latent
-    if before is None or after is None:
-        raise ValueError(
-            f"Mapping {target_name!r} has no saved before and after latent arrays"
-        )
-    before = np.asarray(before, dtype=np.float64)
-    after = np.asarray(after, dtype=np.float64)
-    if before.shape != after.shape or before.ndim != 2:
-        raise ValueError("Correction latent arrays have incompatible shapes")
-    first, second = dimensions
-    if first == second or min(dimensions) < 0 or max(dimensions) >= before.shape[1]:
-        raise ValueError("dimensions must select two distinct latent dimensions")
-    groups = _external_groups(
-        batch_labels,
-        len(before),
-        default="query",
-        argument_name="batch_labels",
-    )
-    order, palette, resolved_scale = _categorical_contract(
-        groups,
-        categorical_scale,
-    )
-    panel_keys: list[Hashable] = ["before", "after", "displacement"]
-    if figsize is None and target is None:
-        figsize = (10.0, 3.2)
-    combined_x = np.concatenate((before[:, first], after[:, first]))
-    combined_y = np.concatenate((before[:, second], after[:, second]))
-    xlim, ylim = _axis_limits(combined_x, combined_y)
-    displacement = np.linalg.norm(after - before, axis=1)
-    size = (
-        float(point_size) if point_size is not None else default_point_size(len(before))
-    )
-    edgewidth = default_point_edgewidth(len(before), point_size=size)
-    edgecolor = scatter_edgecolor(theme)
-    with theme_context(theme):
-        figure, axes, owns = normalize_axes_target(
-            target,
-            panel_keys=panel_keys,
-            figsize=figsize,
-            n_columns=3,
-        )
-        for panel, coordinates in (("before", before), ("after", after)):
-            ax = axes[panel]
-            colors = [palette[value] for value in groups]
-            ax.scatter(
-                coordinates[:, first],
-                coordinates[:, second],
-                c=colors,
-                s=size,
-                edgecolors=edgecolor if edgewidth > 0 else "none",
-                linewidths=edgewidth,
-                rasterized=len(before) >= 50_000,
-            )
-            finish_embedding_axes(
-                ax,
-                xlim=xlim,
-                ylim=ylim,
-                xlabel=f"latent {first + 1}",
-                ylabel=f"latent {second + 1}",
-                title=panel.capitalize(),
-                frame="axes",
-            )
-        displacement_ax = axes["displacement"]
-        for group in order:
-            values = displacement[groups == group]
-            displacement_ax.hist(
-                values,
-                bins=30,
-                histtype="step",
-                linewidth=1.4,
-                color=palette[group],
-                label=str(group),
-            )
-        displacement_ax.set_xlabel("Correction displacement")
-        displacement_ax.set_ylabel("Mapped cells")
-        if show_legend:
-            displacement_ax.legend(frameon=False, title="Query batch")
-        apply_figure_chrome(figure, theme)
-    table = pd.DataFrame(
-        {
-            "cellIndex": np.arange(len(before)),
-            "batch": groups,
-            "beforeX": before[:, first],
-            "beforeY": before[:, second],
-            "afterX": after[:, first],
-            "afterY": after[:, second],
-            "displacement": displacement,
-        }
-    )
-    result = PlotResult(
-        figure=figure,
-        axes=axes,
-        tables={"cells": table},
-        legends=(LegendSpec(kind="categorical", label="Query batch"),),
-        scales=(resolved_scale,),
-        provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
-            assay=from_assay or getattr(store, "_defaultAssay", None),
-            cell_key=cell_key,
-            n_cells=len(before),
-            renderer="matplotlib",
-            notes=("mapping_correction", result_data.correction_method),
-            extras={
-                "target_name": target_name,
-                "dimensions": list(dimensions),
-                "mean_displacement": float(np.mean(displacement)),
-                "median_displacement": float(np.median(displacement)),
-            },
-        ),
-        owns_figure=owns,
-        theme=theme,
-    )
-    if show:
-        result.show()
-    return result
+        plot_result.show()
+    return plot_result
 
 
 def mapping_projection(
     store: Any,
+    result: MappingResult | ArtifactRef | str,
     *,
-    target_name: str,
+    reference: MappingReference | None = None,
     reference_layout_key: str,
     reference_groups: str | Sequence[Any] | np.ndarray | None = None,
     target_groups: Sequence[Any] | np.ndarray | None = None,
     reference_class_group: str | None = None,
     threshold_fraction: float = 0.5,
     na_val: str = "NA",
-    from_assay: str | None = None,
-    cell_key: str | None = None,
+    query_assay: str | None = None,
     ref_name: str = "reference",
+    reference_mode: Literal["background", "groups"] = "background",
     categorical_scale: CategoricalScale | None = None,
     point_size: float | None = None,
-    reference_alpha: float = 0.35,
-    target_alpha: float = 0.9,
+    reference_alpha: float = 0.22,
+    target_alpha: float = 0.95,
     target: Any | None = None,
     figsize: tuple[float, float] | None = None,
     theme: str = "notebook",
     show_legend: bool = True,
     show: bool = True,
 ) -> PlotResult:
-    """Plot query cells projected into an unchanged reference layout."""
+    """Plot query cells projected into an unchanged reference layout.
+
+    ``reference_mode="background"`` draws the reference as a light grey cloud and
+    colours only the query. ``reference_mode="groups"`` colours both layers with
+    the same categorical palette.
+    """
+    if reference_mode not in {"background", "groups"}:
+        raise ValueError("reference_mode must be 'background' or 'groups'")
     if not 0 <= reference_alpha <= 1 or not 0 <= target_alpha <= 1:
         raise ValueError("point alpha values must be between zero and one")
-    resolved_assay, resolved_cell_key = _resolved_mapping_keys(
+    mapping = _mapping_result(
         store,
-        from_assay,
-        cell_key,
+        result,
+        reference=reference,
+        query_assay=query_assay,
     )
-    result_data = _mapping_result(
-        store,
-        target_name=target_name,
-        from_assay=resolved_assay,
-        cell_key=resolved_cell_key,
+    assert mapping.reference is not None
+    reference_layout = _reference_layout(
+        mapping.reference,
+        reference_layout_key,
     )
-    reference_layout, projected = _projected_mapping_coordinates(
+    projected = _mapping_reference_embedding(
         store,
-        result_data,
+        mapping,
+        reference=mapping.reference,
         reference_layout_key=reference_layout_key,
-        cell_key=resolved_cell_key,
+        query_assay=None,
     )
     reference_x = reference_layout[:, 0]
     reference_y = reference_layout[:, 1]
@@ -1339,7 +1252,7 @@ def mapping_projection(
         query_values = _external_groups(
             target_groups,
             len(projected),
-            default=target_name,
+            default=mapping.mapping_name,
             argument_name="target_groups",
         )
     else:
@@ -1350,16 +1263,20 @@ def mapping_projection(
         )
         if isinstance(group_source, str):
             reference_values = np.asarray(
-                store.cells.fetch(group_source, key=resolved_cell_key),
+                mapping.reference.fetch_cell_column(group_source),
                 dtype=object,
             )
+            if reference_values.shape != (len(reference_layout),):
+                raise ValueError(
+                    "Reference labels must contain one value per reference cell"
+                )
             if target_groups is None:
                 evidence = _label_evidence(
                     store,
-                    target_name=target_name,
+                    mapping,
+                    reference=mapping.reference,
                     reference_class_group=group_source,
-                    from_assay=resolved_assay,
-                    cell_key=resolved_cell_key,
+                    query_assay=None,
                     threshold_fraction=threshold_fraction,
                     na_val=na_val,
                     max_distance=None,
@@ -1369,7 +1286,7 @@ def mapping_projection(
                 query_values = _external_groups(
                     target_groups,
                     len(projected),
-                    default=target_name,
+                    default=mapping.mapping_name,
                     argument_name="target_groups",
                 )
         else:
@@ -1381,7 +1298,7 @@ def mapping_projection(
             query_values = _external_groups(
                 target_groups,
                 len(projected),
-                default=target_name,
+                default=mapping.mapping_name,
                 argument_name="target_groups",
             )
     missing_label = (
@@ -1395,57 +1312,90 @@ def mapping_projection(
         [missing_label if pd.isna(value) else value for value in query_values],
         dtype=object,
     )
-    all_groups = np.concatenate((reference_values, query_values))
+    legend_values = (
+        query_values
+        if reference_mode == "background"
+        else np.concatenate((reference_values, query_values))
+    )
     order, palette, resolved_scale = _categorical_contract(
-        all_groups,
+        legend_values,
         categorical_scale,
     )
     combined_x = np.concatenate((reference_x, projected[:, 0]))
     combined_y = np.concatenate((reference_y, projected[:, 1]))
     xlim, ylim = _axis_limits(combined_x, combined_y)
+    reference_finite = np.isfinite(reference_layout).all(axis=1)
+    query_finite = np.isfinite(projected).all(axis=1)
     size = (
         float(point_size)
         if point_size is not None
-        else default_point_size(len(all_groups))
+        else default_point_size(len(combined_x), panel_area=6.5 * 5.0)
     )
-    edgecolor = scatter_edgecolor(theme)
+    background_color = (
+        resolved_scale.missing_color if resolved_scale.missing_color else "#d0d0d0"
+    )
     with theme_context(theme):
         figure, axes, owns = normalize_axes_target(
             target,
             panel_keys=["mapping_projection"],
-            figsize=figsize or ((5.0, 4.4) if target is None else None),
+            figsize=figsize or ((6.5, 5.0) if target is None else None),
         )
         ax = axes["mapping_projection"]
+        if reference_mode == "background":
+            ax.scatter(
+                reference_x[reference_finite],
+                reference_y[reference_finite],
+                c=background_color,
+                s=size * 0.7,
+                alpha=reference_alpha,
+                edgecolors="none",
+                rasterized=int(reference_finite.sum()) >= 50_000,
+                zorder=0,
+            )
+        else:
+            ax.scatter(
+                reference_x[reference_finite],
+                reference_y[reference_finite],
+                c=[palette[value] for value in reference_values[reference_finite]],
+                s=size,
+                alpha=reference_alpha,
+                edgecolors="none",
+                rasterized=int(reference_finite.sum()) >= 50_000,
+                zorder=0,
+            )
         ax.scatter(
-            reference_x,
-            reference_y,
-            c=[palette[value] for value in reference_values],
-            s=size,
-            alpha=reference_alpha,
-            edgecolors="none",
-            rasterized=len(reference_x) >= 50_000,
-            zorder=0,
-        )
-        ax.scatter(
-            projected[:, 0],
-            projected[:, 1],
-            c=[palette[value] for value in query_values],
-            s=size * 1.25,
+            projected[query_finite, 0],
+            projected[query_finite, 1],
+            c=[palette[value] for value in query_values[query_finite]],
+            s=size * 1.45,
             alpha=target_alpha,
-            edgecolors=edgecolor,
-            linewidths=0.25,
-            rasterized=len(projected) >= 50_000,
+            edgecolors="none",
+            rasterized=int(query_finite.sum()) >= 50_000,
             zorder=1,
         )
         finish_embedding_axes(
             ax,
             xlim=xlim,
             ylim=ylim,
-            title=f"{target_name} on {reference_layout_key}",
+            title=f"{mapping.mapping_name} on {reference_layout_key}",
             frame="minimal",
         )
         if show_legend:
-            handles = [
+            handles = []
+            if reference_mode == "background":
+                handles.append(
+                    require_matplotlib()[1].lines.Line2D(
+                        [],
+                        [],
+                        marker="o",
+                        linestyle="",
+                        markerfacecolor=background_color,
+                        markeredgecolor="none",
+                        markersize=5,
+                        label=ref_name,
+                    )
+                )
+            handles.extend(
                 require_matplotlib()[1].lines.Line2D(
                     [],
                     [],
@@ -1461,7 +1411,7 @@ def mapping_projection(
                     ),
                 )
                 for value in order
-            ]
+            )
             if owns:
                 figure.legend(
                     handles=handles,
@@ -1478,6 +1428,7 @@ def mapping_projection(
                     title="Cells",
                 )
         apply_figure_chrome(figure, theme)
+    all_groups = np.concatenate((reference_values, query_values))
     cells = pd.DataFrame(
         {
             "source": np.concatenate(
@@ -1491,31 +1442,31 @@ def mapping_projection(
             "y": combined_y,
         }
     )
-    result = PlotResult(
+    plot_result = PlotResult(
         figure=figure,
         axes=axes,
         tables={"cells": cells},
         legends=(LegendSpec(kind="categorical", label="Cells"),),
         scales=(resolved_scale,),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
-            assay=resolved_assay,
-            cell_key=resolved_cell_key,
+            assay=mapping.ref.assay,
+            cell_key=None,
             n_cells=len(all_groups),
             renderer="matplotlib",
-            notes=("mapping_projection",),
+            notes=("mapping_projection", reference_mode),
             extras={
-                "target_name": target_name,
+                "mapping_name": mapping.mapping_name,
                 "reference_layout_key": reference_layout_key,
                 "n_reference": len(reference_layout),
                 "n_query": len(projected),
                 "reference_class_group": reference_class_group,
                 "threshold_fraction": threshold_fraction,
+                "reference_mode": reference_mode,
             },
         ),
         owns_figure=owns,
         theme=theme,
     )
     if show:
-        result.show()
-    return result
+        plot_result.show()
+    return plot_result

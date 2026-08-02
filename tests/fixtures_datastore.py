@@ -366,38 +366,6 @@ def grouped_assay(datastore, pseudotime_aggregation):
 
 
 @pytest.fixture(scope="session")
-def run_mapping(graph_artifacts, datastore):
-    projections = datastore.z["RNA"].get("projections", None)
-    if projections is None or "selfmap" not in projections:
-        datastore.run_mapping(
-            target_assay=datastore.RNA,
-            target_name="selfmap",
-            target_feat_key="hvgs_self",
-            save_k=3,
-        )
-
-
-@pytest.fixture(scope="session")
-def run_mapping_coral(graph_artifacts, datastore):
-    projections = datastore.z["RNA"].get("projections", None)
-    if projections is None or "selfmap_coral" not in projections:
-        datastore.run_mapping(
-            target_assay=datastore.RNA,
-            target_name="selfmap_coral",
-            target_feat_key="hvgs_self2",
-            save_k=3,
-            run_coral=True,
-        )
-
-
-@pytest.fixture(scope="session")
-def run_unified_umap(run_mapping, datastore):
-    projections = datastore.z["RNA"].get("projections", None)
-    if projections is None or "unified_UMAP" not in projections:
-        datastore.run_unified_umap(target_names=["selfmap"])
-
-
-@pytest.fixture(scope="session")
 def cell_cycle_scoring(auto_filter_cells, datastore):
     del auto_filter_cells
     if not _cell_has(datastore, "RNA_cell_cycle_phase"):

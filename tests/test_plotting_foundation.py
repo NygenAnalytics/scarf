@@ -33,7 +33,6 @@ def test_import_plotting_exports():
         "marker_heatmap",
         "mapping_calibration",
         "mapping_confusion",
-        "mapping_correction",
         "mapping_evidence",
         "mapping_projection",
         "mapping_score",
@@ -43,7 +42,6 @@ def test_import_plotting_exports():
         "register_theme",
         "run_recipe",
         "theme_context",
-        "unified_embedding",
     )
     result_names = (
         "CategoricalScale",
@@ -69,6 +67,16 @@ def test_import_plotting_exports():
     assert all(name in splt.__all__ for name in (*function_names, *result_names))
     assert all(callable(getattr(splt, name)) for name in function_names)
     assert all(getattr(splt, name) is not None for name in result_names)
+
+
+@pytest.mark.parametrize("name", ["mapping_correction", "unified_embedding"])
+def test_retired_mapping_plots_are_absent(name):
+    from scarf.plotting.recipes import ALLOWED_PLOTS
+
+    assert name not in splt.__all__
+    assert name not in ALLOWED_PLOTS
+    with pytest.raises(AttributeError):
+        getattr(splt, name)
 
 
 def test_plotting_modules_import_without_optional_dependencies():

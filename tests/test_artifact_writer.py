@@ -126,7 +126,7 @@ def test_missing_required_attribute_prevents_reuse() -> None:
         root,
         **arguments,
         required_arrays=("data",),
-        required_attributes=("correction_ridge",),
+        required_attributes=("reference_metadata",),
     )
 
     assert not second.reused
@@ -146,7 +146,7 @@ def test_invalid_required_attribute_type_prevents_reuse() -> None:
     }
     first = plan_artifact(root, **arguments)
     group = start_artifact(root, first)
-    group.attrs["correction_ridge"] = "invalid"
+    group.attrs["reference_metadata"] = "invalid"
     finish_artifact(group, first)
 
     second = plan_artifact(
@@ -154,8 +154,8 @@ def test_invalid_required_attribute_type_prevents_reuse() -> None:
         **arguments,
         required_attributes=(
             AttributeRequirement(
-                "correction_ridge",
-                expected_types=(int, float),
+                "reference_metadata",
+                expected_types=(dict,),
             ),
         ),
     )

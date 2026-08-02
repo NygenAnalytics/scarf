@@ -602,7 +602,6 @@ def test_graph_outputs_reject_equal_size_different_cell_selection(
     mask[excluded[0]] = True
     datastore.cells.insert("I", mask, overwrite=True, force=True)
 
-    assert not datastore._has_ann_stream_cache("RNA", "I", "metadata_hvgs")
     with pytest.raises(ValueError, match="no longer matches"):
         datastore.run_leiden_clustering(label="misaligned")
     with pytest.raises(ValueError, match="no longer matches"):

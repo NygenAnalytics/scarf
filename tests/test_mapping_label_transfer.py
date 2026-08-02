@@ -1,339 +1,736 @@
+from dataclasses import replace
+from pathlib import Path
+import shutil
+
 import numpy as np
+import pandas as pd
 import pytest
 
-from scarf.writers import create_zarr_dataset
-from tests.fixtures_datastore import build_neighbourhood_graph
+import scarf.datastore._operations.mapping as mapping_operations
+import scarf.mapping.projection as projection_storage
+from scarf.datastore.datastore import DataStore
+from scarf.mapping.models import MappingResult
+from scarf.mapping.projection import (
+    NO_QUERY_BATCH_FINGERPRINT,
+    ProjectionWriter,
+    load_projection,
+    plan_projection,
+)
+from scarf.metadata.artifacts import (
+    link_cell_data_column,
+    plan_cell_data_artifact,
+    write_cell_data_artifact,
+)
+from scarf.storage.artifact_writer import (
+    finish_artifact,
+    plan_artifact,
+    start_artifact,
+)
+from scarf.storage.artifacts import (
+    ArtifactRef,
+    ExternalArtifactRef,
+    artifact_group,
+    fingerprint_array,
+)
+from scarf.storage.selections import resolve_selection_artifact
+from scarf.storage.types import as_zarr_array as checked_zarr_array
 
 
-def _ensure_graph(datastore) -> None:
-    try:
-        datastore.get_latest_graph_loc("RNA", "I", "hvgs")
-    except KeyError:
-        datastore.auto_filter_cells(show_qc_plots=False)
-        datastore.mark_hvgs(top_n=100, show_plot=False, bin_strategy="fixed")
-        build_neighbourhood_graph(datastore, feat_key="hvgs")
+class _RecordingProjectionArray:
+    def __init__(self, array, name: str, reads: list[tuple[str, object]]) -> None:
+        self._array = array
+        self._name = name
+        self._reads = reads
+
+    def __getattr__(self, name: str):
+        return getattr(self._array, name)
+
+    def __getitem__(self, key):
+        if key == slice(None, None, None) or key is Ellipsis:
+            raise AssertionError(f"{self._name} was materialized with a full slice")
+        self._reads.append((self._name, key))
+        return self._array[key]
+
+    def __array__(self, dtype=None, copy=None):
+        raise AssertionError(f"{self._name} was materialized as a complete array")
 
 
-def _projection_store(datastore, name: str, indices: np.ndarray, distances: np.ndarray):
-    source = datastore.RNA
-    _ensure_graph(datastore)
-    if "projections" not in source.z:
-        source.z.create_group("projections")
-    store = source.z["projections"].create_group(name, overwrite=True)
-    zi = create_zarr_dataset(store, "indices", (len(indices),), "u8", indices.shape)
-    zd = create_zarr_dataset(store, "distances", (len(indices),), "f8", distances.shape)
-    zi[:] = indices
-    zd[:] = distances
-    store.attrs["complete"] = True
-    store.attrs["assay"] = "RNA"
-    return store
+def _record_projection_reads(monkeypatch, reads: list[tuple[str, object]]) -> None:
+    def recording_array(node, *, name: str = ""):
+        array = checked_zarr_array(node, name=name)
+        if name in {"indices", "distances", "uninformative"}:
+            return _RecordingProjectionArray(array, name, reads)
+        return array
+
+    monkeypatch.setattr(mapping_operations, "as_zarr_array", recording_array)
+    monkeypatch.setattr(projection_storage, "as_zarr_array", recording_array)
 
 
-def test_label_transfer_uses_every_neighbor_and_abstains_on_ties(datastore_ephemeral):
-    datastore = datastore_ephemeral
-    reference_ids = datastore.cells.fetch("ids", key="I")
-    _projection_store(
-        datastore,
-        "manual_labels",
-        np.array([[0, 1], [0, 1]], dtype=np.uint64),
-        np.array([[0.0, 1.0], [1.0, 1.0]]),
-    )
-
-    labels = datastore.get_target_classes(
-        "manual_labels",
-        reference_class_group="ids",
-        threshold_fraction=0.5,
-    )
-
-    assert labels.tolist() == [reference_ids[0], "NA"]
+def _plain_reference(datastore):
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    assert state.neighbors is not None
+    return datastore.build_mapping_reference(state.neighbors)
 
 
-def test_mapping_score_uses_all_saved_neighbors(datastore_ephemeral):
-    datastore = datastore_ephemeral
-    _projection_store(
-        datastore,
-        "manual_scores",
-        np.array([[0, 1]], dtype=np.uint64),
-        np.array([[1.0, 1.0]]),
-    )
-
-    score = next(
-        datastore.get_mapping_score(
-            "manual_scores", log_transform=False, multiplier=1.0
-        )
-    )[1]
-
-    np.testing.assert_allclose(score[:2], [0.25, 0.25])
-
-
-def test_mapping_evidence_and_fixed_layout_projection(datastore_ephemeral):
-    datastore = datastore_ephemeral
-    _projection_store(
-        datastore,
-        "manual_evidence",
-        np.array([[0, 1], [0, 1]], dtype=np.uint64),
-        np.array([[0.0, 1.0], [1.0, 1.0]]),
-    )
-    layout1 = np.arange(datastore.cells.N, dtype=float)
-    layout2 = layout1 * 2
-    datastore.cells.insert("fixed_layout1", layout1, overwrite=True)
-    datastore.cells.insert("fixed_layout2", layout2, overwrite=True)
-
-    evidence = datastore.get_target_label_evidence(
-        "manual_evidence",
-        reference_class_group="ids",
-        threshold_fraction=0.75,
-    )
-    layout_path = datastore.project_mapping_layout("manual_evidence", "fixed_layout")
-    projected = datastore.z[layout_path]["data"][:]
-
-    assert evidence["isUnknown"].tolist() == [False, True]
-    assert evidence["label"].tolist()[1] == "NA"
-    assert set(
-        [
-            "voteFraction",
-            "voteEntropy",
-            "topTwoMargin",
-            "featureCoverage",
-            "referenceDistancePercentile",
-        ]
-    ).issubset(evidence.columns)
-    np.testing.assert_allclose(projected[0], [0.0, 0.0])
-    np.testing.assert_allclose(projected[1], [0.5, 1.0])
-
-
-def test_label_threshold_boundary_and_subset_index(datastore_ephemeral):
-    datastore = datastore_ephemeral
-    labels = np.repeat("other", datastore.cells.N).astype(object)
-    labels[:2] = ["winner", "runner_up"]
-    datastore.cells.insert("boundary_labels", labels, overwrite=True)
-    _projection_store(
-        datastore,
-        "boundary_labels",
-        np.array([[0, 1], [0, 1]], dtype=np.uint64),
-        np.array([[1.0, 9.0], [9.0, 1.0]]),
-    )
-
-    predictions = datastore.get_target_classes(
-        "boundary_labels",
-        reference_class_group="boundary_labels",
-        threshold_fraction=0.75,
-        target_subset=[1],
-        na_val="unknown",
-    )
-
-    assert predictions.index.tolist() == [1]
-    assert predictions.tolist() == ["runner_up"]
-    evidence = datastore.get_target_label_evidence(
-        "boundary_labels",
-        reference_class_group="boundary_labels",
-        threshold_fraction=0.75,
-        na_val="unknown",
-    )
-    assert evidence["label"].tolist() == ["winner", "runner_up"]
-    np.testing.assert_allclose(evidence["voteFraction"], [0.75, 0.75])
-
-
-def test_master_projection_without_provenance_warns_on_read(datastore_ephemeral):
-    datastore = datastore_ephemeral
-    store = _projection_store(
-        datastore,
-        "master_projection",
-        np.array([[0, 1]], dtype=np.uint64),
-        np.array([[1.0, 1.0]]),
-    )
-    del store.attrs["complete"]
-
-    with pytest.warns(DeprecationWarning, match="predates"):
-        result = datastore.get_target_classes(
-            "master_projection",
-            reference_class_group="ids",
-        )
-
-    assert len(result) == 1
-    store.attrs["complete"] = False
-    with pytest.raises(ValueError, match="incomplete"):
-        datastore.get_target_classes(
-            "master_projection",
-            reference_class_group="ids",
-        )
-
-
-def test_incomplete_projection_is_rejected(datastore_ephemeral):
-    datastore = datastore_ephemeral
-    store = _projection_store(
-        datastore,
-        "incomplete_projection",
-        np.array([[0, 1]], dtype=np.uint64),
-        np.array([[1.0, 1.0]]),
-    )
-    store.attrs["complete"] = False
-
-    with pytest.raises(ValueError, match="incomplete"):
-        datastore.get_target_classes(
-            "incomplete_projection",
-            reference_class_group="ids",
-        )
-
-
-def test_read_only_fixed_layout_returns_array(datastore_ephemeral):
-    from scarf.datastore.datastore import DataStore
-
-    datastore = datastore_ephemeral
-    _projection_store(
-        datastore,
-        "read_only_layout",
-        np.array([[0, 1]], dtype=np.uint64),
-        np.array([[1.0, 1.0]]),
-    )
-    layout1 = np.arange(datastore.cells.N, dtype=float)
-    layout2 = layout1 * 2
-    datastore.cells.insert("readonly_layout1", layout1, overwrite=True)
-    datastore.cells.insert("readonly_layout2", layout2, overwrite=True)
-    read_only = DataStore(
-        datastore.zarr_loc,
+def _copied_query(datastore, path: Path, *, zarr_mode: str = "r+") -> DataStore:
+    shutil.copytree(datastore.zarr_loc, path)
+    return DataStore(
+        str(path),
         default_assay="RNA",
-        zarr_mode="r",
+        zarr_mode=zarr_mode,
     )
 
-    projected = read_only.project_mapping_layout("read_only_layout", "readonly_layout")
 
-    assert isinstance(projected, np.ndarray)
-    np.testing.assert_allclose(projected[0], [0.5, 1.0])
+def _snapshot_store(path: str) -> dict[str, bytes]:
+    root = Path(path)
+    return {
+        str(file.relative_to(root)): file.read_bytes()
+        for file in root.rglob("*")
+        if file.is_file()
+    }
 
 
-def test_conformal_prediction_sets_are_exposed_in_label_evidence(
-    datastore_ephemeral,
+def _write_projection(
+    query,
+    reference,
+    *,
+    mapping_name: str,
+    indices: np.ndarray,
+    distances: np.ndarray,
+    uninformative: np.ndarray,
+    cell_key: str = "mapping_cells",
+    feature_coverage: float = 0.75,
+) -> MappingResult:
+    index_values = np.asarray(indices, dtype=np.uint64)
+    distance_values = np.asarray(distances, dtype=np.float64)
+    uninformative_values = np.asarray(uninformative, dtype=bool)
+    n_cells = len(index_values)
+    if cell_key == "I":
+        cell_mask = np.asarray(query.cells.fetch_all("I"), dtype=bool)
+        assert int(cell_mask.sum()) == n_cells
+    else:
+        cell_mask = np.zeros(query.cells.N, dtype=bool)
+        cell_mask[:n_cells] = True
+        query.cells.insert(cell_key, cell_mask, overwrite=True)
+    cell_selection = resolve_selection_artifact(
+        query.zw,
+        scope="datastore",
+        kind="cell_selection",
+        values=cell_mask,
+        row_ids=np.asarray(query.cells.fetch_all("ids")),
+        operation="manual_selection",
+        parameters={},
+        inputs={},
+        source_column=cell_key,
+    )
+    feature_mask = np.asarray(query.RNA.feats.fetch_all("I"), dtype=bool)
+    feature_selection = resolve_selection_artifact(
+        query.zw,
+        scope="assay",
+        assay="RNA",
+        kind="feature_selection",
+        values=feature_mask,
+        row_ids=np.asarray(query.RNA.feats.fetch_all("ids")),
+        operation="manual_selection",
+        parameters={},
+        inputs={},
+        source_column="I",
+    )
+    planned = plan_projection(
+        query.zw,
+        query_assay="RNA",
+        mapping_name=mapping_name,
+        n_cells=n_cells,
+        save_k=index_values.shape[1],
+        missing_feature_policy="reference_mean",
+        correction_method="none",
+        cell_selection=cell_selection,
+        feature_selection=feature_selection,
+        selected_expression_fingerprint="e" * 64,
+        query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
+        mapping_reference=reference.external_ref,
+        reference_cell_count=reference.selected_cell_count,
+    )
+    writer = ProjectionWriter(
+        query.zw,
+        planned,
+        chunk_rows=max(1, min(n_cells, 2)),
+    )
+    writer.write_block(
+        0,
+        index_values,
+        distance_values,
+        uninformative_values,
+    )
+    ref = writer.finish(
+        {
+            "featureCoverage": float(feature_coverage),
+            "queryBatchCount": 1,
+            "algorithmVariant": "scaled_pca",
+            "zeroNormCellCount": int(np.count_nonzero(uninformative_values)),
+            "queryScaledDispersion": 1.0,
+        }
+    )
+    return load_projection(query.zw, ref, reference=reference)
+
+
+def _write_reference_labels(reference, name: str = "reference_labels") -> np.ndarray:
+    labels = np.full(reference.selected_cell_count, "other", dtype=object)
+    labels[:2] = ["winner", "runner_up"]
+    reference.datastore.cells.insert(
+        name,
+        labels,
+        key=reference.cell_key,
+        overwrite=True,
+    )
+    return labels
+
+
+def _write_reference_layout(
+    reference,
+    *,
+    layout_key: str,
+    linked: bool,
+) -> tuple[np.ndarray, ArtifactRef | None]:
+    first = np.arange(reference.selected_cell_count, dtype=np.float64) * 10
+    layout = np.column_stack((first, first + 10))
+    source_ref = None
+    if linked:
+        planned = plan_cell_data_artifact(
+            reference.datastore.zw,
+            scope="assay",
+            assay=reference.assay_name,
+            kind="embedding",
+            operation="manual_reference_embedding",
+            parameters={"layout_key": layout_key},
+            inputs={},
+            execution_options={},
+            cell_selection=reference.cell_selection,
+            arrays={"values": (layout.shape, "f")},
+        )
+        write_cell_data_artifact(
+            reference.datastore.zw,
+            planned,
+            {"values": layout},
+        )
+        source_ref = planned.ref
+    for dimension in range(2):
+        column = f"{layout_key}{dimension + 1}"
+        reference.datastore.cells.insert(
+            column,
+            layout[:, dimension],
+            key=reference.cell_key,
+            overwrite=True,
+        )
+        if source_ref is not None:
+            link_cell_data_column(
+                reference.datastore.zw,
+                column,
+                source_ref,
+                value_name="values",
+                value_index=dimension,
+            )
+    return layout, source_ref
+
+
+@pytest.fixture
+def mapping_consumer_context(analyzed_datastore_ephemeral, tmp_path):
+    reference_store = analyzed_datastore_ephemeral
+    reference = _plain_reference(reference_store)
+    query = _copied_query(reference_store, tmp_path / "query.zarr")
+    return reference_store, reference, query
+
+
+def test_mapping_result_resolves_all_handles_and_rejects_reference_ambiguity(
+    mapping_consumer_context,
 ):
-    datastore = datastore_ephemeral
-    _projection_store(
-        datastore,
-        "conformal_evidence",
-        np.array([[0, 1]], dtype=np.uint64),
-        np.array([[0.0, 1.0]]),
+    _, reference, query = mapping_consumer_context
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name="atlas",
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [9.0, 1.0]]),
+        uninformative=np.array([False, False]),
     )
 
-    evidence = datastore.get_target_label_evidence(
-        "conformal_evidence",
-        reference_class_group="ids",
+    by_session = query.get_mapping_result(result, load_arrays=True)
+    by_ref = query.get_mapping_result(result.ref, reference=reference)
+    by_name = query.get_mapping_result(
+        "atlas",
+        reference=reference,
+        query_assay="RNA",
+    )
+
+    assert by_session.ref == by_ref.ref == by_name.ref == result.ref
+    assert by_session.reference is reference
+    assert by_session.indices is not None
+    with pytest.raises(ValueError, match="MappingReference is required"):
+        query.get_mapping_result(result.ref)
+    with pytest.raises(ValueError, match="MappingReference is required"):
+        query.get_mapping_result("atlas")
+    with pytest.raises(ValueError, match="only valid when result is a string"):
+        query.get_mapping_result(
+            result.ref,
+            reference=reference,
+            query_assay="RNA",
+        )
+
+    mismatched = replace(
+        reference,
+        ref=ArtifactRef(
+            scope="assay",
+            assay=reference.assay_name,
+            kind="mapping_reference",
+            artifact_id="0" * 64,
+        ),
+    )
+    with pytest.raises(ValueError, match="does not match.*reference handle"):
+        query.get_mapping_result(result, reference=mismatched)
+
+
+def test_mapping_scores_exclude_uninformative_rows_and_preserve_groups(
+    mapping_consumer_context,
+):
+    _, reference, query = mapping_consumer_context
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name="scores",
+        indices=np.array([[0, 1], [0, 1], [1, 2], [2, 3]]),
+        distances=np.array([[1.0, 9.0], [1.0, 1.0], [1.0, 1.0], [1.0, 1.0]]),
+        uninformative=np.array([False, True, True, True]),
+    )
+    groups = np.array(["informative", "informative", "empty", "empty"])
+
+    weighted = list(
+        query.get_mapping_score(
+            result,
+            target_groups=groups,
+            log_transform=False,
+            multiplier=1.0,
+        )
+    )
+    unweighted = list(
+        query.get_mapping_score(
+            result.ref,
+            target_groups=groups,
+            reference=reference,
+            log_transform=False,
+            multiplier=1.0,
+            weighted=False,
+            fixed_weight=0.2,
+        )
+    )
+
+    assert [group for group, _ in weighted] == ["informative", "empty"]
+    assert [group for group, _ in unweighted] == ["informative", "empty"]
+    assert weighted[0][1].shape == (reference.selected_cell_count,)
+    # Published weight, 1 / (log(distance + 1) + 1), divided by one informative
+    # query cell times two neighbors.
+    expected = 1.0 / (np.log1p(np.array([1.0, 9.0])) + 1.0) / 2.0
+    np.testing.assert_allclose(weighted[0][1][:2], expected)
+    np.testing.assert_array_equal(weighted[1][1], 0.0)
+    np.testing.assert_allclose(unweighted[0][1][:2], [0.1, 0.1])
+    np.testing.assert_array_equal(unweighted[1][1], 0.0)
+
+    with pytest.raises(ValueError, match="one value per projected query cell"):
+        list(query.get_mapping_score(result, target_groups=np.array(["short"])))
+    with pytest.raises(ValueError, match="fixed_weight"):
+        list(query.get_mapping_score(result, fixed_weight=0.0))
+    with pytest.raises(TypeError, match="weighted"):
+        list(query.get_mapping_score(result, weighted=1))
+
+
+def test_labels_and_evidence_abstain_without_fabricating_metrics(
+    mapping_consumer_context,
+):
+    _, reference, query = mapping_consumer_context
+    _write_reference_labels(reference)
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name="labels",
+        indices=np.array([[0, 1], [0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [1.0, 9.0], [1.0, 9.0]]),
+        uninformative=np.array([False, True, False]),
+        feature_coverage=0.625,
+    )
+
+    labels = query.get_target_classes(
+        result,
+        reference_class_group="reference_labels",
+        threshold_fraction=0.75,
+    )
+    evidence = query.get_target_label_evidence(
+        result.ref,
+        reference=reference,
+        reference_class_group="reference_labels",
+        threshold_fraction=0.75,
         calibration_nonconformity=np.array([0.1, 0.2, 0.3]),
         conformal_alpha=0.2,
     )
 
-    assert "predictionSet" in evidence
-    assert datastore.cells.fetch("ids", key="I")[0] in evidence.loc[0, "predictionSet"]
+    assert isinstance(labels, pd.Series)
+    assert labels.tolist() == ["winner", "NA", "runner_up"]
+    assert evidence["label"].tolist() == ["winner", "NA", "runner_up"]
+    assert evidence["isUnknown"].tolist() == [False, True, False]
+    assert evidence["featureCoverage"].tolist() == [0.625] * 3
+    for column in (
+        "voteFraction",
+        "voteEntropy",
+        "topTwoMargin",
+        "referenceDistancePercentile",
+    ):
+        assert np.isnan(evidence.loc[1, column])
+        assert np.isfinite(evidence.loc[[0, 2], column]).all()
+    np.testing.assert_allclose(evidence.loc[[0, 2], "voteFraction"], [0.9, 0.9])
+    assert evidence.loc[1, "predictionSet"] == ()
+    assert "reference_labels" not in query.cells.columns
 
 
-def test_uninformative_projection_rows_are_forced_unknown(datastore_ephemeral):
-    datastore = datastore_ephemeral
-    store = _projection_store(
-        datastore,
-        "uninformative_evidence",
-        np.array([[0, 1], [0, 1]], dtype=np.uint64),
-        np.array([[0.0, 1.0], [0.0, 1.0]]),
-    )
-    uninformative = create_zarr_dataset(
-        store,
-        "uninformative",
-        (2,),
-        "bool",
-        (2,),
-    )
-    uninformative[:] = [True, False]
-
-    evidence = datastore.get_target_label_evidence(
-        "uninformative_evidence",
-        reference_class_group="ids",
-        threshold_fraction=0.0,
-    )
-
-    assert evidence["isUnknown"].tolist() == [True, False]
-    assert evidence.loc[0, "label"] == "NA"
-    classes = datastore.get_target_classes(
-        "uninformative_evidence",
-        reference_class_group="ids",
-        threshold_fraction=0.0,
-        na_val="unknown",
-    )
-    assert classes.iloc[0] == "unknown"
-
-    decision = datastore._label_vote_decision(
-        datastore.cells.fetch("ids", key="I"),
-        np.array([0, 1]),
-        np.array([0.0, 0.0]),
-        0.0,
-        "unknown",
-    )
-    assert decision[0] == "unknown"
-    assert decision[4]
-
-
-def test_reference_distance_percentile_is_query_composition_invariant(
-    datastore_ephemeral,
+def test_mapping_consumers_stream_projection_arrays(
+    mapping_consumer_context,
+    monkeypatch,
 ):
-    datastore = datastore_ephemeral
-    _projection_store(
-        datastore,
-        "distance_single",
-        np.array([[0, 1]], dtype=np.uint64),
-        np.array([[1.0, 4.0]]),
+    _, reference, query = mapping_consumer_context
+    _write_reference_labels(reference)
+    _write_reference_layout(
+        reference,
+        layout_key="stream_layout",
+        linked=False,
     )
-    _projection_store(
-        datastore,
-        "distance_composed",
-        np.array([[0, 1], [2, 3], [4, 5]], dtype=np.uint64),
-        np.array([[1.0, 4.0], [0.1, 0.2], [10.0, 20.0]]),
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name="streaming",
+        indices=np.array([[0, 1], [0, 1], [1, 0], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [2.0, 3.0], [1.0, 9.0], [4.0, 5.0]]),
+        uninformative=np.array([False, True, False, False]),
+    )
+    reads: list[tuple[str, object]] = []
+    _record_projection_reads(monkeypatch, reads)
+
+    consumers = (
+        lambda: list(query.get_mapping_score(result)),
+        lambda: query.get_target_classes(
+            result,
+            reference_class_group="reference_labels",
+        ),
+        lambda: query.get_target_label_evidence(
+            result,
+            reference_class_group="reference_labels",
+        ),
+        lambda: query.project_reference_embedding(
+            result,
+            reference_layout_key="stream_layout",
+            label="streamed_ref",
+        ),
+    )
+    for consume in consumers:
+        reads.clear()
+        consume()
+        assert {name for name, _ in reads} == {
+            "indices",
+            "distances",
+            "uninformative",
+        }
+        for _, key in reads:
+            assert isinstance(key, slice)
+            assert key.start is not None
+            assert key.stop is not None
+            assert 0 < key.stop - key.start <= 2
+
+
+def test_label_scores_are_allocated_only_for_conformal_evidence(
+    mapping_consumer_context,
+    monkeypatch,
+):
+    _, reference, query = mapping_consumer_context
+    labels = _write_reference_labels(reference)
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name="conformal_allocation",
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [1.0, 9.0]]),
+        uninformative=np.array([False, False]),
+    )
+    allocations: list[object] = []
+
+    class _NumpyProxy:
+        def __getattr__(self, name: str):
+            return getattr(np, name)
+
+        def zeros(self, shape, *args, **kwargs):
+            allocations.append(shape)
+            return np.zeros(shape, *args, **kwargs)
+
+    monkeypatch.setattr(mapping_operations, "np", _NumpyProxy())
+    score_shape = (result.n_cells, len(pd.unique(labels)))
+
+    query.get_target_label_evidence(
+        result,
+        reference_class_group="reference_labels",
+    )
+    assert score_shape not in allocations
+
+    allocations.clear()
+    query.get_target_label_evidence(
+        result,
+        reference_class_group="reference_labels",
+        calibration_nonconformity=np.array([0.1, 0.2]),
+    )
+    assert score_shape in allocations
+
+
+def test_reference_embedding_persists_reuses_and_links_selected_query_columns(
+    mapping_consumer_context,
+):
+    reference_store, reference, query = mapping_consumer_context
+    reference_layout, source_ref = _write_reference_layout(
+        reference,
+        layout_key="RNA_UMAP",
+        linked=True,
+    )
+    assert source_ref is not None
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name="embedding",
+        indices=np.array([[0, 1], [0, 1], [1, 0]]),
+        distances=np.array([[1.0, 9.0], [1.0, 1.0], [1.0, 9.0]]),
+        uninformative=np.array([False, False, True]),
+    )
+    reference_before = _snapshot_store(reference_store.zarr_loc)
+
+    embedding = query.project_reference_embedding(
+        result,
+        reference_layout_key="RNA_UMAP",
     )
 
-    single = datastore.get_target_label_evidence(
-        "distance_single",
-        reference_class_group="ids",
+    assert _snapshot_store(reference_store.zarr_loc) == reference_before
+    status = query.inspect_artifact(embedding)
+    assert status.operation == "project_reference_embedding"
+    assert ArtifactRef.from_dict((status.inputs or {})["projection"]) == result.ref
+    assert ExternalArtifactRef.from_dict(
+        (status.inputs or {})["reference_layout"]
+    ) == reference.external_ref.__class__(
+        dataset_fingerprint=reference.dataset_fingerprint,
+        ref=source_ref,
     )
-    composed = datastore.get_target_label_evidence(
-        "distance_composed",
-        reference_class_group="ids",
+    columns = [
+        "RNA_mapping_cells_ref_UMAP1",
+        "RNA_mapping_cells_ref_UMAP2",
+    ]
+    values = np.column_stack(
+        [query.cells.fetch(column, key="mapping_cells") for column in columns]
+    )
+    np.testing.assert_allclose(values[0], [1.0, 11.0])
+    np.testing.assert_allclose(values[1], [5.0, 15.0])
+    assert np.isnan(values[2]).all()
+    for dimension, column in enumerate(columns):
+        attrs = query.zw["cellData"][column].attrs
+        assert ArtifactRef.from_dict(attrs["source_artifact"]) == embedding
+        assert attrs["source_value"] == "values"
+        assert attrs["value_index"] == dimension
+
+    preserved_display = {
+        "kind": "continuous",
+        "colormap": "magma",
+        "minimum": -1.0,
+        "maximum": 20.0,
+        "scale": "linear",
+    }
+    query.zw["cellData"][columns[0]].attrs["display"] = preserved_display
+    reused = query.project_reference_embedding(
+        result.ref,
+        reference=reference,
+        reference_layout_key="RNA_UMAP",
+    )
+    assert reused == embedding
+    assert dict(query.zw["cellData"][columns[0]].attrs["display"]) == preserved_display
+    np.testing.assert_array_equal(
+        artifact_group(query.zw, reused)["values"][:],
+        values,
+    )
+    assert _snapshot_store(reference_store.zarr_loc) == reference_before
+    np.testing.assert_array_equal(reference.fetch_layout("RNA_UMAP"), reference_layout)
+
+
+def test_reference_embedding_fingerprints_unlinked_layout_and_uses_i_naming(
+    mapping_consumer_context,
+):
+    _, reference, query = mapping_consumer_context
+    reference_layout, source_ref = _write_reference_layout(
+        reference,
+        layout_key="manual_layout",
+        linked=False,
+    )
+    assert source_ref is None
+    n_cells = len(query.cells.active_index("I"))
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name="fallback_embedding",
+        indices=np.tile(np.array([[0, 1]], dtype=np.uint64), (n_cells, 1)),
+        distances=np.ones((n_cells, 2), dtype=np.float64),
+        uninformative=np.zeros(n_cells, dtype=bool),
+        cell_key="I",
     )
 
-    assert (
-        single.loc[0, "referenceDistancePercentile"]
-        == composed.loc[0, "referenceDistancePercentile"]
+    embedding = query.project_reference_embedding(
+        result,
+        reference_layout_key="manual_layout",
+        label="manual_ref",
     )
 
+    status = query.inspect_artifact(embedding)
+    assert (status.inputs or {})["reference_layout"] == {
+        "value_fingerprint": fingerprint_array(reference_layout)
+    }
+    assert "RNA_manual_ref1" in query.cells.columns
+    assert "RNA_manual_ref2" in query.cells.columns
 
-def test_legacy_projection_without_provenance_marker_warns(datastore_ephemeral):
-    datastore = datastore_ephemeral
-    _projection_store(
-        datastore,
-        "legacy_projection",
-        np.array([[0, 1]], dtype=np.uint64),
-        np.array([[0.0, 1.0]]),
+
+@pytest.mark.parametrize(
+    ("attribute", "malformed_value"),
+    (
+        ("value_index", 0),
+        ("source_value", "other_values"),
+    ),
+)
+def test_reference_embedding_fingerprints_malformed_layout_links(
+    mapping_consumer_context,
+    attribute,
+    malformed_value,
+):
+    _, reference, query = mapping_consumer_context
+    reference_layout, source_ref = _write_reference_layout(
+        reference,
+        layout_key="malformed_layout",
+        linked=True,
+    )
+    assert source_ref is not None
+    reference.datastore.zw["cellData"]["malformed_layout2"].attrs[attribute] = (
+        malformed_value
+    )
+    assert reference.layout_source("malformed_layout") is None
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name=f"malformed_{attribute}",
+        indices=np.array([[0, 1], [1, 0]]),
+        distances=np.ones((2, 2), dtype=np.float64),
+        uninformative=np.zeros(2, dtype=bool),
     )
 
-    with pytest.warns(DeprecationWarning, match="predates projection provenance"):
-        datastore.get_target_classes(
-            "legacy_projection",
-            reference_class_group="ids",
-            threshold_fraction=0.5,
+    embedding = query.project_reference_embedding(
+        result,
+        reference_layout_key="malformed_layout",
+        label=f"malformed_{attribute}",
+    )
+
+    status = query.inspect_artifact(embedding)
+    assert (status.inputs or {})["reference_layout"] == {
+        "value_fingerprint": fingerprint_array(reference_layout)
+    }
+
+
+def test_reference_layout_source_requires_the_linked_value_array(
+    mapping_consumer_context,
+):
+    _, reference, _ = mapping_consumer_context
+    _write_reference_layout(
+        reference,
+        layout_key="missing_source_values",
+        linked=True,
+    )
+    for column in ("missing_source_values1", "missing_source_values2"):
+        reference.datastore.zw["cellData"][column].attrs["source_value"] = "missing"
+
+    assert reference.layout_source("missing_source_values") is None
+
+
+def test_reference_layout_reads_linked_immutable_artifact(
+    mapping_consumer_context,
+):
+    _, reference, _ = mapping_consumer_context
+    expected, _ = _write_reference_layout(
+        reference,
+        layout_key="linked_layout",
+        linked=True,
+    )
+    for column in ("linked_layout1", "linked_layout2"):
+        values = reference.datastore.zw["cellData"][column]
+        values[:] = np.full(values.shape, -999.0)
+
+    np.testing.assert_array_equal(reference.fetch_layout("linked_layout"), expected)
+
+
+def test_reference_embedding_requires_writable_query_store(
+    mapping_consumer_context,
+):
+    _, reference, query = mapping_consumer_context
+    result = _write_projection(
+        query,
+        reference,
+        mapping_name="read_only",
+        indices=np.array([[0, 1]]),
+        distances=np.array([[1.0, 1.0]]),
+        uninformative=np.array([False]),
+    )
+    read_only = DataStore(
+        query.zarr_loc,
+        default_assay="RNA",
+        zarr_mode="r",
+    )
+
+    with pytest.raises(ValueError, match="read-write query store"):
+        read_only.project_reference_embedding(
+            result,
+            reference_layout_key="unused",
         )
 
 
-def test_partial_provenance_projection_is_rejected_not_downgraded(datastore_ephemeral):
-    # A projection that carries the provenance marker but is missing the rest of
-    # the provenance metadata is a corrupt current write, not a legacy store, so
-    # it must raise rather than silently fall back to the legacy read path.
-    datastore = datastore_ephemeral
-    store = _projection_store(
-        datastore,
-        "partial_provenance",
-        np.array([[0, 1]], dtype=np.uint64),
-        np.array([[0.0, 1.0]]),
+def test_every_mapping_consumer_rejects_old_projection_artifacts(
+    mapping_consumer_context,
+):
+    _, reference, query = mapping_consumer_context
+    planned = plan_artifact(
+        query.zw,
+        scope="assay",
+        assay="RNA",
+        kind="projection",
+        operation="map_with_reference",
+        parameters={},
+        inputs={},
+        execution_options={},
     )
-    marker = create_zarr_dataset(store, "reference_feature_indices", (1,), "u8", (1,))
-    marker[:] = [0]
-
-    with pytest.raises(ValueError, match="incomplete provenance metadata"):
-        datastore.get_target_classes(
-            "partial_provenance",
+    group = start_artifact(query.zw, planned)
+    finish_artifact(group, planned)
+    old = planned.ref
+    consumers = (
+        lambda: query.get_mapping_result(old, reference=reference),
+        lambda: list(query.get_mapping_score(old, reference=reference)),
+        lambda: query.get_target_classes(
+            old,
             reference_class_group="ids",
-            threshold_fraction=0.5,
-        )
+            reference=reference,
+        ),
+        lambda: query.get_target_label_evidence(
+            old,
+            reference_class_group="ids",
+            reference=reference,
+        ),
+        lambda: query.project_reference_embedding(
+            old,
+            reference_layout_key="RNA_UMAP",
+            reference=reference,
+        ),
+    )
+
+    for consumer in consumers:
+        with pytest.raises(ValueError, match="Re-run run_mapping"):
+            consumer()

@@ -13,6 +13,7 @@ _METHODS = {
         "get_cell_vals",
         "get_assay_state",
         "inspect_artifact",
+        "lineage",
         "list_artifacts",
         "load_artifact",
         "set_default_assay",
@@ -51,11 +52,8 @@ _METHODS = {
         "get_mapping_score",
         "get_target_classes",
         "get_target_label_evidence",
-        "load_unified_graph",
-        "project_mapping_layout",
+        "project_reference_embedding",
         "run_mapping",
-        "run_unified_tsne",
-        "run_unified_umap",
     ),
     DataStore: (
         "__init__",
@@ -95,9 +93,9 @@ _METHODS = {
 }
 
 _SIGNATURE_DIGESTS = {
-    BaseDataStore: "bf6861589597bee509cfc22bbb3fbe6bfba1691ebdd5a8bbc1172bd520f191e0",
-    GraphDataStore: "b3d90325a0a6839df1f62371ed05a9f3ba639514b70697919308cae67df342fa",
-    MappingDatastore: "95a0fa2a277259c653db32d94b1334d94be4bbc8331145d614e72796b4871a0f",
+    BaseDataStore: "618821f381727cab2b5b19ec983871b486c5bdcab992435f3a0cb34033dfbcf4",
+    GraphDataStore: "eecfb41646f3b515e2979882a1afe56b0d1497775562110af406c8f178f7005a",
+    MappingDatastore: "c2d386b537ba464e9b08e7a67eb7342a72b4845b76053ef933a0b531b4800c67",
     DataStore: "3da2164eafb9ac1ea17d9faa3ad8be10850a38b5d137f0773a7c9b306943574c",
 }
 
@@ -154,8 +152,6 @@ def test_datastore_static_method_contracts_are_stable():
             "_label_vote_decision",
             "_projection_block_size",
             "_query_batch_codes",
-            "_same_assay_store",
-            "_validate_projection_arrays",
             "calibrate_label_transfer_threshold",
         ),
         DataStore: ("_write_marker_slot",),
@@ -166,13 +162,18 @@ def test_datastore_static_method_contracts_are_stable():
             for name in names
         )
 
-    assert hasattr(MappingDatastore, "_projection_has_provenance")
-    assert not hasattr(MappingDatastore, "_PROJECTION_SCHEMA_VERSION")
-    assert not hasattr(MappingDatastore, "_LEGACY_PROJECTION_SCHEMA_VERSIONS")
-    assert not hasattr(MappingDatastore, "_LEGACY_PROJECTION_ATTRS")
-    assert not hasattr(MappingDatastore, "_LEGACY_PROJECTION_ARRAYS")
-    assert not hasattr(MappingDatastore, "_projection_attr")
-    assert not hasattr(MappingDatastore, "_projection_array_name")
+    for name in (
+        "_same_assay_store",
+        "_validate_projection_arrays",
+        "_projection_has_provenance",
+        "_PROJECTION_SCHEMA_VERSION",
+        "_LEGACY_PROJECTION_SCHEMA_VERSIONS",
+        "_LEGACY_PROJECTION_ATTRS",
+        "_LEGACY_PROJECTION_ARRAYS",
+        "_projection_attr",
+        "_projection_array_name",
+    ):
+        assert not hasattr(MappingDatastore, name)
 
 
 def test_graph_datastore_private_mixin_order_is_stable():
@@ -209,11 +210,14 @@ def test_mapping_datastore_private_mixin_order_is_stable():
     ]
 
 
-def test_unified_layout_adapter_signature_is_stable():
-    assert str(inspect.signature(MappingDatastore._load_unified_layout_data)) == (
-        "(self, layout_key: str, from_assay: str | None = None) -> "
-        "tuple[numpy.ndarray, numpy.ndarray, int, list[int], list[str]]"
-    )
+def test_retired_unified_mapping_apis_are_absent():
+    for name in (
+        "_load_unified_layout_data",
+        "load_unified_graph",
+        "run_unified_tsne",
+        "run_unified_umap",
+    ):
+        assert not hasattr(MappingDatastore, name)
 
 
 def test_datastore_private_mixin_order_is_stable():

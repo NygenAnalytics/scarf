@@ -25,14 +25,12 @@ _STORE_PLOT_METHODS = (
     "marker_heatmap",
     "mapping_calibration",
     "mapping_confusion",
-    "mapping_correction",
     "mapping_evidence",
     "mapping_projection",
     "mapping_score",
     "matrixplot",
     "pseudotime_heatmap",
     "run_recipe",
-    "unified_embedding",
 )
 
 
@@ -96,6 +94,11 @@ def test_plot_accessor_surface_matches_store_first_plotting_exports():
     assert store_first_exports == set(_STORE_PLOT_METHODS)
 
 
+def test_unified_plot_accessor_is_absent():
+    assert "unified_embedding" not in splt.__all__
+    assert not hasattr(DataStorePlotAccessor, "unified_embedding")
+
+
 @pytest.mark.parametrize("name", _STORE_PLOT_METHODS)
 def test_plot_accessor_signatures_match_standalone_functions(name: str):
     standalone = getattr(splt, name)
@@ -129,11 +132,6 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
         ),
         ("embedding_raster", (), {"layout_key": "RNA_UMAP", "pixels": 32}),
         (
-            "unified_embedding",
-            (),
-            {"layout_key": "RNA_unified", "ref_name": "atlas"},
-        ),
-        (
             "dotplot",
             (),
             {
@@ -152,42 +150,34 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
         ("marker_heatmap", (), {"topn": 7, "linewidths": 0.25}),
         (
             "mapping_calibration",
-            (),
+            ("atlas",),
             {
-                "target_name": "atlas",
                 "reference_class_group": "label",
                 "known_labels": ["a"],
             },
         ),
         (
             "mapping_confusion",
-            (),
+            ("atlas",),
             {
-                "target_name": "atlas",
                 "reference_class_group": "label",
                 "known_labels": ["a"],
             },
         ),
         (
-            "mapping_correction",
-            (),
-            {"target_name": "atlas", "dimensions": (1, 2)},
-        ),
-        (
             "mapping_evidence",
-            (),
-            {"target_name": "atlas", "reference_class_group": "label"},
+            ("atlas",),
+            {"reference_class_group": "label"},
         ),
         (
             "mapping_projection",
-            (),
-            {"target_name": "atlas", "reference_layout_key": "RNA_UMAP"},
+            ("atlas",),
+            {"reference_layout_key": "RNA_UMAP"},
         ),
         (
             "mapping_score",
-            (),
+            ("atlas",),
             {
-                "target_name": "atlas",
                 "kind": "histogram",
             },
         ),
@@ -229,6 +219,8 @@ def test_plot_accessor_forwards_to_canonical_function(
     expected_args = [store]
     if name == "distribution":
         expected_args.append(expected_kwargs.pop("keys"))
+    elif name.startswith("mapping_"):
+        expected_args.append(expected_kwargs.pop("result"))
     elif name == "run_recipe":
         expected_args.append(expected_kwargs.pop("recipe"))
 

@@ -24,15 +24,6 @@ from ._style import (
 )
 
 
-def _scarf_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("scarf")
-    except Exception:
-        return "unknown"
-
-
 def _fetch_inputs(
     store: Any,
     *,
@@ -629,7 +620,6 @@ def cluster_connectivity(
         ),
         scales=(resolved_categorical_scale, resolved_size_scale),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             assay=from_assay or getattr(store, "_defaultAssay", None),
             cell_key=cell_key,
             n_cells=len(groups),

@@ -4,12 +4,16 @@ from typing import cast
 
 import numpy as np
 
-from .models import QueryCorrection, SymphonyReferenceModel
+from .models import (
+    QueryCorrection,
+    ScaledPCAProjectionModel,
+    SymphonyCorrectionModel,
+)
 
 SYMPHONY_ALGORITHM = "symphony"
 
 
-def project_pca(values: np.ndarray, model: SymphonyReferenceModel) -> np.ndarray:
+def project_pca(values: np.ndarray, model: ScaledPCAProjectionModel) -> np.ndarray:
     """Project normalized expression onto immutable reference PCA loadings."""
     values = np.asarray(values, dtype=np.float64)
     if values.ndim != 2 or values.shape[1] != model.n_features:
@@ -22,8 +26,26 @@ def project_pca(values: np.ndarray, model: SymphonyReferenceModel) -> np.ndarray
     return cast(np.ndarray, projected)
 
 
+def scaled_dispersion_sum(values: np.ndarray, model: ScaledPCAProjectionModel) -> float:
+    """Return the summed squared scaled deviation of one aligned query block.
+
+    The reference PCA is fitted on z-scored features, so dividing this sum by the
+    cell and feature counts returns exactly 1 for the reference itself. A query
+    that returns much less than 1 occupies a narrower region of the same space
+    and its cells collect near the middle of the reference cloud, where the
+    retrieved neighbors stop reflecting the query's own structure.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != model.n_features:
+        raise ValueError(
+            f"Expected query matrix with {model.n_features} features, got {values.shape}"
+        )
+    scaled = (values - model.feature_means) / model.feature_scales
+    return float(np.einsum("ij,ij->", scaled, scaled))
+
+
 def soft_cluster_assignments(
-    coordinates: np.ndarray, model: SymphonyReferenceModel
+    coordinates: np.ndarray, model: SymphonyCorrectionModel
 ) -> np.ndarray:
     """Calculate cosine-kernel soft assignments to reference centroids."""
     values = np.asarray(coordinates, dtype=np.float64)
@@ -50,7 +72,7 @@ def zero_norm_rows(coordinates: np.ndarray) -> np.ndarray:
 
 
 def initialize_sufficient_statistics(
-    n_batches: int, model: SymphonyReferenceModel
+    n_batches: int, model: SymphonyCorrectionModel
 ) -> tuple[np.ndarray, np.ndarray]:
     if n_batches < 1:
         raise ValueError("At least one query batch is required")
@@ -87,7 +109,7 @@ def accumulate_sufficient_statistics(
 def solve_query_correction(
     counts: np.ndarray,
     sums: np.ndarray,
-    model: SymphonyReferenceModel,
+    model: SymphonyCorrectionModel,
 ) -> QueryCorrection:
     """Fit Symphony's joint cluster-aware query batch correction."""
     if counts.ndim != 2 or counts.shape[1] != model.n_clusters:
@@ -128,7 +150,7 @@ def apply_query_correction(
     coordinates: np.ndarray,
     assignments: np.ndarray,
     batch_codes: np.ndarray,
-    model: SymphonyReferenceModel,
+    model: SymphonyCorrectionModel,
     correction: QueryCorrection,
 ) -> np.ndarray:
     """Map query PCA coordinates into the fixed corrected reference space."""

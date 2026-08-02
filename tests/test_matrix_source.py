@@ -575,15 +575,18 @@ def test_mounted_store_build_mapping_reference(datastore_zarr_root, tmp_path):
         default_assay="RNA",
     )
     ds.mark_hvgs(top_n=50, show_plot=False, bin_strategy="fixed")
-    batches = np.where(np.arange(ds.cells.N) % 2 == 0, "a", "b")
-    ds.cells.insert("mapping_batch", batches, overwrite=True)
-    reference = ds.build_mapping_reference(
+    build_neighbourhood_graph(
+        ds,
         feat_key="hvgs",
-        batch_columns=["mapping_batch"],
         k=3,
+        dims=5,
         n_centroids=10,
-        harmony_params={"nclust": 5},
     )
-    assert bool(reference.metadata.get("complete", False)) is True
+    state = ds.get_assay_state("RNA")
+    assert state is not None
+    assert state.neighbors is not None
+    reference = ds.build_mapping_reference(state.neighbors)
+    assert reference.method == "pca"
+    assert reference.dataset_fingerprint
     assert "counts" not in zarr.open_group(target, mode="r")["RNA"]
     assert _snapshot_store_files(datastore_zarr_root) == source_before

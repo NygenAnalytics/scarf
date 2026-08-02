@@ -1,0 +1,667 @@
+from dataclasses import replace
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import zarr
+from zarr.storage import MemoryStore
+
+from scarf.mapping.models import ScaledPCAProjectionModel
+from scarf.mapping.projection import (
+    NO_QUERY_BATCH_FINGERPRINT,
+    ProjectionWriter,
+    load_projection,
+    plan_projection,
+    resolve_projection,
+)
+from scarf.mapping.reference import MappingReference
+from scarf.storage.artifact_writer import (
+    finish_artifact,
+    plan_artifact,
+    start_artifact,
+)
+from scarf.storage.artifacts import (
+    ArtifactRef,
+    ExternalArtifactRef,
+    artifact_group,
+    inspect_artifact,
+    list_artifacts,
+)
+
+
+def _selection(
+    root: zarr.Group,
+    *,
+    kind: str,
+    values: np.ndarray,
+    assay: str | None,
+) -> ArtifactRef:
+    scope = "datastore" if assay is None else "assay"
+    planned = plan_artifact(
+        root,
+        scope=scope,
+        assay=assay,
+        kind=kind,
+        operation="manual_selection",
+        parameters={},
+        inputs={},
+        execution_options={},
+    )
+    group = start_artifact(root, planned)
+    group.create_array(
+        "values",
+        data=np.asarray(values, dtype=bool),
+        chunks=(len(values),),
+    )
+    finish_artifact(group, planned)
+    return planned.ref
+
+
+def _query_inputs(
+    *,
+    n_cells: int = 4,
+) -> tuple[zarr.Group, ArtifactRef, ArtifactRef]:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    cell_selection = _selection(
+        root,
+        kind="cell_selection",
+        values=np.ones(n_cells, dtype=bool),
+        assay=None,
+    )
+    feature_selection = _selection(
+        root,
+        kind="feature_selection",
+        values=np.array([True, False, True]),
+        assay="RNA",
+    )
+    return root, cell_selection, feature_selection
+
+
+def _artifact_ref(
+    kind: str,
+    token: str,
+    *,
+    assay: str | None = "RNA",
+) -> ArtifactRef:
+    return ArtifactRef(
+        scope="datastore" if assay is None else "assay",
+        assay=assay,
+        kind=kind,
+        artifact_id=token * 64,
+    )
+
+
+class _ReferenceDatastore:
+    def __init__(self, root: zarr.Group) -> None:
+        self.zw = root
+
+    def _get_assay(self, name: str) -> SimpleNamespace:
+        return SimpleNamespace(attrs=self.zw[name].attrs)
+
+
+def _mapping_reference(
+    *,
+    fingerprint: str = "reference-dataset",
+    token: str = "a",
+) -> tuple[MappingReference, zarr.Group]:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    assay = root.create_group("RNA")
+    assay.attrs["dataset_fingerprint"] = fingerprint
+    reference = MappingReference(
+        datastore=_ReferenceDatastore(root),
+        ref=_artifact_ref("mapping_reference", token),
+        assay_name="RNA",
+        cell_key="I",
+        feature_key="I",
+        reduction=_artifact_ref("reduction", "1"),
+        ann_index=_artifact_ref("ann_index", "2"),
+        neighbors=_artifact_ref("neighbors", "3"),
+        cell_selection=_artifact_ref("cell_selection", "4", assay=None),
+        feature_selection=_artifact_ref("feature_selection", "5"),
+        batch_correction=None,
+        dataset_fingerprint=fingerprint,
+        selected_cell_count=3,
+        model=ScaledPCAProjectionModel(
+            feature_means=np.zeros(1),
+            feature_scales=np.ones(1),
+            loadings=np.ones((1, 1)),
+        ),
+        symphony_state=None,
+        feature_ids=np.array(["gene"]),
+        metadata={
+            "method": "pca",
+            "ann_metric": "l2",
+            "normalization_parameters": {"size_factor": 1.0},
+        },
+        reference_distance_quantiles=np.array([0.5]),
+        reference_distance_values=np.array([1.0]),
+    )
+    return reference, root
+
+
+def _plan(
+    root: zarr.Group,
+    cell_selection: ArtifactRef,
+    feature_selection: ArtifactRef,
+    external: ExternalArtifactRef,
+    *,
+    mapping_name: str = "atlas",
+    n_cells: int = 4,
+    save_k: int = 2,
+    invalidate_cache: bool = False,
+):
+    return plan_projection(
+        root,
+        query_assay="RNA",
+        mapping_name=mapping_name,
+        n_cells=n_cells,
+        save_k=save_k,
+        missing_feature_policy="reference_mean",
+        correction_method="none",
+        cell_selection=cell_selection,
+        feature_selection=feature_selection,
+        selected_expression_fingerprint="e" * 64,
+        query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
+        mapping_reference=external,
+        reference_cell_count=3,
+        invalidate_cache=invalidate_cache,
+    )
+
+
+def _blocks() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    return (
+        np.array([[0, 1], [1, 2], [2, 1], [0, 2]], dtype=np.uint32),
+        np.array(
+            [[0.1, 0.2], [0.0, 1.0], [2.0, 3.0], [0.5, 0.75]],
+            dtype=np.float32,
+        ),
+        np.array([False, True, False, True]),
+    )
+
+
+def _diagnostics(*, zero_norm_cell_count: int = 2) -> dict[str, object]:
+    return {
+        "featureCoverage": 0.75,
+        "queryBatchCount": 1,
+        "algorithmVariant": "scaled_pca",
+        "zeroNormCellCount": zero_norm_cell_count,
+        "queryScaledDispersion": 1.0,
+    }
+
+
+def _write(
+    root: zarr.Group,
+    plan,
+    *,
+    created_at_ns: int | None = None,
+) -> ArtifactRef:
+    indices, distances, uninformative = _blocks()
+    writer = ProjectionWriter(root, plan, chunk_rows=2)
+    writer.write_block(0, indices[:2], distances[:2], uninformative[:2])
+    writer.write_block(2, indices[2:], distances[2:], uninformative[2:])
+    ref = writer.finish(_diagnostics())
+    if created_at_ns is not None:
+        artifact_group(root, ref).attrs["created_at_ns"] = created_at_ns
+    return ref
+
+
+def test_projection_writer_persists_exact_contract_and_loads_copies() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, reference_root = _mapping_reference()
+    external = reference.external_ref
+    before_reference_attrs = dict(reference_root["RNA"].attrs)
+    plan = _plan(root, cell_selection, feature_selection, external)
+
+    assert not plan.reused
+    assert not inspect_artifact(root, plan.ref).exists
+    indices, distances, uninformative = _blocks()
+    writer = ProjectionWriter(root, plan, chunk_rows=2)
+    assert not inspect_artifact(root, plan.ref).complete
+    writer.write_block(0, indices[:1], distances[:1], uninformative[:1])
+    writer.write_block(1, indices[1:3], distances[1:3], uninformative[1:3])
+    writer.write_block(3, indices[3:], distances[3:], uninformative[3:])
+    assert writer.finish(_diagnostics()) == plan.ref
+    assert writer.finished
+
+    status = inspect_artifact(root, plan.ref)
+    assert status.complete
+    assert status.operation == "map_query"
+    assert status.parameters == {
+        "mapping_name": "atlas",
+        "save_k": 2,
+        "missing_feature_policy": "reference_mean",
+        "correction_method": "none",
+    }
+    assert set(status.inputs or {}) == {
+        "cell_selection",
+        "feature_selection",
+        "selected_expression_fingerprint",
+        "query_batch_fingerprint",
+        "mapping_reference",
+    }
+    assert (status.inputs or {})["mapping_reference"] == external.to_dict()
+    group = artifact_group(root, plan.ref)
+    assert set(group.array_keys()) == {"indices", "distances", "uninformative"}
+    assert set(group.group_keys()) == set()
+    assert group.attrs["diagnostics"] == _diagnostics()
+    assert "ann_metric" not in (status.parameters or {})
+    assert "reference_feature_indices" not in group
+
+    metadata = load_projection(root, plan.ref)
+    assert metadata.ref == plan.ref
+    assert metadata.mapping_name == "atlas"
+    assert metadata.n_cells == 4
+    assert metadata.correction_method == "none"
+    assert metadata.diagnostics == _diagnostics()
+    assert metadata.indices is None
+    assert metadata.distances is None
+    assert metadata.uninformative is None
+    assert metadata.reference is None
+
+    loaded = load_projection(
+        root,
+        plan.ref,
+        load_arrays=True,
+        reference=reference,
+    )
+    np.testing.assert_array_equal(loaded.indices, indices)
+    np.testing.assert_allclose(loaded.distances, distances)
+    np.testing.assert_array_equal(loaded.uninformative, uninformative)
+    assert loaded.reference is reference
+    assert replace(metadata, reference=reference) == metadata
+    assert "MappingReference" not in repr(loaded)
+    assert "[[" not in repr(loaded)
+    assert dict(reference_root["RNA"].attrs) == before_reference_attrs
+
+
+@pytest.mark.parametrize(
+    ("indices", "distances", "uninformative", "message"),
+    [
+        (
+            np.ones((2, 2), dtype=np.int64),
+            np.ones((2, 2), dtype=np.float64),
+            np.zeros(2, dtype=bool),
+            "unsigned",
+        ),
+        (
+            np.ones((2, 2), dtype=np.uint32),
+            np.array([[0.0, np.nan], [1.0, 2.0]]),
+            np.zeros(2, dtype=bool),
+            "finite",
+        ),
+        (
+            np.ones((2, 2), dtype=np.uint32),
+            np.array([[0.0, -1.0], [1.0, 2.0]]),
+            np.zeros(2, dtype=bool),
+            "non-negative",
+        ),
+        (
+            np.ones((2, 1), dtype=np.uint32),
+            np.ones((2, 1), dtype=np.float64),
+            np.zeros(2, dtype=bool),
+            "shape",
+        ),
+        (
+            np.array([[0, 3], [1, 2]], dtype=np.uint32),
+            np.ones((2, 2), dtype=np.float64),
+            np.zeros(2, dtype=bool),
+            "selected reference cells",
+        ),
+    ],
+)
+def test_projection_writer_aborts_after_invalid_block(
+    indices: np.ndarray,
+    distances: np.ndarray,
+    uninformative: np.ndarray,
+    message: str,
+) -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    plan = _plan(root, cell_selection, feature_selection, reference.external_ref)
+    writer = ProjectionWriter(root, plan, chunk_rows=2)
+
+    with pytest.raises((TypeError, ValueError), match=message):
+        writer.write_block(0, indices, distances, uninformative)
+
+    assert writer.aborted
+    assert not inspect_artifact(root, plan.ref).complete
+    with pytest.raises(RuntimeError, match="aborted"):
+        writer.finish(_diagnostics())
+
+
+def test_projection_writer_requires_contiguous_complete_coverage_and_can_abort() -> (
+    None
+):
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    plan = _plan(root, cell_selection, feature_selection, reference.external_ref)
+    indices, distances, uninformative = _blocks()
+    writer = ProjectionWriter(root, plan, chunk_rows=2)
+
+    writer.write_block(0, indices[:2], distances[:2], uninformative[:2])
+    with pytest.raises(ValueError, match="wrote 2 of 4"):
+        writer.finish(_diagnostics())
+    assert writer.aborted
+    assert not inspect_artifact(root, plan.ref).complete
+
+    second_plan = _plan(
+        root,
+        cell_selection,
+        feature_selection,
+        reference.external_ref,
+        invalidate_cache=True,
+    )
+    second = ProjectionWriter(root, second_plan, chunk_rows=2)
+    second.abort()
+    assert second.aborted
+    assert not inspect_artifact(root, second_plan.ref).complete
+    with pytest.raises(RuntimeError, match="aborted"):
+        second.write_block(0, indices, distances, uninformative)
+
+    third_plan = _plan(
+        root,
+        cell_selection,
+        feature_selection,
+        reference.external_ref,
+        invalidate_cache=True,
+    )
+    third = ProjectionWriter(root, third_plan, chunk_rows=2)
+    with pytest.raises(ValueError, match="expected 0, received 1"):
+        third.write_block(1, indices[:1], distances[:1], uninformative[:1])
+    assert third.aborted
+
+
+def test_projection_writer_reuses_only_a_valid_complete_artifact() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    first = _plan(root, cell_selection, feature_selection, reference.external_ref)
+    ref = _write(root, first)
+
+    reused = _plan(root, cell_selection, feature_selection, reference.external_ref)
+    assert reused.reused
+    assert reused.ref == ref
+    assert load_projection(root, ref).diagnostics["zeroNormCellCount"] == 2
+    with pytest.raises(ValueError, match="without a writer"):
+        ProjectionWriter(root, reused, chunk_rows=2)
+
+    artifact_group(root, ref).create_array(
+        "extra",
+        data=np.ones(1),
+        chunks=(1,),
+    )
+    replacement = _plan(
+        root,
+        cell_selection,
+        feature_selection,
+        reference.external_ref,
+    )
+    assert not replacement.reused
+    assert replacement.ref != ref
+
+
+def test_projection_plan_rejects_out_of_range_cached_neighbors() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    first = _plan(root, cell_selection, feature_selection, reference.external_ref)
+    ref = _write(root, first)
+    artifact_group(root, ref)["indices"][0, 0] = reference.selected_cell_count
+
+    replacement = _plan(
+        root,
+        cell_selection,
+        feature_selection,
+        reference.external_ref,
+    )
+
+    assert not replacement.reused
+    assert replacement.ref != ref
+
+
+def test_projection_finish_rejects_diagnostics_inconsistent_with_rows() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    plan = _plan(root, cell_selection, feature_selection, reference.external_ref)
+    indices, distances, uninformative = _blocks()
+    writer = ProjectionWriter(root, plan, chunk_rows=4)
+    writer.write_block(0, indices, distances, uninformative)
+
+    with pytest.raises(ValueError, match="number of uninformative"):
+        writer.finish(_diagnostics(zero_norm_cell_count=1))
+
+    assert not inspect_artifact(root, plan.ref).complete
+
+
+def _manual_projection(
+    root: zarr.Group,
+    cell_selection: ArtifactRef,
+    feature_selection: ArtifactRef,
+    mapping_reference: ArtifactRef | ExternalArtifactRef,
+    *,
+    operation: str = "map_query",
+) -> ArtifactRef:
+    planned = plan_artifact(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="projection",
+        operation=operation,
+        parameters={
+            "mapping_name": "atlas",
+            "save_k": 2,
+            "missing_feature_policy": "reference_mean",
+            "correction_method": "none",
+        },
+        inputs={
+            "cell_selection": cell_selection,
+            "feature_selection": feature_selection,
+            "selected_expression_fingerprint": "e" * 64,
+            "query_batch_fingerprint": NO_QUERY_BATCH_FINGERPRINT,
+            "mapping_reference": mapping_reference,
+        },
+        execution_options={},
+    )
+    group = start_artifact(root, planned)
+    indices, distances, uninformative = _blocks()
+    group.create_array("indices", data=indices, chunks=(2, 2))
+    group.create_array("distances", data=distances, chunks=(2, 2))
+    group.create_array("uninformative", data=uninformative, chunks=(2,))
+    group.attrs["diagnostics"] = _diagnostics()
+    finish_artifact(group, planned)
+    return planned.ref
+
+
+def test_projection_loader_rejects_old_and_local_reference_contracts() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    old = _manual_projection(
+        root,
+        cell_selection,
+        feature_selection,
+        reference.external_ref,
+        operation="map_with_reference",
+    )
+    local = _manual_projection(
+        root,
+        cell_selection,
+        feature_selection,
+        reference.ref,
+    )
+
+    for ref in (old, local):
+        with pytest.raises(ValueError, match="run_mapping"):
+            load_projection(root, ref)
+
+
+@pytest.mark.parametrize(
+    "malformation",
+    ["missing", "array", "group", "attribute", "diagnostics"],
+)
+def test_projection_loader_rejects_malformed_or_extra_payload(
+    malformation: str,
+) -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    ref = _write(
+        root,
+        _plan(root, cell_selection, feature_selection, reference.external_ref),
+    )
+    group = artifact_group(root, ref)
+    if malformation == "missing":
+        del group["distances"]
+    elif malformation == "array":
+        group.create_array("extra", data=np.ones(1), chunks=(1,))
+    elif malformation == "group":
+        group.create_group("extra")
+    elif malformation == "attribute":
+        group.attrs["extra"] = "invalid"
+    else:
+        diagnostics = dict(group.attrs["diagnostics"])
+        diagnostics["zeroNormCellCount"] = 1
+        group.attrs["diagnostics"] = diagnostics
+
+    with pytest.raises(ValueError, match="run_mapping"):
+        load_projection(root, ref)
+
+
+def test_projection_written_without_the_dispersion_diagnostic_is_rejected() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    ref = _write(
+        root,
+        _plan(root, cell_selection, feature_selection, reference.external_ref),
+    )
+    group = artifact_group(root, ref)
+    diagnostics = dict(group.attrs["diagnostics"])
+    del diagnostics["queryScaledDispersion"]
+    group.attrs["diagnostics"] = diagnostics
+
+    # Projections predating the diagnostic are not silently migrated. They are
+    # cheap to recompute, so the loader names the gap instead of guessing a value.
+    with pytest.raises(ValueError, match="is missing queryScaledDispersion"):
+        load_projection(root, ref)
+
+
+def test_projection_loader_validates_and_matches_provided_reference() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    ref = _write(
+        root,
+        _plan(root, cell_selection, feature_selection, reference.external_ref),
+    )
+    other_artifact, _ = _mapping_reference(
+        fingerprint="reference-dataset",
+        token="b",
+    )
+    other_fingerprint, _ = _mapping_reference(
+        fingerprint="other-dataset",
+        token="a",
+    )
+
+    for mismatched in (other_artifact, other_fingerprint):
+        with pytest.raises(ValueError, match="run_mapping"):
+            load_projection(root, ref, reference=mismatched)
+
+    reference.datastore.zw["RNA"].attrs["dataset_fingerprint"] = "changed"
+    with pytest.raises(ValueError, match="run_mapping"):
+        load_projection(root, ref, reference=reference)
+
+
+def test_projection_loader_metadata_only_rejects_out_of_range_neighbor() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    ref = _write(
+        root,
+        _plan(root, cell_selection, feature_selection, reference.external_ref),
+    )
+    artifact_group(root, ref)["indices"][2, 1] = reference.selected_cell_count
+    mismatched, _ = _mapping_reference(
+        fingerprint="reference-dataset",
+        token="b",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match the projection input.*run_mapping",
+    ):
+        load_projection(root, ref, reference=mismatched)
+
+    with pytest.raises(
+        ValueError,
+        match="outside the selected reference cell range.*run_mapping",
+    ):
+        load_projection(root, ref, reference=reference)
+
+
+def test_projection_resolver_scopes_names_by_reference_and_uses_newest() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    first_reference, _ = _mapping_reference(token="a")
+    second_reference, _ = _mapping_reference(
+        fingerprint="second-dataset",
+        token="b",
+    )
+    first_old = _write(
+        root,
+        _plan(
+            root,
+            cell_selection,
+            feature_selection,
+            first_reference.external_ref,
+            mapping_name="shared",
+        ),
+        created_at_ns=10,
+    )
+    first_new = _write(
+        root,
+        _plan(
+            root,
+            cell_selection,
+            feature_selection,
+            first_reference.external_ref,
+            mapping_name="shared",
+            invalidate_cache=True,
+        ),
+        created_at_ns=30,
+    )
+    second = _write(
+        root,
+        _plan(
+            root,
+            cell_selection,
+            feature_selection,
+            second_reference.external_ref,
+            mapping_name="shared",
+        ),
+        created_at_ns=20,
+    )
+
+    assert first_old != first_new
+    assert (
+        resolve_projection(
+            root,
+            query_assay="RNA",
+            mapping_name="shared",
+            mapping_reference=first_reference.external_ref,
+        )
+        == first_new
+    )
+    assert (
+        resolve_projection(
+            root,
+            query_assay="RNA",
+            mapping_name="shared",
+            mapping_reference=second_reference.external_ref,
+        )
+        == second
+    )
+    assert (
+        len(
+            list_artifacts(
+                root,
+                scope="assay",
+                assay="RNA",
+                kind="projection",
+                complete_only=True,
+            )
+        )
+        == 3
+    )

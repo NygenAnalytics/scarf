@@ -182,13 +182,6 @@ def parse_graph_leaf_name(name: str) -> tuple[float, float]:
     return float(local_connectivity_s), float(bandwidth_s)
 
 
-def parse_cell_graph_group_path(
-    cell_graph_group_path: str,
-) -> tuple[float, float]:
-    """Parse the graph leaf of a complete cell-graph group path."""
-    return parse_graph_leaf_name(_leaf(cell_graph_group_path))
-
-
 def parse_kmeans_leaf_name(name: str) -> tuple[int, int]:
     if not name.startswith("kmeans__"):
         raise ValueError(f"Not a k-means group name: {name}")
@@ -197,27 +190,8 @@ def parse_kmeans_leaf_name(name: str) -> tuple[int, int]:
     return int(n_centroids_s), int(rand_state_s)
 
 
-def parse_kmeans_group_path(kmeans_group_path: str) -> tuple[int, int]:
-    """Parse the k-means leaf of a complete k-means group path."""
-    return parse_kmeans_leaf_name(_leaf(kmeans_group_path))
-
-
 def _leaf(path: str) -> str:
     return path.rsplit("/", 1)[-1]
-
-
-def reduction_group_path_from_neighbor_index(
-    neighbor_index_group_path: str,
-) -> str:
-    """Return and validate the reduction parent of a neighbor-index path."""
-    parse_neighbor_index_group_path(neighbor_index_group_path)
-    if "/" not in neighbor_index_group_path:
-        raise ValueError(
-            f"Neighbor-index path has no reduction parent: {neighbor_index_group_path}"
-        )
-    reduction_group_path = neighbor_index_group_path.rsplit("/", 1)[0]
-    parse_reduction_leaf_name(_leaf(reduction_group_path))
-    return reduction_group_path
 
 
 def parse_assay_keys_from_nearest_neighbors_path(

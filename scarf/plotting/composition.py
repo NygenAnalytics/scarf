@@ -875,13 +875,6 @@ def composition(
         )
         tables["summary"] = summary_output
 
-    from importlib.metadata import version
-
-    try:
-        scarf_version = version("scarf")
-    except Exception:
-        scarf_version = "unknown"
-
     notes = ["composition", kind]
     if pair_col is not None:
         notes.append(f"paired_by={pair_col}")
@@ -926,7 +919,6 @@ def composition(
             ),
         ),
         provenance=PlotProvenance(
-            scarf_version=scarf_version,
             cell_key=cell_key,
             n_cells=int(len(cats)),
             n_samples=int(per_sample["sample"].nunique())

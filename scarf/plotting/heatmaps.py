@@ -1,7 +1,6 @@
 """Native heatmap and cluster-tree plotting."""
 
 from collections.abc import Hashable, Mapping, Sequence
-from importlib.metadata import version
 from typing import Any, cast
 
 import numpy as np
@@ -30,13 +29,6 @@ from ._style import (
     sort_categories,
     theme_context,
 )
-
-
-def _scarf_version() -> str:
-    try:
-        return version("scarf")
-    except Exception:
-        return "unknown"
 
 
 def _marker_log_transform(assay: Any, value: bool | None) -> bool:
@@ -582,7 +574,6 @@ def marker_heatmap(
             CategoricalScale(order=tuple(displayed_matrix.columns)),
         ),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             assay=cast(str, prepared["assay"]),
             cell_key=cast(str, prepared["cell_key"]),
             n_cells=cast(int, prepared["n_cells"]),
@@ -1179,7 +1170,6 @@ def pseudotime_heatmap(
             ),
         ),
         provenance=PlotProvenance(
-            scarf_version=_scarf_version(),
             assay=cast(str, prepared["assay"]),
             cell_key=cast(str, prepared["cell_key"]),
             n_cells=len(pseudotime),

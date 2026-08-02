@@ -20,6 +20,7 @@ See {doc}`../../concepts/provenance` and
    scarf.ArtifactLineage
    scarf.AssayState
    scarf.DataStoreSummary
+   scarf.storage.refs.ExternalArtifactRef
    scarf.storage.ARTIFACT_KINDS
 ```
 
@@ -40,6 +41,9 @@ See {doc}`../../concepts/provenance` and
     :members:
 
 .. autoclass:: scarf.DataStoreSummary
+    :members:
+
+.. autoclass:: scarf.storage.refs.ExternalArtifactRef
     :members:
 ```
 

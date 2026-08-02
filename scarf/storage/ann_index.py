@@ -86,17 +86,6 @@ def save_ann_index(
         os.unlink(path)
 
 
-def serialize_ann_index(ann_idx: Any) -> np.ndarray:
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        path = tmp.name
-    try:
-        ann_idx.save_index(path)
-        data = np.fromfile(path, dtype=np.uint8)
-    finally:
-        os.unlink(path)
-    return data
-
-
 def load_ann_index(
     group: zarr.Group,
     space: str,
