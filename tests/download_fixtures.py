@@ -13,11 +13,71 @@ from pathlib import Path
 
 import h5py
 import pandas as pd
+from huggingface_hub import download_bucket_files
 from scipy.sparse import csr_matrix
 
 _H5AD_DOWNLOAD_ATTEMPTS = 3
 
-_FIXTURES_BASE_URL = "https://raw.githubusercontent.com/parashardhapola/scarf/master/scarf/tests/datasets"
+_BUCKET_ID = "Nygen/cytebase"
+_REPOSITORY = "scarf_tests"
+
+_CYTEBASE_FIXTURES = {
+    "1K_pbmc_citeseq.h5": (
+        "e3dd57c5a8c3426dc5a7dc012a78608554facbddf4c6d1d62671089d197b1053"
+    ),
+    "1K_pbmc_citeseq.zarr.tar.gz": (
+        "53166c8a12f4c621d8d2d10883ae40054a8dd9856bcbf8c62149f9d736106ac6"
+    ),
+    "500_pbmc_atac.zarr.tar.gz": (
+        "f54c79229e674ea2956c048a931aadb4a9d54e75778df17b4bd84608c0e06493"
+    ),
+    "toy_cr_dir.tar.gz": (
+        "8f7a509f577d23bb8b14947bf01ae66dcc44cbf0263aa070fe5759d51e7fddac"
+    ),
+    "toy_cr_dir_empty.tar.gz": (
+        "7b0dad810bb395d837f8b17411b2f7a4a6ff7291c145287cb863ab016c312f35"
+    ),
+    "sympathetic.loom": (
+        "63347f66d1180e544ddff257ee3f15934e989e521527d4cdcacbcb733e846120"
+    ),
+    "cell_attributes.csv": (
+        "cf1edebb1db09918d3d8286dcbe1491bcf8ef5fd7e116bf720e9aef6f078a06c"
+    ),
+    "knn_indices.npy": (
+        "92bf88532823033a5d39350423815b3793e9e806ea8734a59aef303032815fcb"
+    ),
+    "knn_distances.npy": (
+        "4bb814d647fe463ae1e72a5422d34af8588b6eb7fb1da5c4d2cebb056dc96bf4"
+    ),
+    "knn_weights.npy": (
+        "aabc5bec6753d24682f5bb1c2dc7042279496ab0bc7eae99c3908ea198ac0c18"
+    ),
+    "atac_knn_indices.npy": (
+        "e2878cf40604383c954bcb1ecb68c2c9da90a27ccdba2a5cb61ee779e4181246"
+    ),
+    "atac_knn_distances.npy": (
+        "3f446f51636bfc5795f42bc94e26bc98b0c50249ed03b205ea9077b3bc5cd7fb"
+    ),
+    "markers_cluster1.csv": (
+        "04afc7fc03475c6d3eeeeefc1d7c985a3c4475d36a8b445368fc7e74482f6056"
+    ),
+    "pseudotime_markers_r_values.csv": (
+        "b65868812f55fd609fc6dad43a47dd3f5e52404164847cd0746446a6343885d0"
+    ),
+    "aggregated_feat_idx.npy": (
+        "08f2539818778aee5473de16b4b008e3b9343ff5ac4c5fc573e9ccf885d9763f"
+    ),
+    "aggregated_df_top_10.npy": (
+        "dc8443d6f1b7f983f28b3e9ae38f121a3c71e7f711a388676a212100169f127a"
+    ),
+    "pseudotime_clusters.npy": (
+        "f721d50edb512b3d02f9ba37e57804733ca096a625e8a7a0f168dfd113fd66f1"
+    ),
+    "ptime_modules_group_1.npy": (
+        "7c77de233841133b69bacc3d38b9e412f37a2caaa77442e8a9f1beaebf3653bf"
+    ),
+}
+
 _EXTERNAL_FIXTURES = {
     "seurat_assay5_synthetic.rds": (
         "https://raw.githubusercontent.com/harryhaller001/readseurat/"
@@ -31,28 +91,7 @@ _EXTERNAL_FIXTURES = {
     ),
 }
 
-FIXTURE_FILES = (
-    "1K_pbmc_citeseq.h5",
-    "1K_pbmc_citeseq.zarr.tar.gz",
-    "500_pbmc_atac.zarr.tar.gz",
-    "toy_cr_dir.tar.gz",
-    "toy_cr_dir_empty.tar.gz",
-    "sympathetic.loom",
-    "cell_attributes.csv",
-    "knn_indices.npy",
-    "knn_distances.npy",
-    "knn_weights.npy",
-    "atac_knn_indices.npy",
-    "atac_knn_distances.npy",
-    "markers_cluster1.csv",
-    "pseudotime_markers_r_values.csv",
-    "aggregated_feat_idx.npy",
-    "aggregated_df_top_10.npy",
-    "pseudotime_clusters.npy",
-    "ptime_modules_group_1.npy",
-    "seurat_assay5_synthetic.rds",
-    "seurat_v4_1_3_pbmc_mye.rds",
-)
+FIXTURE_FILES = (*_CYTEBASE_FIXTURES, *_EXTERNAL_FIXTURES)
 
 
 def datasets_dir() -> Path:
@@ -67,36 +106,76 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download_fixtures(*, force: bool = False) -> None:
-    target = datasets_dir()
-    target.mkdir(parents=True, exist_ok=True)
+def _remote_path(name: str) -> str:
+    return f"{_REPOSITORY}/{name}"
 
-    missing: list[tuple[str, urllib.error.HTTPError]] = []
-    for name in FIXTURE_FILES:
+
+def _verify_digest(path: Path, expected: str) -> None:
+    digest = _sha256(path)
+    if digest != expected:
+        path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Fixture {path.name} has SHA-256 {digest}, expected {expected}"
+        )
+
+
+def _download_cytebase_fixtures(target: Path, *, force: bool) -> None:
+    needed: list[tuple[str, Path, str]] = []
+    for name, expected in _CYTEBASE_FIXTURES.items():
         dest = target / name
-        external = _EXTERNAL_FIXTURES.get(name)
         if dest.is_file() and not force:
-            if external is None or _sha256(dest) == external[1]:
+            if _sha256(dest) == expected:
                 continue
             dest.unlink()
-        url = f"{_FIXTURES_BASE_URL}/{name}" if external is None else external[0]
+        elif dest.is_file() and force:
+            dest.unlink()
+        needed.append((name, dest, expected))
+
+    if not needed:
+        return
+
+    download_bucket_files(
+        _BUCKET_ID,
+        files=[(_remote_path(name), dest) for name, dest, _ in needed],
+        token=False,
+        raise_on_missing_files=True,
+    )
+
+    for name, dest, expected in needed:
+        if not dest.is_file():
+            raise RuntimeError(
+                f"Cytebase did not download {_remote_path(name)}. "
+                "Publish fixtures with: "
+                "uv run python scripts/publish_test_fixtures.py --apply"
+            )
+        _verify_digest(dest, expected)
+
+
+def _download_external_fixtures(target: Path, *, force: bool) -> None:
+    missing: list[tuple[str, urllib.error.HTTPError]] = []
+    for name, (url, expected) in _EXTERNAL_FIXTURES.items():
+        dest = target / name
+        if dest.is_file() and not force:
+            if _sha256(dest) == expected:
+                continue
+            dest.unlink()
         try:
             urllib.request.urlretrieve(url, dest)
         except urllib.error.HTTPError as exc:
             missing.append((name, exc))
             continue
-        if external is not None:
-            digest = _sha256(dest)
-            if digest != external[1]:
-                dest.unlink()
-                raise RuntimeError(
-                    f"Fixture {name} has SHA-256 {digest}, expected {external[1]}"
-                )
+        _verify_digest(dest, expected)
 
     if missing:
         details = "\n".join(f"  {name}: HTTP {exc.code}" for name, exc in missing)
-        msg = f"Failed to download {len(missing)} fixture(s):\n{details}"
-        raise RuntimeError(msg)
+        raise RuntimeError(f"Failed to download {len(missing)} fixture(s):\n{details}")
+
+
+def download_fixtures(*, force: bool = False) -> None:
+    target = datasets_dir()
+    target.mkdir(parents=True, exist_ok=True)
+    _download_cytebase_fixtures(target, force=force)
+    _download_external_fixtures(target, force=force)
 
 
 def build_mtx_dir_fixture() -> None:
