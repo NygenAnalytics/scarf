@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=83.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -43,7 +43,7 @@ dependencies = [
     "pandas>=2.2.2",
     "scikit-learn>=1.5",
     "scipy>=1.13,!=1.17.0",
-    "setuptools>=61",
+    "setuptools>=83.0.0",
     "statsmodels>=0.14.2",
     "threadpoolctl",
     "tqdm>=4.60",
