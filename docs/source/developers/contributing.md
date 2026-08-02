@@ -164,7 +164,7 @@ Here we acknowledge some of them (at least those with pretty logos).
 ```
 
 [guideline]: https://www.dataschool.io/how-to-contribute-on-github
-[discussion page]: https://github.com/parashardhapola/scarf/discussions
+[discussion page]: https://github.com/NygenAnalytics/scarf/discussions
 [Ruff]: https://docs.astral.sh/ruff/
 [Sphinx]: https://www.sphinx-doc.org
 [MyST]: https://myst-parser.readthedocs.io/en/latest/index.html

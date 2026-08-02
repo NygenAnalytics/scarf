@@ -92,10 +92,10 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/parashardhapola/scarf"
+Homepage = "https://github.com/NygenAnalytics/scarf"
 Documentation = "https://scarf.readthedocs.io/en/latest/"
 Installation = "https://scarf.readthedocs.io/en/latest/installation.html"
-Issues = "https://github.com/parashardhapola/scarf/issues"
+Issues = "https://github.com/NygenAnalytics/scarf/issues"
 
 [tool.setuptools]
 include-package-data = false

@@ -219,12 +219,12 @@ See {ref}`citation` for BibTeX and maintenance notes.
 
 ## Feedback and contributions
 
-Use [GitHub issues](https://github.com/parashardhapola/scarf/issues) for bugs and feature requests.
+Use [GitHub issues](https://github.com/NygenAnalytics/scarf/issues) for bugs and feature requests.
 See {doc}`developers/contributing` for development and documentation checks.
 
 [pypi]: https://img.shields.io/pypi/v/scarf.svg
 [pypiLink]: https://pypi.org/project/scarf
 [docs]: https://readthedocs.org/projects/scarf/badge/?version=latest
 [docsLink]: https://scarf.readthedocs.io
-[stars]: https://img.shields.io/github/stars/parashardhapola/scarf?style=social
-[github]: https://github.com/parashardhapola/scarf
+[stars]: https://img.shields.io/github/stars/NygenAnalytics/scarf?style=social
+[github]: https://github.com/NygenAnalytics/scarf

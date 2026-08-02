@@ -4,8 +4,8 @@
   <a href="https://pypi.org/project/scarf"><img src="https://img.shields.io/pypi/v/scarf.svg?color=4c72b0" alt="PyPI"></a>
   <a href="https://pypi.org/project/scarf"><img src="https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-4c72b0.svg" alt="Python 3.12, 3.13, and 3.14"></a>
   <a href="https://scarf.readthedocs.io"><img src="https://readthedocs.org/projects/scarf/badge/?version=latest" alt="Docs"></a>
-  <a href="https://github.com/parashardhapola/scarf/actions/workflows/pytest.yml"><img src="https://github.com/parashardhapola/scarf/actions/workflows/pytest.yml/badge.svg" alt="Tests"></a>
-  <a href="https://codecov.io/gh/parashardhapola/scarf"><img src="https://codecov.io/gh/parashardhapola/scarf/branch/master/graph/badge.svg?token=ZvJXuYq3pd" alt="Coverage"></a>
+  <a href="https://github.com/NygenAnalytics/scarf/actions/workflows/pytest.yml"><img src="https://github.com/NygenAnalytics/scarf/actions/workflows/pytest.yml/badge.svg" alt="Tests"></a>
+  <a href="https://codecov.io/gh/NygenAnalytics/scarf"><img src="https://codecov.io/gh/NygenAnalytics/scarf/branch/master/graph/badge.svg" alt="Coverage"></a>
 </p>
 
 Scarf is a Python framework for analysing single-cell RNA, ATAC, protein, and multi-omic data, from a few thousand cells to tens of millions.
@@ -50,7 +50,7 @@ Read the [scRNA-seq tutorial](https://scarf.readthedocs.io/en/latest/tutorials/s
 ## Scarf's capabilities
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/parashardhapola/scarf/master/docs/source/_static/overview.png" alt="Compressed count chunks feed incremental algorithms and a neighbourhood graph that serves embedding, clustering, mapping, imputation, downsampling, and pseudotime" width="520">
+  <img src="https://raw.githubusercontent.com/NygenAnalytics/scarf/master/docs/source/_static/overview.png" alt="Compressed count chunks feed incremental algorithms and a neighbourhood graph that serves embedding, clustering, mapping, imputation, downsampling, and pseudotime" width="520">
 </p>
 
 | Area | Methods |
@@ -74,6 +74,6 @@ Dhapola et al. Scarf enables a highly memory-efficient analysis of large-scale s
 
 ## Support
 
-[GitHub issues](https://github.com/parashardhapola/scarf/issues)
+[GitHub issues](https://github.com/NygenAnalytics/scarf/issues)
 
 Scarf is open source with [BSD 3-Clause License](LICENSE) and maintained by [Nygen](https://nygen.io).

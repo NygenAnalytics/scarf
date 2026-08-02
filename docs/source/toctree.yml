@@ -123,9 +123,9 @@ subtrees:
         title: Citation
       - file: reference/license
         title: License
-      - url: https://github.com/parashardhapola/scarf/discussions
+      - url: https://github.com/NygenAnalytics/scarf/discussions
         title: Ask a question
-      - url: https://github.com/parashardhapola/scarf/issues
+      - url: https://github.com/NygenAnalytics/scarf/issues
         title: Report a bug
   - caption: Developers
     entries:

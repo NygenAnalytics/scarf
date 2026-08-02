@@ -7,7 +7,7 @@ are not hardware guarantees, biological validation, or a claim of superiority
 over another package.
 
 The source record, including operational profiling notes, is
-[profiling/BENCHMARKS.md](https://github.com/parashardhapola/scarf/blob/master/profiling/BENCHMARKS.md).
+[profiling/BENCHMARKS.md](https://github.com/NygenAnalytics/scarf/blob/master/profiling/BENCHMARKS.md).
 Resource planning controls are explained in {doc}`scale_and_memory`.
 
 ## What was measured

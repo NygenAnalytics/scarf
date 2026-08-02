@@ -84,6 +84,9 @@ jobs:
         uv run --no-project python tests/smoke_wheel.py dist/*.whl
     - name: Upload coverage to Codecov
       if: matrix.resolution == 'locked' && matrix.python-version == '3.14'
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v5
       with:
-        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: coverage.xml
+        disable_search: true
+        fail_ci_if_error: true

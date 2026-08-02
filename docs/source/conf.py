@@ -72,7 +72,7 @@ html_logo = "_static/scarf-logo-black.png"
 html_title = "Scarf documentation"
 html_baseurl = "https://scarf.readthedocs.io/en/latest/"
 html_theme_options = {
-    "repository_url": "https://github.com/parashardhapola/scarf",
+    "repository_url": "https://github.com/NygenAnalytics/scarf",
     "home_page_in_toc": False,
     "path_to_docs": "docs/source",
     "show_navbar_depth": 2,

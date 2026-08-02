@@ -157,7 +157,7 @@ python -m pip install --upgrade "scarf[extra]"
 Clone the repository and let uv create an editable project environment:
 
 ```bash
-git clone https://github.com/parashardhapola/scarf.git
+git clone https://github.com/NygenAnalytics/scarf.git
 cd scarf
 uv sync --extra extra
 uv run python -c "import scarf; print(scarf.__version__)"
