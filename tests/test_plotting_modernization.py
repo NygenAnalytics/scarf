@@ -1275,3 +1275,218 @@ def test_recipe_batch_output_closes_owned_figure(umap, datastore, tmp_path):
     assert execution.written_paths == (tmp_path / "overview.png",)
     assert execution.written_paths[0].stat().st_size > 0
     assert not plt.fignum_exists(plot_result.figure.number)
+
+
+def _expressed_gene_names(datastore, n=3):
+    names = datastore.RNA.feats.fetch_all("names")
+    counts = np.asarray(
+        datastore.RNA.rawData[:, : len(names)].sum(axis=0).compute(),
+        dtype=np.float64,
+    ).ravel()
+    order = np.argsort(-counts)
+    chosen = []
+    for index in order:
+        if counts[index] > 0:
+            chosen.append(str(names[index]))
+        if len(chosen) == n:
+            break
+    return chosen
+
+
+def test_stacked_violin_mean_color_expression(umap, leiden_clustering, datastore):
+    genes = _expressed_gene_names(datastore)
+    result = splt.distribution(
+        datastore,
+        keys=genes,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        color_by="mean",
+        max_points=0,
+        show=False,
+    )
+    try:
+        assert len(result.axes) == len(genes)
+        assert result.legends[0].kind == "colorbar"
+        assert result.legends[0].label == "mean expression"
+        assert any(isinstance(scale, splt.ColorScale) for scale in result.scales)
+        assert any(ax.get_label().startswith("<colorbar") for ax in result.figure.axes)
+        assert result.provenance.extras["color_by"] == "mean"
+        # Shared scale spans the min/max of every group mean.
+        all_means = [
+            mean
+            for table in result.tables.values()
+            for mean in table.groupby("group")["display_value"].mean()
+        ]
+        assert result.provenance.extras["vmin"] == pytest.approx(min(all_means))
+        assert result.provenance.extras["vmax"] == pytest.approx(max(all_means))
+        # Mean coloring gives each group a distinct colour within a row.
+        ax = list(result.axes.values())[0]
+        face_colors = {
+            tuple(np.round(color.get_facecolor()[0][:3], 3))
+            for color in ax.collections
+            if hasattr(color, "get_facecolor") and len(color.get_facecolor())
+        }
+        assert len(face_colors) >= 2
+    finally:
+        result.close()
+
+
+def test_stacked_violin_mean_color_explicit_bounds(umap, leiden_clustering, datastore):
+    gene = _expressed_gene_names(datastore, n=1)[0]
+    result = splt.distribution(
+        datastore,
+        keys=gene,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        color_by="mean",
+        color_scale=splt.ColorScale(cmap="magma", vmin=0.0, vmax=5.0, scope="shared"),
+        max_points=0,
+        show=False,
+    )
+    try:
+        color_scale = next(
+            scale for scale in result.scales if isinstance(scale, splt.ColorScale)
+        )
+        assert color_scale.cmap == "magma"
+        assert color_scale.vmin == 0.0
+        assert color_scale.vmax == 5.0
+        assert color_scale.scope == "shared"
+        assert result.legends[0].extras["vmin"] == 0.0
+        assert result.legends[0].extras["vmax"] == 5.0
+        assert result.provenance.extras["vmin"] == 0.0
+        assert result.provenance.extras["vmax"] == 5.0
+        assert result.provenance.extras["color_scale_scope"] == "shared"
+    finally:
+        result.close()
+
+
+def test_stacked_violin_mean_color_constant_row(umap, leiden_clustering, datastore):
+    n = len(datastore.cells.active_index("I"))
+    datastore.cells.insert("constant_metric", np.full(n, 5.0), overwrite=True)
+    result = splt.distribution(
+        datastore,
+        keys="constant_metric",
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        row_standardize=True,
+        color_by="mean",
+        max_points=0,
+        show=False,
+    )
+    try:
+        table = list(result.tables.values())[0]
+        assert np.nanmean(table["display_value"]) == pytest.approx(0, abs=1e-9)
+        # Degenerate scale is padded symmetrically around zero so the colourbar
+        # still renders, labelled for the standardized values.
+        vmin = result.provenance.extras["vmin"]
+        vmax = result.provenance.extras["vmax"]
+        assert vmin == pytest.approx(-vmax)
+        assert any(ax.get_label().startswith("<colorbar") for ax in result.figure.axes)
+        colorbar = next(
+            ax for ax in result.figure.axes if ax.get_label().startswith("<colorbar")
+        )
+        assert colorbar.get_ylabel() == "mean standardized value"
+    finally:
+        result.close()
+
+
+def test_stacked_violin_color_scale_requires_mean(umap, leiden_clustering, datastore):
+    gene = _expressed_gene_names(datastore, n=1)[0]
+    with pytest.raises(
+        ValueError, match="color_scale applies only when color_by='mean'"
+    ):
+        splt.distribution(
+            datastore,
+            keys=gene,
+            group_by="RNA_leiden_cluster",
+            kind="stacked_violin",
+            color_scale=splt.ColorScale(cmap="magma"),
+            show=False,
+        )
+
+
+def test_stacked_violin_mean_color_rejects_split(umap, leiden_clustering, datastore):
+    gene = _expressed_gene_names(datastore, n=1)[0]
+    with pytest.raises(ValueError, match="cannot be combined with split_by"):
+        splt.distribution(
+            datastore,
+            keys=gene,
+            group_by="RNA_leiden_cluster",
+            split_by="RNA_leiden_cluster",
+            kind="stacked_violin",
+            color_by="mean",
+            show=False,
+        )
+
+
+def test_stacked_violin_mean_color_rejects_log_scale(
+    umap, leiden_clustering, datastore
+):
+    gene = _expressed_gene_names(datastore, n=1)[0]
+    with pytest.raises(NotImplementedError, match="linear"):
+        splt.distribution(
+            datastore,
+            keys=gene,
+            group_by="RNA_leiden_cluster",
+            kind="stacked_violin",
+            color_by="mean",
+            color_scale=splt.ColorScale(scale="log"),
+            show=False,
+        )
+
+
+def test_stacked_violin_mean_color_quantiles(umap, leiden_clustering, datastore):
+    genes = _expressed_gene_names(datastore, n=2)
+    result = splt.distribution(
+        datastore,
+        keys=genes,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        color_by="mean",
+        color_scale=splt.ColorScale(quantiles=(0.25, 0.75)),
+        max_points=0,
+        show=False,
+    )
+    try:
+        color_scale = next(
+            scale for scale in result.scales if isinstance(scale, splt.ColorScale)
+        )
+        all_means = [
+            mean
+            for table in result.tables.values()
+            for mean in table.groupby("group")["display_value"].mean()
+        ]
+        finite = np.asarray([m for m in all_means if np.isfinite(m)])
+        assert color_scale.vmin == pytest.approx(np.quantile(finite, 0.25))
+        assert color_scale.vmax == pytest.approx(np.quantile(finite, 0.75))
+    finally:
+        result.close()
+
+
+def test_stacked_violin_mean_color_panel_scope(umap, leiden_clustering, datastore):
+    genes = _expressed_gene_names(datastore, n=2)
+    result = splt.distribution(
+        datastore,
+        keys=genes,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        color_by="mean",
+        color_scale=splt.ColorScale(scope="panel"),
+        max_points=0,
+        show=False,
+    )
+    try:
+        color_scale = next(
+            scale for scale in result.scales if isinstance(scale, splt.ColorScale)
+        )
+        assert color_scale.scope == "panel"
+        assert result.provenance.extras["color_scale_scope"] == "panel"
+        # Panel scope still draws a single reference colourbar from the pooled
+        # group means.
+        colorbars = [
+            ax for ax in result.figure.axes if ax.get_label().startswith("<colorbar")
+        ]
+        assert len(colorbars) == 1
+        assert colorbars[0].get_ylabel() == "mean expression (reference)"
+    finally:
+        result.close()
