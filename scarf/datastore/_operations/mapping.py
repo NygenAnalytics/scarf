@@ -6,21 +6,11 @@ import numpy as np
 import pandas as pd
 import zarr
 
-from ...graph.state import validate_cell_selection_artifact
-from ...metadata.artifacts import (
-    artifact_values,
-    column_display,
-    continuous_display,
-    link_cell_data_column,
-    plan_cell_data_artifact,
-    write_cell_data_artifact,
-)
 from ...storage.artifacts import (
     ArtifactRef,
     ValueFingerprintBuilder,
     artifact_group,
     canonical_bytes,
-    fingerprint_array,
     inspect_artifact,
 )
 from ...storage.types import as_zarr_array
@@ -29,7 +19,6 @@ from ...mapping.features import AlignedFeatureStream
 from ...mapping.models import MappingResult
 from ...mapping.projection import (
     NO_QUERY_BATCH_FINGERPRINT,
-    PROJECTION_RERUN_MESSAGE,
     ProjectionWriter,
     load_projection,
     plan_projection,
@@ -317,32 +306,6 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             as_zarr_array(projection["distances"], name="distances"),
             as_zarr_array(projection["uninformative"], name="uninformative"),
         )
-
-    def _projection_cell_selection(
-        self,
-        ref: ArtifactRef,
-    ) -> tuple[ArtifactRef, str]:
-        status = inspect_artifact(self.zw, ref)
-        raw_selection = (status.inputs or {}).get("cell_selection")
-        try:
-            if not isinstance(raw_selection, dict):
-                raise TypeError("cell_selection input is missing")
-            cell_selection = ArtifactRef.from_dict(raw_selection)
-            selection_status = inspect_artifact(self.zw, cell_selection)
-            cell_key = (selection_status.execution_options or {}).get("source_column")
-            if not isinstance(cell_key, str) or not cell_key:
-                raise ValueError("cell selection has no source column")
-            validate_cell_selection_artifact(
-                self.zw,
-                cell_selection,
-                cell_key,
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Projection cell selection is invalid: {exc}. "
-                f"{PROJECTION_RERUN_MESSAGE}"
-            ) from None
-        return cell_selection, cell_key
 
     def run_mapping(
         self,
@@ -1127,226 +1090,3 @@ class _MappingOperationsMixin(_MappingOperationsBase):
             "validationCoverage": float(selected.mean()),
             "validationAccuracy": accuracy,
         }
-
-    def _load_mapping_reference_embedding(
-        self,
-        result: MappingResult | ArtifactRef | str,
-        reference_layout_key: str,
-        *,
-        reference: MappingReference | None = None,
-        query_assay: str | None = None,
-    ) -> np.ndarray:
-        """Load persisted query coordinates for one reference layout."""
-        if not isinstance(reference_layout_key, str) or not reference_layout_key:
-            raise TypeError("reference_layout_key must be a non-empty string")
-        loaded = self.get_mapping_result(
-            result,
-            reference=reference,
-            query_assay=query_assay,
-            load_arrays=False,
-        )
-        assert loaded.reference is not None
-        query_assay_name = loaded.ref.assay
-        if query_assay_name is None:
-            raise ValueError(
-                f"Projection has no query assay. {PROJECTION_RERUN_MESSAGE}"
-            )
-        cell_selection, _ = self._projection_cell_selection(loaded.ref)
-        reference_layout = loaded.reference.fetch_layout(reference_layout_key)
-        layout_source = loaded.reference.layout_source(reference_layout_key)
-        layout_input = (
-            layout_source.to_dict()
-            if layout_source is not None
-            else {"value_fingerprint": fingerprint_array(reference_layout)}
-        )
-        expected_inputs = {
-            "projection": loaded.ref.to_dict(),
-            "reference_layout": layout_input,
-            "cell_selection": cell_selection.to_dict(),
-        }
-        candidates: list[tuple[int, ArtifactRef]] = []
-        for ref in self.list_artifacts(
-            kind="embedding",
-            from_assay=query_assay_name,
-            scope="assay",
-            complete_only=True,
-        ):
-            status = inspect_artifact(self.zw, ref)
-            if (
-                status.operation != "project_reference_embedding"
-                or status.parameters != {"reference_layout_key": reference_layout_key}
-                or status.inputs != expected_inputs
-            ):
-                continue
-            group = artifact_group(self.zw, ref)
-            created_at_ns = group.attrs.get("created_at_ns")
-            if (
-                isinstance(created_at_ns, bool | np.bool_)
-                or not isinstance(created_at_ns, int | np.integer)
-                or int(created_at_ns) < 1
-            ):
-                raise ValueError(
-                    "Persisted reference embedding has an invalid creation time"
-                )
-            candidates.append((int(created_at_ns), ref))
-
-        if not candidates:
-            raise ValueError(
-                "No persisted query reference embedding matches mapping "
-                f"{loaded.mapping_name!r} and layout {reference_layout_key!r}. "
-                "Call query_store.project_reference_embedding("
-                "result, reference_layout_key=..., reference=reference) before plotting."
-            )
-        candidates.sort(
-            key=lambda item: (item[0], item[1].artifact_id),
-            reverse=True,
-        )
-        embedding_ref = candidates[0][1]
-        values = artifact_values(
-            artifact_group(self.zw, embedding_ref),
-            "values",
-        )
-        if values.shape != (loaded.n_cells, 2):
-            raise ValueError(
-                "Persisted query reference embedding must have shape "
-                f"({loaded.n_cells}, 2)"
-            )
-        if values.dtype.kind != "f":
-            raise TypeError(
-                "Persisted query reference embedding must use a floating dtype"
-            )
-        coordinates = np.asarray(values, dtype=np.float64)
-        if not np.all(np.isfinite(coordinates) | np.isnan(coordinates)):
-            raise ValueError(
-                "Persisted query reference embedding contains infinite coordinates"
-            )
-        return np.array(coordinates, copy=True)
-
-    def project_reference_embedding(
-        self,
-        result: MappingResult | ArtifactRef | str,
-        reference_layout_key: str,
-        *,
-        reference: MappingReference | None = None,
-        query_assay: str | None = None,
-        label: str = "ref_UMAP",
-        invalidate_cache: bool = False,
-    ) -> ArtifactRef:
-        """Persist query cells projected into an unchanged reference layout."""
-        if not isinstance(reference_layout_key, str) or not reference_layout_key:
-            raise TypeError("reference_layout_key must be a non-empty string")
-        if not isinstance(label, str) or not label:
-            raise TypeError("label must be a non-empty string")
-        if not isinstance(invalidate_cache, bool):
-            raise TypeError("invalidate_cache must be a boolean")
-        if self.zarr_mode != "r+":
-            raise ValueError(
-                "Projecting a reference embedding requires a read-write query store"
-            )
-
-        loaded = self.get_mapping_result(
-            result,
-            reference=reference,
-            query_assay=query_assay,
-            load_arrays=False,
-        )
-        assert loaded.reference is not None
-        query_assay_name = loaded.ref.assay
-        if query_assay_name is None:
-            raise ValueError(
-                f"Projection has no query assay. {PROJECTION_RERUN_MESSAGE}"
-            )
-
-        cell_selection, cell_key = self._projection_cell_selection(loaded.ref)
-
-        reference_layout = loaded.reference.fetch_layout(reference_layout_key)
-        layout_source = loaded.reference.layout_source(reference_layout_key)
-        layout_input: object = (
-            layout_source
-            if layout_source is not None
-            else {"value_fingerprint": fingerprint_array(reference_layout)}
-        )
-        planned = plan_cell_data_artifact(
-            self.zw,
-            scope="assay",
-            assay=query_assay_name,
-            kind="embedding",
-            operation="project_reference_embedding",
-            parameters={"reference_layout_key": reference_layout_key},
-            inputs={
-                "projection": loaded.ref,
-                "reference_layout": layout_input,
-            },
-            execution_options={
-                "cell_key": cell_key,
-                "label": label,
-            },
-            cell_selection=cell_selection,
-            arrays={"values": ((loaded.n_cells, 2), "f")},
-            invalidate_cache=invalidate_cache,
-        )
-        columns = [
-            self._col_renamer(
-                query_assay_name,
-                cell_key,
-                f"{label}{dimension}",
-            )
-            for dimension in (1, 2)
-        ]
-        preserved_displays = [column_display(self.zw, column) for column in columns]
-        if planned.reused:
-            values = artifact_values(
-                artifact_group(self.zw, planned.ref),
-                "values",
-            )
-        else:
-            from ...mapping.confidence import distance_weights
-
-            indices, distances, uninformative = self._projection_arrays(loaded.ref)
-            values = np.full(
-                (loaded.n_cells, 2),
-                np.nan,
-                dtype=np.float64,
-            )
-            block_size = self._projection_block_size(indices)
-            for start in range(0, loaded.n_cells, block_size):
-                stop = min(start + block_size, loaded.n_cells)
-                informative = ~np.asarray(
-                    uninformative[start:stop],
-                    dtype=bool,
-                )
-                if not informative.any():
-                    continue
-                block_indices = np.asarray(indices[start:stop])[informative]
-                block_weights = distance_weights(
-                    np.asarray(distances[start:stop])[informative]
-                )
-                block_values = values[start:stop]
-                block_values[informative] = np.einsum(
-                    "nk,nkd->nd",
-                    block_weights,
-                    reference_layout[block_indices],
-                )
-            write_cell_data_artifact(
-                self.zw,
-                planned,
-                {"values": values},
-            )
-
-        for dimension, column in enumerate(columns):
-            self.cells.insert(
-                column,
-                values[:, dimension],
-                key=cell_key,
-                overwrite=True,
-            )
-            link_cell_data_column(
-                self.zw,
-                column,
-                planned.ref,
-                value_name="values",
-                value_index=dimension,
-                default_display=continuous_display(values[:, dimension]),
-                preserved_display=preserved_displays[dimension],
-            )
-        return planned.ref

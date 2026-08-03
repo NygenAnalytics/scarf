@@ -11,7 +11,7 @@ Plot functions return a `PlotResult` and render by default with `show=True`. Pas
 
 ```{eval-rst}
 .. automodule:: scarf.plotting
-    :members: embedding, embedding_raster, dotplot, matrixplot, composition, distribution, cluster_connectivity, mapping_score, mapping_evidence, mapping_confusion, mapping_calibration, mapping_projection, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, compose_results, register_theme, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap, run_recipe
+    :members: embedding, embedding_raster, dotplot, matrixplot, composition, distribution, cluster_connectivity, mapping_score, mapping_evidence, mapping_confusion, mapping_calibration, qc, graph_qc, elbow, highly_variable_features, label_panels, collect_legends, compose_results, register_theme, theme_context, marker_heatmap, cluster_tree, pseudotime_heatmap, run_recipe
     :imported-members:
     :undoc-members:
     :show-inheritance:

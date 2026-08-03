@@ -52,7 +52,6 @@ _METHODS = {
         "get_mapping_score",
         "get_target_classes",
         "get_target_label_evidence",
-        "project_reference_embedding",
         "run_mapping",
     ),
     DataStore: (
@@ -95,7 +94,7 @@ _METHODS = {
 _SIGNATURE_DIGESTS = {
     BaseDataStore: "618821f381727cab2b5b19ec983871b486c5bdcab992435f3a0cb34033dfbcf4",
     GraphDataStore: "eecfb41646f3b515e2979882a1afe56b0d1497775562110af406c8f178f7005a",
-    MappingDatastore: "c2d386b537ba464e9b08e7a67eb7342a72b4845b76053ef933a0b531b4800c67",
+    MappingDatastore: "1be2723f0c659336ff3dba16d58f4c9a7aa2f73a9a4a33bf3af232a280f1d7ec",
     DataStore: "1f1cfcc32db7daa61687f1620d80fa7cf74495c89747fe9ae99bc7864062d98c",
 }
 

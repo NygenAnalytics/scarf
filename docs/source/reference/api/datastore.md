@@ -32,7 +32,6 @@ artifacts should write to a separate target. See {doc}`../../tutorials/remote_st
         get_assay_state, build_mapping_reference, get_mapping_reference, run_mapping,
         get_mapping_result, get_mapping_score, get_target_classes,
         get_target_label_evidence, calibrate_label_transfer_threshold,
-        project_reference_embedding,
         integrate_assays, metric_lisi, metric_ilisi, metric_clisi,
         metric_proportional_batch_mixing, metric_graph_connectivity,
         metric_graph_silhouette, metric_label_concordance,

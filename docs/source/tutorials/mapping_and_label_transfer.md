@@ -17,7 +17,9 @@ kernelspec:
 
 # Mapping cells and transferring labels
 
-Mapping answers one question: where do new cells sit on a fixed reference atlas?
+Mapping is the fixed-reference alternative to merging datasets and rebuilding a
+joint graph. Keep one reference atlas unchanged, place new query cells onto it,
+and transfer labels from reference neighbours.
 
 It does three things in order:
 
@@ -26,6 +28,8 @@ It does three things in order:
 3. Use those neighbours to transfer labels and score how much of the query landed on each reference cell.
 
 It does not merge count matrices, retrain the reference graph, or move reference cells.
+When sources must be analysed together in one store, start with {doc}`data_integration`
+and {doc}`batch_correction` instead.
 
 This tutorial maps interferon-stimulated PBMCs onto a control PBMC reference from the same Kang study. The shared author labels let us evaluate the result. For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
 
@@ -76,54 +80,41 @@ ds_stim.plots.embedding(
 ```
 
 These UMAP layouts were fitted independently, so their coordinates are not
-comparable. Mapping will later place stimulated cells into the control layout.
-The shared label vocabulary is what we use for evaluation.
+comparable. Mapping keeps the control layout fixed and reports where query
+weight lands on reference cells. The shared label vocabulary is what we use for
+evaluation.
 
 ## Prepare a labelled reference
 
-The published Kang annotation leaves about 6,000 of the 14,526 active control
-cells unlabelled. Those cells are stored as the string `nan`. Label transfer
-treats every distinct string as a class, so unlabelled reference cells would
-compete for votes and obscure the real cell-type transfer.
-
-Restrict the reference to annotated cells, then select variable features on
-that same cell key so the feature panel matches the cells used for mapping.
+Build the reference graph with the standard RNA pipeline, then package the
+neighbour chain as an immutable mapping reference.
 
 ```{code-cell} ipython3
-labelled = ds_ctrl.cells.fetch_all("cluster_labels").astype(str) != "nan"
-ds_ctrl.cells.insert(
-    "annotated",
-    ds_ctrl.cells.fetch_all("I").astype(bool) & labelled,
-    overwrite=True,
+artifacts = ds_ctrl.pipeline.run(
+    filtering=False,
+    cell_cycle_scoring=False,
+    highly_variable_features={
+        "min_cells": 10,
+        "top_n": 2000,
+        "min_mean": -3,
+        "max_mean": 2,
+        "max_var": 6,
+    },
+    pca={"dims": 25},
+    neighbors={"k": 17},
+    umap=False,
+    leiden={},
+    paris=False,
+    doublet_scoring=False,
+    markers=False,
 )
-print(
-    "annotated reference cells:",
-    int(ds_ctrl.cells.fetch_all("annotated").sum()),
-)
-ds_ctrl.mark_hvgs(
-    cell_key="annotated",
-    top_n=2000,
-    min_cells=10,
-    min_mean=-3,
-    max_mean=2,
-    max_var=6,
-    show_plot=False,
-)
+reference = ds_ctrl.build_mapping_reference(artifacts["neighbors"])
 ```
 
-```{code-cell} ipython3
-normalized = ds_ctrl.run_normalization(cell_key="annotated", feat_key="hvgs")
-pca = ds_ctrl.run_pca(normalized, dims=25, feat_scaling=True)
-ann_index = ds_ctrl.build_ann_index(pca)
-neighbors = ds_ctrl.query_neighbors(ann_index, k=17)
-reference = ds_ctrl.build_mapping_reference(neighbors)
-reference
-```
-
-The completed `MappingReference` is immutable. Its feature order, scaling,
-PCA loadings, neighbour index, and selected cells stay fixed in the reference
+The completed `MappingReference` is immutable. Its feature order, scaling, PCA
+loadings, neighbour index, and selected cells stay fixed in the reference
 datastore. This example uses a plain PCA reference. A Symphony reference instead
-passes `run_harmony` output to `build_ann_index` before querying neighbours.
+passes Harmony-corrected neighbours into `build_mapping_reference`.
 
 ## Map the query
 
@@ -140,7 +131,6 @@ mapping = ds_stim.run_mapping(
     save_k=5,
     missing_feature_policy="reference_mean",
 )
-mapping
 ```
 
 `reference_mean` fills an absent query feature with the reference mean, which
@@ -166,7 +156,7 @@ reference region.
 
 ```{code-cell} ipython3
 query_labels = np.asarray(ds_stim.cells.fetch("cluster_labels")).astype(str)
-focus = {"CD 14 Mono", "CD4 naive T", "NK"}
+focus = {"CD 14 Mono", "CD4 Memory T", "CD4 naive T", "NK"}
 score_groups = np.array(
     [label if label in focus else "other" for label in query_labels],
     dtype=object,
@@ -175,7 +165,7 @@ ds_stim.plots.mapping_score(
     mapping,
     layout_key="RNA_UMAP",
     target_groups=score_groups,
-    figsize=(11, 3.4),
+    figsize=(14, 3.4),
 )
 ```
 
@@ -208,9 +198,15 @@ accepted.value_counts().rename(
 ).rename("query cells")
 ```
 
-`mapping_evidence` summarizes vote fraction, top-two margin, entropy, and
-reference-distance percentile. Low vote fraction, a small margin, or a large
-reference-distance percentile supports abstention rather than a forced label.
+`mapping_evidence` summarizes three abstention signals:
+
+- `voteFraction`: how much neighbour weight supports the winning label
+- `topTwoMargin`: how far the winner sits above the runner-up
+- `referenceDistancePercentile`: how unusual the query cell is relative to
+  reference neighbour distances
+
+Low vote fraction, a small margin, or a large reference-distance percentile
+supports abstention rather than a forced label.
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_evidence(
@@ -225,8 +221,7 @@ ds_stim.plots.mapping_evidence(
 ```
 
 Because this query carries author labels, we can compare known labels with
-transferred labels. The `nan` row is unlabelled query cells, so it has no
-correct answer.
+transferred labels.
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_confusion(
@@ -241,59 +236,43 @@ ds_stim.plots.mapping_confusion(
 The diagonal is recall within each known query label. Off-diagonal blocks are
 systematic swaps. The `NA` column is abstention.
 
-## Calibrate an acceptance threshold
+## Mapping scores by reference cluster
 
-Calibration plots held-out accuracy against retained coverage over a range of
-evidence thresholds. It does not turn vote fractions into class probabilities.
-Here the stimulated labels act as a held-out evaluation set. For deployment,
-calibrate on donors and batches that match future queries.
-
-```{code-cell} ipython3
-ds_stim.plots.mapping_calibration(
-    mapping,
-    reference_class_group="cluster_labels",
-    known_labels=query_labels,
-    metric="voteFraction",
-    chosen_threshold=0.6,
-)
-```
-
-Choose the operating point from the cost of abstention and the required error
-rate, then validate it on a separate evaluation set when possible.
-
-## Project into the unchanged reference layout
-
-Neighbour-weighted projection places query cells into the existing reference
-UMAP without moving reference coordinates. The plot below keeps the reference
-as a light background and colours only the labelled query cells.
+For a focused query population, ask which reference clusters absorbed the
+mapping weight. Box plots summarize the per-reference-cell score distribution
+inside each reference cluster. A sized embedding keeps the same scores on the
+reference UMAP, with larger points for higher scores.
 
 ```{code-cell} ipython3
-projected_embedding = ds_stim.project_reference_embedding(
-    mapping,
-    reference_layout_key="RNA_UMAP",
-    label="ref_UMAP",
-)
-projected_embedding
-```
-
-```{code-cell} ipython3
-labelled_query = np.array(
-    ["unlabelled" if label == "nan" else label for label in query_labels],
+focus_groups = np.array(
+    [
+        label if label in {"CD4 Memory T", "CD 14 Mono", "NK"} else "other"
+        for label in query_labels
+    ],
     dtype=object,
 )
-ds_stim.plots.mapping_projection(
+ds_stim.plots.mapping_score(
     mapping,
-    reference_layout_key="RNA_UMAP",
-    target_groups=labelled_query,
-    ref_name="control reference",
-    reference_mode="background",
-    figsize=(7.2, 5.2),
+    target_groups=focus_groups,
+    kind="box",
+    reference_class_group="cluster_labels",
+    figsize=(14, 3.8),
 )
 ```
 
-Projection is a diagnostic view, not a new graph. Stimulated monocytes and T
-cells should land near their control counterparts. Residual shifts are expected
-because interferon response moves cells off the control manifold.
+```{code-cell} ipython3
+ds_stim.plots.mapping_score(
+    mapping,
+    layout_key="RNA_UMAP",
+    target_groups=focus_groups,
+    size_by_score=True,
+    figsize=(14, 3.4),
+)
+```
+
+A useful map puts high scores on the matching reference clusters. Diffuse score
+mass across many unrelated clusters is a reason to inspect feature coverage or
+the query composition.
 
 ```{raw} html
 <span id="reference-atlas-mapping"></span>
@@ -301,21 +280,20 @@ because interferon response moves cells off the control manifold.
 
 ## Reload a prepared mapping
 
-Reload the reference by `ArtifactRef`. Reload the query projection by name with
-an explicit reference and query assay:
+In a later session you reopen the reference store and load the named mapping
+reference, then reload the query mapping by name:
 
 ```{code-cell} ipython3
-reference = ds_ctrl.get_mapping_reference(reference.ref)
+reference = ds_ctrl.get_mapping_reference()
 reloaded_mapping = ds_stim.get_mapping_result(
     "stim",
     reference=reference,
     query_assay="RNA",
 )
-reloaded_mapping
+reloaded_mapping.mapping_name, reloaded_mapping.n_cells
 ```
 
-Consumers also accept `reloaded_mapping.ref` when `reference=reference` is
-provided. Building and reusing a Symphony-style fixed reference is covered in
+Building and reusing a Symphony-style fixed reference is covered in
 {doc}`reference_atlases`.
 
 Common failures include mapping before the reference exists, ignoring feature

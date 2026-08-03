@@ -28,9 +28,6 @@ from scarf.storage.artifact_writer import (
 )
 from scarf.storage.artifacts import (
     ArtifactRef,
-    ExternalArtifactRef,
-    artifact_group,
-    fingerprint_array,
 )
 from scarf.storage.selections import resolve_selection_artifact
 from scarf.storage.types import as_zarr_array as checked_zarr_array
@@ -396,11 +393,6 @@ def test_mapping_consumers_stream_projection_arrays(
 ):
     _, reference, query = mapping_consumer_context
     _write_reference_labels(reference)
-    _write_reference_layout(
-        reference,
-        layout_key="stream_layout",
-        linked=False,
-    )
     result = _write_projection(
         query,
         reference,
@@ -421,11 +413,6 @@ def test_mapping_consumers_stream_projection_arrays(
         lambda: query.get_target_label_evidence(
             result,
             reference_class_group="reference_labels",
-        ),
-        lambda: query.project_reference_embedding(
-            result,
-            reference_layout_key="stream_layout",
-            label="streamed_ref",
         ),
     )
     for consume in consumers:
@@ -485,159 +472,6 @@ def test_label_scores_are_allocated_only_for_conformal_evidence(
     assert score_shape in allocations
 
 
-def test_reference_embedding_persists_reuses_and_links_selected_query_columns(
-    mapping_consumer_context,
-):
-    reference_store, reference, query = mapping_consumer_context
-    reference_layout, source_ref = _write_reference_layout(
-        reference,
-        layout_key="RNA_UMAP",
-        linked=True,
-    )
-    assert source_ref is not None
-    result = _write_projection(
-        query,
-        reference,
-        mapping_name="embedding",
-        indices=np.array([[0, 1], [0, 1], [1, 0]]),
-        distances=np.array([[1.0, 9.0], [1.0, 1.0], [1.0, 9.0]]),
-        uninformative=np.array([False, False, True]),
-    )
-    reference_before = _snapshot_store(reference_store.zarr_loc)
-
-    embedding = query.project_reference_embedding(
-        result,
-        reference_layout_key="RNA_UMAP",
-    )
-
-    assert _snapshot_store(reference_store.zarr_loc) == reference_before
-    status = query.inspect_artifact(embedding)
-    assert status.operation == "project_reference_embedding"
-    assert ArtifactRef.from_dict((status.inputs or {})["projection"]) == result.ref
-    assert ExternalArtifactRef.from_dict(
-        (status.inputs or {})["reference_layout"]
-    ) == reference.external_ref.__class__(
-        dataset_fingerprint=reference.dataset_fingerprint,
-        ref=source_ref,
-    )
-    columns = [
-        "RNA_mapping_cells_ref_UMAP1",
-        "RNA_mapping_cells_ref_UMAP2",
-    ]
-    values = np.column_stack(
-        [query.cells.fetch(column, key="mapping_cells") for column in columns]
-    )
-    np.testing.assert_allclose(values[0], [1.0, 11.0])
-    np.testing.assert_allclose(values[1], [5.0, 15.0])
-    assert np.isnan(values[2]).all()
-    for dimension, column in enumerate(columns):
-        attrs = query.zw["cellData"][column].attrs
-        assert ArtifactRef.from_dict(attrs["source_artifact"]) == embedding
-        assert attrs["source_value"] == "values"
-        assert attrs["value_index"] == dimension
-
-    preserved_display = {
-        "kind": "continuous",
-        "colormap": "magma",
-        "minimum": -1.0,
-        "maximum": 20.0,
-        "scale": "linear",
-    }
-    query.zw["cellData"][columns[0]].attrs["display"] = preserved_display
-    reused = query.project_reference_embedding(
-        result.ref,
-        reference=reference,
-        reference_layout_key="RNA_UMAP",
-    )
-    assert reused == embedding
-    assert dict(query.zw["cellData"][columns[0]].attrs["display"]) == preserved_display
-    np.testing.assert_array_equal(
-        artifact_group(query.zw, reused)["values"][:],
-        values,
-    )
-    assert _snapshot_store(reference_store.zarr_loc) == reference_before
-    np.testing.assert_array_equal(reference.fetch_layout("RNA_UMAP"), reference_layout)
-
-
-def test_reference_embedding_fingerprints_unlinked_layout_and_uses_i_naming(
-    mapping_consumer_context,
-):
-    _, reference, query = mapping_consumer_context
-    reference_layout, source_ref = _write_reference_layout(
-        reference,
-        layout_key="manual_layout",
-        linked=False,
-    )
-    assert source_ref is None
-    n_cells = len(query.cells.active_index("I"))
-    result = _write_projection(
-        query,
-        reference,
-        mapping_name="fallback_embedding",
-        indices=np.tile(np.array([[0, 1]], dtype=np.uint64), (n_cells, 1)),
-        distances=np.ones((n_cells, 2), dtype=np.float64),
-        uninformative=np.zeros(n_cells, dtype=bool),
-        cell_key="I",
-    )
-
-    embedding = query.project_reference_embedding(
-        result,
-        reference_layout_key="manual_layout",
-        label="manual_ref",
-    )
-
-    status = query.inspect_artifact(embedding)
-    assert (status.inputs or {})["reference_layout"] == {
-        "value_fingerprint": fingerprint_array(reference_layout)
-    }
-    assert "RNA_manual_ref1" in query.cells.columns
-    assert "RNA_manual_ref2" in query.cells.columns
-
-
-@pytest.mark.parametrize(
-    ("attribute", "malformed_value"),
-    (
-        ("value_index", 0),
-        ("source_value", "other_values"),
-    ),
-)
-def test_reference_embedding_fingerprints_malformed_layout_links(
-    mapping_consumer_context,
-    attribute,
-    malformed_value,
-):
-    _, reference, query = mapping_consumer_context
-    reference_layout, source_ref = _write_reference_layout(
-        reference,
-        layout_key="malformed_layout",
-        linked=True,
-    )
-    assert source_ref is not None
-    reference.datastore.zw["cellData"]["malformed_layout2"].attrs[attribute] = (
-        malformed_value
-    )
-    assert reference.layout_source("malformed_layout") is None
-    result = _write_projection(
-        query,
-        reference,
-        mapping_name=f"malformed_{attribute}",
-        indices=np.array([[0, 1], [1, 0]]),
-        distances=np.ones((2, 2), dtype=np.float64),
-        uninformative=np.zeros(2, dtype=bool),
-    )
-
-    embedding = query.project_reference_embedding(
-        result,
-        reference_layout_key="malformed_layout",
-        label=f"malformed_{attribute}",
-    )
-
-    status = query.inspect_artifact(embedding)
-    assert (status.inputs or {})["reference_layout"] == {
-        "value_fingerprint": fingerprint_array(reference_layout)
-    }
-
-
 def test_reference_layout_source_requires_the_linked_value_array(
     mapping_consumer_context,
 ):
@@ -669,31 +503,6 @@ def test_reference_layout_reads_linked_immutable_artifact(
     np.testing.assert_array_equal(reference.fetch_layout("linked_layout"), expected)
 
 
-def test_reference_embedding_requires_writable_query_store(
-    mapping_consumer_context,
-):
-    _, reference, query = mapping_consumer_context
-    result = _write_projection(
-        query,
-        reference,
-        mapping_name="read_only",
-        indices=np.array([[0, 1]]),
-        distances=np.array([[1.0, 1.0]]),
-        uninformative=np.array([False]),
-    )
-    read_only = DataStore(
-        query.zarr_loc,
-        default_assay="RNA",
-        zarr_mode="r",
-    )
-
-    with pytest.raises(ValueError, match="read-write query store"):
-        read_only.project_reference_embedding(
-            result,
-            reference_layout_key="unused",
-        )
-
-
 def test_every_mapping_consumer_rejects_old_projection_artifacts(
     mapping_consumer_context,
 ):
@@ -722,11 +531,6 @@ def test_every_mapping_consumer_rejects_old_projection_artifacts(
         lambda: query.get_target_label_evidence(
             old,
             reference_class_group="ids",
-            reference=reference,
-        ),
-        lambda: query.project_reference_embedding(
-            old,
-            reference_layout_key="RNA_UMAP",
             reference=reference,
         ),
     )

@@ -426,9 +426,7 @@ plt.close(figure)
 ```
 
 ```{note}
-For a fixed-reference mapping view, first persist query coordinates with
-`query_ds.project_reference_embedding(...)`, then use
-`query_ds.plots.mapping_projection(...)`. See
+For fixed-reference mapping diagnostics, see
 {doc}`mapping_and_label_transfer`.
 ```
 

@@ -26,7 +26,6 @@ _STORE_PLOT_METHODS = (
     "mapping_calibration",
     "mapping_confusion",
     "mapping_evidence",
-    "mapping_projection",
     "mapping_score",
     "matrixplot",
     "pseudotime_heatmap",
@@ -168,11 +167,6 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
             "mapping_evidence",
             ("atlas",),
             {"reference_class_group": "label"},
-        ),
-        (
-            "mapping_projection",
-            ("atlas",),
-            {"reference_layout_key": "RNA_UMAP"},
         ),
         (
             "mapping_score",

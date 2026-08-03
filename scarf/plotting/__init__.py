@@ -56,7 +56,6 @@ if TYPE_CHECKING:
         mapping_calibration as mapping_calibration,
         mapping_confusion as mapping_confusion,
         mapping_evidence as mapping_evidence,
-        mapping_projection as mapping_projection,
         mapping_score as mapping_score,
     )
     from .summary import dotplot as dotplot
@@ -100,7 +99,6 @@ __all__ = [
     "mapping_calibration",
     "mapping_confusion",
     "mapping_evidence",
-    "mapping_projection",
     "mapping_score",
     "matrixplot",
     "pseudotime_heatmap",
@@ -148,7 +146,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "mapping_calibration": (".mapping", "mapping_calibration"),
     "mapping_confusion": (".mapping", "mapping_confusion"),
     "mapping_evidence": (".mapping", "mapping_evidence"),
-    "mapping_projection": (".mapping", "mapping_projection"),
     "mapping_score": (".mapping", "mapping_score"),
     "matrixplot": (".summary", "matrixplot"),
     "pseudotime_heatmap": (".heatmaps", "pseudotime_heatmap"),

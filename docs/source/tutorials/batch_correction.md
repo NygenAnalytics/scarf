@@ -255,5 +255,8 @@ Compare methods only when active cells, selected features, neighbour count, and
 LISI perplexity match. Do not choose a method solely because its UMAP appears
 compact.
 
+When the reference should remain fixed and new samples arrive later, use
+{doc}`mapping_and_label_transfer` instead of rebuilding a joint graph.
+
 See {doc}`../reference/api/graph_construction` for the PCA and Harmony
 contracts, and {doc}`../reference/api/integration` for the metric definitions.

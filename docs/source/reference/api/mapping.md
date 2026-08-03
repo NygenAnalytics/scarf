@@ -24,7 +24,6 @@
    scarf.DataStore.get_target_classes
    scarf.DataStore.get_target_label_evidence
    scarf.DataStore.calibrate_label_transfer_threshold
-   scarf.DataStore.project_reference_embedding
 ```
 
 ```{eval-rst}
@@ -36,7 +35,6 @@
 .. automethod:: scarf.DataStore.get_target_classes
 .. automethod:: scarf.DataStore.get_target_label_evidence
 .. automethod:: scarf.DataStore.calibrate_label_transfer_threshold
-.. automethod:: scarf.DataStore.project_reference_embedding
 ```
 
 Mapping diagnostics are documented in the {doc}`plotting` API reference.

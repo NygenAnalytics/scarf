@@ -30,12 +30,12 @@ subtrees:
         title: Dataset merging
       - file: tutorials/batch_correction
         title: Batch correction
-      - file: tutorials/multimodal_integration
-        title: Multimodal diagnostics
       - file: tutorials/mapping_and_label_transfer
         title: Mapping and label transfer
       - file: tutorials/reference_atlases
         title: Reference atlases
+      - file: tutorials/multimodal_integration
+        title: Multimodal diagnostics
   - caption: Downstream analysis
     entries:
       - file: tutorials/annotation

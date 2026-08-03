@@ -34,7 +34,6 @@ def test_import_plotting_exports():
         "mapping_calibration",
         "mapping_confusion",
         "mapping_evidence",
-        "mapping_projection",
         "mapping_score",
         "matrixplot",
         "pseudotime_heatmap",

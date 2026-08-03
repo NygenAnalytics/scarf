@@ -73,31 +73,41 @@ ds_ctrl.cells.insert(
 
 ## Build and reload the reference
 
-```{code-cell} ipython3
-normalized = ds_ctrl.run_normalization(feat_key="hvgs")
-pca = ds_ctrl.run_pca(normalized, dims=25, feat_scaling=True)
-corrected = ds_ctrl.run_harmony(["reference_batch"], pca)
-ann_index = ds_ctrl.build_ann_index(corrected)
-neighbors = ds_ctrl.query_neighbors(ann_index, k=17)
-reference = ds_ctrl.build_mapping_reference(neighbors)
-reference
-```
-
-The {term}`artifact` records the active cells, selected features, normalization, PCA
-loadings, corrected latent coordinates, ANN contract, and batch metadata.
-Building a different contract creates another artifact rather than mutating the
-completed reference.
+Build the Harmony-backed neighbour chain with one pipeline call, then package it
+as the mapping reference.
 
 ```{code-cell} ipython3
-reference = ds_ctrl.get_mapping_reference(reference.ref)
+artifacts = ds_ctrl.pipeline.run(
+    filtering=False,
+    cell_cycle_scoring=False,
+    highly_variable_features={
+        "min_cells": 10,
+        "top_n": 2000,
+        "min_mean": -3,
+        "max_mean": 2,
+        "max_var": 6,
+    },
+    pca={"dims": 25},
+    harmony={"batch_columns": ["reference_batch"]},
+    neighbors={"k": 17},
+    umap=False,
+    leiden={},
+    paris=False,
+    doublet_scoring=False,
+    markers=False,
+)
+reference = ds_ctrl.build_mapping_reference(artifacts["neighbors"])
 ```
 
-Reloading validates that the stored inputs still match the datastore. This is
-the normal entry point in later sessions, and the prepared reference datastore
-may be opened read-only. Mapping still requires a separate writable query
-datastore. Use `mount_datastore` to create that writable analysis layer when
+In a later session, reopen the reference store and load the named mapping
+reference. The prepared reference datastore may be opened read-only. Mapping
+still requires a separate writable query datastore. Use `mount_datastore` when
 the query counts come from a read-only source or from the same source used to
 prepare the reference.
+
+```{code-cell} ipython3
+reference = ds_ctrl.get_mapping_reference()
+```
 
 ## Map and inspect a shifted query
 
@@ -121,10 +131,9 @@ mapping = ds_stim.run_mapping(
     save_k=5,
     query_batches=query_batches,
 )
-mapping
 ```
 
-The projection is stored in `ds_stim`. The reference model and reference
+The mapping result is stored in `ds_stim`. The reference model and reference
 coordinates remain unchanged.
 
 ```{code-cell} ipython3
@@ -158,45 +167,53 @@ ds_stim.cells.insert(
 ```
 
 ```{code-cell} ipython3
+query_labels = np.asarray(ds_stim.cells.fetch("cluster_labels")).astype(str)
 ds_stim.plots.mapping_confusion(
     mapped,
     reference_class_group="cluster_labels",
-    known_labels=ds_stim.cells.fetch("cluster_labels"),
+    known_labels=query_labels,
     normalize="true",
     threshold_fraction=0.6,
 )
 ```
 
+## Mapping scores by reference cluster
+
+After label transfer, inspect where query weight landed on the reference.
+Focused populations should put the highest mapping scores on matching reference
+clusters.
+
 ```{code-cell} ipython3
-projected_embedding = ds_stim.project_reference_embedding(
-    mapped,
-    reference_layout_key="RNA_UMAP",
-    label="atlas_UMAP",
+focus_groups = np.array(
+    [
+        label if label in {"CD4 Memory T", "CD 14 Mono", "NK"} else "other"
+        for label in query_labels
+    ],
+    dtype=object,
 )
-projected_embedding
-```
-
-The call above persists an embedding artifact in the query datastore and links
-`RNA_atlas_UMAP1` and `RNA_atlas_UMAP2` into query cell metadata. Cells with
-uninformative projected PCA coordinates receive `NaN` embedding coordinates
-and retain an abstained label.
-
-```{code-cell} ipython3
-ds_stim.plots.mapping_projection(
+ds_stim.plots.mapping_score(
     mapped,
-    reference_layout_key="RNA_UMAP",
-    target_groups=transferred.to_numpy(),
-    ref_name="control atlas",
-    reference_mode="background",
-    figsize=(7.2, 5.2),
+    target_groups=focus_groups,
+    kind="box",
+    reference_class_group="cluster_labels",
+    figsize=(14, 3.8),
 )
 ```
 
-The projected query should land near compatible reference regions while the
-reference stays as a light background. Systematic off-diagonal confusion or
-large unmapped regions is a reason to inspect feature coverage, batch design,
-and whether the query contains populations absent from the atlas.
-Compare the confusion pattern with the direct KNN workflow in
+```{code-cell} ipython3
+ds_stim.plots.mapping_score(
+    mapped,
+    layout_key="RNA_UMAP",
+    target_groups=focus_groups,
+    size_by_score=True,
+    figsize=(14, 3.4),
+)
+```
+
+Systematic off-diagonal confusion or diffuse mapping scores across unrelated
+reference clusters is a reason to inspect feature coverage, batch design, and
+whether the query contains populations absent from the atlas. Compare the
+confusion pattern with the direct KNN workflow in
 {doc}`mapping_and_label_transfer`; different off-diagonal errors show how the
 reference model and correction assumptions affect transfer.
 
