@@ -129,7 +129,11 @@ def _prepare_store(
     work_directory: Path,
     layout_fixture: Path = _LAYOUT_FIXTURE,
 ) -> DataStore:
-    store = DataStore(str(_copy_fixture(source, work_directory)), default_assay="RNA")
+    store = DataStore(
+        str(_copy_fixture(source, work_directory)),
+        default_assay="RNA",
+        nthreads=2,
+    )
     store.auto_filter_cells(show_qc_plots=False)
     if "hvgs" not in store._get_assay("RNA").feats.columns:
         store.mark_hvgs(

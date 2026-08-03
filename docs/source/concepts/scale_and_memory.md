@@ -8,14 +8,13 @@ marker batches can hold structures in addition to the streamed count blocks.
 
 ## Resource controls
 
-Set a budget when sharing a machine, submitting a batch job, or testing how an
-analysis behaves under a smaller memory allowance:
+Set a memory budget when sharing a machine, submitting a batch job, or testing
+how an analysis behaves under a smaller memory allowance:
 
 ```python
 ds = scarf.DataStore(
     "data.zarr",
     mem_budget="16G",
-    nthreads=8,
 )
 ```
 
@@ -26,10 +25,14 @@ budget, not a hard cap on total process resident memory. Python, native
 libraries, graph structures, and allocator overhead can take total RSS above
 the configured value, so leave host headroom.
 
-`nthreads` controls I/O and compute concurrency used by methods that support it. More workers can
-increase throughput when storage and CPU have capacity, but they can also increase concurrent
-buffers or contend for a slow remote store. Measure the complete workflow rather than assuming the
-largest value is best.
+Worker concurrency is auto-detected from the process environment. On shared
+hosts, multiprocess jobs, or remote object stores, set `SCARF_WORKERS` or pass
+the advanced `nthreads` constructor argument to bound the maximum worker
+budget. More workers can increase concurrent buffers or remote requests, so
+pair a large worker budget with an explicit `mem_budget`. Opt-in parallel UMAP,
+tSNE, and ANN index builds record the resolved worker count in artifact
+provenance; pass `nthreads` explicitly when the same parallel request must stay
+reuse-eligible across machines.
 
 ## Count orientations
 

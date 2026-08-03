@@ -85,7 +85,9 @@ class DataStore(
         mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``MT-|mt``.
         ribo_pattern: Regex pattern to capture ribosomal genes. When None, uses
                       ``RPS|RPL|MRPS|MRPL``.
-        nthreads: Number of maximum threads to use in all multi-threaded functions
+        nthreads: Maximum worker budget for multi-threaded methods. When None, auto-detected
+                  (SCARF_WORKERS env var, else process CPU affinity and cgroup limits). An
+                  explicit integer overrides environment detection.
         zarr_mode: For read-write mode use r+' or for read-only use 'r'. (Default value: 'r+')
         workspace: Workspace for the data
         mem_budget: Memory budget bounding streaming and concurrency. Accepts bytes, a suffixed size
@@ -103,7 +105,7 @@ class DataStore(
         min_cells_per_feature: int = 20,
         mito_pattern: str | None = None,
         ribo_pattern: str | None = None,
-        nthreads: int = 2,
+        nthreads: int | None = None,
         zarr_mode: ZarrMode = "r+",
         workspace: str | None = None,
         zarrProfile: StorageProfile | None = None,

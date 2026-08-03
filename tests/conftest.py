@@ -1,3 +1,8 @@
+import os
+
+# Bound Scarf worker auto-detection before pytest plugins import NumPy or Scarf.
+os.environ["SCARF_WORKERS"] = "2"
+
 import sys
 
 import pytest

@@ -284,6 +284,34 @@ class TestDataStore:
         with pytest.raises(ValueError):
             DataStore(str(out_fn), zarr_mode="wrong", default_assay="RNA")
 
+    def test_nthreads_env_and_explicit_precedence(
+        self, toy_crdir_writer, tmp_path, monkeypatch
+    ):
+        import shutil
+
+        from scarf.datastore.datastore import DataStore
+
+        store_path = tmp_path / "nthreads_budget.zarr"
+        shutil.copytree(toy_crdir_writer, store_path)
+        monkeypatch.setenv("SCARF_WORKERS", "3")
+        auto = DataStore(
+            str(store_path),
+            default_assay="RNA",
+            min_features_per_cell=0,
+            min_cells_per_feature=0,
+        )
+        assert auto.nthreads == 3
+        assert auto.resources.workers == 3
+        explicit = DataStore(
+            str(store_path),
+            default_assay="RNA",
+            min_features_per_cell=0,
+            min_cells_per_feature=0,
+            nthreads=2,
+        )
+        assert explicit.nthreads == 2
+        assert explicit.resources.workers == 2
+
     def test_auto_filter_cells(self, datastore_ephemeral):
         assert (
             datastore_ephemeral.auto_filter_cells(
