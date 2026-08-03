@@ -1,13 +1,119 @@
 import numpy as np
+import pytest
 import zarr
 from zarr.storage import MemoryStore
 
-from scarf.storage.artifacts import ArtifactRef, artifact_path, inspect_artifact
+from scarf.storage.artifacts import (
+    ArtifactRef,
+    artifact_path,
+    fingerprint_strings,
+    inspect_artifact,
+)
 from scarf.storage.arrays import create_metadata_column
 from scarf.storage.selections import (
+    fingerprint_selected_stored_strings,
     resolve_generated_selection_artifact,
     resolve_selection_artifact,
 )
+
+
+def test_fingerprint_selected_stored_strings_rejects_and_hashes() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    ids = create_metadata_column(
+        root,
+        "ids",
+        data=np.array(["a", "b", "c", "d"]),
+        dtype=str,
+    )
+    selection = create_metadata_column(
+        root,
+        "selection",
+        data=np.array([True, False, True, False]),
+        dtype=bool,
+    )
+    digest, count = fingerprint_selected_stored_strings(ids, selection)
+    assert count == 2
+    assert digest == fingerprint_strings(np.array(["a", "c"]))
+    assert digest == fingerprint_selected_stored_strings(ids, selection)[0]
+
+    other = create_metadata_column(
+        root,
+        "other",
+        data=np.array([False, True, False, True]),
+        dtype=bool,
+    )
+    other_digest, other_count = fingerprint_selected_stored_strings(ids, other)
+    assert other_count == 2
+    assert other_digest == fingerprint_strings(np.array(["b", "d"]))
+    assert other_digest != digest
+
+    short_ids = create_metadata_column(
+        root,
+        "short_ids",
+        data=np.array(["a", "b"]),
+        dtype=str,
+    )
+    with pytest.raises(ValueError, match="aligned vectors"):
+        fingerprint_selected_stored_strings(short_ids, selection)
+
+    not_bool = create_metadata_column(
+        root,
+        "not_bool",
+        data=np.array([1, 0, 1, 0], dtype=np.int8),
+        dtype=np.int8,
+    )
+    with pytest.raises(TypeError, match="booleans"):
+        fingerprint_selected_stored_strings(ids, not_bool)
+
+    numeric_ids = create_metadata_column(
+        root,
+        "numeric_ids",
+        data=np.arange(4, dtype=np.int32),
+        dtype=np.int32,
+    )
+    with pytest.raises(TypeError, match="must contain strings"):
+        fingerprint_selected_stored_strings(numeric_ids, selection)
+
+
+def test_resolve_selection_artifact_rejects_bad_masks_and_ids() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    row_ids = np.array(["a", "b", "c"])
+    common = dict(
+        root=root,
+        scope="datastore",
+        kind="cell_selection",
+        row_ids=row_ids,
+        operation="manual_selection",
+        parameters={},
+        inputs={},
+        source_column="I",
+    )
+    with pytest.raises(TypeError, match="one-dimensional boolean"):
+        resolve_selection_artifact(**common, values=np.array([1, 0, 1]))
+    with pytest.raises(ValueError, match="must align"):
+        resolve_selection_artifact(
+            **common,
+            values=np.array([True, False]),
+        )
+    with pytest.raises(TypeError, match="one-dimensional boolean"):
+        resolve_generated_selection_artifact(
+            **common,
+            values=np.array([[True, False, True]]),
+            assay="RNA",
+        )
+    with pytest.raises(ValueError, match="must align"):
+        resolve_generated_selection_artifact(
+            root=root,
+            scope="assay",
+            assay="RNA",
+            kind="feature_selection",
+            values=np.array([True, False, True]),
+            row_ids=np.array(["a", "b"]),
+            operation="mark_hvgs",
+            parameters={},
+            inputs={},
+            source_column="I__hvgs",
+        )
 
 
 def test_selection_artifacts_snapshot_values_and_reuse_by_provenance() -> None:

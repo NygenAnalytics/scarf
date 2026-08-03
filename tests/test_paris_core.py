@@ -6,6 +6,7 @@ from sknetwork.hierarchy import Paris
 from scarf.clustering._paris_core import (
     ParisHierarchy,
     _contract_graph,
+    _nearest_neighbors,
     canonicalize_paris_graph,
 )
 from scarf.clustering.paris import (
@@ -261,3 +262,59 @@ def test_components_isolates_and_synthetic_joins_are_explicit() -> None:
     assert hierarchy.children.dtype == np.int32
     assert hierarchy.sizes.dtype == np.int32
     assert hierarchy.heights.dtype == np.float64
+
+
+def test_nearest_neighbors_skips_self_loops_nonpositive_and_ties_on_id() -> None:
+    indptr = np.asarray([0, 4, 5, 6, 6], dtype=np.int64)
+    indices = np.asarray([0, 1, 2, 3, 0, 0], dtype=np.int64)
+    data = np.asarray([9.0, 0.0, 2.0, 2.0, 1.0, 1.0], dtype=np.float64)
+    volumes = np.ones(4, dtype=np.float64)
+    logical_ids = np.asarray([0, 1, 2, 3], dtype=np.int64)
+
+    nearest, between = _nearest_neighbors(
+        indptr,
+        indices,
+        data,
+        volumes,
+        logical_ids,
+        1,
+    )
+
+    np.testing.assert_array_equal(nearest, [2, 0, 0, -1])
+    np.testing.assert_allclose(between, [2.0, 1.0, 1.0, 0.0])
+
+
+def test_contract_graph_sums_parallel_mapped_edges_and_drops_intra_group() -> None:
+    graph = csr_matrix(
+        np.asarray(
+            [
+                [0.0, 1.0, 2.0, 0.0],
+                [1.0, 0.0, 0.0, 3.0],
+                [2.0, 0.0, 0.0, 4.0],
+                [0.0, 3.0, 4.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+    )
+    mapping = np.asarray([0, 0, 1, 1], dtype=np.int64)
+    values = np.full((1, graph.shape[0]), np.nan, dtype=np.float64)
+    contracted, *_ = _contract_graph(graph, mapping, 2, values)
+
+    np.testing.assert_array_equal(
+        contracted.toarray(),
+        np.asarray([[0.0, 5.0], [5.0, 0.0]]),
+    )
+    assert contracted.has_sorted_indices
+
+
+def test_canonicalize_rejects_symmetrization_overflow() -> None:
+    huge = np.finfo(np.float64).max
+    graph = csr_matrix(
+        (
+            np.asarray([huge, huge], dtype=np.float64),
+            (np.asarray([0, 1]), np.asarray([1, 0])),
+        ),
+        shape=(2, 2),
+    )
+    with pytest.raises(ValueError, match="overflowed during symmetrization"):
+        canonicalize_paris_graph(graph)

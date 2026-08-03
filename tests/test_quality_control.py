@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from scarf.quality_control.cell_cycle import assign_cell_cycle_phase
-from scarf.quality_control.doublets import simulate_doublet_pairs
+from scarf.quality_control.doublets import sample_cluster_pool, simulate_doublet_pairs
 from scarf.quality_control.filtering import gaussian_quantile_bounds
 
 
@@ -21,6 +21,52 @@ def test_simulate_doublet_pairs_is_seeded_and_heterotypic():
     np.testing.assert_array_equal(left, [0, 0, 3, 1, 2, 2, 2, 0, 1, 0, 1, 3])
     np.testing.assert_array_equal(right, [2, 3, 1, 3, 1, 1, 0, 2, 3, 2, 3, 0])
     assert np.all(clusters[left] != clusters[right])
+
+
+def test_simulate_doublet_pairs_allows_homotypic_when_fraction_is_zero():
+    clusters = np.array([0, 0, 1, 1])
+    left, right = simulate_doublet_pairs(
+        clusters,
+        n_sim=40,
+        heterotypic_fraction=0.0,
+        rng=np.random.default_rng(3),
+    )
+
+    assert left.shape == right.shape == (40,)
+    assert np.any(clusters[left] == clusters[right])
+
+
+def test_sample_cluster_pool_respects_fraction_and_cap():
+    clusters = np.array([0, 0, 0, 0, 1, 1, 2])
+    rng = np.random.default_rng(7)
+
+    pool = sample_cluster_pool(
+        clusters,
+        fraction=0.5,
+        max_per_cluster=2,
+        rng=rng,
+    )
+
+    np.testing.assert_array_equal(pool, np.sort(pool))
+    assert set(pool).issubset(set(range(len(clusters))))
+    counts = {int(c): int((clusters[pool] == c).sum()) for c in np.unique(clusters)}
+    assert counts == {0: 2, 1: 1, 2: 1}
+
+    repeated = sample_cluster_pool(
+        clusters,
+        fraction=0.5,
+        max_per_cluster=2,
+        rng=np.random.default_rng(7),
+    )
+    np.testing.assert_array_equal(pool, repeated)
+
+    with pytest.raises(ValueError, match="No cells could be sampled"):
+        sample_cluster_pool(
+            clusters,
+            fraction=0.0,
+            max_per_cluster=2,
+            rng=np.random.default_rng(0),
+        )
 
 
 def test_assign_cell_cycle_phase_preserves_rule_precedence():

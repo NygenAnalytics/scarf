@@ -633,6 +633,42 @@ def test_datastore_scib_metrics(datastore, graph_artifacts, leiden_clustering):
         )
 
 
+def test_metric_lisi_rejects_invalid_inputs(datastore, graph_artifacts):
+    with pytest.raises(TypeError, match="sequence of column names"):
+        datastore.metric_lisi("names")
+    with pytest.raises(ValueError, match="non-empty"):
+        datastore.metric_lisi([])
+    with pytest.raises(TypeError, match="only strings"):
+        datastore.metric_lisi(["names", 1])
+    with pytest.raises(ValueError, match="duplicate names"):
+        datastore.metric_lisi(["names", "names"])
+    with pytest.raises(KeyError, match="__missing_lisi_column__"):
+        datastore.metric_lisi(["__missing_lisi_column__"])
+    with pytest.raises(ValueError, match="KNN graph location"):
+        datastore.metric_lisi(
+            ["names"],
+            use_latest_knn=False,
+            knn_loc=None,
+        )
+    with pytest.raises(ValueError, match="Could not find the knn graph"):
+        datastore.metric_lisi(
+            ["names"],
+            use_latest_knn=False,
+            knn_loc="__missing__/neighbors",
+        )
+    with pytest.raises(ValueError, match="Not a neighbors artifact"):
+        datastore.metric_lisi(
+            ["names"],
+            use_latest_knn=False,
+            from_assay="RNA",
+            knn_loc=datastore.get_latest_graph_loc(
+                from_assay="RNA",
+                cell_key="I",
+                feat_key="hvgs",
+            ),
+        )
+
+
 def test_silhouette_scoring_missing_cluster_labels(datastore):
     result = silhouette_scoring(
         datastore,

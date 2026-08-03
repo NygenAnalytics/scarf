@@ -806,18 +806,134 @@ def test_v2_fixture_read_only(datastore):
     assert datastore.RNA.rawData.shape[0] > 0
 
 
-def test_to_h5ad(datastore, tmp_path):
+@pytest.fixture
+def export_assay_store(toy_crdir_writer, tmp_path):
+    import shutil
+
+    from scarf.datastore.datastore import DataStore
+
+    destination = tmp_path / "export_toy.zarr"
+    shutil.copytree(toy_crdir_writer, destination)
+    return DataStore(
+        str(destination),
+        default_assay="RNA",
+        min_features_per_cell=0,
+        min_cells_per_feature=0,
+        nthreads=1,
+    )
+
+
+def test_to_h5ad_preserves_counts_metadata_and_embeddings(export_assay_store, tmp_path):
+    import h5py
+    from scipy.sparse import csr_matrix
+
     from scarf.writers import to_h5ad
 
-    fn = str(tmp_path / "test_1K_pbmc_citeseq.h5ad")
-    to_h5ad(datastore.RNA, fn)
+    assay = export_assay_store.RNA
+    n_cells = assay.cells.N
+    umap = np.column_stack(
+        [
+            np.linspace(0.0, 1.0, n_cells),
+            np.linspace(2.0, 3.0, n_cells),
+        ]
+    )
+    assay.cells.insert("RNA_UMAP1", umap[:, 0], overwrite=True)
+    assay.cells.insert("RNA_UMAP2", umap[:, 1], overwrite=True)
+    assay.cells.insert(
+        "export_batch", np.array(["a", "b", "a"][:n_cells]), overwrite=True
+    )
+
+    path = tmp_path / "toy_export.h5ad"
+    to_h5ad(assay, str(path), embeddings_cols=["UMAP"])
+
+    expected = csr_matrix(assay.rawData.compute())
+    with h5py.File(path, "r") as h5:
+        shape = tuple(int(x) for x in h5["X"].attrs["shape"])
+        assert shape == (assay.cells.N, assay.feats.N)
+        exported = csr_matrix(
+            (h5["X/data"][:], h5["X/indices"][:], h5["X/indptr"][:]),
+            shape=shape,
+        )
+        np.testing.assert_array_equal(exported.toarray(), expected.toarray())
+        np.testing.assert_array_equal(
+            h5["obs/_index"].asstr()[:],
+            assay.cells.fetch_all("ids").astype(str),
+        )
+        np.testing.assert_array_equal(
+            h5["obs/export_batch"].asstr()[:],
+            assay.cells.fetch_all("export_batch").astype(str),
+        )
+        np.testing.assert_array_equal(
+            h5["var/_index"].asstr()[:],
+            assay.feats.fetch_all("ids").astype(str),
+        )
+        np.testing.assert_array_equal(
+            h5["var/gene_short_name"].asstr()[:],
+            assay.feats.fetch_all("names").astype(str),
+        )
+        emb_cols = sorted(
+            column for column in assay.cells.columns if column.startswith("RNA_UMAP")
+        )
+        assert emb_cols == ["RNA_UMAP1", "RNA_UMAP2"]
+        np.testing.assert_allclose(h5["obsm/X_umap"][:], umap)
+        assert "RNA_UMAP1" not in h5["obs"]
+        assert "RNA_UMAP2" not in h5["obs"]
 
 
-def test_to_mtx(datastore, tmp_path):
+def test_to_mtx_preserves_counts_barcodes_and_features(export_assay_store, tmp_path):
+    from scipy.io import mmread
+    from scipy.sparse import csr_matrix
+
     from scarf.writers import to_mtx
 
-    fn = str(tmp_path / "test_1K_pbmc_citeseq_dir")
-    to_mtx(datastore.RNA, fn)
+    assay = export_assay_store.RNA
+    out_dir = tmp_path / "toy_mtx"
+    to_mtx(assay, str(out_dir), compress=False)
+
+    exported = mmread(out_dir / "matrix.mtx").tocsr()
+    expected = csr_matrix(assay.rawData.compute()).T.tocsr()
+    assert exported.shape == (assay.feats.N, assay.cells.N)
+    np.testing.assert_array_equal(exported.toarray(), expected.toarray())
+
+    barcodes = (out_dir / "barcodes.tsv").read_text().splitlines()
+    assert barcodes == list(assay.cells.fetch_all("ids").astype(str))
+
+    features = [
+        line.split("\t")
+        for line in (out_dir / "genes.tsv").read_text().splitlines()
+        if line
+    ]
+    assert [row[0] for row in features] == list(
+        assay.feats.fetch_all("ids").astype(str)
+    )
+    assert [row[1] for row in features] == list(
+        assay.feats.fetch_all("names").astype(str)
+    )
+
+
+def test_to_mtx_compress_writes_gzipped_matrix_market(export_assay_store, tmp_path):
+    import gzip
+
+    from scipy.io import mmread
+    from scipy.sparse import csr_matrix
+
+    from scarf.writers import to_mtx
+
+    assay = export_assay_store.RNA
+    out_dir = tmp_path / "toy_mtx_gz"
+    to_mtx(assay, str(out_dir), compress=True)
+
+    assert (out_dir / "matrix.mtx.gz").is_file()
+    assert (out_dir / "barcodes.tsv.gz").is_file()
+    assert (out_dir / "features.tsv.gz").is_file()
+
+    exported = mmread(gzip.open(out_dir / "matrix.mtx.gz", "rt")).tocsr()
+    expected = csr_matrix(assay.rawData.compute()).T.tocsr()
+    np.testing.assert_array_equal(exported.toarray(), expected.toarray())
+
+    with gzip.open(out_dir / "barcodes.tsv.gz", "rt") as handle:
+        barcodes = [line.strip() for line in handle if line.strip()]
+    assert barcodes == list(assay.cells.fetch_all("ids").astype(str))
 
 
 def test_zarr_subset(datastore, tmp_path):

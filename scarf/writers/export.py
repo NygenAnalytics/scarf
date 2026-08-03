@@ -149,7 +149,8 @@ def to_h5ad(
         emb_names = np.array(emb_cols)
         c = pd.Series([x[:-1] for x in emb_names])
         for i in c.unique():
-            data = np.array([assay.cells.fetch_all(x) for x in emb_names[c == i]]).T
+            matched = sorted(str(name) for name in emb_names[c == i])
+            data = np.array([assay.cells.fetch_all(x) for x in matched]).T
             h5["obsm"].create_dataset(
                 i.lower().replace(f"{assay.name.lower()}_", "X_"), data=data
             )

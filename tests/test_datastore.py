@@ -540,13 +540,55 @@ class TestDataStore:
             assert actual.equals(expected)
 
     def test_repr(self, datastore):
-        # TODO: Test if the expected values are printed
-        print(datastore)
+        text = repr(datastore)
+        active = datastore.cells.active_index("I").shape[0]
+        assert f"DataStore has {active} ({datastore.cells.N}) cells" in text
+        for assay_name in datastore.assay_names:
+            assert assay_name in text
+            assay = datastore._get_assay(assay_name)
+            assert (
+                f"{assay_name} assay has {assay.feats.fetch_all('I').sum()} "
+                f"({assay.feats.N}) features"
+            ) in text
+        assert "Cell metadata:" in text
+        assert "ids" in text
 
-    def test_get_imputed(self, datastore):
-        # TODO: Test the output values
-        values = datastore.get_imputed(feature_name="CD4")
-        assert values.shape == datastore.cells.fetch("I").shape
+    def test_get_imputed(self, graph_artifacts, datastore):
+        feature_name = "CD4"
+        raw = datastore.get_cell_vals(from_assay="RNA", cell_key="I", k=feature_name)
+        values = datastore.get_imputed(
+            feature_name=feature_name,
+            from_assay="RNA",
+            cell_key="I",
+            feat_key="hvgs",
+            t=2,
+            cache_operator=False,
+        )
+        assert values.shape == raw.shape
+        assert np.all(np.isfinite(values))
+        assert not np.allclose(values, raw)
+
+        from scarf.neighbors.diffusion import diffusion_operator
+
+        graph = datastore.load_graph(
+            from_assay="RNA",
+            cell_key="I",
+            feat_key="hvgs",
+            symmetric=True,
+            upper_only=False,
+        )
+        expected = diffusion_operator(graph, power=2).dot(raw)
+        np.testing.assert_allclose(values, expected)
+
+        smoother = datastore.get_imputed(
+            feature_name=feature_name,
+            from_assay="RNA",
+            cell_key="I",
+            feat_key="hvgs",
+            t=4,
+            cache_operator=False,
+        )
+        assert smoother.std() < values.std()
 
     def test_mean_features(self, datastore):
         import pytest
@@ -819,8 +861,18 @@ class TestDataStore:
         assert hash(tuple((df.values.flatten()))) == -3925915741848261436
 
     def test_to_anndata(self, datastore):
-        # TODO: Check if all the attributes copied to anndata
-        datastore.to_anndata()
+        from scipy import sparse
+
+        adata = datastore.to_anndata()
+        assert sparse.isspmatrix_csr(adata.X)
+        assert adata.n_obs == len(datastore.cells.active_index("I"))
+        assert adata.n_vars == datastore.RNA.feats.N
+        assert list(adata.obs_names) == list(datastore.cells.fetch("ids", key="I"))
+        assert list(adata.var_names) == list(datastore.RNA.feats.fetch_all("ids"))
+        np.testing.assert_array_equal(
+            adata.X.toarray(),
+            datastore.RNA.to_raw_sparse("I").toarray(),
+        )
 
     def test_run_topacedo_sampler(self, paris_clustering, topacedo_sampler):
         assert topacedo_sampler.dtype == bool

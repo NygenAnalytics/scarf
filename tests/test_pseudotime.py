@@ -7,7 +7,10 @@ from zarr.storage import MemoryStore
 
 from scarf.assay import Assay
 from scarf.storage.budget import ResourceBudget
-from scarf.trajectory.feature_dynamics import knn_clustering
+from scarf.trajectory.feature_dynamics import (
+    aggregate_feature_profiles,
+    knn_clustering,
+)
 from scarf.datastore.datastore import DataStore
 from scarf.trajectory.feature_dynamics import (
     scatter_feature_clusters as _scatter_feature_clusters,
@@ -628,3 +631,60 @@ def test_feature_cluster_scatter_honors_custom_unassigned_value():
     assert np.array_equal(values, [0, 1, 0, 2, 0])
     with pytest.raises(ValueError, match="conflicts"):
         _scatter_feature_clusters(3, np.array([0]), np.array([1]), 1)
+
+
+def test_aggregate_feature_profiles_orders_filters_and_bins():
+    values = np.array(
+        [
+            [3.0, 5.0, 0.01],
+            [1.0, 5.0, 0.01],
+            [2.0, 5.0, 0.01],
+            [0.0, 5.0, 0.01],
+        ],
+        dtype=float,
+    )
+    ordering = np.array([3, 1, 2, 0])
+    feature_indices = np.array([10, 11, 12])
+
+    binned, valid = aggregate_feature_profiles(
+        values,
+        ordering,
+        feature_indices,
+        min_expression=0.1,
+        window_size=2,
+        n_bins=2,
+        smooth=False,
+        z_scale=False,
+    )
+
+    np.testing.assert_array_equal(valid, [True, False, False])
+    assert binned.shape == (3, 2)
+    np.testing.assert_allclose(binned[0], [0.5, 2.5])
+    np.testing.assert_array_equal(binned[1], 0.0)
+    np.testing.assert_array_equal(binned[2], 0.0)
+
+    z_binned, z_valid = aggregate_feature_profiles(
+        values,
+        ordering,
+        feature_indices,
+        min_expression=0.1,
+        window_size=2,
+        n_bins=2,
+        smooth=False,
+        z_scale=True,
+    )
+    np.testing.assert_array_equal(z_valid, valid)
+    np.testing.assert_allclose(z_binned[0].mean(), 0.0, atol=1e-12)
+    assert z_binned[0, 0] < 0 < z_binned[0, 1]
+
+    with pytest.raises(ValueError, match="non-finite values"):
+        aggregate_feature_profiles(
+            np.array([[1.0, np.nan], [2.0, 3.0]]),
+            np.array([0, 1]),
+            np.array([0, 1]),
+            min_expression=0.0,
+            window_size=1,
+            n_bins=1,
+            smooth=False,
+            z_scale=False,
+        )

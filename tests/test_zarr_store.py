@@ -856,6 +856,52 @@ def test_copy_array_and_metadata_tree(tmp_path):
     assert copied_metadata["score"].attrs["display"] == {"label": "Score"}
 
 
+def test_copy_zarr_array_rejects_shape_and_rank_mismatch(tmp_path):
+    source_root = zarr.open_group(str(tmp_path / "source.zarr"), mode="w")
+    target_root = zarr.open_group(str(tmp_path / "target.zarr"), mode="w")
+    source = create_numeric_array(
+        source_root,
+        "data",
+        normed_array_spec(8, 4, profile="fast_local"),
+    )
+    mismatched = create_numeric_array(
+        target_root,
+        "data",
+        normed_array_spec(8, 3, profile="fast_local"),
+    )
+    with pytest.raises(ValueError, match="Shape mismatch"):
+        copy_zarr_array(source, mismatched)
+
+    vector = source_root.create_array("vector", data=np.arange(8, dtype=np.float32))
+    vector_target = target_root.create_array(
+        "vector",
+        data=np.zeros(8, dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="only supports 2D"):
+        copy_zarr_array(vector, vector_target)
+
+
+def test_copy_group_tree_resolves_byte_string_metadata(tmp_path):
+    source_root = zarr.open_group(str(tmp_path / "source.zarr"), mode="w")
+    target_root = zarr.open_group(str(tmp_path / "target.zarr"), mode="w")
+    metadata = source_root.create_group("metadata")
+    labels = np.array([b"alpha", b"beta-gamma", b"x"])
+    column = metadata.create_array("labels", data=labels)
+    column.attrs["display"] = {"label": "Labels"}
+    assert np.dtype(column.dtype).kind == "S"
+
+    copied = target_root.create_group("metadata")
+    copy_zarr_group_tree(metadata, copied)
+
+    np.testing.assert_array_equal(
+        np.asarray(copied["labels"][:]).astype(str),
+        ["alpha", "beta-gamma", "x"],
+    )
+    assert copied["labels"].attrs["display"] == {"label": "Labels"}
+    assert np.dtype(copied["labels"].dtype).kind == "U"
+    assert np.dtype(copied["labels"].dtype).itemsize // 4 >= len("beta-gamma")
+
+
 def test_staged_normed_array_reuses_matching_shape(tmp_path):
     path = str(tmp_path / "cache" / "normalized.zarr")
     first = create_or_open_staged_normed_array(path, (32, 4))

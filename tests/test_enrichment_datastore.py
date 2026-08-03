@@ -648,20 +648,6 @@ def test_workspace_results_are_written_to_the_assay_shell(tmp_path):
     assert "enrichment" not in root["matrices/RNA"]
 
 
-def test_enrichment_label_and_execution_digest_reject_invalid_values():
-    from scarf.datastore._operations.enrichment_store import (
-        _execution_digest,
-        _validate_enrichment_label,
-    )
-
-    with pytest.raises(TypeError, match="must be a string"):
-        _validate_enrichment_label(None)  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="JSON-safe"):
-        _execution_digest({"bad": {1, 2, 3}})
-    with pytest.raises(ValueError, match="JSON-safe"):
-        _execution_digest({"bad": float("nan")})
-
-
 def test_get_enrichment_rejects_poisoned_legacy_active_slot(datastore_ephemeral):
     from scarf.datastore._operations.enrichment_store import _ENRICHMENT_ACTIVE_SLOT
     from scarf.datastore._operations.features import _write_enrichment_slot

@@ -39,6 +39,7 @@ docs/**/scarf_datasets/
 **/*.zarr/
 .coverage
 coverage.xml
+coverage.json
 htmlcov/
 .pytest_cache
 interrogate_badge.svg

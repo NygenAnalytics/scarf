@@ -22,6 +22,49 @@ def test_hierarchy_positions_are_pure_and_complete():
     assert positions[0][1] < positions[2][1]
 
 
+def test_hierarchy_positions_rejects_non_trees():
+    cyclic = nx.DiGraph([(0, 1), (1, 2), (2, 0)])
+    with pytest.raises(TypeError, match="not a tree"):
+        _hierarchy_positions(cyclic)
+
+
+def test_tree_palette_requires_complete_color_key():
+    from scarf.plotting.cluster_tree import _tree_palette
+
+    with pytest.raises(KeyError, match="missing in `color_key`"):
+        _tree_palette(
+            object(),
+            ["A", "B"],
+            cmap="tab20",
+            color_key={"A": "#ff0000"},
+        )
+    color_key = {"A": "#ff0000", "B": "#00ff00"}
+    palette = _tree_palette(
+        object(),
+        ["A", "B"],
+        cmap="tab20",
+        color_key=color_key,
+    )
+    assert palette == color_key
+    assert palette is not color_key
+
+
+def test_cluster_tree_rejects_misaligned_color_values():
+    from types import SimpleNamespace
+
+    from scarf.plotting.cluster_tree import cluster_tree
+
+    store = SimpleNamespace(
+        _prepare_cluster_tree=lambda **_kwargs: {
+            "graph": nx.DiGraph([(2, 0), (2, 1)]),
+            "clusters": np.array([1, 1]),
+            "color_values": np.array([0.1, 0.2, 0.3]),
+        }
+    )
+    with pytest.raises(ValueError, match="misaligned"):
+        cluster_tree(store, show=False)
+
+
 def test_marker_heatmap_returns_owned_result(
     marker_search,
     datastore,

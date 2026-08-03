@@ -337,3 +337,75 @@ def test_collect_topology_rejects_synthetic_join_component_root() -> None:
     graph = _canonical_graph(4, [(0, 1), (2, 3)])
     with pytest.raises(ValueError, match="do not match synthetic joins"):
         collect_topology_statistics(graph, hierarchy)
+
+
+def test_aggregate_plateau_statistics_rejects_inconsistent_topology() -> None:
+    hierarchy = _balanced_four_hierarchy()
+    forest = collapse_equal_height_plateaus(hierarchy)
+    graph = _canonical_graph(4, [(0, 1), (2, 3), (0, 2)])
+    topology = collect_topology_statistics(graph, hierarchy)
+
+    with pytest.raises(ValueError, match="leaf degree statistics"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            forest,
+            TopologyStatistics(
+                leaf_degrees=np.zeros(3, dtype=np.int64),
+                lca_edge_counts=topology.lca_edge_counts,
+                component_edge_counts=topology.component_edge_counts,
+            ),
+        )
+    with pytest.raises(ValueError, match="LCA edge statistics"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            forest,
+            TopologyStatistics(
+                leaf_degrees=topology.leaf_degrees,
+                lca_edge_counts=np.zeros(2, dtype=np.int64),
+                component_edge_counts=topology.component_edge_counts,
+            ),
+        )
+    with pytest.raises(ValueError, match="component edge statistics"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            forest,
+            TopologyStatistics(
+                leaf_degrees=topology.leaf_degrees,
+                lca_edge_counts=topology.lca_edge_counts,
+                component_edge_counts=np.zeros(2, dtype=np.int64),
+            ),
+        )
+    with pytest.raises(ValueError, match="disagree on the total edge count"):
+        aggregate_plateau_statistics(
+            hierarchy,
+            forest,
+            TopologyStatistics(
+                leaf_degrees=topology.leaf_degrees,
+                lca_edge_counts=topology.lca_edge_counts,
+                component_edge_counts=topology.component_edge_counts + 1,
+            ),
+        )
+
+    synthetic = _hierarchy(
+        [(0, 1), (2, 3), (4, 5)],
+        [1.0, 1.0, np.inf],
+        component_roots=[4, 5],
+        synthetic_joins=[False, False, True],
+    )
+    synthetic_forest = collapse_equal_height_plateaus(synthetic)
+    synthetic_graph = _canonical_graph(4, [(0, 1), (2, 3)])
+    synthetic_topology = collect_topology_statistics(synthetic_graph, synthetic)
+    poisoned_counts = np.asarray(synthetic_topology.lca_edge_counts).copy()
+    poisoned_counts[np.asarray(synthetic.synthetic_joins)] = 1
+    component_counts = np.zeros_like(synthetic_topology.component_edge_counts)
+    component_counts[0] = int(poisoned_counts.sum())
+    with pytest.raises(ValueError, match="synthetic joins cannot contain"):
+        aggregate_plateau_statistics(
+            synthetic,
+            synthetic_forest,
+            TopologyStatistics(
+                leaf_degrees=np.asarray(synthetic_topology.leaf_degrees).copy(),
+                lca_edge_counts=poisoned_counts,
+                component_edge_counts=component_counts,
+            ),
+        )

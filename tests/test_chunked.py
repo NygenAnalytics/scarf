@@ -53,6 +53,18 @@ class TestChunkedArrayParity:
             np.asarray(ca.count_nonzero(axis=1)), np.count_nonzero(dense, axis=1)
         )
         assert np.array_equal(np.asarray(ca.argmax(axis=1)), dense.argmax(1))
+        with pytest.raises(NotImplementedError, match="argmax\\(axis=0\\)"):
+            ca.argmax(axis=0).compute()
+
+    def test_mean_and_std_matches_numpy_and_rejects_other_axes(self, backed_pair):
+        ca, dense = backed_pair
+        mean, std = ca.mean_and_std(axis=0)
+        np.testing.assert_allclose(mean, dense.mean(axis=0))
+        np.testing.assert_allclose(std, dense.std(axis=0))
+        with pytest.raises(
+            NotImplementedError, match="mean_and_std only supports axis=0"
+        ):
+            ca.mean_and_std(axis=1)
 
     def test_boolean_comparison_reduction(self, backed_pair):
         ca, dense = backed_pair
@@ -124,6 +136,8 @@ class TestChunkedArrayParity:
         rng = np.random.default_rng(3)
         loadings = rng.standard_normal((dense.shape[1], 4))
         assert np.allclose(ca.dot(loadings).compute(), dense @ loadings)
+        with pytest.raises(NotImplementedError, match="Column-indexing after .dot"):
+            ca.dot(loadings)[:, np.array([0, 2])]
 
     def test_from_numpy(self, backed_pair):
         _, dense = backed_pair
