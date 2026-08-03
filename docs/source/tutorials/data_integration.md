@@ -12,26 +12,23 @@ kernelspec:
   name: python3
 ---
 
-# Merging datasets for joint analysis
+(integration_guide)=
 
-Merging places cells from compatible assays into one datastore. It aligns the
-feature order, preserves selected source metadata, and records each cell's
-source. It does not remove batch effects. This guide deliberately builds an
-uncorrected graph first so the source structure is visible before any
-correction.
+# Integrating datasets by merging
 
-Use {doc}`choosing_integration_methods` if you are deciding between merging,
-batch correction, mapping, and multimodal integration.
+Dataset integration starts by placing compatible assays in one datastore.
+`AssayMerge` aligns their feature order, carries selected metadata, and records
+the source of each cell. It does not alter expression values or correct the
+joint representation. This guide builds that uncorrected baseline first.
 
-## Download compatible source stores
+## Load compatible source stores
 
-The control and interferon-stimulated Kang PBMC datasets share an RNA feature
-space. They also differ in biological treatment, so `sample_id` is not a purely
-technical batch variable.
+The control and interferon beta stimulated Kang PBMC stores use the same RNA
+feature space. Their publication recipe physically removes cells without an
+imported cell-type label before running source-level quality control. The
+remaining `I` cell key records that quality-control selection.
 
 ```{code-cell} ipython3
-import matplotlib.pyplot as plt
-
 import scarf
 
 scarf.configure_output(level="ERROR", progress=True)
@@ -52,15 +49,16 @@ ds_ctrl = scarf.DataStore(f"{ctrl_path}/data.zarr", nthreads=4)
 ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
 ```
 
-Check feature identities and assay types before merging real datasets. A shared
-gene symbol is not sufficient if genome builds or quantification conventions
-differ.
+Check assay types, feature identities, genome builds, and quantification
+conventions before merging other datasets. Matching gene symbols alone do not
+establish compatible measurements.
 
 ## Merge counts and metadata
 
-`AssayMerge` writes a new Zarr store. `names` supplies the source labels,
-`source_column` names their cell-metadata column, and `prepend_text` prevents
-source columns from colliding with new analysis results.
+`names` supplies the source labels, `source_column` names their metadata
+column, and `prepend_text` prevents imported columns from colliding with new
+analysis results. `reset_cell_filter=False` preserves the source
+quality-control selections.
 
 ```{code-cell} ipython3
 merged_path = "scarf_datasets/kang_dataset_merging.zarr"
@@ -78,91 +76,102 @@ scarf.AssayMerge(
 ds = scarf.DataStore(merged_path, nthreads=4)
 ```
 
-The merge preserves each input cell filter because
-`reset_cell_filter=False`. It aligns counts and metadata under the same row
-permutation, prefixes imported columns with `orig_`, and prefixes cell IDs by
-source.
+The merged active population contains labelled cells from both sources.
 
 ```{code-cell} ipython3
-ds.cells.to_pandas_dataframe(
-    ["ids", "sample_id", "orig_cluster_labels", "I"]
-).head()
-```
-
-Rows with `I=False` remain in the merged metadata but are inactive. An inactive
-row can therefore show a missing imported label without indicating a failed
-merge.
-
-```{code-cell} ipython3
-ds.cells.to_pandas_dataframe(
-    ["sample_id"],
+active_cells = ds.cells.to_pandas_dataframe(
+    ["sample_id", "orig_cluster_labels"],
     key="I",
-)["sample_id"].value_counts()
-```
-
-## Build an uncorrected joint graph
-
-The naive graph provides a baseline. If samples separate, that observation
-defines what a correction method would need to change. It does not by itself
-show whether the separation is technical or biological.
-
-```{code-cell} ipython3
-ds.mark_hvgs(
-    min_cells=10,
-    top_n=2000,
-    min_mean=-3,
-    max_mean=2,
-    max_var=6,
-    show_plot=False,
 )
-ds.run_normalization(feat_key="hvgs")
-ds.run_pca(dims=25)
-ds.build_embedding_initialization()
-ds.build_ann_index()
-ds.query_neighbors(k=21)
-ds.build_connectivity_map()
-ds.run_umap(
-    n_epochs=250,
-    spread=5,
-    min_dist=1,
-    parallel=True,
+active_cells.groupby("sample_id")["orig_cluster_labels"].agg(
+    cells="count",
+    cell_types="nunique",
 )
 ```
 
+## Build the uncorrected baseline
+
+The standard RNA pipeline records the complete analysis chain as reusable
+artifacts. Filtering is disabled because the source selections were retained.
+The graph uses 21 neighbours so the same graph parameters can be compared with
+the correction methods on the next page.
+
 ```{code-cell} ipython3
-figure, axes = plt.subplots(1, 2, figsize=(12, 4))
-comparison_panels = (
-    ("Source", "sample_id"),
-    ("Imported cell type", "orig_cluster_labels"),
+baseline = ds.pipeline.run(
+    filtering=False,
+    cell_cycle_scoring=False,
+    highly_variable_features={
+        "min_cells": 10,
+        "top_n": 2000,
+        "min_mean": -3,
+        "max_mean": 2,
+        "max_var": 6,
+    },
+    pca={"dims": 25},
+    neighbors={"k": 21},
+    umap={
+        "n_epochs": 250,
+        "spread": 5,
+        "min_dist": 1,
+        "parallel": True,
+    },
+    leiden={1.0: {"label": "integration_clusters"}},
+    paris=False,
+    doublet_scoring=False,
+    markers=False,
 )
-for axis, (title, color_by) in zip(axes, comparison_panels, strict=True):
-    ds.plots.embedding(
-        layout_key="RNA_UMAP",
-        color_by=color_by,
-        legend_loc="right",
-        show_titles=False,
-        target=axis,
-        show=False,
-    )
+```
+
+One plotting call compares source identity with the imported cell types on the
+same layout.
+
+```{code-cell} ipython3
+comparison = ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by=["sample_id", "orig_cluster_labels"],
+    n_columns=2,
+    show_titles=False,
+    show=False,
+)
+for axis, title in zip(
+    comparison.axes.values(),
+    ("Source", "Imported cell type"),
+    strict=True,
+):
     axis.set_title(title)
-figure.tight_layout()
+comparison.show()
 ```
 
-The sample panel shows how strongly source identity structures the uncorrected
-graph. The label panel checks whether imported cell types still occupy coherent
-regions. In this experiment, source and interferon treatment are confounded, so
-separation cannot be classified as a removable batch effect from these plots
-alone.
+A proportional composition plot makes source dominance within the uncorrected
+Leiden clusters explicit.
 
-```{raw} html
-<span id="partial-pca"></span>
-<span id="partial-pca-integration"></span>
-<span id="harmony"></span>
-<span id="harmony-batch-correction"></span>
+```{code-cell} ipython3
+ds.plots.composition(
+    category_by="sample_id",
+    sample_by="RNA_clusters",
+    kind="stacked",
+    show_percent_labels=True,
+)
 ```
 
-## Batch correction
+iLISI summarizes local source mixing on a zero-to-one scale. Zero means the
+median neighbourhood effectively contains cells from only one source. One is
+the maximum mixing score across the observed sources.
 
-Use {doc}`batch_correction` to compare partial PCA and Harmony, then
-{doc}`integration_metrics` to measure mixing and label preservation. Do not use
-corrected coordinates as input for condition-level differential expression.
+```{code-cell} ipython3
+uncorrected_ilisi = ds.metric_ilisi(
+    batch_colname="sample_id",
+    perplexity=7,
+)
+{"uncorrected iLISI": round(uncorrected_ilisi, 3)}
+```
+
+The value `0.000` therefore indicates essentially no source mixing in the
+median uncorrected neighbourhood.
+
+The stimulated sample received interferon beta, and PBMC cell types do not all
+respond identically to that treatment. Source-associated structure can
+therefore include biological response as well as technical variation. This
+page establishes the uncorrected observation; {doc}`batch_correction` compares
+how partial PCA and Harmony change it. Keep uncorrected counts for
+condition-level differential expression.

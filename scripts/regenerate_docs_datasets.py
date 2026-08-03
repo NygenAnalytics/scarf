@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Rebuild the analyzed Zarr stores that Cytebase publishes for the documentation.
 
-Each store is built from the dataset's raw counts, so the result uses the
-current Zarr layout and carries artifact provenance. This script only writes to
-`build/cytebase`; `scripts/publish_docs_datasets.py` uploads the result.
+Source stores are built from raw counts. Derived stores are rebuilt from their
+declared published inputs. Every result uses the current Zarr layout and carries
+artifact provenance. This script only writes to `build/cytebase`;
+`scripts/publish_docs_datasets.py` uploads the result.
 
 Example:
     uv run python scripts/regenerate_docs_datasets.py tenx_5K_pbmc_rnaseq
@@ -23,10 +24,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_DIR = REPO_ROOT / "docs/source/developers/dataset_manifests"
 STORE_NAME = "data.zarr"
 ARCHIVE_NAME = f"{STORE_NAME}.tar.gz"
+LEGACY_SUFFIX = "_legacy_master"
 
 PBMC_FILTERS = {
     "method": "manual",
@@ -34,6 +38,10 @@ PBMC_FILTERS = {
     "highs": [15000, 4000, 15],
     "lows": [1000, 500, 0],
 }
+
+KANG_CONTROL_DATASET = "kang_15K_pbmc_rnaseq"
+KANG_STIMULATED_DATASET = "kang_14K_ifnb-pbmc_rnaseq"
+KANG_INTEGRATED_DATASET = "kang_29K_ctrl-ifnb_pbmc_rnaseq"
 
 
 def _convert_cellranger_h5(source: Path, store: Path) -> None:
@@ -43,19 +51,52 @@ def _convert_cellranger_h5(source: Path, store: Path) -> None:
     scarf.CrToZarr(reader, zarr_loc=str(store)).dump()
 
 
-def _convert_cellranger_mtx(source: Path, store: Path) -> None:
-    import scarf
-
-    reader = scarf.CrDirReader(str(source))
-    scarf.CrToZarr(reader, zarr_loc=str(store)).dump()
-
-
 def _convert_h5ad(source: Path, store: Path) -> None:
     import scarf
 
     inspection = scarf.inspect_h5ad(str(source / "data.h5ad"))
     reader = scarf.H5adReader.from_inspect(inspection)
     scarf.H5adToZarr(reader, zarr_loc=str(store)).dump()
+
+
+def _labelled_cluster_mask(values: Any) -> np.ndarray:
+    labels = np.asarray(values).astype(str)
+    labels = np.char.strip(labels)
+    return (labels != "") & (np.char.lower(labels) != "nan")
+
+
+def _derive_labelled_kang_store(
+    source_paths: dict[str, Path],
+    store: Path,
+) -> None:
+    import scarf
+
+    if len(source_paths) != 1:
+        raise ValueError("A labelled Kang store requires exactly one source")
+    source_dataset, source_path = next(iter(source_paths.items()))
+    source = scarf.DataStore(
+        str(source_path / STORE_NAME),
+        nthreads=4,
+        zarr_mode="r",
+    )
+    keep = _labelled_cluster_mask(source.cells.fetch_all("cluster_labels"))
+    if not keep.any():
+        raise RuntimeError(f"No labelled cells remain in {source_dataset}")
+
+    scarf.SubsetZarr(
+        zarr_loc=str(store),
+        assays=[source.RNA],
+        cell_idx=np.flatnonzero(keep),
+        reset_cell_filter=True,
+        overwrite_existing_file=True,
+        nthreads=4,
+    ).dump()
+    kept = int(keep.sum())
+    removed = int((~keep).sum())
+    print(
+        f"Derived {store} from {source_dataset}: physically removed "
+        f"{removed} unlabelled cells and retained {kept}"
+    )
 
 
 def _analyze_pbmc(store: Any) -> None:
@@ -114,6 +155,51 @@ def _analyze_kang(store: Any) -> None:
         neighbors={"k": 21},
         umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
         leiden={1.0: {"label": "leiden_cluster"}},
+        paris=False,
+        doublet_scoring=False,
+        markers=False,
+    )
+
+
+def _merge_kang(source_paths: dict[str, Path], store: Path) -> None:
+    import scarf
+
+    sources = [
+        scarf.DataStore(
+            str(source_paths[dataset] / STORE_NAME),
+            nthreads=4,
+        )
+        for dataset in (KANG_CONTROL_DATASET, KANG_STIMULATED_DATASET)
+    ]
+
+    scarf.AssayMerge(
+        zarr_path=str(store),
+        assays=[source.RNA for source in sources],
+        names=["ctrl", "stim"],
+        merge_assay_name="RNA",
+        prepend_text="orig",
+        reset_cell_filter=False,
+        source_column="sample_id",
+        overwrite=True,
+        nthreads=4,
+    ).dump()
+
+
+def _analyze_kang_integration(store: Any) -> None:
+    store.pipeline.run(
+        filtering=False,
+        cell_cycle_scoring=False,
+        highly_variable_features={
+            "min_cells": 10,
+            "top_n": 2000,
+            "min_mean": -3,
+            "max_mean": 2,
+            "max_var": 6,
+        },
+        pca={"dims": 25},
+        neighbors={"k": 21},
+        umap={"n_epochs": 250, "spread": 5, "min_dist": 1, "parallel": True},
+        leiden={1.0: {"label": "integration_clusters"}},
         paris=False,
         doublet_scoring=False,
         markers=False,
@@ -185,7 +271,7 @@ def _analyze_atac(store: Any) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class DatasetRecipe:
+class RawDatasetRecipe:
     """One publishable store: where its counts come from and how it is analyzed."""
 
     sources: tuple[str, ...]
@@ -193,12 +279,25 @@ class DatasetRecipe:
     analyze: Callable[[Any], None]
     summary: str
     default_assay: str = "RNA"
-    carry_columns: tuple[str, ...] = ()
     drop_columns: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class DerivedDatasetRecipe:
+    """One publishable store derived from other published stores."""
+
+    source_datasets: tuple[str, ...]
+    derive: Callable[[dict[str, Path], Path], None]
+    analyze: Callable[[Any], None]
+    summary: str
+    default_assay: str = "RNA"
+
+
+type DatasetRecipe = RawDatasetRecipe | DerivedDatasetRecipe
+
+
 RECIPES: dict[str, DatasetRecipe] = {
-    "tenx_5K_pbmc_rnaseq": DatasetRecipe(
+    "tenx_5K_pbmc_rnaseq": RawDatasetRecipe(
         sources=("data.h5",),
         convert=_convert_cellranger_h5,
         analyze=_analyze_pbmc,
@@ -207,7 +306,7 @@ RECIPES: dict[str, DatasetRecipe] = {
             "Leiden 0.5, Paris, doublet scores, markers"
         ),
     ),
-    "bastidas-ponce_4K_pancreas-d15_rnaseq": DatasetRecipe(
+    "bastidas-ponce_4K_pancreas-d15_rnaseq": RawDatasetRecipe(
         sources=("data.h5ad",),
         convert=_convert_h5ad,
         analyze=_analyze_pancreas,
@@ -217,7 +316,7 @@ RECIPES: dict[str, DatasetRecipe] = {
         ),
         drop_columns=("X_pca*",),
     ),
-    "tenx_8K_pbmc_citeseq": DatasetRecipe(
+    "tenx_8K_pbmc_citeseq": RawDatasetRecipe(
         sources=("data.h5",),
         convert=_convert_cellranger_h5,
         analyze=_analyze_citeseq,
@@ -226,21 +325,34 @@ RECIPES: dict[str, DatasetRecipe] = {
             "integrated graphs"
         ),
     ),
-    "kang_15K_pbmc_rnaseq": DatasetRecipe(
-        sources=("matrix.mtx.gz", "features.tsv.gz", "barcodes.tsv.gz"),
-        convert=_convert_cellranger_mtx,
+    KANG_CONTROL_DATASET: DerivedDatasetRecipe(
+        source_datasets=(f"{KANG_CONTROL_DATASET}{LEGACY_SUFFIX}",),
+        derive=_derive_labelled_kang_store,
         analyze=_analyze_kang,
-        summary="2000 HVGs, PCA 25, k=21 graph, UMAP, Leiden 1.0",
-        carry_columns=("cluster_labels",),
+        summary=(
+            "Physical removal of unlabelled cells, manual QC, 2000 HVGs, "
+            "PCA 25, k=21 graph, UMAP, and Leiden 1.0"
+        ),
     ),
-    "kang_14K_ifnb-pbmc_rnaseq": DatasetRecipe(
-        sources=("matrix.mtx.gz", "features.tsv.gz", "barcodes.tsv.gz"),
-        convert=_convert_cellranger_mtx,
+    KANG_STIMULATED_DATASET: DerivedDatasetRecipe(
+        source_datasets=(f"{KANG_STIMULATED_DATASET}{LEGACY_SUFFIX}",),
+        derive=_derive_labelled_kang_store,
         analyze=_analyze_kang,
-        summary="2000 HVGs, PCA 25, k=21 graph, UMAP, Leiden 1.0",
-        carry_columns=("cluster_labels",),
+        summary=(
+            "Physical removal of unlabelled cells, manual QC, 2000 HVGs, "
+            "PCA 25, k=21 graph, UMAP, and Leiden 1.0"
+        ),
     ),
-    "tenx_10K_pbmc-v1_atacseq": DatasetRecipe(
+    KANG_INTEGRATED_DATASET: DerivedDatasetRecipe(
+        source_datasets=(KANG_CONTROL_DATASET, KANG_STIMULATED_DATASET),
+        derive=_merge_kang,
+        analyze=_analyze_kang_integration,
+        summary=(
+            "Control and IFNB assay merge, 2000 HVGs, PCA 25, k=21 graph, "
+            "UMAP, and Leiden 1.0"
+        ),
+    ),
+    "tenx_10K_pbmc-v1_atacseq": RawDatasetRecipe(
         sources=("data.h5",),
         convert=_convert_cellranger_h5,
         analyze=_analyze_atac,
@@ -323,46 +435,29 @@ def _drop_columns(
     print(f"Dropped {len(dropped)} imported column(s) from {store}")
 
 
-def _carry_columns(
+def _resolve_derived_sources(
     *,
     repository: Any,
-    dataset: str,
-    store: Path,
-    columns: Sequence[str],
+    source_datasets: Sequence[str],
+    local_sources: dict[str, Path],
     work: Path,
-    default_assay: str,
-) -> None:
-    """Copy author-provided annotations that only exist in the published store."""
-    import numpy as np
-    import zarr
-
-    from scarf import DataStore
-    from scarf.storage.types import as_zarr_array, as_zarr_group
-
-    repository.download_dataset(dataset, destination=str(work), zarr=True)
-    legacy = zarr.open_group(str(work / dataset / STORE_NAME), mode="r")
-    legacy_cells = as_zarr_group(legacy["cellData"], name="cellData")
-    legacy_ids = np.asarray(as_zarr_array(legacy_cells["ids"], name="ids")[:]).astype(
-        str
-    )
-    positions = {value: index for index, value in enumerate(legacy_ids)}
-
-    target = DataStore(str(store), default_assay=default_assay, nthreads=1)
-    target_ids = np.asarray(target.cells.fetch_all("ids")).astype(str)
-    missing = [value for value in target_ids if value not in positions]
-    if missing:
-        raise RuntimeError(
-            f"{len(missing)} cells of {dataset} are absent from the published "
-            f"store, first missing id {missing[0]!r}"
+) -> dict[str, Path]:
+    resolved: dict[str, Path] = {}
+    for source_dataset in source_datasets:
+        if source_dataset in local_sources:
+            source_path = local_sources[source_dataset]
+            if not (source_path / STORE_NAME).is_dir():
+                raise FileNotFoundError(
+                    f"Local source {source_dataset} has no {STORE_NAME}: {source_path}"
+                )
+            resolved[source_dataset] = source_path
+            continue
+        resolved[source_dataset] = repository.download_dataset(
+            source_dataset,
+            destination=str(work),
+            zarr=True,
         )
-    order = np.array([positions[value] for value in target_ids])
-    for column in columns:
-        if column not in legacy_cells:
-            raise RuntimeError(f"{dataset} has no published column {column!r}")
-        source = as_zarr_array(legacy_cells[column], name=column)
-        values = np.asarray(source[:])[order]
-        target.cells.insert(column, values, overwrite=True)
-    print(f"Carried {len(columns)} published column(s) into {store}")
+    return resolved
 
 
 def build_store(
@@ -371,6 +466,7 @@ def build_store(
     recipe: DatasetRecipe,
     destination: Path,
     repository_name: str,
+    local_sources: dict[str, Path] | None = None,
 ) -> Path:
     import scarf
     from scarf import DataStore
@@ -378,32 +474,38 @@ def build_store(
     started = datetime.now(UTC)
     work = destination / "_source"
     repository = scarf.cytebase.connect(repository_name)
-    for name in recipe.sources:
-        repository.download(f"{dataset}/{name}", destination=str(work))
 
     output = destination / dataset
     output.mkdir(parents=True, exist_ok=True)
     store = output / STORE_NAME
     if store.exists():
         shutil.rmtree(store)
-    recipe.convert(work / dataset, store)
+    if isinstance(recipe, RawDatasetRecipe):
+        for name in recipe.sources:
+            repository.download(f"{dataset}/{name}", destination=str(work))
+        recipe.convert(work / dataset, store)
 
-    if recipe.drop_columns:
-        _drop_columns(
-            store=store,
-            patterns=recipe.drop_columns,
-            default_assay=recipe.default_assay,
-        )
+        if recipe.drop_columns:
+            _drop_columns(
+                store=store,
+                patterns=recipe.drop_columns,
+                default_assay=recipe.default_assay,
+            )
 
-    if recipe.carry_columns:
-        _carry_columns(
+        source_files = list(recipe.sources)
+        source_datasets: list[str] = []
+        carried_columns: list[str] = []
+    else:
+        source_paths = _resolve_derived_sources(
             repository=repository,
-            dataset=dataset,
-            store=store,
-            columns=recipe.carry_columns,
+            source_datasets=recipe.source_datasets,
+            local_sources=local_sources or {},
             work=work,
-            default_assay=recipe.default_assay,
         )
+        recipe.derive(source_paths, store)
+        source_files = []
+        source_datasets = list(recipe.source_datasets)
+        carried_columns = []
 
     datastore = DataStore(
         str(store),
@@ -429,8 +531,9 @@ def build_store(
         "generatedAt": started.isoformat(),
         "generatorCommit": _git_commit(),
         "scarfVersion": getattr(scarf, "__version__", "unknown"),
-        "sourceFiles": list(recipe.sources),
-        "carriedColumns": list(recipe.carry_columns),
+        "sourceFiles": source_files,
+        "sourceDatasets": source_datasets,
+        "carriedColumns": carried_columns,
         "nCellsTotal": cells_total,
         "nCellsActive": cells_active,
         "storeBytes": store_bytes,
@@ -474,7 +577,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--repository",
         default="scarf_docs",
-        help="Cytebase repository holding the raw counts",
+        help="Cytebase repository holding the declared source inputs",
     )
     parser.add_argument(
         "--destination",
@@ -488,13 +591,16 @@ def main(argv: list[str] | None = None) -> int:
     if not selected:
         parser.error("name at least one dataset or pass --all")
     args.destination.mkdir(parents=True, exist_ok=True)
+    local_sources: dict[str, Path] = {}
     for dataset in selected:
-        build_store(
+        store = build_store(
             dataset=dataset,
             recipe=RECIPES[dataset],
             destination=args.destination,
             repository_name=args.repository,
+            local_sources=local_sources,
         )
+        local_sources[dataset] = store.parent
     return 0
 
 

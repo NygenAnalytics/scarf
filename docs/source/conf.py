@@ -60,6 +60,8 @@ redirects = {
     "tutorials/dimensionality_reduction_and_clustering": (
         "dimensionality_reduction.html"
     ),
+    "tutorials/choosing_integration_methods": "data_integration.html",
+    "tutorials/integration_metrics": "batch_correction.html#integration-metrics",
 }
 myst_enable_extensions = [
     "colon_fence",

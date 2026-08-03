@@ -125,10 +125,11 @@ page is 600 seconds (`nb_execution_timeout` in `conf.py`).
 ### Republishing the example stores
 
 Pages that are not about building an analysis chain open a pre-analyzed store
-with `download_dataset(..., zarr=True)`. Those stores are rebuilt from each
-dataset's raw counts by `scripts/regenerate_docs_datasets.py`, which also writes
-a manifest under `docs/source/developers/dataset_manifests/` recording the
-recipe, the cell counts, the artifact inventory, and the archive checksum:
+with `download_dataset(..., zarr=True)`. Source stores are rebuilt from raw
+counts, while declared derived stores are rebuilt from their published inputs.
+`scripts/regenerate_docs_datasets.py` writes both kinds and creates a manifest
+under `docs/source/developers/dataset_manifests/` recording the recipe, cell
+counts, artifact inventory, and archive checksum:
 
     uv run python scripts/regenerate_docs_datasets.py --all
 

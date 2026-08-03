@@ -43,8 +43,8 @@ Scarf provides complete workflows for:
   weighted-nearest-neighbour integration
 - pseudotime ordering, expression dynamics, modules, and multi-sink fate
   probabilities
-- dataset merging, Harmony or partial-PCA correction, integration metrics,
-  reference mapping, and label transfer
+- dataset merging, Harmony or partial-PCA correction with quantitative
+  diagnostics, reference mapping, and label transfer
 - cell-cycle scoring, gene-set activity, imputation, downsampling, and
   pseudobulk export
 

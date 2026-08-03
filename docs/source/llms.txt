@@ -21,9 +21,8 @@
 
 ## Integration and inference
 
-- [Choose integration or mapping](tutorials/choosing_integration_methods.html): merge, correct, map, or combine modalities
-- [Batch correction](tutorials/batch_correction.html): uncorrected, partial-PCA, and Harmony graphs
-- [Integration metrics](tutorials/integration_metrics.html): mixing and biological preservation
+- [Dataset merging](tutorials/data_integration.html): compatible stores and an uncorrected joint baseline
+- [Batch correction](tutorials/batch_correction.html): partial PCA, Harmony, mixing, and structural preservation
 - [Mapping and label transfer](tutorials/mapping_and_label_transfer.html): fixed-reference projection
 - [Pseudobulk and differential expression](tutorials/pseudobulk_and_differential_expression.html): biological-replicate aggregation and export
 

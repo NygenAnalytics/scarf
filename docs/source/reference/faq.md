@@ -29,12 +29,12 @@ After PCA, call `ds.run_harmony(['batch_column'], pca)` then continue with
 `build_embedding_initialization`, `build_ann_index`, `query_neighbors`, and
 `build_connectivity_map`. See
 {ref}`Harmony batch correction <harmony_batch_correction>` and the
-{ref}`integration methods guide <integration_guide>`.
+{ref}`dataset integration guide <integration_guide>`.
 
 ## Which integration method should I choose?
 
-- Separate scRNA-seq batches: merge with `AssayMerge`, then Harmony or partial PCA
-  ({doc}`../tutorials/data_integration`).
+- Separate scRNA-seq batches: start with {doc}`../tutorials/data_integration`,
+  then compare Harmony or partial PCA in {doc}`../tutorials/batch_correction`.
 - Multiple assays in the same cells (CITE-seq): SNN or WNN
   ({ref}`recommended workflow <multimodal_integration>` and
   {doc}`../tutorials/multimodal_integration` for diagnostics).

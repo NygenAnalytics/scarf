@@ -140,7 +140,9 @@ inside the subset. Preserve the parent labels so the split remains auditable.
 
 ### Integration, mapping, and paired modalities
 
-Start with {doc}`tutorials/choosing_integration_methods`.
+Start with {doc}`tutorials/data_integration` when compatible datasets need one
+joint datastore, then use {doc}`tutorials/batch_correction` only when a
+defensible technical covariate should be reduced.
 
 - Merge without correction when compatible datasets need joint inspection but no technical effect
   has been identified.
@@ -149,9 +151,10 @@ Start with {doc}`tutorials/choosing_integration_methods`.
 - Use fixed-reference mapping when queries must remain comparable to one reference over time.
 - Use SNN or WNN for modalities measured in the same cells, not independent batches.
 
-Use {doc}`tutorials/integration_metrics` to compare mixing and biological preservation. Scarf's
-`metric_*` methods provide evidence, not an automatic winner. Never correct a variable that is
-indistinguishable from the condition of interest and then claim the condition was preserved.
+The batch-correction workflow compares source mixing and structural preservation.
+Scarf's `metric_*` methods provide evidence, not an automatic winner. Never
+correct a variable that is indistinguishable from the condition of interest and
+then claim the condition was preserved.
 
 ### Annotation, contrasts, and differential expression
 

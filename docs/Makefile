@@ -33,7 +33,7 @@ resume-docs:
 	@uv run python execute_all_vignettes.py --resume -j $(or $(JOBS),1)
 
 # Execute all pages concurrently on Modal and publish the cache locally.
-# Set PAGES="cite_seq integration_metrics" for a partial run.
+# Set PAGES="cite_seq batch_correction" for a partial run.
 execute-docs-modal:
 	@cd .. && MODAL_ENVIRONMENT=scarf_profiling uv run --group docs-modal --extra docs --extra extra modal run -m docs.modal_docs $(if $(strip $(PAGES)),--pages "$(strip $(PAGES))",)
 

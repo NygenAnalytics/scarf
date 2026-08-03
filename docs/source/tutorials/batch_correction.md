@@ -16,89 +16,80 @@ kernelspec:
 
 # Correcting batch effects
 
-Batch correction changes the reduced representation used to build a
-neighbourhood graph. It should remove unwanted technical structure while
-preserving biological structure relevant to the analysis. This guide compares
-an uncorrected graph with partial PCA and Harmony.
-
-The Kang control and interferon-stimulated PBMC datasets demonstrate the APIs,
-but treatment and source are confounded. Better mixing in this example is not
-proof that a technical effect was removed without losing interferon biology.
-
-## Prepare a merged datastore
+Batch correction changes the reduced coordinates used to build a neighbourhood
+graph. Counts remain unchanged. A useful correction should increase source
+mixing without dissolving biological populations. This guide resumes the
+persisted uncorrected analysis from {doc}`data_integration` and compares it
+with partial PCA and Harmony.
 
 ```{code-cell} ipython3
-import matplotlib.pyplot as plt
+import pandas as pd
 
 import scarf
 
 scarf.configure_output(level="ERROR", progress=True)
 
 repository = scarf.cytebase.connect("scarf_docs")
-ctrl_path = repository.download_dataset(
-    name="kang_15K_pbmc_rnaseq",
+merged_path = repository.download_dataset(
+    name="kang_29K_ctrl-ifnb_pbmc_rnaseq",
     destination="scarf_datasets",
     zarr=True,
 )
-stim_path = repository.download_dataset(
-    name="kang_14K_ifnb-pbmc_rnaseq",
-    destination="scarf_datasets",
-    zarr=True,
-)
-ds_ctrl = scarf.DataStore(f"{ctrl_path}/data.zarr", nthreads=4)
-ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
+ds = scarf.DataStore(f"{merged_path}/data.zarr", nthreads=4)
 
-merged_path = "scarf_datasets/kang_batch_correction.zarr"
-scarf.AssayMerge(
-    zarr_path=merged_path,
-    assays=[ds_ctrl.RNA, ds_stim.RNA],
-    names=["ctrl", "stim"],
-    merge_assay_name="RNA",
-    prepend_text="orig",
-    reset_cell_filter=False,
-    source_column="sample_id",
-    overwrite=True,
-).dump()
-ds = scarf.DataStore(merged_path, nthreads=4)
+baseline = ds.get_assay_state("RNA")
+normalized = baseline.normalized
+pca_full = baseline.reduction
+uncorrected_neighbors = baseline.neighbors
+uncorrected_graph = baseline.connectivity_map
 
-ds.mark_hvgs(
-    min_cells=10,
-    top_n=2000,
-    min_mean=-3,
-    max_mean=2,
-    max_var=6,
-    show_plot=False,
-)
-normalized = ds.run_normalization(feat_key="hvgs")
+
+def integration_scores(neighbors, graph):
+    knn_path = ds.inspect_artifact(neighbors).path
+    graph_path = ds.inspect_artifact(graph).path
+    return {
+        "iLISI": ds.metric_ilisi(
+            batch_colname="sample_id",
+            use_latest_knn=False,
+            knn_loc=knn_path,
+            perplexity=7,
+        ),
+        "cLISI": ds.metric_clisi(
+            label_colname="orig_cluster_labels",
+            use_latest_knn=False,
+            knn_loc=knn_path,
+            perplexity=7,
+        ),
+        "graph connectivity": ds.metric_graph_connectivity(
+            label_colname="orig_cluster_labels",
+            graph_loc=graph_path,
+        ),
+    }
+
+
+scores = {
+    "Uncorrected": integration_scores(
+        uncorrected_neighbors,
+        uncorrected_graph,
+    )
+}
+{"uncorrected iLISI": round(scores["Uncorrected"]["iLISI"], 3)}
 ```
 
-## Keep an uncorrected baseline
+The baseline artifacts fix the active cells, highly variable features, full
+PCA, and 21-neighbour graph used by every comparison below.
 
-```{code-cell} ipython3
-pca_full = ds.run_pca(normalized, dims=25)
-ds.build_embedding_initialization(pca_full)
-ann = ds.build_ann_index(pca_full)
-neighbors = ds.query_neighbors(ann, k=21)
-graph = ds.build_connectivity_map(neighbors)
-ds.run_umap(
-    graph,
-    n_epochs=250,
-    spread=5,
-    min_dist=1,
-    parallel=True,
-    label="uncorrected_UMAP",
-)
+```{raw} html
+<span id="partial-pca"></span>
+<span id="partial-pca-integration"></span>
 ```
-
-The baseline records the source separation that correction will change. Retain
-it for comparison rather than judging the corrected layout in isolation.
 
 ## Learn PCA from a reference subset
 
-Partial PCA learns the loading basis from cells selected by `pca_cell_key`, then
-projects all active cells into that basis. It is appropriate when one trusted
-sample defines the reference space. Signals absent from that subset, including
-real condition-specific biology, contribute less to the graph.
+Partial PCA learns its loading basis from cells selected by `pca_cell_key`, then
+projects every active cell into that basis. Here the control cells define the
+reference space. Signals absent from the control subset contribute less to the
+resulting graph.
 
 ```{code-cell} ipython3
 ds.cells.insert(
@@ -106,16 +97,17 @@ ds.cells.insert(
     values=ds.cells.fetch_all("sample_id") == "ctrl",
     overwrite=True,
 )
-
 pca_partial = ds.run_pca(
     normalized,
     dims=25,
     pca_cell_key="is_ctrl",
 )
 ds.build_embedding_initialization(pca_partial)
-ann = ds.build_ann_index(pca_partial)
-neighbors = ds.query_neighbors(ann, k=21)
-partial_graph = ds.build_connectivity_map(neighbors)
+partial_neighbors = ds.query_neighbors(
+    ds.build_ann_index(pca_partial),
+    k=21,
+)
+partial_graph = ds.build_connectivity_map(partial_neighbors)
 ds.run_umap(
     partial_graph,
     n_epochs=250,
@@ -124,21 +116,54 @@ ds.run_umap(
     parallel=True,
     label="partial_UMAP",
 )
+ds.run_leiden_clustering(
+    partial_graph,
+    resolution=1.0,
+    label="partial_clusters",
+)
+scores["Partial PCA"] = integration_scores(
+    partial_neighbors,
+    partial_graph,
+)
+{"partial PCA iLISI": round(scores["Partial PCA"]["iLISI"], 3)}
+```
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_partial_UMAP",
+    color_by=["sample_id", "orig_cluster_labels"],
+    n_columns=2,
+)
+```
+
+```{code-cell} ipython3
+ds.plots.composition(
+    category_by="sample_id",
+    sample_by="RNA_partial_clusters",
+    kind="stacked",
+    show_percent_labels=True,
+)
+```
+
+```{raw} html
+<span id="harmony"></span>
+<span id="harmony-batch-correction"></span>
 ```
 
 ## Correct PCA coordinates with Harmony
 
 Harmony adjusts the full PCA coordinates using one or more batch columns before
-the ANN index is built. It treats the supplied column as unwanted variation, so
-do not pass a biological condition that the downstream analysis needs to retain.
+the ANN index is built. Treat each supplied column as variation to remove. Do
+not use a biological condition that the downstream analysis needs to retain.
 
 ```{code-cell} ipython3
-pca_full = ds.run_pca(normalized, dims=25)
 corrected = ds.run_harmony(["sample_id"], pca_full)
 ds.build_embedding_initialization(pca_full)
-ann = ds.build_ann_index(corrected)
-neighbors = ds.query_neighbors(ann, k=21)
-harmony_graph = ds.build_connectivity_map(neighbors)
+harmony_neighbors = ds.query_neighbors(
+    ds.build_ann_index(corrected),
+    k=21,
+)
+harmony_graph = ds.build_connectivity_map(harmony_neighbors)
 ds.run_umap(
     harmony_graph,
     n_epochs=250,
@@ -147,53 +172,88 @@ ds.run_umap(
     parallel=True,
     label="harmony_UMAP",
 )
+ds.run_leiden_clustering(
+    harmony_graph,
+    resolution=1.0,
+    label="harmony_clusters",
+)
+scores["Harmony"] = integration_scores(
+    harmony_neighbors,
+    harmony_graph,
+)
+{"Harmony iLISI": round(scores["Harmony"]["iLISI"], 3)}
+```
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_harmony_UMAP",
+    color_by=["sample_id", "orig_cluster_labels"],
+    n_columns=2,
+)
+```
+
+```{code-cell} ipython3
+ds.plots.composition(
+    category_by="sample_id",
+    sample_by="RNA_harmony_clusters",
+    kind="stacked",
+    show_percent_labels=True,
+)
 ```
 
 ## Compare the three graphs
 
+The plotting facade accepts several layouts directly, so the comparison does
+not need a custom Matplotlib helper. Panels appear in uncorrected, partial-PCA,
+and Harmony order.
+
 ```{code-cell} ipython3
-layout_comparisons = (
-    ("Uncorrected", "RNA_uncorrected_UMAP"),
-    ("Partial PCA", "RNA_partial_UMAP"),
-    ("Harmony", "RNA_harmony_UMAP"),
+layouts = [
+    "RNA_UMAP",
+    "RNA_partial_UMAP",
+    "RNA_harmony_UMAP",
+]
+ds.plots.embedding(
+    layout_key=layouts,
+    color_by="sample_id",
+    n_columns=3,
+    legend_loc="right",
 )
-
-
-def compare_graphs(color_by):
-    figure, axes = plt.subplots(1, 3, figsize=(12, 4))
-    for index, (axis, (title, layout_key)) in enumerate(
-        zip(axes, layout_comparisons, strict=True)
-    ):
-        ds.plots.embedding(
-            layout_key=layout_key,
-            color_by=color_by,
-            legend_loc="right",
-            show_legend=index == 2,
-            show_titles=False,
-            target=axis,
-            show=False,
-        )
-        axis.set_title(title)
-    figure.tight_layout()
-    return figure
-
-
-compare_graphs("sample_id");
 ```
 
 ```{code-cell} ipython3
-compare_graphs("orig_cluster_labels");
+ds.plots.embedding(
+    layout_key=layouts,
+    color_by="orig_cluster_labels",
+    n_columns=3,
+    legend_loc="right",
+)
 ```
 
-Correction should increase source mixing without collapsing the imported cell
-types. Layouts only suggest that trade-off. Use {doc}`integration_metrics` for
-quantitative checks, and retain uncorrected counts for condition-level
-differential expression.
+(lisi_metrics)=
+(integration_metrics)=
 
-Common failures include correcting a confounded biological condition, comparing
-methods built with different features or neighbour counts, and selecting the
-method that produces the most visually compact UMAP.
+## Quantify mixing and structural preservation
 
-See the {doc}`../reference/api/graph_construction` for the exact
-{py:meth}`~scarf.DataStore.run_pca` and
-{py:meth}`~scarf.DataStore.run_harmony` contracts.
+iLISI measures source mixing. cLISI checks whether imported cell-type labels
+remain locally separated, while graph connectivity checks whether cells with
+the same imported label remain connected. All three scores are scaled so
+higher values are better.
+
+```{code-cell} ipython3
+score_frame = pd.DataFrame.from_dict(scores, orient="index")
+score_frame.round(3)
+```
+
+The two Kang sources are also the control and interferon beta treatment groups,
+so iLISI describes source mixing rather than proving removal of a technical
+effect. cLISI and connectivity provide preservation checks, but they cannot
+establish that every treatment response was retained. Keep the uncorrected
+counts for condition-level differential expression.
+
+Compare methods only when active cells, selected features, neighbour count, and
+LISI perplexity match. Do not choose a method solely because its UMAP appears
+compact.
+
+See {doc}`../reference/api/graph_construction` for the PCA and Harmony
+contracts, and {doc}`../reference/api/integration` for the metric definitions.

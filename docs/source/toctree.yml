@@ -26,14 +26,10 @@ subtrees:
         title: CITE-seq
   - caption: Integration and mapping
     entries:
-      - file: tutorials/choosing_integration_methods
-        title: Integration vs. mapping
       - file: tutorials/data_integration
         title: Dataset merging
       - file: tutorials/batch_correction
         title: Batch correction
-      - file: tutorials/integration_metrics
-        title: Integration metrics
       - file: tutorials/multimodal_integration
         title: Multimodal diagnostics
       - file: tutorials/mapping_and_label_transfer
