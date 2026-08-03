@@ -10,6 +10,7 @@ import pandas as pd
 from ._contracts import (
     CategoricalScale,
     CellField,
+    ColorScale,
     DistKind,
     FeatureRef,
     NormalizationSpec,
@@ -29,6 +30,7 @@ from ._style import (
     apply_figure_chrome,
     capped_figsize,
     categorical_color_map,
+    continuous_norm,
     sort_categories,
     theme_context,
 )
@@ -344,6 +346,146 @@ def _draw_ecdf(
     return subsampled
 
 
+def _panel_display_frame(
+    values: np.ndarray,
+    groups_arr: np.ndarray,
+    *,
+    split_arr: np.ndarray | None,
+    sample_arr: np.ndarray | None,
+    sample_stat: Literal["mean", "median", "fraction"],
+    expression_cutoff: float,
+    row_standardize: bool,
+) -> pd.DataFrame:
+    """Build the per-panel display frame (value, group[, split][, sample])."""
+    cell_frame = pd.DataFrame(
+        {
+            "raw_value": np.asarray(values, dtype=np.float64),
+            "group": groups_arr,
+        }
+    )
+    if split_arr is not None:
+        cell_frame["split"] = split_arr
+    if sample_arr is not None:
+        cell_frame["sample"] = sample_arr
+        frame = _sample_aggregate(
+            cell_frame,
+            statistic=sample_stat,
+            expression_cutoff=expression_cutoff,
+            split=split_arr is not None,
+        )
+    else:
+        frame = cell_frame
+    display_values = frame["raw_value"].to_numpy(dtype=np.float64)
+    if row_standardize:
+        finite = np.isfinite(display_values)
+        mean = float(np.mean(display_values[finite])) if finite.any() else 0.0
+        std = float(np.std(display_values[finite])) if finite.any() else 0.0
+        display_values = (
+            (display_values - mean) / std if std > 0 else np.zeros_like(display_values)
+        )
+    frame["value"] = display_values
+    return frame
+
+
+def _panel_group_means(frame: pd.DataFrame) -> pd.Series:
+    """Per-group mean of the display values in one panel."""
+    return frame.groupby("group", observed=False)["value"].mean()
+
+
+def _mean_color_limits(
+    means_by_panel: Sequence[pd.Series],
+    color_scale: ColorScale,
+) -> tuple[list[tuple[float, float]], tuple[float, float]]:
+    """Resolve per-panel and reference colour limits from group means.
+
+    ``scope="shared"`` (default) gives every stacked row the same limits derived
+    from all pooled group means, so the rows share one continuous scale.
+    ``scope="panel"`` rescales each row independently. Explicit ``vmin`` /
+    ``vmax`` override quantile or observed bounds.
+    """
+    if color_scale.scale != "linear":
+        raise NotImplementedError(
+            "distribution mean coloring currently supports only linear color scales"
+        )
+
+    def resolve(values: np.ndarray) -> tuple[float, float]:
+        finite = np.asarray(values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return 0.0, 1.0
+        if color_scale.quantiles is not None:
+            q0, q1 = color_scale.quantiles
+            lo = float(np.nanquantile(finite, q0))
+            hi = float(np.nanquantile(finite, q1))
+        else:
+            lo = float(np.nanmin(finite))
+            hi = float(np.nanmax(finite))
+        if color_scale.vmin is not None:
+            lo = color_scale.vmin
+        if color_scale.vmax is not None:
+            hi = color_scale.vmax
+        if hi < lo:
+            raise ValueError("vmax must be greater than or equal to vmin")
+        return lo, hi
+
+    arrays = [
+        np.asarray(means.to_numpy(dtype=np.float64), dtype=np.float64)
+        for means in means_by_panel
+    ]
+    pooled = np.concatenate(arrays) if arrays else np.array([], dtype=np.float64)
+    if pooled[np.isfinite(pooled)].size == 0:
+        raise ValueError("No finite expression values to colour by")
+    reference = resolve(pooled)
+    if color_scale.scope == "shared":
+        return [reference] * len(arrays), reference
+    return [resolve(array) for array in arrays], reference
+
+
+def _render_color_limits(lo: float, hi: float) -> tuple[float, float]:
+    """Return colourbar limits, padding degenerate scales so a bar renders."""
+    if hi > lo:
+        return lo, hi
+    pad = max(0.5, abs(lo) * 0.05)
+    return lo - pad, hi + pad
+
+
+def _mean_colorbar_label(color_scale: ColorScale, row_standardize: bool) -> str:
+    """Label for the mean-expression colourbar, adapted to the value scale."""
+    label = "mean standardized value" if row_standardize else "mean expression"
+    if color_scale.scope == "panel":
+        label += " (reference)"
+    return label
+
+
+def _mean_group_palette(
+    means: pd.Series,
+    order: Sequence[Any],
+    *,
+    color_scale: ColorScale,
+    lo: float,
+    hi: float,
+) -> dict[Any, str]:
+    """Map each group to a colour by its mean expression in ``means``."""
+    from matplotlib import colormaps
+    from matplotlib.colors import to_hex
+
+    _, mpl = require_matplotlib()
+    cmap = color_scale.cmap or "viridis"
+    if cmap not in colormaps:
+        raise ValueError(f"Unknown colormap {cmap!r}")
+    span = hi - lo
+    norm = continuous_norm(mpl, vmin=lo, vmax=hi, vcenter=color_scale.vcenter)
+    palette_map: dict[Any, str] = {}
+    for group in order:
+        mean = means.get(group)
+        if mean is None or not np.isfinite(float(mean)):
+            t = 0.5
+        else:
+            t = 0.5 if span == 0 else float(np.clip(norm(float(mean)), 0, 1))
+        palette_map[group] = to_hex(colormaps[cmap](t))
+    return palette_map
+
+
 def distribution(
     store: Any,
     keys: str | CellField | FeatureRef | Sequence[str | CellField | FeatureRef],
@@ -368,6 +510,8 @@ def distribution(
     point_alpha: float = 0.28,
     seed: int = 0,
     color: str = "steelblue",
+    color_by: Literal["group", "mean"] = "group",
+    color_scale: ColorScale | None = None,
     orientation: Literal["vertical", "horizontal"] = "vertical",
     row_standardize: bool = False,
     share_y: bool | None = None,
@@ -407,9 +551,32 @@ def distribution(
     Set ``sample_by`` or ``study_design`` to summarize cells within biological
     samples before plotting. ``split_by`` draws two violin halves for a second
     categorical variable.
+
+    For ``kind="stacked_violin"``, pass ``color_by="mean"`` to colour each
+    stacked violin by its group mean expression on a continuous scale. Pass a
+    ``ColorScale`` to control the mapping: ``cmap`` chooses the colormap,
+    ``vmin``/``vmax`` fix explicit limits, ``quantiles`` clips extreme means,
+    and ``vcenter`` enables diverging maps. The scale is shared across every
+    stacked row by default (``scope="shared"``) and drawn as a colorbar on the
+    right; ``scope="panel"`` rescales each row independently and draws a single
+    reference colorbar. ``color_by="mean"`` cannot be combined with ``split_by``.
     """
-    require_matplotlib()
+    plt, mpl = require_matplotlib()
     normalization = normalization or NormalizationSpec()
+    color_scale_was_explicit = color_scale is not None
+    color_scale = color_scale or ColorScale(cmap="viridis", scope="shared")
+    if color_scale.scale != "linear":
+        raise NotImplementedError(
+            "distribution mean coloring currently supports only linear color scales"
+        )
+    if color_scale_was_explicit and color_by != "mean":
+        raise ValueError("color_scale applies only when color_by='mean'")
+    if color_by not in ("group", "mean"):
+        raise ValueError("color_by must be 'group' or 'mean'")
+    if color_by == "mean" and kind != "stacked_violin":
+        raise ValueError("color_by='mean' is available only for stacked_violin")
+    if color_by == "mean" and group_by is None:
+        raise ValueError("color_by='mean' requires group_by")
     if kind not in ("violin", "stacked_violin", "box", "hist", "ecdf"):
         raise ValueError(
             "kind must be 'violin', 'stacked_violin', 'box', 'hist', or 'ecdf'"
@@ -432,6 +599,8 @@ def distribution(
         raise ValueError("split_by requires group_by")
     if split_by is not None and kind not in ("violin", "stacked_violin"):
         raise ValueError("split_by is available only for violin plots")
+    if split_by is not None and color_by == "mean":
+        raise ValueError("color_by='mean' cannot be combined with split_by")
     if split_by == group_by and split_by is not None:
         raise ValueError("split_by and group_by must refer to different columns")
     if sample_stat not in ("mean", "median", "fraction"):
@@ -624,6 +793,38 @@ def distribution(
     else:
         n_columns = n_panels
 
+    # Build the per-panel display frames and group means once so the shared
+    # mean-expression colour scale can be derived when ``color_by="mean"``.
+    panel_display_frames = [
+        _panel_display_frame(
+            np.asarray(vals),
+            groups_arr,
+            split_arr=split_arr,
+            sample_arr=sample_arr,
+            sample_stat=sample_stat,
+            expression_cutoff=expression_cutoff,
+            row_standardize=row_standardize,
+        )
+        for vals, _label, _is_feature in series_list
+    ]
+    panel_group_means = [_panel_group_means(frame) for frame in panel_display_frames]
+    mean_limits: list[tuple[float, float]] | None = None
+    reference_limits: tuple[float, float] | None = None
+    if color_by == "mean":
+        mean_limits, reference_limits = _mean_color_limits(
+            panel_group_means,
+            color_scale,
+        )
+    # Limits actually drawn on the colourbar. Degenerate scales (all group
+    # means equal) are padded symmetrically so the key is always visible.
+    render_limits: tuple[float, float] | None = None
+    if mean_limits is not None:
+        assert reference_limits is not None
+        base_lo, base_hi = (
+            mean_limits[0] if color_scale.scope == "shared" else reference_limits
+        )
+        render_limits = _render_color_limits(base_lo, base_hi)
+
     fig, axes, owns = normalize_axes_target(
         target,
         panel_keys=panel_keys,
@@ -640,35 +841,7 @@ def distribution(
             zip(series_list, panel_keys)
         ):
             ax = axes[panel_key]
-            cell_frame = pd.DataFrame(
-                {
-                    "raw_value": np.asarray(vals, dtype=np.float64),
-                    "group": groups_arr,
-                }
-            )
-            if split_arr is not None:
-                cell_frame["split"] = split_arr
-            if sample_arr is not None:
-                cell_frame["sample"] = sample_arr
-                df = _sample_aggregate(
-                    cell_frame,
-                    statistic=sample_stat,
-                    expression_cutoff=expression_cutoff,
-                    split=split_arr is not None,
-                )
-            else:
-                df = cell_frame
-            display_values = df["raw_value"].to_numpy(dtype=np.float64)
-            if row_standardize:
-                finite = np.isfinite(display_values)
-                mean = float(np.mean(display_values[finite])) if finite.any() else 0.0
-                std = float(np.std(display_values[finite])) if finite.any() else 0.0
-                display_values = (
-                    (display_values - mean) / std
-                    if std > 0
-                    else np.zeros_like(display_values)
-                )
-            df["value"] = display_values
+            df = panel_display_frames[panel_index]
             table = df.rename(
                 columns={
                     "raw_value": "value",
@@ -684,6 +857,16 @@ def distribution(
                 value_axis_label = f"Sample {sample_stat} {label}"
             if kind in ("violin", "stacked_violin", "box"):
                 assert sns is not None
+                panel_palette = palette
+                if mean_limits is not None:
+                    lo, hi = mean_limits[panel_index]
+                    panel_palette = _mean_group_palette(
+                        panel_group_means[panel_index],
+                        list(group_order or []),
+                        color_scale=color_scale,
+                        lo=lo,
+                        hi=hi,
+                    )
                 subsampled = _draw_violin_or_box(
                     ax,
                     sns,
@@ -694,7 +877,7 @@ def distribution(
                     point_size=point_size,
                     rng=rng,
                     order=None if group_by is None else list(group_order or []),
-                    palette=palette,
+                    palette=panel_palette,
                     orientation=orientation,
                     violin_inner=violin_inner,
                     linewidth=violin_linewidth,
@@ -818,7 +1001,8 @@ def distribution(
                 else:
                     ax.tick_params(axis="y", labelleft=False)
                     ax.set_ylabel("")
-            finite = display_values[np.isfinite(display_values)]
+            finite = df["value"].to_numpy(dtype=np.float64)
+            finite = finite[np.isfinite(finite)]
             if len(finite):
                 y_limits.append((float(finite.min()), float(finite.max())))
 
@@ -839,6 +1023,27 @@ def distribution(
         if title is not None:
             fig.suptitle(title)
         apply_figure_chrome(fig, theme)
+        if render_limits is not None:
+            lo, hi = render_limits
+            mappable = plt.cm.ScalarMappable(
+                cmap=color_scale.cmap or "viridis",
+                norm=continuous_norm(
+                    mpl,
+                    vmin=lo,
+                    vmax=hi,
+                    vcenter=color_scale.vcenter,
+                ),
+            )
+            mappable.set_array([])
+            colorbar = fig.colorbar(
+                mappable,
+                ax=list(axes.values()),
+                location="right",
+                shrink=0.8,
+                fraction=0.04,
+                pad=0.02,
+            )
+            colorbar.set_label(_mean_colorbar_label(color_scale, row_standardize))
 
     label_counts = pd.Series([label for _, label, _ in series_list]).value_counts()
     tables = {}
@@ -849,39 +1054,59 @@ def distribution(
     if any_subsampled:
         notes.append("subsampled_display")
 
+    resolved_color_scale: ColorScale | None = None
+    if render_limits is not None:
+        lo, hi = render_limits
+        resolved_color_scale = ColorScale(
+            cmap=color_scale.cmap,
+            vmin=lo,
+            vmax=hi,
+            vcenter=color_scale.vcenter,
+            quantiles=color_scale.quantiles,
+            missing_color=color_scale.missing_color,
+            scope=color_scale.scope,
+            scale=color_scale.scale,
+        )
+
+    if resolved_color_scale is not None:
+        assert render_limits is not None
+        lo, hi = render_limits
+        legend_specs: tuple[LegendSpec, ...] = (
+            LegendSpec(
+                kind="colorbar",
+                label=_mean_colorbar_label(color_scale, row_standardize),
+                extras={"vmin": lo, "vmax": hi},
+            ),
+        )
+        scale_specs: tuple[Any, ...] = (resolved_color_scale,)
+    elif split_order is not None:
+        legend_specs = (LegendSpec(kind="categorical", label=split_by or "split"),)
+        scale_specs = (
+            CategoricalScale(
+                order=tuple(split_order),
+                palette=split_palette,
+                labels=(split_scale.labels if split_scale is not None else None),
+                missing_color=(
+                    split_scale.missing_color if split_scale is not None else "#bdbdbd"
+                ),
+                missing_label=(
+                    split_scale.missing_label if split_scale is not None else "NA"
+                ),
+                palette_name=(
+                    split_scale.palette_name if split_scale is not None else "default"
+                ),
+            ),
+        )
+    else:
+        legend_specs = (LegendSpec(kind="distribution", label=kind),)
+        scale_specs = () if categorical_scale is None else (categorical_scale,)
+
     result = PlotResult(
         figure=fig,
         axes=axes,
         tables=tables,
-        legends=(
-            (LegendSpec(kind="categorical", label=split_by or "split"),)
-            if split_order is not None
-            else (LegendSpec(kind="distribution", label=kind),)
-        ),
-        scales=(
-            (
-                CategoricalScale(
-                    order=tuple(split_order),
-                    palette=split_palette,
-                    labels=(split_scale.labels if split_scale is not None else None),
-                    missing_color=(
-                        split_scale.missing_color
-                        if split_scale is not None
-                        else "#bdbdbd"
-                    ),
-                    missing_label=(
-                        split_scale.missing_label if split_scale is not None else "NA"
-                    ),
-                    palette_name=(
-                        split_scale.palette_name
-                        if split_scale is not None
-                        else "default"
-                    ),
-                ),
-            )
-            if split_order is not None
-            else (() if categorical_scale is None else (categorical_scale,))
-        ),
+        legends=legend_specs,
+        scales=scale_specs,
         provenance=PlotProvenance(
             assay=(next(iter(feature_assays)) if len(feature_assays) == 1 else None),
             cell_key=cell_key,
@@ -913,6 +1138,20 @@ def distribution(
                 "orientation": orientation,
                 "row_standardize": row_standardize,
                 "share_y": resolved_share_y,
+                "color_by": color_by,
+                "color_scale": (
+                    resolved_color_scale if resolved_color_scale is not None else None
+                ),
+                "color_scale_scope": (
+                    color_scale.scope if resolved_color_scale is not None else None
+                ),
+                "cmap": (
+                    resolved_color_scale.cmap
+                    if resolved_color_scale is not None
+                    else None
+                ),
+                "vmin": render_limits[0] if render_limits is not None else None,
+                "vmax": render_limits[1] if render_limits is not None else None,
                 "violin_inner": violin_inner,
                 "italicize_features": italicize_features,
                 "approximate": any_subsampled,
