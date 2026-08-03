@@ -4,6 +4,8 @@ from scipy.sparse import csr_matrix
 
 from scarf.clustering._paris_core import ParisHierarchy
 from scarf.clustering._paris_modularity import (
+    PlateauModularityStatistics,
+    TopologyStatistics,
     aggregate_plateau_statistics,
     collect_topology_statistics,
     modularity_split_gains,
@@ -225,3 +227,113 @@ def test_guard_reduces_erdos_renyi_null_fragmentation() -> None:
         )
     )
     assert 2 * sum(guarded_counts) <= sum(unguarded_counts)
+
+
+def test_topology_statistics_reject_invalid_arrays() -> None:
+    with pytest.raises(TypeError, match="one-dimensional integer array"):
+        TopologyStatistics(
+            leaf_degrees=np.array([[1]], dtype=np.int64),
+            lca_edge_counts=np.array([0], dtype=np.int64),
+            component_edge_counts=np.array([0], dtype=np.int64),
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        TopologyStatistics(
+            leaf_degrees=np.array([-1], dtype=np.int64),
+            lca_edge_counts=np.array([0], dtype=np.int64),
+            component_edge_counts=np.array([0], dtype=np.int64),
+        )
+    with pytest.raises(TypeError, match="integer array over events"):
+        PlateauModularityStatistics(
+            cross_edges=np.array([1.0]),
+            volumes=np.array([2], dtype=np.int64),
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        PlateauModularityStatistics(
+            cross_edges=np.array([1], dtype=np.int64),
+            volumes=np.array([-2], dtype=np.int64),
+        )
+
+
+def test_collect_topology_rejects_non_canonical_graphs() -> None:
+    hierarchy = _balanced_four_hierarchy()
+
+    with pytest.raises(TypeError, match="csr_matrix"):
+        collect_topology_statistics(np.ones((4, 4)), hierarchy)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="square"):
+        collect_topology_statistics(
+            csr_matrix(np.ones((4, 3), dtype=np.float64)),
+            hierarchy,
+        )
+    with pytest.raises(ValueError, match="different leaf counts"):
+        collect_topology_statistics(_canonical_graph(3, [(0, 1)]), hierarchy)
+
+    unsorted = csr_matrix(
+        (
+            np.array([1.0, 1.0], dtype=np.float64),
+            np.array([2, 1], dtype=np.int32),
+            np.array([0, 2, 2, 2, 2], dtype=np.int32),
+        ),
+        shape=(4, 4),
+    )
+    with pytest.raises(ValueError, match="sorted canonical CSR"):
+        collect_topology_statistics(unsorted, hierarchy)
+
+    nonpositive = _canonical_graph(4, [(0, 1), (2, 3)])
+    nonpositive.data[0] = 0.0
+    with pytest.raises(ValueError, match="finite and positive"):
+        collect_topology_statistics(nonpositive, hierarchy)
+
+    with_self_loop = csr_matrix(
+        (
+            np.array([1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float64),
+            np.array([0, 1, 0, 2, 3], dtype=np.int32),
+            np.array([0, 2, 3, 4, 5], dtype=np.int32),
+        ),
+        shape=(4, 4),
+    )
+    with_self_loop = with_self_loop + with_self_loop.T
+    with_self_loop.sum_duplicates()
+    with_self_loop.sort_indices()
+    with pytest.raises(ValueError, match="self-loops"):
+        collect_topology_statistics(with_self_loop, hierarchy)
+
+    asymmetric = _canonical_graph(4, [(0, 1), (2, 3)])
+    asymmetric.data[0] = 2.0
+    with pytest.raises(ValueError, match="exactly symmetric"):
+        collect_topology_statistics(asymmetric, hierarchy)
+
+    directed_only = csr_matrix(
+        (
+            np.array([1.0], dtype=np.float64),
+            np.array([1], dtype=np.int32),
+            np.array([0, 1, 1, 1, 1], dtype=np.int32),
+        ),
+        shape=(4, 4),
+    )
+    directed_only.sort_indices()
+    with pytest.raises(ValueError, match="structurally symmetric"):
+        collect_topology_statistics(directed_only, hierarchy)
+
+
+def test_collect_topology_rejects_edges_across_hierarchy_components() -> None:
+    hierarchy = _hierarchy(
+        [(0, 1), (2, 3), (4, 5)],
+        [1.0, 1.0, np.inf],
+        component_roots=[4, 5],
+        synthetic_joins=[False, False, True],
+    )
+    graph = _canonical_graph(4, [(0, 1), (2, 3), (0, 2)])
+    with pytest.raises(ValueError, match="across hierarchy components"):
+        collect_topology_statistics(graph, hierarchy)
+
+
+def test_collect_topology_rejects_synthetic_join_component_root() -> None:
+    hierarchy = _hierarchy(
+        [(0, 1), (2, 3), (4, 5)],
+        [1.0, 1.0, np.inf],
+        component_roots=[6],
+        synthetic_joins=[False, False, True],
+    )
+    graph = _canonical_graph(4, [(0, 1), (2, 3)])
+    with pytest.raises(ValueError, match="do not match synthetic joins"):
+        collect_topology_statistics(graph, hierarchy)

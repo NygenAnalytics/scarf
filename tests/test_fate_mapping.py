@@ -324,6 +324,96 @@ def test_asymmetric_graph_support_is_rejected():
         )
 
 
+def test_compute_fate_rejects_invalid_parameters_and_inputs():
+    graph, pseudotime, labels = _y_graph()
+
+    with pytest.raises(TypeError, match="beta must be numeric"):
+        compute_fate_probabilities(graph, pseudotime, labels, ["A"], beta="fast")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="beta must be finite"):
+        compute_fate_probabilities(graph, pseudotime, labels, ["A"], beta=-1.0)
+    with pytest.raises(ValueError, match="beta must be finite"):
+        compute_fate_probabilities(graph, pseudotime, labels, ["A"], beta=np.nan)
+    with pytest.raises(TypeError, match="solver_tol must be numeric"):
+        compute_fate_probabilities(
+            graph,
+            pseudotime,
+            labels,
+            ["A"],
+            solver_tol=None,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="solver_tol must be finite"):
+        compute_fate_probabilities(graph, pseudotime, labels, ["A"], solver_tol=0.0)
+    with pytest.raises(ValueError, match="solver_tol must be finite"):
+        compute_fate_probabilities(graph, pseudotime, labels, ["A"], solver_tol=1.0)
+    with pytest.raises(TypeError, match="max_iterations must be an integer"):
+        compute_fate_probabilities(
+            graph,
+            pseudotime,
+            labels,
+            ["A"],
+            max_iterations=1.5,  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="max_iterations must be an integer"):
+        compute_fate_probabilities(
+            graph,
+            pseudotime,
+            labels,
+            ["A"],
+            max_iterations=True,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="at least 1"):
+        compute_fate_probabilities(graph, pseudotime, labels, ["A"], max_iterations=0)
+
+    with pytest.raises(TypeError, match="csr_matrix"):
+        compute_fate_probabilities(
+            np.asarray(graph.toarray()),  # type: ignore[arg-type]
+            pseudotime,
+            labels,
+            ["A"],
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        compute_fate_probabilities(graph, pseudotime, labels[:3], ["A"])
+    with pytest.raises(ValueError, match="non-negative"):
+        negative = graph.copy()
+        negative.data[0] = -1.0
+        compute_fate_probabilities(negative, pseudotime, labels, ["A"])
+    with pytest.raises(ValueError, match="No cells were selected"):
+        compute_fate_probabilities(
+            csr_matrix((0, 0), dtype=np.float64),
+            np.array([], dtype=np.float64),
+            np.array([], dtype=object),
+            ["A"],
+        )
+    with pytest.raises(ValueError, match="one-dimensional"):
+        compute_fate_probabilities(
+            graph,
+            pseudotime,
+            labels.reshape(-1, 1),
+            ["A"],
+        )
+    with pytest.raises(ValueError, match="align with the selected cells"):
+        compute_fate_probabilities(graph, pseudotime[:2], labels, ["A"])
+    with pytest.raises(TypeError, match="Pseudotime values must be numeric"):
+        compute_fate_probabilities(
+            graph,
+            np.array(["a", "b", "c", "d", "e"], dtype=object),
+            labels,
+            ["A"],
+        )
+    with pytest.raises(ValueError, match="at least two distinct"):
+        compute_fate_probabilities(
+            graph,
+            np.zeros(labels.shape[0], dtype=np.float64),
+            labels,
+            ["A"],
+        )
+
+
+def test_make_sink_tokens_fallback_and_collision_suffixes():
+    assert make_sink_tokens(("!!!", "!!!", "A")) == ("sink_1", "sink_2", "A")
+    assert make_sink_tokens(("A!", "A_", "A")) == ("A", "A_2", "A_3")
+
+
 def test_malformed_csr_structure_is_rejected():
     graph, pseudotime, labels = _y_graph()
     graph.indices[0] = graph.shape[0]

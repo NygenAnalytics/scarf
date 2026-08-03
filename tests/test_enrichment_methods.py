@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from scarf.features.enrichment.aucell import (
+    GeneSetIndex,
     build_gene_set_index,
     make_rank_permutation,
     resolve_n_up,
@@ -142,7 +143,127 @@ def test_resolve_n_up_validates_the_ranking_universe():
 
     with pytest.raises(ValueError, match="at least two"):
         resolve_n_up(1, None)
+    with pytest.raises(TypeError, match="n_features must be an integer"):
+        resolve_n_up(4.0, None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="n_features must be an integer"):
+        resolve_n_up(True, None)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="n_up must be an integer or None"):
+        resolve_n_up(4, 2.0)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="greater than 1"):
         resolve_n_up(4, 1)
     with pytest.raises(ValueError, match="at most 4"):
         resolve_n_up(4, 5)
+
+
+def test_gene_set_index_rejects_inconsistent_arrays():
+    with pytest.raises(ValueError, match="one-dimensional"):
+        GeneSetIndex(
+            connections=np.array([[0, 1]], dtype=np.int64),
+            starts=np.array([0], dtype=np.int64),
+            offsets=np.array([2], dtype=np.int64),
+        )
+    with pytest.raises(ValueError, match="non-empty and aligned"):
+        GeneSetIndex(
+            connections=np.array([0, 1], dtype=np.int64),
+            starts=np.array([], dtype=np.int64),
+            offsets=np.array([], dtype=np.int64),
+        )
+    with pytest.raises(ValueError, match="non-empty and aligned"):
+        GeneSetIndex(
+            connections=np.array([0, 1], dtype=np.int64),
+            starts=np.array([0], dtype=np.int64),
+            offsets=np.array([1, 1], dtype=np.int64),
+        )
+    with pytest.raises(ValueError, match="integer dtypes"):
+        GeneSetIndex(
+            connections=np.array([0.0, 1.0]),
+            starts=np.array([0], dtype=np.int64),
+            offsets=np.array([2], dtype=np.int64),
+        )
+    with pytest.raises(ValueError, match="offsets must be positive"):
+        GeneSetIndex(
+            connections=np.array([0], dtype=np.int64),
+            starts=np.array([0], dtype=np.int64),
+            offsets=np.array([0], dtype=np.int64),
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        GeneSetIndex(
+            connections=np.array([-1], dtype=np.int64),
+            starts=np.array([0], dtype=np.int64),
+            offsets=np.array([1], dtype=np.int64),
+        )
+    with pytest.raises(ValueError, match="do not match offsets"):
+        GeneSetIndex(
+            connections=np.array([0], dtype=np.int64),
+            starts=np.array([0], dtype=np.int64),
+            offsets=np.array([2], dtype=np.int64),
+        )
+    with pytest.raises(ValueError, match="starts are invalid"):
+        GeneSetIndex(
+            connections=np.array([0, 1], dtype=np.int64),
+            starts=np.array([1], dtype=np.int64),
+            offsets=np.array([2], dtype=np.int64),
+        )
+    with pytest.raises(ValueError, match="duplicate connections"):
+        GeneSetIndex(
+            connections=np.array([0, 0], dtype=np.int64),
+            starts=np.array([0], dtype=np.int64),
+            offsets=np.array([2], dtype=np.int64),
+        )
+
+
+def test_make_rank_permutation_rejects_invalid_arguments():
+    with pytest.raises(TypeError, match="n_features must be an integer"):
+        make_rank_permutation(4.0, 0)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="at least two"):
+        make_rank_permutation(1, 0)
+    with pytest.raises(TypeError, match="tie_seed must be an integer"):
+        make_rank_permutation(4, 0.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="non-negative"):
+        make_rank_permutation(4, -1)
+
+
+def test_build_gene_set_index_rejects_invalid_ranking_universe():
+    network = _prepared_network(weighted=False)
+
+    with pytest.raises(ValueError, match="at least two features"):
+        build_gene_set_index(network, np.array([0], dtype=np.int64))
+    with pytest.raises(ValueError, match="integer dtype"):
+        build_gene_set_index(network, np.array([0.0, 1.0, 2.0, 3.0]))
+    with pytest.raises(ValueError, match="non-negative"):
+        build_gene_set_index(network, np.array([-1, 0, 1, 2], dtype=np.int64))
+    with pytest.raises(ValueError, match="unique feature indices"):
+        build_gene_set_index(network, np.array([0, 0, 1, 2], dtype=np.int64))
+    with pytest.raises(ValueError, match="absent from the AUCell ranking universe"):
+        build_gene_set_index(network, np.array([10, 11, 12, 13], dtype=np.int64))
+
+
+def test_score_aucell_block_rejects_invalid_matrix_and_permutation():
+    network = _prepared_network(weighted=False)
+    permutation = make_rank_permutation(4, 0)
+    sets = build_gene_set_index(network, np.arange(4)[permutation])
+    values = np.array([[4, 3, 2, 1]], dtype=np.float64)
+
+    with pytest.raises(ValueError, match="two-dimensional"):
+        score_aucell_block(np.arange(4), permutation, sets, n_up=3)
+    with pytest.raises(ValueError, match="finite and numeric"):
+        score_aucell_block(
+            np.array([[1.0, np.nan, 2.0, 3.0]]),
+            permutation,
+            sets,
+            n_up=3,
+        )
+    with pytest.raises(ValueError, match="align with matrix features"):
+        score_aucell_block(values, permutation[:3], sets, n_up=3)
+    with pytest.raises(ValueError, match="integer dtype"):
+        score_aucell_block(values, permutation.astype(np.float64), sets, n_up=3)
+    with pytest.raises(ValueError, match="every feature position once"):
+        score_aucell_block(values, np.array([0, 0, 1, 2], dtype=np.int64), sets, n_up=3)
+
+    out_of_range = GeneSetIndex(
+        connections=np.array([0, 99], dtype=np.int64),
+        starts=np.array([0, 1], dtype=np.int64),
+        offsets=np.array([1, 1], dtype=np.int64),
+    )
+    with pytest.raises(ValueError, match="outside the ranking universe"):
+        score_aucell_block(values, permutation, out_of_range, n_up=3)

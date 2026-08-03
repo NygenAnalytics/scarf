@@ -413,3 +413,102 @@ def test_imported_coordinates_kind_is_assay_scoped() -> None:
             kind="imported_coordinates",
             artifact_id="a" * 64,
         )
+
+
+def test_imported_coordinates_reject_invalid_block_rows_and_fingerprints() -> None:
+    root, selection, cell_ids, mask = _root_with_selection()
+    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
+    fingerprints = {"data": fingerprint_array(coordinates[mask])}
+    common = dict(
+        assay="RNA",
+        cell_selection=selection,
+        cell_key="I",
+        source_cell_ids=cell_ids[mask],
+        coordinates=coordinates[mask],
+        dimreduc_key="pca",
+        role="pca",
+        source_digest=_SOURCE_DIGEST,
+        payload_fingerprints=fingerprints,
+    )
+
+    with pytest.raises(TypeError, match="block_rows must be a positive integer"):
+        write_imported_coordinates(root, block_rows=0.5, **common)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="block_rows must be greater than zero"):
+        write_imported_coordinates(root, block_rows=0, **common)
+    with pytest.raises(ValueError, match="64-character lowercase hex"):
+        write_imported_coordinates(
+            root,
+            assay="RNA",
+            cell_selection=selection,
+            cell_key="I",
+            source_cell_ids=cell_ids[mask],
+            coordinates=coordinates[mask],
+            dimreduc_key="pca",
+            role="pca",
+            source_digest=_SOURCE_DIGEST,
+            payload_fingerprints={"data": "not-a-fingerprint"},
+        )
+
+
+def test_imported_coordinates_reject_invalid_cell_ids_and_nonfinite_values() -> None:
+    root, selection, cell_ids, mask = _root_with_selection()
+    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
+    selected = coordinates[mask].copy()
+    bad_ids = cell_ids[mask].copy()
+    bad_ids[0] = ""
+
+    with pytest.raises(ValueError, match="invalid identifier"):
+        write_imported_coordinates(
+            root,
+            assay="RNA",
+            cell_selection=selection,
+            cell_key="I",
+            source_cell_ids=bad_ids,
+            coordinates=selected,
+            dimreduc_key="pca",
+            role="pca",
+            source_digest=_SOURCE_DIGEST,
+            payload_fingerprints={"data": fingerprint_array(selected)},
+        )
+
+    selected[0, 0] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        write_imported_coordinates(
+            root,
+            assay="RNA",
+            cell_selection=selection,
+            cell_key="I",
+            source_cell_ids=cell_ids[mask],
+            coordinates=selected,
+            dimreduc_key="pca",
+            role="pca",
+            source_digest=_SOURCE_DIGEST,
+            payload_fingerprints={"data": fingerprint_array(np.nan_to_num(selected))},
+        )
+
+
+def test_imported_coordinates_reject_mismatched_loadings_shape() -> None:
+    root, selection, cell_ids, mask = _root_with_selection()
+    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
+    loadings = np.arange(10, dtype=np.float64).reshape(5, 2)
+    feature_ids = np.array([f"gene_{index}" for index in range(5)])
+
+    with pytest.raises(ValueError, match="loadings dimensions must match"):
+        write_imported_coordinates(
+            root,
+            assay="RNA",
+            cell_selection=selection,
+            cell_key="I",
+            source_cell_ids=cell_ids[mask],
+            coordinates=coordinates[mask],
+            dimreduc_key="pca",
+            role="pca",
+            source_digest=_SOURCE_DIGEST,
+            payload_fingerprints=_fingerprints(
+                data=coordinates[mask],
+                loadings=loadings,
+                feature_ids=feature_ids,
+            ),
+            loadings=loadings,
+            feature_ids=feature_ids,
+        )

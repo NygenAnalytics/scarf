@@ -665,3 +665,78 @@ def test_projection_resolver_scopes_names_by_reference_and_uses_newest() -> None
         )
         == 3
     )
+
+
+def test_plan_projection_rejects_empty_string_arguments() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+
+    with pytest.raises(TypeError, match="query_assay must be a non-empty string"):
+        plan_projection(
+            root,
+            query_assay=" ",
+            mapping_name="atlas",
+            n_cells=4,
+            save_k=2,
+            missing_feature_policy="reference_mean",
+            correction_method="none",
+            cell_selection=cell_selection,
+            feature_selection=feature_selection,
+            selected_expression_fingerprint="e" * 64,
+            query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
+            mapping_reference=reference.external_ref,
+            reference_cell_count=3,
+        )
+    with pytest.raises(TypeError, match="mapping_name must be a non-empty string"):
+        plan_projection(
+            root,
+            query_assay="RNA",
+            mapping_name="",
+            n_cells=4,
+            save_k=2,
+            missing_feature_policy="reference_mean",
+            correction_method="none",
+            cell_selection=cell_selection,
+            feature_selection=feature_selection,
+            selected_expression_fingerprint="e" * 64,
+            query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
+            mapping_reference=reference.external_ref,
+            reference_cell_count=3,
+        )
+    with pytest.raises(ValueError, match="save_k must be positive"):
+        plan_projection(
+            root,
+            query_assay="RNA",
+            mapping_name="atlas",
+            n_cells=4,
+            save_k=0,
+            missing_feature_policy="reference_mean",
+            correction_method="none",
+            cell_selection=cell_selection,
+            feature_selection=feature_selection,
+            selected_expression_fingerprint="e" * 64,
+            query_batch_fingerprint=NO_QUERY_BATCH_FINGERPRINT,
+            mapping_reference=reference.external_ref,
+            reference_cell_count=3,
+        )
+
+
+def test_resolve_projection_rejects_empty_mapping_name() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    _write(
+        root,
+        _plan(
+            root,
+            cell_selection,
+            feature_selection,
+            reference.external_ref,
+        ),
+    )
+    with pytest.raises(ValueError, match="mapping_name must be a non-empty string"):
+        resolve_projection(
+            root,
+            query_assay="RNA",
+            mapping_name="",
+            mapping_reference=reference.external_ref,
+        )

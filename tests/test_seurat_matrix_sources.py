@@ -2388,6 +2388,30 @@ def test_path_resolution_rejects_symlink_escape(tmp_path: Path) -> None:
         SidecarPathResolver(rds).resolve("linked.h5")
 
 
+def test_path_resolution_rejects_nul_and_invalid_absolute_remaps(
+    tmp_path: Path,
+) -> None:
+    rds = tmp_path / "object.rds"
+    rds.write_bytes(b"rds")
+
+    with pytest.raises(UnsafeSidecarError, match="NUL character"):
+        SidecarPathResolver(rds).resolve("bad\x00name.h5")
+    with pytest.raises(
+        ValueError, match="absolute path remaps require absolute prefixes"
+    ):
+        SidecarPathResolver(
+            rds,
+            absolute_prefix_remaps={"relative/prefix": tmp_path / "dest"},
+        )
+    with pytest.raises(
+        ValueError, match="absolute path remaps require absolute prefixes"
+    ):
+        SidecarPathResolver(
+            rds,
+            absolute_prefix_remaps={"/absolute/source": "relative/dest"},
+        )
+
+
 def test_hdf5_rejects_external_links_and_live_handles(tmp_path: Path) -> None:
     target = tmp_path / "target.h5"
     with h5py.File(target, mode="w") as handle:

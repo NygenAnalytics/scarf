@@ -3,7 +3,11 @@ import pytest
 from scipy.sparse import csr_matrix
 from sknetwork.hierarchy import Paris
 
-from scarf.clustering._paris_core import _contract_graph, canonicalize_paris_graph
+from scarf.clustering._paris_core import (
+    ParisHierarchy,
+    _contract_graph,
+    canonicalize_paris_graph,
+)
 from scarf.clustering.paris import (
     fit_paris_hierarchy,
     hierarchy_to_dendrogram,
@@ -200,6 +204,36 @@ def test_invalid_weights_are_rejected(weight: float) -> None:
     error = "non-negative" if weight < 0 else "finite"
     with pytest.raises(ValueError, match=error):
         fit_paris_hierarchy(graph)
+
+
+def test_canonicalize_rejects_non_square_and_tiny_graphs() -> None:
+    with pytest.raises(ValueError, match="square"):
+        canonicalize_paris_graph(csr_matrix(np.ones((2, 3), dtype=np.float64)))
+    with pytest.raises(ValueError, match="at least two vertices"):
+        canonicalize_paris_graph(csr_matrix([[0.0]], dtype=np.float64))
+
+
+def test_paris_hierarchy_rejects_shape_mismatches() -> None:
+    with pytest.raises(ValueError, match="children must have shape"):
+        ParisHierarchy(
+            children=np.zeros((1, 2), dtype=np.int32),
+            heights=np.array([1.0, 2.0], dtype=np.float64),
+            sizes=np.array([2, 3], dtype=np.int32),
+            component_roots=np.array([4], dtype=np.int32),
+            synthetic_joins=np.array([False, False]),
+            n_leaves=3,
+            total_weight=1.0,
+        )
+    with pytest.raises(ValueError, match="heights must have length"):
+        ParisHierarchy(
+            children=np.array([[0, 1], [2, 3]], dtype=np.int32),
+            heights=np.array([1.0], dtype=np.float64),
+            sizes=np.array([2, 3], dtype=np.int32),
+            component_roots=np.array([4], dtype=np.int32),
+            synthetic_joins=np.array([False, False]),
+            n_leaves=3,
+            total_weight=1.0,
+        )
 
 
 def test_components_isolates_and_synthetic_joins_are_explicit() -> None:

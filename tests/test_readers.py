@@ -589,6 +589,172 @@ def test_inspect_h5ad_falls_back_from_mismatched_raw_var(tmp_path):
     assert inspection.featureNameKey == "opaque_short"
 
 
+def test_inspect_h5ad_uses_index_attr_and_categorical_codes_for_lengths(tmp_path):
+    import h5py
+
+    from scarf.readers import inspect_h5ad
+
+    file_name = tmp_path / "index_attr_lengths.h5ad"
+    with h5py.File(file_name, mode="w") as h5:
+        _write_sparse_group(
+            h5,
+            "X",
+            np.array([[1, 0, 2], [0, 3, 0]], dtype=np.uint16),
+        )
+        obs = h5.create_group("obs")
+        obs.attrs["_index"] = "barcode"
+        barcode = obs.create_group("barcode")
+        barcode.create_dataset("codes", data=np.array([0, 1], dtype=np.int8))
+        barcode.create_dataset("categories", data=np.array([b"c0", b"c1"]))
+        # A non-index column that would otherwise be the first length probe.
+        obs.create_dataset("batch", data=np.array([0, 1], dtype=np.int8))
+
+        var = h5.create_group("var")
+        var.attrs["_index"] = "gene_ids"
+        var.create_dataset(
+            "gene_ids",
+            data=np.array([b"g0", b"g1", b"g2"]),
+        )
+        var.create_dataset(
+            "gene_symbol",
+            data=np.array([b"A", b"B", b"C"]),
+        )
+
+    inspection = inspect_h5ad(str(file_name))
+    assert inspection.nCells == 2
+    assert inspection.nFeatures == 3
+    assert inspection.cellIdsKey == "barcode"
+    assert inspection.featureIdsKey == "gene_ids"
+    assert inspection.featureNameKey == "gene_symbol"
+
+
+def test_inspect_h5ad_infers_sparse_shape_without_stored_attrs(tmp_path):
+    import h5py
+    from scipy.sparse import csr_matrix
+
+    from scarf.readers import inspect_h5ad
+
+    values = np.array([[1, 0, 2], [0, 3, 0], [4, 0, 5]], dtype=np.uint16)
+    matrix = csr_matrix(values)
+    file_name = tmp_path / "inferred_shape.h5ad"
+    with h5py.File(file_name, mode="w") as h5:
+        sparse = h5.create_group("X")
+        # No encoding-type / shape attrs: default CSR and infer from indptr/indices.
+        sparse.create_dataset("data", data=matrix.data)
+        sparse.create_dataset("indices", data=matrix.indices.astype(np.int64))
+        sparse.create_dataset("indptr", data=matrix.indptr.astype(np.int64))
+        obs = h5.create_group("obs")
+        obs.create_dataset(
+            "cell_id",
+            data=np.array([b"a", b"b", b"c"]),
+        )
+        var = h5.create_group("var")
+        var.create_dataset(
+            "feature_id",
+            data=np.array([b"f0", b"f1", b"f2"]),
+        )
+
+    inspection = inspect_h5ad(str(file_name))
+    assert inspection.matrixEncoding == "csr"
+    assert inspection.nCells == 3
+    assert inspection.nFeatures == 3
+    assert inspection.cellIdsKey == "cell_id"
+    assert inspection.featureIdsKey == "feature_id"
+
+
+def test_inspect_h5ad_falls_back_to_generated_ids_when_columns_are_not_unique(
+    tmp_path,
+):
+    import h5py
+
+    from scarf.readers import inspect_h5ad
+
+    file_name = tmp_path / "non_unique_ids.h5ad"
+    with h5py.File(file_name, mode="w") as h5:
+        _write_sparse_group(
+            h5,
+            "X",
+            np.array([[1, 0], [0, 2]], dtype=np.uint16),
+        )
+        obs = h5.create_group("obs")
+        obs.create_dataset("batch", data=np.array([b"A", b"A"]))
+        var = h5.create_group("var")
+        var.create_dataset("score", data=np.array([1.0, 2.0]))
+
+    inspection = inspect_h5ad(str(file_name))
+    assert inspection.cellIdsKey == "_index"
+    assert inspection.featureIdsKey == "_index"
+    assert inspection.featureNameKey == "_index"
+
+
+def test_inspect_h5ad_ignores_matrix_with_mismatched_obs_length(tmp_path):
+    import h5py
+
+    from scarf.readers import inspect_h5ad
+
+    file_name = tmp_path / "obs_mismatch.h5ad"
+    with h5py.File(file_name, mode="w") as h5:
+        _write_sparse_group(
+            h5,
+            "X",
+            np.array([[1, 0], [0, 2], [3, 0]], dtype=np.uint16),
+        )
+        layers = h5.create_group("layers")
+        _write_sparse_group(
+            layers,
+            "counts",
+            np.array([[1, 0], [0, 2]], dtype=np.uint16),
+        )
+        obs = h5.create_group("obs")
+        obs.create_dataset("barcode", data=np.array([b"c0", b"c1"]))
+        var = h5.create_group("var")
+        var.create_dataset("gene_ids", data=np.array([b"g0", b"g1"]))
+
+    inspection = inspect_h5ad(str(file_name))
+    assert inspection.matrixKey == "layers/counts"
+    assert inspection.nCells == 2
+    assert inspection.nFeatures == 2
+
+
+def test_inspect_h5ad_uses_generated_feature_ids_when_var_group_is_absent(tmp_path):
+    import h5py
+
+    from scarf.readers import inspect_h5ad
+
+    file_name = tmp_path / "missing_var.h5ad"
+    with h5py.File(file_name, mode="w") as h5:
+        _write_sparse_group(
+            h5,
+            "X",
+            np.array([[1, 0], [0, 2]], dtype=np.uint16),
+        )
+        obs = h5.create_group("obs")
+        obs.create_dataset("barcode", data=np.array([b"c0", b"c1"]))
+
+    inspection = inspect_h5ad(str(file_name))
+    assert inspection.featureAttrsKey == "var"
+    assert inspection.featureIdsKey == "_index"
+    assert inspection.featureNameKey == "_index"
+    assert inspection.nCells == 2
+    assert inspection.nFeatures == 2
+
+
+def test_inspect_h5ad_rejects_files_without_numeric_matrices(tmp_path):
+    import h5py
+
+    from scarf.readers import inspect_h5ad
+
+    file_name = tmp_path / "no_matrix.h5ad"
+    with h5py.File(file_name, mode="w") as h5:
+        obs = h5.create_group("obs")
+        obs.create_dataset("barcode", data=np.array([b"c0"]))
+        var = h5.create_group("var")
+        var.create_dataset("gene_ids", data=np.array([b"g0"]))
+
+    with pytest.raises(ValueError, match="No sparse or numeric 2D matrix"):
+        inspect_h5ad(str(file_name))
+
+
 def test_h5ad_reader_streams_sparse_matrix(h5ad_reader):
     streamed_rows = 0
     streamed_nnz = 0

@@ -646,3 +646,107 @@ def test_workspace_results_are_written_to_the_assay_shell(tmp_path):
     assert "enrichment" in root["ws/RNA"]
     assert "artifacts" in root["ws/RNA"]
     assert "enrichment" not in root["matrices/RNA"]
+
+
+def test_enrichment_label_and_execution_digest_reject_invalid_values():
+    from scarf.datastore._operations.enrichment_store import (
+        _execution_digest,
+        _validate_enrichment_label,
+    )
+
+    with pytest.raises(TypeError, match="must be a string"):
+        _validate_enrichment_label(None)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="JSON-safe"):
+        _execution_digest({"bad": {1, 2, 3}})
+    with pytest.raises(ValueError, match="JSON-safe"):
+        _execution_digest({"bad": float("nan")})
+
+
+def test_get_enrichment_rejects_poisoned_legacy_active_slot(datastore_ephemeral):
+    from scarf.datastore._operations.enrichment_store import _ENRICHMENT_ACTIVE_SLOT
+    from scarf.datastore._operations.features import _write_enrichment_slot
+
+    _, _, _, net = _configure_enrichment_keys(datastore_ephemeral)
+    expected = datastore_ephemeral.run_waggr(
+        net,
+        "active_source",
+        cell_key="enrichment_cells",
+        feat_key="enrichment_features",
+        tmin=3,
+    )
+    _, source = _enrichment_artifact(datastore_ephemeral, "active_source")
+    enrichment = datastore_ephemeral.RNA.z["enrichment"]
+    legacy = enrichment.create_group("active_legacy")
+    attr_names = (
+        "algorithm_version",
+        "cell_digest",
+        "cell_key",
+        "feature_digest",
+        "feat_key",
+        "layout",
+        "log_transform",
+        "method",
+        "network_digest",
+        "normalization",
+        "size_factor",
+        "tmin",
+        "waggr_mode",
+    )
+    attrs = {name: source.attrs[name] for name in attr_names}
+    attrs["execution_digest"] = "legacy-execution"
+    _write_enrichment_slot(
+        legacy,
+        attrs=attrs,
+        score_batches=iter([np.asarray(source["scores"][:])]),
+        n_cells=source["scores"].shape[0],
+        source_names=np.asarray(source["source_names"][:]),
+        source_sizes=np.asarray(source["source_sizes"][:]),
+        cell_index=np.asarray(source["cell_index"][:]),
+        matched_feature_index=np.asarray(source["matched_feature_index"][:]),
+        rank_feature_index=None,
+    )
+
+    loaded = datastore_ephemeral.get_enrichment("active_legacy")
+    np.testing.assert_array_equal(
+        loaded.data.compute(),
+        expected.data.compute(),
+    )
+
+    legacy.attrs[_ENRICHMENT_ACTIVE_SLOT] = "../escape"
+    with pytest.raises(ValueError, match="invalid active result"):
+        datastore_ephemeral.get_enrichment("active_legacy")
+
+    legacy.attrs[_ENRICHMENT_ACTIVE_SLOT] = "_run_missing"
+    with pytest.raises(ValueError, match="invalid active result"):
+        datastore_ephemeral.get_enrichment("active_legacy")
+
+
+def test_get_enrichment_rejects_unknown_method_and_missing_arrays(datastore_ephemeral):
+    _, _, _, net = _configure_enrichment_keys(datastore_ephemeral)
+    datastore_ephemeral.run_waggr(
+        net,
+        "method_poison",
+        cell_key="enrichment_cells",
+        feat_key="enrichment_features",
+        tmin=3,
+    )
+    method_ref, _ = _enrichment_artifact(datastore_ephemeral, "method_poison")
+    method_path = datastore_ephemeral.inspect_artifact(method_ref).path
+    method_group = datastore_ephemeral.zw[method_path]
+    method_group.attrs["method"] = "mystery"
+    with pytest.raises(ValueError, match="unknown method"):
+        datastore_ephemeral.get_enrichment("method_poison")
+
+    datastore_ephemeral.run_waggr(
+        net,
+        "array_poison",
+        cell_key="enrichment_cells",
+        feat_key="enrichment_features",
+        tmin=3,
+    )
+    array_ref, _ = _enrichment_artifact(datastore_ephemeral, "array_poison")
+    array_path = datastore_ephemeral.inspect_artifact(array_ref).path
+    array_group = datastore_ephemeral.zw[array_path]
+    del array_group["source_sizes"]
+    with pytest.raises(ValueError, match="missing required arrays"):
+        datastore_ephemeral.get_enrichment("array_poison")
