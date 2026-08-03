@@ -10,7 +10,6 @@ _EXPECTED_EXPORTS = {
     "ArtifactRef": "scarf.storage.refs",
     "ArtifactSelectionError": "scarf.graph.state",
     "ArtifactStatus": "scarf.storage.artifacts",
-    "AssayMerge": "scarf.merge",
     "AssayState": "scarf.graph.state",
     "CSVReader": "scarf.readers",
     "CSVtoZarr": "scarf.writers",
@@ -20,7 +19,7 @@ _EXPECTED_EXPORTS = {
     "CrToZarr": "scarf.writers",
     "DataStore": "scarf.datastore.datastore",
     "DataStoreSummary": "scarf.datastore.summary",
-    "DatasetMerge": "scarf.merge",
+    "DataStoreMerge": "scarf.merge",
     "EnrichmentResult": "scarf.features.enrichment.results",
     "FateMappingResult": "scarf.trajectory.results",
     "GffReader": "scarf.features.genomic.gff",
@@ -475,6 +474,15 @@ def test_legacy_dataset_download_api_is_absent():
     assert find_spec("scarf.readers.datasets") is None
 
 
+def test_retired_merge_names_are_absent():
+    import scarf
+    import scarf.merge as merge_module
+
+    for name in ("DatasetMerge", "AssayMerge"):
+        assert not hasattr(scarf, name)
+        assert not hasattr(merge_module, name)
+
+
 def test_lazy_facades_clear_cached_exports_on_reload():
     subprocess.run(
         [
@@ -488,7 +496,7 @@ cases = (
     ("scarf.features", "fit_lowess"),
     ("scarf.readers", "CSVReader"),
     ("scarf.writers", "CSVtoZarr"),
-    ("scarf.merge", "DatasetMerge"),
+    ("scarf.merge", "DataStoreMerge"),
     ("scarf.utils", "clean_array"),
     ("scarf.neighbors", "diffusion_operator"),
     ("scarf.clustering", "balanced_cut"),

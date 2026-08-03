@@ -172,11 +172,11 @@ def _merge_kang(source_paths: dict[str, Path], store: Path) -> None:
         for dataset in (KANG_CONTROL_DATASET, KANG_STIMULATED_DATASET)
     ]
 
-    scarf.AssayMerge(
+    scarf.DataStoreMerge(
+        datasets=sources,
         zarr_path=str(store),
-        assays=[source.RNA for source in sources],
         names=["ctrl", "stim"],
-        merge_assay_name="RNA",
+        assays=["RNA"],
         prepend_text="orig",
         reset_cell_filter=False,
         source_column="sample_id",

@@ -17,7 +17,7 @@ kernelspec:
 # Integrating datasets by merging
 
 Dataset integration starts by placing compatible assays in one datastore.
-`AssayMerge` aligns their feature order, carries selected metadata, and records
+`DataStoreMerge` aligns their feature order, carries selected metadata, and records
 the source of each cell. It does not alter expression values or correct the
 joint representation. This guide builds that uncorrected baseline first.
 
@@ -62,11 +62,11 @@ quality-control selections.
 
 ```{code-cell} ipython3
 merged_path = "scarf_datasets/kang_dataset_merging.zarr"
-scarf.AssayMerge(
+scarf.DataStoreMerge(
+    datasets=[ds_ctrl, ds_stim],
     zarr_path=merged_path,
-    assays=[ds_ctrl.RNA, ds_stim.RNA],
     names=["ctrl", "stim"],
-    merge_assay_name="RNA",
+    assays=["RNA"],
     prepend_text="orig",
     reset_cell_filter=False,
     source_column="sample_id",

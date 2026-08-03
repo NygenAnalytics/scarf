@@ -38,6 +38,24 @@ def validate_assay_name(assay_name: str) -> None:
         )
 
 
+def validate_workspace_name(workspace: str | None) -> None:
+    """Reject invalid workspace names and names reserved by the datastore layout."""
+    if workspace is None:
+        return
+    if not workspace or not workspace.strip():
+        raise ValueError("Workspace names must be non-empty")
+    if "/" in workspace or "\\" in workspace:
+        raise ValueError(
+            f"Workspace name {workspace!r} must not contain path separators"
+        )
+    if workspace in RESERVED_ASSAY_NAMES:
+        owner = _ASSAY_NAME_OWNERS[workspace]
+        raise ValueError(
+            f"Workspace name {workspace!r} is reserved for {owner}. "
+            "Choose another workspace name."
+        )
+
+
 def create_zarr_count_assay(
     z: zarr.Group,
     assay_name: str,

@@ -12,7 +12,9 @@ from scarf.features.markers import find_markers_by_rank, find_markers_by_regress
 from scarf.metadata import MetaData
 from scarf.quality_control.doublets import write_doublet_target_zarr
 from scarf.storage.budget import ResourceBudget
-from scarf.storage.sharding import write_counts_t
+from scarf.storage.sharding import counts_t_spec, write_counts_t
+from scarf.storage.layout import ZarrArraySpec
+from scarf.storage.profiles import resolve_storage_profile
 from tests.store_probes import RecordingStore
 from scarf.writers import (
     create_cell_data,
@@ -76,6 +78,37 @@ def test_explicit_write_counts_t_builds_complete_counts_t(workspace):
     assert counts_t.shape == (4, 5)
     assert counts_t.dtype == counts.dtype
     np.testing.assert_array_equal(counts_t[:], values.T)
+
+
+def test_counts_t_spec_matches_write_layout_and_data():
+    root = _memory_root()
+    group = root.create_group("RNA")
+    values = np.arange(24, dtype=np.uint32).reshape(6, 4)
+    counts = group.create_array(
+        "counts",
+        data=values,
+        chunks=(3, 2),
+    )
+    profile = resolve_storage_profile(root.store)
+    preview = counts_t_spec(
+        ZarrArraySpec(
+            shape=tuple(int(value) for value in counts.shape),
+            chunks=tuple(int(value) for value in counts.chunks),
+            dtype=counts.dtype,
+            compressors=None,
+            shards=None,
+            fillValue=0,
+            overwrite=True,
+        ),
+        profile=profile,
+    )
+    written = write_counts_t(counts, group, profile=profile)
+    assert written is not None
+    assert tuple(int(value) for value in written.shape) == preview.shape
+    assert np.dtype(written.dtype) == np.dtype(preview.dtype)
+    assert tuple(int(value) for value in written.chunks) == preview.chunks
+    assert written.attrs.get("complete") is True
+    np.testing.assert_array_equal(written[:], values.T)
 
 
 def test_write_counts_t_marks_incomplete_until_finished():

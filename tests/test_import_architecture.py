@@ -695,7 +695,15 @@ def test_merge_implementations_are_runtime_isolated():
     merge_root = _SCARF_ROOT / "merge"
     assert merge_root.is_dir()
     assert not (_SCARF_ROOT / "merge.py").exists()
-    required_files = {"__init__.py", "assays.py", "datasets.py"}
+    required_files = {
+        "__init__.py",
+        "datasets.py",
+        "features.py",
+        "metadata.py",
+        "models.py",
+        "row_plan.py",
+        "writer.py",
+    }
     assert {path.name for path in merge_root.glob("*.py")} == required_files
     assert (
         _runtime_import_modules(
@@ -706,41 +714,15 @@ def test_merge_implementations_are_runtime_isolated():
     )
 
     forbidden_roots = {"datastore", "mapping", "plotting", "readers", "writers"}
-    expected_merge_edges = {
-        "assays.py": {"merge.controlled_compute"},
-        "datasets.py": {
-            "merge.AssayMerge",
-            "merge.DummyAssay",
-            "merge.assays",
-        },
-    }
-    for file_name, expected_edges in expected_merge_edges.items():
-        path = merge_root / file_name
+    for path in merge_root.glob("*.py"):
+        if path.name == "__init__.py":
+            continue
         runtime_imports = _runtime_import_modules(path)
         assert not {
             module_name
             for module_name in runtime_imports
             if module_name.split(".", 1)[0] in forbidden_roots
         }
-        merge_edges = {
-            module_name
-            for module_name in runtime_imports
-            if module_name == "merge" or module_name.startswith("merge.")
-        }
-        assert merge_edges == expected_edges
-
-        module_scope_imports = _runtime_import_modules(
-            path,
-            include_function_local=False,
-        )
-        function_local_merge_edges = merge_edges - module_scope_imports
-        if file_name == "assays.py":
-            assert function_local_merge_edges == {"merge.controlled_compute"}
-        else:
-            assert function_local_merge_edges == {
-                "merge.AssayMerge",
-                "merge.DummyAssay",
-            }
 
 
 def test_mapping_does_not_import_datastore_at_runtime():

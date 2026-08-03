@@ -42,6 +42,7 @@ _RETIRED_MODULES = {
     "scarf/markers/search.py",
     "scarf/meld_assay.py",
     "scarf/merge.py",
+    "scarf/merge/assays.py",
     "scarf/metadata.py",
     "scarf/metrics.py",
     "scarf/neighbors/graph_store.py",
@@ -102,7 +103,7 @@ from scarf.features import (
     select_highly_variable_features,
 )
 from scarf.matrix import Block, ChunkedArray
-from scarf.merge import AssayMerge, DatasetMerge, DummyAssay
+from scarf.merge import DataStoreMerge
 from scarf.metadata import MetaData, MetaDataRowBlock
 from scarf.readers import (
     CSVReader,
@@ -143,13 +144,14 @@ for matrix_class in (Block, ChunkedArray):
     assert matrix_class.__module__ == "scarf.matrix"
 for metadata_class in (MetaData, MetaDataRowBlock):
     assert metadata_class.__module__ == "scarf.metadata"
-assert scarf.AssayMerge is scarf.merge.AssayMerge is AssayMerge
-assert scarf.DatasetMerge is scarf.merge.DatasetMerge is DatasetMerge
-assert scarf.merge.DummyAssay is DummyAssay
+assert scarf.DataStoreMerge is scarf.merge.DataStoreMerge is DataStoreMerge
+assert not hasattr(scarf, "AssayMerge")
+assert not hasattr(scarf.merge, "AssayMerge")
+assert not hasattr(scarf, "DatasetMerge")
+assert not hasattr(scarf.merge, "DatasetMerge")
 assert not hasattr(scarf, "ZarrMerge")
 assert not hasattr(scarf.merge, "ZarrMerge")
-for merge_class in (AssayMerge, DatasetMerge, DummyAssay):
-    assert merge_class.__module__ == "scarf.merge"
+assert DataStoreMerge.__module__ == "scarf.merge"
 assert scarf.CrH5Reader is scarf.readers.CrH5Reader
 assert scarf.CrToZarr is scarf.writers.CrToZarr
 assert scarf.cytebase.Repository is Repository

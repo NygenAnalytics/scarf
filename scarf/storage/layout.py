@@ -17,6 +17,12 @@ DEFAULT_TARGET_CHUNK_BYTES = 128 * 1024 * 1024
 DEFAULT_TARGET_SHARD_BYTES = 5 * DEFAULT_TARGET_CHUNK_BYTES
 
 
+def _encoded_chunk_bound(rawBytes: int) -> int:
+    """Conservative encoded-size bound for the supported compressors."""
+    raw_bytes = max(0, int(rawBytes))
+    return raw_bytes + raw_bytes // 128 + 1024
+
+
 def _divisors(value: int) -> tuple[int, ...]:
     small: list[int] = []
     large: list[int] = []

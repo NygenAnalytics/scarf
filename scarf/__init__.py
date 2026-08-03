@@ -25,8 +25,7 @@ if TYPE_CHECKING:
     from .features.genomic.gff import GffReader as GffReader
     from .features.genomic.melding import coordinate_melding as coordinate_melding
     from .merge import (
-        AssayMerge as AssayMerge,
-        DatasetMerge as DatasetMerge,
+        DataStoreMerge as DataStoreMerge,
     )
     from .readers import (
         CSVReader as CSVReader,
@@ -104,7 +103,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ArtifactRef": (".storage.refs", "ArtifactRef"),
     "ArtifactSelectionError": (".graph.state", "ArtifactSelectionError"),
     "ArtifactStatus": (".storage.artifacts", "ArtifactStatus"),
-    "AssayMerge": (".merge", "AssayMerge"),
     "AssayState": (".graph.state", "AssayState"),
     "CSVReader": (".readers", "CSVReader"),
     "CSVtoZarr": (".writers", "CSVtoZarr"),
@@ -114,7 +112,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "CrToZarr": (".writers", "CrToZarr"),
     "DataStore": (".datastore.datastore", "DataStore"),
     "DataStoreSummary": (".datastore.summary", "DataStoreSummary"),
-    "DatasetMerge": (".merge", "DatasetMerge"),
+    "DataStoreMerge": (".merge", "DataStoreMerge"),
     "EnrichmentResult": (".features.enrichment", "EnrichmentResult"),
     "FateMappingResult": (".trajectory.results", "FateMappingResult"),
     "GffReader": (".features.genomic.gff", "GffReader"),

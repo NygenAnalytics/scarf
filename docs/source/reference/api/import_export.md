@@ -182,14 +182,26 @@ operation memory budget. Explicit positive values remain supported.
 
 ## Merge
 
-Use `AssayMerge` to merge assay matrices across samples.
+Use `DataStoreMerge` to merge DataStores. Pass `assays=["RNA"]` when only one
+assay type is needed. By default RNA assays also receive a feature-major
+`countsT` matrix for faster gene-wise reads, which roughly doubles stored
+counts for those assays. Interrupted merges resume at whole-component
+boundaries (`cellData`, each assay `counts`, and each requested `countsT`)
+rather than mid-matrix shards.
 
 ```{eval-rst}
-.. autoclass:: scarf.merge.AssayMerge
+.. autoclass:: scarf.merge.DataStoreMerge
     :members:
-```
 
-```{eval-rst}
-.. autoclass:: scarf.merge.DatasetMerge
+.. autoclass:: scarf.merge.MergePlan
+    :members:
+
+.. autoclass:: scarf.merge.AssayMergePlan
+    :members:
+
+.. autoclass:: scarf.merge.MergeResult
+    :members:
+
+.. autoclass:: scarf.merge.ComponentResult
     :members:
 ```

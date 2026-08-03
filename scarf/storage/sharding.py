@@ -15,8 +15,10 @@ from .budget import (
     admitted_worker_split,
     resolve_budget,
 )
+from .geometry import ArrayGeometry, array_geometry
 from .layout import (
     ZarrArraySpec,
+    _encoded_chunk_bound,
     _group_zarr_format,
     array_shard_rows,
     get_compressors,
@@ -95,6 +97,31 @@ class SparseImportPlan:
     writeTasks: int
 
 
+def _destination_geometry(
+    destination: zarr.Array | ZarrArraySpec,
+) -> tuple[ArrayGeometry, np.dtype[Any]]:
+    if isinstance(destination, ZarrArraySpec):
+        if len(destination.shape) != 2 or len(destination.chunks) != 2:
+            raise ValueError(
+                "Sparse import destination specifications must be two-dimensional"
+            )
+        geometry = ArrayGeometry(
+            shape=(int(destination.shape[0]), int(destination.shape[1])),
+            chunks=(int(destination.chunks[0]), int(destination.chunks[1])),
+            shards=(
+                None
+                if destination.shards is None
+                else tuple(int(value) for value in destination.shards)
+            ),
+            itemsize=max(1, int(np.dtype(destination.dtype).itemsize)),
+        )
+        return geometry, np.dtype(destination.dtype)
+    resolved = array_geometry(destination)
+    if resolved is None or len(resolved.shape) != 2:
+        raise ValueError("Sparse import destinations must be two-dimensional arrays")
+    return resolved, np.dtype(destination.dtype)
+
+
 def sparse_matrix_bytes(*matrices: Any) -> int:
     """Return unique array bytes owned by SciPy sparse matrices."""
     arrays = (
@@ -130,6 +157,17 @@ def sparse_producer_peak_bytes(
     return buffered_bytes + source_bytes + source_indexes + canonicalization_bytes
 
 
+def row_band_task_count(nRows: int, bandRows: int) -> int:
+    """Return the number of fixed-height row bands covering a matrix."""
+    rows = max(0, int(nRows))
+    band_rows = int(bandRows)
+    if band_rows <= 0:
+        raise ValueError("bandRows must be positive")
+    if rows == 0:
+        return 0
+    return (rows + band_rows - 1) // band_rows
+
+
 def sparse_write_task_count(
     destinations: Sequence[zarr.Array],
     nRows: int,
@@ -140,7 +178,7 @@ def sparse_write_task_count(
         return 0
     return int(
         sum(
-            (rows + array_shard_rows(destination) - 1) // array_shard_rows(destination)
+            row_band_task_count(rows, array_shard_rows(destination))
             for destination in destinations
         )
     )
@@ -158,6 +196,58 @@ def resolve_sparse_import_batch(
     producerStagingBytes: Callable[[int], int] | None = None,
     extraProducerBytes: Callable[[int], int] | None = None,
 ) -> SparseImportPlan:
+    """Resolve sparse source rows for physical destination arrays."""
+    return _resolve_sparse_import_geometries(
+        tuple(_destination_geometry(destination) for destination in destinations),
+        nRows=nRows,
+        resources=resources,
+        maxWindowNnz=maxWindowNnz,
+        sourceDtype=sourceDtype,
+        batchRows=batchRows,
+        residentBytes=residentBytes,
+        producerStagingBytes=producerStagingBytes,
+        extraProducerBytes=extraProducerBytes,
+    )
+
+
+def resolve_sparse_import_spec(
+    destinations: Sequence[ZarrArraySpec],
+    *,
+    nRows: int,
+    resources: ResourceBudget,
+    maxWindowNnz: Callable[[int], int],
+    sourceDtype: Any,
+    batchRows: int | None = None,
+    residentBytes: int = 0,
+    producerStagingBytes: Callable[[int], int] | None = None,
+    extraProducerBytes: Callable[[int], int] | None = None,
+) -> SparseImportPlan:
+    """Resolve sparse source rows before destination arrays are created."""
+    return _resolve_sparse_import_geometries(
+        tuple(_destination_geometry(destination) for destination in destinations),
+        nRows=nRows,
+        resources=resources,
+        maxWindowNnz=maxWindowNnz,
+        sourceDtype=sourceDtype,
+        batchRows=batchRows,
+        residentBytes=residentBytes,
+        producerStagingBytes=producerStagingBytes,
+        extraProducerBytes=extraProducerBytes,
+    )
+
+
+def _resolve_sparse_import_geometries(
+    destinations: Sequence[tuple[ArrayGeometry, np.dtype[Any]]],
+    *,
+    nRows: int,
+    resources: ResourceBudget,
+    maxWindowNnz: Callable[[int], int],
+    sourceDtype: Any,
+    batchRows: int | None = None,
+    residentBytes: int = 0,
+    producerStagingBytes: Callable[[int], int] | None = None,
+    extraProducerBytes: Callable[[int], int] | None = None,
+) -> SparseImportPlan:
     """Resolve source rows while admitting one complete destination write band."""
     destination_list = tuple(destinations)
     if not destination_list:
@@ -165,8 +255,8 @@ def resolve_sparse_import_batch(
     rows = int(nRows)
     if rows < 0:
         raise ValueError("nRows cannot be negative")
-    for destination in destination_list:
-        if int(destination.shape[0]) != rows:
+    for geometry, _dtype in destination_list:
+        if geometry.shape[0] != rows:
             raise ValueError(
                 "Sparse import destinations must match the source row count"
             )
@@ -176,24 +266,27 @@ def resolve_sparse_import_batch(
     source_dtype = np.dtype(sourceDtype)
     value_itemsize = max(
         source_dtype.itemsize,
-        *(np.dtype(destination.dtype).itemsize for destination in destination_list),
+        *(dtype.itemsize for _geometry, dtype in destination_list),
     )
     staging_bytes = producerStagingBytes or (lambda _: 0)
     extra_bytes = extraProducerBytes or (lambda _: 0)
     maximum_shard_rows = max(
-        array_shard_rows(destination) for destination in destination_list
+        geometry.axisShard(0) for geometry, _dtype in destination_list
     )
-    write_tasks = sparse_write_task_count(destination_list, rows)
+    write_tasks = sum(
+        row_band_task_count(rows, geometry.axisShard(0))
+        for geometry, _dtype in destination_list
+    )
 
-    band_requirements: list[tuple[zarr.Array, int, int]] = []
+    band_requirements: list[tuple[ArrayGeometry, np.dtype[Any], int, int]] = []
     if rows:
-        for destination in destination_list:
-            band_rows = min(rows, array_shard_rows(destination))
+        for geometry, dtype in destination_list:
+            band_rows = min(rows, geometry.axisShard(0))
             band_values = max(0, int(maxWindowNnz(band_rows)))
             band_sparse_bytes = band_values * (
                 source_dtype.itemsize + 2 * np.dtype(np.int64).itemsize
             )
-            band_requirements.append((destination, band_values, band_sparse_bytes))
+            band_requirements.append((geometry, dtype, band_values, band_sparse_bytes))
 
     def reserve(width: int) -> int:
         source_values = max(0, int(maxWindowNnz(width)))
@@ -213,9 +306,13 @@ def resolve_sparse_import_batch(
 
     def admit(width: int) -> int:
         producer_reserve = reserve(width)
-        for destination, band_values, band_sparse_bytes in band_requirements:
-            dense_bytes, inner_bytes, n_chunks = _band_geometry(destination)
-            destination_dtype = np.dtype(destination.dtype)
+        for (
+            geometry,
+            destination_dtype,
+            band_values,
+            band_sparse_bytes,
+        ) in band_requirements:
+            dense_bytes, inner_bytes, n_chunks = _band_geometry(geometry)
             conversion_bytes = (
                 band_values * destination_dtype.itemsize
                 if source_dtype != destination_dtype
@@ -257,7 +354,7 @@ def resolve_sparse_import_batch(
     else:
         preferred_rows = min(
             rows,
-            min(array_shard_rows(destination) for destination in destination_list),
+            min(geometry.axisShard(0) for geometry, _dtype in destination_list),
         )
 
         def fits(width: int) -> bool:
@@ -378,15 +475,21 @@ class SparseShardBuffer:
 
 
 def _band_geometry(
-    destination: zarr.Array,
+    destination: zarr.Array | ArrayGeometry,
     nRows: int | None = None,
 ) -> tuple[int, int, int]:
-    rows = array_shard_rows(destination) if nRows is None else max(1, int(nRows))
-    columns = max(1, int(destination.shape[1]))
-    itemsize = max(1, int(np.dtype(destination.dtype).itemsize))
-    chunks = tuple(int(value) for value in destination.chunks)
-    chunk_rows = min(rows, chunks[0])
-    chunk_columns = min(columns, chunks[1])
+    if isinstance(destination, ArrayGeometry):
+        geometry = destination
+    else:
+        resolved = array_geometry(destination)
+        if resolved is None:
+            raise ValueError("Destination array has no chunk geometry")
+        geometry = resolved
+    rows = geometry.axisShard(0) if nRows is None else max(1, int(nRows))
+    columns = max(1, geometry.shape[1])
+    itemsize = max(1, geometry.itemsize)
+    chunk_rows = min(rows, geometry.chunks[0])
+    chunk_columns = min(columns, geometry.chunks[1])
     n_chunks = (
         (rows + chunk_rows - 1)
         // chunk_rows
@@ -395,12 +498,6 @@ def _band_geometry(
     dense_bytes = rows * columns * itemsize
     inner_bytes = chunk_rows * chunk_columns * itemsize
     return dense_bytes, inner_bytes, n_chunks
-
-
-def _encoded_chunk_bound(rawBytes: int) -> int:
-    """Conservative encoded-size bound for the supported compressors."""
-    raw_bytes = max(0, int(rawBytes))
-    return raw_bytes + raw_bytes // 128 + 1024
 
 
 def _shard_index_bound(nChunks: int) -> int:
@@ -798,6 +895,85 @@ def accumulate_sparse_to_shards(
     return buffer.rows
 
 
+def _counts_t_layout(
+    n_cells: int,
+    n_feats: int,
+    source_rows: int,
+    feature_chunk_source: int,
+    dtype: Any,
+    profile: StorageProfile,
+) -> ZarrArraySpec:
+    feature_chunk = max(1, min(max(1, n_feats), int(feature_chunk_source)))
+    cell_chunk = max(1, min(max(1, n_cells), int(source_rows)))
+    return ZarrArraySpec(
+        shape=(n_feats, n_cells),
+        chunks=(feature_chunk, cell_chunk),
+        dtype=dtype,
+        compressors=get_compressors(profile, zarrFormat=3),
+        shards=None,
+        fillValue=0,
+        overwrite=True,
+    )
+
+
+def counts_t_spec(
+    counts: ZarrArraySpec,
+    *,
+    profile: StorageProfile,
+) -> ZarrArraySpec:
+    """Return the unsharded feature-major layout derived from counts."""
+    if len(counts.shape) != 2 or len(counts.chunks) != 2:
+        raise ValueError("counts must be a two-dimensional array specification")
+    n_cells = int(counts.shape[0])
+    n_feats = int(counts.shape[1])
+    source_rows = (
+        int(counts.chunks[0]) if counts.shards is None else int(counts.shards[0])
+    )
+    return _counts_t_layout(
+        n_cells,
+        n_feats,
+        source_rows,
+        int(counts.chunks[1]),
+        counts.dtype,
+        profile,
+    )
+
+
+def preflight_counts_t_spec(
+    counts: ZarrArraySpec,
+    *,
+    profile: StorageProfile,
+    resources: ResourceBudget,
+    residentBytes: int = 0,
+) -> ZarrArraySpec:
+    """Admit countsT construction before creating the destination."""
+    transpose = counts_t_spec(counts, profile=profile)
+    n_feats, n_cells = (int(value) for value in transpose.shape)
+    feature_chunk, cell_chunk = (int(value) for value in transpose.chunks)
+    if n_cells == 0 or n_feats == 0:
+        return transpose
+    inner_bytes = (
+        feature_chunk * cell_chunk * max(1, int(np.dtype(transpose.dtype).itemsize))
+    )
+    n_tasks = row_band_task_count(n_cells, cell_chunk) * row_band_task_count(
+        n_feats,
+        feature_chunk,
+    )
+    admitted_worker_split(
+        resources,
+        nTasks=n_tasks,
+        residentBytes=max(0, int(residentBytes)),
+        taskBytes=lambda concurrency: _row_band_task_peak(
+            sourceBytes=inner_bytes,
+            denseBytes=inner_bytes,
+            innerChunkBytes=inner_bytes,
+            nChunks=1,
+            innerConcurrency=concurrency,
+        ),
+    )
+    return transpose
+
+
 def write_counts_t(
     counts: zarr.Array,
     group: zarr.Group,
@@ -805,6 +981,7 @@ def write_counts_t(
     profile: StorageProfile | None = None,
     resources: ResourceBudget | None = None,
     feature_major_layout: bool = False,
+    residentBytes: int = 0,
 ) -> zarr.Array | None:
     """Write the optional feature-major count matrix using public Zarr APIs."""
     from ..utils.logging import logger
@@ -827,16 +1004,7 @@ def write_counts_t(
                 chunk_elements // cell_chunk,
             ),
         )
-    else:
-        source_rows = array_shard_rows(counts)
-        feature_chunk = max(1, min(max(1, n_feats), int(counts.chunks[1])))
-        cell_chunk = max(1, min(max(1, n_cells), source_rows))
-    inner_bytes = feature_chunk * cell_chunk * itemsize
-
-    counts_t = create_numeric_array(
-        group,
-        "countsT",
-        ZarrArraySpec(
+        layout = ZarrArraySpec(
             shape=(n_feats, n_cells),
             chunks=(feature_chunk, cell_chunk),
             dtype=counts.dtype,
@@ -844,7 +1012,23 @@ def write_counts_t(
             shards=None,
             fillValue=0,
             overwrite=True,
-        ),
+        )
+    else:
+        layout = _counts_t_layout(
+            n_cells,
+            n_feats,
+            array_shard_rows(counts),
+            int(counts.chunks[1]),
+            counts.dtype,
+            resolved_profile,
+        )
+        feature_chunk, cell_chunk = (int(value) for value in layout.chunks)
+    inner_bytes = feature_chunk * cell_chunk * itemsize
+
+    counts_t = create_numeric_array(
+        group,
+        "countsT",
+        layout,
     )
     counts_t.attrs["complete"] = False
     if n_cells == 0 or n_feats == 0:
@@ -859,6 +1043,7 @@ def write_counts_t(
     workers, inner = admitted_worker_split(
         resources,
         nTasks=n_tasks,
+        residentBytes=max(0, int(residentBytes)),
         taskBytes=lambda concurrency: _row_band_task_peak(
             sourceBytes=inner_bytes,
             denseBytes=inner_bytes,

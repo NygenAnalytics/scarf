@@ -16,6 +16,7 @@ __all__ = [
     "affordable_width",
     "checked_indices",
     "contiguous_ranges",
+    "is_contiguous",
     "partition_indices",
     "row_band",
 ]
@@ -52,6 +53,15 @@ def contiguous_ranges(nRows: int, band: int) -> list[tuple[int, int]]:
     rows = max(0, int(nRows))
     step = max(1, int(band))
     return [(start, min(start + step, rows)) for start in range(0, rows, step)]
+
+
+def is_contiguous(indices: np.ndarray) -> bool:
+    """Return whether indices form a strictly increasing consecutive run."""
+    if indices.size == 0:
+        return True
+    if indices[0] < 0:
+        return False
+    return bool(indices.size == 1 or np.all(np.diff(indices) == 1))
 
 
 def affordable_width(fits: Fits, maxWidth: int) -> int:

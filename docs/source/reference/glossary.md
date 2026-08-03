@@ -123,6 +123,6 @@ densMAP
 LSI
   Latent Semantic Indexing. Linear dimension reduction used for scATAC-seq graphs.
 
-AssayMerge
-  Canonical class for merging assays from multiple DataStores into one Zarr file.
+DataStoreMerge
+  Canonical class for merging DataStores into one Zarr file.
 ```

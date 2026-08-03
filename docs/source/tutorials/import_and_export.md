@@ -26,7 +26,7 @@ counts or metadata to interoperable formats.
 
 - Download datasets from the `scarf_docs` Cytebase catalog
 - Convert 10x HDF5, MTX, H5AD, CSV, and sparse inputs to Zarr
-- Merge full DataStores with `DatasetMerge`
+- Merge full DataStores with `DataStoreMerge`
 - Export an assay to MTX or H5AD
 
 ## Guided steps
@@ -356,11 +356,11 @@ ds_sparse = scarf.DataStore(str(sparse_zarr))
 ds_sparse
 ```
 
-### 6. Merge full DataStores with DatasetMerge
+### 6. Merge full DataStores with DataStoreMerge
 
-`DatasetMerge` merges multiple full DataStores (all assays per dataset) into one Zarr file.
+`DataStoreMerge` merges multiple full DataStores (all assays per dataset) into one Zarr file.
 The example below merges two tiny stores created with `SparseToZarr`. For single-assay merges
-of larger studies see `AssayMerge` in {doc}`data_integration`.
+pass `assays=["RNA"]` (or the assay name you need).
 
 ```{code-cell} ipython3
 for name, values in [
@@ -381,7 +381,7 @@ for name, values in [
 
 ds_a = scarf.DataStore('scarf_datasets/toy_merge_a.zarr')
 ds_b = scarf.DataStore('scarf_datasets/toy_merge_b.zarr')
-merger = scarf.DatasetMerge(
+merger = scarf.DataStoreMerge(
     datasets=[ds_a, ds_b],
     zarr_path='scarf_datasets/toy_merged.zarr',
     names=['a', 'b'],
@@ -402,11 +402,11 @@ page does not execute a Loom example.
 - Fetching a prepared Zarr store when the aim is to demonstrate source-format conversion
 - Reusing an existing Zarr output path without confirming that it can be overwritten
 - Exporting normalized values when a downstream method requires raw counts
-- Using `DatasetMerge` when you only need one assay from each store (`AssayMerge` is enough)
+- Using `DataStoreMerge` without `assays=` when you only need one modality from multi-assay stores
 - Assuming an H5AD file uses `X` for raw counts without inspecting its layers
 - Expecting sparse or malformed `obsm` arrays to be imported as embeddings
 - Materializing a full AnnData object when a feature panel would answer the export question
 
 Conversion writes the requested Zarr target. Export commands write MTX or H5AD
-at the supplied destination, and `DatasetMerge` writes its merged store at
+at the supplied destination, and `DataStoreMerge` writes its merged store at
 `zarr_path`.

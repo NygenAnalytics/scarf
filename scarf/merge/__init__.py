@@ -5,36 +5,43 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .assays import (
-        AssayMerge as AssayMerge,
-        DummyAssay as DummyAssay,
-        MergeAssay as MergeAssay,
-        _RowPlan as _RowPlan,
-        controlled_compute as controlled_compute,
-        load_zarr as load_zarr,
+    from .datasets import DataStoreMerge as DataStoreMerge
+    from .models import (
+        AssayMergePlan as AssayMergePlan,
+        ComponentResult as ComponentResult,
+        MergePlan as MergePlan,
+        MergeResult as MergeResult,
     )
-    from .datasets import DatasetMerge as DatasetMerge
 
 __all__ = [
-    "DatasetMerge",
-    "AssayMerge",
+    "DataStoreMerge",
+    "MergePlan",
+    "MergeResult",
+    "AssayMergePlan",
+    "ComponentResult",
 ]
 
 _LAZY_EXPORTS = {
-    "DatasetMerge": "datasets",
-    "AssayMerge": "assays",
-    "DummyAssay": "assays",
-    "MergeAssay": "assays",
-    "_RowPlan": "assays",
-    "load_zarr": "assays",
-    "controlled_compute": "assays",
+    "DataStoreMerge": "datasets",
+    "MergePlan": "models",
+    "MergeResult": "models",
+    "AssayMergePlan": "models",
+    "ComponentResult": "models",
 }
 
 for _export_name in _LAZY_EXPORTS:
     globals().pop(_export_name, None)
 del _export_name
 
-_CLASS_EXPORTS = frozenset({"DatasetMerge", "AssayMerge", "DummyAssay"})
+_CLASS_EXPORTS = frozenset(
+    {
+        "DataStoreMerge",
+        "MergePlan",
+        "MergeResult",
+        "AssayMergePlan",
+        "ComponentResult",
+    }
+)
 
 
 def _normalize_class_metadata(value: type[Any]) -> None:

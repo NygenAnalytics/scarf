@@ -6,6 +6,14 @@ from zarr.storage import MemoryStore
 
 import scarf.metadata as metadata
 from scarf.metadata.rows import MetaDataRowBlock as implementation_row_block
+from scarf.metadata.rows import (
+    array_row_selection_peak_bytes,
+    iter_metadata_column_blocks,
+    metadata_missing_mask,
+    read_metadata_missing_rows,
+    read_metadata_rows,
+    read_metadata_rows_chunkwise,
+)
 from scarf.metadata.table import MetaData as implementation_metadata
 from tests.signature_contracts import signature_digest
 
@@ -104,6 +112,183 @@ def test_metadata_rows_and_queries_match_table_contract():
     )
     assert table.grep("^AL") == ["ALPHA", "ALPINE"]
     assert table.head(2)["score"].tolist() == [0.5, 2.0]
+
+
+def test_metadata_row_helpers_read_permutations_and_missing_masks():
+    table = _metadata_fixture()
+    group = table.locations["primary"]
+    group.create_array(
+        "__scarf_missing__score",
+        data=np.array([False, True, False, True]),
+        chunks=(2,),
+    )
+    group["score"].attrs["missing_mask"] = "__scarf_missing__score"
+
+    np.testing.assert_allclose(
+        read_metadata_rows(table, "score", np.array([3, 2])),
+        [5.0, 3.5],
+    )
+    assert metadata_missing_mask(table, "score") is not None
+    np.testing.assert_array_equal(
+        read_metadata_missing_rows(table, "score", np.array([3, 2])),
+        [True, False],
+    )
+    assert "__scarf_missing__score" not in table.columns
+
+
+def test_metadata_row_helpers_preserve_noncontiguous_order_without_span():
+    class TrackingArray:
+        def __init__(self, values):
+            self._values = np.asarray(values)
+            self.shape = self._values.shape
+            self.requests: list[tuple[str, object]] = []
+
+        def __getitem__(self, key):
+            self.requests.append(("getitem", key))
+            return self._values[key]
+
+        def get_orthogonal_selection(self, selection):
+            self.requests.append(("orthogonal", selection))
+            (indices,) = selection
+            return self._values[np.asarray(indices)]
+
+    class TrackingMeta:
+        N = 6
+        columns = ["score"]
+
+        def __init__(self, array):
+            self._array = array
+
+        def _get_array(self, column):
+            assert column == "score"
+            return self._array
+
+        def _verify_bool(self, key):
+            return False
+
+        def default_block_rows(self, column="I"):
+            return self.N
+
+    array = TrackingArray([10, 20, 30, 40, 50, 60])
+    table = TrackingMeta(array)
+    rows = np.array([5, 1, 4], dtype=np.int64)
+    np.testing.assert_array_equal(
+        read_metadata_rows(table, "score", rows), [60, 20, 50]
+    )
+    assert array.requests[0][0] == "orthogonal"
+    assert not any(kind == "getitem" for kind, _ in array.requests)
+
+    contiguous = TrackingArray([10, 20, 30, 40])
+    contiguous_table = TrackingMeta(contiguous)
+    np.testing.assert_array_equal(
+        read_metadata_rows(contiguous_table, "score", np.array([1, 2, 3])),
+        [20, 30, 40],
+    )
+    assert contiguous.requests == [("getitem", slice(1, 4))]
+
+
+def test_chunkwise_metadata_rows_preserve_order_and_decode_one_chunk():
+    class ArrayMetadata:
+        shards = None
+
+    class TrackingArray:
+        def __init__(self, values, chunk_rows):
+            self._values = np.asarray(values)
+            self.shape = self._values.shape
+            self.dtype = self._values.dtype
+            self.chunks = (chunk_rows,)
+            self.metadata = ArrayMetadata()
+            self.requests: list[tuple[str, object]] = []
+
+        def __getitem__(self, key):
+            self.requests.append(("getitem", key))
+            return self._values[key]
+
+        def get_orthogonal_selection(self, selection):
+            self.requests.append(("orthogonal", selection))
+            (indices,) = selection
+            return self._values[np.asarray(indices)]
+
+    class TrackingMeta:
+        columns = ["score"]
+
+        def __init__(self, array):
+            self._array = array
+            self.N = int(array.shape[0])
+
+        def _get_array(self, column):
+            assert column == "score"
+            return self._array
+
+        def default_block_rows(self, column="I"):
+            _ = column
+            return int(self._array.chunks[0])
+
+    array = TrackingArray([10, 20, 30, 40, 50, 60], chunk_rows=2)
+    table = TrackingMeta(array)
+    rows = np.array([5, 0, 4, 1, 2], dtype=np.int64)
+    np.testing.assert_array_equal(
+        read_metadata_rows_chunkwise(table, "score", rows),
+        [60, 10, 50, 20, 30],
+    )
+
+    for kind, request in array.requests:
+        if kind == "getitem":
+            assert isinstance(request, slice)
+            selected = np.arange(request.start, request.stop)
+        else:
+            assert isinstance(request, tuple)
+            selected = np.asarray(request[0])
+        assert np.unique(selected // array.chunks[0]).size == 1
+
+    one_row = array_row_selection_peak_bytes(array, 1)
+    five_rows = array_row_selection_peak_bytes(array, 5)
+    assert one_row > array.chunks[0] * array.dtype.itemsize
+    assert five_rows > one_row
+
+
+def test_metadata_column_blocks_respect_source_chunk_boundaries():
+    class ArrayMetadata:
+        shards = None
+
+    class TrackingArray:
+        def __init__(self):
+            self._values = np.arange(7)
+            self.shape = self._values.shape
+            self.dtype = self._values.dtype
+            self.chunks = (3,)
+            self.metadata = ArrayMetadata()
+            self.requests: list[slice] = []
+
+        def __getitem__(self, key):
+            assert isinstance(key, slice)
+            self.requests.append(key)
+            return self._values[key]
+
+    class TrackingMeta:
+        N = 7
+        columns = ["score"]
+
+        def __init__(self, array):
+            self._array = array
+
+        def _get_array(self, column):
+            assert column == "score"
+            return self._array
+
+        def default_block_rows(self, column="I"):
+            _ = column
+            return int(self._array.chunks[0])
+
+    array = TrackingArray()
+    table = TrackingMeta(array)
+    values = list(iter_metadata_column_blocks(table, "score", block_rows=2))
+    np.testing.assert_array_equal(np.concatenate(values), np.arange(7))
+    assert max(value.size for value in values) <= 2
+    for request in array.requests:
+        first_bin = request.start // array.chunks[0]
+        last_bin = (request.stop - 1) // array.chunks[0]
+        assert first_bin == last_bin
 
 
 def test_metadata_remove_trend_preserves_fixed_strategy():

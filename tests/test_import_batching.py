@@ -10,11 +10,13 @@ from zarr.storage import MemoryStore
 
 from scarf.readers import CrH5Reader, H5adReader
 from scarf.storage.budget import ResourceBudget
-from scarf.storage.layout import array_shard_rows
+from scarf.storage.layout import ZarrArraySpec, array_shard_rows, get_compressors
 from scarf.storage.sharding import (
     resolve_sparse_import_batch,
+    resolve_sparse_import_spec,
     sparse_write_task_count,
 )
+from scarf.storage.types import array_metadata_shards
 from scarf.writers import CrToZarr, H5adToZarr, SparseToZarr
 
 
@@ -35,6 +37,45 @@ def _planner_destinations() -> tuple[zarr.Array, zarr.Array]:
         dtype=np.uint32,
     )
     return first, second
+
+
+def test_sparse_import_spec_matches_physical_array_plan() -> None:
+    first, second = _planner_destinations()
+    resources = ResourceBudget(memoryBytes=2_000_000, workers=2)
+
+    def max_window_nnz(rows: int) -> int:
+        return max(0, int(rows)) * 3
+
+    array_plan = resolve_sparse_import_batch(
+        (first, second),
+        nRows=12,
+        resources=resources,
+        maxWindowNnz=max_window_nnz,
+        sourceDtype=np.uint32,
+    )
+    specs = []
+    for array in (first, second):
+        shards = array_metadata_shards(array)
+        specs.append(
+            ZarrArraySpec(
+                shape=tuple(int(value) for value in array.shape),
+                chunks=tuple(int(value) for value in array.chunks),
+                dtype=array.dtype,
+                compressors=get_compressors("fast_local"),
+                shards=(
+                    None if shards is None else tuple(int(value) for value in shards)
+                ),
+                fillValue=0,
+            )
+        )
+    spec_plan = resolve_sparse_import_spec(
+        tuple(specs),
+        nRows=12,
+        resources=resources,
+        maxWindowNnz=max_window_nnz,
+        sourceDtype=np.uint32,
+    )
+    assert spec_plan == array_plan
 
 
 def test_sparse_import_planner_prefers_geometry_and_shrinks_monotonically() -> None:

@@ -100,6 +100,15 @@ class MetaData:
             name=stored_column,
         )
 
+    def _get_missing_mask_array(self, column: str) -> zarr.Array | None:
+        location, stored_column = self._get_loc(column)
+        group = self.locations[location]
+        output = as_zarr_array(group[stored_column], name=stored_column)
+        missing_name = output.attrs.get("missing_mask")
+        if not isinstance(missing_name, str) or missing_name not in group:
+            return None
+        return as_zarr_array(group[missing_name], name=missing_name)
+
     def get_dtype(self, column: str) -> np.dtype[Any]:
         """Return the dtype of a metadata column."""
         return self._get_array(column).dtype
