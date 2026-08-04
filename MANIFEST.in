@@ -12,6 +12,5 @@ prune profiling
 prune scripts
 prune .circleci
 prune .github
-include VERSION
 include README.md
 graft bin

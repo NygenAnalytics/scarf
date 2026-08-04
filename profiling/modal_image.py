@@ -21,7 +21,6 @@ image = (
     )
     .add_local_python_source("scarf", "profiling", copy=True)
     .add_local_file("uv.lock", "/root/uv.lock", copy=True)
-    .add_local_file("VERSION", "/root/VERSION", copy=True)
 )
 
 

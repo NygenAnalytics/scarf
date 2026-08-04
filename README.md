@@ -1,15 +1,16 @@
 # Scarf
 
 <p align="left">
-  <a href="https://pypi.org/project/scarf"><img src="https://img.shields.io/pypi/v/scarf.svg?color=4c72b0" alt="PyPI"></a>
-  <a href="https://pypi.org/project/scarf"><img src="https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-4c72b0.svg" alt="Python 3.12, 3.13, and 3.14"></a>
-  <a href="https://scarf.readthedocs.io"><img src="https://readthedocs.org/projects/scarf/badge/?version=latest" alt="Docs"></a>
   <a href="https://github.com/NygenAnalytics/scarf/actions/workflows/pytest.yml"><img src="https://github.com/NygenAnalytics/scarf/actions/workflows/pytest.yml/badge.svg" alt="Tests"></a>
   <a href="https://codecov.io/gh/NygenAnalytics/scarf"><img src="https://codecov.io/gh/NygenAnalytics/scarf/graph/badge.svg?token=ZvJXuYq3pd" alt="Coverage"></a>
+  <a href="https://scarf.readthedocs.io"><img src="https://readthedocs.org/projects/scarf/badge/?version=latest" alt="Docs"></a>
+  <a href="https://pypi.org/project/scarf"><img src="https://img.shields.io/pypi/v/scarf.svg?color=4c72b0" alt="PyPI"></a>
+  <a href="https://pypi.org/project/scarf"><img src="https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-4c72b0.svg" alt="Python 3.12, 3.13, and 3.14"></a>
+  <a href="https://pepy.tech/projects/scarf"><img src="https://static.pepy.tech/personalized-badge/scarf?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads" alt="Downloads"></a>
 </p>
 
 > [!IMPORTANT]
-> **Scarf 1.0 is coming soon.** Install the `1.0.0rc1` release candidate with `uv pip install --prerelease allow "scarf[extra]"`. The current stable release on PyPI is `0.32.3`.
+> **Scarf 1.0 is coming soon.** Install the ![Latest release](https://img.shields.io/github/v/release/NygenAnalytics/scarf) release candidate with `uv pip install --prerelease allow "scarf[extra]"`. The current stable release on PyPI is `0.32.3`.
 
 Scarf is a Python framework for analysing single-cell RNA, ATAC, protein, and multi-omic data, from a few thousand cells to tens of millions.
 

@@ -9,7 +9,6 @@ on:
       - "scarf/**"
       - "LICENSE"
       - "README.md"
-      - "VERSION"
       - "pyproject.toml"
       - "tests/test_docs_cache.py"
       - "tests/test_docs_structure.py"
@@ -24,7 +23,6 @@ on:
       - "scarf/**"
       - "LICENSE"
       - "README.md"
-      - "VERSION"
       - "pyproject.toml"
       - "tests/test_docs_cache.py"
       - "tests/test_docs_structure.py"
@@ -39,6 +37,8 @@ jobs:
       HNSWLIB_NO_NATIVE: "1"
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Install system build dependencies
         run: |
           sudo apt-get update

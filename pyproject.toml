@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=80", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -100,13 +100,13 @@ Issues = "https://github.com/NygenAnalytics/scarf/issues"
 [tool.setuptools]
 include-package-data = false
 
-[tool.setuptools.dynamic]
-version = {file = "VERSION"}
-
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["scarf*"]
 exclude = ["profiling*", "scripts*", "tests*", "docs*", "bin*"]
+
+[tool.setuptools_scm]
+version_file = "scarf/_version.py"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
@@ -171,6 +171,11 @@ docs-modal = [
 ]
 
 [tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "setup.py" },
+    { git = { commit = true, tags = true } },
+]
 no-binary-package = ["pcst-fast", "hnswlib"]
 extra-build-variables = { hnswlib = { HNSWLIB_NO_NATIVE = "1" } }
 
@@ -188,13 +193,14 @@ exclude = [
     "docs/.jupyter_cache",
     "docs/build",
     "docs/source/tutorials/scarf_datasets",
+    "scarf/_version.py",
 ]
 
 [tool.mypy]
 strict = false
 
 python_version = "3.12"
-exclude = ["^docs/", "^setup\\.py$"]
+exclude = ["^docs/", "^setup\\.py$", "^scarf/_version\\.py$"]
 
 disable_error_code = ["import-untyped"]
 

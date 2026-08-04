@@ -1114,7 +1114,6 @@ def execution_fingerprint(
     fixed_inputs = [
         repo_root / "pyproject.toml",
         repo_root / "uv.lock",
-        repo_root / "VERSION",
         docs_root / "execute_vignette.py",
         docs_root / "execute_all_vignettes.py",
         docs_root / "modal_cache.py",

@@ -11,7 +11,6 @@ from docs.execute_vignette import ParsedSource, discover_sources, execute_page
 from docs.modal_cache import PageCachePayload, SpawnedPageRunner, pack_page_cache
 
 DOCS_ROOT = Path(__file__).resolve().parent
-REPO_ROOT = DOCS_ROOT.parent
 REMOTE_CACHE = Path("/tmp/scarf-doc-page-cache")
 MODAL_ENVIRONMENT_NAME = "scarf_profiling"
 MODAL_PYTHON_VERSION = "3.14"
@@ -70,7 +69,6 @@ image = (
         "/root/docs/modal_docs.py",
         copy=True,
     )
-    .add_local_file(str(REPO_ROOT / "VERSION"), "/root/VERSION", copy=True)
 )
 
 

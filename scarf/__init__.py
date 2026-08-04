@@ -3,6 +3,7 @@ from importlib import import_module as _import_module
 from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 from pathlib import Path as _Path
+from re import search as _re_search
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -93,10 +94,15 @@ _warnings.filterwarnings(
 try:
     __version__ = _distribution_version("scarf")
 except _PackageNotFoundError:
-    _version_path = _Path(__file__).resolve().parents[1] / "VERSION"
-    __version__ = (
-        _version_path.read_text().strip() if _version_path.is_file() else "unavailable"
+    _version_text = ""
+    _version_path = _Path(__file__).with_name("_version.py")
+    if _version_path.is_file():
+        _version_text = _version_path.read_text(encoding="utf-8")
+    _version_match = _re_search(
+        r"\bversion\s*=\s*['\"]([^'\"]+)['\"]",
+        _version_text,
     )
+    __version__ = _version_match.group(1) if _version_match else "unavailable"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ArtifactLineage": (".lineage", "ArtifactLineage"),
