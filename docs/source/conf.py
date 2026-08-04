@@ -75,6 +75,9 @@ redirects = {
 myst_enable_extensions = [
     "colon_fence",
 ]
+# Notebook lineage outputs use ```mermaid fences. Treat them as mermaid
+# directives (sphinxcontrib.mermaid) instead of unknown Pygments lexers.
+myst_fence_as_directive = {"mermaid"}
 
 
 html_theme = "sphinx_book_theme"
@@ -113,6 +116,9 @@ nb_execution_cache_path = os.path.join(
 )
 nb_execution_timeout = 600
 nb_merge_streams = True
+# Render notebook markdown outputs with MyST so ```mermaid fences become
+# sphinxcontrib.mermaid directives (CommonMark leaves them as unknown lexers).
+nb_render_markdown_format = "myst"
 
 matplotlib.use("agg")
 
