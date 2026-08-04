@@ -28,7 +28,7 @@ while recording which inputs and parameters produced each result.
 - {ref}`Install Scarf <installation>`
 - Follow the {ref}`Quick start <quickstart>`
 - Use {doc}`analysis_with_agents` to route an autonomous or AI-assisted analysis
-- Read {doc}`scarf_and_scanpy` if you already use Scanpy or Seurat
+- Read {doc}`scanpy_and_seurat` if you already use Scanpy or Seurat
 - See {doc}`concepts/benchmarks` for measured end-to-end scale and stage timings
 
 ## Supported workflows
@@ -84,7 +84,7 @@ budget generally reduces peak memory and increases wall time.
 
 Measured end-to-end timings and peak memory across input sizes are in
 {doc}`concepts/benchmarks`. Resource controls and measurement caveats are
-explained in {doc}`concepts/scale_and_memory`.
+explained in {doc}`concepts/memory_and_execution`.
 
 ## Provenance and reuse
 
@@ -104,7 +104,7 @@ This record is useful whenever the analysis is long-running, revisited after a g
 through a pipeline or software agent, because the dependency chain can be inspected independently
 of the code or description that produced it. See {doc}`analysis_with_agents` for the scientific
 decision and troubleshooting framework, {doc}`concepts/provenance` for the data model, and
-{doc}`tutorials/provenance_and_reuse` for an executable example.
+{doc}`tutorials/reuse_and_tracing` for an executable example.
 
 ## Selections and multi-scale analysis
 

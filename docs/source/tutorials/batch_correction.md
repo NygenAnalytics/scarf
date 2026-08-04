@@ -19,7 +19,7 @@ kernelspec:
 Batch correction changes the reduced coordinates used to build a neighbourhood
 graph. Counts remain unchanged. A useful correction should increase source
 mixing without dissolving biological populations. This guide resumes the
-persisted uncorrected analysis from {doc}`data_integration` and compares it
+persisted uncorrected analysis from {doc}`dataset_merging` and compares it
 with partial PCA and Harmony.
 
 ```{code-cell} ipython3

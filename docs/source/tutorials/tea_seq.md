@@ -27,7 +27,7 @@ and plotting their results.
 
 - Scarf installed with the `extra` optional dependencies
 - Familiarity with the two-modality workflow in {doc}`cite_seq`
-- The integration diagnostics in {doc}`multimodal_integration`
+- The integration diagnostics in {doc}`multimodal_diagnostics`
 
 ## What you will learn
 

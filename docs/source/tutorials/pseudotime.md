@@ -184,6 +184,6 @@ causal lineage or evidence that every dynamic gene changes monotonically.
 - Interpreting linear correlation as the only form of expression dynamics along pseudotime
 - Ignoring `RNA_pseudotime__valid` when the graph has more than one connected component
 
-Use {doc}`pseudotime_modules` to group nonlinear expression patterns and
-{doc}`trajectory_analysis` for component policy, marker-testing assumptions,
+Use {doc}`expression_dynamics` to group nonlinear expression patterns and
+{doc}`trajectory_validation` for component policy, marker-testing assumptions,
 module diagnostics, and fate-probability validation.

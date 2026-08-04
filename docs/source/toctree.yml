@@ -8,27 +8,33 @@ subtrees:
         title: Quick start
       - file: analysis_with_agents
         title: Analysis with AI agents
-      - file: scarf_and_scanpy
+      - file: scanpy_and_seurat
         title: Scanpy and Seurat users
-  - caption: Core workflows
+  - caption: Assay workflows
     entries:
       - file: tutorials/scrna_seq
         title: scRNA-seq heterogeneity
-      - file: tutorials/pseudotime
-        title: Pseudotime
-      - file: tutorials/pseudotime_modules
-        title: Expression dynamics
-      - file: tutorials/fate_mapping
-        title: Fate mapping
       - file: tutorials/scatac_seq
         title: scATAC-seq
       - file: tutorials/cite_seq
         title: CITE-seq
       - file: tutorials/tea_seq
         title: TEA-seq
+      - file: tutorials/hto_demultiplexing
+        title: HTO demultiplexing
+  - caption: Trajectories
+    entries:
+      - file: tutorials/pseudotime
+        title: Pseudotime
+      - file: tutorials/expression_dynamics
+        title: Expression dynamics
+      - file: tutorials/fate_mapping
+        title: Fate mapping
+      - file: tutorials/trajectory_validation
+        title: Trajectory validation
   - caption: Integration and mapping
     entries:
-      - file: tutorials/data_integration
+      - file: tutorials/dataset_merging
         title: Dataset merging
       - file: tutorials/batch_correction
         title: Batch correction
@@ -36,19 +42,19 @@ subtrees:
         title: Mapping and label transfer
       - file: tutorials/reference_atlases
         title: Reference atlases
-      - file: tutorials/multimodal_integration
+      - file: tutorials/multimodal_diagnostics
         title: Multimodal diagnostics
-  - caption: Downstream analysis
+  - caption: Annotation and biology
     entries:
       - file: tutorials/annotation
         title: Cell type annotation
       - file: tutorials/cell_cycle
         title: Cell cycle
-      - file: tutorials/gene_set_enrichment
+      - file: tutorials/gene_set_scoring
         title: Gene-set scoring
       - file: tutorials/pseudobulk_and_differential_expression
         title: Pseudobulk and DE
-  - caption: Methods and diagnostics
+  - caption: Building blocks
     entries:
       - file: tutorials/plotting
         title: Plotting
@@ -56,7 +62,7 @@ subtrees:
         title: Quality control
       - file: tutorials/feature_selection
         title: Feature selection
-      - file: tutorials/custom_graph_construction
+      - file: tutorials/graph_construction
         title: Graph construction
       - file: tutorials/dimensionality_reduction
         title: Dimensionality reduction
@@ -66,11 +72,9 @@ subtrees:
         title: Imputation by graph diffusion
       - file: tutorials/downsampling
         title: Cell downsampling
-      - file: tutorials/trajectory_analysis
-        title: Trajectory validation
       - file: tutorials/custom_analyses
         title: Custom analyses
-  - caption: Data management and scaling
+  - caption: Stores, scale, and provenance
     entries:
       - file: tutorials/import_and_export
         title: Import and export
@@ -80,16 +84,14 @@ subtrees:
         title: Remote stores
       - file: concepts/provenance
         title: Provenance
-      - file: tutorials/provenance_and_reuse
+      - file: tutorials/reuse_and_tracing
         title: Reuse and tracing
-      - file: concepts/scale_and_memory
+      - file: concepts/memory_and_execution
         title: Memory and execution
       - file: concepts/benchmarks
         title: Benchmarks
-  - caption: Reference and support
+  - caption: Reference
     entries:
-      - file: tutorials/hto_demultiplexing
-        title: HTO demultiplexing
       - file: reference/api
         title: API reference
         entries:

@@ -14,14 +14,14 @@
 - [scRNA-seq heterogeneity](tutorials/scrna_seq.html): filtering through marker interpretation
 - [Quality control](tutorials/quality_control.html): modality-aware and sample-aware filtering
 - [Feature selection](tutorials/feature_selection.html): feature-set diagnostics
-- [Graph construction](tutorials/custom_graph_construction.html): granular normalization, reduction, neighbours, and graphs
+- [Graph construction](tutorials/graph_construction.html): granular normalization, reduction, neighbours, and graphs
 - [Dimensionality reduction](tutorials/dimensionality_reduction.html): PCA dimensions and layout comparison
 - [Clustering](tutorials/clustering.html): Leiden, Paris, stability, connectivity, and markers
 - [Cell type annotation](tutorials/annotation.html): marker interpretation and label assignment
 
 ## Integration and inference
 
-- [Dataset merging](tutorials/data_integration.html): compatible stores and an uncorrected joint baseline
+- [Dataset merging](tutorials/dataset_merging.html): compatible stores and an uncorrected joint baseline
 - [Batch correction](tutorials/batch_correction.html): partial PCA, Harmony, mixing, and structural preservation
 - [TEA-seq](tutorials/tea_seq.html): prepared RNA, ATAC, and protein analysis with three-way WNN
 - [Mapping and label transfer](tutorials/mapping_and_label_transfer.html): fixed-reference projection
@@ -30,15 +30,15 @@
 ## Trajectory analysis
 
 - [Pseudotime](tutorials/pseudotime.html): supervised sources and sinks
-- [Expression dynamics](tutorials/pseudotime_modules.html): feature profiles and modules
+- [Expression dynamics](tutorials/expression_dynamics.html): feature profiles and modules
 - [Fate mapping](tutorials/fate_mapping.html): multiple terminal outcomes
-- [Trajectory validation](tutorials/trajectory_analysis.html): boundary, graph, statistical, and numerical checks
+- [Trajectory validation](tutorials/trajectory_validation.html): boundary, graph, statistical, and numerical checks
 
 ## State, scale, and extension
 
 - [Provenance](concepts/provenance.html): artifacts, reuse, lineage, and limits
-- [Reuse and tracing](tutorials/provenance_and_reuse.html): executable branching example
-- [Memory and execution](concepts/scale_and_memory.html): resource budgets and scale
+- [Reuse and tracing](tutorials/reuse_and_tracing.html): executable branching example
+- [Memory and execution](concepts/memory_and_execution.html): resource budgets and scale
 - [Benchmarks](concepts/benchmarks.html): measured end-to-end timings and peak memory
 - [Remote stores](tutorials/remote_stores.html): object-storage execution
 - [Custom analyses](tutorials/custom_analyses.html): public extension and export boundaries

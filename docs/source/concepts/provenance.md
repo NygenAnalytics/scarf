@@ -51,7 +51,7 @@ be reused.
 
 The current analysis chain is a convenience for a linear workflow, not the
 only history in the store. Side branches can be created without selecting them
-as current. See {doc}`../tutorials/custom_graph_construction` for that
+as current. See {doc}`../tutorials/graph_construction` for that
 relationship.
 
 ## Inspect a result
@@ -119,4 +119,4 @@ computational relationships needed to inspect and reproduce store-backed
 results.
 
 For an executable walkthrough, see
-{doc}`../tutorials/provenance_and_reuse`.
+{doc}`../tutorials/reuse_and_tracing`.

@@ -12,7 +12,7 @@ kernelspec:
   name: python3
 ---
 
-(gene_set_enrichment)=
+(gene_set_scoring)=
 
 # Gene-set activity scoring
 

@@ -54,14 +54,23 @@ external_toc_exclude_missing = False
 redirects = {
     "about": "index.html",
     "install": "installation.html",
-    "tutorials/atomic_graph_operations": "custom_graph_construction.html",
-    "concepts/graph_and_state": "../tutorials/custom_graph_construction.html",
+    "scarf_and_scanpy": "scanpy_and_seurat.html",
+    "tutorials/atomic_graph_operations": "graph_construction.html",
+    "tutorials/custom_graph_construction": "graph_construction.html",
+    "concepts/graph_and_state": "../tutorials/graph_construction.html",
+    "concepts/scale_and_memory": "memory_and_execution.html",
     "reference/api/graph_ops": "graph_construction.html",
     "tutorials/dimensionality_reduction_and_clustering": (
         "dimensionality_reduction.html"
     ),
-    "tutorials/choosing_integration_methods": "data_integration.html",
+    "tutorials/choosing_integration_methods": "dataset_merging.html",
+    "tutorials/data_integration": "dataset_merging.html",
     "tutorials/integration_metrics": "batch_correction.html#integration-metrics",
+    "tutorials/multimodal_integration": "multimodal_diagnostics.html",
+    "tutorials/gene_set_enrichment": "gene_set_scoring.html",
+    "tutorials/pseudotime_modules": "expression_dynamics.html",
+    "tutorials/trajectory_analysis": "trajectory_validation.html",
+    "tutorials/provenance_and_reuse": "reuse_and_tracing.html",
 }
 myst_enable_extensions = [
     "colon_fence",

@@ -1,4 +1,4 @@
-(scale_and_memory)=
+(memory_and_execution)=
 # Scale, memory, and execution
 
 Scarf keeps large matrices in Zarr and streams planned blocks through memory.

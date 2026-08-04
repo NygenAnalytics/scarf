@@ -8,7 +8,7 @@ over another package.
 
 The source record, including operational profiling notes, is
 [profiling/BENCHMARKS.md](https://github.com/NygenAnalytics/scarf/blob/master/profiling/BENCHMARKS.md).
-Resource planning controls are explained in {doc}`scale_and_memory`.
+Resource planning controls are explained in {doc}`memory_and_execution`.
 
 ## What was measured
 

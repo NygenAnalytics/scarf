@@ -12,7 +12,7 @@ kernelspec:
   name: python3
 ---
 
-(custom_graph_construction)=
+(graph_construction_guide)=
 (graph_and_state)=
 
 # Building neighbourhood graphs step by step
@@ -214,4 +214,4 @@ corrected_graph = ds.build_connectivity_map(corrected_neighbors)
 ```
 
 Use {doc}`../concepts/provenance` to inspect complete lineage and
-{doc}`provenance_and_reuse` for reuse and invalidation patterns.
+{doc}`reuse_and_tracing` for reuse and invalidation patterns.

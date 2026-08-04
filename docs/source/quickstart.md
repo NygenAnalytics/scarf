@@ -83,7 +83,7 @@ sorted(artifacts)
 Most optional stages accept `False`. For example, cell-cycle scoring, UMAP,
 Paris, doublet scoring, and marker search can be disabled separately; pass an
 empty `leiden` mapping to skip Leiden. Highly variable feature selection remains
-required. Use {doc}`tutorials/custom_graph_construction` for stage-by-stage
+required. Use {doc}`tutorials/graph_construction` for stage-by-stage
 control and {doc}`tutorials/clustering` for choosing a partition.
 
 ## Plot the result
@@ -126,6 +126,6 @@ The Zarr store now holds the UMAP coordinates, cluster labels, marker tables,
 and every intermediate result.
 
 Continue with the complete {doc}`tutorials/scrna_seq` workflow or translate an
-existing workflow with {doc}`scarf_and_scanpy`. The
+existing workflow with {doc}`scanpy_and_seurat`. The
 {doc}`reference/api/pipeline` documents every option, returned artifact, and the
 callback contract for advanced automation.

@@ -166,4 +166,4 @@ are active in the original cell layout.
 Feature labels are stored under `modules.cluster_key`, and `PTIME_MODULES`
 contains one mean-expression feature per assigned module. Parameter diagnostics
 and comparison with cluster marker genes are covered in
-{doc}`trajectory_analysis`.
+{doc}`trajectory_validation`.

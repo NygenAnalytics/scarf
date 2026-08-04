@@ -172,4 +172,4 @@ does not discover terminal states automatically and does not use RNA velocity.
 
 Fate probabilities are stored under the keys returned in `fate.fate_keys`,
 with a matching validity column. Probability-simplex checks, solver diagnostics,
-and tuning belong in {doc}`trajectory_analysis`.
+and tuning belong in {doc}`trajectory_validation`.

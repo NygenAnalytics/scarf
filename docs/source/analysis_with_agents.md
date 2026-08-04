@@ -127,7 +127,7 @@ thresholds from another tissue or protocol without inspecting the current distri
 
 ### Reduction, graph construction, and clustering
 
-- Use {doc}`tutorials/custom_graph_construction` for granular normalization, reduction, neighbour,
+- Use {doc}`tutorials/graph_construction` for granular normalization, reduction, neighbour,
   and graph methods.
 - Use {doc}`tutorials/dimensionality_reduction` to compare dimension counts and layouts.
 - Use {doc}`tutorials/clustering` to compare Leiden resolutions, Paris cuts, graph connectivity,
@@ -140,7 +140,7 @@ inside the subset. Preserve the parent labels so the split remains auditable.
 
 ### Integration, mapping, and paired modalities
 
-Start with {doc}`tutorials/data_integration` when compatible datasets need one
+Start with {doc}`tutorials/dataset_merging` when compatible datasets need one
 joint datastore, then use {doc}`tutorials/batch_correction` only when a
 defensible technical covariate should be reduced.
 
@@ -178,9 +178,9 @@ Use pseudotime only when the graph and biological question support a plausible c
 Source and sink labels supervise the orientation; Scarf does not discover terminal states.
 
 - Use {doc}`tutorials/pseudotime` for source and sink scoring.
-- Use {doc}`tutorials/pseudotime_modules` for expression dynamics.
+- Use {doc}`tutorials/expression_dynamics` for expression dynamics.
 - Use {doc}`tutorials/fate_mapping` for multiple terminal outcomes.
-- Use {doc}`tutorials/trajectory_analysis` to compare boundaries, graph components, marker tests,
+- Use {doc}`tutorials/trajectory_validation` to compare boundaries, graph components, marker tests,
   modules, and fate-probability validity.
 
 Compare plausible source and sink definitions when the endpoints are uncertain. Check validity
@@ -202,7 +202,7 @@ Classify the problem before retrying:
   keys, and lineage. `ArtifactSelectionError.code` distinguishes missing, incomplete, or changed
   selection inputs. Do not consume incomplete artifacts.
 - **Resource or I/O:** inspect the configured memory budget, worker count, storage profile, remote
-  latency, and `countsT` availability. See {doc}`concepts/scale_and_memory`,
+  latency, and `countsT` availability. See {doc}`concepts/memory_and_execution`,
   {doc}`concepts/benchmarks`, and {doc}`tutorials/remote_stores`.
 - **Numerical or graph:** check dimensions, graph components, neighbour count, convergence,
   validity masks, and method-specific diagnostics.

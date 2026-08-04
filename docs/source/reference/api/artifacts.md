@@ -6,7 +6,7 @@ below are the public contracts for a metadata-only store summary, references, st
 lineage, and the assay's current {term}`analysis chain`.
 
 See {doc}`../../concepts/provenance` and
-{doc}`../../tutorials/custom_graph_construction`.
+{doc}`../../tutorials/graph_construction`.
 
 ## Types
 

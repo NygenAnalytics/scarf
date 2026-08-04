@@ -28,7 +28,7 @@ It does three things in order:
 3. Use those neighbours to transfer labels and score how much of the query landed on each reference cell.
 
 It does not merge count matrices, retrain the reference graph, or move reference cells.
-When sources must be analysed together in one store, start with {doc}`data_integration`
+When sources must be analysed together in one store, start with {doc}`dataset_merging`
 and {doc}`batch_correction` instead.
 
 This tutorial maps interferon-stimulated PBMCs onto a control PBMC reference from the same Kang study. The shared author labels let us evaluate the result. For a reusable Symphony-style atlas, see {doc}`reference_atlases`.

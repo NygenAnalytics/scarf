@@ -12,14 +12,14 @@ kernelspec:
   name: python3
 ---
 
-(trajectory_analysis)=
+(trajectory_validation)=
 
 # Trajectory validation
 
 Trajectory results depend on the selected graph, the source and sink
 annotations, and the features used for downstream tests. This guide checks those
 dependencies on the Bastidas-Ponce pancreas dataset after the recommended path
-in {doc}`pseudotime`, {doc}`pseudotime_modules`, and {doc}`fate_mapping`.
+in {doc}`pseudotime`, {doc}`expression_dynamics`, and {doc}`fate_mapping`.
 
 ## Standalone setup
 
@@ -177,7 +177,7 @@ systematic departures identify cells whose position depends on the selected
 terminal states. Disagreement does not show that one ordering is true. Low
 coverage can instead indicate disconnected populations or a graph that does not
 support the proposed trajectory. Use
-{doc}`custom_graph_construction` when the graph itself needs a controlled
+{doc}`graph_construction` when the graph itself needs a controlled
 sensitivity analysis.
 
 ## Validate pseudotime marker tests

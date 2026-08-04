@@ -37,7 +37,7 @@ replicate-aware FDR-controlled DE.
 ## Dataset
 
 This page uses the Kang control PBMC store and Leiden clusters as groups. For multi-sample
-designs, merge samples first ({doc}`data_integration`) and pass sample and cell-type columns
+designs, merge samples first ({doc}`dataset_merging`) and pass sample and cell-type columns
 to `make_bulk`.
 
 ```{code-cell} ipython3
@@ -150,7 +150,7 @@ print(f'Wrote {bulk.shape[0]} features x {bulk.shape[1]} groups to {export_path}
 Use the exported count matrix and sample-level metadata with a method appropriate to the study
 design, such as edgeR or DESeq2. Scarf stops at aggregation and export; it does not run those
 models. For a true multi-sample design, merge donors or conditions first
-({doc}`data_integration`), aggregate with a sample-aware `group_key` (for example sample
+({doc}`dataset_merging`), aggregate with a sample-aware `group_key` (for example sample
 nested with cell type), and keep biological replicates in the exported metadata.
 
 ## Common mistakes

@@ -20,7 +20,7 @@ normalization and graph, and the two can then be compared or merged.
 
 This tutorial processes RNA and ADT independently, then builds one integrated
 graph. It shows SNN and WNN because combining modalities is the central outcome,
-while method comparison and tuning remain in {doc}`multimodal_integration`.
+while method comparison and tuning remain in {doc}`multimodal_diagnostics`.
 
 ## Prerequisites
 
@@ -257,7 +257,7 @@ figure.tight_layout()
 The panels need not match one-to-one. They should nevertheless show related
 broad populations. A modality split that is completely absent from the other
 can reflect real complementarity, assay noise, or a graph mismatch. The
-{doc}`multimodal_integration` guide evaluates those possibilities with
+{doc}`multimodal_diagnostics` guide evaluates those possibilities with
 normalized overlap and protein-versus-RNA checks.
 
 (multimodal_integration)=

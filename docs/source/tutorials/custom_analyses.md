@@ -31,7 +31,7 @@ depending on private storage internals.
 ## Prepare a graph
 
 Every technique on this page reads an existing graph, so the published PBMC
-store is enough. See {doc}`custom_graph_construction` to build one by hand.
+store is enough. See {doc}`graph_construction` to build one by hand.
 
 ```{code-cell} ipython3
 import numpy as np

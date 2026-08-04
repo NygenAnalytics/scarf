@@ -265,7 +265,7 @@ print('Arrays:', list(group.array_keys())[:5])
 
 Identical inputs and parameters {term}`reuse` a complete result. Branching,
 invalidation, lineage, and the current {term}`analysis chain` are covered in
-{doc}`provenance_and_reuse`.
+{doc}`reuse_and_tracing`.
 
 ### 6. Marker features
 
@@ -310,7 +310,7 @@ uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_l
 
 Storage profiles and conversion belong to the physical store, while
 `mem_budget` and `nthreads` control execution. See
-{doc}`../concepts/scale_and_memory` for memory planning and
+{doc}`../concepts/memory_and_execution` for memory planning and
 {doc}`remote_stores` for object storage and local scratch.
 
 ## Common mistakes

@@ -2,7 +2,7 @@
 description: Decide where Scarf fits and translate familiar Scanpy and Seurat workflows to its store-backed API.
 ---
 
-(scarf_and_scanpy)=
+(scanpy_and_seurat)=
 # Scarf for Scanpy and Seurat users
 
 If you already analyze single-cell data with
@@ -66,7 +66,7 @@ The rows below map intent, not identical statistical implementations:
 | Calculate QC metrics | `sc.pp.calculate_qc_metrics` | Opening a new `DataStore` calculates `RNA_nCounts`, `RNA_nFeatures`, mito/ribo fractions when available, and feature cell counts |
 | Filter cells | `sc.pp.filter_cells` or an `obs` mask | `ds.filter_cells` or `ds.auto_filter_cells`; cells are marked inactive rather than deleted |
 | Select and normalize features | `sc.pp.normalize_total`, `sc.pp.log1p`, `sc.pp.highly_variable_genes` | `ds.mark_hvgs`, then `ds.run_normalization` |
-| Run PCA and find neighbours | `sc.pp.pca`, then `sc.pp.neighbors` | `ds.run_pca`, then the approximate-nearest-neighbour (ANN), neighbour-query, and connectivity methods; {doc}`tutorials/custom_graph_construction` shows the full chain |
+| Run PCA and find neighbours | `sc.pp.pca`, then `sc.pp.neighbors` | `ds.run_pca`, then the approximate-nearest-neighbour (ANN), neighbour-query, and connectivity methods; {doc}`tutorials/graph_construction` shows the full chain |
 | Embed the graph | `sc.tl.umap` | `ds.run_umap` |
 | Cluster cells | `sc.tl.leiden` | `ds.run_leiden_clustering` or `ds.run_paris_clustering` |
 | Find marker genes | `sc.tl.rank_genes_groups` | `ds.run_marker_search`, then `ds.get_markers`; Scarf reports AUC, two-sided Mann-Whitney p-values, and within-group Benjamini-Hochberg adjustment over tested features. This is not replicate-aware differential expression |
@@ -137,5 +137,5 @@ workflow.
 
 - Run a first analysis: {ref}`Quick start <quickstart>`
 - Tune each stage of an RNA workflow: {doc}`tutorials/scrna_seq`
-- Control graph construction step by step: {doc}`tutorials/custom_graph_construction`
+- Control graph construction step by step: {doc}`tutorials/graph_construction`
 - Understand stored results and reuse: {doc}`concepts/provenance`

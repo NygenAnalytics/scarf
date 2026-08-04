@@ -20,7 +20,7 @@ kernelspec:
 This tutorial follows one recommended path from a 5K PBMC count matrix to broad
 cellular populations and marker genes. The dataset is small enough for teaching
 and has familiar immune-cell structure. It is not evidence for Scarf's scaling
-claims; see {doc}`../concepts/scale_and_memory` for measured resource profiles.
+claims; see {doc}`../concepts/memory_and_execution` for measured resource profiles.
 
 ## Prerequisites
 
@@ -221,7 +221,7 @@ confirm the graph covers the active cells.
 ```{seealso}
 Each step also returns a reference to the artifact it wrote. Capturing those
 references allows branches and partial recomputation without changing the
-recommended path here. See {doc}`custom_graph_construction`.
+recommended path here. See {doc}`graph_construction`.
 ```
 
 

@@ -142,7 +142,7 @@ ds.load_graph()
 active cells.
 
 TF-IDF, LSI choices, and graph tuning are covered in
-{doc}`custom_graph_construction` and {doc}`dimensionality_reduction`.
+{doc}`graph_construction` and {doc}`dimensionality_reduction`.
 
 ## 5. Run UMAP and clustering
 

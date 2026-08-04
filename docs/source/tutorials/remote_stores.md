@@ -18,7 +18,7 @@ kernelspec:
 
 Scarf can open a Zarr store on object storage and run analysis without first
 copying the full matrix to local disk. Counts stream in tiles sized from your
-memory budget. Read {doc}`../concepts/scale_and_memory` for measured local versus
+memory budget. Read {doc}`../concepts/memory_and_execution` for measured local versus
 remote overhead.
 
 ## Prerequisites
@@ -291,7 +291,7 @@ At 100k cells, a matched countsT funnel was about **1.75× slower** on remote
 object storage than on ephemeral local disk (~735 s vs ~421 s). Gene-wise
 stages and small metadata opens feel remote latency most. Remote-first analysis
 is still useful for shared stores; download-then-analyze remains available when
-you need the local ceiling. See {doc}`../concepts/scale_and_memory` for the
+you need the local ceiling. See {doc}`../concepts/memory_and_execution` for the
 resource envelope and benchmark caveats.
 
 ## Repack older stores

@@ -15,7 +15,7 @@ feature requests for the Python package belong on
 
 ## How does Scarf compare to Scanpy?
 
-See {doc}`../scarf_and_scanpy` for a stage-by-stage mapping, round-trip notes, and a short Seurat subsection.
+See {doc}`../scanpy_and_seurat` for a stage-by-stage mapping, round-trip notes, and a short Seurat subsection.
 
 ## How should an AI agent use Scarf?
 
@@ -33,11 +33,11 @@ After PCA, call `ds.run_harmony(['batch_column'], pca)` then continue with
 
 ## Which integration method should I choose?
 
-- Separate scRNA-seq batches: start with {doc}`../tutorials/data_integration`,
+- Separate scRNA-seq batches: start with {doc}`../tutorials/dataset_merging`,
   then compare Harmony or partial PCA in {doc}`../tutorials/batch_correction`.
 - Multiple assays in the same cells (CITE-seq): SNN or WNN
   ({ref}`recommended workflow <multimodal_integration>` and
-  {doc}`../tutorials/multimodal_integration` for diagnostics).
+  {doc}`../tutorials/multimodal_diagnostics` for diagnostics).
 - Map onto an existing reference: {doc}`../tutorials/mapping_and_label_transfer`.
 
 Scarf does not include Scanorama, BBKNN, scVI, ComBat, or other external integration packages.

@@ -7,7 +7,7 @@ chain (`update_state=True`). Prefer `ds.pipeline.run` for a default RNA recipe;
 use individual methods when you need branching, custom parameters, or partial
 recomputation.
 
-See {doc}`../../tutorials/custom_graph_construction`.
+See {doc}`../../tutorials/graph_construction`.
 
 ## Chain order
 
