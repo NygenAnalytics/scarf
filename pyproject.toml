@@ -125,6 +125,7 @@ norecursedirs = [
 
 [tool.coverage.run]
 source = ["scarf"]
+omit = ["scarf/_version.py"]
 parallel = true
 
 [tool.interrogate]

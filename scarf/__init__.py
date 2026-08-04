@@ -1,4 +1,5 @@
 import warnings as _warnings
+from collections.abc import Callable as _Callable
 from importlib import import_module as _import_module
 from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _distribution_version
@@ -91,18 +92,25 @@ _warnings.filterwarnings(
     module=r"zarr\.core\.dtype\..*",
 )
 
-try:
-    __version__ = _distribution_version("scarf")
-except _PackageNotFoundError:
-    _version_text = ""
-    _version_path = _Path(__file__).with_name("_version.py")
-    if _version_path.is_file():
-        _version_text = _version_path.read_text(encoding="utf-8")
-    _version_match = _re_search(
-        r"\bversion\s*=\s*['\"]([^'\"]+)['\"]",
-        _version_text,
-    )
-    __version__ = _version_match.group(1) if _version_match else "unavailable"
+
+def _resolve_version(
+    distribution_version: _Callable[[str], str] = _distribution_version,
+    version_path: _Path | None = None,
+) -> str:
+    try:
+        return distribution_version("scarf")
+    except _PackageNotFoundError:
+        path = version_path or _Path(__file__).with_name("_version.py")
+        if not path.is_file():
+            return "unavailable"
+        match = _re_search(
+            r"\bversion\s*=\s*['\"]([^'\"]+)['\"]",
+            path.read_text(encoding="utf-8"),
+        )
+        return match.group(1) if match else "unavailable"
+
+
+__version__ = _resolve_version()
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ArtifactLineage": (".lineage", "ArtifactLineage"),

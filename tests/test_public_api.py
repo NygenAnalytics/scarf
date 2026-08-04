@@ -2,6 +2,8 @@ import json
 import subprocess
 import sys
 from importlib import import_module
+from importlib.metadata import PackageNotFoundError
+from pathlib import Path
 from typing import cast
 
 
@@ -166,6 +168,38 @@ def _run_probe(source: str) -> dict[str, object]:
         text=True,
     )
     return cast(dict[str, object], json.loads(result.stdout))
+
+
+def _missing_distribution(_name: str) -> str:
+    raise PackageNotFoundError
+
+
+def test_version_resolution_prefers_distribution(tmp_path: Path):
+    import scarf
+
+    assert (
+        scarf._resolve_version(lambda _name: "9.8.7", tmp_path / "missing.py")
+        == "9.8.7"
+    )
+
+
+def test_version_resolution_reads_generated_file(tmp_path: Path):
+    import scarf
+
+    version_path = tmp_path / "_version.py"
+    version_path.write_text("__version__ = version = '9.8.7'\n", encoding="utf-8")
+
+    assert scarf._resolve_version(_missing_distribution, version_path) == "9.8.7"
+
+
+def test_version_resolution_rejects_missing_or_invalid_file(tmp_path: Path):
+    import scarf
+
+    version_path = tmp_path / "_version.py"
+    assert scarf._resolve_version(_missing_distribution, version_path) == "unavailable"
+
+    version_path.write_text("version is missing\n", encoding="utf-8")
+    assert scarf._resolve_version(_missing_distribution, version_path) == "unavailable"
 
 
 def test_bare_import_is_lazy():
