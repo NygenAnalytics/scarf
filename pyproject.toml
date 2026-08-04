@@ -56,6 +56,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+agent = [
+    "pydantic-ai-slim[openai]",
+]
 extra = [
     "anndata>=0.12",
     "kneed>=0.8",

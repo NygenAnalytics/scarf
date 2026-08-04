@@ -53,6 +53,9 @@ benchmarks/.env.*
 profiling/.env
 profiling/.env.*
 !profiling/.env.example
+scarf/agent/.env
+scarf/agent/.env.*
+!scarf/agent/.env.example
 /profiling/config.toml
 /profiling/config.*.toml
 !/profiling/config.example.toml
