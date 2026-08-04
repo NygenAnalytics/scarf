@@ -136,9 +136,17 @@ if 'RNA_percentHB' in ds.cells.columns:
         ds.cells.to_pandas_dataframe(['RNA_percentHB'], key='I')['RNA_percentHB']
         .describe()
     )
+    ds.plots.distribution(
+        keys=['RNA_percentHB'],
+        kind='violin',
+        max_points=2000,
+    )
 else:
     print('No features matched ^HB[AB] in this store')
 ```
+
+Most cells sit near zero hemoglobin fraction; the long upper tail is the set worth
+inspecting before you set an upper cutoff for erythrocyte contamination.
 
 ## 4) Automatic thresholds
 
@@ -175,18 +183,23 @@ ds.cells.insert(
     overwrite=True,
 )
 ds.cells.reset_key(key="I")
+n_before = int(ds.cells.fetch_all('I').sum())
 ds.auto_filter_cells(
     attrs=qc_cols,
     sample_column="qc_sample",
     n_mads=3.0,
     min_cells_per_sample=20,
-    show_qc_plots=False,
+    show_qc_plots=True,
 )
+n_after = int(ds.cells.fetch_all('I').sum())
+print(f'Active cells before MAD filter: {n_before}')
+print(f'Active cells after MAD filter: {n_after}')
 ```
 
-Plot output is disabled because the balanced labels above are synthetic and do
-not support a meaningful sample comparison. Set `show_qc_plots=True` when using
-a real sample column.
+The pre/post plots and active-cell counts show the sample-aware path. The
+`qc_sample` labels are synthetic and balanced, so treat the retained counts as a
+mechanics demo, not a biological sample comparison. Use a real sample column when
+comparing depth distributions across donors or batches.
 
 Count-like metrics such as `nCounts` and `nFeatures` use log1p values and
 two-sided bounds. Percentage metrics such as `percentMito` and `percentRibo`
@@ -214,8 +227,9 @@ ds.pipeline.run(
 
 `add_percent_feature` measures the fraction of each cell's counts matching a
 gene-name pattern. High mitochondrial, ribosomal, or hemoglobin fractions can
-indicate damaged cells or study-specific biology. Inspect their distributions
-before applying upper thresholds.
+indicate damaged cells or study-specific biology. The mito/ribo violins in
+section 1 and the hemoglobin violin in section 3 are the inspection step before
+you apply upper thresholds.
 
 Gene families excluded from the graph are a separate feature-selection
 decision. See {doc}`feature_selection` for the default HVG blacklist and
@@ -259,25 +273,35 @@ ds.plots.distribution(
 ```
 
 The score distribution and embedding should be reviewed together. A threshold
-is study-dependent, and `run_doublet_detection` does not remove cells. Insert a
-new boolean cell key or update `I` only after deciding how doublets should be
-handled.
+is study-dependent, and `run_doublet_detection` does not remove cells. After
+choosing an upper bound from the ECDF shoulder, apply it as an additional
+filter. The teaching cutoff below keeps the upper 5% of scores on this PBMC run;
+replace it with a study-specific value when the ECDF shape differs.
 
-After reviewing the score distribution, apply the chosen upper bound as an
-additional filter:
-
-```python
+```{code-cell} ipython3
+scores = ds.cells.to_pandas_dataframe([score_col], key='I')[score_col]
+print(scores.describe())
+doublet_threshold = float(scores.quantile(0.95))
+print(f'Doublet threshold (95th percentile): {doublet_threshold:.4f}')
+n_before = int(ds.cells.fetch_all('I').sum())
 ds.filter_cells(
     attrs=[score_col],
     lows=[None],
-    highs=[reviewed_doublet_threshold],
+    highs=[doublet_threshold],
     reset_previous=False,
+)
+n_after = int(ds.cells.fetch_all('I').sum())
+print(f'Active cells before doublet filter: {n_before}')
+print(f'Active cells after doublet filter: {n_after}')
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by=score_col,
 )
 ```
 
-Define `reviewed_doublet_threshold` from the study-specific evidence first.
 With `reset_previous=False`, this call intersects the threshold with the current
-selection and does not reactivate cells removed by earlier QC.
+selection and does not reactivate cells removed by earlier QC. The post-filter
+embedding should lose the highest-scoring hotspot cells from the map above.
 
 ## 8) ATAC quality control
 

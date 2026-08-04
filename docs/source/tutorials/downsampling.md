@@ -30,6 +30,9 @@ result to create a smaller Zarr store for workflows that do not need every cell.
 ## Dataset
 
 ```{code-cell} ipython3
+import matplotlib.pyplot as plt
+import pandas as pd
+
 import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
@@ -80,23 +83,62 @@ if 'RNA_sketched' not in ds.cells.columns:
         "TopACeDo did not create RNA_sketched. Verify that topacedo is installed."
     )
 
-print('Active cells:', int(ds.cells.fetch_all('I').sum()))
-print('Selected cells:', int(ds.cells.fetch_all('RNA_sketched').sum()))
+{
+    'active cells': int(ds.cells.fetch_all('I').sum()),
+    'seed cells': int(ds.cells.fetch_all('RNA_sketch_seeds').sum()),
+    'selected cells': int(ds.cells.fetch_all('RNA_sketched').sum()),
+}
 ```
 
-Selected cells are marked `True` under `RNA_sketched`. Plot them with `subset_by`:
+Selected cells are marked `True` under `RNA_sketched`. Seed cells used to initialize the
+sampler are marked under `RNA_sketch_seeds`. Per-cluster counts show that sampling stays
+balanced rather than draining one partition:
 
 ```{code-cell} ipython3
+sampling = ds.cells.to_pandas_dataframe(
+    columns=['RNA_paris_cluster', 'RNA_sketched', 'RNA_sketch_seeds'],
+    key='I',
+)
+cluster_sampling = sampling.groupby('RNA_paris_cluster', sort=True).agg(
+    cells=('RNA_paris_cluster', 'size'),
+    seeds=('RNA_sketch_seeds', 'sum'),
+    selected=('RNA_sketched', 'sum'),
+)
+cluster_sampling['sampling_rate'] = (
+    cluster_sampling['selected'] / cluster_sampling['cells']
+).round(3)
+cluster_sampling
+```
+
+Compare the full manifold with the selected cells side by side. The right panel should still
+cover the main clusters:
+
+```{code-cell} ipython3
+figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by='RNA_paris_cluster',
+    legend_loc='on_data',
+    show_titles=False,
+    target=axes[0],
+    show=False,
+)
+axes[0].set_title('Full')
 ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='RNA_paris_cluster',
     subset_by='RNA_sketched',
+    legend_loc='on_data',
+    show_titles=False,
+    target=axes[1],
+    show=False,
 )
+axes[1].set_title('Selected')
+figure.tight_layout()
+figure
 ```
 
-The subset should still cover the main clusters on the UMAP.
-
-Seed cells used for PCST are marked under `RNA_sketch_seeds`:
+Seed cells are a smaller set used to initialize the sampler:
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -105,8 +147,6 @@ ds.plots.embedding(
     subset_by='RNA_sketch_seeds',
 )
 ```
-
-Seed cells are a smaller set used to initialize the sampler.
 
 ---
 ### 3. Inspect downsampling parameters
@@ -121,7 +161,32 @@ ds.plots.embedding(
 )
 ```
 
-Higher `RNA_cell_density` marks denser graph neighbourhoods.
+Higher `RNA_cell_density` marks denser graph neighbourhoods. Selection rate by density
+quantile links that penalty to who was kept:
+
+```{code-cell} ipython3
+density = ds.cells.to_pandas_dataframe(
+    columns=['RNA_cell_density', 'RNA_sketched'],
+    key='I',
+)
+density['density_bin'] = pd.qcut(
+    density['RNA_cell_density'],
+    q=5,
+    duplicates='drop',
+)
+(
+    density.groupby('density_bin', observed=True)
+    .agg(
+        cells=('RNA_sketched', 'size'),
+        selected=('RNA_sketched', 'sum'),
+    )
+    .assign(
+        selection_rate=lambda frame: (
+            frame['selected'] / frame['cells']
+        ).round(3)
+    )
+)
+```
 
 The sampler also scores tight connectivity via mean shared nearest neighbours of each cell's
 neighbours. Tight regions get a sampling reward. Values are stored in `RNA_snn_value`.
@@ -170,6 +235,16 @@ ds2 = scarf.DataStore(subset_path)
     "source RNA features": ds.RNA.feats.N,
     "subset RNA features": ds2.RNA.feats.N,
 }
+```
+
+Cell metadata, including UMAP coordinates and cluster labels, is copied into the subset
+store, so the smaller object plots without recomputing the graph:
+
+```{code-cell} ipython3
+ds2.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by='RNA_paris_cluster',
+)
 ```
 
 When the subset fits in memory, export to AnnData for tools in the

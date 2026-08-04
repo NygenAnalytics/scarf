@@ -71,7 +71,15 @@ ds.cells.insert(
     key="I",
     overwrite=True,
 )
+{
+    "cells": int(graph.shape[0]),
+    "edges": int(graph.nnz),
+    "customGraphStrength mean": float(graph_strength.mean()),
+}
 ```
+
+The insert writes one value per active cell in graph row order. The summary
+confirms the CSR cover and that the new column is populated.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -110,10 +118,16 @@ ds.cells.insert(
     key="I",
     overwrite=True,
 )
+{
+    "cells": int(detected_hvgs.size),
+    "customDetectedHVGs mean": float(detected_hvgs.mean()),
+    "customDetectedHVGs max": int(detected_hvgs.max()),
+}
 ```
 
 `stream_blocks` preserves row order. Insert with the same `cell_key` used to
-construct the view so values align with metadata rows.
+construct the view so values align with metadata rows. The summary checks that
+every streamed cell received a detection count.
 
 ## Create custom selections
 
@@ -146,66 +160,113 @@ cell order.
 
 Install a supplied RNA feature mask with `set_hvgs`. This records the
 cell-selection relationship and produces the feature key
-`wellConnected__customPanel`:
+`wellConnected__customPanel`. Downstream methods take the short name
+`customPanel` as `feat_key`:
 
 ```{code-cell} ipython3
+panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
 feature_names = ds.RNA.feats.fetch_all("names").astype(str)
-panel_mask = np.isin(
-    feature_names,
-    ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"],
-)
+panel_mask = np.isin(feature_names, panel_genes)
 custom_feature_key = ds.set_hvgs(
     cell_key="wellConnected",
     mask=panel_mask,
     hvg_key_name="customPanel",
     blacklist="",
 )
-custom_feature_key
+custom_feature_key, int(ds.RNA.feats.fetch_all(custom_feature_key).sum())
 ```
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by=panel_genes,
+    cell_key="wellConnected",
+    n_columns=3,
+    sort_values=True,
+)
+```
+
+The returned key is the full feature column. The plot checks the same panel on
+the `wellConnected` cells that the selection is linked to.
 
 ## Register external feature loadings
 
-`run_custom_reduction` is for an external feature-by-dimension loading matrix.
+`run_custom_reduction` accepts an external feature-by-dimension loading matrix.
 Its rows must match the selected normalized features in order. It projects
 Scarf's normalized cell blocks through those loadings and records a reusable
-reduction artifact.
+reduction artifact. Here an identity matrix stands in for loadings from an
+external tool:
 
-```python
+```{code-cell} ipython3
 branch_normalized = ds.run_normalization(
     cell_key="wellConnected",
     feat_key="customPanel",
     update_state=False,
 )
-external_loadings = np.load("custom_feature_loadings.npy")
+n_features = int(ds.load_artifact(branch_normalized)["data"].shape[1])
+external_loadings = np.eye(n_features, dtype=np.float64)
 
 custom_reduction = ds.run_custom_reduction(
     external_loadings,
-    normalized=branch_normalized,
+    branch_normalized,
     update_state=False,
 )
 custom_ann = ds.build_ann_index(
     custom_reduction,
     update_state=False,
 )
+ds.load_artifact(custom_reduction)["data"].shape, custom_ann
 ```
 
 `update_state=False` keeps this experiment as a side branch, outside the assay's
 {term}`analysis chain`. Pass returned
 references explicitly through later graph-construction steps. Select a branch
-as current only after checking its outputs.
+as current only after checking its outputs. Replace the identity matrix with
+real loadings when an external method supplies them; the row count must still
+match `n_features`.
 
 ## Choose an exit path
 
-- `ds.to_anndata(cell_key=..., feature_names=...)` returns an in-memory,
-  feature-selective AnnData object.
-- `scarf.writers.to_h5ad` and `scarf.writers.to_mtx` export a complete assay.
-- AnnData's writer can persist a feature-selective object returned by
-  `to_anndata`.
-- `scarf.writers.SubsetZarr(..., cell_key=...)` writes any boolean cell
-  selection as a smaller Scarf store, retaining all assay features.
+Confirm a feature-selective in-memory handoff with `to_anndata`, then a
+cell-selective Scarf store with `SubsetZarr`:
 
-See {doc}`import_and_export` for executable export examples and
-{doc}`remote_stores` when the count source itself must remain remote.
+```{code-cell} ipython3
+adata = ds.to_anndata(
+    cell_key="wellConnected",
+    feature_names=panel_genes,
+)
+adata.shape, adata.var_names.tolist()
+```
+
+```{code-cell} ipython3
+from pathlib import Path
+import shutil
+
+subset_path = Path("scarf_datasets/custom_analyses_subset.zarr")
+if subset_path.exists():
+    shutil.rmtree(subset_path)
+
+writer = scarf.SubsetZarr(
+    zarr_loc=str(subset_path),
+    assays=[ds.RNA],
+    cell_key="wellConnected",
+    reset_cell_filter=False,
+    overwrite_existing_file=True,
+)
+writer.dump()
+
+subset_ds = scarf.DataStore(str(subset_path))
+{
+    "source wellConnected cells": int(ds.cells.fetch_all("wellConnected").sum()),
+    "subset cells": subset_ds.cells.N,
+    "subset RNA features": subset_ds.RNA.feats.N,
+}
+```
+
+`to_anndata` drops unselected features. `SubsetZarr` keeps every RNA feature and
+only the selected cells. For full-assay `to_h5ad` / `to_mtx` writers, see
+{doc}`import_and_export`. Use {doc}`remote_stores` when the count source itself
+must remain remote.
 
 ## Extension boundary
 

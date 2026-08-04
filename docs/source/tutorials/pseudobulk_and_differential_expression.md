@@ -41,6 +41,8 @@ designs, merge samples first ({doc}`dataset_merging`) and pass sample and cell-t
 to `make_bulk`.
 
 ```{code-cell} ipython3
+import pandas as pd
+
 import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
@@ -110,13 +112,48 @@ columns as replicate-aware differential expression results.
 
 ### 2. Aggregate with make_bulk
 
+Cell counts per Leiden group set the scale for each bulk column:
+
 ```{code-cell} ipython3
-bulk = ds.make_bulk(
+group_sizes = (
+    ds.cells.to_pandas_dataframe(
+        columns=['RNA_clusters'],
+        key='I',
+    )['RNA_clusters']
+    .astype(str)
+    .value_counts()
+    .sort_index()
+)
+group_sizes
+```
+
+`make_bulk` sums raw counts per group. `return_fraction=True` adds the fraction of
+cells with non-zero counts in the same pass:
+
+```{code-cell} ipython3
+bulk, fracs = ds.make_bulk(
     group_key='RNA_clusters',
     aggr_type='sum',
     feature_label='name',
+    return_fraction=True,
 )
-bulk.iloc[:5, :5]
+totals = bulk.sum().rename('total_counts')
+totals.index = totals.index.astype(str)
+pd.concat(
+    [group_sizes.rename('n_cells'), totals],
+    axis=1,
+)
+```
+
+Top expressed genes across groups (summed counts), with detection fractions alongside:
+
+```{code-cell} ipython3
+top_genes = bulk.sum(axis=1).sort_values(ascending=False).head(8).index
+bulk.loc[top_genes]
+```
+
+```{code-cell} ipython3
+fracs.loc[top_genes]
 ```
 
 Optional pseudo-replicates within each group:
@@ -136,6 +173,13 @@ bulk_reps = ds.make_bulk(
     feature_label='name',
     pseudo_reps=2,
 )
+list(bulk_reps.columns)
+```
+
+Column names carry the group label plus `_Rep1` / `_Rep2`. Shape doubles the
+group count because each cluster is split once:
+
+```{code-cell} ipython3
 bulk_reps.shape
 ```
 
@@ -143,8 +187,27 @@ bulk_reps.shape
 
 ```{code-cell} ipython3
 export_path = 'scarf_datasets/kang_pseudobulk_counts.csv'
+meta_path = 'scarf_datasets/kang_pseudobulk_sample_meta.csv'
 bulk.to_csv(export_path)
+sample_meta = pd.concat(
+    [group_sizes.rename('n_cells'), totals],
+    axis=1,
+)
+sample_meta.index.name = 'group'
+sample_meta.to_csv(meta_path)
 print(f'Wrote {bulk.shape[0]} features x {bulk.shape[1]} groups to {export_path}')
+print(f'Wrote sample metadata for {sample_meta.shape[0]} groups to {meta_path}')
+```
+
+Peek the written count matrix and the group-level metadata that pairs with its
+columns:
+
+```{code-cell} ipython3
+pd.read_csv(export_path, index_col=0, nrows=5).iloc[:, :5]
+```
+
+```{code-cell} ipython3
+pd.read_csv(meta_path, index_col=0)
 ```
 
 Use the exported count matrix and sample-level metadata with a method appropriate to the study

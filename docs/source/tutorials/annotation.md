@@ -39,6 +39,7 @@ has both, so this page opens it and goes straight to reading the evidence.
 
 ```{code-cell} ipython3
 import numpy as np
+import pandas as pd
 import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
@@ -55,8 +56,22 @@ ds = scarf.DataStore(
 ```
 
 `RNA_clusters` holds the partition the pipeline selected, and the marker table
-is indexed under the same column.
+is indexed under the same column. Confirm cluster sizes and their layout before
+reading markers.
 
+```{code-cell} ipython3
+ds.cells.to_pandas_dataframe(
+    columns=['RNA_clusters'],
+    key='I',
+)['RNA_clusters'].value_counts().sort_index()
+```
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by='RNA_clusters',
+)
+```
 
 ## 1) Marker tables
 
@@ -115,7 +130,23 @@ Rows are top markers per cluster; use them with known lineage genes, not as FDR 
 
 ## 2) Known markers on the embedding
 
-Confirm panel genes on the UMAP before assigning labels.
+Before assigning labels, check where the panel genes rank across clusters, then
+confirm them on the UMAP.
+
+```{code-cell} ipython3
+markers = ds.get_markers(
+    group_key='RNA_clusters',
+    group_id=None,
+    min_score=-1,
+    min_frac_exp=-1,
+)
+(
+    markers[markers['feature_name'].astype(str).isin(['CD14', 'MS4A1', 'CD3D'])]
+    .sort_values(['feature_name', 'score'], ascending=[True, False])
+    .groupby('feature_name', as_index=False)
+    .head(1)[['feature_name', 'group_id', 'score', 'auc', 'frac_exp']]
+)
+```
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -127,7 +158,8 @@ ds.plots.embedding(
 ```
 
 CD14, MS4A1, and CD3D mark monocyte-, B-, and T-cell-like regions when those lineages
-are present.
+are present. The lookup above names the highest-scoring cluster for each gene;
+the UMAP shows whether that signal is spatially coherent.
 
 ## 3) Assign labels
 
@@ -142,13 +174,6 @@ unique = sorted(
     key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
 )
 
-markers = ds.get_markers(
-    group_key='RNA_clusters',
-    group_id=None,
-    min_score=-1,
-    min_frac_exp=-1,
-)
-
 label_map = {c: f'Cluster {c}' for c in unique}
 for gene, name in [('CD14', 'Monocytes'), ('MS4A1', 'B cells'), ('CD3D', 'T cells')]:
     hit = markers[markers['feature_name'].astype(str) == gene]
@@ -157,8 +182,19 @@ for gene, name in [('CD14', 'Monocytes'), ('MS4A1', 'B cells'), ('CD3D', 'T cell
     cid = str(hit.sort_values('score', ascending=False).iloc[0]['group_id'])
     label_map[cid] = name
 
+label_map
+```
+
+```{code-cell} ipython3
 labels = np.array([label_map[str(c)] for c in cluster_ids], dtype=object)
 ds.cells.insert(column_name='cell_type', values=labels, overwrite=True)
+ds.cells.to_pandas_dataframe(
+    columns=['cell_type'],
+    key='I',
+)['cell_type'].value_counts()
+```
+
+```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='cell_type',
@@ -166,6 +202,8 @@ ds.plots.embedding(
 ```
 
 Assigned labels replace numeric cluster IDs where the panel genes ranked highest.
+Compare `label_map` and the `cell_type` counts with the gene UMAPs before treating
+unnamed `Cluster_*` groups as distinct types.
 
 ## 4) Relabel clusters with `smart_label`
 
@@ -180,6 +218,13 @@ ds.smart_label(
     base_label='cell_type',
     new_col_name='leiden_by_type',
 )
+pd.crosstab(
+    pd.Series(ds.cells.fetch('RNA_clusters'), name='RNA_clusters'),
+    pd.Series(ds.cells.fetch('leiden_by_type'), name='leiden_by_type'),
+)
+```
+
+```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='leiden_by_type',
@@ -187,12 +232,17 @@ ds.plots.embedding(
 ```
 
 `leiden_by_type` is a convenience labeling of clusters, not an automated ontology annotation.
+The crosstab shows which Leiden IDs were rewritten and which shared a base label.
 
 ## 5) Annotate scATAC-seq with gene scores
 
 Peak IDs are difficult to interpret directly. `add_melded_assay` can combine
 ATAC peaks that overlap gene bodies and promoter regions into a `GeneScores`
 assay, which can then be plotted like RNA features.
+
+This page stays on the RNA store. An executable GeneScores path, including the
+prepared BED download and marker panel on an ATAC UMAP, is in {doc}`scatac_seq`.
+The API sketch below is for coordinate melding on an ATAC assay you already have.
 
 The external BED file has no header and uses tab-separated columns in this
 order: chromosome, start, end, gene ID, gene name, and optional strand. Its

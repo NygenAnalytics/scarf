@@ -18,6 +18,8 @@ subtrees:
         title: scATAC-seq
       - file: tutorials/cite_seq
         title: CITE-seq
+      - file: tutorials/multimodal_diagnostics
+        title: Multimodal diagnostics
       - file: tutorials/tea_seq
         title: TEA-seq
       - file: tutorials/hto_demultiplexing
@@ -42,8 +44,6 @@ subtrees:
         title: Mapping and label transfer
       - file: tutorials/reference_atlases
         title: Reference atlases
-      - file: tutorials/multimodal_diagnostics
-        title: Multimodal diagnostics
   - caption: Annotation and biology
     entries:
       - file: tutorials/annotation

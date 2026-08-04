@@ -97,7 +97,33 @@ artifacts = ds_ctrl.pipeline.run(
     markers=False,
 )
 reference = ds_ctrl.build_mapping_reference(artifacts["neighbors"])
+pd.Series(
+    {
+        "method": reference.method,
+        "assay": reference.assay_name,
+        "selected_cells": reference.selected_cell_count,
+        "n_features": reference.model.n_features,
+        "n_dims": reference.model.n_dims,
+        "has_symphony_state": reference.symphony_state is not None,
+    },
+    name="mapping_reference",
+)
 ```
+
+`method="symphony"` means the neighbour chain used Harmony-corrected
+coordinates and the reference carries soft-assignment state for query
+correction. The feature count and PCA dimensions stay fixed for every later
+query.
+
+```{code-cell} ipython3
+ds_ctrl.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="cluster_labels",
+)
+```
+
+This layout is the fixed atlas identity. Mapping places query weight onto these
+cells without moving them.
 
 In a later session, reopen the reference store and load the named mapping
 reference. The prepared reference datastore may be opened read-only. Mapping
@@ -107,6 +133,17 @@ prepare the reference.
 
 ```{code-cell} ipython3
 reference = ds_ctrl.get_mapping_reference()
+pd.Series(
+    {
+        "method": reference.method,
+        "assay": reference.assay_name,
+        "selected_cells": reference.selected_cell_count,
+        "n_features": reference.model.n_features,
+        "n_dims": reference.model.n_dims,
+        "has_symphony_state": reference.symphony_state is not None,
+    },
+    name="reloaded_mapping_reference",
+)
 ```
 
 ## Map and inspect a shifted query
@@ -131,10 +168,13 @@ mapping = ds_stim.run_mapping(
     save_k=5,
     query_batches=query_batches,
 )
+mapping.mapping_name, mapping.n_cells, mapping.correction_method
 ```
 
 The mapping result is stored in `ds_stim`. The reference model and reference
-coordinates remain unchanged.
+coordinates remain unchanged. `correction_method="symphony"` confirms the query
+used the fixed-reference ridge correction rather than a plain PCA neighbour
+lookup.
 
 ```{code-cell} ipython3
 mapped = ds_stim.get_mapping_result(
@@ -164,7 +204,15 @@ ds_stim.cells.insert(
     transferred.to_numpy(),
     overwrite=True,
 )
+accepted = transferred.notna() & transferred.ne("NA")
+accepted.value_counts().rename(
+    index={True: "accepted", False: "abstained"}
+).rename("query cells")
 ```
+
+Cells below `threshold_fraction` abstain as `NA` instead of taking a weak
+majority label. Compare the accepted and abstained counts with the `NA` column
+in the confusion matrix below.
 
 ```{code-cell} ipython3
 query_labels = np.asarray(ds_stim.cells.fetch("cluster_labels")).astype(str)
@@ -180,24 +228,41 @@ ds_stim.plots.mapping_confusion(
 ## Mapping scores by reference cluster
 
 After label transfer, inspect where query weight landed on the reference.
-Focused populations should put the highest mapping scores on matching reference
-clusters.
+Per-reference-cell scores are mostly zero, so cell-level box plots look flat
+even when the embedding shows clear hotspots. Sum the raw (non-log) scores
+within each reference cluster, then check the sized embedding. Focused
+populations should put the highest score mass on matching reference clusters.
 
 ```{code-cell} ipython3
+focus_labels = ("CD4 Memory T", "CD 14 Mono", "NK")
 focus_groups = np.array(
-    [
-        label if label in {"CD4 Memory T", "CD 14 Mono", "NK"} else "other"
-        for label in query_labels
-    ],
+    [label if label in focus_labels else "other" for label in query_labels],
     dtype=object,
 )
-ds_stim.plots.mapping_score(
+assert mapped.reference is not None
+ref_classes = np.asarray(
+    mapped.reference.fetch_cell_column("cluster_labels"),
+    dtype=object,
+)
+score_mass: dict[str, pd.Series] = {}
+for group, values in ds_stim.get_mapping_score(
     mapped,
     target_groups=focus_groups,
-    kind="box",
-    reference_class_group="cluster_labels",
-    figsize=(14, 3.8),
-)
+    log_transform=False,
+):
+    if group == "other":
+        continue
+    score_mass[str(group)] = (
+        pd.Series(np.asarray(values, dtype=np.float64), index=ref_classes)
+        .groupby(level=0, sort=False)
+        .sum()
+    )
+score_mass_table = pd.DataFrame(
+    {label: score_mass[label] for label in focus_labels if label in score_mass}
+).fillna(0.0)
+score_mass_table.loc[
+    score_mass_table.max(axis=1).sort_values(ascending=False).index
+].round(3)
 ```
 
 ```{code-cell} ipython3
@@ -210,7 +275,7 @@ ds_stim.plots.mapping_score(
 )
 ```
 
-Systematic off-diagonal confusion or diffuse mapping scores across unrelated
+Systematic off-diagonal confusion or diffuse score mass across unrelated
 reference clusters is a reason to inspect feature coverage, batch design, and
 whether the query contains populations absent from the atlas. Compare the
 confusion pattern with the direct KNN workflow in

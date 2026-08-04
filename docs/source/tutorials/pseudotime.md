@@ -102,17 +102,40 @@ labels off the embedding and pick the ones at each end of the trajectory. Every 
 in `sources` or `sinks` has to be present among the scored cells, otherwise the call fails
 rather than guessing.
 
-The scores are stored in `RNA_pseudotime`, with the actual generated name
-available as `pseudotime.pseudotime_key`. The companion key returned as
-`pseudotime.validity_key` identifies cells that were scored. Values should
-progress from the ductal region toward the endocrine endpoints. A disconnected
-or internally reversed pattern is a reason to revisit the graph and endpoint
-choices.
+The scores are stored under the generated column named by
+`pseudotime.pseudotime_key` (by default `RNA_pseudotime`). The companion key
+`pseudotime.validity_key` identifies cells that were scored.
+
+```{code-cell} ipython3
+{
+    "pseudotime_key": pseudotime.pseudotime_key,
+    "validity_key": pseudotime.validity_key,
+    "valid cells": int(ds.cells.fetch_all(pseudotime.validity_key).sum()),
+}
+```
+
+Values should progress from the ductal region toward the endocrine endpoints.
+A disconnected or internally reversed pattern is a reason to revisit the graph
+and endpoint choices. Restrict the embedding to scored cells with
+`subset_by=pseudotime.validity_key`.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=pseudotime.pseudotime_key,
+    subset_by=pseudotime.validity_key,
+)
+```
+
+Compare the score distribution across annotated populations. Early source
+clusters should sit lower than the sink populations.
+
+```{code-cell} ipython3
+ds.plots.distribution(
+    keys=pseudotime.pseudotime_key,
+    group_by='clusters',
+    subset_by=pseudotime.validity_key,
+    kind='violin',
 )
 ```
 
@@ -129,24 +152,46 @@ markers = ds.run_pseudotime_marker_search(
     cell_key=pseudotime.validity_key,
     pseudotime_key=pseudotime.pseudotime_key,
 )
-(
-    markers.table.loc[
-        markers.table["p_value_adjusted"].notna(),
-        ["feature_name", "r_value", "p_value_adjusted"],
-    ]
-    .assign(abs_r_value=lambda frame: frame["r_value"].abs())
-    .sort_values("abs_r_value", ascending=False)
-    .drop(columns="abs_r_value")
-    .head(10)
-)
 ```
 
 The correlations, raw p-values, and adjusted p-values are saved in feature
 metadata. Their generated column names are available as
 `markers.correlation_key`, `markers.p_value_key`, and
 `markers.p_value_adjusted_key`. The returned `markers.table` contains the same
-values with feature names. The table above ranks the strongest tested linear
-associations in either direction.
+values with feature names.
+
+Count how many features were tested versus left as `NaN`:
+
+```{code-cell} ipython3
+markers.table[["p_value", "p_value_adjusted"]].isna().sum()
+```
+
+```{code-cell} ipython3
+markers.table[["p_value", "p_value_adjusted"]].notna().sum()
+```
+
+Rank the strongest positive associations (increasing with pseudotime) and the
+strongest negative associations (decreasing with pseudotime) separately:
+
+```{code-cell} ipython3
+tested = markers.table.loc[
+    markers.table["p_value_adjusted"].notna(),
+    ["feature_name", "r_value", "p_value_adjusted"],
+]
+(
+    tested.loc[tested["r_value"] > 0]
+    .sort_values("r_value", ascending=False)
+    .head(10)
+)
+```
+
+```{code-cell} ipython3
+(
+    tested.loc[tested["r_value"] < 0]
+    .sort_values("r_value", ascending=True)
+    .head(10)
+)
+```
 
 ---
 ## 4) Visualize pseudotime correlated features
@@ -177,6 +222,31 @@ ds.plots.embedding(
 `Spp1` should be strongest near the ductal source, while `Cpe` should increase
 toward endocrine states. This agreement is a useful checkpoint, not proof of a
 causal lineage or evidence that every dynamic gene changes monotonically.
+
+As an optional check, scatter each checkpoint gene against the ordering among
+scored cells:
+
+```{code-cell} ipython3
+import matplotlib.pyplot as plt
+
+cell_key = pseudotime.validity_key
+ptime = ds.get_cell_vals(
+    from_assay="RNA",
+    cell_key=cell_key,
+    k=pseudotime.pseudotime_key,
+)
+figure, axes = plt.subplots(1, 2, figsize=(8, 3.5), sharex=True)
+for axis, gene in zip(axes, checkpoint_genes, strict=True):
+    expression = ds.get_cell_vals(
+        from_assay="RNA",
+        cell_key=cell_key,
+        k=gene,
+    )
+    axis.scatter(ptime, expression, s=4, alpha=0.35)
+    axis.set(xlabel="Pseudotime", ylabel=gene)
+figure.tight_layout()
+plt.show()
+```
 
 ## Common mistakes and limitations
 

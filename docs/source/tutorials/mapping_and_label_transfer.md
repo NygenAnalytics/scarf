@@ -39,6 +39,7 @@ Mapping currently supports RNA queries. The prepared reference may be reopened r
 
 ```{code-cell} ipython3
 import numpy as np
+import pandas as pd
 
 import scarf
 
@@ -137,6 +138,14 @@ mapping = ds_stim.run_mapping(
 becomes zero after reference scaling. Use `zero` to fill with a normalized zero,
 or `error` when complete feature overlap is required.
 
+Reload the projection with neighbour arrays to confirm the write: one row per
+mapped query cell, `save_k` reference neighbours, and finite distances.
+
+```{code-cell} ipython3
+peek = ds_stim.get_mapping_result(mapping, load_arrays=True)
+peek.n_cells, int(peek.indices.shape[1]), peek.indices[:3], peek.distances[:3]
+```
+
 `mapping.diagnostics["queryScaledDispersion"]` compares query spread with the
 reference after scaling. Values near 1 mean the query occupies a similar region
 of feature space. Values much below 1 mean the query is compressed toward the
@@ -165,14 +174,16 @@ ds_stim.plots.mapping_score(
     mapping,
     layout_key="RNA_UMAP",
     target_groups=score_groups,
+    size_by_score=True,
     figsize=(14, 3.4),
 )
 ```
 
 Grey points received no weight from that query group. Coloured points are the
-reference cells that attracted it. A useful map lights up the matching
-reference population. Concentration in an unrelated pocket suggests a domain
-shift or a feature-alignment problem.
+reference cells that attracted it; point size scales with score so sparse hits
+stay visible. A useful map lights up the matching reference population.
+Concentration in an unrelated pocket suggests a domain shift or a
+feature-alignment problem.
 
 ## Transfer labels and inspect evidence
 
@@ -196,6 +207,17 @@ accepted = transferred_labels.notna() & transferred_labels.ne("NA")
 accepted.value_counts().rename(
     index={True: "accepted", False: "abstained"}
 ).rename("query cells")
+```
+
+Plot the transferred labels on the query UMAP. The `NA` category is abstention
+geography: those cells did not clear the vote threshold.
+
+```{code-cell} ipython3
+ds_stim.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by=["cluster_labels", "transferred_labels"],
+    figsize=(10, 4),
+)
 ```
 
 `mapping_evidence` summarizes three abstention signals:
@@ -234,30 +256,64 @@ ds_stim.plots.mapping_confusion(
 ```
 
 The diagonal is recall within each known query label. Off-diagonal blocks are
-systematic swaps. The `NA` column is abstention.
+systematic swaps. The `NA` column is abstention. Watch the monocyte rows:
+stimulated CD14 Mono and DC often spill into CD16 Mono rather than a clean
+match, which is a domain-shift failure mode rather than a plotting artifact.
+
+Because known labels are available, `mapping_calibration` shows how label
+accuracy trades off against retained coverage as the vote threshold rises. The
+marker is the `threshold_fraction` used above. Higher thresholds keep fewer
+cells and usually raise accuracy among the cells that remain.
+
+```{code-cell} ipython3
+ds_stim.plots.mapping_calibration(
+    mapping,
+    reference_class_group="cluster_labels",
+    known_labels=query_labels,
+    chosen_threshold=0.6,
+)
+```
 
 ## Mapping scores by reference cluster
 
 For a focused query population, ask which reference clusters absorbed the
-mapping weight. Box plots summarize the per-reference-cell score distribution
-inside each reference cluster. A sized embedding keeps the same scores on the
-reference UMAP, with larger points for higher scores.
+mapping weight. Per-reference-cell scores are mostly zero, so cell-level box
+plots collapse to a flat line even when a few reference cells carry real
+weight. Sum the raw (non-log) scores within each reference cluster instead.
+That score mass is readable, and the sized embedding below keeps the same
+sparse scores on the reference UMAP. The monocyte columns are the place to
+connect back to the confusion off-diagonals.
 
 ```{code-cell} ipython3
+focus_labels = ("CD 14 Mono", "CD16 Mono", "NK")
 focus_groups = np.array(
-    [
-        label if label in {"CD4 Memory T", "CD 14 Mono", "NK"} else "other"
-        for label in query_labels
-    ],
+    [label if label in focus_labels else "other" for label in query_labels],
     dtype=object,
 )
-ds_stim.plots.mapping_score(
+assert mapping.reference is not None
+ref_classes = np.asarray(
+    mapping.reference.fetch_cell_column("cluster_labels"),
+    dtype=object,
+)
+score_mass: dict[str, pd.Series] = {}
+for group, values in ds_stim.get_mapping_score(
     mapping,
     target_groups=focus_groups,
-    kind="box",
-    reference_class_group="cluster_labels",
-    figsize=(14, 3.8),
-)
+    log_transform=False,
+):
+    if group == "other":
+        continue
+    score_mass[str(group)] = (
+        pd.Series(np.asarray(values, dtype=np.float64), index=ref_classes)
+        .groupby(level=0, sort=False)
+        .sum()
+    )
+score_mass_table = pd.DataFrame(
+    {label: score_mass[label] for label in focus_labels if label in score_mass}
+).fillna(0.0)
+score_mass_table.loc[
+    score_mass_table.max(axis=1).sort_values(ascending=False).index
+].round(3)
 ```
 
 ```{code-cell} ipython3
@@ -270,9 +326,11 @@ ds_stim.plots.mapping_score(
 )
 ```
 
-A useful map puts high scores on the matching reference clusters. Diffuse score
-mass across many unrelated clusters is a reason to inspect feature coverage or
-the query composition.
+NK should put most score mass on the matching reference NK cluster and light
+up that pocket on the UMAP. CD14 Mono often spreads toward CD16 Mono rather
+than a tight CD14-only peak; that matches the monocyte swaps in the confusion
+matrix. Diffuse score mass across many unrelated clusters is a reason to
+inspect feature coverage or the query composition.
 
 ```{raw} html
 <span id="reference-atlas-mapping"></span>

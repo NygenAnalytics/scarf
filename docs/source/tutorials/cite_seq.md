@@ -44,6 +44,7 @@ them as separate assays named `RNA` and `ADT`.
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
@@ -87,6 +88,10 @@ assay wrote the column.
 
 ```{code-cell} ipython3
 ds.auto_filter_cells()
+print(
+    f"Active cells: {int(ds.cells.fetch_all('I').sum())}"
+    f" of {ds.cells.N}"
+)
 ```
 
 `auto_filter_cells` models each RNA QC column as a normal distribution, takes its 1st and
@@ -137,8 +142,16 @@ ds.plots.embedding(
 )
 ```
 
-The RNA layout should recover broad PBMC structure. A dominant region aligned
-with low counts suggests the shared cell selection needs more inspection.
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by='RNA_nCounts',
+)
+```
+
+The RNA layout should recover broad PBMC structure. Colouring by `RNA_nCounts`
+shows whether a dominant region aligns with low library size; that pattern
+suggests the shared cell selection needs more inspection.
 
 ## 3. Process the ADT assay
 
@@ -222,8 +235,19 @@ ds.plots.embedding(
 )
 ```
 
-The ADT layout should resolve protein-defined populations without being
-dominated by control antibodies.
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key='ADT_UMAP',
+    color_by=['CD3_TotalSeqB', 'CD14_TotalSeqB'],
+    from_assay='ADT',
+    n_columns=2,
+    sort_values=True,
+)
+```
+
+CD3 and CD14 antibodies should mark T-cell-like and monocyte-like regions when
+those lineages are present. The ADT layout should resolve protein-defined
+populations without being dominated by control antibodies.
 
 ## 4. Integrate the modalities
 
@@ -356,6 +380,48 @@ ds.run_leiden_clustering(
 The integrated artifact stores blended affinities as graph weights. It also publishes the
 per-cell columns `RNA+ADT_wnn_RNA_weight` and `RNA+ADT_wnn_ADT_weight`. The weights are
 non-negative and sum to one for each selected cell.
+
+```{code-cell} ipython3
+weight_columns = [
+    'RNA+ADT_wnn_RNA_weight',
+    'RNA+ADT_wnn_ADT_weight',
+]
+weight_values = np.column_stack(
+    [ds.cells.fetch(column, key='I') for column in weight_columns]
+)
+
+pd.Series(
+    {
+        'minimum weight': float(weight_values.min()),
+        'maximum weight': float(weight_values.max()),
+        'mean RNA weight': float(weight_values[:, 0].mean()),
+        'mean ADT weight': float(weight_values[:, 1].mean()),
+        'maximum row-sum error': float(
+            np.abs(weight_values.sum(axis=1) - 1).max()
+        ),
+    }
+)
+```
+
+```{code-cell} ipython3
+wnn_weights = ds.plots.embedding(
+    layout_key='RNA+ADT_wnn_UMAP',
+    color_by=weight_columns,
+    n_columns=2,
+    show_titles=False,
+    show=False,
+)
+for axis, title in zip(
+    wnn_weights.axes.values(),
+    ('RNA weight', 'ADT weight'),
+    strict=True,
+):
+    axis.set_title(title)
+wnn_weights.figure.set_size_inches(9, 4)
+```
+
+Plotting both weights on the WNN layout shows where the graph leans on RNA or
+ADT local neighbourhoods.
 
 Scarf WNN is Hao-inspired, but it is not bit-identical to Seurat's
 `FindMultiModalNeighbors`:

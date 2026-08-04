@@ -29,7 +29,7 @@ that decide which of the two happens.
 - Reuse normalization, PCA, and ANN when only neighbor `k` changes
 - Rebuild reduction and everything downstream when `dims` changes
 - Force a new artifact with `invalidate_cache=True`
-- Compare upstream lineage for several connectivity artifacts
+- Compare upstream lineage for neighbour-count and dimensionality forks
 
 ## Dataset
 
@@ -54,8 +54,9 @@ ds.filter_cells(
     lows=[1000, 500],
     reset_previous=True,
 )
-if 'I__hvgs' not in ds.RNA.feats.columns:
-    ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
+# Remake HVGs after this tutorial's cell filter so lineage does not pull in a
+# feature selection that was computed under an earlier cell mask on the store.
+ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ```
 
 ## Build a baseline chain
@@ -90,6 +91,19 @@ print('neighbors recomputed:', neighbors_k15 != neighbors_k11)
 print('graph recomputed:', graph_k15 != graph_k11)
 ```
 
+Degree and edge-weight distributions shift with `k` even though the upstream
+artifacts are identical:
+
+```{code-cell} ipython3
+import scarf.plotting as splt
+
+matrix_k11 = ds.load_graph(graph_loc=ds.inspect_artifact(graph_k11).path)
+matrix_k15 = ds.load_graph(graph_loc=ds.inspect_artifact(graph_k15).path)
+print('edges (nnz):', {'k11': matrix_k11.nnz, 'k15': matrix_k15.nnz})
+splt.graph_qc(matrix_k11)
+splt.graph_qc(matrix_k15)
+```
+
 ## Vary `dims`: invalidate downstream
 
 A new PCA dimensionality creates a new reduction. ANN, neighbors, and
@@ -111,7 +125,13 @@ print('normalization reused:', ds.run_normalization(feat_key='hvgs', update_stat
 ## Force recompute
 
 `invalidate_cache=True` skips {term}`reuse` even when the parameters match.
-Previously completed artifacts remain on disk.
+Previously completed artifacts remain on disk. The new reference has a different
+id and path. The operation and parameters stay the same.
+
+For normalization, `invalidate_cache` also writes fresh cell and feature
+selection snapshots and records those new selection artifacts as inputs. The
+input roles stay the same (`cell_selection`, `feature_selection`), but the
+selection artifact ids differ:
 
 ```{code-cell} ipython3
 forced = ds.run_normalization(
@@ -120,33 +140,60 @@ forced = ds.run_normalization(
     invalidate_cache=True,
 )
 status = ds.inspect_artifact(forced)
+baseline = ds.inspect_artifact(normalized)
+baseline_inputs = baseline.inputs or {}
+forced_inputs = status.inputs or {}
+
 print('new artifact:', forced != normalized)
 print('complete:', status.complete)
 print('operation:', status.operation)
+print('path:', status.path)
+print('baseline path:', baseline.path)
+print('same parameters:', status.parameters == baseline.parameters)
+print('same input roles:', set(baseline_inputs) == set(forced_inputs))
+print('same inputs:', forced_inputs == baseline_inputs)
+for name in sorted(set(baseline_inputs) | set(forced_inputs)):
+    left = baseline_inputs.get(name)
+    right = forced_inputs.get(name)
+    if left == right:
+        print(f'{name}: same')
+        continue
+    print(f'{name}: different artifact id')
+    print('  baseline:', left)
+    print('  forced:', right)
 ```
 
 ## Compare lineage
 
-Build one read-only report from both neighbour-count branches. The report
-shares their common normalization, PCA, and ANN nodes instead of repeating
-them:
+Build one read-only report from both neighbour-count branches and the
+`dims=20` fork. Shared upstream nodes appear once; the forks show where each
+branch diverged. Because HVGs were remade after this page's cell filter, the
+graph should not include an older mito filter that lived on the shared store:
 
 ```{code-cell} ipython3
 lineage = ds.lineage(
     {
         'k11 graph': graph_k11,
         'k15 graph': graph_k15,
+        'dims20 graph': graph_dims20,
     }
 )
-print(lineage)
+lineage
 ```
 
-The graph should branch after the ANN index because only `k` changed. Export
-the same report when it needs to travel with an analysis:
+Notebook display renders the Mermaid dependency graph and the artifact details
+beneath it. The `k` branches should diverge after the ANN index. The `dims=20`
+branch should fork earlier, at PCA, then carry its own ANN, neighbours, and
+graph.
+
+Export the same report when it needs to travel with an analysis. `to_markdown()`
+is what notebook display uses; showing it here makes that export explicit:
 
 ```{code-cell} ipython3
-print(lineage.to_mermaid())
+from IPython.display import Markdown
+
+Markdown(lineage.to_markdown())
 ```
 
-`lineage.to_markdown()` adds artifact details below the Mermaid source. It is
-suited to a notebook, issue, or analysis record that supports Mermaid.
+`lineage.to_mermaid()` returns only the diagram source when a tooling pipeline
+needs that form alone.

@@ -51,19 +51,27 @@ repository = scarf.cytebase.connect('scarf_docs')
 remote_group = repository.open_zarr('tenx_5K_pbmc_rnaseq/data.zarr')
 
 ds = scarf.DataStore(remote_group.store, zarr_mode='r', nthreads=4)
+print(ds)
 ```
 
 Opening a store over object storage costs many small metadata requests, so expect
 this step to take a few minutes on a home connection. Nothing but metadata is read
-until you touch the counts.
+until you touch the counts. The printed summary lists active cells, assays, and
+the cell and feature columns already present in the remote store.
 
 The store already carries a full analysis, so its {term}`artifacts <artifact>`
-and current {term}`analysis chain` are readable straight away:
+and current {term}`analysis chain` are readable straight away. Plot the stored
+UMAP coloured by the published cluster partition:
 
 ```{code-cell} ipython3
 state = ds.get_assay_state('RNA')
 print('Reduction available:', state.reduction is not None)
 print('Graph available:', state.connectivity_map is not None)
+
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by='RNA_clusters',
+)
 ```
 
 ## Mount read-only counts into a writable store
@@ -100,10 +108,17 @@ mounted = scarf.mount_datastore(
     storage_options={"token": False},
     nthreads=4,
 )
+
+matrix_source = zarr.open_group(str(target_path), mode='r').attrs['matrixSource']
+print('Target path:', target_path)
+print('Target exists:', target_path.exists())
+print('Source URI:', matrix_source['location'])
+print('Mounted assays:', sorted(matrix_source['assays']))
 ```
 
 Counts and optional `countsT` stay in the source. Cell and feature metadata are
-copied once, while new analysis artifacts are written to the target.
+copied once, while new analysis artifacts are written to the target. The printed
+`matrixSource` record is what later reopen uses to resolve the remote counts.
 
 ```{mermaid}
 flowchart LR
@@ -125,12 +140,15 @@ print('Mounted shape:', mounted.RNA.rawData.shape)
 ```
 
 Run a complete graph and plotting checkpoint through the mount. Count blocks are
-read from the remote source; reductions, neighbours, graph, UMAP, and clusters
-are stored locally.
+read from the remote source. Normalized data, reductions, neighbours, graph,
+UMAP, and clusters are written only to the local target. Because that target is
+a local path, `local_cache` staging is skipped here even though counts remain
+remote; the next section shows staging on a truly remote DataStore open.
 
 ```{code-cell} ipython3
 normalized = mounted.run_normalization(feat_key='hvgs')
-pca = mounted.run_pca(normalized, dims=15, local_cache=True)
+pca = mounted.run_pca(normalized, dims=15)
+
 mounted.build_embedding_initialization(pca)
 mounted.build_ann_index(pca)
 mounted.query_neighbors(k=11)
@@ -257,9 +275,12 @@ After open, call the same analysis APIs as on a local store:
 ## Local scratch for reductions
 
 PCA fitting and score projection make multiple passes over normalized
-expression. Against object storage, set `local_cache` on the reduction so those
-passes hit local disk. Harmony, ANN, and neighbor queries read persisted
-reduced coordinates and do not use normalized-expression scratch.
+expression. `local_cache` stages that normalized artifact to local disk when the
+*DataStore location* is remote (object-storage URI or non-local backend). It
+does not key off whether counts alone are remote. A mounted local target already
+holds normalized artifacts locally, so staging is skipped there even when
+`counts` stream from a remote source. Harmony, ANN, and neighbor queries read
+persisted reduced coordinates and do not use normalized-expression scratch.
 
 | Value | Behavior |
 |---|---|
@@ -268,9 +289,41 @@ reduced coordinates and do not use normalized-expression scratch.
 | `False` | No staging; every pass reads the store URI |
 | `"/path/to/scratch"` | Persistent scratch keyed by artifact ID |
 
+Reuse the remote-opened `ds` from the first section. Pass a scratch path so the
+staged files remain after PCA (the published reduction is reused; staging still
+runs):
+
+```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+scratch_directory = TemporaryDirectory()
+scratch_dir = Path(scratch_directory.name) / 'pca_scratch'
+normalized = ds.get_assay_state('RNA').normalized
+pca = ds.run_pca(
+    normalized,
+    dims=15,
+    local_cache=str(scratch_dir),
+    update_state=False,
+)
+staged_bytes = sum(
+    path.stat().st_size for path in scratch_dir.rglob('*') if path.is_file()
+)
+print('Local cache path:', scratch_dir)
+print('Staged normalized bytes:', staged_bytes)
+print('Local cache present after PCA:', scratch_dir.exists())
+print('Reduction reused:', pca == ds.get_assay_state('RNA').reduction)
+```
+
+On a writable remote store the same pattern fits a full graph build:
+
 ```python
 normalized = ds.run_normalization(feat_key="hvgs")
-reduction = ds.run_pca(normalized, dims=15, local_cache=True)
+reduction = ds.run_pca(
+    normalized,
+    dims=15,
+    local_cache="/tmp/scarf_pca_scratch",
+)
 ds.build_embedding_initialization(reduction)
 ann_index = ds.build_ann_index(reduction)
 neighbors = ds.query_neighbors(ann_index, k=11)
@@ -279,8 +332,9 @@ ds.build_connectivity_map(neighbors)
 
 `local_cache` is an execution option. It does not change artifact identity, so
 a completed remote-normalized artifact can be reused with a different scratch
-policy later. Temporary scratch is deleted after a successful stage; failed
-runs may leave a directory behind for debugging.
+policy later. Temporary scratch (`True` or `"auto"` on a remote store) is
+deleted after a successful stage; a path string keeps the staged files for
+reuse or inspection. Failed runs may leave a directory behind for debugging.
 
 Plan local disk for float32 dense blocks roughly as
 `n_cells × n_features × 4` bytes (about 8 GiB for 1M cells × 2000 HVGs).

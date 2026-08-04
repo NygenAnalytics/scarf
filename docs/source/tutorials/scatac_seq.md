@@ -100,7 +100,11 @@ cells inactive in `I`; it does not delete them. The
 and the ATAC metrics Scarf does and does not provide.
 
 ```{code-cell} ipython3
+n_before = int(ds.cells.fetch_all('I').sum())
 ds.auto_filter_cells(show_qc_plots=True)
+n_after = int(ds.cells.fetch_all('I').sum())
+print(f'Active cells before filter: {n_before}')
+print(f'Active cells after filter: {n_after}')
 ```
 
 ## 3. Select prevalent peaks
@@ -111,6 +115,7 @@ peaks, slightly more than one quarter of the available peaks.
 
 ```{code-cell} ipython3
 ds.mark_prevalent_peaks(top_n=25000)
+print('Selected peaks:', int(ds.ATAC.feats.fetch_all('I__prevalent_peaks').sum()))
 ```
 
 The retained peaks should be present across enough cells to support stable
@@ -163,7 +168,14 @@ Leiden clustering also acts on the neighbourhood graph directly.
 
 ```{code-cell} ipython3
 ds.run_leiden_clustering(resolution=0.6)
+ds.cells.to_pandas_dataframe(
+    columns=['ATAC_leiden_cluster'],
+    key='I'
+)['ATAC_leiden_cluster'].value_counts().sort_index()
 ```
+
+Cluster sizes are worth a look before plotting: a resolution that is too high splits one
+accessibility state into several small clusters.
 
 UMAP and Leiden results are stored in the cell attribute table with an `ATAC` prefix because
 they were run on the default ATAC assay. Filtered cells (`I` is False) have NaN UMAP
@@ -220,6 +232,10 @@ ds.add_melded_assay(
     renormalization=False,
     assay_label='GeneScores',
     assay_type='RNA'
+)
+print(
+    'Valid GeneScores features:',
+    int(ds.GeneScores.feats.fetch_all('I').sum()),
 )
 ```
 

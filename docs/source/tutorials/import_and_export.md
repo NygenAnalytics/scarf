@@ -71,10 +71,12 @@ h5ad_dir = datasets.download_dataset(
     name='bastidas-ponce_4K_pancreas-d15_rnaseq',
     destination='scarf_datasets'
 )
+
+tenx_h5, mtx_dir, h5ad_dir
 ```
 
 The downloads land under `scarf_datasets` in the current working directory unless
-`destination` is changed.
+`destination` is changed. The cell prints each returned path.
 
 ### 2. Convert data to a Scarf Zarr store
 
@@ -93,6 +95,14 @@ writer = scarf.CrToZarr(
     zarr_loc='scarf_datasets/pbmc_atac.zarr'  
 )  
 writer.dump()
+```
+
+Open the written store. The summary lists an ATAC assay, which confirms that
+inference from the H5 feature types survived the dump:
+
+```{code-cell} ipython3
+ds_atac = scarf.DataStore('scarf_datasets/pbmc_atac.zarr')
+ds_atac
 ```
 
 #### From Matrix Market count files
@@ -122,6 +132,14 @@ writer = scarf.MtxToZarr(
     dtype='uint64'
 )
 writer.dump()
+```
+
+Reopen the store and check that the count matrix kept the requested width and
+the candidate dimensions:
+
+```{code-cell} ipython3
+ds_mtx = scarf.DataStore('scarf_datasets/xin_1K.zarr')
+ds_mtx.RNA.rawData.dtype, ds_mtx.RNA.rawData.shape
 ```
 
 Cell-major coordinates stream directly. Feature-major coordinates, including
@@ -213,6 +231,15 @@ embeddings:
 }
 ```
 
+Plot the imported layout colored by the imported cluster labels:
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key='X_umap',
+    color_by='clusters',
+)
+```
+
 ```{code-cell} ipython3
 scarf.writers.to_mtx(
     assay=ds.RNA,
@@ -222,30 +249,55 @@ scarf.writers.to_mtx(
 
 #### To H5ad format
 
-`to_h5ad` exports the count matrix and metadata, and writes UMAP or tSNE coordinate pairs to
-AnnData `obsm` by default. `DataStore.to_anndata` returns an in-memory AnnData object with
-counts, cell and feature metadata, and optional assay layers. It currently leaves layout
-coordinates as ordinary `obs` columns rather than populating `obsm` (see {doc}`downsampling`).
+`to_h5ad` exports the count matrix and metadata, and promotes recognized
+`{assay}_UMAP` / `{assay}_tSNE` column pairs into AnnData `obsm`. Imported
+layouts arrive as `X_umap1` / `X_umap2`, so copy them to the Scarf export names
+before writing. `DataStore.to_anndata` returns an in-memory AnnData object with
+counts, cell and feature metadata, and optional assay layers. It currently leaves
+layout coordinates as ordinary `obs` columns rather than populating `obsm`
+(see {doc}`downsampling`).
 
 ```{code-cell} ipython3
+ds.cells.insert(
+    column_name='RNA_UMAP1',
+    values=ds.cells.fetch_all('X_umap1'),
+    overwrite=True,
+)
+ds.cells.insert(
+    column_name='RNA_UMAP2',
+    values=ds.cells.fetch_all('X_umap2'),
+    overwrite=True,
+)
 scarf.writers.to_h5ad(
     assay=ds.RNA,
     h5ad_filename='scarf_datasets/diff_pancreas.h5ad'
 )
 ```
 
+Reload the H5AD and confirm that the promoted layout is in `obsm`:
+
+```{code-cell} ipython3
+import anndata as ad
+
+adata = ad.read_h5ad('scarf_datasets/diff_pancreas.h5ad')
+sorted(adata.obsm.keys()), adata.obsm['X_umap'].shape
+```
+
 Full-assay export can require enough memory and disk for the selected cell by
 feature matrix. When only a marker panel is needed, select features before
-materializing AnnData:
+materializing AnnData. Genes absent from the feature table are omitted from the
+panel; here `INS` is not present, so it is dropped:
 
 ```{code-cell} ipython3
 all_names = ds.RNA.feats.fetch_all("names").astype(str)
 name_lookup = {name.upper(): name for name in all_names}
+requested = ["GCG", "INS", "SST", "KRT19"]
 panel = [
     name_lookup[gene]
-    for gene in ["GCG", "INS", "SST", "KRT19"]
+    for gene in requested
     if gene in name_lookup
 ]
+dropped = [gene for gene in requested if gene not in name_lookup]
 if not panel:
     panel = all_names[:4].tolist()
 selected = ds.to_anndata(
@@ -254,16 +306,26 @@ selected = ds.to_anndata(
     matrix="raw",
     feature_names=panel,
 )
-selected.shape, selected.var_names.tolist()
+{
+    "shape": selected.shape,
+    "genes": selected.var_names.tolist(),
+    "dropped": dropped,
+    "umapInObs": [
+        name
+        for name in selected.obs.columns
+        if str(name).startswith("X_umap")
+    ],
+    "obsmKeys": list(selected.obsm.keys()),
+}
 ```
 
 Use `feature_indexes` instead when stable feature rows are already available.
 `feature_names` and `feature_indexes` are mutually exclusive, preserve the
 requested order, and reject duplicate or unknown selections.
 
-`to_h5ad` writes recognized UMAP and t-SNE coordinate pairs to `obsm`.
-`DataStore.to_anndata` currently leaves layout coordinates as ordinary `obs`
-columns. This distinction matters when another tool expects `obsm["X_umap"]`.
+The panel export keeps layout coordinates in `obs` and leaves `obsm` empty.
+That is the `to_anndata` side of the distinction above: use `to_h5ad` when
+another tool expects `obsm["X_umap"]`.
 
 Writers also accept remote Zarr locations. Choose the `cloud` profile for an
 object-store destination and pass credentials through the environment or
@@ -326,8 +388,11 @@ writer = scarf.CSVtoZarr(
 )
 writer.dump()
 ds_csv = scarf.DataStore(str(csv_zarr))
-ds_csv
+ds_csv.cells.head()
 ```
+
+`quality` is cell metadata rather than a count column, which is what
+`cell_data_cols` is for.
 
 ### 5. Convert a sparse matrix to Zarr
 

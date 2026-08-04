@@ -42,6 +42,8 @@ the graph.
 ```{code-cell} ipython3
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import pandas as pd
 import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
@@ -103,7 +105,12 @@ weighted_sets.loc[
     weighted_sets['target'].isin(['S100A8', 'S100A9']),
     'weight',
 ] = 1.5
+weighted_sets
+```
 
+S100A8 and S100A9 carry weight 1.5; every other edge stays at 1.0.
+
+```{code-cell} ipython3
 waggr = ds.run_waggr(
     weighted_sets,
     label='pbmc_waggr',
@@ -111,8 +118,41 @@ waggr = ds.run_waggr(
     tmin=3,
     overwrite=True,
 )
-waggr.source_names, waggr.data.shape
+waggr_scores = pd.DataFrame(
+    waggr.data.compute(),
+    columns=list(waggr.source_names),
+)
+waggr_scores.describe().loc[['min', '50%', 'max']]
 ```
+
+Each column is one source. The ranges show that WAGGR tracks expression magnitude and is
+not confined to values between zero and one.
+
+To see what the raised Myeloid weights change, run the same network with every weight at
+1.0 and compare Myeloid summaries:
+
+```{code-cell} ipython3
+waggr_unweighted = ds.run_waggr(
+    gene_sets.assign(weight=1.0),
+    label='pbmc_waggr_unweighted',
+    mode='wmean',
+    tmin=3,
+    overwrite=True,
+)
+unweighted_scores = pd.DataFrame(
+    waggr_unweighted.data.compute(),
+    columns=list(waggr_unweighted.source_names),
+)
+pd.DataFrame(
+    {
+        'weighted': waggr_scores['Myeloid'],
+        'unweighted': unweighted_scores['Myeloid'],
+    }
+).describe().loc[['min', '50%', 'max']]
+```
+
+Compare the Myeloid rows: any shift is the effect of raising S100A8 and S100A9. T_cell and
+B_cell edges were left at 1.0 in both runs.
 
 WAGGR uses Scarf's default RNA library-size normalization. Set `log_transform=True` to
 apply `log1p` before aggregation.
@@ -134,12 +174,16 @@ aucell = ds.run_aucell(
     tie_seed=0,
     overwrite=True,
 )
-aucell.source_names, aucell.data.shape
+aucell_scores = pd.DataFrame(
+    aucell.data.compute(),
+    columns=list(aucell.source_names),
+)
+aucell_scores.describe().loc[['min', '50%', 'max']]
 ```
 
-The same `tie_seed` gives a deterministic global ordering for equal expression values.
-Changing `n_up`, `tie_seed`, the feature selection, or the network creates a different
-execution.
+AUCell values stay between zero and one. The same `tie_seed` gives a deterministic global
+ordering for equal expression values. Changing `n_up`, `tie_seed`, the feature selection,
+or the network creates a different execution.
 
 ## 4) Load selected sources and visualize scores
 
@@ -173,14 +217,32 @@ AUCell scores highlight lineage-consistent regions: T-cell, B-cell, and Myeloid 
 peak in separate parts of the UMAP when those populations are present.
 
 ```{code-cell} ipython3
-waggr_myeloid = ds.get_enrichment('pbmc_waggr', sources=['Myeloid'])
-ds.cells.insert(
-    'Myeloid_WAGGR',
-    waggr_myeloid.data.compute().ravel(),
-    key=waggr_myeloid.cell_key,
-    overwrite=True,
-)
+waggr_cols = []
+for source in ['T_cell', 'B_cell', 'Myeloid']:
+    result = ds.get_enrichment('pbmc_waggr', sources=[source])
+    col = f'{source}_WAGGR'
+    ds.cells.insert(
+        col,
+        result.data.compute().ravel(),
+        key=result.cell_key,
+        overwrite=True,
+    )
+    waggr_cols.append(col)
 
+present = [c for c in waggr_cols if c in ds.cells.columns]
+if present:
+    ds.plots.embedding(
+        layout_key='RNA_UMAP',
+        color_by=present,
+        n_columns=3,
+        sort_values=True,
+    )
+```
+
+WAGGR marks the same lineage regions, but the color scale follows expression magnitude
+rather than rank recovery.
+
+```{code-cell} ipython3
 compare = [
     c for c in ['Myeloid_WAGGR', 'Myeloid_AUCell'] if c in ds.cells.columns
 ]
@@ -195,6 +257,31 @@ if len(compare) == 2:
 
 WAGGR and AUCell both mark myeloid-like cells here, but the score scales differ because
 one aggregates weighted expression and the other measures within-cell rank recovery.
+Quantify that difference cell by cell:
+
+```{code-cell} ipython3
+myeloid_compare = ds.cells.to_pandas_dataframe(
+    ['Myeloid_WAGGR', 'Myeloid_AUCell'],
+    key='I',
+)
+myeloid_compare.describe()
+```
+
+```{code-cell} ipython3
+figure, axis = plt.subplots(figsize=(4, 4))
+axis.scatter(
+    myeloid_compare['Myeloid_WAGGR'],
+    myeloid_compare['Myeloid_AUCell'],
+    s=4,
+    alpha=0.35,
+)
+axis.set_xlabel('Myeloid WAGGR')
+axis.set_ylabel('Myeloid AUCell')
+plt.show()
+```
+
+Cells that rank high for Myeloid under AUCell also tend to score high under WAGGR, while
+the absolute values stay on different scales.
 
 ## Choosing a method
 

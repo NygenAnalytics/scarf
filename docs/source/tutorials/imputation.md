@@ -29,6 +29,7 @@ carries one along with its UMAP. Opening it is the whole setup. Building the
 same {term}`analysis chain` from counts is covered in {doc}`scrna_seq`.
 
 ```{code-cell} ipython3
+import pandas as pd
 import scarf
 import scarf.plotting as splt
 
@@ -60,6 +61,44 @@ for t in (1, 2, 4):
 ```
 
 ```{code-cell} ipython3
+observed = ds.get_cell_vals(from_assay="RNA", cell_key="I", k="CD4")
+cd4_series = {
+    "Observed CD4": observed,
+    "Diffusion t=1": ds.cells.fetch("CD4_imputed_t1", key="I"),
+    "Diffusion t=2": ds.cells.fetch("CD4_imputed_t2", key="I"),
+    "Diffusion t=4": ds.cells.fetch("CD4_imputed_t4", key="I"),
+}
+cd4_summary = pd.DataFrame(
+    {
+        label: {
+            "mean": float(vals.mean()),
+            "max": float(vals.max()),
+            "zero_fraction": float((vals == 0).mean()),
+            "filled_zeros": int(((observed == 0) & (vals > 0)).sum()),
+        }
+        for label, vals in cd4_series.items()
+    }
+).T
+cd4_summary
+```
+
+Mean stays near the observed level while max falls with `t` as diffusion
+spreads peak signal across neighbours. `zero_fraction` also falls with `t`.
+`filled_zeros` counts active cells that were zero for observed CD4 and became
+nonzero after diffusion. That count is the size of the nonzero-as-detection
+mistake for this feature.
+
+Paris clusters on the published UMAP give the population context for the CD4
+panels below.
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="RNA_paris_cluster",
+)
+```
+
+```{code-cell} ipython3
 imputation_comparison = ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by=[
@@ -80,12 +119,14 @@ for axis, title in zip(
     strict=True,
 ):
     axis.set_title(title)
+imputation_comparison.figure
 ```
 
 The imputed panels should fill gaps inside the same high-expression
-neighbourhoods visible in the observed panel. Signal spreading across unrelated
-populations indicates excessive diffusion or a graph that does not represent
-the intended biology.
+neighbourhoods visible in the observed panel. Use the cluster map to check that
+high CD4 stays inside T-cell-like partitions rather than spreading into
+unrelated populations. Signal across unrelated clusters indicates excessive
+diffusion or a graph that does not represent the intended biology.
 
 The result depends on the active cell selection, feature selection, and graph.
 By default, each diffusion operator remains cached in memory for reuse across
@@ -93,4 +134,5 @@ features. Set `cache_operator=False` when memory matters more than repeated
 feature speed. Inserted columns such as `CD4_imputed_t2` are explicit cell
 metadata. Do not interpret a nonzero imputed value as detection in that cell,
 use it for marker significance, or feed it to replicate-aware differential
-expression.
+expression. The `filled_zeros` column above is the concrete count of that
+mismatch for CD4 at each `t`.

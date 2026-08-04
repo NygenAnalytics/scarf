@@ -56,6 +56,10 @@ ds.mark_hvgs(
     show_plot=True,
     hvg_key_name="hvgs_500",
 )
+print(
+    "Selected genes:",
+    int(ds.RNA.feats.fetch_all("I__hvgs_500").sum()),
+)
 ```
 
 The plot should retain genes above the fitted mean-variance trend across a
@@ -71,23 +75,87 @@ Scarf applies the following case-insensitive regular expression to gene names:
 ^XIST$|^DDX3Y$|^USP9Y$|^EIF1AY$|^KDM5D$|^SRY$|^ZFY$|^UTY$|^TMSB4Y$|^NLGN4Y$
 ```
 
-Matching starts at the beginning of the name. The patterns exclude
-mitochondrial and ribosomal genes, `CCN*` cell-cycle genes, HLA or H2 genes,
-histones, and common human sex-linked genes. These families can dominate broad
-variation without representing the cell identities sought in a typical
-heterogeneity workflow. They can be biologically relevant in another study, so
-the default is a starting point rather than a claim that those genes are
-unimportant.
+Matching starts at the beginning of the name. Count how many genes in this
+dataset fall into each family:
+
+```{code-cell} ipython3
+default_blacklist = (
+    "^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST|"
+    "^XIST$|^DDX3Y$|^USP9Y$|^EIF1AY$|^KDM5D$|^SRY$|^ZFY$|^UTY$|^TMSB4Y$|^NLGN4Y$"
+)
+exclusion_families = {
+    "mitochondrial (MT-)": r"^MT-",
+    "ribosomal protein (RPS/RPL)": r"^RPS|^RPL",
+    "mitoribosomal (MRPS/MRPL)": r"^MRPS|^MRPL",
+    "cell cycle (CCN)": r"^CCN",
+    "HLA": r"^HLA-",
+    "H2": r"^H2-",
+    "histone (HIST)": r"^HIST",
+    "sex-linked": (
+        r"^XIST$|^DDX3Y$|^USP9Y$|^EIF1AY$|^KDM5D$"
+        r"|^SRY$|^ZFY$|^UTY$|^TMSB4Y$|^NLGN4Y$"
+    ),
+}
+family_counts = pd.Series(
+    {
+        name: len(ds.RNA.feats.grep(pattern))
+        for name, pattern in exclusion_families.items()
+    },
+    name="genes matching pattern",
+)
+print(
+    "Default blacklist matches:",
+    len(ds.RNA.feats.grep(default_blacklist)),
+)
+family_counts
+```
+
+These families can dominate broad variation without representing the cell
+identities sought in a typical heterogeneity workflow. They can be biologically
+relevant in another study, so the default is a starting point rather than a
+claim that those genes are unimportant.
 
 Genes detected in all but 20 selected cells are also excluded by default as
 nearly ubiquitous. The bound adapts to the selected cell count.
 
-Use the supported overrides deliberately:
+Clearing the blacklist keeps every gene name while retaining other HVG filters.
+Compare the same `top_n` with and without the default pattern:
+
+```{code-cell} ipython3
+for key, kwargs in (
+    ("hvgs_default", {}),
+    ("hvgs_no_blacklist", {"blacklist": ""}),
+):
+    ds.mark_hvgs(
+        min_cells=20,
+        top_n=500,
+        show_plot=False,
+        hvg_key_name=key,
+        **kwargs,
+    )
+
+pd.Series(
+    {
+        key: int(ds.RNA.feats.fetch_all(f"I__{key}").sum())
+        for key in ("hvgs_default", "hvgs_no_blacklist")
+    },
+    name="selected genes",
+)
+```
+
+```{code-cell} ipython3
+feature_names = ds.RNA.feats.fetch_all("names")
+only_without_blacklist = feature_names[
+    ds.RNA.feats.fetch_all("I__hvgs_no_blacklist")
+    & ~ds.RNA.feats.fetch_all("I__hvgs_default")
+]
+print("Genes selected only when blacklist is cleared:", len(only_without_blacklist))
+pd.Series(only_without_blacklist).head(15)
+```
+
+Other overrides stay available for study-specific work:
 
 ```python
-# Keep every gene name while retaining other HVG filters.
-ds.mark_hvgs(blacklist="", top_n=2000)
-
 # Replace the default with a study-specific, case-insensitive regex.
 ds.mark_hvgs(blacklist=r"^MT-|^RPS|^RPL", top_n=2000)
 
@@ -153,6 +221,29 @@ pd.Series(
 )
 ```
 
+Cluster sizes and the cross-tabulation show how partitions rematch when the
+feature set grows. Off-diagonal mass marks groups that split or merge.
+
+```{code-cell} ipython3
+pd.DataFrame(
+    {
+        "300 genes": pd.Series(
+            ds.cells.fetch("RNA_hvgs_300_clusters")
+        ).value_counts().sort_index(),
+        "1,000 genes": pd.Series(
+            ds.cells.fetch("RNA_hvgs_1000_clusters")
+        ).value_counts().sort_index(),
+    }
+)
+```
+
+```{code-cell} ipython3
+pd.crosstab(
+    pd.Series(ds.cells.fetch("RNA_hvgs_300_clusters"), name="300 genes"),
+    pd.Series(ds.cells.fetch("RNA_hvgs_1000_clusters"), name="1,000 genes"),
+)
+```
+
 ```{code-cell} ipython3
 feature_set_partitions = [
     "RNA_hvgs_300_clusters",
@@ -182,23 +273,27 @@ biology instead of choosing the layout that appears most separated.
 
 `set_hvgs` accepts either a boolean mask aligned to feature metadata or physical
 feature indexes. It records the supplied selection so downstream
-{term}`artifacts <artifact>` can trace which genes were used.
+{term}`artifacts <artifact>` can trace which genes were used. Verify the mask
+length and selected count before building a graph:
 
-```python
+```{code-cell} ipython3
+panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
 manual_mask = np.isin(
-    ds.RNA.feats.fetch_all("names"),
-    list(selected_gene_names),
+    ds.RNA.feats.fetch_all("names").astype(str),
+    panel_genes,
 )
-ds.set_hvgs(
+print("mask length:", len(manual_mask), "selected:", int(manual_mask.sum()))
+custom_feature_key = ds.set_hvgs(
     cell_key="I",
     mask=manual_mask,
     hvg_key_name="custom_features",
+    blacklist="",
 )
+custom_feature_key, int(ds.RNA.feats.fetch_all(custom_feature_key).sum())
 ```
 
 Construct masks with Scarf's metadata helpers such as `sift`, `multi_sift`, or
-`get_index_by` when possible, and verify their length and selected count before
-building a graph.
+`get_index_by` when possible.
 
 The standard pipeline forwards the same choices:
 

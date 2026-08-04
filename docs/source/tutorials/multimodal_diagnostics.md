@@ -99,18 +99,38 @@ fig.colorbar(image, ax=ax, label="Fraction within ADT cluster")
 fig.tight_layout()
 ```
 
+Plot each modality's clusters on the other layout to locate local disagreement
+that the table averages away.
+
+```{code-cell} ipython3
+figure, axes = plt.subplots(1, 2, figsize=(9, 4))
+cross_panels = (
+    ("RNA layout, ADT clusters", "RNA_UMAP", "ADT_leiden_cluster"),
+    ("ADT layout, RNA clusters", "ADT_UMAP", "RNA_leiden_cluster"),
+)
+for axis, (title, layout_key, color_by) in zip(
+    axes, cross_panels, strict=True
+):
+    ds.plots.embedding(
+        layout_key=layout_key,
+        color_by=color_by,
+        legend_loc="on_data",
+        show_titles=False,
+        target=axis,
+        show=False,
+    )
+    axis.set_title(title)
+figure.tight_layout()
+```
+
 Compare an antibody with its coding gene to distinguish genuine modality
 complementarity from a gross alignment problem.
 
 ```{code-cell} ipython3
-def compare_signal(feature, assay, label):
+def compare_signal(feature, assay, label, layouts):
     figure, axes = plt.subplots(1, 2, figsize=(9, 4))
     for index, (axis, (layout_label, layout_key)) in enumerate(
-        zip(
-            axes,
-            (("RNA layout", "RNA_UMAP"), ("ADT layout", "ADT_UMAP")),
-            strict=True,
-        )
+        zip(axes, layouts, strict=True)
     ):
         ds.plots.embedding(
             layout_key=layout_key,
@@ -123,15 +143,35 @@ def compare_signal(feature, assay, label):
             show=False,
         )
         axis.set_title(f"{layout_label}: {label}")
+    # Top colorbars occupy the title slot; label the colorbar axes instead.
+    right_title = f"{layouts[-1][0]}: {label}"
+    for colorbar_axis in set(figure.axes) - set(axes):
+        colorbar_axis.set_title(right_title)
+        colorbar_axis.set_xlabel("")
+        colorbar_axis.set_ylabel("")
     figure.tight_layout()
     return figure
 
 
-compare_signal("CD16_TotalSeqB", "ADT", "CD16 protein");
+modality_layouts = (
+    ("RNA layout", "RNA_UMAP"),
+    ("ADT layout", "ADT_UMAP"),
+)
+compare_signal(
+    "CD16_TotalSeqB",
+    "ADT",
+    "CD16 protein",
+    modality_layouts,
+);
 ```
 
 ```{code-cell} ipython3
-compare_signal("FCGR3A", "RNA", "FCGR3A transcript");
+compare_signal(
+    "FCGR3A",
+    "RNA",
+    "FCGR3A transcript",
+    modality_layouts,
+);
 ```
 
 Protein signal is commonly less sparse than the matching transcript, so exact
@@ -202,6 +242,31 @@ ARI and NMI quantify partition agreement without choosing which modality or
 integration method is correct. Compare them with marker coherence and the
 overlap structure above instead of selecting the cleanest layout.
 
+Plot the same protein and transcript on the two integrated layouts to check
+whether marker geography stays coherent after merging.
+
+```{code-cell} ipython3
+integrated_layouts = (
+    ("SNN layout", "RNA+ADT_UMAP"),
+    ("WNN layout", "RNA+ADT_wnn_UMAP"),
+)
+compare_signal(
+    "CD16_TotalSeqB",
+    "ADT",
+    "CD16 protein",
+    integrated_layouts,
+);
+```
+
+```{code-cell} ipython3
+compare_signal(
+    "FCGR3A",
+    "RNA",
+    "FCGR3A transcript",
+    integrated_layouts,
+);
+```
+
 ## Inspect WNN modality weights
 
 WNN records how much each cell relies on each modality. First check the weight
@@ -228,6 +293,35 @@ pd.Series(
         ),
     }
 )
+```
+
+Map the weights onto the WNN layout, then inspect their distribution. Because
+the two weights sum to one per cell, the RNA-weight histogram also shows where
+ADT takes over.
+
+```{code-cell} ipython3
+weight_view = ds.plots.embedding(
+    layout_key="RNA+ADT_wnn_UMAP",
+    color_by=list(weight_columns.values()),
+    n_columns=2,
+    point_size=5,
+    show_titles=False,
+    show=False,
+)
+for axis, title in zip(
+    weight_view.axes.values(),
+    weight_columns,
+    strict=True,
+):
+    axis.set_title(title)
+weight_view.figure.set_size_inches(9, 4)
+```
+
+```{code-cell} ipython3
+figure, axis = plt.subplots(figsize=(5, 3.5))
+axis.hist(weight_frame["RNA weight"], bins=40, color="C0", alpha=0.85)
+axis.set(xlabel="RNA weight", ylabel="Cells")
+figure.tight_layout()
 ```
 
 Use the earlier overlap table to distinguish cells in the dominant RNA cluster

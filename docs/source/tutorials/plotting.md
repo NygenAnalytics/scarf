@@ -35,6 +35,7 @@ such as color and normalization scales.
 ## Dataset
 
 ```{code-cell} ipython3
+import json
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -81,29 +82,61 @@ ds.plots.embedding(
 );
 ```
 
-Outliers can wash out a gene UMAP. `ColorScale(quantiles=(0.0, 0.99))` sets the
-color limit from the 99th percentile instead of the absolute maximum.
+Outliers can wash out a gene UMAP. The left panel uses the default absolute
+maximum; the right panel sets the color limit from the 99th percentile with
+`ColorScale(quantiles=(0.0, 0.99))`.
 
 ```{code-cell} ipython3
+figure, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), layout="constrained")
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="Gcg",
+    normalization=splt.NormalizationSpec(transform="log1p"),
+    sort_values=True,
+    target=axes[0],
+    show_titles=False,
+    show=False,
+)
 ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by="Gcg",
     normalization=splt.NormalizationSpec(transform="log1p"),
     color_scale=splt.ColorScale(cmap="viridis", quantiles=(0.0, 0.99)),
     sort_values=True,
-);
+    target=axes[1],
+    show_titles=False,
+    show=False,
+)
+axes[0].set_title("default max")
+axes[1].set_title("99th percentile")
+figure
 ```
 
 For large datasets, `ds.plots.embedding_raster` builds a pixel image from continuous
 cell metadata without loading full columns into memory. Empty pixels are white
-by default. It does not color by gene; use `ds.plots.embedding` for that.
+by default. It does not color by gene; use `ds.plots.embedding` for that. Side by
+side with a vector scatter on the same column, the raster fills space as pixels
+instead of overlapping markers.
 
 ```{code-cell} ipython3
+figure, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), layout="constrained")
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="RNA_nCounts",
+    target=axes[0],
+    show_titles=False,
+    show=False,
+)
 ds.plots.embedding_raster(
     layout_key="RNA_UMAP",
     color_by="RNA_nCounts",
     pixels=400,
-);
+    target=axes[1],
+    show=False,
+)
+axes[0].set_title("embedding")
+axes[1].set_title("embedding_raster")
+figure
 ```
 
 ### Facets and coordinated layouts
@@ -130,7 +163,23 @@ ds.plots.embedding(
 
 Pass several layout keys when the same values need to be compared across
 embeddings. The panels remain coordinated views of one cell table, not
-independent analyses.
+independent analyses. This store ships a single UMAP; the reflected
+`demo_layout` below is only so the multi-layout API is visible. Compare
+independently fitted layouts in {doc}`dimensionality_reduction`.
+
+```{code-cell} ipython3
+umap1 = ds.cells.fetch("RNA_UMAP1")
+umap2 = ds.cells.fetch("RNA_UMAP2")
+ds.cells.insert("demo_layout1", umap1, overwrite=True)
+ds.cells.insert("demo_layout2", -umap2, overwrite=True)
+
+ds.plots.embedding(
+    layout_key=["RNA_UMAP", "demo_layout"],
+    color_by="clusters",
+    n_columns=2,
+    legend_loc="on_data",
+);
+```
 
 ### Highlights and density contours
 
@@ -197,13 +246,28 @@ uses smaller fonts suited to multi-panel figures; `theme="dark"` is for dark
 notebook themes.
 
 ```{code-cell} ipython3
+figure, axes = plt.subplots(1, 2, figsize=(7.2, 3.2), layout="constrained")
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="clusters",
+    target=axes[0],
+    show_titles=False,
+    show=False,
+)
 ds.plots.embedding(
     layout_key="RNA_UMAP",
     color_by="clusters",
     legend_loc="on_data",
     frame="none",
     theme="paper",
-);
+    point_size=28,
+    target=axes[1],
+    show_titles=False,
+    show=False,
+)
+axes[0].set_title("defaults")
+axes[1].set_title("on_data, no frame, large points")
+figure
 ```
 
 ### Point size
@@ -211,7 +275,7 @@ ds.plots.embedding(
 Leave `point_size=None` (the default) so marker size follows the cell count.
 Small datasets get larger points; dense clouds get smaller points and thinner
 edges so clusters do not turn into a dark smudge. Pass an explicit `point_size`
-only when you need a fixed look across figures.
+only when you need a fixed look across figures, as in the right panel above.
 
 ---
 
@@ -243,12 +307,14 @@ ds.plots.dotplot(
 A matrixplot is a heatmap of mean or fraction. Gene and group order are left as
 you pass them by default. Use `feature_order` or `group_order` for explicit
 orders, or `cluster_features=True` and `cluster_groups=True` to cluster them.
+Here `value="fraction"` colors by detection rate and groups are clustered.
 
 ```{code-cell} ipython3
 ds.plots.matrixplot(
     features=["Gcg", "Ins2", "Sst"],
     group_by="clusters",
-    value="mean",
+    value="fraction",
+    cluster_groups=True,
 );
 ```
 
@@ -295,8 +361,7 @@ by cluster. Groups are colored distinctly. `max_points` limits how many
 individual cells are overlaid as points (`0` turns points off). Use the same
 selection knobs as embeddings: `subset_by` for a boolean cell column and
 `groups` to keep and order categories from `group_by`. Several gene keys share
-a y-axis scale and wrap into a grid. Pass `sample_by` to plot biological-sample
-summaries, or `split_by` for condition-split violins.
+a y-axis scale and wrap into a grid.
 
 ```{code-cell} ipython3
 cluster_ids = sorted(set(ds.cells.fetch("clusters")), key=str)[:6]
@@ -326,8 +391,22 @@ ds.plots.distribution(
 );
 ```
 
-For replicated studies, add `sample_by` to summarize biological samples rather
-than displaying every cell as an independent replicate.
+For replicated studies, `sample_by` summarizes biological samples rather than
+plotting every cell as an independent replicate. `split_by` draws two violin
+halves for a second categorical column (exactly two observed categories).
+
+```{code-cell} ipython3
+ds.plots.distribution(
+    keys="Ins2",
+    group_by="clusters",
+    groups=["Alpha", "Beta", "Delta"],
+    sample_by="demo_sample",
+    split_by="demo_condition",
+    normalization=splt.NormalizationSpec(transform="log1p"),
+    kind="violin",
+    max_points=0,
+);
+```
 
 ---
 
@@ -354,8 +433,11 @@ result.save(
     exact_size=True,
     provenance_sidecar=True,
 )
+sidecar = out.with_suffix(out.suffix + ".json")
 assert out.exists()
-assert out.with_suffix(out.suffix + ".json").exists()
+assert sidecar.exists()
+print(out)
+print(json.dumps(json.loads(sidecar.read_text())["provenance"], indent=2))
 result.close()
 ```
 
@@ -422,6 +504,9 @@ composite.save(
     exact_size=True,
     provenance_sidecar=True,
 )
+composite_sidecar = composite_out.with_suffix(composite_out.suffix + ".json")
+print(composite_out)
+print(json.dumps(json.loads(composite_sidecar.read_text())["provenance"], indent=2))
 plt.close(figure)
 ```
 

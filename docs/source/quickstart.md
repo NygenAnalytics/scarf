@@ -37,6 +37,13 @@ counts = scarf.cytebase.connect("scarf_docs").download(
 
 store = counts.with_name("data.zarr")
 reader = scarf.CrH5Reader(str(counts))
+```
+
+```{code-cell} ipython3
+reader.nCells, reader.nFeatures
+```
+
+```{code-cell} ipython3
 scarf.CrToZarr(
     reader,
     zarr_loc=str(store),
@@ -58,6 +65,13 @@ ds = scarf.DataStore(
 )
 ```
 
+```{code-cell} ipython3
+print(f"Active cells: {int(ds.cells.fetch_all('I').sum())} / {ds.cells.N}")
+ds.cells.to_pandas_dataframe(
+    columns=["RNA_nCounts", "RNA_nFeatures", "RNA_percentMito"],
+).describe().loc[["min", "50%", "max"]]
+```
+
 ## Run the RNA pipeline
 
 The default pipeline filters cells, scores cell cycle, selects highly variable
@@ -68,13 +82,39 @@ clustering. The partition with the highest PCA silhouette is copied to
 one explicitly.
 
 ```{code-cell} ipython3
+n_before = int(ds.cells.fetch_all("I").sum())
 artifacts = ds.pipeline.run()
+n_after = int(ds.cells.fetch_all("I").sum())
+print(f"Active cells before pipeline: {n_before}")
+print(f"Active cells after pipeline: {n_after}")
+
+selected = next(
+    key
+    for key, ref in artifacts.items()
+    if key != "selected_clusters" and ref == artifacts["selected_clusters"]
+)
+print(f"RNA_clusters selected from: {selected}")
+```
+
+```{code-cell} ipython3
+ds.cells.to_pandas_dataframe(
+    columns=["RNA_clusters"],
+    key="I",
+)["RNA_clusters"].value_counts().sort_index()
+```
+
+```{code-cell} ipython3
+ds.cells.to_pandas_dataframe(
+    columns=["RNA_leiden_0.5"],
+    key="I",
+)["RNA_leiden_0.5"].value_counts().sort_index()
 ```
 
 The return value maps each result name to an {term}`ArtifactRef`: a handle on a
 stored result that names it without loading it. Every result the pipeline wrote
 is an {term}`artifact` in the Zarr store, saved together with the
-{term}`provenance` record of what produced it.
+{term}`provenance` record of what produced it. `RNA_leiden_0.5` is one of the
+Leiden partitions kept alongside the selected `RNA_clusters` labels.
 
 ```{code-cell} ipython3
 sorted(artifacts)
@@ -100,8 +140,20 @@ ds.plots.embedding(
 ```
 
 Several broad PBMC populations should separate without every group becoming an
-isolated island. A tiny group dominated by low-count cells is a reason to
-revisit quality control before assigning a cell type.
+isolated island. Per-cluster library size flags any tiny low-count group that
+should be revisited in quality control before assigning a cell type:
+
+```{code-cell} ipython3
+(
+    ds.cells.to_pandas_dataframe(
+        columns=["RNA_clusters", "RNA_nCounts"],
+        key="I",
+    )
+    .groupby("RNA_clusters")["RNA_nCounts"]
+    .agg(n_cells="size", median_nCounts="median")
+    .sort_values("median_nCounts")
+)
+```
 
 Marker search ran on the same partition, so its table is already in the store:
 
@@ -114,13 +166,18 @@ ds.plots.marker_heatmap(
 ```
 
 Each column is a cluster and each row one of its top-scoring genes. The clean
-block structure is the signal that the partition tracks real populations, and
-recognisable PBMC markers name most of them: `CD14` and `FPR1` for monocytes,
-`CD8A` and `GZMK` for cytotoxic T cells, `KLRF1` and `FGFBP2` for NK cells,
-`TCL1A` and `IGHD` for naive B cells, `IGHG1` and `IGHA1` for plasma cells,
-`PPBP` and `GNG11` for platelets, `LILRA4` and `IL3RA` for plasmacytoid
-dendritic cells. Read one cluster's full table with
-`ds.get_markers(group_key="RNA_clusters", group_id=...)`.
+block structure is the signal that the partition tracks real populations.
+Inspect one cluster's ranked markers directly:
+
+```{code-cell} ipython3
+cluster_id = (
+    ds.cells.to_pandas_dataframe(columns=["RNA_clusters"], key="I")["RNA_clusters"]
+    .value_counts()
+    .index[0]
+)
+print(f"Markers for cluster {cluster_id}")
+ds.get_markers(group_key="RNA_clusters", group_id=cluster_id).head(10)
+```
 
 The Zarr store now holds the UMAP coordinates, cluster labels, marker tables,
 and every intermediate result.

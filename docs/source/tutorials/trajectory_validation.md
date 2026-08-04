@@ -29,6 +29,7 @@ import numpy as np
 import pandas as pd
 
 import scarf
+import scarf.plotting as splt
 
 scarf.configure_output(level="WARNING", progress=True)
 
@@ -53,6 +54,18 @@ multi_sink = ds.run_pseudotime_scoring(
     sources=["Ductal"],
     sinks=["Alpha", "Beta", "Delta"],
     label="multi_sink_pseudotime",
+)
+```
+
+Inspect the fitted ordering on the stored UMAP. Values should progress from the
+ductal source toward the endocrine sinks. A disconnected or reversed pattern is
+a reason to revisit the graph and boundary choices before changing parameters.
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by=multi_sink.pseudotime_key,
+    subset_by=multi_sink.validity_key,
 )
 ```
 
@@ -153,6 +166,68 @@ figure.tight_layout()
 plt.show()
 ```
 
+Place both orderings on the same UMAP layout. Shared early structure can look
+similar while terminal branches diverge once the sink set changes.
+
+```{code-cell} ipython3
+figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+for index, (axis, (title, result)) in enumerate(
+    zip(axes, boundary_results.items(), strict=True)
+):
+    ds.plots.embedding(
+        layout_key="RNA_UMAP",
+        color_by=result.pseudotime_key,
+        subset_by=result.validity_key,
+        show_legend=index == 1,
+        show_titles=False,
+        target=axis,
+        show=False,
+    )
+    axis.set_title(title)
+figure.tight_layout()
+figure
+```
+
+Map rank disagreement onto the embedding. Large absolute rank shifts locate
+cells whose relative position depends on the chosen sinks, beyond what a global
+correlation summarizes.
+
+```{code-cell} ipython3
+selected = ds.cells.fetch_all("I").astype(bool)
+rank_delta = np.full(multi_values.shape[0], np.nan, dtype=float)
+rank_delta[shared_valid] = (
+    pd.Series(multi_values[shared_valid]).rank(method="average")
+    - pd.Series(beta_values[shared_valid]).rank(method="average")
+).to_numpy()
+ds.cells.insert(
+    "boundary_rank_delta",
+    rank_delta[selected],
+    key="I",
+    overwrite=True,
+)
+ds.cells.insert(
+    "boundary_shared_valid",
+    shared_valid[selected],
+    fill_value=False,
+    key="I",
+    overwrite=True,
+)
+rank_limit = float(np.nanmax(np.abs(rank_delta[shared_valid])))
+if rank_limit == 0.0:
+    rank_limit = 1.0
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="boundary_rank_delta",
+    subset_by="boundary_shared_valid",
+    color_scale=splt.ColorScale(
+        cmap="coolwarm",
+        vmin=-rank_limit,
+        vmax=rank_limit,
+        vcenter=0,
+    ),
+)
+```
+
 ```{code-cell} ipython3
 population_summary = pd.DataFrame(
     {
@@ -174,11 +249,11 @@ population_summary
 
 A narrow diagonal band means the boundary change largely preserves cell order;
 systematic departures identify cells whose position depends on the selected
-terminal states. Disagreement does not show that one ordering is true. Low
-coverage can instead indicate disconnected populations or a graph that does not
-support the proposed trajectory. Use
-{doc}`graph_construction` when the graph itself needs a controlled
-sensitivity analysis.
+terminal states. The rank-delta embedding shows where that disagreement sits in
+cell space. Disagreement does not show that one ordering is true. Low coverage
+can instead indicate disconnected populations or a graph that does not support
+the proposed trajectory. Use {doc}`graph_construction` when the graph itself
+needs a controlled sensitivity analysis.
 
 ## Validate pseudotime marker tests
 
@@ -193,16 +268,24 @@ markers = ds.run_pseudotime_marker_search(
     pseudotime_key=multi_sink.pseudotime_key,
 )
 
-markers.table[
-    ["feature_name", "r_value", "p_value", "p_value_adjusted"]
-].head()
+(
+    markers.table.loc[
+        markers.table["p_value_adjusted"].notna(),
+        ["feature_name", "r_value", "p_value", "p_value_adjusted"],
+    ]
+    .assign(abs_r_value=lambda frame: frame["r_value"].abs())
+    .sort_values("abs_r_value", ascending=False)
+    .drop(columns="abs_r_value")
+    .head(10)
+)
 ```
 
 ```{code-cell} ipython3
 markers.table[["p_value", "p_value_adjusted"]].isna().sum()
 ```
 
-A small adjusted p-value supports association with this fitted ordering. It does
+The table ranks the strongest tested linear associations in either direction. A
+small adjusted p-value supports association with this fitted ordering. It does
 not establish a nonlinear pattern, branch specificity, causality, or
 replicate-aware differential expression.
 
@@ -264,25 +347,28 @@ pd.crosstab(
 
 The cross-tabulation shows how each coarse module divides at finer
 granularity. A split can reveal distinct profiles, but a fragmented row with
-very small groups can also indicate an unstable setting.
+very small groups can also indicate an unstable setting. Compare the heatmaps
+directly: coarse modules should keep coherent early, intermediate, and late
+blocks, while fine modules may split those blocks into sharper peaks.
 
 ```{code-cell} ipython3
-modules = fine_modules
-assigned = module_features[
-    module_features[modules.cluster_key] != -1
-]
-representatives = (
-    assigned.groupby(modules.cluster_key, sort=True)["names"]
-    .first()
-)
-labels = representatives.iloc[::2].tolist()
-ds.plots.pseudotime_heatmap(
-    cell_key=modules.cell_key,
-    feat_key=modules.feature_key,
-    feature_cluster_key=modules.cluster_key,
-    pseudotime_key=modules.pseudotime_key,
-    show_features=labels,
-)
+for name, modules in module_results.items():
+    assigned = module_features[
+        module_features[modules.cluster_key] != -1
+    ]
+    representatives = (
+        assigned.groupby(modules.cluster_key, sort=True)["names"]
+        .first()
+    )
+    labels = representatives.iloc[::2].tolist()
+    print(f"{name} modules ({modules.cluster_key})")
+    ds.plots.pseudotime_heatmap(
+        cell_key=modules.cell_key,
+        feat_key=modules.feature_key,
+        feature_cluster_key=modules.cluster_key,
+        pseudotime_key=modules.pseudotime_key,
+        show_features=labels,
+    )
 ```
 
 Unassigned features use `-1`. A module made mostly of genes without a coherent
@@ -294,6 +380,10 @@ their profiles along an ordering. Their overlap can be informative without
 being complete.
 
 ```{code-cell} ipython3
+modules = fine_modules
+assigned = module_features[
+    module_features[modules.cluster_key] != -1
+]
 ds.run_marker_search(group_key="clusters")
 beta_markers = set(
     ds.get_markers(group_key="clusters", group_id="Beta").feature_name
@@ -347,6 +437,58 @@ for index, sink in enumerate(fate.sink_labels):
         }
     )
 pd.DataFrame(terminal_checks)
+```
+
+Plot each fate probability on the UMAP. Terminal regions should be dominated by
+their matching fate. Intermediate cells can retain probability across several
+outcomes.
+
+```{code-cell} ipython3
+figure, axes = plt.subplots(1, 3, figsize=(11, 4))
+probability_scale = splt.ColorScale(vmin=0, vmax=1)
+for index, (axis, sink, fate_key) in enumerate(
+    zip(axes, fate.sink_labels, fate.fate_keys, strict=True)
+):
+    ds.plots.embedding(
+        layout_key="RNA_UMAP",
+        color_by=fate_key,
+        subset_by=fate.validity_key,
+        color_scale=probability_scale,
+        sort_values=True,
+        show_legend=index == 2,
+        show_titles=False,
+        target=axis,
+        show=False,
+    )
+    axis.set_title(f"{sink} fate probability")
+for colorbar_axis in set(figure.axes) - set(axes):
+    colorbar_axis.set_title(f"{fate.sink_labels[-1]} fate probability")
+    colorbar_axis.set_xlabel("")
+    colorbar_axis.set_ylabel("")
+figure.tight_layout()
+figure
+```
+
+Quantify intermediate mix as one minus the strongest fate probability. High
+values mark cells that are not absorbed into a single terminal state under this
+graph and boundary choice.
+
+```{code-cell} ipython3
+mix_values = np.full(len(fate.valid), np.nan, dtype=float)
+mix_values[fate.valid] = 1.0 - fate.values[fate.valid].max(axis=1)
+ds.cells.insert(
+    "fate_intermediate_mix",
+    mix_values,
+    key=fate.result_cell_key,
+    overwrite=True,
+)
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="fate_intermediate_mix",
+    subset_by=fate.validity_key,
+    color_scale=splt.ColorScale(vmin=0, vmax=1),
+    sort_values=True,
+)
 ```
 
 Large simplex errors, terminal probabilities below one, or fate fields that do

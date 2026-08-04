@@ -35,6 +35,7 @@ fates.
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
+import pandas as pd
 
 import scarf
 import scarf.plotting as splt
@@ -84,6 +85,51 @@ ds.cells.to_pandas_dataframe(
 )['clusters'].value_counts()
 ```
 
+The panels below mark the source and sinks on the same embedding. Other populations,
+including Epsilon, stay in the background and are not used as boundaries.
+
+```{code-cell} ipython3
+figure, axes = plt.subplots(1, 2, figsize=(9, 4))
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by=None,
+    default_color='#bdbdbd',
+    point_alpha=0.4,
+    highlight=splt.Highlight(
+        by='clusters',
+        groups=tuple(progenitors),
+        color='#1f77b4',
+        dim_alpha=0.12,
+        size_multiplier=1.35,
+        halo_width=0.4,
+    ),
+    show_titles=False,
+    target=axes[0],
+    show=False,
+)
+axes[0].set_title('Source: Ductal')
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by=None,
+    default_color='#bdbdbd',
+    point_alpha=0.4,
+    highlight=splt.Highlight(
+        by='clusters',
+        groups=tuple(terminal_cell_types),
+        color='#d62728',
+        dim_alpha=0.12,
+        size_multiplier=1.35,
+        halo_width=0.4,
+    ),
+    show_titles=False,
+    target=axes[1],
+    show=False,
+)
+axes[1].set_title('Sinks: Alpha, Beta, Delta')
+figure.tight_layout()
+figure
+```
+
 ## 3. Estimate a shared pseudotime
 
 PBA supplies the developmental direction. The terminal cell types are used as sinks so the
@@ -96,6 +142,18 @@ pseudotime = ds.run_pseudotime_scoring(
     sources=progenitors,
     sinks=terminal_cell_types,
     label='fate_pseudotime',
+)
+
+selected_cells = int(ds.cells.fetch_all('I').sum())
+valid_cells = int(ds.cells.fetch_all(pseudotime.validity_key).sum())
+pd.Series(
+    {
+        'pseudotime_key': pseudotime.pseudotime_key,
+        'validity_key': pseudotime.validity_key,
+        'valid cells': valid_cells,
+        'selected cells': selected_cells,
+        'valid fraction': valid_cells / selected_cells,
+    }
 )
 ```
 
@@ -122,6 +180,17 @@ fate = ds.run_fate_mapping(
     pseudotime_key=pseudotime.pseudotime_key,
     sink_key='clusters',
     sinks=terminal_cell_types,
+)
+
+fate_valid = int(ds.cells.fetch_all(fate.validity_key).sum())
+pd.Series(
+    {
+        'fate_keys': ', '.join(fate.fate_keys),
+        'validity_key': fate.validity_key,
+        'valid cells': fate_valid,
+        'selected cells': selected_cells,
+        'valid fraction': fate_valid / selected_cells,
+    }
 )
 ```
 
@@ -151,9 +220,24 @@ figure.tight_layout()
 figure
 ```
 
-The terminal regions should be dominated by their matching fate, while
-intermediate cells can retain probability across several outcomes. A terminal
-group with low probability for its own fate indicates a mismatch between the
+Mean probability by cluster makes the same claim numerically. Terminal rows should
+peak on their own fate, while intermediate populations such as Pre-endocrine retain
+probability across several outcomes.
+
+```{code-cell} ipython3
+fate_frame = ds.cells.to_pandas_dataframe(
+    ['clusters', *fate.fate_keys],
+    key=fate.validity_key,
+)
+(
+    fate_frame.groupby('clusters', sort=True)[list(fate.fate_keys)]
+    .mean()
+    .rename(columns=dict(zip(fate.fate_keys, fate.sink_labels, strict=True)))
+    .round(3)
+)
+```
+
+A terminal group with low probability for its own fate indicates a mismatch between the
 annotations, graph, and selected boundaries.
 
 ## Interpretation and limits

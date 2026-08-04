@@ -55,6 +55,8 @@ The default assay supplies method defaults when `from_assay` is omitted. It
 does not merge assay-specific feature tables or results.
 
 ```{code-cell} ipython3
+import pandas as pd
+
 import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
@@ -117,6 +119,13 @@ ds.show_zarr_tree(start='cellData')
 Values are boolean: filtered-out cells are `False`. Most `DataStore` methods take
 `cell_key` (default `I`) and operate only on cells marked `True`.
 
+```{code-cell} ipython3
+ds.cells.to_pandas_dataframe(['I'])['I'].value_counts()
+```
+
+This store keeps every barcode active (`True`). Filtered cells stay in the table as
+`False` rows; they are not deleted.
+
 Each assay group holds `counts`, `featureData`, optional `markers`, and its
 persisted analysis outputs.
 
@@ -163,21 +172,49 @@ ds.cells.to_pandas_dataframe(
 ).set_index('ids')
 ```
 
-`fetch` returns values for the active subset (default column `I`). `fetch_all` returns every
-row in the store.
-
-```{code-cell} ipython3
-cluster_labels = ds.cells.fetch('clusters')
-cluster_labels.shape, ds.cells.fetch_all('clusters').shape
-```
-
 `insert` writes a new column and aligns values to the active subset unless you override `key`.
 Re-inserting an existing column requires `overwrite=True`.
 
 ```{code-cell} ipython3
+cluster_labels = ds.cells.fetch('clusters')
 first_cluster = str(cluster_labels[0])
 is_first_cluster = cluster_labels.astype(str) == first_cluster
 ds.cells.insert(column_name='is_first_cluster', values=is_first_cluster, overwrite=True)
+```
+
+```{code-cell} ipython3
+ds.cells.to_pandas_dataframe(
+    columns=['ids', 'clusters', 'is_first_cluster']
+).head()
+```
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by='is_first_cluster',
+)
+```
+
+The new column marks one cluster on the same active cells used for the insert.
+
+`fetch` returns values for the active subset (default column `I`). `fetch_all` returns every
+row in the store. With every cell active the lengths match, so temporarily restrict `I` to
+make the difference visible, then restore the backup:
+
+```{code-cell} ipython3
+i_backup = ds.cells.fetch_all('I').copy()
+ds.cells.update_key(is_first_cluster, 'I')
+
+print(
+    'fetch:', ds.cells.fetch('clusters').shape,
+    'fetch_all:', ds.cells.fetch_all('clusters').shape,
+)
+ds.cells.to_pandas_dataframe(['I'])['I'].value_counts()
+```
+
+```{code-cell} ipython3
+ds.cells.insert(column_name='I', values=i_backup, overwrite=True, force=True)
+print('Restored active cells:', int(ds.cells.fetch_all('I').sum()))
 ```
 
 ```{code-cell} ipython3
@@ -196,6 +233,7 @@ except ValueError:
 several ranges, and `get_index_by` locates exact categorical values:
 
 ```{code-cell} ipython3
+active_before = int(ds.cells.fetch_all('I').sum())
 count_range = ds.cells.sift(
     'RNA_nCounts',
     min_v=1000,
@@ -208,7 +246,21 @@ joint_range = ds.cells.multi_sift(
 )
 cluster_rows = ds.cells.get_index_by([first_cluster], 'clusters')
 
-count_range.sum(), joint_range.sum(), cluster_rows.size
+print(
+    'count_range:', int(count_range.sum()),
+    'joint_range:', int(joint_range.sum()),
+    'cluster_rows:', int(cluster_rows.size),
+)
+print('Active cells (I) before:', active_before)
+print('Active cells (I) after:', int(ds.cells.fetch_all('I').sum()))
+```
+
+```{code-cell} ipython3
+ds.cells.insert(column_name='in_count_range', values=count_range, overwrite=True)
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by='in_count_range',
+)
 ```
 
 These helpers return masks or indexes aligned with the metadata table. They do
@@ -226,10 +278,21 @@ ds.RNA.rawData
 ```
 
 Normalized values are computed on demand through `normed()`. Scarf keeps only raw counts on
-disk by default.
+disk by default. `normed()` drops inactive features, so its column count is smaller than
+`rawData`:
 
 ```{code-cell} ipython3
 ds.RNA.normed()
+```
+
+```{code-cell} ipython3
+print('Raw shape:', ds.RNA.rawData.shape)
+print('Normed shape:', ds.RNA.normed().shape)
+ds.RNA.rawData[:3, :5].compute()
+```
+
+```{code-cell} ipython3
+ds.RNA.normed()[:3, :5].compute()
 ```
 
 Override normalization by assigning `normMethod`. Reassign a custom function each time you
@@ -285,8 +348,8 @@ table = scarf.ArtifactRef.from_dict(index['I__clusters'])
 print('Stored at:', ds.inspect_artifact(table).path)
 ```
 
-Fetch one group with `get_markers`, or export all groups with
-`export_markers_to_csv`.
+Fetch one group with `get_markers`, plot the stored table with `marker_heatmap`,
+or export all groups with `export_markers_to_csv`.
 
 ```{code-cell} ipython3
 ds.get_markers(
@@ -295,6 +358,25 @@ ds.get_markers(
     min_score=0.1,
     min_frac_exp=0.1,
 ).head()
+```
+
+```{code-cell} ipython3
+ds.plots.marker_heatmap(
+    group_key='clusters',
+    topn=5,
+    figsize=(5, 9),
+)
+```
+
+```{code-cell} ipython3
+markers_csv = 'scarf_datasets/pancreas_cluster_markers.csv'
+ds.export_markers_to_csv(
+    group_key='clusters',
+    csv_filename=markers_csv,
+    min_score=0.1,
+    min_frac_exp=0.1,
+)
+pd.read_csv(markers_csv).iloc[:5, :6]
 ```
 
 ### 7. Zarr versions and storage profiles

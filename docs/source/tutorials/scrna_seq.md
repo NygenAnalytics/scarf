@@ -43,6 +43,9 @@ claims; see {doc}`../concepts/memory_and_execution` for measured resource profil
 `scarf_docs` Cytebase repository.
 
 ```{code-cell} ipython3
+import numpy as np
+import pandas as pd
+
 import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
@@ -91,7 +94,10 @@ ds = scarf.DataStore(
     nthreads=4,
     min_features_per_cell=10
 )
+ds
 ```
+
+Active cells, assay feature counts, and the QC column names computed on open.
 
 ## 2) Quality control
 
@@ -123,9 +129,11 @@ ds.filter_cells(
     highs=[15000, 4000, 15],
     lows=[1000, 500, 0]
 )
-n_after = int(ds.cells.fetch_all('I').sum())
+I = ds.cells.fetch_all('I')
 print(f'Active cells before filter: {n_before}')
-print(f'Active cells after filter: {n_after}')
+print(f'Active cells after filter: {int(I.sum())}')
+print(f'Inactive cells (I=False): {int((~I).sum())}; total in store: {len(I)}')
+ds.cells.to_pandas_dataframe(columns=['I'])['I'].value_counts()
 ```
 
 ```{note}
@@ -182,7 +190,10 @@ it to `ds.RNA.sf`, and applies the assay's transformation. The default size
 factor is 1000, and the earlier filter removes cells below that count.
 
 ```{code-cell} ipython3
-ds.run_normalization(feat_key='hvgs')
+normalized = ds.run_normalization(feat_key='hvgs')
+opts = ds.inspect_artifact(normalized).execution_options or {}
+print('Size factor (ds.RNA.sf):', ds.RNA.sf)
+print('cell_key:', opts.get('cell_key'), 'feat_key:', opts.get('feat_key'))
 ```
 
 The normalized {term}`artifact` records both the active cell selection and the
@@ -191,10 +202,11 @@ The normalized {term}`artifact` records both the active cell selection and the
 ## 5) PCA
 
 PCA represents the dominant axes of variation among the selected genes. Fifteen
-components are sufficient for this controlled PBMC example.
+components are sufficient for this controlled PBMC example; the elbow plot shows
+explained variance flattening after the early components.
 
 ```{code-cell} ipython3
-ds.run_pca(dims=15)
+ds.run_pca(dims=15, show_elbow_plot=True)
 ```
 
 Choosing a component count is a scientific decision on new data. The
@@ -212,11 +224,20 @@ ds.build_ann_index()
 ds.query_neighbors(k=11)
 ds.build_connectivity_map()
 
-ds.load_graph()
+graph = ds.load_graph()
+degrees = graph.getnnz(axis=1)
+print(graph.shape, graph.nnz)
+print(
+    'Degree min / median / max:',
+    int(degrees.min()),
+    int(np.median(degrees)),
+    int(degrees.max()),
+)
 ```
 
-`load_graph` returns the result as a sparse cell-by-cell matrix, which is a quick way to
-confirm the graph covers the active cells.
+`load_graph` returns the result as a sparse cell-by-cell matrix. Shape and nnz
+confirm the graph covers the active cells; the degree summary checks that
+neighbourhood sizes stay near the requested `k`.
 
 ```{seealso}
 Each step also returns a reference to the artifact it wrote. Capturing those
@@ -287,16 +308,31 @@ useful second checkpoint, not a replacement for biological validation.
 
 ```{code-cell} ipython3
 paris = ds.run_paris_clustering()
+ds.cells.to_pandas_dataframe(
+    columns=[paris.label_key],
+    key='I'
+)[paris.label_key].value_counts().sort_index()
+```
+
+```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by=paris.label_key,
 )
 ```
 
+```{code-cell} ipython3
+pd.crosstab(
+    pd.Series(ds.cells.fetch('RNA_leiden_cluster', key='I'), name='Leiden'),
+    pd.Series(ds.cells.fetch(paris.label_key, key='I'), name='Paris'),
+)
+```
+
 Both partitions should preserve broad monocyte, B-cell, and T-cell structure.
-Tiny isolated clusters dominated by low-count cells are a reason to revisit QC
-before interpreting markers. Resolution sweeps, cluster confidence, graph
-connectivity, and the Paris tree are covered in {doc}`clustering`.
+The sizes and Leiden×Paris crosstab make that concordance readable before the
+marker step. Tiny isolated clusters dominated by low-count cells are a reason to
+revisit QC before interpreting markers. Resolution sweeps, cluster confidence,
+graph connectivity, and the Paris tree are covered in {doc}`clustering`.
 
 ## 9) Marker genes
 
@@ -331,6 +367,22 @@ df = ds.get_markers(
 df.head()
 ```
 
+Rank the same three lineage genes across all Leiden groups before plotting them
+on the embedding.
+
+```{code-cell} ipython3
+markers = ds.get_markers(
+    group_key='RNA_leiden_cluster',
+    group_id=None,
+    min_score=-1,
+    min_frac_exp=-1,
+)
+panel = markers[markers['feature_name'].isin(['CD14', 'MS4A1', 'CD3D'])]
+panel.sort_values(
+    ['feature_name', 'score'], ascending=[True, False]
+).groupby('feature_name', sort=False).head(2)
+```
+
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
@@ -341,7 +393,7 @@ ds.plots.embedding(
 ```
 
 CD14, MS4A1, and CD3D mark monocyte-, B-, and T-cell-like regions when those lineages
-are present.
+are present. The lookup above names which Leiden clusters rank each gene highest.
 
 Annotation from markers, known gene panels, and subclustering is covered in
 {doc}`annotation`.

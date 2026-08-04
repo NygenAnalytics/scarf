@@ -29,6 +29,8 @@ imported cell-type label before running source-level quality control. The
 remaining `I` cell key records that quality-control selection.
 
 ```{code-cell} ipython3
+import pandas as pd
+
 import scarf
 
 scarf.configure_output(level="ERROR", progress=True)
@@ -49,9 +51,27 @@ ds_ctrl = scarf.DataStore(f"{ctrl_path}/data.zarr", nthreads=4)
 ds_stim = scarf.DataStore(f"{stim_path}/data.zarr", nthreads=4)
 ```
 
-Check assay types, feature identities, genome builds, and quantification
-conventions before merging other datasets. Matching gene symbols alone do not
-establish compatible measurements.
+Confirm assay type, cell counts, and feature counts before merging. Matching
+gene symbols alone do not establish compatible measurements; genome builds and
+quantification conventions still need to match when you bring other datasets.
+
+```{code-cell} ipython3
+ctrl_ids = set(ds_ctrl.RNA.feats.fetch_all("ids").astype(str))
+stim_ids = set(ds_stim.RNA.feats.fetch_all("ids").astype(str))
+
+pd.DataFrame(
+    [
+        {
+            "source": label,
+            "assay": type(store.RNA).__name__,
+            "cells": store.cells.N,
+            "active cells": int(store.cells.fetch_all("I").sum()),
+            "features": store.RNA.feats.N,
+        }
+        for label, store in (("ctrl", ds_ctrl), ("stim", ds_stim))
+    ]
+).assign(shared_features=len(ctrl_ids & stim_ids))
+```
 
 ## Merge counts and metadata
 
@@ -74,6 +94,18 @@ scarf.DataStoreMerge(
 ).dump()
 
 ds = scarf.DataStore(merged_path, nthreads=4)
+```
+
+`sample_id` records the source label. Columns imported from the sources keep
+the `orig_` prefix so later analysis columns can reuse their original names.
+
+```{code-cell} ipython3
+orig_cols = [
+    column
+    for column in ds.cells.columns
+    if column == "sample_id" or column.startswith("orig_")
+]
+ds.cells.to_pandas_dataframe(orig_cols, key="I").head()
 ```
 
 The merged active population contains labelled cells from both sources.
@@ -120,7 +152,11 @@ baseline = ds.pipeline.run(
     doublet_scoring=False,
     markers=False,
 )
+sorted(baseline)
 ```
+
+The return value lists each written {term}`artifact` by name. The selected
+Leiden partition is also published as `RNA_clusters` for later plotting.
 
 One plotting call compares source identity with the imported cell types on the
 same layout.
@@ -140,6 +176,16 @@ for axis, title in zip(
 ):
     axis.set_title(title)
 comparison.show()
+```
+
+The uncorrected Leiden partition that the pipeline selected as `RNA_clusters`
+should track broad cell-type structure even while sources remain segregated.
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="RNA_clusters",
+)
 ```
 
 A proportional composition plot makes source dominance within the uncorrected
@@ -171,7 +217,17 @@ median uncorrected neighbourhood.
 
 The stimulated sample received interferon beta, and PBMC cell types do not all
 respond identically to that treatment. Source-associated structure can
-therefore include biological response as well as technical variation. This
-page establishes the uncorrected observation; {doc}`batch_correction` compares
-how partial PCA and Harmony change it. Keep uncorrected counts for
+therefore include biological response as well as technical variation. An
+interferon-response gene such as `ISG15` makes that stim-enriched program
+visible on the same uncorrected layout.
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by="ISG15",
+)
+```
+
+This page establishes the uncorrected observation; {doc}`batch_correction`
+compares how partial PCA and Harmony change it. Keep uncorrected counts for
 condition-level differential expression.

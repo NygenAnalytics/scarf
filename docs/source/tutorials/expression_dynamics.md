@@ -38,6 +38,8 @@ is standalone: it downloads the store, opens a `DataStore`, and runs pseudotime 
 when needed.
 
 ```{code-cell} ipython3
+import pandas as pd
+
 import scarf
 
 scarf.configure_output(level='WARNING', progress=True)
@@ -64,7 +66,16 @@ validity_key = pseudotime.validity_key
 ```
 
 The sources and sinks come from the provided `clusters` annotation, the same choice made in
-{doc}`pseudotime`.
+{doc}`pseudotime`. The embedding below anchors that trajectory before modules are built.
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key='RNA_UMAP',
+    color_by=['clusters', pseudotime_key],
+    n_columns=2,
+    legend_loc='on_data',
+)
+```
 
 ## 1. Identify feature modules
 
@@ -87,19 +98,35 @@ The returned result contains the lazy binned matrix in `modules.data`, the
 aligned physical feature indices, and their cluster assignments. It also
 exposes the feature column as `modules.cluster_key`.
 
-Features with mean expression below `min_exp` or with no variation along the ordering are treated as invalid. They are excluded from the clustering and from the heatmap below, and they receive the unassigned cluster value (`-1`) in the feature table.
-
-`ds.plots.pseudotime_heatmap` visualizes the binned matrix along with the feature clusters.
+Features with mean expression below `min_exp` or with no variation along the ordering
+are treated as invalid. They are excluded from the clustering and from the heatmap
+below, and they receive the unassigned cluster value (`-1`) in the feature table.
+Module sizes make that split explicit: `-1` is the unassigned bin.
 
 ```{code-cell} ipython3
 ptime_feat = ds.RNA.feats.to_pandas_dataframe(
     columns=['names', modules.cluster_key]
 )
+ptime_feat[modules.cluster_key].value_counts().sort_index()
+```
+
+One representative gene per assigned module ties heatmap labels and later UMAP
+panels to the same module ids.
+
+```{code-cell} ipython3
 assigned = ptime_feat[ptime_feat[modules.cluster_key] != -1]
 representatives = (
     assigned.groupby(modules.cluster_key, sort=True)['names']
     .first()
+    .rename('representative gene')
 )
+representatives
+```
+
+`ds.plots.pseudotime_heatmap` visualizes the binned matrix along with the feature
+clusters. Spaced representatives become row labels.
+
+```{code-cell} ipython3
 genes_to_label = representatives.iloc[::3].tolist()
 
 ds.plots.pseudotime_heatmap(
@@ -131,15 +158,29 @@ ds.add_grouped_assay(
 )
 ```
 
-The new assay has one feature per module.
+The new assay has one feature per assigned module and one mean-expression value
+per cell. The preview below is the first five cells against the first five
+modules.
 
 ```{code-cell} ipython3
 module_features = ds.PTIME_MODULES.feats.fetch_all('names').tolist()
-{"module count": len(module_features), "first modules": module_features[:5]}
+{
+    "module count": len(module_features),
+    "cells": int(ds.PTIME_MODULES.rawData.shape[0]),
+    "first modules": module_features[:5],
+}
+```
+
+```{code-cell} ipython3
+pd.DataFrame(
+    ds.PTIME_MODULES.rawData[:5, :5].compute(),
+    columns=module_features[:5],
+)
 ```
 
 Inspect a spaced subset of modules on the original UMAP. These are mean
-expression summaries, so a sequential colour scale is appropriate.
+expression summaries, so a sequential colour scale is appropriate. The first panel
+repeats the ordering so module hotspots can be read against the trajectory.
 
 ```{code-cell} ipython3
 selected_modules = [
@@ -148,7 +189,7 @@ selected_modules = [
 ds.plots.embedding(
     from_assay='PTIME_MODULES',
     layout_key='RNA_UMAP',
-    color_by=selected_modules,
+    color_by=[pseudotime_key, *selected_modules],
     n_columns=3,
     sort_values=True,
 )

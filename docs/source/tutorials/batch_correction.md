@@ -23,6 +23,7 @@ persisted uncorrected analysis from {doc}`dataset_merging` and compares it
 with partial PCA and Harmony.
 
 ```{code-cell} ipython3
+import matplotlib.pyplot as plt
 import pandas as pd
 
 import scarf
@@ -73,11 +74,33 @@ scores = {
         uncorrected_graph,
     )
 }
-{"uncorrected iLISI": round(scores["Uncorrected"]["iLISI"], 3)}
 ```
 
 The baseline artifacts fix the active cells, highly variable features, full
-PCA, and 21-neighbour graph used by every comparison below.
+PCA, and 21-neighbour graph used by every comparison below. Source identity and
+imported cell types on the uncorrected UMAP show the defect this page aims to
+reduce.
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key="RNA_UMAP",
+    color_by=["sample_id", "orig_cluster_labels"],
+    n_columns=2,
+)
+```
+
+```{code-cell} ipython3
+ds.plots.composition(
+    category_by="sample_id",
+    sample_by="RNA_clusters",
+    kind="stacked",
+    show_percent_labels=True,
+)
+```
+
+```{code-cell} ipython3
+pd.Series(scores["Uncorrected"]).round(3).rename("Uncorrected")
+```
 
 ```{raw} html
 <span id="partial-pca"></span>
@@ -97,6 +120,18 @@ ds.cells.insert(
     values=ds.cells.fetch_all("sample_id") == "ctrl",
     overwrite=True,
 )
+active = ds.cells.fetch_all("I").astype(bool)
+is_ctrl = ds.cells.fetch_all("is_ctrl")
+pd.Series(
+    {
+        "active cells": int(active.sum()),
+        "reference (is_ctrl)": int(is_ctrl[active].sum()),
+        "reference fraction": round(float(is_ctrl[active].mean()), 3),
+    }
+)
+```
+
+```{code-cell} ipython3
 pca_partial = ds.run_pca(
     normalized,
     dims=25,
@@ -125,7 +160,6 @@ scores["Partial PCA"] = integration_scores(
     partial_neighbors,
     partial_graph,
 )
-{"partial PCA iLISI": round(scores["Partial PCA"]["iLISI"], 3)}
 ```
 
 ```{code-cell} ipython3
@@ -133,15 +167,6 @@ ds.plots.embedding(
     layout_key="RNA_partial_UMAP",
     color_by=["sample_id", "orig_cluster_labels"],
     n_columns=2,
-)
-```
-
-```{code-cell} ipython3
-ds.plots.composition(
-    category_by="sample_id",
-    sample_by="RNA_partial_clusters",
-    kind="stacked",
-    show_percent_labels=True,
 )
 ```
 
@@ -181,7 +206,6 @@ scores["Harmony"] = integration_scores(
     harmony_neighbors,
     harmony_graph,
 )
-{"Harmony iLISI": round(scores["Harmony"]["iLISI"], 3)}
 ```
 
 ```{code-cell} ipython3
@@ -189,15 +213,6 @@ ds.plots.embedding(
     layout_key="RNA_harmony_UMAP",
     color_by=["sample_id", "orig_cluster_labels"],
     n_columns=2,
-)
-```
-
-```{code-cell} ipython3
-ds.plots.composition(
-    category_by="sample_id",
-    sample_by="RNA_harmony_clusters",
-    kind="stacked",
-    show_percent_labels=True,
 )
 ```
 
@@ -230,6 +245,84 @@ ds.plots.embedding(
 )
 ```
 
+Each method also writes its own Leiden partition. Plotting those labels on the
+matching layout links the composition bars below to geography on the page.
+
+```{code-cell} ipython3
+figure, axes = plt.subplots(1, 3, figsize=(12, 4))
+cluster_panels = (
+    ("Uncorrected", "RNA_UMAP", "RNA_clusters"),
+    ("Partial PCA", "RNA_partial_UMAP", "RNA_partial_clusters"),
+    ("Harmony", "RNA_harmony_UMAP", "RNA_harmony_clusters"),
+)
+for axis, (title, layout_key, color_by) in zip(
+    axes, cluster_panels, strict=True
+):
+    ds.plots.embedding(
+        layout_key=layout_key,
+        color_by=color_by,
+        legend_loc="on_data",
+        show_titles=False,
+        target=axis,
+        show=False,
+    )
+    axis.set_title(title)
+figure.tight_layout()
+figure
+```
+
+```{code-cell} ipython3
+figure, axes = plt.subplots(1, 3, figsize=(14, 4))
+composition_panels = (
+    ("Uncorrected", "RNA_clusters"),
+    ("Partial PCA", "RNA_partial_clusters"),
+    ("Harmony", "RNA_harmony_clusters"),
+)
+for index, (axis, (title, sample_by)) in enumerate(
+    zip(axes, composition_panels, strict=True)
+):
+    ds.plots.composition(
+        category_by="sample_id",
+        sample_by=sample_by,
+        kind="stacked",
+        show_percent_labels=True,
+        show_legend=index == 2,
+        target=axis,
+        show=False,
+    )
+    axis.set_title(title)
+figure.tight_layout()
+figure
+```
+
+## Treatment response is not batch structure
+
+The two Kang sources are also the control and interferon beta treatment groups.
+`ISG15` is an interferon-stimulated gene. Coloring uncorrected and Harmony
+layouts with the same count-backed values shows that Harmony moves cells while
+expression itself is unchanged. Source mixing on the graph is therefore not the
+same question as removing a treatment effect from the counts.
+
+```{code-cell} ipython3
+ds.plots.embedding(
+    layout_key=["RNA_UMAP", "RNA_harmony_UMAP"],
+    color_by="ISG15",
+    n_columns=2,
+    sort_values=True,
+    legend_loc="right",
+)
+```
+
+```{code-cell} ipython3
+ds.plots.distribution(
+    keys="ISG15",
+    group_by="sample_id",
+    kind="violin",
+    max_points=2000,
+    seed=0,
+)
+```
+
 (lisi_metrics)=
 (integration_metrics)=
 
@@ -245,11 +338,11 @@ score_frame = pd.DataFrame.from_dict(scores, orient="index")
 score_frame.round(3)
 ```
 
-The two Kang sources are also the control and interferon beta treatment groups,
-so iLISI describes source mixing rather than proving removal of a technical
-effect. cLISI and connectivity provide preservation checks, but they cannot
-establish that every treatment response was retained. Keep the uncorrected
-counts for condition-level differential expression.
+Because `sample_id` coincides with treatment, iLISI describes source mixing
+rather than proving removal of a technical effect. cLISI and connectivity
+provide preservation checks, but they cannot establish that every treatment
+response was retained. The `ISG15` panels above keep that distinction visible.
+Keep the uncorrected counts for condition-level differential expression.
 
 Compare methods only when active cells, selected features, neighbour count, and
 LISI perplexity match. Do not choose a method solely because its UMAP appears
