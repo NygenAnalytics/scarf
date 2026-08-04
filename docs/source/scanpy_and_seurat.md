@@ -126,12 +126,33 @@ exported H5AD may therefore need a new neighbour graph in Scanpy. See
 
 ### Seurat
 
-Scarf does not read a live `SeuratObject`, `.rds`, or `.h5seurat` file
-directly. Start from the original 10x HDF5 or Matrix Market counts when they
-are available. Otherwise, convert the counts and required metadata to H5AD
-before creating the Scarf store. To return to Seurat, write H5AD or Matrix
-Market from Scarf and convert or import it with the tools used by your R
-workflow.
+Scarf can import a serialized Seurat object from an `.rds` file.
+
+Inspect the RDS file, select importable assays and reductions, then write a
+Zarr store:
+
+```python
+import scarf
+
+inspection = scarf.inspect_seurat("pbmc.rds")
+with scarf.SeuratReader(
+    "pbmc.rds",
+    assays=["RNA"],
+    reductions=["pca"],
+) as reader:
+    scarf.SeuratToZarr(reader, zarr_loc="pbmc.zarr").dump()
+ds = scarf.DataStore("pbmc.zarr")
+```
+
+The importer brings across supported count layers, cell metadata,
+`active.ident`, and selected reductions. Neighbour graphs, images, commands,
+and most tool slots stay behind. Prefer original 10x HDF5 or Matrix Market
+counts when they are available and you only need raw matrices.
+
+To return to Seurat, write H5AD or Matrix Market from Scarf and convert or
+import it with the tools used by your R workflow. See
+{doc}`tutorials/import_and_export` for the full Seurat import contract and the
+other format paths.
 
 ## Choose a workflow
 

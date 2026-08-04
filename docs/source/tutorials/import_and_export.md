@@ -15,7 +15,21 @@ kernelspec:
 # Import and export
 
 Scarf reads common single-cell count formats, writes a Zarr store for analysis, and exports
-counts or metadata to interoperable formats.
+counts or metadata to interoperable formats. Most imports follow the same pattern: inspect
+when the source layout can vary, open a reader, then call a matching `*ToZarr` writer.
+
+| Source | Inspect | Reader | Writer |
+|---|---|---|---|
+| 10x HDF5 | (inferred by reader) | `CrH5Reader` | `CrToZarr` |
+| Matrix Market / MEX | `inspect_mtx` | `MtxReader` | `MtxToZarr` |
+| AnnData H5AD | `inspect_h5ad` | `H5adReader` | `H5adToZarr` |
+| Seurat RDS | `inspect_seurat` | `SeuratReader` | `SeuratToZarr` |
+| Dense CSV | | `CSVReader` | `CSVtoZarr` |
+| SciPy CSR | | | `SparseToZarr` |
+| Loom | | `LoomReader` | `LoomToZarr` |
+
+Export paths write Matrix Market or H5AD. Scarf does not write Seurat `.rds` or `.h5seurat`
+files. See {doc}`../scanpy_and_seurat` for Scanpy and Seurat workflow mapping.
 
 ## Prerequisites
 
@@ -25,11 +39,13 @@ counts or metadata to interoperable formats.
 ## What you will learn
 
 - Download datasets from the `scarf_docs` Cytebase catalog
-- Convert 10x HDF5, MTX, H5AD, CSV, and sparse inputs to Zarr
-- Merge full DataStores with `DataStoreMerge`
+- Convert 10x HDF5, MTX, H5AD, Seurat RDS, CSV, and sparse inputs to Zarr
 - Export an assay to MTX or H5AD
+- Merge full DataStores with `DataStoreMerge`
 
-## Guided steps
+## 1. Download example datasets
+
+Scarf hosts example datasets in the public [Cytebase bucket](https://huggingface.co/buckets/Nygen/cytebase) in formats such as MTX, 10x HDF5, and H5AD. Connect to the `scarf_docs` repository to list or download them:
 
 ```{code-cell} ipython3
 import scarf
@@ -37,18 +53,12 @@ import scarf
 scarf.configure_output(level='ERROR', progress=True)
 ```
 
-### 1. Download datasets from Cytebase
-
-Scarf hosts example datasets in the public [Cytebase bucket](https://huggingface.co/buckets/Nygen/cytebase) in formats such as MTX, 10x HDF5, and H5AD. Connect to the `scarf_docs` repository to list or download them:
-
 ```{code-cell} ipython3
 datasets = scarf.cytebase.connect("scarf_docs")
 datasets.list_datasets()
 ```
 
 **Naming format**: `<author>_<number of cells>_<cell/tissue type or species>_<single-cell method>`
-
-Examples used below:
 
 Each download returns the directory it wrote, which the readers below use as their input
 path.
@@ -78,12 +88,11 @@ tenx_h5, mtx_dir, h5ad_dir
 The downloads land under `scarf_datasets` in the current working directory unless
 `destination` is changed. The cell prints each returned path.
 
-### 2. Convert data to a Scarf Zarr store
+## 2. Import 10x HDF5
 
-Scarf stores data as dense, compressed chunks in Zarr. `scarf.readers` and `scarf.writers`
-provide complementary classes that convert common count formats into that layout.
-
-#### From 10x's HDF5 file format
+Scarf stores data as dense, compressed chunks in Zarr. `CrH5Reader` and `CrToZarr`
+convert Cell Ranger HDF5 into that layout. Assay type is inferred from the H5 feature
+types (RNA, ATAC, or multimodal).
 
 ```{code-cell} ipython3
 # Assay type is inferred from the H5 contents (RNA, ATAC, or multimodal).
@@ -105,7 +114,7 @@ ds_atac = scarf.DataStore('scarf_datasets/pbmc_atac.zarr')
 ds_atac
 ```
 
-#### From Matrix Market count files
+## 3. Import Matrix Market
 
 Inspect a Matrix Market source before selecting a triplet. A source can be an
 `.mtx` or `.mtx.gz` file, a directory, or a direct MEX ZIP. Inspection recognizes
@@ -148,6 +157,8 @@ The reader checks available capacity and reports the exact required bytes
 before creating those files. Pass `temp_dir` to `MtxReader` when the system
 temporary directory is too small.
 
+### 3.1 Parse DGE directories
+
 Parse DGE matrices use cells by genes orientation and require
 `cell_metadata.csv`. Scarf imports its non-ID columns. It recognizes
 `bc_wells` and `bc_index`; pass `cell_id_key` when both are present:
@@ -158,7 +169,7 @@ reader = scarf.MtxReader(candidate, cell_id_key="bc_index")
 scarf.MtxToZarr(reader, zarr_loc="parse.zarr").dump()
 ```
 
-#### From AnnData H5AD file format
+## 4. Import H5AD
 
 H5AD files vary in where they store counts, feature names, metadata, and
 layers. Inspect the file before conversion rather than assuming `X`, `obs`, and
@@ -204,21 +215,78 @@ antigen, custom, RNA, and antibody labels receive stable assay names. Scarf
 does not infer BD guide features from names. Reclassify known feature indexes
 before constructing the writer when a vendor labels guides as gene expression.
 
-Loom import remains available through `LoomReader` and `LoomToZarr` for legacy
-compatibility.
+## 5. Import Seurat RDS
 
-### 3. Export data from a Zarr store
+Scarf can import a serialized Seurat object from an `.rds` file through
+`inspect_seurat`, `SeuratReader`, and `SeuratToZarr`. This path reads the on-disk
+RDS document. It does not attach to a live R session, and it does not read
+`.h5seurat`.
 
-#### To Cellranger (10x) MTX format
+Inspect first. The result reports which assays and reductions are importable,
+their dimensions, and any blocking diagnostics or notices:
+
+```python
+import scarf
+
+inspection = scarf.inspect_seurat("pbmc.rds")
+inspection.activeAssay
+[assay.name for assay in inspection.assays if assay.importable]
+[
+    reduction.name
+    for reduction in inspection.reductions
+    if reduction.importable
+]
+```
+
+Open a reader for the assays and reductions you want, then write the Zarr store.
+Omit `reductions` to import every importable reduction, or pass an empty sequence
+to skip them:
+
+```python
+with scarf.SeuratReader(
+    "pbmc.rds",
+    assays=["RNA"],
+    reductions=["pca"],
+) as reader:
+    result = scarf.SeuratToZarr(
+        reader,
+        zarr_loc="pbmc_from_seurat.zarr",
+    ).dump()
+
+ds = scarf.DataStore("pbmc_from_seurat.zarr")
+result.assayNames, result.defaultAssay, result.notices
+```
+
+What this import covers:
+
+- Legacy `Assay`, `Assay5`, and `ChromatinAssay` count layers when their matrix
+  layout is supported
+- Cell metadata, `active.ident`, and selected reductions such as PCA or LSI
+- Partial Assay5 cell membership as per-assay boolean columns when needed
+
+What it does not import as analysis artifacts:
+
+- Neighbour graphs, Seurat `neighbors` objects, images, commands, and most
+  `tools` slots
+- Normalized layers when the selected count layer is used for the Scarf assay
+- Transposed Assay5 storage (`Assay5T`)
+- A return path to `.rds` or `.h5seurat` (export H5AD or MTX instead)
+
+Pass `assay_layers` when an assay stores several count layers and you need a
+non-default choice. Pass `sidecar_path_remaps` when a `SaveSeuratRds` sidecar
+cache points at moved on-disk matrices. Prefer original 10x HDF5 or Matrix Market
+counts when they are available and you only need raw matrices.
+
+## 6. Export to Matrix Market
+
+Open the H5AD-derived store written in section 4 and inspect transferred columns
+before exporting:
 
 ```{code-cell} ipython3
 ds = scarf.DataStore('scarf_datasets/differentiating_pancreatic_cells.zarr')
 
 ds
 ```
-
-Check the imported cell columns before relying on transferred labels or
-embeddings:
 
 ```{code-cell} ipython3
 {
@@ -247,7 +315,7 @@ scarf.writers.to_mtx(
 )
 ```
 
-#### To H5ad format
+## 7. Export to H5AD and AnnData
 
 `to_h5ad` exports the count matrix and metadata, and promotes recognized
 `{assay}_UMAP` / `{assay}_tSNE` column pairs into AnnData `obsm`. Imported
@@ -256,6 +324,8 @@ before writing. `DataStore.to_anndata` returns an in-memory AnnData object with
 counts, cell and feature metadata, and optional assay layers. It currently leaves
 layout coordinates as ordinary `obs` columns rather than populating `obsm`
 (see {doc}`downsampling`).
+
+### 7.1 Promote layouts for `to_h5ad`
 
 ```{code-cell} ipython3
 ds.cells.insert(
@@ -282,6 +352,8 @@ import anndata as ad
 adata = ad.read_h5ad('scarf_datasets/diff_pancreas.h5ad')
 sorted(adata.obsm.keys()), adata.obsm['X_umap'].shape
 ```
+
+### 7.2 Export a feature panel with `to_anndata`
 
 Full-assay export can require enough memory and disk for the selected cell by
 feature matrix. When only a marker panel is needed, select features before
@@ -327,26 +399,7 @@ The panel export keeps layout coordinates in `obs` and leaves `obsm` empty.
 That is the `to_anndata` side of the distinction above: use `to_h5ad` when
 another tool expects `obsm["X_umap"]`.
 
-Writers also accept remote Zarr locations. Choose the `cloud` profile for an
-object-store destination and pass credentials through the environment or
-runtime configuration:
-
-```python
-import os
-
-writer = scarf.H5adToZarr(
-    reader,
-    zarr_loc="s3://my-bucket/project/data.zarr",
-    storage_options={
-        "access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
-        "secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
-    },
-    profile="cloud",
-)
-writer.dump()
-```
-
-### 4. Convert a CSV matrix to Zarr
+## 8. Import CSV
 
 `CSVReader` and `CSVtoZarr` provide small-data compatibility for dense CSV count matrices. The toy matrix below is
 synthesized in-notebook so the conversion does not depend on a catalog file. Rows are cells
@@ -394,7 +447,7 @@ ds_csv.cells.head()
 `quality` is cell metadata rather than a count column, which is what
 `cell_data_cols` is for.
 
-### 5. Convert a sparse matrix to Zarr
+## 9. Import sparse matrices
 
 `SparseToZarr` accepts a SciPy CSR matrix with matching cell and feature IDs.
 
@@ -421,7 +474,7 @@ ds_sparse = scarf.DataStore(str(sparse_zarr))
 ds_sparse
 ```
 
-### 6. Merge full DataStores with DataStoreMerge
+## 10. Merge DataStores
 
 `DataStoreMerge` merges multiple full DataStores (all assays per dataset) into one Zarr file.
 The example below merges two tiny stores created with `SparseToZarr`. For single-assay merges
@@ -458,9 +511,37 @@ ds_merged = scarf.DataStore('scarf_datasets/toy_merged.zarr')
 ds_merged.cells.head()
 ```
 
-`dask_to_zarr` writes from a Dask array when lazy out-of-core conversion is needed. Loom
-import uses `LoomReader` / `LoomToZarr` with the same dump pattern as the readers above; this
-page does not execute a Loom example.
+## 11. Other import paths
+
+### 11.1 Loom
+
+Loom import remains available through `LoomReader` and `LoomToZarr` with the same
+dump pattern as the readers above. This page does not execute a Loom example.
+
+### 11.2 Dask arrays
+
+`dask_to_zarr` writes from a Dask array when lazy out-of-core conversion is needed.
+
+### 11.3 Remote Zarr destinations
+
+Writers also accept remote Zarr locations. Choose the `cloud` profile for an
+object-store destination and pass credentials through the environment or
+runtime configuration:
+
+```python
+import os
+
+writer = scarf.H5adToZarr(
+    reader,
+    zarr_loc="s3://my-bucket/project/data.zarr",
+    storage_options={
+        "access_key_id": os.environ["AWS_ACCESS_KEY_ID"],
+        "secret_access_key": os.environ["AWS_SECRET_ACCESS_KEY"],
+    },
+    profile="cloud",
+)
+writer.dump()
+```
 
 ## Common mistakes and limitations
 
@@ -471,6 +552,8 @@ page does not execute a Loom example.
 - Assuming an H5AD file uses `X` for raw counts without inspecting its layers
 - Expecting sparse or malformed `obsm` arrays to be imported as embeddings
 - Materializing a full AnnData object when a feature panel would answer the export question
+- Treating Seurat neighbour graphs, images, or normalized layers as imported Scarf artifacts
+- Expecting Scarf to read `.h5seurat` or write Seurat `.rds` files
 
 Conversion writes the requested Zarr target. Export commands write MTX or H5AD
 at the supplied destination, and `DataStoreMerge` writes its merged store at
