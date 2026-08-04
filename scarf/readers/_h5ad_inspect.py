@@ -55,6 +55,7 @@ class H5adInspectResult:
     matrixKey: str
     matrixCandidates: tuple[str, ...]
     matrixEncoding: str
+    integerLike: bool
     cellAttrsKey: str
     cellIdsKey: str
     featureAttrsKey: str
@@ -545,11 +546,18 @@ def _select_matrix(
     raise ValueError("No matrix candidate matches the obs and var dimensions")
 
 
-def inspect_h5ad(h5ad_fn: str) -> H5adInspectResult:
+def inspect_h5ad(
+    h5ad_fn: str,
+    *,
+    matrix_key: str | None = None,
+) -> H5adInspectResult:
     """Report the matrix and metadata layout of an H5AD file.
 
     Args:
         h5ad_fn: Path to the H5AD file.
+        matrix_key: Optional matrix path to force (for example ``X`` or
+            ``raw/X``). When set, that candidate must exist and match obs/var
+            dimensions.
 
     Returns:
         Keys, shape, and column names needed to configure
@@ -560,7 +568,18 @@ def inspect_h5ad(h5ad_fn: str) -> H5adInspectResult:
         if not candidates:
             raise ValueError("No sparse or numeric 2D matrix found in the H5AD file")
 
-        matrix, feature_attrs_key = _select_matrix(h5, candidates)
+        if matrix_key is not None:
+            forced = [
+                candidate for candidate in candidates if candidate.key == matrix_key
+            ]
+            if not forced:
+                available = ", ".join(candidate.key for candidate in candidates)
+                raise ValueError(
+                    f"matrix_key {matrix_key!r} not found. Available: {available}"
+                )
+            matrix, feature_attrs_key = _select_matrix(h5, forced)
+        else:
+            matrix, feature_attrs_key = _select_matrix(h5, candidates)
         n_cells, n_features = matrix.shape
         cell_node = h5.get("obs")
         feature_node = h5.get(feature_attrs_key)
@@ -624,6 +643,7 @@ def inspect_h5ad(h5ad_fn: str) -> H5adInspectResult:
         matrixKey=matrix.key,
         matrixCandidates=tuple(candidate.key for candidate in candidates),
         matrixEncoding=matrix.encoding,
+        integerLike=matrix.integerLike,
         cellAttrsKey="obs",
         cellIdsKey=cell_ids_key,
         featureAttrsKey=feature_attrs_key,
