@@ -17,7 +17,7 @@ from scarf.neighbors.graph import (
     weight_sort_indices,
 )
 from scarf.neighbors.diffusion import diffusion_operator
-from scarf.neighbors.integration import wnn_integration
+from scarf.neighbors.integration import _wnn_integration_many, wnn_integration
 from scarf.utils import logger
 
 
@@ -220,6 +220,167 @@ def _reference_wnn(
         selected_affinities[cell] = affinities[selected]
 
     return selected_indices, selected_affinities, modality_weights
+
+
+def _reference_wnn_many(
+    modalities: list[tuple[str, np.ndarray, np.ndarray]],
+    *,
+    l2_normalize: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def normalize(values: np.ndarray) -> np.ndarray:
+        output = np.asarray(values, dtype=np.float64).copy()
+        if not l2_normalize:
+            return output
+        norms = np.linalg.norm(output, axis=1)
+        np.divide(
+            output,
+            norms[:, np.newaxis],
+            out=output,
+            where=norms[:, np.newaxis] > 0,
+        )
+        return output
+
+    def kernel(
+        distances: np.ndarray,
+        nearest: float,
+        bandwidth: float,
+    ) -> np.ndarray:
+        adjusted = np.maximum(distances - nearest, 0)
+        tolerance = 8.0 * np.finfo(np.float64).eps * nearest
+        if bandwidth <= tolerance:
+            return (adjusted <= tolerance).astype(np.float64)
+        return np.exp(-(adjusted / bandwidth))
+
+    indices = [np.asarray(modality[1]) for modality in modalities]
+    embeddings = [normalize(modality[2]) for modality in modalities]
+    n_cells = indices[0].shape[0]
+    output_k = min(values.shape[1] for values in indices)
+    selected_indices = np.empty((n_cells, output_k), dtype=np.int64)
+    selected_affinities = np.empty((n_cells, output_k), dtype=np.float64)
+    modality_weights = np.empty((n_cells, len(modalities)), dtype=np.float64)
+
+    for cell in range(n_cells):
+        neighbor_rows = [values[cell] for values in indices]
+        candidates = np.unique(np.concatenate(neighbor_rows))
+        positions = [
+            np.searchsorted(candidates, neighbors) for neighbors in neighbor_rows
+        ]
+        candidate_embeddings = [values[candidates] for values in embeddings]
+        points = [values[cell] for values in embeddings]
+        distances = [
+            np.linalg.norm(point - candidate, axis=1)
+            for point, candidate in zip(points, candidate_embeddings, strict=True)
+        ]
+        own_distances = [
+            np.sort(values[own_positions])
+            for values, own_positions in zip(distances, positions, strict=True)
+        ]
+        nearest = [float(values[0]) for values in own_distances]
+        bandwidths = [float(values[-1] - values[0]) for values in own_distances]
+
+        within = [
+            kernel(
+                np.asarray(
+                    [np.linalg.norm(point - candidate[own_positions].mean(axis=0))]
+                ),
+                nearest_distance,
+                bandwidth,
+            )[0]
+            for point, candidate, own_positions, nearest_distance, bandwidth in zip(
+                points,
+                candidate_embeddings,
+                positions,
+                nearest,
+                bandwidths,
+                strict=True,
+            )
+        ]
+        directed_scores = np.full(
+            (len(modalities), len(modalities)),
+            -np.inf,
+            dtype=np.float64,
+        )
+        for target, (
+            point,
+            candidate,
+            nearest_distance,
+            bandwidth,
+            within_affinity,
+        ) in enumerate(
+            zip(
+                points,
+                candidate_embeddings,
+                nearest,
+                bandwidths,
+                within,
+                strict=True,
+            )
+        ):
+            for source, source_positions in enumerate(positions):
+                if source == target:
+                    continue
+                cross = kernel(
+                    np.asarray(
+                        [
+                            np.linalg.norm(
+                                point - candidate[source_positions].mean(axis=0)
+                            )
+                        ]
+                    ),
+                    nearest_distance,
+                    bandwidth,
+                )[0]
+                directed_scores[target, source] = np.clip(
+                    within_affinity / (cross + 1e-4),
+                    0,
+                    200,
+                )
+
+        finite = np.isfinite(directed_scores)
+        shifted = directed_scores[finite] - directed_scores[finite].max()
+        strengths = np.zeros(directed_scores.shape, dtype=np.float64)
+        strengths[finite] = np.exp(shifted)
+        weights = strengths.sum(axis=1)
+        weights /= weights.sum()
+        modality_weights[cell] = weights
+
+        affinity = weights[0] * kernel(distances[0], nearest[0], bandwidths[0])
+        for weight, values, nearest_distance, bandwidth in zip(
+            weights[1:],
+            distances[1:],
+            nearest[1:],
+            bandwidths[1:],
+            strict=True,
+        ):
+            affinity += weight * kernel(values, nearest_distance, bandwidth)
+        selected = np.lexsort((candidates, -affinity))[:output_k]
+        selected_indices[cell] = candidates[selected]
+        selected_affinities[cell] = affinity[selected]
+
+    return selected_indices, selected_affinities, modality_weights
+
+
+def _three_way_wnn_inputs() -> list[tuple[str, np.ndarray, np.ndarray]]:
+    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
+    indices3 = _grouped_knn_indices([[0, 1, 4, 5], [2, 3, 6, 7]])
+    ld3 = np.array(
+        [
+            [0.0, 0.1, 2.0, -0.2],
+            [0.1, 0.0, 1.9, -0.1],
+            [2.1, -0.2, 0.1, 0.0],
+            [1.9, -0.1, 0.0, 0.1],
+            [0.2, 0.2, 2.2, -0.3],
+            [0.0, -0.1, 1.8, -0.2],
+            [2.2, -0.3, 0.2, 0.0],
+            [1.8, 0.0, -0.1, 0.2],
+        ],
+        dtype=np.float64,
+    )
+    return [
+        ("RNA", indices1, ld1),
+        ("ATAC", indices2, ld2),
+        ("ADT", indices3, ld3),
+    ]
 
 
 def test_calc_snn_returns_normalized_overlap():
@@ -487,6 +648,33 @@ def test_wnn_integration_rejects_mismatched_neighbor_rows():
         )
 
 
+def test_two_input_wnn_adapter_preserves_duplicate_diagnostic_names():
+    indices1, ld1, indices2, ld2 = _multimodal_wnn_inputs()
+    expected, expected_weights = wnn_integration(
+        "first",
+        indices1,
+        ld1,
+        "second",
+        indices2,
+        ld2,
+        n_threads=1,
+    )
+    actual, actual_weights = wnn_integration(
+        "same",
+        indices1,
+        ld1,
+        "same",
+        indices2,
+        ld2,
+        n_threads=1,
+    )
+
+    np.testing.assert_array_equal(actual.row, expected.row)
+    np.testing.assert_array_equal(actual.col, expected.col)
+    np.testing.assert_array_equal(actual.data, expected.data)
+    np.testing.assert_array_equal(actual_weights, expected_weights)
+
+
 @pytest.mark.parametrize(
     ("indices", "error", "match"),
     [
@@ -666,7 +854,7 @@ def test_wnn_integration_is_invariant_to_per_modality_scale(
     )
 
 
-def test_wnn_integration_uses_kth_nonself_neighbor_for_bandwidth():
+def test_wnn_integration_uses_nearest_to_kth_distance_span_for_bandwidth():
     indices = _simple_knn_indices(5, k=2)
     embedding = np.arange(5, dtype=np.float64).reshape(-1, 1)
 
@@ -758,6 +946,129 @@ def test_wnn_integration_matches_scalar_affinity_reference():
         rtol=1e-6,
         atol=1e-7,
     )
+
+
+def test_wnn_many_matches_independent_scalar_reference():
+    modalities = _three_way_wnn_inputs()
+    expected_indices, expected_affinities, expected_weights = _reference_wnn_many(
+        modalities,
+        l2_normalize=True,
+    )
+
+    actual, actual_weights = _wnn_integration_many(
+        modalities,
+        n_threads=1,
+    )
+
+    assert actual_weights.shape == (len(expected_indices), 3)
+    np.testing.assert_array_equal(
+        actual.col.reshape(expected_indices.shape),
+        expected_indices,
+    )
+    np.testing.assert_allclose(
+        actual.data.reshape(expected_affinities.shape),
+        expected_affinities,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(
+        actual_weights,
+        expected_weights,
+        rtol=1e-6,
+        atol=1e-7,
+    )
+    np.testing.assert_allclose(actual_weights.sum(axis=1), 1, rtol=1e-6)
+
+
+def test_wnn_many_is_equivariant_to_modality_permutation():
+    modalities = _three_way_wnn_inputs()
+    expected, expected_weights = _wnn_integration_many(modalities, n_threads=1)
+    permutation = [2, 0, 1]
+
+    actual, actual_weights = _wnn_integration_many(
+        [modalities[index] for index in permutation],
+        n_threads=1,
+    )
+
+    np.testing.assert_allclose(actual.toarray(), expected.toarray())
+    np.testing.assert_allclose(
+        actual_weights,
+        expected_weights[:, permutation],
+        rtol=1e-6,
+        atol=1e-7,
+    )
+
+
+def test_wnn_many_is_invariant_to_cell_order():
+    modalities = _three_way_wnn_inputs()
+    expected, expected_weights = _wnn_integration_many(modalities, n_threads=1)
+    permutation = np.array([5, 0, 7, 2, 6, 1, 4, 3])
+    old_to_new = np.argsort(permutation)
+    permuted_modalities = [
+        (
+            name,
+            old_to_new[indices[permutation]],
+            embedding[permutation],
+        )
+        for name, indices, embedding in modalities
+    ]
+
+    actual, actual_weights = _wnn_integration_many(
+        permuted_modalities,
+        n_threads=1,
+    )
+    inverse = np.argsort(permutation)
+
+    np.testing.assert_allclose(
+        actual.tocsr()[inverse][:, inverse].toarray(),
+        expected.toarray(),
+    )
+    np.testing.assert_allclose(actual_weights[inverse], expected_weights)
+
+
+def test_wnn_many_handles_degenerate_bandwidths():
+    modalities = [
+        (name, indices, np.zeros_like(embedding))
+        for name, indices, embedding in _three_way_wnn_inputs()
+    ]
+
+    graph, weights = _wnn_integration_many(modalities, n_threads=1)
+
+    np.testing.assert_array_equal(graph.data, np.ones(graph.nnz, dtype=np.float32))
+    np.testing.assert_allclose(weights, 1 / 3, rtol=0, atol=1e-7)
+
+
+def test_wnn_many_rejects_too_few_or_duplicate_modalities():
+    modalities = _three_way_wnn_inputs()
+
+    with pytest.raises(ValueError, match="at least two modalities"):
+        _wnn_integration_many(modalities[:1], n_threads=1)
+    with pytest.raises(ValueError, match="names must be unique"):
+        _wnn_integration_many(
+            [modalities[0], ("RNA", modalities[1][1], modalities[1][2])],
+            n_threads=1,
+        )
+
+
+def test_wnn_grouped_pairwise_weights_differ_from_max_cross_shortcut():
+    directed_scores = np.array(
+        [
+            [-np.inf, 4.0, 0.0],
+            [2.0, -np.inf, 2.0],
+            [1.0, 0.5, -np.inf],
+        ]
+    )
+    finite = np.isfinite(directed_scores)
+    pairwise = np.zeros_like(directed_scores)
+    pairwise[finite] = np.exp(directed_scores[finite] - directed_scores[finite].max())
+    grouped = pairwise.sum(axis=1)
+    grouped /= grouped.sum()
+    max_cross_scores = np.max(directed_scores, axis=1)
+    max_cross = np.exp(max_cross_scores - max_cross_scores.max())
+    max_cross /= max_cross.sum()
+
+    assert not np.allclose(grouped, max_cross)
+    assert grouped[1] > max_cross[1]
 
 
 def test_wnn_integration_follows_informative_modality_across_numeric_scales():
@@ -903,6 +1214,36 @@ def _seurat_golden_wnn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     )
 
 
+@functools.cache
+def _seurat_three_way_golden() -> dict:
+    path = Path(__file__).parent / "seurat_wnn_3way_5_5_1_golden.json"
+    return json.loads(path.read_text())
+
+
+def _seurat_three_way_golden_wnn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    fixture = _seurat_three_way_golden()
+    inputs = fixture["inputs"]
+    modalities = [
+        (
+            name,
+            np.asarray(inputs["neighborIndices"][name], dtype=np.uint32),
+            np.asarray(inputs["embeddings"][name], dtype=np.float64),
+        )
+        for name in inputs["modalityNames"]
+    ]
+    graph, weights = _wnn_integration_many(
+        modalities,
+        n_threads=1,
+        l2_normalize=fixture["provenance"]["l2Normalize"],
+    )
+    shape = modalities[0][1].shape
+    return (
+        graph.col.reshape(shape),
+        graph.data.reshape(shape).astype(np.float64),
+        weights.astype(np.float64),
+    )
+
+
 def test_seurat_wnn_golden_fixture_pins_its_provenance():
     provenance = _seurat_golden()["provenance"]
 
@@ -912,6 +1253,38 @@ def test_seurat_wnn_golden_fixture_pins_its_provenance():
     assert provenance["l2Normalize"] is True
     assert "Seurat:::PredictAssay" in provenance["matchedFunctions"]
     assert provenance["defaultFunction"] == "Seurat::FindMultiModalNeighbors"
+
+
+def test_seurat_three_way_wnn_fixture_pins_its_provenance():
+    provenance = _seurat_three_way_golden()["provenance"]
+
+    assert provenance["package"] == "Seurat"
+    assert provenance["packageVersion"] == "5.5.1"
+    assert provenance["dataset"] == "synthetic_three_modality"
+    assert provenance["modalityNames"] == ["RNA", "ATAC", "ADT"]
+    assert provenance["l2Normalize"] is True
+
+
+def test_wnn_many_matches_seurat_three_way_equations():
+    expected = _seurat_three_way_golden()["matched"]
+    selected, affinities, weights = _seurat_three_way_golden_wnn()
+
+    np.testing.assert_array_equal(
+        selected,
+        np.asarray(expected["neighborIndices"], dtype=selected.dtype),
+    )
+    np.testing.assert_allclose(
+        weights,
+        np.asarray(expected["modalityWeights"]),
+        rtol=0,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        affinities,
+        np.asarray(expected["neighborAffinities"]),
+        rtol=0,
+        atol=1e-6,
+    )
 
 
 def test_wnn_integration_matches_seurat_matched_equations():

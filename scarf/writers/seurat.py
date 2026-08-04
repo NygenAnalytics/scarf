@@ -155,7 +155,7 @@ class SeuratToZarr:
         membership_names = {
             f"{assay.name}_I"
             for assay in assays
-            if assay.sourceClass == "Assay5" and not assay.cellMembership.allIncluded
+            if not assay.cellMembership.allIncluded
         }
         cell_names = set(reader.cellMetadata.columnNames)
         conflicts = sorted(cell_names.intersection(membership_names))
@@ -371,7 +371,7 @@ class SeuratToZarr:
             block_rows,
         )
         for assay in self._assays:
-            if assay.sourceClass != "Assay5" or assay.cellMembership.allIncluded:
+            if assay.cellMembership.allIncluded:
                 continue
             column_name = f"{assay.name}_I"
             output = self._create_boolean_column(

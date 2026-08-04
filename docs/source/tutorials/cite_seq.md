@@ -327,8 +327,9 @@ the partition the merged graph supports.
 
 SNN treats both modalities equally and accepts two or more assays. Weighted nearest
 neighbors instead learns a per-cell weight for each modality, so cells whose identity is
-better resolved by protein lean on the ADT graph and the rest lean on RNA. WNN takes exactly
-two assays. Scarf implements the affinity and per-cell weighting equations from
+better resolved by protein lean on the ADT graph and the rest lean on RNA. WNN also accepts
+two or more assays. This RNA and ADT workflow is its two-modality special case. Scarf
+implements the affinity and per-cell weighting equations from
 [Hao et al., Cell 2021](https://doi.org/10.1016/j.cell.2021.04.048), with the
 scaling choices described below.
 
@@ -359,17 +360,20 @@ non-negative and sum to one for each selected cell.
 Scarf WNN is Hao-inspired, but it is not bit-identical to Seurat's
 `FindMultiModalNeighbors`:
 
-- Scarf scores the union of the two existing KNN rows, at most `2k` candidates per cell,
-  and retains `min(k_RNA, k_ADT)` neighbours. Seurat normally obtains a wider candidate
-  pool with `knn.range=200`, then retains `k.nn=20`. Scarf therefore cannot tune candidate
-  pool size independently of final graph degree.
-- The wider search would require two more L2-space index builds and 20 million queries at
-  ten million cells. Materializing 200 candidates for each modality would hold 4 billion
-  neighbour records and scoring work would increase by roughly tenfold. Scarf keeps the
-  existing graphs to avoid that cost.
-- Scarf uses the distance from each cell to its `k`-th stored nonself neighbour as the
-  affinity bandwidth. This corresponds to Seurat's supported simple-bandwidth path, not
-  its default SNN-far bandwidth.
+- Scarf scores the union of every existing KNN row, at most the sum of their
+  degrees, and retains the smallest input degree. In this RNA and ADT example
+  that means at most `2k` candidates and `min(k_RNA, k_ADT)` output neighbours.
+  Seurat normally obtains a wider candidate pool with `knn.range=200`, then
+  retains `k.nn=20`. Scarf therefore cannot tune candidate pool size
+  independently of final graph degree.
+- For this two-modality example, the wider search would require two more
+  L2-space index builds and 20 million queries at ten million cells.
+  Materializing 200 candidates for each modality would hold 4 billion
+  neighbour records and scoring work would increase by roughly tenfold. Scarf
+  keeps the existing graphs to avoid that cost.
+- Scarf uses the distance span from each cell's nearest to its `k`-th stored
+  nonself neighbour as the affinity bandwidth. This corresponds to Seurat's
+  supported simple-bandwidth path, not its default SNN-far bandwidth.
 - Scarf builds candidates in the PCA or Harmony geometry used by each source graph, then
   scores them after row-wise L2 normalization by default. Distance after normalization is
   monotone with cosine distance, but the candidate ordering is not guaranteed to match a
@@ -382,13 +386,10 @@ Scarf WNN is Hao-inspired, but it is not bit-identical to Seurat's
 - If the source graphs use different `k`, each modality predicts from its own row and the
   integrated graph retains the smaller degree.
 
-At 100,000 cells with 20 neighbours per modality the corrected path measures 137 to 146
-microseconds per cell single-threaded, and peak memory grows by about 0.9 MB per 1,000
-cells. Extrapolating linearly, ten million cells need roughly 25 minutes and 9 to 10 GB.
-Reading neighbour-index arrays directly and preallocating outputs is what keeps memory at
-that level instead of the 25 to 35 GB the earlier full-graph path would have needed. Both
-figures come from synthetic benchmarks at 100,000 to 200,000 cells rather than a
-ten-million-cell run, so treat them as estimates.
+Per-cell prediction work grows quadratically with the number of modalities,
+while blended edge scoring is linear in the union candidate pool. Reading
+neighbour-index arrays directly and preallocating outputs keeps stored input and
+output memory linear in cell count.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
@@ -411,8 +412,8 @@ for axis, (title, layout_key, color_by) in zip(
 figure.tight_layout()
 ```
 
-SNN merges edge support across two or more assays. WNN accepts exactly two
-assays and adjusts their contributions cell by cell. In this dataset, both
+SNN merges edge support across two or more assays. WNN also accepts two or more
+assays and adjusts their contributions cell by cell. In this two-assay dataset, both
 integrated layouts should preserve broad PBMC populations while resolving
 differences supported by the protein panel. Use the advanced guide to compare
 them quantitatively rather than choosing from UMAP appearance alone.
@@ -428,5 +429,5 @@ RNA/ADT integration path. See {doc}`hto_demultiplexing`.
 - Filtering cells on one assay and then comparing modalities built from different cell sets
 - Integrating per-assay graphs built with different `k`
 - Leaving control antibodies active in the ADT panel
-- Using WNN with anything other than two assays
+- Using WNN with fewer than two assays or with graphs built over different cells
 - Reading RNA and ADT clusters as interchangeable labels for the same populations

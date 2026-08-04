@@ -141,9 +141,10 @@ need inspection before integration.
 ## Compare SNN and WNN
 
 SNN combines shared edge support and can integrate two or more assays. WNN
-accepts exactly two assays and learns how strongly each cell should rely on each
-modality. Both consume one graph per named assay, which is why the two chains
-above had to use matched cells and neighbour counts.
+also accepts two or more assays and learns how strongly each cell should rely
+on each modality. Both consume one graph per named assay, which is why the two
+chains above had to use matched cells and neighbour counts. The RNA and ADT
+comparison here is the two-modality special case.
 
 ## Compare integrated partitions
 
@@ -256,9 +257,9 @@ one modality, but they can also expose noise or a graph mismatch. The
 {doc}`cite_seq` workflow covers how SNN and WNN construct the integrated graph.
 
 Choose between methods from the assay design and evidence, not from the layout
-that looks cleaner. SNN is the available choice for more than two modalities.
-WNN is useful when the relative informativeness of RNA and ADT varies across
-cells. Compare cluster stability, marker coherence, known populations, and the
+that looks cleaner. WNN is useful when relative local informativeness varies
+across two or more modalities, while SNN gives all source graphs equal standing.
+Compare cluster stability, marker coherence, known populations, and the
 modality-concordance checks above.
 
 Common failures include integrating graphs built over different cells, using

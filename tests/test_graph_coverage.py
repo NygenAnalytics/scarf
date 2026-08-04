@@ -883,9 +883,16 @@ def test_integrate_assays_validation_errors() -> None:
             method="snn",
         )
 
-    with pytest.raises(ValueError, match="only two assays"):
+    with pytest.raises(ValueError, match="at least two assays"):
         store.integrate_assays(
             assays=["RNA"],
+            label="invalid",
+            method="wnn",
+        )
+
+    with pytest.raises(ValueError, match="unique assay names"):
+        store.integrate_assays(
+            assays=["RNA", "RNA"],
             label="invalid",
             method="wnn",
         )

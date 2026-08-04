@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
+from zipfile import ZipFile
 
 import numpy as np
 
@@ -42,6 +44,55 @@ PBMC_FILTERS = {
 KANG_CONTROL_DATASET = "kang_15K_pbmc_rnaseq"
 KANG_STIMULATED_DATASET = "kang_14K_ifnb-pbmc_rnaseq"
 KANG_INTEGRATED_DATASET = "kang_29K_ctrl-ifnb_pbmc_rnaseq"
+TEASEQ_DATASET = "swanson_7K_pbmc_teaseq"
+TEASEQ_RDS_NAME = "GSM5123951_PBMC_permcells_TEA-seq_SeuratObject.rds"
+TEASEQ_ANNOTATIONS_NAME = "elife-63632-fig4-data2-v1.zip"
+TEASEQ_TOTAL_CELLS = 7_069
+TEASEQ_MATCHED_PUBLICATION_CELLS = 6_194
+EXTERNAL_DOWNLOAD_TIMEOUT_SECONDS = 60
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalSource:
+    filename: str
+    url: str
+    sha256: str
+
+
+def _download_external_source(
+    source: ExternalSource,
+    destination: Path,
+) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
+    target = destination / source.filename
+    if target.exists() and _file_digest(target) == source.sha256:
+        return target
+
+    partial = destination / f"{source.filename}.partial"
+    partial.unlink(missing_ok=True)
+    digest = hashlib.sha256()
+    try:
+        with (
+            urlopen(
+                source.url,
+                timeout=EXTERNAL_DOWNLOAD_TIMEOUT_SECONDS,
+            ) as response,
+            partial.open("wb") as handle,
+        ):
+            for block in iter(lambda: response.read(1 << 20), b""):
+                digest.update(block)
+                handle.write(block)
+        actual = digest.hexdigest()
+        if actual != source.sha256:
+            raise ValueError(
+                f"Checksum mismatch for {source.filename}: "
+                f"expected {source.sha256}, found {actual}"
+            )
+        partial.replace(target)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        raise
+    return target
 
 
 def _convert_cellranger_h5(source: Path, store: Path) -> None:
@@ -270,6 +321,251 @@ def _analyze_atac(store: Any) -> None:
     store.run_leiden_clustering(graph, resolution=0.6, label="leiden_cluster")
 
 
+def _add_teaseq_annotations(store: Any, source: Path) -> None:
+    import pandas as pd
+
+    with ZipFile(source / TEASEQ_ANNOTATIONS_NAME) as archive:
+        csv_names = [name for name in archive.namelist() if name.endswith(".csv")]
+        if csv_names != ["Figure4_SourceData2_TypeLabelsUMAP.csv"]:
+            raise RuntimeError("Unexpected TEA-seq annotation archive contents")
+        with archive.open(csv_names[0]) as handle:
+            annotations = pd.read_csv(handle)
+    if not annotations["barcode"].is_unique:
+        raise RuntimeError("TEA-seq publication barcodes are not unique")
+
+    original_barcodes = pd.Series(
+        store.cells.fetch_all("original_barcodes"),
+        dtype="string",
+    ).str.replace(r"-\d+$", "", regex=True)
+    well_suffixes = pd.Series(
+        store.cells.fetch_all("well_id"),
+        dtype="string",
+    ).str.extract(r"W(\d+)$", expand=False)
+    if well_suffixes.isna().any():
+        raise RuntimeError("TEA-seq well_id values do not end in a well number")
+    publication_barcodes = original_barcodes + "-" + well_suffixes
+    positions = pd.Index(annotations["barcode"].astype(str)).get_indexer(
+        publication_barcodes,
+    )
+    publication_cells = positions >= 0
+    matched_cells = int(publication_cells.sum())
+    if (
+        len(publication_cells) != TEASEQ_TOTAL_CELLS
+        or matched_cells != TEASEQ_MATCHED_PUBLICATION_CELLS
+    ):
+        raise RuntimeError(
+            "TEA-seq publication mapping must retain "
+            f"{TEASEQ_TOTAL_CELLS:,} cells and select "
+            f"{TEASEQ_MATCHED_PUBLICATION_CELLS:,}; found "
+            f"{len(publication_cells):,} and {matched_cells:,}"
+        )
+
+    def matched_text(column: str) -> np.ndarray:
+        values = np.full(len(positions), "", dtype=object)
+        values[publication_cells] = (
+            annotations[column].astype(str).to_numpy()[positions[publication_cells]]
+        )
+        return values.astype(str)
+
+    def matched_float(column: str) -> np.ndarray:
+        values = np.full(len(positions), np.nan, dtype=np.float64)
+        values[publication_cells] = annotations[column].to_numpy(dtype=np.float64)[
+            positions[publication_cells]
+        ]
+        return values
+
+    store.cells.insert(
+        "publication_barcode",
+        publication_barcodes.to_numpy(dtype=str),
+        overwrite=True,
+    )
+    store.cells.insert(
+        "tea_cell_type",
+        matched_text("seurat_pbmc_cell_type"),
+        overwrite=True,
+    )
+    store.cells.insert(
+        "tea_cell_type_color",
+        matched_text("seurat_pbmc_type_color"),
+        overwrite=True,
+    )
+    store.cells.insert(
+        "tea_predicted_cell_type",
+        matched_text("predicted.celltype.l2"),
+        overwrite=True,
+    )
+    store.cells.insert(
+        "tea_prediction_score",
+        matched_float("predicted.celltype.l2.score"),
+        overwrite=True,
+    )
+    store.cells.update_key(publication_cells, "I")
+    active_cells = int(np.asarray(store.cells.fetch_all("I"), dtype=bool).sum())
+    if active_cells != TEASEQ_MATCHED_PUBLICATION_CELLS:
+        raise RuntimeError(
+            "TEA-seq imported cell filter removed publication matches: "
+            f"expected {TEASEQ_MATCHED_PUBLICATION_CELLS:,}, found {active_cells:,}"
+        )
+
+
+def _convert_teaseq(source: Path, store: Path) -> None:
+    from scarf import SeuratReader
+    from scarf.writers.seurat import SeuratToZarr
+
+    expected_dimensions = {
+        "RNA": (36_601, 7_069),
+        "ATAC": (240_122, 7_069),
+        "ADT": (46, 7_069),
+    }
+    with SeuratReader(
+        source / TEASEQ_RDS_NAME,
+        temp_dir=source,
+        assays=list(expected_dimensions),
+        reductions=[],
+    ) as reader:
+        dimensions = {
+            assay: reader.get_assay(assay).dimensions for assay in expected_dimensions
+        }
+        if dimensions != expected_dimensions:
+            raise RuntimeError(f"Unexpected TEA-seq assay dimensions: {dimensions!r}")
+        SeuratToZarr(
+            reader,
+            str(store),
+            mem_budget=4 * (1 << 30),
+            nthreads=4,
+        ).dump()
+
+    import scarf
+
+    imported = scarf.DataStore(
+        str(store),
+        default_assay="RNA",
+        nthreads=1,
+        mem_budget=4 * (1 << 30),
+    )
+    _add_teaseq_annotations(imported, source)
+
+
+def _build_teaseq_graph(
+    store: Any,
+    *,
+    reduction: Any,
+) -> Any:
+    store.build_embedding_initialization(
+        reduction,
+        n_centroids=100,
+        rand_state=4466,
+    )
+    ann = store.build_ann_index(
+        reduction,
+        ann_parallel=False,
+        rand_state=4466,
+    )
+    neighbors = store.query_neighbors(
+        ann,
+        coordinates=reduction,
+        k=20,
+    )
+    graph = store.build_connectivity_map(neighbors)
+    store.run_umap(
+        graph,
+        n_epochs=250,
+        spread=1,
+        min_dist=0.1,
+        random_seed=4444,
+        parallel=False,
+    )
+    store.run_leiden_clustering(
+        graph,
+        resolution=1.0,
+        label="leiden_cluster",
+        random_seed=4444,
+    )
+    return graph
+
+
+def _analyze_teaseq(store: Any) -> None:
+    store.mark_hvgs(
+        from_assay="RNA",
+        cell_key="I",
+        min_cells=20,
+        top_n=2_000,
+        show_plot=False,
+        hvg_key_name="hvgs",
+    )
+    rna_normalized = store.run_normalization(
+        from_assay="RNA",
+        cell_key="I",
+        feat_key="hvgs",
+    )
+    rna_reduction = store.run_pca(
+        rna_normalized,
+        dims=30,
+        feat_scaling=True,
+    )
+    _build_teaseq_graph(store, reduction=rna_reduction)
+
+    store.mark_prevalent_peaks(
+        from_assay="ATAC",
+        cell_key="I",
+        top_n=25_000,
+        prevalence_key_name="prevalent_peaks",
+    )
+    atac_normalized = store.run_normalization(
+        from_assay="ATAC",
+        cell_key="I",
+        feat_key="prevalent_peaks",
+    )
+    atac_reduction = store.run_lsi(
+        atac_normalized,
+        dims=30,
+        skip_first=True,
+        rand_state=4466,
+        solver="streaming",
+    )
+    _build_teaseq_graph(store, reduction=atac_reduction)
+
+    adt_names = np.asarray(store.ADT.feats.fetch_all("names")).astype(str)
+    adt_controls = np.char.find(np.char.lower(adt_names), "control") >= 0
+    store.ADT.feats.update_key(~adt_controls, "I")
+    adt_normalized = store.run_normalization(
+        from_assay="ADT",
+        cell_key="I",
+        feat_key="I",
+    )
+    adt_reduction = store.run_pca(
+        adt_normalized,
+        dims=15,
+        feat_scaling=True,
+    )
+    _build_teaseq_graph(store, reduction=adt_reduction)
+
+    assays = ["RNA", "ATAC", "ADT"]
+    for label, method in (
+        ("RNA+ATAC+ADT", "snn"),
+        ("RNA+ATAC+ADT_wnn", "wnn"),
+    ):
+        integrated = store.integrate_assays(
+            assays=assays,
+            label=label,
+            method=method,
+        )
+        store.run_umap(
+            integrated,
+            n_epochs=250,
+            spread=1,
+            min_dist=0.1,
+            random_seed=4444,
+            parallel=False,
+        )
+        store.run_leiden_clustering(
+            integrated,
+            resolution=1.0,
+            label="leiden_cluster",
+            random_seed=4444,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class RawDatasetRecipe:
     """One publishable store: where its counts come from and how it is analyzed."""
@@ -278,6 +574,29 @@ class RawDatasetRecipe:
     convert: Callable[[Path, Path], None]
     analyze: Callable[[Any], None]
     summary: str
+    default_assay: str = "RNA"
+    drop_columns: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalDatasetRecipe:
+    """A publishable store built from checksum-pinned public source files."""
+
+    sources: tuple[ExternalSource, ...]
+    convert: Callable[[Path, Path], None]
+    analyze: Callable[[Any], None]
+    summary: str
+    attribution: tuple[str, ...]
+    cell_selection: str
+    import_memory_bytes: int
+    analysis_memory_bytes: int
+    analysis_parameters: tuple[
+        tuple[
+            str,
+            tuple[tuple[str, str | int | float | bool | tuple[str, ...]], ...],
+        ],
+        ...,
+    ]
     default_assay: str = "RNA"
     drop_columns: tuple[str, ...] = ()
 
@@ -293,7 +612,7 @@ class DerivedDatasetRecipe:
     default_assay: str = "RNA"
 
 
-type DatasetRecipe = RawDatasetRecipe | DerivedDatasetRecipe
+type DatasetRecipe = RawDatasetRecipe | ExternalDatasetRecipe | DerivedDatasetRecipe
 
 
 RECIPES: dict[str, DatasetRecipe] = {
@@ -323,6 +642,109 @@ RECIPES: dict[str, DatasetRecipe] = {
         summary=(
             "RNA and ADT chains with UMAP and Leiden, plus SNN and WNN "
             "integrated graphs"
+        ),
+    ),
+    TEASEQ_DATASET: ExternalDatasetRecipe(
+        sources=(
+            ExternalSource(
+                filename=TEASEQ_RDS_NAME,
+                url=(
+                    "https://zenodo.org/api/records/6360802/files/"
+                    f"{TEASEQ_RDS_NAME}/content"
+                ),
+                sha256=(
+                    "501a1716a370a3958a71a1aec8e8620f1496d115329d6943ed2bfa450eefac9f"
+                ),
+            ),
+            ExternalSource(
+                filename=TEASEQ_ANNOTATIONS_NAME,
+                url=(
+                    "https://cdn.elifesciences.org/articles/63632/"
+                    "elife-63632-fig4-data2-v1.zip"
+                ),
+                sha256=(
+                    "012e6a61de2a79bd96302353536d0a8e44f527007df8f32a4c44417e2bfc1197"
+                ),
+            ),
+        ),
+        convert=_convert_teaseq,
+        analyze=_analyze_teaseq,
+        summary=(
+            "RNA PCA, ATAC TF-IDF and LSI, ADT CLR and PCA, modality UMAPs, "
+            "three-way SNN and WNN, integrated UMAPs, and Leiden labels"
+        ),
+        attribution=(
+            "Swanson et al. 2021, eLife 10:e63632",
+            "GEO accession GSM5123951",
+            "eLife Figure 4 source data 2",
+        ),
+        cell_selection=(
+            "Retain all 7,069 imported cells and activate the 6,194 exact "
+            "matches to the 6,333 Figure 4 labels from well W3. The pinned "
+            "Zenodo RDS omits 139 publication-labelled barcodes."
+        ),
+        import_memory_bytes=4 * (1 << 30),
+        analysis_memory_bytes=8 * (1 << 30),
+        analysis_parameters=(
+            (
+                "rna",
+                (
+                    ("normalization", "librarySizeLog1p"),
+                    ("sizeFactor", 1_000),
+                    ("hvgMinCells", 20),
+                    ("hvgTopN", 2_000),
+                    ("pcaDimensions", 30),
+                    ("featureScaling", True),
+                ),
+            ),
+            (
+                "atac",
+                (
+                    ("normalization", "tfIdf"),
+                    ("prevalentPeaks", 25_000),
+                    ("lsiDimensions", 30),
+                    ("skipFirst", True),
+                    ("lsiSolver", "streaming"),
+                ),
+            ),
+            (
+                "adt",
+                (
+                    ("excludedNameSubstring", "control"),
+                    ("normalization", "clr"),
+                    ("pcaDimensions", 15),
+                    ("featureScaling", True),
+                ),
+            ),
+            (
+                "neighborhood",
+                (
+                    ("selfFreeNeighbors", 20),
+                    ("embeddingCentroids", 100),
+                    ("graphSeed", 4_466),
+                    ("annParallel", False),
+                ),
+            ),
+            (
+                "integration",
+                (
+                    ("assayOrder", ("RNA", "ATAC", "ADT")),
+                    ("methods", ("snn", "wnn")),
+                    ("wnnL2Normalize", True),
+                ),
+            ),
+            (
+                "layoutAndClustering",
+                (
+                    ("umapEpochs", 250),
+                    ("umapSpread", 1.0),
+                    ("umapMinDist", 0.1),
+                    ("umapSeed", 4_444),
+                    ("umapParallel", False),
+                    ("leidenResolution", 1.0),
+                    ("leidenSeed", 4_444),
+                ),
+            ),
         ),
     ),
     KANG_CONTROL_DATASET: DerivedDatasetRecipe(
@@ -473,7 +895,6 @@ def build_store(
 
     started = datetime.now(UTC)
     work = destination / "_source"
-    repository = scarf.cytebase.connect(repository_name)
 
     output = destination / dataset
     output.mkdir(parents=True, exist_ok=True)
@@ -481,6 +902,7 @@ def build_store(
     if store.exists():
         shutil.rmtree(store)
     if isinstance(recipe, RawDatasetRecipe):
+        repository = scarf.cytebase.connect(repository_name)
         for name in recipe.sources:
             repository.download(f"{dataset}/{name}", destination=str(work))
         recipe.convert(work / dataset, store)
@@ -495,7 +917,33 @@ def build_store(
         source_files = list(recipe.sources)
         source_datasets: list[str] = []
         carried_columns: list[str] = []
+        external_sources: list[dict[str, str]] = []
+    elif isinstance(recipe, ExternalDatasetRecipe):
+        source_directory = work / dataset
+        for source in recipe.sources:
+            _download_external_source(source, source_directory)
+        recipe.convert(source_directory, store)
+
+        if recipe.drop_columns:
+            _drop_columns(
+                store=store,
+                patterns=recipe.drop_columns,
+                default_assay=recipe.default_assay,
+            )
+
+        source_files = [source.filename for source in recipe.sources]
+        source_datasets = []
+        carried_columns = []
+        external_sources = [
+            {
+                "filename": source.filename,
+                "url": source.url,
+                "sha256": source.sha256,
+            }
+            for source in recipe.sources
+        ]
     else:
+        repository = scarf.cytebase.connect(repository_name)
         source_paths = _resolve_derived_sources(
             repository=repository,
             source_datasets=recipe.source_datasets,
@@ -506,11 +954,18 @@ def build_store(
         source_files = []
         source_datasets = list(recipe.source_datasets)
         carried_columns = []
+        external_sources = []
 
+    datastore_options = (
+        {"mem_budget": recipe.analysis_memory_bytes}
+        if isinstance(recipe, ExternalDatasetRecipe)
+        else {}
+    )
     datastore = DataStore(
         str(store),
         default_assay=recipe.default_assay,
         nthreads=4,
+        **datastore_options,
     )
     recipe.analyze(datastore)
 
@@ -547,6 +1002,17 @@ def build_store(
             f"and swaps {ARCHIVE_NAME} in place.",
         ],
     }
+    if isinstance(recipe, ExternalDatasetRecipe):
+        manifest["externalSources"] = external_sources
+        manifest["attribution"] = list(recipe.attribution)
+        manifest["cellSelection"] = recipe.cell_selection
+        manifest["memoryBudgets"] = {
+            "importBytes": recipe.import_memory_bytes,
+            "analysisBytes": recipe.analysis_memory_bytes,
+        }
+        manifest["analysisParameters"] = {
+            stage: dict(parameters) for stage, parameters in recipe.analysis_parameters
+        }
     MANIFEST_DIR.mkdir(parents=True, exist_ok=True)
     manifest_path = MANIFEST_DIR / f"{dataset}_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
@@ -561,6 +1027,14 @@ def build_store(
     return store
 
 
+def _datasets_for_all() -> list[str]:
+    return [
+        name
+        for name, recipe in RECIPES.items()
+        if not isinstance(recipe, ExternalDatasetRecipe)
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -572,7 +1046,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Rebuild every dataset in the recipe table",
+        help="Rebuild every Cytebase-backed dataset, excluding external sources",
     )
     parser.add_argument(
         "--repository",
@@ -587,7 +1061,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    selected = list(RECIPES) if args.all else list(args.datasets)
+    if args.all and args.datasets:
+        parser.error("--all cannot be combined with named datasets")
+    selected = _datasets_for_all() if args.all else list(args.datasets)
     if not selected:
         parser.error("name at least one dataset or pass --all")
     args.destination.mkdir(parents=True, exist_ok=True)

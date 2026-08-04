@@ -16,6 +16,7 @@ from tests.test_seurat_reader import (
     _Wire,
     _legacy_assay,
     _reduction,
+    _write_chromatin_fixture,
     _write_fixture,
 )
 
@@ -34,7 +35,11 @@ def _ordered_factor(
     )
 
 
-def _partial_assay5(wire: _Wire) -> bytes:
+def _partial_assay5(
+    wire: _Wire,
+    *,
+    source_class: str = "Assay5",
+) -> bytes:
     layer_names = ["counts", "data"]
     layers = wire.vector(
         [
@@ -59,12 +64,17 @@ def _partial_assay5(wire: _Wire) -> bytes:
                 wire.logmap([1, 1, 1, 1], ["p1", "p2"], layer_names),
             ),
             ("meta.data", metadata),
-            ("class", wire.string_vector(["Assay5"])),
+            ("class", wire.string_vector([source_class])),
         ]
     )
 
 
-def _write_partial_fixture(path: Path, *, reduction_name: str = "pca") -> Path:
+def _write_partial_fixture(
+    path: Path,
+    *,
+    reduction_name: str = "pca",
+    assay5_source_class: str = "Assay5",
+) -> Path:
     wire = _Wire()
     metadata = wire.data_frame(
         [
@@ -88,7 +98,13 @@ def _write_partial_fixture(path: Path, *, reduction_name: str = "pca") -> Path:
             (
                 "assays",
                 wire.vector(
-                    [_legacy_assay(wire), _partial_assay5(wire)],
+                    [
+                        _legacy_assay(wire),
+                        _partial_assay5(
+                            wire,
+                            source_class=assay5_source_class,
+                        ),
+                    ],
                     names=["RNA", "ADT"],
                 ),
             ),
@@ -199,6 +215,33 @@ def test_import_materializes_metadata_counts_membership_and_pca(
         result.defaultAssay = "ADT"  # type: ignore[misc]
 
 
+def test_assay5_subclass_preserves_partial_cell_membership(
+    tmp_path: Path,
+) -> None:
+    source = _write_partial_fixture(
+        tmp_path / "partial-subclass.rds",
+        assay5_source_class="ChromatinAssay5",
+    )
+    destination = MemoryStore()
+
+    with SeuratReader(source) as reader:
+        assert reader.get_assay("ADT").sourceClass == "ChromatinAssay5"
+        SeuratToZarr(
+            reader,
+            destination,
+            mem_budget="64M",
+            nthreads=1,
+            targetChunkBytes=1024,
+            targetShardBytes=4096,
+        ).dump(batch_size=1)
+
+    root = zarr.open_group(store=destination, mode="r")
+    np.testing.assert_array_equal(
+        root["cellData/ADT_I"][:],
+        [True, False, True],
+    )
+
+
 def test_imported_store_is_readable_by_datastore(tmp_path: Path) -> None:
     source = _write_fixture(tmp_path / "datastore.rds")
     destination = MemoryStore()
@@ -226,6 +269,46 @@ def test_imported_store_is_readable_by_datastore(tmp_path: Path) -> None:
     assert store.get_assay("RNA").rawData.shape == (3, 2)
     assert store.get_assay_state("RNA") is not None
     assert store.get_assay_state("RNA").reduction is None  # type: ignore[union-attr]
+
+
+def test_chromatin_assay_streams_counts_and_round_trips_to_zarr(
+    tmp_path: Path,
+) -> None:
+    source = _write_chromatin_fixture(tmp_path / "chromatin.rds")
+    destination = MemoryStore()
+
+    with SeuratReader(source) as reader:
+        result = SeuratToZarr(
+            reader,
+            destination,
+            mem_budget="64M",
+            nthreads=1,
+            targetChunkBytes=1024,
+            targetShardBytes=4096,
+        ).dump(batch_size=1)
+
+    root = zarr.open_group(store=destination, mode="r")
+    assert result.assayNames == ("ATAC",)
+    assert result.defaultAssay == "ATAC"
+    assert "lsi" in result.reductionArtifacts
+    np.testing.assert_array_equal(
+        root["ATAC/counts"][:],
+        [[1, 0], [0, 2], [3, 0]],
+    )
+    assert any(
+        notice.code == "ignored_assay_slot"
+        and notice.objectPath == "assays/ATAC/ranges"
+        for notice in result.notices
+    )
+    store = DataStore(
+        destination,
+        min_features_per_cell=0,
+        min_cells_per_feature=0,
+        nthreads=1,
+        mem_budget="64M",
+    )
+    assert store.assay_names == ["ATAC"]
+    assert store.ATAC.rawData.shape == (3, 2)
 
 
 def test_import_normalizes_seurat_reduction_name_for_assay_state(

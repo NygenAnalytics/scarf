@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 
 from scarf import ArtifactRef
+from scarf.datastore.datastore import DataStore
 from scarf.storage.artifacts import parse_artifact_path
+from scarf.storage.schema import create_zarr_count_assay
 from scarf.graph.state import AssayState
 from tests.fixtures_datastore import build_neighbourhood_graph
 
@@ -42,6 +44,25 @@ def _state_refs(state: AssayState) -> dict[str, str]:
         if (ref := getattr(state, field.name, None)) is not None
         and hasattr(ref, "artifact_id")
     }
+
+
+def _add_third_assay(datastore) -> DataStore:
+    source = datastore.assay2
+    counts = create_zarr_count_assay(
+        datastore.zw,
+        "ADT",
+        workspace=None,
+        n_cells=source.cells.N,
+        feat_ids=np.asarray(source.feats.fetch_all("ids")),
+        feat_names=np.asarray(source.feats.fetch_all("names")),
+        dtype=str(source.rawData.dtype),
+    )
+    counts[:, :] = np.asarray(source.rawData.compute())
+    return DataStore(
+        datastore.zarr_loc,
+        default_assay="RNA",
+        nthreads=datastore.nthreads,
+    )
 
 
 def test_graph_construction_chain_writes_only_artifacts_and_state(
@@ -468,3 +489,81 @@ def test_wnn_uses_exact_nondefault_cell_selection(
         rechunked["modality_weights"][:],
         expected_modality_weights,
     )
+
+
+def test_three_way_wnn_persists_ordered_weights_and_reuses_artifact(
+    datastore_ephemeral,
+) -> None:
+    datastore = _add_third_assay(datastore_ephemeral)
+    _prepare_features(datastore)
+    build_neighbourhood_graph(datastore, **_graph_kwargs())
+    for assay in ("assay2", "ADT"):
+        build_neighbourhood_graph(
+            datastore,
+            from_assay=assay,
+            cell_key="I",
+            feat_key="I",
+            dims=3,
+            k=3,
+            n_centroids=10,
+            batch_size=200,
+            local_cache=False,
+        )
+
+    assays = ["RNA", "assay2", "ADT"]
+    integrated = datastore.integrate_assays(
+        assays,
+        label="artifact_wnn_three",
+        method="wnn",
+    )
+    group = datastore.load_artifact(integrated)
+    n_cells = int(datastore.cells.fetch_all("I").sum())
+
+    assert group["modality_weights"].dtype == np.dtype(np.float32)
+    assert group["modality_weights"].shape == (n_cells, 3)
+    assert group.attrs["assays"] == assays
+    np.testing.assert_allclose(
+        np.asarray(group["modality_weights"][:]).sum(axis=1),
+        1,
+        rtol=1e-6,
+    )
+    status = datastore.inspect_artifact(integrated)
+    assert status.parameters == {
+        "method": "wnn",
+        "assays": assays,
+        "l2_normalize": True,
+    }
+    assert all(
+        set(status.inputs[assay]) == {"neighbors", "coordinates"} for assay in assays
+    )
+
+    columns = [
+        "artifact_wnn_three_RNA_weight",
+        "artifact_wnn_three_assay2_weight",
+        "artifact_wnn_three_ADT_weight",
+    ]
+    for index, column in enumerate(columns):
+        np.testing.assert_allclose(
+            datastore.cells.fetch(column),
+            np.asarray(group["modality_weights"][:, index]),
+        )
+        attrs = datastore.zw["cellData"][column].attrs
+        assert attrs["source_artifact"] == integrated.to_dict()
+        assert attrs["source_value"] == "modality_weights"
+        assert attrs["value_index"] == index
+
+    graph = datastore.load_graph(graph_loc=status.path)
+    assert graph.shape == (n_cells, n_cells)
+    assert graph.nnz == n_cells * 3
+    embedding = datastore.run_umap(integrated, n_epochs=10, label="three_way")
+    assert embedding.kind == "embedding"
+
+    for column in columns:
+        datastore.cells.drop(column)
+    reused = datastore.integrate_assays(
+        tuple(assays),  # type: ignore[arg-type]
+        label="artifact_wnn_three",
+        method="wnn",
+    )
+    assert reused == integrated
+    assert all(column in datastore.cells.columns for column in columns)

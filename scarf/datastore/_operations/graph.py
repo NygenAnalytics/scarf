@@ -3474,10 +3474,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         """Integrate the latest neighbourhood graphs for selected assays.
 
         SNN combines shared edge support across two or more assays. WNN accepts
-        exactly two assays and uses Hao-inspired per-cell modality weights.
+        two or more assays and uses Hao-inspired per-cell modality weights.
         Scarf WNN scores only the union of the existing self-free KNN rows and
-        uses a simple k-th-neighbour bandwidth, so it is not bit-identical to
-        Seurat's default wider search and SNN-far bandwidth.
+        uses the distance span from the nearest to the k-th neighbour as its
+        bandwidth, so it is not bit-identical to Seurat's default wider search
+        and SNN-far bandwidth.
 
         Args:
             assays: Name of the input assays. The latest constructed graph from each assay is used.
@@ -3494,20 +3495,21 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             `run_tsne`, or the clustering methods as their ``graph`` argument,
             or keep using ``integrated_graph=label``.
 
-        WNN stores two modality-weight columns named
+        WNN stores one modality-weight column per assay, named
         ``{label}_{assay}_weight`` in cell metadata.
         """
         from ...neighbors.graph import merge_graphs
-        from ...neighbors.integration import wnn_integration
+        from ...neighbors.integration import _wnn_integration_many
 
+        assays = list(assays)
         if method not in {"snn", "wnn"}:
             raise ValueError(
                 f"Method {method} not supported, choose one of these: 'snn', 'wnn'"
             )
-        if method == "wnn" and len(assays) != 2:
-            raise ValueError(
-                "WNN integration in Scarf can currently be performed using only two assays"
-            )
+        if method == "wnn" and len(assays) < 2:
+            raise ValueError("WNN integration requires at least two assays")
+        if method == "wnn" and len(set(assays)) != len(assays):
+            raise ValueError("WNN integration requires unique assay names")
         if method == "wnn" and not isinstance(l2_normalize, bool | np.bool_):
             raise TypeError("l2_normalize must be a boolean")
 
@@ -3691,7 +3693,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             required_arrays.append(
                 ArrayRequirement(
                     "modality_weights",
-                    shape=(None, 2),
+                    shape=(None, len(assays)),
                     dtype=np.float32,
                 )
             )
@@ -3737,6 +3739,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if method != "wnn":
                 return
             group = artifact_group(self.zw, integrated_plan.ref)
+            stored_assays = group.attrs.get("assays")
+            if not isinstance(stored_assays, list) or stored_assays != assays:
+                raise RuntimeError("Stored WNN modality assay order is invalid")
             try:
                 stored_n_cells = _positive_integer(
                     group.attrs.get("n_cells"),
@@ -3753,7 +3758,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )[:],
                 dtype=np.float32,
             )
-            if values.shape != (stored_n_cells, 2):
+            if values.shape != (stored_n_cells, len(assays)):
                 raise RuntimeError("Stored WNN modality weights have an invalid shape")
             for index, column in enumerate(weight_columns):
                 column_values = values[:, index]
@@ -3839,15 +3844,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 )
             merged_graph = merge_graphs(graphs)
         elif method == "wnn":
-            indices1, ld1 = load_wnn_inputs(assays[0])
-            indices2, ld2 = load_wnn_inputs(assays[1])
-            merged_graph, modality_weights = wnn_integration(
-                assays[0],
-                indices1,
-                ld1,
-                assays[1],
-                indices2,
-                ld2,
+            modalities = [(assay, *load_wnn_inputs(assay)) for assay in assays]
+            merged_graph, modality_weights = _wnn_integration_many(
+                modalities,
                 self.nthreads,
                 l2_normalize=l2_normalize,
             )
@@ -3882,7 +3881,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             stored_modality_weights = create_zarr_dataset(
                 store,
                 "modality_weights",
-                (min(chunk_size, n_cells), 2),
+                (min(chunk_size, n_cells), len(assays)),
                 np.float32,
                 modality_weights.shape,
             )

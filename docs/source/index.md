@@ -134,9 +134,9 @@ path, not reimplementation for its own sake.
   [Harmony](https://doi.org/10.1038/s41592-019-0619-0) and
   [Symphony-style](https://doi.org/10.1038/s41467-021-25957-x) fixed-reference
   mapping, with label transfer and mapping diagnostics.
-- **Matched multi-omics:** {term}`SNN integration` for two or more assays and a
-  [Hao-inspired WNN](https://doi.org/10.1016/j.cell.2021.04.048) implementation
-  for exactly two modalities, reporting per-cell modality weights.
+- **Matched multi-omics:** {term}`SNN integration` and
+  [Hao-inspired WNN](https://doi.org/10.1016/j.cell.2021.04.048) integration
+  for two or more assays, with WNN reporting one per-cell weight per modality.
 - **Clustering and sampling:**
   [Leiden](https://doi.org/10.1038/s41598-019-41695-z), a native implementation
   of [Paris hierarchical clustering](https://doi.org/10.48550/arXiv.1806.01664)
@@ -176,10 +176,11 @@ establish biological ground truth.
   large-tie corrections.
 - Paris hierarchies are compared with the scikit-network reference
   implementation on tie-free graphs.
-- WNN is checked against scalar reference calculations and for modality-order
-  symmetry, row-order invariance, and degenerate bandwidths. It follows the
-  published weighting equations but is not bit-identical to Seurat defaults, as
-  described in {ref}`the FAQ <faq>`.
+- WNN is checked against scalar reference calculations, a two-modality CITE-seq
+  fixture, and a synthetic three-modality Seurat 5.5.1 fixture, plus
+  modality-order symmetry, row-order invariance, and degenerate bandwidths. It
+  follows the published weighting equations but is not bit-identical to Seurat
+  defaults, as described in {ref}`the FAQ <faq>`.
 - AUCell and WAGGR scores are checked against frozen decoupler 2.2 fixtures.
 - Fate probabilities are checked against dense Dirichlet solutions on controlled
   graphs.
@@ -199,7 +200,7 @@ provide scVI, Scanorama, RNA velocity, peak calling, FRiP/TSS APIs, or a
 complete replicate-aware differential-expression framework. Marker searches
 report cell-level Mann-Whitney statistics, AUC, and within-group multiple-testing
 correction, which are not a substitute for inference across biological
-replicates. {term}`WNN integration` requires exactly two cell-aligned
+replicates. {term}`WNN integration` requires two or more cell-aligned
 modalities, and Scarf does not align unpaired modalities. Fate mapping needs
 user-supplied terminal states and does not infer them or use RNA velocity.
 Imputation is intended for exploratory visualization rather than differential

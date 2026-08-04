@@ -106,57 +106,57 @@ def _prediction_affinity(
     )
 
 
-def wnn_integration(
-    name1: str,
-    indices1: np.ndarray,
-    ld1: np.ndarray,
-    name2: str,
-    indices2: np.ndarray,
-    ld2: np.ndarray,
+def _wnn_integration_many(
+    modalities: list[tuple[str, np.ndarray, np.ndarray]],
     n_threads: int,
     *,
     l2_normalize: bool = True,
 ) -> tuple[coo_matrix, np.ndarray]:
-    """Build a Hao-inspired WNN graph and per-cell modality weights.
-
-    Candidates are the union of two self-free neighbour-index rows. Each
-    modality uses its own nearest and k-th-neighbour distances to convert
-    distances into affinities. Rows are L2-normalized during scoring by default.
-    The returned COO graph stores blended affinity as float32 edge weights, and
-    the second array stores two float32 modality weights per cell.
-
-    This bounded candidate pool and simple bandwidth differ from Seurat's
-    default wider search and SNN-far bandwidth. At 100,000 cells with 20
-    neighbours per modality the path measures 137 to 146 microseconds per cell
-    single-threaded, and peak memory grows by about 0.9 MB per 1,000 cells.
-    """
+    """Build an N-modality WNN graph using Scarf's bounded candidate pool."""
     if not isinstance(l2_normalize, bool | np.bool_):
         raise TypeError("l2_normalize must be a boolean")
+    if len(modalities) < 2:
+        raise ValueError("WNN integration requires at least two modalities")
 
-    neighbor_indices1 = _validate_neighbor_indices(name1, indices1)
-    n_cells, k1 = neighbor_indices1.shape
-    neighbor_indices2 = _validate_neighbor_indices(name2, indices2, n_cells)
-    k2 = neighbor_indices2.shape[1]
-    ld1 = _validate_embedding(name1, ld1, n_cells)
-    ld2 = _validate_embedding(name2, ld2, n_cells)
+    names = [name for name, _indices, _embedding in modalities]
+    if len(set(names)) != len(names):
+        raise ValueError("WNN modality names must be unique")
 
-    nk = min(k1, k2)
-    if k1 != k2:
+    first_name, first_indices, first_embedding = modalities[0]
+    validated_indices = [_validate_neighbor_indices(first_name, first_indices)]
+    n_cells = validated_indices[0].shape[0]
+    validated_embeddings = [_validate_embedding(first_name, first_embedding, n_cells)]
+    for name, indices, embedding in modalities[1:]:
+        validated_indices.append(
+            _validate_neighbor_indices(name, indices, expected_cells=n_cells)
+        )
+        validated_embeddings.append(_validate_embedding(name, embedding, n_cells))
+
+    neighbor_counts = [indices.shape[1] for indices in validated_indices]
+    nk = min(neighbor_counts)
+    if len(set(neighbor_counts)) != 1:
+        counts = ", ".join(
+            f"{name}: {count}"
+            for name, count in zip(names, neighbor_counts, strict=True)
+        )
         logger.warning(
-            f"WNN graphs have different neighbor counts ({name1}: {k1}, "
-            f"{name2}: {k2}). The integrated graph will retain {nk} "
+            f"WNN graphs have different neighbor counts ({counts}). "
+            f"The integrated graph will retain {nk} "
             "neighbors per cell."
         )
 
     from threadpoolctl import threadpool_limits
 
-    inverse_norms1 = _inverse_row_norms(ld1) if l2_normalize else None
-    inverse_norms2 = _inverse_row_norms(ld2) if l2_normalize else None
+    inverse_norms = (
+        [_inverse_row_norms(embedding) for embedding in validated_embeddings]
+        if l2_normalize
+        else [None] * len(modalities)
+    )
     index_dtype = np.uint32 if n_cells < 2**32 else np.uint64
     output_size = n_cells * nk
     merged_columns = np.empty(output_size, dtype=index_dtype)
     merged_data = np.empty(output_size, dtype=np.float32)
-    modality_weights = np.empty((n_cells, 2), dtype=np.float32)
+    modality_weights = np.empty((n_cells, len(modalities)), dtype=np.float32)
 
     with threadpool_limits(limits=n_threads):
         for cell_idx in iter_progress(
@@ -164,90 +164,117 @@ def wnn_integration(
             desc="Building WNN graph",
             total=n_cells,
         ):
-            neighbors1 = neighbor_indices1[cell_idx]
-            neighbors2 = neighbor_indices2[cell_idx]
-            mixed_k = np.union1d(neighbors1, neighbors2)
+            neighbor_rows = [indices[cell_idx] for indices in validated_indices]
+            mixed_k = neighbor_rows[0]
+            for neighbors in neighbor_rows[1:]:
+                mixed_k = np.union1d(mixed_k, neighbors)
 
-            candidate_data1 = ld1[mixed_k]
-            candidate_data2 = ld2[mixed_k]
-            point1 = ld1[cell_idx]
-            point2 = ld2[cell_idx]
-            if inverse_norms1 is not None:
-                candidate_data1 = candidate_data1 * inverse_norms1[mixed_k, np.newaxis]
-                point1 = point1 * inverse_norms1[cell_idx]
-            if inverse_norms2 is not None:
-                candidate_data2 = candidate_data2 * inverse_norms2[mixed_k, np.newaxis]
-                point2 = point2 * inverse_norms2[cell_idx]
+            candidate_data: list[np.ndarray] = []
+            points: list[np.ndarray] = []
+            distances: list[np.ndarray] = []
+            positions = [
+                np.searchsorted(mixed_k, neighbors) for neighbors in neighbor_rows
+            ]
+            nearest_distances: list[float] = []
+            bandwidths: list[float] = []
+            for embedding, inverse, own_positions in zip(
+                validated_embeddings,
+                inverse_norms,
+                positions,
+                strict=True,
+            ):
+                candidates = embedding[mixed_k]
+                point = embedding[cell_idx]
+                if inverse is not None:
+                    candidates = candidates * inverse[mixed_k, np.newaxis]
+                    point = point * inverse[cell_idx]
+                modality_distances = np.linalg.norm(point - candidates, axis=1)
+                ranked_distances = np.sort(modality_distances[own_positions])
+                nearest_distance = float(ranked_distances[0])
+                candidate_data.append(candidates)
+                points.append(point)
+                distances.append(modality_distances)
+                nearest_distances.append(nearest_distance)
+                bandwidths.append(float(ranked_distances[-1] - nearest_distance))
 
-            distances1 = np.linalg.norm(point1 - candidate_data1, axis=1)
-            distances2 = np.linalg.norm(point2 - candidate_data2, axis=1)
-            positions1 = np.searchsorted(mixed_k, neighbors1)
-            positions2 = np.searchsorted(mixed_k, neighbors2)
-            self_distances1 = distances1[positions1]
-            self_distances2 = distances2[positions2]
-            ranked_distances1 = np.sort(self_distances1)
-            ranked_distances2 = np.sort(self_distances2)
-            nearest_distance1 = float(ranked_distances1[0])
-            nearest_distance2 = float(ranked_distances2[0])
-            bandwidth1 = float(ranked_distances1[-1] - nearest_distance1)
-            bandwidth2 = float(ranked_distances2[-1] - nearest_distance2)
-
-            theta_self1 = _prediction_affinity(
-                point1,
-                candidate_data1[positions1].mean(axis=0),
-                nearest_distance1,
-                bandwidth1,
-            )
-            theta_cross1 = _prediction_affinity(
-                point1,
-                candidate_data1[positions2].mean(axis=0),
-                nearest_distance1,
-                bandwidth1,
-            )
-            theta_self2 = _prediction_affinity(
-                point2,
-                candidate_data2[positions2].mean(axis=0),
-                nearest_distance2,
-                bandwidth2,
-            )
-            theta_cross2 = _prediction_affinity(
-                point2,
-                candidate_data2[positions1].mean(axis=0),
-                nearest_distance2,
-                bandwidth2,
-            )
-            score1 = float(
-                np.clip(
-                    theta_self1 / (theta_cross1 + 1e-4),
-                    0,
-                    200,
+            within_affinities = [
+                _prediction_affinity(
+                    point,
+                    candidates[own_positions].mean(axis=0),
+                    nearest_distance,
+                    bandwidth,
                 )
-            )
-            score2 = float(
-                np.clip(
-                    theta_self2 / (theta_cross2 + 1e-4),
-                    0,
-                    200,
+                for point, candidates, own_positions, nearest_distance, bandwidth in zip(
+                    points,
+                    candidate_data,
+                    positions,
+                    nearest_distances,
+                    bandwidths,
+                    strict=True,
                 )
+            ]
+            scores = np.full(
+                (len(modalities), len(modalities)),
+                -np.inf,
+                dtype=np.float64,
             )
+            for target_idx, (
+                point,
+                candidates,
+                nearest_distance,
+                bandwidth,
+                within_affinity,
+            ) in enumerate(
+                zip(
+                    points,
+                    candidate_data,
+                    nearest_distances,
+                    bandwidths,
+                    within_affinities,
+                    strict=True,
+                )
+            ):
+                for source_idx, source_positions in enumerate(positions):
+                    if source_idx == target_idx:
+                        continue
+                    cross_affinity = _prediction_affinity(
+                        point,
+                        candidates[source_positions].mean(axis=0),
+                        nearest_distance,
+                        bandwidth,
+                    )
+                    scores[target_idx, source_idx] = np.clip(
+                        within_affinity / (cross_affinity + 1e-4),
+                        0,
+                        200,
+                    )
 
-            max_score = max(score1, score2)
-            exp1 = np.exp(score1 - max_score)
-            exp2 = np.exp(score2 - max_score)
-            normalizer = exp1 + exp2
-            weight1 = float(exp1 / normalizer)
-            weight2 = float(exp2 / normalizer)
-            modality_weights[cell_idx] = (weight1, weight2)
+            finite_scores = scores[np.isfinite(scores)]
+            max_score = float(finite_scores.max())
+            pairwise_strengths = np.zeros(scores.shape, dtype=np.float64)
+            finite = np.isfinite(scores)
+            pairwise_strengths[finite] = np.exp(scores[finite] - max_score)
+            modality_strengths = pairwise_strengths.sum(axis=1)
+            weights = modality_strengths / modality_strengths.sum()
+            modality_weights[cell_idx] = weights
 
-            combined_affinity = weight1 * _kernel_affinity(
-                distances1,
-                nearest_distance1,
-                bandwidth1,
-            ) + weight2 * _kernel_affinity(
-                distances2,
-                nearest_distance2,
-                bandwidth2,
+            combined_affinity = weights[0] * _kernel_affinity(
+                distances[0],
+                nearest_distances[0],
+                bandwidths[0],
             )
+            for weight, modality_distances, nearest_distance, bandwidth in zip(
+                weights[1:],
+                distances[1:],
+                nearest_distances[1:],
+                bandwidths[1:],
+                strict=True,
+            ):
+                combined_affinity += weight * _kernel_affinity(
+                    modality_distances,
+                    nearest_distance,
+                    bandwidth,
+                )
             selected = np.lexsort((mixed_k, -combined_affinity))[:nk]
             output_slice = slice(cell_idx * nk, (cell_idx + 1) * nk)
             merged_columns[output_slice] = mixed_k[selected]
@@ -266,3 +293,39 @@ def wnn_integration(
         shape=(n_cells, n_cells),
     )
     return graph, modality_weights
+
+
+def wnn_integration(
+    name1: str,
+    indices1: np.ndarray,
+    ld1: np.ndarray,
+    name2: str,
+    indices2: np.ndarray,
+    ld2: np.ndarray,
+    n_threads: int,
+    *,
+    l2_normalize: bool = True,
+) -> tuple[coo_matrix, np.ndarray]:
+    """Build a two-modality WNN graph and per-cell modality weights.
+
+    Candidates are the union of two self-free neighbour-index rows. Each
+    modality uses its own nearest and k-th-neighbour distances to convert
+    distances into affinities. Rows are L2-normalized during scoring by default.
+    The returned COO graph stores blended affinity as float32 edge weights, and
+    the second array stores two float32 modality weights per cell.
+
+    This bounded candidate pool and simple bandwidth differ from Seurat's
+    default wider search and SNN-far bandwidth. This adapter is the
+    two-modality special case of Scarf's private N-modality implementation.
+    """
+    private_names = (
+        (name1, name2) if name1 != name2 else (f"{name1} [first]", f"{name2} [second]")
+    )
+    return _wnn_integration_many(
+        [
+            (private_names[0], indices1, ld1),
+            (private_names[1], indices2, ld2),
+        ],
+        n_threads,
+        l2_normalize=l2_normalize,
+    )

@@ -24,6 +24,8 @@ subtrees:
         title: scATAC-seq
       - file: tutorials/cite_seq
         title: CITE-seq
+      - file: tutorials/tea_seq
+        title: TEA-seq
   - caption: Integration and mapping
     entries:
       - file: tutorials/data_integration

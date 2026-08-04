@@ -59,28 +59,34 @@ execution; live notebooks animate the same operations.
 
 Both merge modality-specific KNN graphs with `integrate_assays`. SNN (default)
 supports two or more assays and combines shared edge support. WNN
-(`method='wnn'`) requires exactly two assays, learns two weights per cell, and
-ranks candidates by the resulting blended affinity.
+(`method='wnn'`) also supports two or more assays, learns one weight per assay
+and cell, and ranks candidates by the resulting blended affinity.
 
 Scarf WNN follows the weighting equations from Hao et al. but does not reproduce
-Seurat's default search exactly. It considers at most the union of the two
-existing KNN rows, uses the `k`-th nonself neighbour for bandwidth, and
-L2-normalizes rows only during scoring. Seurat normally searches a wider
-`knn.range=200` pool and uses SNN-far bandwidth. Scarf's smaller pool avoids two
-additional index builds, 20 million queries, and 4 billion materialized candidate
-records at ten million cells.
+Seurat's default search exactly. It considers the union of the existing KNN rows,
+uses the distance span from each assay's nearest to its `k`-th nonself neighbour
+as that assay's bandwidth, and L2-normalizes rows only during scoring. For each
+cell and ordered pair of modalities, it compares within-modality and
+cross-modality prediction affinity. It then sums the exponentiated directed
+scores for each target modality and normalizes those grouped strengths across
+all modalities.
+
+Seurat normally searches a wider `knn.range=200` pool and uses SNN-far
+bandwidth. Scarf instead reuses the stored assay graphs. With two modalities,
+avoiding the wider search at ten million cells saves two additional index
+builds, 20 million queries, and 4 billion materialized candidate records.
 
 Both differences are measured rather than assumed. Given the same candidate pool and bandwidth,
-Scarf reproduces Seurat 5.5.1 to the float32 resolution of the stored graph. Against Seurat's
-shipped defaults on a CITE-seq subset, Scarf selects 89 percent of the same neighbours and its
-per-cell RNA weight correlates at 0.76. The reference values ship with the test suite, so both
-numbers are checked on every run.
+Scarf reproduces Seurat 5.5.1 to the float32 resolution of the stored graph in
+both two-modality and synthetic three-modality fixtures. Against Seurat's
+shipped defaults on a two-modality CITE-seq subset, Scarf selects 89 percent of
+the same neighbours and its per-cell RNA weight correlates at 0.76. The
+reference values ship with the test suite.
 
-At 100,000 cells with 20 neighbours per modality the corrected path measures 137 to 146
-microseconds per cell single-threaded, which extrapolates to roughly 25 minutes at ten million
-cells. Peak memory grows by about 0.9 MB per 1,000 cells, so ten million cells need roughly 9 to 10
-GB. Both figures come from synthetic benchmarks at 100,000 to 200,000 cells rather than a
-ten-million-cell run. See {ref}`WNN integration <wnn_integration>` for deviations and trade-offs.
+The per-cell prediction work grows quadratically with the number of modalities,
+while scoring blended graph edges is linear in the union candidate pool. Stored
+neighbour rows, output edges, and modality weights remain linear in cell count.
+See {ref}`WNN integration <wnn_integration>` for deviations and trade-offs.
 
 ## How do I compute LISI in Scarf?
 

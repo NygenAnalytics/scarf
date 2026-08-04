@@ -64,6 +64,7 @@ statistics, not replicate-aware differential expression.
 features that were not tested and adjusts p-values over tested features only.
 
 {py:meth}`~scarf.DataStore.integrate_assays` is the public SNN/WNN graph integration entry point.
+Both methods accept two or more cell-aligned assays; WNN stores one per-cell weight for each assay.
 The recommended workflow is in {doc}`../../tutorials/cite_seq`; method comparison and diagnostics
 are in {doc}`../../tutorials/multimodal_integration`.
 

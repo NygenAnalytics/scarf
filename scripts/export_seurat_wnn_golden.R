@@ -31,18 +31,40 @@ write_matrix <- function(values, name) {
   writeLines(lines, file.path(work, name))
 }
 
-rna <- read_matrix("rna_embedding.tsv")
-adt <- read_matrix("adt_embedding.tsv")
+spec <- read.table(
+  file.path(work, "modalities.tsv"),
+  header = FALSE,
+  sep = "\t",
+  col.names = c("name", "stem", "reduction"),
+  stringsAsFactors = FALSE
+)
+if (nrow(spec) < 2L || anyDuplicated(spec$name) || anyDuplicated(spec$reduction)) {
+  stop("modality specification must contain at least two unique entries")
+}
+modality_names <- spec$name
+reductions <- spec$reduction
+embeddings <- setNames(lapply(seq_len(nrow(spec)), function(i) {
+  read_matrix(paste0(spec$stem[[i]], "_embedding.tsv"))
+}), reductions)
 # Python writes zero-based, self-free neighbour rows.
-rna_idx <- read_matrix("rna_indices.tsv") + 1
-adt_idx <- read_matrix("adt_indices.tsv") + 1
+indices <- setNames(lapply(seq_len(nrow(spec)), function(i) {
+  read_matrix(paste0(spec$stem[[i]], "_indices.tsv")) + 1
+}), reductions)
 
-n_cells <- nrow(rna)
-k <- ncol(rna_idx)
+n_cells <- nrow(embeddings[[1]])
+k <- ncol(indices[[1]])
+if (
+  any(vapply(embeddings, nrow, integer(1)) != n_cells) ||
+  any(vapply(indices, nrow, integer(1)) != n_cells) ||
+  any(vapply(indices, ncol, integer(1)) != k)
+) {
+  stop("all modalities must use the same cell count and neighbour count")
+}
 cell_names <- paste0("cell", seq_len(n_cells))
-rownames(rna) <- rownames(adt) <- cell_names
-colnames(rna) <- paste0("PC_", seq_len(ncol(rna)))
-colnames(adt) <- paste0("APC_", seq_len(ncol(adt)))
+for (r in reductions) {
+  rownames(embeddings[[r]]) <- cell_names
+  colnames(embeddings[[r]]) <- paste0(toupper(r), "_", seq_len(ncol(embeddings[[r]])))
+}
 
 counts <- matrix(
   1,
@@ -51,15 +73,19 @@ counts <- matrix(
   dimnames = list(paste0("gene", 1:5), cell_names)
 )
 object <- CreateSeuratObject(counts = counts, assay = "RNA")
-object[["pca"]] <- CreateDimReducObject(embeddings = rna, key = "PC_", assay = "RNA")
-object[["apca"]] <- CreateDimReducObject(embeddings = adt, key = "APC_", assay = "RNA")
-
-reductions <- c("pca", "apca")
-dims <- list(pca = seq_len(ncol(rna)), apca = seq_len(ncol(adt)))
-indices <- list(pca = rna_idx, apca = adt_idx)
+dims <- setNames(lapply(embeddings, function(values) seq_len(ncol(values))), reductions)
+for (r in reductions) {
+  object[[r]] <- CreateDimReducObject(
+    embeddings = embeddings[[r]],
+    key = paste0(toupper(r), "_"),
+    assay = "RNA"
+  )
+}
 
 # Seurat's own row normalization, matching l2_normalize=True on the Scarf side.
-normed <- lapply(reductions, function(r) Seurat:::L2Norm(mat = Embeddings(object, r)[, dims[[r]]]))
+normed <- lapply(reductions, function(r) {
+  Seurat:::L2Norm(mat = Embeddings(object, r)[, dims[[r]], drop = FALSE])
+})
 names(normed) <- reductions
 for (r in reductions) {
   object[[paste0(r, ".norm")]] <- CreateDimReducObject(
@@ -76,7 +102,8 @@ for (r in reductions) {
 own_distances <- lapply(reductions, function(r) {
   embedding <- normed[[r]]
   t(sapply(seq_len(n_cells), function(i) {
-    sqrt(rowSums((embedding[indices[[r]][i, ], , drop = FALSE] - rep(embedding[i, ], each = k))^2))
+    neighbours <- embedding[indices[[r]][i, ], , drop = FALSE]
+    sqrt(rowSums(sweep(neighbours, 2, embedding[i, ], FUN = "-")^2))
   }))
 })
 names(own_distances) <- reductions
@@ -99,16 +126,19 @@ within_impute <- lapply(reductions, function(r) {
 })
 names(within_impute) <- reductions
 cross_impute <- lapply(reductions, function(r) {
-  other <- setdiff(reductions, r)
-  PredictAssay(
-    object = object,
-    nn.idx = indices[[other]],
-    assay = DefaultAssay(object[[r]]),
-    reduction = paste0(r, ".norm"),
-    dims = dims[[r]],
-    return.assay = FALSE,
-    verbose = FALSE
-  )
+  sources <- setdiff(reductions, r)
+  values <- lapply(sources, function(source) {
+    PredictAssay(
+      object = object,
+      nn.idx = indices[[source]],
+      assay = DefaultAssay(object[[r]]),
+      reduction = paste0(r, ".norm"),
+      dims = dims[[r]],
+      return.assay = FALSE,
+      verbose = FALSE
+    )
+  })
+  setNames(values, sources)
 })
 names(cross_impute) <- reductions
 
@@ -120,32 +150,41 @@ within_dist <- lapply(reductions, function(r) {
   )
 })
 cross_dist <- lapply(reductions, function(r) {
-  Seurat:::impute_dist(
-    x = normed[[r]],
-    y = t(cross_impute[[r]]),
-    nearest.dist = nearest_dist[[r]]
-  )
+  lapply(cross_impute[[r]], function(values) {
+    Seurat:::impute_dist(
+      x = normed[[r]],
+      y = t(values),
+      nearest.dist = nearest_dist[[r]]
+    )
+  })
 })
 names(within_dist) <- names(cross_dist) <- reductions
 
-# The next three expressions are copied from the body of FindModalityWeights.
+# The next expressions follow the N-modality loops in FindModalityWeights.
 within_kernel <- lapply(reductions, function(r) exp(-1 * (within_dist[[r]] / sigma[[r]])))
-cross_kernel <- lapply(reductions, function(r) exp(-1 * (cross_dist[[r]] / sigma[[r]])))
+cross_kernel <- lapply(reductions, function(r) {
+  lapply(cross_dist[[r]], function(values) exp(-1 * (values / sigma[[r]])))
+})
 names(within_kernel) <- names(cross_kernel) <- reductions
 score <- lapply(reductions, function(r) {
-  MinMax(data = within_kernel[[r]] / (cross_kernel[[r]] + 1e-04), min = 0, max = 200)
+  lapply(cross_kernel[[r]], function(values) {
+    MinMax(data = within_kernel[[r]] / (values + 1e-04), min = 0, max = 200)
+  })
 })
 names(score) <- reductions
-score_total <- rowSums(exp(Reduce(cbind, score)))
-weights <- lapply(reductions, function(r) exp(score[[r]]) / score_total)
+score_columns <- unlist(score, recursive = FALSE, use.names = FALSE)
+score_total <- rowSums(exp(do.call(cbind, score_columns)))
+weights <- lapply(reductions, function(r) {
+  rowSums(exp(do.call(cbind, score[[r]]))) / score_total
+})
 names(weights) <- reductions
 
-# Blend the two kernels over the union pool and keep the k strongest, breaking
+# Blend the modality kernels over the union pool and keep the k strongest, breaking
 # ties by ascending cell index the way Scarf's lexsort does.
 matched_indices <- matrix(0L, nrow = n_cells, ncol = k)
 matched_affinity <- matrix(0, nrow = n_cells, ncol = k)
 for (i in seq_len(n_cells)) {
-  pool <- sort(union(indices$pca[i, ], indices$apca[i, ]))
+  pool <- sort(unique(unlist(lapply(indices, function(values) values[i, ]))))
   affinity <- rep(0, length(pool))
   for (r in reductions) {
     adjusted <- Seurat:::NNdist(
@@ -163,23 +202,25 @@ for (i in seq_len(n_cells)) {
 
 write_matrix(matched_indices, "matched_indices.tsv")
 write_matrix(matched_affinity, "matched_affinities.tsv")
-write_matrix(cbind(weights$pca, weights$apca), "matched_modality_weights.tsv")
+write_matrix(do.call(cbind, weights), "matched_modality_weights.tsv")
 
 # Public defaults. Scarf deliberately differs here, so this table only supports
 # a drift check on how far apart the two stay.
+weight_names <- paste0(reductions, ".weight")
 default_object <- FindMultiModalNeighbors(
   object = object,
-  reduction.list = list("pca", "apca"),
-  dims.list = list(dims$pca, dims$apca),
+  reduction.list = as.list(reductions),
+  dims.list = unname(dims[reductions]),
   k.nn = k,
-  modality.weight.name = c("pca.weight", "apca.weight"),
+  knn.range = min(200L, n_cells - 1L),
+  modality.weight.name = weight_names,
   verbose = FALSE
 )
 default_nn <- default_object[["weighted.nn"]]
 default_indices <- Indices(default_nn)
 write_matrix(default_indices - 1L, "default_indices.tsv")
 write_matrix(
-  cbind(default_object$pca.weight, default_object$apca.weight),
+  default_object[[]][, weight_names, drop = FALSE],
   "default_modality_weights.tsv"
 )
 

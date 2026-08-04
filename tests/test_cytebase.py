@@ -403,6 +403,7 @@ def test_live_bucket_catalog_is_public():
         "kang_15K_pbmc_rnaseq",
         "kang_15K_pbmc_rnaseq_legacy_master",
         "kang_29K_ctrl-ifnb_pbmc_rnaseq",
+        "swanson_7K_pbmc_teaseq",
         "tenx_10K_pbmc-v1_atacseq",
         "tenx_5K_pbmc_rnaseq",
         "tenx_8K_pbmc_citeseq",

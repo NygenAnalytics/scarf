@@ -133,6 +133,11 @@ counts, artifact inventory, and archive checksum:
 
     uv run python scripts/regenerate_docs_datasets.py --all
 
+`--all` excludes checksum-pinned external recipes so routine regeneration does
+not trigger large third-party downloads. Rebuild one of those recipes by name:
+
+    uv run python scripts/regenerate_docs_datasets.py swanson_7K_pbmc_teaseq
+
 Rebuild a store whenever its recipe changes, or whenever the stored layout
 changes in a way that would stop the published artifacts from being reused.
 Nothing leaves `build/cytebase` until you publish:

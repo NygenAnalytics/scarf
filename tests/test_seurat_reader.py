@@ -262,7 +262,12 @@ class _Wire:
         return self.header() + root
 
 
-def _legacy_assay(wire: _Wire) -> bytes:
+def _legacy_assay(
+    wire: _Wire,
+    *,
+    source_class: str = "Assay",
+    extra_slots: list[tuple[str, bytes]] | None = None,
+) -> bytes:
     counts = wire.matrix(
         [1, 0, 0, 2, 3, 0],
         (2, 3),
@@ -273,13 +278,13 @@ def _legacy_assay(wire: _Wire) -> bytes:
         [("symbol", wire.string_vector(["G1", "G2"]))],
         ["g1", "g2"],
     )
-    return wire.s4(
-        [
-            ("counts", counts),
-            ("meta.features", feature_metadata),
-            ("class", wire.string_vector(["Assay"])),
-        ]
-    )
+    slots = [
+        ("counts", counts),
+        ("meta.features", feature_metadata),
+        *(extra_slots or []),
+        ("class", wire.string_vector([source_class])),
+    ]
+    return wire.s4(slots)
 
 
 def _assay5(
@@ -287,6 +292,7 @@ def _assay5(
     *,
     invalid_membership: bool,
     overlap: bool,
+    source_class: str = "Assay5",
 ) -> bytes:
     layer_names = ["counts.1", "counts.2", "data"]
     cell_values = [
@@ -329,12 +335,12 @@ def _assay5(
                 wire.logmap(feature_values, ["p1", "p2", "p3"], layer_names),
             ),
             ("meta.data", metadata),
-            ("class", wire.string_vector(["Assay5"])),
+            ("class", wire.string_vector([source_class])),
         ]
     )
 
 
-def _reduction(wire: _Wire) -> bytes:
+def _reduction(wire: _Wire, *, assay_used: str = "RNA") -> bytes:
     embeddings = wire.matrix(
         [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         (3, 2),
@@ -347,7 +353,7 @@ def _reduction(wire: _Wire) -> bytes:
         [
             ("cell.embeddings", embeddings),
             ("feature.loadings", empty_loadings),
-            ("assay.used", wire.string_vector(["RNA"])),
+            ("assay.used", wire.string_vector([assay_used])),
             ("global", wire.logical_vector([0])),
             ("stdev", wire.real_vector([2.0, 1.0])),
             ("key", wire.string_vector(["PC_"])),
@@ -360,6 +366,8 @@ def _seurat_payload(
     *,
     invalid_membership: bool = False,
     overlap: bool = False,
+    unnamed_empty_reductions: bool = False,
+    unnamed_nonempty_reductions: bool = False,
 ) -> bytes:
     wire = _Wire()
     metadata = wire.data_frame(
@@ -400,7 +408,14 @@ def _seurat_payload(
             ),
             (
                 "reductions",
-                wire.vector([_reduction(wire)], names=["pca"]),
+                (
+                    wire.vector([])
+                    if unnamed_empty_reductions
+                    else wire.vector(
+                        [_reduction(wire)],
+                        names=None if unnamed_nonempty_reductions else ["pca"],
+                    )
+                ),
             ),
             ("graphs", wire.vector([], names=[])),
             ("class", wire.string_vector(["Seurat"])),
@@ -415,12 +430,83 @@ def _write_fixture(
     compressed: bool = False,
     invalid_membership: bool = False,
     overlap: bool = False,
+    unnamed_empty_reductions: bool = False,
+    unnamed_nonempty_reductions: bool = False,
 ) -> Path:
     payload = _seurat_payload(
         invalid_membership=invalid_membership,
         overlap=overlap,
+        unnamed_empty_reductions=unnamed_empty_reductions,
+        unnamed_nonempty_reductions=unnamed_nonempty_reductions,
     )
     path.write_bytes(gzip.compress(payload) if compressed else payload)
+    return path
+
+
+def _write_chromatin_fixture(path: Path) -> Path:
+    wire = _Wire()
+    metadata = wire.data_frame(
+        [("well", wire.string_vector(["W3", "W3", "W3"]))],
+        ["c1", "c2", "c3"],
+    )
+    chromatin = _legacy_assay(
+        wire,
+        source_class="ChromatinAssay",
+        extra_slots=[
+            (
+                "ranges",
+                wire.string_vector(["chr1:1-10", "chr2:5-20"]),
+            )
+        ],
+    )
+    root = wire.s4(
+        [
+            ("assays", wire.vector([chromatin], names=["ATAC"])),
+            ("meta.data", metadata),
+            ("active.assay", wire.string_vector(["ATAC"])),
+            (
+                "active.ident",
+                wire.factor([1, 1, 1], ["cells"], names=["c1", "c2", "c3"]),
+            ),
+            (
+                "reductions",
+                wire.vector(
+                    [_reduction(wire, assay_used="ATAC")],
+                    names=["lsi"],
+                ),
+            ),
+            ("class", wire.string_vector(["Seurat"])),
+        ]
+    )
+    path.write_bytes(wire.document(root))
+    return path
+
+
+def _write_single_assay_fixture(
+    path: Path,
+    *,
+    wire: _Wire,
+    assay: bytes,
+    assay_name: str = "RNA",
+) -> Path:
+    metadata = wire.data_frame(
+        [("group", wire.string_vector(["a", "b", "c"]))],
+        ["c1", "c2", "c3"],
+    )
+    root = wire.s4(
+        [
+            ("assays", wire.vector([assay], names=[assay_name])),
+            ("meta.data", metadata),
+            ("active.assay", wire.string_vector([assay_name])),
+            (
+                "active.ident",
+                wire.factor([1, 1, 1], ["cells"], names=["c1", "c2", "c3"]),
+            ),
+            ("reductions", wire.vector([], names=[])),
+            ("class", wire.string_vector(["Seurat"])),
+        ]
+    )
+    path.write_bytes(wire.document(root))
     return path
 
 
@@ -752,6 +838,134 @@ def _write_fragment_matrix_fixture(path: Path) -> Path:
     )
     path.write_bytes(wire.document(root))
     return path
+
+
+def test_empty_unnamed_reductions_are_accepted(tmp_path: Path) -> None:
+    path = _write_fixture(
+        tmp_path / "empty-unnamed-reductions.rds",
+        unnamed_empty_reductions=True,
+    )
+
+    with SeuratReader(path) as reader:
+        assert reader.reductionNames == ()
+        assert reader.inspection.assay("RNA").importable
+
+
+def test_nonempty_unnamed_reductions_remain_invalid(tmp_path: Path) -> None:
+    path = _write_fixture(
+        tmp_path / "nonempty-unnamed-reductions.rds",
+        unnamed_nonempty_reductions=True,
+    )
+
+    with pytest.raises(SeuratImportError) as error:
+        SeuratReader(path)
+
+    assert error.value.code == "invalid_named_list"
+    assert error.value.objectPath == "reductions"
+
+
+def test_chromatin_assay_uses_legacy_capabilities_and_reduction(
+    tmp_path: Path,
+) -> None:
+    path = _write_chromatin_fixture(tmp_path / "chromatin.rds")
+
+    with SeuratReader(path) as reader:
+        inspection = reader.inspection.assay("ATAC")
+        assert inspection.importable
+        assert inspection.sourceClass == "ChromatinAssay"
+        assay = reader.get_assay("ATAC")
+        assert assay.sourceClass == "ChromatinAssay"
+        np.testing.assert_array_equal(
+            assay.counts.read_cells(0, 3),
+            [[1, 0], [0, 2], [3, 0]],
+        )
+        assert any(
+            notice.code == "ignored_assay_slot"
+            and notice.objectPath == "assays/ATAC/ranges"
+            for notice in assay.notices
+        )
+        reduction = reader.get_reduction("lsi")
+        assert reduction.assayUsed == "ATAC"
+        assert reduction.dimensions == (3, 2)
+
+
+def test_transposed_assay5_storage_is_rejected_explicitly(
+    tmp_path: Path,
+) -> None:
+    wire = _Wire()
+    path = _write_single_assay_fixture(
+        tmp_path / "assay5t.rds",
+        wire=wire,
+        assay=_assay5(
+            wire,
+            invalid_membership=False,
+            overlap=False,
+            source_class="Assay5T",
+        ),
+    )
+
+    with SeuratReader(path, reductions=[]) as reader:
+        diagnostic = reader.inspection.assay("RNA").blockingDiagnostic
+        assert diagnostic is not None
+        assert diagnostic.code == "unsupported_assay_class"
+        assert diagnostic.objectPath == "assays/RNA"
+
+
+def test_malformed_assay5_and_legacy_layouts_keep_precise_diagnostics(
+    tmp_path: Path,
+) -> None:
+    assay5_wire = _Wire()
+    assay5_path = _write_single_assay_fixture(
+        tmp_path / "malformed-assay5.rds",
+        wire=assay5_wire,
+        assay=assay5_wire.s4(
+            [
+                (
+                    "layers",
+                    assay5_wire.vector(
+                        [
+                            assay5_wire.matrix(
+                                [1, 0, 0, 2, 3, 0],
+                                (2, 3),
+                            )
+                        ],
+                        names=["counts"],
+                    ),
+                ),
+                ("class", assay5_wire.string_vector(["Assay5"])),
+            ]
+        ),
+    )
+    with SeuratReader(assay5_path, reductions=[]) as reader:
+        diagnostic = reader.inspection.assay("RNA").blockingDiagnostic
+        assert diagnostic is not None
+        assert diagnostic.code == "missing_slot"
+        assert diagnostic.objectPath == "assays/RNA/cells"
+
+    legacy_wire = _Wire()
+    legacy_path = _write_single_assay_fixture(
+        tmp_path / "malformed-legacy.rds",
+        wire=legacy_wire,
+        assay=legacy_wire.s4(
+            [
+                (
+                    "counts",
+                    legacy_wire.matrix(
+                        [1, 0, 0, 2, 3, 0],
+                        (2, 3),
+                        rows=["g1", "g2"],
+                        columns=["c1", "c2", "c3"],
+                    ),
+                ),
+                ("class", legacy_wire.string_vector(["Assay"])),
+            ]
+        ),
+    )
+    with SeuratReader(legacy_path, reductions=[]) as reader:
+        diagnostic = reader.inspection.assay("RNA").blockingDiagnostic
+        assert diagnostic is not None
+        assert diagnostic.code == "missing_slot"
+        assert diagnostic.objectPath == "assays/RNA/meta.features"
 
 
 def test_mixed_assay_dispatch_metadata_and_reduction(tmp_path: Path) -> None:

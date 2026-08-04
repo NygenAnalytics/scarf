@@ -1150,10 +1150,51 @@ def _require_slot(node: RNode, name: str, *, object_path: str) -> RNode:
     return value
 
 
+def _assay_storage_kind(
+    node: RNode,
+    classes: tuple[str, ...],
+    *,
+    object_path: str,
+) -> str:
+    if "Assay5T" in classes:
+        raise _error(
+            "transposed Assay5 storage is not supported",
+            object_path=object_path,
+            code="unsupported_assay_class",
+            classNames=classes,
+        )
+    has_assay5_slots = all(
+        get_slot(node, name) is not None for name in ("layers", "cells", "features")
+    )
+    if "Assay5" in classes or has_assay5_slots:
+        return "assay5"
+
+    has_layers = get_slot(node, "layers") is not None
+    has_legacy_slots = all(
+        get_slot(node, name) is not None for name in ("counts", "meta.features")
+    )
+    if "Assay" in classes or (has_legacy_slots and not has_layers):
+        return "legacy"
+
+    raise _error(
+        "assay does not expose legacy Assay or Assay5 capabilities",
+        object_path=object_path,
+        code="unsupported_assay_class",
+        classNames=classes,
+    )
+
+
 def _named_nodes(node: RNode, *, object_path: str) -> tuple[tuple[str, RNode], ...]:
     try:
         raw = tuple(iter_named(node))
     except (TypeError, ValueError) as error:
+        if (
+            node.type is RType.VECTOR
+            and isinstance(node.value, tuple)
+            and not node.value
+            and get_attribute(node, "names") is None
+        ):
+            return ()
         raise _error(
             "expected a named list",
             object_path=object_path,
@@ -2658,17 +2699,15 @@ class SeuratReader:
         blocked_error: SeuratImportError
         try:
             classes = _class_names(node, object_path=object_path)
-            if "Assay5" in classes:
+            storage_kind = _assay_storage_kind(
+                node,
+                classes,
+                object_path=object_path,
+            )
+            if storage_kind == "assay5":
                 assay = self._build_assay5(name, node)
-            elif "Assay" in classes:
-                assay = self._build_legacy_assay(name, node)
             else:
-                raise _error(
-                    "assay does not expose legacy Assay or Assay5 capabilities",
-                    object_path=object_path,
-                    code="unsupported_assay_class",
-                    classNames=classes,
-                )
+                assay = self._build_legacy_assay(name, node)
             self._assayModels[name] = assay
             source = getattr(assay.counts, "_source", assay.counts)
             estimate = assay.counts.estimate_read_memory(
@@ -3496,17 +3535,15 @@ class SeuratReader:
                 assay=name,
             )
         classes = _class_names(node, object_path=f"assays/{name}")
-        if "Assay5" in classes:
+        storage_kind = _assay_storage_kind(
+            node,
+            classes,
+            object_path=f"assays/{name}",
+        )
+        if storage_kind == "assay5":
             assay = self._build_assay5(name, node)
-        elif "Assay" in classes:
-            assay = self._build_legacy_assay(name, node)
         else:
-            raise _error(
-                f"reduction assay {name!r} has an unsupported class",
-                object_path=f"assays/{name}",
-                code="unsupported_assay_class",
-                classNames=classes,
-            )
+            assay = self._build_legacy_assay(name, node)
         self._assayModels[name] = assay
         return assay
 
