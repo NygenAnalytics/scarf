@@ -616,7 +616,7 @@ class DataStorePlotAccessor:
         split_scale: "CategoricalScale | None" = None,
         kind: "DistKind" = "violin",
         bins: int = 40,
-        max_points: int = 10000,
+        max_points: int | None = None,
         point_size: float = 0.8,
         point_alpha: float = 0.28,
         seed: int = 0,

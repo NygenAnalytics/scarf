@@ -398,14 +398,16 @@ def _mean_color_limits(
 ) -> tuple[list[tuple[float, float]], tuple[float, float]]:
     """Resolve per-panel and reference colour limits from group means.
 
-    ``scope="shared"`` (default) gives every stacked row the same limits derived
-    from all pooled group means, so the rows share one continuous scale.
+    ``scope="shared"`` gives every stacked row the same limits derived from all
+    pooled group means, so the rows share one continuous scale.
     ``scope="panel"`` rescales each row independently. Explicit ``vmin`` /
-    ``vmax`` override quantile or observed bounds.
+    ``vmax`` override quantile or observed bounds; a ``vcenter`` pivot extends
+    derived bounds so diverging maps work on one-sided data.
     """
-    if color_scale.scale != "linear":
-        raise NotImplementedError(
-            "distribution mean coloring currently supports only linear color scales"
+    if color_scale.scope not in ("shared", "panel"):
+        raise ValueError(
+            "color_scale.scope must be 'shared' or 'panel' for mean coloring; "
+            f"got {color_scale.scope!r}"
         )
 
     def resolve(values: np.ndarray) -> tuple[float, float]:
@@ -426,6 +428,21 @@ def _mean_color_limits(
             hi = color_scale.vmax
         if hi < lo:
             raise ValueError("vmax must be greater than or equal to vmin")
+        if color_scale.vcenter is not None:
+            if not lo < color_scale.vcenter < hi:
+                if color_scale.vmin is not None or color_scale.vmax is not None:
+                    raise ValueError(
+                        "vcenter must be strictly between the resolved color limits "
+                        "when vmin/vmax are explicit"
+                    )
+                lo = min(lo, color_scale.vcenter)
+                hi = max(hi, color_scale.vcenter)
+                span = hi - lo
+                eps = max(span * 1e-6, 1e-9)
+                if color_scale.vcenter <= lo:
+                    lo = color_scale.vcenter - eps
+                if color_scale.vcenter >= hi:
+                    hi = color_scale.vcenter + eps
         return lo, hi
 
     arrays = [
@@ -479,10 +496,10 @@ def _mean_group_palette(
     for group in order:
         mean = means.get(group)
         if mean is None or not np.isfinite(float(mean)):
-            t = 0.5
+            palette_map[group] = color_scale.missing_color
         else:
-            t = 0.5 if span == 0 else float(np.clip(norm(float(mean)), 0, 1))
-        palette_map[group] = to_hex(colormaps[cmap](t))
+            t = 0.5 if span == 0 else float(norm(float(mean), clip=True))
+            palette_map[group] = to_hex(colormaps[cmap](t))
     return palette_map
 
 
@@ -505,7 +522,7 @@ def distribution(
     split_scale: CategoricalScale | None = None,
     kind: DistKind = "violin",
     bins: int = 40,
-    max_points: int = 10000,
+    max_points: int | None = None,
     point_size: float = 0.8,
     point_alpha: float = 0.28,
     seed: int = 0,
@@ -542,11 +559,13 @@ def distribution(
     - ``groups``: keep / order these ``group_by`` categories
 
     For violins and boxes, Scarf can overlay a subsample of cells as points.
-    ``max_points`` limits how many points are drawn (``0`` disables points).
-    Histograms always use every selected cell. Regular multi-gene violin and
-    box panels share their value scale by default. Stacked violins keep
-    independent scales unless ``share_y=True``. With horizontal orientation,
-    the same option shares the x-axis value scale.
+    ``max_points`` limits how many points are drawn (``0`` disables points;
+    ``None`` selects the kind default). Stacked violins default to no overlay
+    (``0``), while other kinds default to ``10000``. Histograms always use
+    every selected cell. Regular multi-gene violin and box panels share their
+    value scale by default. Stacked violins keep independent scales unless
+    ``share_y=True``. With horizontal orientation, the same option shares the
+    x-axis value scale.
 
     Set ``sample_by`` or ``study_design`` to summarize cells within biological
     samples before plotting. ``split_by`` draws two violin halves for a second
@@ -556,19 +575,19 @@ def distribution(
     stacked violin by its group mean expression on a continuous scale. Pass a
     ``ColorScale`` to control the mapping: ``cmap`` chooses the colormap,
     ``vmin``/``vmax`` fix explicit limits, ``quantiles`` clips extreme means,
-    and ``vcenter`` enables diverging maps. The scale is shared across every
-    stacked row by default (``scope="shared"``) and drawn as a colorbar on the
-    right; ``scope="panel"`` rescales each row independently and draws a single
-    reference colorbar. ``color_by="mean"`` cannot be combined with ``split_by``.
+    and ``vcenter`` enables diverging maps. The color scale follows
+    ``share_y``: ``scope="shared"`` when ``share_y=True`` and ``scope="panel"``
+    otherwise, unless an explicit ``color_scale.scope`` overrides it. A
+    ``scope="shared"`` scale is drawn as a colorbar on the right;
+    ``scope="panel"`` rescales each row independently and draws a single
+    reference colorbar. On caller-supplied axes the colorbar is not drawn;
+    its limits are exposed through ``PlotResult.legends``.
+    ``color_by="mean"`` cannot be combined with ``split_by``.
     """
     plt, mpl = require_matplotlib()
     normalization = normalization or NormalizationSpec()
     color_scale_was_explicit = color_scale is not None
-    color_scale = color_scale or ColorScale(cmap="viridis", scope="shared")
-    if color_scale.scale != "linear":
-        raise NotImplementedError(
-            "distribution mean coloring currently supports only linear color scales"
-        )
+    color_scale = color_scale or ColorScale(cmap="viridis")
     if color_scale_was_explicit and color_by != "mean":
         raise ValueError("color_scale applies only when color_by='mean'")
     if color_by not in ("group", "mean"):
@@ -577,6 +596,28 @@ def distribution(
         raise ValueError("color_by='mean' is available only for stacked_violin")
     if color_by == "mean" and group_by is None:
         raise ValueError("color_by='mean' requires group_by")
+    resolved_max_points = (
+        0
+        if max_points is None and kind == "stacked_violin"
+        else 10000
+        if max_points is None
+        else max_points
+    )
+    if color_by == "mean":
+        if not color_scale_was_explicit:
+            color_scale = ColorScale(
+                cmap="viridis",
+                scope="shared" if share_y is True else "panel",
+            )
+        if color_scale.scale != "linear":
+            raise NotImplementedError(
+                "distribution mean coloring currently supports only linear color scales"
+            )
+        if color_scale.scope not in ("shared", "panel"):
+            raise ValueError(
+                "color_scale.scope must be 'shared' or 'panel' for mean coloring; "
+                f"got {color_scale.scope!r}"
+            )
     if kind not in ("violin", "stacked_violin", "box", "hist", "ecdf"):
         raise ValueError(
             "kind must be 'violin', 'stacked_violin', 'box', 'hist', or 'ecdf'"
@@ -793,8 +834,8 @@ def distribution(
     else:
         n_columns = n_panels
 
-    # Build the per-panel display frames and group means once so the shared
-    # mean-expression colour scale can be derived when ``color_by="mean"``.
+    # Build the per-panel display frames once; the group means that feed the
+    # mean-expression colour scale are derived only when ``color_by="mean"``.
     panel_display_frames = [
         _panel_display_frame(
             np.asarray(vals),
@@ -807,10 +848,13 @@ def distribution(
         )
         for vals, _label, _is_feature in series_list
     ]
-    panel_group_means = [_panel_group_means(frame) for frame in panel_display_frames]
+    panel_group_means: list[pd.Series] | None = None
     mean_limits: list[tuple[float, float]] | None = None
     reference_limits: tuple[float, float] | None = None
     if color_by == "mean":
+        panel_group_means = [
+            _panel_group_means(frame) for frame in panel_display_frames
+        ]
         mean_limits, reference_limits = _mean_color_limits(
             panel_group_means,
             color_scale,
@@ -859,6 +903,7 @@ def distribution(
                 assert sns is not None
                 panel_palette = palette
                 if mean_limits is not None:
+                    assert panel_group_means is not None
                     lo, hi = mean_limits[panel_index]
                     panel_palette = _mean_group_palette(
                         panel_group_means[panel_index],
@@ -873,7 +918,7 @@ def distribution(
                     df,
                     kind=("violin" if kind == "stacked_violin" else kind),  # type: ignore[arg-type]
                     color=color,
-                    max_points=max_points,
+                    max_points=resolved_max_points,
                     point_size=point_size,
                     rng=rng,
                     order=None if group_by is None else list(group_order or []),
@@ -937,7 +982,7 @@ def distribution(
                     ax,
                     df,
                     color=color,
-                    max_points=max_points,
+                    max_points=resolved_max_points,
                     rng=rng,
                     group_by=group_by,
                     order=None if group_by is None else list(group_order or []),
@@ -1023,7 +1068,10 @@ def distribution(
         if title is not None:
             fig.suptitle(title)
         apply_figure_chrome(fig, theme)
-        if render_limits is not None:
+        # The colorbar is only drawn on figures Scarf owns; caller-supplied
+        # axes keep their layout and the limits are exposed through
+        # ``PlotResult.legends`` / ``scales`` instead.
+        if render_limits is not None and owns:
             lo, hi = render_limits
             mappable = plt.cm.ScalarMappable(
                 cmap=color_scale.cmap or "viridis",
@@ -1117,7 +1165,7 @@ def distribution(
             renderer="matplotlib",
             notes=tuple(notes),
             extras={
-                "max_points": max_points,
+                "max_points": resolved_max_points,
                 "seed": seed,
                 "group_by": group_by,
                 "groups": None if groups is None else list(groups),
@@ -1139,9 +1187,6 @@ def distribution(
                 "row_standardize": row_standardize,
                 "share_y": resolved_share_y,
                 "color_by": color_by,
-                "color_scale": (
-                    resolved_color_scale if resolved_color_scale is not None else None
-                ),
                 "color_scale_scope": (
                     color_scale.scope if resolved_color_scale is not None else None
                 ),
