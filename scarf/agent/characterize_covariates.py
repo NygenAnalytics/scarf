@@ -8,10 +8,14 @@ from typing import Any, Literal, cast
 import numpy as np
 import pandas as pd
 
-from ..metrics.association import report_confounding, report_technical_nesting
+from ..metrics.association import (
+    directional_mapping,
+    report_confounding,
+    report_technical_nesting,
+)
 from ..storage.types import as_zarr_array, as_zarr_group
 from ._deps import AGENT_INSTALL_HINT
-from .decide import decide
+from .decide import DecisionValidationError, decide
 from .types import Decision, EvidenceItem, StageStatus
 
 try:
@@ -55,6 +59,7 @@ _DROP_REASONS = {
     "dropAssayStat": "Scarf assay statistic column",
     "dropProvenance": "analysis-linked column",
     "dropEmbedding": "embedding-style column",
+    "dropConstant": "single-level column",
 }
 
 _DOMAIN_EVIDENCE = [
@@ -140,7 +145,16 @@ class _Run:
         """Run one grounded decision, or return None when it cannot be asked."""
         if self.model is None or len(evidence) < 2:
             return None
-        decision = decide(model=self.model, question=question, evidence=evidence)
+        try:
+            decision = decide(model=self.model, question=question, evidence=evidence)
+        except DecisionValidationError as exc:
+            self.note(
+                kind="decisionInvalid",
+                detail=str(exc),
+                task=task,
+                column=column,
+            )
+            return None
         record: dict[str, Any] = {
             "task": task,
             "selectedId": decision.selectedId,
@@ -528,6 +542,55 @@ def _unit_evidence(run: _Run, names: Sequence[str], prefix: str) -> list[Evidenc
     ]
 
 
+def _coefficient_constant_within(
+    frame: pd.DataFrame,
+    coefficient: str,
+    unit: str,
+) -> bool:
+    """True when the coefficient does not vary inside each unit level."""
+    if coefficient not in frame.columns or unit not in frame.columns:
+        return False
+    return bool(
+        frame.groupby(unit, dropna=False)[coefficient].nunique(dropna=False).le(1).all()
+    )
+
+
+def _observation_unit_candidates(
+    run: _Run,
+    coefficient: str,
+    pool: Sequence[str],
+) -> list[str]:
+    """Design/technical columns that can host a between-unit coefficient.
+
+    A valid observation unit is a metadata fact, not a judgement: the coefficient
+    must be constant within each level. No clustering column is required; when
+    nothing in the pool works, the coefficient stays within-unit or unresolved.
+    """
+    return [
+        name
+        for name in pool
+        if name != coefficient
+        and _coefficient_constant_within(run.frame, coefficient, name)
+    ]
+
+
+def _independent_is_coarser(
+    frame: pd.DataFrame,
+    *,
+    observation: str,
+    independent: str,
+) -> bool:
+    """True when each observation level maps to one independent level.
+
+    The independent unit must be coarser (or equal), never finer. A finer
+    independent unit inflates the design table with pseudo-replicated rows.
+    """
+    if observation not in frame.columns or independent not in frame.columns:
+        return False
+    nesting = directional_mapping(frame[observation], frame[independent]).get("nesting")
+    return nesting in {"leftInRight", "equivalent"}
+
+
 def _resolve_units(
     run: _Run,
     coefficient: str,
@@ -539,33 +602,107 @@ def _resolve_units(
     unit_map = dict(directed.get(coefficient) or {})
     observation = unit_map.get("observationUnit")
     independent = unit_map.get("independentUnit")
+    valid_observation = _observation_unit_candidates(run, coefficient, unit_candidates)
 
-    if observation is None:
+    if observation is not None:
+        if observation not in run.frame.columns:
+            run.note(
+                kind="invalidObservationUnit",
+                detail=f"Directed observation unit {observation!r} is missing",
+                column=coefficient,
+                observationUnit=observation,
+            )
+            observation = None
+        elif not _coefficient_constant_within(run.frame, coefficient, observation):
+            # Keep the directed unit; _characterize_coefficient records withinUnit.
+            pass
+        elif observation not in valid_observation:
+            valid_observation = [observation, *valid_observation]
+    elif len(valid_observation) == 1:
+        observation = valid_observation[0]
+        run.actions.append(f"observationUnit:{coefficient}->{observation}")
+    elif len(valid_observation) >= 2:
         decision = run.ask(
             task="observationUnit",
             column=coefficient,
             question=(
                 f"Choose the observation unit for coefficient {coefficient}. "
-                "Each distinct value of this column is one design-table row. "
+                "Only columns where this coefficient is constant within each "
+                "level are listed. Each distinct value is one design-table row. "
                 f"Study context: {run.context or 'none provided'}."
             ),
-            evidence=_unit_evidence(
-                run,
-                [name for name in unit_candidates if name != coefficient],
-                "unit",
-            ),
+            evidence=_unit_evidence(run, valid_observation, "unit"),
         )
         if decision is not None:
             observation = decision.selectedId.removeprefix("unit:")
-            run.actions.append(f"observationUnit:{coefficient}->{observation}")
+            if observation not in valid_observation:
+                run.note(
+                    kind="invalidObservationUnit",
+                    detail=(
+                        f"Model chose {observation!r}, which is not a valid "
+                        f"observation unit for {coefficient}"
+                    ),
+                    column=coefficient,
+                    observationUnit=observation,
+                )
+                observation = None
+            else:
+                run.actions.append(f"observationUnit:{coefficient}->{observation}")
+    else:
+        run.note(
+            kind="noValidObservationUnit",
+            detail=(
+                f"No design/technical column keeps {coefficient} constant; "
+                "cannot build a between-unit design table from available metadata"
+            ),
+            column=coefficient,
+        )
 
-    if observation is not None and independent is None:
+    if observation is None:
+        return None, None
+
+    valid_independent = [
+        name
+        for name in design_columns
+        if name not in {coefficient, observation}
+        and _independent_is_coarser(
+            run.frame, observation=observation, independent=name
+        )
+    ]
+
+    if independent is not None:
+        if independent not in run.frame.columns:
+            run.note(
+                kind="invalidIndependentUnit",
+                detail=f"Directed independent unit {independent!r} is missing",
+                column=coefficient,
+                independentUnit=independent,
+            )
+            independent = None
+        elif not _independent_is_coarser(
+            run.frame, observation=observation, independent=independent
+        ):
+            run.note(
+                kind="independentUnitFiner",
+                detail=(
+                    f"Independent unit {independent!r} is finer than observation "
+                    f"unit {observation!r}; dropped to avoid pseudo-replicated "
+                    "design rows"
+                ),
+                column=coefficient,
+                observationUnit=observation,
+                independentUnit=independent,
+            )
+            independent = None
+    elif valid_independent:
         decision = run.ask(
             task="independentUnit",
             column=coefficient,
             question=(
                 f"Optional independent unit for coefficient {coefficient} "
-                f"with observation unit {observation}."
+                f"with observation unit {observation}. Listed columns are "
+                "coarser than the observation unit (each observation level "
+                "maps to one independent level)."
             ),
             evidence=[
                 EvidenceItem(
@@ -573,20 +710,24 @@ def _resolve_units(
                     label="none",
                     summary="No separate independent unit or subject column",
                 ),
-                *_unit_evidence(
-                    run,
-                    [
-                        name
-                        for name in design_columns
-                        if name not in {coefficient, observation}
-                    ],
-                    "independentUnit",
-                ),
+                *_unit_evidence(run, valid_independent, "independentUnit"),
             ],
         )
         if decision is not None and decision.selectedId != "independentUnit:none":
-            independent = decision.selectedId.removeprefix("independentUnit:")
-            run.actions.append(f"independentUnit:{coefficient}->{independent}")
+            chosen = decision.selectedId.removeprefix("independentUnit:")
+            if chosen not in valid_independent:
+                run.note(
+                    kind="invalidIndependentUnit",
+                    detail=(
+                        f"Model chose {chosen!r}, which is not coarser than "
+                        f"observation unit {observation!r}"
+                    ),
+                    column=coefficient,
+                    independentUnit=chosen,
+                )
+            else:
+                independent = chosen
+                run.actions.append(f"independentUnit:{coefficient}->{independent}")
     return observation, independent
 
 
@@ -656,7 +797,26 @@ def _characterize_coefficient(
 
     group_cols = [observation_unit]
     if independent_unit is not None and independent_unit in run.frame.columns:
-        group_cols.append(independent_unit)
+        if _independent_is_coarser(
+            run.frame,
+            observation=observation_unit,
+            independent=independent_unit,
+        ):
+            group_cols.append(independent_unit)
+        else:
+            run.note(
+                kind="independentUnitFiner",
+                detail=(
+                    f"Independent unit {independent_unit!r} is finer than "
+                    f"observation unit {observation_unit!r}; omitted from "
+                    "design table"
+                ),
+                column=coefficient,
+                observationUnit=observation_unit,
+                independentUnit=independent_unit,
+            )
+            independent_unit = None
+            record["independentUnit"] = None
     columns = list(dict.fromkeys([*group_cols, coefficient, *unit_constant]))
     design = (
         run.frame.loc[:, columns]
@@ -770,13 +930,28 @@ def characterize_covariates(
     frame = store.cells.to_pandas_dataframe([*candidates, cellKey], key=cellKey)
     reviewed = len(candidates) + len(dropped)
     candidates = [name for name in candidates if name in frame.columns]
+    # Single-level columns are not covariates. Leaving them in creates spurious
+    # "perfect confounding" among every pair of constants.
+    directed_coefficients = set(direction_map.get("coefficientsOfInterest") or [])
+    varying: list[str] = []
+    for name in candidates:
+        if int(frame[name].nunique(dropna=False)) <= 1:
+            dropped.append((name, "dropConstant"))
+            continue
+        varying.append(name)
+    candidates = varying
     candidates, aliases, alias_notes = _collapse_ontology_aliases(candidates, frame)
 
     run = _Run(frame=frame, context=_bounded_context(studyContext), model=model)
     for name, reason in dropped:
+        detail = f"Dropped {_DROP_REASONS[reason]} {name}"
+        if reason == "dropConstant" and name in directed_coefficients:
+            detail = (
+                f"{detail}; also listed in coefficientsOfInterest but has no variation"
+            )
         run.note(
             kind=reason,
-            detail=f"Dropped {_DROP_REASONS[reason]} {name}",
+            detail=detail,
             column=name,
         )
     run.audit.extend(alias_notes)

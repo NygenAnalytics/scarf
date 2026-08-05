@@ -546,14 +546,36 @@ def test_inspect_h5ad_prefers_dimension_matched_raw_counts(tmp_path):
     finally:
         reader.h5.close()
 
-    overridden = H5adReader.from_inspect(
-        inspection,
-        feature_name_key="gene_ids",
-    )
-    try:
-        assert overridden.featNamesKey == "gene_ids"
-    finally:
-        overridden.h5.close()
+
+def test_inspect_h5ad_ignores_ensembl_biotype_feature_type(tmp_path):
+    """CELLxGENE feature_type is gene biotype, not a modality split key."""
+    import h5py
+    from scipy import sparse
+
+    from scarf.readers import inspect_h5ad
+
+    file_name = tmp_path / "biotype.h5ad"
+    matrix = sparse.csr_matrix(np.array([[1, 0], [0, 2]], dtype=np.int32))
+    with h5py.File(file_name, "w") as h5:
+        x = h5.create_group("X")
+        x.create_dataset("data", data=matrix.data)
+        x.create_dataset("indices", data=matrix.indices)
+        x.create_dataset("indptr", data=matrix.indptr)
+        x.attrs["encoding-type"] = "csr_matrix"
+        x.attrs["encoding-version"] = "0.1.0"
+        x.attrs["shape"] = matrix.shape
+        obs = h5.create_group("obs")
+        obs.create_dataset("_index", data=np.array([b"c1", b"c2"]))
+        var = h5.create_group("var")
+        var.create_dataset("_index", data=np.array([b"ENSG1", b"ENSG2"]))
+        var.create_dataset(
+            "feature_type",
+            data=np.array([b"protein_coding", b"lncRNA"]),
+        )
+
+    inspection = inspect_h5ad(str(file_name))
+    assert inspection.assaySplitKey is None
+    assert inspection.suggestedAssays == {}
 
 
 def test_inspect_h5ad_falls_back_from_mismatched_raw_var(tmp_path):

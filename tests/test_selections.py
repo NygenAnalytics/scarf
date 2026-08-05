@@ -17,6 +17,14 @@ from scarf.storage.selections import (
 )
 
 
+def test_create_metadata_column_accepts_utf8_byte_strings() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    values = np.array([b"1000 cells/\xce\xbcl", b"unknown"], dtype=object)
+    column = create_metadata_column(root, "cell_number_loaded", data=values)
+    assert column[0] == "1000 cells/\u03bcl"
+    assert column[1] == "unknown"
+
+
 def test_fingerprint_selected_stored_strings_rejects_and_hashes() -> None:
     root = zarr.open_group(store=MemoryStore(), mode="w")
     ids = create_metadata_column(

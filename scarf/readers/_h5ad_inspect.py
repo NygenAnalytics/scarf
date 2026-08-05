@@ -5,7 +5,11 @@ import h5py
 import numpy as np
 
 from ..utils.logging import logger
-from ._assay_names import auto_name_feat_table, make_feat_table_from_types
+from ._assay_names import (
+    AUTO_ASSAY_NAMES,
+    auto_name_feat_table,
+    make_feat_table_from_types,
+)
 
 
 _FEATURE_ID_KEYS = (
@@ -615,17 +619,26 @@ def inspect_h5ad(
                     assay_split_key = None
                 else:
                     feature_types = [_as_text(value) for value in values]
-                    assay_table = auto_name_feat_table(
-                        make_feat_table_from_types(feature_types)
-                    )
-                    for assay_name in dict.fromkeys(assay_table.columns):
-                        selected = assay_table[assay_name]
-                        count = (
-                            int(selected.loc["nFeatures"].sum())
-                            if selected.ndim == 2
-                            else int(selected.loc["nFeatures"])
+                    # CELLxGENE stores Ensembl biotypes in feature_type. Those are
+                    # not assay modalities; splitting on them invents thousands of
+                    # ASSAY* spans. Require at least one known modality label.
+                    if not any(
+                        feature_type in AUTO_ASSAY_NAMES
+                        for feature_type in feature_types
+                    ):
+                        assay_split_key = None
+                    else:
+                        assay_table = auto_name_feat_table(
+                            make_feat_table_from_types(feature_types)
                         )
-                        suggested_assays[str(assay_name)] = count
+                        for assay_name in dict.fromkeys(assay_table.columns):
+                            selected = assay_table[assay_name]
+                            count = (
+                                int(selected.loc["nFeatures"].sum())
+                                if selected.ndim == 2
+                                else int(selected.loc["nFeatures"])
+                            )
+                            suggested_assays[str(assay_name)] = count
 
         layers_node = h5.get("layers")
         layers = (

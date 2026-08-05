@@ -76,9 +76,7 @@ def _store_with_design(tmp_path: Path) -> DataStore:
     # Same partition as cell_type under different labels.
     author_cell_type = np.array(["AC", "BC", "AC", "BC", "AC", "BC"] * 2)
     # Constant within sample: valid design-table continuous technical.
-    depth = np.array(
-        [1000.0] * 3 + [2000.0] * 3 + [3500.5] * 3 + [4800.25] * 3
-    )
+    depth = np.array([1000.0] * 3 + [2000.0] * 3 + [3500.5] * 3 + [4800.25] * 3)
     # Varies within sample: must be excluded from the design table.
     umi_noise = np.linspace(100.0, 500.0, n_cells)
     store.cells.insert("donor", donor, overwrite=True)
@@ -90,6 +88,8 @@ def _store_with_design(tmp_path: Path) -> DataStore:
     store.cells.insert("author_cell_type", author_cell_type, overwrite=True)
     store.cells.insert("sequencing_depth", depth, overwrite=True)
     store.cells.insert("umi_noise", umi_noise, overwrite=True)
+    # Single-level metadata must be dropped before domain/equivalence work.
+    store.cells.insert("protocol", np.array(["v1"] * n_cells), overwrite=True)
     store.cells.insert("X_umap1", np.linspace(0, 1, n_cells), overwrite=True)
     store.cells.insert("X_umap2", np.linspace(1, 0, n_cells), overwrite=True)
     store.cells.insert(
@@ -154,7 +154,11 @@ def test_characterize_covariates_directions_only(tmp_path: Path) -> None:
         if entry["kind"].startswith("drop")
     }
     assert drops["X_umap1"] == "dropEmbedding"
+    assert drops["protocol"] == "dropConstant"
     assert any(kind == "dropAssayStat" for kind in drops.values())
+    assert "protocol" not in {
+        column["name"] for column in result.columns if column["domain"] != "ignore"
+    }
 
     # donor, batch and disease partition the cells identically but sit in three
     # different domains, so they are a confounding finding rather than aliases.
@@ -331,3 +335,59 @@ def test_characterize_covariates_does_not_mutate_store(tmp_path: Path) -> None:
     )
     assert result.status == "done"
     assert set(store.cells.columns) == set(before)
+
+
+def test_characterize_covariates_rejects_finer_independent_unit(tmp_path: Path) -> None:
+    """Independent unit must be coarser than observation unit, never finer."""
+    store = _store_with_design(tmp_path)
+    result = characterize_covariates(
+        store,
+        directions={
+            "columnDomains": {
+                "donor": "design",
+                "sample": "design",
+                "batch": "technical",
+                "disease": "biological",
+            },
+            "coefficientsOfInterest": ["disease"],
+            # sample is finer than donor: would inflate the design table.
+            "unitsOfInference": {
+                "disease": {"observationUnit": "donor", "independentUnit": "sample"}
+            },
+        },
+    )
+    assert result.status == "done"
+    assert any(entry["kind"] == "independentUnitFiner" for entry in result.auditLog)
+    coeff = next(item for item in result.coefficients if item["name"] == "disease")
+    assert coeff["observationUnit"] == "donor"
+    assert coeff["independentUnit"] is None
+    assert coeff["designRows"] == 2
+    assert len(result.confounding) == 1
+    assert result.confounding[0]["nRows"] == 2
+
+
+def test_characterize_covariates_drops_directed_constant_coefficient(
+    tmp_path: Path,
+) -> None:
+    store = _store_with_design(tmp_path)
+    result = characterize_covariates(
+        store,
+        directions={
+            "columnDomains": {"protocol": "technical", "disease": "biological"},
+            "coefficientsOfInterest": ["protocol", "disease"],
+            "unitsOfInference": {"disease": {"observationUnit": "donor"}},
+        },
+    )
+    assert result.status == "done"
+    drops = {
+        entry["column"]: entry["kind"]
+        for entry in result.auditLog
+        if entry["kind"].startswith("drop")
+    }
+    assert drops["protocol"] == "dropConstant"
+    assert any(
+        entry["kind"] == "dropConstant" and "coefficientsOfInterest" in entry["detail"]
+        for entry in result.auditLog
+        if entry.get("column") == "protocol"
+    )
+    assert "protocol" not in {item["name"] for item in result.coefficients}

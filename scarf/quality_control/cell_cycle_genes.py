@@ -1,4 +1,9 @@
-__all__ = ["s_phase_genes", "g2m_phase_genes"]
+__all__ = [
+    "g2m_phase_genes",
+    "g2m_phase_genes_mouse",
+    "s_phase_genes",
+    "s_phase_genes_mouse",
+]
 
 s_phase_genes: list[str] = [
     "MCM5",
@@ -102,3 +107,14 @@ g2m_phase_genes: list[str] = [
     "CBX5",
     "CENPA",
 ]
+
+
+def _mouse_symbol(human: str) -> str:
+    """Title-case mouse ortholog naming used by common Seurat-style lists."""
+    if not human:
+        return human
+    return human[0] + human[1:].lower()
+
+
+s_phase_genes_mouse: list[str] = [_mouse_symbol(name) for name in s_phase_genes]
+g2m_phase_genes_mouse: list[str] = [_mouse_symbol(name) for name in g2m_phase_genes]

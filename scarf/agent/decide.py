@@ -19,13 +19,23 @@ class DecisionValidationError(ValueError):
     """Raised when a model decision cites unknown or invalid evidence."""
 
 
-def _coerce_selected_id(selected_id: str, allowed: set[str]) -> str:
-    if selected_id in allowed:
-        return selected_id
-    matches = [evidence_id for evidence_id in allowed if evidence_id in selected_id]
+def _coerce_evidence_id(evidence_id: str, allowed: set[str]) -> str:
+    """Map a model-emitted id onto an allowed evidence id when unambiguous.
+
+    Live models often echo prompt scaffolding such as ``id=domain:biological``
+    instead of the bare id. Accept that when exactly one allowed id is embedded.
+    """
+    if evidence_id in allowed:
+        return evidence_id
+    stripped = evidence_id.strip()
+    if stripped.startswith("id="):
+        stripped = stripped[3:].strip()
+        if stripped in allowed:
+            return stripped
+    matches = [allowed_id for allowed_id in allowed if allowed_id in evidence_id]
     if len(matches) == 1:
         return matches[0]
-    return selected_id
+    return evidence_id
 
 
 def validate_decision(
@@ -35,13 +45,17 @@ def validate_decision(
     allowed = {item.id for item in evidence}
     if not allowed:
         raise DecisionValidationError("evidence must contain at least one item")
-    selected_id = _coerce_selected_id(decision.selectedId, allowed)
-    evidence_ids = list(decision.evidenceIds)
-    if selected_id != decision.selectedId or (
-        selected_id not in evidence_ids and selected_id in allowed
+    selected_id = _coerce_evidence_id(decision.selectedId, allowed)
+    evidence_ids = [
+        _coerce_evidence_id(evidence_id, allowed)
+        for evidence_id in decision.evidenceIds
+    ]
+    if selected_id not in evidence_ids and selected_id in allowed:
+        evidence_ids = [selected_id, *evidence_ids]
+    if (
+        selected_id != decision.selectedId
+        or evidence_ids != list(decision.evidenceIds)
     ):
-        if selected_id not in evidence_ids:
-            evidence_ids = [selected_id, *evidence_ids]
         decision = Decision(
             selectedId=selected_id,
             rationale=decision.rationale,

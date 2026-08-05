@@ -73,15 +73,44 @@ def create_numeric_array(
 
 def dtype_fix(dtype: Any, data: np.ndarray) -> Any:
     """Infer or adjust a metadata dtype from sample values."""
+
+    def _text(value: Any) -> str:
+        if isinstance(value, bytes | bytearray | np.bytes_):
+            return bytes(value).decode("utf-8")
+        if value is None:
+            return ""
+        return str(value)
+
     if dtype is None or np.dtype(dtype).kind == "O":
-        return "U" + str(max(len(str(value)) for value in data))
+        width = max((len(_text(value)) for value in data), default=1)
+        return f"U{max(width, 1)}"
     if np.issubdtype(data.dtype, np.dtype("S")):
         try:
             decoded = data.astype("U")
         except UnicodeDecodeError:
-            decoded = np.array([value.decode("UTF-8") for value in data]).astype("U")
+            decoded = np.array([_text(value) for value in data]).astype("U")
         return decoded.dtype
     return dtype
+
+
+def _decode_metadata_values(data: Any) -> np.ndarray:
+    """Decode UTF-8 byte strings before writing metadata columns."""
+    values = np.asarray(data)
+    if values.dtype.kind == "S":
+        return np.asarray([bytes(value).decode("utf-8") for value in values.flat])
+    if values.dtype.kind == "O" and any(
+        isinstance(value, bytes | bytearray | np.bytes_) for value in values.flat
+    ):
+        decoded: list[str] = []
+        for value in values.flat:
+            if isinstance(value, bytes | bytearray | np.bytes_):
+                decoded.append(bytes(value).decode("utf-8"))
+            elif value is None:
+                decoded.append("")
+            else:
+                decoded.append(str(value))
+        return np.asarray(decoded)
+    return values
 
 
 def create_metadata_column(
@@ -107,8 +136,14 @@ def create_metadata_column(
     )
 
     if data is not None:
-        values = np.array(data)
-        values = np.asarray(values, dtype=dtype_fix(dtype, values))
+        values = _decode_metadata_values(data)
+        # Decoded byte strings need a unicode width; ignore the original S/O dtype.
+        use_dtype = (
+            None
+            if values.dtype.kind == "U" and np.asarray(data).dtype.kind in {"S", "O"}
+            else dtype
+        )
+        values = np.asarray(values, dtype=dtype_fix(use_dtype, values))
         if chunks is False:
             chunks = (len(values),)
         return group.create_array(

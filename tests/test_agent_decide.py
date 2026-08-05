@@ -77,6 +77,17 @@ def test_validate_decision_coerces_selected_id_embedded_in_line() -> None:
     assert result.evidenceIds == ["matrix:raw/X"]
 
 
+def test_validate_decision_coerces_id_equals_prefix_in_evidence_ids() -> None:
+    decision = Decision(
+        selectedId="id=matrix:raw/X",
+        rationale="echoed prompt scaffolding",
+        evidenceIds=["id=matrix:raw/X"],
+    )
+    result = validate_decision(decision, _evidence())
+    assert result.selectedId == "matrix:raw/X"
+    assert result.evidenceIds == ["matrix:raw/X"]
+
+
 def test_decide_rejects_unknown_selected_id() -> None:
     bad = Decision(
         selectedId="matrix:missing",
