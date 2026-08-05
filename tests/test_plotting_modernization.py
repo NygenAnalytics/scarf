@@ -1301,6 +1301,7 @@ def test_stacked_violin_mean_color_expression(umap, leiden_clustering, datastore
         group_by="RNA_leiden_cluster",
         kind="stacked_violin",
         color_by="mean",
+        color_scale=splt.ColorScale(scope="shared"),
         max_points=0,
         show=False,
     )
@@ -1370,6 +1371,7 @@ def test_stacked_violin_mean_color_constant_row(umap, leiden_clustering, datasto
         kind="stacked_violin",
         row_standardize=True,
         color_by="mean",
+        color_scale=splt.ColorScale(scope="shared"),
         max_points=0,
         show=False,
     )
@@ -1443,7 +1445,7 @@ def test_stacked_violin_mean_color_quantiles(umap, leiden_clustering, datastore)
         group_by="RNA_leiden_cluster",
         kind="stacked_violin",
         color_by="mean",
-        color_scale=splt.ColorScale(quantiles=(0.25, 0.75)),
+        color_scale=splt.ColorScale(quantiles=(0.25, 0.75), scope="shared"),
         max_points=0,
         show=False,
     )
@@ -1459,6 +1461,31 @@ def test_stacked_violin_mean_color_quantiles(umap, leiden_clustering, datastore)
         finite = np.asarray([m for m in all_means if np.isfinite(m)])
         assert color_scale.vmin == pytest.approx(np.quantile(finite, 0.25))
         assert color_scale.vmax == pytest.approx(np.quantile(finite, 0.75))
+        # Rendered face colours honour the quantile clip: the lowest mean maps
+        # to the bottom of the colormap and the highest to the top. Seaborn
+        # desaturates the fills by ``saturation=0.9``.
+        from matplotlib import colormaps
+        from matplotlib.colors import to_rgb
+        from seaborn.utils import desaturate
+
+        face_colors = {
+            tuple(np.round(color.get_facecolor()[0][:3], 3))
+            for ax in result.axes.values()
+            for color in ax.collections
+            if hasattr(color, "get_facecolor") and len(color.get_facecolor())
+        }
+
+        def desat(t: float) -> tuple[float, float, float]:
+            return tuple(
+                np.round(to_rgb(desaturate(to_rgb(colormaps["viridis"](t)), 0.9)), 3)
+            )
+
+        def close_to(fc: tuple[float, ...], expected: tuple[float, ...]) -> bool:
+            return all(abs(a - b) <= 0.01 for a, b in zip(fc, expected))
+
+        assert any(close_to(fc, desat(0.0)) for fc in face_colors)
+        assert any(close_to(fc, desat(1.0)) for fc in face_colors)
+        assert len(face_colors) >= 3
     finally:
         result.close()
 
@@ -1488,5 +1515,149 @@ def test_stacked_violin_mean_color_panel_scope(umap, leiden_clustering, datastor
         ]
         assert len(colorbars) == 1
         assert colorbars[0].get_ylabel() == "mean expression (reference)"
+    finally:
+        result.close()
+
+
+def test_stacked_violin_scope_follows_share_y(umap, leiden_clustering, datastore):
+    gene = _expressed_gene_names(datastore, n=1)[0]
+    independent = splt.distribution(
+        datastore,
+        keys=gene,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        color_by="mean",
+        max_points=0,
+        show=False,
+    )
+    try:
+        assert independent.provenance.extras["color_scale_scope"] == "panel"
+        assert independent.legends[0].label == "mean expression (reference)"
+    finally:
+        independent.close()
+    shared = splt.distribution(
+        datastore,
+        keys=gene,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        color_by="mean",
+        share_y=True,
+        max_points=0,
+        show=False,
+    )
+    try:
+        assert shared.provenance.extras["color_scale_scope"] == "shared"
+        assert shared.legends[0].label == "mean expression"
+    finally:
+        shared.close()
+
+
+def test_stacked_violin_mean_color_rejects_feature_scope(
+    umap, leiden_clustering, datastore
+):
+    gene = _expressed_gene_names(datastore, n=1)[0]
+    with pytest.raises(ValueError, match="scope must be 'shared' or 'panel'"):
+        splt.distribution(
+            datastore,
+            keys=gene,
+            group_by="RNA_leiden_cluster",
+            kind="stacked_violin",
+            color_by="mean",
+            color_scale=splt.ColorScale(),
+            max_points=0,
+            show=False,
+        )
+
+
+def test_stacked_violin_mean_color_no_colorbar_on_target(
+    umap, leiden_clustering, datastore
+):
+    genes = _expressed_gene_names(datastore, n=2)
+    fig, axes = plt.subplots(1, 2)
+    result = splt.distribution(
+        datastore,
+        keys=genes,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        color_by="mean",
+        color_scale=splt.ColorScale(scope="shared"),
+        max_points=0,
+        target=[axes[0], axes[1]],
+        show=False,
+    )
+    try:
+        assert result.owns_figure is False
+        assert not any(
+            ax.get_label().startswith("<colorbar") for ax in result.figure.axes
+        )
+        assert any(legend.kind == "colorbar" for legend in result.legends)
+    finally:
+        result.close()
+        plt.close(fig)
+
+
+def test_stacked_violin_mean_color_missing_group_missing_color():
+    import pandas as pd
+
+    from scarf.plotting.distribution import _mean_group_palette
+
+    means = pd.Series({"a": 1.0, "b": np.nan})
+    color_scale = splt.ColorScale(scope="shared")
+    palette = _mean_group_palette(
+        means,
+        ["a", "b"],
+        color_scale=color_scale,
+        lo=0.0,
+        hi=2.0,
+    )
+    assert palette["b"] == color_scale.missing_color
+    assert palette["a"] != color_scale.missing_color
+
+
+def test_stacked_violin_mean_color_vcenter_extends_bounds(
+    umap, leiden_clustering, datastore
+):
+    gene = _expressed_gene_names(datastore, n=1)[0]
+    result = splt.distribution(
+        datastore,
+        keys=gene,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        color_by="mean",
+        color_scale=splt.ColorScale(vcenter=0.0, scope="shared"),
+        max_points=0,
+        show=False,
+    )
+    try:
+        scale = next(s for s in result.scales if isinstance(s, splt.ColorScale))
+        assert scale.vmin <= 0.0
+        assert scale.vmax > 0.0
+        assert result.legends[0].kind == "colorbar"
+    finally:
+        result.close()
+
+
+def test_stacked_violin_defaults_to_no_overlay(umap, leiden_clustering, datastore):
+    gene = _expressed_gene_names(datastore, n=1)[0]
+    result = splt.distribution(
+        datastore,
+        keys=gene,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        show=False,
+    )
+    try:
+        assert result.provenance.extras["max_points"] == 0
+        for ax in result.axes.values():
+            point_collections = [
+                collection
+                for collection in ax.collections
+                if hasattr(collection, "get_offsets")
+            ]
+            # Violin bodies carry a single default offset; a jitter overlay
+            # would add a collection with one offset per drawn cell.
+            assert all(
+                len(collection.get_offsets()) <= 1 for collection in point_collections
+            )
     finally:
         result.close()
