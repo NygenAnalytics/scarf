@@ -1,5 +1,9 @@
 """Optional grounded decision helpers for Scarf workflows."""
 
+from .characterize_covariates import (
+    CovariateCharacterization,
+    characterize_covariates,
+)
 from .decide import DecisionValidationError, decide
 from .ingest import IngestResult, detect_format, ingest
 from .runtime import check_runtime, load_env
@@ -12,6 +16,7 @@ from .types import (
 )
 
 __all__ = [
+    "CovariateCharacterization",
     "Decision",
     "DecisionValidationError",
     "EvidenceItem",
@@ -19,6 +24,7 @@ __all__ = [
     "NeedsInput",
     "StageResult",
     "StageStatus",
+    "characterize_covariates",
     "check_runtime",
     "decide",
     "detect_format",
