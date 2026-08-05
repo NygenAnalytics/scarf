@@ -399,16 +399,38 @@ def _mean_color_limits(
     """Resolve per-panel and reference colour limits from group means.
 
     ``scope="shared"`` gives every stacked row the same limits derived from all
-    pooled group means, so the rows share one continuous scale.
-    ``scope="panel"`` rescales each row independently. Explicit ``vmin`` /
-    ``vmax`` override quantile or observed bounds; a ``vcenter`` pivot extends
-    derived bounds so diverging maps work on one-sided data.
+    pooled group means, so the rows share one continuous scale. Explicit
+    ``vmin`` / ``vmax`` override quantile or observed bounds; a ``vcenter``
+    pivot extends derived bounds so diverging maps work on one-sided data.
+
+    ``scope="panel"`` rescales each row independently by the strict min/max of
+    that row's own group means, so the lowest mean maps to 0 and the highest to
+    1. Quantiles, bounds, and pivots are not applied per panel; the shared
+    reference for the unit colorbar is ``(0, 1)``.
     """
     if color_scale.scope not in ("shared", "panel"):
         raise ValueError(
             "color_scale.scope must be 'shared' or 'panel' for mean coloring; "
             f"got {color_scale.scope!r}"
         )
+
+    arrays = [
+        np.asarray(means.to_numpy(dtype=np.float64), dtype=np.float64)
+        for means in means_by_panel
+    ]
+    pooled = np.concatenate(arrays) if arrays else np.array([], dtype=np.float64)
+    if pooled[np.isfinite(pooled)].size == 0:
+        raise ValueError("No finite expression values to colour by")
+
+    if color_scale.scope == "panel":
+        limits: list[tuple[float, float]] = []
+        for array in arrays:
+            finite = array[np.isfinite(array)]
+            if finite.size == 0:
+                limits.append((0.0, 1.0))
+            else:
+                limits.append((float(np.nanmin(finite)), float(np.nanmax(finite))))
+        return limits, (0.0, 1.0)
 
     def resolve(values: np.ndarray) -> tuple[float, float]:
         finite = np.asarray(values, dtype=np.float64)
@@ -445,17 +467,8 @@ def _mean_color_limits(
                     hi = color_scale.vcenter + eps
         return lo, hi
 
-    arrays = [
-        np.asarray(means.to_numpy(dtype=np.float64), dtype=np.float64)
-        for means in means_by_panel
-    ]
-    pooled = np.concatenate(arrays) if arrays else np.array([], dtype=np.float64)
-    if pooled[np.isfinite(pooled)].size == 0:
-        raise ValueError("No finite expression values to colour by")
     reference = resolve(pooled)
-    if color_scale.scope == "shared":
-        return [reference] * len(arrays), reference
-    return [resolve(array) for array in arrays], reference
+    return [reference] * len(arrays), reference
 
 
 def _render_color_limits(lo: float, hi: float) -> tuple[float, float]:
@@ -468,10 +481,9 @@ def _render_color_limits(lo: float, hi: float) -> tuple[float, float]:
 
 def _mean_colorbar_label(color_scale: ColorScale, row_standardize: bool) -> str:
     """Label for the mean-expression colourbar, adapted to the value scale."""
-    label = "mean standardized value" if row_standardize else "mean expression"
     if color_scale.scope == "panel":
-        label += " (reference)"
-    return label
+        return "Relative Expression Per Gene"
+    return "mean standardized value" if row_standardize else "mean expression"
 
 
 def _mean_group_palette(
@@ -617,6 +629,16 @@ def distribution(
             raise ValueError(
                 "color_scale.scope must be 'shared' or 'panel' for mean coloring; "
                 f"got {color_scale.scope!r}"
+            )
+        if color_scale.scope == "panel" and (
+            color_scale.quantiles is not None
+            or color_scale.vmin is not None
+            or color_scale.vmax is not None
+            or color_scale.vcenter is not None
+        ):
+            raise ValueError(
+                "quantiles/vmin/vmax/vcenter apply only to scope='shared' for "
+                "mean coloring; panel scope uses strict per-gene 0-to-1 scaling"
             )
     if kind not in ("violin", "stacked_violin", "box", "hist", "ecdf"):
         raise ValueError(
@@ -850,12 +872,11 @@ def distribution(
     ]
     panel_group_means: list[pd.Series] | None = None
     mean_limits: list[tuple[float, float]] | None = None
-    reference_limits: tuple[float, float] | None = None
     if color_by == "mean":
         panel_group_means = [
             _panel_group_means(frame) for frame in panel_display_frames
         ]
-        mean_limits, reference_limits = _mean_color_limits(
+        mean_limits, _reference_limits = _mean_color_limits(
             panel_group_means,
             color_scale,
         )
@@ -863,11 +884,13 @@ def distribution(
     # means equal) are padded symmetrically so the key is always visible.
     render_limits: tuple[float, float] | None = None
     if mean_limits is not None:
-        assert reference_limits is not None
-        base_lo, base_hi = (
-            mean_limits[0] if color_scale.scope == "shared" else reference_limits
-        )
-        render_limits = _render_color_limits(base_lo, base_hi)
+        if color_scale.scope == "shared":
+            base = mean_limits[0]
+        else:
+            # Panel scope colours each row by its own 0-to-1 relative scale, so
+            # the single colorbar shows the unit range.
+            base = (0.0, 1.0)
+        render_limits = _render_color_limits(*base)
 
     fig, axes, owns = normalize_axes_target(
         target,

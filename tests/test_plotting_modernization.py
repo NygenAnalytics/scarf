@@ -1514,7 +1514,14 @@ def test_stacked_violin_mean_color_panel_scope(umap, leiden_clustering, datastor
             ax for ax in result.figure.axes if ax.get_label().startswith("<colorbar")
         ]
         assert len(colorbars) == 1
-        assert colorbars[0].get_ylabel() == "mean expression (reference)"
+        assert colorbars[0].get_ylabel() == "Relative Expression Per Gene"
+        # Panel scope draws a single colorbar on the unit 0-to-1 relative scale.
+        assert color_scale.vmin == pytest.approx(0.0)
+        assert color_scale.vmax == pytest.approx(1.0)
+        assert result.legends[0].extras["vmin"] == pytest.approx(0.0)
+        assert result.legends[0].extras["vmax"] == pytest.approx(1.0)
+        assert result.provenance.extras["vmin"] == pytest.approx(0.0)
+        assert result.provenance.extras["vmax"] == pytest.approx(1.0)
     finally:
         result.close()
 
@@ -1532,7 +1539,7 @@ def test_stacked_violin_scope_follows_share_y(umap, leiden_clustering, datastore
     )
     try:
         assert independent.provenance.extras["color_scale_scope"] == "panel"
-        assert independent.legends[0].label == "mean expression (reference)"
+        assert independent.legends[0].label == "Relative Expression Per Gene"
     finally:
         independent.close()
     shared = splt.distribution(
@@ -1661,3 +1668,80 @@ def test_stacked_violin_defaults_to_no_overlay(umap, leiden_clustering, datastor
             )
     finally:
         result.close()
+
+
+def test_stacked_violin_panel_scope_strict_minmax(umap, leiden_clustering, datastore):
+    genes = _expressed_gene_names(datastore, n=2)
+    result = splt.distribution(
+        datastore,
+        keys=genes,
+        group_by="RNA_leiden_cluster",
+        kind="stacked_violin",
+        color_by="mean",
+        color_scale=splt.ColorScale(scope="panel"),
+        max_points=0,
+        show=False,
+    )
+    try:
+        from matplotlib import colormaps
+        from matplotlib.colors import to_rgb
+        from seaborn.utils import desaturate
+
+        def desat(t: float) -> tuple[float, float, float]:
+            return tuple(
+                np.round(to_rgb(desaturate(to_rgb(colormaps["viridis"](t)), 0.9)), 3)
+            )
+
+        def close_to(fc: tuple[float, ...], expected: tuple[float, ...]) -> bool:
+            return all(abs(a - b) <= 0.01 for a, b in zip(fc, expected))
+
+        lo_color, hi_color = desat(0.0), desat(1.0)
+        # Every panel rescales to its own 0-to-1 range, so the lowest and
+        # highest-mean clusters in EVERY row land on the colormap endpoints.
+        for ax in result.axes.values():
+            face_colors = {
+                tuple(np.round(c.get_facecolor()[0][:3], 3))
+                for c in ax.collections
+                if hasattr(c, "get_facecolor") and len(c.get_facecolor())
+            }
+            assert any(close_to(fc, lo_color) for fc in face_colors)
+            assert any(close_to(fc, hi_color) for fc in face_colors)
+    finally:
+        result.close()
+
+
+def test_stacked_violin_panel_scope_rejects_bounds(umap, leiden_clustering, datastore):
+    gene = _expressed_gene_names(datastore, n=1)[0]
+    with pytest.raises(ValueError, match="apply only to scope='shared'"):
+        splt.distribution(
+            datastore,
+            keys=gene,
+            group_by="RNA_leiden_cluster",
+            kind="stacked_violin",
+            color_by="mean",
+            color_scale=splt.ColorScale(scope="panel", vmin=0.0),
+            max_points=0,
+            show=False,
+        )
+    with pytest.raises(ValueError, match="apply only to scope='shared'"):
+        splt.distribution(
+            datastore,
+            keys=gene,
+            group_by="RNA_leiden_cluster",
+            kind="stacked_violin",
+            color_by="mean",
+            color_scale=splt.ColorScale(scope="panel", quantiles=(0.1, 0.9)),
+            max_points=0,
+            show=False,
+        )
+    with pytest.raises(ValueError, match="apply only to scope='shared'"):
+        splt.distribution(
+            datastore,
+            keys=gene,
+            group_by="RNA_leiden_cluster",
+            kind="stacked_violin",
+            color_by="mean",
+            color_scale=splt.ColorScale(scope="panel", vcenter=0.0),
+            max_points=0,
+            show=False,
+        )
