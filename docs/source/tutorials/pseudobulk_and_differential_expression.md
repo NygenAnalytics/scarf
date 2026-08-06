@@ -16,12 +16,10 @@ kernelspec:
 
 # Pseudobulk and differential expression
 
-Scarf stops at aggregation and export. Use `make_bulk` to build bulk-like count profiles, then
-export those counts (with sample-level metadata) for condition-level differential expression in
-an external tool such as edgeR or DESeq2. `run_marker_search` is separate: it returns
-Mann-Whitney `p_value` columns plus within-group `p_value_adjusted` (Benjamini-Hochberg) for
-cluster interpretation. Those adjusted values are still cell-level marker statistics, not
-replicate-aware FDR-controlled DE.
+Scarf stops at aggregation and export.
+Use `make_bulk` to build bulk-like count profiles, then export those counts (with sample-level metadata) for condition-level differential expression in an external tool such as edgeR or DESeq2.
+`run_marker_search` is separate: it returns Mann-Whitney `p_value` columns plus within-group `p_value_adjusted` (Benjamini-Hochberg) for cluster interpretation.
+Those adjusted values are still cell-level marker statistics, not replicate-aware FDR-controlled DE.
 
 ## Prerequisites
 
@@ -36,9 +34,8 @@ replicate-aware FDR-controlled DE.
 
 ## Dataset
 
-This page uses the Kang control PBMC store and Leiden clusters as groups. For multi-sample
-designs, merge samples first ({doc}`dataset_merging`) and pass sample and cell-type columns
-to `make_bulk`.
+This page uses the Kang control PBMC store and Leiden clusters as groups.
+For multi-sample designs, merge samples first ({doc}`dataset_merging`) and pass sample and cell-type columns to `make_bulk`.
 
 ```{code-cell} ipython3
 import pandas as pd
@@ -58,9 +55,8 @@ ds = scarf.DataStore(
 )
 ```
 
-The published Kang store carries a UMAP and a Leiden partition under
-`RNA_clusters`. Those groups are the aggregation key below, and they may differ
-from the author-provided `cluster_labels` column.
+The published Kang store carries a UMAP and a Leiden partition under `RNA_clusters`.
+Those groups are the aggregation key below, and they may differ from the author-provided `cluster_labels` column.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -71,9 +67,7 @@ ds.plots.embedding(
 
 Leiden clusters on the published UMAP; these labels are the grouping key for `make_bulk` below.
 
-## Guided steps
-
-### 1. Inspect marker ranks separately from DE
+## 1. Inspect marker ranks separately from DE
 
 ```{code-cell} ipython3
 ds.run_marker_search(group_key='RNA_clusters')
@@ -106,11 +100,11 @@ ds.plots.marker_heatmap(
 Rows are top markers per cluster for interpretation only, not exported DE results.
 
 ```{note}
-Use marker tables for cluster interpretation. Do not treat within-group `p_value_adjusted`
-columns as replicate-aware differential expression results.
+Use marker tables for cluster interpretation.
+Do not treat within-group `p_value_adjusted` columns as replicate-aware differential expression results.
 ```
 
-### 2. Aggregate with make_bulk
+## 2. Aggregate with make_bulk
 
 Cell counts per Leiden group set the scale for each bulk column:
 
@@ -127,8 +121,8 @@ group_sizes = (
 group_sizes
 ```
 
-`make_bulk` sums raw counts per group. `return_fraction=True` adds the fraction of
-cells with non-zero counts in the same pass:
+`make_bulk` sums raw counts per group.
+`return_fraction=True` adds the fraction of cells with non-zero counts in the same pass:
 
 ```{code-cell} ipython3
 bulk, fracs = ds.make_bulk(
@@ -159,11 +153,10 @@ fracs.loc[top_genes]
 Optional pseudo-replicates within each group:
 
 ```{note}
-`pseudo_reps > 1` randomly splits cells within each group. These are descriptive
-resamples of the same cells, not independent biological replicates. Do not treat
-them as replicates in edgeR, DESeq2, or PyDESeq2. For replicate-aware differential
-expression, aggregate with a sample-aware `group_key` (for example sample nested
-with cell type) and keep true biological replicates in the exported metadata.
+`pseudo_reps > 1` randomly splits cells within each group.
+These are descriptive resamples of the same cells, not independent biological replicates.
+Do not treat them as replicates in edgeR, DESeq2, or PyDESeq2.
+For replicate-aware differential expression, aggregate with a sample-aware `group_key` (for example sample nested with cell type) and keep true biological replicates in the exported metadata.
 ```
 
 ```{code-cell} ipython3
@@ -176,14 +169,14 @@ bulk_reps = ds.make_bulk(
 list(bulk_reps.columns)
 ```
 
-Column names carry the group label plus `_Rep1` / `_Rep2`. Shape doubles the
-group count because each cluster is split once:
+Column names carry the group label plus `_Rep1` / `_Rep2`.
+Shape doubles the group count because each cluster is split once:
 
 ```{code-cell} ipython3
 bulk_reps.shape
 ```
 
-### 3. Export counts for external DE
+## 3. Export counts for external DE
 
 ```{code-cell} ipython3
 export_path = 'scarf_datasets/kang_pseudobulk_counts.csv'
@@ -199,8 +192,7 @@ print(f'Wrote {bulk.shape[0]} features x {bulk.shape[1]} groups to {export_path}
 print(f'Wrote sample metadata for {sample_meta.shape[0]} groups to {meta_path}')
 ```
 
-Peek the written count matrix and the group-level metadata that pairs with its
-columns:
+Peek the written count matrix and the group-level metadata that pairs with its columns:
 
 ```{code-cell} ipython3
 pd.read_csv(export_path, index_col=0, nrows=5).iloc[:, :5]
@@ -210,11 +202,9 @@ pd.read_csv(export_path, index_col=0, nrows=5).iloc[:, :5]
 pd.read_csv(meta_path, index_col=0)
 ```
 
-Use the exported count matrix and sample-level metadata with a method appropriate to the study
-design, such as edgeR or DESeq2. Scarf stops at aggregation and export; it does not run those
-models. For a true multi-sample design, merge donors or conditions first
-({doc}`dataset_merging`), aggregate with a sample-aware `group_key` (for example sample
-nested with cell type), and keep biological replicates in the exported metadata.
+Use the exported count matrix and sample-level metadata with a method appropriate to the study design, such as edgeR or DESeq2.
+Scarf stops at aggregation and export; it does not run those models.
+For a true multi-sample design, merge donors or conditions first ({doc}`dataset_merging`), aggregate with a sample-aware `group_key` (for example sample nested with cell type), and keep biological replicates in the exported metadata.
 
 ## Common mistakes
 

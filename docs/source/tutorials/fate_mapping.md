@@ -15,10 +15,9 @@ kernelspec:
 
 # Fate mapping across terminal states
 
-Pseudotime places cells along one progression axis. Fate mapping complements that
-ordering with a probability for each user-provided terminal state. This notebook
-uses pancreatic endocrine differentiation to estimate Alpha, Beta, and Delta
-fates.
+Pseudotime places cells along one progression axis.
+Fate mapping complements that ordering with a probability for each user-provided terminal state.
+This notebook uses pancreatic endocrine differentiation to estimate Alpha, Beta, and Delta fates.
 
 ## Prerequisites
 
@@ -45,8 +44,7 @@ scarf.configure_output(level='WARNING', progress=True)
 
 ## 1. Load the preprocessed dataset
 
-The prepared Zarr store from the `scarf_docs` Cytebase catalog contains a KNN graph,
-UMAP coordinates, Scarf clusters, and the provided cell-type annotations.
+The prepared Zarr store from the `scarf_docs` Cytebase catalog contains a KNN graph, UMAP coordinates, Scarf clusters, and the provided cell-type annotations.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -71,9 +69,10 @@ ds.plots.embedding(
 
 ## 2. Define progenitor and terminal groups
 
-Fate mapping needs a starting point and a set of endpoints. The provided `clusters`
-annotation names both: ductal cells are the progenitor pool of this stage, and the
-hormone-expressing states are the terminal fates.
+These groups feed different calls.
+Progenitors are sources for `run_pseudotime_scoring` (PBA), which writes the pseudotime that fate mapping consumes.
+Terminal cell types are sinks for that PBA score and for `run_fate_mapping`, which takes only `pseudotime_key`, `sink_key`, and `sinks`.
+The provided `clusters` annotation names both: ductal cells are the progenitor pool of this stage, and the hormone-expressing states are the terminal fates.
 
 ```{code-cell} ipython3
 progenitors = ['Ductal']
@@ -85,8 +84,8 @@ ds.cells.to_pandas_dataframe(
 )['clusters'].value_counts()
 ```
 
-The panels below mark the source and sinks on the same embedding. Other populations,
-including Epsilon, stay in the background and are not used as boundaries.
+The panels below mark the source and sinks on the same embedding.
+Other populations, including Epsilon, stay in the background and are not used as boundaries.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
@@ -132,9 +131,9 @@ figure
 
 ## 3. Estimate a shared pseudotime
 
-PBA supplies the developmental direction. The terminal cell types are used as sinks so the
-ordering covers the branches analyzed below. `label='fate_pseudotime'` keeps these columns
-separate from any pseudotime already stored on the object.
+PBA supplies the developmental direction.
+The terminal cell types are used as sinks so the ordering covers the branches analyzed below.
+`label='fate_pseudotime'` keeps these columns separate from any pseudotime already stored on the object.
 
 ```{code-cell} ipython3
 pseudotime = ds.run_pseudotime_scoring(
@@ -167,11 +166,10 @@ ds.plots.embedding(
 
 ## 4. Compute fate probabilities
 
-`run_fate_mapping` biases the KNN graph toward increasing pseudotime and solves
-the absorption probability for each terminal cell type. Every cell carrying an Alpha, Beta,
-or Delta annotation defines the corresponding fate boundary. The PBA validity key excludes
-any unscored graph components from the fate calculation. Since that subset key is
-not `I`, Scarf includes it in the saved fate column names.
+`run_fate_mapping` biases the KNN graph toward increasing pseudotime and solves the absorption probability for each terminal cell type.
+Every cell carrying an Alpha, Beta, or Delta annotation defines the corresponding fate boundary.
+The PBA validity key excludes any unscored graph components from the fate calculation.
+Since that subset key is not `I`, Scarf includes it in the saved fate column names.
 
 ```{code-cell} ipython3
 fate = ds.run_fate_mapping(
@@ -220,9 +218,8 @@ figure.tight_layout()
 figure
 ```
 
-Mean probability by cluster makes the same claim numerically. Terminal rows should
-peak on their own fate, while intermediate populations such as Pre-endocrine retain
-probability across several outcomes.
+Mean probability by cluster makes the same claim numerically.
+Terminal rows should peak on their own fate, while intermediate populations such as Pre-endocrine retain probability across several outcomes.
 
 ```{code-cell} ipython3
 fate_frame = ds.cells.to_pandas_dataframe(
@@ -237,15 +234,13 @@ fate_frame = ds.cells.to_pandas_dataframe(
 )
 ```
 
-A terminal group with low probability for its own fate indicates a mismatch between the
-annotations, graph, and selected boundaries.
+A terminal group with low probability for its own fate indicates a mismatch between the annotations, graph, and selected boundaries.
 
 ## Interpretation and limits
 
 The PBA score describes progress along the shared developmental direction.
-The fate columns separate that direction into terminal outcomes and quantify
-ambiguous intermediate cells. Sink identities remain supervised: this method
-does not discover terminal states automatically and does not use RNA velocity.
+The fate columns separate that direction into terminal outcomes and quantify ambiguous intermediate cells.
+Sink identities remain supervised: this method does not discover terminal states automatically and does not use RNA velocity.
 
 ## Common mistakes and limitations
 
@@ -254,6 +249,5 @@ does not discover terminal states automatically and does not use RNA velocity.
 - Ignoring the pseudotime validity key when the graph has multiple components
 - Expecting the method to find terminal states on its own
 
-Fate probabilities are stored under the keys returned in `fate.fate_keys`,
-with a matching validity column. Probability-simplex checks, solver diagnostics,
-and tuning belong in {doc}`trajectory_validation`.
+Fate probabilities are stored under the keys returned in `fate.fate_keys`, with a matching validity column.
+Probability-simplex checks, solver diagnostics, and tuning belong in {doc}`trajectory_validation`.

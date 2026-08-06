@@ -1,5 +1,7 @@
 # Datasets and utilities API reference
 
+## Cytebase and store helpers
+
 ```{eval-rst}
 .. autofunction:: scarf.cytebase.list_repositories
 ```
@@ -27,9 +29,9 @@
 
 ## Logging and progress
 
-Scarf starts with `INFO` logs and progress enabled, without timestamps. Notebook
-sessions do not need an output setup call. For a batch pipeline, configure the
-independent settings once at startup:
+Scarf starts with `INFO` logs and progress enabled, without timestamps.
+Notebook sessions do not need an output setup call.
+For a batch pipeline, configure the independent settings once at startup:
 
 ```python
 scarf.configure_output(progress=False, timestamps=True)
@@ -42,11 +44,11 @@ Arguments that are omitted retain their current values.
 - `progress` controls progress bars, including `show_dask_progress`.
 - `timestamps` controls timestamps in Scarf's installed log sink.
 
-Progress is independent of log level. Setting a quiet level such as `WARNING`
-does not disable progress. Code that previously relied on log level to suppress
-bars should call `configure_output(progress=False)` explicitly. Interactive
-notebooks animate these bars. Read the Docs shows deterministic completed
-snapshots from the committed notebook cache instead of replaying an animation.
+Progress is independent of log level.
+Setting a quiet level such as `WARNING` does not disable progress.
+Code that previously relied on log level to suppress bars should call `configure_output(progress=False)` explicitly.
+Interactive notebooks animate these bars.
+Read the Docs shows deterministic completed snapshots from the committed notebook cache instead of replaying an animation.
 
 ```{eval-rst}
 .. autofunction:: scarf.configure_output
@@ -56,9 +58,8 @@ snapshots from the committed notebook cache instead of replaying an animation.
 .. autofunction:: scarf.set_verbosity
 ```
 
-`set_verbosity(level=..., filepath=...)` remains the interface for selecting a
-log level and optional file destination. Use it when a durable batch log is
-needed; use `configure_output` for ordinary notebook and console behavior.
+`set_verbosity(level=..., filepath=...)` remains the interface for selecting a log level and optional file destination.
+Use it when a durable batch log is needed; use `configure_output` for ordinary notebook and console behavior.
 
 ```{eval-rst}
 .. autofunction:: scarf.get_log_level
@@ -93,8 +94,7 @@ needed; use `configure_output` for ordinary notebook and console behavior.
 
 ## Array helpers
 
-These operate on plain arrays and are used by Scarf's own normalization and feature
-selection code.
+These operate on plain arrays and are used by Scarf's own embeddings, graph construction, trajectory dynamics, and merge code.
 
 ```{eval-rst}
 .. autofunction:: scarf.clean_array

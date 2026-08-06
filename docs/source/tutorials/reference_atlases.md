@@ -16,16 +16,13 @@ kernelspec:
 
 # Building reusable reference atlases
 
-A reusable atlas keeps its feature set, normalization, PCA basis, corrected
-coordinates, and neighbour index fixed while new queries arrive. Scarf stores
-those components as a content-addressed mapping reference and applies a
-Symphony-style correction without moving the reference cells.
+A reusable atlas keeps its feature set, normalization, PCA basis, corrected coordinates, and neighbour index fixed while new queries arrive.
+Scarf stores those components as a content-addressed mapping reference and applies a Symphony-style correction without moving the reference cells.
 
-Scarf's `symphony` path follows a fixed-reference PCA, soft-assignment, and
-ridge-correction contract. It is not a complete reimplementation of every
-option in the Symphony R package.
+Scarf's `symphony` path follows a fixed-reference PCA, soft-assignment, and ridge-correction contract.
+It is not a complete reimplementation of every option in the Symphony R package.
 
-## Open the reference and query
+## 1. Open the reference and query
 
 ```{code-cell} ipython3
 import numpy as np
@@ -58,10 +55,9 @@ ds_stim = scarf.DataStore(
 )
 ```
 
-`reference_batch` must represent technical structure such as donor,
-preparation, or sequencing batch. The single control label below only exercises
-the API. It is confounded with the biological condition in the stimulated
-query, so correction magnitude must not be given a biological interpretation.
+`reference_batch` must represent technical structure such as donor, preparation, or sequencing batch.
+The single control label below only exercises the API.
+It is confounded with the biological condition in the stimulated query, so correction magnitude must not be given a biological interpretation.
 
 ```{code-cell} ipython3
 ds_ctrl.cells.insert(
@@ -71,10 +67,9 @@ ds_ctrl.cells.insert(
 )
 ```
 
-## Build and reload the reference
+## 2. Build and reload the reference
 
-Build the Harmony-backed neighbour chain with one pipeline call, then package it
-as the mapping reference.
+Build the Harmony-backed neighbour chain with one pipeline call, then package it as the mapping reference.
 
 ```{code-cell} ipython3
 artifacts = ds_ctrl.pipeline.run(
@@ -110,10 +105,8 @@ pd.Series(
 )
 ```
 
-`method="symphony"` means the neighbour chain used Harmony-corrected
-coordinates and the reference carries soft-assignment state for query
-correction. The feature count and PCA dimensions stay fixed for every later
-query.
+`method="symphony"` means the neighbour chain used Harmony-corrected coordinates and the reference carries soft-assignment state for query correction.
+The feature count and PCA dimensions stay fixed for every later query.
 
 ```{code-cell} ipython3
 ds_ctrl.plots.embedding(
@@ -122,14 +115,15 @@ ds_ctrl.plots.embedding(
 )
 ```
 
-This layout is the fixed atlas identity. Mapping places query weight onto these
-cells without moving them.
+This plot uses the pre-published `RNA_UMAP` already on the datastore.
+`umap=False` above skipped recomputing UMAP for the Harmony neighbour chain, so the layout is a viewing aid rather than part of the packaged mapping reference.
+`MappingReference` stores the feature set, PCA basis, corrected coordinates, and neighbour index; it does not store an embedding.
+Mapping places query weight onto reference cells without moving those cells.
 
-In a later session, reopen the reference store and load the named mapping
-reference. The prepared reference datastore may be opened read-only. Mapping
-still requires a separate writable query datastore. Use `mount_datastore` when
-the query counts come from a read-only source or from the same source used to
-prepare the reference.
+In a later session, reopen the reference store and load the named mapping reference.
+The prepared reference datastore may be opened read-only.
+Mapping still requires a separate writable query datastore.
+Use `mount_datastore` when the query counts come from a read-only source or from the same source used to prepare the reference.
 
 ```{code-cell} ipython3
 reference = ds_ctrl.get_mapping_reference()
@@ -146,11 +140,10 @@ pd.Series(
 )
 ```
 
-## Map and inspect a shifted query
+## 3. Map and inspect a shifted query
 
-Mapping runs in streaming passes so the query matrix does not need to be
-materialized. Missing reference features fall back to the reference mean, which
-becomes zero after reference scaling.
+Mapping runs in streaming passes so the query matrix does not need to be materialized.
+Missing reference features fall back to the reference mean, which becomes zero after reference scaling.
 
 ```{code-cell} ipython3
 query_batches = pd.DataFrame(
@@ -171,10 +164,9 @@ mapping = ds_stim.run_mapping(
 mapping.mapping_name, mapping.n_cells, mapping.correction_method
 ```
 
-The mapping result is stored in `ds_stim`. The reference model and reference
-coordinates remain unchanged. `correction_method="symphony"` confirms the query
-used the fixed-reference ridge correction rather than a plain PCA neighbour
-lookup.
+The mapping result is stored in `ds_stim`.
+The reference model and reference coordinates remain unchanged.
+`correction_method="symphony"` confirms the query used the fixed-reference ridge correction rather than a plain PCA neighbour lookup.
 
 ```{code-cell} ipython3
 mapped = ds_stim.get_mapping_result(
@@ -186,12 +178,11 @@ mapped = ds_stim.get_mapping_result(
 mapped.diagnostics
 ```
 
-Diagnostics report feature coverage, query batch count, the mapping algorithm,
-and uninformative-cell count. Mapping rejects using the same physical datastore
-as both query and reference. Use a separate writable query datastore for
-controls.
+Diagnostics report feature coverage, query batch count, the mapping algorithm, and uninformative-cell count.
+Mapping rejects using the same physical datastore as both query and reference.
+Use a separate writable query datastore for controls.
 
-## Transfer labels and retain abstention
+## 4. Transfer labels and retain abstention
 
 ```{code-cell} ipython3
 transferred = ds_stim.get_target_classes(
@@ -210,9 +201,8 @@ accepted.value_counts().rename(
 ).rename("query cells")
 ```
 
-Cells below `threshold_fraction` abstain as `NA` instead of taking a weak
-majority label. Compare the accepted and abstained counts with the `NA` column
-in the confusion matrix below.
+Cells below `threshold_fraction` abstain as `NA` instead of taking a weak majority label.
+Compare the accepted and abstained counts with the `NA` column in the confusion matrix below.
 
 ```{code-cell} ipython3
 query_labels = np.asarray(ds_stim.cells.fetch("cluster_labels")).astype(str)
@@ -225,13 +215,12 @@ ds_stim.plots.mapping_confusion(
 )
 ```
 
-## Mapping scores by reference cluster
+## 5. Mapping scores by reference cluster
 
 After label transfer, inspect where query weight landed on the reference.
-Per-reference-cell scores are mostly zero, so cell-level box plots look flat
-even when the embedding shows clear hotspots. Sum the raw (non-log) scores
-within each reference cluster, then check the sized embedding. Focused
-populations should put the highest score mass on matching reference clusters.
+Per-reference-cell scores are mostly zero, so cell-level box plots look flat even when the embedding shows clear hotspots.
+Sum the raw (non-log) scores within each reference cluster, then check the sized embedding.
+Focused populations should put the highest score mass on matching reference clusters.
 
 ```{code-cell} ipython3
 focus_labels = ("CD4 Memory T", "CD 14 Mono", "NK")
@@ -271,19 +260,14 @@ ds_stim.plots.mapping_score(
     layout_key="RNA_UMAP",
     target_groups=focus_groups,
     size_by_score=True,
+    log_transform=False,
     figsize=(14, 3.4),
 )
 ```
 
-Systematic off-diagonal confusion or diffuse score mass across unrelated
-reference clusters is a reason to inspect feature coverage, batch design, and
-whether the query contains populations absent from the atlas. Compare the
-confusion pattern with the direct KNN workflow in
-{doc}`mapping_and_label_transfer`; different off-diagonal errors show how the
-reference model and correction assumptions affect transfer.
+Systematic off-diagonal confusion or diffuse score mass across unrelated reference clusters is a reason to inspect feature coverage, batch design, and whether the query contains populations absent from the atlas.
+Compare the confusion pattern with the direct KNN workflow in {doc}`mapping_and_label_transfer`; different off-diagonal errors show how the reference model and correction assumptions affect transfer.
 
-Split-conformal prediction sets are available for label transfer, but their
-coverage claim requires calibration examples exchangeable with future queries.
-The Kang catalog data does not provide a donor-level calibration design, so
-this page does not manufacture a prediction-set demonstration. Use the mapping
-API reference when a defensible calibration cohort is available.
+Split-conformal prediction sets are available for label transfer, but their coverage claim requires calibration examples exchangeable with future queries.
+The Kang catalog data does not provide a donor-level calibration design, so this page does not manufacture a prediction-set demonstration.
+Use the mapping API reference when a defensible calibration cohort is available.

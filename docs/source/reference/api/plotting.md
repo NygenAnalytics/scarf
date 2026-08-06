@@ -1,13 +1,14 @@
 # Plotting API reference
 
-`scarf.plotting` is Scarf's plotting API. Import it as `splt` and call functions such as
-`splt.embedding(...)`, `splt.dotplot(...)`, and `splt.cluster_tree(...)`.
-For functions whose first argument is a datastore, `ds.plots.embedding(...)`
-and related accessor methods provide the same behavior with that argument
-already bound. Array and DataFrame diagnostics remain standalone.
+`scarf.plotting` is Scarf's plotting API.
+Import it as `splt` and call functions such as `splt.embedding(...)`, `splt.dotplot(...)`, and `splt.cluster_tree(...)`.
+For functions whose first argument is a datastore, `ds.plots.embedding(...)` and related accessor methods provide the same behavior with that argument already bound.
+Diagnostics remain standalone: `qc` takes a DataFrame, `elbow` and `highly_variable_features` take arrays, and `graph_qc` takes a sparse graph.
 
-Plot functions return a `PlotResult` and render by default with `show=True`. Pass
-`show=False` before accessing, saving, or reusing an owned figure.
+Store-backed plotters and diagnostics generally return a `PlotResult` and render by default with `show=True`.
+Pass `show=False` before accessing, saving, or reusing an owned figure.
+`run_recipe` returns a `PlotRecipeResult` and defaults to `show=False`.
+Helpers differ: `label_panels` and `register_theme` return `None`, `collect_legends` returns a tuple, `theme_context` is an iterator, and `compose_results` returns a `PlotResult` without a `show` parameter.
 
 ```{eval-rst}
 .. automodule:: scarf.plotting

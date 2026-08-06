@@ -15,15 +15,13 @@ kernelspec:
 
 # Expression dynamics along pseudotime
 
-Group features with similar pseudotime expression patterns, store module means as a new
-assay, and inspect where those programs are active.
+Group features with similar pseudotime expression patterns, store module means as a new assay, and inspect where those programs are active.
 
 ## Prerequisites
 
 - Scarf installed with the `extra` optional dependencies
 - An RNA assay with a neighbourhood graph and UMAP embedding
-- Complete {doc}`pseudotime` through correlated genes, or let the setup below score
-  pseudotime when it is missing
+- Complete {doc}`pseudotime` through correlated genes, or run the setup below, which always scores pseudotime
 
 ## What you will learn
 
@@ -33,9 +31,8 @@ assay, and inspect where those programs are active.
 
 ## Dataset
 
-This page uses the Bastidas-Ponce pancreas store from {doc}`pseudotime`. The setup below
-is standalone: it downloads the store, opens a `DataStore`, and runs pseudotime scoring
-when needed.
+This page uses the Bastidas-Ponce pancreas store from {doc}`pseudotime`.
+The setup below is standalone: it downloads the store, opens a `DataStore`, and always runs pseudotime scoring.
 
 ```{code-cell} ipython3
 import pandas as pd
@@ -65,8 +62,8 @@ pseudotime_key = pseudotime.pseudotime_key
 validity_key = pseudotime.validity_key
 ```
 
-The sources and sinks come from the provided `clusters` annotation, the same choice made in
-{doc}`pseudotime`. The embedding below anchors that trajectory before modules are built.
+The sources and sinks come from the provided `clusters` annotation, the same choice made in {doc}`pseudotime`.
+The embedding below anchors that trajectory before modules are built.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -79,9 +76,12 @@ ds.plots.embedding(
 
 ## 1. Identify feature modules
 
-`run_pseudotime_marker_search` identifies features with a linear relationship to pseudotime. It does not capture every dynamic pattern. Some genes, for example, may peak only in the middle of a trajectory or along one branch.
+`run_pseudotime_marker_search` identifies features with a linear relationship to pseudotime.
+It does not capture every dynamic pattern.
+Some genes, for example, may peak only in the middle of a trajectory or along one branch.
 
-`run_pseudotime_aggregation` orders cells by pseudotime and creates a smoothed, scaled, binned expression matrix. It then applies KNN and Paris clustering to identify features with similar expression patterns.
+`run_pseudotime_aggregation` orders cells by pseudotime and creates a smoothed, scaled, binned expression matrix.
+It then applies KNN and Paris clustering to identify features with similar expression patterns.
 
 ```{code-cell} ipython3
 modules = ds.run_pseudotime_aggregation(
@@ -94,13 +94,11 @@ modules = ds.run_pseudotime_aggregation(
 )
 ```
 
-The returned result contains the lazy binned matrix in `modules.data`, the
-aligned physical feature indices, and their cluster assignments. It also
-exposes the feature column as `modules.cluster_key`.
+The returned result contains the lazy binned matrix in `modules.data`, the aligned physical feature indices, and their cluster assignments.
+It also exposes the feature column as `modules.cluster_key`.
 
-Features with mean expression below `min_exp` or with no variation along the ordering
-are treated as invalid. They are excluded from the clustering and from the heatmap
-below, and they receive the unassigned cluster value (`-1`) in the feature table.
+Features with mean expression below `min_exp` or with no variation along the ordering are treated as invalid.
+They are excluded from the clustering and from the heatmap below, and they receive the unassigned cluster value (`-1`) in the feature table.
 Module sizes make that split explicit: `-1` is the unassigned bin.
 
 ```{code-cell} ipython3
@@ -110,8 +108,7 @@ ptime_feat = ds.RNA.feats.to_pandas_dataframe(
 ptime_feat[modules.cluster_key].value_counts().sort_index()
 ```
 
-One representative gene per assigned module ties heatmap labels and later UMAP
-panels to the same module ids.
+One representative gene per assigned module ties heatmap labels and later UMAP panels to the same module ids.
 
 ```{code-cell} ipython3
 assigned = ptime_feat[ptime_feat[modules.cluster_key] != -1]
@@ -123,8 +120,8 @@ representatives = (
 representatives
 ```
 
-`ds.plots.pseudotime_heatmap` visualizes the binned matrix along with the feature
-clusters. Spaced representatives become row labels.
+`ds.plots.pseudotime_heatmap` visualizes the binned matrix along with the feature clusters.
+Spaced representatives become row labels.
 
 ```{code-cell} ipython3
 genes_to_label = representatives.iloc[::3].tolist()
@@ -138,18 +135,18 @@ ds.plots.pseudotime_heatmap(
 )
 ```
 
-The heatmap shows expression dynamics as cells progress through pseudotime. Each
-row block is one feature module. A useful result contains coherent early,
-intermediate, and late patterns rather than one block dominated by uniformly
-expressed genes. Module numbers are clustering labels and do not encode temporal
-order.
+The heatmap shows expression dynamics as cells progress through pseudotime.
+Each row block is one feature module.
+A useful result contains coherent early, intermediate, and late patterns rather than one block dominated by uniformly expressed genes.
+After Paris clustering, modules are renumbered by median peak bin along pseudotime, so earlier peaks get lower IDs.
+That order reflects when modules peak, not a strict developmental sequence of every gene.
 
 ## 2. Create a module assay
 
-The pseudotime-based feature clusters can seed a new assay. `add_grouped_assay` takes the
-mean expression of genes in each cluster and stores those means as features in a new assay.
-That keeps many related genes out of the cell metadata table while still exposing one summary
-value per module. Here we create an assay named `PTIME_MODULES`.
+The pseudotime-based feature clusters can seed a new assay.
+`add_grouped_assay` takes the mean expression of genes in each cluster and stores those means as features in a new assay.
+That keeps many related genes out of the cell metadata table while still exposing one summary value per module.
+Here we create an assay named `PTIME_MODULES`.
 
 ```{code-cell} ipython3
 ds.add_grouped_assay(
@@ -158,9 +155,8 @@ ds.add_grouped_assay(
 )
 ```
 
-The new assay has one feature per assigned module and one mean-expression value
-per cell. The preview below is the first five cells against the first five
-modules.
+The new assay has one feature per assigned module and one mean-expression value per cell.
+The preview below is the first five cells against the first five modules.
 
 ```{code-cell} ipython3
 module_features = ds.PTIME_MODULES.feats.fetch_all('names').tolist()
@@ -178,9 +174,9 @@ pd.DataFrame(
 )
 ```
 
-Inspect a spaced subset of modules on the original UMAP. These are mean
-expression summaries, so a sequential colour scale is appropriate. The first panel
-repeats the ordering so module hotspots can be read against the trajectory.
+Inspect a spaced subset of modules on the original UMAP.
+These are mean expression summaries, so a sequential colour scale is appropriate.
+The first panel repeats the ordering so module hotspots can be read against the trajectory.
 
 ```{code-cell} ipython3
 selected_modules = [
@@ -195,16 +191,13 @@ ds.plots.embedding(
 )
 ```
 
-This figure complements the heatmap by showing where selected module programs
-are active in the original cell layout.
+This figure complements the heatmap by showing where selected module programs are active in the original cell layout.
 
 ## Common mistakes and limitations
 
 - Interpreting linear correlation as the only form of expression dynamics along pseudotime
-- Treating module numbers as ordered along pseudotime (they are clustering labels)
+- Reading module IDs as a strict developmental sequence rather than peak-time order along the binned trajectory
 - Comparing module gene lists to cluster markers without accounting for unassigned features (`-1`)
 
-Feature labels are stored under `modules.cluster_key`, and `PTIME_MODULES`
-contains one mean-expression feature per assigned module. Parameter diagnostics
-and comparison with cluster marker genes are covered in
-{doc}`trajectory_validation`.
+Feature labels are stored under `modules.cluster_key`, and `PTIME_MODULES` contains one mean-expression feature per assigned module.
+Parameter diagnostics and comparison with cluster marker genes are covered in {doc}`trajectory_validation`.

@@ -38,14 +38,12 @@ import scarf.plotting as splt
 scarf.configure_output(level='WARNING', progress=True)
 ```
 
-## Guided steps
-
-### 1. Fetch pre-analyzed data
+## 1. Fetch pre-analyzed data
 
 Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://journals.biologists.com/dev/article/146/12/dev173849/19483/) for E15.5 stage of differentiation of endocrine cells from a pool of endocrine progenitors-precursors.
 
-The prepared Zarr store is available from the `scarf_docs` Cytebase catalog. It already
-includes the top 2000 highly variable genes, a neighbourhood graph, and a UMAP embedding. 
+The prepared Zarr store is available from the `scarf_docs` Cytebase catalog.
+It already includes the top 2000 highly variable genes, a neighbourhood graph, and a UMAP embedding.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -68,16 +66,15 @@ ds.plots.embedding(
 )
 ```
 
----
-### 2. Run cell-cycle scoring
+## 2. Run cell-cycle scoring
 
-The cell cycle scoring function in Scarf is highly inspired by the [equivalent function](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.score_genes_cell_cycle.html) in Scanpy. The cell cycle phase of each individual cell is identified following steps below:
+The cell cycle scoring function in Scarf is highly inspired by the [equivalent function](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.score_genes_cell_cycle.html) in Scanpy.
+The cell cycle phase of each individual cell is identified following steps below:
 - A list of S and G2M phase is provided to the function (Scarf already has a generic list of genes that works both for human and mouse data)
-- Average expression of all the genes (separately for S and G2M lists) in across `cell_key` cells is calculated
-- The log average expression is divided in `n_bins` bins
-- A control set of genes is identified by sampling genes from same expression bins where phase's genes are
-present.
-- The average expression of phase genes (Ep) and control genes (Ec) is calculated per cell.
+- Per-gene averages across `cell_key` cells are calculated genome-wide from the assay's current normalized values (default RNA: library-size, not log)
+- Those averages are divided into `n_bins` bins
+- A control set of genes is identified by sampling genes from same expression bins where phase's genes are present.
+- S and G2M are then scored separately (two `score_features` calls): for each phase, the average expression of phase genes (Ep) and control genes (Ec) is calculated per cell.
 - A phase score is calculated as: Ep-Ec
 Cell cycle phase is assigned as follows (cells default to S, then rules override):
 - G2M phase: G2M score > S score
@@ -88,16 +85,13 @@ Cell cycle phase is assigned as follows (cells default to S, then rules override
 ds.run_cell_cycle_scoring()
 ```
 
-The bundled list contains one marker that is absent from this assay. The warning
-about one unmatched name is expected, and Scarf scores the cells with the
-remaining markers.
+The bundled list contains one marker that is absent from this assay.
+The warning about one unmatched name is expected, and Scarf scores the cells with the remaining markers.
 
----
-### 3. Visualize cell-cycle phases
+## 3. Visualize cell-cycle phases
 
-By default, the cell-cycle phase is stored in the cell metadata column
-`RNA_cell_cycle_phase`. Explicit colors keep the phase encoding consistent with
-the composition plot below:
+By default, the cell-cycle phase is stored in the cell metadata column `RNA_cell_cycle_phase`.
+Explicit colors keep the phase encoding consistent with the composition plot below:
 
 ```{code-cell} ipython3
 color_key = {
@@ -113,8 +107,7 @@ ds.plots.embedding(
 )
 ```
 
-Cycling cells should be concentrated in the ductal region rather than spread
-uniformly across the embedding.
+Cycling cells should be concentrated in the ductal region rather than spread uniformly across the embedding.
 
 Phase composition per cluster shows which groups are enriched for S or G2M relative to G1:
 
@@ -130,13 +123,12 @@ ds.plots.composition(
 )
 ```
 
-Stacked bars are cluster-wise phase fractions among active cells; ductal-associated
-clusters should show a higher S/G2M share if the embedding pattern above holds.
+Stacked bars are cluster-wise phase fractions among active cells; ductal-associated clusters should show a higher S/G2M share if the embedding pattern above holds.
 
----
-### 4. Visualize phase-specific scores
+## 4. Visualize phase-specific scores
 
-The individual and S and G2M scores for each cell are stored under columns `RNA_S_score` and `RNA_G2M_score`. We can visualize the distribution of these scores on the UMAP plots
+The individual and S and G2M scores for each cell are stored under columns `RNA_S_score` and `RNA_G2M_score`.
+We can visualize the distribution of these scores on the UMAP plots.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -145,10 +137,11 @@ ds.plots.embedding(
 )
 ```
 
----
-### 5. Compare scores calculated with Scanpy
+## 5. Compare scores calculated with Scanpy
 
-The dataset we downloaded, already had cell cycle scores calculated using Scanpy. For example, the S phase scores are stored under the column `S_score`. We can plot these scores on the UMAP.
+The dataset we downloaded, already had cell cycle scores calculated using Scanpy.
+For example, the S phase scores are stored under the column `S_score`.
+We can plot these scores on the UMAP.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -157,7 +150,8 @@ ds.plots.embedding(
 )
 ```
 
-The Scanpy scores look similar to Scarf's. Quantify the concordance:
+The Scanpy scores look similar to Scarf's.
+Quantify the concordance:
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -180,7 +174,7 @@ plt.tight_layout()
 plt.show()
 ```
 
-High correlation coefficients indicate a large degree of concordance between the scores obtained using Scanpy and Scarf
+High correlation coefficients indicate a large degree of concordance between the scores obtained using Scanpy and Scarf.
 
 ## Common mistakes and limitations
 
@@ -188,6 +182,4 @@ High correlation coefficients indicate a large degree of concordance between the
 - Interpreting a phase score as evidence of cell proliferation without checking the underlying genes
 - Comparing scores across workflows with different gene sets or normalization
 
-`run_cell_cycle_scoring` stores `RNA_cell_cycle_phase`, `RNA_S_score`, and
-`RNA_G2M_score` beside the scoring step so they can be reused by plots and
-downstream metadata queries.
+`run_cell_cycle_scoring` stores `RNA_cell_cycle_phase`, `RNA_S_score`, and `RNA_G2M_score` beside the scoring step so they can be reused by plots and downstream metadata queries.

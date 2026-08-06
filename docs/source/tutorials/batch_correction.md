@@ -16,11 +16,10 @@ kernelspec:
 
 # Correcting batch effects
 
-Batch correction changes the reduced coordinates used to build a neighbourhood
-graph. Counts remain unchanged. A useful correction should increase source
-mixing without dissolving biological populations. This guide resumes the
-persisted uncorrected analysis from {doc}`dataset_merging` and compares it
-with partial PCA and Harmony.
+Batch correction changes the reduced coordinates used to build a neighbourhood graph.
+Counts remain unchanged.
+A useful correction should increase source mixing without dissolving biological populations.
+This guide resumes the persisted uncorrected analysis from {doc}`dataset_merging` and compares it with partial PCA and Harmony.
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -76,10 +75,8 @@ scores = {
 }
 ```
 
-The baseline artifacts fix the active cells, highly variable features, full
-PCA, and 21-neighbour graph used by every comparison below. Source identity and
-imported cell types on the uncorrected UMAP show the defect this page aims to
-reduce.
+The baseline artifacts fix the active cells, highly variable features, full PCA, and 21-neighbour graph used by every comparison below.
+Source identity and imported cell types on the uncorrected UMAP show the defect this page aims to reduce.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -107,12 +104,11 @@ pd.Series(scores["Uncorrected"]).round(3).rename("Uncorrected")
 <span id="partial-pca-integration"></span>
 ```
 
-## Learn PCA from a reference subset
+## 1. Learn PCA from a reference subset
 
-Partial PCA learns its loading basis from cells selected by `pca_cell_key`, then
-projects every active cell into that basis. Here the control cells define the
-reference space. Signals absent from the control subset contribute less to the
-resulting graph.
+Partial PCA learns its loading basis from cells selected by `pca_cell_key`, then projects every active cell into that basis.
+Here the control cells define the reference space.
+Signals absent from the control subset contribute less to the resulting graph.
 
 ```{code-cell} ipython3
 ds.cells.insert(
@@ -175,11 +171,11 @@ ds.plots.embedding(
 <span id="harmony-batch-correction"></span>
 ```
 
-## Correct PCA coordinates with Harmony
+## 2. Correct PCA coordinates with Harmony
 
-Harmony adjusts the full PCA coordinates using one or more batch columns before
-the ANN index is built. Treat each supplied column as variation to remove. Do
-not use a biological condition that the downstream analysis needs to retain.
+Harmony adjusts the full PCA coordinates using one or more batch columns before the ANN index is built.
+Treat each supplied column as variation to remove.
+Do not use a biological condition that the downstream analysis needs to retain.
 
 ```{code-cell} ipython3
 corrected = ds.run_harmony(["sample_id"], pca_full)
@@ -216,11 +212,10 @@ ds.plots.embedding(
 )
 ```
 
-## Compare the three graphs
+## 3. Compare the three graphs
 
-The plotting facade accepts several layouts directly, so the comparison does
-not need a custom Matplotlib helper. Panels appear in uncorrected, partial-PCA,
-and Harmony order.
+The plotting facade accepts several layouts directly, so the comparison does not need a custom Matplotlib helper.
+Panels appear in uncorrected, partial-PCA, and Harmony order.
 
 ```{code-cell} ipython3
 layouts = [
@@ -245,8 +240,8 @@ ds.plots.embedding(
 )
 ```
 
-Each method also writes its own Leiden partition. Plotting those labels on the
-matching layout links the composition bars below to geography on the page.
+Each method also writes its own Leiden partition.
+Plotting those labels on the matching layout links the composition bars below to geography on the page.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
@@ -295,13 +290,13 @@ figure.tight_layout()
 figure
 ```
 
-## Treatment response is not batch structure
+## 4. Treatment response is not batch structure
 
 The two Kang sources are also the control and interferon beta treatment groups.
-`ISG15` is an interferon-stimulated gene. Coloring uncorrected and Harmony
-layouts with the same count-backed values shows that Harmony moves cells while
-expression itself is unchanged. Source mixing on the graph is therefore not the
-same question as removing a treatment effect from the counts.
+`ISG15` is an interferon-stimulated gene.
+Default `plots.embedding` and `plots.distribution` use assay-normalized expression via `NormalizationSpec(source="assay")` (library-size normalized through `assay.normed()`), not raw counts; use `source="raw"` for counts.
+Coloring uncorrected and Harmony layouts with those same values shows that Harmony moves cells while expression itself is unchanged.
+Source mixing on the graph is therefore not the same question as removing a treatment effect from the counts.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -326,30 +321,23 @@ ds.plots.distribution(
 (lisi_metrics)=
 (integration_metrics)=
 
-## Quantify mixing and structural preservation
+## 5. Quantify mixing and structural preservation
 
-iLISI measures source mixing. cLISI checks whether imported cell-type labels
-remain locally separated, while graph connectivity checks whether cells with
-the same imported label remain connected. All three scores are scaled so
-higher values are better.
+iLISI measures source mixing. cLISI checks whether imported cell-type labels remain locally separated, while graph connectivity checks whether cells with the same imported label remain connected.
+All three scores are scaled so higher values are better.
 
 ```{code-cell} ipython3
 score_frame = pd.DataFrame.from_dict(scores, orient="index")
 score_frame.round(3)
 ```
 
-Because `sample_id` coincides with treatment, iLISI describes source mixing
-rather than proving removal of a technical effect. cLISI and connectivity
-provide preservation checks, but they cannot establish that every treatment
-response was retained. The `ISG15` panels above keep that distinction visible.
+Because `sample_id` coincides with treatment, iLISI describes source mixing rather than proving removal of a technical effect. cLISI and connectivity provide preservation checks, but they cannot establish that every treatment response was retained.
+The `ISG15` panels above keep that distinction visible.
 Keep the uncorrected counts for condition-level differential expression.
 
-Compare methods only when active cells, selected features, neighbour count, and
-LISI perplexity match. Do not choose a method solely because its UMAP appears
-compact.
+Compare methods only when active cells, selected features, neighbour count, and LISI perplexity match.
+Do not choose a method solely because its UMAP appears compact.
 
-When the reference should remain fixed and new samples arrive later, use
-{doc}`mapping_and_label_transfer` instead of rebuilding a joint graph.
+When the reference should remain fixed and new samples arrive later, use {doc}`mapping_and_label_transfer` instead of rebuilding a joint graph.
 
-See {doc}`../reference/api/graph_construction` for the PCA and Harmony
-contracts, and {doc}`../reference/api/integration` for the metric definitions.
+See {doc}`../reference/api/graph_construction` for the PCA and Harmony contracts, and {doc}`../reference/api/integration` for the metric definitions.

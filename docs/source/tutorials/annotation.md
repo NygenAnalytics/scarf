@@ -16,8 +16,7 @@ kernelspec:
 
 # Interpreting markers and assigning cell types
 
-This chapter starts from a clustered PBMC store and shows how to read marker tables,
-plot known markers, and assign labels without treating cluster IDs as cell types.
+This chapter starts from a clustered PBMC store and shows how to read marker tables, plot known markers, and assign labels without treating cluster IDs as cell types.
 
 ## Prerequisites
 
@@ -33,8 +32,8 @@ plot known markers, and assign labels without treating cluster IDs as cell types
 
 ## Standalone setup
 
-Annotation starts from clusters and a marker table. The published PBMC store
-has both, so this page opens it and goes straight to reading the evidence.
+Annotation starts from clusters and a marker table.
+The published PBMC store has both, so this page opens it and goes straight to reading the evidence.
 {doc}`clustering` covers how the partition is chosen and scored.
 
 ```{code-cell} ipython3
@@ -55,9 +54,8 @@ ds = scarf.DataStore(
 )
 ```
 
-`RNA_clusters` holds the partition the pipeline selected, and the marker table
-is indexed under the same column. Confirm cluster sizes and their layout before
-reading markers.
+`RNA_clusters` holds the silhouette-selected partition (Leiden or Paris), and the marker table is indexed under the same column.
+Confirm cluster sizes and their layout before reading markers.
 
 ```{code-cell} ipython3
 ds.cells.to_pandas_dataframe(
@@ -73,12 +71,11 @@ ds.plots.embedding(
 )
 ```
 
-## 1) Marker tables
+## 1. Marker tables
 
-`get_markers` returns genes ranked by marker score. Pass a `group_id` for one cluster, or
-`group_id=None` for every cluster in one long table with a `group_id` column. Columns include
-scores, expression fractions, fold change, a two-sided Mann-Whitney `p_value`,
-AUC, and `p_value_adjusted`.
+`get_markers` returns genes ranked by marker score.
+Pass a `group_id` for one cluster, or `group_id=None` for every cluster in one long table with a `group_id` column.
+Columns include scores, expression fractions, fold change, a two-sided Mann-Whitney `p_value`, AUC, and `p_value_adjusted`.
 
 ```{code-cell} ipython3
 markers = ds.get_markers(
@@ -102,21 +99,21 @@ markers[
 
 Interpret the columns together:
 
-- `score` ranks marker specificity using expression inside and outside the group.
+- `score` is the group's mean dense-rank as a share of the sum of mean dense-ranks across all groups.
 - `frac_exp` is the fraction of target-group cells with detected expression.
 - `fold_change` compares average expression in the target and reference cells.
-- `auc` is the probability that a randomly selected target cell has a higher
-  value than a randomly selected reference cell. Values near 0.5 provide little
-  separation.
+- `auc` is the probability that a randomly selected target cell has a higher value than a randomly selected reference cell.
+  Values near 0.5 provide little separation.
 - `p_value` is the two-sided Mann-Whitney result.
-- `p_value_adjusted` applies Benjamini-Hochberg correction within this
-  one-versus-rest group over all tested features.
+- `p_value_adjusted` applies Benjamini-Hochberg correction within this one-versus-rest group over all tested features.
 
-Both p-value columns treat cells as observations. They are useful for marker
-ranking but are not replicate-aware differential expression. Groups need at
-least two target and two reference cells; smaller comparisons fail rather than
-returning unstable statistics. Older marker tables remain readable and may not
-contain the newer AUC and adjusted-p-value columns until marker search is rerun.
+`fold_change`, `auc`, and the Mann-Whitney columns cover one-versus-rest expression contrast.
+Both p-value columns treat cells as observations.
+They are useful for marker ranking but are not replicate-aware differential expression.
+Groups need at least two target and two reference cells; smaller comparisons fail rather than returning unstable statistics.
+Older marker tables remain readable.
+AUC may be missing until marker search is rerun.
+`p_value_adjusted` can be synthesized on read with Benjamini-Hochberg correction when raw `p_value` is present.
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
@@ -128,10 +125,9 @@ ds.plots.marker_heatmap(
 
 Rows are top markers per cluster; use them with known lineage genes, not as FDR DE.
 
-## 2) Known markers on the embedding
+## 2. Known markers on the embedding
 
-Before assigning labels, check where the panel genes rank across clusters, then
-confirm them on the UMAP.
+Before assigning labels, check where the panel genes rank across clusters, then confirm them on the UMAP.
 
 ```{code-cell} ipython3
 markers = ds.get_markers(
@@ -157,15 +153,13 @@ ds.plots.embedding(
 )
 ```
 
-CD14, MS4A1, and CD3D mark monocyte-, B-, and T-cell-like regions when those lineages
-are present. The lookup above names the highest-scoring cluster for each gene;
-the UMAP shows whether that signal is spatially coherent.
+CD14, MS4A1, and CD3D mark monocyte-, B-, and T-cell-like regions when those lineages are present.
+The lookup above names the highest-scoring cluster for each gene; the UMAP shows whether that signal is spatially coherent.
 
-## 3) Assign labels
+## 3. Assign labels
 
-Map Leiden clusters to names using the marker UMAPs and marker tables. Cluster IDs are not
-stable across parameter changes, so this cell picks the cluster where each lineage gene
-ranks highest among markers, then leaves other clusters as `Cluster_<id>`.
+Map `RNA_clusters` to names using the marker UMAPs and marker tables.
+Cluster IDs are not stable across parameter changes, so this cell picks the cluster where each lineage gene ranks highest among markers, then leaves other clusters as `Cluster {id}`.
 
 ```{code-cell} ipython3
 cluster_ids = ds.cells.fetch_all('RNA_clusters')
@@ -202,15 +196,13 @@ ds.plots.embedding(
 ```
 
 Assigned labels replace numeric cluster IDs where the panel genes ranked highest.
-Compare `label_map` and the `cell_type` counts with the gene UMAPs before treating
-unnamed `Cluster_*` groups as distinct types.
+Compare `label_map` and the `cell_type` counts with the gene UMAPs before treating unnamed `Cluster {id}` groups as distinct types.
 
-## 4) Relabel clusters with `smart_label`
+## 4. Relabel clusters with `smart_label`
 
-`smart_label` renames values in one categorical column from the most frequent overlap with
-another column. Here Leiden cluster IDs are rewritten from the `cell_type` labels just
-assigned. Shared base labels get letter suffixes when more than one Leiden cluster maps to
-the same type.
+`smart_label` renames values in one categorical column from the most frequent overlap with another column.
+Here `RNA_clusters` IDs are rewritten from the `cell_type` labels just assigned.
+Letter suffixes are always appended (`Monocytes` becomes `Monocytesa`); when several clusters share a base label they get ordered suffixes such as `a`, `b`.
 
 ```{code-cell} ipython3
 ds.smart_label(
@@ -232,22 +224,20 @@ ds.plots.embedding(
 ```
 
 `leiden_by_type` is a convenience labeling of clusters, not an automated ontology annotation.
-The crosstab shows which Leiden IDs were rewritten and which shared a base label.
+The crosstab shows which cluster IDs were rewritten and how letter suffixes were assigned.
 
-## 5) Annotate scATAC-seq with gene scores
+## 5. Annotate scATAC-seq with gene scores
 
-Peak IDs are difficult to interpret directly. `add_melded_assay` can combine
-ATAC peaks that overlap gene bodies and promoter regions into a `GeneScores`
-assay, which can then be plotted like RNA features.
+Peak IDs are difficult to interpret directly.
+`add_melded_assay` can combine ATAC peaks that overlap gene bodies and promoter regions into a `GeneScores` assay, which can then be plotted like RNA features.
 
-This page stays on the RNA store. An executable GeneScores path, including the
-prepared BED download and marker panel on an ATAC UMAP, is in {doc}`scatac_seq`.
+This page stays on the RNA store.
+An executable GeneScores path, including the prepared BED download and marker panel on an ATAC UMAP, is in {doc}`scatac_seq`.
 The API sketch below is for coordinate melding on an ATAC assay you already have.
 
-The external BED file has no header and uses tab-separated columns in this
-order: chromosome, start, end, gene ID, gene name, and optional strand. Its
-genome build must match the peak coordinates. Promoter offsets should be chosen
-before melding and reported with the annotation source.
+The external BED file has no header and uses tab-separated columns in this order: chromosome, start, end, gene ID, gene name, and optional strand.
+Its genome build must match the peak coordinates.
+Promoter offsets should be chosen before melding and reported with the annotation source.
 
 ```python
 ds.add_melded_assay(
@@ -260,32 +250,28 @@ ds.add_melded_assay(
 )
 ```
 
-`renormalization=False` retains the summed TF-IDF-normalized peak signal before
-the resulting RNA-like assay applies its own normalization. Set it differently
-only when a constant total across melded features matches the intended
-interpretation. Features with no overlapping peaks remain present but invalid.
+`renormalization=False` retains the summed TF-IDF-normalized peak signal before the resulting RNA-like assay applies its own normalization.
+Set it differently only when a constant total across melded features matches the intended interpretation.
+Features with no overlapping peaks remain present but invalid.
 
-Gene scores are accessibility summaries, not measured RNA expression. Confirm
-cell identities with several loci, known chromatin biology, and the coordinate
-overlap rate. A flat marker panel can indicate a genome-build mismatch or
-insufficient peak overlap.
+Gene scores are accessibility summaries, not measured RNA expression.
+Confirm cell identities with several loci, known chromatin biology, and the coordinate overlap rate.
+A flat marker panel can indicate a genome-build mismatch or insufficient peak overlap.
 
 ```{raw} html
 <span id="subset-and-recluster"></span>
 ```
 
-## 6) Subset and recluster
+## 6. Subset and recluster
 
-Subset graph construction and validation now live in {doc}`clustering`. This
-page keeps annotation focused on evidence and label assignment.
+Subset graph construction and validation now live in {doc}`clustering`.
+This page keeps annotation focused on evidence and label assignment.
 
 ## Choose an annotation path
 
-Use the marker workflow above when assigning labels within the store being
-analysed. Use {doc}`mapping_and_label_transfer` when query cells should inherit
-evidence or labels from a fixed external reference. Use {doc}`reference_atlases`
-when that reference must be built, serialized, reloaded, and checked for
-repeated mapping.
+Use the marker workflow above when assigning labels within the store being analysed.
+Use {doc}`mapping_and_label_transfer` when query cells should inherit evidence or labels from a fixed external reference.
+Use {doc}`reference_atlases` when that reference must be built, serialized, reloaded, and checked for repeated mapping.
 
 ## Common mistakes and limitations
 
@@ -295,5 +281,5 @@ repeated mapping.
 - Assigning a cell type from one marker gene or one cluster statistic
 - Interpreting ATAC gene scores as measured transcript abundance
 
-Scarf does not ship an automated ontology annotator. Labels here are assigned
-from marker evidence and must be reviewed against the study context.
+Scarf does not ship an automated ontology annotator.
+Labels here are assigned from marker evidence and must be reviewed against the study context.

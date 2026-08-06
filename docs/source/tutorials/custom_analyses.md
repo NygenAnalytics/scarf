@@ -16,9 +16,7 @@ kernelspec:
 
 # Extending Scarf with custom analyses
 
-Scarf exposes graphs, bounded count streams, metadata tables, and export
-formats so an external algorithm can participate in an analysis without
-depending on private storage internals.
+Scarf exposes graphs, bounded count streams, metadata tables, and export formats so an external algorithm can participate in an analysis without depending on private storage internals.
 
 ## What you will learn
 
@@ -28,10 +26,12 @@ depending on private storage internals.
 - Register external feature loadings as a reduction branch
 - Choose an exit path for another analysis system
 
-## Prepare a graph
+## 1. Prepare a store
 
-Every technique on this page reads an existing graph, so the published PBMC
-store is enough. See {doc}`graph_construction` to build one by hand.
+The published PBMC store is enough for the examples below.
+Only the graph-statistic and `wellConnected` path uses `load_graph`.
+Streaming, `set_hvgs`, custom reduction, `to_anndata`, and `SubsetZarr` do not.
+See {doc}`graph_construction` to build a graph by hand.
 
 ```{code-cell} ipython3
 import numpy as np
@@ -50,7 +50,7 @@ ds = scarf.DataStore(
 )
 ```
 
-## Calculate from the graph
+## 2. Calculate from the graph
 
 `load_graph` returns the selected neighbourhood graph as a SciPy CSR matrix.
 Here the row sum measures each cell's total edge weight in the symmetric graph.
@@ -78,8 +78,8 @@ ds.cells.insert(
 }
 ```
 
-The insert writes one value per active cell in graph row order. The summary
-confirms the CSR cover and that the new column is populated.
+The insert writes one value per active cell in graph row order.
+The summary confirms the CSR cover and that the new column is populated.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -89,15 +89,14 @@ ds.plots.embedding(
 )
 ```
 
-The plot asks where cells have stronger or weaker weighted connectivity in this
-specific graph. Rebuilds with another feature set or neighbour count need a new
-statistic.
+The plot asks where cells have stronger or weaker weighted connectivity in this specific graph.
+Rebuilds with another feature set or neighbour count need a new statistic.
 
-## Stream count blocks
+## 3. Stream count blocks
 
-Avoid `.compute()` on a matrix that may exceed memory. Slice to the intended
-cell and feature keys, then process ordered row blocks. This example counts
-detected HVGs per active cell:
+Avoid `.compute()` on a matrix that may exceed memory.
+Slice to the intended cell and feature keys, then process ordered row blocks.
+This example counts detected HVGs per active cell:
 
 ```{code-cell} ipython3
 cell_index = ds.cells.active_index("I")
@@ -125,14 +124,14 @@ ds.cells.insert(
 }
 ```
 
-`stream_blocks` preserves row order. Insert with the same `cell_key` used to
-construct the view so values align with metadata rows. The summary checks that
-every streamed cell received a detection count.
+`stream_blocks` preserves row order.
+Insert with the same `cell_key` used to construct the view so values align with metadata rows.
+The summary checks that every streamed cell received a detection count.
 
-## Create custom selections
+## 4. Create custom selections
 
-A boolean cell column can become a `cell_key`. Use `fill_value=False` when the
-new key is defined only for currently active cells:
+A boolean cell column can become a `cell_key`.
+Use `fill_value=False` when the new key is defined only for currently active cells:
 
 ```{code-cell} ipython3
 well_connected = graph_strength >= np.quantile(graph_strength, 0.25)
@@ -154,14 +153,12 @@ ds.plots.embedding(
 )
 ```
 
-The first panel checks where the streamed count statistic varies. The second
-shows the lower-quartile graph-strength exclusion created from the same active
-cell order.
+The first panel checks where the streamed count statistic varies.
+The second shows the lower-quartile graph-strength exclusion created from the same active cell order.
 
-Install a supplied RNA feature mask with `set_hvgs`. This records the
-cell-selection relationship and produces the feature key
-`wellConnected__customPanel`. Downstream methods take the short name
-`customPanel` as `feat_key`:
+Install a supplied RNA feature mask with `set_hvgs`.
+This records the cell-selection relationship and produces the feature key `wellConnected__customPanel`.
+Downstream methods take the short name `customPanel` as `feat_key`:
 
 ```{code-cell} ipython3
 panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
@@ -186,16 +183,15 @@ ds.plots.embedding(
 )
 ```
 
-The returned key is the full feature column. The plot checks the same panel on
-the `wellConnected` cells that the selection is linked to.
+The returned key is the full feature column.
+The plot checks the same panel on the `wellConnected` cells that the selection is linked to.
 
-## Register external feature loadings
+## 5. Register external feature loadings
 
 `run_custom_reduction` accepts an external feature-by-dimension loading matrix.
-Its rows must match the selected normalized features in order. It projects
-Scarf's normalized cell blocks through those loadings and records a reusable
-reduction artifact. Here an identity matrix stands in for loadings from an
-external tool:
+Its rows must match the selected normalized features in order.
+It projects Scarf's normalized cell blocks through those loadings and records a reusable reduction artifact.
+Here an identity matrix stands in for loadings from an external tool:
 
 ```{code-cell} ipython3
 branch_normalized = ds.run_normalization(
@@ -218,17 +214,14 @@ custom_ann = ds.build_ann_index(
 ds.load_artifact(custom_reduction)["data"].shape, custom_ann
 ```
 
-`update_state=False` keeps this experiment as a side branch, outside the assay's
-{term}`analysis chain`. Pass returned
-references explicitly through later graph-construction steps. Select a branch
-as current only after checking its outputs. Replace the identity matrix with
-real loadings when an external method supplies them; the row count must still
-match `n_features`.
+`update_state=False` keeps this experiment as a side branch, outside the assay's {term}`analysis chain`.
+Pass returned references explicitly through later graph-construction steps.
+Select a branch as current only after checking its outputs.
+Replace the identity matrix with real loadings when an external method supplies them; the row count must still match `n_features`.
 
-## Choose an exit path
+## 6. Choose an exit path
 
-Confirm a feature-selective in-memory handoff with `to_anndata`, then a
-cell-selective Scarf store with `SubsetZarr`:
+Confirm a feature-selective in-memory handoff with `to_anndata`, then a cell-selective Scarf store with `SubsetZarr`:
 
 ```{code-cell} ipython3
 adata = ds.to_anndata(
@@ -263,18 +256,19 @@ subset_ds = scarf.DataStore(str(subset_path))
 }
 ```
 
-`to_anndata` drops unselected features. `SubsetZarr` keeps every RNA feature and
-only the selected cells. For full-assay `to_h5ad` / `to_mtx` writers, see
-{doc}`import_and_export`. Use {doc}`remote_stores` when the count source itself
-must remain remote.
+`to_anndata` drops unselected features.
+It indexes `var` by gene ids (Ensembl here); gene symbols stay in `var["names"]`.
+So `adata.var_names` after `feature_names=panel_genes` lists ids, not the panel symbols.
+Check `adata.var["names"]` when you need the symbols.
+`SubsetZarr` keeps every RNA feature and only the selected cells.
+For full-assay `to_h5ad` / `to_mtx` writers, see {doc}`import_and_export`.
+Use {doc}`remote_stores` when the count source itself must remain remote.
 
 ## Extension boundary
 
-Direct arbitrary artifact writing is not a stable public extension API. Do not
-mutate `ds.z`, `ds.zw`, `_matrix_z`, or assay-state attributes from analysis
-code. Those objects expose implementation layout and can change as storage
-contracts evolve.
+Direct arbitrary artifact writing is not a stable public extension API.
+Do not mutate `ds.z`, `ds.zw`, `_matrix_z`, or assay-state attributes from analysis code.
+Those objects expose implementation layout and can change as storage contracts evolve.
 
-Use public metadata insertion, result-returning methods, graph loading, block
-streams, and export APIs. Pipeline callbacks provide read-only execution
-events; their contract is documented in {doc}`../reference/api/pipeline`.
+Use public metadata insertion, result-returning methods, graph loading, block streams, and export APIs.
+Pipeline callbacks provide read-only execution events; their contract is documented in {doc}`../reference/api/pipeline`.

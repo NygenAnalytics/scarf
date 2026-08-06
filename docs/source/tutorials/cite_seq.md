@@ -14,13 +14,11 @@ kernelspec:
 
 # RNA and protein integration with CITE-seq
 
-CITE-seq measures RNA counts and antibody-derived tags (ADT) in the same cells. Scarf keeps
-both as separate assays in one store, so each modality is processed with its own
-normalization and graph, and the two can then be compared or merged.
+CITE-seq measures RNA counts and antibody-derived tags (ADT) in the same cells.
+Scarf keeps both as separate assays in one store, so each modality is processed with its own normalization and graph, and the two can then be compared or merged.
 
-This tutorial processes RNA and ADT independently, then builds one integrated
-graph. It shows SNN and WNN because combining modalities is the central outcome,
-while method comparison and tuning remain in {doc}`multimodal_diagnostics`.
+This tutorial processes RNA and ADT independently, then builds one integrated graph.
+It shows SNN and WNN because combining modalities is the central outcome, while method comparison and tuning remain in {doc}`multimodal_diagnostics`.
 
 ## Prerequisites
 
@@ -37,9 +35,8 @@ while method comparison and tuning remain in {doc}`multimodal_diagnostics`.
 
 ## Dataset
 
-This page builds the multimodal store from CellRanger counts so every step is
-visible. `CrH5Reader` reports both libraries in the file, and `CrToZarr` writes
-them as separate assays named `RNA` and `ADT`.
+This page builds the multimodal store from CellRanger counts so every step is visible.
+`CrH5Reader` reports both libraries in the file, and `CrToZarr` writes them as separate assays named `RNA` and `ADT`.
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -68,8 +65,8 @@ scarf.CrToZarr(
 
 ## 1. Open and filter the multimodal store
 
-`default_assay` decides which assay unqualified calls act on. Cell filtering and QC always
-run on the default assay, so set it to `RNA` here.
+`default_assay` decides which assay unqualified calls act on.
+Cell filtering and QC always run on the default assay, so set it to `RNA` here.
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(
@@ -80,11 +77,9 @@ ds = scarf.DataStore(
 ds
 ```
 
-The summary lists both assays with their own feature counts, and the cell count reads as
-active followed by total in brackets. Every barcode is still active here because no filter
-has run yet, while the RNA feature count is already reduced: opening a store drops features
-detected in too few cells. Cell metadata is shared across assays: one row per cell, whichever
-assay wrote the column.
+The summary lists both assays with their own feature counts, and the cell count reads as active followed by total in brackets.
+Every barcode is still active here because no filter has run yet, while the RNA feature count is already reduced: opening a store drops features detected in too few cells.
+Cell metadata is shared across assays: one row per cell, whichever assay wrote the column.
 
 ```{code-cell} ipython3
 ds.auto_filter_cells()
@@ -94,10 +89,9 @@ print(
 )
 ```
 
-`auto_filter_cells` models each RNA QC column as a normal distribution, takes its 1st and
-99th percentiles as bounds, and marks outliers inactive in {term}`cell key` `I`. The two figures are
-the QC distributions before and after that filter. Because the key is shared, the ADT assay
-analyzes the same cells.
+`auto_filter_cells` models each RNA QC column as a normal distribution, takes its 1st and 99th percentiles as bounds, and marks outliers inactive in {term}`cell key` `I`.
+The two figures are the QC distributions before and after that filter.
+Because the key is shared, the ADT assay analyzes the same cells.
 
 ## 2. Process the RNA assay
 
@@ -131,8 +125,8 @@ ds.load_graph()
 ```
 
 ```{note}
-Both assays are given `k=21` here. `integrate_assays` later merges the two graphs, and
-matching `k` keeps one modality from contributing far more edges than the other.
+Both assays are given `k=21` here.
+SNN merge requires identical per-cell neighbor degree and raises if the graphs differ; WNN allows different `k` values and keeps `min(k)` neighbors per cell.
 ```
 
 ```{code-cell} ipython3
@@ -149,24 +143,21 @@ ds.plots.embedding(
 )
 ```
 
-The RNA layout should recover broad PBMC structure. Colouring by `RNA_nCounts`
-shows whether a dominant region aligns with low library size; that pattern
-suggests the shared cell selection needs more inspection.
+The RNA layout should recover broad PBMC structure.
+Colouring by `RNA_nCounts` shows whether a dominant region aligns with low library size; that pattern suggests the shared cell selection needs more inspection.
 
 ## 3. Process the ADT assay
 
-ADT panels hold tens of antibodies rather than thousands of genes, which changes two things:
-there is no feature selection step, and control antibodies have to be removed by hand.
+ADT panels hold tens of antibodies rather than thousands of genes, which changes two things: there is no feature selection step, and control antibodies have to be removed by hand.
 
-Scarf recognizes an assay named `ADT` as an `ADTassay`, which normalizes with a centred log
-ratio rather than the library-size scaling used for RNA.
+Scarf recognizes an assay named `ADT` as an `ADTassay`, which normalizes with a centred log ratio rather than the library-size scaling used for RNA.
 
 ```{code-cell} ipython3
 ds.ADT.normMethod.__name__
 ```
 
-Controls in this panel carry `control` in their name. Other panels use other conventions, so
-inspect the names before choosing a pattern.
+Controls in this panel carry `control` in their name.
+Other panels use other conventions, so inspect the names before choosing a pattern.
 
 ```{code-cell} ipython3
 adt_panel = ds.ADT.feats.to_pandas_dataframe(['names'])
@@ -174,8 +165,7 @@ adt_panel['is_control'] = adt_panel['names'].str.contains('control')
 adt_panel[adt_panel['is_control']]
 ```
 
-`update_key` takes a boolean array and marks features `False` as inactive, so pass the
-inverse of the control flag.
+`update_key` takes a boolean array and marks features `False` as inactive, so pass the inverse of the control flag.
 
 ```{code-cell} ipython3
 ds.ADT.feats.update_key(~adt_panel['is_control'].values, 'I')
@@ -185,12 +175,12 @@ print(
 )
 ```
 
-Now build the ADT graph. Arguments differ from the RNA chain:
+Now build the ADT graph.
+Arguments differ from the RNA chain:
 
 - `from_assay='ADT'` targets the non-default assay on every step
 - `feat_key='I'` uses every active antibody, since there is no feature selection column
-- `run_custom_reduction` with an identity loading matrix keeps neighbours in the
-  normalized antibody space
+- `run_custom_reduction` with an identity loading matrix keeps neighbours in the normalized antibody space
 
 ```{code-cell} ipython3
 normalized_adt = ds.run_normalization(from_assay='ADT', feat_key='I')
@@ -207,9 +197,8 @@ ds.build_connectivity_map(from_assay='ADT')
 ```
 
 ```{note}
-A PCA of 15 components over a panel of roughly 20 antibodies would discard little and cost
-an extra fit, which is why an identity reduction is the sensible default for ADT. For RNA,
-where thousands of genes are in play, PCA is what makes the neighbour search tractable.
+A PCA of 15 components over a panel of roughly 20 antibodies would discard little and cost an extra fit, which is why an identity reduction is the sensible default for ADT.
+For RNA, where thousands of genes are in play, PCA is what makes the neighbour search tractable.
 ```
 
 UMAP and clustering take the same `from_assay` argument and write assay-prefixed columns.
@@ -245,14 +234,13 @@ ds.plots.embedding(
 )
 ```
 
-CD3 and CD14 antibodies should mark T-cell-like and monocyte-like regions when
-those lineages are present. The ADT layout should resolve protein-defined
-populations without being dominated by control antibodies.
+CD3 and CD14 antibodies should mark T-cell-like and monocyte-like regions when those lineages are present.
+The ADT layout should resolve protein-defined populations without being dominated by control antibodies.
 
 ## 4. Integrate the modalities
 
-Each modality now has its own embedding and its own clusters over the same cells. Plotting
-one modality's clusters on the other's layout shows where they agree.
+Each modality now has its own embedding and its own clusters over the same cells.
+Plotting one modality's clusters on the other's layout shows where they agree.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(2, 2, figsize=(9, 8))
@@ -278,22 +266,19 @@ for axis, (title, layout_key, color_by) in zip(
 figure.tight_layout()
 ```
 
-The panels need not match one-to-one. They should nevertheless show related
-broad populations. A modality split that is completely absent from the other
-can reflect real complementarity, assay noise, or a graph mismatch. The
-{doc}`multimodal_diagnostics` guide evaluates those possibilities with
-normalized overlap and protein-versus-RNA checks.
+The panels need not match one-to-one.
+They should nevertheless show related broad populations.
+A modality split that is completely absent from the other can reflect real complementarity, assay noise, or a graph mismatch.
+The {doc}`multimodal_diagnostics` guide evaluates those possibilities with normalized overlap and protein-versus-RNA checks.
 
 (multimodal_integration)=
 
 ### Shared nearest neighbours
 
-Comparing clusters is descriptive. Integration goes further and produces a single graph, so
-one embedding and one set of clusters describe both modalities.
+Comparing clusters is descriptive.
+Integration goes further and produces a single graph, so one embedding and one set of clusters describe both modalities.
 
-`integrate_assays` takes the latest graph of each named assay, merges their edges, then
-prunes by shared nearest neighbors until each cell keeps about as many edges as it had in
-the per-assay graphs.
+`integrate_assays` takes the latest graph of each named assay, merges their edges, then prunes by shared nearest neighbors until each cell keeps exactly the shared input degree `nk`.
 
 ```{code-cell} ipython3
 ds.integrate_assays(
@@ -303,15 +288,15 @@ ds.integrate_assays(
 )
 ```
 
-The merged graph is stored under its `label`. Downstream steps reach it through
-`integrated_graph` instead of `from_assay`, and write columns using the same label as prefix.
+The merged graph is stored under its `label`.
+Downstream steps reach it through `integrated_graph` instead of `from_assay`, and write columns using the same label as prefix.
 
 ```{code-cell} ipython3
 ds.run_umap(
     integrated_graph='RNA+ADT',
-    n_epochs=500,
+    n_epochs=250,
     spread=5,
-    min_dist=0.5,
+    min_dist=1,
     parallel=True
 )
 ds.run_leiden_clustering(
@@ -342,20 +327,17 @@ for axis, title in zip(
 snn_comparison.figure.tight_layout()
 ```
 
-The first two panels show where each modality alone would split these cells; the third shows
-the partition the merged graph supports.
+The first two panels show where each modality alone would split these cells; the third shows the partition the merged graph supports.
 
 (wnn_integration)=
 
 ### Weighted nearest neighbours
 
-SNN treats both modalities equally and accepts two or more assays. Weighted nearest
-neighbors instead learns a per-cell weight for each modality, so cells whose identity is
-better resolved by protein lean on the ADT graph and the rest lean on RNA. WNN also accepts
-two or more assays. This RNA and ADT workflow is its two-modality special case. Scarf
-implements the affinity and per-cell weighting equations from
-[Hao et al., Cell 2021](https://doi.org/10.1016/j.cell.2021.04.048), with the
-scaling choices described below.
+SNN treats both modalities equally and accepts two or more assays.
+Weighted nearest neighbors instead learns a per-cell weight for each modality, so cells whose identity is better resolved by protein lean on the ADT graph and the rest lean on RNA.
+WNN also accepts two or more assays.
+This RNA and ADT workflow is its two-modality special case.
+Scarf implements the affinity and per-cell weighting equations from [Hao et al., Cell 2021](https://doi.org/10.1016/j.cell.2021.04.048), with the scaling choices described below.
 
 ```{code-cell} ipython3
 ds.integrate_assays(
@@ -366,9 +348,9 @@ ds.integrate_assays(
 )
 ds.run_umap(
     integrated_graph='RNA+ADT_wnn',
-    n_epochs=500,
+    n_epochs=250,
     spread=5,
-    min_dist=0.5,
+    min_dist=1,
     parallel=True
 )
 ds.run_leiden_clustering(
@@ -377,9 +359,9 @@ ds.run_leiden_clustering(
 )
 ```
 
-The integrated artifact stores blended affinities as graph weights. It also publishes the
-per-cell columns `RNA+ADT_wnn_RNA_weight` and `RNA+ADT_wnn_ADT_weight`. The weights are
-non-negative and sum to one for each selected cell.
+The integrated artifact stores blended affinities as graph weights.
+It also publishes the per-cell columns `RNA+ADT_wnn_RNA_weight` and `RNA+ADT_wnn_ADT_weight`.
+The weights are non-negative and sum to one for each selected cell.
 
 ```{code-cell} ipython3
 weight_columns = [
@@ -420,42 +402,30 @@ for axis, title in zip(
 wnn_weights.figure.set_size_inches(9, 4)
 ```
 
-Plotting both weights on the WNN layout shows where the graph leans on RNA or
-ADT local neighbourhoods.
+Plotting both weights on the WNN layout shows where the graph leans on RNA or ADT local neighbourhoods.
 
-Scarf WNN is Hao-inspired, but it is not bit-identical to Seurat's
-`FindMultiModalNeighbors`:
+Scarf WNN is Hao-inspired, but it is not bit-identical to Seurat's `FindMultiModalNeighbors`:
 
-- Scarf scores the union of every existing KNN row, at most the sum of their
-  degrees, and retains the smallest input degree. In this RNA and ADT example
-  that means at most `2k` candidates and `min(k_RNA, k_ADT)` output neighbours.
-  Seurat normally obtains a wider candidate pool with `knn.range=200`, then
-  retains `k.nn=20`. Scarf therefore cannot tune candidate pool size
-  independently of final graph degree.
-- For this two-modality example, the wider search would require two more
-  L2-space index builds and 20 million queries at ten million cells.
-  Materializing 200 candidates for each modality would hold 4 billion
-  neighbour records and scoring work would increase by roughly tenfold. Scarf
-  keeps the existing graphs to avoid that cost.
-- Scarf uses the distance span from each cell's nearest to its `k`-th stored
-  nonself neighbour as the affinity bandwidth. This corresponds to Seurat's
-  supported simple-bandwidth path, not its default SNN-far bandwidth.
-- Scarf builds candidates in the PCA or Harmony geometry used by each source graph, then
-  scores them after row-wise L2 normalization by default. Distance after normalization is
-  monotone with cosine distance, but the candidate ordering is not guaranteed to match a
-  KNN index built directly in the normalized space. Set `l2_normalize=False` only when this
-  difference is intentional. The setting is part of artifact provenance.
-- Prediction means exclude the query cell in both implementations. Scarf's stored rows
-  contain `k` nonself cells, while Seurat's internal `k.nn` includes a self slot. Public
-  Seurat `k.nn=20` therefore averages 19 nonself neighbours, while Scarf `k=20` averages
-  20.
-- If the source graphs use different `k`, each modality predicts from its own row and the
-  integrated graph retains the smaller degree.
+- Scarf scores the union of every existing KNN row, at most the sum of their degrees, and retains the smallest input degree.
+  In this RNA and ADT example that means at most `2k` candidates and `min(k_RNA, k_ADT)` output neighbours.
+  Seurat normally obtains a wider candidate pool with `knn.range=200`, then retains `k.nn=20`.
+  Scarf therefore cannot tune candidate pool size independently of final graph degree.
+- For this two-modality example, the wider search would require two more L2-space index builds and 20 million queries at ten million cells.
+  Materializing 200 candidates for each modality would hold 4 billion neighbour records and scoring work would increase by roughly tenfold.
+  Scarf keeps the existing graphs to avoid that cost.
+- Scarf uses the distance span from each cell's nearest to its `k`-th stored nonself neighbour as the affinity bandwidth.
+  This corresponds to Seurat's supported simple-bandwidth path, not its default SNN-far bandwidth.
+- Scarf builds candidates in the PCA or Harmony geometry used by each source graph, then scores them after row-wise L2 normalization by default.
+  Distance after normalization is monotone with cosine distance, but the candidate ordering is not guaranteed to match a KNN index built directly in the normalized space.
+  Set `l2_normalize=False` only when this difference is intentional.
+  The setting is part of artifact provenance.
+- Prediction means exclude the query cell in both implementations.
+  Scarf's stored rows contain `k` nonself cells, while Seurat's internal `k.nn` includes a self slot.
+  Public Seurat `k.nn=20` therefore averages 19 nonself neighbours, while Scarf `k=20` averages 20.
+- If the source graphs use different `k`, each modality predicts from its own row and the integrated graph retains the smaller degree.
 
-Per-cell prediction work grows quadratically with the number of modalities,
-while blended edge scoring is linear in the union candidate pool. Reading
-neighbour-index arrays directly and preallocating outputs keeps stored input and
-output memory linear in cell count.
+Per-cell prediction work grows quadratically with the number of modalities, while blended edge scoring is linear in the union candidate pool.
+Reading neighbour-index arrays directly and preallocating outputs keeps stored input and output memory linear in cell count.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
@@ -478,17 +448,16 @@ for axis, (title, layout_key, color_by) in zip(
 figure.tight_layout()
 ```
 
-SNN merges edge support across two or more assays. WNN also accepts two or more
-assays and adjusts their contributions cell by cell. In this two-assay dataset, both
-integrated layouts should preserve broad PBMC populations while resolving
-differences supported by the protein panel. Use the advanced guide to compare
-them quantitatively rather than choosing from UMAP appearance alone.
+SNN merges edge support across two or more assays.
+WNN also accepts two or more assays and adjusts their contributions cell by cell.
+In this two-assay dataset, both integrated layouts should preserve broad PBMC populations while resolving differences supported by the protein panel.
+Use the advanced guide to compare them quantitatively rather than choosing from UMAP appearance alone.
 
 (hto_demultiplexing)=
-## HTO demultiplexing
+## 5. HTO demultiplexing
 
-Hashtag assignment is a separate sample-identification task, not part of the
-RNA/ADT integration path. See {doc}`hto_demultiplexing`.
+Hashtag assignment is a separate sample-identification task, not part of the RNA/ADT integration path.
+See {doc}`hto_demultiplexing`.
 
 ## Common mistakes and limitations
 

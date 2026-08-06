@@ -16,9 +16,9 @@ kernelspec:
 
 # Gene-set activity scoring
 
-Score pathway or cell-state signatures per cell with WAGGR or AUCell. Both methods stream
-RNA counts from the Zarr store and persist activity scores for later use. These
-methods do not calculate enrichment p-values.
+Score pathway or cell-state signatures per cell with WAGGR or AUCell.
+Both methods stream RNA counts from the Zarr store and persist activity scores for later use.
+These methods do not calculate enrichment p-values.
 
 ## Prerequisites
 
@@ -35,9 +35,9 @@ methods do not calculate enrichment p-values.
 
 ## Dataset
 
-This page opens the published 5K PBMC store, which already carries the UMAP the
-score plots are drawn on. Signature scoring itself reads normalized counts, not
-the graph.
+This page opens the published 5K PBMC store, which already carries the UMAP the score plots are drawn on.
+Signature scoring streams raw counts from `assay.rawData`, not a pre-normalized matrix or the graph.
+AUCell ranks those raw counts; WAGGR applies library-size normalization inside the scorer.
 
 ```{code-cell} ipython3
 from pathlib import Path
@@ -59,12 +59,11 @@ ds = scarf.DataStore(
 )
 ```
 
+## 1. Read and inspect gene sets
 
-## 1) Read and inspect gene sets
-
-GMT stores one source per line. The first field is the source name, the second is a
-description, and the remaining fields are target genes. `read_gmt` returns one
-source-target row per gene.
+GMT stores one source per line.
+The first field is the source name, the second is a description, and the remaining fields are target genes.
+`read_gmt` returns one source-target row per gene.
 
 ```{code-cell} ipython3
 gmt_path = Path('scarf_datasets/pbmc_signatures.gmt')
@@ -78,9 +77,9 @@ gene_sets = scarf.read_gmt(gmt_path)
 gene_sets
 ```
 
-Targets are matched to active RNA feature names without case sensitivity. `tmin` is applied
-after matching, so a source is retained only when enough of its targets are present. Missing
-targets do not need to be removed from the input table first.
+Targets are matched to active RNA feature names without case sensitivity.
+`tmin` is applied after matching, so a source is retained only when enough of its targets are present.
+Missing targets do not need to be removed from the input table first.
 
 ```{code-cell} ipython3
 available = {str(name).upper() for name in ds.RNA.feats.fetch('names')}
@@ -93,11 +92,11 @@ available = {str(name).upper() for name in ds.RNA.feats.fetch('names')}
 )
 ```
 
-## 2) Score weighted signatures with WAGGR
+## 2. Score weighted signatures with WAGGR
 
-WAGGR applies edge weights to library-size-normalized expression. `wmean` divides each
-weighted sum by the sum of absolute weights, while `wsum` leaves the weighted sum
-unscaled. Signed weights are supported.
+WAGGR applies edge weights to library-size-normalized expression.
+`wmean` divides each weighted sum by the sum of absolute weights, while `wsum` leaves the weighted sum unscaled.
+Signed weights are supported.
 
 ```{code-cell} ipython3
 weighted_sets = gene_sets.assign(weight=1.0)
@@ -125,11 +124,10 @@ waggr_scores = pd.DataFrame(
 waggr_scores.describe().loc[['min', '50%', 'max']]
 ```
 
-Each column is one source. The ranges show that WAGGR tracks expression magnitude and is
-not confined to values between zero and one.
+Each column is one source.
+The ranges show that WAGGR tracks expression magnitude and is not confined to values between zero and one.
 
-To see what the raised Myeloid weights change, run the same network with every weight at
-1.0 and compare Myeloid summaries:
+To see what the raised Myeloid weights change, run the same network with every weight at 1.0 and compare Myeloid summaries:
 
 ```{code-cell} ipython3
 waggr_unweighted = ds.run_waggr(
@@ -151,19 +149,21 @@ pd.DataFrame(
 ).describe().loc[['min', '50%', 'max']]
 ```
 
-Compare the Myeloid rows: any shift is the effect of raising S100A8 and S100A9. T_cell and
-B_cell edges were left at 1.0 in both runs.
+Compare the Myeloid rows: any shift is the effect of raising S100A8 and S100A9.
+T_cell and B_cell edges were left at 1.0 in both runs.
 
-WAGGR uses Scarf's default RNA library-size normalization. Set `log_transform=True` to
-apply `log1p` before aggregation.
+WAGGR uses Scarf's default RNA library-size normalization.
+Set `log_transform=True` to apply `log1p` before aggregation.
 
-## 3) Score rank recovery with AUCell
+## 3. Score rank recovery with AUCell
 
-AUCell ranks the selected RNA features within each cell and measures how early a source's
-targets are recovered. Scores range from zero to one. Network weights are ignored.
+AUCell ranks the selected RNA features within each cell and measures how early a source's targets are recovered.
+Scores range from zero to one.
+Network weights are ignored.
 
-The {term}`feat_key` defines the ranking universe. Here the default `I` feature key ranks all active
-features. `n_up=500` evaluates recovery within the top 500 ranks.
+The {term}`feat_key` defines the ranking universe.
+Here the default `I` feature key ranks all active features.
+`n_up=500` evaluates recovery within the top 500 ranks.
 
 ```{code-cell} ipython3
 aucell = ds.run_aucell(
@@ -181,14 +181,15 @@ aucell_scores = pd.DataFrame(
 aucell_scores.describe().loc[['min', '50%', 'max']]
 ```
 
-AUCell values stay between zero and one. The same `tie_seed` gives a deterministic global
-ordering for equal expression values. Changing `n_up`, `tie_seed`, the feature selection,
-or the network creates a different execution.
+AUCell values stay between zero and one.
+The same `tie_seed` gives a deterministic global ordering for equal expression values.
+Changing `n_up`, `tie_seed`, the feature selection, or the network creates a different execution.
 
-## 4) Load selected sources and visualize scores
+## 4. Load selected sources and visualize scores
 
-`get_enrichment` returns a lazy result. Selecting sources first avoids loading unrelated
-columns. The values below are activity scores, not p-values.
+`get_enrichment` returns a lazy result.
+Selecting sources first avoids loading unrelated columns.
+The values below are activity scores, not p-values.
 
 ```{code-cell} ipython3
 aucell_cols = []
@@ -213,8 +214,7 @@ if present:
     )
 ```
 
-AUCell scores highlight lineage-consistent regions: T-cell, B-cell, and Myeloid scores
-peak in separate parts of the UMAP when those populations are present.
+AUCell scores highlight lineage-consistent regions: T-cell, B-cell, and Myeloid scores peak in separate parts of the UMAP when those populations are present.
 
 ```{code-cell} ipython3
 waggr_cols = []
@@ -239,8 +239,7 @@ if present:
     )
 ```
 
-WAGGR marks the same lineage regions, but the color scale follows expression magnitude
-rather than rank recovery.
+WAGGR marks the same lineage regions, but the color scale follows expression magnitude rather than rank recovery.
 
 ```{code-cell} ipython3
 compare = [
@@ -255,8 +254,7 @@ if len(compare) == 2:
     )
 ```
 
-WAGGR and AUCell both mark myeloid-like cells here, but the score scales differ because
-one aggregates weighted expression and the other measures within-cell rank recovery.
+WAGGR and AUCell both mark myeloid-like cells here, but the score scales differ because one aggregates weighted expression and the other measures within-cell rank recovery.
 Quantify that difference cell by cell:
 
 ```{code-cell} ipython3
@@ -280,16 +278,14 @@ axis.set_ylabel('Myeloid AUCell')
 plt.show()
 ```
 
-Cells that rank high for Myeloid under AUCell also tend to score high under WAGGR, while
-the absolute values stay on different scales.
+Cells that rank high for Myeloid under AUCell also tend to score high under WAGGR, while the absolute values stay on different scales.
 
 ## Choosing a method
 
-- Use WAGGR when edge weights or signed targets carry useful information and expression
-  magnitude should affect the score.
+- Use WAGGR when edge weights or signed targets carry useful information and expression magnitude should affect the score.
 - Use AUCell when relative within-cell ranks are preferable to expression magnitude.
-- Treat both outputs as activity scores, not p-values. Scores from different feature
-  universes or AUCell `n_up` values are not directly interchangeable.
+- Treat both outputs as activity scores, not p-values.
+  Scores from different feature universes or AUCell `n_up` values are not directly interchangeable.
 
 ## Common mistakes and limitations
 
@@ -300,6 +296,5 @@ the absolute values stay on different scales.
 - Reusing a label for different inputs without `overwrite=True`
 - Editing the count matrix outside Scarf after a result has been cached
 
-Scarf persists each score matrix. Repeating an identical call reuses its
-completed result; `overwrite=True` keeps the previous complete result available
-until replacement finishes.
+Scarf persists each score matrix.
+Repeating an identical call reuses its completed result; `overwrite=True` keeps the previous complete result available until replacement finishes.

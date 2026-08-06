@@ -14,16 +14,13 @@ kernelspec:
 
 # Choosing informative features
 
-Feature selection decides which measured genes define PCA and the neighbourhood
-graph. `mark_hvgs` models the relationship between mean expression and variance,
-then selects genes whose corrected variance is high relative to genes with
-similar abundance.
+Feature selection decides which measured genes define PCA and the neighbourhood graph.
+`mark_hvgs` models the relationship between mean expression and variance, then selects genes whose corrected variance is high relative to genes with similar abundance.
 
-This is distinct from cell quality control. A gene can be measured correctly
-and still be excluded because it contributes broad technical or confounding
-variation to the graph.
+This is distinct from cell quality control.
+A gene can be measured correctly and still be excluded because it contributes broad technical or confounding variation to the graph.
 
-## Fit the mean-variance model
+## 1. Fit the mean-variance model
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -62,11 +59,10 @@ print(
 )
 ```
 
-The plot should retain genes above the fitted mean-variance trend across a
-useful expression range. A selection concentrated only among the most abundant
-genes can make library size or housekeeping programs dominate the graph.
+The plot should retain genes above the fitted mean-variance trend across a useful expression range.
+A selection concentrated only among the most abundant genes can make library size or housekeeping programs dominate the graph.
 
-## Understand the default exclusions
+## 2. Understand the default exclusions
 
 Scarf applies the following case-insensitive regular expression to gene names:
 
@@ -75,8 +71,8 @@ Scarf applies the following case-insensitive regular expression to gene names:
 ^XIST$|^DDX3Y$|^USP9Y$|^EIF1AY$|^KDM5D$|^SRY$|^ZFY$|^UTY$|^TMSB4Y$|^NLGN4Y$
 ```
 
-Matching starts at the beginning of the name. Count how many genes in this
-dataset fall into each family:
+Matching starts at the beginning of the name.
+Count how many genes in this dataset fall into each family:
 
 ```{code-cell} ipython3
 default_blacklist = (
@@ -110,13 +106,11 @@ print(
 family_counts
 ```
 
-These families can dominate broad variation without representing the cell
-identities sought in a typical heterogeneity workflow. They can be biologically
-relevant in another study, so the default is a starting point rather than a
-claim that those genes are unimportant.
+These families can dominate broad variation without representing the cell identities sought in a typical heterogeneity workflow.
+They can be biologically relevant in another study, so the default is a starting point rather than a claim that those genes are unimportant.
 
-Genes detected in all but 20 selected cells are also excluded by default as
-nearly ubiquitous. The bound adapts to the selected cell count.
+By default, `max_cells` is `n_selected - 20`.
+Genes detected in at least that many selected cells are excluded as nearly ubiquitous.
 
 Clearing the blacklist keeps every gene name while retaining other HVG filters.
 Compare the same `top_n` with and without the default pattern:
@@ -163,10 +157,10 @@ ds.mark_hvgs(blacklist=r"^MT-|^RPS|^RPL", top_n=2000)
 ds.mark_hvgs(max_cells=np.inf, top_n=2000)
 ```
 
-## Compare feature-set size
+## 3. Compare feature-set size
 
-The number of selected genes changes the PCA basis and can change neighbourhood
-structure. This small comparison keeps all other graph choices fixed.
+The number of selected genes changes the PCA basis and can change neighbourhood structure.
+This small comparison keeps all other graph choices fixed.
 
 ```{code-cell} ipython3
 for top_n, key in ((300, "hvgs_300"), (1000, "hvgs_1000")):
@@ -221,8 +215,8 @@ pd.Series(
 )
 ```
 
-Cluster sizes and the cross-tabulation show how partitions rematch when the
-feature set grows. Off-diagonal mass marks groups that split or merge.
+Cluster sizes and the cross-tabulation show how partitions rematch when the feature set grows.
+Off-diagonal mass marks groups that split or merge.
 
 ```{code-cell} ipython3
 pd.DataFrame(
@@ -264,17 +258,15 @@ pd.Series(
 )
 ```
 
-A larger set can recover weaker populations, but it can also restore unwanted
-programs. ARI and NMI quantify partition agreement but do not identify which
-feature set is more biologically useful. Compare marker specificity and known
-biology instead of choosing the layout that appears most separated.
+A larger set can recover weaker populations, but it can also restore unwanted programs.
+ARI and NMI quantify partition agreement but do not identify which feature set is more biologically useful.
+Compare marker specificity and known biology instead of choosing the layout that appears most separated.
 
-## Install an externally chosen feature set
+## 4. Install an externally chosen feature set
 
-`set_hvgs` accepts either a boolean mask aligned to feature metadata or physical
-feature indexes. It records the supplied selection so downstream
-{term}`artifacts <artifact>` can trace which genes were used. Verify the mask
-length and selected count before building a graph:
+`set_hvgs` accepts either a boolean mask aligned to feature metadata or physical feature indexes.
+It records the supplied selection so downstream {term}`artifacts <artifact>` can trace which genes were used.
+Verify the mask length and selected count before building a graph:
 
 ```{code-cell} ipython3
 panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
@@ -292,8 +284,7 @@ custom_feature_key = ds.set_hvgs(
 custom_feature_key, int(ds.RNA.feats.fetch_all(custom_feature_key).sum())
 ```
 
-Construct masks with Scarf's metadata helpers such as `sift`, `multi_sift`, or
-`get_index_by` when possible.
+Construct selections with Scarf's metadata helpers when possible: `sift` and `multi_sift` return boolean masks for `mask=`; `get_index_by` returns integer feature-table indexes for `feature_indexes=`.
 
 The standard pipeline forwards the same choices:
 
@@ -308,6 +299,5 @@ ds.pipeline.run(
 )
 ```
 
-For scATAC-seq, prevalent peak selection is the analogous step. See
-{doc}`scatac_seq`; peak prevalence, not an RNA mean-variance model, defines the
-candidate accessibility features.
+For scATAC-seq, prevalent peak selection is the analogous step.
+See {doc}`scatac_seq`; peak prevalence, not an RNA mean-variance model, defines the candidate accessibility features.

@@ -5,20 +5,14 @@ description: Decide where Scarf fits and translate familiar Scanpy and Seurat wo
 (scanpy_and_seurat)=
 # Scarf for Scanpy and Seurat users
 
-If you already analyze single-cell data with
-[Scanpy](https://scanpy.readthedocs.io/) or
-[Seurat](https://satijalab.org/seurat/), use this page to decide where Scarf
-fits and to translate the workflow stages you already know.
+If you already analyze single-cell data with [Scanpy](https://scanpy.readthedocs.io/) or [Seurat](https://satijalab.org/seurat/), use this page to decide where Scarf fits and to translate the workflow stages you already know.
 
-The biological workflow remains familiar: quality control, feature selection,
-normalization, PCA, a neighbourhood graph, embeddings, clustering, and marker
-genes. The main change is how the work is executed. A Scarf `DataStore` points
-to a Zarr store, a chunked format that works on local disk or object storage.
-Analysis methods stream data from that store and write results back as they
-complete.
+The biological workflow remains familiar: quality control, feature selection, normalization, PCA, a neighbourhood graph, embeddings, clustering, and marker genes.
+The main change is how the work is executed.
+A Scarf `DataStore` points to a Zarr store, a chunked format that works on local disk or object storage.
+Analysis methods stream data from that store and write results back as they complete.
 
-If you want to run Scarf before comparing APIs, start with the
-{ref}`Quick start <quickstart>`.
+If you want to run Scarf before comparing APIs, start with the {ref}`Quick start <quickstart>`.
 
 ## Where Scarf fits
 
@@ -29,16 +23,14 @@ Scarf is most useful when:
 - completed steps should persist so they can be inspected, reused, or resumed
 - RNA, ATAC, or CITE-seq assays should live in one analysis store
 
-You do not need to move an entire project to Scarf. A common pattern is to run
-the large, graph-based part of an analysis in Scarf, then export data for a
-method from another single-cell ecosystem. Scarf does not include scVI,
-Scanorama, RNA velocity, or a full differential-expression workflow with
-multiple-testing correction.
+You do not need to move an entire project to Scarf.
+A common pattern is to run the large, graph-based part of an analysis in Scarf, then export data for a method from another single-cell ecosystem.
+Scarf does not include scVI, Scanorama, RNA velocity, or replicate-aware differential expression.
+Marker search does apply within-group Benjamini-Hochberg adjustment over tested features.
 
 ## The key mental-model change
 
-Start with the object and workflow concepts that are familiar from Scanpy or
-Seurat:
+Start with the object and workflow concepts that are familiar from Scanpy or Seurat:
 
 | Scanpy or Seurat | Scarf |
 |---|---|
@@ -48,22 +40,21 @@ Seurat:
 | Neighbour graphs and embeddings occupy named object slots | Graphs and embeddings are stored results that later methods can reuse |
 | Larger data needs a backed mode or an additional on-disk backend | Store-backed execution is Scarf's default path |
 
-A `DataStore` can contain several assays, such as `RNA` and `ADT`. Most methods
-use the default assay unless you select another one. Local paths and
-`s3://` or `gs://` locations use the same analysis API.
+A `DataStore` can contain several assays, such as `RNA` and `ADT`.
+Most methods use the default assay unless you select another one.
+Local paths and `s3://` or `gs://` locations use the same analysis API.
 
 ## Scanpy workflow map
 
-Scanpy commonly composes the stages as separate `sc.pp`, `sc.tl`, and `sc.pl`
-calls. Scarf provides the same level of control through individual methods,
-but `ds.pipeline.run()` is the shortest path through the standard RNA recipe.
+Scanpy commonly composes the stages as separate `sc.pp`, `sc.tl`, and `sc.pl` calls.
+Scarf provides the same level of control through individual methods, but `ds.pipeline.run()` is the shortest path through the standard RNA recipe.
 
 The rows below map intent, not identical statistical implementations:
 
 | Goal | Scanpy | Scarf |
 |---|---|---|
 | Load counts | `sc.read_*` returns an `AnnData` | A reader and `*ToZarr` writer create the store; `DataStore` opens it |
-| Calculate QC metrics | `sc.pp.calculate_qc_metrics` | Opening a new `DataStore` calculates `RNA_nCounts`, `RNA_nFeatures`, mito/ribo fractions when available, and feature cell counts |
+| Calculate QC metrics | `sc.pp.calculate_qc_metrics` | Opening a new `DataStore` calculates `RNA_nCounts`, `RNA_nFeatures`, `percentMito`/`percentRibo` percentages (0-100) when available, and feature cell counts |
 | Filter cells | `sc.pp.filter_cells` or an `obs` mask | `ds.filter_cells` or `ds.auto_filter_cells`; cells are marked inactive rather than deleted |
 | Select and normalize features | `sc.pp.normalize_total`, `sc.pp.log1p`, `sc.pp.highly_variable_genes` | `ds.mark_hvgs`, then `ds.run_normalization` |
 | Run PCA and find neighbours | `sc.pp.pca`, then `sc.pp.neighbors` | `ds.run_pca`, then the approximate-nearest-neighbour (ANN), neighbour-query, and connectivity methods; {doc}`tutorials/graph_construction` shows the full chain |
@@ -75,8 +66,8 @@ The rows below map intent, not identical statistical implementations:
 
 ## Seurat workflow map
 
-This map translates common Seurat concepts. The methods are approximate
-counterparts rather than one-to-one implementations.
+This map translates common Seurat concepts.
+The methods are approximate counterparts rather than one-to-one implementations.
 
 | Goal | Seurat | Scarf |
 |---|---|---|
@@ -93,8 +84,7 @@ counterparts rather than one-to-one implementations.
 
 ### Scanpy and H5AD
 
-Scarf reads and writes H5AD, so Scarf and Scanpy can be used at different
-stages of one project.
+Scarf reads and writes H5AD, so Scarf and Scanpy can be used at different stages of one project.
 
 Import an H5AD file into a Scarf store:
 
@@ -114,22 +104,20 @@ adata = ds.to_anndata()
 scarf.to_h5ad(ds.RNA, "analysis.h5ad")
 ```
 
-`ds.to_anndata()` materializes the selected cells and features in memory. For a
-large store, select only the cells and features needed by the next method.
-`scarf.to_h5ad` writes the assay to disk without first creating an in-memory
-`AnnData`.
+`ds.to_anndata()` defaults to active cells (`I`) and all features.
+Pass `feature_indexes` or `feature_names` to subset features.
+For a large store, export only what the next method needs.
+`scarf.to_h5ad` writes the full assay to disk (all cells, including those with `I=False`, and all features) without first creating an in-memory `AnnData`.
 
-Counts and metadata transfer, but Scarf's neighbourhood graphs, provenance
-records, and multimodal relationships do not map directly to AnnData. The
-exported H5AD may therefore need a new neighbour graph in Scanpy. See
-{doc}`tutorials/import_and_export` for format details and export options.
+Counts and metadata transfer, but Scarf's neighbourhood graphs, provenance records, and multimodal relationships do not map directly to AnnData.
+The exported H5AD may therefore need a new neighbour graph in Scanpy.
+See {doc}`tutorials/import_and_export` for format details and export options.
 
 ### Seurat
 
 Scarf can import a serialized Seurat object from an `.rds` file.
 
-Inspect the RDS file, select importable assays and reductions, then write a
-Zarr store:
+Inspect the RDS file, select importable assays and reductions, then write a Zarr store:
 
 ```python
 import scarf
@@ -144,15 +132,12 @@ with scarf.SeuratReader(
 ds = scarf.DataStore("pbmc.zarr")
 ```
 
-The importer brings across supported count layers, cell metadata,
-`active.ident`, and selected reductions. Neighbour graphs, images, commands,
-and most tool slots stay behind. Prefer original 10x HDF5 or Matrix Market
-counts when they are available and you only need raw matrices.
+The importer brings across supported count layers, cell metadata, `active.ident`, and selected reductions.
+Neighbour graphs, images, commands, and most tool slots stay behind.
+Prefer original 10x HDF5 or Matrix Market counts when they are available and you only need raw matrices.
 
-To return to Seurat, write H5AD or Matrix Market from Scarf and convert or
-import it with the tools used by your R workflow. See
-{doc}`tutorials/import_and_export` for the full Seurat import contract and the
-other format paths.
+To return to Seurat, write H5AD or Matrix Market from Scarf and convert or import it with the tools used by your R workflow.
+See {doc}`tutorials/import_and_export` for the full Seurat import contract and the other format paths.
 
 ## Choose a workflow
 

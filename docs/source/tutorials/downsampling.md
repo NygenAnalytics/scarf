@@ -14,8 +14,8 @@ kernelspec:
 
 # Cell downsampling
 
-TopACeDo selects representative cells from a graph while retaining local structure. Use the
-result to create a smaller Zarr store for workflows that do not need every cell.
+TopACeDo selects representative cells from a graph while retaining local structure.
+Use the result to create a smaller Zarr store for workflows that do not need every cell.
 
 ## Prerequisites
 
@@ -38,15 +38,12 @@ import scarf
 scarf.configure_output(level='WARNING', progress=True)
 ```
 
-## Guided steps
+## 1. Fetch prepared data
 
-### 1. Fetch prepared data
-
-TopACeDo samples from a KNN graph and needs cluster labels to balance across.
-The published PBMC store carries both, so nothing has to be recomputed here.
-{doc}`scrna_seq` shows how the {term}`analysis chain` is built, and
-{doc}`clustering` covers the
-Paris cut.
+TopACeDo samples from a KNN graph and needs Paris cluster labels to balance across partitions, plus the Paris dendrogram for that graph.
+Arbitrary cluster partitions or Leiden-only labels are not enough.
+The published PBMC store already has the Paris cut and dendrogram, so nothing has to be recomputed here.
+{doc}`scrna_seq` shows how the {term}`analysis chain` is built, and {doc}`clustering` covers the Paris cut.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -67,11 +64,10 @@ ds.plots.embedding(
 
 Paris clusters on the full UMAP before downsampling.
 
----
-### 2. Run the TopACeDo downsampler
+## 2. Run the TopACeDo downsampler
 
-Some downstream steps remain expensive on every cell. TopACeDo selects a topology-preserving
-subset from Scarf's KNN graph while keeping heterogeneous regions.
+Some downstream steps remain expensive on every cell.
+TopACeDo selects a topology-preserving subset from Scarf's KNN graph while keeping heterogeneous regions.
 
 ```{code-cell} ipython3
 ds.run_topacedo_sampler(
@@ -90,9 +86,9 @@ if 'RNA_sketched' not in ds.cells.columns:
 }
 ```
 
-Selected cells are marked `True` under `RNA_sketched`. Seed cells used to initialize the
-sampler are marked under `RNA_sketch_seeds`. Per-cluster counts show that sampling stays
-balanced rather than draining one partition:
+Selected cells are marked `True` under `RNA_sketched`.
+Seed cells used to initialize the sampler are marked under `RNA_sketch_seeds`.
+Per-cluster counts show that sampling stays balanced rather than draining one partition:
 
 ```{code-cell} ipython3
 sampling = ds.cells.to_pandas_dataframe(
@@ -110,8 +106,8 @@ cluster_sampling['sampling_rate'] = (
 cluster_sampling
 ```
 
-Compare the full manifold with the selected cells side by side. The right panel should still
-cover the main clusters:
+Compare the full manifold with the selected cells side by side.
+The right panel should still cover the main clusters:
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -148,11 +144,11 @@ ds.plots.embedding(
 )
 ```
 
----
-### 3. Inspect downsampling parameters
+## 3. Inspect downsampling parameters
 
-To place seed cells, the sampler estimates density from neighbourhood degree. Dense regions
-get a sampling penalty. Per-cell values are stored in `RNA_cell_density`.
+To place seed cells, the sampler estimates density from neighbourhood degree.
+Dense regions get a sampling penalty.
+Per-cell values are stored in `RNA_cell_density`.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -161,8 +157,8 @@ ds.plots.embedding(
 )
 ```
 
-Higher `RNA_cell_density` marks denser graph neighbourhoods. Selection rate by density
-quantile links that penalty to who was kept:
+Higher `RNA_cell_density` marks denser graph neighbourhoods.
+Selection rate by density quantile links that penalty to who was kept:
 
 ```{code-cell} ipython3
 density = ds.cells.to_pandas_dataframe(
@@ -188,8 +184,9 @@ density['density_bin'] = pd.qcut(
 )
 ```
 
-The sampler also scores tight connectivity via mean shared nearest neighbours of each cell's
-neighbours. Tight regions get a sampling reward. Values are stored in `RNA_snn_value`.
+The sampler also scores tight connectivity via mean shared nearest neighbours of each cell's neighbours.
+Tight regions get a sampling reward.
+Values are stored in `RNA_snn_value`.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -200,13 +197,12 @@ ds.plots.embedding(
 
 Higher `RNA_snn_value` marks more tightly connected neighbourhoods.
 
----
-### 4. Export downsampled data
+## 4. Export downsampled data
 
-TopACeDo marks representative cells but leaves the source store unchanged.
-`SubsetZarr` accepts any boolean cell-metadata column, not only a TopACeDo
-result. Use it for a manually annotated population, a QC selection, or the
-`RNA_sketched` selection below.
+TopACeDo writes cell-metadata columns such as `RNA_sketched` and a sampling artifact in the source store.
+It does not create a smaller counts store.
+`SubsetZarr` does that: it accepts any boolean cell-metadata column, not only a TopACeDo result.
+Use it for a manually annotated population, a QC selection, or the `RNA_sketched` selection below.
 
 ```{code-cell} ipython3
 subset_path = f'{dataset}/subset.zarr'
@@ -221,9 +217,8 @@ writer.dump()
 ```
 
 The output contains selected cells from every assay listed in `assays`.
-`SubsetZarr` retains all features in those assays; it is cell-selective, not
-feature-selective. Use `to_anndata(feature_names=...)` when both axes need to
-be reduced before disk export.
+`SubsetZarr` retains all features in those assays; it is cell-selective, not feature-selective.
+Use `to_anndata(feature_names=...)` when both axes need to be reduced before disk export.
 
 Open the downsampled store as a new `DataStore`:
 
@@ -237,8 +232,7 @@ ds2 = scarf.DataStore(subset_path)
 }
 ```
 
-Cell metadata, including UMAP coordinates and cluster labels, is copied into the subset
-store, so the smaller object plots without recomputing the graph:
+Cell metadata, including UMAP coordinates and cluster labels, is copied into the subset store, so the smaller object plots without recomputing the graph:
 
 ```{code-cell} ipython3
 ds2.plots.embedding(
@@ -247,8 +241,7 @@ ds2.plots.embedding(
 )
 ```
 
-When the subset fits in memory, export to AnnData for tools in the
-[scverse](https://scverse.org/) ecosystem:
+When the subset fits in memory, export to AnnData for tools in the [scverse](https://scverse.org/) ecosystem:
 
 ```{code-cell} ipython3
 adata = ds2.to_anndata()
@@ -257,10 +250,10 @@ adata.shape
 
 ## Common mistakes
 
-- Calling `run_topacedo_sampler` before clustering; pass a `cluster_key` column with cell partitions
+- Calling `run_topacedo_sampler` without a Paris dendrogram for the graph; Leiden-only labels or other cluster partitions alone are not enough
 - Passing a cluster column that was created from a different cell subset than the graph
 - Treating the sampled cells as a replacement for the full dataset in quantitative analysis
 - Expecting `SubsetZarr` to remove unselected features
 
-TopACeDo writes its selection and diagnostic columns to cell metadata.
-`SubsetZarr` writes the selected cells to the requested destination.
+TopACeDo writes its selection and diagnostic columns to cell metadata, plus a sampling artifact.
+`SubsetZarr` writes selected cells to a new Zarr store.

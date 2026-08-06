@@ -48,6 +48,8 @@ ds.plots.embedding(
     color_by="RNA_clusters",
 )
 ```
+<img width="400" alt="image" src="https://github.com/user-attachments/assets/c4e62d37-4c03-4cbc-8a8b-2ff86556b370" />
+
 
 Read the [scRNA-seq tutorial](https://scarf.readthedocs.io/en/latest/tutorials/scrna_seq.html) for a granular workflow, or [remote stores](https://scarf.readthedocs.io/en/latest/tutorials/remote_stores.html) for cloud setups.
 

@@ -16,9 +16,8 @@ kernelspec:
 
 # Provenance and reuse
 
-This tutorial shows when Scarf will {term}`reuse` a completed {term}`artifact`
-and when it builds a new one. Read {doc}`../concepts/provenance` for the rules
-that decide which of the two happens.
+This tutorial shows when Scarf will {term}`reuse` a completed {term}`artifact` and when it builds a new one.
+Read {doc}`../concepts/provenance` for the rules that decide which of the two happens.
 
 ## Prerequisites
 
@@ -59,10 +58,9 @@ ds.filter_cells(
 ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ```
 
-## Build a baseline chain
+## 1. Build a baseline chain
 
-Keep `update_state=False` so side comparisons do not replace the current
-{term}`analysis chain` until you choose a branch.
+Keep `update_state=False` so side comparisons do not replace the current {term}`analysis chain` until you choose a branch.
 
 ```{code-cell} ipython3
 normalized = ds.run_normalization(
@@ -75,10 +73,10 @@ neighbors_k11 = ds.query_neighbors(ann, k=11, update_state=False)
 graph_k11 = ds.build_connectivity_map(neighbors_k11, update_state=False)
 ```
 
-## Vary `k`: reuse upstream
+## 2. Vary `k`: reuse upstream
 
-A new neighbor count changes only the neighbors and connectivity
-{term}`provenance`. The normalization, PCA, and ANN references are unchanged.
+A new neighbor count changes only the neighbors and connectivity {term}`provenance`.
+The normalization, PCA, and ANN references are unchanged.
 
 ```{code-cell} ipython3
 neighbors_k15 = ds.query_neighbors(ann, k=15, update_state=False)
@@ -91,8 +89,7 @@ print('neighbors recomputed:', neighbors_k15 != neighbors_k11)
 print('graph recomputed:', graph_k15 != graph_k11)
 ```
 
-Degree and edge-weight distributions shift with `k` even though the upstream
-artifacts are identical:
+Degree and edge-weight distributions shift with `k` even though the upstream artifacts are identical:
 
 ```{code-cell} ipython3
 import scarf.plotting as splt
@@ -104,10 +101,10 @@ splt.graph_qc(matrix_k11)
 splt.graph_qc(matrix_k15)
 ```
 
-## Vary `dims`: invalidate downstream
+## 3. Vary `dims`: invalidate downstream
 
-A new PCA dimensionality creates a new reduction. ANN, neighbors, and
-connectivity that depend on the old reduction are not reused for the new chain.
+A new PCA dimensionality creates a new reduction.
+ANN, neighbors, and connectivity that depend on the old reduction are not reused for the new chain.
 
 ```{code-cell} ipython3
 pca_dims20 = ds.run_pca(normalized, dims=20, update_state=False)
@@ -122,16 +119,15 @@ print('graph recomputed:', graph_dims20 != graph_k11)
 print('normalization reused:', ds.run_normalization(feat_key='hvgs', update_state=False) == normalized)
 ```
 
-## Force recompute
+## 4. Force recompute
 
 `invalidate_cache=True` skips {term}`reuse` even when the parameters match.
-Previously completed artifacts remain on disk. The new reference has a different
-id and path. The operation and parameters stay the same.
+Previously completed artifacts remain on disk.
+The new reference has a different id and path.
+The operation and parameters stay the same.
 
-For normalization, `invalidate_cache` also writes fresh cell and feature
-selection snapshots and records those new selection artifacts as inputs. The
-input roles stay the same (`cell_selection`, `feature_selection`), but the
-selection artifact ids differ:
+For normalization, `invalidate_cache` also writes fresh cell and feature selection snapshots and records those new selection artifacts as inputs.
+The input roles stay the same (`cell_selection`, `feature_selection`), but the selection artifact ids differ:
 
 ```{code-cell} ipython3
 forced = ds.run_normalization(
@@ -163,12 +159,11 @@ for name in sorted(set(baseline_inputs) | set(forced_inputs)):
     print('  forced:', right)
 ```
 
-## Compare lineage
+## 5. Compare lineage
 
-Build one read-only report from both neighbour-count branches and the
-`dims=20` fork. Shared upstream nodes appear once; the forks show where each
-branch diverged. Because HVGs were remade after this page's cell filter, the
-graph should not include an older mito filter that lived on the shared store:
+Build one read-only report from both neighbour-count branches and the `dims=20` fork.
+Shared upstream nodes appear once; the forks show where each branch diverged.
+Because HVGs were remade after this page's cell filter, the graph should not include an older mito filter that lived on the shared store:
 
 ```{code-cell} ipython3
 lineage = ds.lineage(
@@ -181,13 +176,12 @@ lineage = ds.lineage(
 lineage
 ```
 
-Notebook display renders the Mermaid dependency graph and the artifact details
-beneath it. The `k` branches should diverge after the ANN index. The `dims=20`
-branch should fork earlier, at PCA, then carry its own ANN, neighbours, and
-graph.
+Notebook display renders the Mermaid dependency graph and the artifact details beneath it.
+The `k` branches should diverge after the ANN index.
+The `dims=20` branch should fork earlier, at PCA, then carry its own ANN, neighbours, and graph.
 
-Export the same report when it needs to travel with an analysis. `to_markdown()`
-is what notebook display uses; showing it here makes that export explicit:
+Export the same report when it needs to travel with an analysis.
+`to_markdown()` is what notebook display uses; showing it here makes that export explicit:
 
 ```{code-cell} ipython3
 from IPython.display import Markdown
@@ -195,5 +189,4 @@ from IPython.display import Markdown
 Markdown(lineage.to_markdown())
 ```
 
-`lineage.to_mermaid()` returns only the diagram source when a tooling pipeline
-needs that form alone.
+`lineage.to_mermaid()` returns only the diagram source when a tooling pipeline needs that form alone.

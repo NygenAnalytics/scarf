@@ -18,15 +18,13 @@ kernelspec:
 # Building neighbourhood graphs step by step
 
 Embeddings, clustering, imputation, and trajectories consume a cell graph.
-Scarf builds that graph from a selected cell population and feature set through
-separate persisted stages. Calling the stages directly is useful when you need
-to branch one parameter, insert batch correction, or {term}`reuse` an expensive
-reduction.
+Scarf builds that graph from a selected cell population and feature set through separate persisted stages.
+Calling the stages directly is useful when you need to branch one parameter, insert batch correction, or {term}`reuse` an expensive reduction.
 
-Feature selection is covered in {doc}`feature_selection`. This guide begins once
-the feature key exists.
+Feature selection is covered in {doc}`feature_selection`.
+This guide begins once the feature key exists.
 
-## The standard graph workflow
+## 1. The standard graph workflow
 
 For RNA, the graph stages are:
 
@@ -36,18 +34,16 @@ For RNA, the graph stages are:
 4. Build an approximate-neighbour index.
 5. Query `k` neighbours per cell.
 6. Convert neighbour distances into weighted connectivity.
-7. Build a separate initialization for UMAP.
+7. Build a separate initialization for UMAP and t-SNE.
 
-ATAC follows the same shape but uses TF-IDF normalization and LSI. The
-initialization does not define graph edges; it only supplies starting
-coordinates for a layout.
+ATAC follows the same shape but uses TF-IDF normalization and LSI.
+The initialization does not define graph edges; it only supplies starting coordinates for a layout.
 
-`ds.pipeline.run()` orchestrates the standard RNA path and can continue through
-UMAP, clustering, doublet scoring, and markers. Use it when the defaults match
-the analysis. The stage methods below expose the same persisted results with
-more control.
+`ds.pipeline.run()` orchestrates the standard RNA path and can continue through UMAP, clustering, doublet scoring, and markers.
+Use it when the defaults match the analysis.
+The stage methods below expose the same persisted results with more control.
 
-## Build an RNA graph explicitly
+## 2. Build an RNA graph explicitly
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -84,8 +80,8 @@ if "I__hvgs" not in ds.RNA.feats.columns:
     )
 ```
 
-Each method returns an {term}`ArtifactRef`. Passing it to the next method makes
-the dependency explicit.
+Each method returns an {term}`ArtifactRef`.
+Passing it to the next method makes the dependency explicit.
 
 ```{code-cell} ipython3
 normalized = ds.run_normalization(feat_key="hvgs")
@@ -123,8 +119,7 @@ for name, ref in (
 pd.DataFrame(stage_rows)
 ```
 
-`load_graph` returns the sparse cell-by-cell connectivity matrix for supported
-custom graph analyses.
+`load_graph` returns the sparse cell-by-cell connectivity matrix for supported custom graph analyses.
 
 ```{code-cell} ipython3
 loaded_graph = ds.load_graph()
@@ -135,8 +130,7 @@ loaded_graph.shape, loaded_graph.nnz
 splt.graph_qc(loaded_graph)
 ```
 
-Check isolation and whether degree tracks QC metrics before treating the graph
-as ready for clustering:
+Check isolation and whether degree tracks QC metrics before treating the graph as ready for clustering:
 
 ```{code-cell} ipython3
 degrees = np.asarray((loaded_graph != 0).sum(axis=0)).ravel()
@@ -163,16 +157,14 @@ degree_vs_qc = pd.DataFrame(
 degree_vs_qc.corr(numeric_only=True)
 ```
 
-The graph should include every active cell and have finite nonzero
-connectivities. A disconnected graph, many isolated cells, or degree structure
-driven by a QC metric warrants revisiting features, PCA dimensions, or `k`.
+The graph should include every active cell and have finite nonzero connectivities.
+A disconnected graph, many isolated cells, or degree structure driven by a QC metric warrants revisiting features, PCA dimensions, or `k`.
 
-## Understand the current analysis chain
+## 3. Understand the current analysis chain
 
-Successful stages normally update a small pointer set for the assay. In plain
-language, this is the {term}`analysis chain` that downstream calls should use
-when no explicit input is supplied. The public class representing it is
-`AssayState`.
+Successful stages normally update a small pointer set for the assay.
+In plain language, this is the {term}`analysis chain` that downstream calls should use when no explicit input is supplied.
+The public class representing it is `AssayState`.
 
 ```{code-cell} ipython3
 state = ds.get_assay_state("RNA")
@@ -187,8 +179,8 @@ state = ds.get_assay_state("RNA")
 }
 ```
 
-The initialization artifact stores K-means centers and labels used only as
-UMAP starting coordinates. Inspect it, then plot the projected seed layout:
+The initialization artifact stores K-means centers and labels used only as UMAP and t-SNE starting coordinates.
+Inspect it, then plot the projected seed layout:
 
 ```{code-cell} ipython3
 init_status = ds.inspect_artifact(initialization)
@@ -215,10 +207,11 @@ figure.tight_layout()
 figure
 ```
 
-`run_umap`, Leiden, and Paris resolve the current connectivity and
-initialization from this chain. They write their cell-metadata columns as usual
-and return the artifact they wrote, so a result can be inspected or reused
-without looking the column up first.
+`run_umap` and `run_tsne` resolve the current connectivity and initialization from this chain.
+Leiden and Paris resolve only the connectivity graph.
+They write their cell-metadata columns as usual.
+UMAP, t-SNE, and Leiden return the artifact they wrote; Paris returns a `ParisClusteringResult` whose `.ref` holds that artifact.
+Either way, a result can be inspected or reused without looking the column up first.
 
 ```{code-cell} ipython3
 umap = ds.run_umap(
@@ -236,10 +229,10 @@ ds.plots.embedding(
 ds.inspect_artifact(clusters).parameters
 ```
 
-## Branch without changing the current chain
+## 4. Branch without changing the current chain
 
-Suppose the PCA and ANN index are expensive but two neighbour counts need to be
-compared. Reuse the same index and set `update_state=False` on the side branch.
+Suppose the PCA and ANN index are expensive but two neighbour counts need to be compared.
+Reuse the same index and set `update_state=False` on the side branch.
 
 ```{code-cell} ipython3
 neighbors_k21 = ds.query_neighbors(
@@ -256,9 +249,8 @@ current_state = ds.get_assay_state("RNA")
 current_state.connectivity_map == graph, graph_k21 != graph
 ```
 
-The side branch remains a complete, addressable artifact, while downstream
-calls without explicit inputs still use the `k=11` graph. This prevents a
-parameter experiment from silently replacing the selected chain.
+The side branch remains a complete, addressable artifact, while downstream calls without explicit inputs still use the `k=11` graph.
+This prevents a parameter experiment from silently replacing the selected chain.
 
 Degree and edge weight both shift when every cell sees more neighbours:
 
@@ -279,8 +271,8 @@ pd.Series(
 splt.graph_qc(loaded_graph_k21)
 ```
 
-To analyse the side branch, pass its graph as the first argument. The current
-chain is untouched, so both partitions stay available for comparison.
+To analyse the side branch, pass its graph as the first argument.
+The current chain is untouched, so both partitions stay available for comparison.
 
 ```{code-cell} ipython3
 ds.run_leiden_clustering(
@@ -290,8 +282,7 @@ ds.run_leiden_clustering(
 )
 ```
 
-Place both partitions on the shared `k=11` UMAP so absorption is visible, then
-quantify agreement with a crosstab:
+Place both partitions on the shared `k=11` UMAP so absorption is visible, then quantify agreement with a crosstab:
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -321,17 +312,15 @@ pd.crosstab(
 )
 ```
 
-Most cells keep their group. The off-diagonal mass shows which splits depend on
-`k`: the smallest `k=11` clusters are absorbed once every cell sees more
-neighbours, so treat those boundaries as provisional.
+Most cells keep their group.
+The off-diagonal mass shows which splits depend on `k`: the smallest `k=11` clusters are absorbed once every cell sees more neighbours, so treat those boundaries as provisional.
 
-## Recompute only what changed
+## 5. Recompute only what changed
 
-Artifact identity includes the operation, scientific parameters, and upstream
-inputs. Calling an identical stage reuses its completed result. Changing `k`
-reuses normalization, PCA, and the ANN index but creates new neighbour and
-connectivity artifacts. Changing the cell or feature selection invalidates all
-dependent stages.
+Artifact identity includes the operation, scientific parameters, and upstream inputs.
+Calling an identical stage reuses its completed result.
+Changing `k` reuses normalization, PCA, and the ANN index but creates new neighbour and connectivity artifacts.
+Changing the cell or feature selection invalidates all dependent stages.
 
 Harmony fits between PCA and the ANN index:
 
@@ -342,5 +331,4 @@ corrected_neighbors = ds.query_neighbors(corrected_index, k=21)
 corrected_graph = ds.build_connectivity_map(corrected_neighbors)
 ```
 
-Use {doc}`../concepts/provenance` to inspect complete lineage and
-{doc}`reuse_and_tracing` for reuse and invalidation patterns.
+Use {doc}`../concepts/provenance` to inspect complete lineage and {doc}`reuse_and_tracing` for reuse and invalidation patterns.

@@ -14,14 +14,11 @@ kernelspec:
 
 # Three-way RNA, ATAC, and protein integration with TEA-seq
 
-TEA-seq measures gene expression, chromatin accessibility, and surface proteins
-in the same cells. This tutorial opens a prepared store, inspects the three
-modality-specific analyses, and reuses a three-way weighted nearest neighbour
-(WNN) artifact.
+TEA-seq measures gene expression, chromatin accessibility, and surface proteins in the same cells.
+This tutorial opens a prepared store, inspects the three modality-specific analyses, and reuses a three-way weighted nearest neighbour (WNN) artifact.
 
-The expensive import and preprocessing steps have already run. The executable
-work here is limited to downloading the analyzed store, reading its artifacts,
-and plotting their results.
+The expensive import and preprocessing steps have already run.
+The executable work here is limited to downloading the analyzed store, reading its artifacts, and plotting their results.
 
 ## Prerequisites
 
@@ -36,19 +33,15 @@ and plotting their results.
 - Reuse a stored RNA plus ATAC plus ADT WNN graph
 - Validate and visualize one modality weight per cell and assay
 
-## Dataset and cell selection
+## 1. Dataset and cell selection
 
-The prepared store contains the 7,069 peripheral blood mononuclear cells and
-all raw features in the checksum-pinned
-[GSM5123951 TEA-seq Seurat object](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSM5123951).
-Cell types come from
-[eLife Figure 4 source data](https://doi.org/10.7554/eLife.63632).
+The prepared store contains the 7,069 peripheral blood mononuclear cells and all raw features in the checksum-pinned [GSM5123951 TEA-seq Seurat object](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSM5123951).
+Cell types come from [eLife Figure 4 source data](https://doi.org/10.7554/eLife.63632).
 
-The two pinned sources are not the same revision. Figure 4 lists 6,333 cells
-from well W3, but exact matching by `original_barcodes` and the W3 suffix finds
-6,194 cells in the Seurat object. The prepared analysis activates those 6,194
-exact matches. It does not replace the 139 missing publication cells with
-unlabelled cells.
+The two pinned sources are not the same revision.
+Figure 4 lists 6,333 cells from well W3, but exact matching by `original_barcodes` and the W3 suffix finds 6,194 cells in the Seurat object.
+The prepared analysis activates those 6,194 exact matches.
+It does not replace the 139 missing publication cells with unlabelled cells.
 
 ```{code-cell} ipython3
 import matplotlib.pyplot as plt
@@ -71,9 +64,8 @@ ds = scarf.DataStore(
 )
 ```
 
-Read the stored shapes instead of loading a complete matrix. The ATAC count
-array retains all 240,122 peaks, while the analysis chain selects 25,000 peaks
-for reduction.
+Read the stored shapes instead of loading a complete matrix.
+The ATAC count array retains all 240,122 peaks, while the analysis chain selects 25,000 peaks for reduction.
 
 ```{code-cell} ipython3
 assay_inventory = []
@@ -91,8 +83,7 @@ for assay_name in ("RNA", "ATAC", "ADT"):
 pd.DataFrame(assay_inventory)
 ```
 
-The active key identifies the exact publication matches used by every stored
-analysis artifact.
+The active key identifies the exact publication matches used by every stored analysis artifact.
 
 ```{code-cell} ipython3
 active_cells = int(ds.cells.fetch_all("I").sum())
@@ -112,11 +103,10 @@ Publication lineage labels on the active exact matches:
 pd.Series(ds.cells.fetch("tea_cell_type", key="I")).value_counts()
 ```
 
-## Fixed preprocessing recipe
+## 2. Fixed preprocessing recipe
 
-The recipe below is recorded in the dataset manifest and represented by
-complete artifacts in the store. This page does not refit normalization,
-reductions, neighbour graphs, UMAP, or clustering.
+The recipe below is recorded in the dataset manifest and represented by complete artifacts in the store.
+This page does not refit normalization, reductions, neighbour graphs, UMAP, or clustering.
 
 ```{code-cell} ipython3
 preprocessing = pd.DataFrame(
@@ -202,15 +192,14 @@ pd.DataFrame(artifact_rows)
 ```
 
 Each modality has a 20-neighbour self-free row over the same active cells.
-Those matched rows feed both integrations. SNN merges shared edge support with
-equal standing for each source graph. WNN estimates a separate local
-contribution for each assay and cell.
+Those matched rows feed both integrations.
+SNN merges shared edge support with equal standing for each source graph.
+WNN estimates a separate local contribution for each assay and cell.
 
-## Compare modality-specific and SNN layouts
+## 3. Compare modality-specific and SNN layouts
 
-These layouts are independent outputs. Similar broad populations support a
-shared signal, while local differences can reflect complementary measurements
-or modality-specific noise.
+These layouts are independent outputs.
+Similar broad populations support a shared signal, while local differences can reflect complementary measurements or modality-specific noise.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(2, 2, figsize=(10, 8))
@@ -237,11 +226,9 @@ for index, (axis, (title, layout_key)) in enumerate(
 figure.tight_layout()
 ```
 
-The SNN layout is a joint view, not a reference truth. Differences between
-panels should be checked against markers and assay quality rather than judged
-from visual compactness alone. This store keeps Ensembl IDs as RNA feature
-names, so the panel below uses ADT proteins for T, B, monocyte, and NK-like
-landmarks.
+The SNN layout is a joint view, not a reference truth.
+Differences between panels should be checked against markers and assay quality rather than judged from visual compactness alone.
+This store keeps Ensembl IDs as RNA feature names, so the panel below uses ADT proteins for T, B, monocyte, and NK-like landmarks.
 
 ```{code-cell} ipython3
 snn_markers = ds.plots.embedding(
@@ -257,11 +244,10 @@ snn_markers = ds.plots.embedding(
 snn_markers.figure.set_size_inches(10, 8)
 ```
 
-## Reuse the three-way WNN graph
+## 4. Reuse the three-way WNN graph
 
-Calling `integrate_assays` with the recorded parameters resolves to the
-existing immutable artifact. The assertion verifies reuse rather than
-recomputation.
+Calling `integrate_assays` with the recorded parameters resolves to the existing immutable artifact.
+The assertion verifies reuse rather than recomputation.
 
 ```{code-cell} ipython3
 assays = ["RNA", "ATAC", "ADT"]
@@ -294,8 +280,7 @@ pd.Series(
 )
 ```
 
-The artifact publishes its modality weights as cell metadata in the same order
-as the input assays.
+The artifact publishes its modality weights as cell metadata in the same order as the input assays.
 
 ```{code-cell} ipython3
 weight_columns = [
@@ -322,8 +307,7 @@ pd.Series(
 )
 ```
 
-Mean modality weight by publication label shows which populations lean on
-RNA, ATAC, or ADT under this stored neighbourhood.
+Mean modality weight by publication label shows which populations lean on RNA, ATAC, or ADT under this stored neighbourhood.
 
 ```{code-cell} ipython3
 weight_frame = pd.DataFrame(
@@ -339,8 +323,7 @@ weight_frame.groupby("tea_cell_type")[
 ].agg(["count", "mean"]).round(3)
 ```
 
-Plotting all three weights on the integrated layout shows where the graph
-relies more strongly on each local neighbourhood.
+Plotting all three weights on the integrated layout shows where the graph relies more strongly on each local neighbourhood.
 
 ```{code-cell} ipython3
 wnn_view = ds.plots.embedding(
@@ -360,9 +343,8 @@ for axis, title in zip(
 wnn_view.figure.set_size_inches(10, 8)
 ```
 
-Place the three-way SNN and WNN layouts side by side under the same cell-type
-colouring. Broad populations should agree; local rearrangements need marker
-and weight support before interpretation.
+Place the three-way SNN and WNN layouts side by side under the same cell-type colouring.
+Broad populations should agree; local rearrangements need marker and weight support before interpretation.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -387,8 +369,7 @@ for index, (axis, (title, layout_key)) in enumerate(
 figure.tight_layout()
 ```
 
-The same ADT panel on the WNN layout checks whether lineage landmarks remain
-coherent after per-cell reweighting.
+The same ADT panel on the WNN layout checks whether lineage landmarks remain coherent after per-cell reweighting.
 
 ```{code-cell} ipython3
 wnn_markers = ds.plots.embedding(
@@ -404,65 +385,45 @@ wnn_markers = ds.plots.embedding(
 wnn_markers.figure.set_size_inches(10, 8)
 ```
 
-## How N-way WNN combines the assays
+## 5. How N-way WNN combines the assays
 
-For cell \(i\), let \(\mathcal{N}_{m,i}\) be the stored self-free neighbour
-row for modality \(m\). Scarf scores the bounded candidate set
+For cell \(i\), let \(\mathcal{N}_{m,i}\) be the stored self-free neighbour row for modality \(m\).
+Scarf scores the bounded candidate set
 
-\[
-\mathcal{C}_i = \bigcup_m \mathcal{N}_{m,i}
-\]
+\[ \mathcal{C}_i = \bigcup_m \mathcal{N}_{m,i} \]
 
-and retains \(\min_m |\mathcal{N}_{m,i}|\) output neighbours. Let
-\(\theta_{m \leftarrow n,i}\) be the affinity in target modality \(m\)
-between cell \(i\) and the mean target-modality coordinates of neighbours
-selected by source modality \(n\). The directed cross-modality score is
+and retains \(\min_m |\mathcal{N}_{m,i}|\) output neighbours.
+Let \(\theta_{m \leftarrow n,i}\) be the affinity in target modality \(m\) between cell \(i\) and the mean target-modality coordinates of neighbours selected by source modality \(n\).
+The directed cross-modality score is
 
-\[
-s_{m,n,i} =
-\operatorname{clip}\left(
-\frac{\theta_{m \leftarrow m,i}}
+\[ s_{m,n,i} = \operatorname{clip}\left( \frac{\theta_{m \leftarrow m,i}}
      {\theta_{m \leftarrow n,i} + 10^{-4}},
-0,
-200
-\right), \qquad m \ne n.
-\]
+0, 200 \right), \qquad m \ne n. \]
 
-For three or more assays, Scarf uses the grouped pairwise normalization from
-the Hao/current-Seurat formulation:
+For three or more assays, Scarf uses the grouped pairwise normalization from the Hao/current-Seurat formulation:
 
-\[
-w_{m,i} =
-\frac{\sum_{n \ne m}\exp(s_{m,n,i})}
+\[ w_{m,i} = \frac{\sum_{n \ne m}\exp(s_{m,n,i})}
      {\sum_a\sum_{b \ne a}\exp(s_{a,b,i})}.
 \]
 
-The largest directed score is subtracted before exponentiation for numerical
-stability. This leaves the ratio unchanged and reduces to the existing
-two-modality softmax when there are two assays. Candidate \(j\) then receives
-the blended affinity
+The largest directed score is subtracted before exponentiation for numerical stability.
+This leaves the ratio unchanged and reduces to the existing two-modality softmax when there are two assays.
+Candidate \(j\) then receives the blended affinity
 
-\[
-A_{i,j} = \sum_m w_{m,i} A^{(m)}_{i,j}.
-\]
+\[ A_{i,j} = \sum_m w_{m,i} A^{(m)}_{i,j}. \]
 
 Each target modality uses its own nearest-neighbour distance and bandwidth.
-Scarf uses the union of existing KNN rows and the distance span from the
-nearest to the k-th neighbour as bandwidth. It therefore follows the weighting
-equations but is not bit-identical to Seurat's default wider candidate search
-and SNN-far bandwidth, or to the TEA-seq fork's max-cross shortcut.
+Scarf uses the union of existing KNN rows and the distance span from the nearest to the k-th neighbour as bandwidth.
+It therefore follows the weighting equations but is not bit-identical to Seurat's default wider candidate search and SNN-far bandwidth, or to the TEA-seq fork's max-cross shortcut.
 
 ## Interpretation and limitations
 
-WNN weights report relative local predictability under these stored
-embeddings and neighbourhoods. They do not measure molecular abundance,
-global assay quality, or causal importance. A high weight can reflect useful
-resolution, but it can also reflect preprocessing choices or noise.
+WNN weights report relative local predictability under these stored embeddings and neighbourhoods.
+They do not measure molecular abundance, global assay quality, or causal importance.
+A high weight can reflect useful resolution, but it can also reflect preprocessing choices or noise.
 
-The prepared UMAPs are Scarf results and are not intended to reproduce the
-published TEA-seq UMAP. The exact-match selection also means that conclusions
-apply to the 6,194 cells represented in both pinned sources, not to all 6,333
-Figure 4 labels.
+The prepared UMAPs are Scarf results and are not intended to reproduce the published TEA-seq UMAP.
+The exact-match selection also means that conclusions apply to the 6,194 cells represented in both pinned sources, not to all 6,333 Figure 4 labels.
 
 Data attribution:
 

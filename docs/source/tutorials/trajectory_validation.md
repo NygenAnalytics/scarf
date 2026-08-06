@@ -16,10 +16,8 @@ kernelspec:
 
 # Trajectory validation
 
-Trajectory results depend on the selected graph, the source and sink
-annotations, and the features used for downstream tests. This guide checks those
-dependencies on the Bastidas-Ponce pancreas dataset after the recommended path
-in {doc}`pseudotime`, {doc}`expression_dynamics`, and {doc}`fate_mapping`.
+Trajectory results depend on the selected graph, the source and sink annotations, and the features used for downstream tests.
+This guide checks those dependencies on the Bastidas-Ponce pancreas dataset after the recommended path in {doc}`pseudotime`, {doc}`expression_dynamics`, and {doc}`fate_mapping`.
 
 ## Standalone setup
 
@@ -45,8 +43,7 @@ ds = scarf.DataStore(
 )
 ```
 
-This section opens the prepared datastore used by {doc}`pseudotime` and fits the
-same multi-sink baseline so the page can run independently.
+This section opens the prepared datastore used by {doc}`pseudotime` and fits the same multi-sink baseline so the page can run independently.
 
 ```{code-cell} ipython3
 multi_sink = ds.run_pseudotime_scoring(
@@ -57,9 +54,9 @@ multi_sink = ds.run_pseudotime_scoring(
 )
 ```
 
-Inspect the fitted ordering on the stored UMAP. Values should progress from the
-ductal source toward the endocrine sinks. A disconnected or reversed pattern is
-a reason to revisit the graph and boundary choices before changing parameters.
+Inspect the fitted ordering on the stored UMAP.
+Values should progress from the ductal source toward the endocrine sinks.
+A disconnected or reversed pattern is a reason to revisit the graph and boundary choices before changing parameters.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -69,11 +66,11 @@ ds.plots.embedding(
 )
 ```
 
-## Compare boundary choices
+## 1. Compare boundary choices
 
 Population balance analysis directs movement between the selected boundaries.
-Changing those boundaries changes the scientific question. Compare the
-multi-sink baseline with a narrower ductal-to-Beta question.
+Changing those boundaries changes the scientific question.
+Compare the multi-sink baseline with a narrower ductal-to-Beta question.
 
 ```{code-cell} ipython3
 beta_sink = ds.run_pseudotime_scoring(
@@ -166,8 +163,8 @@ figure.tight_layout()
 plt.show()
 ```
 
-Place both orderings on the same UMAP layout. Shared early structure can look
-similar while terminal branches diverge once the sink set changes.
+Place both orderings on the same UMAP layout.
+Shared early structure can look similar while terminal branches diverge once the sink set changes.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
@@ -188,9 +185,8 @@ figure.tight_layout()
 figure
 ```
 
-Map rank disagreement onto the embedding. Large absolute rank shifts locate
-cells whose relative position depends on the chosen sinks, beyond what a global
-correlation summarizes.
+Map rank disagreement onto the embedding.
+Large absolute rank shifts locate cells whose relative position depends on the chosen sinks, beyond what a global correlation summarizes.
 
 ```{code-cell} ipython3
 selected = ds.cells.fetch_all("I").astype(bool)
@@ -247,20 +243,17 @@ population_summary = pd.DataFrame(
 population_summary
 ```
 
-A narrow diagonal band means the boundary change largely preserves cell order;
-systematic departures identify cells whose position depends on the selected
-terminal states. The rank-delta embedding shows where that disagreement sits in
-cell space. Disagreement does not show that one ordering is true. Low coverage
-can instead indicate disconnected populations or a graph that does not support
-the proposed trajectory. Use {doc}`graph_construction` when the graph itself
-needs a controlled sensitivity analysis.
+A narrow diagonal band means the boundary change largely preserves cell order; systematic departures identify cells whose position depends on the selected terminal states.
+The rank-delta embedding shows where that disagreement sits in cell space.
+Disagreement does not show that one ordering is true.
+Low coverage can instead indicate disconnected populations or a graph that does not support the proposed trajectory.
+Use {doc}`graph_construction` when the graph itself needs a controlled sensitivity analysis.
 
-## Validate pseudotime marker tests
+## 2. Validate pseudotime marker tests
 
-`run_pseudotime_marker_search` tests features that meet its minimum-cell and
-variance requirements. Untested features retain `NaN` for both raw and adjusted
-p-values. Benjamini-Hochberg correction is applied only across the tested
-features in this search.
+`run_pseudotime_marker_search` tests features that meet its minimum-cell and variance requirements.
+Untested features retain `NaN` for both raw and adjusted p-values.
+Benjamini-Hochberg correction is applied only across the tested features in this search.
 
 ```{code-cell} ipython3
 markers = ds.run_pseudotime_marker_search(
@@ -284,17 +277,15 @@ markers = ds.run_pseudotime_marker_search(
 markers.table[["p_value", "p_value_adjusted"]].isna().sum()
 ```
 
-The table ranks the strongest tested linear associations in either direction. A
-small adjusted p-value supports association with this fitted ordering. It does
-not establish a nonlinear pattern, branch specificity, causality, or
-replicate-aware differential expression.
+The table ranks the strongest tested linear associations in either direction.
+A small adjusted p-value supports association with this fitted ordering.
+It does not establish a nonlinear pattern, branch specificity, causality, or replicate-aware differential expression.
 
-## Compare module choices
+## 3. Compare module choices
 
-Aggregation smooths expression over ordered windows and clusters genes with
-similar profiles. `window_size` controls smoothing, while `n_clusters` controls
-the requested module granularity. Compare results for coherent patterns and
-reasonable module sizes rather than selecting a value from the heatmap alone.
+Aggregation smooths expression over ordered windows and clusters genes with similar profiles.
+`window_size` controls smoothing, while `n_clusters` controls the requested module granularity.
+Compare results for coherent patterns and reasonable module sizes rather than selecting a value from the heatmap alone.
 
 ```{code-cell} ipython3
 module_results = {}
@@ -345,11 +336,9 @@ pd.crosstab(
 ).round(2)
 ```
 
-The cross-tabulation shows how each coarse module divides at finer
-granularity. A split can reveal distinct profiles, but a fragmented row with
-very small groups can also indicate an unstable setting. Compare the heatmaps
-directly: coarse modules should keep coherent early, intermediate, and late
-blocks, while fine modules may split those blocks into sharper peaks.
+The cross-tabulation shows how each coarse module divides at finer granularity.
+A split can reveal distinct profiles, but a fragmented row with very small groups can also indicate an unstable setting.
+Compare the heatmaps directly: coarse modules should keep coherent early, intermediate, and late blocks, while fine modules may split those blocks into sharper peaks.
 
 ```{code-cell} ipython3
 for name, modules in module_results.items():
@@ -371,13 +360,12 @@ for name, modules in module_results.items():
     )
 ```
 
-Unassigned features use `-1`. A module made mostly of genes without a coherent
-ordered pattern is a reason to adjust smoothing or module granularity.
+Unassigned features use `-1`.
+A module made mostly of genes without a coherent ordered pattern is a reason to adjust smoothing or module granularity.
 
-Cluster markers and trajectory modules answer different questions. The first
-contrasts a discrete group with the remaining cells; the second groups genes by
-their profiles along an ordering. Their overlap can be informative without
-being complete.
+Cluster markers and trajectory modules answer different questions.
+The first contrasts a discrete group with the remaining cells; the second groups genes by their profiles along an ordering.
+Their overlap can be informative without being complete.
 
 ```{code-cell} ipython3
 modules = fine_modules
@@ -396,12 +384,11 @@ module_overlap = (
 module_overlap.head()
 ```
 
-## Validate fate probabilities
+## 4. Validate fate probabilities
 
-Fate mapping solves one absorption probability per terminal group on a graph
-biased toward increasing pseudotime. For valid cells, probabilities should sum
-to one. Cells in a terminal boundary should have probability one for their own
-fate.
+Fate mapping solves one absorption probability per terminal group on a graph biased toward increasing pseudotime.
+For valid cells, probabilities should sum to one.
+Cells in a terminal boundary should have probability one for their own fate.
 
 ```{code-cell} ipython3
 fate = ds.run_fate_mapping(
@@ -439,9 +426,9 @@ for index, sink in enumerate(fate.sink_labels):
 pd.DataFrame(terminal_checks)
 ```
 
-Plot each fate probability on the UMAP. Terminal regions should be dominated by
-their matching fate. Intermediate cells can retain probability across several
-outcomes.
+Plot each fate probability on the UMAP.
+Terminal regions should be dominated by their matching fate.
+Intermediate cells can retain probability across several outcomes.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 3, figsize=(11, 4))
@@ -469,9 +456,8 @@ figure.tight_layout()
 figure
 ```
 
-Quantify intermediate mix as one minus the strongest fate probability. High
-values mark cells that are not absorbed into a single terminal state under this
-graph and boundary choice.
+Quantify intermediate mix as one minus the strongest fate probability.
+High values mark cells that are not absorbed into a single terminal state under this graph and boundary choice.
 
 ```{code-cell} ipython3
 mix_values = np.full(len(fate.valid), np.nan, dtype=float)
@@ -491,7 +477,5 @@ ds.plots.embedding(
 )
 ```
 
-Large simplex errors, terminal probabilities below one, or fate fields that do
-not align with the chosen terminal regions indicate a numerical, graph, or
-boundary problem. Fate probabilities remain model-based summaries and require
-independent biological validation.
+Large simplex errors, terminal probabilities below one, or fate fields that do not align with the chosen terminal regions indicate a numerical, graph, or boundary problem.
+Fate probabilities remain model-based summaries and require independent biological validation.

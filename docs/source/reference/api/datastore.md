@@ -1,21 +1,21 @@
 # DataStore API reference
 
-`DataStore` is the primary analyst-facing object. It inherits graph, mapping, and assay helpers
-from the classes below. Use this page for analyst-facing methods and consult the inheritance
-appendix when extending Scarf.
+`DataStore` is the primary analyst-facing object.
+It inherits graph, mapping, and assay helpers from the classes below.
+Use this page for analyst-facing methods and consult the inheritance appendix when extending Scarf.
 
-Graph-construction methods are documented on {doc}`graph_construction`. Read-only state inspection,
-including the metadata-only `DataStore.summary()`, is documented on {doc}`artifacts`. Mapping
-methods are on {doc}`mapping`, and integration metrics are on {doc}`integration`. Those methods are
-excluded here rather than repeated.
+Graph-construction methods are documented on {doc}`graph_construction`.
+Read-only state inspection, including the metadata-only `DataStore.summary()`, is documented on {doc}`artifacts`.
+Mapping methods are on {doc}`mapping`, and integration metrics are on {doc}`integration`.
+Those methods are excluded here rather than repeated.
 
-`summary` is reserved for `DataStore.summary()` and cannot be used as an assay name. Writers and
-`DataStore` opening reject that name before mutating store-level state.
+`summary` is reserved for `DataStore.summary()` and cannot be used as an assay name.
+Writers and `DataStore` opening reject that name before mutating store-level state.
 
 ## Mounting shared count matrices
 
-Use `mount_datastore` when count matrices stay in a read-only source store and analysis
-artifacts should write to a separate target. See {doc}`../../tutorials/remote_stores`.
+Use `mount_datastore` when count matrices stay in a read-only source store and analysis artifacts should write to a separate target.
+See {doc}`../../tutorials/remote_stores`.
 
 ```{eval-rst}
 .. autofunction:: scarf.mount_datastore
@@ -40,9 +40,8 @@ artifacts should write to a separate target. See {doc}`../../tutorials/remote_st
 
 ## Store-bound plotting
 
-`DataStore.plots` binds the datastore argument for canonical store-first functions in
-`scarf.plotting`. Array and DataFrame diagnostics such as `elbow`, `qc`, `graph_qc`, and
-`highly_variable_features` remain standalone.
+`DataStore.plots` binds the datastore argument for canonical store-first functions in `scarf.plotting`.
+Array and DataFrame diagnostics such as `elbow`, `qc`, `graph_qc`, and `highly_variable_features` remain standalone.
 
 ```{eval-rst}
 .. autoclass:: scarf.datastore.plot_accessor.DataStorePlotAccessor
@@ -51,22 +50,18 @@ artifacts should write to a separate target. See {doc}`../../tutorials/remote_st
 
 ## Selected analysis contracts
 
-{py:meth}`scarf.datastore.datastore.DataStore.auto_filter_cells` uses pooled Gaussian bounds by
-default. Supplying `sample_column` selects per-sample MAD bounds with `n_mads` and
-`min_cells_per_sample`; `min_p` and `max_p` do not configure that path.
+{py:meth}`scarf.datastore.datastore.DataStore.auto_filter_cells` uses pooled Gaussian bounds by default.
+Supplying `sample_column` selects per-sample MAD bounds with `n_mads` and `min_cells_per_sample`; `min_p` and `max_p` do not configure that path.
 
-Fresh {py:meth}`scarf.datastore.datastore.DataStore.run_marker_search` results include score,
-expression fractions, fold change, AUC, two-sided Mann-Whitney p-values, and Benjamini-Hochberg
-values adjusted within each one-versus-rest group over tested features. These are cell-level marker
-statistics, not replicate-aware differential expression.
+Fresh {py:meth}`scarf.datastore.datastore.DataStore.run_marker_search` results include score, expression fractions, fold change, AUC, two-sided Mann-Whitney p-values, and Benjamini-Hochberg values adjusted within each one-versus-rest group over tested features.
+These are cell-level marker statistics, not replicate-aware differential expression.
 
-{py:meth}`scarf.datastore.datastore.DataStore.run_pseudotime_marker_search` stores `NaN` for
-features that were not tested and adjusts p-values over tested features only.
+{py:meth}`scarf.datastore.datastore.DataStore.run_pseudotime_marker_search` leaves untested features with `r_value` 0.0 and `NaN` for `p_value` and `p_value_adjusted`, and adjusts p-values over tested features only.
 
 {py:meth}`~scarf.DataStore.integrate_assays` is the public SNN/WNN graph integration entry point.
-Both methods accept two or more cell-aligned assays; WNN stores one per-cell weight for each assay.
-The recommended workflow is in {doc}`../../tutorials/cite_seq`; method comparison and diagnostics
-are in {doc}`../../tutorials/multimodal_diagnostics`.
+WNN requires two or more cell-aligned assays and stores one per-cell weight for each assay.
+SNN via `merge_graphs` requires one or more graphs.
+The recommended workflow is in {doc}`../../tutorials/cite_seq`; method comparison and diagnostics are in {doc}`../../tutorials/multimodal_diagnostics`.
 
 ## Analysis results
 

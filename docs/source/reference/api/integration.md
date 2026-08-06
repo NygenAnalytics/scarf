@@ -54,8 +54,7 @@ Prefer the `DataStore` methods below in analysis code.
     :imported-members:
 ```
 
-Scarf's iLISI and cLISI use the scIB median and scaling definitions over
-Scarf's self-free persisted KNN arrays. Graph connectivity follows the
-original scIB symmetrized-graph definition. YosefLab `scib-metrics` currently
-uses directed strong components for graph connectivity, so those values need
-not match. See Luecken et al. 2022, doi: 10.1038/s41592-021-01336-8.
+Scarf's iLISI and cLISI use the scIB median and scaling definitions over Scarf's self-free persisted KNN arrays.
+Graph connectivity follows the original scIB symmetrized-graph definition.
+YosefLab `scib-metrics` currently uses directed strong components for graph connectivity, so those values need not match.
+See Luecken et al. 2022, doi: 10.1038/s41592-021-01336-8.

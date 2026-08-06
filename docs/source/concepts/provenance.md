@@ -1,16 +1,12 @@
 (provenance)=
 # Provenance and artifacts
 
-Single-cell analysis is a chain of dependent choices. A marker table depends on
-a clustering, the clustering depends on a graph, and the graph depends on a
-particular cell set, feature set, normalization, and reduction. When several
-parameter branches live in one datastore, filenames and cluster labels alone
-do not explain which choices produced a result.
+Single-cell analysis is a chain of dependent choices.
+A marker table depends on a clustering, the clustering depends on a graph, and the graph depends on a particular cell set, feature set, normalization, and reduction.
+When several parameter branches live in one datastore, filenames and cluster labels alone do not explain which choices produced a result.
 
-Scarf persists each substantial result as an {term}`artifact` and records what
-produced it. This lets a user inspect an inherited datastore, compare branches,
-and {term}`reuse` upstream work without maintaining a separate datastore for
-every parameter choice.
+Scarf persists each substantial result as an {term}`artifact` and records what produced it.
+This lets a user inspect an inherited datastore, compare branches, and {term}`reuse` upstream work without maintaining a separate datastore for every parameter choice.
 
 ```{mermaid}
 flowchart LR
@@ -28,31 +24,30 @@ flowchart LR
     norm --> pca30 --> graph30
 ```
 
-The two PCA branches can share counts, selections, and normalization. Their
-downstream graphs remain distinct because their inputs differ.
+The two PCA branches can share counts, selections, and normalization.
+Their downstream graphs remain distinct because their inputs differ.
 
 ## What Scarf records
 
-An artifact has a stable reference, its stored payload, and a {term}`provenance`
-record:
+An artifact has a stable reference, its stored payload, and a {term}`provenance` record.
+Provenance is only:
 
 - the operation that produced it, such as `run_pca`
 - scientific parameters that can change the result
 - input selections and upstream artifact references
-- execution options, such as local scratch policy, that do not change the
-  scientific identity
-- whether the write completed successfully
 
-Downstream methods receive these references directly or resolve them from the
-assay's current {term}`analysis chain`. A completed result with the same
-operation, parameters, and inputs can be reused. Changing PCA dimensions creates a new
-reduction and new dependent results, while the matching normalization can still
-be reused.
+The artifact also stores sibling attributes that are not part of provenance: execution options (for example local scratch policy) and whether the write completed successfully.
+Reuse matches on provenance only.
 
-The current analysis chain is a convenience for a linear workflow, not the
-only history in the store. Side branches can be created without selecting them
-as current. See {doc}`../tutorials/graph_construction` for that
-relationship.
+### Analysis chain and reuse
+
+Downstream methods receive these references directly or resolve them from the assay's current {term}`analysis chain`.
+A completed result with the same operation, parameters, and inputs can be reused.
+Changing PCA dimensions creates a new reduction and new dependent results, while the matching normalization can still be reused.
+
+The current analysis chain is a convenience for a linear workflow, not the only history in the store.
+Side branches can be created without selecting them as current.
+See {doc}`../tutorials/graph_construction` for that relationship.
 
 ## Inspect a result
 
@@ -70,22 +65,19 @@ status.execution_options
 
 `list_artifacts` uses the default assay unless another assay is supplied.
 Store-level outputs can be listed with `scope="datastore"`.
-`load_artifact(ref)` opens the payload only after Scarf confirms that the
-artifact exists and is complete.
+`load_artifact(ref)` opens the payload only after Scarf confirms that the artifact exists and is complete.
 
 ## View upstream lineage
 
-`DataStore.lineage` follows artifact inputs upstream and returns an
-`ArtifactLineage` report:
+`DataStore.lineage` follows artifact inputs upstream and returns an `ArtifactLineage` report:
 
 ```python
 lineage = ds.lineage(graph_ref)
 lineage
 ```
 
-Notebook display renders a Mermaid dependency graph followed by operation,
-parameter, execution-option, and external-input details. The same report can be
-exported explicitly:
+Notebook display renders a Mermaid dependency graph followed by operation, parameter, execution-option, and external-input details.
+The same report can be exported explicitly:
 
 ```python
 mermaid_source = lineage.to_mermaid()
@@ -103,20 +95,15 @@ lineage = ds.lineage(
 )
 ```
 
-This answers questions such as which PCA fed a graph, which clustering produced
-a marker table, and where two analysis branches diverged.
+This answers questions such as which PCA fed a graph, which clustering produced a marker table, and where two analysis branches diverged.
 
 ## Reuse, replacement, and limits
 
-`invalidate_cache=True` asks a producing method to write a new artifact even
-when a completed match exists. It does not delete the older artifact. A failed
-or interrupted writer leaves an incomplete result, which downstream readers
-reject.
+`invalidate_cache=True` asks a producing method to write a new artifact even when a completed match exists.
+It does not delete the older artifact.
+A failed or interrupted writer leaves an incomplete result, which downstream readers reject.
 
-Provenance does not prove that an analysis choice was scientifically suitable,
-delete superseded branches, or replace study records. It records the
-computational relationships needed to inspect and reproduce store-backed
-results.
+Provenance does not prove that an analysis choice was scientifically suitable, delete superseded branches, or replace study records.
+It records the computational relationships needed to inspect and reproduce store-backed results.
 
-For an executable walkthrough, see
-{doc}`../tutorials/reuse_and_tracing`.
+For an executable walkthrough, see {doc}`../tutorials/reuse_and_tracing`.

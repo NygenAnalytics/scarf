@@ -39,16 +39,14 @@
 
 ## H5AD inspection
 
-Use this before `H5adReader` when you do not know which matrix and metadata keys an
-H5AD file uses.
+Use this before `H5adReader` when you do not know which matrix and metadata keys an H5AD file uses.
 
 `H5adReader` decodes AnnData categorical columns and pandas nullable columns.
-Missing categorical or object values become `None`; missing numeric values
-become `NaN`. Unsupported group encodings are skipped with a warning.
+Missing categorical or object values become `None`; missing numeric values become `NaN`.
+Unsupported group encodings are skipped with a warning.
 
-Dense `obsm` arrays with one row per cell are flattened into numbered metadata
-columns, such as `X_umap1` and `X_umap2`. Sparse arrays, group-encoded slots, and
-arrays with an unexpected row count are warned about and skipped.
+Dense `obsm` arrays with one row per cell are flattened into numbered metadata columns, such as `X_umap1` and `X_umap2`.
+Sparse arrays, group-encoded slots, and arrays with an unexpected row count are warned about and skipped.
 
 ```{eval-rst}
 .. autofunction:: scarf.inspect_h5ad
@@ -61,8 +59,8 @@ arrays with an unexpected row count are warned about and skipped.
 
 ## Matrix Market inspection
 
-`inspect_mtx` reports every complete matrix, feature, and cell triplet in a
-supported source. Pass one returned candidate to `MtxReader`.
+`inspect_mtx` reports every complete matrix, feature, and cell triplet in a supported source.
+Pass one returned candidate to `MtxReader`.
 
 ```{eval-rst}
 .. autofunction:: scarf.inspect_mtx
@@ -74,11 +72,10 @@ supported source. Pass one returned candidate to `MtxReader`.
 
 ## Seurat import
 
-Import a serialized Seurat object from an `.rds` file. Inspect with
-`inspect_seurat`, open `SeuratReader`, then write with `SeuratToZarr`. This path
-does not attach to a live R session and does not read or write `.h5seurat`. See
-{doc}`../../tutorials/import_and_export` for the worked contract and
-{doc}`../../scanpy_and_seurat` for workflow mapping.
+Import a serialized Seurat object from an `.rds` file.
+Inspect with `inspect_seurat`, open `SeuratReader`, then write with `SeuratToZarr`.
+This path does not attach to a live R session and does not read or write `.h5seurat`.
+See {doc}`../../tutorials/import_and_export` for the worked contract and {doc}`../../scanpy_and_seurat` for workflow mapping.
 
 ```{eval-rst}
 .. autoclass:: scarf.SeuratReader
@@ -169,31 +166,26 @@ does not attach to a live R session and does not read or write `.h5seurat`. See
 
 ## Selection and layout behavior
 
-{py:meth}`scarf.datastore.datastore.DataStore.to_anndata` supports cell selection plus either
-`feature_names` or `feature_indexes`. The two feature selectors are mutually
-exclusive. `SubsetZarr` selects cells but retains every feature in each supplied
-assay.
+{py:meth}`scarf.datastore.datastore.DataStore.to_anndata` supports cell selection plus either `feature_names` or `feature_indexes`.
+The two feature selectors are mutually exclusive.
+`SubsetZarr` selects cells but retains every feature in each supplied assay.
 
-`to_h5ad` and `to_mtx` export a complete assay. For feature-selective disk
-export, call `to_anndata` and use AnnData's writer.
+`to_h5ad` and `to_mtx` export a complete assay.
+For feature-selective disk export, call `to_anndata` and use AnnData's writer.
 
-H5AD export recognizes UMAP and t-SNE coordinate pairs and writes them to
-`obsm`. H5AD import flattens supported dense `obsm` arrays into cell metadata;
-it does not preserve an AnnData-style `obsm` container inside `DataStore`.
+H5AD export recognizes UMAP and t-SNE coordinate pairs and writes them to `obsm`.
+H5AD import flattens supported dense `obsm` arrays into cell metadata; it does not preserve an AnnData-style `obsm` container inside `DataStore`.
 
-`CrToZarr`, `MtxToZarr`, `H5adToZarr`, and `SparseToZarr` select source batch
-rows automatically when `batch_size` is omitted. The selection starts from the
-smallest destination row-shard height and shrinks only when required by the
-operation memory budget. Explicit positive values remain supported.
+`CrToZarr`, `MtxToZarr`, `H5adToZarr`, and `SparseToZarr` select source batch rows automatically when `batch_size` is omitted.
+The selection starts from the smallest destination row-shard height and shrinks only when required by the operation memory budget.
+Explicit positive values remain supported.
 
 ## Merge
 
-Use `DataStoreMerge` to merge DataStores. Pass `assays=["RNA"]` when only one
-assay type is needed. By default RNA assays also receive a feature-major
-`countsT` matrix for faster gene-wise reads, which roughly doubles stored
-counts for those assays. Interrupted merges resume at whole-component
-boundaries (`cellData`, each assay `counts`, and each requested `countsT`)
-rather than mid-matrix shards.
+Use `DataStoreMerge` to merge DataStores.
+Pass `assays=["RNA"]` when only one assay type is needed.
+By default RNA assays also receive a feature-major `countsT` matrix for faster gene-wise reads, which roughly doubles stored counts for those assays.
+Interrupted merges resume at whole-component boundaries (`cellData`, each assay `counts`, and each requested `countsT`) rather than mid-matrix shards.
 
 ```{eval-rst}
 .. autoclass:: scarf.merge.DataStoreMerge

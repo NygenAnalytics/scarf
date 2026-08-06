@@ -16,17 +16,16 @@ kernelspec:
 
 # Imputation by graph diffusion
 
-Dropout makes observed single-cell expression sparse. Scarf can diffuse a
-feature over the neighbourhood graph to reveal coherent regional patterns.
-Imputation is a visualization and exploratory-analysis aid. It does not create
-new molecular observations and should not replace counts in differential
-expression.
+Dropout makes observed single-cell expression sparse.
+Scarf can diffuse a feature over the neighbourhood graph to reveal coherent regional patterns.
+Imputation is a visualization and exploratory-analysis aid.
+It does not create new molecular observations and should not replace counts in differential expression.
 
-## Standalone setup
+## 1. Standalone setup
 
-Diffusion needs a neighbourhood graph, and the published PBMC store already
-carries one along with its UMAP. Opening it is the whole setup. Building the
-same {term}`analysis chain` from counts is covered in {doc}`scrna_seq`.
+Diffusion needs a neighbourhood graph, and the published PBMC store already carries one along with its UMAP.
+Opening it is the whole setup.
+Building the same {term}`analysis chain` from counts is covered in {doc}`scrna_seq`.
 
 ```{code-cell} ipython3
 import pandas as pd
@@ -46,10 +45,10 @@ ds = scarf.DataStore(
 )
 ```
 
-## Diffuse one feature
+## 2. Diffuse one feature
 
-`t` controls diffusion depth. A larger value mixes information over more graph
-steps and can erase real boundaries.
+`t` controls diffusion depth.
+A larger value mixes information over more graph steps and can erase real boundaries.
 
 ```{code-cell} ipython3
 for t in (1, 2, 4):
@@ -82,14 +81,14 @@ cd4_summary = pd.DataFrame(
 cd4_summary
 ```
 
-Mean stays near the observed level while max falls with `t` as diffusion
-spreads peak signal across neighbours. `zero_fraction` also falls with `t`.
-`filled_zeros` counts active cells that were zero for observed CD4 and became
-nonzero after diffusion. That count is the size of the nonzero-as-detection
-mistake for this feature.
+## 3. Compare observed and diffused values
 
-Paris clusters on the published UMAP give the population context for the CD4
-panels below.
+Mean stays near the observed level while max falls with `t` as diffusion spreads peak signal across neighbours.
+`zero_fraction` also falls with `t`.
+`filled_zeros` counts active cells that were zero for observed CD4 and became nonzero after diffusion.
+That count is the size of the nonzero-as-detection mistake for this feature.
+
+Paris clusters on the published UMAP give the population context for the CD4 panels below.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
@@ -122,17 +121,15 @@ for axis, title in zip(
 imputation_comparison.figure
 ```
 
-The imputed panels should fill gaps inside the same high-expression
-neighbourhoods visible in the observed panel. Use the cluster map to check that
-high CD4 stays inside T-cell-like partitions rather than spreading into
-unrelated populations. Signal across unrelated clusters indicates excessive
-diffusion or a graph that does not represent the intended biology.
+The imputed panels should fill gaps inside the same high-expression neighbourhoods visible in the observed panel.
+Use the cluster map to check that high CD4 stays inside T-cell-like partitions rather than spreading into unrelated populations.
+Signal across unrelated clusters indicates excessive diffusion or a graph that does not represent the intended biology.
+
+## 4. Caveats
 
 The result depends on the active cell selection, feature selection, and graph.
-By default, each diffusion operator remains cached in memory for reuse across
-features. Set `cache_operator=False` when memory matters more than repeated
-feature speed. Inserted columns such as `CD4_imputed_t2` are explicit cell
-metadata. Do not interpret a nonzero imputed value as detection in that cell,
-use it for marker significance, or feed it to replicate-aware differential
-expression. The `filled_zeros` column above is the concrete count of that
-mismatch for CD4 at each `t`.
+By default, each diffusion operator remains cached in memory for reuse across features.
+Set `cache_operator=False` when memory matters more than repeated feature speed.
+Inserted columns such as `CD4_imputed_t2` are explicit cell metadata.
+Do not interpret a nonzero imputed value as detection in that cell, use it for marker significance, or feed it to replicate-aware differential expression.
+The `filled_zeros` column above is the concrete count of that mismatch for CD4 at each `t`.

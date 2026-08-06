@@ -17,17 +17,16 @@ kernelspec:
 # Choosing dimensionality reductions
 
 PCA compresses selected features into the coordinates used to find neighbours.
-UMAP, densMAP, and t-SNE then turn the resulting graph into a two-dimensional
-view. They are visual summaries, not alternative cluster assignments.
+UMAP, densMAP, and t-SNE then turn the resulting graph into a two-dimensional view.
+They are visual summaries, not alternative cluster assignments.
 
 ```{raw} html
 <span id="clustering"></span>
 ```
 
-Clustering guidance from the former combined page now lives in
-{doc}`clustering`.
+Clustering guidance from the former combined page now lives in {doc}`clustering`.
 
-## Standalone setup
+## 1. Standalone setup
 
 ```{code-cell} ipython3
 from itertools import combinations
@@ -66,15 +65,12 @@ if "I__hvgs" not in ds.RNA.feats.columns:
 normalized = ds.run_normalization(feat_key="hvgs")
 ```
 
-This section reconstructs the selected cells, features, and normalization from
-{doc}`scrna_seq` so the page can run independently.
+This section reconstructs the selected cells, features, and normalization from {doc}`scrna_seq` so the page can run independently.
 
-## Compare PCA dimension counts
+## 2. Compare PCA dimension counts
 
-Build each candidate from the same normalized data and cluster each graph by
-passing it explicitly. The 15-component chain runs last, so it is the one left
-in the assay's {term}`analysis chain`, and the layout comparisons below pick it
-up when no graph is named.
+Build each candidate from the same normalized data and cluster each graph by passing it explicitly.
+The 15-component chain runs last, so it is the one left in the assay's {term}`analysis chain`, and the layout comparisons below pick it up when no graph is named.
 
 ```{code-cell} ipython3
 cluster_keys = {}
@@ -102,13 +98,12 @@ for dimensions in (10, 30, 15):
 ```
 
 PCA axes represent decreasing amounts of variation in the selected genes.
-The elbow plot above is for the 30-component fit. An early bend means later
-axes add less variance each; it does not force a stop at the marked component,
-and it does not make 10, 15, and 30 interchangeable. The cumulative shares
-below place those cutoffs on the same 30-component fit. Too few axes can merge
-distinct populations; too many can restore technical variation and noise.
-Compare graph connectivity, cluster stability, and marker coherence when the
-choice is uncertain.
+The elbow plot uses 31 explained-variance ratios from a dims+1 fit (`dims=30`), not a scree of only the 30 kept components.
+On artifact reuse the fit is unavailable, so Scarf may warn and skip the plot.
+An early bend means later axes add less variance each; it does not force a stop at the marked component, and it does not make 10, 15, and 30 interchangeable.
+The cumulative shares below place those cutoffs on the same 30 kept components.
+Too few axes can merge distinct populations; too many can restore technical variation and noise.
+Compare graph connectivity, cluster stability, and marker coherence when the choice is uncertain.
 
 ```{code-cell} ipython3
 scores_30 = np.asarray(ds.load_artifact(pca_refs[30])["data"])
@@ -137,8 +132,8 @@ cluster_counts = pd.Series(
 cluster_counts
 ```
 
-Similar cluster counts can still hide size flips. Per-cluster sizes show whether
-an extra group is a real split or a tiny fragment.
+Similar cluster counts can still hide size flips.
+Per-cluster sizes show whether an extra group is a real split or a tiny fragment.
 
 ```{code-cell} ipython3
 cluster_sizes = pd.DataFrame(
@@ -172,12 +167,10 @@ for first, second in combinations(cluster_keys, 2):
 pd.DataFrame(agreement_rows)
 ```
 
-ARI and NMI measure agreement between partitions but do not identify the
-biologically correct dimension count. Investigate a low-agreement arm through
-markers, technical covariates, and graph diagnostics before choosing it or
-discarding it.
+ARI and NMI measure agreement between partitions but do not identify the biologically correct dimension count.
+Investigate a low-agreement arm through markers, technical covariates, and graph diagnostics before choosing it or discarding it.
 
-## Run UMAP
+## 3. Run UMAP
 
 ```{code-cell} ipython3
 ds.run_umap(
@@ -189,9 +182,8 @@ ds.run_umap(
 )
 ```
 
-The layout below uses the active 15-component graph. Colouring by each Leiden
-partition shows how the 10-, 15-, and 30-component cuts land on the same
-coordinates.
+The layout below uses the active 15-component graph.
+Colouring by each Leiden partition shows how the 10-, 15-, and 30-component cuts land on the same coordinates.
 
 ```{code-cell} ipython3
 pca_partition_view = ds.plots.embedding(
@@ -212,10 +204,9 @@ pca_partition_view.figure.set_size_inches(12, 4)
 pca_partition_view.figure
 ```
 
-`min_dist` controls how tightly local groups can pack, while `spread` controls
-the overall scale. These parameters change appearance without changing the
-input graph. A second UMAP with a smaller `min_dist` shows packing on the same
-neighbours.
+`min_dist` controls how tightly local groups can pack, while `spread` controls the overall scale.
+These parameters change appearance without changing the input graph.
+A second UMAP with a smaller `min_dist` shows packing on the same neighbours.
 
 ```{code-cell} ipython3
 ds.run_umap(
@@ -246,7 +237,7 @@ min_dist_view.figure.set_size_inches(10, 4)
 min_dist_view.figure
 ```
 
-## Preserve local density with densMAP
+## 4. Preserve local density with densMAP
 
 ```{code-cell} ipython3
 ds.run_umap(
@@ -259,9 +250,9 @@ ds.run_umap(
 )
 ```
 
-densMAP adds a density-preservation objective. Contours below contrast local
-cell density on the same cells under UMAP and densMAP. Relative packing can
-differ; plot area is still not a direct estimate of cell frequency.
+densMAP adds a density-preservation objective.
+Contours below contrast local cell density on the same cells under UMAP and densMAP.
+Relative packing can differ; plot area is still not a direct estimate of cell frequency.
 
 ```{code-cell} ipython3
 density_contrast = ds.plots.embedding(
@@ -283,10 +274,10 @@ density_contrast.figure.set_size_inches(10, 4)
 density_contrast.figure
 ```
 
-## Run graph-based t-SNE
+## 5. Run graph-based t-SNE
 
-Scarf's t-SNE consumes the same neighbourhood graph. It is not supported on
-native Windows; use Linux or WSL.
+Scarf's t-SNE consumes the same neighbourhood graph.
+Computing a new embedding requires `sys.platform` in `posix` or `linux`; macOS (`darwin`) and Windows are unsupported.
 
 ```{code-cell} ipython3
 ds.run_tsne(
@@ -298,7 +289,7 @@ ds.run_tsne(
 )
 ```
 
-## Compare layouts responsibly
+## 6. Compare layouts responsibly
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 3, figsize=(12, 4))
@@ -324,18 +315,16 @@ figure.tight_layout()
 figure
 ```
 
-The three panels share cells, graph, and cluster labels. A useful comparison
-asks whether local neighbours and known populations remain visible. Differences
-in global orientation, distance, empty space, or apparent island size do not
-demonstrate different biology. A layout that hides connected transitions or
-separates obvious technical covariates needs further investigation.
+The three panels share cells, graph, and cluster labels.
+A useful comparison asks whether local neighbours and known populations remain visible.
+Differences in global orientation, distance, empty space, or apparent island size do not demonstrate different biology.
+A layout that hides connected transitions or separates obvious technical covariates needs further investigation.
 
 ```{raw} html
 <span id="run-paris-clustering-and-inspect-the-tree"></span>
 ```
 
-## Paris clustering and its tree
+## 7. Paris clustering and its tree
 
-This material moved to {doc}`clustering`. That guide distinguishes graph
-connectivity between groups from the Paris hierarchy and covers both adaptive
-and fixed cuts.
+This material moved to {doc}`clustering`.
+That guide distinguishes graph connectivity between groups from the Paris hierarchy and covers both adaptive and fixed cuts.

@@ -16,11 +16,9 @@ kernelspec:
 
 # Quality control across assays
 
-Quality control defines the cells and features that downstream analyses can
-use. Scarf stores selections as boolean metadata rather than deleting data, so
-thresholds can be inspected, reset, and replaced. This guide covers manual,
-global automatic, and sample-aware filtering, followed by assay-specific
-checks.
+Quality control defines the cells and features that downstream analyses can use.
+Scarf stores selections as boolean metadata rather than deleting data, so thresholds can be inspected, reset, and replaced.
+This guide covers manual, global automatic, and sample-aware filtering, followed by assay-specific checks.
 
 ## Prerequisites
 
@@ -37,8 +35,7 @@ checks.
 
 ## Standalone setup
 
-Quality control has to see the population it is judging, so this page builds its
-store from raw counts rather than opening one that has already been filtered.
+Quality control has to see the population it is judging, so this page builds its store from raw counts rather than opening one that has already been filtered.
 
 ```{code-cell} ipython3
 import numpy as np
@@ -66,15 +63,13 @@ ds = scarf.DataStore(
 )
 ```
 
-The `I` {term}`cell key` is the active selection used by most methods. Filtering
-updates that key and leaves all rows in the datastore. Feature selections work
-the same way within each assay.
+The `I` {term}`cell key` is the active selection used by most methods.
+Filtering updates that key and leaves all rows in the datastore.
+Feature selections work the same way within each assay.
 
-## 1) Inspect QC distributions
+## 1. Inspect QC distributions
 
-On open, Scarf streams the count matrix once to compute initialization statistics:
-columns such as `RNA_nCounts`, `RNA_nFeatures`, and mito/ribo fractions when gene
-names match the configured patterns, plus per-feature cell counts for feature filtering.
+On open, Scarf streams the count matrix once to compute initialization statistics: columns such as `RNA_nCounts`, `RNA_nFeatures`, and mito/ribo fractions when gene names match the configured patterns, plus per-feature cell counts for feature filtering.
 
 ```{code-cell} ipython3
 qc_cols = [
@@ -90,13 +85,14 @@ ds.plots.distribution(
 )
 ```
 
-Each violin shows the distribution of one QC metric before filtering; use the tails to set
-dataset-specific cutoffs.
+Each violin uses the active cell key `I`, so cells already below `min_features_per_cell` from open are excluded.
+Use the tails to set further cutoffs.
 
-## 2) Manual thresholds
+## 2. Manual thresholds
 
-Thresholds are dataset-specific. The values below match the PBMC example in
-{doc}`scrna_seq`. Filtered cells are marked inactive in cell key `I`.
+Thresholds are dataset-specific.
+The values below match the PBMC example in {doc}`scrna_seq`.
+Filtered cells are marked inactive in cell key `I`.
 
 ```{code-cell} ipython3
 n_before = int(ds.cells.fetch_all('I').sum())
@@ -117,17 +113,14 @@ ds.plots.distribution(
 )
 ```
 
-After filtering, the same metrics are restricted to active cells (`I=True`), so
-the coral violins are visibly tighter than the ones above: the long low-count
-tail and the high-mito shoulder are both gone. Roughly a fifth of the barcodes
-drop out here, which is typical for this dataset and is the number worth
-sanity-checking against your own expectations before continuing.
+After filtering, the same metrics are restricted to active cells (`I=True`), so the coral violins are visibly tighter than the ones above: the long low-count tail and the high-mito shoulder are both gone.
+Roughly a fifth of the barcodes drop out here, which is typical for this dataset and is the number worth sanity-checking against your own expectations before continuing.
 
-## 3) Custom percent-feature columns
+## 3. Custom percent-feature columns
 
-`add_percent_feature` stores the fraction of counts from features matching a regular
-expression. Built-in mito and ribo columns use this mechanism. The example below adds a
-hemoglobin-gene fraction when those gene names are present.
+`add_percent_feature` stores the fraction of counts from features matching a regular expression.
+Built-in mito and ribo columns use this mechanism.
+The example below adds a hemoglobin-gene fraction when those gene names are present.
 
 ```{code-cell} ipython3
 ds.RNA.add_percent_feature(feat_pattern='^HB[AB]', name='RNA_percentHB')
@@ -145,34 +138,29 @@ else:
     print('No features matched ^HB[AB] in this store')
 ```
 
-Most cells sit near zero hemoglobin fraction; the long upper tail is the set worth
-inspecting before you set an upper cutoff for erythrocyte contamination.
+Most cells sit near zero hemoglobin fraction; the long upper tail is the set worth inspecting before you set an upper cutoff for erythrocyte contamination.
 
-## 4) Automatic thresholds
+## 4. Automatic thresholds
 
-`auto_filter_cells` models each QC column as a normal distribution from its median and
-standard deviation, then takes density points at `min_p` and `max_p` (defaults 0.01 and
-0.99). Default columns are nCounts, nFeatures, percentMito, and percentRibo when present.
-Like repeated `filter_cells` calls, it intersects its result with the current `I` column and
-does not reactivate cells. The call below intentionally refines the manual filter from the
-previous section. Use a fresh store or reset `I` before the call when comparing it as an
-alternative filtering strategy.
+`auto_filter_cells` fits a normal distribution (`loc=median`, `scale=std`) to each QC column, then takes quantiles at `min_p` and `max_p` via `scipy.stats.norm.ppf` (defaults 0.01 and 0.99).
+Default columns are nCounts, nFeatures, percentMito, and percentRibo when present.
+Like repeated `filter_cells` calls, it intersects its result with the current `I` column and does not reactivate cells.
+The call below intentionally refines the manual filter from the previous section.
+Use a fresh store or reset `I` before the call when comparing it as an alternative filtering strategy.
 
 ```{code-cell} ipython3
 ds.auto_filter_cells(show_qc_plots=True)
 ```
 
-The plots show fitted density bounds on each QC column used for the automatic cutoffs.
+With `show_qc_plots=True`, Scarf shows pre- and post-filtering distributions via `distribution(...)` for each QC column used.
 
-## 5) Per-sample MAD filtering
+## 5. Per-sample MAD filtering
 
-Global bounds can penalize a sample whose count-depth distribution differs from
-the pooled distribution. With `sample_column`, Scarf calculates robust bounds
-within each sample using the median absolute deviation (MAD).
+Global bounds can penalize a sample whose count-depth distribution differs from the pooled distribution.
+With `sample_column`, Scarf calculates robust bounds within each sample using the median absolute deviation (MAD).
 
-The PBMC teaching dataset has no biological sample column. The balanced
-`qc_sample` labels below make the API executable but must not be interpreted as
-a real sample-aware result.
+The PBMC teaching dataset has no biological sample column.
+The balanced `qc_sample` labels below make the API executable but must not be interpreted as a real sample-aware result.
 
 ```{code-cell} ipython3
 ds.cells.insert(
@@ -196,18 +184,14 @@ print(f'Active cells before MAD filter: {n_before}')
 print(f'Active cells after MAD filter: {n_after}')
 ```
 
-The pre/post plots and active-cell counts show the sample-aware path. The
-`qc_sample` labels are synthetic and balanced, so treat the retained counts as a
-mechanics demo, not a biological sample comparison. Use a real sample column when
-comparing depth distributions across donors or batches.
+The pre/post plots and active-cell counts show the sample-aware path.
+The `qc_sample` labels are synthetic and balanced, so treat the retained counts as a mechanics demo, not a biological sample comparison.
+Use a real sample column when comparing depth distributions across donors or batches.
 
-Count-like metrics such as `nCounts` and `nFeatures` use log1p values and
-two-sided bounds. Percentage metrics such as `percentMito` and `percentRibo`
-use their original scale and an upper bound only. Samples with fewer than
-`min_cells_per_sample` active cells are retained with a warning because stable
-within-sample bounds cannot be estimated. `min_p` and `max_p` apply only to the
-global Gaussian path and must remain at their defaults when `sample_column` is
-used.
+Count-like metrics such as `nCounts` and `nFeatures` use log1p values and two-sided bounds.
+Percentage metrics such as `percentMito` and `percentRibo` use their original scale and an upper bound only.
+Samples with fewer than `min_cells_per_sample` active cells are retained with a warning because stable within-sample bounds cannot be estimated.
+`min_p` and `max_p` apply only to the global Gaussian path and must remain at their defaults when `sample_column` is used.
 
 The same options can be forwarded through the standard pipeline:
 
@@ -223,23 +207,20 @@ ds.pipeline.run(
 )
 ```
 
-## 6) RNA percentages and feature exclusions
+## 6. RNA percentages and feature exclusions
 
-`add_percent_feature` measures the fraction of each cell's counts matching a
-gene-name pattern. High mitochondrial, ribosomal, or hemoglobin fractions can
-indicate damaged cells or study-specific biology. The mito/ribo violins in
-section 1 and the hemoglobin violin in section 3 are the inspection step before
-you apply upper thresholds.
+`add_percent_feature` measures the fraction of each cell's counts matching a gene-name pattern.
+High mitochondrial, ribosomal, or hemoglobin fractions can indicate damaged cells or study-specific biology.
+The mito/ribo violins in section 1 and the hemoglobin violin in section 3 are the inspection step before you apply upper thresholds.
 
-Gene families excluded from the graph are a separate feature-selection
-decision. See {doc}`feature_selection` for the default HVG blacklist and
-supported overrides.
+Gene families excluded from the graph are a separate feature-selection decision.
+See {doc}`feature_selection` for the default HVG blacklist and supported overrides.
 
-## 7) Doublet scores
+## 7. Doublet scores
 
-`run_doublet_detection` simulates doublets, maps them onto the existing neighbourhood
-graph, and writes a per-cell score (default base label `doublet_score`). It does not
-remove cells automatically. It requires an existing cluster column.
+`run_doublet_detection` simulates doublets, maps them onto the existing neighbourhood graph, and writes a per-cell score (default base label `doublet_score`).
+It does not remove cells automatically.
+It requires an existing cluster column.
 
 ```{code-cell} ipython3
 ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
@@ -262,8 +243,8 @@ ds.plots.embedding(
 )
 ```
 
-Higher doublet scores mark cells that map near simulated doublets. Inspect the score
-distribution before applying a cutoff:
+Higher doublet scores mark cells that map near simulated doublets.
+Inspect the score distribution before applying a cutoff:
 
 ```{code-cell} ipython3
 ds.plots.distribution(
@@ -272,11 +253,10 @@ ds.plots.distribution(
 )
 ```
 
-The score distribution and embedding should be reviewed together. A threshold
-is study-dependent, and `run_doublet_detection` does not remove cells. After
-choosing an upper bound from the ECDF shoulder, apply it as an additional
-filter. The teaching cutoff below keeps the upper 5% of scores on this PBMC run;
-replace it with a study-specific value when the ECDF shape differs.
+The score distribution and embedding should be reviewed together.
+A threshold is study-dependent, and `run_doublet_detection` does not remove cells.
+After choosing an upper bound from the ECDF shoulder, apply it as an additional filter.
+The teaching cutoff below keeps the upper 5% of scores on this PBMC run; replace it with a study-specific value when the ECDF shape differs.
 
 ```{code-cell} ipython3
 scores = ds.cells.to_pandas_dataframe([score_col], key='I')[score_col]
@@ -299,27 +279,21 @@ ds.plots.embedding(
 )
 ```
 
-With `reset_previous=False`, this call intersects the threshold with the current
-selection and does not reactivate cells removed by earlier QC. The post-filter
-embedding should lose the highest-scoring hotspot cells from the map above.
+With `reset_previous=False`, this call intersects the threshold with the current selection and does not reactivate cells removed by earlier QC.
+The post-filter embedding should lose the highest-scoring hotspot cells from the map above.
 
-## 8) ATAC quality control
+## 8. ATAC quality control
 
-Scarf initializes per-cell ATAC fragment or cut-site counts and accessible-peak
-counts, and it records per-peak prevalence for feature filtering.
-`mark_prevalent_peaks` selects peaks for LSI and graph construction. Scarf does
-not currently calculate FRiP or TSS enrichment, so those metrics must be
-imported as metadata or computed with an external tool rather than implied by
-the available columns.
+Scarf initializes per-cell ATAC fragment or cut-site counts and accessible-peak counts, and it records per-peak prevalence for feature filtering.
+`mark_prevalent_peaks` selects peaks for LSI and graph construction.
+Scarf does not currently calculate FRiP or TSS enrichment, so those metrics must be imported as metadata or computed with an external tool rather than implied by the available columns.
 
-## 9) ADT and multimodal quality control
+## 9. ADT and multimodal quality control
 
-ADT panels often include control antibodies that should be marked inactive in
-feature metadata after their names are inspected. RNA, ADT, and HTO assays
-share one cell table, so changing `I` applies the same cell selection across
-modalities. Check whether an RNA-driven filter is appropriate for the protein
-question before reusing it automatically. Hashtag demultiplexing is covered
-separately in {doc}`hto_demultiplexing`.
+ADT panels often include control antibodies that should be marked inactive in feature metadata after their names are inspected.
+RNA, ADT, and HTO assays share one cell table, so changing `I` applies the same cell selection across modalities.
+Check whether an RNA-driven filter is appropriate for the protein question before reusing it automatically.
+Hashtag demultiplexing is covered separately in {doc}`hto_demultiplexing`.
 
 ## Common mistakes and limitations
 

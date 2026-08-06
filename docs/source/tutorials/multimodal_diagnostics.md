@@ -14,18 +14,14 @@ kernelspec:
 
 # Multimodal diagnostics
 
-RNA and ADT can agree on broad cell populations while resolving different local
-structure. This guide measures that concordance and compares Scarf's SNN and
-WNN integration methods. It assumes the reader already understands the
-recommended CITE-seq path in {doc}`cite_seq`.
+RNA and ADT can agree on broad cell populations while resolving different local structure.
+This guide measures that concordance and compares Scarf's SNN and WNN integration methods.
+It assumes the reader already understands the recommended CITE-seq path in {doc}`cite_seq`.
 
 ## Standalone setup
 
-The published CITE-seq store carries the independent RNA and ADT
-{term}`analysis chains <analysis chain>` and
-both integrated graphs, built exactly as {doc}`cite_seq` describes: matched
-active cells, `k=21` for each modality, control antibodies already marked
-inactive. This page reads those results rather than reproducing them.
+The published CITE-seq store carries the independent RNA and ADT {term}`analysis chains <analysis chain>` and both integrated graphs, built exactly as {doc}`cite_seq` describes: matched active cells, `k=21` for each modality, control antibodies already marked inactive.
+This page reads those results rather than reproducing them.
 
 ```{code-cell} ipython3
 from itertools import combinations
@@ -50,10 +46,8 @@ ds = scarf.DataStore(
 )
 ```
 
-The SNN graph is stored under `RNA+ADT` and the WNN graph under
-`RNA+ADT_wnn`, each with its own UMAP and Leiden partition. The method is a
-parameter, because it changes the result, while the label is an execution
-option, because renaming a graph does not.
+The SNN graph is stored under `RNA+ADT` and the WNN graph under `RNA+ADT_wnn`, each with its own UMAP and Leiden partition.
+The method is a parameter, because it changes the result, while the label is an execution option, because renaming a graph does not.
 
 ```{code-cell} ipython3
 integrated = []
@@ -69,14 +63,13 @@ for ref in ds.list_artifacts(scope="datastore", kind="integrated_graph"):
 pd.DataFrame(integrated).sort_values("label", ignore_index=True)
 ```
 
-## Measure modality concordance
+## 1. Measure modality concordance
 
-First compare the cluster partitions on the two layouts. Agreement at broad
-scales supports a shared biological signal. Local disagreement can be useful
-when one modality resolves a population more clearly.
+First compare the cluster partitions on the two layouts.
+Agreement at broad scales supports a shared biological signal.
+Local disagreement can be useful when one modality resolves a population more clearly.
 
-A normalized cross-tabulation shows which RNA populations contribute to each
-ADT cluster without letting large clusters dominate the comparison.
+A normalized cross-tabulation shows which RNA populations contribute to each ADT cluster without letting large clusters dominate the comparison.
 
 ```{code-cell} ipython3
 overlap = pd.crosstab(
@@ -99,8 +92,7 @@ fig.colorbar(image, ax=ax, label="Fraction within ADT cluster")
 fig.tight_layout()
 ```
 
-Plot each modality's clusters on the other layout to locate local disagreement
-that the table averages away.
+Plot each modality's clusters on the other layout to locate local disagreement that the table averages away.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
@@ -123,8 +115,7 @@ for axis, (title, layout_key, color_by) in zip(
 figure.tight_layout()
 ```
 
-Compare an antibody with its coding gene to distinguish genuine modality
-complementarity from a gross alignment problem.
+Compare an antibody with its coding gene to distinguish genuine modality complementarity from a gross alignment problem.
 
 ```{code-cell} ipython3
 def compare_signal(feature, assay, label, layouts):
@@ -174,19 +165,18 @@ compare_signal(
 );
 ```
 
-Protein signal is commonly less sparse than the matching transcript, so exact
-point-wise agreement is not expected. Large regions with contradictory signal
-need inspection before integration.
+Protein signal is commonly less sparse than the matching transcript, so exact point-wise agreement is not expected.
+Large regions with contradictory signal need inspection before integration.
 
-## Compare SNN and WNN
+## 2. Compare SNN and WNN
 
-SNN combines shared edge support and can integrate two or more assays. WNN
-also accepts two or more assays and learns how strongly each cell should rely
-on each modality. Both consume one graph per named assay, which is why the two
-chains above had to use matched cells and neighbour counts. The RNA and ADT
-comparison here is the two-modality special case.
+SNN combines shared edge support and can integrate two or more assays.
+WNN also accepts two or more assays and learns how strongly each cell should rely on each modality.
+Both consume one graph per named assay and require matched cells.
+Matched neighbour counts (`k`) are required for SNN only; WNN warns and keeps `min(k)` when they differ.
+The RNA and ADT comparison here is the two-modality special case.
 
-## Compare integrated partitions
+## 3. Compare integrated partitions
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 2, figsize=(9, 4))
@@ -238,12 +228,10 @@ for first, second in combinations(partition_columns, 2):
 pd.DataFrame(concordance_rows)
 ```
 
-ARI and NMI quantify partition agreement without choosing which modality or
-integration method is correct. Compare them with marker coherence and the
-overlap structure above instead of selecting the cleanest layout.
+ARI and NMI quantify partition agreement without choosing which modality or integration method is correct.
+Compare them with marker coherence and the overlap structure above instead of selecting the cleanest layout.
 
-Plot the same protein and transcript on the two integrated layouts to check
-whether marker geography stays coherent after merging.
+Plot the same protein and transcript on the two integrated layouts to check whether marker geography stays coherent after merging.
 
 ```{code-cell} ipython3
 integrated_layouts = (
@@ -267,10 +255,10 @@ compare_signal(
 );
 ```
 
-## Inspect WNN modality weights
+## 4. Inspect WNN modality weights
 
-WNN records how much each cell relies on each modality. First check the weight
-constraints directly.
+WNN records how much each cell relies on each modality.
+First check the weight constraints directly.
 
 ```{code-cell} ipython3
 weight_columns = {
@@ -295,9 +283,8 @@ pd.Series(
 )
 ```
 
-Map the weights onto the WNN layout, then inspect their distribution. Because
-the two weights sum to one per cell, the RNA-weight histogram also shows where
-ADT takes over.
+Map the weights onto the WNN layout, then inspect their distribution.
+Because the two weights sum to one per cell, the RNA-weight histogram also shows where ADT takes over.
 
 ```{code-cell} ipython3
 weight_view = ds.plots.embedding(
@@ -324,8 +311,7 @@ axis.set(xlabel="RNA weight", ylabel="Cells")
 figure.tight_layout()
 ```
 
-Use the earlier overlap table to distinguish cells in the dominant RNA cluster
-for each ADT cluster from other RNA and ADT combinations.
+Use the earlier overlap table to distinguish cells in the dominant RNA cluster for each ADT cluster from other RNA and ADT combinations.
 
 ```{code-cell} ipython3
 rna_clusters = pd.Series(
@@ -346,17 +332,11 @@ weight_frame.groupby("RNA-ADT overlap")[
 ```
 
 The dominant-overlap grouping is descriptive, not a reference annotation.
-Weight shifts can identify cells whose local structure is better resolved by
-one modality, but they can also expose noise or a graph mismatch. The
-{doc}`cite_seq` workflow covers how SNN and WNN construct the integrated graph.
+Weight shifts can identify cells whose local structure is better resolved by one modality, but they can also expose noise or a graph mismatch.
+The {doc}`cite_seq` workflow covers how SNN and WNN construct the integrated graph.
 
-Choose between methods from the assay design and evidence, not from the layout
-that looks cleaner. WNN is useful when relative local informativeness varies
-across two or more modalities, while SNN gives all source graphs equal standing.
-Compare cluster stability, marker coherence, known populations, and the
-modality-concordance checks above.
+Choose between methods from the assay design and evidence, not from the layout that looks cleaner.
+WNN is useful when relative local informativeness varies across two or more modalities, while SNN gives all source graphs equal standing.
+Compare cluster stability, marker coherence, known populations, and the modality-concordance checks above.
 
-Common failures include integrating graphs built over different cells, using
-different `k` values, retaining control antibodies, and interpreting an
-integrated embedding as proof that all modality-specific disagreement has been
-resolved.
+Common failures include integrating graphs built over different cells, using different `k` values with SNN, retaining control antibodies, and interpreting an integrated embedding as proof that all modality-specific disagreement has been resolved.

@@ -14,14 +14,13 @@ kernelspec:
 
 # Choosing and validating clusters
 
-Clustering turns a neighbourhood graph into a discrete partition. It does not
-reveal one universally optimal number of cell types. A useful partition should
-be stable enough for the question, preserve known biology, avoid groups driven
-only by technical covariates, and support interpretable markers.
+Clustering turns a neighbourhood graph into a discrete partition.
+It does not reveal one universally optimal number of cell types.
+A useful partition should be stable enough for the question, preserve known biology, avoid groups driven only by technical covariates, and support interpretable markers.
 
 This guide compares Leiden resolutions and Paris cuts with several diagnostics.
 
-## Build the shared graph
+## 1. Build the shared graph
 
 ```{code-cell} ipython3
 from dataclasses import asdict
@@ -71,14 +70,13 @@ ds.run_umap(
 )
 ```
 
-Every partition below consumes this same graph. That keeps differences in
-cluster labels separate from differences caused by changing features, PCA, or
-neighbours.
+Every partition below consumes this same graph.
+That keeps differences in cluster labels separate from differences caused by changing features, PCA, or neighbours.
 
-## Sweep Leiden resolution
+## 2. Sweep Leiden resolution
 
-Higher Leiden resolution usually produces more and smaller groups. Keep each
-candidate under a distinct label.
+Higher Leiden resolution usually produces more and smaller groups.
+Keep each candidate under a distinct label.
 
 ```{code-cell} ipython3
 leiden_candidates = {
@@ -122,12 +120,10 @@ for axis, resolution in zip(
 leiden_comparison.figure
 ```
 
-Reject a resolution when new groups are tiny, spatially diffuse, dominated by
-low-count cells, or unsupported by markers. A coarse partition can still be
-appropriate when the question concerns broad lineages.
+Reject a resolution when new groups are tiny, spatially diffuse, dominated by low-count cells, or unsupported by markers.
+A coarse partition can still be appropriate when the question concerns broad lineages.
 
-Check whether small groups in the working partition are QC outliers before
-treating them as cell types.
+Check whether small groups in the working partition are QC outliers before treating them as cell types.
 
 ```{code-cell} ipython3
 chosen_sizes = (
@@ -146,16 +142,14 @@ ds.plots.distribution(
 )
 ```
 
-Tiny groups that also sit at low `RNA_nCounts` or high `RNA_percentMito` need
-QC review. Marker support for the smallest group is checked after
-`run_marker_search` below.
+Tiny groups that also sit at low `RNA_nCounts` or high `RNA_percentMito` need QC review.
+Marker support for the smallest group is checked after `run_marker_search` below.
 
-## Compare partitions and separation
+## 3. Compare partitions and separation
 
-ARI and NMI quantify agreement between pairs of partitions. They do not say
-which partition is biologically correct. Graph silhouette asks whether each
-group is closer to itself than to neighbouring groups and can penalize
-transitional populations that are biologically real.
+ARI and NMI quantify agreement between pairs of partitions.
+They do not say which partition is biologically correct.
+Graph silhouette asks whether each group is closer to itself than to neighbouring groups and can penalize transitional populations that are biologically real.
 
 ```{code-cell} ipython3
 agreement_rows = []
@@ -191,8 +185,7 @@ for label in leiden_candidates.values():
 pd.DataFrame(silhouette_rows)
 ```
 
-Per-cluster graph silhouette for the working partition, then the same scores
-mapped onto the UMAP so weak groups are visible in embedding space.
+Per-cluster graph silhouette for the working partition, then the same scores mapped onto the UMAP so weak groups are visible in embedding space.
 
 ```{code-cell} ipython3
 graph_scores = ds.metric_graph_silhouette(res_label="leiden_r05")
@@ -230,9 +223,7 @@ ds.plots.embedding(
 ```
 
 Coordinate separability asks whether the PCA values can recover each partition.
-Macro F1 gives each cluster equal influence, weighted F1 follows cluster size,
-and coordinate silhouette compares within-cluster and between-cluster
-distances.
+Macro F1 gives each cluster equal influence, weighted F1 follows cluster size, and coordinate silhouette compares within-cluster and between-cluster distances.
 
 ```{code-cell} ipython3
 separability = ds.metric_cluster_separability(
@@ -244,8 +235,7 @@ separability = ds.metric_cluster_separability(
 separability.clustering_scores
 ```
 
-Per-cluster F1 and the confusion table show which groups drive a weak
-aggregate score.
+Per-cluster F1 and the confusion table show which groups drive a weak aggregate score.
 
 ```{code-cell} ipython3
 separability.cluster_scores.query(
@@ -257,21 +247,17 @@ separability.cluster_scores.query(
 separability.confusion.query("clustering == @chosen_key")
 ```
 
-Graph silhouette evaluates the neighbourhood graph, while these scores evaluate
-the PCA coordinates. The labels were derived from a graph built from the same
-PCA, so strong separability supports internal coherence but is not independent
-biological validation.
+Graph silhouette uses the neighbourhood graph to identify each cluster's nearest neighbour, then compares within- and between-cluster distances in the reduced embedding.
+These coordinate separability scores evaluate the PCA coordinates directly.
+The labels were derived from a graph built from the same PCA, so strong separability supports internal coherence but is not independent biological validation.
 
-The standard pipeline compares several Leiden resolutions and uses PCA
-silhouette as one heuristic when it needs a partition for markers or doublet
-scoring. Treat that automatic choice as a starting point, not a declared
-optimum.
+The standard pipeline compares Leiden resolutions and Paris (unless `paris=False`) and selects the partition with the highest PCA silhouette when it needs labels for markers or doublet scoring.
+Treat that automatic choice as a starting point, not a declared optimum.
 
-## Inspect per-cell membership strength
+## 4. Inspect per-cell membership strength
 
-Membership strength is the fraction of a cell's graph neighbours assigned to
-its most common cluster. Low values often occur near boundaries or in weakly
-supported groups.
+Membership strength is the fraction of a cell's graph neighbours assigned to its most common cluster.
+Low values often occur near boundaries or in weakly supported groups.
 
 ```{code-cell} ipython3
 ds.calc_membership_strength(
@@ -295,11 +281,10 @@ ds.plots.distribution(
 )
 ```
 
-Low membership throughout one cluster suggests that its boundary is not well
-supported. A few low values between otherwise coherent groups can instead
-represent continuous biology.
+Low membership throughout one cluster suggests that its boundary is not well supported.
+A few low values between otherwise coherent groups can instead represent continuous biology.
 
-## Inspect graph connectivity between groups
+## 5. Inspect graph connectivity between groups
 
 ```{code-cell} ipython3
 ds.plots.cluster_connectivity(
@@ -311,14 +296,14 @@ ds.plots.cluster_connectivity(
 )
 ```
 
-This view summarizes weighted graph connections between groups. It is not a
-lineage graph and is distinct from the Paris hierarchy below.
+This view summarizes weighted graph connections between groups.
+It is not a lineage graph and is distinct from the Paris hierarchy below.
 
-## Compare Paris adaptive and fixed cuts
+## 6. Compare Paris adaptive and fixed cuts
 
-Paris builds a hierarchy by repeatedly contracting the graph. The automatic cut
-retains persistent branches subject to a minimum size. A fixed cut requests an
-exact cluster count from the same hierarchy.
+Paris builds a hierarchy by repeatedly contracting the graph.
+The automatic cut retains persistent branches subject to a minimum size and a modularity `split_gate`.
+A fixed cut requests an exact cluster count from the same hierarchy.
 
 ```{code-cell} ipython3
 paris_auto = ds.run_paris_clustering(
@@ -338,10 +323,10 @@ pd.DataFrame(
 ]
 ```
 
-Persistence describes the resolution interval over which a selected branch
-survives. The decision margin measures how strongly the adaptive objective
-favoured retaining that branch. Forced groups satisfy structural constraints
-and should not be interpreted as strongly supported solely from that flag.
+Persistence is the size-weighted keep score for a selected branch.
+`resolution_lower` and `resolution_upper` describe the resolution interval over which that branch survives.
+The decision margin measures how strongly the adaptive objective favoured retaining that branch.
+Forced groups satisfy structural constraints and should not be interpreted as strongly supported solely from that flag.
 
 ```{code-cell} ipython3
 paris_fixed = ds.run_paris_clustering(
@@ -381,11 +366,9 @@ ds.plots.cluster_tree(
 )
 ```
 
-The tree represents hierarchical merges, while
-`plots.cluster_connectivity` represents direct inter-group graph structure.
+The tree represents hierarchical merges, while `plots.cluster_connectivity` represents direct inter-group graph structure.
 
-Optionally place Leiden and Paris on the same embedding frame, and colour the
-Paris tree by Leiden membership.
+Optionally place Leiden and Paris on the same embedding frame, and colour the Paris tree by Leiden membership.
 
 ```{code-cell} ipython3
 leiden_paris = ds.plots.embedding(
@@ -422,7 +405,7 @@ ds.plots.cluster_tree(
 )
 ```
 
-## Review marker specificity
+## 7. Review marker specificity
 
 ```{code-cell} ipython3
 ds.run_marker_search(group_key=chosen_key)
@@ -482,20 +465,17 @@ ds.plots.embedding(
 )
 ```
 
-AUC measures how often a randomly selected cell in the group has a higher value
-than a cell outside it. Review AUC, specificity score, expression fraction, and
-known biology together. Adjusted p-values are within-group cell-level tests, not
-replicate-aware differential expression. Groups with fewer than two target or
-reference cells fail marker testing rather than returning a misleading table.
+AUC measures how often a randomly selected cell in the group has a higher value than a cell outside it.
+Review AUC, specificity score, expression fraction, and known biology together.
+Adjusted p-values are within-group cell-level tests, not replicate-aware differential expression.
+Groups with fewer than two target or reference cells fail marker testing rather than returning a misleading table.
 
-## Subset and recluster
+## 8. Subset and recluster
 
-Subclustering should rebuild feature selection and the graph within the selected
-population. Reusing the full-dataset graph can preserve boundaries that are
-irrelevant inside the subset.
+Subclustering should rebuild feature selection and the graph within the selected population.
+Reusing the full-dataset graph can preserve boundaries that are irrelevant inside the subset.
 
-Highlight the focus population on the full embedding before rebuilding the
-subset graph.
+Highlight the focus population on the full embedding before rebuilding the subset graph.
 
 ```{code-cell} ipython3
 clusters = ds.cells.fetch_all(chosen_key)
@@ -566,6 +546,5 @@ ds.plots.embedding(
 )
 ```
 
-The resulting columns apply only to `focus_cells`. Revisit QC, feature
-selection, marker support, and stability before assigning finer biological
-labels.
+The resulting columns apply only to `focus_cells`.
+Revisit QC, feature selection, marker support, and stability before assigning finer biological labels.
