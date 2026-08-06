@@ -52,10 +52,7 @@ def validate_decision(
     ]
     if selected_id not in evidence_ids and selected_id in allowed:
         evidence_ids = [selected_id, *evidence_ids]
-    if (
-        selected_id != decision.selectedId
-        or evidence_ids != list(decision.evidenceIds)
-    ):
+    if selected_id != decision.selectedId or evidence_ids != list(decision.evidenceIds):
         decision = Decision(
             selectedId=selected_id,
             rationale=decision.rationale,

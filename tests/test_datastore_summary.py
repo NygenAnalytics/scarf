@@ -266,3 +266,52 @@ def test_summary_does_not_mutate_read_only_store(
     assert all(assay.dataset_fingerprint is None for assay in summary.assays)
     reopened = zarr.open_group(str(location), mode="r")
     assert "dataset_fingerprint" not in reopened["RNA"].attrs
+
+
+def test_summarize_zarr_readonly_does_not_write_default_assay(tmp_path: Path) -> None:
+    from scarf.datastore.summary import summarize_zarr_readonly
+
+    location = tmp_path / "readonly-default.zarr"
+    datastore = _create_minimal_datastore(location)
+    root = zarr.open_group(str(location), mode="r+")
+    root.attrs.pop("defaultAssay", None)
+    del root
+    before = _file_snapshot(location)
+
+    summary = summarize_zarr_readonly(str(location), default_assay=None)
+    assert summary.default_assay == "RNA"
+    assert _file_snapshot(location) == before
+    reopened = zarr.open_group(str(location), mode="r")
+    assert "defaultAssay" not in reopened.attrs
+
+    # Explicit direction also must not persist.
+    summary2 = summarize_zarr_readonly(str(location), default_assay="RNA")
+    assert summary2.default_assay == "RNA"
+    assert _file_snapshot(location) == before
+    del datastore
+
+
+def test_summarize_zarr_readonly_supports_workspace(tmp_path: Path) -> None:
+    from scarf.datastore.summary import summarize_zarr_readonly
+
+    location = tmp_path / "readonly-workspace.zarr"
+    writer = SparseToZarr(
+        csr_matrix(np.array([[1, 0], [0, 2]], dtype=np.uint16)),
+        str(location),
+        cell_ids=["cell-1", "cell-2"],
+        feature_ids=["gene-1", "gene-2"],
+        workspace="analysis",
+        mem_budget=64 * 1024 * 1024,
+        nthreads=1,
+    )
+    writer.dump()
+    before = _file_snapshot(location)
+
+    summary = summarize_zarr_readonly(str(location), workspace="analysis")
+
+    assert summary.workspace == "analysis"
+    assert summary.default_assay == "RNA"
+    assert summary.total_cells == 2
+    assert [assay.name for assay in summary.assays] == ["RNA"]
+    assert summary.assays[0].total_features == 2
+    assert _file_snapshot(location) == before

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from .cellranger import ingest_cellranger
+from .common import CONVERT_FORMATS, ensure_convert_destination
 from .detect import detect_format
 from .h5ad import ingest_h5ad
 from .loom import ingest_loom
@@ -40,6 +41,21 @@ def ingest(
     format_name = str(direction_map.get("format") or detect_format(source))
     notes.append(f"Detected format: {format_name}")
 
+    destination: str | None = None
+    if format_name in CONVERT_FORMATS:
+        preflight = ensure_convert_destination(
+            source,
+            zarrPath,
+            direction_map,
+            format_name=format_name,
+        )
+        if isinstance(preflight, IngestResult):
+            preflight.notes = [*notes, *preflight.notes]
+            return preflight
+        destination = preflight
+        if direction_map.get("overwrite") is True:
+            notes.append(f"Overwrite authorized for destination {destination}")
+
     if format_name == "zarr":
         return ingest_zarr(
             source,
@@ -47,51 +63,57 @@ def ingest(
             default_assay=direction_map.get("defaultAssay"),
         )
     if format_name == "h5ad":
+        assert destination is not None
         return ingest_h5ad(
             source,
-            zarrPath=zarrPath,
+            zarrPath=destination,
             model=model,
             directions=direction_map,
             notes=notes,
         )
     if format_name == "10x_h5":
+        assert destination is not None
         return ingest_cellranger(
             source,
             format_name=format_name,
             reader_class_name="CrH5Reader",
-            zarrPath=zarrPath,
+            zarrPath=destination,
             model=model,
             directions=direction_map,
             notes=notes,
         )
     if format_name == "10x_dir":
+        assert destination is not None
         return ingest_cellranger(
             source,
             format_name=format_name,
             reader_class_name="CrDirReader",
-            zarrPath=zarrPath,
+            zarrPath=destination,
             model=model,
             directions=direction_map,
             notes=notes,
         )
     if format_name == "mtx":
+        assert destination is not None
         return ingest_mtx(
             source,
-            zarrPath=zarrPath,
+            zarrPath=destination,
             directions=direction_map,
             notes=notes,
         )
     if format_name == "loom":
+        assert destination is not None
         return ingest_loom(
             source,
-            zarrPath=zarrPath,
+            zarrPath=destination,
             directions=direction_map,
             notes=notes,
         )
     if format_name == "seurat":
+        assert destination is not None
         return ingest_seurat(
             source,
-            zarrPath=zarrPath,
+            zarrPath=destination,
             directions=direction_map,
             notes=notes,
         )

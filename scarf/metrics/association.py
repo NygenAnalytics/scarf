@@ -358,24 +358,48 @@ def coefficient_estimability(
             return _not_computed("constantCoefficient", rowsUsed=rows_used)
 
     encoded = int(technical_matrix.shape[1] + coeff_block.shape[1])
-    if encoded >= rows_used:
+    coefficient_df = int(coeff_block.shape[1])
+    rank_technical = int(np.linalg.matrix_rank(technical_matrix))
+    rank_full = int(
+        np.linalg.matrix_rank(np.concatenate([technical_matrix, coeff_block], axis=1))
+    )
+    estimable_df = int(rank_full - rank_technical)
+    residual_df = int(rows_used - rank_full)
+
+    if coefficientKind == "continuous":
+        fully_estimable = estimable_df == 1
+        partially_estimable = False
+        required_df = 1
+    else:
+        fully_estimable = estimable_df == coefficient_df
+        partially_estimable = 0 < estimable_df < coefficient_df
+        required_df = coefficient_df
+
+    # A saturated design with a fully recovered coefficient cannot be audited
+    # for residual variation. Rank loss still reports absent/partial estimability.
+    if encoded >= rows_used and fully_estimable and residual_df <= 0:
         return {
             "status": "notComputed",
             "reason": "encodedColumnsReachRows",
             "rowsUsed": rows_used,
             "encodedColumns": encoded,
+            "rankTechnical": rank_technical,
+            "rankWithCoefficient": rank_full,
+            "coefficientDf": required_df,
+            "estimableDf": estimable_df,
+            "residualDf": residual_df,
         }
-    rank_technical = int(np.linalg.matrix_rank(technical_matrix))
-    rank_full = int(
-        np.linalg.matrix_rank(np.concatenate([technical_matrix, coeff_block], axis=1))
-    )
-    estimable = rank_full > rank_technical
+
     return {
         "status": "ok",
-        "coefficientEstimable": estimable,
-        "rankDeficient": not estimable,
+        "coefficientEstimable": fully_estimable,
+        "partiallyEstimable": partially_estimable,
+        "rankDeficient": estimable_df < required_df,
         "rankTechnical": rank_technical,
         "rankWithCoefficient": rank_full,
+        "coefficientDf": required_df,
+        "estimableDf": estimable_df,
+        "residualDf": residual_df,
         "rowsUsed": rows_used,
         "encodedColumns": encoded,
     }
@@ -397,7 +421,6 @@ def report_confounding(
         raise KeyError(f"technical columns missing from design: {missing}")
     coeff_kind = columnKinds[coefficient]
     pairs: list[dict[str, Any]] = []
-    associated: list[str] = []
     for name in technicalColumns:
         result = association_pair(
             design[coefficient].to_numpy(),
@@ -413,8 +436,6 @@ def report_confounding(
             and abs(float(result["value"])) >= associationFloor
         ) or mapping.get("nesting", "none") != "none"
         pairs.append({"technical": name, "association": result, "selected": selected})
-        if selected:
-            associated.append(name)
 
     return {
         "coefficient": coefficient,
@@ -423,7 +444,7 @@ def report_confounding(
         "estimability": coefficient_estimability(
             design[coefficient].to_numpy(),
             coefficientKind=coeff_kind,
-            technicals={name: design[name].to_numpy() for name in associated},
-            technicalKinds={name: columnKinds[name] for name in associated},
+            technicals={name: design[name].to_numpy() for name in technicalColumns},
+            technicalKinds={name: columnKinds[name] for name in technicalColumns},
         ),
     }

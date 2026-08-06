@@ -254,7 +254,9 @@ def test_coefficient_estimability_without_technicals() -> None:
 
 
 def test_coefficient_estimability_gates_when_columns_reach_rows() -> None:
-    # Three technical factors with many levels relative to six rows.
+    # Three technical factors with many levels relative to six rows. Rank loss
+    # still proves the coefficient is not estimable, so the result is reported
+    # instead of deferred as notComputed.
     rows = 6
     technicals = {
         "t1": np.array([f"a{i}" for i in range(rows)]),
@@ -267,8 +269,10 @@ def test_coefficient_estimability_gates_when_columns_reach_rows() -> None:
         technicals=technicals,
         technicalKinds={name: "categorical" for name in technicals},
     )
-    assert result["status"] == "notComputed"
-    assert result["reason"] == "encodedColumnsReachRows"
+    assert result["status"] == "ok"
+    assert result["coefficientEstimable"] is False
+    assert result["rankDeficient"] is True
+    assert result["encodedColumns"] >= result["rowsUsed"]
 
 
 def test_report_confounding_on_design_table() -> None:
@@ -299,7 +303,8 @@ def test_report_confounding_on_design_table() -> None:
 
 def test_report_confounding_selects_deterministic_pair_without_effect_size() -> None:
     # The corrected effect size is unavailable here, so selection has to fall
-    # back on the exact mapping or the aliasing would be reported as estimable.
+    # back on the exact mapping. Estimability still reports non-estimable even
+    # though the encoded design saturates the row count.
     design = pd.DataFrame(
         {
             "disease": ["case"] * 3 + ["ctrl"] * 3,
@@ -315,8 +320,67 @@ def test_report_confounding_selects_deterministic_pair_without_effect_size() -> 
     pair = report["pairs"][0]
     assert pair["association"]["status"] == "notComputed"
     assert pair["selected"] is True
-    assert report["estimability"]["status"] == "notComputed"
-    assert "coefficientEstimable" not in report["estimability"]
+    assert report["estimability"]["status"] == "ok"
+    assert report["estimability"]["coefficientEstimable"] is False
+    assert report["estimability"]["rankDeficient"] is True
+
+
+def test_coefficient_estimability_partially_estimable_categorical() -> None:
+    # Three disease levels, one contrast recoverable against batch, one aliased.
+    batch = np.array(["y", "y", "x", "x", "y", "y", "y", "y"])
+    disease = np.array(["A", "A", "B", "B", "C", "C", "C", "A"])
+    result = coefficient_estimability(
+        disease,
+        coefficientKind="categorical",
+        technicals={"batch": batch},
+        technicalKinds={"batch": "categorical"},
+    )
+    assert result["status"] == "ok"
+    assert result["coefficientEstimable"] is False
+    assert result["partiallyEstimable"] is True
+    assert result["coefficientDf"] == 2
+    assert result["estimableDf"] == 1
+
+
+def test_report_confounding_estimability_uses_all_technicals() -> None:
+    # Neither technical passes the pairwise threshold, but together they exactly
+    # span the coefficient. Estimability must therefore use both unselected terms.
+    design = pd.DataFrame(
+        {
+            "batch": [0.0, 0.0, 1.0, 1.0, 2.0, 2.0],
+            "site": [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+        }
+    )
+    design["response"] = design["batch"] + design["site"]
+    report = report_confounding(
+        design,
+        coefficient="response",
+        technicalColumns=["batch", "site"],
+        columnKinds={
+            "response": "continuous",
+            "batch": "continuous",
+            "site": "continuous",
+        },
+        associationFloor=0.99,
+    )
+    assert all(pair["selected"] is False for pair in report["pairs"])
+    assert report["estimability"]["status"] == "ok"
+    assert report["estimability"]["coefficientEstimable"] is False
+    assert report["estimability"]["rankDeficient"] is True
+
+
+def test_coefficient_estimability_saturated_but_full_is_not_computed() -> None:
+    # Fully recovered coefficient with no residual df reports notComputed.
+    result = coefficient_estimability(
+        np.array(["a", "b"]),
+        coefficientKind="categorical",
+        technicals={},
+        technicalKinds={},
+    )
+    assert result["status"] == "notComputed"
+    assert result["reason"] == "encodedColumnsReachRows"
+    assert result["estimableDf"] == result["coefficientDf"]
+    assert result["residualDf"] == 0
 
 
 def test_report_confounding_requires_present_columns() -> None:

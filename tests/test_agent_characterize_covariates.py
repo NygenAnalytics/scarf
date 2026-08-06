@@ -391,3 +391,149 @@ def test_characterize_covariates_drops_directed_constant_coefficient(
         if entry.get("column") == "protocol"
     )
     assert "protocol" not in {item["name"] for item in result.coefficients}
+
+
+def test_characterize_covariates_rejects_vacuous_cell_id_unit(tmp_path: Path) -> None:
+    store = _store_with_design(tmp_path)
+    cell_ids = store.cells.fetch_all("ids")
+    store.cells.insert("barcode", cell_ids, overwrite=True)
+    result = characterize_covariates(
+        store,
+        directions={
+            "columnDomains": {
+                "barcode": "design",
+                "disease": "biological",
+                "batch": "technical",
+            },
+            "coefficientsOfInterest": ["disease"],
+            "unitsOfInference": {"disease": {"observationUnit": "barcode"}},
+        },
+    )
+    assert result.status == "done"
+    assert any(
+        entry["kind"] == "invalidObservationUnit"
+        and entry.get("observationUnit") == "barcode"
+        for entry in result.auditLog
+    )
+    coeff = next(item for item in result.coefficients if item["name"] == "disease")
+    assert coeff["scope"] == "unresolvedUnit"
+    assert coeff.get("observationUnit") is None
+
+
+def test_characterize_covariates_rejects_auto_unique_per_cell_unit(
+    tmp_path: Path,
+) -> None:
+    store = _store_with_design(tmp_path)
+    # Only vacuous unit candidates: unique per cell identifiers.
+    n = store.cells.N
+    store.cells.insert(
+        "barcode", np.array([f"bc{i}" for i in range(n)]), overwrite=True
+    )
+    result = characterize_covariates(
+        store,
+        directions={
+            "columnDomains": {
+                "barcode": "design",
+                "disease": "biological",
+            },
+            "coefficientsOfInterest": ["disease"],
+        },
+    )
+    assert result.status == "done"
+    assert any(entry["kind"] == "noValidObservationUnit" for entry in result.auditLog)
+    coeff = next(item for item in result.coefficients if item["name"] == "disease")
+    assert coeff["scope"] == "unresolvedUnit"
+
+
+def test_characterize_covariates_respects_subset_cell_key(tmp_path: Path) -> None:
+    store = _store_with_design(tmp_path)
+    keep = np.zeros(store.cells.N, dtype=bool)
+    keep[:6] = True  # donor d1 only; disease is constant (case)
+    store.cells.insert("subset", keep, overwrite=True)
+    result = characterize_covariates(
+        store,
+        cellKey="subset",
+        directions={
+            "columnDomains": {
+                "donor": "design",
+                "sample": "design",
+                "batch": "technical",
+                "disease": "biological",
+            },
+            "coefficientsOfInterest": ["disease"],
+            "unitsOfInference": {"disease": {"observationUnit": "sample"}},
+        },
+    )
+    assert result.status == "done"
+    assert "disease" not in {item["name"] for item in result.coefficients}
+    assert any(
+        entry["kind"].startswith("drop") and entry.get("column") == "disease"
+        for entry in result.auditLog
+    )
+    disease_col = next(col for col in result.columns if col["name"] == "disease")
+    assert "single-level" in disease_col["summary"]
+    assert disease_col["domain"] == "ignore"
+
+
+def test_characterize_covariates_avoids_bulk_metadata_loads(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = _store_with_design(tmp_path)
+    original_fetch = store.cells.fetch
+    original_fetch_all = store.cells.fetch_all
+    original_blocks = store.cells.iter_row_blocks
+    inside_fetch = False
+    direct_full_fetches: list[str] = []
+    block_widths: list[int] = []
+
+    def reject_frame(*_args, **_kwargs):
+        raise AssertionError("characterization must not build a cell-level dataframe")
+
+    def fetch_spy(column: str, key: str = "I"):
+        nonlocal inside_fetch
+        inside_fetch = True
+        try:
+            return original_fetch(column, key=key)
+        finally:
+            inside_fetch = False
+
+    def fetch_all_spy(column: str):
+        if not inside_fetch and column != "I":
+            direct_full_fetches.append(column)
+        return original_fetch_all(column)
+
+    def blocks_spy(*, cell_key="I", columns=None, block_rows=None):
+        names = tuple(columns or ())
+        block_widths.append(len(names))
+        return original_blocks(
+            cell_key=cell_key,
+            columns=names,
+            block_rows=block_rows,
+        )
+
+    monkeypatch.setattr(store.cells, "to_pandas_dataframe", reject_frame)
+    monkeypatch.setattr(store.cells, "fetch", fetch_spy)
+    monkeypatch.setattr(store.cells, "fetch_all", fetch_all_spy)
+    monkeypatch.setattr(store.cells, "iter_row_blocks", blocks_spy)
+    result = characterize_covariates(
+        store,
+        directions={
+            "columnDomains": {
+                "donor": "design",
+                "sample": "design",
+                "batch": "technical",
+                "disease": "biological",
+            },
+            "coefficientsOfInterest": ["disease"],
+            "unitsOfInference": {
+                "disease": {
+                    "observationUnit": "sample",
+                    "independentUnit": "donor",
+                }
+            },
+        },
+    )
+    assert result.status == "done"
+    assert direct_full_fetches == []
+    assert block_widths
+    assert max(block_widths) < len(store.cells.columns)

@@ -112,6 +112,30 @@ def load_zarr(
     return open_store(zarr_loc, mode=mode, storage_options=storage_options)
 
 
+def zarr_location_has_content(
+    location: ZarrLocation,
+    *,
+    storage_options: dict[str, Any] | None = None,
+) -> bool:
+    """Return whether a Zarr location already holds content.
+
+    Local filesystem paths, including ``file://`` URIs, use path existence.
+    Remote and in-memory stores are probed through the Zarr store API. Probe
+    failures raise so callers can fail closed instead of overwriting blindly.
+    """
+    if isinstance(location, str) and not is_remote_zarr_location(location):
+        path = location[7:] if location.startswith("file://") else location
+        return os.path.lexists(path)
+
+    store = make_store(location, storage_options=storage_options, read_only=True)
+    if isinstance(store, str):
+        return os.path.lexists(store)
+
+    from zarr.core.sync import sync
+
+    return not bool(sync(store.is_empty("")))
+
+
 def _persistable_location(source: str) -> str:
     """Return a location that resolves identically from any working directory."""
     if "://" in source:

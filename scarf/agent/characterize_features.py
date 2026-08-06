@@ -27,7 +27,7 @@ from ..quality_control.cell_cycle_genes import (
     s_phase_genes_mouse,
 )
 from ._deps import AGENT_INSTALL_HINT
-from .decide import decide
+from .decide import DecisionValidationError, decide
 from .types import Decision, EvidenceItem, StageStatus
 
 try:
@@ -80,12 +80,23 @@ def _ask(
     question: str,
     evidence: Sequence[EvidenceItem],
     decisions: list[dict[str, Any]],
+    audit_log: list[dict[str, Any]],
     task: str,
     assay: str | None = None,
 ) -> Decision | None:
     if model is None or len(evidence) < 2:
         return None
-    decision = decide(model=model, question=question, evidence=evidence)
+    try:
+        decision = decide(model=model, question=question, evidence=evidence)
+    except DecisionValidationError as exc:
+        _audit(
+            audit_log,
+            kind="decisionInvalid",
+            detail=str(exc),
+            task=task,
+            assay=assay,
+        )
+        return None
     record: dict[str, Any] = {
         "task": task,
         "selectedId": decision.selectedId,
@@ -164,6 +175,7 @@ def _assist_species(
     unresolved: Mapping[str, Any],
     context: str,
     decisions: list[dict[str, Any]],
+    audit_log: list[dict[str, Any]],
     assay: str,
 ) -> str | None:
     # Only ask among species that already have overlap evidence. Expanding to the
@@ -202,6 +214,7 @@ def _assist_species(
         ),
         evidence=evidence,
         decisions=decisions,
+        audit_log=audit_log,
         task="species",
         assay=assay,
     )
@@ -217,6 +230,7 @@ def _classify_exogenous(
     candidates: Sequence[Mapping[str, Any]],
     context: str,
     decisions: list[dict[str, Any]],
+    audit_log: list[dict[str, Any]],
     assay: str,
     species: str,
 ) -> list[dict[str, Any]]:
@@ -243,6 +257,7 @@ def _classify_exogenous(
             ),
             evidence=evidence,
             decisions=decisions,
+            audit_log=audit_log,
             task="exogenous",
             assay=assay,
         )
@@ -310,6 +325,7 @@ def _characterize_assay(
             unresolved=resolution,
             context=context,
             decisions=decisions,
+            audit_log=audit_log,
             assay=assay_name,
         )
         if assisted is not None:
@@ -460,6 +476,7 @@ def _characterize_assay(
         candidates=candidates,
         context=context,
         decisions=decisions,
+        audit_log=audit_log,
         assay=assay_name,
         species=species,
     )

@@ -191,3 +191,53 @@ def test_characterize_features_does_not_mutate_store(tmp_path: Path) -> None:
     assert result.status == "done"
     assert list(store.RNA.feats.fetch_all("ids")) == before_ids
     assert list(store.RNA.feats.fetch_all("names")) == before_names
+
+
+def test_characterize_features_invalid_decision_is_audited(tmp_path: Path) -> None:
+    from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+    from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+    from scarf.agent.types import Decision
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    write_reference_fixture(
+        cache / "homo_sapiens.tsv",
+        species="homo_sapiens",
+        release="test",
+        rows=[("ENSG00000075624", "ACTB", "7")],
+    )
+    write_reference_fixture(
+        cache / "mus_musculus.tsv",
+        species="mus_musculus",
+        release="test",
+        rows=[("ENSMUSG00000029580", "Actb", "5")],
+    )
+    store = _store(
+        tmp_path,
+        feature_ids=["ENSG00000075624", "ENSMUSG00000029580"],
+        feature_names=["ACTB", "Actb"],
+    )
+
+    def reply(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool = info.output_tools[0]
+        bad = Decision(
+            selectedId="species:not-a-species",
+            rationale="invalid",
+            evidenceIds=["species:homo_sapiens"],
+        )
+        return ModelResponse(
+            parts=[ToolCallPart(tool_name=tool.name, args=bad.model_dump())]
+        )
+
+    result = characterize_features(
+        store,
+        cacheDir=cache,
+        allowDownload=False,
+        model=FunctionModel(reply),
+    )
+    assert result.status == "done"
+    assert any(
+        entry["kind"] == "decisionInvalid" and entry.get("task") == "species"
+        for entry in result.auditLog
+    )

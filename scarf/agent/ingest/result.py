@@ -1,5 +1,6 @@
 """Ingest result types and stage helpers."""
 
+from collections.abc import Sequence
 from typing import Any
 
 from .._deps import AGENT_INSTALL_HINT
@@ -65,4 +66,49 @@ def needs_input(
             evidenceIds=evidence_ids,
         ),
         notes=notes or [],
+    )
+
+
+def failed(
+    *,
+    format_name: str | None = None,
+    notes: list[str],
+    zarr_path: str | None = None,
+) -> IngestResult:
+    return IngestResult(
+        status="failed",
+        format=format_name,
+        zarrPath=zarr_path,
+        notes=notes,
+    )
+
+
+def failure_note(operation: str, exc: BaseException) -> str:
+    return f"{operation} failed: {type(exc).__name__}: {exc}"
+
+
+def failed_from_exception(
+    *,
+    format_name: str,
+    operation: str,
+    exc: BaseException,
+    notes: Sequence[str],
+    zarr_path: str | None = None,
+    extra_notes: Sequence[str] = (),
+    partial_store: bool = False,
+) -> IngestResult:
+    partial_notes = (
+        [f"Destination may contain a partial store at {zarr_path}"]
+        if partial_store and zarr_path is not None
+        else []
+    )
+    return failed(
+        format_name=format_name,
+        zarr_path=zarr_path,
+        notes=[
+            *notes,
+            failure_note(operation, exc),
+            *partial_notes,
+            *extra_notes,
+        ],
     )

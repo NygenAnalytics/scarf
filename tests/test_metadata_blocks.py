@@ -155,3 +155,82 @@ def test_make_bulk_pseudo_reps_warns_without_changing_values(
             rtol=1e-5,
             atol=1e-6,
         )
+
+
+def test_column_partition_digest_matches_factorization(datastore):
+    from scarf.metadata.queries import column_partition_digest, columns_same_partition
+
+    cells = datastore.cells
+    ids = cells.fetch_all("ids")
+    # Renamed labels, same partition as ids under a fresh codebook.
+    alias = np.array([f"alias-{value}" for value in ids], dtype=object)
+    cells.insert("digest_alias_ids", alias, overwrite=True)
+
+    digest_ids = column_partition_digest(cells, "ids")
+    digest_alias = column_partition_digest(cells, "digest_alias_ids")
+    assert digest_ids.digest == digest_alias.digest
+    assert digest_ids.nLevels == digest_alias.nLevels
+    assert digest_ids.nRows == int(cells.active_index("I").size)
+
+    same, shown = columns_same_partition(cells, "ids", "digest_alias_ids")
+    assert same is True
+    assert " = " in shown
+
+    # Missing values use a numeric column so NaN survives storage. Place them on
+    # active rows so the default cell_key="I" scan observes them.
+    with_missing = np.arange(cells.N, dtype=float)
+    active = cells.active_index("I")
+    assert active.size >= 2
+    with_missing[int(active[0])] = np.nan
+    with_missing[int(active[1])] = np.nan
+    cells.insert("digest_alias_missing", with_missing, overwrite=True)
+    digest_missing = column_partition_digest(cells, "digest_alias_missing")
+    assert digest_missing.nMissing == 2
+    assert digest_missing.nLevels == digest_missing.nRows - 1
+    assert digest_missing.digest != digest_alias.digest
+
+
+def test_partition_digest_is_global_across_blocks(datastore):
+    from scarf.metadata.queries import column_partition_digest, columns_same_partition
+
+    cells = datastore.cells
+    n = cells.N
+    # Two columns with identical per-block patterns but different global partitions.
+    left = np.array(["a", "b"] * (n // 2) + ["a"] * (n % 2), dtype=object)
+    right = left.copy()
+    mid = n // 2
+    if mid + 1 < n:
+        right[mid], right[mid + 1] = right[mid + 1], right[mid]
+    cells.insert("digest_part_left", left, overwrite=True)
+    cells.insert("digest_part_right", right, overwrite=True)
+
+    left_digest = column_partition_digest(cells, "digest_part_left")
+    right_digest = column_partition_digest(cells, "digest_part_right")
+    if np.array_equal(left, right):
+        assert left_digest.digest == right_digest.digest
+    else:
+        assert left_digest.digest != right_digest.digest
+        same, _ = columns_same_partition(cells, "digest_part_left", "digest_part_right")
+        assert same is False
+
+
+def test_reduce_observation_units_respects_cell_key(datastore):
+    from scarf.metadata.queries import reduce_observation_units
+
+    cells = datastore.cells
+    keep = np.zeros(cells.N, dtype=bool)
+    keep[::2] = True
+    cells.insert("digest_unit_subset", keep, overwrite=True)
+    sample = np.array([f"s{i % 3}" for i in range(cells.N)], dtype=object)
+    cells.insert("digest_unit_sample", sample, overwrite=True)
+    disease = np.array(["case" if i % 2 == 0 else "ctrl" for i in range(cells.N)])
+    cells.insert("digest_unit_disease", disease, overwrite=True)
+
+    design = reduce_observation_units(
+        cells,
+        "digest_unit_sample",
+        ["digest_unit_disease"],
+        cell_key="digest_unit_subset",
+    )
+    assert len(design) == len(set(sample[keep]))
+    assert set(design.columns) >= {"digest_unit_sample", "digest_unit_disease"}

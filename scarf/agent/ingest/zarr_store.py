@@ -17,6 +17,7 @@ def ingest_zarr(
         zarr_path=str(path),
         notes=notes,
         convert_actions=[],
-        action_labels=["open_datastore"],
+        action_labels=["summarize_zarr"],
         default_assay=default_assay,
+        summary_mode="r",
     )

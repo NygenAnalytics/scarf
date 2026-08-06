@@ -5,13 +5,19 @@ from typing import Any, Protocol
 import zarr
 
 from ..assay import Assay
-from ..graph.state import AssayState
+from ..graph.state import AssayState, read_assay_state
 from ..metadata import MetaData
-from ..storage.artifacts import ArtifactStatus
-from ..storage.budget import ResourceBudget
-from ..storage.profiles import StorageProfile
+from ..storage.artifacts import (
+    ArtifactStatus,
+    inspect_artifact,
+    list_artifacts as list_artifact_refs,
+)
+from ..storage.budget import ResourceBudget, resolve_budget
+from ..storage.profiles import StorageProfile, resolve_storage_profile
 from ..storage.refs import ArtifactRef, ArtifactScope
-from ..storage.types import ZarrMode
+from ..storage.schema import validate_assay_name
+from ..storage.stores import load_zarr
+from ..storage.types import ZarrMode, as_zarr_group
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +101,11 @@ class DataStoreSummary:
         }
 
 
+class _AssaySummaryView(Protocol):
+    feats: MetaData
+    attrs: Mapping[str, Any]
+
+
 class _SummaryStore(Protocol):
     zarr_mode: ZarrMode
     workspace: str | None
@@ -109,7 +120,7 @@ class _SummaryStore(Protocol):
     @property
     def zw(self) -> zarr.Group: ...
 
-    def _get_assay(self, from_assay: str | None) -> Assay: ...
+    def _get_assay(self, from_assay: str | None) -> Assay | _AssaySummaryView: ...
 
     def get_assay_state(self, from_assay: str | None = None) -> AssayState | None: ...
 
@@ -123,6 +134,117 @@ class _SummaryStore(Protocol):
     ) -> list[ArtifactRef]: ...
 
     def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus: ...
+
+
+@dataclass(slots=True)
+class _ReadOnlyAssayView:
+    name: str
+    feats: MetaData
+    attrs: Mapping[str, Any]
+
+
+class _ReadOnlySummaryStore:
+    """Read-only adapter that summarizes a Scarf Zarr without DataStore init."""
+
+    zarr_mode: ZarrMode = "r"
+
+    def __init__(
+        self,
+        zarr_path: str,
+        *,
+        default_assay: str | None = None,
+        workspace: str | None = None,
+        storage_options: dict[str, Any] | None = None,
+    ) -> None:
+        self.workspace = workspace
+        self.resources = resolve_budget()
+        self.storageProfile = resolve_storage_profile(zarr_path)
+        self._root = load_zarr(zarr_path, mode="r", storage_options=storage_options)
+        self.cells = MetaData(as_zarr_group(self.zw["cellData"], name="cellData"))
+        names = self.assay_names
+        if not names:
+            raise ValueError(f"No assays found in Zarr store at {zarr_path}")
+        self._defaultAssay = self._resolve_default_assay(default_assay, names)
+
+    @property
+    def zw(self) -> zarr.Group:
+        if self.workspace is None:
+            return self._root
+        return as_zarr_group(self._root[self.workspace], name=self.workspace)
+
+    @property
+    def assay_names(self) -> list[str]:
+        names: list[str] = []
+        for name in sorted(dict.fromkeys(self.zw.group_keys())):
+            node = self.zw[name]
+            if isinstance(node, zarr.Group) and "is_assay" in node.attrs:
+                validate_assay_name(name)
+                names.append(name)
+        return names
+
+    def _resolve_default_assay(
+        self,
+        requested: str | None,
+        assay_names: list[str],
+    ) -> str:
+        if requested is not None:
+            if requested not in assay_names:
+                raise ValueError(
+                    f"Default assay {requested!r} was not found. "
+                    f"Choose one from: {' '.join(assay_names)}"
+                )
+            return requested
+        stored = self.zw.attrs.get("defaultAssay")
+        if isinstance(stored, str) and stored in assay_names:
+            return stored
+        if "RNA" in assay_names:
+            return "RNA"
+        return assay_names[0]
+
+    def _get_assay(self, from_assay: str | None) -> Assay | _AssaySummaryView:
+        assay = from_assay or self._defaultAssay
+        if assay not in self.assay_names:
+            raise ValueError(f"Assay {assay!r} not found in the Zarr file")
+        feature_path = f"{assay}/featureData"
+        display_path = (
+            feature_path
+            if self.workspace is None
+            else f"{self.workspace}/{feature_path}"
+        )
+        assay_group = as_zarr_group(
+            self.zw[assay],
+            name=assay if self.workspace is None else f"{self.workspace}/{assay}",
+        )
+        return _ReadOnlyAssayView(
+            name=assay,
+            feats=MetaData(as_zarr_group(self.zw[feature_path], name=display_path)),
+            attrs=assay_group.attrs,
+        )
+
+    def get_assay_state(self, from_assay: str | None = None) -> AssayState | None:
+        assay = from_assay or self._defaultAssay
+        return read_assay_state(self.zw, assay)
+
+    def list_artifacts(
+        self,
+        *,
+        kind: str | None = None,
+        from_assay: str | None = None,
+        scope: ArtifactScope = "assay",
+        complete_only: bool = False,
+    ) -> list[ArtifactRef]:
+        if scope == "assay" and from_assay is None:
+            from_assay = self._defaultAssay
+        return list_artifact_refs(
+            self.zw,
+            scope=scope,
+            assay=from_assay,
+            kind=kind,
+            complete_only=complete_only,
+        )
+
+    def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus:
+        return inspect_artifact(self.zw, ref)
 
 
 def _count_active(metadata: MetaData) -> int:
@@ -211,3 +333,22 @@ def build_datastore_summary(
             store.list_artifacts(scope="datastore"),
         ),
     )
+
+
+def summarize_zarr_readonly(
+    zarr_path: str,
+    *,
+    default_assay: str | None = None,
+    workspace: str | None = None,
+    storage_options: dict[str, Any] | None = None,
+) -> DataStoreSummary:
+    """Summarize an existing Scarf Zarr without mutating it."""
+    from .. import __version__
+
+    store = _ReadOnlySummaryStore(
+        zarr_path,
+        default_assay=default_assay,
+        workspace=workspace,
+        storage_options=storage_options,
+    )
+    return build_datastore_summary(store, scarf_version=__version__)

@@ -8,11 +8,14 @@ from typing import Any, Literal, cast
 import numpy as np
 import pandas as pd
 
-from ..metrics.association import (
-    directional_mapping,
-    report_confounding,
-    report_technical_nesting,
+from ..metadata.queries import (
+    PartitionDigest,
+    column_constant_within,
+    column_partition_digest,
+    columns_same_partition,
+    reduce_observation_units,
 )
+from ..metrics.association import directional_mapping, report_confounding
 from ..storage.types import as_zarr_array, as_zarr_group
 from ._deps import AGENT_INSTALL_HINT
 from .decide import DecisionValidationError, decide
@@ -115,14 +118,23 @@ class CovariateCharacterization(BaseModel):
     confounding: list[dict[str, Any]] = Field(default_factory=list)
 
 
+@dataclass(frozen=True, slots=True)
+class _ColumnProfile:
+    kind: ColumnKind
+    summary: str
+    digest: PartitionDigest
+
+
 @dataclass
 class _Run:
     """Mutable state shared by the stage steps."""
 
-    frame: pd.DataFrame
+    store: Any
+    cell_key: str
+    n_rows: int
     context: str
     model: Any | None
-    kinds: dict[str, ColumnKind] = field(default_factory=dict)
+    profiles: dict[str, _ColumnProfile] = field(default_factory=dict)
     domains: dict[str, Domain] = field(default_factory=dict)
     audit: list[dict[str, Any]] = field(default_factory=list)
     actions: list[str] = field(default_factory=list)
@@ -132,7 +144,13 @@ class _Run:
         self.audit.append({"kind": kind, "detail": detail, **fields})
 
     def summary(self, name: str) -> str:
-        return _summarize(self.frame[name].to_numpy(), self.kinds[name])
+        return self.profiles[name].summary
+
+    def kind(self, name: str) -> ColumnKind:
+        return self.profiles[name].kind
+
+    def digest(self, name: str) -> PartitionDigest:
+        return self.profiles[name].digest
 
     def ask(
         self,
@@ -227,9 +245,22 @@ def _summarize(values: np.ndarray, kind: ColumnKind) -> str:
     )
 
 
-def _partition_signature(values: np.ndarray) -> tuple[int, ...]:
-    codes, _ = pd.factorize(pd.Series(values), use_na_sentinel=True)
-    return tuple(int(code) for code in codes.tolist())
+def _digest_key(digest: PartitionDigest) -> tuple[bytes, int, int]:
+    return (digest.digest, digest.nLevels, digest.nMissing)
+
+
+def _profile_column(
+    store: Any,
+    name: str,
+    *,
+    cell_key: str,
+    kind: ColumnKind | None = None,
+) -> _ColumnProfile:
+    values = store.cells.fetch(name, key=cell_key)
+    resolved_kind = kind or _infer_kind(values)
+    summary = _summarize(values, resolved_kind)
+    digest = column_partition_digest(store.cells, name, cell_key=cell_key)
+    return _ColumnProfile(kind=resolved_kind, summary=summary, digest=digest)
 
 
 def _triage_columns(
@@ -257,8 +288,11 @@ def _triage_columns(
 
 
 def _collapse_ontology_aliases(
+    store: Any,
     columns: Sequence[str],
-    frame: pd.DataFrame,
+    profiles: Mapping[str, _ColumnProfile],
+    *,
+    cell_key: str,
 ) -> tuple[list[str], dict[str, list[str]], list[dict[str, Any]]]:
     """Collapse ``x`` with ``x_ontology_term_id`` when partitions match.
 
@@ -275,20 +309,27 @@ def _collapse_ontology_aliases(
         base = name[: -len(_ONTOLOGY_SUFFIX)]
         if base not in present or {name, base} & dropped:
             continue
-        if _partition_signature(frame[name].to_numpy()) != _partition_signature(
-            frame[base].to_numpy()
-        ):
+        if _digest_key(profiles[name].digest) != _digest_key(profiles[base].digest):
+            continue
+        same, correspondence = columns_same_partition(
+            store.cells,
+            base,
+            name,
+            cell_key=cell_key,
+        )
+        if not same:
             continue
         aliases.setdefault(base, []).append(name)
         dropped.add(name)
-        notes.append(
-            {
-                "kind": "ontologyAlias",
-                "detail": f"Collapsed ontology alias {name} onto {base}",
-                "representative": base,
-                "aliases": [name],
-            }
-        )
+        note: dict[str, Any] = {
+            "kind": "ontologyAlias",
+            "detail": f"Collapsed ontology alias {name} onto {base}",
+            "representative": base,
+            "aliases": [name],
+        }
+        if correspondence:
+            note["levels"] = correspondence
+        notes.append(note)
     return [name for name in columns if name not in dropped], aliases, notes
 
 
@@ -352,16 +393,6 @@ def _validate_directions(
     return errors
 
 
-def _level_correspondence(frame: pd.DataFrame, names: Sequence[str]) -> str:
-    """Matched label tuples for columns known to share one partition."""
-    rows = frame.loc[:, list(names)].drop_duplicates()
-    shown = "; ".join(
-        " = ".join(str(value) for value in row)
-        for row in rows.head(_SAMPLE_LEVELS).itertuples(index=False)
-    )
-    return shown if len(rows) <= _SAMPLE_LEVELS else f"{shown}; ..."
-
-
 def _choose_representative(
     run: _Run,
     members: Sequence[str],
@@ -420,12 +451,11 @@ def _collapse_equivalent_columns(
     and the representative is a model judgement rather than a name rule.
     Extends ``aliases`` in place.
     """
-    classes: dict[tuple[int, ...], list[str]] = {}
+    classes: dict[tuple[bytes, int, int], list[str]] = {}
     for name in candidates:
-        if run.kinds[name] != "categorical" or run.domains[name] not in _ANALYSED:
+        if run.kind(name) != "categorical" or run.domains[name] not in _ANALYSED:
             continue
-        signature = _partition_signature(run.frame[name].to_numpy())
-        classes.setdefault(signature, []).append(name)
+        classes.setdefault(_digest_key(run.digest(name)), []).append(name)
 
     # Store column order is not stable, and members of a class are
     # interchangeable, so order them here to keep prompts and notes reproducible.
@@ -433,8 +463,24 @@ def _collapse_equivalent_columns(
     for members in sorted(sorted(group) for group in classes.values()):
         if len(members) < 2:
             continue
+        representative_name = members[0]
+        verified: list[str] = [representative_name]
+        correspondence = ""
+        for other in members[1:]:
+            same, corr = columns_same_partition(
+                run.store.cells,
+                representative_name,
+                other,
+                cell_key=run.cell_key,
+            )
+            if not same:
+                continue
+            verified.append(other)
+            correspondence = corr
+        if len(verified) < 2:
+            continue
+        members = verified
         domains = sorted({run.domains[name] for name in members})
-        correspondence = _level_correspondence(run.frame, members)
         if len(domains) > 1:
             run.note(
                 kind="equivalentAcrossDomains",
@@ -542,19 +588,6 @@ def _unit_evidence(run: _Run, names: Sequence[str], prefix: str) -> list[Evidenc
     ]
 
 
-def _coefficient_constant_within(
-    frame: pd.DataFrame,
-    coefficient: str,
-    unit: str,
-) -> bool:
-    """True when the coefficient does not vary inside each unit level."""
-    if coefficient not in frame.columns or unit not in frame.columns:
-        return False
-    return bool(
-        frame.groupby(unit, dropna=False)[coefficient].nunique(dropna=False).le(1).all()
-    )
-
-
 def _observation_unit_candidates(
     run: _Run,
     coefficient: str,
@@ -563,20 +596,28 @@ def _observation_unit_candidates(
     """Design/technical columns that can host a between-unit coefficient.
 
     A valid observation unit is a metadata fact, not a judgement: the coefficient
-    must be constant within each level. No clustering column is required; when
-    nothing in the pool works, the coefficient stays within-unit or unresolved.
+    must be constant within each level, and the unit must leave more than one
+    design row while still being coarser than cell-level variation.
     """
     return [
         name
         for name in pool
         if name != coefficient
-        and _coefficient_constant_within(run.frame, coefficient, name)
+        and name in run.profiles
+        and column_constant_within(
+            run.store.cells,
+            coefficient,
+            name,
+            cell_key=run.cell_key,
+        )
+        and 2 <= run.digest(name).nLevels < run.n_rows
     ]
 
 
 def _independent_is_coarser(
-    frame: pd.DataFrame,
+    store: Any,
     *,
+    cell_key: str,
     observation: str,
     independent: str,
 ) -> bool:
@@ -585,9 +626,9 @@ def _independent_is_coarser(
     The independent unit must be coarser (or equal), never finer. A finer
     independent unit inflates the design table with pseudo-replicated rows.
     """
-    if observation not in frame.columns or independent not in frame.columns:
-        return False
-    nesting = directional_mapping(frame[observation], frame[independent]).get("nesting")
+    observation_values = store.cells.fetch(observation, key=cell_key)
+    independent_values = store.cells.fetch(independent, key=cell_key)
+    nesting = directional_mapping(observation_values, independent_values).get("nesting")
     return nesting in {"leftInRight", "equivalent"}
 
 
@@ -605,7 +646,7 @@ def _resolve_units(
     valid_observation = _observation_unit_candidates(run, coefficient, unit_candidates)
 
     if observation is not None:
-        if observation not in run.frame.columns:
+        if observation not in run.profiles:
             run.note(
                 kind="invalidObservationUnit",
                 detail=f"Directed observation unit {observation!r} is missing",
@@ -613,11 +654,25 @@ def _resolve_units(
                 observationUnit=observation,
             )
             observation = None
-        elif not _coefficient_constant_within(run.frame, coefficient, observation):
+        elif not column_constant_within(
+            run.store.cells,
+            coefficient,
+            observation,
+            cell_key=run.cell_key,
+        ):
             # Keep the directed unit; _characterize_coefficient records withinUnit.
             pass
         elif observation not in valid_observation:
-            valid_observation = [observation, *valid_observation]
+            run.note(
+                kind="invalidObservationUnit",
+                detail=(
+                    f"Directed observation unit {observation!r} is vacuous or "
+                    f"otherwise invalid for {coefficient}"
+                ),
+                column=coefficient,
+                observationUnit=observation,
+            )
+            observation = None
     elif len(valid_observation) == 1:
         observation = valid_observation[0]
         run.actions.append(f"observationUnit:{coefficient}->{observation}")
@@ -665,13 +720,17 @@ def _resolve_units(
         name
         for name in design_columns
         if name not in {coefficient, observation}
+        and name in run.profiles
         and _independent_is_coarser(
-            run.frame, observation=observation, independent=name
+            run.store,
+            cell_key=run.cell_key,
+            observation=observation,
+            independent=name,
         )
     ]
 
     if independent is not None:
-        if independent not in run.frame.columns:
+        if independent not in run.profiles:
             run.note(
                 kind="invalidIndependentUnit",
                 detail=f"Directed independent unit {independent!r} is missing",
@@ -680,7 +739,10 @@ def _resolve_units(
             )
             independent = None
         elif not _independent_is_coarser(
-            run.frame, observation=observation, independent=independent
+            run.store,
+            cell_key=run.cell_key,
+            observation=observation,
+            independent=independent,
         ):
             run.note(
                 kind="independentUnitFiner",
@@ -741,12 +803,12 @@ def _characterize_coefficient(
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
     record: dict[str, Any] = {
         "name": coefficient,
-        "kind": run.kinds[coefficient],
+        "kind": run.kind(coefficient),
         "observationUnit": observation_unit,
         "independentUnit": independent_unit,
         "scope": "unresolvedUnit",
     }
-    if observation_unit is None or observation_unit not in run.frame.columns:
+    if observation_unit is None or observation_unit not in run.profiles:
         run.note(
             kind="unresolvedUnit",
             detail=f"No usable observation unit for coefficient {coefficient}",
@@ -754,8 +816,12 @@ def _characterize_coefficient(
         )
         return record, None
 
-    grouped = run.frame.groupby(observation_unit, dropna=False)[coefficient]
-    if not bool(grouped.nunique(dropna=False).le(1).all()):
+    if not column_constant_within(
+        run.store.cells,
+        coefficient,
+        observation_unit,
+        cell_key=run.cell_key,
+    ):
         record["scope"] = "withinUnit"
         run.note(
             kind="withinUnit",
@@ -768,19 +834,18 @@ def _characterize_coefficient(
         )
         return record, None
 
-    record["scope"] = "betweenUnit"
     # Technically only columns constant inside the observation unit have a
     # well-defined design-table value; drop_duplicates would otherwise keep an
     # arbitrary cell row.
     unit_constant: list[str] = []
     for name in technical:
-        if name not in run.frame.columns:
+        if name not in run.profiles:
             continue
-        if bool(
-            run.frame.groupby(observation_unit, dropna=False)[name]
-            .nunique(dropna=False)
-            .le(1)
-            .all()
+        if column_constant_within(
+            run.store.cells,
+            name,
+            observation_unit,
+            cell_key=run.cell_key,
         ):
             unit_constant.append(name)
             continue
@@ -796,9 +861,10 @@ def _characterize_coefficient(
         )
 
     group_cols = [observation_unit]
-    if independent_unit is not None and independent_unit in run.frame.columns:
+    if independent_unit is not None and independent_unit in run.profiles:
         if _independent_is_coarser(
-            run.frame,
+            run.store,
+            cell_key=run.cell_key,
             observation=observation_unit,
             independent=independent_unit,
         ):
@@ -818,20 +884,38 @@ def _characterize_coefficient(
             independent_unit = None
             record["independentUnit"] = None
     columns = list(dict.fromkeys([*group_cols, coefficient, *unit_constant]))
-    design = (
-        run.frame.loc[:, columns]
-        .drop_duplicates(subset=group_cols)
-        .reset_index(drop=True)
+    design = reduce_observation_units(
+        run.store.cells,
+        observation_unit,
+        columns,
+        cell_key=run.cell_key,
     )
-    record["designRows"] = int(len(design))
+    design_rows = int(len(design))
+    if not (2 <= design_rows < run.n_rows):
+        run.note(
+            kind="invalidObservationUnit",
+            detail=(
+                f"Observation unit {observation_unit!r} yields {design_rows} "
+                f"design rows for {coefficient}; need at least 2 and fewer "
+                f"than {run.n_rows} active cells"
+            ),
+            column=coefficient,
+            observationUnit=observation_unit,
+            designRows=design_rows,
+        )
+        record["scope"] = "unresolvedUnit"
+        return record, None
+
+    record["scope"] = "betweenUnit"
+    record["designRows"] = design_rows
 
     report = report_confounding(
         design,
         coefficient=coefficient,
         technicalColumns=unit_constant,
         columnKinds={
-            coefficient: run.kinds[coefficient],
-            **{name: run.kinds[name] for name in unit_constant},
+            coefficient: run.kind(coefficient),
+            **{name: run.kind(name) for name in unit_constant},
         },
         associationFloor=_ASSOCIATION_FLOOR,
     )
@@ -872,6 +956,33 @@ def _characterize_coefficients(
     return records, reports
 
 
+def _technical_nesting_reports(
+    store: Any,
+    names: Sequence[str],
+    *,
+    cell_key: str,
+) -> list[dict[str, Any]]:
+    """Directional nesting among categorical technical columns without bulk fetch."""
+    name_list = list(names)
+    reports: list[dict[str, Any]] = []
+    for index, left_name in enumerate(name_list):
+        left_values = store.cells.fetch(left_name, key=cell_key)
+        for right_name in name_list[index + 1 :]:
+            right_values = store.cells.fetch(right_name, key=cell_key)
+            mapping = directional_mapping(left_values, right_values)
+            if mapping["nesting"] == "none":
+                continue
+            reports.append(
+                {
+                    "left": left_name,
+                    "right": right_name,
+                    "nesting": mapping["nesting"],
+                    "directionalMapping": mapping,
+                }
+            )
+    return reports
+
+
 def _column_records(
     run: _Run,
     candidates: Sequence[str],
@@ -882,7 +993,7 @@ def _column_records(
     records = [
         {
             "name": name,
-            "kind": run.kinds[name],
+            "kind": run.kind(name),
             "domain": run.domains[name],
             "summary": run.summary(name),
             "aliases": list(aliases.get(name, [])),
@@ -927,22 +1038,44 @@ def characterize_covariates(
         cell_key=cellKey,
         exclude=set(direction_map.get("excludeColumns") or []),
     )
-    frame = store.cells.to_pandas_dataframe([*candidates, cellKey], key=cellKey)
     reviewed = len(candidates) + len(dropped)
-    candidates = [name for name in candidates if name in frame.columns]
-    # Single-level columns are not covariates. Leaving them in creates spurious
-    # "perfect confounding" among every pair of constants.
+    candidates = [name for name in candidates if name in store.cells.columns]
+    kind_directions = dict(direction_map.get("columnKinds") or {})
     directed_coefficients = set(direction_map.get("coefficientsOfInterest") or [])
+
+    profiles: dict[str, _ColumnProfile] = {}
+    n_rows = 0
     varying: list[str] = []
     for name in candidates:
-        if int(frame[name].nunique(dropna=False)) <= 1:
+        directed_kind = kind_directions.get(name)
+        profile = _profile_column(
+            store,
+            name,
+            cell_key=cellKey,
+            kind=cast(ColumnKind, directed_kind) if directed_kind in _KINDS else None,
+        )
+        profiles[name] = profile
+        n_rows = profile.digest.nRows
+        if profile.digest.nLevels <= 1:
             dropped.append((name, "dropConstant"))
             continue
         varying.append(name)
     candidates = varying
-    candidates, aliases, alias_notes = _collapse_ontology_aliases(candidates, frame)
+    candidates, aliases, alias_notes = _collapse_ontology_aliases(
+        store,
+        candidates,
+        profiles,
+        cell_key=cellKey,
+    )
 
-    run = _Run(frame=frame, context=_bounded_context(studyContext), model=model)
+    run = _Run(
+        store=store,
+        cell_key=cellKey,
+        n_rows=n_rows,
+        context=_bounded_context(studyContext),
+        model=model,
+        profiles=profiles,
+    )
     for name, reason in dropped:
         detail = f"Dropped {_DROP_REASONS[reason]} {name}"
         if reason == "dropConstant" and name in directed_coefficients:
@@ -956,12 +1089,7 @@ def characterize_covariates(
         )
     run.audit.extend(alias_notes)
 
-    kind_directions = dict(direction_map.get("columnKinds") or {})
     domain_directions = dict(direction_map.get("columnDomains") or {})
-    for name in candidates:
-        run.kinds[name] = kind_directions.get(name) or _infer_kind(
-            frame[name].to_numpy()
-        )
     for name in candidates:
         run.domains[name] = _assign_domain(run, name, domain_directions)
     candidates = _collapse_equivalent_columns(run, candidates, aliases)
@@ -982,11 +1110,9 @@ def characterize_covariates(
         technical=technical,
     )
 
-    categorical_technical = {
-        name: frame[name].to_numpy()
-        for name in technical
-        if run.kinds[name] == "categorical"
-    }
+    categorical_technical = [
+        name for name in technical if run.kind(name) == "categorical"
+    ]
     return CovariateCharacterization(
         status="done",
         auditLog=run.audit,
@@ -999,7 +1125,11 @@ def characterize_covariates(
         columns=_column_records(run, candidates, aliases=aliases, dropped=dropped),
         coefficients=records,
         technicalNesting=(
-            report_technical_nesting(categorical_technical)
+            _technical_nesting_reports(
+                store,
+                categorical_technical,
+                cell_key=cellKey,
+            )
             if len(categorical_technical) >= 2
             else []
         ),
