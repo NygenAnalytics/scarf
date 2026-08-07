@@ -36,7 +36,21 @@ from ...features.markers.table import (
     _validate_marker_slot,
     load_marker_table,
 )
-from ...metadata.arguments import AucellArguments, MarkerTableArguments, WaggrArguments
+from ...features.statistical import (
+    DUNN_COLUMNS,
+    KRUSKAL_WALLIS_COLUMNS,
+    MANN_WHITNEY_COLUMNS,
+    StatisticalTestResult,
+    WILCOXON_COLUMNS,
+    adjust_pvalues,
+    compare_group_distributions,
+)
+from ...metadata.arguments import (
+    AucellArguments,
+    MarkerTableArguments,
+    StatisticalTestingArguments,
+    WaggrArguments,
+)
 from ...metadata.artifacts import (
     categorical_display,
     feature_column_display,
@@ -61,11 +75,53 @@ from .enrichment_store import (
 
 if TYPE_CHECKING:
     from ..mapping_datastore import MappingDatastore as _FeatureOperationsBase
+    from ...plotting._contracts import (
+        CellField as CellField,
+        FeatureRef as FeatureRef,
+        NormalizationSpec as NormalizationSpec,
+        StudyDesign as StudyDesign,
+    )
 else:
     _FeatureOperationsBase = object
 
 _MARKER_STAT_COLUMNS = MARKER_STAT_COLUMNS
 _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
+
+
+def _statistical_storage_columns(
+    method: str,
+    posthoc: str | None,
+) -> tuple[str, ...]:
+    """Persisted columns for a statistical test layout, including adjustment."""
+    base: tuple[str, ...]
+    if method == "mann_whitney":
+        base = MANN_WHITNEY_COLUMNS
+    elif method == "wilcoxon":
+        base = WILCOXON_COLUMNS
+    elif posthoc == "dunn":
+        base = DUNN_COLUMNS
+    else:
+        base = KRUSKAL_WALLIS_COLUMNS
+    return (*base, "p_value_adjusted")
+
+
+def _native_artifact_value(value: Any) -> Any:
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _resolve_assay_and_cell_key(
+    store: Any,
+    from_assay: str | None,
+    cell_key: str | None,
+) -> tuple[str, str]:
+    """Resolve assay and cell key without requiring a feature key."""
+    if from_assay is None:
+        from_assay = store._defaultAssay
+    if from_assay is None:
+        raise ValueError("No default assay is configured")
+    if cell_key is None:
+        cell_key = store._get_latest_cell_key(from_assay)
+    return from_assay, cell_key
 
 
 def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray:
@@ -1851,3 +1907,598 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             fracs_df.set_index(vals_df.index, inplace=True, drop=True)
             return vals_df, fracs_df
         return vals_df
+
+    def run_statistical_testing(
+        self,
+        keys: ("str | CellField | FeatureRef | Sequence[str | CellField | FeatureRef]"),
+        *,
+        group_by: str,
+        groups: Sequence[Any] | None = None,
+        comparisons: Sequence[tuple[Any, Any]] | None = None,
+        test: Literal["auto", "mann_whitney", "kruskal_wallis", "wilcoxon"] = "auto",
+        posthoc: Literal["dunn"] | None = None,
+        adjustment: Literal["fdr_bh", "bonferroni", "holm", "none"] = "fdr_bh",
+        sample_by: str | None = None,
+        study_design: "StudyDesign | None" = None,
+        pair_by: str | None = None,
+        sample_stat: Literal["mean", "median", "fraction"] = "mean",
+        expression_cutoff: float = 0.0,
+        subset_by: str | None = None,
+        cell_key: str | None = "I",
+        from_assay: str | None = None,
+        normalization: "NormalizationSpec | None" = None,
+        skip_save: bool = False,
+        invalidate_cache: bool = False,
+    ) -> "StatisticalTestResult":
+        """Run statistical tests on values grouped by a categorical column.
+
+        This mirrors the inputs of ``distribution`` so results can be compared
+        directly against violin or box plots. ``keys`` may be cell-metadata
+        columns or feature names. The chosen test follows the single-cell
+        conventions for zero-inflated, non-normal values:
+
+        - ``"mann_whitney"``: two independent groups (two-sided, tie and
+          continuity corrected, matching the marker-search statistic).
+        - ``"kruskal_wallis"``: three or more groups, with optional
+          ``posthoc="dunn"`` for pairwise significance.
+        - ``"wilcoxon"``: paired samples on aggregated (pseudobulk) data.
+          Requires ``sample_by`` and ``pair_by``.
+
+        With ``test="auto"`` the test is chosen from the design: paired data
+        uses Wilcoxon, two groups use Mann-Whitney, and three or more use
+        Kruskal-Wallis. ``groups`` restricts the group set; ``comparisons``
+        restricts pairwise rows to the listed group pairs. When multiple keys
+        are tested, ``adjustment`` corrects p-values across all keys and
+        comparison rows in one pass (default ``"fdr_bh"``).
+
+        Results are persisted as an immutable artifact under
+        ``statistical_tests`` unless ``skip_save`` is ``True``. Use
+        ``get_statistical_tests`` to read them back.
+
+        Args:
+            keys: Feature names or cell-metadata columns to test.
+            group_by: Cell metadata column that groups the cells.
+            groups: Keep and order only these ``group_by`` categories.
+            comparisons: Restrict pairwise comparisons to these group pairs.
+            test: Statistical test, or ``"auto"`` to pick from the design.
+            posthoc: Pairwise test to run after Kruskal-Wallis (``"dunn"``).
+            adjustment: Multiple-testing correction across keys and rows.
+            sample_by: Cell metadata column identifying biological samples.
+            study_design: Study design supplying ``sample_by`` and ``pair_by``.
+            pair_by: Cell metadata column identifying subjects or donors for
+                paired tests.
+            sample_stat: Aggregation across cells within a sample.
+            expression_cutoff: Detection cutoff for ``sample_stat="fraction"``.
+            subset_by: Boolean metadata column keeping only ``True`` cells.
+            cell_key: Boolean column selecting cells (default ``"I"``).
+            from_assay: Assay to read feature values from.
+            normalization: How feature values are read.
+            skip_save: Return results without writing to Zarr.
+            invalidate_cache: Recompute even when a matching artifact exists.
+
+        Returns:
+            A :class:`~scarf.features.statistical.StatisticalTestResult`.
+        """
+        from ...plotting._contracts import (
+            CellField,
+            FeatureRef,
+            NormalizationSpec,
+        )
+        from ...plotting._data import (
+            fetch_normalized_feature_matrix,
+            resolve_cell_selection,
+            resolve_feature,
+        )
+
+        if group_by is None:
+            raise ValueError(
+                "ERROR: Please provide a value for group_by. This should be the "
+                "name of a cell metadata column that groups the cells."
+            )
+        if adjustment not in ("fdr_bh", "bonferroni", "holm", "none"):
+            raise ValueError(
+                "adjustment must be 'fdr_bh', 'bonferroni', 'holm', or 'none'"
+            )
+        if posthoc not in (None, "dunn"):
+            raise ValueError("posthoc must be 'dunn' or None")
+        if sample_stat not in ("mean", "median", "fraction"):
+            raise ValueError("sample_stat must be 'mean', 'median', or 'fraction'")
+        if test not in ("auto", "mann_whitney", "kruskal_wallis", "wilcoxon"):
+            raise ValueError(
+                "test must be 'auto', 'mann_whitney', 'kruskal_wallis', or 'wilcoxon'"
+            )
+        normalization = normalization or NormalizationSpec()
+        if study_design is not None:
+            if sample_by is not None and sample_by != study_design.sample_by:
+                raise ValueError("sample_by conflicts with study_design.sample_by")
+            sample_by = study_design.sample_by
+            if pair_by is None:
+                pair_by = study_design.subject_by or study_design.pair_by
+        if comparisons is not None and not comparisons:
+            raise ValueError("comparisons must be non-empty when provided")
+
+        from_assay, cell_key = _resolve_assay_and_cell_key(
+            self,
+            from_assay,
+            cell_key,
+        )
+        assay = self._get_assay(from_assay)
+        if isinstance(keys, (str, CellField, FeatureRef)):
+            key_list: list[str | CellField | FeatureRef] = [keys]
+        else:
+            key_list = list(keys)
+        if not key_list:
+            raise ValueError("keys must be non-empty")
+
+        cell_columns = set(self.cells.columns)
+        cell_idx = self.cells.active_index(cell_key)
+        groups_arr = np.asarray(self.cells.fetch(group_by, key=cell_key))
+        sample_arr = (
+            np.asarray(self.cells.fetch(sample_by, key=cell_key))
+            if sample_by is not None
+            else None
+        )
+        pair_arr = (
+            np.asarray(self.cells.fetch(pair_by, key=cell_key))
+            if pair_by is not None
+            else None
+        )
+        subset_vals = (
+            np.asarray(self.cells.fetch(subset_by, key=cell_key))
+            if subset_by is not None
+            else None
+        )
+
+        selection_mask, group_order = resolve_cell_selection(
+            len(groups_arr),
+            subset=subset_vals,
+            subset_name=subset_by,
+            category_values=groups_arr,
+            groups=groups,
+        )
+        if sample_arr is not None:
+            valid_sample = pd.notna(sample_arr) & (
+                np.asarray(sample_arr, dtype=str) != ""
+            )
+            selection_mask &= valid_sample
+        if pair_arr is not None:
+            valid_pair = pd.notna(pair_arr) & (np.asarray(pair_arr, dtype=str) != "")
+            selection_mask &= valid_pair
+        if not selection_mask.any():
+            raise ValueError("No cells remain after statistical-testing selections")
+
+        series_list: list[tuple[np.ndarray, str]] = []
+        for key in key_list:
+            if isinstance(key, FeatureRef) or (
+                isinstance(key, str) and key not in cell_columns
+            ):
+                resolved = resolve_feature(self, key, from_assay=from_assay)
+                values = fetch_normalized_feature_matrix(
+                    self,
+                    [resolved],
+                    cell_idx,
+                    normalization,
+                )[:, 0]
+                label = resolved.label
+            else:
+                column = key.key if isinstance(key, CellField) else key
+                values = np.asarray(
+                    self.cells.fetch(column, key=cell_key),
+                    dtype=np.float64,
+                )
+                label = (
+                    key.label if isinstance(key, CellField) and key.label else column
+                )
+            series_list.append((values, label))
+
+        series_list = [
+            (np.asarray(vals)[selection_mask], label) for vals, label in series_list
+        ]
+        groups_arr = groups_arr[selection_mask]
+        if sample_arr is not None:
+            sample_arr = sample_arr[selection_mask]
+        if pair_arr is not None:
+            pair_arr = pair_arr[selection_mask]
+        n = int(selection_mask.sum())
+        n_groups = len(group_order or [])
+
+        labels = [label for _, label in series_list]
+        panel_keys: list[Any]
+        if len(set(labels)) != len(labels):
+            panel_keys = list(range(len(labels)))
+        else:
+            panel_keys = labels
+        key_labels = [str(key) for key in panel_keys]
+
+        if test == "auto":
+            if pair_arr is not None:
+                effective_method = "wilcoxon"
+            elif n_groups == 2:
+                effective_method = "mann_whitney"
+            else:
+                effective_method = "kruskal_wallis"
+        else:
+            effective_method = test
+        if posthoc == "dunn" and effective_method != "kruskal_wallis":
+            raise ValueError("posthoc='dunn' requires test='kruskal_wallis'")
+
+        tables: dict[str, pd.DataFrame] = {}
+        for key_label, (values, _label) in zip(key_labels, series_list, strict=True):
+            tables[key_label] = compare_group_distributions(
+                values,
+                groups_arr,
+                test=effective_method,
+                posthoc=posthoc,
+                adjustment="none",
+                samples=sample_arr,
+                pairs=pair_arr,
+                comparisons=comparisons,
+                sample_stat=sample_stat,
+                expression_cutoff=expression_cutoff,
+            )
+
+        all_p_values = np.concatenate(
+            [
+                table["p_value"].to_numpy(dtype=np.float64, copy=False)
+                for table in tables.values()
+            ]
+        )
+        adjusted = adjust_pvalues(all_p_values, adjustment)
+        offset = 0
+        adjusted_tables: dict[str, pd.DataFrame] = {}
+        for key_label, table in tables.items():
+            frame = table.copy()
+            n_rows = len(frame)
+            frame["p_value_adjusted"] = adjusted[offset : offset + n_rows]
+            offset += n_rows
+            adjusted_tables[key_label] = frame
+        tables = adjusted_tables
+
+        result = StatisticalTestResult(
+            method=effective_method,
+            posthoc=posthoc,
+            adjustment_method=adjustment,
+            group_key=group_by,
+            cell_key=cell_key,
+            sample_by=sample_by,
+            pair_by=pair_by,
+            sample_stat=sample_stat,
+            expression_cutoff=expression_cutoff,
+            n_groups=n_groups,
+            n_cells=n,
+            tables=tables,
+        )
+
+        if not skip_save:
+            assay_grp = as_zarr_group(self.zw[from_assay], name=from_assay)
+            if "statistical_tests" not in assay_grp:
+                assay_grp.create_group("statistical_tests")
+            stats_grp = as_zarr_group(
+                assay_grp["statistical_tests"],
+                name="statistical_tests",
+            )
+            cell_selection = self._ensure_cell_selection(cell_key)
+            group_input = self._resolve_cell_data_provenance_input(
+                group_by,
+                cell_key=cell_key,
+            )
+            slot_name = f"{cell_key}__{group_by}__{effective_method}"
+            if posthoc is not None:
+                slot_name += f"__{posthoc}"
+            native_groups = (
+                tuple(_native_artifact_value(value) for value in groups)
+                if groups is not None
+                else None
+            )
+            native_comparisons = (
+                tuple(
+                    (
+                        _native_artifact_value(left),
+                        _native_artifact_value(right),
+                    )
+                    for left, right in comparisons
+                )
+                if comparisons is not None
+                else None
+            )
+            expected_stat_columns = _statistical_storage_columns(
+                effective_method,
+                posthoc,
+            )
+            arguments = StatisticalTestingArguments(
+                cell_selection=cell_selection,
+                group_labels=group_input,
+                normalization_method=callable_identity(assay.normMethod),
+                size_factor=getattr(assay, "sf", None),
+                method=effective_method,
+                posthoc=posthoc,
+                adjustment_method=adjustment,
+                sample_stat=sample_stat,
+                expression_cutoff=expression_cutoff,
+                groups=native_groups,
+                comparisons=native_comparisons,
+                sample_by=sample_by,
+                pair_by=pair_by,
+                normalization={
+                    "source": normalization.source,
+                    "transform": normalization.transform,
+                },
+                n_groups=n_groups,
+                n_cells=n,
+                from_assay=from_assay,
+                cell_key=cell_key,
+                group_key=group_by,
+                key_labels=tuple(key_labels),
+                invalidate_cache=invalidate_cache,
+            )
+
+            def statistical_reuse_is_valid(
+                _ref: ArtifactRef,
+                candidate: zarr.Group,
+            ) -> bool:
+                try:
+                    if candidate.attrs.get("key_labels") != list(key_labels):
+                        return False
+                    if candidate.attrs.get("method") != effective_method:
+                        return False
+                    if candidate.attrs.get("posthoc") != posthoc:
+                        return False
+                    if candidate.attrs.get("adjustment_method") != adjustment:
+                        return False
+                    if candidate.attrs.get("n_groups") != n_groups:
+                        return False
+                    if candidate.attrs.get("n_cells") != n:
+                        return False
+                    if candidate.attrs.get("stat_columns") != list(
+                        expected_stat_columns
+                    ):
+                        return False
+                    numeric_columns = [
+                        column
+                        for column in expected_stat_columns
+                        if column not in ("group_1", "group_2")
+                    ]
+                    for idx in range(len(key_labels)):
+                        key_group = as_zarr_group(
+                            candidate[str(idx)],
+                            name=str(idx),
+                        )
+                        stats = np.asarray(
+                            as_zarr_array(
+                                key_group["stats"],
+                                name="stats",
+                            )[:]
+                        )
+                        if stats.ndim != 2 or stats.shape[1] != len(numeric_columns):
+                            return False
+                except (KeyError, TypeError, ValueError, IndexError):
+                    return False
+                return True
+
+            planned = arguments.plan(
+                self.zw,
+                scope="assay",
+                assay=from_assay,
+                invalidate_cache=invalidate_cache,
+                required_arrays=(),
+                required_attributes=(
+                    AttributeRequirement(
+                        "stat_columns",
+                        expected_types=(list, tuple),
+                    ),
+                ),
+                reuse_validator=statistical_reuse_is_valid,
+            )
+
+            def select_statistical_artifact(ref: ArtifactRef) -> None:
+                raw_artifacts = stats_grp.attrs.get("artifacts", {})
+                if "artifacts" in stats_grp.attrs and not isinstance(
+                    raw_artifacts,
+                    dict,
+                ):
+                    raise RuntimeError("Statistical test artifact index is invalid")
+                artifacts = (
+                    dict(raw_artifacts) if isinstance(raw_artifacts, dict) else {}
+                )
+                artifacts[slot_name] = ref.to_dict()
+                stats_grp.attrs["artifacts"] = artifacts
+
+            if planned.reused:
+                select_statistical_artifact(planned.ref)
+                return result
+
+            remote_slot = start_artifact(self.zw, planned)
+            self._write_statistical_slot(remote_slot, result, key_labels=key_labels)
+            finish_artifact(remote_slot, planned)
+            select_statistical_artifact(planned.ref)
+            logger.info(
+                f"Stored statistical test results ({effective_method}) for "
+                f"{len(key_labels)} keys"
+            )
+        return result
+
+    @staticmethod
+    def _write_statistical_slot(
+        group: zarr.Group,
+        result: StatisticalTestResult,
+        *,
+        key_labels: list[str],
+    ) -> None:
+        from ...storage.arrays import create_metadata_column, create_zarr_dataset
+
+        storage_columns = _statistical_storage_columns(result.method, result.posthoc)
+        string_columns = [
+            column for column in storage_columns if column in ("group_1", "group_2")
+        ]
+        numeric_columns = [
+            column for column in storage_columns if column not in string_columns
+        ]
+        group.attrs["stat_columns"] = list(storage_columns)
+        group.attrs["method"] = result.method
+        group.attrs["posthoc"] = result.posthoc
+        group.attrs["adjustment_method"] = result.adjustment_method
+        group.attrs["group_by"] = result.group_key
+        group.attrs["sample_by"] = result.sample_by
+        group.attrs["pair_by"] = result.pair_by
+        group.attrs["sample_stat"] = result.sample_stat
+        group.attrs["expression_cutoff"] = result.expression_cutoff
+        group.attrs["n_groups"] = result.n_groups
+        group.attrs["n_cells"] = result.n_cells
+        group.attrs["key_labels"] = list(key_labels)
+
+        for idx, key_label in enumerate(key_labels):
+            table = result.tables[key_label]
+            key_group = group.create_group(str(idx))
+            key_group.attrs["key_label"] = key_label
+            key_group.attrs["key_index"] = idx
+            numeric = np.asarray(
+                table.loc[:, numeric_columns].to_numpy(dtype=np.float64)
+            )
+            if numeric.ndim == 1:
+                numeric = numeric.reshape(-1, 1)
+            if not np.isfinite(numeric).all():
+                raise ValueError("Statistical test results must all be finite")
+            stats = create_zarr_dataset(
+                key_group,
+                "stats",
+                (int(numeric.shape[0]), int(numeric.shape[1])),
+                "float64",
+                (int(numeric.shape[0]), int(numeric.shape[1])),
+            )
+            stats[:] = numeric
+            for column in string_columns:
+                create_metadata_column(
+                    key_group,
+                    column,
+                    data=list(table[column].astype(str)),
+                )
+
+    def _resolve_statistical_slot(
+        self,
+        from_assay: str | None,
+        cell_key: str,
+        group_key: str,
+        method: str,
+        posthoc: str | None,
+    ) -> zarr.Group:
+        assay = self._get_assay(from_assay)
+        if "statistical_tests" not in assay.z:
+            raise KeyError(
+                "ERROR: Couldn't find statistical test results. Make sure "
+                "`run_statistical_testing` was called with the same `cell_key`, "
+                "`group_key`, and `test` method."
+            )
+        stats_grp = as_zarr_group(
+            assay.z["statistical_tests"],
+            name="statistical_tests",
+        )
+        slot_name = f"{cell_key}__{group_key}__{method}"
+        if posthoc is not None:
+            slot_name += f"__{posthoc}"
+        raw_artifacts = stats_grp.attrs.get("artifacts", {})
+        if "artifacts" in stats_grp.attrs and not isinstance(raw_artifacts, dict):
+            raise ValueError("Statistical test artifact index is invalid")
+        artifacts = dict(raw_artifacts) if isinstance(raw_artifacts, dict) else {}
+        if slot_name not in artifacts:
+            raise KeyError(
+                "ERROR: Couldn't find statistical test results. Make sure "
+                "`run_statistical_testing` was called with the same `cell_key`, "
+                "`group_key`, and `test` method."
+            )
+        ref = ArtifactRef.from_dict(artifacts[slot_name])
+        path = artifact_path(ref)
+        if path not in self.zw:
+            raise KeyError(
+                f"Statistical test artifact is missing at {path}; "
+                "the store may have been modified"
+            )
+        return as_zarr_group(self.zw[path], name=path)
+
+    @staticmethod
+    def _read_statistical_slot(
+        slot_group: zarr.Group,
+        *,
+        cell_key: str,
+    ) -> StatisticalTestResult:
+        method = slot_group.attrs.get("method")
+        posthoc = slot_group.attrs.get("posthoc")
+        storage_columns = _statistical_storage_columns(method, posthoc)
+        string_columns = [
+            column for column in storage_columns if column in ("group_1", "group_2")
+        ]
+        numeric_columns = [
+            column for column in storage_columns if column not in string_columns
+        ]
+        key_labels = slot_group.attrs.get("key_labels", [])
+        tables: dict[str, pd.DataFrame] = {}
+        for idx, key_label in enumerate(key_labels):
+            key_group = as_zarr_group(slot_group[str(idx)], name=str(idx))
+            stats = np.asarray(as_zarr_array(key_group["stats"], name="stats")[:])
+            frame = pd.DataFrame(stats, columns=numeric_columns)
+            for column in string_columns:
+                raw = np.asarray(as_zarr_array(key_group[column], name=column)[:])
+                if raw.dtype.kind == "S":
+                    raw = np.char.decode(raw, "utf-8")
+                frame[column] = np.asarray(raw, dtype=object)
+            frame = frame.loc[:, list(storage_columns)]
+            tables[str(key_label)] = frame
+        return StatisticalTestResult(
+            method=str(method),
+            posthoc=posthoc,
+            adjustment_method=str(slot_group.attrs.get("adjustment_method")),
+            group_key=str(slot_group.attrs.get("group_by")),
+            cell_key=cell_key,
+            sample_by=slot_group.attrs.get("sample_by"),
+            pair_by=slot_group.attrs.get("pair_by"),
+            sample_stat=str(slot_group.attrs.get("sample_stat", "mean")),
+            expression_cutoff=float(slot_group.attrs.get("expression_cutoff", 0.0)),
+            n_groups=int(slot_group.attrs.get("n_groups", 0)),
+            n_cells=int(slot_group.attrs.get("n_cells", 0)),
+            tables=tables,
+        )
+
+    def get_statistical_tests(
+        self,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        group_key: str | None = None,
+        method: str | None = None,
+        posthoc: str | None = None,
+    ) -> StatisticalTestResult:
+        """Return statistical test results from `run_statistical_testing`.
+
+        Args:
+            from_assay: Name of the assay used when the results were stored.
+            cell_key: Cell key used when the results were stored.
+            group_key: Grouping column used when the results were stored.
+            method: Test method used when the results were stored
+                (``"mann_whitney"``, ``"kruskal_wallis"``, or ``"wilcoxon"``).
+            posthoc: Post-hoc test used when the results were stored.
+
+        Returns:
+            A :class:`~scarf.features.statistical.StatisticalTestResult`.
+        """
+        if cell_key is None:
+            from_assay, cell_key = _resolve_assay_and_cell_key(
+                self,
+                from_assay,
+                cell_key,
+            )
+        if group_key is None:
+            raise ValueError(
+                "ERROR: Please provide a value for group_key. This should be "
+                "the same value used for `run_statistical_testing`"
+            )
+        if method is None:
+            raise ValueError(
+                "ERROR: Please provide the statistical test method used in "
+                "`run_statistical_testing`"
+            )
+        slot_group = self._resolve_statistical_slot(
+            from_assay,
+            cell_key,
+            group_key,
+            method,
+            posthoc,
+        )
+        return self._read_statistical_slot(slot_group, cell_key=cell_key)

@@ -23,6 +23,12 @@ if TYPE_CHECKING:
         sort_marker_results as sort_marker_results,
     )
     from .scoring import binned_sampling as binned_sampling
+    from .statistical import (
+        StatisticalTestResult as StatisticalTestResult,
+        adjust_pvalues as adjust_pvalues,
+        aggregate_samples as aggregate_samples,
+        compare_group_distributions as compare_group_distributions,
+    )
     from .variability import (
         fit_lowess as fit_lowess,
         select_highly_variable_features as select_highly_variable_features,
@@ -31,9 +37,13 @@ if TYPE_CHECKING:
 __all__ = [
     "EnrichmentResult",
     "GffReader",
+    "StatisticalTestResult",
+    "adjust_pvalues",
+    "aggregate_samples",
     "binary_search",
     "binned_sampling",
     "coordinate_melding",
+    "compare_group_distributions",
     "create_bed_from_coord_ids",
     "create_counts_mat",
     "find_markers_by_rank",
@@ -51,9 +61,16 @@ __all__ = [
 _LAZY_EXPORTS = {
     "EnrichmentResult": (".enrichment", "EnrichmentResult"),
     "GffReader": (".genomic", "GffReader"),
+    "StatisticalTestResult": (".statistical", "StatisticalTestResult"),
+    "adjust_pvalues": (".statistical", "adjust_pvalues"),
+    "aggregate_samples": (".statistical", "aggregate_samples"),
     "binary_search": (".genomic", "binary_search"),
     "binned_sampling": (".scoring", "binned_sampling"),
     "coordinate_melding": (".genomic", "coordinate_melding"),
+    "compare_group_distributions": (
+        ".statistical",
+        "compare_group_distributions",
+    ),
     "create_bed_from_coord_ids": (".genomic", "create_bed_from_coord_ids"),
     "create_counts_mat": (".genomic", "create_counts_mat"),
     "find_markers_by_rank": (".markers", "find_markers_by_rank"),

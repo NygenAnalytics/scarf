@@ -1,0 +1,348 @@
+import numpy as np
+import pandas as pd
+import pytest
+from scipy.stats import kruskal
+from scipy.stats import mannwhitneyu as scipy_mannwhitneyu
+from scipy.stats import norm
+from scipy.stats import rankdata
+from scipy.stats import wilcoxon as scipy_wilcoxon
+from statsmodels.stats.multitest import multipletests
+
+from scarf.features.markers import mannwhitneyu_from_ranks
+from scarf.features.statistical import (
+    StatisticalTestResult,
+    adjust_pvalues,
+    aggregate_samples,
+    compare_group_distributions,
+)
+
+
+def _dunn_reference(values, groups):
+    """Independent Dunn's test reference using scipy rankdata and norm."""
+    values = np.asarray(values, dtype=np.float64)
+    groups = np.asarray(groups, dtype=object)
+    present = sorted(pd.unique(groups), key=str)
+    ranks = rankdata(values, method="average")
+    n_total = len(values)
+    _, counts = np.unique(values, return_counts=True)
+    tied = counts[counts > 1]
+    tie_correction = float(np.sum(tied**3 - tied)) if tied.size else 0.0
+    variance = (n_total * (n_total + 1)) / 12 - tie_correction / (12 * (n_total - 1))
+    rows = []
+    for idx, g1 in enumerate(present):
+        for g2 in present[idx + 1 :]:
+            rank_1 = float(np.mean(ranks[groups == g1]))
+            rank_2 = float(np.mean(ranks[groups == g2]))
+            n_1 = int((groups == g1).sum())
+            n_2 = int((groups == g2).sum())
+            standard_error = np.sqrt(variance * (1 / n_1 + 1 / n_2))
+            z = (rank_1 - rank_2) / standard_error if standard_error > 0 else 0.0
+            rows.append((g1, g2, float(z), float(2 * norm.sf(abs(z)))))
+    return pd.DataFrame(rows, columns=["group_1", "group_2", "z", "p_value"])
+
+
+def _seeded_groups(rng, n, n_groups):
+    return np.array([f"g{i % n_groups}" for i in range(n)], dtype=object)
+
+
+def test_mann_whitney_matches_scipy_and_marker_ranks():
+    rng = np.random.default_rng(11)
+    values = np.concatenate([rng.poisson(2, 60), rng.poisson(4, 60), np.zeros(20)])
+    groups = _seeded_groups(rng, 140, 2)
+    table = compare_group_distributions(values, groups, test="mann_whitney")
+    g1, g2 = table.loc[0, "group_1"], table.loc[0, "group_2"]
+    left = values[groups == g1]
+    right = values[groups == g2]
+    u_scipy, p_scipy = scipy_mannwhitneyu(
+        left,
+        right,
+        method="asymptotic",
+        alternative="two-sided",
+    )
+    assert table.loc[0, "n_1"] == len(left)
+    assert table.loc[0, "n_2"] == len(right)
+    assert np.isclose(table.loc[0, "u_statistic"], float(u_scipy))
+    assert np.isclose(table.loc[0, "p_value"], float(p_scipy))
+    assert np.isclose(table.loc[0, "mean_1"], float(np.mean(left)))
+    assert np.isclose(
+        table.loc[0, "mean_difference"],
+        float(np.mean(left) - np.mean(right)),
+    )
+    ranked = pd.DataFrame({"feature": pd.Series(values).rank(method="average")})
+    reference = mannwhitneyu_from_ranks(
+        ranked,
+        groups,
+        np.array([g1, g2], dtype=object),
+    )
+    assert np.isclose(table.loc[0, "p_value"], float(reference.loc[g1, "feature"]))
+
+
+def test_mann_whitney_requires_two_groups():
+    rng = np.random.default_rng(1)
+    values = rng.normal(size=90)
+    groups = _seeded_groups(rng, 90, 3)
+    with pytest.raises(ValueError, match="exactly two groups"):
+        compare_group_distributions(values, groups, test="mann_whitney")
+    two_groups = np.array(["g0", "g1"], dtype=object)
+    with pytest.raises(ValueError, match="at least two cells"):
+        compare_group_distributions(np.arange(2, dtype=float), two_groups)
+
+
+def test_kruskal_matches_scipy():
+    rng = np.random.default_rng(2)
+    values = np.concatenate(
+        [rng.normal(0, 1, 40), rng.normal(1, 1, 40), rng.normal(2, 1, 40)]
+    )
+    groups = _seeded_groups(rng, 120, 3)
+    table = compare_group_distributions(values, groups, test="kruskal_wallis")
+    expected_stat, expected_p = kruskal(
+        values[groups == "g0"],
+        values[groups == "g1"],
+        values[groups == "g2"],
+    )
+    assert np.isclose(table.loc[0, "kruskal_statistic"], float(expected_stat))
+    assert np.isclose(table.loc[0, "p_value"], float(expected_p))
+    assert table.loc[0, "df"] == 2
+
+
+def test_kruskal_handles_all_tied_values():
+    values = np.zeros(60)
+    groups = _seeded_groups(np.random.default_rng(0), 60, 3)
+    table = compare_group_distributions(values, groups, test="kruskal_wallis")
+    assert table.loc[0, "kruskal_statistic"] == 0.0
+    assert table.loc[0, "p_value"] == 1.0
+
+
+def test_kruskal_requires_three_groups():
+    rng = np.random.default_rng(3)
+    values = rng.normal(size=40)
+    groups = _seeded_groups(rng, 40, 2)
+    with pytest.raises(ValueError, match="at least three groups"):
+        compare_group_distributions(values, groups, test="kruskal_wallis")
+
+
+def test_dunn_posthoc_matches_reference():
+    rng = np.random.default_rng(4)
+    values = np.concatenate(
+        [
+            rng.normal(0, 1, 30),
+            rng.normal(0.8, 1, 30),
+            rng.normal(1.6, 1, 30),
+            rng.poisson(1, 15),
+        ]
+    )
+    groups = _seeded_groups(rng, 105, 4)
+    table = compare_group_distributions(
+        values,
+        groups,
+        test="kruskal_wallis",
+        posthoc="dunn",
+    )
+    reference = _dunn_reference(values, groups)
+    assert len(table) == 6
+    merged = table.merge(reference, on=["group_1", "group_2"], suffixes=("", "_ref"))
+    assert np.allclose(merged["z"], merged["z_ref"])
+    assert np.allclose(merged["p_value"], merged["p_value_ref"])
+
+
+def test_dunn_comparisons_restricts_pairs():
+    rng = np.random.default_rng(5)
+    values = rng.normal(size=90)
+    groups = _seeded_groups(rng, 90, 3)
+    table = compare_group_distributions(
+        values,
+        groups,
+        test="kruskal_wallis",
+        posthoc="dunn",
+        comparisons=[("g0", "g2")],
+    )
+    assert list(table["group_1"]) == ["g0"]
+    assert list(table["group_2"]) == ["g2"]
+    reference = _dunn_reference(values, groups)
+    expected = reference[
+        (reference["group_1"] == "g0") & (reference["group_2"] == "g2")
+    ]
+    assert np.isclose(table.loc[0, "z"], expected["z"].iloc[0])
+
+
+def test_dunn_comparisons_missing_group_raises():
+    rng = np.random.default_rng(6)
+    values = rng.normal(size=90)
+    groups = _seeded_groups(rng, 90, 3)
+    with pytest.raises(ValueError, match="not present in the data"):
+        compare_group_distributions(
+            values,
+            groups,
+            test="kruskal_wallis",
+            posthoc="dunn",
+            comparisons=[("g0", "missing")],
+        )
+
+
+def test_wilcoxon_matches_scipy_on_aggregated_pairs():
+    rng = np.random.default_rng(7)
+    n = 120
+    values = np.concatenate([rng.normal(0, 1, n // 2), rng.normal(1.2, 1, n // 2)])
+    groups = np.array(["a"] * (n // 2) + ["b"] * (n // 2), dtype=object)
+    samples = np.array([f"s{i % 8}" for i in range(n)], dtype=object)
+    pairs = np.array([f"d{i % 4}" for i in range(n)], dtype=object)
+    table = compare_group_distributions(
+        values,
+        groups,
+        test="wilcoxon",
+        samples=samples,
+        pairs=pairs,
+    )
+    aggregated = aggregate_samples(
+        values,
+        groups,
+        samples,
+        pairs=pairs,
+    )
+    left = aggregated[aggregated["group"] == "a"]
+    right = aggregated[aggregated["group"] == "b"]
+    merged = left.merge(right, on="pair")
+    stat, p = scipy_wilcoxon(
+        merged["value_x"].to_numpy(),
+        merged["value_y"].to_numpy(),
+    )
+    assert table.loc[0, "n_pairs"] == len(merged)
+    assert np.isclose(table.loc[0, "statistic"], float(stat))
+    assert np.isclose(table.loc[0, "p_value"], float(p))
+
+
+def test_wilcoxon_requires_samples_and_pairs():
+    rng = np.random.default_rng(8)
+    values = rng.normal(size=40)
+    groups = _seeded_groups(rng, 40, 2)
+    with pytest.raises(ValueError, match="requires sample aggregation"):
+        compare_group_distributions(values, groups, test="wilcoxon")
+    samples = np.array([f"s{i % 4}" for i in range(40)], dtype=object)
+    with pytest.raises(ValueError, match="requires sample aggregation"):
+        compare_group_distributions(
+            values,
+            groups,
+            test="wilcoxon",
+            samples=samples,
+        )
+
+
+def test_pairs_require_samples():
+    rng = np.random.default_rng(9)
+    values = rng.normal(size=40)
+    groups = _seeded_groups(rng, 40, 2)
+    pairs = np.array([f"d{i % 4}" for i in range(40)], dtype=object)
+    with pytest.raises(ValueError, match="pairs requires samples"):
+        compare_group_distributions(values, groups, samples=None, pairs=pairs)
+
+
+def test_aggregate_samples_semantics():
+    rng = np.random.default_rng(10)
+    n = 32
+    values = rng.poisson(3, n).astype(float)
+    groups = np.array([f"g{i % 2}" for i in range(n)], dtype=object)
+    samples = np.array([f"s{i // 4}" for i in range(n)], dtype=object)
+    mean_frame = aggregate_samples(values, groups, samples, sample_stat="mean")
+    median_frame = aggregate_samples(values, groups, samples, sample_stat="median")
+    frac_frame = aggregate_samples(
+        values,
+        groups,
+        samples,
+        sample_stat="fraction",
+        expression_cutoff=1.0,
+    )
+    assert len(mean_frame) == 16
+    for _, row in mean_frame.iterrows():
+        cells = values[(groups == row["group"]) & (samples == row["sample"])]
+        assert np.isclose(row["value"], float(np.mean(cells)))
+    for _, row in median_frame.iterrows():
+        cells = values[(groups == row["group"]) & (samples == row["sample"])]
+        assert np.isclose(row["value"], float(np.median(cells)))
+    for _, row in frac_frame.iterrows():
+        cells = values[(groups == row["group"]) & (samples == row["sample"])]
+        assert np.isclose(row["value"], float(np.mean(cells > 1.0)))
+
+
+def test_aggregate_samples_rejects_multiple_pairs_per_sample():
+    rng = np.random.default_rng(12)
+    n = 40
+    values = rng.normal(size=n)
+    groups = _seeded_groups(rng, n, 2)
+    samples = np.array([f"s{i % 4}" for i in range(n)], dtype=object)
+    pairs = np.array([f"d{i % 8}" for i in range(n)], dtype=object)
+    with pytest.raises(ValueError, match="exactly one pair key"):
+        aggregate_samples(values, groups, samples, pairs=pairs)
+
+
+def test_auto_selects_test_by_design():
+    rng = np.random.default_rng(13)
+    values2 = rng.normal(size=80)
+    groups2 = _seeded_groups(rng, 80, 2)
+    two_group_table = compare_group_distributions(values2, groups2)
+    assert two_group_table.columns[0] == "group_1"
+    values3 = rng.normal(size=120)
+    groups3 = _seeded_groups(rng, 120, 3)
+    assert (
+        compare_group_distributions(values3, groups3).columns[0] == "kruskal_statistic"
+    )
+    samples = np.array([f"s{i // 4}" for i in range(80)], dtype=object)
+    pairs = np.array([f"d{i // 4}" for i in range(80)], dtype=object)
+    paired_table = compare_group_distributions(
+        values2,
+        groups2,
+        samples=samples,
+        pairs=pairs,
+    )
+    assert "n_pairs" in paired_table.columns
+
+
+def test_adjust_pvalues_matches_statsmodels():
+    rng = np.random.default_rng(14)
+    p_values = rng.uniform(0, 1, 50)
+    for method in ("fdr_bh", "bonferroni", "holm"):
+        expected = multipletests(p_values, method=method)[1]
+        assert np.allclose(adjust_pvalues(p_values, method), expected)
+    assert np.allclose(adjust_pvalues(p_values, "none"), p_values)
+    with_nan = p_values.copy()
+    with_nan[3] = np.nan
+    adjusted = adjust_pvalues(with_nan, "fdr_bh")
+    assert np.isnan(adjusted[3])
+    assert np.isfinite(adjusted).sum() == 49
+
+
+def test_compare_rejects_bad_inputs():
+    rng = np.random.default_rng(15)
+    values = rng.normal(size=40)
+    groups = _seeded_groups(rng, 40, 2)
+    with pytest.raises(ValueError, match="must match values"):
+        compare_group_distributions(values[:20], groups)
+    with pytest.raises(ValueError, match="one-dimensional"):
+        compare_group_distributions(values.reshape(2, 20), groups)
+    with pytest.raises(ValueError, match="finite"):
+        values_with_nan = values.copy()
+        values_with_nan[0] = np.nan
+        compare_group_distributions(values_with_nan, groups)
+    with pytest.raises(ValueError, match="test must be"):
+        compare_group_distributions(values, groups, test="anova")
+    with pytest.raises(ValueError, match="posthoc must be"):
+        compare_group_distributions(values, groups, posthoc="bonferroni")
+    single = values[:20]
+    single_groups = np.full(20, "g0", dtype=object)
+    with pytest.raises(ValueError, match="two populated groups"):
+        compare_group_distributions(single, single_groups)
+    dropped_groups = groups[:20].copy()
+    dropped_groups[::2] = ""
+    with pytest.raises(ValueError, match="two populated groups"):
+        compare_group_distributions(values[:20], dropped_groups)
+
+
+def test_statistical_test_result_is_frozen():
+    result = StatisticalTestResult(
+        method="mann_whitney",
+        posthoc=None,
+        adjustment_method="fdr_bh",
+        group_key="grp",
+        cell_key="I",
+    )
+    with pytest.raises(AttributeError):
+        result.method = "kruskal_wallis"

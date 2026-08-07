@@ -358,6 +358,35 @@ _CONTRACTS = (
         ),
     ),
     OperationContract(
+        DataStore.run_statistical_testing,
+        metadata_arguments.StatisticalTestingArguments,
+        aliases={
+            "group_by": "group_key",
+            "adjustment": "adjustment_method",
+        },
+        signature_only={
+            **_classified("transformed", "keys", "test", "study_design"),
+            **_classified("execution", "subset_by"),
+            **_classified("publication", "skip_save"),
+        },
+        model_only={
+            **_classified(
+                "resolved_input",
+                "cell_selection",
+                "group_labels",
+                "normalization_method",
+                "size_factor",
+            ),
+            **_classified(
+                "derived",
+                "method",
+                "n_groups",
+                "n_cells",
+                "key_labels",
+            ),
+        },
+    ),
+    OperationContract(
         DataStore.run_tsne,
         metadata_arguments.TsneArguments,
         aliases={

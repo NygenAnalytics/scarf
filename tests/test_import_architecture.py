@@ -650,6 +650,7 @@ assert "scarf.features.enrichment.net" not in sys.modules
 assert "scarf.features.enrichment.results" not in sys.modules
 assert "scarf.features.enrichment.aucell" not in sys.modules
 assert "scarf.features.enrichment.waggr" not in sys.modules
+assert "scarf.features.statistical" not in sys.modules
 
 _ = scarf.read_gmt
 assert "scarf.features.enrichment.net" in sys.modules
@@ -666,6 +667,10 @@ assert "scarf.features.enrichment.waggr" not in sys.modules
 _ = features.find_markers_by_rank
 assert "scarf.features.markers.search" in sys.modules
 assert "scarf.features.markers.batching" not in sys.modules
+
+_ = features.compare_group_distributions
+assert "scarf.features.statistical" in sys.modules
+assert "scarf.features.markers.search" in sys.modules
 
 _ = features.GffReader
 assert "scarf.features.genomic.gff" in sys.modules
