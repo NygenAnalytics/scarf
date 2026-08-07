@@ -2292,6 +2292,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 effective_method = "kruskal_wallis"
         else:
             effective_method = test
+            if groups is not None and n_groups != len(groups):
+                raise ValueError(
+                    "Explicit statistical group selections must all retain at "
+                    "least one valid cell"
+                )
         if posthoc == "dunn" and effective_method != "kruskal_wallis":
             raise ValueError("posthoc='dunn' requires test='kruskal_wallis'")
 

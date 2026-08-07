@@ -418,6 +418,25 @@ def test_auto_counts_surviving_groups_after_dropout(datastore_ephemeral):
     assert set(result.tables["MALAT1"]["group_1"]) <= {"g0", "g1"}
 
 
+def test_explicit_test_rejects_filtered_requested_group(datastore_ephemeral):
+    ds = datastore_ephemeral
+    n = len(ds.cells.active_index("I"))
+    groups3 = np.array([f"g{i % 3}" for i in range(n)], dtype=object)
+    samples = np.array([f"s{i % 6}" for i in range(n)], dtype=object)
+    samples = np.where(groups3 == "g2", "", samples).astype(object)
+    ds.cells.insert("stat_grp_drop", groups3, overwrite=True)
+    ds.cells.insert("stat_samp_drop", samples, overwrite=True)
+    with pytest.warns(UserWarning, match="removed because all of its cells"):
+        with pytest.raises(ValueError, match="must all retain at least one valid cell"):
+            ds.run_statistical_testing(
+                ["MALAT1"],
+                group_by="stat_grp_drop",
+                groups=["g0", "g1", "g2"],
+                test="kruskal_wallis",
+                sample_by="stat_samp_drop",
+            )
+
+
 def test_run_statistical_testing_errors(datastore_ephemeral):
     ds = datastore_ephemeral
     _insert_group_columns(ds)
