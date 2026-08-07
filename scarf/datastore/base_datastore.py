@@ -35,7 +35,7 @@ from ..utils.logging import logger
 
 if TYPE_CHECKING:
     from ..graph.state import AssayState
-    from ..lineage import ArtifactLineage
+    from ..storage.lineage import ArtifactLineage
     from ..mapping.reference import MappingReference
     from .summary import DataStoreSummary
 
@@ -194,7 +194,7 @@ class BaseDataStore:
         references: "MappingReference | Sequence[MappingReference] | None" = None,
     ) -> "ArtifactLineage":
         """Build a read-only upstream lineage report for artifact outputs."""
-        from ..lineage import ArtifactLineage
+        from ..storage.lineage import ArtifactLineage
         from ..mapping.reference import MappingReference
 
         if references is None:

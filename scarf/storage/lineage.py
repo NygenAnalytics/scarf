@@ -8,8 +8,8 @@ from typing import Any, cast
 import networkx as nx
 import zarr
 
-from .storage.artifacts import ArtifactStatus, inspect_artifact
-from .storage.refs import ArtifactLocator, ArtifactRef, ExternalArtifactRef
+from .artifacts import ArtifactStatus, inspect_artifact
+from .refs import ArtifactLocator, ArtifactRef, ExternalArtifactRef
 
 type LineageTarget = ArtifactRef | Mapping[str, ArtifactRef]
 

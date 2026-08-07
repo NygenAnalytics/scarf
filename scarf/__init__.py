@@ -15,7 +15,7 @@ if TYPE_CHECKING:
         ArtifactSelectionError as ArtifactSelectionError,
         AssayState as AssayState,
     )
-    from .lineage import ArtifactLineage as ArtifactLineage
+    from .storage.lineage import ArtifactLineage as ArtifactLineage
     from .features.enrichment import (
         EnrichmentResult as EnrichmentResult,
         read_gmt as read_gmt,
@@ -113,7 +113,7 @@ def _resolve_version(
 __version__ = _resolve_version()
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
-    "ArtifactLineage": (".lineage", "ArtifactLineage"),
+    "ArtifactLineage": (".storage.lineage", "ArtifactLineage"),
     "ArtifactRef": (".storage.refs", "ArtifactRef"),
     "ArtifactSelectionError": (".graph.state", "ArtifactSelectionError"),
     "ArtifactStatus": (".storage.artifacts", "ArtifactStatus"),

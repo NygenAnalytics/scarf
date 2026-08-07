@@ -38,7 +38,7 @@ These calls do not create module-load cycles.
 
 ### Foundation
 
-- `storage/` owns stores, layouts, schemas, arrays, sharding, copying, resource budgets, storage profiles, materialization, ANN persistence, and Zarr runtime guards.
+- `storage/` owns stores, layouts, schemas, arrays, sharding, copying, resource budgets, storage profiles, materialization, ANN persistence, Zarr runtime guards, and artifact lineage reports.
 - `matrix/` owns the lazy blockwise matrix abstraction used over NumPy and Zarr arrays.
   Its arithmetic, indexing, and reduction behavior keeps it separate from low-level storage mechanics.
 - `utils/` owns generic array, compute, logging, prefetch, process, and progress helpers.
@@ -75,7 +75,7 @@ A domain that persists an artifact may use a narrow, named `storage` adapter.
 
 ### Import and export
 
-- `cytebase` lists, downloads, and opens public datasets.
+- `cytebase/` lists, downloads, and opens public datasets.
 - `readers/` parses supported input formats.
 - `writers/` materializes Scarf stores and exports supported formats.
 - `merge/` combines assays and datasets without importing `DataStore` during normal module loading.

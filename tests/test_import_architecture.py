@@ -586,8 +586,18 @@ def test_retired_root_import_paths_do_not_resolve():
         "scarf.clustering.hierarchy",
         "scarf.features.lowess",
         "scarf.trajectory.aggregation",
+        "scarf.lineage",
     ):
         assert find_spec(module_name) is None
+
+
+def test_cytebase_and_lineage_live_in_packages():
+    cytebase_root = _SCARF_ROOT / "cytebase"
+    assert cytebase_root.is_dir()
+    assert not (_SCARF_ROOT / "cytebase.py").exists()
+    assert (cytebase_root / "__init__.py").is_file()
+    assert not (_SCARF_ROOT / "lineage.py").exists()
+    assert (_SCARF_ROOT / "storage" / "lineage.py").is_file()
 
 
 def test_utility_modules_use_domain_names():
