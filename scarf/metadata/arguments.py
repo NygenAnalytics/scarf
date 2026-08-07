@@ -398,8 +398,7 @@ class StatisticalTestingArguments(OperationArguments):
     operation: ClassVar[str] = "run_statistical_testing"
     artifact_kind: ClassVar[str] = "statistical_tests"
 
-    cell_selection: ArtifactRef = artifact_input()
-    group_labels: Any = artifact_input()
+    cell_selection: ArtifactRef | None = artifact_input()
     normalization_method: dict[str, str] = parameter()
     size_factor: float | None = parameter()
     method: str = parameter()
@@ -414,8 +413,14 @@ class StatisticalTestingArguments(OperationArguments):
     normalization: dict[str, Any] = parameter()
     n_groups: int = parameter()
     n_cells: int = parameter()
+    cell_selection_hash: str = parameter()
+    tested_features: tuple[str, ...] = parameter()
+    group_fingerprint: str = parameter()
+    subset_fingerprint: str | None = parameter()
+    sample_fingerprint: str | None = parameter()
+    pair_fingerprint: str | None = parameter()
     from_assay: str = execution()
-    cell_key: str = execution()
+    cell_key: str | None = execution()
     group_key: str = execution()
     key_labels: tuple[str, ...] = execution()
     invalidate_cache: bool = execution()

@@ -24,10 +24,12 @@ if TYPE_CHECKING:
     )
     from .scoring import binned_sampling as binned_sampling
     from .statistical import (
+        GroupComparisonResult as GroupComparisonResult,
         StatisticalTestResult as StatisticalTestResult,
         adjust_pvalues as adjust_pvalues,
         aggregate_samples as aggregate_samples,
         compare_group_distributions as compare_group_distributions,
+        resolve_group_order as resolve_group_order,
     )
     from .variability import (
         fit_lowess as fit_lowess,
@@ -37,6 +39,7 @@ if TYPE_CHECKING:
 __all__ = [
     "EnrichmentResult",
     "GffReader",
+    "GroupComparisonResult",
     "StatisticalTestResult",
     "adjust_pvalues",
     "aggregate_samples",
@@ -53,6 +56,7 @@ __all__ = [
     "get_ranges",
     "mannwhitneyu_from_ranks",
     "read_gmt",
+    "resolve_group_order",
     "resolve_marker_gene_batch_size",
     "select_highly_variable_features",
     "sort_marker_results",
@@ -61,6 +65,7 @@ __all__ = [
 _LAZY_EXPORTS = {
     "EnrichmentResult": (".enrichment", "EnrichmentResult"),
     "GffReader": (".genomic", "GffReader"),
+    "GroupComparisonResult": (".statistical", "GroupComparisonResult"),
     "StatisticalTestResult": (".statistical", "StatisticalTestResult"),
     "adjust_pvalues": (".statistical", "adjust_pvalues"),
     "aggregate_samples": (".statistical", "aggregate_samples"),
@@ -80,6 +85,7 @@ _LAZY_EXPORTS = {
     "get_ranges": (".genomic", "get_ranges"),
     "mannwhitneyu_from_ranks": (".markers", "mannwhitneyu_from_ranks"),
     "read_gmt": (".enrichment", "read_gmt"),
+    "resolve_group_order": (".statistical", "resolve_group_order"),
     "resolve_marker_gene_batch_size": (".markers", "resolve_marker_gene_batch_size"),
     "select_highly_variable_features": (
         ".variability",

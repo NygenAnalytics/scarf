@@ -17,6 +17,13 @@ Tests are standard for zero-inflated, non-normal single-cell values:
 
 Multiple-testing correction is delegated to ``statsmodels.stats.multitest``
 (the same backend the marker statistics use).
+
+Phase 1 is explicitly non-parametric. Parametric test requests raise
+``NotImplementedError``. Cell-level testing (no ``samples``) is descriptive
+distribution testing and emits a ``UserWarning``; sample-level aggregation
+(``sample_stat`` over ``samples``) is "sample-level distribution summary
+testing" and is not a replacement for replicate-aware differential
+expression (for example DESeq2 or edgeR).
 """
 
 import warnings
@@ -35,6 +42,26 @@ TestMethod = Literal["auto", "mann_whitney", "kruskal_wallis", "wilcoxon"]
 PosthocMethod = Literal["dunn"]
 AdjustmentMethod = Literal["fdr_bh", "bonferroni", "holm", "none"]
 SampleStatistic = Literal["mean", "median", "fraction"]
+SummaryScope = Literal["cell", "sample"]
+
+_PARAMETRIC_TESTS = frozenset(
+    {
+        "anova",
+        "one_way_anova",
+        "t_test",
+        "welch",
+        "welch_t_test",
+        "paired_t_test",
+        "student_t_test",
+        "f_test",
+    }
+)
+_CELL_LEVEL_WARNING = (
+    "Cell-level statistical testing treats each cell as an independent "
+    "observation. Results are descriptive distribution testing, not "
+    "population-level condition or disease inference. Aggregate cells to "
+    "biological samples with sample_by for sample-level summary testing."
+)
 
 MANN_WHITNEY_COLUMNS = (
     "group_1",
@@ -59,6 +86,7 @@ _METHOD_COLUMNS: dict[str, tuple[str, ...]] = {
 
 __all__ = [
     "DUNN_COLUMNS",
+    "GroupComparisonResult",
     "KRUSKAL_WALLIS_COLUMNS",
     "MANN_WHITNEY_COLUMNS",
     "StatisticalTestResult",
@@ -66,7 +94,22 @@ __all__ = [
     "adjust_pvalues",
     "aggregate_samples",
     "compare_group_distributions",
+    "resolve_group_order",
 ]
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class GroupComparisonResult:
+    """One key's statistical comparison outcome.
+
+    ``table`` is the primary test table. When ``posthoc="dunn"`` was
+    requested, ``table`` holds the omnibus Kruskal-Wallis result and
+    ``posthoc_table`` holds the pairwise Dunn's table; otherwise
+    ``posthoc_table`` is ``None``.
+    """
+
+    table: pd.DataFrame
+    posthoc_table: pd.DataFrame | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -84,7 +127,10 @@ class StatisticalTestResult:
     expression_cutoff: float = 0.0
     n_groups: int = 0
     n_cells: int = 0
+    tested_features: tuple[str, ...] = ()
+    summary_scope: SummaryScope = "cell"
     tables: dict[str, pd.DataFrame] = field(default_factory=dict)
+    posthoc_tables: dict[str, pd.DataFrame] = field(default_factory=dict)
 
 
 def adjust_pvalues(
@@ -113,22 +159,84 @@ def adjust_pvalues(
     return adjusted
 
 
-def _category_sort_key(value: Any) -> tuple[int, str]:
-    numeric = isinstance(
-        value, int | float | np.integer | np.floating
-    ) and not isinstance(
-        value,
-        bool,
-    )
-    return (0 if numeric else 1, str(value))
-
-
-def _natural_group_order(groups: np.ndarray) -> list[Any]:
-    return sorted(list(pd.unique(groups)), key=_category_sort_key)
-
-
 def _native(value: Any) -> Any:
     return value.item() if isinstance(value, np.generic) else value
+
+
+def resolve_group_order(
+    groups: np.ndarray,
+    *,
+    group_order: Sequence[Any] | None = None,
+    full_groups: np.ndarray | None = None,
+) -> list[Any]:
+    """Return the ordered surviving group labels.
+
+    When ``group_order`` is provided its order is preserved exactly, which
+    fixes the contrast direction and row order of the reported tables. When
+    omitted, groups appear in first-seen order; labels are never
+    natural-sorted. Missing or empty labels are dropped.
+
+    Requested groups are validated strictly:
+
+    - Duplicate labels in ``group_order`` raise ``ValueError``.
+    - A requested group that does not exist in the data at all raises
+      ``ValueError`` (matching the cell-selection helper). Pass
+      ``full_groups`` to distinguish "absent from the dataset" from "present
+      but removed by subset or sample filters".
+    - A requested group that exists but had every cell removed by filtering
+      (``full_groups`` supplied) emits a ``UserWarning`` and is excluded from
+      the returned order; the contrast design is otherwise left untouched.
+    """
+    values = np.asarray(groups, dtype=object)
+    valid = _valid_group_mask(values)
+    surviving = [_native(value) for value in pd.unique(values[valid])]
+    if group_order is None:
+        return surviving
+    ordered = [_native(value) for value in group_order]
+    if len(set(ordered)) != len(ordered):
+        raise ValueError("group_order must not contain duplicate labels")
+    surviving_set = set(surviving)
+    if full_groups is not None:
+        full = np.asarray(full_groups, dtype=object)
+        full_set = {_native(value) for value in pd.unique(full)}
+        missing = [value for value in ordered if value not in full_set]
+        if missing:
+            raise ValueError(
+                "groups contains labels not present in the data: "
+                + ", ".join(map(str, missing[:10]))
+            )
+        dropped = [value for value in ordered if value not in surviving_set]
+        for value in dropped:
+            warnings.warn(
+                f"Requested group {value!r} was removed because all of its "
+                "cells were excluded by subset or sample filters; it is not "
+                "part of the comparison design.",
+                UserWarning,
+                stacklevel=3,
+            )
+    else:
+        missing = [value for value in ordered if value not in surviving_set]
+        if missing:
+            raise ValueError(
+                "groups contains labels not present in the data: "
+                + ", ".join(map(str, missing[:10]))
+            )
+    return [value for value in ordered if value in surviving_set]
+
+
+def _maybe_adjust(
+    table: pd.DataFrame,
+    adjustment: AdjustmentMethod,
+) -> pd.DataFrame:
+    """Add a within-table ``p_value_adjusted`` column when it has multiple rows."""
+    if adjustment == "none" or len(table) <= 1:
+        return table
+    frame = table.copy()
+    frame["p_value_adjusted"] = adjust_pvalues(
+        frame["p_value"].to_numpy(dtype=np.float64, copy=False),
+        adjustment,
+    )
+    return frame
 
 
 def _valid_group_mask(groups: np.ndarray) -> np.ndarray:
@@ -146,6 +254,11 @@ def aggregate_samples(
     pairs: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Aggregate per-cell values within biological samples.
+
+    This is sample-level distribution summary testing: each sample becomes
+    one observation of its group. It is not a raw-count pseudobulk
+    aggregation and must not be confused with replicate-aware differential
+    expression tools such as DESeq2 or edgeR.
 
     Returns a frame with one row per ``(sample, group)`` (and ``pair`` when
     supplied) holding the aggregated ``value``. ``sample_stat`` is ``"mean"``,
@@ -333,6 +446,20 @@ def _wilcoxon_signed_rank(
                     "wilcoxon comparisons must reference the two selected "
                     f"groups ({g1!r}, {g2!r})"
                 )
+    pair_group_counts = aggregated.groupby(
+        ["pair", "group"],
+        observed=False,
+    ).size()
+    duplicates = pair_group_counts[pair_group_counts > 1]
+    if not duplicates.empty:
+        pairs = ", ".join(f"{pair!r}/{group!r}" for pair, group in duplicates.index[:5])
+        raise ValueError(
+            "Duplicate (pair, group) rows found for the Wilcoxon test "
+            f"(e.g. {pairs}); each subject or pair must have exactly one "
+            "aggregated value per group. Collapse technical replicates "
+            "(for example by summing or averaging them) before running the "
+            "test."
+        )
     left = aggregated[aggregated["group"] == g1]
     right = aggregated[aggregated["group"] == g2]
     merged = left.merge(right, on="pair", suffixes=("_1", "_2"))
@@ -381,7 +508,8 @@ def compare_group_distributions(
     comparisons: Sequence[tuple[Any, Any]] | None = None,
     sample_stat: SampleStatistic = "mean",
     expression_cutoff: float = 0.0,
-) -> pd.DataFrame:
+    group_order: Sequence[Any] | None = None,
+) -> GroupComparisonResult:
     """Compare one value array across groups with a non-parametric test.
 
     ``values`` and ``groups`` must be one-dimensional and equal in length.
@@ -393,14 +521,19 @@ def compare_group_distributions(
     ``test`` is ``"auto"`` (pick by design: paired -> Wilcoxon, two groups ->
     Mann-Whitney, three or more -> Kruskal-Wallis), ``"mann_whitney"``,
     ``"kruskal_wallis"``, or ``"wilcoxon"``. ``posthoc="dunn"`` adds pairwise
-    Dunn's tests after Kruskal-Wallis. ``comparisons`` restricts the pairwise
-    rows to the listed group pairs. ``adjustment`` corrects p-values within
-    the returned table when it holds multiple comparisons; pass ``"none"`` to
+    Dunn's tests after Kruskal-Wallis and preserves the omnibus result in the
+    returned :class:`GroupComparisonResult`. ``comparisons`` restricts the
+    pairwise rows to the listed group pairs. ``group_order`` fixes the group
+    order (and therefore the contrast direction) exactly; when omitted,
+    first-seen order is used. ``adjustment`` corrects p-values within the
+    returned tables when they hold multiple comparisons; pass ``"none"`` to
     adjust across keys in the caller instead.
 
     Returns:
-        A DataFrame with one row per comparison (Mann-Whitney, Dunn, and
-        Wilcoxon) or a single row per key (Kruskal-Wallis).
+        A :class:`GroupComparisonResult` whose ``table`` is the primary test
+        table (one row per comparison for Mann-Whitney and Wilcoxon, a single
+        row for Kruskal-Wallis) and whose ``posthoc_table`` holds the pairwise
+        Dunn's table when ``posthoc="dunn"``.
     """
     values = np.asarray(values, dtype=np.float64)
     groups = np.asarray(groups, dtype=object)
@@ -414,14 +547,46 @@ def compare_group_distributions(
         raise ValueError("posthoc must be 'dunn' or None")
     if comparisons is not None and not comparisons:
         raise ValueError("comparisons must be non-empty when provided")
+    if test in _PARAMETRIC_TESTS:
+        raise NotImplementedError(
+            "Phase 1 is explicitly non-parametric (mann_whitney, "
+            "kruskal_wallis, wilcoxon); parametric tests such as "
+            f"{test!r} are not supported."
+        )
+    if samples is not None:
+        samples = np.asarray(samples, dtype=object)
+        if samples.shape != values.shape:
+            raise ValueError("samples length must match values")
+    if pairs is not None:
+        pairs = np.asarray(pairs, dtype=object)
+        if pairs.shape != values.shape:
+            raise ValueError("pairs length must match values")
+    if group_order is not None:
+        ordered_check = [_native(value) for value in group_order]
+        if len(set(ordered_check)) != len(ordered_check):
+            raise ValueError("group_order must not contain duplicate labels")
+    if comparisons is not None:
+        seen_pairs: set[tuple[Any, Any]] = set()
+        for left, right in comparisons:
+            pair = (_native(left), _native(right))
+            if pair[0] == pair[1]:
+                raise ValueError("comparisons must reference two distinct groups")
+            if pair in seen_pairs or (pair[1], pair[0]) in seen_pairs:
+                raise ValueError(
+                    "comparisons must not contain duplicate or reversed-duplicate pairs"
+                )
+            seen_pairs.add(pair)
+
+    if samples is None:
+        warnings.warn(_CELL_LEVEL_WARNING, UserWarning, stacklevel=2)
 
     valid = _valid_group_mask(groups)
     values = values[valid]
     groups = groups[valid]
     if samples is not None:
-        samples = np.asarray(samples, dtype=object)[valid]
+        samples = samples[valid]
     if pairs is not None:
-        pairs = np.asarray(pairs, dtype=object)[valid]
+        pairs = pairs[valid]
     if len(values) == 0:
         raise ValueError("No values remain after dropping missing groups")
 
@@ -445,7 +610,15 @@ def compare_group_distributions(
         groups = aggregated["group"].to_numpy(dtype=object)
         pairs = aggregated["pair"].to_numpy(dtype=object) if pairs is not None else None
 
-    present = _natural_group_order(groups)
+    present = resolve_group_order(groups, group_order=group_order)
+    if comparisons is not None:
+        present_set = set(present)
+        for left, right in comparisons:
+            if _native(left) not in present_set or _native(right) not in present_set:
+                raise ValueError(
+                    "comparisons references a group not present in "
+                    f"group_order: {left!r} or {right!r}"
+                )
     if len(present) < 2:
         raise ValueError("At least two populated groups are required")
 
@@ -461,6 +634,9 @@ def compare_group_distributions(
             "test must be 'auto', 'mann_whitney', 'kruskal_wallis', or "
             f"'wilcoxon'; got {test!r}"
         )
+    if posthoc == "dunn" and test != "kruskal_wallis":
+        raise ValueError("posthoc='dunn' requires test='kruskal_wallis'")
+
     if test == "wilcoxon":
         if pairs is None:
             raise ValueError(
@@ -468,18 +644,22 @@ def compare_group_distributions(
             )
         assert aggregated is not None
         table = _wilcoxon_signed_rank(aggregated, present, comparisons)
-    elif test == "mann_whitney":
-        table = _mann_whitney(values, groups, present, comparisons)
-    else:
-        if posthoc == "dunn":
-            table = _dunn_posthoc(values, groups, present, comparisons)
-        else:
-            table = _kruskal_wallis(values, groups, present)
-
-    if adjustment != "none" and len(table) > 1:
-        table = table.copy()
-        table["p_value_adjusted"] = adjust_pvalues(
-            table["p_value"].to_numpy(dtype=np.float64, copy=False),
-            adjustment,
+        return GroupComparisonResult(
+            _maybe_adjust(table, adjustment),
         )
-    return table
+    if test == "mann_whitney":
+        table = _mann_whitney(values, groups, present, comparisons)
+        return GroupComparisonResult(
+            _maybe_adjust(table, adjustment),
+        )
+    if posthoc == "dunn":
+        omnibus = _kruskal_wallis(values, groups, present)
+        posthoc_table = _dunn_posthoc(values, groups, present, comparisons)
+        return GroupComparisonResult(
+            _maybe_adjust(omnibus, adjustment),
+            _maybe_adjust(posthoc_table, adjustment),
+        )
+    table = _kruskal_wallis(values, groups, present)
+    return GroupComparisonResult(
+        _maybe_adjust(table, adjustment),
+    )

@@ -19,7 +19,10 @@ from ...storage.artifacts import (
     ArtifactRef,
     artifact_path,
     callable_identity,
+    fingerprint_array,
+    fingerprint_strings,
     inspect_artifact,
+    provenance_hash,
 )
 from ...storage.selections import resolve_selection_artifact
 from ...storage.types import as_zarr_array, as_zarr_group
@@ -38,12 +41,15 @@ from ...features.markers.table import (
 )
 from ...features.statistical import (
     DUNN_COLUMNS,
+    GroupComparisonResult,
     KRUSKAL_WALLIS_COLUMNS,
     MANN_WHITNEY_COLUMNS,
     StatisticalTestResult,
     WILCOXON_COLUMNS,
+    _PARAMETRIC_TESTS,
     adjust_pvalues,
     compare_group_distributions,
+    resolve_group_order,
 )
 from ...metadata.arguments import (
     AucellArguments,
@@ -92,35 +98,143 @@ def _statistical_storage_columns(
     method: str,
     posthoc: str | None,
 ) -> tuple[str, ...]:
-    """Persisted columns for a statistical test layout, including adjustment."""
+    """Persisted primary-table columns, including adjustment.
+
+    For Kruskal-Wallis the primary table is always the omnibus result,
+    whether or not a post-hoc test was requested.
+    """
     base: tuple[str, ...]
     if method == "mann_whitney":
         base = MANN_WHITNEY_COLUMNS
     elif method == "wilcoxon":
         base = WILCOXON_COLUMNS
-    elif posthoc == "dunn":
-        base = DUNN_COLUMNS
     else:
         base = KRUSKAL_WALLIS_COLUMNS
     return (*base, "p_value_adjusted")
+
+
+def _statistical_posthoc_columns(
+    posthoc: str | None,
+) -> tuple[str, ...]:
+    """Persisted post-hoc table columns, including adjustment."""
+    if posthoc == "dunn":
+        return (*DUNN_COLUMNS, "p_value_adjusted")
+    return ()
 
 
 def _native_artifact_value(value: Any) -> Any:
     return value.item() if isinstance(value, np.generic) else value
 
 
+def _value_fingerprint(values: Any) -> str:
+    array = np.asarray(values)
+    if array.dtype.kind in {"O", "S", "U"}:
+        return fingerprint_strings(array)
+    return fingerprint_array(array)
+
+
+def _pool_adjust(
+    tables: dict[str, pd.DataFrame],
+    adjustment: str,
+) -> dict[str, pd.DataFrame]:
+    """Add ``p_value_adjusted`` to each table with one pooled correction pass."""
+    if not tables:
+        return {}
+    all_p_values = np.concatenate(
+        [
+            table["p_value"].to_numpy(dtype=np.float64, copy=False)
+            for table in tables.values()
+        ]
+    )
+    adjusted = adjust_pvalues(all_p_values, adjustment)
+    offset = 0
+    out: dict[str, pd.DataFrame] = {}
+    for label, table in tables.items():
+        frame = table.copy()
+        n_rows = len(frame)
+        frame["p_value_adjusted"] = adjusted[offset : offset + n_rows]
+        offset += n_rows
+        out[label] = frame
+    return out
+
+
+def _statistical_cell_key_key(cell_key: str | None) -> str:
+    return "all_cells" if cell_key is None else cell_key
+
+
+def _statistical_cell_indices(store: Any, cell_key: str | None) -> np.ndarray:
+    if cell_key is None:
+        return np.arange(store.cells.N, dtype=np.int64)
+    return np.asarray(store.cells.active_index(cell_key))
+
+
+def _fetch_statistical_column(
+    store: Any,
+    column: str,
+    cell_key: str | None,
+) -> np.ndarray:
+    if cell_key is None:
+        return np.asarray(store.cells.fetch_all(column))
+    return np.asarray(store.cells.fetch(column, key=cell_key))
+
+
+def _normalized_variant_groups(
+    groups: Sequence[Any] | None,
+) -> tuple[Any, ...] | None:
+    if groups is None:
+        return None
+    return tuple(_native_artifact_value(value) for value in groups)
+
+
+def _normalized_variant_comparisons(
+    comparisons: Sequence[tuple[Any, Any]] | None,
+) -> tuple[tuple[Any, Any], ...] | None:
+    if comparisons is None:
+        return None
+    return tuple(
+        (_native_artifact_value(left), _native_artifact_value(right))
+        for left, right in comparisons
+    )
+
+
+def _statistical_variant_digest(
+    *,
+    tested_features: tuple[str, ...],
+    groups: tuple[Any, ...] | None,
+    comparisons: tuple[tuple[Any, Any], ...] | None,
+    adjustment: str,
+    sample_by: str | None,
+    pair_by: str | None,
+    subset_by: str | None,
+) -> str:
+    """Deterministic digest identifying one retrievable test variant."""
+    return provenance_hash(
+        {
+            "tested_features": tested_features,
+            "groups": groups,
+            "comparisons": comparisons,
+            "adjustment": adjustment,
+            "sample_by": sample_by,
+            "pair_by": pair_by,
+            "subset_by": subset_by,
+        }
+    )[:16]
+
+
 def _resolve_assay_and_cell_key(
     store: Any,
     from_assay: str | None,
     cell_key: str | None,
-) -> tuple[str, str]:
-    """Resolve assay and cell key without requiring a feature key."""
+) -> tuple[str, str | None]:
+    """Resolve the assay and normalize ``cell_key`` for statistical tests.
+
+    ``cell_key=None`` selects every cell in the store (matching
+    ``scarf.plotting.distribution``); it is not replaced with the latest key.
+    """
     if from_assay is None:
         from_assay = store._defaultAssay
     if from_assay is None:
         raise ValueError("No default assay is configured")
-    if cell_key is None:
-        cell_key = store._get_latest_cell_key(from_assay)
     return from_assay, cell_key
 
 
@@ -1908,6 +2022,69 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             return vals_df, fracs_df
         return vals_df
 
+    def _statistical_key_series(
+        self,
+        keys: ("Sequence[str | CellField | FeatureRef]"),
+        *,
+        from_assay: str,
+        cell_key: str | None,
+        cell_idx: np.ndarray,
+        normalization: "NormalizationSpec | None",
+        fetch_values: bool,
+    ) -> tuple[list[str], list[str], list[np.ndarray]]:
+        """Resolve statistical keys into (labels, tested_features, values).
+
+        Feature keys report the assay, the resolved feature ids, and the
+        reduction semantics so that the digest is stable across renames.
+        Cell-metadata keys report the column name plus a fingerprint of its
+        values. ``values`` is populated only when ``fetch_values`` is true;
+        feature identity resolution is always performed.
+        """
+        from ...plotting._contracts import CellField, FeatureRef
+        from ...plotting._data import (
+            fetch_normalized_feature_matrix,
+            resolve_feature,
+        )
+
+        cell_columns = set(self.cells.columns)
+        labels: list[str] = []
+        tested_features: list[str] = []
+        values_list: list[np.ndarray] = []
+        for key in keys:
+            if isinstance(key, FeatureRef) or (
+                isinstance(key, str) and key not in cell_columns
+            ):
+                resolved = resolve_feature(self, key, from_assay=from_assay)
+                labels.append(resolved.label)
+                tested_features.append(
+                    f"{resolved.assay}|"
+                    f"{','.join(str(identifier) for identifier in resolved.ids)}|"
+                    f"{resolved.reduction or ''}"
+                )
+                if fetch_values:
+                    assert normalization is not None
+                    matrix = fetch_normalized_feature_matrix(
+                        self,
+                        [resolved],
+                        cell_idx,
+                        normalization,
+                    )
+                    values_list.append(matrix[:, 0])
+            else:
+                column = key.key if isinstance(key, CellField) else key
+                column_values = _fetch_statistical_column(
+                    self,
+                    column,
+                    cell_key,
+                )
+                labels.append(
+                    key.label if isinstance(key, CellField) and key.label else column
+                )
+                tested_features.append(f"{column}|{_value_fingerprint(column_values)}")
+                if fetch_values:
+                    values_list.append(np.asarray(column_values, dtype=np.float64))
+        return labels, tested_features, values_list
+
     def run_statistical_testing(
         self,
         keys: ("str | CellField | FeatureRef | Sequence[str | CellField | FeatureRef]"),
@@ -1946,14 +2123,19 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         With ``test="auto"`` the test is chosen from the design: paired data
         uses Wilcoxon, two groups use Mann-Whitney, and three or more use
-        Kruskal-Wallis. ``groups`` restricts the group set; ``comparisons``
-        restricts pairwise rows to the listed group pairs. When multiple keys
-        are tested, ``adjustment`` corrects p-values across all keys and
-        comparison rows in one pass (default ``"fdr_bh"``).
+        Kruskal-Wallis. ``groups`` restricts the group set and fixes its order
+        (which sets the contrast direction); ``comparisons`` restricts
+        pairwise rows to the listed group pairs. With ``posthoc="dunn"`` both
+        the omnibus Kruskal-Wallis and the pairwise Dunn's results are
+        preserved. When multiple keys are tested, ``adjustment`` corrects
+        p-values across keys in one pooled pass (default ``"fdr_bh"``);
+        post-hoc p-values are corrected separately.
 
         Results are persisted as an immutable artifact under
-        ``statistical_tests`` unless ``skip_save`` is ``True``. Use
-        ``get_statistical_tests`` to read them back.
+        ``statistical_tests`` unless ``skip_save`` is ``True``. Every distinct
+        variant (keys, groups, comparisons, adjustment, sample and subset
+        columns) is stored under its own retrievable slot; repeat the same
+        variant parameters to ``get_statistical_tests`` to read it back.
 
         Args:
             keys: Feature names or cell-metadata columns to test.
@@ -1984,11 +2166,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             FeatureRef,
             NormalizationSpec,
         )
-        from ...plotting._data import (
-            fetch_normalized_feature_matrix,
-            resolve_cell_selection,
-            resolve_feature,
-        )
+        from ...plotting._data import resolve_cell_selection
 
         if group_by is None:
             raise ValueError(
@@ -2004,6 +2182,12 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         if sample_stat not in ("mean", "median", "fraction"):
             raise ValueError("sample_stat must be 'mean', 'median', or 'fraction'")
         if test not in ("auto", "mann_whitney", "kruskal_wallis", "wilcoxon"):
+            if test in _PARAMETRIC_TESTS:
+                raise NotImplementedError(
+                    "Phase 1 is explicitly non-parametric (mann_whitney, "
+                    "kruskal_wallis, wilcoxon); parametric tests such as "
+                    f"{test!r} are not supported."
+                )
             raise ValueError(
                 "test must be 'auto', 'mann_whitney', 'kruskal_wallis', or 'wilcoxon'"
             )
@@ -2030,26 +2214,33 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         if not key_list:
             raise ValueError("keys must be non-empty")
 
-        cell_columns = set(self.cells.columns)
-        cell_idx = self.cells.active_index(cell_key)
-        groups_arr = np.asarray(self.cells.fetch(group_by, key=cell_key))
+        cell_idx = _statistical_cell_indices(self, cell_key)
+        labels, tested_features, values_list = self._statistical_key_series(
+            key_list,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            cell_idx=cell_idx,
+            normalization=normalization,
+            fetch_values=True,
+        )
+        groups_arr = _fetch_statistical_column(self, group_by, cell_key)
         sample_arr = (
-            np.asarray(self.cells.fetch(sample_by, key=cell_key))
+            _fetch_statistical_column(self, sample_by, cell_key)
             if sample_by is not None
             else None
         )
         pair_arr = (
-            np.asarray(self.cells.fetch(pair_by, key=cell_key))
+            _fetch_statistical_column(self, pair_by, cell_key)
             if pair_by is not None
             else None
         )
         subset_vals = (
-            np.asarray(self.cells.fetch(subset_by, key=cell_key))
+            _fetch_statistical_column(self, subset_by, cell_key)
             if subset_by is not None
             else None
         )
 
-        selection_mask, group_order = resolve_cell_selection(
+        selection_mask, _group_order = resolve_cell_selection(
             len(groups_arr),
             subset=subset_vals,
             subset_name=subset_by,
@@ -2067,42 +2258,24 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         if not selection_mask.any():
             raise ValueError("No cells remain after statistical-testing selections")
 
-        series_list: list[tuple[np.ndarray, str]] = []
-        for key in key_list:
-            if isinstance(key, FeatureRef) or (
-                isinstance(key, str) and key not in cell_columns
-            ):
-                resolved = resolve_feature(self, key, from_assay=from_assay)
-                values = fetch_normalized_feature_matrix(
-                    self,
-                    [resolved],
-                    cell_idx,
-                    normalization,
-                )[:, 0]
-                label = resolved.label
-            else:
-                column = key.key if isinstance(key, CellField) else key
-                values = np.asarray(
-                    self.cells.fetch(column, key=cell_key),
-                    dtype=np.float64,
-                )
-                label = (
-                    key.label if isinstance(key, CellField) and key.label else column
-                )
-            series_list.append((values, label))
-
         series_list = [
-            (np.asarray(vals)[selection_mask], label) for vals, label in series_list
+            (np.asarray(values)[selection_mask], label)
+            for values, label in zip(values_list, labels, strict=True)
         ]
-        groups_arr = groups_arr[selection_mask]
-        if sample_arr is not None:
-            sample_arr = sample_arr[selection_mask]
-        if pair_arr is not None:
-            pair_arr = pair_arr[selection_mask]
+        groups_arr_masked = groups_arr[selection_mask]
+        sample_arr_masked = (
+            sample_arr[selection_mask] if sample_arr is not None else None
+        )
+        pair_arr_masked = pair_arr[selection_mask] if pair_arr is not None else None
         n = int(selection_mask.sum())
-        n_groups = len(group_order or [])
 
-        labels = [label for _, label in series_list]
+        present = resolve_group_order(
+            groups_arr_masked,
+            group_order=groups,
+            full_groups=groups_arr,
+        )
+        n_groups = len(present)
+
         panel_keys: list[Any]
         if len(set(labels)) != len(labels):
             panel_keys = list(range(len(labels)))
@@ -2111,7 +2284,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         key_labels = [str(key) for key in panel_keys]
 
         if test == "auto":
-            if pair_arr is not None:
+            if pair_arr_masked is not None:
                 effective_method = "wilcoxon"
             elif n_groups == 2:
                 effective_method = "mann_whitney"
@@ -2122,53 +2295,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         if posthoc == "dunn" and effective_method != "kruskal_wallis":
             raise ValueError("posthoc='dunn' requires test='kruskal_wallis'")
 
-        tables: dict[str, pd.DataFrame] = {}
-        for key_label, (values, _label) in zip(key_labels, series_list, strict=True):
-            tables[key_label] = compare_group_distributions(
-                values,
-                groups_arr,
-                test=effective_method,
-                posthoc=posthoc,
-                adjustment="none",
-                samples=sample_arr,
-                pairs=pair_arr,
-                comparisons=comparisons,
-                sample_stat=sample_stat,
-                expression_cutoff=expression_cutoff,
-            )
-
-        all_p_values = np.concatenate(
-            [
-                table["p_value"].to_numpy(dtype=np.float64, copy=False)
-                for table in tables.values()
-            ]
-        )
-        adjusted = adjust_pvalues(all_p_values, adjustment)
-        offset = 0
-        adjusted_tables: dict[str, pd.DataFrame] = {}
-        for key_label, table in tables.items():
-            frame = table.copy()
-            n_rows = len(frame)
-            frame["p_value_adjusted"] = adjusted[offset : offset + n_rows]
-            offset += n_rows
-            adjusted_tables[key_label] = frame
-        tables = adjusted_tables
-
-        result = StatisticalTestResult(
-            method=effective_method,
-            posthoc=posthoc,
-            adjustment_method=adjustment,
-            group_key=group_by,
-            cell_key=cell_key,
-            sample_by=sample_by,
-            pair_by=pair_by,
-            sample_stat=sample_stat,
-            expression_cutoff=expression_cutoff,
-            n_groups=n_groups,
-            n_cells=n,
-            tables=tables,
-        )
-
+        planned: Any = None
+        select_statistical_artifact: Any = None
         if not skip_save:
             assay_grp = as_zarr_group(self.zw[from_assay], name=from_assay)
             if "statistical_tests" not in assay_grp:
@@ -2177,37 +2305,34 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 assay_grp["statistical_tests"],
                 name="statistical_tests",
             )
-            cell_selection = self._ensure_cell_selection(cell_key)
-            group_input = self._resolve_cell_data_provenance_input(
-                group_by,
-                cell_key=cell_key,
+            native_groups = _normalized_variant_groups(groups)
+            native_comparisons = _normalized_variant_comparisons(comparisons)
+            cell_key_key = _statistical_cell_key_key(cell_key)
+            variant_digest = _statistical_variant_digest(
+                tested_features=tuple(tested_features),
+                groups=native_groups,
+                comparisons=native_comparisons,
+                adjustment=adjustment,
+                sample_by=sample_by,
+                pair_by=pair_by,
+                subset_by=subset_by,
             )
-            slot_name = f"{cell_key}__{group_by}__{effective_method}"
+            slot_name = f"{cell_key_key}__{group_by}__{effective_method}"
             if posthoc is not None:
                 slot_name += f"__{posthoc}"
-            native_groups = (
-                tuple(_native_artifact_value(value) for value in groups)
-                if groups is not None
-                else None
-            )
-            native_comparisons = (
-                tuple(
-                    (
-                        _native_artifact_value(left),
-                        _native_artifact_value(right),
-                    )
-                    for left, right in comparisons
-                )
-                if comparisons is not None
-                else None
+            slot_name += f"__{variant_digest}"
+
+            cell_selection_input: ArtifactRef | None = (
+                self._ensure_cell_selection(cell_key) if cell_key is not None else None
             )
             expected_stat_columns = _statistical_storage_columns(
                 effective_method,
                 posthoc,
             )
+            expected_posthoc_columns = _statistical_posthoc_columns(posthoc)
+
             arguments = StatisticalTestingArguments(
-                cell_selection=cell_selection,
-                group_labels=group_input,
+                cell_selection=cell_selection_input,
                 normalization_method=callable_identity(assay.normMethod),
                 size_factor=getattr(assay, "sf", None),
                 method=effective_method,
@@ -2225,6 +2350,18 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 },
                 n_groups=n_groups,
                 n_cells=n,
+                cell_selection_hash=_value_fingerprint(cell_idx),
+                tested_features=tuple(tested_features),
+                group_fingerprint=_value_fingerprint(groups_arr),
+                subset_fingerprint=(
+                    _value_fingerprint(subset_vals) if subset_vals is not None else None
+                ),
+                sample_fingerprint=(
+                    _value_fingerprint(sample_arr) if sample_arr is not None else None
+                ),
+                pair_fingerprint=(
+                    _value_fingerprint(pair_arr) if pair_arr is not None else None
+                ),
                 from_assay=from_assay,
                 cell_key=cell_key,
                 group_key=group_by,
@@ -2249,13 +2386,28 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                         return False
                     if candidate.attrs.get("n_cells") != n:
                         return False
+                    if candidate.attrs.get("tested_features") != list(tested_features):
+                        return False
+                    if candidate.attrs.get("cell_selection_hash") != _value_fingerprint(
+                        cell_idx
+                    ):
+                        return False
                     if candidate.attrs.get("stat_columns") != list(
                         expected_stat_columns
                     ):
                         return False
-                    numeric_columns = [
+                    if list(candidate.attrs.get("posthoc_stat_columns", [])) != list(
+                        expected_posthoc_columns
+                    ):
+                        return False
+                    main_numeric = [
                         column
                         for column in expected_stat_columns
+                        if column not in ("group_1", "group_2")
+                    ]
+                    posthoc_numeric = [
+                        column
+                        for column in expected_posthoc_columns
                         if column not in ("group_1", "group_2")
                     ]
                     for idx in range(len(key_labels)):
@@ -2269,8 +2421,19 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                                 name="stats",
                             )[:]
                         )
-                        if stats.ndim != 2 or stats.shape[1] != len(numeric_columns):
+                        if stats.ndim != 2 or stats.shape[1] != len(main_numeric):
                             return False
+                        if expected_posthoc_columns:
+                            posthoc_stats = np.asarray(
+                                as_zarr_array(
+                                    key_group["posthoc_stats"],
+                                    name="posthoc_stats",
+                                )[:]
+                            )
+                            if posthoc_stats.ndim != 2 or posthoc_stats.shape[1] != len(
+                                posthoc_numeric
+                            ):
+                                return False
                 except (KeyError, TypeError, ValueError, IndexError):
                     return False
                 return True
@@ -2305,10 +2468,77 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
             if planned.reused:
                 select_statistical_artifact(planned.ref)
-                return result
+                slot_group = self._resolve_statistical_slot(
+                    from_assay,
+                    cell_key,
+                    group_by,
+                    effective_method,
+                    posthoc,
+                    variant_digest=variant_digest,
+                )
+                logger.info(
+                    f"Reused statistical test results ({effective_method}) for "
+                    f"{len(key_labels)} keys"
+                )
+                return self._read_statistical_slot(slot_group)
 
+        outcomes: dict[str, GroupComparisonResult] = {}
+        for key_label, (values, _label) in zip(key_labels, series_list, strict=True):
+            outcomes[key_label] = compare_group_distributions(
+                values,
+                groups_arr_masked,
+                test=effective_method,
+                posthoc=posthoc,
+                adjustment="none",
+                samples=sample_arr_masked,
+                pairs=pair_arr_masked,
+                comparisons=comparisons,
+                sample_stat=sample_stat,
+                expression_cutoff=expression_cutoff,
+                group_order=present,
+            )
+
+        tables = _pool_adjust(
+            {label: outcome.table for label, outcome in outcomes.items()},
+            adjustment,
+        )
+        posthoc_tables = _pool_adjust(
+            {
+                label: outcome.posthoc_table
+                for label, outcome in outcomes.items()
+                if outcome.posthoc_table is not None
+            },
+            adjustment,
+        )
+
+        result = StatisticalTestResult(
+            method=effective_method,
+            posthoc=posthoc,
+            adjustment_method=adjustment,
+            group_key=group_by,
+            cell_key=cell_key,
+            sample_by=sample_by,
+            pair_by=pair_by,
+            sample_stat=sample_stat,
+            expression_cutoff=expression_cutoff,
+            n_groups=n_groups,
+            n_cells=n,
+            tested_features=tuple(tested_features),
+            summary_scope="sample" if sample_by is not None else "cell",
+            tables=tables,
+            posthoc_tables=posthoc_tables,
+        )
+
+        if not skip_save:
+            assert planned is not None
+            assert select_statistical_artifact is not None
             remote_slot = start_artifact(self.zw, planned)
-            self._write_statistical_slot(remote_slot, result, key_labels=key_labels)
+            self._write_statistical_slot(
+                remote_slot,
+                result,
+                key_labels=key_labels,
+                cell_selection_hash=_value_fingerprint(cell_idx),
+            )
             finish_artifact(remote_slot, planned)
             select_statistical_artifact(planned.ref)
             logger.info(
@@ -2317,33 +2547,44 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             )
         return result
 
-    @staticmethod
     def _write_statistical_slot(
+        self,
         group: zarr.Group,
         result: StatisticalTestResult,
         *,
         key_labels: list[str],
+        cell_selection_hash: str,
     ) -> None:
-        from ...storage.arrays import create_metadata_column, create_zarr_dataset
-
         storage_columns = _statistical_storage_columns(result.method, result.posthoc)
-        string_columns = [
+        posthoc_columns = _statistical_posthoc_columns(result.posthoc)
+        main_string_columns = [
             column for column in storage_columns if column in ("group_1", "group_2")
         ]
-        numeric_columns = [
-            column for column in storage_columns if column not in string_columns
+        main_numeric_columns = [
+            column for column in storage_columns if column not in main_string_columns
+        ]
+        posthoc_string_columns = [
+            column for column in posthoc_columns if column in ("group_1", "group_2")
+        ]
+        posthoc_numeric_columns = [
+            column for column in posthoc_columns if column not in posthoc_string_columns
         ]
         group.attrs["stat_columns"] = list(storage_columns)
+        group.attrs["posthoc_stat_columns"] = list(posthoc_columns)
         group.attrs["method"] = result.method
         group.attrs["posthoc"] = result.posthoc
         group.attrs["adjustment_method"] = result.adjustment_method
         group.attrs["group_by"] = result.group_key
+        group.attrs["cell_key"] = result.cell_key
         group.attrs["sample_by"] = result.sample_by
         group.attrs["pair_by"] = result.pair_by
         group.attrs["sample_stat"] = result.sample_stat
         group.attrs["expression_cutoff"] = result.expression_cutoff
         group.attrs["n_groups"] = result.n_groups
         group.attrs["n_cells"] = result.n_cells
+        group.attrs["tested_features"] = list(result.tested_features)
+        group.attrs["cell_selection_hash"] = cell_selection_hash
+        group.attrs["summary_scope"] = result.summary_scope
         group.attrs["key_labels"] = list(key_labels)
 
         for idx, key_label in enumerate(key_labels):
@@ -2351,50 +2592,49 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             key_group = group.create_group(str(idx))
             key_group.attrs["key_label"] = key_label
             key_group.attrs["key_index"] = idx
-            numeric = np.asarray(
-                table.loc[:, numeric_columns].to_numpy(dtype=np.float64)
-            )
-            if numeric.ndim == 1:
-                numeric = numeric.reshape(-1, 1)
-            if not np.isfinite(numeric).all():
-                raise ValueError("Statistical test results must all be finite")
-            stats = create_zarr_dataset(
-                key_group,
-                "stats",
-                (int(numeric.shape[0]), int(numeric.shape[1])),
-                "float64",
-                (int(numeric.shape[0]), int(numeric.shape[1])),
-            )
-            stats[:] = numeric
-            for column in string_columns:
-                create_metadata_column(
+            _write_stats_array(key_group, "stats", table, main_numeric_columns)
+            for column in main_string_columns:
+                _write_group_column(key_group, column, table[column])
+            if result.posthoc_tables and key_label in result.posthoc_tables:
+                posthoc_table = result.posthoc_tables[key_label]
+                _write_stats_array(
                     key_group,
-                    column,
-                    data=list(table[column].astype(str)),
+                    "posthoc_stats",
+                    posthoc_table,
+                    posthoc_numeric_columns,
                 )
+                for column in posthoc_string_columns:
+                    _write_group_column(
+                        key_group,
+                        f"posthoc_{column}",
+                        posthoc_table[column],
+                    )
 
     def _resolve_statistical_slot(
         self,
         from_assay: str | None,
-        cell_key: str,
+        cell_key: str | None,
         group_key: str,
         method: str,
         posthoc: str | None,
+        *,
+        variant_digest: str,
     ) -> zarr.Group:
         assay = self._get_assay(from_assay)
         if "statistical_tests" not in assay.z:
             raise KeyError(
                 "ERROR: Couldn't find statistical test results. Make sure "
                 "`run_statistical_testing` was called with the same `cell_key`, "
-                "`group_key`, and `test` method."
+                "`group_key`, `test` method, and variant parameters."
             )
         stats_grp = as_zarr_group(
             assay.z["statistical_tests"],
             name="statistical_tests",
         )
-        slot_name = f"{cell_key}__{group_key}__{method}"
+        slot_name = f"{_statistical_cell_key_key(cell_key)}__{group_key}__{method}"
         if posthoc is not None:
             slot_name += f"__{posthoc}"
+        slot_name += f"__{variant_digest}"
         raw_artifacts = stats_grp.attrs.get("artifacts", {})
         if "artifacts" in stats_grp.attrs and not isinstance(raw_artifacts, dict):
             raise ValueError("Statistical test artifact index is invalid")
@@ -2403,7 +2643,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             raise KeyError(
                 "ERROR: Couldn't find statistical test results. Make sure "
                 "`run_statistical_testing` was called with the same `cell_key`, "
-                "`group_key`, and `test` method."
+                "`group_key`, `test` method, and variant parameters (keys, "
+                "groups, comparisons, adjustment, sample_by, pair_by, subset_by)."
             )
         ref = ArtifactRef.from_dict(artifacts[slot_name])
         path = artifact_path(ref)
@@ -2417,73 +2658,119 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     @staticmethod
     def _read_statistical_slot(
         slot_group: zarr.Group,
-        *,
-        cell_key: str,
     ) -> StatisticalTestResult:
         method = slot_group.attrs.get("method")
         posthoc = slot_group.attrs.get("posthoc")
         storage_columns = _statistical_storage_columns(method, posthoc)
-        string_columns = [
+        posthoc_columns = _statistical_posthoc_columns(posthoc)
+        main_string_columns = [
             column for column in storage_columns if column in ("group_1", "group_2")
         ]
-        numeric_columns = [
-            column for column in storage_columns if column not in string_columns
+        main_numeric_columns = [
+            column for column in storage_columns if column not in main_string_columns
+        ]
+        posthoc_string_columns = [
+            column for column in posthoc_columns if column in ("group_1", "group_2")
+        ]
+        posthoc_numeric_columns = [
+            column for column in posthoc_columns if column not in posthoc_string_columns
         ]
         key_labels = slot_group.attrs.get("key_labels", [])
         tables: dict[str, pd.DataFrame] = {}
+        posthoc_tables: dict[str, pd.DataFrame] = {}
         for idx, key_label in enumerate(key_labels):
             key_group = as_zarr_group(slot_group[str(idx)], name=str(idx))
             stats = np.asarray(as_zarr_array(key_group["stats"], name="stats")[:])
-            frame = pd.DataFrame(stats, columns=numeric_columns)
-            for column in string_columns:
-                raw = np.asarray(as_zarr_array(key_group[column], name=column)[:])
-                if raw.dtype.kind == "S":
-                    raw = np.char.decode(raw, "utf-8")
-                frame[column] = np.asarray(raw, dtype=object)
+            frame = pd.DataFrame(stats, columns=main_numeric_columns)
+            for column in main_string_columns:
+                frame[column] = _read_group_column(key_group, column)
             frame = frame.loc[:, list(storage_columns)]
             tables[str(key_label)] = frame
+            if posthoc_columns:
+                posthoc_stats = np.asarray(
+                    as_zarr_array(
+                        key_group["posthoc_stats"],
+                        name="posthoc_stats",
+                    )[:]
+                )
+                posthoc_frame = pd.DataFrame(
+                    posthoc_stats,
+                    columns=posthoc_numeric_columns,
+                )
+                for column in posthoc_string_columns:
+                    posthoc_frame[column] = _read_group_column(
+                        key_group,
+                        f"posthoc_{column}",
+                    )
+                posthoc_frame = posthoc_frame.loc[:, list(posthoc_columns)]
+                posthoc_tables[str(key_label)] = posthoc_frame
         return StatisticalTestResult(
             method=str(method),
             posthoc=posthoc,
             adjustment_method=str(slot_group.attrs.get("adjustment_method")),
             group_key=str(slot_group.attrs.get("group_by")),
-            cell_key=cell_key,
+            cell_key=slot_group.attrs.get("cell_key"),
             sample_by=slot_group.attrs.get("sample_by"),
             pair_by=slot_group.attrs.get("pair_by"),
             sample_stat=str(slot_group.attrs.get("sample_stat", "mean")),
             expression_cutoff=float(slot_group.attrs.get("expression_cutoff", 0.0)),
             n_groups=int(slot_group.attrs.get("n_groups", 0)),
             n_cells=int(slot_group.attrs.get("n_cells", 0)),
+            tested_features=tuple(slot_group.attrs.get("tested_features", [])),
+            summary_scope=slot_group.attrs.get("summary_scope", "cell"),
             tables=tables,
+            posthoc_tables=posthoc_tables,
         )
 
     def get_statistical_tests(
         self,
         from_assay: str | None = None,
-        cell_key: str | None = None,
+        cell_key: str | None = "I",
         group_key: str | None = None,
         method: str | None = None,
         posthoc: str | None = None,
+        *,
+        keys: ("str | CellField | FeatureRef | Sequence[str | CellField | FeatureRef]"),
+        groups: Sequence[Any] | None = None,
+        comparisons: Sequence[tuple[Any, Any]] | None = None,
+        adjustment: Literal["fdr_bh", "bonferroni", "holm", "none"] = "fdr_bh",
+        sample_by: str | None = None,
+        pair_by: str | None = None,
+        subset_by: str | None = None,
     ) -> StatisticalTestResult:
         """Return statistical test results from `run_statistical_testing`.
 
+        Because every distinct variant (tested keys, ``groups``, pairwise
+        ``comparisons``, ``adjustment``, and sample or subset columns) is
+        stored under its own retrievable slot, the variant parameters must be
+        repeated here exactly as they were passed to ``run_statistical_testing``.
+
         Args:
             from_assay: Name of the assay used when the results were stored.
-            cell_key: Cell key used when the results were stored.
+            cell_key: Cell key used when the results were stored (``"I"`` by
+                default; ``None`` matches the all-cells run).
             group_key: Grouping column used when the results were stored.
             method: Test method used when the results were stored
                 (``"mann_whitney"``, ``"kruskal_wallis"``, or ``"wilcoxon"``).
             posthoc: Post-hoc test used when the results were stored.
+            keys: Keys tested when the results were stored.
+            groups: Group selection used when the results were stored.
+            comparisons: Pairwise comparisons used when the results were stored.
+            adjustment: Correction method used when the results were stored.
+            sample_by: Sample column used when the results were stored.
+            pair_by: Pair column used when the results were stored.
+            subset_by: Subset column used when the results were stored.
 
         Returns:
             A :class:`~scarf.features.statistical.StatisticalTestResult`.
         """
-        if cell_key is None:
-            from_assay, cell_key = _resolve_assay_and_cell_key(
-                self,
-                from_assay,
-                cell_key,
-            )
+        from ...plotting._contracts import CellField, FeatureRef
+
+        from_assay, cell_key = _resolve_assay_and_cell_key(
+            self,
+            from_assay,
+            cell_key,
+        )
         if group_key is None:
             raise ValueError(
                 "ERROR: Please provide a value for group_key. This should be "
@@ -2494,11 +2781,124 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "ERROR: Please provide the statistical test method used in "
                 "`run_statistical_testing`"
             )
+        if keys is None:
+            raise ValueError(
+                "ERROR: Please provide the keys tested in `run_statistical_testing`"
+            )
+        if adjustment not in ("fdr_bh", "bonferroni", "holm", "none"):
+            raise ValueError(
+                "adjustment must be 'fdr_bh', 'bonferroni', 'holm', or 'none'"
+            )
+        if isinstance(keys, (str, CellField, FeatureRef)):
+            key_list: list[str | CellField | FeatureRef] = [keys]
+        else:
+            key_list = list(keys)
+        if not key_list:
+            raise ValueError("keys must be non-empty")
+
+        cell_idx = _statistical_cell_indices(self, cell_key)
+        _labels, tested_features, _values = self._statistical_key_series(
+            key_list,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            cell_idx=cell_idx,
+            normalization=None,
+            fetch_values=False,
+        )
+        native_groups = _normalized_variant_groups(groups)
+        native_comparisons = _normalized_variant_comparisons(comparisons)
+        variant_digest = _statistical_variant_digest(
+            tested_features=tuple(tested_features),
+            groups=native_groups,
+            comparisons=native_comparisons,
+            adjustment=adjustment,
+            sample_by=sample_by,
+            pair_by=pair_by,
+            subset_by=subset_by,
+        )
         slot_group = self._resolve_statistical_slot(
             from_assay,
             cell_key,
             group_key,
             method,
             posthoc,
+            variant_digest=variant_digest,
         )
-        return self._read_statistical_slot(slot_group, cell_key=cell_key)
+        return self._read_statistical_slot(slot_group)
+
+
+def _write_stats_array(
+    key_group: zarr.Group,
+    name: str,
+    table: pd.DataFrame,
+    columns: Sequence[str],
+) -> None:
+    from ...storage.arrays import create_zarr_dataset
+
+    numeric = np.asarray(table.loc[:, columns].to_numpy(dtype=np.float64))
+    if numeric.ndim == 1:
+        numeric = numeric.reshape(-1, 1)
+    if not np.isfinite(numeric).all():
+        raise ValueError("Statistical test results must all be finite")
+    stats = create_zarr_dataset(
+        key_group,
+        name,
+        (int(numeric.shape[0]), int(numeric.shape[1])),
+        "float64",
+        (int(numeric.shape[0]), int(numeric.shape[1])),
+    )
+    stats[:] = numeric
+
+
+def _write_group_column(
+    key_group: zarr.Group,
+    name: str,
+    values: pd.Series,
+) -> None:
+    """Write a group-label column preserving its native dtype."""
+    from ...storage.arrays import create_metadata_column, create_zarr_dataset
+
+    array = np.asarray(values)
+    kind = array.dtype.kind
+    if kind == "b":
+        dtype_tag = "bool"
+        data = array.astype(bool)
+    elif kind in {"i", "u"}:
+        dtype_tag = "int"
+        data = array.astype(np.int64)
+    elif kind == "f":
+        dtype_tag = "float"
+        data = array.astype(np.float64)
+    else:
+        dtype_tag = "str"
+        data = array
+    key_group.attrs[f"{name}_dtype"] = dtype_tag
+    if dtype_tag == "str":
+        create_metadata_column(
+            key_group,
+            name,
+            data=[str(value) for value in data],
+        )
+        return
+    column = create_zarr_dataset(
+        key_group,
+        name,
+        (int(len(data)),),
+        dtype_tag,
+        (int(len(data)),),
+    )
+    column[:] = data
+
+
+def _read_group_column(key_group: zarr.Group, name: str) -> np.ndarray:
+    dtype_tag = key_group.attrs.get(f"{name}_dtype", "str")
+    raw = np.asarray(as_zarr_array(key_group[name], name=name)[:])
+    if dtype_tag == "bool":
+        return np.asarray(raw, dtype=bool)
+    if dtype_tag == "int":
+        return np.asarray(raw, dtype=np.int64)
+    if dtype_tag == "float":
+        return np.asarray(raw, dtype=np.float64)
+    if raw.dtype.kind == "S":
+        raw = np.char.decode(raw, "utf-8")
+    return np.asarray(raw, dtype=object)
