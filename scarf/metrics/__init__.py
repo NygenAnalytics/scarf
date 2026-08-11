@@ -32,6 +32,11 @@ from .lisi import (
     ilisi_knn,
     lisi_batch_mixing_score,
 )
+from .pca_diagnostics import (
+    branch_nuisance_summary,
+    family_loading_concentration,
+    per_pc_covariate_associations,
+)
 from .silhouette import process_cluster, silhouette_scoring
 
 __all__ = [
@@ -40,6 +45,7 @@ __all__ = [
     "NeighborMetric",
     "ZarrArray",
     "association_pair",
+    "branch_nuisance_summary",
     "calculate_knn_cluster_similarity",
     "calculate_top_k_neighbor_distances",
     "calculate_weighted_cluster_similarity",
@@ -51,11 +57,13 @@ __all__ = [
     "directional_mapping",
     "eta_squared",
     "evaluate_cluster_separability",
+    "family_loading_concentration",
     "graph_connectivity",
     "ilisi_knn",
     "knn_to_csr_matrix",
     "label_concordance_score",
     "lisi_batch_mixing_score",
+    "per_pc_covariate_associations",
     "process_cluster",
     "report_confounding",
     "report_technical_nesting",

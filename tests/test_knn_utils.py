@@ -11,6 +11,7 @@ from sklearn.metrics import adjusted_rand_score
 from scarf.clustering.leiden import leiden_membership
 from scarf.neighbors.graph import (
     build_connectivity_arrays,
+    build_connectivity_block,
     calc_snn,
     merge_graphs,
     take_nearest_per_row,
@@ -501,6 +502,43 @@ def test_build_connectivity_arrays_runs_in_memory():
         ).astype(np.uint32),
     )
     np.testing.assert_allclose(weights, expected_weights, rtol=1e-6, atol=1e-7)
+
+
+def test_connectivity_blocks_match_complete_matrix_with_self_neighbors():
+    n_cells = 8
+    indices = np.array(
+        [[row, (row + 1) % n_cells, (row + 3) % n_cells] for row in range(n_cells)],
+        dtype=np.int64,
+    )
+    distances = np.tile(np.array([0.0, 0.5, 1.0]), (n_cells, 1))
+    expected_edges, expected_weights = build_connectivity_arrays(
+        indices,
+        distances,
+        local_connectivity=1.0,
+        bandwidth=1.5,
+    )
+
+    edge_blocks = []
+    weight_blocks = []
+    for start, end in ((0, 3), (3, 6), (6, 8)):
+        edges, weights = build_connectivity_block(
+            indices[start:end],
+            distances[start:end],
+            row_offset=start,
+            n_cells=n_cells,
+            local_connectivity=1.0,
+            bandwidth=1.5,
+        )
+        edge_blocks.append(edges)
+        weight_blocks.append(weights)
+
+    np.testing.assert_array_equal(np.vstack(edge_blocks), expected_edges)
+    np.testing.assert_allclose(
+        np.concatenate(weight_blocks),
+        expected_weights,
+        rtol=1e-6,
+        atol=1e-7,
+    )
 
 
 def test_connectivity_omits_zero_membership_edges():

@@ -13,6 +13,7 @@ def smooth_knn_chunk(
     *,
     local_connectivity: float,
     bandwidth: float,
+    row_offset: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Convert one KNN distance block into fuzzy graph edges."""
     from umap.umap_ import compute_membership_strengths, smooth_knn_dist
@@ -27,13 +28,26 @@ def smooth_knn_chunk(
         local_connectivity=local_connectivity,
         bandwidth=bandwidth,
     )
-    rows, columns, values, _ = compute_membership_strengths(
-        indices_array,
+    membership_indices = np.asarray(indices_array, dtype=np.int64).copy()
+    for row in range(membership_indices.shape[0]):
+        local_self = row
+        global_self = row + row_offset
+        nonself_collision = (membership_indices[row] == local_self) & (
+            membership_indices[row] != global_self
+        )
+        membership_indices[row, nonself_collision] = -2
+        membership_indices[row, indices_array[row] == global_self] = local_self
+    rows, _, values, _ = compute_membership_strengths(
+        membership_indices,
         distance_array,
         sigmas,
         rhos,
     )
-    return np.asarray(rows), np.asarray(columns), np.asarray(values)
+    return (
+        np.asarray(rows),
+        np.asarray(indices_array).reshape(-1),
+        np.asarray(values),
+    )
 
 
 def validate_connectivity_parameters(
@@ -64,6 +78,29 @@ def build_connectivity_arrays(
     bandwidth: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build compact edge and weight arrays for a complete KNN matrix."""
+    neighbor_indices = np.asarray(indices)
+    if neighbor_indices.ndim != 2:
+        raise ValueError("Neighbor indices and distances must have matching matrices")
+    return build_connectivity_block(
+        neighbor_indices,
+        distances,
+        row_offset=0,
+        n_cells=int(neighbor_indices.shape[0]),
+        local_connectivity=local_connectivity,
+        bandwidth=bandwidth,
+    )
+
+
+def build_connectivity_block(
+    indices: np.ndarray,
+    distances: np.ndarray,
+    *,
+    row_offset: int,
+    n_cells: int,
+    local_connectivity: float,
+    bandwidth: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build compact edges for one contiguous KNN row block."""
     local_connectivity, bandwidth = validate_connectivity_parameters(
         local_connectivity,
         bandwidth,
@@ -74,10 +111,10 @@ def build_connectivity_arrays(
         raise ValueError("Neighbor indices and distances must have matching matrices")
     if not np.issubdtype(neighbor_indices.dtype, np.integer):
         raise TypeError("Neighbor indices must be integers")
-    if np.any(neighbor_indices < 0) or np.any(
-        neighbor_indices >= neighbor_indices.shape[0]
-    ):
+    if np.any(neighbor_indices < 0) or np.any(neighbor_indices >= n_cells):
         raise ValueError("Neighbor indices are outside the cell range")
+    if row_offset < 0 or row_offset + neighbor_indices.shape[0] > n_cells:
+        raise ValueError("Connectivity row block is outside the cell range")
     if not np.all(np.isfinite(neighbor_distances)) or np.any(neighbor_distances < 0):
         raise ValueError("Neighbor distances must be finite and non-negative")
     rows, columns, values = smooth_knn_chunk(
@@ -85,6 +122,7 @@ def build_connectivity_arrays(
         neighbor_distances,
         local_connectivity=local_connectivity,
         bandwidth=bandwidth,
+        row_offset=row_offset,
     )
     expected = int(neighbor_indices.size)
     if (
@@ -93,11 +131,11 @@ def build_connectivity_arrays(
         or values.shape != (expected,)
     ):
         raise ValueError("UMAP membership output does not match the KNN matrix")
-    if (
-        np.any(rows < 0)
-        or np.any(columns < 0)
-        or np.any(rows > np.iinfo(np.uint32).max)
-        or np.any(columns > np.iinfo(np.uint32).max)
+    rows = np.asarray(rows, dtype=np.int64) + row_offset
+    if np.any(rows < 0) or np.any(columns < 0):
+        raise ValueError("Connectivity endpoints must be non-negative")
+    if np.any(rows > np.iinfo(np.uint32).max) or np.any(
+        columns > np.iinfo(np.uint32).max
     ):
         raise ValueError("Connectivity endpoints exceed uint32 bounds")
     edges = np.empty((expected, 2), dtype=np.uint32)

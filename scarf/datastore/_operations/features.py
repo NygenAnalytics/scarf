@@ -254,6 +254,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         max_cells: float | None = None,
         bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
         invalidate_cache: bool = False,
+        blacklist_indexes: Sequence[int] | None = None,
         **plot_kwargs: Any,
     ) -> None:
         """Identify and mark genes as highly variable genes (HVGs). This is a
@@ -286,6 +287,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             blacklist: Regex of gene names to exclude from HVGs. Matching is case-insensitive.
                        Default excludes mitochondrial, ribosomal, cell-cycle (``CCN*``), HLA/H2, histone,
                        and common human sex-linked genes (``XIST``, Y-chromosome markers).
+            blacklist_indexes: Exact feature indexes excluded before ranking. Applied in addition to
+                               ``blacklist`` when both are provided.
             keep_bounds: If True, retain upper cell-count and expression-statistic bounds.
                          The ``min_cells`` boundary is always inclusive. (Default: False)
             show_plot: If True then a diagnostic scatter plot is shown with HVGs highlighted. (Default: True)
@@ -346,6 +349,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             lowess_frac=lowess_frac,
             bin_strategy=bin_strategy,
             blacklist=blacklist,
+            blacklist_indexes=blacklist_indexes,
             hvg_key_name=hvg_key_name,
             keep_bounds=keep_bounds,
             show_plot=show_plot,
@@ -378,6 +382,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "n_bins": n_bins,
                 "lowess_frac": lowess_frac,
                 "blacklist": blacklist,
+                "blacklist_indexes": (
+                    None
+                    if blacklist_indexes is None
+                    else [int(index) for index in blacklist_indexes]
+                ),
                 "keep_bounds": keep_bounds,
                 "bin_strategy": bin_strategy,
             },

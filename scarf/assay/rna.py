@@ -1110,6 +1110,7 @@ class RNAassay(Assay):
         show_plot: bool,
         max_cells: int | float,
         bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
+        blacklist_indexes: Sequence[int] | None = None,
         **plot_kwargs: Any,
     ) -> None:
         """Identifies highly variable genes in the dataset.
@@ -1147,6 +1148,8 @@ class RNAassay(Assay):
             bin_strategy: Strategy used to construct bins and variance anchors.
             blacklist: A regular expression string pattern. Gene names matching to this pattern will be excluded from
                        the final highly variable genes list
+            blacklist_indexes: Exact feature indexes excluded before ranking. Applied in addition to
+                               ``blacklist`` when both are provided.
             hvg_key_name: The label for highly variable genes. This label will be used to mark the HVGs in the
                           feature attribute table. The value for 'cell_key' parameter is prepended to this value.
             keep_bounds: If True, retain upper cell-count and expression-statistic bounds.
@@ -1186,6 +1189,7 @@ class RNAassay(Assay):
             max_mean=max_mean,
             blacklist=blacklist,
             keep_bounds=keep_bounds,
+            blacklist_indexes=blacklist_indexes,
         )
         hvg_key_name = cell_key + "__" + hvg_key_name
         logger.info(f"{sum(hvgs)} genes marked as HVGs")

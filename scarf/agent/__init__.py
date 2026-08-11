@@ -11,6 +11,8 @@ from .characterize_features import (
 from .decide import DecisionValidationError, decide
 from .ingest import IngestResult, detect_format, ingest
 from .runtime import check_runtime, load_env
+from .select_graph import GraphSelectionResult, select_graph
+from .select_pca import PcaSelectionResult, select_pca
 from .types import (
     Decision,
     EvidenceItem,
@@ -25,8 +27,10 @@ __all__ = [
     "DecisionValidationError",
     "EvidenceItem",
     "FeatureCharacterization",
+    "GraphSelectionResult",
     "IngestResult",
     "NeedsInput",
+    "PcaSelectionResult",
     "StageResult",
     "StageStatus",
     "characterize_covariates",
@@ -36,4 +40,6 @@ __all__ = [
     "detect_format",
     "ingest",
     "load_env",
+    "select_graph",
+    "select_pca",
 ]

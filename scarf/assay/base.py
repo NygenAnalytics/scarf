@@ -1,4 +1,4 @@
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Literal, cast
@@ -342,6 +342,82 @@ class Assay:
             self.nthreads,
         )
         self._write_percent_feature(name, total)
+
+    def add_percent_features_by_indexes(
+        self,
+        feature_sets: dict[str, Sequence[int]],
+    ) -> dict[str, bool]:
+        """Compute percentage features from exact feature indexes in one matrix pass.
+
+        Results are reused when the ordered feature-index digest matches a prior
+        write for the same column name.
+
+        Args:
+            feature_sets: Mapping from cell-metadata column name to feature indexes.
+
+        Returns:
+            Mapping from column name to whether the column was recomputed.
+        """
+        if not feature_sets:
+            return {}
+
+        digests_raw = self.attrs.get("percentFeatureIndexDigests", {})
+        digests: dict[str, str] = {}
+        if isinstance(digests_raw, Mapping):
+            digests = {
+                str(key): str(value)
+                for key, value in digests_raw.items()
+                if value is not None
+            }
+        planned: dict[str, np.ndarray] = {}
+        planned_digests: dict[str, str] = {}
+        recomputed: dict[str, bool] = {}
+
+        for name, indexes in feature_sets.items():
+            if isinstance(indexes, (str, bytes)):
+                raise TypeError(
+                    f"feature indexes for {name!r} must be a sequence of integers"
+                )
+            values = np.asarray(indexes)
+            if values.ndim != 1:
+                raise ValueError(
+                    f"feature indexes for {name!r} must be one-dimensional"
+                )
+            if values.size == 0:
+                recomputed[name] = False
+                continue
+            if not np.issubdtype(values.dtype, np.integer):
+                raise TypeError(
+                    f"feature indexes for {name!r} must contain only integers"
+                )
+            values = np.unique(values.astype(np.int64, copy=False))
+            if np.any(values < 0) or np.any(values >= self.feats.N):
+                raise IndexError(f"feature indexes for {name!r} are out of range")
+            digest = array_digest(values)
+            planned_digests[name] = digest
+            if digests.get(name) == digest and name in self.cells.columns:
+                recomputed[name] = False
+                continue
+            planned[name] = values
+            recomputed[name] = True
+
+        if planned:
+            stats = self._stream_initialization_stats(
+                compute_n_counts=False,
+                compute_n_features=False,
+                compute_n_cells=False,
+                percent_feature_indices=planned,
+            )
+            n_counts = np.asarray(
+                self.cells.fetch_all(self.name + "_nCounts"),
+                dtype=float,
+            )
+            for name, total in stats.items():
+                self._write_percent_feature(name, total, n_counts=n_counts)
+                digests[name] = planned_digests[name]
+            self.attrs["percentFeatureIndexDigests"] = digests
+
+        return recomputed
 
     def _verify_keys(self, cell_key: str, feat_key: str) -> None:
         """Checks if provided key names are present in cells and feature

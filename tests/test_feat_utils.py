@@ -328,6 +328,47 @@ def test_hvg_cell_count_bounds_include_minimum_and_exclude_maximum():
     )
 
 
+def test_hvg_shortfall_returns_all_valid_candidates():
+    selected = select_highly_variable_features(
+        corrected_variance=np.array([5.0, 4.0, 3.0]),
+        normalized_cell_counts=np.full(3, 5),
+        mean_nonzero=np.full(3, 1.0),
+        active_features=np.ones(3, dtype=bool),
+        feature_names=np.array(["A", "B", "C"]),
+        min_cells=0,
+        max_cells=np.inf,
+        top_n=10,
+        min_var=-np.inf,
+        max_var=np.inf,
+        min_mean=-np.inf,
+        max_mean=np.inf,
+        blacklist="",
+        keep_bounds=False,
+    )
+    np.testing.assert_array_equal(selected, np.array([True, True, True]))
+
+
+def test_hvg_blacklist_indexes_apply_before_ranking():
+    selected = select_highly_variable_features(
+        corrected_variance=np.array([10.0, 9.0, 8.0, 1.0]),
+        normalized_cell_counts=np.full(4, 5),
+        mean_nonzero=np.full(4, 1.0),
+        active_features=np.ones(4, dtype=bool),
+        feature_names=np.array(["A", "B", "C", "D"]),
+        min_cells=0,
+        max_cells=np.inf,
+        top_n=2,
+        min_var=-np.inf,
+        max_var=np.inf,
+        min_mean=-np.inf,
+        max_mean=np.inf,
+        blacklist="",
+        keep_bounds=False,
+        blacklist_indexes=[0, 1],
+    )
+    np.testing.assert_array_equal(selected, np.array([False, False, True, True]))
+
+
 def test_binned_sampling_excludes_query_genes():
     rng = np.random.default_rng(1)
     gene_names = [f"gene_{i}" for i in range(120)]

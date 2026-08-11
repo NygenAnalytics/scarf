@@ -100,12 +100,15 @@ def test_characterize_features_prefix_species_and_families(tmp_path: Path) -> No
     assert assay["speciesMethod"] == "ensemblPrefix"
     families = {item["family"]: item for item in assay["families"]}
     assert families["mitochondrial"]["examples"] == ["MT-CYB"]
+    assert families["mitochondrial"]["featureIndexes"] == [1]
     assert "RPL31" in families["ribosomal"]["examples"]
     assert set(families["sex"]["examples"]) == {"RPS4Y1", "XIST"}
+    assert families["sex"]["featureIndexes"] == [3, 4]
     assert families["sex"]["method"] == "chromosome"
     assert families["sex"]["defaultExclude"] is False
     assert families["mitochondrial"]["defaultExclude"] is True
     assert families["histone"]["examples"] == ["HIST1H4A"]
+    assert families["histone"]["featureIndexes"] == [5]
     assert any(item["name"] == "ERCC-00002" for item in assay["exogenous"])
     assert any(entry["kind"] == "sexChromosomeTracked" for entry in result.auditLog)
 

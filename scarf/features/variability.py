@@ -1,4 +1,5 @@
 import re
+from collections.abc import Sequence
 from typing import Any, Literal
 
 import numpy as np
@@ -202,6 +203,7 @@ def select_highly_variable_features(
     max_mean: float,
     blacklist: str,
     keep_bounds: bool,
+    blacklist_indexes: Sequence[int] | None = None,
 ) -> np.ndarray:
     """Select highly variable features from precomputed feature statistics."""
     corrected_variance = np.asarray(corrected_variance)
@@ -236,6 +238,18 @@ def select_highly_variable_features(
     else:
         allowed = np.ones(size, dtype=bool)
 
+    if blacklist_indexes is not None:
+        indexes = np.asarray(blacklist_indexes)
+        if indexes.ndim != 1:
+            raise ValueError("blacklist_indexes must be one-dimensional")
+        if indexes.size:
+            if not np.issubdtype(indexes.dtype, np.integer):
+                raise TypeError("blacklist_indexes must contain only integers")
+            indexes = indexes.astype(np.int64, copy=False)
+            if np.any(indexes < 0) or np.any(indexes >= size):
+                raise IndexError("blacklist_indexes contains an out-of-range index")
+            allowed[indexes] = False
+
     cell_count_candidates = normalized_cell_counts >= min_cells
     cell_count_candidates &= (
         normalized_cell_counts <= max_cells
@@ -262,11 +276,11 @@ def select_highly_variable_features(
             )
         if top_n >= n_valid_features:
             logger.warning(
-                f"WARNING: Number of valid features are less then value "
-                f"of parameter `top_n`: {top_n}. Resetting `top_n` to "
-                f"{n_valid_features - 1}"
+                "WARNING: Number of valid features "
+                f"({n_valid_features}) is less than or equal to `top_n` "
+                f"({top_n}). Returning all valid candidates."
             )
-            top_n = n_valid_features - 1
+            return np.asarray(candidates, dtype=bool)
         min_var = (
             pd.Series(corrected_variance)[candidates]
             .sort_values(ascending=False)

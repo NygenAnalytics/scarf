@@ -3303,20 +3303,21 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             invalidate_cache=invalidate_cache,
         )
         if not planned.reused:
-            from ...neighbors.graph import build_connectivity_arrays
+            from ...neighbors.graph import build_connectivity_block
 
-            distance_values = np.asarray(
-                as_zarr_array(
-                    group["distances"],
-                    name="distances",
-                )[:]
+            distances = as_zarr_array(
+                group["distances"],
+                name="distances",
             )
-            edge_values, weight_values = build_connectivity_arrays(
-                np.asarray(indices[:]),
-                distance_values,
-                local_connectivity=local_connectivity,
-                bandwidth=bandwidth,
+            row_bytes = max(1, n_neighbors * 64)
+            block_rows = max(
+                1,
+                min(
+                    n_cells,
+                    int(self.resources.memoryBytes // row_bytes),
+                ),
             )
+            max_edges = n_cells * n_neighbors
             output = start_artifact(self.zw, planned)
             profile = resolve_storage_profile(output.store)
             zarr_format = _group_zarr_format(output)
@@ -3325,7 +3326,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 output,
                 "edges",
                 row_sharded_array_spec(
-                    edge_values.shape,
+                    (max_edges, 2),
                     np.uint32,
                     profile=profile,
                     band_rows=edge_band_rows,
@@ -3336,7 +3337,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 output,
                 "weights",
                 row_sharded_array_spec(
-                    weight_values.shape,
+                    (max_edges,),
                     np.float32,
                     profile=profile,
                     band_rows=edge_band_rows,
@@ -3344,10 +3345,27 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     fill_value=0.0,
                 ),
             )
-            edges[:, :] = edge_values
-            weights[:] = weight_values
+            written = 0
+            for start in range(0, n_cells, block_rows):
+                end = min(start + block_rows, n_cells)
+                edge_values, weight_values = build_connectivity_block(
+                    np.asarray(indices[start:end]),
+                    np.asarray(distances[start:end]),
+                    row_offset=start,
+                    n_cells=n_cells,
+                    local_connectivity=local_connectivity,
+                    bandwidth=bandwidth,
+                )
+                block_edges = int(edge_values.shape[0])
+                if block_edges:
+                    edges[written : written + block_edges, :] = edge_values
+                    weights[written : written + block_edges] = weight_values
+                    written += block_edges
+            edges.resize((written, 2))
+            weights.resize((written,))
             output.attrs["n_cells"] = n_cells
             output.attrs["n_neighbors"] = n_neighbors
+            output.attrs["block_rows"] = block_rows
             finish_artifact(output, planned)
         self._publish_current_artifact(
             planned.ref,

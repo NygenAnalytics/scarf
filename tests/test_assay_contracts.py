@@ -28,6 +28,7 @@ _PUBLIC_CLASS_METHODS = {
         "normed",
         "to_raw_sparse",
         "add_percent_feature",
+        "add_percent_features_by_indexes",
         "save_normalized_data",
         "iter_normed_feature_wise",
         "save_aggregated_ordering",
@@ -60,8 +61,8 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    Assay: "98c61afcfba07dee60b2132c227882886ccb248832048d385c1f82d43f3617c7",
-    RNAassay: "26951c69d48c7cb169d8d59014850ff1cf47cdb7dc4cff63e3daf8851f74c604",
+    Assay: "6d149802baae01e49d350a71b13ec0cfa2d9edc95df0513c5c664844c503a3c4",
+    RNAassay: "fb8a504a18e66bba016dc932dbcd6cab28d137cd15e83cb5dc22ec56af4e430e",
     ATACassay: "491bb1c63ad83fa5d9634200c5b3778a3018e39abdd3ae87208eb3e85659633c",
     ADTassay: "a1ff1bebdd8fcd3f30a1b64a42dbf2931f6b8031ddce75abcf362750eb4e9c34",
 }

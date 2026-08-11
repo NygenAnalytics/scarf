@@ -153,12 +153,16 @@ def test_observe_families_uses_chromosome_for_mito_and_sex(tmp_path: Path) -> No
     }
     assert families["mitochondrial"]["method"] == "chromosome"
     assert families["mitochondrial"]["examples"] == ["MT-CYB"]
+    assert families["mitochondrial"]["featureIndexes"] == [0]
     assert families["mitochondrial"]["defaultExclude"] is True
     assert "RPL31" in families["ribosomal"]["examples"]
+    assert families["ribosomal"]["featureIndexes"] == [1, 3]
     assert families["sex"]["method"] == "chromosome"
     assert set(families["sex"]["examples"]) == {"RPS4Y1", "XIST"}
+    assert families["sex"]["featureIndexes"] == [2, 3]
     assert families["sex"]["defaultExclude"] is False
     assert families["histone"]["examples"] == ["HIST1H4A"]
+    assert families["histone"]["featureIndexes"] == [4]
     assert "catalogSuspect" not in families["histone"]
     assert families["cellCycle"]["defaultExclude"] is False
     assert "catalogJoinRate" in families["cellCycle"]

@@ -259,49 +259,66 @@ def _chromosomes_for(
     symbol_list: Sequence[str],
     reference: GeneReference,
     chromosomes: frozenset[str],
-) -> list[str]:
-    hits: list[str] = []
+) -> list[int]:
+    hits: list[int] = []
     wanted = {chrom.upper() for chrom in chromosomes}
-    for gene_id, symbol in zip(id_list, symbol_list, strict=True):
+    for index, (gene_id, _symbol) in enumerate(zip(id_list, symbol_list, strict=True)):
         chrom = reference.chromosome_for(gene_id)
         if chrom is not None and chrom.upper() in wanted:
-            hits.append(symbol or gene_id)
+            hits.append(index)
     return hits
 
 
-def _match_prefix(symbols: Sequence[str], prefixes: Sequence[str]) -> list[str]:
-    hits: list[str] = []
+def _match_prefix(symbols: Sequence[str], prefixes: Sequence[str]) -> list[int]:
+    hits: list[int] = []
     upper_prefixes = tuple(prefix.upper() for prefix in prefixes)
-    for symbol in symbols:
+    for index, symbol in enumerate(symbols):
         if not symbol:
             continue
         upper = symbol.upper()
         if any(upper.startswith(prefix) for prefix in upper_prefixes):
-            hits.append(symbol)
+            hits.append(index)
     return hits
 
 
-def _match_set(symbols: Sequence[str], catalog: frozenset[str]) -> list[str]:
-    return [symbol for symbol in symbols if symbol in catalog]
+def _match_set(symbols: Sequence[str], catalog: frozenset[str]) -> list[int]:
+    return [index for index, symbol in enumerate(symbols) if symbol in catalog]
+
+
+def _family_labels(
+    feature_indexes: Sequence[int],
+    id_list: Sequence[str],
+    symbol_list: Sequence[str],
+) -> list[str]:
+    labels: list[str] = []
+    for index in feature_indexes:
+        symbol = symbol_list[index]
+        labels.append(symbol or id_list[index])
+    return labels
 
 
 def _family_record(
     *,
     family: str,
     method: str,
-    matches: Sequence[str],
+    feature_indexes: Sequence[int],
+    id_list: Sequence[str],
+    symbol_list: Sequence[str],
     species: str,
     skipped: str | None = None,
     defaultExclude: bool | None = None,
     catalogSuspect: str | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
+    indexes = sorted({int(index) for index in feature_indexes})
+    labels = _family_labels(indexes, id_list, symbol_list)
     record: dict[str, Any] = {
         "family": family,
         "species": species,
         "method": method,
-        "count": len(matches),
-        "examples": _bounded(sorted(set(matches))),
+        "count": len(indexes),
+        "featureIndexes": indexes,
+        "examples": _bounded(sorted(set(labels))),
     }
     if skipped is not None:
         record["skipped"] = skipped
@@ -315,13 +332,13 @@ def _family_record(
 
 def _suspect_if_empty(
     *,
-    matches: Sequence[str],
+    feature_indexes: Sequence[int],
     skipped: str | None,
     reference: GeneReference | None,
     symbols: Sequence[str],
 ) -> str | None:
     """Flag empty family hits when the lookup surface was non-empty."""
-    if skipped is not None or matches:
+    if skipped is not None or feature_indexes:
         return None
     if reference is not None or any(symbols):
         return "zeroMatches"
@@ -351,7 +368,9 @@ def observe_families(
             _family_record(
                 family=name,
                 method="skipped",
-                matches=[],
+                feature_indexes=[],
+                id_list=id_list,
+                symbol_list=symbol_list,
                 species=species,
                 skipped="speciesUnknown",
                 defaultExclude=False if name in {"sex", "cellCycle"} else True,
@@ -370,7 +389,9 @@ def observe_families(
                 _family_record(
                     family=family,
                     method=method,
-                    matches=[],
+                    feature_indexes=[],
+                    id_list=id_list,
+                    symbol_list=symbol_list,
                     species=species,
                     skipped="referenceUnavailable",
                     defaultExclude=default_exclude,
@@ -382,11 +403,13 @@ def observe_families(
             _family_record(
                 family="mitochondrial",
                 method="chromosome",
-                matches=mito,
+                feature_indexes=mito,
+                id_list=id_list,
+                symbol_list=symbol_list,
                 species=species,
                 defaultExclude=True,
                 catalogSuspect=_suspect_if_empty(
-                    matches=mito,
+                    feature_indexes=mito,
                     skipped=None,
                     reference=reference,
                     symbols=symbol_list,
@@ -398,11 +421,13 @@ def observe_families(
             _family_record(
                 family="sex",
                 method="chromosome",
-                matches=sex,
+                feature_indexes=sex,
+                id_list=id_list,
+                symbol_list=symbol_list,
                 species=species,
                 defaultExclude=False,
                 catalogSuspect=_suspect_if_empty(
-                    matches=sex,
+                    feature_indexes=sex,
                     skipped=None,
                     reference=reference,
                     symbols=symbol_list,
@@ -415,11 +440,13 @@ def observe_families(
         _family_record(
             family="ribosomal",
             method="symbolPrefix",
-            matches=ribo,
+            feature_indexes=ribo,
+            id_list=id_list,
+            symbol_list=symbol_list,
             species=species,
             defaultExclude=True,
             catalogSuspect=_suspect_if_empty(
-                matches=ribo,
+                feature_indexes=ribo,
                 skipped=None,
                 reference=reference,
                 symbols=symbol_list,
@@ -430,7 +457,7 @@ def observe_families(
     if cellCycleGenes is not None and species in cellCycleGenes:
         catalog = cellCycleGenes[species]
         catalog_symbols = frozenset([*catalog.get("s", []), *catalog.get("g2m", [])])
-        matches = sorted(_match_set(symbol_list, catalog_symbols))
+        matches = _match_set(symbol_list, catalog_symbols)
         extra: dict[str, Any] = {"catalogSize": len(catalog_symbols)}
         if reference is not None and catalog_symbols:
             present = sum(
@@ -442,11 +469,13 @@ def observe_families(
             _family_record(
                 family="cellCycle",
                 method="staticList",
-                matches=matches,
+                feature_indexes=matches,
+                id_list=id_list,
+                symbol_list=symbol_list,
                 species=species,
                 defaultExclude=False,
                 catalogSuspect=_suspect_if_empty(
-                    matches=matches,
+                    feature_indexes=matches,
                     skipped=None,
                     reference=reference,
                     symbols=symbol_list,
@@ -459,7 +488,9 @@ def observe_families(
             _family_record(
                 family="cellCycle",
                 method="staticList",
-                matches=[],
+                feature_indexes=[],
+                id_list=id_list,
+                symbol_list=symbol_list,
                 species=species,
                 skipped="catalogUnavailable",
                 defaultExclude=False,
@@ -472,11 +503,13 @@ def observe_families(
             _family_record(
                 family="histone",
                 method="symbolPrefix",
-                matches=histone,
+                feature_indexes=histone,
+                id_list=id_list,
+                symbol_list=symbol_list,
                 species=species,
                 defaultExclude=True,
                 catalogSuspect=_suspect_if_empty(
-                    matches=histone,
+                    feature_indexes=histone,
                     skipped=None,
                     reference=reference,
                     symbols=symbol_list,
@@ -488,7 +521,9 @@ def observe_families(
             _family_record(
                 family="histone",
                 method="symbolPrefix",
-                matches=[],
+                feature_indexes=[],
+                id_list=id_list,
+                symbol_list=symbol_list,
                 species=species,
                 skipped="catalogUnavailable",
                 defaultExclude=True,
