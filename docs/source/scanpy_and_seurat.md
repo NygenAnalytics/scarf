@@ -49,15 +49,17 @@ Local paths and `s3://` or `gs://` locations use the same analysis API.
 Scanpy commonly composes the stages as separate `sc.pp`, `sc.tl`, and `sc.pl` calls.
 Scarf provides the same level of control through individual methods, but `ds.pipeline.run()` is the shortest path through the standard RNA recipe.
 
-The rows below map intent, not identical statistical implementations:
+The rows below map intent, not identical statistical implementations.
+Scarf selects HVGs before normalizing on that feature set, which differs from the common Scanpy order of normalize, log-transform, then select HVGs.
+When calling stages manually, pass `feat_key="hvgs"` to normalization and build embedding initialization before UMAP; {doc}`tutorials/graph_construction` shows the full chain.
 
 | Goal | Scanpy | Scarf |
 |---|---|---|
 | Load counts | `sc.read_*` returns an `AnnData` | A reader and `*ToZarr` writer create the store; `DataStore` opens it |
-| Calculate QC metrics | `sc.pp.calculate_qc_metrics` | Opening a new `DataStore` calculates `RNA_nCounts`, `RNA_nFeatures`, `percentMito`/`percentRibo` percentages (0-100) when available, and feature cell counts |
+| Calculate QC metrics | `sc.pp.calculate_qc_metrics` | Opening a new `DataStore` calculates `RNA_nCounts`, `RNA_nFeatures`, and for RNA assays `RNA_percentMito`/`RNA_percentRibo` (0-100 when detected), plus feature cell counts |
 | Filter cells | `sc.pp.filter_cells` or an `obs` mask | `ds.filter_cells` or `ds.auto_filter_cells`; cells are marked inactive rather than deleted |
 | Select and normalize features | `sc.pp.normalize_total`, `sc.pp.log1p`, `sc.pp.highly_variable_genes` | `ds.mark_hvgs`, then `ds.run_normalization` |
-| Run PCA and find neighbours | `sc.pp.pca`, then `sc.pp.neighbors` | `ds.run_pca`, then the approximate-nearest-neighbour (ANN), neighbour-query, and connectivity methods; {doc}`tutorials/graph_construction` shows the full chain |
+| Run PCA and find neighbours | `sc.pp.pca`, then `sc.pp.neighbors` | `ds.run_pca`, then Scarf's neighbour-graph methods; {doc}`tutorials/graph_construction` shows the full chain |
 | Embed the graph | `sc.tl.umap` | `ds.run_umap` |
 | Cluster cells | `sc.tl.leiden` | `ds.run_leiden_clustering` or `ds.run_paris_clustering` |
 | Find marker genes | `sc.tl.rank_genes_groups` | `ds.run_marker_search`, then `ds.get_markers`; Scarf reports AUC, two-sided Mann-Whitney p-values, and within-group Benjamini-Hochberg adjustment over tested features. This is not replicate-aware differential expression |
@@ -68,16 +70,18 @@ The rows below map intent, not identical statistical implementations:
 
 This map translates common Seurat concepts.
 The methods are approximate counterparts rather than one-to-one implementations.
+After importing an `.rds` file, the rows below describe analysis on the resulting Zarr store.
 
 | Goal | Seurat | Scarf |
 |---|---|---|
 | Hold the analysis | `SeuratObject` | `DataStore` |
+| Load a saved project | `readRDS()` | `inspect_seurat`, `SeuratReader`, `SeuratToZarr`, then `DataStore` |
 | Work with modalities | Assays such as `RNA` and `ADT` | Assays in the same Zarr store |
 | Select and normalize features | `NormalizeData`, `FindVariableFeatures` | `ds.mark_hvgs`, then `ds.run_normalization` |
 | Scale, reduce, and find neighbours | `ScaleData`, `RunPCA`, `FindNeighbors` | `ds.run_pca` standardizes features by default, followed by Scarf's neighbour-graph methods |
 | Embed and cluster | `RunUMAP`, `FindClusters` | `ds.run_umap`, `ds.run_leiden_clustering` |
 | Correct batches with Harmony | Harmony integration after PCA | `ds.run_harmony` after PCA, followed by the graph-building methods |
-| Integrate modalities with WNN | WNN | `ds.integrate_assays(..., method="wnn")` |
+| Integrate modalities with WNN | `FindMultiModalNeighbors` | Build a graph per assay, then `ds.integrate_assays(..., method="wnn")` |
 | Select representative cells | Sketching | TopACeDo through {doc}`tutorials/downsampling` |
 
 ## Move data between tools
@@ -115,7 +119,9 @@ See {doc}`tutorials/import_and_export` for format details and export options.
 
 ### Seurat
 
-Scarf can import a serialized Seurat object from an `.rds` file.
+Scarf imports a saved Seurat object from an `.rds` file.
+It reads the on-disk RDS document and does not attach to a live R session.
+It does not read `.h5seurat`.
 
 Inspect the RDS file, select importable assays and reductions, then write a Zarr store:
 
@@ -134,7 +140,12 @@ ds = scarf.DataStore("pbmc.zarr")
 
 The importer brings across supported count layers, cell metadata, `active.ident`, and selected reductions.
 Neighbour graphs, images, commands, and most tool slots stay behind.
-Prefer original 10x HDF5 or Matrix Market counts when they are available and you only need raw matrices.
+Graphs, clustering, marker search, and integrated analyses such as WNN are rebuilt in Scarf rather than imported from the RDS object.
+Scarf does not write `.rds` or `.h5seurat`.
+
+Typical next steps are `ds.pipeline.run()`, {doc}`tutorials/scrna_seq`, or {doc}`tutorials/graph_construction`.
+For multimodal data, build a graph per assay before calling `integrate_assays`.
+When you only need raw matrices, original 10x HDF5 or Matrix Market counts are still preferable to an RDS export.
 
 To return to Seurat, write H5AD or Matrix Market from Scarf and convert or import it with the tools used by your R workflow.
 See {doc}`tutorials/import_and_export` for the full Seurat import contract and the other format paths.
