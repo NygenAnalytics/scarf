@@ -102,6 +102,11 @@ Paris clustering
 
 Leiden clustering
   Graph community detection via `run_leiden_clustering`.
+  Labels are stored in cell metadata as `{assay}_{label}` for the default cell key `I` (for example `RNA_leiden_cluster`).
+  A manual call uses default label `leiden_cluster`.
+  The RNA pipeline runs several resolutions at once and defaults each to `leiden_<resolution>` (for example `RNA_leiden_0.5`).
+  When more than one partition is available, the pipeline copies the silhouette-selected winner to `RNA_clusters` and uses that column for doublet scoring and marker search unless another partition is named.
+  Pass `label=` to choose the suffix; when comparing resolutions manually, use distinct labels for each run.
 
 SNN integration
   Shared-nearest-neighbor merge of modality-specific KNN graphs via `integrate_assays(method='snn')`.
