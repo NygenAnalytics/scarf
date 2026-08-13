@@ -38,7 +38,7 @@ A store may also contain `countsT`, a derived feature-major orientation used by 
 
 These are two orientations of the same assay matrix, not independent datastores.
 Ordinary converters write cell-major `counts` only.
-`countsT` is optional later via merge (RNA default), `repack_zarr`, or `write_counts_t`, and can reduce repeated strided reads.
+`countsT` is optional later via merge (RNA default) or `repack_zarr`, and can reduce repeated strided reads.
 A store without `countsT` remains valid.
 
 ## Storage profiles
