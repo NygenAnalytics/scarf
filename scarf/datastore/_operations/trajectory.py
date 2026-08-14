@@ -310,7 +310,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
     ) -> PseudotimeScoreResult:
         """
         Calculate differentiation potential of cells. This function is a reimplementation of population balance
-        analysis (PBA) approach published in Weinreb et al. 2017, PNAS. This function computes the random walk
+        analysis (PBA) approach published in Weinreb et al. 2018, PNAS. This function computes the random walk
         normalized Laplacian matrix of the reference graph, L_rw = I-A/D and then calculates a Moore-Penrose
         pseudoinverse of L_rw.
 
