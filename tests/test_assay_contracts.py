@@ -79,7 +79,17 @@ _MODULE_SIGNATURE_DIGEST = (
 
 
 def test_assay_facade_surface_is_stable():
-    assert assay_module.__all__ == ["Assay", "RNAassay", "ATACassay", "ADTassay"]
+    assert assay_module.__all__ == [
+        "Assay",
+        "RNAassay",
+        "ATACassay",
+        "ADTassay",
+        "is_rna_assay_type",
+        "lookup_persisted_assay_type",
+        "preset_assay_types",
+        "resolve_persisted_assay_type",
+        "rna_assay_type_names",
+    ]
     expected = {
         "ADTassay",
         "ATACassay",
@@ -88,12 +98,17 @@ def test_assay_facade_surface_is_stable():
         "PercentFeatures",
         "RNAassay",
         "_read_block",
+        "is_rna_assay_type",
         "lib_size_feature_stream_eligible",
+        "lookup_persisted_assay_type",
         "norm_clr",
         "norm_dummy",
         "norm_lib_size",
         "norm_lib_size_log",
         "norm_tf_idf",
+        "preset_assay_types",
+        "resolve_persisted_assay_type",
+        "rna_assay_type_names",
     }
     assert expected.issubset(vars(assay_module))
 

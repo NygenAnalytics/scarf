@@ -180,7 +180,7 @@ class H5adToZarr:
                 )
 
     def dump(self, batch_size: int | None = None) -> None:
-        """Write h5ad matrix data into the Zarr counts array.
+        """Write h5ad matrix data into Zarr ``counts`` and RNA ``countsT``.
 
         Args:
             batch_size: Number of source cells per batch. By default, a
@@ -192,6 +192,19 @@ class H5adToZarr:
         Returns:
             None
         """
+        self._write_counts(batch_size=batch_size)
+        from .counts_t import finalize_writer_counts_t_many
+
+        finalize_writer_counts_t_many(
+            self.z,
+            self.assayNames,
+            self.workspace,
+            resources=self.resources,
+            profile=self.profile,
+        )
+
+    def _write_counts(self, batch_size: int | None = None) -> None:
+        """Write cell-major ``counts`` only (profiling stage split helper)."""
         from ..storage.sharding import (
             SparseShardBuffer,
             resolve_sparse_import_batch,
@@ -297,8 +310,8 @@ class H5adToZarr:
                     f"successfully written into the {assay_name} counts array. "
                     "Please report this issue"
                 )
-        # counts is the durable physical orientation for H5AD imports. Assay
-        # readers use it directly when the optional derived countsT is absent.
+        # counts is the durable physical orientation for H5AD imports. Public
+        # dump() always finalizes strip-sharded RNA countsT after this step.
         logger.debug(f"Counts written in {counts_seconds:.1f}s")
         logger.info(
             f"Wrote {self.h5ad.nCells} cells and {self.h5ad.nFeatures} features "

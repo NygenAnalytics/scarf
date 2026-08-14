@@ -75,7 +75,8 @@ ds.plots.embedding(
 Use `mount_datastore` when count matrices must remain in a shared source store, but each analysis needs its own writable store.
 Scarf copies cell and feature metadata into the target.
 Mount validates and reads primary `counts` for matrix identity.
-`countsT` is optional and is picked up later if present.
+For RNA sources, strip-sharded `countsT` is required on Zarr v3 and is mounted with `counts`.
+Non-RNA assays have no `countsT`.
 New metadata and analysis artifacts are written only to the target.
 
 The mounted target below lives in a temporary local directory, but its count source is the public remote URI.
@@ -113,13 +114,13 @@ print('Source URI:', matrix_source['location'])
 print('Mounted assays:', sorted(matrix_source['assays']))
 ```
 
-Counts and optional `countsT` stay in the source.
+Counts and RNA strip `countsT` stay in the source.
 Cell and feature metadata are copied once, while new analysis artifacts are written to the target.
 The printed `matrixSource` record is what later reopen uses to resolve the remote counts.
 
 ```{mermaid}
 flowchart LR
-    source["Read-only remote source<br/>counts (countsT optional)"]
+    source["Read-only remote source<br/>counts and RNA strip countsT"]
     mount["Mounted DataStore"]
     target["Writable target<br/>metadata and new artifacts"]
     source -->|stream count blocks| mount

@@ -189,6 +189,15 @@ class SparseToZarr:
             f"Wrote {self.nCells} cells and {self.nFeatures} features "
             f"to assay {self.assayName}"
         )
+        from .counts_t import finalize_writer_counts_t
+
+        finalize_writer_counts_t(
+            self.z,
+            self.assayName,
+            self.workspace,
+            resources=self.resources,
+            profile=self.profile,
+        )
 
 
 def bed_to_sparse_array(

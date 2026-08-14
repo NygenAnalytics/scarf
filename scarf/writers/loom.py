@@ -173,3 +173,12 @@ class LoomToZarr:
             f"Wrote {self.loom.nCells} cells and {self.loom.nFeatures} features "
             f"from Loom to assay {self.assayName}"
         )
+        from .counts_t import finalize_writer_counts_t
+
+        finalize_writer_counts_t(
+            self.z,
+            self.assayName,
+            self.workspace,
+            resources=self.resources,
+            profile=self.profile,
+        )

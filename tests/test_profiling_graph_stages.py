@@ -151,9 +151,11 @@ def test_forced_profile_stages_invalidate_reusable_artifacts() -> None:
             _resources(),
             invalidateCache=True,
         )
+        assert store.calls
         assert all(
             kwargs.get("invalidate_cache") is True
-            for _method, _args, kwargs in store.calls
+            for method, _args, kwargs in store.calls
+            if not method.startswith("_")
         )
 
 

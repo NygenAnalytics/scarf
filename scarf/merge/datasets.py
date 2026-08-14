@@ -32,7 +32,6 @@ from .models import (
     AssayMergePlan,
     ComponentAction,
     ComponentResult,
-    CountsTPolicy,
     MergePlan,
     MergeResult,
     MissingAssayPolicy,
@@ -43,12 +42,12 @@ from .writer import (
     _assay_metadata_path,
     _cell_data_path,
     _matrix_group_path,
+    assess_counts_t_reuse,
     counts_t_complete,
     create_assay_counts,
     matrix_group_complete,
     preflight_assay_counts,
     validate_assay_counts,
-    validate_counts_t,
     write_assay_counts,
     write_assay_counts_t,
 )
@@ -133,7 +132,6 @@ class DataStoreMerge:
         profile: StorageProfile | None = None,
         targetChunkBytes: int | None = None,
         targetShardBytes: int | None = None,
-        counts_t: CountsTPolicy = "rna",
         missing_assay_policy: MissingAssayPolicy = "zero_fill",
     ) -> None:
         validate_workspace_name(out_workspace)
@@ -145,8 +143,6 @@ class DataStoreMerge:
             raise ValueError("A unique name must be provided for each source DataStore")
         if assays is not None and len(assays) != len(set(assays)):
             raise ValueError("assays must not contain duplicate assay names")
-        if counts_t not in {"rna", "all", "none"}:
-            raise ValueError("counts_t must be one of 'rna', 'all', or 'none'")
         if missing_assay_policy not in {"zero_fill", "error"}:
             raise ValueError(
                 "missing_assay_policy must be one of 'zero_fill' or 'error'"
@@ -163,7 +159,6 @@ class DataStoreMerge:
         self.seed = seed
         self.storageOptions = storage_options
         self.sourceColumn = source_column
-        self.countsT = counts_t
         self.missingAssayPolicy = missing_assay_policy
         self.targetChunkBytes = targetChunkBytes
         self.targetShardBytes = targetShardBytes
@@ -307,25 +302,35 @@ class DataStoreMerge:
             self._alignments[assay_name] = align_features(sources, self.names)
 
     def _should_write_counts_t(self, assay_name: str, sources: list[Any]) -> bool:
-        if self.countsT == "none":
-            logger.debug(f"countsT disabled for assay {assay_name} by policy")
-            return False
-        if self.countsT == "all":
-            logger.debug(f"countsT enabled for assay {assay_name} by policy")
-            return True
-        from ..assay import RNAassay
+        from ..assay.base import Assay
+        from ..assay.classification import is_rna_assay_type
 
-        source_is_rna = [
-            isinstance(source, RNAassay)
-            for source in sources
-            if not isinstance(source, MissingAssay)
-        ]
-        decision = any(source_is_rna)
-        logger.debug(
-            f"countsT {'enabled' if decision else 'disabled'} for assay "
-            f"{assay_name} from source assay types"
-        )
-        return decision
+        saw_present = False
+        for source in sources:
+            if isinstance(source, MissingAssay):
+                continue
+            saw_present = True
+            # Scarf Assay instances: class is authoritative over the group name.
+            if isinstance(source, Assay):
+                if is_rna_assay_type(source):
+                    logger.debug(
+                        f"countsT enabled for assay {assay_name} from source class"
+                    )
+                    return True
+                continue
+            # Untyped merge fixtures / foreign objects: fall back to names.
+            source_name = getattr(source, "name", None)
+            if isinstance(source_name, str) and is_rna_assay_type(source_name):
+                logger.debug(f"countsT enabled for assay {assay_name} from source name")
+                return True
+            if is_rna_assay_type(assay_name):
+                logger.debug(f"countsT enabled for assay {assay_name} by assay name")
+                return True
+        if not saw_present and is_rna_assay_type(assay_name):
+            logger.debug(f"countsT enabled for assay {assay_name} by assay name")
+            return True
+        logger.debug(f"countsT disabled for assay {assay_name}")
+        return False
 
     def _build_manifest(self) -> dict[str, Any]:
         self._prepare_sources()
@@ -352,7 +357,6 @@ class DataStoreMerge:
             "profile": self.profile,
             "targetChunkBytes": self.targetChunkBytes,
             "targetShardBytes": self.targetShardBytes,
-            "countsT": self.countsT,
             "missingAssayPolicy": self.missingAssayPolicy,
             "outWorkspace": self.outWorkspace,
             "nCells": self._rowPlan.nCells,
@@ -614,7 +618,7 @@ class DataStoreMerge:
             elif actions[f"counts:{assay_name}"] != "skip":
                 actions[f"countsT:{assay_name}"] = "resume"
             elif counts_t_complete(existing, assay_name, self.outWorkspace):
-                invalid = validate_counts_t(
+                assessment = assess_counts_t_reuse(
                     existing,
                     assay_name,
                     self.outWorkspace,
@@ -622,24 +626,34 @@ class DataStoreMerge:
                     n_features=assay_plan.nFeatures,
                     dtype=assay_plan.dtype,
                 )
-                if invalid is not None:
+                if assessment.outcome == "reusable":
+                    actions[f"countsT:{assay_name}"] = "skip"
+                elif assessment.outcome == "block-shape/dtype":
                     return self._blocked_inspection(
                         assay_plans,
-                        f"Completed countsT for {assay_name!r} cannot be reused: "
-                        f"{invalid}. Set overwrite=True to rebuild it.",
+                        f"Completed countsT for {assay_name!r} cannot be "
+                        f"reused: {assessment.reason}. Set overwrite=True to "
+                        "rebuild it.",
                     )
-                actions[f"countsT:{assay_name}"] = "skip"
+                else:
+                    # incomplete or rewrite-layout: rewrite strip countsT.
+                    actions[f"countsT:{assay_name}"] = "resume"
             else:
                 actions[f"countsT:{assay_name}"] = "resume"
 
         all_complete = all(action == "skip" for action in actions.values())
         if (import_complete or complete) and not all_complete:
-            return self._blocked_inspection(
-                assay_plans,
-                "Destination is marked complete but one or more planned "
-                "components are incomplete. Set overwrite=True to rebuild the "
-                "merge-owned components.",
+            only_counts_t_layout_rewrites = all(
+                action == "skip" or key.startswith("countsT:")
+                for key, action in actions.items()
             )
+            if not only_counts_t_layout_rewrites:
+                return self._blocked_inspection(
+                    assay_plans,
+                    "Destination is marked complete but one or more planned "
+                    "components are incomplete. Set overwrite=True to rebuild the "
+                    "merge-owned components.",
+                )
         return _DestinationInspection(
             actions,
             needsFinalization=all_complete and not (import_complete and complete),
@@ -728,8 +742,7 @@ class DataStoreMerge:
         if any(item.writeCountsT for item in preliminary_plans) and zarr_format < 3:
             inspection = self._blocked_inspection(
                 preliminary_plans,
-                "countsT requires a Zarr v3 destination. Repack the store or "
-                "choose counts_t='none'.",
+                "countsT requires a Zarr v3 destination. Repack the store to Zarr v3.",
             )
         if inspection.canDump:
             alignment_bytes = {
@@ -789,7 +802,6 @@ class DataStoreMerge:
             assays=tuple(assay_plans),
             profile=self.profile,
             seed=self.seed,
-            countsT=self.countsT,
             missingAssayPolicy=self.missingAssayPolicy,
             willResume=will_resume,
             canDump=inspection.canDump,

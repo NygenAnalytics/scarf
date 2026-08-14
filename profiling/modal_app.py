@@ -49,6 +49,7 @@ from profiling.modal_resources import (
     validate_modal_environment,
 )
 from profiling.io_baseline import run_io_baseline_body
+from profiling.provenance import attach_client_provenance, provenance_from_config
 from profiling.r2 import (
     download_file,
     object_exists,
@@ -321,6 +322,8 @@ def io_baseline_job(
     memory=65_536,
     cpu=8.0,
     ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+    # Targeted writeCountsT / long stages: avoid worker preemption.
+    nonpreemptible=True,
 )
 def run_stage_job(
     configDict: dict[str, Any],
@@ -363,6 +366,7 @@ def run_stage_job(
         storageLayout=config.storageLayout,
         workDir=work,
         invalidateCache=force,
+        clientProvenance=config.clientProvenance,
     )
     write_result(config, result)
     return result.to_json()
@@ -444,6 +448,7 @@ def run_local_funnel_job(
             localH5adPath=local_h5ad if stage == "createStore" else None,
             storageLayout=config.storageLayout,
             workDir=work / stage,
+            clientProvenance=config.clientProvenance,
         )
         write_result(config, result)
         payload = result.to_json()
@@ -548,6 +553,7 @@ def run_e2e_funnel_body(
                 containerCpuRequest=float(resource_envelope["modalCpuRequest"]),
                 containerCpuLimit=float(resource_envelope["modalCpuLimit"]),
                 resetCgroupPeak=False,
+                clientProvenance=config.clientProvenance,
             )
             result_uri = write_result(config, result)
             payload = result.to_json()
@@ -591,6 +597,7 @@ def run_e2e_funnel_body(
         "claimUri": config.e2eClaimUri(),
         "funnelResultUri": config.funnelResultUri(nRows),
         **summarize_resource_measurement(measurement),
+        "provenance": provenance_from_config(config, nonpreemptible=True),
     }
     write_funnel_result(config, nRows, summary)
     return summary
@@ -602,6 +609,8 @@ def run_e2e_funnel_body(
     memory=32_768,
     cpu=8.0,
     ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+    # Long 1M+ funnels: avoid worker preemption (Modal bills ~3x CPU/memory).
+    nonpreemptible=True,
 )
 def run_e2e_funnel_job(
     configDict: dict[str, Any],
@@ -888,6 +897,15 @@ def main(*arg_list: str) -> None:
     )
     e2e_parser.add_argument("--config", required=True)
     e2e_parser.add_argument("--size", type=int, required=True)
+    e2e_parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help=(
+            "Spawn from this modal run app (no deploy). Prefer --detach. "
+            "Needed to pick up decorator changes such as nonpreemptible "
+            "before redeploying."
+        ),
+    )
 
     io_parser = sub.add_parser("io-baseline")
     io_parser.add_argument("--config", required=True)
@@ -903,7 +921,10 @@ def main(*arg_list: str) -> None:
 
     args = parser.parse_args(list(arg_list))
     config = _load_config(args.config)
-    payload = config.model_dump(mode="python")
+    payload = attach_client_provenance(
+        config.model_dump(mode="python"),
+        configPath=args.config,
+    )
 
     if args.command == "smoke":
         smoke_options = orchestrator_function_options(config)
@@ -1001,11 +1022,12 @@ def main(*arg_list: str) -> None:
         if not config.runTag.strip():
             raise SystemExit("run-e2e requires a non-empty runTag")
         options = _e2e_function_options(config)
-        call = (
-            _deployed_function(config, "run_e2e_funnel_job")
-            .with_options(**options)
-            .spawn(payload, args.size)
+        target = (
+            run_e2e_funnel_job
+            if args.ephemeral
+            else _deployed_function(config, "run_e2e_funnel_job")
         )
+        call = target.with_options(**options).spawn(payload, args.size)
         _print_spawned(f"run_e2e_funnel_job {args.size}", call)
         print(f"result URI (when done): {config.funnelResultUri(args.size)}")
         return

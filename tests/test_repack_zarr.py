@@ -25,6 +25,8 @@ def test_repack_store_round_trip(toy_crdir_writer, tmp_path):
 
     assert set(src.keys()) == set(dst.keys())
     assay_names = [name for name in src.keys() if src[name].attrs.get("is_assay")]
+    from scarf.assay.classification import is_rna_assay_type
+
     for assay_name in assay_names:
         src_assay = src[assay_name]
         dst_assay = dst[assay_name]
@@ -32,11 +34,14 @@ def test_repack_store_round_trip(toy_crdir_writer, tmp_path):
         assert "counts" in dst_assay
         assert src_assay["counts"].shape == dst_assay["counts"].shape
         assert (src_assay["counts"][...] == dst_assay["counts"][...]).all()
-        assert dst_assay["countsT"].attrs["complete"] is True
-        np.testing.assert_array_equal(
-            dst_assay["countsT"][:],
-            np.asarray(dst_assay["counts"][:]).T,
-        )
+        if is_rna_assay_type(assay_name):
+            assert dst_assay["countsT"].attrs["complete"] is True
+            np.testing.assert_array_equal(
+                dst_assay["countsT"][:],
+                np.asarray(dst_assay["counts"][:]).T,
+            )
+        else:
+            assert "countsT" not in dst_assay
 
 
 def test_repack_v2_without_counts_t_builds_complete_transpose(tmp_path):

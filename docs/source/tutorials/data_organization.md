@@ -44,7 +44,7 @@ flowchart TB
     cells["Shared cell metadata"]
     rna["RNA assay<br/>feature metadata and results<br/>(default assay)"]
     atac["ATAC assay<br/>feature metadata and results"]
-    source["Optional mounted source<br/>counts and countsT"]
+    source["Optional mounted source<br/>counts and RNA strip countsT"]
     ds --> cells
     ds --> rna
     ds --> atac

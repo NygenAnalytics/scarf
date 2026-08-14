@@ -182,11 +182,20 @@ def toy_crdir_ds(toy_crdir_writer):
 
 @pytest.fixture(scope="session")
 def datastore_zarr_root():
+    from scarf.tools.repack_zarr import repack_store
+
     temp_dir, zarr_root = _extract_zarr_fixture(
         _datastore_tar_path(), "scarf_session_1K_pbmc_"
     )
-    yield zarr_root
-    remove(temp_dir)
+    # Legacy fixtures are Zarr v2 without strip countsT. Repack once per
+    # session until published fixtures ship the new contract.
+    v3_dir = tempfile.mkdtemp(prefix="scarf_session_1K_pbmc_v3_")
+    try:
+        repack_store(zarr_root, v3_dir, nthreads=2)
+    finally:
+        remove(temp_dir)
+    yield v3_dir
+    remove(v3_dir)
 
 
 @pytest.fixture(scope="session")

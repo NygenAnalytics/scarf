@@ -17,7 +17,7 @@ from ..storage.artifacts import (
 )
 from ..storage.types import ZarrMode, as_zarr_array, as_zarr_group
 from ..storage.budget import ResourceBudget
-from ..assay import RNAassay, ATACassay, ADTassay, Assay
+from ..assay import RNAassay, ATACassay, ADTassay, Assay, preset_assay_types
 from ..assay.base import _defer_feature_props
 from ..metadata import MetaData
 from ..metadata.artifacts import (
@@ -389,19 +389,7 @@ class BaseDataStore:
         Returns:
         """
 
-        preset_assay_types = {
-            "RNA": RNAassay,
-            "ATAC": ATACassay,
-            "ADT": ADTassay,
-            "HTO": ADTassay,
-            "CRISPR": Assay,
-            "ANTIGEN": Assay,
-            "CUSTOM": Assay,
-            "GeneActivity": RNAassay,
-            "GeneScores": RNAassay,
-            "URNA": RNAassay,
-            "Assay": Assay,
-        }
+        preset_assay_types_map = preset_assay_types()
         caution_statement = (
             "%s was set as a generic Assay with no normalization. If this is unintended "
             "then please make sure that you provide a correct assay type for this assay using "
@@ -425,13 +413,13 @@ class BaseDataStore:
             custom_assay_types = {}
         for i in self.assay_names:
             if i in custom_assay_types:
-                if custom_assay_types[i] in preset_assay_types:
-                    assay = preset_assay_types[custom_assay_types[i]]
+                if custom_assay_types[i] in preset_assay_types_map:
+                    assay = preset_assay_types_map[custom_assay_types[i]]
                     assay_name = custom_assay_types[i]
                 else:
                     logger.warning(
                         f"{custom_assay_types[i]} is not a recognized assay type. Has to be one of "
-                        f"{', '.join(list(preset_assay_types.keys()))}\nPLease note that the names are"
+                        f"{', '.join(list(preset_assay_types_map.keys()))}\nPLease note that the names are"
                         f" case-sensitive."
                     )
                     logger.warning(caution_statement % i)
@@ -443,10 +431,10 @@ class BaseDataStore:
                     z_attrs[i] = assay_name
                     logger.debug(f"Setting assay {i} to assay type: {assay.__name__}")
             elif i in z_attrs:
-                assay = preset_assay_types[z_attrs[i]]
+                assay = preset_assay_types_map[z_attrs[i]]
             else:
-                if i in preset_assay_types:
-                    assay = preset_assay_types[i]
+                if i in preset_assay_types_map:
+                    assay = preset_assay_types_map[i]
                     assay_name = i
                 else:
                     logger.warning(caution_statement % i)

@@ -106,5 +106,34 @@ def write_doublet_target_zarr(
         msg="Writing simulated doublets",
         resources=resources,
     )
+    from ..assay.classification import (
+        is_rna_assay_type,
+        resolve_persisted_assay_type,
+    )
+    from ..storage.sharding import finalize_rna_counts_t
+    from ..storage.types import as_zarr_group
+
+    type_name = resolve_persisted_assay_type(assay_name)
+    raw_types = z.attrs.get("assayTypes", {})
+    types = (
+        {str(k): str(v) for k, v in raw_types.items()}
+        if isinstance(raw_types, dict)
+        else {}
+    )
+    types[assay_name] = type_name
+    z.attrs["assayTypes"] = types
+    if is_rna_assay_type(type_name):
+        group = as_zarr_group(z[assay_name], name=assay_name)
+        counts_t = finalize_rna_counts_t(
+            store,
+            group,
+            profile=resolved_profile,
+            resources=resources,
+        )
+        if counts_t is None:
+            raise ValueError(
+                f"RNA assay {assay_name!r} requires Zarr v3 for strip-sharded "
+                "countsT when writing doublet targets."
+            )
     logger.debug(f"Wrote {n_sim} simulated doublets to {zarr_loc}")
     return z

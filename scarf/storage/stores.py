@@ -279,6 +279,11 @@ def create_matrix_source(
         raise ValueError("No assays found in the matrix source")
 
     source_zw = _workspace_group(source_root, workspace)
+    from .counts_t_contract import require_rna_counts_t_ready
+
+    for assay_name in assay_names:
+        require_rna_counts_t_ready(source_root, assay_name, workspace)
+
     source_cell_data = as_zarr_group(
         source_zw["cellData"],
         name="cellData",
@@ -393,6 +398,8 @@ def resolve_matrix_source(
         cell_ids = as_zarr_array(cell_data["ids"], name="ids")
         cell_ids_fingerprint = fingerprint_stored_strings(cell_ids)
 
+    from .counts_t_contract import require_rna_counts_t_ready
+
     for assay_name, expected in entries:
         source_assay = as_zarr_group(source_zw[assay_name], name=assay_name)
         _validate_assay_identity(
@@ -403,4 +410,5 @@ def resolve_matrix_source(
             expected,
             cell_ids_fingerprint=cell_ids_fingerprint,
         )
+        require_rna_counts_t_ready(source_root, assay_name, workspace)
     return source_root, workspace

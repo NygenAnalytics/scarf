@@ -34,12 +34,15 @@ Opt-in parallel UMAP, tSNE, and ANN index builds record the resolved worker coun
 
 `counts` is the primary cell-major count array.
 It supports cell-wise scans used by normalization and graph construction.
-A store may also contain `countsT`, a derived feature-major orientation used by gene-wise stages such as HVG and marker calculations.
+
+For RNA assays, Scarf also writes `countsT`, a strip-sharded feature-major orientation used by
+gene-wise stages such as HVG and marker calculations.
+RNA ingest, subset, merge, and `repack_zarr` always write strip `countsT` on Zarr v3.
+Missing, unsharded, or Zarr v2 `countsT` is invalid for `RNAassay` load.
+Non-RNA assays do not use `countsT`.
 
 These are two orientations of the same assay matrix, not independent datastores.
-Ordinary converters write cell-major `counts` only.
-`countsT` is optional later via merge (RNA default), `repack_zarr`, or `write_counts_t`, and can reduce repeated strided reads.
-A store without `countsT` remains valid.
+After a layout rewrite, recompute downstream HVG / normalization / PCA / graph / marker artefacts.
 
 ## Storage profiles
 

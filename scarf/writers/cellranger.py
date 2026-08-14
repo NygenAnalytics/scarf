@@ -351,6 +351,15 @@ class CrToZarr:
                 f"{sum(buffer.nColumns for buffer in buffers.values())} features "
                 f"from Cell Ranger to {len(stores)} assay(s)"
             )
+            from .counts_t import finalize_writer_counts_t_many
+
+            finalize_writer_counts_t_many(
+                self.z,
+                tuple(stores),
+                self.workspace,
+                resources=self.resources,
+                profile=self.profile,
+            )
         finally:
             if callable(release):
                 release()

@@ -1,4 +1,3 @@
-import time
 from typing import Any
 
 import numba
@@ -8,15 +7,12 @@ from numba import set_num_threads
 from scipy.special import ndtr
 
 from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
-from ...storage.feature_stream import plan_feature_stream
 from ...utils.logging import logger
 from ...utils.numba import restore_numba_threads
-from ...utils.process import process_rss_mb
 from .correction import _bh_adjusted_pvalues
 from .rank import (
     _batch_stats,
     _marker_stats_gene_major,
-    gene_major_rank_scratch_bytes,
     sort_marker_results,
 )
 from .regression import (
@@ -119,50 +115,56 @@ def find_markers_by_rank(
             (len(feat_idx), n_groups, 8),
             dtype=np.float64,
         )
-        raw_source, feature_axis, cell_axis = assay._raw_feature_stream_source()
-        active_threads = numba.get_num_threads()
-        resident_bytes = (
-            scalar_values.nbytes
-            + int_indices.nbytes
-            + group_counts32.nbytes
-            + stats_matrix.nbytes
-            + gene_major_rank_scratch_bytes(
-                n_cells=len(cell_idx),
-                n_groups=n_groups,
-                n_threads=active_threads,
+        counts_t = assay.rawDataT
+        if counts_t is None:
+            raise ValueError(
+                f"RNA assay {assay.name!r} requires strip-sharded countsT "
+                "for marker search"
             )
+        from ...storage.feature_shards import (
+            map_feature_shards,
+            plan_feature_shard_consume_for_array,
+            selected_strip_starts,
+            shard_values_for_selection,
         )
-        orientation_buffers = 1 if feature_axis == 0 else 2
-        raw_itemsize = max(1, int(np.dtype(raw_source.dtype).itemsize))
-        plan = plan_feature_stream(
-            raw_source,
-            featureAxis=feature_axis,
-            cellAxis=cell_axis,
-            featureIndices=feat_idx,
-            cellIndices=cell_idx,
-            resources=assay.resources,
-            residentBytes=resident_bytes,
-            blockBytes=lambda width: max(
-                1,
-                len(cell_idx) * width * raw_itemsize * orientation_buffers,
-            ),
-            requestedBatchSize=batch_size,
+        from ...storage.budget import resolve_budget
+
+        n_feats = int(counts_t.shape[0])
+        dest_of = np.full(n_feats, -1, dtype=np.int64)
+        dest_of[feat_idx] = np.arange(len(feat_idx), dtype=np.int64)
+        resources = getattr(assay, "resources", None) or resolve_budget(
+            workers=n_threads
         )
-        logger.debug(
-            f"Marker search plan: features={len(feat_idx)} groups={n_groups} "
-            f"blocks={len(plan.blocks)} readWorkers={plan.readWorkers} "
-            f"ioConcurrency={plan.ioConcurrency} numbaThreads={active_threads} "
-            f"repeatedDecodes={plan.repeatedDecodeCount}"
-        )
-        block_idx = 0
-        for block, raw, read_sec, source in assay.iter_raw_feature_major_blocks(
+        starts = selected_strip_starts(counts_t, feat_idx)
+        consume = plan_feature_shard_consume_for_array(
+            counts_t,
+            resources=resources,
             cell_idx=cell_idx,
-            plan=plan,
-            msg="Finding markers",
-        ):
-            block_idx += 1
-            compute_started = time.perf_counter()
-            cpu_started = time.process_time()
+            feat_idx=feat_idx,
+        )
+        threads = min(
+            consume.numbaThreads,
+            max(1, int(numba.config.NUMBA_NUM_THREADS)),
+        )
+        previous_threads = numba.get_num_threads()
+        set_num_threads(threads)
+        logger.debug(
+            f"Marker search whole-shard: features={len(feat_idx)} "
+            f"groups={n_groups} prefetchDepth={consume.prefetchDepth} "
+            f"(requested={consume.requestedPrefetchDepth}) "
+            f"readConcurrency={consume.readConcurrency} "
+            f"(requested={consume.requestedReadConcurrency}) "
+            f"numbaThreads={threads} inFlight={consume.inFlight} "
+            f"estBytes={consume.estimatedResidentBytes} source={consume.source}"
+        )
+
+        def process_shard(shard: Any) -> None:
+            local_dest = dest_of[shard.featStart : shard.featEnd]
+            keep = local_dest >= 0
+            if not np.any(keep):
+                return None
+            raw = shard_values_for_selection(shard.values, keep)
+            destinations = local_dest[keep].astype(np.int64, copy=False)
             _marker_stats_gene_major(
                 raw,
                 scalar_values,
@@ -171,22 +173,25 @@ def find_markers_by_rank(
                 int_indices,
                 group_counts32,
                 np.float32(n_total),
-                block.destinations,
+                destinations,
                 stats_matrix,
             )
-            compute_seconds = time.perf_counter() - compute_started
-            cpu_seconds = time.process_time() - cpu_started
-            effective_cores = (
-                cpu_seconds / compute_seconds if compute_seconds > 0 else 0.0
-            )
-            logger.debug(
-                f"Marker block {block_idx}/{len(plan.blocks)}: "
-                f"width={block.indices.size} read={read_sec:.1f}s ({source}) "
-                f"compute={compute_seconds:.1f}s cpu={cpu_seconds:.1f}s "
-                f"effectiveCores={effective_cores:.2f} "
-                f"rss={process_rss_mb():.0f} MiB"
-            )
-            del raw
+            return None
+
+        try:
+            for _ in map_feature_shards(
+                counts_t,
+                process_shard,
+                cell_idx=cell_idx,
+                feat_idx=feat_idx,
+                feat_starts=starts,
+                plan=consume,
+                resources=resources,
+                progress="Finding markers",
+            ):
+                pass
+        finally:
+            set_num_threads(previous_threads)
         z_values = np.asarray(stats_matrix[:, :, 6], dtype=np.float64)
         stats_matrix[:, :, 6] = 2.0 * ndtr(-np.abs(z_values))
     else:

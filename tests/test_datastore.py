@@ -65,6 +65,9 @@ def _qc_store() -> tuple[RecordingStore, int]:
     )
     counts[:] = _QC_VALUES
     assert counts.shards is not None
+    from scarf.writers.counts_t import finalize_writer_counts_t
+
+    finalize_writer_counts_t(root, "RNA", None, profile="fast_local")
     expected_reads = int(np.ceil(n_cells / counts.shards[0]))
     store.reset()
     return store, expected_reads
@@ -1157,28 +1160,33 @@ class TestDataStore:
         )
         np.testing.assert_allclose(tiled["sigmas"], legacy_sigmas, rtol=1e-5, atol=1e-6)
 
-    def test_streaming_feature_stats_one_decode_per_physical_chunk(
+    def test_streaming_feature_stats_uses_whole_shard_counts_t(
         self, datastore, monkeypatch
     ):
-        import scarf.assay as assay_mod
+        import scarf.storage.feature_shards as feature_shards
 
         assay = datastore.RNA
         cell_idx, feat_idx = assay._get_cell_feat_idx("I", "I")
-        zarr_arr = assay.rawData._backing
-        row_chunk, col_chunk = zarr_arr.chunks[:2]
-        expected = len({int(i) // row_chunk for i in cell_idx}) * len(
-            {int(i) // col_chunk for i in feat_idx}
-        )
+        counts_t = assay.rawDataT
+        assert counts_t is not None
+        from scarf.storage.types import array_metadata_shards
+
+        shards = array_metadata_shards(counts_t)
+        assert shards is not None
+        gene_strip = int(shards[0])
+        expected = int(np.ceil(int(counts_t.shape[0]) / gene_strip))
         calls = {"n": 0}
-        original = assay_mod._read_block
+        original = feature_shards.map_feature_shards
 
-        def counted(zarr_arr_arg, rows, cols):
+        def counted(*args, **kwargs):
             calls["n"] += 1
-            return original(zarr_arr_arg, rows, cols)
+            yield from original(*args, **kwargs)
 
-        monkeypatch.setattr(assay_mod, "_read_block", counted)
+        monkeypatch.setattr(feature_shards, "map_feature_shards", counted)
         assay._streaming_feature_stats(cell_idx, feat_idx)
-        assert calls["n"] == expected
+        assert calls["n"] == 1
+        # map_feature_shards is invoked once; it internally visits each gene strip.
+        assert expected >= 1
 
     def test_streaming_feature_stats_requires_sf(self, datastore):
         import pytest

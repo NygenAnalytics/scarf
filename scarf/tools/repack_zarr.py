@@ -364,12 +364,23 @@ def repack_store(
         )
         group_path = assay_name if workspace is None else f"matrices/{assay_name}"
         counts = as_zarr_array(dst[counts_path], name=counts_path)
-        write_counts_t(
-            counts,
-            as_zarr_group(dst[group_path], name=group_path),
-            profile=profile,
-            resources=resources,
+        from ..assay.classification import is_rna_assay_type
+
+        # Prefer persisted assayTypes; fall back to assay group name.
+        type_name = assay_name
+        attr_root = (
+            dst if workspace is None else as_zarr_group(dst[workspace], name=workspace)
         )
+        raw_types = attr_root.attrs.get("assayTypes", {})
+        if isinstance(raw_types, dict) and assay_name in raw_types:
+            type_name = str(raw_types[assay_name])
+        if is_rna_assay_type(type_name):
+            write_counts_t(
+                counts,
+                as_zarr_group(dst[group_path], name=group_path),
+                profile=profile,
+                resources=resources,
+            )
         print(f"  {counts_path}: {array_info(counts)}")
 
 

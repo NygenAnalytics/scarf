@@ -249,6 +249,7 @@ module = [
     "scarf.utils.numba",
     "scarf.clustering._paris_core",
     "scarf.embeddings.umap",
+    "scarf.assay.rna",
     "scarf.features.markers.*",
     "scarf.features.enrichment.aucell",
     "scarf.datastore._operations.features",

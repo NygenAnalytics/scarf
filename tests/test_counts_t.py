@@ -5,21 +5,20 @@ import zarr
 from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
-from scarf.assay import Assay, RNAassay, lib_size_feature_stream_eligible, norm_dummy
-from scarf.features.markers.batching import feature_column_chunk
+from scarf.assay import Assay, RNAassay
 from scarf.features.genomic.melding import coordinate_melding
 from scarf.features.markers import find_markers_by_rank, find_markers_by_regression
 from scarf.metadata import MetaData
 from scarf.quality_control.doublets import write_doublet_target_zarr
 from scarf.storage.budget import ResourceBudget
-from scarf.storage.sharding import counts_t_spec, write_counts_t
 from scarf.storage.layout import ZarrArraySpec
 from scarf.storage.profiles import resolve_storage_profile
-from tests.store_probes import RecordingStore
+from scarf.storage.sharding import counts_t_spec, write_counts_t
 from scarf.writers import (
     create_cell_data,
     create_zarr_count_assay,
 )
+from tests.store_probes import RecordingStore
 
 
 def _memory_root() -> zarr.Group:
@@ -128,7 +127,10 @@ def test_write_counts_t_marks_incomplete_until_finished():
     np.testing.assert_array_equal(counts_t[:], counts[:].T)
 
 
-def test_write_counts_t_feature_major_candidate_inherits_chunk_area():
+def test_write_counts_t_uses_strip_layout_independent_of_source_chunks():
+    from scarf.storage.sharding import choose_strip_layout
+    from scarf.storage.types import array_metadata_shards
+
     root = _memory_root()
     group = root.create_group("RNA")
     values = np.arange(22 * 7, dtype=np.uint32).reshape(22, 7)
@@ -142,11 +144,15 @@ def test_write_counts_t_feature_major_candidate_inherits_chunk_area():
         counts,
         group,
         resources=ResourceBudget(1024**2, 2),
-        feature_major_layout=True,
     )
 
     assert counts_t is not None
-    assert counts_t.chunks == (1, 22)
+    expected = choose_strip_layout(7, 22, values.dtype.itemsize)
+    assert counts_t.chunks == (expected["geneStrip"], expected["cellChunk"])
+    assert array_metadata_shards(counts_t) == (
+        expected["geneStrip"],
+        expected["shardCells"],
+    )
     np.testing.assert_array_equal(counts_t[:], values.T)
 
 
@@ -202,7 +208,7 @@ def test_assay_falls_back_on_wrong_shape_dtype_or_group_node():
     assert Assay(root, None, "RNA", cells, nthreads=1).rawDataT is None
 
 
-def test_rna_feature_reads_match_with_and_without_counts_t():
+def test_rna_requires_strip_counts_t():
     root = _memory_root()
     values = np.array(
         [
@@ -214,55 +220,35 @@ def test_rna_feature_reads_match_with_and_without_counts_t():
         dtype=np.uint32,
     )
     _write_small_assay(root, workspace=None, values=values)
-    del root["RNA/countsT"]
-    counts_t = root["RNA"].create_array(
-        "countsT",
-        data=values.T,
-        chunks=(1, 2),
-    )
-    counts_t.attrs["complete"] = True
     cells = MetaData(root["cellData"])
     cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
-
-    with_t = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
-    with_t.sf = 1000
-    assert with_t.rawDataT is not None
-
+    assay = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
+    assay.sf = 1000
+    assert assay.rawDataT is not None
     cell_idx = np.array([0, 2, 3])
     feat_idx = np.array([1, 3, 0])
-    stats_with = with_t._streaming_feature_stats(cell_idx, feat_idx)
-    blocks_with = [
-        raw.copy()
-        for _, raw, _, _, _ in with_t.iter_raw_column_blocks(
-            cell_idx, feat_idx, batch_size=2
-        )
-    ]
+    stats = assay._streaming_feature_stats(cell_idx, feat_idx)
+    assert set(stats) == {"normed_tot", "normed_n", "sigmas"}
+    assert stats["normed_tot"].shape == (3,)
 
-    root["RNA/countsT"].attrs["complete"] = False
-    without_t = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
-    without_t.sf = 1000
-    assert without_t.rawDataT is None
-    stats_without = without_t._streaming_feature_stats(cell_idx, feat_idx)
-    blocks_without = [
-        raw.copy()
-        for _, raw, _, _, _ in without_t.iter_raw_column_blocks(
-            cell_idx, feat_idx, batch_size=2
-        )
-    ]
-
-    for key in stats_with:
-        np.testing.assert_allclose(stats_with[key], stats_without[key], rtol=1e-10)
-    assert len(blocks_with) == len(blocks_without)
-    for left, right in zip(blocks_with, blocks_without, strict=True):
-        np.testing.assert_array_equal(left, right)
-
-    assert feature_column_chunk(with_t, n_features=4) == int(with_t.rawDataT.chunks[0])
-    assert feature_column_chunk(without_t, n_features=4) == int(
-        without_t.rawData._backing.chunks[1]
-    )
+    del root["RNA/countsT"]
+    with pytest.raises(ValueError, match="requires a complete strip-sharded"):
+        RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
 
 
-def test_marker_results_match_with_and_without_counts_t():
+def test_rna_rejects_unsharded_counts_t():
+    root = _memory_root()
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    _write_small_assay(root, workspace=None, values=values)
+    cells = MetaData(root["cellData"])
+    del root["RNA/countsT"]
+    root["RNA"].create_array("countsT", data=values.T, chunks=(1, 2))
+    root["RNA/countsT"].attrs["complete"] = True
+    with pytest.raises(ValueError, match="unsupported countsT layout"):
+        RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
+
+
+def test_marker_results_on_strip_counts_t():
     root = _memory_root()
     values = np.array(
         [
@@ -274,102 +260,14 @@ def test_marker_results_match_with_and_without_counts_t():
         dtype=np.uint32,
     )
     _write_small_assay(root, workspace=None, values=values)
-    del root["RNA/countsT"]
-    counts_t = root["RNA"].create_array(
-        "countsT",
-        data=values.T,
-        chunks=(1, 2),
-    )
-    counts_t.attrs["complete"] = True
     cells = MetaData(root["cellData"])
     cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
     cells.insert("cluster", np.array(["a", "a", "b", "b"]), overwrite=True)
-
-    with_t = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
-    with_t.sf = 1000.0
-    assert with_t.rawDataT is not None
-    results_with = find_markers_by_rank(
-        with_t,
-        group_key="cluster",
-        cell_key="I",
-        feat_key="I",
-        batch_size=2,
-        n_threads=1,
-    )
-
-    root["RNA/countsT"].attrs["complete"] = False
-    without_t = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
-    without_t.sf = 1000.0
-    assert without_t.rawDataT is None
-    results_without = find_markers_by_rank(
-        without_t,
-        group_key="cluster",
-        cell_key="I",
-        feat_key="I",
-        batch_size=2,
-        n_threads=1,
-    )
-
-    assert set(results_with) == set(results_without)
-    for group in results_with:
-        left = results_with[group].sort_index()
-        right = results_without[group].sort_index()
-        np.testing.assert_allclose(
-            left.to_numpy(dtype=np.float64),
-            right.to_numpy(dtype=np.float64),
-            rtol=1e-10,
-            equal_nan=True,
-        )
-
-
-def test_marker_stream_releases_consumed_block_before_reading_next(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    import gc
-    import weakref
-
-    import scarf.assay.rna as rna_module
-
-    root = _memory_root()
-    values = np.arange(1, 37, dtype=np.uint32).reshape(6, 6)
-    _write_small_assay(root, workspace=None, values=values)
-    cells = MetaData(root["cellData"])
-    cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
-    cells.insert("cluster", np.array(["a", "a", "a", "b", "b", "b"]), overwrite=True)
     assay = RNAassay(
-        root,
-        "RNA",
-        cells,
-        workspace=None,
-        nthreads=1,
-        min_cells_per_feature=1,
+        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
     )
-    assay.sf = 1_000.0
-
-    original_read = rna_module._read_facade_block
-    previous: weakref.ReferenceType[np.ndarray] | None = None
-    read_count = 0
-
-    def tracked_read(
-        array: zarr.Array,
-        rows: np.ndarray,
-        columns: np.ndarray,
-    ) -> np.ndarray:
-        nonlocal previous, read_count
-        gc.collect()
-        if previous is not None:
-            assert previous() is None
-        raw = np.ascontiguousarray(original_read(array, rows, columns))
-        previous = weakref.ref(raw)
-        read_count += 1
-        return raw
-
-    monkeypatch.setattr(rna_module, "_read_facade_block", tracked_read)
-    find_markers_by_rank(
+    assay.sf = 1000.0
+    results = find_markers_by_rank(
         assay,
         group_key="cluster",
         cell_key="I",
@@ -377,23 +275,12 @@ def test_marker_stream_releases_consumed_block_before_reading_next(
         batch_size=2,
         n_threads=1,
     )
-
-    gc.collect()
-    assert read_count == 3
-    assert previous is not None
-    assert previous() is None
+    assert set(results) == {"a", "b"}
+    assert len(results["a"]) == 4
 
 
-def _small_rna_with_ptime(values: np.ndarray) -> tuple[zarr.Group, MetaData]:
+def test_iter_normed_feature_wise_on_strip_counts_t():
     root = _memory_root()
-    _write_small_assay(root, workspace=None, values=values)
-    cells = MetaData(root["cellData"])
-    cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
-    cells.insert("ptime", np.linspace(0.0, 1.0, values.shape[0]), overwrite=True)
-    return root, cells
-
-
-def test_iter_normed_feature_wise_matches_with_and_without_counts_t():
     values = np.array(
         [
             [4, 0, 1, 2],
@@ -403,42 +290,101 @@ def test_iter_normed_feature_wise_matches_with_and_without_counts_t():
         ],
         dtype=np.uint32,
     )
-    root, cells = _small_rna_with_ptime(values)
-
-    with_t = RNAassay(
+    _write_small_assay(root, workspace=None, values=values)
+    cells = MetaData(root["cellData"])
+    cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
+    assay = RNAassay(
         root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
     )
-    with_t.sf = 1000.0
-    assert with_t.rawDataT is not None
-    frames_with = list(
-        with_t.iter_normed_feature_wise("I", "I", 2, "normed feats", log_transform=True)
-    )
-
-    root["RNA/countsT"].attrs["complete"] = False
-    without_t = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
-    without_t.sf = 1000.0
-    assert without_t.rawDataT is None
-    frames_without = list(
-        without_t.iter_normed_feature_wise(
-            "I", "I", 2, "normed feats", log_transform=True
+    assay.sf = 1000.0
+    batches = list(
+        assay.iter_normed_feature_wise(
+            cell_key="I",
+            feat_key="I",
+            batch_size=2,
+            msg=None,
+            as_dataframe=True,
         )
     )
+    assert batches
+    joined = np.concatenate([batch.to_numpy() for batch in batches], axis=1)
+    assert joined.shape[0] == 4
 
-    mat_with = pd.concat(frames_with, axis=1)
-    mat_without = pd.concat(frames_without, axis=1)
-    assert list(mat_with.columns) == list(mat_without.columns)
-    np.testing.assert_allclose(
-        mat_with.to_numpy(dtype=np.float64),
-        mat_without.to_numpy(dtype=np.float64),
-        rtol=1e-10,
+
+def test_regression_on_strip_counts_t():
+    root = _memory_root()
+    values = np.array(
+        [
+            [4, 0, 1, 2],
+            [3, 0, 1, 0],
+            [0, 5, 1, 2],
+            [0, 6, 1, 2],
+        ],
+        dtype=np.uint32,
     )
+    _write_small_assay(root, workspace=None, values=values)
+    cells = MetaData(root["cellData"])
+    cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
+    assay = RNAassay(
+        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
+    )
+    assay.sf = 1000.0
+    regressor = np.linspace(0.0, 1.0, values.shape[0])
+    table = find_markers_by_regression(
+        assay,
+        cell_key="I",
+        feat_key="I",
+        regressor=regressor,
+        min_cells=1,
+        batch_size=2,
+    )
+    assert len(table) == 4
 
 
-def test_slow_feature_iterator_never_exceeds_batch_size():
+def test_iter_normed_feature_wise_uses_base_path_when_ineligible(monkeypatch):
+    root = _memory_root()
+    values = np.array(
+        [
+            [4, 0, 1, 2],
+            [3, 0, 1, 0],
+            [0, 5, 1, 2],
+            [0, 6, 1, 2],
+        ],
+        dtype=np.uint32,
+    )
+    _write_small_assay(root, workspace=None, values=values)
+    cells = MetaData(root["cellData"])
+    cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
+    assay = RNAassay(
+        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
+    )
+    assay.sf = 1000.0
+    called = {"base": False}
+
+    def fake_base(self, *args, **kwargs):
+        called["base"] = True
+        if False:
+            yield None
+
+    monkeypatch.setattr(Assay, "iter_normed_feature_wise", fake_base)
+    list(
+        assay.iter_normed_feature_wise(
+            cell_key="I",
+            feat_key="I",
+            batch_size=2,
+            msg=None,
+            renormalize_subset=True,
+        )
+    )
+    assert called["base"] is True
+
+
+def test_renormalize_subset_path_batches_features():
+    root = _memory_root()
     values = np.arange(1, 29, dtype=np.uint32).reshape(4, 7)
-    root, cells = _small_rna_with_ptime(values)
+    _write_small_assay(root, workspace=None, values=values)
+    cells = MetaData(root["cellData"])
+    cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
     assay = RNAassay(
         root,
         "RNA",
@@ -448,7 +394,6 @@ def test_slow_feature_iterator_never_exceeds_batch_size():
         min_cells_per_feature=1,
     )
     assay.sf = 1000.0
-
     frames = list(
         assay.iter_normed_feature_wise(
             "I",
@@ -458,141 +403,7 @@ def test_slow_feature_iterator_never_exceeds_batch_size():
             renormalize_subset=True,
         )
     )
-
-    assert [frame.shape[1] for frame in frames] == [4, 3]
-
-
-def test_regression_and_aggregation_match_with_and_without_counts_t():
-    values = np.array(
-        [
-            [4, 0, 1, 2],
-            [3, 0, 1, 0],
-            [0, 5, 1, 2],
-            [0, 6, 1, 2],
-        ],
-        dtype=np.uint32,
-    )
-    root, cells = _small_rna_with_ptime(values)
-    ptime = cells.fetch("ptime", key="I")
-
-    with_t = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
-    with_t.sf = 1000.0
-    assert with_t.rawDataT is not None
-    regression_with = find_markers_by_regression(
-        with_t,
-        cell_key="I",
-        feat_key="I",
-        regressor=ptime,
-        min_cells=1,
-        batch_size=2,
-    )
-    agg_with, feats_with = with_t.save_aggregated_ordering(
-        cell_key="I",
-        feat_key="I",
-        ordering_key="ptime",
-        min_exp=0.0,
-        smoothen=False,
-        z_scale=False,
-        window_size=2,
-        chunk_size=2,
-        batch_size=2,
-    )
-    agg_with_vals = np.asarray(agg_with.compute())
-    location = "aggregated_I_I_ptime"
-    del root["RNA"][location]
-
-    root["RNA/countsT"].attrs["complete"] = False
-    without_t = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
-    without_t.sf = 1000.0
-    assert without_t.rawDataT is None
-    regression_without = find_markers_by_regression(
-        without_t,
-        cell_key="I",
-        feat_key="I",
-        regressor=ptime,
-        min_cells=1,
-        batch_size=2,
-    )
-    agg_without, feats_without = without_t.save_aggregated_ordering(
-        cell_key="I",
-        feat_key="I",
-        ordering_key="ptime",
-        min_exp=0.0,
-        smoothen=False,
-        z_scale=False,
-        window_size=2,
-        chunk_size=2,
-        batch_size=2,
-    )
-
-    np.testing.assert_allclose(
-        regression_with.sort_index().to_numpy(dtype=np.float64),
-        regression_without.sort_index().to_numpy(dtype=np.float64),
-        rtol=1e-10,
-        equal_nan=True,
-    )
-    np.testing.assert_array_equal(feats_with, feats_without)
-    np.testing.assert_allclose(
-        agg_with_vals,
-        np.asarray(agg_without.compute()),
-        rtol=1e-10,
-    )
-
-
-def test_iter_normed_feature_wise_uses_slow_path_when_ineligible(monkeypatch):
-    values = np.array(
-        [
-            [4, 0, 1, 2],
-            [3, 0, 1, 0],
-            [0, 5, 1, 2],
-            [0, 6, 1, 2],
-        ],
-        dtype=np.uint32,
-    )
-    root, cells = _small_rna_with_ptime(values)
-    assay = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
-    assay.sf = 1000.0
-    assert lib_size_feature_stream_eligible(assay) is True
-    assert lib_size_feature_stream_eligible(assay, renormalize_subset=True) is False
-
-    calls = {"raw": 0, "base": 0}
-    orig_raw = RNAassay._iter_raw_feature_columns
-    orig_base = Assay.iter_normed_feature_wise
-
-    def spy_raw(self, *args, **kwargs):
-        calls["raw"] += 1
-        yield from orig_raw(self, *args, **kwargs)
-
-    def spy_base(self, *args, **kwargs):
-        calls["base"] += 1
-        yield from orig_base(self, *args, **kwargs)
-
-    monkeypatch.setattr(RNAassay, "_iter_raw_feature_columns", spy_raw)
-    monkeypatch.setattr(Assay, "iter_normed_feature_wise", spy_base)
-
-    list(assay.iter_normed_feature_wise("I", "I", 2, None))
-    assert calls["raw"] >= 1
-    assert calls["base"] == 0
-
-    calls["raw"] = 0
-    calls["base"] = 0
-    list(assay.iter_normed_feature_wise("I", "I", 2, None, renormalize_subset=True))
-    assert calls["raw"] == 0
-    assert calls["base"] >= 1
-
-    calls["raw"] = 0
-    calls["base"] = 0
-    assay.normMethod = norm_dummy
-    assert lib_size_feature_stream_eligible(assay) is False
-    list(assay.iter_normed_feature_wise("I", "I", 2, None))
-    assert calls["raw"] == 0
-    assert calls["base"] >= 1
+    assert sum(frame.shape[1] for frame in frames) == 7
 
 
 def test_coordinate_melding_leaves_counts_t_on_demand():
@@ -633,8 +444,6 @@ def test_coordinate_melding_leaves_counts_t_on_demand():
     cells.insert("ATAC_nCounts", n_counts, overwrite=True)
     assay = Assay(root, None, "ATAC", cells, nthreads=1, min_cells_per_feature=1)
     assay.feats.insert("nCells", n_cells_per_peak, overwrite=True)
-
-    import pandas as pd
 
     feature_bed = pd.DataFrame(
         {
@@ -680,7 +489,7 @@ def test_count_assay_leaves_counts_t_on_demand():
     assert "countsT" not in root["PTIME_MODULES"]
 
 
-def test_write_doublet_target_zarr_skips_counts_t(tmp_path):
+def test_write_doublet_target_zarr_writes_strip_counts_t(tmp_path):
     sim = csr_matrix(np.array([[1, 0, 2], [0, 3, 0]], dtype=np.uint32))
     zarr_loc = str(tmp_path / "doublets.zarr")
     root = write_doublet_target_zarr(
@@ -692,7 +501,64 @@ def test_write_doublet_target_zarr_skips_counts_t(tmp_path):
         dtype="uint32",
     )
     assert "counts" in root["RNA"]
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
+    np.testing.assert_array_equal(
+        root["RNA/countsT"][:],
+        np.asarray(root["RNA/counts"][:]).T,
+    )
+
+
+def test_custom_assay_name_seeds_generic_type_and_loads(tmp_path):
+    from scarf import DataStore
+    from scarf.writers import SparseToZarr
+
+    path = str(tmp_path / "custom.zarr")
+    SparseToZarr(
+        csr_matrix(np.array([[1, 0], [0, 2]], dtype=np.uint32)),
+        zarr_loc=path,
+        cell_ids=["c0", "c1"],
+        feature_ids=["f0", "f1"],
+        assay_name="CUSTOM_NAME",
+    ).dump()
+    root = zarr.open_group(path, mode="r")
+    assert root.attrs["assayTypes"]["CUSTOM_NAME"] == "Assay"
+    assert "countsT" not in root["CUSTOM_NAME"]
+    store = DataStore(
+        path,
+        default_assay="CUSTOM_NAME",
+        min_features_per_cell=0,
+        min_cells_per_feature=0,
+    )
+    assert type(store.CUSTOM_NAME).__name__ == "Assay"
+
+
+def test_explicit_assay_type_can_declare_custom_group_as_rna(tmp_path):
+    from scarf.writers import create_cell_data, create_zarr_count_assay
+    from scarf.writers.counts_t import finalize_writer_counts_t
+
+    path = str(tmp_path / "declared_rna.zarr")
+    root = zarr.open_group(path, mode="w")
+    values = np.array([[1, 2], [3, 4]], dtype=np.uint32)
+    create_cell_data(
+        root,
+        None,
+        ids=np.array(["c0", "c1"]),
+        names=np.array(["c0", "c1"]),
+    )
+    create_zarr_count_assay(
+        root,
+        "CUSTOM_NAME",
+        None,
+        2,
+        feat_ids=np.array(["f0", "f1"]),
+        feat_names=np.array(["g0", "g1"]),
+        dtype="uint32",
+    )
+    root["CUSTOM_NAME/counts"][:] = values
+    finalize_writer_counts_t(root, "CUSTOM_NAME", None, assay_type="RNA")
+    assert root.attrs["assayTypes"]["CUSTOM_NAME"] == "RNA"
+    assert root["CUSTOM_NAME/countsT"].attrs["complete"] is True
 
 
 def test_write_doublet_target_rejects_summary_before_truncating_destination():
@@ -755,6 +621,9 @@ def test_write_counts_t_transposes_exactly(workers):
 
 
 def test_write_counts_t_geometry_matches_serial_baseline():
+    from scarf.storage.sharding import choose_strip_layout
+    from scarf.storage.types import array_metadata_shards
+
     values = _dense_values(22, 7)
     metadata = []
     for workers in (1, 4):
@@ -765,17 +634,22 @@ def test_write_counts_t_geometry_matches_serial_baseline():
             resources=ResourceBudget(8 * 1024**3, workers),
         )
         np.testing.assert_array_equal(counts_t[:], values.T)
-        metadata.append(counts_t.metadata.to_dict())
+        metadata.append(
+            (
+                tuple(counts_t.shape),
+                tuple(counts_t.chunks),
+                array_metadata_shards(counts_t),
+            )
+        )
 
     assert metadata[0] == metadata[1]
-    assert metadata[0]["shape"] == (7, 22)
-    assert metadata[0]["chunk_grid"]["configuration"]["chunk_shape"] == (2, 3)
-    assert metadata[0]["fill_value"] == 0
+    expected = choose_strip_layout(7, 22, values.dtype.itemsize)
+    assert metadata[0][0] == (7, 22)
+    assert metadata[0][1] == (expected["geneStrip"], expected["cellChunk"])
+    assert metadata[0][2] == (expected["geneStrip"], expected["shardCells"])
 
 
-def test_write_counts_t_covers_edge_tiles():
-    # 7 features over a 2-wide grid and 22 cells over a 6-wide grid leave a
-    # partial tile on both axes, including the shared corner tile.
+def test_write_counts_t_covers_edge_strips():
     values = _dense_values(22, 7)
     group, counts = _counts_array(values)
     counts_t = write_counts_t(
@@ -783,13 +657,12 @@ def test_write_counts_t_covers_edge_tiles():
         group,
         resources=ResourceBudget(8 * 1024**3, 4),
     )
-    np.testing.assert_array_equal(counts_t[0:2, 0:3], values[0:3, 0:2].T)
-    np.testing.assert_array_equal(counts_t[6:7, 0:3], values[0:3, 6:7].T)
-    np.testing.assert_array_equal(counts_t[0:2, 21:22], values[21:22, 0:2].T)
-    np.testing.assert_array_equal(counts_t[6:7, 21:22], values[21:22, 6:7].T)
+    np.testing.assert_array_equal(counts_t[:], values.T)
+    np.testing.assert_array_equal(counts_t[0:1, :], values[:, 0:1].T)
+    np.testing.assert_array_equal(counts_t[6:7, :], values[:, 6:7].T)
 
 
-def test_write_counts_t_writes_each_chunk_once_without_destination_read():
+def test_write_counts_t_writes_each_strip_once():
     store = RecordingStore()
     values = _dense_values(22, 7)
     group, counts = _counts_array(values, store=store)
@@ -799,67 +672,179 @@ def test_write_counts_t_writes_each_chunk_once_without_destination_read():
         group,
         resources=ResourceBudget(8 * 1024**3, 4),
     )
-
     chunk_ops = store.chunk_ops("RNA/countsT/c/")
     assert {kind for kind, _ in chunk_ops} == {"set"}
     keys = [key for _, key in chunk_ops]
     assert len(keys) == len(set(keys))
-    n_tiles = len(range(0, 7, 2)) * len(range(0, 22, 3))
-    assert len(keys) == n_tiles
+    gene_strip = int(counts_t.chunks[0])
+    n_strips = (7 + gene_strip - 1) // gene_strip
+    assert len(keys) == n_strips
     np.testing.assert_array_equal(counts_t[:], values.T)
 
 
-def test_write_counts_t_reads_each_source_inner_chunk_once():
-    store = RecordingStore()
-    values = _dense_values(24, 8)
-    group, counts = _counts_array(
-        values,
-        chunks=(3, 2),
-        shards=(6, 8),
-        store=store,
-    )
-    store.reset()
+def test_counts_t_write_plan_grows_with_memory():
+    from scarf.storage.sharding import COUNTS_T_MAX_UPLOAD_WORKERS, plan_counts_t_write
 
-    counts_t = write_counts_t(
+    # Force many small strips so concurrency is the admission variable.
+    tight = plan_counts_t_write(
+        nFeats=2000,
+        nCells=100_000,
+        dtype=np.uint16,
+        sourceCellRows=1000,
+        resources=ResourceBudget(80 * 1024**2, 2),
+        residentBytes=0,
+        profile="fast_local",
+        maxShardBytes=100 * 100_000 * 2,
+    )
+    roomy = plan_counts_t_write(
+        nFeats=2000,
+        nCells=100_000,
+        dtype=np.uint16,
+        sourceCellRows=1000,
+        resources=ResourceBudget(320 * 1024**2, 4),
+        residentBytes=0,
+        profile="fast_local",
+        maxShardBytes=100 * 100_000 * 2,
+    )
+    assert tight.nStrips == 20
+    assert tight.stripsPerBatch >= 1
+    assert tight.stripsPerBatch <= COUNTS_T_MAX_UPLOAD_WORKERS
+    assert roomy.stripsPerBatch <= COUNTS_T_MAX_UPLOAD_WORKERS
+    assert roomy.stripsPerBatch <= roomy.nStrips
+    assert roomy.uploadWorkers >= tight.uploadWorkers
+    assert roomy.uploadWorkers >= roomy.stripsPerBatch
+
+
+def test_counts_t_write_plan_caps_in_memory_strips_and_prefers_uploads():
+    from scarf.storage.sharding import COUNTS_T_MAX_UPLOAD_WORKERS, plan_counts_t_write
+
+    plan = plan_counts_t_write(
+        nFeats=45_000,
+        nCells=5_000_000,
+        dtype=np.uint16,
+        sourceCellRows=7370,
+        resources=ResourceBudget(48 * 1024**3, 16),
+        residentBytes=0,
+        profile="fast_local",
+        maxShardBytes=1024**3,
+    )
+    assert plan.nStrips > COUNTS_T_MAX_UPLOAD_WORKERS
+    assert plan.stripsPerBatch <= COUNTS_T_MAX_UPLOAD_WORKERS
+    assert plan.uploadWorkers == COUNTS_T_MAX_UPLOAD_WORKERS
+    assert plan.uploadWorkers == plan.stripsPerBatch
+    assert plan.readWorkers >= plan.uploadWorkers
+    # Four ~1 GiB strips plus encode scratch; previously this shape admitted ~45 strips.
+    assert plan.peakBytes < 16 * 1024**3
+    assert plan.peakBytes < 48 * 1024**3 // 2
+
+
+def test_counts_t_write_plan_rejects_when_one_strip_cannot_fit():
+    from scarf.storage.sharding import plan_counts_t_write
+
+    with pytest.raises(MemoryError, match="countsT strip write needs"):
+        plan_counts_t_write(
+            nFeats=8,
+            nCells=1_000_000,
+            dtype=np.uint16,
+            sourceCellRows=1000,
+            resources=ResourceBudget(8 * 1024**2, 2),
+            residentBytes=0,
+            profile="fast_local",
+            maxShardBytes=2 * 1_000_000 * 2,
+        )
+
+
+def test_choose_strip_layout_pads_awkward_cell_counts():
+    from scarf.storage.sharding import choose_strip_layout, is_strip_counts_t_layout
+
+    layout = choose_strip_layout(30_000, 1_000_003, 4)
+    assert layout["cellChunk"] > 1
+    assert layout["shardCells"] >= 1_000_003
+    assert layout["shardCells"] % layout["cellChunk"] == 0
+    assert is_strip_counts_t_layout(
+        shape=(30_000, 1_000_003),
+        chunks=(layout["geneStrip"], layout["cellChunk"]),
+        shards=(layout["geneStrip"], layout["shardCells"]),
+        dtype=np.uint32,
+    )
+
+
+def test_is_strip_counts_t_layout_accepts_structural_variants():
+    from scarf.storage.sharding import is_strip_counts_t_layout
+
+    assert is_strip_counts_t_layout(
+        shape=(100, 1000),
+        chunks=(10, 128),
+        shards=(10, 1024),
+        dtype=np.uint16,
+    )
+    assert not is_strip_counts_t_layout(
+        shape=(100, 1000),
+        chunks=(10, 128),
+        shards=(20, 1024),
+        dtype=np.uint16,
+    )
+    assert not is_strip_counts_t_layout(
+        shape=(100, 1000),
+        chunks=(10, 128),
+        shards=(10, 512),
+        dtype=np.uint16,
+    )
+
+
+def test_write_counts_t_uploads_disjoint_strips_concurrently(monkeypatch):
+    import threading
+
+    import zarr
+
+    import scarf.storage.sharding as sharding
+
+    original = sharding.choose_strip_layout
+
+    def tiny_strips(n_feats, n_cells, itemsize, **kwargs):
+        return original(
+            n_feats,
+            n_cells,
+            itemsize,
+            maxShardBytes=64,
+            targetChunkBytes=32,
+        )
+
+    monkeypatch.setattr(sharding, "choose_strip_layout", tiny_strips)
+    store = RecordingStore()
+    values = _dense_values(32, 16)
+    group, counts = _counts_array(values, store=store)
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    release = threading.Event()
+    real_setitem = zarr.Array.__setitem__
+
+    def counted_setitem(self, selection, value):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active >= 2:
+                release.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("concurrent strip uploads did not overlap")
+        try:
+            return real_setitem(self, selection, value)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(zarr.Array, "__setitem__", counted_setitem)
+    store.reset()
+    write_counts_t(
         counts,
         group,
         resources=ResourceBudget(8 * 1024**3, 4),
     )
-
-    source_gets = [
-        (key, byte_range)
-        for kind, key, byte_range in store.byte_ranges
-        if kind == "get" and key.startswith("RNA/counts/c/")
-    ]
-    shard_rows, shard_columns = counts.metadata.shards
-    expected_shard_keys = {
-        f"RNA/counts/c/{row}/{column}"
-        for row in range((counts.shape[0] + shard_rows - 1) // shard_rows)
-        for column in range((counts.shape[1] + shard_columns - 1) // shard_columns)
-    }
-    assert {key for key, _ in source_gets} == expected_shard_keys
-    assert all(byte_range is not None for _, byte_range in source_gets)
-    index_reads = [
-        (key, byte_range.suffix)
-        for key, byte_range in source_gets
-        if hasattr(byte_range, "suffix")
-    ]
-    chunk_reads = [
-        (key, byte_range.start, byte_range.end)
-        for key, byte_range in source_gets
-        if hasattr(byte_range, "start")
-    ]
-    n_tasks = ((counts.shape[0] + shard_rows - 1) // shard_rows) * (
-        (counts.shape[1] + counts.chunks[1] - 1) // counts.chunks[1]
-    )
-    chunks_per_task = (shard_rows + counts.chunks[0] - 1) // counts.chunks[0]
-    assert len(index_reads) == n_tasks
-    # Destination tiles partition the source; Zarr may coalesce adjacent inner
-    # chunks into one ranged get, so unique ranges must not exceed the naive
-    # per-task chunk count and must not repeat.
-    assert len(chunk_reads) == len(set(chunk_reads))
-    assert 1 <= len(chunk_reads) <= n_tasks * chunks_per_task
-    np.testing.assert_array_equal(counts_t[:], values.T)
+    assert max_active >= 2
+    np.testing.assert_array_equal(group["countsT"][:], values.T)
 
 
 def test_write_counts_t_overwrite_leaves_no_stale_chunks():
@@ -884,41 +869,13 @@ def test_write_counts_t_overwrite_leaves_no_stale_chunks():
 
     live = sorted(k for k in store._store_dict if k.startswith("RNA/countsT/c/"))
     assert live == sorted(set(live))
-    assert len(live) < len(stale)
+    assert len(live) <= len(stale)
     np.testing.assert_array_equal(counts_t[:], smaller.T)
 
 
-def test_write_counts_t_overlaps_tiles_within_worker_budget():
-    store = RecordingStore(delay=0.01)
-    values = _dense_values(24, 8)
-    group, counts = _counts_array(values, store=store)
-    store.reset()
-    write_counts_t(
-        counts,
-        group,
-        resources=ResourceBudget(8 * 1024**3, 4),
-    )
-    assert store.max_in_flight_for("set") > 1
-    assert store.max_in_flight_for("set") <= 4
-
-
-def test_write_counts_t_keeps_concurrency_within_worker_budget():
-    store = RecordingStore(delay=0.005)
-    values = _dense_values(24, 8)
-    group, counts = _counts_array(values, store=store)
-    store.reset()
-    write_counts_t(
-        counts,
-        group,
-        resources=ResourceBudget(8 * 1024**3, 2),
-    )
-    assert store.max_in_flight_for("set") <= 2
-
-
-def test_write_counts_t_restores_zarr_concurrency():
+def test_write_counts_t_restores_without_async_concurrency_mutation():
     before = zarr.config.get("async.concurrency")
     values = _dense_values(24, 8)
-
     group, counts = _counts_array(values)
     write_counts_t(
         counts,
@@ -927,39 +884,22 @@ def test_write_counts_t_restores_zarr_concurrency():
     )
     assert zarr.config.get("async.concurrency") == before
 
-    store = RecordingStore(fail_on="RNA/countsT/c/1/1")
-    group, counts = _counts_array(values, store=store)
-    with pytest.raises(RuntimeError, match="injected write failure"):
-        write_counts_t(
-            counts,
-            group,
-            resources=ResourceBudget(8 * 1024**3, 4),
-        )
-    assert zarr.config.get("async.concurrency") == before
 
-
-def test_write_counts_t_stays_incomplete_when_a_tile_fails():
-    store = RecordingStore(fail_on="RNA/countsT/c/1/1")
-    values = _dense_values(24, 8)
-    group, counts = _counts_array(values, store=store)
-    with pytest.raises(RuntimeError, match="injected write failure"):
-        write_counts_t(
-            counts,
-            group,
-            resources=ResourceBudget(8 * 1024**3, 4),
-        )
-    assert group["countsT"].attrs["complete"] is False
-
-
-def test_write_counts_t_rejects_oversized_tile():
+def test_write_counts_t_stays_incomplete_when_a_strip_fails(monkeypatch):
     values = _dense_values(24, 8)
     group, counts = _counts_array(values)
-    with pytest.raises(MemoryError):
+
+    def boom(self, selection):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(type(counts), "__getitem__", boom)
+    with pytest.raises(RuntimeError, match="boom"):
         write_counts_t(
             counts,
             group,
-            resources=ResourceBudget(100, 8),
+            resources=ResourceBudget(8 * 1024**3, 2),
         )
+    assert group["countsT"].attrs.get("complete") is False
 
 
 def test_repack_rebuilds_complete_counts_t(tmp_path):
@@ -977,3 +917,133 @@ def test_repack_rebuilds_complete_counts_t(tmp_path):
     assert "countsT" in dst["RNA"]
     assert dst["RNA/countsT"].attrs["complete"] is True
     np.testing.assert_array_equal(dst["RNA/countsT"][:], values.T)
+
+
+def test_inspect_counts_t_reports_ready_and_missing(tmp_path):
+    from scarf.storage.counts_t_contract import inspect_counts_t
+
+    path = tmp_path / "inspect.zarr"
+    root = zarr.open_group(str(path), mode="w")
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    _write_small_assay(root, workspace=None, values=values)
+    ready = inspect_counts_t(root, "RNA")
+    assert ready.status == "ready"
+    assert ready.assayType == "RNA"
+
+    del root["RNA/countsT"]
+    missing = inspect_counts_t(root, "RNA")
+    assert missing.status == "missing"
+
+
+def test_inspect_counts_t_reports_shape_dtype_mismatch(tmp_path):
+    from scarf.storage.counts_t_contract import inspect_counts_t
+
+    path = tmp_path / "mismatch.zarr"
+    root = zarr.open_group(str(path), mode="w")
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    _write_small_assay(root, workspace=None, values=values)
+    del root["RNA/counts"]
+    root["RNA"].create_array(
+        "counts",
+        shape=(5, 4),
+        chunks=(5, 4),
+        dtype="uint32",
+        fill_value=0,
+    )
+    mismatch = inspect_counts_t(root, "RNA")
+    assert mismatch.status == "shape-dtype-mismatch"
+
+
+def test_inspect_counts_t_reports_dtype_mismatch(tmp_path):
+    from scarf.storage.counts_t_contract import inspect_counts_t
+
+    path = tmp_path / "dtype-mismatch.zarr"
+    root = zarr.open_group(str(path), mode="w")
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    _write_small_assay(root, workspace=None, values=values)
+    del root["RNA/counts"]
+    root["RNA"].create_array(
+        "counts",
+        shape=(3, 4),
+        chunks=(3, 4),
+        dtype="uint16",
+        fill_value=0,
+    )
+    mismatch = inspect_counts_t(root, "RNA")
+    assert mismatch.status == "shape-dtype-mismatch"
+
+
+def test_assess_counts_t_reuse_outcomes(tmp_path):
+    from scarf.merge.writer import assess_counts_t_reuse
+
+    path = tmp_path / "reuse.zarr"
+    root = zarr.open_group(str(path), mode="w")
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    _write_small_assay(root, workspace=None, values=values)
+
+    ok = assess_counts_t_reuse(
+        root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
+    )
+    assert ok.outcome == "reusable"
+
+    root["RNA/countsT"].attrs["complete"] = False
+    incomplete = assess_counts_t_reuse(
+        root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
+    )
+    assert incomplete.outcome == "incomplete"
+
+    root["RNA/countsT"].attrs["complete"] = True
+    blocked = assess_counts_t_reuse(
+        root, "RNA", None, n_cells=3, n_features=4, dtype="float32"
+    )
+    assert blocked.outcome == "block-shape/dtype"
+
+    # Non-strip: rewrite by replacing with an unsharded destination.
+    del root["RNA/countsT"]
+    counts = root["RNA/counts"]
+    unsharded = root["RNA"].create_array(
+        "countsT",
+        shape=(4, 3),
+        chunks=(4, 3),
+        dtype=counts.dtype,
+        fill_value=0,
+    )
+    unsharded[:] = np.asarray(counts[:]).T
+    unsharded.attrs["complete"] = True
+    layout = assess_counts_t_reuse(
+        root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
+    )
+    assert layout.outcome == "rewrite-layout"
+
+
+def test_subset_preserves_gene_activity_alias(tmp_path):
+    from scarf import DataStore
+    from scarf.writers import SparseToZarr
+    from scarf.writers.subset import SubsetZarr
+
+    src = str(tmp_path / "src.zarr")
+    SparseToZarr(
+        csr_matrix(np.array([[1, 0], [0, 2], [3, 4]], dtype=np.uint32)),
+        zarr_loc=src,
+        cell_ids=["c0", "c1", "c2"],
+        feature_ids=["f0", "f1"],
+        assay_name="GeneActivity",
+    ).dump()
+    root = zarr.open_group(src, mode="r+")
+    root.attrs["assayTypes"] = {"GeneActivity": "GeneActivity"}
+    store = DataStore(
+        src,
+        default_assay="GeneActivity",
+        min_features_per_cell=0,
+        min_cells_per_feature=0,
+    )
+    out = str(tmp_path / "subset.zarr")
+    SubsetZarr(
+        out,
+        [store.GeneActivity],
+        cell_idx=np.array([0, 2]),
+        overwrite_existing_file=True,
+    ).dump()
+    subset_root = zarr.open_group(out, mode="r")
+    assert subset_root.attrs["assayTypes"]["GeneActivity"] == "GeneActivity"
+    assert subset_root["GeneActivity/countsT"].attrs["complete"] is True

@@ -265,6 +265,7 @@ def test_storage_has_no_upward_dependencies():
         _upward_imports(
             "storage",
             {"assay", "datastore", "plotting", "writers"},
+            allowed_modules=frozenset({"assay.classification"}),
         )
         == set()
     )
@@ -842,6 +843,7 @@ def test_writer_implementations_are_runtime_isolated():
         "_materialize.py",
         "_store.py",
         "cellranger.py",
+        "counts_t.py",
         "csv.py",
         "export.py",
         "h5ad.py",
@@ -860,6 +862,8 @@ def test_writer_implementations_are_runtime_isolated():
     )
 
     forbidden_roots = {"assay", "datastore", "mapping", "merge", "plotting"}
+    # Shared RNA classifier is the intentional write/load boundary for countsT.
+    allowed_assay_imports = {"assay.classification"}
     format_modules = {
         "writers.cellranger",
         "writers.csv",
@@ -877,7 +881,7 @@ def test_writer_implementations_are_runtime_isolated():
         "writers.load_count_store",
         "writers.load_zarr",
     }
-    shared_edges = {"writers._materialize", "writers._store"}
+    shared_edges = {"writers._materialize", "writers._store", "writers.counts_t"}
     matching_reader_exports = {
         "cellranger.py": {"CrReader"},
         "csv.py": {"CSVReader"},
@@ -904,6 +908,7 @@ def test_writer_implementations_are_runtime_isolated():
             module_name
             for module_name in runtime_imports
             if module_name.split(".", 1)[0] in forbidden_roots
+            and module_name not in allowed_assay_imports
         }
         writer_edges = {
             module_name
@@ -968,6 +973,9 @@ def test_assay_implementations_are_runtime_isolated():
         allowed_function_local = {"plotting"}
         if path.name == "base.py":
             allowed_function_local.add("assay.rna")
+        if path.name == "classification.py":
+            # Classifier resolves preset strings to modality classes.
+            allowed_function_local |= modality_modules
         function_local_imports = (
             _runtime_import_modules(path)
             - module_scope_imports

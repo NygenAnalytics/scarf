@@ -903,7 +903,8 @@ def test_h5ad_reader_converts_csc_sparse_encoding(tmp_path):
 
     root = zarr.open_group(str(zarr_path), mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
@@ -933,7 +934,8 @@ def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
 
     root = zarr.open_group(str(zarr_path), mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):

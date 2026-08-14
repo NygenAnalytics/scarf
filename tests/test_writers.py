@@ -103,7 +103,8 @@ def test_crtozarr_preserves_exact_counts_metadata_and_transpose():
 
     root = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
     np.testing.assert_array_equal(root["cellData/ids"][:], ["c1", "c2", "c3"])
     np.testing.assert_array_equal(root["RNA/featureData/ids"][:], ["f1", "f2", "f3"])
 
@@ -200,7 +201,8 @@ def test_h5adtozarr_splits_noncontiguous_feature_types():
     assert set(root.group_keys()) == {"cellData", "RNA", "ADT"}
     np.testing.assert_array_equal(root["RNA/counts"][:], values[:, [0, 2]])
     np.testing.assert_array_equal(root["ADT/counts"][:], values[:, [1, 3]])
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
     assert "countsT" not in root["ADT"]
     np.testing.assert_array_equal(root["cellData/batch"][:], ["A", "A", "B"])
     np.testing.assert_array_equal(root["RNA/featureData/ids"][:], ["f1", "f2"])
@@ -293,6 +295,27 @@ def test_h5adtozarr_writes_shard_bands_for_every_encoding(tmp_path, encoding):
     counts = root["RNA/counts"]
     assert array_metadata_shards(counts) == (4, 3)
     np.testing.assert_array_equal(counts[:], values)
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
+
+
+def test_h5adtozarr_write_counts_defers_counts_t(tmp_path):
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    values = _band_counts(12, 3)
+    path = _write_h5ad(tmp_path / "defer_counts_t.h5ad", values, encoding="csr")
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = MemoryStore()
+    try:
+        H5adToZarr(reader, zarr_loc=store, **_SHARD_BAND_BUDGET)._write_counts(
+            batch_size=5,
+        )
+    finally:
+        reader.h5.close()
+
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], values)
     assert "countsT" not in root["RNA"]
 
 
@@ -328,7 +351,8 @@ def test_h5adtozarr_uses_smallest_lossless_dtype_for_float_counts(
     root = zarr.open_group(store=store, mode="r")
     assert np.dtype(root["RNA/counts"].dtype) == expected_dtype
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 @pytest.mark.parametrize("encoding", ["csr", "csc"])
@@ -463,7 +487,8 @@ def test_h5adtozarr_reads_the_source_once_for_all_assays(tmp_path, monkeypatch):
     assert set(root.group_keys()) == {"cellData", "RNA", "ADT"}
     np.testing.assert_array_equal(root["RNA/counts"][:], values[:, [0, 2]])
     np.testing.assert_array_equal(root["ADT/counts"][:], values[:, [1, 3]])
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
     assert "countsT" not in root["ADT"]
     assert root["RNA/counts"].dtype == values.dtype
 
@@ -590,7 +615,8 @@ def test_loomtozarr_preserves_exact_counts_and_transpose(tmp_path):
 
     root = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_sparsetozarr(tmp_path):
@@ -615,7 +641,8 @@ def test_sparsetozarr(tmp_path):
     writer.dump()
     root = zarr.open_group(fn, mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], mat.toarray())
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_sparsetozarr_sharded_layout(tmp_path):
@@ -683,7 +710,8 @@ def test_csv_to_zarr_round_trip(tmp_path):
         dtype=np.uint16,
     )
     np.testing.assert_array_equal(root["RNA/counts"][:], expected)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
     np.testing.assert_array_equal(
         root["RNA/featureData/ids"][:],
         np.array(["geneA", "geneB", "geneC"]),
@@ -942,6 +970,19 @@ def test_zarr_subset(datastore, tmp_path):
         zarr_loc=zarr_path, assays=[datastore.RNA], cell_idx=np.array([1, 10, 100, 500])
     )
     writer.dump()
+    root = zarr.open_group(zarr_path, mode="r")
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
+    np.testing.assert_array_equal(
+        root["RNA/countsT"][:],
+        np.asarray(root["RNA/counts"][:]).T,
+    )
+    # Subset store must open as RNAassay under the strip contract.
+    from scarf import DataStore
+
+    subset_ds = DataStore(zarr_path, default_assay="RNA", assay_types={"RNA": "RNA"})
+    assert subset_ds.RNA.rawDataT is not None
+    assert subset_ds.RNA.rawDataT.shape == (root["RNA/counts"].shape[1], 4)
 
 
 def test_subset_zarr_rejects_invalid_assay_inputs():

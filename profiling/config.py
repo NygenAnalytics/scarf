@@ -87,11 +87,17 @@ class WorkflowParameters(BaseModel):
     leidenLabel: str = "leiden_cluster"
     markerFeatureKey: str = "I"
     markerGeneBatchSize: int | None = None
-    countsTLayout: Literal["source", "featureMajor"] = "source"
     graphLocalCache: bool | str = "auto"
     parisNClusters: int | Literal["auto"] = "auto"
     parisLabel: str = "paris_cluster"
     parisMinClusterSize: int | None = None
+    # Optional HVG/marker consume overrides for measurement runs.
+    featureShardPrefetchDepth: int | None = None
+    featureShardReadConcurrency: int | None = None
+    featureShardNumbaThreads: int | None = None
+    # Optional strip countsT layout target for canonical-layout gates.
+    countsTMaxShardBytes: int | None = None
+    countsTTargetChunkBytes: int | None = None
 
     @property
     def resolvedHvgKey(self) -> str:
@@ -116,6 +122,28 @@ class WorkflowParameters(BaseModel):
                 raise ValueError("parisMinClusterSize must be >= 2")
             if self.parisNClusters != "auto":
                 raise ValueError("parisMinClusterSize requires parisNClusters='auto'")
+        if (
+            self.featureShardPrefetchDepth is not None
+            and self.featureShardPrefetchDepth < 0
+        ):
+            raise ValueError("featureShardPrefetchDepth must be >= 0")
+        if (
+            self.featureShardReadConcurrency is not None
+            and self.featureShardReadConcurrency < 1
+        ):
+            raise ValueError("featureShardReadConcurrency must be >= 1")
+        if (
+            self.featureShardNumbaThreads is not None
+            and self.featureShardNumbaThreads < 1
+        ):
+            raise ValueError("featureShardNumbaThreads must be >= 1")
+        if self.countsTMaxShardBytes is not None and self.countsTMaxShardBytes <= 0:
+            raise ValueError("countsTMaxShardBytes must be positive when set")
+        if (
+            self.countsTTargetChunkBytes is not None
+            and self.countsTTargetChunkBytes <= 0
+        ):
+            raise ValueError("countsTTargetChunkBytes must be positive when set")
         return self
 
 
@@ -207,6 +235,9 @@ class ProfilingConfig(BaseModel):
     datasetPrefixUri: str
     resultsUri: str
     runTag: str = ""
+    # When set, stage jobs read/write this store instead of stores/{runTag}/...
+    # Useful for consume A/B runs against an existing store with a fresh result tag.
+    storeUriOverride: str | None = None
     storageLayout: StorageLayout = Field(default_factory=StorageLayout)
     targetSizes: tuple[int, ...] = Field(default_factory=lambda: DEFAULT_TARGET_SIZES)
     samplingSeed: int = 0
@@ -215,6 +246,8 @@ class ProfilingConfig(BaseModel):
     stageResources: dict[StageName, StageResources]
     # If unset, the complete current funnel runs.
     stages: tuple[StageName, ...] | None = None
+    # Filled by the submitting client before Modal spawn; not a TOML setting.
+    clientProvenance: dict[str, Any] | None = None
 
     @property
     def effectiveStages(self) -> tuple[StageName, ...]:
@@ -228,6 +261,18 @@ class ProfilingConfig(BaseModel):
             raise ValueError("datasetPrefixUri must be an s3:// URI")
         if not self.resultsUri.startswith("s3://"):
             raise ValueError("resultsUri must be an s3:// URI")
+        if self.storeUriOverride is not None:
+            override = self.storeUriOverride.strip()
+            if not override:
+                raise ValueError("storeUriOverride must be non-empty when set")
+            if not (
+                override.startswith("s3://")
+                or override.startswith("/")
+                or override.startswith("file://")
+            ):
+                raise ValueError(
+                    "storeUriOverride must be an s3:// URI or a local filesystem path"
+                )
         if "/" in self.runTag or "\\" in self.runTag or self.runTag in {".", ".."}:
             raise ValueError("runTag must be a single path segment")
         if not self.targetSizes:
@@ -261,6 +306,8 @@ class ProfilingConfig(BaseModel):
         return base
 
     def storeUri(self, nRows: int) -> str:
+        if self.storeUriOverride is not None:
+            return self.storeUriOverride.rstrip("/")
         return f"{self._tagged_prefix('stores')}/{nRows}.zarr"
 
     def resultUri(self, nRows: int, stage: StageName) -> str:

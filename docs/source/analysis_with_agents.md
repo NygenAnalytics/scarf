@@ -193,7 +193,7 @@ Classify the problem before retrying:
 - **State or provenance:** inspect the selected `AssayState`, explicit artifact status, selection keys, and lineage.
   `ArtifactSelectionError.code` distinguishes missing, incomplete, or changed selection inputs.
   Do not consume incomplete artifacts.
-- **Resource or I/O:** inspect the configured memory budget, worker count, storage profile, remote latency, and `countsT` availability.
+- **Resource or I/O:** inspect the configured memory budget, worker count, storage profile, remote latency, and RNA `countsT` strip layout (mandatory on Zarr v3).
   See {doc}`concepts/memory_and_execution`, {doc}`concepts/benchmarks`, and {doc}`tutorials/remote_stores`.
 - **Numerical or graph:** check dimensions, graph components, neighbour count, convergence, validity masks, and method-specific diagnostics.
 - **Scientific ambiguity:** preserve branches, seek another independent form of evidence, narrow the claim, or report that the available design does not resolve the alternatives.

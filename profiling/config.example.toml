@@ -71,22 +71,24 @@ graphLocalCache = "auto"
 
 # Tune memory before large runs. Values are examples.
 
+# Strip countsT gate: pin createStore / writeCountsT / markHvgs / findMarkers
+# to 8 CPU / 32 GiB (scarf budget ~24 GiB). Other stages keep larger envelopes.
 [stageResources.createStore]
-modalMemoryRequestMb = 65536
-modalMemoryLimitMb = 73728
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
 modalCpuRequest = 8.0
 modalCpuLimit = 8.0
-scarfMemoryBudget = 51539607552
+scarfMemoryBudget = 25769803776
 workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
 [stageResources.writeCountsT]
-modalMemoryRequestMb = 65536
-modalMemoryLimitMb = 73728
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
 modalCpuRequest = 8.0
 modalCpuLimit = 8.0
-scarfMemoryBudget = 51539607552
+scarfMemoryBudget = 25769803776
 workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
@@ -122,11 +124,11 @@ timeoutSeconds = 14400
 ephemeralDiskMb = 524288
 
 [stageResources.markHvgs]
-modalMemoryRequestMb = 65536
-modalMemoryLimitMb = 73728
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
 modalCpuRequest = 8.0
 modalCpuLimit = 8.0
-scarfMemoryBudget = 51539607552
+scarfMemoryBudget = 25769803776
 workers = 8
 timeoutSeconds = 43200
 ephemeralDiskMb = 524288
@@ -222,11 +224,11 @@ timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
 [stageResources.findMarkers]
-modalMemoryRequestMb = 131072
-modalMemoryLimitMb = 147456
-modalCpuRequest = 16.0
-modalCpuLimit = 16.0
-scarfMemoryBudget = 120259084288
-workers = 16
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288

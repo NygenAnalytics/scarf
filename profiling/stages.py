@@ -10,7 +10,6 @@ from typing import Any
 import numpy as np
 from scarf import DataStore, H5adReader, H5adToZarr, configure_output
 from scarf.storage.budget import resolve_budget
-from scarf.storage.sharding import write_counts_t
 from scarf.storage.stores import open_store
 from scarf.storage.types import as_zarr_array, as_zarr_group
 
@@ -58,6 +57,7 @@ class StageRunResult:
     operationPeakSource: str | None = None
     cgroupPeakScope: str | None = None
     details: dict[str, Any] | None = None
+    provenance: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
@@ -385,21 +385,55 @@ def _write_counts_t(
     *,
     storeUri: str,
     assayName: str,
-    featureMajorLayout: bool = False,
-) -> Any:
+    maxShardBytes: int | None = None,
+    targetChunkBytes: int | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    from scarf.storage.sharding import (
+        COUNTS_T_MAX_SHARD_BYTES,
+        COUNTS_T_TARGET_CHUNK_BYTES,
+        counts_t_write_plan_details,
+        plan_counts_t_write_for_array,
+        write_counts_t,
+    )
+
+    profile = "cloud" if storeUri.startswith("s3://") else "fast_local"
+    shard_bytes = (
+        COUNTS_T_MAX_SHARD_BYTES if maxShardBytes is None else int(maxShardBytes)
+    )
+    chunk_bytes = (
+        COUNTS_T_TARGET_CHUNK_BYTES
+        if targetChunkBytes is None
+        else int(targetChunkBytes)
+    )
+    plan = plan_counts_t_write_for_array(
+        context.counts,
+        profile=profile,
+        resources=context.budget,
+        maxShardBytes=shard_bytes,
+        targetChunkBytes=chunk_bytes,
+    )
+    plan_details = counts_t_write_plan_details(
+        plan,
+        nFeats=int(context.counts.shape[1]),
+        nCells=int(context.counts.shape[0]),
+        itemsize=int(np.dtype(context.counts.dtype).itemsize),
+    )
+    plan_details["maxShardBytes"] = shard_bytes
+    plan_details["targetChunkBytes"] = chunk_bytes
     counts_t = write_counts_t(
         context.counts,
         context.group,
-        profile="cloud" if storeUri.startswith("s3://") else "fast_local",
+        profile=profile,
         resources=context.budget,
-        feature_major_layout=featureMajorLayout,
+        maxShardBytes=shard_bytes,
+        targetChunkBytes=chunk_bytes,
     )
     if counts_t is None:
         raise RuntimeError(
             f"write_counts_t skipped for {assayName} (Zarr format < 3); "
             "cannot create countsT"
         )
-    return counts_t
+    return counts_t, plan_details
 
 
 def _validate_counts_t(
@@ -416,16 +450,32 @@ def _validate_counts_t(
         raise RuntimeError(
             f"countsT rewrite finished without complete=True at {storeUri}"
         )
-    countsT.attrs["complete"] = False
 
     expected_shape = (int(context.counts.shape[1]), int(context.counts.shape[0]))
     if tuple(countsT.shape) != expected_shape:
+        countsT.attrs["complete"] = False
         raise RuntimeError(
             f"countsT shape {tuple(countsT.shape)} != expected {expected_shape}"
         )
     if np.dtype(countsT.dtype) != np.dtype(context.counts.dtype):
+        countsT.attrs["complete"] = False
         raise RuntimeError(
             f"countsT dtype {countsT.dtype} != counts dtype {context.counts.dtype}"
+        )
+
+    from scarf.storage.sharding import is_strip_counts_t_layout
+    from scarf.storage.types import array_metadata_shards
+
+    shards = array_metadata_shards(countsT)
+    if shards is None or not is_strip_counts_t_layout(
+        shape=tuple(int(v) for v in countsT.shape),
+        chunks=tuple(int(v) for v in countsT.chunks),
+        shards=tuple(int(v) for v in shards),
+        dtype=countsT.dtype,
+    ):
+        countsT.attrs["complete"] = False
+        raise RuntimeError(
+            f"countsT at {storeUri} is not strip-sharded; RNA requires strip layout"
         )
 
     rng = np.random.default_rng(seed)
@@ -433,30 +483,35 @@ def _validate_counts_t(
     cell_chunk = max(1, int(countsT.chunks[1]))
     n_feats, n_cells = countsT.shape
     checks: list[dict[str, Any]] = []
-    for _ in range(max(0, nCheckTiles)):
-        feat_start = int(rng.integers(0, n_feats))
-        feat_start = (feat_start // feat_chunk) * feat_chunk
-        cell_start = int(rng.integers(0, n_cells))
-        cell_start = (cell_start // cell_chunk) * cell_chunk
-        feat_end = min(feat_start + feat_chunk, n_feats)
-        cell_end = min(cell_start + cell_chunk, n_cells)
-        got = np.asarray(countsT[feat_start:feat_end, cell_start:cell_end])
-        expect = np.asarray(context.counts[cell_start:cell_end, feat_start:feat_end]).T
-        if got.shape != expect.shape or not np.array_equal(got, expect):
-            raise RuntimeError(
-                "countsT tile mismatch after rewrite "
-                f"feat=[{feat_start}:{feat_end}] cell=[{cell_start}:{cell_end}]"
+    try:
+        for _ in range(max(0, nCheckTiles)):
+            feat_start = int(rng.integers(0, n_feats))
+            feat_start = (feat_start // feat_chunk) * feat_chunk
+            cell_start = int(rng.integers(0, n_cells))
+            cell_start = (cell_start // cell_chunk) * cell_chunk
+            feat_end = min(feat_start + feat_chunk, n_feats)
+            cell_end = min(cell_start + cell_chunk, n_cells)
+            got = np.asarray(countsT[feat_start:feat_end, cell_start:cell_end])
+            expect = np.asarray(
+                context.counts[cell_start:cell_end, feat_start:feat_end]
+            ).T
+            if got.shape != expect.shape or not np.array_equal(got, expect):
+                raise RuntimeError(
+                    "countsT tile mismatch after rewrite "
+                    f"feat=[{feat_start}:{feat_end}] cell=[{cell_start}:{cell_end}]"
+                )
+            checks.append(
+                {
+                    "featStart": feat_start,
+                    "featEnd": feat_end,
+                    "cellStart": cell_start,
+                    "cellEnd": cell_end,
+                }
             )
-        checks.append(
-            {
-                "featStart": feat_start,
-                "featEnd": feat_end,
-                "cellStart": cell_start,
-                "cellEnd": cell_end,
-            }
-        )
+    except Exception:
+        countsT.attrs["complete"] = False
+        raise
 
-    countsT.attrs["complete"] = True
     return {
         "assayName": assayName,
         "beforeComplete": context.beforeComplete,
@@ -485,6 +540,7 @@ def run_stage(
     containerCpuLimit: float | None = None,
     resetCgroupPeak: bool = True,
     invalidateCache: bool = False,
+    clientProvenance: dict[str, Any] | None = None,
 ) -> StageRunResult:
     timer = StageTimer()
     sampler = ResourceSampler(
@@ -516,7 +572,9 @@ def run_stage(
                         )
                     with timer.operation():
                         assert writer is not None
-                        writer.dump(batch_size=workflow.h5adBatchSize)
+                        # Keep createStore = counts only. writeCountsT owns
+                        # strip countsT so the two stages stay measurable.
+                        writer._write_counts(batch_size=workflow.h5adBatchSize)
                 finally:
                     writer = None
                     if reader is not None:
@@ -534,25 +592,27 @@ def run_stage(
                         )
                     with timer.operation():
                         assert counts_context is not None
-                        counts_t = _write_counts_t(
+                        counts_t, write_details = _write_counts_t(
                             counts_context,
                             storeUri=storeUri,
                             assayName=workflow.assayName,
-                            featureMajorLayout=(
-                                workflow.countsTLayout == "featureMajor"
-                            ),
+                            maxShardBytes=workflow.countsTMaxShardBytes,
+                            targetChunkBytes=workflow.countsTTargetChunkBytes,
                         )
                     with timer.validationPersistence():
                         assert counts_context is not None
-                        details = _validate_counts_t(
-                            counts_context,
-                            counts_t,
-                            storeUri=storeUri,
-                            assayName=workflow.assayName,
-                            resources=resources,
-                            nCheckTiles=3,
-                            seed=0,
-                        )
+                        details = {
+                            **write_details,
+                            **_validate_counts_t(
+                                counts_context,
+                                counts_t,
+                                storeUri=storeUri,
+                                assayName=workflow.assayName,
+                                resources=resources,
+                                nCheckTiles=3,
+                                seed=0,
+                            ),
+                        }
                 finally:
                     counts_t = None
                     counts_context = None
@@ -608,13 +668,18 @@ def run_stage(
                             f"[run_stage] datastore open; ENTER analysis stage={stage}",
                             flush=True,
                         )
-                        _run_analysis(
+                        analysis_details = _run_analysis(
                             stage,
                             store,
                             workflow,
                             resources,
                             invalidateCache=invalidateCache,
                         )
+                        if analysis_details:
+                            details = {
+                                **(details or {}),
+                                **analysis_details,
+                            }
                         print(
                             f"[run_stage] analysis DONE stage={stage}",
                             flush=True,
@@ -646,8 +711,26 @@ def run_stage(
                 "workerWholeSeconds": float(worker_whole),
             }
     if stage == "createStore" and details is None:
-        details = {"countsWriteSeconds": seconds}
+        counts_t_present = False
+        if status == "ok":
+            root = open_store(
+                storeUri,
+                mode="r",
+                storage_options=storage_options(storeUri),
+            )
+            assay = as_zarr_group(
+                root[workflow.assayName],
+                name=workflow.assayName,
+            )
+            counts_t_present = "countsT" in assay
+        details = {
+            "countsWriteSeconds": seconds,
+            "countsOnly": True,
+            "countsTPresent": counts_t_present,
+        }
     resource_summary = summarize_resource_measurement(measurement)
+    from profiling.provenance import collect_run_provenance
+
     return StageRunResult(
         stage=stage,
         nRows=nRows,
@@ -673,8 +756,87 @@ def run_stage(
         validationPersistenceSeconds=timings.validationPersistenceSeconds,
         wholeFunctionSeconds=timings.wholeFunctionSeconds,
         details=details,
+        provenance=collect_run_provenance(
+            nonpreemptible=True,
+            clientProvenance=clientProvenance,
+        ),
         **resource_summary,
     )
+
+
+def _apply_feature_shard_consume_env(
+    workflow: WorkflowParameters,
+    *,
+    nthreads: int,
+) -> dict[str, Any]:
+    """Publish optional consume knobs into process env for assay/marker code."""
+    import os
+
+    from scarf.storage.feature_shards import resolve_feature_shard_consume
+
+    mapping = {
+        "SCARF_FEATURE_SHARD_PREFETCH_DEPTH": workflow.featureShardPrefetchDepth,
+        "SCARF_FEATURE_SHARD_READ_CONCURRENCY": workflow.featureShardReadConcurrency,
+        "SCARF_FEATURE_SHARD_NUMBA_THREADS": workflow.featureShardNumbaThreads,
+    }
+    for key, value in mapping.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(int(value))
+    plan = resolve_feature_shard_consume(
+        nthreads=max(1, int(nthreads)),
+        prefetchDepth=workflow.featureShardPrefetchDepth,
+        readConcurrency=workflow.featureShardReadConcurrency,
+        numbaThreads=workflow.featureShardNumbaThreads,
+    )
+    return _consume_plan_details(plan)
+
+
+def _consume_plan_details(plan: Any) -> dict[str, Any]:
+    return {
+        "prefetchDepth": plan.prefetchDepth,
+        "readConcurrency": plan.readConcurrency,
+        "numbaThreads": plan.numbaThreads,
+        "inFlight": plan.inFlight,
+        "estimatedResidentBytes": plan.estimatedResidentBytes,
+        "requestedPrefetchDepth": plan.requestedPrefetchDepth,
+        "requestedReadConcurrency": plan.requestedReadConcurrency,
+        "requestedNumbaThreads": plan.requestedNumbaThreads,
+        "source": plan.source,
+    }
+
+
+def _effective_feature_shard_consume_details(
+    store: DataStore,
+    workflow: WorkflowParameters,
+    resources: StageResources,
+    *,
+    feat_key: str,
+) -> dict[str, Any]:
+    """Resolve the consume plan that HVG/markers will actually run."""
+    from scarf.storage.feature_shards import plan_feature_shard_consume_for_array
+
+    fallback = _apply_feature_shard_consume_env(
+        workflow,
+        nthreads=resources.workers,
+    )
+    assay = store._get_assay(workflow.assayName)
+    counts_t = getattr(assay, "rawDataT", None)
+    assay_resources = getattr(assay, "resources", None)
+    if counts_t is None or assay_resources is None:
+        return fallback
+    cell_idx = assay.cells.active_index(workflow.cellKey)
+    feat_idx = assay.feats.active_index(feat_key)
+    # Same planner signature as HVG stats and marker search: knobs come from
+    # process env, geometry from the active cell/feature selection.
+    plan = plan_feature_shard_consume_for_array(
+        counts_t,
+        resources=assay_resources,
+        cell_idx=cell_idx,
+        feat_idx=feat_idx,
+    )
+    return _consume_plan_details(plan)
 
 
 def _run_analysis(
@@ -684,7 +846,17 @@ def _run_analysis(
     resources: StageResources,
     *,
     invalidateCache: bool = False,
-) -> None:
+) -> dict[str, Any] | None:
+    consume_details: dict[str, Any] | None = None
+    if stage in {"markHvgs", "findMarkers"}:
+        feat_key = "I" if stage == "markHvgs" else workflow.markerFeatureKey
+        consume_details = _effective_feature_shard_consume_details(
+            store,
+            workflow,
+            resources,
+            feat_key=feat_key,
+        )
+
     if stage == "filterCells":
         store.auto_filter_cells(
             attrs=workflow.filterAttrs,
@@ -693,8 +865,19 @@ def _run_analysis(
             show_qc_plots=False,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "markHvgs":
+        if invalidateCache:
+            assay = store._get_assay(workflow.assayName)
+            identifier, stats_loc = assay._get_summary_stats_loc(workflow.cellKey)
+            if stats_loc in assay.z:
+                del assay.z[stats_loc]
+                print(
+                    f"[run_stage] cleared cached feature stats at {stats_loc}",
+                    flush=True,
+                )
+            if identifier in assay.feats.locations:
+                del assay.feats.locations[identifier]
         store.mark_hvgs(
             from_assay=workflow.assayName,
             cell_key=workflow.cellKey,
@@ -704,7 +887,7 @@ def _run_analysis(
             hvg_key_name=workflow.hvgKey,
             invalidate_cache=invalidateCache,
         )
-        return
+        return {"featureShardConsume": consume_details}
     if stage == "runNormalization":
         store.run_normalization(
             from_assay=workflow.assayName,
@@ -713,7 +896,7 @@ def _run_analysis(
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "runPca":
         store.run_pca(
             from_assay=workflow.assayName,
@@ -723,7 +906,7 @@ def _run_analysis(
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "buildEmbeddingInitialization":
         store.build_embedding_initialization(
             from_assay=workflow.assayName,
@@ -734,7 +917,7 @@ def _run_analysis(
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "buildAnnIndex":
         store.build_ann_index(
             from_assay=workflow.assayName,
@@ -746,7 +929,7 @@ def _run_analysis(
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "queryNeighbors":
         store.query_neighbors(
             from_assay=workflow.assayName,
@@ -754,14 +937,14 @@ def _run_analysis(
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "buildConnectivityMap":
         store.build_connectivity_map(
             from_assay=workflow.assayName,
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "runUmap":
         store.run_umap(
             from_assay=workflow.assayName,
@@ -774,7 +957,7 @@ def _run_analysis(
             nthreads=resources.workers,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "runLeiden":
         raise AssertionError("runLeiden must execute in its child process")
     if stage == "findMarkers":
@@ -788,7 +971,7 @@ def _run_analysis(
             skip_save=False,
             invalidate_cache=invalidateCache,
         )
-        return
+        return {"featureShardConsume": consume_details}
     if stage == "runClustering":
         raise AssertionError("runClustering must execute in its child process")
     raise ValueError(f"No analysis operation for {stage}")

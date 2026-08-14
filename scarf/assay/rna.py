@@ -4,13 +4,14 @@ from typing import Any, Literal, cast
 import numpy as np
 import pandas as pd
 import zarr
+from numba import njit, prange
 
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
 from ..storage.budget import admit_stream
 from ..storage.feature_stream import FeatureStreamPlan, plan_feature_stream
 from ..storage.geometry import array_geometry
-from ..storage.partition import IndexBlock, partition_indices, row_band
+from ..storage.partition import IndexBlock, row_band
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.compute import show_dask_progress
 from ..utils.logging import logger
@@ -30,6 +31,37 @@ def _read_facade_block(
     from . import _read_block
 
     return _read_block(zarr_arr, row_idx, col_idx)
+
+
+@njit(parallel=True, cache=True)
+def _hvg_stats_gene_major(
+    values: np.ndarray,
+    inv: np.ndarray,
+    sf: float,
+    dest: np.ndarray,
+    out_nz: np.ndarray,
+    out_s1: np.ndarray,
+    out_s2: np.ndarray,
+) -> None:
+    """Accumulate lib-size HVG stats for a gene-major count block."""
+    n_genes = values.shape[0]
+    n_cells = values.shape[1]
+    for g in prange(n_genes):
+        target = dest[g]
+        if target < 0:
+            continue
+        c_nz = 0.0
+        c_s1 = 0.0
+        c_s2 = 0.0
+        for c in range(n_cells):
+            value = sf * np.float64(values[g, c]) * inv[c]
+            if value > 0.0:
+                c_nz += 1.0
+            c_s1 += value
+            c_s2 += value * value
+        out_nz[target] = c_nz
+        out_s1[target] = c_s1
+        out_s2[target] = c_s2
 
 
 def _as_feature_indexes(
@@ -128,6 +160,47 @@ class RNAassay(Assay):
             self.sf = 1000
             self.attrs["size_factor"] = self.sf
         self.scalar: np.ndarray | None = None
+        self._require_strip_counts_t()
+
+    def _require_strip_counts_t(self) -> None:
+        """RNA assays require complete strip-sharded ``countsT`` on Zarr v3."""
+        from ..storage.sharding import is_strip_counts_t_layout
+        from ..storage.types import array_metadata_shards
+
+        # Stub construction (tests that monkeypatch Assay.__init__) skips load.
+        if not hasattr(self, "rawDataT"):
+            return
+        if self.rawDataT is None:
+            raise ValueError(
+                f"RNA assay {self.name!r} requires a complete strip-sharded "
+                "countsT matrix. Rebuild with ingest/subset/merge on Zarr v3, "
+                "or run repack_zarr / write_counts_t."
+            )
+        counts_t = self.rawDataT
+        zarr_format = int(getattr(counts_t.metadata, "zarr_format", 3) or 3)
+        if zarr_format < 3:
+            raise ValueError(
+                f"RNA assay {self.name!r} requires Zarr v3 for strip-sharded "
+                "countsT. Repack the store to Zarr v3."
+            )
+        shards = array_metadata_shards(counts_t)
+        if shards is None:
+            raise ValueError(
+                f"RNA assay {self.name!r} has an unsupported countsT layout "
+                "(unsharded or non-strip). Rebuild countsT with the current "
+                "Scarf strip writer (repack_zarr or write_counts_t)."
+            )
+        if not is_strip_counts_t_layout(
+            shape=tuple(int(v) for v in counts_t.shape),
+            chunks=tuple(int(v) for v in counts_t.chunks),
+            shards=tuple(int(v) for v in shards),
+            dtype=counts_t.dtype,
+        ):
+            raise ValueError(
+                f"RNA assay {self.name!r} has an unsupported countsT layout "
+                "(unsharded or non-strip). Rebuild countsT with the current "
+                "Scarf strip writer (repack_zarr or write_counts_t)."
+            )
 
     def iter_normed_feature_wise(
         self,
@@ -171,43 +244,105 @@ class RNAassay(Assay):
             raise ValueError("RNA library-size normalization requires a size factor")
         scalar = self.cells.fetch_all(self.name + "_nCounts")[cell_idx]
         log_transform = bool(norm_params.get("log_transform", False))
-        zarr_arr, feature_axis, cell_axis = self._raw_feature_stream_source()
-        raw_itemsize = max(1, int(np.dtype(zarr_arr.dtype).itemsize))
-        n_cells = len(cell_idx)
-        plan = plan_feature_stream(
-            zarr_arr,
-            featureAxis=feature_axis,
-            cellAxis=cell_axis,
-            featureIndices=feat_idx,
-            cellIndices=cell_idx,
-            resources=self.resources,
-            blockBytes=lambda width: max(
-                1,
-                n_cells
-                * width
-                * (
-                    raw_itemsize
-                    + np.dtype(np.float32).itemsize
-                    + np.dtype(np.float64).itemsize
-                ),
-            ),
-            requestedBatchSize=batch_size,
+        counts_t = self.rawDataT
+        if counts_t is None:
+            raise ValueError(
+                f"RNA assay {self.name!r} requires strip-sharded countsT "
+                "for feature-wise streaming"
+            )
+        from ..storage.feature_shards import (
+            map_feature_shards,
+            plan_feature_shard_consume_for_array,
+            selected_strip_starts,
+            shard_values_for_selection,
         )
-        for mat, cols in self._iter_raw_feature_columns(
+
+        scalar_values = np.asarray(scalar, dtype=np.float32)
+        scalar_values[scalar_values == 0] = 1
+        n_feats = int(counts_t.shape[0])
+        dest_of = np.full(n_feats, -1, dtype=np.int64)
+        dest_of[feat_idx] = np.arange(len(feat_idx), dtype=np.int64)
+        feat_labels = np.asarray(feat_idx)
+        starts = selected_strip_starts(counts_t, feat_idx)
+        geometry = array_geometry(counts_t)
+        if geometry is None:
+            raise ValueError(
+                f"RNA assay {self.name!r} requires strip-sharded countsT "
+                "for feature-wise streaming"
+            )
+        gene_strip = geometry.axisChunk(0)
+        n_sel_cells = int(np.asarray(cell_idx).shape[0])
+        # float32 working copy, float64 emit, and one concat remainder.
+        extra_bytes = n_sel_cells * gene_strip * (4 + 8 + 8)
+        plan = plan_feature_shard_consume_for_array(
+            counts_t,
+            resources=self.resources,
             cell_idx=cell_idx,
             feat_idx=feat_idx,
-            batch_size=batch_size,
-            scalar=scalar,
-            sf=float(sf),
-            log_transform=log_transform,
-            msg=msg,
-            plan=plan,
-        ):
-            mat64 = np.asarray(mat, dtype=np.float64)
+            extraBytesPerShard=extra_bytes,
+        )
+        resolved_batch = None if batch_size is None else max(1, int(batch_size))
+        pending_cols: list[np.ndarray] = []
+        pending_labels: list[np.ndarray] = []
+        pending_n = 0
+
+        def emit(
+            cols: np.ndarray, labels: np.ndarray
+        ) -> pd.DataFrame | tuple[np.ndarray, np.ndarray]:
             if as_dataframe:
-                yield pd.DataFrame(mat64, columns=cols)
-            else:
-                yield mat64.T, cols
+                return pd.DataFrame(np.asarray(cols, dtype=np.float64), columns=labels)
+            return np.asarray(cols.T, dtype=np.float64), labels
+
+        for shard in map_feature_shards(
+            counts_t,
+            lambda loaded: loaded,
+            cell_idx=cell_idx,
+            feat_idx=feat_idx,
+            feat_starts=starts,
+            plan=plan,
+            resources=self.resources,
+            progress=msg or None,
+        ):
+            local_dest = dest_of[shard.featStart : shard.featEnd]
+            keep = local_dest >= 0
+            if not np.any(keep):
+                continue
+            raw = shard_values_for_selection(shard.values, keep)
+            destinations = local_dest[keep]
+            # cells x features for downstream consumers
+            mat = raw.T.astype(np.float32, copy=False)
+            mat *= float(sf)
+            mat /= scalar_values[:, None]
+            if log_transform:
+                np.log2(mat + 1.0, out=mat)
+            labels = feat_labels[destinations]
+            cols = np.asarray(mat, dtype=np.float64)
+            if resolved_batch is None:
+                yield emit(cols, labels)
+                del mat, raw
+                continue
+            pending_cols.append(cols)
+            pending_labels.append(labels)
+            pending_n += int(labels.shape[0])
+            while pending_n >= resolved_batch:
+                stacked = np.concatenate(pending_cols, axis=1)
+                stacked_labels = np.concatenate(pending_labels)
+                yield emit(stacked[:, :resolved_batch], stacked_labels[:resolved_batch])
+                remainder = stacked[:, resolved_batch:]
+                remainder_labels = stacked_labels[resolved_batch:]
+                if remainder.shape[1] == 0:
+                    pending_cols = []
+                    pending_labels = []
+                    pending_n = 0
+                else:
+                    pending_cols = [remainder]
+                    pending_labels = [remainder_labels]
+                    pending_n = int(remainder_labels.shape[0])
+            del mat, raw
+        if pending_n > 0:
+            stacked = np.concatenate(pending_cols, axis=1)
+            stacked_labels = np.concatenate(pending_labels)
+            yield emit(stacked, stacked_labels)
 
     def save_normalized_data(
         self,
@@ -705,17 +840,23 @@ class RNAassay(Assay):
         cell_idx: np.ndarray,
         feat_idx: np.ndarray,
     ) -> dict[str, np.ndarray]:
-        """Per-feature library-size normalized stats in one streaming pass.
+        """Per-feature library-size normalized stats via whole-shard countsT.
 
-        Decodes each selected physical Zarr tile once, normalizes it in float64,
-        and accumulates per-feature nonzero count, sum, and sum of squares.
-        Reads use shallow ordered prefetch. Values match ``norm_lib_size``.
-        Returns ``normed_tot`` (sum), ``normed_n`` (nonzero count), and
-        ``sigmas`` (population variance).
+        Loads each gene-strip shard once, accumulates with a gene-major Numba
+        kernel (no full float64 shard materialization), and returns
+        ``normed_tot``, ``normed_n``, and ``sigmas`` matching ``norm_lib_size``.
         """
         import time
 
-        from ..utils.prefetch import iter_column_blocks
+        import numba
+        from numba import set_num_threads
+
+        from ..storage.feature_shards import (
+            map_feature_shards,
+            plan_feature_shard_consume_for_array,
+            selected_strip_starts,
+            shard_values_for_selection,
+        )
         from ..utils.process import process_rss_mb
 
         cell_idx = np.asarray(cell_idx)
@@ -739,76 +880,80 @@ class RNAassay(Assay):
         if n_cells == 0 or n_features == 0:
             return {"normed_tot": s1, "normed_n": nz, "sigmas": s2}
 
-        zarr_arr, feature_axis, cell_axis = self._raw_feature_stream_source()
-        use_counts_t = feature_axis == 0
-        geometry = array_geometry(zarr_arr)
-        if geometry is None:
-            raise ValueError("Feature stats require a chunked raw count array")
-        cell_tiles = partition_indices(geometry, cell_axis, cell_idx)
-        feat_tiles = partition_indices(geometry, feature_axis, feat_idx)
-        if use_counts_t:
-            tiles = [(cells, feats) for feats in feat_tiles for cells in cell_tiles]
-        else:
-            tiles = [(cells, feats) for cells in cell_tiles for feats in feat_tiles]
-
-        n_blocks = len(tiles)
-
-        def read_block(block_idx: int) -> np.ndarray:
-            cells, feats = tiles[block_idx]
-            if use_counts_t:
-                return _read_facade_block(zarr_arr, feats.indices, cells.indices).T
-            return _read_facade_block(zarr_arr, cells.indices, feats.indices)
-
-        def accumulate_block(
-            raw: np.ndarray,
-            local_cells: np.ndarray,
-            local_feats: np.ndarray,
-        ) -> None:
-            local_inv = inv_scalar[local_cells]
-            nz[local_feats] += (raw > 0).sum(axis=0)
-            scaled = raw.astype(np.float64, copy=True)
-            scaled *= sf
-            np.multiply(scaled, local_inv[:, None], out=scaled)
-            s1[local_feats] += scaled.sum(axis=0)
-            s2[local_feats] += np.einsum("ij,ij->j", scaled, scaled)
-
-        raw_itemsize = max(1, int(np.dtype(zarr_arr.dtype).itemsize))
-        block_bytes = max(
-            (
-                cells.indices.size
-                * feats.indices.size
-                * (raw_itemsize + np.dtype(np.float64).itemsize)
-                for cells, feats in tiles
-            ),
-            default=1,
+        counts_t = self.rawDataT
+        if counts_t is None:
+            raise ValueError(
+                f"RNA assay {self.name!r} requires strip-sharded countsT "
+                "for feature statistics"
+            )
+        n_feats = int(counts_t.shape[0])
+        dest_of = np.full(n_feats, -1, dtype=np.int64)
+        dest_of[feat_idx] = np.arange(n_features, dtype=np.int64)
+        starts = selected_strip_starts(counts_t, feat_idx)
+        consume = plan_feature_shard_consume_for_array(
+            counts_t,
+            resources=self.resources,
+            cell_idx=cell_idx,
+            feat_idx=feat_idx,
         )
-        resident_bytes = (
-            scalar.nbytes + inv_scalar.nbytes + nz.nbytes + s1.nbytes + s2.nbytes
+        threads = min(
+            consume.numbaThreads,
+            max(1, int(numba.config.NUMBA_NUM_THREADS)),
         )
-        admission = admit_stream(
-            self.resources,
-            nBlocks=max(1, n_blocks),
-            blockBytes=block_bytes,
-            decodeBytes=geometry.nominalChunkBytes(),
-            residentBytes=resident_bytes,
+        previous_threads = numba.get_num_threads()
+        logger.info(
+            f"({self.name}) feature stats consume "
+            f"prefetchDepth={consume.prefetchDepth} "
+            f"(requested={consume.requestedPrefetchDepth}) "
+            f"readConcurrency={consume.readConcurrency} "
+            f"(requested={consume.requestedReadConcurrency}) "
+            f"numbaThreads={threads} "
+            f"inFlight={consume.inFlight} "
+            f"estBytes={consume.estimatedResidentBytes} "
+            f"source={consume.source}"
         )
-        for block_idx, raw, read_sec, source in iter_column_blocks(
-            n_blocks,
-            read_block,
-            workers=admission.outerWorkers,
-            io_concurrency=admission.ioConcurrency,
-            msg=f"Computing {self.name} feature statistics",
-        ):
-            cells, feats = tiles[block_idx]
+
+        def process_shard(shard: Any) -> None:
+            local_dest = dest_of[shard.featStart : shard.featEnd]
+            keep = local_dest >= 0
+            if not np.any(keep):
+                return None
+            raw = shard_values_for_selection(shard.values, keep)
+            destinations = local_dest[keep].astype(np.int64, copy=False)
             t_compute = time.perf_counter()
-            accumulate_block(raw, cells.destinations, feats.destinations)
+            _hvg_stats_gene_major(
+                raw,
+                inv_scalar,
+                float(sf),
+                destinations,
+                nz,
+                s1,
+                s2,
+            )
             compute_sec = time.perf_counter() - t_compute
             logger.debug(
-                f"({self.name}) feature stats block {block_idx + 1}/{n_blocks}: "
-                f"read {read_sec:.1f}s ({source}) compute {compute_sec:.1f}s "
+                f"({self.name}) feature stats shard "
+                f"{shard.featStart}:{shard.featEnd}: "
+                f"read {shard.readSec:.1f}s compute {compute_sec:.1f}s "
                 f"rss {process_rss_mb():.0f} MiB"
             )
-            del raw
+            return None
+
+        try:
+            set_num_threads(threads)
+            for _ in map_feature_shards(
+                counts_t,
+                process_shard,
+                cell_idx=cell_idx,
+                feat_idx=feat_idx,
+                feat_starts=starts,
+                plan=consume,
+                resources=self.resources,
+                progress="Calculating feature statistics",
+            ):
+                pass
+        finally:
+            set_num_threads(previous_threads)
 
         mean = s1 / n_cells
         sigmas = s2 / n_cells - np.square(mean)

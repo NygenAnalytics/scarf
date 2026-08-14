@@ -753,6 +753,8 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
 
     class FakeRNA:
         def __init__(self):
+            from scarf.storage.sharding import write_counts_t
+
             self.cells = Cells()
             self.feats = Feats()
             self.normMethod = norm_lib_size
@@ -765,6 +767,9 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
                 data=data.astype(np.uint32),
                 chunks=(2, 2),
             )
+            counts_t = write_counts_t(self.raw, root)
+            assert counts_t is not None
+            self.rawDataT = counts_t
 
         def _raw_feature_stream_source(self):
             return self.raw, 1, 0

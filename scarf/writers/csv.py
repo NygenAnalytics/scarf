@@ -146,3 +146,12 @@ class CSVtoZarr:
             f"Wrote {self.csvr.nCells} cells and {self.csvr.nFeatures} features "
             f"from CSV to assay {self.assayName}"
         )
+        from .counts_t import finalize_writer_counts_t
+
+        finalize_writer_counts_t(
+            self.z,
+            self.assayName,
+            self.workspace,
+            resources=self.resources,
+            profile=self.profile,
+        )

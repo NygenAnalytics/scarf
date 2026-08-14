@@ -19,6 +19,25 @@ from ..storage.stores import load_zarr
 from ..utils.logging import logger
 
 
+def _source_assay_types(assay: Any, _in_workspace: str | None = None) -> dict[str, str]:
+    """Read persisted ``assayTypes`` from the source store when available.
+
+    ``assay.z`` is the assay group. For legacy stores its parent is the Zarr
+    root; for workspace stores the parent is the workspace group. Both places
+    hold ``assayTypes``.
+    """
+    try:
+        parent = assay.z.parent
+    except Exception:
+        return {}
+    if parent is None:
+        return {}
+    raw = parent.attrs.get("assayTypes", {})
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    return {}
+
+
 def subset_assay_zarr(
     zarr_loc: ZarrLocation,
     in_grp: str,
@@ -287,6 +306,25 @@ class SubsetZarr:
                 msg=f"Subsetting assay: {assay.name}",
                 resources=self.resources,
             )
+            from ..assay.classification import (
+                is_rna_assay_type,
+                lookup_persisted_assay_type,
+            )
+            from .counts_t import finalize_writer_counts_t
+
+            if is_rna_assay_type(assay):
+                source_types = _source_assay_types(assay, self.inWorkspace)
+                finalize_writer_counts_t(
+                    self.z,
+                    assay.name,
+                    self.outWorkspace,
+                    assay_type=lookup_persisted_assay_type(
+                        assay.name,
+                        source_types,
+                    ),
+                    resources=self.resources,
+                    profile=self.profile,
+                )
         logger.info(
             f"Wrote a subset of {len(self.cellIdx)} cells across "
             f"{len(self.assays)} assay(s)"

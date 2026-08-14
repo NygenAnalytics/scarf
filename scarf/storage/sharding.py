@@ -895,22 +895,141 @@ def accumulate_sparse_to_shards(
     return buffer.rows
 
 
+# Strip-sharded countsT: gene strips (~1 GiB) with ~128 MiB cell chunks.
+# Selected on the 1M R2 layout matrix (1/2/4 GiB). Validation is structural
+# and does not require these exact targets.
+COUNTS_T_MAX_SHARD_BYTES = 1 * 1024**3
+COUNTS_T_TARGET_CHUNK_BYTES = 128 * 1024**2
+# Upload concurrency, and the max number of finished strips held in RAM.
+# The writer does not keep more in-memory strips than it can upload at once.
+COUNTS_T_MAX_UPLOAD_WORKERS = 4
+
+
+@dataclass(frozen=True, slots=True)
+class CountsTWritePlan:
+    """Admitted strip ``countsT`` write geometry and concurrency."""
+
+    layout: ZarrArraySpec
+    nStrips: int
+    stripsPerBatch: int
+    sourceCellRows: int
+    readWorkers: int
+    uploadWorkers: int
+    stripBytes: int
+    peakBytes: int
+    residentBytes: int
+
+
+def counts_t_write_plan_details(
+    plan: CountsTWritePlan,
+    *,
+    nFeats: int,
+    nCells: int,
+    itemsize: int,
+) -> dict[str, int | float]:
+    """Observability fields for ``writeCountsT`` result details.
+
+    The bounded in-memory path reads each source feature column once across
+    batches, so estimated read amplification is ~1.0 relative to the logical
+    matrix. Scratch transpose is only considered when gates report worse
+    amplification or admission failure.
+    """
+    logical_bytes = max(0, int(nFeats) * int(nCells) * max(1, int(itemsize)))
+    n_batches = (
+        1
+        if plan.nStrips <= 0
+        else (plan.nStrips + max(1, plan.stripsPerBatch) - 1)
+        // max(1, plan.stripsPerBatch)
+    )
+    # Feature strips are partitioned across batches; each batch streams all cells.
+    source_bytes = logical_bytes
+    amplification = (
+        float(source_bytes) / float(logical_bytes) if logical_bytes > 0 else 0.0
+    )
+    return {
+        "logicalMatrixBytes": logical_bytes,
+        "sourceBytesRequested": source_bytes,
+        "estimatedReadAmplification": amplification,
+        "nStrips": int(plan.nStrips),
+        "stripsPerBatch": int(plan.stripsPerBatch),
+        "nBatches": int(n_batches),
+        "readWorkers": int(plan.readWorkers),
+        "uploadWorkers": int(plan.uploadWorkers),
+        "admittedPeakBytes": int(plan.peakBytes),
+        "stripBytes": int(plan.stripBytes),
+        "sourceCellRows": int(plan.sourceCellRows),
+        "residentBytes": int(plan.residentBytes),
+    }
+
+
+def choose_strip_layout(
+    n_feats: int,
+    n_cells: int,
+    itemsize: int,
+    *,
+    maxShardBytes: int = COUNTS_T_MAX_SHARD_BYTES,
+    targetChunkBytes: int = COUNTS_T_TARGET_CHUNK_BYTES,
+) -> dict[str, int]:
+    """Gene-strip shards with near-target cell chunks and padded shard tails.
+
+    The shard cell extent is a multiple of ``cellChunk`` and may exceed
+    ``nCells`` when the logical cell count is not chunk-aligned. Reads still
+    observe the logical array shape.
+    """
+    n_feats = max(0, int(n_feats))
+    n_cells = max(0, int(n_cells))
+    itemsize = max(1, int(itemsize))
+    if n_feats == 0 or n_cells == 0:
+        return {
+            "geneStrip": max(1, n_feats) if n_feats else 1,
+            "cellChunk": max(1, n_cells) if n_cells else 1,
+            "shardCells": max(1, n_cells) if n_cells else 1,
+            "shardBytes": 0,
+            "chunkBytes": 0,
+            "nShardsFeat": 0,
+        }
+    row_bytes = n_cells * itemsize
+    gene_strip = max(1, min(n_feats, int(maxShardBytes) // max(1, row_bytes)))
+    target_cells = max(1, int(targetChunkBytes) // max(1, gene_strip * itemsize))
+    cell_chunk = max(1, min(n_cells, target_cells))
+    shard_cells = ((n_cells + cell_chunk - 1) // cell_chunk) * cell_chunk
+    return {
+        "geneStrip": int(gene_strip),
+        "cellChunk": int(cell_chunk),
+        "shardCells": int(shard_cells),
+        "shardBytes": int(gene_strip * n_cells * itemsize),
+        "chunkBytes": int(gene_strip * cell_chunk * itemsize),
+        "nShardsFeat": int((n_feats + gene_strip - 1) // gene_strip),
+    }
+
+
 def _counts_t_layout(
     n_cells: int,
     n_feats: int,
-    source_rows: int,
-    feature_chunk_source: int,
     dtype: Any,
     profile: StorageProfile,
+    *,
+    maxShardBytes: int = COUNTS_T_MAX_SHARD_BYTES,
+    targetChunkBytes: int = COUNTS_T_TARGET_CHUNK_BYTES,
 ) -> ZarrArraySpec:
-    feature_chunk = max(1, min(max(1, n_feats), int(feature_chunk_source)))
-    cell_chunk = max(1, min(max(1, n_cells), int(source_rows)))
+    """Return the strip-sharded feature-major layout for ``countsT``."""
+    itemsize = max(1, int(np.dtype(dtype).itemsize))
+    chosen = choose_strip_layout(
+        n_feats,
+        n_cells,
+        itemsize,
+        maxShardBytes=maxShardBytes,
+        targetChunkBytes=targetChunkBytes,
+    )
+    gene_strip = int(chosen["geneStrip"])
+    cell_chunk = int(chosen["cellChunk"])
+    shard_cells = int(chosen["shardCells"])
     return ZarrArraySpec(
-        shape=(n_feats, n_cells),
-        chunks=(feature_chunk, cell_chunk),
+        shape=(max(0, int(n_feats)), max(0, int(n_cells))),
+        chunks=(gene_strip, cell_chunk),
         dtype=dtype,
         compressors=get_compressors(profile, zarrFormat=3),
-        shards=None,
+        shards=(gene_strip, shard_cells),
         fillValue=0,
         overwrite=True,
     )
@@ -920,22 +1039,267 @@ def counts_t_spec(
     counts: ZarrArraySpec,
     *,
     profile: StorageProfile,
+    maxShardBytes: int = COUNTS_T_MAX_SHARD_BYTES,
+    targetChunkBytes: int = COUNTS_T_TARGET_CHUNK_BYTES,
 ) -> ZarrArraySpec:
-    """Return the unsharded feature-major layout derived from counts."""
+    """Return the strip-sharded feature-major layout derived from counts."""
     if len(counts.shape) != 2 or len(counts.chunks) != 2:
         raise ValueError("counts must be a two-dimensional array specification")
     n_cells = int(counts.shape[0])
     n_feats = int(counts.shape[1])
-    source_rows = (
-        int(counts.chunks[0]) if counts.shards is None else int(counts.shards[0])
-    )
     return _counts_t_layout(
         n_cells,
         n_feats,
-        source_rows,
-        int(counts.chunks[1]),
         counts.dtype,
         profile,
+        maxShardBytes=maxShardBytes,
+        targetChunkBytes=targetChunkBytes,
+    )
+
+
+def is_strip_counts_t_layout(
+    *,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    shards: tuple[int, ...] | None,
+    dtype: Any,
+) -> bool:
+    """Return True for a structural strip-sharded ``countsT`` layout.
+
+    Accepts padded shard tails and any gene-strip / cell-chunk sizes that obey
+    the strip contract. Write-time byte targets are not part of validation.
+    """
+    del dtype
+    if len(shape) != 2 or len(chunks) != 2:
+        return False
+    if shards is None or len(shards) != 2:
+        return False
+    n_feats, n_cells = (int(value) for value in shape)
+    gene_strip, cell_chunk = (int(value) for value in chunks)
+    shard_feats, shard_cells = (int(value) for value in shards)
+    if n_feats < 0 or n_cells < 0:
+        return False
+    if gene_strip < 1 or cell_chunk < 1:
+        return False
+    if shard_feats != gene_strip:
+        return False
+    if shard_cells < cell_chunk or shard_cells % cell_chunk != 0:
+        return False
+    if n_cells > 0 and shard_cells < n_cells:
+        return False
+    if n_feats > 0 and gene_strip > n_feats:
+        return False
+    return True
+
+
+def _counts_t_write_overhead(*, stripBytes: int, available: int) -> int:
+    """Allocator / decode headroom scaled to the admitted strip size."""
+    strip_bytes = max(0, int(stripBytes))
+    available = max(0, int(available))
+    if strip_bytes == 0:
+        return min(64 * 1024, available) if available else 64 * 1024
+    if strip_bytes <= 128 * 1024**2:
+        return max(64 * 1024, strip_bytes // 4)
+    return max(strip_bytes // 8, 1 * 1024**2)
+
+
+def _counts_t_peak_bytes(
+    *,
+    stripsPerBatch: int,
+    geneStrip: int,
+    nFeats: int,
+    nCells: int,
+    itemsize: int,
+    sourceCellRows: int,
+    readWorkers: int,
+    uploadWorkers: int,
+    available: int,
+) -> int:
+    batch = max(1, int(stripsPerBatch))
+    gene_strip = max(1, int(geneStrip))
+    n_cells = max(1, int(nCells))
+    itemsize = max(1, int(itemsize))
+    source_rows = max(1, int(sourceCellRows))
+    read_workers = max(1, int(readWorkers))
+    upload_workers = max(1, int(uploadWorkers))
+    strip_bytes = gene_strip * n_cells * itemsize
+    feat_width = min(max(1, int(nFeats)), batch * gene_strip)
+    read_each = source_rows * feat_width * itemsize * 2
+    encode_each = (
+        _encoded_chunk_bound(strip_bytes)
+        + _encoded_chunk_bound(strip_bytes)
+        + _shard_index_bound(1)
+    )
+    overhead = _counts_t_write_overhead(stripBytes=strip_bytes, available=available)
+    return (
+        batch * strip_bytes
+        + read_workers * read_each
+        + min(upload_workers, batch) * encode_each
+        + overhead
+    )
+
+
+def plan_counts_t_write(
+    *,
+    nFeats: int,
+    nCells: int,
+    dtype: Any,
+    sourceCellRows: int,
+    resources: ResourceBudget,
+    residentBytes: int = 0,
+    profile: StorageProfile,
+    maxShardBytes: int = COUNTS_T_MAX_SHARD_BYTES,
+    targetChunkBytes: int = COUNTS_T_TARGET_CHUNK_BYTES,
+) -> CountsTWritePlan:
+    """Admit strip ``countsT`` write concurrency from one shared memory model.
+
+    Hold at most ``COUNTS_T_MAX_UPLOAD_WORKERS`` finished strips in RAM, and
+    prefer extra upload and read workers over a larger in-memory batch.
+    """
+    layout = _counts_t_layout(
+        nCells,
+        nFeats,
+        dtype,
+        profile,
+        maxShardBytes=maxShardBytes,
+        targetChunkBytes=targetChunkBytes,
+    )
+    gene_strip = int(layout.chunks[0])
+    n_feats = max(0, int(nFeats))
+    n_cells = max(0, int(nCells))
+    itemsize = max(1, int(np.dtype(dtype).itemsize))
+    source_rows = max(1, int(sourceCellRows))
+    resident = max(0, int(residentBytes))
+    available = max(0, int(resources.memoryBytes) - resident)
+    n_strips = max(1, row_band_task_count(n_feats, gene_strip)) if n_feats else 1
+    strip_bytes = gene_strip * max(1, n_cells) * itemsize if n_cells and n_feats else 0
+    if n_cells == 0 or n_feats == 0:
+        return CountsTWritePlan(
+            layout=layout,
+            nStrips=0,
+            stripsPerBatch=1,
+            sourceCellRows=source_rows,
+            readWorkers=1,
+            uploadWorkers=1,
+            stripBytes=0,
+            peakBytes=0,
+            residentBytes=resident,
+        )
+
+    max_read = max(1, int(resources.workers))
+    max_upload = max(1, min(max_read, COUNTS_T_MAX_UPLOAD_WORKERS))
+    max_batch = min(n_strips, max_upload)
+
+    def peak(batch: int, read_workers: int, upload_workers: int) -> int:
+        return _counts_t_peak_bytes(
+            stripsPerBatch=batch,
+            geneStrip=gene_strip,
+            nFeats=n_feats,
+            nCells=n_cells,
+            itemsize=itemsize,
+            sourceCellRows=source_rows,
+            readWorkers=read_workers,
+            uploadWorkers=upload_workers,
+            available=available,
+        )
+
+    one_peak = peak(1, 1, 1)
+    if available and one_peak > available:
+        raise MemoryError(
+            "countsT strip write needs at least "
+            f"{one_peak} bytes with the current resource budget "
+            f"({available} bytes available after residentBytes={resident})"
+        )
+
+    best_batch = 1
+    best_read = 1
+    best_upload = 1
+    best_peak = one_peak
+    for read_workers in range(1, max_read + 1):
+        for upload_workers in range(1, max_upload + 1):
+            # Do not hold more finished strips than this candidate can upload.
+            limit = min(max_batch, upload_workers)
+            batch = 1
+            while batch < limit:
+                nxt = batch + 1
+                if peak(nxt, read_workers, min(upload_workers, nxt)) > available:
+                    break
+                batch = nxt
+            candidate_upload = min(upload_workers, batch)
+            candidate_peak = peak(batch, read_workers, candidate_upload)
+            if candidate_peak > available:
+                continue
+            better_upload = candidate_upload > best_upload
+            better_read = candidate_upload == best_upload and read_workers > best_read
+            better_batch = (
+                candidate_upload == best_upload
+                and read_workers == best_read
+                and batch > best_batch
+            )
+            better_peak = (
+                candidate_upload == best_upload
+                and read_workers == best_read
+                and batch == best_batch
+                and candidate_peak < best_peak
+            )
+            if better_upload or better_read or better_batch or better_peak:
+                best_batch = batch
+                best_read = read_workers
+                best_upload = candidate_upload
+                best_peak = candidate_peak
+
+    return CountsTWritePlan(
+        layout=layout,
+        nStrips=n_strips,
+        stripsPerBatch=best_batch,
+        sourceCellRows=source_rows,
+        readWorkers=best_read,
+        uploadWorkers=best_upload,
+        stripBytes=strip_bytes,
+        peakBytes=best_peak,
+        residentBytes=resident,
+    )
+
+
+def plan_counts_t_write_for_array(
+    counts: zarr.Array | ZarrArraySpec,
+    *,
+    profile: StorageProfile,
+    resources: ResourceBudget,
+    residentBytes: int = 0,
+    sourceCellRows: int | None = None,
+    maxShardBytes: int = COUNTS_T_MAX_SHARD_BYTES,
+    targetChunkBytes: int = COUNTS_T_TARGET_CHUNK_BYTES,
+) -> CountsTWritePlan:
+    """Admit a strip write plan for a counts array or array specification."""
+    if isinstance(counts, ZarrArraySpec):
+        n_cells = int(counts.shape[0])
+        n_feats = int(counts.shape[1])
+        dtype = counts.dtype
+        source_rows = (
+            max(1, int(sourceCellRows))
+            if sourceCellRows is not None
+            else max(1, int(counts.chunks[0]))
+        )
+    else:
+        n_cells = int(counts.shape[0])
+        n_feats = int(counts.shape[1])
+        dtype = counts.dtype
+        source_rows = (
+            max(1, int(sourceCellRows))
+            if sourceCellRows is not None
+            else max(1, int(array_shard_rows(counts)))
+        )
+    return plan_counts_t_write(
+        nFeats=n_feats,
+        nCells=n_cells,
+        dtype=dtype,
+        sourceCellRows=source_rows,
+        resources=resources,
+        residentBytes=residentBytes,
+        profile=profile,
+        maxShardBytes=maxShardBytes,
+        targetChunkBytes=targetChunkBytes,
     )
 
 
@@ -946,32 +1310,13 @@ def preflight_counts_t_spec(
     resources: ResourceBudget,
     residentBytes: int = 0,
 ) -> ZarrArraySpec:
-    """Admit countsT construction before creating the destination."""
-    transpose = counts_t_spec(counts, profile=profile)
-    n_feats, n_cells = (int(value) for value in transpose.shape)
-    feature_chunk, cell_chunk = (int(value) for value in transpose.chunks)
-    if n_cells == 0 or n_feats == 0:
-        return transpose
-    inner_bytes = (
-        feature_chunk * cell_chunk * max(1, int(np.dtype(transpose.dtype).itemsize))
-    )
-    n_tasks = row_band_task_count(n_cells, cell_chunk) * row_band_task_count(
-        n_feats,
-        feature_chunk,
-    )
-    admitted_worker_split(
-        resources,
-        nTasks=n_tasks,
-        residentBytes=max(0, int(residentBytes)),
-        taskBytes=lambda concurrency: _row_band_task_peak(
-            sourceBytes=inner_bytes,
-            denseBytes=inner_bytes,
-            innerChunkBytes=inner_bytes,
-            nChunks=1,
-            innerConcurrency=concurrency,
-        ),
-    )
-    return transpose
+    """Admit strip ``countsT`` construction with the shared write plan."""
+    return plan_counts_t_write_for_array(
+        counts,
+        profile=profile,
+        resources=resources,
+        residentBytes=residentBytes,
+    ).layout
 
 
 def write_counts_t(
@@ -980,10 +1325,20 @@ def write_counts_t(
     *,
     profile: StorageProfile | None = None,
     resources: ResourceBudget | None = None,
-    feature_major_layout: bool = False,
     residentBytes: int = 0,
+    maxShardBytes: int = COUNTS_T_MAX_SHARD_BYTES,
+    targetChunkBytes: int = COUNTS_T_TARGET_CHUNK_BYTES,
 ) -> zarr.Array | None:
-    """Write the optional feature-major count matrix using public Zarr APIs."""
+    """Write strip-sharded feature-major ``countsT``.
+
+    Streams cell-major ``counts`` in memory-bounded gene-strip batches so each
+    source cell band is read once per batch (not once per strip). A batch holds
+    at most as many strips as admitted upload workers. Within a batch, cell
+    bands are fetched concurrently and completed strips are uploaded
+    concurrently. Read and upload concurrency are admitted together.
+    """
+    from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+
     from ..utils.logging import logger
     from ..utils.progress import tqdmbar
 
@@ -991,117 +1346,126 @@ def write_counts_t(
         return None
     resources = resources or resolve_budget()
     resolved_profile = profile or resolve_storage_profile(group.store)
+    plan = plan_counts_t_write_for_array(
+        counts,
+        profile=resolved_profile,
+        resources=resources,
+        residentBytes=residentBytes,
+        maxShardBytes=maxShardBytes,
+        targetChunkBytes=targetChunkBytes,
+    )
+    layout = plan.layout
     n_cells = int(counts.shape[0])
     n_feats = int(counts.shape[1])
-    itemsize = max(1, int(np.dtype(counts.dtype).itemsize))
-    if feature_major_layout:
-        chunk_elements = max(1, int(np.prod(counts.chunks, dtype=np.int64)))
-        cell_chunk = max(1, min(max(1, n_cells), chunk_elements))
-        feature_chunk = max(
-            1,
-            min(
-                max(1, n_feats),
-                chunk_elements // cell_chunk,
-            ),
-        )
-        layout = ZarrArraySpec(
-            shape=(n_feats, n_cells),
-            chunks=(feature_chunk, cell_chunk),
-            dtype=counts.dtype,
-            compressors=get_compressors(resolved_profile, zarrFormat=3),
-            shards=None,
-            fillValue=0,
-            overwrite=True,
-        )
-    else:
-        layout = _counts_t_layout(
-            n_cells,
-            n_feats,
-            array_shard_rows(counts),
-            int(counts.chunks[1]),
-            counts.dtype,
-            resolved_profile,
-        )
-        feature_chunk, cell_chunk = (int(value) for value in layout.chunks)
-    inner_bytes = feature_chunk * cell_chunk * itemsize
+    gene_strip, cell_chunk = (int(value) for value in layout.chunks)
+    source_rows = plan.sourceCellRows
+    strips_per_batch = plan.stripsPerBatch
+    read_workers = plan.readWorkers
+    upload_workers = plan.uploadWorkers
 
-    counts_t = create_numeric_array(
-        group,
-        "countsT",
-        layout,
-    )
+    counts_t = create_numeric_array(group, "countsT", layout)
     counts_t.attrs["complete"] = False
     if n_cells == 0 or n_feats == 0:
         counts_t.attrs["complete"] = True
         return counts_t
 
-    n_tasks = (
-        (n_cells + cell_chunk - 1)
-        // cell_chunk
-        * ((n_feats + feature_chunk - 1) // feature_chunk)
-    )
-    workers, inner = admitted_worker_split(
-        resources,
-        nTasks=n_tasks,
-        residentBytes=max(0, int(residentBytes)),
-        taskBytes=lambda concurrency: _row_band_task_peak(
-            sourceBytes=inner_bytes,
-            denseBytes=inner_bytes,
-            innerChunkBytes=inner_bytes,
-            nChunks=1,
-            innerConcurrency=concurrency,
-        ),
-    )
+    strips = [
+        (feat_start, min(feat_start + gene_strip, n_feats))
+        for feat_start in range(0, n_feats, gene_strip)
+    ]
+    cell_starts = list(range(0, n_cells, source_rows))
+
     logger.debug(
-        f"Writing countsT shape=({n_feats}, {n_cells}) "
-        f"chunks=({feature_chunk}, {cell_chunk}) "
-        f"tasks={n_tasks} workers={workers}"
+        f"Writing strip countsT shape=({n_feats}, {n_cells}) "
+        f"shards=({gene_strip}, {layout.shards[1] if layout.shards else n_cells}) "
+        f"chunks=({gene_strip}, {cell_chunk}) "
+        f"strips={len(strips)} stripsPerBatch={strips_per_batch} "
+        f"readWorkers={read_workers} uploadWorkers={upload_workers} "
+        f"peakBytes={plan.peakBytes}"
     )
-    progress = tqdmbar(desc="Writing transposed counts", total=n_tasks)
+    progress = tqdmbar(desc="Writing transposed counts", total=len(strips))
+    try:
+        for batch_start in range(0, len(strips), strips_per_batch):
+            batch = strips[batch_start : batch_start + strips_per_batch]
+            feat_lo = int(batch[0][0])
+            feat_hi = int(batch[-1][1])
+            buffers = {
+                g0: np.zeros((g1 - g0, n_cells), dtype=counts.dtype) for g0, g1 in batch
+            }
 
-    def inner_chunk_values(
-        task: tuple[int, int],
-    ) -> tuple[tuple[slice, slice], np.ndarray]:
-        feat_start, cell_start = task
-        feat_end = min(feat_start + feature_chunk, n_feats)
-        cell_end = min(cell_start + cell_chunk, n_cells)
-        block = np.asarray(
-            counts[cell_start:cell_end, feat_start:feat_end],
-        )
-        return (
-            (slice(feat_start, feat_end), slice(cell_start, cell_end)),
-            np.ascontiguousarray(block.T),
-        )
+            def _read_band(
+                cell_start: int,
+                *,
+                _feat_lo: int = feat_lo,
+                _feat_hi: int = feat_hi,
+            ) -> tuple[int, int, np.ndarray]:
+                cell_end = min(cell_start + source_rows, n_cells)
+                block = np.asarray(counts[cell_start:cell_end, _feat_lo:_feat_hi])
+                return cell_start, cell_end, block
 
-    async def copy_all() -> None:
-        remaining = (
-            (feat_start, cell_start)
-            for cell_start in range(0, n_cells, cell_chunk)
-            for feat_start in range(0, n_feats, feature_chunk)
-        )
+            with ThreadPoolExecutor(max_workers=read_workers) as pool:
+                pending: list[Future[tuple[int, int, np.ndarray]]] = []
+                start_iter = iter(cell_starts)
 
-        async def copy_worker() -> None:
-            for task in remaining:
-                selection, values = await asyncio.to_thread(
-                    inner_chunk_values,
-                    task,
-                )
-                await counts_t.async_array.setitem(selection, values)
-                del selection, values
-                progress.update()
+                def fill() -> None:
+                    while len(pending) < read_workers:
+                        try:
+                            nxt = next(start_iter)
+                        except StopIteration:
+                            break
+                        pending.append(pool.submit(_read_band, nxt))
 
-        async with asyncio.TaskGroup() as group_tasks:
-            for _ in range(workers):
-                group_tasks.create_task(copy_worker())
+                fill()
+                while pending:
+                    future = pending.pop(0)
+                    cell_start, cell_end, block = future.result()
+                    fill()
+                    for g0, g1 in batch:
+                        buffers[g0][:, cell_start:cell_end] = np.ascontiguousarray(
+                            block[:, g0 - feat_lo : g1 - feat_lo].T
+                        )
+                    del block
 
-    with zarr.config.set({"async.concurrency": inner}):
-        try:
-            _run_async(copy_all)
-        except ExceptionGroup as error:
-            if len(error.exceptions) == 1:
-                raise error.exceptions[0] from error
-            raise
-        finally:
-            progress.close()
+            def _write_strip(g0: int, g1: int) -> None:
+                counts_t[g0:g1, :] = buffers[g0]
+
+            with ThreadPoolExecutor(max_workers=upload_workers) as pool:
+                upload_futures = [pool.submit(_write_strip, g0, g1) for g0, g1 in batch]
+                for upload_future in as_completed(upload_futures):
+                    upload_future.result()
+            buffers.clear()
+            progress.update(len(batch))
+    except BaseException:
+        counts_t.attrs["complete"] = False
+        raise
+    finally:
+        progress.close()
     counts_t.attrs["complete"] = True
     return counts_t
+
+
+def finalize_rna_counts_t(
+    counts: zarr.Array,
+    group: zarr.Group,
+    *,
+    profile: StorageProfile | None = None,
+    resources: ResourceBudget | None = None,
+    mem_budget: int | str | None = None,
+    nthreads: int | None = None,
+    residentBytes: int = 0,
+) -> zarr.Array | None:
+    """Write mandatory strip ``countsT`` after RNA ``counts`` is complete.
+
+    Resolves a resource budget when the caller has none. Returns ``None`` when
+    the destination group is Zarr format < 3 (cannot hold strip shards).
+    """
+    resolved = resources
+    if resolved is None:
+        resolved = resolve_budget(mem_budget, nthreads)
+    return write_counts_t(
+        counts,
+        group,
+        profile=profile,
+        resources=resolved,
+        residentBytes=residentBytes,
+    )

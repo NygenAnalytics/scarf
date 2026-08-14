@@ -323,6 +323,17 @@ class SeuratToZarr:
                 self._write_feature_data(assay, metadata_rows)
             for assay in self._assays:
                 self._write_counts(assay, requested_rows)
+            from .counts_t import finalize_writer_counts_t
+
+            for assay in self._assays:
+                finalize_writer_counts_t(
+                    self.z,
+                    assay.name,
+                    self.workspace,
+                    assay_type=assay.name,
+                    resources=self.resources,
+                    profile=self.profile,
+                )
             cell_selection = self._write_cell_selection()
             reduction_artifacts = self._write_reductions(
                 cell_selection,
