@@ -102,10 +102,11 @@ Paris clustering
 
 Leiden clustering
   Graph community detection via `run_leiden_clustering`.
-  Labels are stored in cell metadata as `{assay}_{label}` for the default cell key `I` (for example `RNA_leiden_cluster`).
-  A manual call uses default label `leiden_cluster`.
-  The RNA pipeline runs several resolutions at once and defaults each to `leiden_<resolution>` (for example `RNA_leiden_0.5`).
-  When more than one partition is available, the pipeline copies the silhouette-selected winner to `RNA_clusters` and uses that column for doublet scoring and marker search unless another partition is named.
+  Labels are stored as `{assay}_{label}` for the default cell key `I`.
+  A manual call defaults to label `leiden_cluster` (for example `RNA_leiden_cluster`).
+  The RNA pipeline defaults each Leiden job to `leiden_<resolution>` (for example `RNA_leiden_0.5`) and also runs Paris unless `paris=False`.
+  After clustering, the pipeline copies the chosen partition to `{assay}_clusters` (for example `RNA_clusters`) and uses that column for doublet scoring and marker search unless another partition is named.
+  With more than one partition, the copy is the silhouette winner on PCA coordinates and can be a Leiden or Paris result.
   Pass `label=` to choose the suffix; when comparing resolutions manually, use distinct labels for each run.
 
 SNN integration

@@ -268,7 +268,8 @@ Parameter choice, densMAP, and t-SNE are covered in {doc}`dimensionality_reducti
 ## 8. Clustering
 
 Leiden clustering runs on the same neighbourhood graph.
-Cluster labels are saved as `RNA_leiden_cluster`.
+This manual call saves labels as `RNA_leiden_cluster`.
+`ds.pipeline.run()` instead writes `RNA_leiden_<resolution>` columns (for example `RNA_leiden_0.5`) and copies the selected partition to `RNA_clusters`.
 
 ```{code-cell} ipython3
 ds.run_leiden_clustering(resolution=0.5)
