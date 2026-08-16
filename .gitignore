@@ -61,6 +61,7 @@ scarf/agent/.env.*
 !/profiling/config.example.toml
 # Generated and machine-specific profiling configs.
 profiling/layouts/
+/profiling/cluster_sources.toml
 test_data
 # Generated plotting showcase outputs. Curated references live in tests/visual.
 /artifacts/

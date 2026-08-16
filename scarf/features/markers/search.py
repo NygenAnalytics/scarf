@@ -121,12 +121,6 @@ def find_markers_by_rank(
                 f"RNA assay {assay.name!r} requires strip-sharded countsT "
                 "for marker search"
             )
-        from ...storage.feature_shards import (
-            map_feature_shards,
-            plan_feature_shard_consume_for_array,
-            selected_strip_starts,
-            shard_values_for_selection,
-        )
         from ...storage.budget import resolve_budget
 
         n_feats = int(counts_t.shape[0])
@@ -135,35 +129,69 @@ def find_markers_by_rank(
         resources = getattr(assay, "resources", None) or resolve_budget(
             workers=n_threads
         )
-        starts = selected_strip_starts(counts_t, feat_idx)
-        consume = plan_feature_shard_consume_for_array(
-            counts_t,
-            resources=resources,
-            cell_idx=cell_idx,
-            feat_idx=feat_idx,
+        consume_mode_method = getattr(assay, "_feature_consume_mode", None)
+        consume_mode = (
+            consume_mode_method() if callable(consume_mode_method) else "bounded"
         )
-        threads = min(
-            consume.numbaThreads,
-            max(1, int(numba.config.NUMBA_NUM_THREADS)),
-        )
+        if consume_mode == "wholeStrip":
+            from ...storage.feature_shards import (
+                map_feature_shards,
+                plan_feature_shard_consume_for_array,
+                selected_strip_starts,
+                shard_values_for_selection,
+            )
+
+            starts = selected_strip_starts(counts_t, feat_idx)
+            consume = plan_feature_shard_consume_for_array(
+                counts_t,
+                resources=resources,
+                cell_idx=cell_idx,
+                feat_idx=feat_idx,
+            )
+            threads = min(
+                consume.numbaThreads,
+                max(1, int(numba.config.NUMBA_NUM_THREADS)),
+            )
+
+            def selected_values(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
+                return shard_values_for_selection(values, keep)
+
+            consume_log = (
+                f"whole-shard: features={len(feat_idx)} groups={n_groups} "
+                f"prefetchDepth={consume.prefetchDepth} "
+                f"readConcurrency={consume.readConcurrency} "
+                f"numbaThreads={threads} inFlight={consume.inFlight} "
+                f"estBytes={consume.estimatedResidentBytes}"
+            )
+        else:
+            from ...storage.feature_stream import (
+                map_feature_read_groups,
+                selected_feature_values,
+            )
+
+            threads = min(
+                max(1, int(resources.workers)),
+                max(1, int(numba.config.NUMBA_NUM_THREADS)),
+            )
+
+            def selected_values(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
+                return selected_feature_values(values, keep)
+
+            consume_log = (
+                f"bounded groups: features={len(feat_idx)} groups={n_groups} "
+                f"workers={resources.workers} numbaThreads={threads} "
+                f"memoryBytes={resources.memoryBytes}"
+            )
         previous_threads = numba.get_num_threads()
         set_num_threads(threads)
-        logger.debug(
-            f"Marker search whole-shard: features={len(feat_idx)} "
-            f"groups={n_groups} prefetchDepth={consume.prefetchDepth} "
-            f"(requested={consume.requestedPrefetchDepth}) "
-            f"readConcurrency={consume.readConcurrency} "
-            f"(requested={consume.requestedReadConcurrency}) "
-            f"numbaThreads={threads} inFlight={consume.inFlight} "
-            f"estBytes={consume.estimatedResidentBytes} source={consume.source}"
-        )
+        logger.debug(f"Marker search {consume_log}")
 
-        def process_shard(shard: Any) -> None:
-            local_dest = dest_of[shard.featStart : shard.featEnd]
+        def process_group(group: Any) -> None:
+            local_dest = dest_of[group.featStart : group.featEnd]
             keep = local_dest >= 0
             if not np.any(keep):
                 return None
-            raw = shard_values_for_selection(shard.values, keep)
+            raw = selected_values(group.values, keep)
             destinations = local_dest[keep].astype(np.int64, copy=False)
             _marker_stats_gene_major(
                 raw,
@@ -179,17 +207,28 @@ def find_markers_by_rank(
             return None
 
         try:
-            for _ in map_feature_shards(
-                counts_t,
-                process_shard,
-                cell_idx=cell_idx,
-                feat_idx=feat_idx,
-                feat_starts=starts,
-                plan=consume,
-                resources=resources,
-                progress="Finding markers",
-            ):
-                pass
+            if consume_mode == "wholeStrip":
+                for _ in map_feature_shards(
+                    counts_t,
+                    process_group,
+                    cell_idx=cell_idx,
+                    feat_idx=feat_idx,
+                    feat_starts=starts,
+                    plan=consume,
+                    resources=resources,
+                    progress="Finding markers",
+                ):
+                    pass
+            else:
+                for _ in map_feature_read_groups(
+                    counts_t,
+                    process_group,
+                    cell_idx=cell_idx,
+                    feat_idx=feat_idx,
+                    resources=resources,
+                    progress="Finding markers",
+                ):
+                    pass
         finally:
             set_num_threads(previous_threads)
         z_values = np.asarray(stats_matrix[:, :, 6], dtype=np.float64)

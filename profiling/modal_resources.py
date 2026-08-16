@@ -9,12 +9,8 @@ MIN_EPHEMERAL_DISK_MB = 524_288
 MAX_EPHEMERAL_DISK_MB = 3_145_728
 BASE_EPHEMERAL_DISK_MB = MIN_EPHEMERAL_DISK_MB
 
-# Stage workers: retry after runner loss / InternalFailure. Orchestrators stay at 0.
-STAGE_JOB_RETRIES = modal.Retries(
-    max_retries=3,
-    backoff_coefficient=2.0,
-    initial_delay=5.0,
-)
+# Mutating workers never retry. A retry can overlap an in-flight write.
+STAGE_JOB_RETRIES = 0
 
 
 def resolve_ephemeral_disk_mb(requestedMb: int) -> int:

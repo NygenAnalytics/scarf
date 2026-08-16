@@ -54,7 +54,7 @@ def test_resolve_feature_shard_consume_argument_env_default_precedence(monkeypat
     monkeypatch.setenv("SCARF_FEATURE_SHARD_NUMBA_THREADS", "5")
     env_plan = resolve_feature_shard_consume(nthreads=8)
     assert env_plan.prefetchDepth == 3
-    assert env_plan.readConcurrency == 4  # clamped to inFlight=4
+    assert env_plan.readConcurrency == 4
     assert env_plan.numbaThreads == 5
     assert env_plan.source == "env"
 

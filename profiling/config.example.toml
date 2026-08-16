@@ -232,3 +232,23 @@ scarfMemoryBudget = 25769803776
 workers = 8
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
+
+[stageResources.importClusters]
+modalMemoryRequestMb = 16384
+modalMemoryLimitMb = 20480
+modalCpuRequest = 4.0
+modalCpuLimit = 4.0
+scarfMemoryBudget = 12884901888
+workers = 4
+timeoutSeconds = 3600
+ephemeralDiskMb = 524288
+
+[stageResources.validateExperiment]
+modalMemoryRequestMb = 16384
+modalMemoryLimitMb = 20480
+modalCpuRequest = 4.0
+modalCpuLimit = 4.0
+scarfMemoryBudget = 12884901888
+workers = 4
+timeoutSeconds = 3600
+ephemeralDiskMb = 524288

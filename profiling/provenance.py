@@ -77,15 +77,30 @@ def _source_tree_digest() -> str | None:
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    if completed.returncode != 0:
-        return None
     digest = hashlib.sha256()
-    names = [name for name in completed.stdout.split(b"\0") if name]
-    for name in sorted(names):
-        path = _REPO_ROOT / name.decode("utf-8", errors="surrogateescape")
+    if completed.returncode == 0:
+        names = [
+            name.decode("utf-8", errors="surrogateescape")
+            for name in completed.stdout.split(b"\0")
+            if name
+        ]
+    else:
+        names = []
+        for root_name in ("scarf", "profiling"):
+            root = _REPO_ROOT / root_name
+            names.extend(
+                str(path.relative_to(_REPO_ROOT))
+                for pattern in ("*.py", "*.pyi")
+                for path in root.rglob(pattern)
+                if "__pycache__" not in path.parts
+            )
+        names.extend(("pyproject.toml", "uv.lock"))
+    for name in sorted(set(names)):
+        encoded_name = name.encode("utf-8", errors="surrogateescape")
+        path = _REPO_ROOT / name
         if not path.is_file():
             continue
-        digest.update(name)
+        digest.update(encoded_name)
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
@@ -189,6 +204,15 @@ def collect_run_provenance(
         zarr_async_concurrency = zarr.config.get("async.concurrency")
     except Exception:
         pass
+    modal_input_id = None
+    modal_function_call_id = None
+    try:
+        import modal
+
+        modal_input_id = modal.current_input_id()
+        modal_function_call_id = modal.current_function_call_id()
+    except Exception:
+        pass
 
     dirty = _run_git("status", "--porcelain")
     provenance: dict[str, Any] = {
@@ -202,6 +226,8 @@ def collect_run_provenance(
         "pythonVersion": sys.version.split()[0],
         "platform": platform.platform(),
         "hostname": socket.gethostname(),
+        "modalInputId": modal_input_id,
+        "modalFunctionCallId": modal_function_call_id,
         "cpuModel": _cpu_model(),
         "cpuCountLogical": os.cpu_count(),
         "packageVersions": {
@@ -214,13 +240,6 @@ def collect_run_provenance(
         "zarrCodecPipeline": zarr_pipeline,
         "zarrAsyncConcurrency": zarr_async_concurrency,
         "scarfZarrProfile": os.environ.get("SCARF_ZARR_PROFILE"),
-        "featureShardPrefetchDepth": os.environ.get(
-            "SCARF_FEATURE_SHARD_PREFETCH_DEPTH"
-        ),
-        "featureShardReadConcurrency": os.environ.get(
-            "SCARF_FEATURE_SHARD_READ_CONCURRENCY"
-        ),
-        "featureShardNumbaThreads": os.environ.get("SCARF_FEATURE_SHARD_NUMBA_THREADS"),
         "nonpreemptible": nonpreemptible,
         "hasClientCodeIdentity": False,
     }

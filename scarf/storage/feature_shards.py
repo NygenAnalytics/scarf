@@ -11,18 +11,18 @@ Measurement overrides (optional, not production defaults):
 ``SCARF_FEATURE_SHARD_NUMBA_THREADS``.
 """
 
+import os
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TypeVar
-import os
 
 import numpy as np
 import zarr
 
+from ..utils.progress import tqdmbar
 from .budget import ResourceBudget
 from .types import array_metadata_shards, as_zarr_array
-from ..utils.progress import tqdmbar
 
 # Cloud/R2-tuned whole-shard consume defaults (see performance_reconfig.md).
 FEATURE_SHARD_COMPUTE_WORKERS = 2

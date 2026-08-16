@@ -349,6 +349,7 @@ def test_targeted_run_requires_force_to_overwrite_an_existing_result(
 
     monkeypatch.setattr(modal_app, "_load_config", lambda _path: config)
     monkeypatch.setattr(modal_app, "result_exists", lambda *_args: True)
+    monkeypatch.setattr(modal_app, "existing_error_result", lambda *_args: None)
     monkeypatch.setattr(
         modal_app,
         "modal_function_options",

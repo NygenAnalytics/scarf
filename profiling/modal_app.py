@@ -20,18 +20,23 @@ Watch progress with:
 
 import argparse
 import os
+import random
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import modal
 
 from profiling.config import (
+    ALL_STAGE_CHOICES,
+    ClusterSourceRef,
     CORE_STAGE_ORDER,
     MAX_TIMEOUT_SECONDS,
     ProfilingConfig,
     StageName,
     StageResources,
+    bind_cluster_source,
     load_profiling_config,
 )
 from profiling.datasets import (
@@ -52,24 +57,55 @@ from profiling.io_baseline import run_io_baseline_body
 from profiling.provenance import attach_client_provenance, provenance_from_config
 from profiling.r2 import (
     download_file,
+    get_json,
     object_exists,
     object_size,
     put_json_if_absent,
     upload_file,
 )
 from profiling.results import (
+    existing_error_result,
+    load_result,
     result_exists,
     write_funnel_result,
     write_result,
 )
 from profiling.spawn_wait import (
     DEFAULT_GRACE_SECONDS,
-    DEFAULT_STAGE_SPAWN_ATTEMPTS,
     await_function_call,
+    await_json_uri,
     await_many_function_calls,
     await_stage_result,
 )
 from profiling.metrics import ResourceSampler
+from profiling.phase_checks import (
+    PHASE3_PCA_FLOAT32_ATOL,
+    PHASE3_PCA_FLOAT32_RTOL,
+    PHASE3_PCA_FLOAT64_ATOL,
+    PHASE3_PCA_FLOAT64_RTOL,
+    PHASE_FINALIZERS,
+    PHASE_REOPENERS,
+    PHASE_WORKERS,
+    PhaseName,
+    Phase3VariantName,
+    Phase3VariantResult,
+    PhaseReopenResult,
+    PhaseWorkerResult,
+    ScaleBatchValidationResult,
+    ScaleComparisonFinalResult,
+    build_scale_comparison_schedule,
+    claim_phase,
+    claim_scale_comparison,
+    finalize_scale_comparison,
+    resume_phase_claim,
+    run_phase3_variant_body,
+    run_scale_batch_validation_body,
+    validate_scale_comparison_prerequisites,
+    validate_phase3_prerequisites,
+    write_final_result,
+    write_reopen_result,
+    write_worker_result,
+)
 from profiling.stages import (
     run_stage,
     summarize_resource_measurement,
@@ -334,6 +370,7 @@ def run_stage_job(
     config = ProfilingConfig.model_validate(configDict)
     resources = config.resourcesFor(stage)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    workflow = bind_cluster_source(config, nRows)
     if result_exists(config, nRows, stage) and not force:
         return {
             "nRows": nRows,
@@ -360,7 +397,7 @@ def run_stage_job(
         stage,
         nRows=nRows,
         storeUri=config.storeUri(nRows),
-        workflow=config.workflow,
+        workflow=workflow,
         resources=resources,
         localH5adPath=local_h5ad,
         storageLayout=config.storageLayout,
@@ -368,7 +405,7 @@ def run_stage_job(
         invalidateCache=force,
         clientProvenance=config.clientProvenance,
     )
-    write_result(config, result)
+    write_result(config, result, overwrite=force)
     return result.to_json()
 
 
@@ -417,6 +454,26 @@ def run_local_funnel_job(
 
     outcomes: list[dict[str, Any]] = []
     for stage in selected_stages:
+        failed = existing_error_result(config, nRows, stage)
+        if failed is not None:
+            return {
+                "nRows": nRows,
+                "stopped": True,
+                "storeBackend": "local",
+                "storeUri": store_uri,
+                "failed": failed,
+                "outcomes": [
+                    *outcomes,
+                    {
+                        "nRows": nRows,
+                        "stage": stage,
+                        "status": "error",
+                        "resultUri": config.resultUri(nRows, stage),
+                        "storeBackend": "local",
+                        "terminalExistingError": True,
+                    },
+                ],
+            }
         if result_exists(config, nRows, stage):
             outcomes.append(
                 {
@@ -443,7 +500,7 @@ def run_local_funnel_job(
             stage,
             nRows=nRows,
             storeUri=store_uri,
-            workflow=config.workflow,
+            workflow=bind_cluster_source(config, nRows),
             resources=resources,
             localH5adPath=local_h5ad if stage == "createStore" else None,
             storageLayout=config.storageLayout,
@@ -641,6 +698,23 @@ def run_size_jobs(
     outcomes: list[dict[str, Any]] = []
 
     for stage in selected_stages:
+        failed = existing_error_result(config, nRows, stage)
+        if failed is not None:
+            return {
+                "nRows": nRows,
+                "stopped": True,
+                "failed": failed,
+                "outcomes": [
+                    *outcomes,
+                    {
+                        "nRows": nRows,
+                        "stage": stage,
+                        "status": "error",
+                        "resultUri": config.resultUri(nRows, stage),
+                        "terminalExistingError": True,
+                    },
+                ],
+            }
         if result_exists(config, nRows, stage):
             outcomes.append(
                 {
@@ -652,26 +726,36 @@ def run_size_jobs(
             )
             continue
         resources = config.resourcesFor(stage)
-        options = (
-            modal_function_options(
-                config,
-                resources,
-                maxContainers=parallel_sizes,
-                retries=0,
-            )
-            if stage == "writeCountsT"
-            else modal_function_options(
-                config,
-                resources,
-                maxContainers=parallel_sizes,
-            )
+        options = modal_function_options(
+            config,
+            resources,
+            maxContainers=parallel_sizes,
+            retries=0,
         )
         deadline_seconds = float(resources.timeoutSeconds) + DEFAULT_GRACE_SECONDS
         result: dict[str, Any] | None = None
         last_error: BaseException | None = None
-        spawn_attempts = 1 if stage == "writeCountsT" else DEFAULT_STAGE_SPAWN_ATTEMPTS
+        spawn_attempts = 1
         for attempt in range(1, spawn_attempts + 1):
             if result_exists(config, nRows, stage):
+                recovered = load_result(config, nRows, stage) or {}
+                if recovered.get("status") == "error":
+                    return {
+                        "nRows": nRows,
+                        "stopped": True,
+                        "failed": recovered,
+                        "outcomes": [
+                            *outcomes,
+                            {
+                                "nRows": nRows,
+                                "stage": stage,
+                                "status": "error",
+                                "resultUri": config.resultUri(nRows, stage),
+                                "terminalExistingError": True,
+                                "spawnAttempt": attempt,
+                            },
+                        ],
+                    }
                 result = {
                     "nRows": nRows,
                     "stage": stage,
@@ -698,6 +782,25 @@ def run_size_jobs(
             except Exception as exc:  # noqa: BLE001 - Modal surfaces many failure types
                 last_error = exc
                 if result_exists(config, nRows, stage):
+                    recovered = load_result(config, nRows, stage) or {}
+                    if recovered.get("status") == "error":
+                        return {
+                            "nRows": nRows,
+                            "stopped": True,
+                            "failed": recovered,
+                            "outcomes": [
+                                *outcomes,
+                                {
+                                    "nRows": nRows,
+                                    "stage": stage,
+                                    "status": "error",
+                                    "resultUri": config.resultUri(nRows, stage),
+                                    "terminalExistingError": True,
+                                    "spawnAttempt": attempt,
+                                    "callError": str(exc),
+                                },
+                            ],
+                        }
                     result = {
                         "nRows": nRows,
                         "stage": stage,
@@ -797,6 +900,622 @@ def smoke_check(configDict: dict[str, Any]) -> dict[str, Any]:
     return {"probeUri": probe, "exists": object_exists(probe)}
 
 
+def _hydrated_call_id(call: Any) -> str:
+    if hasattr(call, "hydrate"):
+        call.hydrate()
+    call_id = getattr(call, "object_id", None) or getattr(call, "call_id", None)
+    if not call_id:
+        raise RuntimeError("Spawned Modal call has no durable function-call ID")
+    return str(call_id)
+
+
+def _spawn_or_recover_scale_call(
+    config: ProfilingConfig,
+    *,
+    nRows: int,
+    operation: str,
+    spawn: Callable[[], Any],
+) -> Any:
+    receipt_uri = config.scaleCallReceiptUri(nRows, operation)
+    if object_exists(receipt_uri):
+        receipt = get_json(receipt_uri)
+        call_id = str(receipt.get("functionCallId", ""))
+        if not call_id:
+            raise RuntimeError(f"Scale call receipt lacks an ID: {receipt_uri}")
+        return modal.FunctionCall.from_id(call_id)
+    call = spawn()
+    call_id = _hydrated_call_id(call)
+    if not put_json_if_absent(
+        receipt_uri,
+        {
+            "functionCallId": call_id,
+            "operation": operation,
+            "nRows": int(nRows),
+            "kind": "observed",
+        },
+    ):
+        raise RuntimeError(f"Scale call receipt already exists: {receipt_uri}")
+    return call
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=32_768,
+    cpu=4.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def phase_check_job(
+    configDict: dict[str, Any],
+    phase: PhaseName,
+) -> dict[str, Any]:
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    work = _WORK / "phase-check" / phase
+    work.mkdir(parents=True, exist_ok=True)
+    worker = PHASE_WORKERS.get(phase)
+    if worker is None:
+        raise ValueError(f"Unsupported phase-check worker: {phase}")
+    result = worker(config, work, True)
+    write_worker_result(config, result)
+    if result.status != "ok":
+        raise RuntimeError(result.error or f"{phase} worker failed")
+    return result.model_dump(mode="json")
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=32_768,
+    cpu=4.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def phase3_variant_job(
+    configDict: dict[str, Any],
+    repetition: int,
+    variant: Phase3VariantName,
+) -> dict[str, Any]:
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    work = _WORK / "phase-check" / "phase3" / f"rep-{repetition}" / variant
+    result = run_phase3_variant_body(config, repetition, variant, work)
+    return result.model_dump(mode="json")
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=32_768,
+    cpu=8.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def scale_comparison_variant_job(
+    configDict: dict[str, Any],
+    nRows: int,
+    repetition: int,
+    variant: Phase3VariantName,
+) -> dict[str, Any]:
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    work = _WORK / "scale-check" / str(int(nRows)) / f"rep-{int(repetition)}" / variant
+    result = run_phase3_variant_body(
+        config,
+        repetition,
+        variant,
+        work,
+        nRows=nRows,
+        namespace="scale",
+    )
+    return result.model_dump(mode="json")
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=32_768,
+    cpu=8.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def scale_comparison_validation_job(
+    configDict: dict[str, Any],
+    nRows: int,
+    batch: str,
+    repetitionStart: int,
+    repetitionEnd: int,
+    expectedInputSha256: str,
+) -> dict[str, Any]:
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    if batch not in {"pilot", "continuation"}:
+        raise ValueError(f"Unsupported scale comparison batch: {batch}")
+    result = run_scale_batch_validation_body(
+        config,
+        nRows=nRows,
+        batch=batch,
+        repetitionStart=repetitionStart,
+        repetitionEnd=repetitionEnd,
+        expectedInputSha256=expectedInputSha256,
+    )
+    uri = config.scaleBatchValidationUri(nRows, batch)
+    if not put_json_if_absent(uri, result.model_dump(mode="json")):
+        raise RuntimeError(f"Scale validation result already exists: {uri}")
+    if result.status != "ok":
+        raise RuntimeError(result.error or f"Scale {batch} validation failed")
+    return result.model_dump(mode="json")
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=3_600,
+    memory=4_096,
+    cpu=1.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def phase_reopen_job(
+    configDict: dict[str, Any],
+    phase: PhaseName,
+) -> dict[str, Any]:
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    reopen = PHASE_REOPENERS.get(phase)
+    if reopen is None:
+        raise ValueError(f"Unsupported phase-check reopen: {phase}")
+    result = reopen(config)
+    write_reopen_result(config, result)
+    if result.status != "ok":
+        raise RuntimeError(result.error or f"{phase} reopen failed")
+    return result.model_dump(mode="json")
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=2_048,
+    cpu=1.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def scale_comparison_coordinator_job(
+    configDict: dict[str, Any],
+    nRows: int,
+    evidenceRunTag: str,
+    baselineRunTag: str,
+) -> dict[str, Any]:
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    final_uri = config.scaleFinalResultUri(nRows)
+    if object_exists(final_uri):
+        return get_json(final_uri)
+
+    repetitions = 3
+    pilot_repetitions = 1
+    pilot_uri = config.scaleBatchValidationUri(nRows, "pilot")
+    continuation_uri = config.scaleBatchValidationUri(nRows, "continuation")
+    try:
+        prerequisites = validate_scale_comparison_prerequisites(
+            config,
+            nRows=nRows,
+            evidenceRunTag=evidenceRunTag,
+        )
+        cluster_source = ClusterSourceRef.model_validate(prerequisites["clusterSource"])
+        cluster_sources = tuple(
+            item for item in config.clusterSources if item.nRows != nRows
+        ) + (cluster_source,)
+        config = config.model_copy(update={"clusterSources": cluster_sources})
+        configDict = config.model_dump(mode="python")
+        claim = claim_scale_comparison(
+            config,
+            nRows=nRows,
+            evidenceRunTag=evidenceRunTag,
+            baselineRunTag=baselineRunTag,
+            repetitions=repetitions,
+            pilotRepetitions=pilot_repetitions,
+        )
+        schedule = build_scale_comparison_schedule(repetitions=repetitions)
+        schedule_payload = {
+            "nRows": int(nRows),
+            "repetitions": repetitions,
+            "pilotRepetitions": pilot_repetitions,
+            "freshContainerPerVariant": True,
+            "parallelVariants": False,
+            "randomSeed": 4_466,
+            "decisionRule": "scale-focused",
+            "automaticPercentageRejection": False,
+            "pcaTolerances": {
+                "float32": {
+                    "rtol": PHASE3_PCA_FLOAT32_RTOL,
+                    "atol": PHASE3_PCA_FLOAT32_ATOL,
+                },
+                "float64": {
+                    "rtol": PHASE3_PCA_FLOAT64_RTOL,
+                    "atol": PHASE3_PCA_FLOAT64_ATOL,
+                },
+            },
+            "stopBeforeLargerScale": True,
+            "prerequisites": prerequisites,
+            "schedule": schedule,
+            "kind": "planned",
+        }
+        schedule_uri = config.scaleScheduleUri(nRows)
+        if object_exists(schedule_uri):
+            if get_json(schedule_uri) != schedule_payload:
+                raise RuntimeError("Existing scale comparison schedule does not match")
+        elif not put_json_if_absent(schedule_uri, schedule_payload):
+            raise RuntimeError("Scale comparison schedule already exists")
+
+        selected_resources = [
+            config.resourcesFor(stage) for stage in config.effectiveStages
+        ]
+        variant_resources = max(
+            selected_resources,
+            key=lambda item: (
+                item.modalMemoryLimitMb,
+                item.modalCpuLimit,
+                item.timeoutSeconds,
+            ),
+        )
+        variant_options = modal_function_options(
+            config,
+            variant_resources,
+            retries=0,
+        )
+        validation_options = modal_function_options(
+            config,
+            config.resourcesFor("reopenStore"),
+            retries=0,
+        )
+
+        def run_variant(item: dict[str, Any]) -> None:
+            repetition = int(item["repetition"])
+            variant = str(item["variant"])
+            result_uri = config.scaleVariantResultUri(
+                nRows,
+                repetition,
+                variant,
+            )
+            if object_exists(result_uri):
+                existing = Phase3VariantResult.model_validate(get_json(result_uri))
+                if existing.status != "ok":
+                    raise RuntimeError(
+                        existing.error
+                        or f"Scale variant failed: {repetition}/{variant}"
+                    )
+                print(
+                    f"reusing scale variant rep={repetition} variant={variant}",
+                    flush=True,
+                )
+                return
+            operation = f"variant-r{repetition}-{variant}"
+            call = _spawn_or_recover_scale_call(
+                config,
+                nRows=nRows,
+                operation=operation,
+                spawn=lambda: scale_comparison_variant_job.with_options(
+                    **variant_options
+                ).spawn(
+                    configDict,
+                    nRows,
+                    repetition,
+                    variant,
+                ),
+            )
+            print(
+                f"awaiting scale variant rep={repetition} variant={variant}: "
+                f"{_hydrated_call_id(call)}",
+                flush=True,
+            )
+            payload = await_function_call(
+                call,
+                deadlineSeconds=float(
+                    variant_resources.timeoutSeconds + DEFAULT_GRACE_SECONDS
+                ),
+            )
+            result = Phase3VariantResult.model_validate(
+                get_json(result_uri) if object_exists(result_uri) else payload
+            )
+            if result.status != "ok":
+                raise RuntimeError(
+                    result.error or f"Scale variant failed: {repetition}/{variant}"
+                )
+
+        def validate_batch(
+            batch: str,
+            *,
+            repetition_start: int,
+            repetition_end: int,
+        ) -> ScaleBatchValidationResult:
+            result_uri = config.scaleBatchValidationUri(nRows, batch)
+            if object_exists(result_uri):
+                existing = ScaleBatchValidationResult.model_validate(
+                    get_json(result_uri)
+                )
+                if existing.status != "ok" or not existing.validated:
+                    raise RuntimeError(
+                        existing.error or f"Scale {batch} validation failed"
+                    )
+                return existing
+            operation = f"validation-{batch}"
+            call = _spawn_or_recover_scale_call(
+                config,
+                nRows=nRows,
+                operation=operation,
+                spawn=lambda: scale_comparison_validation_job.with_options(
+                    **validation_options
+                ).spawn(
+                    configDict,
+                    nRows,
+                    batch,
+                    repetition_start,
+                    repetition_end,
+                    str(prerequisites["inputSha256"]),
+                ),
+            )
+            print(
+                f"awaiting scale {batch} validation: {_hydrated_call_id(call)}",
+                flush=True,
+            )
+            payload = await_function_call(
+                call,
+                deadlineSeconds=float(
+                    config.resourcesFor("reopenStore").timeoutSeconds
+                    + DEFAULT_GRACE_SECONDS
+                ),
+            )
+            result = ScaleBatchValidationResult.model_validate(
+                get_json(result_uri) if object_exists(result_uri) else payload
+            )
+            if result.status != "ok" or not result.validated:
+                raise RuntimeError(result.error or f"Scale {batch} validation failed")
+            return result
+
+        for item in schedule:
+            if int(item["repetition"]) >= pilot_repetitions:
+                continue
+            run_variant(item)
+        validate_batch(
+            "pilot",
+            repetition_start=0,
+            repetition_end=pilot_repetitions,
+        )
+        print("scale pilot validated; continuing remaining repetitions", flush=True)
+
+        for item in schedule:
+            if int(item["repetition"]) < pilot_repetitions:
+                continue
+            run_variant(item)
+        validate_batch(
+            "continuation",
+            repetition_start=pilot_repetitions,
+            repetition_end=repetitions,
+        )
+        final = finalize_scale_comparison(
+            config,
+            nRows=nRows,
+            repetitions=repetitions,
+            baselineRunTag=baselineRunTag,
+        )
+        if not put_json_if_absent(final_uri, final.model_dump(mode="json")):
+            return get_json(final_uri)
+        print(
+            {
+                "claimUri": config.scaleClaimUri(nRows),
+                "claimedAt": claim.claimedAt,
+                "finalUri": final_uri,
+                "status": final.status,
+                "conclusion": final.conclusion,
+            },
+            flush=True,
+        )
+        return final.model_dump(mode="json")
+    except Exception as exc:
+        final = ScaleComparisonFinalResult(
+            nRows=nRows,
+            status="error",
+            conclusion="measurement-failed",
+            decisionRule="scale-focused",
+            repetitions=repetitions,
+            completedChecks=(),
+            pilotValidationUri=pilot_uri,
+            continuationValidationUri=continuation_uri,
+            error=f"{type(exc).__name__}: {exc}",
+            provenance=provenance_from_config(config),
+        )
+        if put_json_if_absent(final_uri, final.model_dump(mode="json")):
+            return final.model_dump(mode="json")
+        return get_json(final_uri)
+
+
+@app.function(
+    **COMMON_FUNCTION_OPTIONS,
+    timeout=86_400,
+    memory=2_048,
+    cpu=1.0,
+    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+)
+def phase_check_coordinator_job(
+    configDict: dict[str, Any],
+    phase: PhaseName,
+    resume: bool = False,
+) -> dict[str, Any]:
+    config = ProfilingConfig.model_validate(configDict)
+    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    if resume and object_exists(config.phaseFinalResultUri(phase)):
+        return get_json(config.phaseFinalResultUri(phase))
+    phase_order: tuple[PhaseName, ...] = (
+        "phase0",
+        "phase1",
+        "phase2",
+        "phase3",
+        "phase4",
+        "phase5",
+        "phase6",
+        "phase7",
+        "phase8",
+    )
+    phase_index = phase_order.index(phase)
+    if phase_index > 0:
+        previous_phase = phase_order[phase_index - 1]
+        previous = get_json(config.phaseFinalResultUri(previous_phase))
+        if previous.get("decision") != "accept" or previous.get("nextPhase") != phase:
+            raise RuntimeError(
+                f"{phase} requires an accepted {previous_phase} result "
+                f"that selects {phase}"
+            )
+    phase3_prerequisites = (
+        validate_phase3_prerequisites(config) if phase == "phase3" else None
+    )
+    claim = resume_phase_claim(config, phase) if resume else claim_phase(config, phase)
+    if phase == "phase3":
+        variants: list[Phase3VariantName] = [
+            "currentWholeStrip",
+            "currentBounded",
+            "candidateBounded",
+        ]
+        schedule: list[dict[str, Any]] = []
+        for repetition in range(3):
+            ordered = list(variants)
+            random.Random(4_466 + repetition).shuffle(ordered)
+            schedule.extend(
+                {
+                    "repetition": repetition,
+                    "variant": variant,
+                    "order": len(schedule),
+                }
+                for variant in ordered
+            )
+        schedule_payload = {
+            "nRows": 100_000,
+            "repetitions": 3,
+            "freshContainerPerVariant": True,
+            "parallelVariants": False,
+            "randomSeed": 4_466,
+            "wallRegressionLimit": 0.15,
+            "primaryImprovementLimit": 0.20,
+            "memoryOrIoImprovementLimit": 0.30,
+            "highVarianceRangeFraction": 0.15,
+            "prerequisites": phase3_prerequisites,
+            "schedule": schedule,
+            "kind": "planned",
+        }
+        if resume and object_exists(config.phase3ScheduleUri()):
+            if get_json(config.phase3ScheduleUri()) != schedule_payload:
+                raise RuntimeError("Existing Phase 3 schedule does not match")
+        elif not put_json_if_absent(config.phase3ScheduleUri(), schedule_payload):
+            raise RuntimeError("Phase 3 schedule already exists")
+        variant_options = modal_function_options(
+            config,
+            config.resourcesFor("writeCountsT"),
+            retries=0,
+        )
+        for item in schedule:
+            repetition = int(item["repetition"])
+            variant = str(item["variant"])
+            validation_uri = config.phase3ValidationUri(repetition, variant)
+            if resume and object_exists(validation_uri):
+                existing = Phase3VariantResult.model_validate(get_json(validation_uri))
+                if existing.status != "ok":
+                    raise RuntimeError(
+                        "Cannot resume a Phase 3 variant that recorded an error: "
+                        f"{repetition}/{variant}: {existing.error}"
+                    )
+                print(
+                    f"reusing completed Phase 3 variant rep={repetition} "
+                    f"variant={variant}",
+                    flush=True,
+                )
+                continue
+            call = phase3_variant_job.with_options(**variant_options).spawn(
+                configDict,
+                repetition,
+                variant,
+            )
+            print(
+                f"spawned Phase 3 variant rep={repetition} variant={variant}: "
+                f"{getattr(call, 'object_id', None) or call}",
+                flush=True,
+            )
+            try:
+                payload = await_function_call(
+                    call,
+                    deadlineSeconds=float(
+                        config.resourcesFor("writeCountsT").timeoutSeconds
+                        + DEFAULT_GRACE_SECONDS
+                    ),
+                )
+            except Exception as exc:
+                print(
+                    "stopping Phase 3 schedule after terminal variant call "
+                    f"failure: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                break
+            if payload.get("status") != "ok":
+                print(
+                    f"stopping Phase 3 schedule after failed variant: {payload}",
+                    flush=True,
+                )
+                break
+    worker_options = modal_function_options(
+        config,
+        config.resourcesFor("createStore"),
+        retries=0,
+    )
+    reopen_options = modal_function_options(
+        config,
+        config.resourcesFor("reopenStore"),
+        retries=0,
+    )
+    if resume and object_exists(config.phaseWorkerResultUri(phase)):
+        worker_payload = get_json(config.phaseWorkerResultUri(phase))
+    else:
+        worker_call = phase_check_job.with_options(**worker_options).spawn(
+            configDict,
+            phase,
+        )
+        print(
+            f"spawned phase worker {phase}: "
+            f"{getattr(worker_call, 'object_id', None) or worker_call}",
+            flush=True,
+        )
+        worker_payload = await_json_uri(
+            config.phaseWorkerResultUri(phase),
+            deadlineSeconds=float(config.resourcesFor("createStore").timeoutSeconds),
+        )
+    worker = PhaseWorkerResult.model_validate(worker_payload)
+    if resume and object_exists(config.phaseReopenResultUri(phase)):
+        reopen_payload = get_json(config.phaseReopenResultUri(phase))
+    else:
+        reopen_call = phase_reopen_job.with_options(**reopen_options).spawn(
+            configDict,
+            phase,
+        )
+        print(
+            f"spawned phase reopen {phase}: "
+            f"{getattr(reopen_call, 'object_id', None) or reopen_call}",
+            flush=True,
+        )
+        reopen_payload = await_json_uri(
+            config.phaseReopenResultUri(phase),
+            deadlineSeconds=float(config.resourcesFor("reopenStore").timeoutSeconds),
+        )
+    reopen = PhaseReopenResult.model_validate(reopen_payload)
+    finalizer = PHASE_FINALIZERS.get(phase)
+    if finalizer is None:
+        raise ValueError(f"Unsupported phase-check finalize: {phase}")
+    final = finalizer(worker, reopen)
+    write_final_result(config, final)
+    print(
+        {
+            "claimUri": config.phaseClaimUri(phase),
+            "claimedAt": claim.claimedAt,
+            "finalUri": config.phaseFinalResultUri(phase),
+            "decision": final.decision,
+            "branch": final.branch,
+        },
+        flush=True,
+    )
+    return final.model_dump(mode="json")
+
+
 def _load_config(path: str) -> ProfilingConfig:
     config = load_profiling_config(path)
     validate_modal_environment(config)
@@ -851,7 +1570,7 @@ def main(*arg_list: str) -> None:
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--config", required=True)
     run_parser.add_argument("--size", type=int, required=True)
-    run_parser.add_argument("--stage", choices=CORE_STAGE_ORDER, required=True)
+    run_parser.add_argument("--stage", choices=ALL_STAGE_CHOICES, required=True)
     run_parser.add_argument(
         "--force",
         action="store_true",
@@ -870,7 +1589,7 @@ def main(*arg_list: str) -> None:
     all_parser.add_argument("--config", required=True)
     all_parser.add_argument("--sizes", nargs="*", type=int, default=None)
     all_parser.add_argument(
-        "--stages", nargs="*", choices=CORE_STAGE_ORDER, default=None
+        "--stages", nargs="*", choices=ALL_STAGE_CHOICES, default=None
     )
     all_parser.add_argument(
         "--ephemeral",
@@ -888,7 +1607,7 @@ def main(*arg_list: str) -> None:
     local_parser.add_argument("--config", required=True)
     local_parser.add_argument("--size", type=int, required=True)
     local_parser.add_argument(
-        "--stages", nargs="*", choices=CORE_STAGE_ORDER, default=None
+        "--stages", nargs="*", choices=ALL_STAGE_CHOICES, default=None
     )
 
     e2e_parser = sub.add_parser(
@@ -917,6 +1636,52 @@ def main(*arg_list: str) -> None:
         "--ephemeral",
         action="store_true",
         help="Spawn from this modal run app without a deploy.",
+    )
+
+    phase_parser = sub.add_parser(
+        "phase-check",
+        help="Run one gated lattice phase check with a durable R2 result",
+    )
+    phase_parser.add_argument("--config", required=True)
+    phase_parser.add_argument(
+        "--phase",
+        default="phase0",
+        choices=(
+            "phase0",
+            "phase1",
+            "phase2",
+            "phase3",
+            "phase4",
+            "phase5",
+            "phase6",
+            "phase7",
+            "phase8",
+        ),
+    )
+    phase_parser.add_argument("--wait", action="store_true")
+    phase_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an interrupted coordinator from its create-only R2 artifacts.",
+    )
+    phase_parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="Spawn from this modal run app (no deploy). Prefer --detach.",
+    )
+    scale_parser = sub.add_parser(
+        "scale-check",
+        help="Run a staged, durable scale continuation of the three-way comparison",
+    )
+    scale_parser.add_argument("--config", required=True)
+    scale_parser.add_argument("--size", type=int, default=1_000_000)
+    scale_parser.add_argument("--evidence-run-tag", required=True)
+    scale_parser.add_argument("--baseline-run-tag", required=True)
+    scale_parser.add_argument("--wait", action="store_true")
+    scale_parser.add_argument(
+        "--ephemeral",
+        action="store_true",
+        help="Spawn from this modal run app without deploying.",
     )
 
     args = parser.parse_args(list(arg_list))
@@ -969,6 +1734,18 @@ def main(*arg_list: str) -> None:
     if args.command == "run":
         if args.size not in config.targetSizes:
             raise SystemExit(f"size {args.size} is not in config.targetSizes")
+        failed = existing_error_result(config, args.size, args.stage)
+        if failed is not None and not args.force:
+            print(
+                {
+                    "nRows": args.size,
+                    "stage": args.stage,
+                    "status": "error",
+                    "resultUri": config.resultUri(args.size, args.stage),
+                    "terminalExistingError": True,
+                }
+            )
+            raise SystemExit(1)
         if result_exists(config, args.size, args.stage) and not args.force:
             print(
                 {
@@ -980,13 +1757,7 @@ def main(*arg_list: str) -> None:
             )
             return
         resources = config.resourcesFor(args.stage)
-        # retries=0 for writeCountsT: a retry that overlaps the original write
-        # leaves countsT marked incomplete again.
-        options = (
-            modal_function_options(config, resources, retries=0)
-            if args.stage == "writeCountsT"
-            else modal_function_options(config, resources)
-        )
+        options = modal_function_options(config, resources, retries=0)
         target = (
             run_stage_job
             if args.ephemeral
@@ -1082,4 +1853,63 @@ def main(*arg_list: str) -> None:
             f"{config.resultsUri.rstrip('/')}/io-baseline/{config.runTag}"
             f"{'-' + args.result_label if args.result_label else ''}.json"
         )
+        return
+
+    if args.command == "phase-check":
+        if not config.runTag.strip():
+            raise SystemExit("phase-check requires a non-empty runTag")
+        coordinator_options = orchestrator_function_options(config)
+        target = (
+            phase_check_coordinator_job
+            if args.ephemeral
+            else _deployed_function(config, "phase_check_coordinator_job")
+        )
+        spawn_args: tuple[Any, ...] = (payload, args.phase)
+        if args.resume:
+            spawn_args += (True,)
+        call = target.with_options(**coordinator_options).spawn(*spawn_args)
+        _print_spawned(f"phase_check_coordinator_job {args.phase}", call)
+        print(f"claim URI: {config.phaseClaimUri(args.phase)}")
+        print(f"final URI (when done): {config.phaseFinalResultUri(args.phase)}")
+        if args.wait:
+            print(
+                await_function_call(
+                    call,
+                    deadlineSeconds=float(
+                        config.resourcesFor("createStore").timeoutSeconds
+                    ),
+                )
+            )
+        return
+
+    if args.command == "scale-check":
+        if args.size not in config.targetSizes:
+            raise SystemExit(f"size {args.size} is not in config.targetSizes")
+        if not config.runTag.strip():
+            raise SystemExit("scale-check requires a non-empty runTag")
+        coordinator_options = orchestrator_function_options(config)
+        target = (
+            scale_comparison_coordinator_job
+            if args.ephemeral
+            else _deployed_function(config, "scale_comparison_coordinator_job")
+        )
+        call = target.with_options(**coordinator_options).spawn(
+            payload,
+            args.size,
+            args.evidence_run_tag,
+            args.baseline_run_tag,
+        )
+        _print_spawned(
+            f"scale_comparison_coordinator_job {args.size}",
+            call,
+        )
+        print(f"claim URI: {config.scaleClaimUri(args.size)}")
+        print(f"final URI (when done): {config.scaleFinalResultUri(args.size)}")
+        if args.wait:
+            print(
+                await_function_call(
+                    call,
+                    deadlineSeconds=float(MAX_TIMEOUT_SECONDS),
+                )
+            )
         return

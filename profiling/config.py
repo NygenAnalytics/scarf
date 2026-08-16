@@ -24,6 +24,8 @@ StageName = Literal[
     "runLeiden",
     "runClustering",
     "findMarkers",
+    "importClusters",
+    "validateExperiment",
 ]
 
 GRAPH_CONSTRUCTION_STAGE_ORDER: tuple[StageName, ...] = (
@@ -49,7 +51,66 @@ CORE_STAGE_ORDER: tuple[StageName, ...] = (
     "findMarkers",
 )
 
+SELECTED_STAGE_ORDER: tuple[StageName, ...] = (
+    "createStore",
+    "writeCountsT",
+    "initializeStore",
+    "reopenStore",
+    "filterCells",
+    "markHvgs",
+    "runNormalization",
+    "runPca",
+    "importClusters",
+    "findMarkers",
+    "validateExperiment",
+)
+
+SELECTED_STAGE_DEPENDENCIES: dict[StageName, tuple[StageName, ...]] = {
+    "createStore": (),
+    "writeCountsT": ("createStore",),
+    "initializeStore": ("writeCountsT",),
+    "reopenStore": ("initializeStore",),
+    "filterCells": ("reopenStore",),
+    "markHvgs": ("filterCells",),
+    "runNormalization": ("markHvgs",),
+    "runPca": ("runNormalization",),
+    "importClusters": ("filterCells",),
+    "findMarkers": ("importClusters",),
+    "validateExperiment": ("runPca", "findMarkers"),
+}
+
+ALL_STAGE_CHOICES: tuple[StageName, ...] = tuple(
+    dict.fromkeys((*CORE_STAGE_ORDER, *SELECTED_STAGE_ORDER))
+)
+
+
+def validate_requested_stages(stages: tuple[StageName, ...]) -> None:
+    if not stages:
+        raise ValueError("stages must not be empty")
+    if len(set(stages)) != len(stages):
+        raise ValueError("stages must be unique")
+    selected = set(stages)
+    positions = {stage: index for index, stage in enumerate(stages)}
+    core_set = set(CORE_STAGE_ORDER)
+    if selected <= core_set:
+        core_index = {stage: index for index, stage in enumerate(CORE_STAGE_ORDER)}
+        ordered = tuple(sorted(stages, key=lambda stage: core_index[stage]))
+        if stages != ordered:
+            raise ValueError("CORE stages must appear in CORE_STAGE_ORDER")
+        return
+    for stage in stages:
+        deps = SELECTED_STAGE_DEPENDENCIES.get(stage)
+        if deps is None:
+            raise ValueError(f"{stage} is not in the selected-stage graph")
+        for dep in deps:
+            if dep not in selected:
+                raise ValueError(f"{stage} requires {dep}")
+            if positions[dep] >= positions[stage]:
+                raise ValueError(f"{dep} must precede {stage}")
+
+
 MAX_TIMEOUT_SECONDS = 86_400
+CLUSTER_SOURCES_PATH = Path(__file__).resolve().parent / "cluster_sources.toml"
 
 
 class WorkflowParameters(BaseModel):
@@ -91,10 +152,10 @@ class WorkflowParameters(BaseModel):
     parisNClusters: int | Literal["auto"] = "auto"
     parisLabel: str = "paris_cluster"
     parisMinClusterSize: int | None = None
-    # Optional HVG/marker consume overrides for measurement runs.
-    featureShardPrefetchDepth: int | None = None
-    featureShardReadConcurrency: int | None = None
-    featureShardNumbaThreads: int | None = None
+    clusterSourceUri: str | None = None
+    clusterLabelColumn: str = "RNA_leiden_cluster"
+    countMatrixWriter: Literal["current", "experimental"] = "current"
+    featureConsume: Literal["wholeStrip", "bounded"] = "bounded"
     # Optional strip countsT layout target for canonical-layout gates.
     countsTMaxShardBytes: int | None = None
     countsTTargetChunkBytes: int | None = None
@@ -122,21 +183,6 @@ class WorkflowParameters(BaseModel):
                 raise ValueError("parisMinClusterSize must be >= 2")
             if self.parisNClusters != "auto":
                 raise ValueError("parisMinClusterSize requires parisNClusters='auto'")
-        if (
-            self.featureShardPrefetchDepth is not None
-            and self.featureShardPrefetchDepth < 0
-        ):
-            raise ValueError("featureShardPrefetchDepth must be >= 0")
-        if (
-            self.featureShardReadConcurrency is not None
-            and self.featureShardReadConcurrency < 1
-        ):
-            raise ValueError("featureShardReadConcurrency must be >= 1")
-        if (
-            self.featureShardNumbaThreads is not None
-            and self.featureShardNumbaThreads < 1
-        ):
-            raise ValueError("featureShardNumbaThreads must be >= 1")
         if self.countsTMaxShardBytes is not None and self.countsTMaxShardBytes <= 0:
             raise ValueError("countsTMaxShardBytes must be positive when set")
         if (
@@ -144,6 +190,18 @@ class WorkflowParameters(BaseModel):
             and self.countsTTargetChunkBytes <= 0
         ):
             raise ValueError("countsTTargetChunkBytes must be positive when set")
+        if self.clusterSourceUri is not None:
+            uri = self.clusterSourceUri.strip()
+            if not uri:
+                raise ValueError("clusterSourceUri must be non-empty when set")
+            if not (
+                uri.startswith("s3://")
+                or uri.startswith("/")
+                or uri.startswith("file://")
+            ):
+                raise ValueError("clusterSourceUri must be an s3:// URI or local path")
+        if not self.clusterLabelColumn:
+            raise ValueError("clusterLabelColumn must be non-empty")
         return self
 
 
@@ -224,6 +282,66 @@ class StorageLayout(BaseModel):
         return self
 
 
+class CountMatrixLayout(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    targetReadUnitBytes: int
+    targetChunkBytes: int
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        if min(self.targetReadUnitBytes, self.targetChunkBytes) < 1:
+            raise ValueError("countMatrixLayout values must be positive")
+        if self.targetReadUnitBytes < self.targetChunkBytes:
+            raise ValueError("targetReadUnitBytes must be at least targetChunkBytes")
+        return self
+
+
+class ExecutionPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    codecWorkerLimit: int
+    zarrAsyncConcurrency: int
+    computeWorkerLimit: int
+    readGroupsInFlight: int
+    destinationCommitsInFlight: int
+    readGroupChunks: int
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        if (
+            min(
+                self.codecWorkerLimit,
+                self.zarrAsyncConcurrency,
+                self.computeWorkerLimit,
+                self.readGroupsInFlight,
+                self.destinationCommitsInFlight,
+                self.readGroupChunks,
+            )
+            < 1
+        ):
+            raise ValueError("executionPolicy values must be positive")
+        return self
+
+
+class ClusterSourceRef(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    nRows: int
+    storeUri: str
+    labelColumn: str = "RNA_leiden_cluster"
+
+    @model_validator(mode="after")
+    def _check_ref(self) -> Self:
+        if self.nRows <= 0:
+            raise ValueError("cluster source nRows must be positive")
+        if not self.storeUri.startswith("s3://"):
+            raise ValueError("cluster source storeUri must be an s3:// URI")
+        if not self.labelColumn:
+            raise ValueError("cluster source labelColumn must be non-empty")
+        return self
+
+
 class ProfilingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -239,6 +357,9 @@ class ProfilingConfig(BaseModel):
     # Useful for consume A/B runs against an existing store with a fresh result tag.
     storeUriOverride: str | None = None
     storageLayout: StorageLayout = Field(default_factory=StorageLayout)
+    countMatrixLayout: CountMatrixLayout | None = None
+    executionPolicy: ExecutionPolicy | None = None
+    clusterSources: tuple[ClusterSourceRef, ...] = ()
     targetSizes: tuple[int, ...] = Field(default_factory=lambda: DEFAULT_TARGET_SIZES)
     samplingSeed: int = 0
     workflow: WorkflowParameters = Field(default_factory=WorkflowParameters)
@@ -291,6 +412,10 @@ class ProfilingConfig(BaseModel):
         missing = [stage for stage in selected if stage not in self.stageResources]
         if missing:
             raise ValueError(f"Missing stageResources for: {', '.join(missing)}")
+        validate_requested_stages(selected)
+        cluster_sizes = [item.nRows for item in self.clusterSources]
+        if len(set(cluster_sizes)) != len(cluster_sizes):
+            raise ValueError("clusterSources nRows must be unique")
         return self
 
     def datasetUri(self, nRows: int) -> str:
@@ -319,14 +444,145 @@ class ProfilingConfig(BaseModel):
     def e2eClaimUri(self) -> str:
         return f"{self._tagged_prefix('results')}/e2e-claim.json"
 
+    def phaseCheckPrefix(self, phase: str) -> str:
+        return f"{self._tagged_prefix('phase-checks')}/{phase}"
+
+    def phaseClaimUri(self, phase: str) -> str:
+        return f"{self.phaseCheckPrefix(phase)}/claim.json"
+
+    def phaseWorkerResultUri(self, phase: str) -> str:
+        return f"{self.phaseCheckPrefix(phase)}/worker.json"
+
+    def phaseReopenResultUri(self, phase: str) -> str:
+        return f"{self.phaseCheckPrefix(phase)}/reopen.json"
+
+    def phaseFinalResultUri(self, phase: str) -> str:
+        return f"{self.phaseCheckPrefix(phase)}/final.json"
+
+    def phaseSyntheticStoreUri(self, phase: str) -> str:
+        return f"{self.phaseCheckPrefix(phase)}/synthetic.zarr"
+
+    def phaseFailureStoreUri(self, phase: str) -> str:
+        return f"{self.phaseCheckPrefix(phase)}/failure.zarr"
+
+    def phaseSweepStoreUri(
+        self,
+        phase: str,
+        *,
+        readGroupsInFlight: int,
+        destinationCommitsInFlight: int,
+    ) -> str:
+        return (
+            f"{self.phaseCheckPrefix(phase)}/sweeps/"
+            f"reads-{int(readGroupsInFlight)}-commits-"
+            f"{int(destinationCommitsInFlight)}.zarr"
+        )
+
+    def phaseInputManifestUri(self, phase: str, nRows: int) -> str:
+        return f"{self.phaseCheckPrefix(phase)}/inputs/{nRows}.h5ad.manifest.json"
+
+    def phaseClusterInventoryUri(self, phase: str) -> str:
+        return f"{self.phaseCheckPrefix(phase)}/cluster-inventory.json"
+
+    def phaseClusterSourcesTomlUri(self, phase: str) -> str:
+        return f"{self.phaseCheckPrefix(phase)}/cluster-sources.toml"
+
+    def phase3ValidationUri(self, repetition: int, variant: str) -> str:
+        return (
+            f"{self.phaseCheckPrefix('phase3')}/variants/"
+            f"rep-{int(repetition)}/{variant}/reopen.json"
+        )
+
+    def phase3ScheduleUri(self) -> str:
+        return f"{self.phaseCheckPrefix('phase3')}/schedule.json"
+
+    def phase3ReferenceUri(self) -> str:
+        return f"{self.phaseCheckPrefix('phase3')}/reference.json"
+
+    def phase3ReferenceArraysUri(self) -> str:
+        return f"{self.phaseCheckPrefix('phase3')}/reference-hvg.npz"
+
+    def scaleCheckPrefix(self, nRows: int) -> str:
+        return f"{self._tagged_prefix('scale-checks')}/{int(nRows)}"
+
+    def scaleClaimUri(self, nRows: int) -> str:
+        return f"{self.scaleCheckPrefix(nRows)}/claim.json"
+
+    def scaleScheduleUri(self, nRows: int) -> str:
+        return f"{self.scaleCheckPrefix(nRows)}/schedule.json"
+
+    def scaleVariantResultUri(
+        self,
+        nRows: int,
+        repetition: int,
+        variant: str,
+    ) -> str:
+        return (
+            f"{self.scaleCheckPrefix(nRows)}/variants/"
+            f"rep-{int(repetition)}/{variant}/result.json"
+        )
+
+    def scaleReferenceUri(self, nRows: int) -> str:
+        return f"{self.scaleCheckPrefix(nRows)}/reference.json"
+
+    def scaleReferenceArraysUri(self, nRows: int) -> str:
+        return f"{self.scaleCheckPrefix(nRows)}/reference-hvg.npz"
+
+    def scaleBatchValidationUri(
+        self,
+        nRows: int,
+        batch: str,
+    ) -> str:
+        return f"{self.scaleCheckPrefix(nRows)}/validation/{batch}.json"
+
+    def scaleCallReceiptUri(
+        self,
+        nRows: int,
+        operation: str,
+    ) -> str:
+        return f"{self.scaleCheckPrefix(nRows)}/calls/{operation}.json"
+
+    def scaleFinalResultUri(self, nRows: int) -> str:
+        return f"{self.scaleCheckPrefix(nRows)}/final.json"
+
     def resourcesFor(self, stage: StageName) -> StageResources:
         return self.stageResources[stage]
+
+    def clusterSourceFor(self, nRows: int) -> ClusterSourceRef | None:
+        for item in self.clusterSources:
+            if item.nRows == nRows:
+                return item
+        return None
 
 
 def load_profiling_config(path: str | Path) -> ProfilingConfig:
     config_path = Path(path)
     raw = tomllib.loads(config_path.read_text())
-    return ProfilingConfig.model_validate(_normalize_raw_config(raw))
+    config = ProfilingConfig.model_validate(_normalize_raw_config(raw))
+    if config.clusterSources or not CLUSTER_SOURCES_PATH.is_file():
+        return config
+    extra = tomllib.loads(CLUSTER_SOURCES_PATH.read_text())
+    refs = tuple(
+        ClusterSourceRef.model_validate(item)
+        for item in extra.get("clusterSources", [])
+    )
+    if not refs:
+        return config
+    return config.model_copy(update={"clusterSources": refs})
+
+
+def bind_cluster_source(config: ProfilingConfig, nRows: int) -> WorkflowParameters:
+    if config.workflow.clusterSourceUri:
+        return config.workflow
+    source = config.clusterSourceFor(nRows)
+    if source is None:
+        return config.workflow
+    return config.workflow.model_copy(
+        update={
+            "clusterSourceUri": source.storeUri,
+            "clusterLabelColumn": source.labelColumn,
+        }
+    )
 
 
 def _normalize_raw_config(raw: dict[str, Any]) -> dict[str, Any]:

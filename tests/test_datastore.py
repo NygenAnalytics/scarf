@@ -1160,10 +1160,10 @@ class TestDataStore:
         )
         np.testing.assert_allclose(tiled["sigmas"], legacy_sigmas, rtol=1e-5, atol=1e-6)
 
-    def test_streaming_feature_stats_uses_whole_shard_counts_t(
+    def test_streaming_feature_stats_uses_cell_band_counts_t(
         self, datastore, monkeypatch
     ):
-        import scarf.storage.feature_shards as feature_shards
+        import scarf.storage.feature_stream as feature_stream
 
         assay = datastore.RNA
         cell_idx, feat_idx = assay._get_cell_feat_idx("I", "I")
@@ -1173,19 +1173,18 @@ class TestDataStore:
 
         shards = array_metadata_shards(counts_t)
         assert shards is not None
-        gene_strip = int(shards[0])
-        expected = int(np.ceil(int(counts_t.shape[0]) / gene_strip))
+        expected = int(np.ceil(int(counts_t.shape[0]) / int(counts_t.chunks[0])))
         calls = {"n": 0}
-        original = feature_shards.map_feature_shards
+        original = feature_stream.map_feature_cell_bands
 
         def counted(*args, **kwargs):
             calls["n"] += 1
             yield from original(*args, **kwargs)
 
-        monkeypatch.setattr(feature_shards, "map_feature_shards", counted)
+        monkeypatch.setattr(feature_stream, "map_feature_cell_bands", counted)
+        assay._experimentalFeatureConsume = "bounded"
         assay._streaming_feature_stats(cell_idx, feat_idx)
         assert calls["n"] == 1
-        # map_feature_shards is invoked once; it internally visits each gene strip.
         assert expected >= 1
 
     def test_streaming_feature_stats_requires_sf(self, datastore):

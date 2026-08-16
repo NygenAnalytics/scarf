@@ -10,10 +10,23 @@ import numpy as np
 import zarr
 
 from .arrays import create_numeric_array
+from .async_execution import AsyncStorageRunner
 from .budget import (
     ResourceBudget,
     admitted_worker_split,
     resolve_budget,
+)
+from .count_matrix import (
+    DEFAULT_LAYOUT_STRATEGY,
+    EXPERIMENTAL_POLICY,
+    LAYOUT_STRATEGIES,
+    CountMatrixLayoutPolicy,
+    LayoutStrategy,
+    create_count_matrix_array,
+    load_count_matrix_plan,
+    persist_count_matrix_plan,
+    plan_count_matrix_pair,
+    validate_count_matrix_source,
 )
 from .geometry import ArrayGeometry, array_geometry
 from .layout import (
@@ -27,6 +40,7 @@ from .layout import (
 from .parallel import _close_iterator, stream_shards
 from .partition import affordable_width
 from .profiles import StorageProfile, resolve_storage_profile
+from .types import as_zarr_array
 from ..utils.arrays import canonicalize_sparse, checked_sparse_cast
 
 
@@ -1092,6 +1106,46 @@ def is_strip_counts_t_layout(
     return True
 
 
+def is_paired_counts_t_layout(
+    *,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    shards: tuple[int, ...] | None,
+    dtype: Any,
+) -> bool:
+    """Return True for a structurally valid paired countsT lattice."""
+    del dtype
+    if len(shape) != 2 or len(chunks) != 2:
+        return False
+    if shards is None or len(shards) != 2:
+        return False
+    n_feats, n_cells = (int(value) for value in shape)
+    chunk_f, chunk_c = (int(value) for value in chunks)
+    shard_f, shard_c = (int(value) for value in shards)
+    if n_feats < 0 or n_cells < 0:
+        return False
+    if min(chunk_f, chunk_c, shard_f, shard_c) < 1:
+        return False
+    if shard_f % chunk_f or shard_c % chunk_c:
+        return False
+    return True
+
+
+def is_readable_counts_t_layout(
+    *,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    shards: tuple[int, ...] | None,
+    dtype: Any,
+) -> bool:
+    """Return True for a countsT array the bounded reader can consume."""
+    return is_strip_counts_t_layout(
+        shape=shape, chunks=chunks, shards=shards, dtype=dtype
+    ) or is_paired_counts_t_layout(
+        shape=shape, chunks=chunks, shards=shards, dtype=dtype
+    )
+
+
 def _counts_t_write_overhead(*, stripBytes: int, available: int) -> int:
     """Allocator / decode headroom scaled to the admitted strip size."""
     strip_bytes = max(0, int(stripBytes))
@@ -1469,3 +1523,411 @@ def finalize_rna_counts_t(
         resources=resolved,
         residentBytes=residentBytes,
     )
+
+
+def write_counts_t_experimental(
+    counts: zarr.Array,
+    group: zarr.Group,
+    *,
+    policy: CountMatrixLayoutPolicy | None = None,
+    profile: StorageProfile | None = None,
+    resources: ResourceBudget | None = None,
+    readGroupChunks: int = 1,
+    readGroupsInFlight: int = 1,
+    destinationCommitsInFlight: int = 1,
+    strategy: LayoutStrategy | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> zarr.Array:
+    """Write countsT with the experimental paired layout and async runner.
+
+    This path is private until a later phase selects it as the product writer.
+    """
+    if _group_zarr_format(group) < 3:
+        raise ValueError("experimental countsT requires Zarr format 3")
+    resources = resources or resolve_budget()
+    resolved_profile = profile or resolve_storage_profile(group.store)
+    resolved_policy = policy or EXPERIMENTAL_POLICY
+    resolved_strategy: LayoutStrategy = DEFAULT_LAYOUT_STRATEGY
+    if strategy is not None:
+        resolved_strategy = strategy
+    else:
+        try:
+            recorded = load_count_matrix_plan(counts).get("strategy")
+        except ValueError:
+            recorded = None
+        if recorded in LAYOUT_STRATEGIES:
+            resolved_strategy = recorded
+    plan = plan_count_matrix_pair(
+        int(counts.shape[0]),
+        int(counts.shape[1]),
+        counts.dtype,
+        policy=resolved_policy,
+        strategy=resolved_strategy,
+        profile=resolved_profile,
+    )
+    validate_count_matrix_source(counts, expected=plan)
+    requested_read_group_chunks = int(readGroupChunks)
+    if requested_read_group_chunks < 1:
+        raise ValueError("readGroupChunks must be positive")
+    requested_reads_in_flight = int(readGroupsInFlight)
+    requested_commits_in_flight = int(destinationCommitsInFlight)
+    if requested_reads_in_flight < 1:
+        raise ValueError("readGroupsInFlight must be positive")
+    if requested_commits_in_flight < 1:
+        raise ValueError("destinationCommitsInFlight must be positive")
+    if "countsT" in group:
+        existing = as_zarr_array(group["countsT"], name="countsT")
+        complete = bool(existing.attrs.get("complete", False))
+        if complete:
+            return existing
+        del group["countsT"]
+    counts_t = as_zarr_array(
+        create_count_matrix_array(group, "countsT", plan.countsT),
+        name="countsT",
+    )
+    counts_t.attrs["complete"] = False
+    persist_count_matrix_plan(group, plan)
+    persist_count_matrix_plan(counts_t, plan)
+    n_cells = int(counts.shape[0])
+    n_feats = int(counts.shape[1])
+    if n_cells == 0 or n_feats == 0:
+        counts_t.attrs["complete"] = True
+        return counts_t
+
+    owners: set[tuple[int, int]] = set()
+    dest_feat_shard = int(plan.countsT.shards[0]) if plan.countsT.shards else n_feats
+    dest_cell_band = int(plan.countsT.shards[1]) if plan.countsT.shards else n_cells
+    source_cell_chunk = int(plan.counts.chunks[0])
+    source_feat_chunk = int(plan.counts.chunks[1])
+    source_feat_shard = int(plan.counts.shards[1]) if plan.counts.shards else n_feats
+    max_group_chunks = max(1, source_feat_shard // source_feat_chunk)
+    resolved_read_group_chunks = min(requested_read_group_chunks, max_group_chunks)
+    itemsize = int(np.dtype(counts.dtype).itemsize)
+    observed: dict[str, Any] = {
+        "mode": "destination-shard",
+        "strategy": plan.strategy,
+        "readGroupChunks": resolved_read_group_chunks,
+        "requestedReadGroupsInFlight": requested_reads_in_flight,
+        "requestedDestinationCommitsInFlight": requested_commits_in_flight,
+        "effectiveReadGroupsInFlight": 1,
+        "sourceReadGroups": 0,
+        "sourceLogicalBytes": 0,
+        "sourceDecodeBytes": 0,
+        "sourceRepeatedDecodeCount": 0,
+        "sourceRepeatedDecodeBytes": 0,
+        "destinationCommits": 0,
+        "destinationLogicalBytes": 0,
+        "destinationOwners": 0,
+        "kind": "observed",
+    }
+    seen_source_chunks: set[tuple[int, int]] = set()
+
+    def _shard_key(feat_start: int, cell_start: int) -> tuple[int, int]:
+        return (feat_start // dest_feat_shard, cell_start // dest_cell_band)
+
+    def _destination_ranges(
+        feat_start: int,
+        feat_end: int,
+    ) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        start = feat_start
+        while start < feat_end:
+            boundary = ((start // dest_feat_shard) + 1) * dest_feat_shard
+            end = min(feat_end, boundary)
+            ranges.append((start, end))
+            start = end
+        return ranges
+
+    def _source_feature_ranges(
+        feat_start: int,
+        feat_end: int,
+    ) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        start = feat_start
+        while start < feat_end:
+            chunk_start = (start // source_feat_chunk) * source_feat_chunk
+            shard_end = ((start // source_feat_shard) + 1) * source_feat_shard
+            grouped_end = chunk_start + resolved_read_group_chunks * source_feat_chunk
+            end = min(feat_end, shard_end, grouped_end)
+            if end <= start:
+                raise RuntimeError("source read-group planner did not advance")
+            ranges.append((start, end))
+            start = end
+        return ranges
+
+    def _source_read_admission_bytes(
+        source_feat_start: int,
+        source_feat_end: int,
+    ) -> int:
+        first_chunk = source_feat_start // source_feat_chunk
+        last_chunk = (source_feat_end - 1) // source_feat_chunk
+        touched_chunks = last_chunk - first_chunk + 1
+        return source_cell_chunk * touched_chunks * source_feat_chunk * itemsize
+
+    async def _operation(runner: AsyncStorageRunner) -> None:
+        source = counts.async_array
+        destination = counts_t.async_array
+
+        async def _process_destination_set(
+            destination_ranges: list[tuple[int, int]],
+            *,
+            cell_start: int,
+            cell_end: int,
+        ) -> None:
+            if not destination_ranges:
+                return
+            output_bytes = sum(
+                (feat_end - feat_start) * (cell_end - cell_start) * itemsize
+                for feat_start, feat_end in destination_ranges
+            )
+            min_feat = destination_ranges[0][0]
+            max_feat = destination_ranges[-1][1]
+            source_ranges = _source_feature_ranges(min_feat, max_feat)
+            max_read_bytes = max(
+                _source_read_admission_bytes(start, end) for start, end in source_ranges
+            )
+            available_for_reads = resources.memoryBytes - output_bytes
+            if available_for_reads < max_read_bytes:
+                raise MemoryError(
+                    "experimental countsT cannot admit one source read while "
+                    "holding its destination buffer"
+                )
+            effective_reads = min(
+                requested_reads_in_flight,
+                max(1, available_for_reads // max_read_bytes),
+            )
+            observed["effectiveReadGroupsInFlight"] = max(
+                int(observed["effectiveReadGroupsInFlight"]),
+                int(effective_reads),
+            )
+
+            async with runner.reserve_bytes(output_bytes):
+                buffers = {
+                    (feat_start, feat_end): np.empty(
+                        (feat_end - feat_start, cell_end - cell_start),
+                        dtype=counts.dtype,
+                    )
+                    for feat_start, feat_end in destination_ranges
+                }
+
+                read_work = [
+                    (
+                        source_cell_start,
+                        min(source_cell_start + source_cell_chunk, cell_end),
+                        source_feat_start,
+                        source_feat_end,
+                    )
+                    for source_cell_start in range(
+                        cell_start,
+                        cell_end,
+                        source_cell_chunk,
+                    )
+                    for source_feat_start, source_feat_end in source_ranges
+                ]
+
+                async def _read_and_scatter(
+                    source_cell_start: int,
+                    source_cell_end: int,
+                    source_feat_start: int,
+                    source_feat_end: int,
+                    read_bytes: int,
+                    reservation: dict[str, bool],
+                ) -> None:
+                    try:
+                        async with runner.read_lane():
+                            payload = np.asarray(
+                                await source.getitem(
+                                    (
+                                        slice(source_cell_start, source_cell_end),
+                                        slice(source_feat_start, source_feat_end),
+                                    )
+                                )
+                            )
+
+                        def _scatter() -> None:
+                            for (
+                                destination_feat_start,
+                                destination_feat_end,
+                            ), buffer in buffers.items():
+                                overlap_start = max(
+                                    source_feat_start,
+                                    destination_feat_start,
+                                )
+                                overlap_end = min(
+                                    source_feat_end,
+                                    destination_feat_end,
+                                )
+                                if overlap_start >= overlap_end:
+                                    continue
+                                source_slice = slice(
+                                    overlap_start - source_feat_start,
+                                    overlap_end - source_feat_start,
+                                )
+                                destination_slice = slice(
+                                    overlap_start - destination_feat_start,
+                                    overlap_end - destination_feat_start,
+                                )
+                                cell_slice = slice(
+                                    source_cell_start - cell_start,
+                                    source_cell_end - cell_start,
+                                )
+                                buffer[destination_slice, cell_slice] = payload[
+                                    :, source_slice
+                                ].T
+
+                        await runner.compute(_scatter)
+                        observed["sourceReadGroups"] = (
+                            int(observed["sourceReadGroups"]) + 1
+                        )
+                        observed["sourceLogicalBytes"] = int(
+                            observed["sourceLogicalBytes"]
+                        ) + int(payload.nbytes)
+                        cell_chunk_index = source_cell_start // source_cell_chunk
+                        first_feature_chunk = source_feat_start // source_feat_chunk
+                        last_feature_chunk = (source_feat_end - 1) // source_feat_chunk
+                        for feature_chunk_index in range(
+                            first_feature_chunk,
+                            last_feature_chunk + 1,
+                        ):
+                            chunk_key = (cell_chunk_index, feature_chunk_index)
+                            decode_bytes = (
+                                source_cell_chunk * source_feat_chunk * itemsize
+                            )
+                            observed["sourceDecodeBytes"] = (
+                                int(observed["sourceDecodeBytes"]) + decode_bytes
+                            )
+                            if chunk_key in seen_source_chunks:
+                                observed["sourceRepeatedDecodeCount"] = (
+                                    int(observed["sourceRepeatedDecodeCount"]) + 1
+                                )
+                                observed["sourceRepeatedDecodeBytes"] = (
+                                    int(observed["sourceRepeatedDecodeBytes"])
+                                    + decode_bytes
+                                )
+                            else:
+                                seen_source_chunks.add(chunk_key)
+                    finally:
+                        if not reservation["released"]:
+                            await runner.ledger.release(read_bytes)
+                            reservation["released"] = True
+
+                pending: set[asyncio.Task[None]] = set()
+                reservations: list[tuple[int, dict[str, bool]]] = []
+                try:
+                    async with asyncio.TaskGroup() as read_tasks:
+                        for (
+                            source_cell_start,
+                            source_cell_end,
+                            source_feat_start,
+                            source_feat_end,
+                        ) in read_work:
+                            read_bytes = _source_read_admission_bytes(
+                                source_feat_start,
+                                source_feat_end,
+                            )
+                            await runner.ledger.acquire(read_bytes)
+                            reservation = {"released": False}
+                            reservations.append((read_bytes, reservation))
+                            task = read_tasks.create_task(
+                                _read_and_scatter(
+                                    source_cell_start,
+                                    source_cell_end,
+                                    source_feat_start,
+                                    source_feat_end,
+                                    read_bytes,
+                                    reservation,
+                                )
+                            )
+                            pending.add(task)
+                            if len(pending) >= effective_reads:
+                                done, pending = await asyncio.wait(
+                                    pending,
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                for completed in done:
+                                    completed.result()
+                finally:
+                    for read_bytes, reservation in reservations:
+                        if not reservation["released"]:
+                            await runner.ledger.release(read_bytes)
+                            reservation["released"] = True
+
+                async def _commit(
+                    feat_start: int,
+                    feat_end: int,
+                    buffer: np.ndarray,
+                ) -> None:
+                    async with runner.commit_lane():
+                        await destination.setitem(
+                            (
+                                slice(feat_start, feat_end),
+                                slice(cell_start, cell_end),
+                            ),
+                            buffer,
+                        )
+                    observed["destinationCommits"] = (
+                        int(observed["destinationCommits"]) + 1
+                    )
+                    observed["destinationLogicalBytes"] = int(
+                        observed["destinationLogicalBytes"]
+                    ) + int(buffer.nbytes)
+
+                pending_commits: set[asyncio.Task[None]] = set()
+                async with asyncio.TaskGroup() as commit_tasks:
+                    for (feat_start, feat_end), buffer in buffers.items():
+                        task = commit_tasks.create_task(
+                            _commit(feat_start, feat_end, buffer)
+                        )
+                        pending_commits.add(task)
+                        if len(pending_commits) >= requested_commits_in_flight:
+                            done, pending_commits = await asyncio.wait(
+                                pending_commits,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            for completed in done:
+                                completed.result()
+
+        for cell_start in range(0, n_cells, dest_cell_band):
+            cell_end = min(cell_start + dest_cell_band, n_cells)
+            for feat_start in range(0, n_feats, dest_feat_shard):
+                feat_end = min(feat_start + dest_feat_shard, n_feats)
+                key = _shard_key(feat_start, cell_start)
+                if key in owners:
+                    raise RuntimeError(f"destination shard {key} already has an owner")
+                owners.add(key)
+                await _process_destination_set(
+                    [(feat_start, feat_end)],
+                    cell_start=cell_start,
+                    cell_end=cell_end,
+                )
+
+    dest_chunk_feats = int(plan.countsT.chunks[0])
+    runner = AsyncStorageRunner(
+        resources,
+        chunksPerShard=max(1, dest_feat_shard // max(1, dest_chunk_feats)),
+        readGroupsInFlight=requested_reads_in_flight,
+        destinationCommitsInFlight=requested_commits_in_flight,
+    )
+    try:
+        runner.run(_operation)
+    except BaseException:
+        observed["terminalStatus"] = "error"
+        observed["peakLedgerBytes"] = runner.ledger.peak_bytes()
+        observed["heldLedgerBytes"] = runner.ledger.held_bytes()
+        if metrics is not None:
+            metrics.clear()
+            metrics.update(observed)
+        counts_t.attrs["complete"] = False
+        raise
+    observed["destinationOwners"] = len(owners)
+    observed["terminalStatus"] = "ok"
+    observed["peakLedgerBytes"] = runner.ledger.peak_bytes()
+    observed["heldLedgerBytes"] = runner.ledger.held_bytes()
+    observed["plannedDestinationBufferBytes"] = plan.destinationBufferBytes
+    observed["plannedSourceBufferBytes"] = plan.sourceBufferBytes
+    observed["sourceDecodeAmplification"] = plan.sourceDecodeAmplification
+    if metrics is not None:
+        metrics.clear()
+        metrics.update(observed)
+    counts_t.attrs["complete"] = True
+    return counts_t

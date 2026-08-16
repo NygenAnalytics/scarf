@@ -115,14 +115,83 @@ def object_size(uri: str) -> int | None:
     return int(meta["size"])
 
 
-def get_json(uri: str) -> dict[str, Any]:
+def object_metadata(uri: str) -> dict[str, Any] | None:
     store, key = open_r2_object(uri)
-    result = store.get(key)
-    body = bytes(result.bytes())
+    try:
+        meta = store.head(key)
+    except FileNotFoundError:
+        return None
+    e_tag = meta.get("e_tag")
+    return {
+        "size": int(meta["size"]),
+        "eTag": str(e_tag) if e_tag else None,
+    }
+
+
+def list_objects(
+    prefixUri: str,
+    *,
+    maxKeys: int = 256,
+) -> list[dict[str, Any]]:
+    if maxKeys < 1:
+        raise ValueError("maxKeys must be positive")
+    parsed = urlsplit(prefixUri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Expected an s3:// object URI, got: {prefixUri}")
+    prefix = parsed.path.lstrip("/")
+    store, _key = open_r2_object(prefixUri if prefix else f"{prefixUri.rstrip('/')}/.")
+    listed: list[dict[str, Any]] = []
+    for batch in store.list(prefix=prefix or None, chunk_size=min(50, maxKeys)):
+        for item in batch:
+            path = str(item["path"])
+            e_tag = item.get("e_tag")
+            listed.append(
+                {
+                    "uri": f"s3://{parsed.netloc}/{path}",
+                    "path": path,
+                    "size": int(item["size"]),
+                    "eTag": str(e_tag) if e_tag else None,
+                }
+            )
+            if len(listed) >= maxKeys:
+                return listed
+    return listed
+
+
+def list_common_prefixes(prefixUri: str) -> list[str]:
+    parsed = urlsplit(prefixUri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Expected an s3:// object URI, got: {prefixUri}")
+    prefix = parsed.path.lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    store, _key = open_r2_object(
+        prefixUri if parsed.path.lstrip("/") else f"{prefixUri.rstrip('/')}/."
+    )
+    result = store.list_with_delimiter(prefix or None)
+    prefixes = result.get("common_prefixes") or []
+    uris: list[str] = []
+    for item in prefixes:
+        path = str(item).strip("/")
+        uris.append(f"s3://{parsed.netloc}/{path}")
+    return uris
+
+
+def get_json(uri: str) -> dict[str, Any]:
+    body = get_bytes(uri)
     payload = json.loads(body.decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object at {uri}")
     return payload
+
+
+def get_bytes(uri: str) -> bytes:
+    store, key = open_r2_object(uri)
+    return bytes(store.get(key).bytes())
+
+
+def get_text(uri: str) -> str:
+    return get_bytes(uri).decode("utf-8")
 
 
 def _encode_json(value: dict[str, Any]) -> bytes:
@@ -137,17 +206,25 @@ def put_json(uri: str, value: dict[str, Any]) -> None:
 
 
 def put_json_if_absent(uri: str, value: dict[str, Any]) -> bool:
+    return put_bytes_if_absent(uri, _encode_json(value))
+
+
+def put_bytes_if_absent(uri: str, value: bytes) -> bool:
     store, key = open_r2_object(uri)
     try:
         store.put(
             key,
-            _encode_json(value),
+            value,
             mode="create",
             use_multipart=False,
         )
     except AlreadyExistsError:
         return False
     return True
+
+
+def put_text_if_absent(uri: str, value: str) -> bool:
+    return put_bytes_if_absent(uri, value.encode("utf-8"))
 
 
 def download_file(

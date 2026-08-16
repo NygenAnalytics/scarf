@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 from profiling.config import ProfilingConfig, StageName
-from profiling.r2 import get_json
+from profiling.r2 import get_json, object_exists
 from profiling.results import result_exists
 
 # How often orchestrators poll R2 / call status. Short polls keep heartbeats alive.
@@ -185,3 +185,23 @@ def await_stage_result(
     raise TimeoutError(
         f"Timed out waiting for {stage} result at {config.resultUri(nRows, stage)}"
     )
+
+
+def await_json_uri(
+    uri: str,
+    *,
+    pollSeconds: float = DEFAULT_POLL_SECONDS,
+    deadlineSeconds: float,
+) -> dict[str, Any]:
+    """Wait for a create-only JSON object to appear on R2."""
+    if pollSeconds <= 0:
+        raise ValueError("pollSeconds must be positive")
+    if deadlineSeconds <= 0:
+        raise ValueError("deadlineSeconds must be positive")
+    deadline = time.monotonic() + deadlineSeconds
+    while time.monotonic() < deadline:
+        if object_exists(uri):
+            return get_json(uri)
+        remaining = max(0.1, deadline - time.monotonic())
+        time.sleep(min(pollSeconds, remaining))
+    raise TimeoutError(f"Timed out waiting for JSON object at {uri}")

@@ -3,8 +3,15 @@ import pytest
 import zarr
 
 from profiling import stages as profiling_stages
-from profiling.config import StageResources, WorkflowParameters
+from profiling.config import (
+    CountMatrixLayout,
+    ExecutionPolicy,
+    StageResources,
+    WorkflowParameters,
+)
+from profiling.lattice_experiment import SCALED_POLICY, copy_candidate_counts
 from profiling.stages import run_stage
+from scarf.storage.budget import ResourceBudget
 from scarf.storage.sharding import write_counts_t
 
 
@@ -77,6 +84,56 @@ def test_write_counts_t_runs_as_standard_profile_stage(tmp_path):
     assert result.details["complete"] is True
     assert result.details["shape"] == [4, 6]
     assert result.details["beforeComplete"] is None
+    reopened = zarr.open_group(str(root_path), mode="r")
+    np.testing.assert_array_equal(reopened["RNA/countsT"][:], values.T)
+
+
+def test_experimental_profile_writer_uses_candidate_counts(tmp_path):
+    root_path = tmp_path / "store.zarr"
+    root = zarr.open_group(str(root_path), mode="w")
+    group = root.create_group("RNA")
+    values = np.arange(221 * 37, dtype=np.uint16).reshape(221, 37)
+    counts = group.create_array(
+        "counts",
+        shape=values.shape,
+        chunks=(50, 37),
+        shards=(100, 37),
+        dtype=values.dtype,
+    )
+    counts[:] = values
+    copy_candidate_counts(
+        group,
+        counts,
+        policy=SCALED_POLICY,
+        profile="fast_local",
+        resources=ResourceBudget(2 * 1024**3, 1),
+    )
+
+    result = run_stage(
+        "writeCountsT",
+        nRows=values.shape[0],
+        storeUri=str(root_path),
+        workflow=WorkflowParameters(countMatrixWriter="experimental"),
+        resources=_resources(),
+        countMatrixLayout=CountMatrixLayout(
+            targetReadUnitBytes=SCALED_POLICY.targetReadUnitBytes,
+            targetChunkBytes=SCALED_POLICY.targetChunkBytes,
+        ),
+        executionPolicy=ExecutionPolicy(
+            codecWorkerLimit=1,
+            zarrAsyncConcurrency=1,
+            computeWorkerLimit=1,
+            readGroupsInFlight=1,
+            destinationCommitsInFlight=1,
+            readGroupChunks=1,
+        ),
+        sampleIntervalSeconds=0.01,
+    )
+
+    assert result.status == "ok", result.error
+    assert result.details is not None
+    assert result.details["writer"] == "experimental"
+    assert result.details["metrics"]["peakLedgerBytes"] > 0
     reopened = zarr.open_group(str(root_path), mode="r")
     np.testing.assert_array_equal(reopened["RNA/countsT"][:], values.T)
 

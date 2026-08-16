@@ -1,7 +1,10 @@
 from pathlib import Path
 
+import pytest
+
 from profiling.config import (
     CORE_STAGE_ORDER,
+    SELECTED_STAGE_ORDER,
     StorageLayout,
     WorkflowParameters,
     _normalize_raw_config,
@@ -16,7 +19,7 @@ _EXAMPLE_CONFIG = Path(__file__).parents[1] / "profiling" / "config.example.toml
 def test_example_config_loads():
     config = load_profiling_config(_EXAMPLE_CONFIG)
     assert config.modalEnvironmentName == "scarf_profiling"
-    assert set(config.stageResources) == set(CORE_STAGE_ORDER)
+    assert set(CORE_STAGE_ORDER) <= set(config.stageResources)
     assert config.effectiveStages == CORE_STAGE_ORDER
     assert "writeCountsT" in CORE_STAGE_ORDER
     assert "runClustering" in CORE_STAGE_ORDER
@@ -62,6 +65,26 @@ def test_marker_group_key_matches_leiden_column():
     workflow = WorkflowParameters()
     assert workflow.resolvedMarkerGroupKey == "RNA_leiden_cluster"
     assert workflow.resolvedHvgKey == "I__hvgs"
+
+
+def test_existing_error_result_is_terminal(monkeypatch) -> None:
+    config = load_profiling_config(_EXAMPLE_CONFIG)
+    payload = {
+        "stage": "createStore",
+        "nRows": 10_000,
+        "status": "error",
+        "error": "boom",
+    }
+    monkeypatch.setattr(
+        "profiling.results.object_exists",
+        lambda uri: uri.endswith("/results/10000/createStore.json"),
+    )
+    monkeypatch.setattr("profiling.results.get_json", lambda uri: payload)
+    from profiling.results import existing_error_result
+
+    failed = existing_error_result(config, 10_000, "createStore")
+    assert failed == payload
+    assert existing_error_result(config, 10_000, "filterCells") is None
 
 
 def test_result_exists_skips_when_object_present(monkeypatch):
@@ -111,3 +134,26 @@ def test_stage_run_result_json_shape():
     assert payload["cgroupCurrentAfterBytes"] == 1536
     assert payload["operationPeakSource"] == "cgroupMemoryCurrent"
     assert payload["cgroupPeakScope"] == "operation"
+
+
+def test_selected_stage_graph_is_available_and_rejects_gaps() -> None:
+    from profiling.config import ProfilingConfig
+
+    config = load_profiling_config(_EXAMPLE_CONFIG)
+    selected = ProfilingConfig.model_validate(
+        {**config.model_dump(mode="python"), "stages": SELECTED_STAGE_ORDER}
+    )
+    assert selected.effectiveStages == SELECTED_STAGE_ORDER
+    payload = config.model_dump(mode="python")
+    payload["stages"] = ("filterCells", "importClusters")
+    with pytest.raises(ValueError, match="requires"):
+        ProfilingConfig.model_validate(payload)
+
+
+def test_partial_execution_policy_is_rejected() -> None:
+    from profiling.config import ProfilingConfig
+
+    payload = load_profiling_config(_EXAMPLE_CONFIG).model_dump(mode="python")
+    payload["executionPolicy"] = {"readGroupsInFlight": 1}
+    with pytest.raises(Exception):
+        ProfilingConfig.model_validate(payload)
