@@ -62,6 +62,10 @@ Pipeline-local keys are consumed first:
 
 Only `pipeline_id="basic_rna_analysis"` is currently supported.
 
+HVG selection and marker search read the gene-major `countsT` copy written at RNA import.
+An older RNA store that lacks that copy fails when the datastore is opened, before `run` starts.
+See {doc}`../../concepts/memory_and_execution`.
+
 ## Returned refs
 
 `run` returns `dict[str, ArtifactRef]` keyed by result name (for example `normalized`, `pca`, `connectivity_map`, Leiden keys, and any enabled embedding or cluster outputs).

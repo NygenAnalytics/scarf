@@ -144,6 +144,12 @@ def _load_marker_cluster_frame(
     )
 
 
+def _aligned_feature_labels(values: np.ndarray, index: pd.Index) -> np.ndarray:
+    """Return feature labels as a hashable NumPy array aligned to ``index``."""
+    labels = np.asarray(values, dtype=object).reshape(-1)
+    return labels[np.asarray(index, dtype=np.intp)]
+
+
 def _group_assignment_digest(values: np.ndarray) -> str:
     return array_digest(np.asarray(values).astype(str))
 
@@ -1693,6 +1699,17 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             idf_cell_idx=idf_cell_idx,
         )
 
+        from ...storage.stores import zarr_group_root
+        from ...writers.counts_t import finalize_writer_counts_t
+
+        finalize_writer_counts_t(
+            zarr_group_root(self.z, mode="r+"),
+            assay_label,
+            self.workspace,
+            assay_type=assay_type,
+            resources=self.resources,
+        )
+
         self._load_assays(min_cells=10, custom_assay_types={assay_label: assay_type})
         self._ini_cell_props(min_features=0, mito_pattern=None, ribo_pattern=None)
 
@@ -1833,13 +1850,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         if feature_label == "id":
             vals_df.set_index(
-                pd.Series(assay.feats.fetch_all("ids")).reindex(vals_df.index).values,
+                _aligned_feature_labels(assay.feats.fetch_all("ids"), vals_df.index),
                 inplace=True,
                 drop=True,
             )
         elif feature_label == "name":
             vals_df.set_index(
-                pd.Series(assay.feats.fetch_all("names")).reindex(vals_df.index).values,
+                _aligned_feature_labels(assay.feats.fetch_all("names"), vals_df.index),
                 inplace=True,
                 drop=True,
             )

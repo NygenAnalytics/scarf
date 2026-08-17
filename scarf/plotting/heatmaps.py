@@ -95,6 +95,27 @@ def _place_clustermap_annotation_legend(
                 )
 
 
+def _writable_float64(values: np.ndarray) -> np.ndarray:
+    """Copy values so later in-place adds do not write through a view."""
+    return np.array(values, dtype=np.float64, copy=True)
+
+
+def _clip_marker_means(
+    group_means: pd.DataFrame, vmin: float, vmax: float
+) -> pd.DataFrame:
+    """Clip group means without writing through a possibly read-only view."""
+    values = np.clip(
+        group_means.to_numpy(dtype=np.float64, copy=True).T,
+        vmin,
+        vmax,
+    )
+    return pd.DataFrame(
+        values,
+        index=group_means.columns,
+        columns=group_means.index,
+    )
+
+
 def _prepare_marker_heatmap(
     store: Any,
     *,
@@ -207,7 +228,7 @@ def _prepare_marker_heatmap(
         block_sum = grouped.sum()
         block_count = grouped.size()
         for label in block_sum.index:
-            summed = block_sum.loc[label].to_numpy(dtype=np.float64)
+            summed = _writable_float64(block_sum.loc[label].to_numpy())
             if label not in group_sums:
                 group_sums[label] = summed
                 group_counts[label] = int(block_count.loc[label])
@@ -226,9 +247,7 @@ def _prepare_marker_heatmap(
     )
     feature_names = np.asarray(assay.feats.fetch_all("names"))
     group_means.columns = feature_names[feature_index]
-    matrix = group_means.T
-    matrix[matrix < vmin] = vmin
-    matrix[matrix > vmax] = vmax
+    matrix = _clip_marker_means(group_means, vmin, vmax)
 
     marker_table = pd.DataFrame(marker_rows)
     marker_table["feature"] = feature_names[

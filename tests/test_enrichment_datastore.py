@@ -9,6 +9,8 @@ from scarf.assay import norm_lib_size_log
 from scarf.matrix import ChunkedArray
 from scarf.storage.artifacts import ArtifactRef
 from scarf.utils.arrays import array_digest
+from scarf.storage.budget import ResourceBudget
+from scarf.storage.sharding import write_counts_t
 from scarf.writers import (
     create_cell_data,
     create_zarr_count_assay,
@@ -598,7 +600,8 @@ def test_workspace_results_are_written_to_the_assay_shell(tmp_path):
         feat_names=np.array([f"g{i}" for i in range(6)]),
         dtype="uint32",
     )
-    root["matrices/RNA/counts"][:] = np.array(
+    counts = root["matrices/RNA/counts"]
+    counts[:] = np.array(
         [
             [6, 5, 4, 3, 2, 1],
             [1, 2, 3, 4, 5, 6],
@@ -607,6 +610,11 @@ def test_workspace_results_are_written_to_the_assay_shell(tmp_path):
             [2, 5, 6, 1, 4, 3],
         ],
         dtype=np.uint32,
+    )
+    write_counts_t(
+        counts,
+        root["matrices/RNA"],
+        resources=ResourceBudget(1024**3, 2),
     )
     datastore = DataStore(
         str(path),

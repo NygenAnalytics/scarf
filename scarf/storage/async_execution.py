@@ -5,17 +5,18 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 
 import zarr
 
-from .budget import ResourceBudget
+from .budget import ResourceBudget, resolve_budget
 
 T = TypeVar("T")
 
-_INSTALLED_RUNTIME: tuple[int, int] | None = None
-_EXPLICIT_RUNTIME = False
+# Zarr's sync ThreadPoolExecutor is created on first use and never resized.
+# This is the process thread ceiling, not an operation plan.
+_HOST_THREAD_CEILING: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,36 +50,23 @@ def resolve_execution_plan(
     )
 
 
-def install_zarr_runtime(plan: ExecutionPlan, *, _explicit: bool = False) -> None:
-    global _EXPLICIT_RUNTIME, _INSTALLED_RUNTIME
-    desired = (plan.codecWorkerLimit, plan.zarrAsyncConcurrency)
-    if _INSTALLED_RUNTIME is not None and _INSTALLED_RUNTIME != desired:
-        raise RuntimeError(
-            "Zarr already has a process runtime of "
-            f"codecWorkers={_INSTALLED_RUNTIME[0]}, "
-            f"async.concurrency={_INSTALLED_RUNTIME[1]}; "
-            f"this operation requested {desired}. Start a new process instead of "
-            "reconfiguring a live executor."
-        )
-    if _INSTALLED_RUNTIME is None:
-        zarr.config.set(
-            {
-                "threading.max_workers": plan.codecWorkerLimit,
-                "async.concurrency": plan.zarrAsyncConcurrency,
-            }
-        )
-        _INSTALLED_RUNTIME = desired
-    if _explicit:
-        _EXPLICIT_RUNTIME = True
-
-
-def ensure_zarr_runtime(plan: ExecutionPlan) -> None:
-    install_zarr_runtime(plan)
+def ensure_zarr_host_ceiling(maxWorkers: int | None = None) -> int:
+    """Set Zarr's process thread ceiling once. Later calls do not shrink it."""
+    global _HOST_THREAD_CEILING
+    requested = (
+        max(1, int(maxWorkers))
+        if maxWorkers is not None
+        else max(1, resolve_budget().workers)
+    )
+    if _HOST_THREAD_CEILING is None:
+        zarr.config.set({"threading.max_workers": requested})
+        _HOST_THREAD_CEILING = requested
+    return _HOST_THREAD_CEILING
 
 
 def zarr_runtime_installed() -> bool:
-    """Return True when this process already has a Zarr executor."""
-    return _INSTALLED_RUNTIME is not None
+    """Return True when this process already has a Zarr thread ceiling."""
+    return _HOST_THREAD_CEILING is not None
 
 
 def configure_zarr_runtime(
@@ -86,34 +74,29 @@ def configure_zarr_runtime(
     codecWorkers: int,
     asyncConcurrency: int,
 ) -> None:
-    """Install one explicit process runtime before opening remote arrays."""
+    """Set the process Zarr thread ceiling before opening remote arrays.
+
+    ``asyncConcurrency`` becomes the restored default after each runner
+    scopes its own cap. The first ceiling wins; Zarr does not resize a
+    live thread pool.
+    """
     codec_workers = int(codecWorkers)
     async_concurrency = int(asyncConcurrency)
     if codec_workers < 1 or async_concurrency < 1:
         raise ValueError("Zarr runtime limits must be positive")
-    install_zarr_runtime(
-        ExecutionPlan(
-            codecWorkerLimit=codec_workers,
-            zarrAsyncConcurrency=async_concurrency,
-            computeWorkerLimit=1,
-            readGroupsInFlight=1,
-            destinationCommitsInFlight=1,
-            chunksPerShard=max(1, async_concurrency),
-        ),
-        _explicit=True,
-    )
+    ensure_zarr_host_ceiling(codec_workers)
+    zarr.config.set({"async.concurrency": async_concurrency})
 
 
 def reset_zarr_runtime_for_tests() -> None:
-    global _EXPLICIT_RUNTIME, _INSTALLED_RUNTIME
+    global _HOST_THREAD_CEILING
     zarr.config.set(
         {
             "threading.max_workers": None,
             "async.concurrency": 10,
         }
     )
-    _INSTALLED_RUNTIME = None
-    _EXPLICIT_RUNTIME = False
+    _HOST_THREAD_CEILING = None
 
 
 class ByteLedger:
@@ -184,15 +167,6 @@ class AsyncStorageRunner:
             destinationCommitsInFlight=destinationCommitsInFlight,
             computeWorkerLimit=computeWorkerLimit,
         )
-        if (
-            _EXPLICIT_RUNTIME
-            and _INSTALLED_RUNTIME is not None
-            and self.plan.codecWorkerLimit == _INSTALLED_RUNTIME[0]
-        ):
-            self.plan = replace(
-                self.plan,
-                zarrAsyncConcurrency=_INSTALLED_RUNTIME[1],
-            )
         self.ledger = ByteLedger(resources.memoryBytes)
         self._compute_pool: ThreadPoolExecutor | None = None
         self._codec_pool: ThreadPoolExecutor | None = None
@@ -225,7 +199,7 @@ class AsyncStorageRunner:
         operation: Callable[["AsyncStorageRunner"], Awaitable[T]],
     ) -> T:
         loop = asyncio.get_running_loop()
-        ensure_zarr_runtime(self.plan)
+        ensure_zarr_host_ceiling()
         self._codec_pool = ThreadPoolExecutor(
             max_workers=self.plan.codecWorkerLimit,
             thread_name_prefix="scarf-zarr-codec",
@@ -240,7 +214,8 @@ class AsyncStorageRunner:
         result: Any = None
         operation_error: BaseException | None = None
         try:
-            result = await operation(self)
+            with zarr.config.set({"async.concurrency": self.plan.zarrAsyncConcurrency}):
+                result = await operation(self)
         except BaseException as exc:
             operation_error = exc
         finally:

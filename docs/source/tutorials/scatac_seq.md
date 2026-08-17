@@ -57,10 +57,13 @@ reader = scarf.CrH5Reader(f'{dataset}/data.h5')
 reader.assayFeats
 ```
 
+This peak matrix is wide. `mem_budget="8G"` leaves room for one source row and one destination row band; the default 4 GiB budget is not enough for this file.
+
 ```{code-cell} ipython3
 writer = scarf.CrToZarr(
     reader,
     zarr_loc=f'{dataset}/data.zarr',
+    mem_budget="8G",
 )
 writer.dump()
 ```

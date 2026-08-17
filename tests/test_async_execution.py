@@ -9,6 +9,7 @@ from scarf.storage.async_execution import (
     AsyncStorageRunner,
     ByteLedger,
     configure_zarr_runtime,
+    ensure_zarr_host_ceiling,
     reset_zarr_runtime_for_tests,
 )
 from scarf.storage.budget import ResourceBudget
@@ -248,44 +249,79 @@ def test_byte_ledger_is_empty_after_success() -> None:
     assert runner_holder[0].ledger.is_empty()
 
 
-def test_incompatible_zarr_runtime_fails_closed() -> None:
-    from scarf.storage.async_execution import ExecutionPlan, install_zarr_runtime
-
-    install_zarr_runtime(
-        ExecutionPlan(
-            codecWorkerLimit=1,
-            zarrAsyncConcurrency=1,
-            computeWorkerLimit=1,
-            readGroupsInFlight=1,
-            destinationCommitsInFlight=1,
-            chunksPerShard=10,
-        )
-    )
-    with pytest.raises(RuntimeError, match="already has a process runtime"):
-        install_zarr_runtime(
-            ExecutionPlan(
-                codecWorkerLimit=3,
-                zarrAsyncConcurrency=3,
-                computeWorkerLimit=1,
-                readGroupsInFlight=1,
-                destinationCommitsInFlight=1,
-                chunksPerShard=10,
-            )
-        )
+async def _current_async_concurrency(_active: AsyncStorageRunner) -> int:
+    return int(zarr.config.get("async.concurrency"))
 
 
-def test_runner_uses_explicit_process_concurrency_across_array_geometries() -> None:
+def test_host_ceiling_is_set_once_and_does_not_shrink() -> None:
+    assert ensure_zarr_host_ceiling(2) == 2
+    assert zarr.config.get("threading.max_workers") == 2
+    assert ensure_zarr_host_ceiling(8) == 2
+    assert zarr.config.get("threading.max_workers") == 2
+
+
+def test_sequential_runners_keep_their_own_plans() -> None:
+    first = AsyncStorageRunner(ResourceBudget(1024, 2), chunksPerShard=10)
+    second = AsyncStorageRunner(ResourceBudget(1024, 4), chunksPerShard=1)
+    third = AsyncStorageRunner(ResourceBudget(1024, 4), chunksPerShard=10)
+
+    assert first.plan.codecWorkerLimit == 1
+    assert first.plan.zarrAsyncConcurrency == 1
+    assert second.plan.codecWorkerLimit == 3
+    assert second.plan.zarrAsyncConcurrency == 1
+    assert third.plan.codecWorkerLimit == 3
+    assert third.plan.zarrAsyncConcurrency == 3
+
+    assert first.run(_current_async_concurrency) == 1
+    assert second.run(_current_async_concurrency) == 1
+    assert third.run(_current_async_concurrency) == 3
+    assert zarr.config.get("async.concurrency") == 10
+
+
+def test_runner_scopes_async_concurrency_and_restores_configured_default() -> None:
     configure_zarr_runtime(codecWorkers=3, asyncConcurrency=3)
     runner = AsyncStorageRunner(
         ResourceBudget(1024, 4),
         chunksPerShard=1,
     )
 
-    async def read_nothing(_active: AsyncStorageRunner) -> str:
-        return "ok"
+    assert runner.plan.zarrAsyncConcurrency == 1
+    assert runner.run(_current_async_concurrency) == 1
+    assert zarr.config.get("async.concurrency") == 3
+    assert zarr.config.get("threading.max_workers") == 3
 
-    assert runner.run(read_nothing) == "ok"
-    assert runner.plan.zarrAsyncConcurrency == 3
+
+def test_runner_restores_async_concurrency_after_failure() -> None:
+    runner = AsyncStorageRunner(ResourceBudget(1024, 4), chunksPerShard=10)
+
+    async def boom(_active: AsyncStorageRunner) -> None:
+        assert int(zarr.config.get("async.concurrency")) == 3
+        raise ValueError("operation failed")
+
+    with pytest.raises(ValueError, match="operation failed"):
+        runner.run(boom)
+    assert zarr.config.get("async.concurrency") == 10
+
+
+def test_write_counts_t_accepts_a_later_larger_worker_budget() -> None:
+    values = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    group, counts = _write_counts(values)
+    first = write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(32 * 1024 * 1024, 2),
+    )
+    del group["countsT"]
+    second = write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(32 * 1024 * 1024, 4),
+    )
+    assert first.attrs["complete"] is True
+    assert second.attrs["complete"] is True
+    np.testing.assert_array_equal(np.asarray(second[:]), values.T)
 
 
 def test_byte_ledger_rejects_over_release() -> None:

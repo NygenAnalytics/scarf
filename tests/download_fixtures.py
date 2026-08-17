@@ -24,7 +24,7 @@ _CYTEBASE_FIXTURES = {
         "e3dd57c5a8c3426dc5a7dc012a78608554facbddf4c6d1d62671089d197b1053"
     ),
     "1K_pbmc_citeseq.zarr.tar.gz": (
-        "53166c8a12f4c621d8d2d10883ae40054a8dd9856bcbf8c62149f9d736106ac6"
+        "29ee0f75b416f773dd63f07b78e468c3a74d3620b2333e7fcbdf232f5aa90711"
     ),
     "500_pbmc_atac.zarr.tar.gz": (
         "f54c79229e674ea2956c048a931aadb4a9d54e75778df17b4bd84608c0e06493"

@@ -70,6 +70,37 @@ def test_cluster_tree_rejects_misaligned_color_values():
         cluster_tree(store, show=False)
 
 
+def test_writable_float64_accumulator_accepts_readonly_blocks() -> None:
+    from scarf.plotting.heatmaps import _writable_float64
+
+    first = np.array([1.0, 2.0], dtype=np.float64)
+    first.flags.writeable = False
+    second = np.array([3.0, 4.0], dtype=np.float64)
+    second.flags.writeable = False
+
+    total = _writable_float64(first)
+    total += _writable_float64(second)
+
+    np.testing.assert_allclose(total, [4.0, 6.0])
+    assert first.flags.writeable is False
+    np.testing.assert_array_equal(first, [1.0, 2.0])
+
+
+def test_clip_marker_means_does_not_write_through_readonly_values() -> None:
+    from scarf.plotting.heatmaps import _clip_marker_means
+
+    values = np.array([[-2.0, 0.5], [3.0, 1.0]], dtype=np.float64)
+    values.flags.writeable = False
+    group_means = pd.DataFrame(values, index=["a", "b"], columns=["g1", "g2"])
+
+    matrix = _clip_marker_means(group_means, vmin=-1.0, vmax=2.0)
+
+    assert list(matrix.index) == ["g1", "g2"]
+    assert list(matrix.columns) == ["a", "b"]
+    np.testing.assert_allclose(matrix.to_numpy(), [[-1.0, 2.0], [0.5, 1.0]])
+    assert values[0, 0] == -2.0
+
+
 def test_marker_heatmap_returns_owned_result(
     marker_search,
     datastore,

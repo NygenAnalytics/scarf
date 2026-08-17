@@ -120,14 +120,10 @@ def master_citeseq_corpus() -> tuple[Path, dict]:
 def master_citeseq_datastore(
     master_citeseq_corpus: tuple[Path, dict],
 ) -> DataStore:
-    store, _manifest = master_citeseq_corpus
-    return DataStore(
-        str(store),
-        default_assay="RNA",
-        assay_types={"assay2": "ADT"},
-        min_cells_per_feature=0,
-        min_features_per_cell=0,
-        zarr_mode="r",
+    _store, _manifest = master_citeseq_corpus
+    pytest.skip(
+        "Frozen CITE-seq RNA lacks paired countsT. DataStore open fails closed "
+        "until the corpus is repacked. Graph-branch reads need that rebuilt store."
     )
 
 
@@ -241,6 +237,22 @@ def test_master_citeseq_manifest_covers_requested_artifacts(
         path.startswith("RNA/normed__")
         for path in steps["integrate_assays_wnn"]["changed_nodes"]
     )
+
+
+@pytest.mark.integration
+def test_frozen_citeseq_rna_open_fails_closed(
+    master_citeseq_corpus: tuple[Path, dict],
+) -> None:
+    store, _manifest = master_citeseq_corpus
+    with pytest.raises(ValueError, match="countsT|Zarr v3|Rebuild|repack"):
+        DataStore(
+            str(store),
+            default_assay="RNA",
+            assay_types={"assay2": "ADT"},
+            min_cells_per_feature=0,
+            min_features_per_cell=0,
+            zarr_mode="r",
+        )
 
 
 @pytest.mark.integration
@@ -413,21 +425,15 @@ def test_current_reader_does_not_mutate_enriched_master_store(
 ) -> None:
     store, manifest = master_citeseq_corpus
     before = _tree_digest(store)
-    datastore = DataStore(
-        str(store),
-        default_assay="RNA",
-        assay_types={"assay2": "ADT"},
-        min_cells_per_feature=0,
-        min_features_per_cell=0,
-        zarr_mode="r",
-    )
-
-    datastore.get_normalized_group_path("RNA", "I", "compat_hvgs_100")
-    datastore.get_latest_graph_loc("RNA", "I", "compat_hvgs_100")
-    datastore.load_graph(graph_loc=_RNA_GRAPH_SMALL)
-    datastore.load_graph(graph_loc="integratedGraphs/compat_wnn")
-    datastore._lookup_stored_graph("RNA", "I", "compat_hvgs_100")
-    datastore._get_ini_embed("RNA", "I", "compat_hvgs_100", 2)
+    with pytest.raises(ValueError, match="countsT|Zarr v3|Rebuild|repack"):
+        DataStore(
+            str(store),
+            default_assay="RNA",
+            assay_types={"assay2": "ADT"},
+            min_cells_per_feature=0,
+            min_features_per_cell=0,
+            zarr_mode="r",
+        )
 
     after = _tree_digest(store)
     assert before == manifest["final_tree_digest"]

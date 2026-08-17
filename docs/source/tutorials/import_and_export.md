@@ -98,6 +98,7 @@ The cell prints each returned path.
 Scarf stores data as dense, compressed chunks in Zarr.
 `CrH5Reader` and `CrToZarr` convert Cell Ranger HDF5 into that layout.
 Assay type is inferred from the H5 feature types (RNA, ATAC, or multimodal).
+This ATAC file needs `mem_budget="8G"` so one source row and one destination row band fit.
 
 ```{code-cell} ipython3
 # Assay type is inferred from the H5 contents (RNA, ATAC, or multimodal).
@@ -106,8 +107,9 @@ reader = scarf.CrH5Reader(f'{tenx_h5}/data.h5')
 # change value of `zarr_loc` to your choice of filename and path
 writer = scarf.CrToZarr(
     reader,
-    zarr_loc='scarf_datasets/pbmc_atac.zarr'  
-)  
+    zarr_loc='scarf_datasets/pbmc_atac.zarr',
+    mem_budget="8G",
+)
 writer.dump()
 ```
 
