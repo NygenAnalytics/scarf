@@ -50,9 +50,9 @@ uv run --group profiling modal run --env scarf_profiling \
 Use `run --stage ...` for a targeted stage, including repair of an incomplete `countsT`; use
 `run-local` for the Modal ephemeral-disk comparison and `io-baseline` for read-pattern diagnostics.
 
-## Strip countsT 1M R2 gate
+## 1M R2 gate
 
-Productization gate for mandatory RNA strip-sharded `countsT`. Use a fresh `runTag`, full funnel,
+The 1M gate is `run-e2e` on the product rotateOnce path. Use a fresh `runTag`, full funnel,
 size `1000000`, R2 backend (`scarf_profiling` env).
 
 `profiling/config.example.toml` pins **8 CPU / 32 GiB** (Scarf budget ~24 GiB) on
@@ -73,7 +73,7 @@ uv run --group profiling modal run --env scarf_profiling \
   --config profiling/config.toml --size 1000000
 ```
 
-Success: all stages ok; strip `countsT` with `complete=True`; HVG and markers finish without OOM;
+Success: all stages ok; paired `countsT` with `complete=True`; HVG and markers finish without OOM;
 result JSON under the run's `runTag`. Expect hours of Modal time and real cost.
 
 ## Durable execution

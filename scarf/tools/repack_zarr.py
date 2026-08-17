@@ -13,10 +13,13 @@ import zarr
 from scarf.storage.arrays import create_numeric_array
 from scarf.storage.budget import ResourceBudget, resolve_budget
 from scarf.storage.copy import _copy_metadata_array
+from scarf.storage.count_matrix import (
+    COUNT_MATRIX_LAYOUT_KEY,
+    create_product_counts_array,
+)
 from scarf.storage.layout import (
     ZarrArraySpec,
     array_info,
-    count_array_spec,
     get_compressors,
     normalize_chunks,
 )
@@ -109,8 +112,18 @@ def _counts_t_path(counts_path: str) -> str:
     raise ValueError(f"Not a counts path: {counts_path!r}")
 
 
-def _copy_array_attrs(src: zarr.Array, dst: zarr.Array) -> None:
+_STRIPPED_COUNT_ATTRS = frozenset({"complete", COUNT_MATRIX_LAYOUT_KEY})
+
+
+def _copy_array_attrs(
+    src: zarr.Array,
+    dst: zarr.Array,
+    *,
+    strip_keys: frozenset[str] = frozenset(),
+) -> None:
     for attr_key, attr_val in src.attrs.items():
+        if attr_key in strip_keys:
+            continue
         dst.attrs[attr_key] = attr_val
 
 
@@ -236,6 +249,8 @@ def _copy_group(
         if isinstance(node, zarr.Group):
             new_group = dst.create_group(key, overwrite=True)
             for attr_key, attr_val in node.attrs.items():
+                if attr_key in _STRIPPED_COUNT_ATTRS:
+                    continue
                 new_group.attrs[attr_key] = attr_val
             _copy_group(
                 node,
@@ -250,13 +265,13 @@ def _copy_group(
 
         array = as_zarr_array(node, name=child_path)
         if child_path in shardedCounts:
-            spec = count_array_spec(
+            dst_array = create_product_counts_array(
+                dst,
                 int(array.shape[0]),
                 int(array.shape[1]),
-                dtype=array.dtype,
+                array.dtype,
                 profile=profile,
             )
-            dst_array = create_numeric_array(dst, key, spec)
             write_dense_in_shard_rows(
                 dst_array,
                 _row_block_producer(array),
@@ -271,7 +286,8 @@ def _copy_group(
                 "shards": None if stored_shards is None else list(stored_shards),
                 "zarr_format": 3,
             }
-            _copy_array_attrs(array, dst_array)
+            dst.attrs.pop("complete", None)
+            _copy_array_attrs(array, dst_array, strip_keys=_STRIPPED_COUNT_ATTRS)
             continue
 
         if array.ndim == 1:

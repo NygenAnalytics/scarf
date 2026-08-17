@@ -5,6 +5,8 @@ import zarr
 from numpy.typing import NDArray
 from scipy.sparse import csr_matrix
 
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile
 from ..utils.logging import logger
 
@@ -65,8 +67,8 @@ def write_doublet_target_zarr(
     mem_budget: int | str | None = None,
     nthreads: int | None = None,
     profile: StorageProfile | None = None,
-    targetChunkBytes: int | None = None,
-    targetShardBytes: int | None = None,
+    policy: CountMatrixPolicy | None = None,
+    io: StorageIoPolicy | None = None,
 ) -> zarr.Group:
     """Materialise simulated doublet counts as a minimal Scarf Zarr hierarchy."""
     from ..storage.schema import (
@@ -96,8 +98,7 @@ def write_doublet_target_zarr(
         feat_names=np.asarray(feat_names),
         dtype=dtype,
         profile=resolved_profile,
-        targetChunkBytes=targetChunkBytes,
-        targetShardBytes=targetShardBytes,
+        policy=policy,
     )
     store = load_count_array(z, assay_name, None)
     write_dense_in_shard_rows(
@@ -124,16 +125,13 @@ def write_doublet_target_zarr(
     z.attrs["assayTypes"] = types
     if is_rna_assay_type(type_name):
         group = as_zarr_group(z[assay_name], name=assay_name)
-        counts_t = finalize_rna_counts_t(
+        finalize_rna_counts_t(
             store,
             group,
             profile=resolved_profile,
             resources=resources,
+            policy=policy,
+            io=io,
         )
-        if counts_t is None:
-            raise ValueError(
-                f"RNA assay {assay_name!r} requires Zarr v3 for strip-sharded "
-                "countsT when writing doublet targets."
-            )
     logger.debug(f"Wrote {n_sim} simulated doublets to {zarr_loc}")
     return z

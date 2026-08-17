@@ -2,6 +2,8 @@
 
 import asyncio
 import operator
+import queue
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -11,8 +13,13 @@ import numpy as np
 
 from .async_execution import AsyncStorageRunner
 from .budget import ResourceBudget, admit_stream, resolve_budget
-from .count_matrix import TARGET_READ_UNIT_BYTES
+from .count_matrix import (
+    REBUILD_REMEDY,
+    load_count_matrix_plan,
+    read_group_from_payload,
+)
 from .geometry import ArrayGeometry, array_geometry
+from .io_policy import DEFAULT_STORAGE_IO_POLICY, StorageIoPolicy
 from .partition import (
     IndexBlock,
     affordable_width,
@@ -29,11 +36,10 @@ __all__ = [
     "FeatureReadGroup",
     "FeatureStreamPlan",
     "feature_column_chunk",
-    "load_feature_strip",
     "map_feature_cell_bands",
     "map_feature_read_groups",
     "plan_feature_stream",
-    "planned_read_group_chunks",
+    "persisted_read_group",
     "selected_feature_chunk_starts",
     "selected_feature_values",
 ]
@@ -258,41 +264,6 @@ def selected_feature_values(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(values[keep])
 
 
-def load_feature_strip(
-    counts_t: Any,
-    feat_start: int,
-    *,
-    cell_idx: np.ndarray | None = None,
-) -> FeatureReadGroup:
-    """Load one inner-chunk feature strip across the full cell axis.
-
-    This is the whole-strip baseline used by the Phase 3 comparison. Product
-    consumers use ``map_feature_read_groups`` or ``map_feature_cell_bands``.
-    """
-    array = as_zarr_array(counts_t)
-    geometry = _plane(array)
-    gene_strip = geometry.axisChunk(0)
-    n_feats = int(geometry.shape[0])
-    feat_end = min(int(feat_start) + gene_strip, n_feats)
-    started = time.perf_counter()
-    block = np.ascontiguousarray(np.asarray(array[int(feat_start) : feat_end, :]))
-    read_sec = time.perf_counter() - started
-    if cell_idx is not None:
-        selected = np.asarray(cell_idx)
-        n_cells = int(geometry.shape[1])
-        if selected.shape[0] != n_cells or not np.array_equal(
-            selected, np.arange(n_cells)
-        ):
-            block = np.ascontiguousarray(block[:, selected])
-    return FeatureReadGroup(
-        featStart=int(feat_start),
-        featEnd=int(feat_end),
-        values=block,
-        readSec=float(read_sec),
-        blockBytes=int(block.nbytes),
-    )
-
-
 def selected_feature_chunk_starts(
     array: Any,
     feat_idx: Sequence[int] | np.ndarray | None = None,
@@ -310,23 +281,35 @@ def selected_feature_chunk_starts(
     return [int(item) * feat_chunk for item in bins]
 
 
+def persisted_read_group(array: Any) -> tuple[int, int]:
+    """Return persisted ``(featureWidth, readGroupBytes)`` for consume grouping."""
+    payload = load_count_matrix_plan(array)
+    feature_width, read_group_bytes = read_group_from_payload(payload)
+    geometry = _plane(array)
+    expected_bytes = int(geometry.shape[1]) * feature_width * geometry.itemsize
+    if read_group_bytes != expected_bytes:
+        raise ValueError(
+            "persisted read group does not match live geometry. " + REBUILD_REMEDY
+        )
+    return feature_width, read_group_bytes
+
+
 def _feature_group_ranges(
     array: Any,
     *,
     feat_idx: Sequence[int] | np.ndarray | None,
     feat_starts: Sequence[int] | None,
-    readGroupChunks: int,
+    featureWidth: int,
 ) -> list[tuple[int, int]]:
     geometry = _plane(array)
     n_feats = int(geometry.shape[0])
-    feat_chunk = geometry.axisChunk(0)
-    group_width = max(1, int(readGroupChunks)) * feat_chunk
+    group_width = max(1, int(featureWidth))
     if feat_starts is None:
         starts = selected_feature_chunk_starts(array, feat_idx)
         width = group_width
     else:
         starts = [int(value) for value in feat_starts]
-        width = feat_chunk
+        width = group_width
     merged: list[tuple[int, int]] = []
     for start in starts:
         feat_end = min(start + width, n_feats)
@@ -343,18 +326,87 @@ def _feature_group_ranges(
     return merged
 
 
-def planned_read_group_chunks(
-    array: Any,
+def _admit_groups_in_flight(
+    budget: ResourceBudget,
     *,
-    targetReadUnitBytes: int = TARGET_READ_UNIT_BYTES,
-) -> int:
-    """Return how many inner feature chunks fit in one target read unit."""
-    geometry = _plane(array)
-    n_cells = max(1, int(geometry.shape[1]))
-    feat_chunk = max(1, geometry.axisChunk(0))
-    itemsize = max(1, geometry.itemsize)
-    group_feats = max(1, int(targetReadUnitBytes) // (n_cells * itemsize))
-    return max(1, group_feats // feat_chunk)
+    io: StorageIoPolicy,
+    readGroupBytes: int,
+) -> tuple[int, int | None]:
+    memory_max = max(1, int(budget.memoryBytes) // max(1, int(readGroupBytes)))
+    requested = io.groupsInFlight
+    if requested is None:
+        return min(memory_max, max(1, int(budget.workers))), None
+    return min(int(requested), memory_max), int(requested)
+
+
+def _iter_bounded_handoff(
+    *,
+    in_flight: int,
+    run: Callable[[Callable[[Any], None], threading.Event], None],
+) -> Iterator[Any]:
+    handoff: queue.Queue[Any] = queue.Queue(maxsize=max(1, int(in_flight)))
+    release: queue.Queue[None] = queue.Queue()
+    stop = threading.Event()
+    sentinel = object()
+    error: list[BaseException] = []
+
+    def deliver(item: Any) -> None:
+        if stop.is_set():
+            return
+        while not stop.is_set():
+            try:
+                handoff.put(item, timeout=0.05)
+                break
+            except queue.Full:
+                continue
+        else:
+            return
+        while not stop.is_set():
+            try:
+                release.get(timeout=0.05)
+                return
+            except queue.Empty:
+                continue
+
+    def _worker() -> None:
+        try:
+            run(deliver, stop)
+        except BaseException as exc:
+            error.append(exc)
+        finally:
+            while True:
+                try:
+                    handoff.put(sentinel, timeout=0.05)
+                    break
+                except queue.Full:
+                    if not stop.is_set():
+                        continue
+                    try:
+                        handoff.get_nowait()
+                    except queue.Empty:
+                        continue
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = handoff.get()
+            if item is sentinel:
+                break
+            release.put(None)
+            yield item
+    finally:
+        stop.set()
+        while thread.is_alive():
+            try:
+                item = handoff.get(timeout=0.05)
+                if item is not sentinel:
+                    release.put(None)
+            except queue.Empty:
+                release.put(None)
+        thread.join()
+    if error:
+        raise error[0]
 
 
 def _selected_cell_bands(
@@ -375,13 +427,6 @@ def _selected_cell_bands(
     return bands
 
 
-def _groups_in_flight(budget: ResourceBudget, unit_bytes: int) -> int:
-    unit = max(1, int(unit_bytes))
-    by_memory = max(1, int(budget.memoryBytes) // unit)
-    by_workers = max(1, int(budget.workers))
-    return max(1, min(by_memory, by_workers))
-
-
 def map_feature_read_groups(
     counts_t: Any,
     process: Callable[[FeatureReadGroup], T],
@@ -391,31 +436,21 @@ def map_feature_read_groups(
     feat_starts: Sequence[int] | None = None,
     resources: ResourceBudget | None = None,
     progress: str | None = None,
-    readGroupChunks: int | None = None,
-    readGroupsInFlight: int | None = None,
+    io: StorageIoPolicy | None = None,
+    metrics: dict[str, Any] | None = None,
 ) -> Iterator[T]:
-    """Map ``process`` over bounded feature/cell read groups.
-
-    Ordinary slices drive the reads. Adjacent inner chunks are grouped only
-    when ``readGroupChunks`` is greater than 1. Independent groups stay in
-    flight up to the admitted memory/worker limit. ``process`` is serialized
-    so Numba kernels stay on one thread pool.
-    """
+    """Map ``process`` over persisted read groups with bounded handoff."""
     array = as_zarr_array(counts_t)
     geometry = _plane(array)
     _n_feats, n_cells = (int(value) for value in geometry.shape)
     feat_chunk = geometry.axisChunk(0)
     cell_chunk = geometry.axisChunk(1)
-    group_chunks = (
-        planned_read_group_chunks(array)
-        if readGroupChunks is None
-        else max(1, int(readGroupChunks))
-    )
+    feature_width, read_group_bytes = persisted_read_group(array)
     merged = _feature_group_ranges(
         array,
         feat_idx=feat_idx,
         feat_starts=feat_starts,
-        readGroupChunks=group_chunks,
+        featureWidth=feature_width,
     )
     if not merged:
         return iter(())
@@ -426,98 +461,110 @@ def map_feature_read_groups(
         selected_cells = np.asarray(cell_idx, dtype=np.int64)
     n_selected = int(selected_cells.shape[0])
     budget = resources or resolve_budget()
+    resolved_io = io or DEFAULT_STORAGE_IO_POLICY
     itemsize = geometry.itemsize
     bands = _selected_cell_bands(
         selected_cells,
         n_cells=n_cells,
         cell_chunk=cell_chunk,
     )
-    max_local = max((feat_end - feat_start) for feat_start, feat_end in merged)
-    max_band = (
-        max(cell_end - cell_start for cell_start, cell_end, _local, _dest in bands)
-        if bands
-        else 1
+    in_flight, requested = _admit_groups_in_flight(
+        budget,
+        io=resolved_io,
+        readGroupBytes=read_group_bytes,
     )
-    unit_bytes = max_local * n_selected * itemsize + max_local * max_band * itemsize
-    if unit_bytes > budget.memoryBytes:
-        raise MemoryError(
-            "One feature read group plus its source cell band exceeds "
-            "the operation memory limit"
+    if metrics is not None:
+        metrics.clear()
+        metrics.update(
+            {
+                "requestedGroupsInFlight": requested,
+                "effectiveGroupsInFlight": in_flight,
+                "readGroupBytes": read_group_bytes,
+                "featureWidth": feature_width,
+            }
         )
-    in_flight = (
-        max(1, int(readGroupsInFlight))
-        if readGroupsInFlight is not None
-        else _groups_in_flight(budget, unit_bytes)
-    )
 
     from ..utils.progress import tqdmbar
 
-    results: list[T] = []
     progress_bar = tqdmbar(desc=progress, total=len(merged)) if progress else None
 
-    async def _operation(runner: AsyncStorageRunner) -> None:
-        source = array.async_array
-        turn = asyncio.Condition()
-        next_idx = 0
+    def _run(deliver: Callable[[T], None], stop: threading.Event) -> None:
+        async def _operation(runner: AsyncStorageRunner) -> None:
+            source = array.async_array
+            turn = asyncio.Condition()
+            next_idx = 0
 
-        async def _one_group(idx: int, feat_start: int, feat_end: int) -> None:
-            nonlocal next_idx
-            n_local = feat_end - feat_start
-            destination_bytes = max(1, n_local * n_selected * itemsize)
-            async with runner.reserve_bytes(destination_bytes):
-                dest = np.empty((n_local, n_selected), dtype=array.dtype)
-                started = time.perf_counter()
-                for cell_start, cell_end, local, destinations in bands:
-                    read_bytes = n_local * (cell_end - cell_start) * itemsize
-                    async with runner.reserve_bytes(read_bytes):
-                        async with runner.read_lane():
-                            block = np.asarray(
-                                await source.getitem(
-                                    (
-                                        slice(feat_start, feat_end),
-                                        slice(cell_start, cell_end),
+            async def _one_group(idx: int, feat_start: int, feat_end: int) -> None:
+                nonlocal next_idx
+                if stop.is_set():
+                    async with turn:
+                        while next_idx != idx:
+                            await turn.wait()
+                        next_idx += 1
+                        turn.notify_all()
+                    return
+                n_local = feat_end - feat_start
+                destination_bytes = max(1, n_local * n_selected * itemsize)
+                async with runner.reserve_bytes(destination_bytes):
+                    dest = np.empty((n_local, n_selected), dtype=array.dtype)
+                    started = time.perf_counter()
+                    for cell_start, cell_end, local, destinations in bands:
+                        read_bytes = n_local * (cell_end - cell_start) * itemsize
+                        async with runner.reserve_bytes(read_bytes):
+                            async with runner.read_lane():
+                                block = np.asarray(
+                                    await source.getitem(
+                                        (
+                                            slice(feat_start, feat_end),
+                                            slice(cell_start, cell_end),
+                                        )
                                     )
                                 )
-                            )
-                        dest[:, destinations] = block[:, local]
-                group = FeatureReadGroup(
-                    featStart=int(feat_start),
-                    featEnd=int(feat_end),
-                    values=dest,
-                    readSec=time.perf_counter() - started,
-                    blockBytes=int(dest.nbytes),
-                )
-                async with turn:
-                    while next_idx != idx:
-                        await turn.wait()
-                    results.append(process(group))
-                    next_idx += 1
-                    turn.notify_all()
-                    if progress_bar is not None:
-                        progress_bar.update(1)
-
-        pending: set[asyncio.Task[None]] = set()
-        async with asyncio.TaskGroup() as tasks:
-            for idx, (feat_start, feat_end) in enumerate(merged):
-                pending.add(tasks.create_task(_one_group(idx, feat_start, feat_end)))
-                if len(pending) >= in_flight:
-                    done, pending = await asyncio.wait(
-                        pending,
-                        return_when=asyncio.FIRST_COMPLETED,
+                            dest[:, destinations] = block[:, local]
+                    group = FeatureReadGroup(
+                        featStart=int(feat_start),
+                        featEnd=int(feat_end),
+                        values=dest,
+                        readSec=time.perf_counter() - started,
+                        blockBytes=int(dest.nbytes),
                     )
-                    for completed in done:
-                        completed.result()
+                    async with turn:
+                        while next_idx != idx:
+                            await turn.wait()
+                        item = process(group)
+                        await asyncio.to_thread(deliver, item)
+                        next_idx += 1
+                        turn.notify_all()
+                        if progress_bar is not None:
+                            progress_bar.update(1)
 
-    try:
-        AsyncStorageRunner(
-            budget,
-            chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
-            readGroupsInFlight=in_flight,
-        ).run(_operation)
-    finally:
-        if progress_bar is not None:
-            progress_bar.close()
-    return iter(results)
+            pending: set[asyncio.Task[None]] = set()
+            async with asyncio.TaskGroup() as tasks:
+                for idx, (feat_start, feat_end) in enumerate(merged):
+                    if stop.is_set():
+                        break
+                    pending.add(
+                        tasks.create_task(_one_group(idx, feat_start, feat_end))
+                    )
+                    if len(pending) >= in_flight:
+                        done, pending = await asyncio.wait(
+                            pending,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for completed in done:
+                            completed.result()
+
+        try:
+            AsyncStorageRunner(
+                budget,
+                chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
+                readGroupsInFlight=in_flight,
+            ).run(_operation)
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
+
+    return _iter_bounded_handoff(in_flight=in_flight, run=_run)
 
 
 def map_feature_cell_bands(
@@ -529,31 +576,21 @@ def map_feature_cell_bands(
     feat_starts: Sequence[int] | None = None,
     resources: ResourceBudget | None = None,
     progress: str | None = None,
-    readGroupChunks: int | None = None,
-    readGroupsInFlight: int | None = None,
+    io: StorageIoPolicy | None = None,
+    metrics: dict[str, Any] | None = None,
 ) -> Iterator[T]:
-    """Map ``process`` over cell-band slices in deterministic feature order.
-
-    Each callback receives one raw decoded band. Active cells are described by
-    ``selectedLocal`` rather than a gathered copy. Independent bands stay in
-    flight up to the admitted memory/worker limit. ``process`` runs in band
-    order so reductions stay deterministic.
-    """
+    """Map ``process`` over cell-band slices in deterministic feature order."""
     array = as_zarr_array(counts_t)
     geometry = _plane(array)
     _n_feats, n_cells = (int(value) for value in geometry.shape)
     feat_chunk = geometry.axisChunk(0)
     cell_chunk = geometry.axisChunk(1)
-    group_chunks = (
-        planned_read_group_chunks(array)
-        if readGroupChunks is None
-        else max(1, int(readGroupChunks))
-    )
+    feature_width, read_group_bytes = persisted_read_group(array)
     merged = _feature_group_ranges(
         array,
         feat_idx=feat_idx,
         feat_starts=feat_starts,
-        readGroupChunks=group_chunks,
+        featureWidth=feature_width,
     )
     if not merged:
         return iter(())
@@ -576,92 +613,107 @@ def map_feature_cell_bands(
         return iter(())
 
     budget = resources or resolve_budget()
+    resolved_io = io or DEFAULT_STORAGE_IO_POLICY
     itemsize = geometry.itemsize
-    max_local = max(feat_end - feat_start for feat_start, feat_end, *_rest in work)
-    max_band = max(
-        cell_end - cell_start for _fs, _fe, cell_start, cell_end, _local, _dest in work
+    in_flight, requested = _admit_groups_in_flight(
+        budget,
+        io=resolved_io,
+        readGroupBytes=read_group_bytes,
     )
-    unit_bytes = max(1, max_local * max_band * itemsize)
-    if unit_bytes > budget.memoryBytes:
-        raise MemoryError("One feature cell band exceeds the operation memory limit")
-    in_flight = (
-        max(1, int(readGroupsInFlight))
-        if readGroupsInFlight is not None
-        else _groups_in_flight(budget, unit_bytes)
-    )
+    if metrics is not None:
+        metrics.clear()
+        metrics.update(
+            {
+                "requestedGroupsInFlight": requested,
+                "effectiveGroupsInFlight": in_flight,
+                "readGroupBytes": read_group_bytes,
+                "featureWidth": feature_width,
+            }
+        )
 
     from ..utils.progress import tqdmbar
 
-    results: list[T] = []
     progress_bar = tqdmbar(desc=progress, total=len(work)) if progress else None
 
-    async def _operation(runner: AsyncStorageRunner) -> None:
-        source = array.async_array
-        turn = asyncio.Condition()
-        next_idx = 0
+    def _run(deliver: Callable[[T], None], stop: threading.Event) -> None:
+        async def _operation(runner: AsyncStorageRunner) -> None:
+            source = array.async_array
+            turn = asyncio.Condition()
+            next_idx = 0
 
-        async def _one_band(
-            idx: int,
-            feat_start: int,
-            feat_end: int,
-            cell_start: int,
-            cell_end: int,
-            local: np.ndarray,
-            destinations: np.ndarray,
-        ) -> None:
-            nonlocal next_idx
-            n_local = feat_end - feat_start
-            read_bytes = max(1, n_local * (cell_end - cell_start) * itemsize)
-            started = time.perf_counter()
-            async with runner.reserve_bytes(read_bytes):
-                async with runner.read_lane():
-                    block = np.asarray(
-                        await source.getitem(
-                            (
-                                slice(feat_start, feat_end),
-                                slice(cell_start, cell_end),
+            async def _one_band(
+                idx: int,
+                feat_start: int,
+                feat_end: int,
+                cell_start: int,
+                cell_end: int,
+                local: np.ndarray,
+                destinations: np.ndarray,
+            ) -> None:
+                nonlocal next_idx
+                if stop.is_set():
+                    async with turn:
+                        while next_idx != idx:
+                            await turn.wait()
+                        next_idx += 1
+                        turn.notify_all()
+                    return
+                n_local = feat_end - feat_start
+                read_bytes = max(1, n_local * (cell_end - cell_start) * itemsize)
+                started = time.perf_counter()
+                async with runner.reserve_bytes(read_bytes):
+                    async with runner.read_lane():
+                        block = np.asarray(
+                            await source.getitem(
+                                (
+                                    slice(feat_start, feat_end),
+                                    slice(cell_start, cell_end),
+                                )
                             )
                         )
+                    band = FeatureCellBand(
+                        featStart=int(feat_start),
+                        featEnd=int(feat_end),
+                        cellStart=int(cell_start),
+                        cellEnd=int(cell_end),
+                        values=block,
+                        selectedLocal=local,
+                        selectedDestinations=destinations,
+                        readSec=time.perf_counter() - started,
+                        blockBytes=int(block.nbytes),
                     )
-                band = FeatureCellBand(
-                    featStart=int(feat_start),
-                    featEnd=int(feat_end),
-                    cellStart=int(cell_start),
-                    cellEnd=int(cell_end),
-                    values=block,
-                    selectedLocal=local,
-                    selectedDestinations=destinations,
-                    readSec=time.perf_counter() - started,
-                    blockBytes=int(block.nbytes),
-                )
-                async with turn:
-                    while next_idx != idx:
-                        await turn.wait()
-                    results.append(process(band))
-                    next_idx += 1
-                    turn.notify_all()
-                    if progress_bar is not None:
-                        progress_bar.update(1)
+                    async with turn:
+                        while next_idx != idx:
+                            await turn.wait()
+                        item = process(band)
+                        await asyncio.to_thread(deliver, item)
+                        next_idx += 1
+                        turn.notify_all()
+                        if progress_bar is not None:
+                            progress_bar.update(1)
 
-        pending: set[asyncio.Task[None]] = set()
-        async with asyncio.TaskGroup() as tasks:
-            for idx, spec in enumerate(work):
-                pending.add(tasks.create_task(_one_band(idx, *spec)))
-                if len(pending) >= in_flight:
-                    done, pending = await asyncio.wait(
-                        pending,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for completed in done:
-                        completed.result()
+            pending: set[asyncio.Task[None]] = set()
+            async with asyncio.TaskGroup() as tasks:
+                for idx, spec in enumerate(work):
+                    if stop.is_set():
+                        break
+                    pending.add(tasks.create_task(_one_band(idx, *spec)))
+                    if len(pending) >= in_flight:
+                        done, pending = await asyncio.wait(
+                            pending,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for completed in done:
+                            completed.result()
 
-    try:
-        AsyncStorageRunner(
-            budget,
-            chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
-            readGroupsInFlight=in_flight,
-        ).run(_operation)
-    finally:
-        if progress_bar is not None:
-            progress_bar.close()
-    return iter(results)
+        try:
+            AsyncStorageRunner(
+                budget,
+                chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
+                readGroupsInFlight=in_flight,
+            ).run(_operation)
+        finally:
+            if progress_bar is not None:
+                progress_bar.close()
+
+    return _iter_bounded_handoff(in_flight=in_flight, run=_run)

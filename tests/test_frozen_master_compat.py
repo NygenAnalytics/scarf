@@ -1,10 +1,9 @@
 """Hard-break migration gates against a frozen pre-1.0 master-format store.
 
 These tests download a genuine master-format (Zarr v2) RNA store from the
-public cytebase bucket. Under the mandatory strip-``countsT`` contract, opening
-that archive as RNA must fail with a migration error. A repacked copy must
-preserve graph and marker layout while the untouched legacy archive digest
-stays identical.
+public cytebase bucket. Opening that archive as RNA must fail closed and ask
+for a rebuild. A repacked copy must preserve graph and marker layout while the
+untouched legacy archive digest stays identical.
 
 The corpus lives under a ``_legacy_master`` dataset. Cytebase publishes the
 current-format store under the plain dataset name, and the archive it replaced
@@ -87,9 +86,11 @@ def test_frozen_master_rna_open_hard_breaks_without_strip_counts_t(
         "unsupported-layout",
         "incomplete",
         "shape-dtype-mismatch",
+        "missing-layout-metadata",
+        "layout-mismatch",
     }
 
-    with pytest.raises(ValueError, match="countsT|Zarr v3|strip"):
+    with pytest.raises(ValueError, match="countsT|Zarr v3|Rebuild|repack"):
         DataStore(frozen_master_store, default_assay=_ASSAY, zarr_mode="r")
 
 

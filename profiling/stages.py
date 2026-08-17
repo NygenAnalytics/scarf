@@ -3,7 +3,6 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -15,11 +14,10 @@ from scarf.storage.stores import open_store
 from scarf.storage.types import as_zarr_array, as_zarr_group
 
 from profiling.config import (
-    CountMatrixLayout,
-    ExecutionPolicy,
+    CountMatrixConfig,
     StageName,
     StageResources,
-    StorageLayout,
+    StorageIoConfig,
     WorkflowParameters,
 )
 from profiling.metrics import ResourceMeasurement, ResourceSampler, StageTimer
@@ -67,6 +65,29 @@ class StageRunResult:
         return asdict(self)
 
 
+def _count_matrix_policy(config: CountMatrixConfig | None) -> Any:
+    if config is None:
+        return None
+    from scarf.storage.count_matrix import CountMatrixPolicy
+
+    return CountMatrixPolicy(unitBytes=config.unitBytes, chunkBytes=config.chunkBytes)
+
+
+def _storage_io_policy(config: StorageIoConfig | None) -> Any:
+    if config is None:
+        return None
+    from scarf.storage.io_policy import StorageIoPolicy
+
+    return StorageIoPolicy(
+        sourceReadsInFlight=config.sourceReadsInFlight,
+        sourceGroupChunks=config.sourceGroupChunks,
+        destShardsInFlight=config.destShardsInFlight,
+        destCommitsInFlight=config.destCommitsInFlight,
+        computeWorkers=config.computeWorkers,
+        groupsInFlight=config.groupsInFlight,
+    )
+
+
 def _open_datastore(
     storeUri: str,
     workflow: WorkflowParameters,
@@ -74,6 +95,7 @@ def _open_datastore(
     *,
     initialize: bool,
     storeProbe: Any | None = None,
+    storageIo: StorageIoConfig | None = None,
 ) -> DataStore:
     options = storage_options(storeUri)
     location: Any = storeUri
@@ -92,6 +114,7 @@ def _open_datastore(
         "zarrProfile": ("cloud" if storeUri.startswith("s3://") else "fast_local"),
         "storage_options": options,
         "mem_budget": resources.scarfMemoryBudget,
+        "storageIo": _storage_io_policy(storageIo),
     }
     if initialize:
         arguments.update(
@@ -102,11 +125,6 @@ def _open_datastore(
                 "min_cells_per_feature": workflow.minCellsPerFeature,
             }
         )
-    if workflow.countMatrixWriter == "experimental":
-        from scarf.storage.count_matrix import allow_experimental_layout_reads
-
-        with allow_experimental_layout_reads():
-            return DataStore(location, **arguments)
     return DataStore(location, **arguments)
 
 
@@ -121,7 +139,8 @@ def _prepare_create_store(
     storeUri: str,
     workflow: WorkflowParameters,
     resources: StageResources,
-    storageLayout: StorageLayout | None = None,
+    countMatrix: CountMatrixConfig | None = None,
+    storageIo: StorageIoConfig | None = None,
     storeProbe: Any | None = None,
 ) -> tuple[H5adReader, H5adToZarr]:
     options = storage_options(storeUri)
@@ -144,12 +163,6 @@ def _prepare_create_store(
         feature_ids_key="_index",
         feature_name_key="feature_name",
     )
-    layout_kwargs: dict[str, Any] = {}
-    if storageLayout is not None:
-        if storageLayout.targetChunkBytes is not None:
-            layout_kwargs["targetChunkBytes"] = storageLayout.targetChunkBytes
-        if storageLayout.targetShardBytes is not None:
-            layout_kwargs["targetShardBytes"] = storageLayout.targetShardBytes
     try:
         writer = H5adToZarr(
             reader,
@@ -159,7 +172,8 @@ def _prepare_create_store(
             mem_budget=resources.scarfMemoryBudget,
             nthreads=resources.workers,
             profile=("cloud" if storeUri.startswith("s3://") else "fast_local"),
-            **layout_kwargs,
+            policy=_count_matrix_policy(countMatrix),
+            io=_storage_io_policy(storageIo),
         )
     except BaseException:
         _close_h5ad_reader(reader)
@@ -389,7 +403,6 @@ def _prepare_counts_t_write(
     storeUri: str,
     assayName: str,
     resources: StageResources,
-    countMatrixWriter: str = "current",
     storeProbe: Any | None = None,
 ) -> _CountsTWriteContext:
     budget = resolve_budget(
@@ -409,12 +422,7 @@ def _prepare_counts_t_write(
         location = wrap_recording_store(resolved, probe=storeProbe)
     root = open_store(location, mode="r+", storage_options=options)
     group = as_zarr_group(root[assayName], name=assayName)
-    counts_name = (
-        "countsCandidate"
-        if countMatrixWriter == "experimental" and "countsCandidate" in group
-        else "counts"
-    )
-    counts = as_zarr_array(group[counts_name], name=f"{assayName}/{counts_name}")
+    counts = as_zarr_array(group["counts"], name=f"{assayName}/counts")
     before_complete = None
     if "countsT" in group:
         before_complete = group["countsT"].attrs.get("complete")
@@ -431,136 +439,42 @@ def _write_counts_t(
     *,
     storeUri: str,
     assayName: str,
-    maxShardBytes: int | None = None,
-    targetChunkBytes: int | None = None,
-    countMatrixWriter: str = "current",
-    countMatrixLayout: CountMatrixLayout | None = None,
-    executionPolicy: ExecutionPolicy | None = None,
+    countMatrix: CountMatrixConfig | None = None,
+    storageIo: StorageIoConfig | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    from scarf.storage.sharding import (
-        COUNTS_T_MAX_SHARD_BYTES,
-        COUNTS_T_TARGET_CHUNK_BYTES,
-        counts_t_write_plan_details,
-        plan_counts_t_write_for_array,
-        write_counts_t,
-        write_counts_t_experimental,
-    )
+    from scarf.storage.count_matrix import plan_count_matrix_pair
+    from scarf.storage.sharding import write_counts_t
 
     profile = "cloud" if storeUri.startswith("s3://") else "fast_local"
-    if countMatrixWriter == "experimental":
-        from scarf.storage.async_execution import resolve_execution_plan
-        from scarf.storage.count_matrix import (
-            EXPERIMENTAL_POLICY,
-            CountMatrixLayoutPolicy,
-            plan_count_matrix_pair,
-        )
-
-        policy = (
-            EXPERIMENTAL_POLICY
-            if countMatrixLayout is None
-            else CountMatrixLayoutPolicy(
-                targetReadUnitBytes=countMatrixLayout.targetReadUnitBytes,
-                targetChunkBytes=countMatrixLayout.targetChunkBytes,
-            )
-        )
-        budget = context.budget
-        plan = plan_count_matrix_pair(
-            int(context.counts.shape[0]),
-            int(context.counts.shape[1]),
-            context.counts.dtype,
-            policy=policy,
-            profile=profile,
-        )
-        if executionPolicy is not None:
-            resolved_execution = resolve_execution_plan(
-                budget,
-                chunksPerShard=plan.chunksPerShard,
-                readGroupsInFlight=executionPolicy.readGroupsInFlight,
-                destinationCommitsInFlight=(executionPolicy.destinationCommitsInFlight),
-            )
-            requested_execution = (
-                executionPolicy.codecWorkerLimit,
-                executionPolicy.zarrAsyncConcurrency,
-                executionPolicy.computeWorkerLimit,
-            )
-            resolved_limits = (
-                resolved_execution.codecWorkerLimit,
-                resolved_execution.zarrAsyncConcurrency,
-                resolved_execution.computeWorkerLimit,
-            )
-            if requested_execution != resolved_limits:
-                raise ValueError(
-                    "executionPolicy runtime limits do not match the "
-                    f"resource-derived plan: requested={requested_execution}, "
-                    f"resolved={resolved_limits}"
-                )
-        writer_metrics: dict[str, Any] = {}
-        counts_t = write_counts_t_experimental(
-            context.counts,
-            context.group,
-            policy=policy,
-            profile=profile,
-            resources=budget,
-            readGroupChunks=1
-            if executionPolicy is None
-            else executionPolicy.readGroupChunks,
-            readGroupsInFlight=1
-            if executionPolicy is None
-            else executionPolicy.readGroupsInFlight,
-            destinationCommitsInFlight=1
-            if executionPolicy is None
-            else executionPolicy.destinationCommitsInFlight,
-            metrics=writer_metrics,
-        )
-        return counts_t, {
-            "writer": "experimental",
-            "fingerprint": plan.fingerprint,
-            "strategy": plan.strategy,
-            "sourceDecodeAmplification": plan.sourceDecodeAmplification,
-            "countsTChunks": list(plan.countsT.chunks),
-            "countsTShards": list(plan.countsT.shards or ()),
-            "metrics": writer_metrics,
-            "kind": "observed",
-        }
-
-    shard_bytes = (
-        COUNTS_T_MAX_SHARD_BYTES if maxShardBytes is None else int(maxShardBytes)
+    policy = _count_matrix_policy(countMatrix)
+    pair_kwargs: dict[str, Any] = {"profile": profile}
+    if policy is not None:
+        pair_kwargs["policy"] = policy
+    pair = plan_count_matrix_pair(
+        int(context.counts.shape[0]),
+        int(context.counts.shape[1]),
+        context.counts.dtype,
+        **pair_kwargs,
     )
-    chunk_bytes = (
-        COUNTS_T_TARGET_CHUNK_BYTES
-        if targetChunkBytes is None
-        else int(targetChunkBytes)
-    )
-    plan = plan_counts_t_write_for_array(
-        context.counts,
-        profile=profile,
-        resources=context.budget,
-        maxShardBytes=shard_bytes,
-        targetChunkBytes=chunk_bytes,
-    )
-    plan_details = counts_t_write_plan_details(
-        plan,
-        nFeats=int(context.counts.shape[1]),
-        nCells=int(context.counts.shape[0]),
-        itemsize=int(np.dtype(context.counts.dtype).itemsize),
-    )
-    plan_details["maxShardBytes"] = shard_bytes
-    plan_details["targetChunkBytes"] = chunk_bytes
-    plan_details["writer"] = "current"
+    writer_metrics: dict[str, Any] = {}
     counts_t = write_counts_t(
         context.counts,
         context.group,
         profile=profile,
         resources=context.budget,
-        maxShardBytes=shard_bytes,
-        targetChunkBytes=chunk_bytes,
+        policy=policy,
+        io=_storage_io_policy(storageIo),
+        metrics=writer_metrics,
     )
-    if counts_t is None:
-        raise RuntimeError(
-            f"write_counts_t skipped for {assayName} (Zarr format < 3); "
-            "cannot create countsT"
-        )
-    return counts_t, plan_details
+    return counts_t, {
+        "writer": "product",
+        "fingerprint": pair.fingerprint,
+        "sourceDecodeAmplification": pair.sourceDecodeAmplification,
+        "countsTChunks": list(pair.countsT.chunks),
+        "countsTShards": list(pair.countsT.shards or ()),
+        "metrics": writer_metrics,
+        "kind": "observed",
+    }
 
 
 def _validate_counts_t(
@@ -572,7 +486,6 @@ def _validate_counts_t(
     resources: StageResources,
     nCheckTiles: int,
     seed: int,
-    experimentalLayout: bool = False,
 ) -> dict[str, Any]:
     if countsT.attrs.get("complete") is not True:
         raise RuntimeError(
@@ -591,23 +504,18 @@ def _validate_counts_t(
             f"countsT dtype {countsT.dtype} != counts dtype {context.counts.dtype}"
         )
 
-    from scarf.storage.sharding import (
-        is_paired_counts_t_layout,
-        is_strip_counts_t_layout,
-    )
+    from scarf.storage.sharding import is_readable_counts_t_layout
     from scarf.storage.types import array_metadata_shards
 
     shards = array_metadata_shards(countsT)
     layout_arguments = {
         "shape": tuple(int(v) for v in countsT.shape),
         "chunks": tuple(int(v) for v in countsT.chunks),
-        "shards": () if shards is None else tuple(int(v) for v in shards),
+        "shards": None if shards is None else tuple(int(v) for v in shards),
         "dtype": countsT.dtype,
     }
-    valid_layout = shards is not None and (
-        is_paired_counts_t_layout(**layout_arguments)
-        if experimentalLayout
-        else is_strip_counts_t_layout(**layout_arguments)
+    valid_layout = shards is not None and is_readable_counts_t_layout(
+        **layout_arguments
     )
     if not valid_layout:
         countsT.attrs["complete"] = False
@@ -661,6 +569,28 @@ def _validate_counts_t(
     }
 
 
+def install_stage_zarr_runtime(resources: StageResources) -> None:
+    """Install the process Zarr runtime once from the first stage budget."""
+    from scarf.storage.async_execution import (
+        configure_zarr_runtime,
+        resolve_execution_plan,
+        zarr_runtime_installed,
+    )
+
+    if zarr_runtime_installed():
+        return
+    runtime = resolve_execution_plan(
+        resolve_budget(
+            memory=resources.scarfMemoryBudget,
+            workers=resources.workers,
+        )
+    )
+    configure_zarr_runtime(
+        codecWorkers=runtime.codecWorkerLimit,
+        asyncConcurrency=runtime.zarrAsyncConcurrency,
+    )
+
+
 def run_stage(
     stage: StageName,
     *,
@@ -669,9 +599,8 @@ def run_stage(
     workflow: WorkflowParameters,
     resources: StageResources,
     localH5adPath: Path | None = None,
-    storageLayout: StorageLayout | None = None,
-    countMatrixLayout: CountMatrixLayout | None = None,
-    executionPolicy: ExecutionPolicy | None = None,
+    countMatrix: CountMatrixConfig | None = None,
+    storageIo: StorageIoConfig | None = None,
     workDir: Path | None = None,
     sampleIntervalSeconds: float = 0.25,
     containerMemoryMb: int | None = None,
@@ -682,13 +611,7 @@ def run_stage(
     recordStoreOperations: bool = False,
     clientProvenance: dict[str, Any] | None = None,
 ) -> StageRunResult:
-    if executionPolicy is not None:
-        from scarf.storage.async_execution import configure_zarr_runtime
-
-        configure_zarr_runtime(
-            codecWorkers=executionPolicy.codecWorkerLimit,
-            asyncConcurrency=executionPolicy.zarrAsyncConcurrency,
-        )
+    install_stage_zarr_runtime(resources)
     timer = StageTimer()
     cpu_started = time.process_time()
     sampler = ResourceSampler(
@@ -721,13 +644,14 @@ def run_stage(
                             storeUri=storeUri,
                             workflow=workflow,
                             resources=resources,
-                            storageLayout=storageLayout,
+                            countMatrix=countMatrix,
+                            storageIo=storageIo,
                             storeProbe=store_probe,
                         )
                     with timer.operation():
                         assert writer is not None
                         # Keep createStore = counts only. writeCountsT owns
-                        # strip countsT so the two stages stay measurable.
+                        # paired countsT so the two stages stay measurable.
                         writer._write_counts(batch_size=workflow.h5adBatchSize)
                 finally:
                     writer = None
@@ -743,7 +667,6 @@ def run_stage(
                             storeUri=storeUri,
                             assayName=workflow.assayName,
                             resources=resources,
-                            countMatrixWriter=workflow.countMatrixWriter,
                             storeProbe=store_probe,
                         )
                     with timer.operation():
@@ -752,11 +675,8 @@ def run_stage(
                             counts_context,
                             storeUri=storeUri,
                             assayName=workflow.assayName,
-                            maxShardBytes=workflow.countsTMaxShardBytes,
-                            targetChunkBytes=workflow.countsTTargetChunkBytes,
-                            countMatrixWriter=workflow.countMatrixWriter,
-                            countMatrixLayout=countMatrixLayout,
-                            executionPolicy=executionPolicy,
+                            countMatrix=countMatrix,
+                            storageIo=storageIo,
                         )
                     with timer.validationPersistence():
                         assert counts_context is not None
@@ -770,9 +690,6 @@ def run_stage(
                                 resources=resources,
                                 nCheckTiles=3,
                                 seed=0,
-                                experimentalLayout=(
-                                    workflow.countMatrixWriter == "experimental"
-                                ),
                             ),
                         }
                 finally:
@@ -788,6 +705,7 @@ def run_stage(
                             resources,
                             initialize=True,
                             storeProbe=store_probe,
+                            storageIo=storageIo,
                         )
                 finally:
                     store = None
@@ -801,6 +719,7 @@ def run_stage(
                             resources,
                             initialize=False,
                             storeProbe=store_probe,
+                            storageIo=storageIo,
                         )
                 finally:
                     store = None
@@ -835,6 +754,7 @@ def run_stage(
                             resources,
                             initialize=False,
                             storeProbe=store_probe,
+                            storageIo=storageIo,
                         )
                     with timer.operation():
                         assert store is not None
@@ -842,22 +762,13 @@ def run_stage(
                             f"[run_stage] datastore open; ENTER analysis stage={stage}",
                             flush=True,
                         )
-                        if workflow.countMatrixWriter == "experimental":
-                            from scarf.storage.count_matrix import (
-                                allow_experimental_layout_reads,
-                            )
-
-                            read_context = allow_experimental_layout_reads()
-                        else:
-                            read_context = nullcontext()
-                        with read_context:
-                            analysis_details = _run_analysis(
-                                stage,
-                                store,
-                                workflow,
-                                resources,
-                                invalidateCache=invalidateCache,
-                            )
+                        analysis_details = _run_analysis(
+                            stage,
+                            store,
+                            workflow,
+                            resources,
+                            invalidateCache=invalidateCache,
+                        )
                         if analysis_details:
                             details = {
                                 **(details or {}),
@@ -959,8 +870,6 @@ def _feature_consume_details(
     resources: StageResources,
 ) -> dict[str, Any]:
     return {
-        "featureConsume": workflow.featureConsume,
-        "appliedInternalMode": workflow.featureConsume,
         "workers": resources.workers,
         "scarfMemoryBudget": resources.scarfMemoryBudget,
         "kind": "observed",
@@ -1143,14 +1052,6 @@ def _run_analysis(
     consume_details: dict[str, Any] | None = None
     if stage in {"markHvgs", "findMarkers"}:
         consume_details = _feature_consume_details(workflow, resources)
-    if stage in {"markHvgs", "runPca", "findMarkers"} and isinstance(
-        store,
-        DataStore,
-    ):
-        assay = store._get_assay(workflow.assayName)
-        if hasattr(assay, "_feature_consume_mode"):
-            assay._experimentalFeatureConsume = workflow.featureConsume
-
     if stage == "filterCells":
         store.auto_filter_cells(
             attrs=workflow.filterAttrs,
@@ -1181,7 +1082,7 @@ def _run_analysis(
             hvg_key_name=workflow.hvgKey,
             invalidate_cache=invalidateCache,
         )
-        return {"featureConsume": consume_details}
+        return {"consume": consume_details}
     if stage == "runNormalization":
         store.run_normalization(
             from_assay=workflow.assayName,
@@ -1265,7 +1166,7 @@ def _run_analysis(
             skip_save=False,
             invalidate_cache=invalidateCache,
         )
-        return {"featureConsume": consume_details}
+        return {"consume": consume_details}
     if stage == "runClustering":
         raise AssertionError("runClustering must execute in its child process")
     if stage == "importClusters":

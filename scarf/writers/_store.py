@@ -12,6 +12,7 @@ from ..storage.schema import (
     create_zarr_count_assay as _create_zarr_count_assay,
     load_count_array as _load_count_array,
 )
+from ..storage.count_matrix import CountMatrixPolicy
 from ..storage.profiles import StorageProfile
 from ..storage.stores import load_zarr as load_zarr
 
@@ -71,25 +72,9 @@ def create_zarr_count_assay(
     dtype: str = "uint32",
     *,
     profile: StorageProfile | None = None,
-    targetChunkBytes: int | None = None,
-    targetShardBytes: int | None = None,
+    policy: CountMatrixPolicy | None = None,
 ) -> zarr.Array:
-    """Creates and returns a Zarr array with name 'counts'.
-
-    Args:
-        z (zarr.Group):
-        assay_name (str):
-        workspace (str | None):
-        n_cells (int):
-        feat_ids (np.ndarray | list[str]):
-        feat_names (np.ndarray | list[str]):
-        dtype (str = 'uint32'):
-        targetChunkBytes: Optional inner-chunk byte target.
-        targetShardBytes: Optional full-width shard byte target.
-
-    Returns:
-        A Zarr array.
-    """
+    """Creates and returns a Zarr array with name 'counts'."""
     return _create_zarr_count_assay(
         z,
         assay_name,
@@ -99,8 +84,7 @@ def create_zarr_count_assay(
         feat_names,
         dtype,
         profile=profile,
-        targetChunkBytes=targetChunkBytes,
-        targetShardBytes=targetShardBytes,
+        policy=policy,
     )
 
 

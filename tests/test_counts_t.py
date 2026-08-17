@@ -10,7 +10,15 @@ from scarf.features.genomic.melding import coordinate_melding
 from scarf.features.markers import find_markers_by_rank, find_markers_by_regression
 from scarf.metadata import MetaData
 from scarf.quality_control.doublets import write_doublet_target_zarr
+from scarf.storage.async_execution import reset_zarr_runtime_for_tests
 from scarf.storage.budget import ResourceBudget
+from scarf.storage.count_matrix import (
+    COUNT_MATRIX_LAYOUT_KEY,
+    CountMatrixPolicy,
+    DEFAULT_COUNT_MATRIX_POLICY,
+    persist_count_matrix_plan,
+    plan_count_matrix_pair,
+)
 from scarf.storage.layout import ZarrArraySpec
 from scarf.storage.profiles import resolve_storage_profile
 from scarf.storage.sharding import counts_t_spec, write_counts_t
@@ -19,6 +27,14 @@ from scarf.writers import (
     create_zarr_count_assay,
 )
 from tests.store_probes import RecordingStore
+
+
+def setup_function() -> None:
+    reset_zarr_runtime_for_tests()
+
+
+def teardown_function() -> None:
+    reset_zarr_runtime_for_tests()
 
 
 def _memory_root() -> zarr.Group:
@@ -80,15 +96,9 @@ def test_explicit_write_counts_t_builds_complete_counts_t(workspace):
 
 
 def test_counts_t_spec_matches_write_layout_and_data():
-    root = _memory_root()
-    group = root.create_group("RNA")
     values = np.arange(24, dtype=np.uint32).reshape(6, 4)
-    counts = group.create_array(
-        "counts",
-        data=values,
-        chunks=(3, 2),
-    )
-    profile = resolve_storage_profile(root.store)
+    group, counts = _counts_array(values)
+    profile = resolve_storage_profile(group.store)
     preview = counts_t_spec(
         ZarrArraySpec(
             shape=tuple(int(value) for value in counts.shape),
@@ -111,35 +121,19 @@ def test_counts_t_spec_matches_write_layout_and_data():
 
 
 def test_write_counts_t_marks_incomplete_until_finished():
-    root = _memory_root()
-    group = root.create_group("RNA")
-    counts = group.create_array(
-        "counts",
-        shape=(4, 3),
-        chunks=(2, 2),
-        dtype=np.uint32,
-        fill_value=0,
-    )
-    counts[:] = np.arange(12, dtype=np.uint32).reshape(4, 3)
+    values = np.arange(12, dtype=np.uint32).reshape(4, 3)
+    group, counts = _counts_array(values)
     counts_t = write_counts_t(counts, group)
     assert counts_t is not None
     assert counts_t.attrs["complete"] is True
     np.testing.assert_array_equal(counts_t[:], counts[:].T)
 
 
-def test_write_counts_t_uses_strip_layout_independent_of_source_chunks():
-    from scarf.storage.sharding import choose_strip_layout
+def test_write_counts_t_uses_paired_layout_from_source_plan():
     from scarf.storage.types import array_metadata_shards
 
-    root = _memory_root()
-    group = root.create_group("RNA")
     values = np.arange(22 * 7, dtype=np.uint32).reshape(22, 7)
-    counts = group.create_array(
-        "counts",
-        data=values,
-        chunks=(6, 4),
-    )
-
+    group, counts = _counts_array(values)
     counts_t = write_counts_t(
         counts,
         group,
@@ -147,12 +141,9 @@ def test_write_counts_t_uses_strip_layout_independent_of_source_chunks():
     )
 
     assert counts_t is not None
-    expected = choose_strip_layout(7, 22, values.dtype.itemsize)
-    assert counts_t.chunks == (expected["geneStrip"], expected["cellChunk"])
-    assert array_metadata_shards(counts_t) == (
-        expected["geneStrip"],
-        expected["shardCells"],
-    )
+    expected = plan_count_matrix_pair(22, 7, values.dtype).countsT
+    assert counts_t.chunks == expected.chunks
+    assert array_metadata_shards(counts_t) == expected.shards
     np.testing.assert_array_equal(counts_t[:], values.T)
 
 
@@ -232,7 +223,7 @@ def test_rna_requires_strip_counts_t():
     assert stats["normed_tot"].shape == (3,)
 
     del root["RNA/countsT"]
-    with pytest.raises(ValueError, match="requires a complete strip-sharded"):
+    with pytest.raises(ValueError, match="requires a complete sharded"):
         RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
 
 
@@ -244,7 +235,7 @@ def test_rna_rejects_unsharded_counts_t():
     del root["RNA/countsT"]
     root["RNA"].create_array("countsT", data=values.T, chunks=(1, 2))
     root["RNA/countsT"].attrs["complete"] = True
-    with pytest.raises(ValueError, match="unsupported countsT layout"):
+    with pytest.raises(ValueError, match="layout metadata is missing|Rebuild"):
         RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
 
 
@@ -582,23 +573,32 @@ def test_write_doublet_target_rejects_summary_before_truncating_destination():
 def _counts_array(
     values: np.ndarray,
     *,
-    chunks: tuple[int, int] = (3, 2),
-    shards: tuple[int, int] | None = None,
+    policy: CountMatrixPolicy | None = None,
     store: MemoryStore | None = None,
 ) -> tuple[zarr.Group, zarr.Array]:
+    plan = plan_count_matrix_pair(
+        values.shape[0],
+        values.shape[1],
+        values.dtype,
+        policy=policy or DEFAULT_COUNT_MATRIX_POLICY,
+    )
     root = zarr.open_group(
         store=store if store is not None else MemoryStore(), mode="w"
     )
     group = root.create_group("RNA")
     counts = group.create_array(
         "counts",
-        shape=values.shape,
-        chunks=chunks,
-        shards=shards,
+        shape=plan.counts.shape,
+        chunks=plan.counts.chunks,
+        shards=plan.counts.shards,
         dtype=values.dtype,
         fill_value=0,
+        overwrite=True,
     )
-    counts[:] = values
+    if values.size:
+        counts[:] = values
+    persist_count_matrix_plan(group, plan)
+    persist_count_matrix_plan(counts, plan)
     return group, counts
 
 
@@ -621,12 +621,13 @@ def test_write_counts_t_transposes_exactly(workers):
 
 
 def test_write_counts_t_geometry_matches_serial_baseline():
-    from scarf.storage.sharding import choose_strip_layout
+    from scarf.storage.count_matrix import plan_count_matrix_pair
     from scarf.storage.types import array_metadata_shards
 
     values = _dense_values(22, 7)
     metadata = []
     for workers in (1, 4):
+        reset_zarr_runtime_for_tests()
         group, counts = _counts_array(values)
         counts_t = write_counts_t(
             counts,
@@ -643,10 +644,10 @@ def test_write_counts_t_geometry_matches_serial_baseline():
         )
 
     assert metadata[0] == metadata[1]
-    expected = choose_strip_layout(7, 22, values.dtype.itemsize)
+    expected = plan_count_matrix_pair(22, 7, values.dtype).countsT
     assert metadata[0][0] == (7, 22)
-    assert metadata[0][1] == (expected["geneStrip"], expected["cellChunk"])
-    assert metadata[0][2] == (expected["geneStrip"], expected["shardCells"])
+    assert metadata[0][1] == expected.chunks
+    assert metadata[0][2] == expected.shards
 
 
 def test_write_counts_t_covers_edge_strips():
@@ -662,189 +663,38 @@ def test_write_counts_t_covers_edge_strips():
     np.testing.assert_array_equal(counts_t[6:7, :], values[:, 6:7].T)
 
 
-def test_write_counts_t_writes_each_strip_once():
-    store = RecordingStore()
+def test_write_counts_t_is_exact_and_complete():
     values = _dense_values(22, 7)
-    group, counts = _counts_array(values, store=store)
-    store.reset()
+    group, counts = _counts_array(values)
     counts_t = write_counts_t(
         counts,
         group,
         resources=ResourceBudget(8 * 1024**3, 4),
     )
-    chunk_ops = store.chunk_ops("RNA/countsT/c/")
-    assert {kind for kind, _ in chunk_ops} == {"set"}
-    keys = [key for _, key in chunk_ops]
-    assert len(keys) == len(set(keys))
-    gene_strip = int(counts_t.chunks[0])
-    n_strips = (7 + gene_strip - 1) // gene_strip
-    assert len(keys) == n_strips
+    assert counts_t is not None
+    assert counts_t.attrs["complete"] is True
     np.testing.assert_array_equal(counts_t[:], values.T)
 
 
-def test_counts_t_write_plan_grows_with_memory():
-    from scarf.storage.sharding import COUNTS_T_MAX_UPLOAD_WORKERS, plan_counts_t_write
+def test_preflight_counts_t_spec_rejects_when_one_shard_cannot_fit():
+    from scarf.storage.layout import ZarrArraySpec
+    from scarf.storage.sharding import preflight_counts_t_spec
 
-    # Force many small strips so concurrency is the admission variable.
-    tight = plan_counts_t_write(
-        nFeats=2000,
-        nCells=100_000,
+    spec = ZarrArraySpec(
+        shape=(1_000_000, 8),
+        chunks=(1000, 8),
         dtype=np.uint16,
-        sourceCellRows=1000,
-        resources=ResourceBudget(80 * 1024**2, 2),
-        residentBytes=0,
-        profile="fast_local",
-        maxShardBytes=100 * 100_000 * 2,
+        compressors=None,
+        shards=(1000, 8),
+        fillValue=0,
+        overwrite=True,
     )
-    roomy = plan_counts_t_write(
-        nFeats=2000,
-        nCells=100_000,
-        dtype=np.uint16,
-        sourceCellRows=1000,
-        resources=ResourceBudget(320 * 1024**2, 4),
-        residentBytes=0,
-        profile="fast_local",
-        maxShardBytes=100 * 100_000 * 2,
-    )
-    assert tight.nStrips == 20
-    assert tight.stripsPerBatch >= 1
-    assert tight.stripsPerBatch <= COUNTS_T_MAX_UPLOAD_WORKERS
-    assert roomy.stripsPerBatch <= COUNTS_T_MAX_UPLOAD_WORKERS
-    assert roomy.stripsPerBatch <= roomy.nStrips
-    assert roomy.uploadWorkers >= tight.uploadWorkers
-    assert roomy.uploadWorkers >= roomy.stripsPerBatch
-
-
-def test_counts_t_write_plan_caps_in_memory_strips_and_prefers_uploads():
-    from scarf.storage.sharding import COUNTS_T_MAX_UPLOAD_WORKERS, plan_counts_t_write
-
-    plan = plan_counts_t_write(
-        nFeats=45_000,
-        nCells=5_000_000,
-        dtype=np.uint16,
-        sourceCellRows=7370,
-        resources=ResourceBudget(48 * 1024**3, 16),
-        residentBytes=0,
-        profile="fast_local",
-        maxShardBytes=1024**3,
-    )
-    assert plan.nStrips > COUNTS_T_MAX_UPLOAD_WORKERS
-    assert plan.stripsPerBatch <= COUNTS_T_MAX_UPLOAD_WORKERS
-    assert plan.uploadWorkers == COUNTS_T_MAX_UPLOAD_WORKERS
-    assert plan.uploadWorkers == plan.stripsPerBatch
-    assert plan.readWorkers >= plan.uploadWorkers
-    # Four ~1 GiB strips plus encode scratch; previously this shape admitted ~45 strips.
-    assert plan.peakBytes < 16 * 1024**3
-    assert plan.peakBytes < 48 * 1024**3 // 2
-
-
-def test_counts_t_write_plan_rejects_when_one_strip_cannot_fit():
-    from scarf.storage.sharding import plan_counts_t_write
-
-    with pytest.raises(MemoryError, match="countsT strip write needs"):
-        plan_counts_t_write(
-            nFeats=8,
-            nCells=1_000_000,
-            dtype=np.uint16,
-            sourceCellRows=1000,
-            resources=ResourceBudget(8 * 1024**2, 2),
-            residentBytes=0,
+    with pytest.raises(MemoryError, match="countsT write needs"):
+        preflight_counts_t_spec(
+            spec,
             profile="fast_local",
-            maxShardBytes=2 * 1_000_000 * 2,
+            resources=ResourceBudget(8 * 1024**2, 2),
         )
-
-
-def test_choose_strip_layout_pads_awkward_cell_counts():
-    from scarf.storage.sharding import choose_strip_layout, is_strip_counts_t_layout
-
-    layout = choose_strip_layout(30_000, 1_000_003, 4)
-    assert layout["cellChunk"] > 1
-    assert layout["shardCells"] >= 1_000_003
-    assert layout["shardCells"] % layout["cellChunk"] == 0
-    assert is_strip_counts_t_layout(
-        shape=(30_000, 1_000_003),
-        chunks=(layout["geneStrip"], layout["cellChunk"]),
-        shards=(layout["geneStrip"], layout["shardCells"]),
-        dtype=np.uint32,
-    )
-
-
-def test_is_strip_counts_t_layout_accepts_structural_variants():
-    from scarf.storage.sharding import is_strip_counts_t_layout
-
-    assert is_strip_counts_t_layout(
-        shape=(100, 1000),
-        chunks=(10, 128),
-        shards=(10, 1024),
-        dtype=np.uint16,
-    )
-    assert not is_strip_counts_t_layout(
-        shape=(100, 1000),
-        chunks=(10, 128),
-        shards=(20, 1024),
-        dtype=np.uint16,
-    )
-    assert not is_strip_counts_t_layout(
-        shape=(100, 1000),
-        chunks=(10, 128),
-        shards=(10, 512),
-        dtype=np.uint16,
-    )
-
-
-def test_write_counts_t_uploads_disjoint_strips_concurrently(monkeypatch):
-    import threading
-
-    import zarr
-
-    import scarf.storage.sharding as sharding
-
-    original = sharding.choose_strip_layout
-
-    def tiny_strips(n_feats, n_cells, itemsize, **kwargs):
-        return original(
-            n_feats,
-            n_cells,
-            itemsize,
-            maxShardBytes=64,
-            targetChunkBytes=32,
-        )
-
-    monkeypatch.setattr(sharding, "choose_strip_layout", tiny_strips)
-    store = RecordingStore()
-    values = _dense_values(32, 16)
-    group, counts = _counts_array(values, store=store)
-
-    active = 0
-    max_active = 0
-    lock = threading.Lock()
-    release = threading.Event()
-    real_setitem = zarr.Array.__setitem__
-
-    def counted_setitem(self, selection, value):
-        nonlocal active, max_active
-        with lock:
-            active += 1
-            max_active = max(max_active, active)
-            if active >= 2:
-                release.set()
-        if not release.wait(timeout=5):
-            raise TimeoutError("concurrent strip uploads did not overlap")
-        try:
-            return real_setitem(self, selection, value)
-        finally:
-            with lock:
-                active -= 1
-
-    monkeypatch.setattr(zarr.Array, "__setitem__", counted_setitem)
-    store.reset()
-    write_counts_t(
-        counts,
-        group,
-        resources=ResourceBudget(8 * 1024**3, 4),
-    )
-    assert max_active >= 2
-    np.testing.assert_array_equal(group["countsT"][:], values.T)
 
 
 def test_write_counts_t_overwrite_leaves_no_stale_chunks():
@@ -859,8 +709,20 @@ def test_write_counts_t_overwrite_leaves_no_stale_chunks():
     stale = sorted(k for k in store._store_dict if k.startswith("RNA/countsT/c/"))
 
     smaller = values[:6]
-    counts.resize(smaller.shape)
+    plan = plan_count_matrix_pair(smaller.shape[0], smaller.shape[1], smaller.dtype)
+    del group["counts"]
+    counts = group.create_array(
+        "counts",
+        shape=plan.counts.shape,
+        chunks=plan.counts.chunks,
+        shards=plan.counts.shards,
+        dtype=smaller.dtype,
+        fill_value=0,
+        overwrite=True,
+    )
     counts[:] = smaller
+    persist_count_matrix_plan(group, plan)
+    persist_count_matrix_plan(counts, plan)
     counts_t = write_counts_t(
         counts,
         group,
@@ -873,26 +735,17 @@ def test_write_counts_t_overwrite_leaves_no_stale_chunks():
     np.testing.assert_array_equal(counts_t[:], smaller.T)
 
 
-def test_write_counts_t_restores_without_async_concurrency_mutation():
-    before = zarr.config.get("async.concurrency")
-    values = _dense_values(24, 8)
-    group, counts = _counts_array(values)
-    write_counts_t(
-        counts,
-        group,
-        resources=ResourceBudget(8 * 1024**3, 4),
-    )
-    assert zarr.config.get("async.concurrency") == before
-
-
-def test_write_counts_t_stays_incomplete_when_a_strip_fails(monkeypatch):
+def test_write_counts_t_stays_incomplete_when_the_write_fails(monkeypatch):
     values = _dense_values(24, 8)
     group, counts = _counts_array(values)
 
-    def boom(self, selection):
+    def boom(*_args, **_kwargs):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(type(counts), "__getitem__", boom)
+    monkeypatch.setattr(
+        "scarf.storage.async_execution.AsyncStorageRunner.run",
+        boom,
+    )
     with pytest.raises(RuntimeError, match="boom"):
         write_counts_t(
             counts,
@@ -973,6 +826,54 @@ def test_inspect_counts_t_reports_dtype_mismatch(tmp_path):
     assert mismatch.status == "shape-dtype-mismatch"
 
 
+def test_inspect_counts_t_reports_missing_layout_metadata(tmp_path):
+    from scarf.storage.counts_t_contract import inspect_counts_t
+
+    path = tmp_path / "missing-layout.zarr"
+    root = zarr.open_group(str(path), mode="w")
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    _write_small_assay(root, workspace=None, values=values)
+    for node in (root["RNA"], root["RNA/counts"], root["RNA/countsT"]):
+        if COUNT_MATRIX_LAYOUT_KEY in node.attrs:
+            del node.attrs[COUNT_MATRIX_LAYOUT_KEY]
+    missing = inspect_counts_t(root, "RNA")
+    assert missing.status == "missing-layout-metadata"
+    assert "Rebuild" in missing.reason or "repack" in missing.reason.lower()
+
+
+def test_inspect_counts_t_reports_layout_mismatch(tmp_path):
+    from scarf.storage.counts_t_contract import inspect_counts_t
+
+    path = tmp_path / "layout-mismatch.zarr"
+    root = zarr.open_group(str(path), mode="w")
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    _write_small_assay(root, workspace=None, values=values)
+    payload = dict(root["RNA/countsT"].attrs[COUNT_MATRIX_LAYOUT_KEY])
+    payload["fingerprint"] = "wrong"
+    root["RNA/countsT"].attrs[COUNT_MATRIX_LAYOUT_KEY] = payload
+    mismatch = inspect_counts_t(root, "RNA")
+    assert mismatch.status == "layout-mismatch"
+    assert "Rebuild" in mismatch.reason or "repack" in mismatch.reason.lower()
+
+
+def test_inspect_counts_t_reports_retired_layout_keys(tmp_path):
+    from scarf.storage.counts_t_contract import inspect_counts_t
+
+    path = tmp_path / "retired-keys.zarr"
+    root = zarr.open_group(str(path), mode="w")
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    _write_small_assay(root, workspace=None, values=values)
+    retired = {
+        "targetReadUnitBytes": 1_000_000_000,
+        "targetChunkBytes": 100_000_000,
+    }
+    for node in (root["RNA"], root["RNA/counts"], root["RNA/countsT"]):
+        node.attrs[COUNT_MATRIX_LAYOUT_KEY] = retired
+    missing = inspect_counts_t(root, "RNA")
+    assert missing.status == "missing-layout-metadata"
+    assert "retired" in missing.reason.lower() or "Rebuild" in missing.reason
+
+
 def test_assess_counts_t_reuse_outcomes(tmp_path):
     from scarf.merge.writer import assess_counts_t_reuse
 
@@ -1014,6 +915,55 @@ def test_assess_counts_t_reuse_outcomes(tmp_path):
         root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
     )
     assert layout.outcome == "rewrite-layout"
+
+
+def test_assess_counts_t_reuse_keeps_non_default_unit(tmp_path):
+    from scarf.merge.writer import assess_counts_t_reuse
+    from scarf.storage.count_matrix import load_count_matrix_plan
+
+    path = tmp_path / "reuse-unit.zarr"
+    root = zarr.open_group(str(path), mode="w")
+    values = np.arange(12, dtype=np.uint32).reshape(3, 4)
+    n_cells, n_feats = values.shape
+    create_cell_data(
+        root,
+        None,
+        ids=np.array([f"c{i}" for i in range(n_cells)]),
+        names=np.array([f"c{i}" for i in range(n_cells)]),
+    )
+    policy = CountMatrixPolicy(unitBytes=2_000_000_000, chunkBytes=100_000_000)
+    create_zarr_count_assay(
+        z=root,
+        assay_name="RNA",
+        workspace=None,
+        n_cells=n_cells,
+        feat_ids=np.array([f"f{i}" for i in range(n_feats)]),
+        feat_names=np.array([f"g{i}" for i in range(n_feats)]),
+        dtype="uint32",
+        policy=policy,
+    )
+    counts = root["RNA/counts"]
+    counts[:] = values
+    write_counts_t(
+        counts,
+        root["RNA"],
+        resources=ResourceBudget(1024**3, 2),
+        policy=policy,
+    )
+    ok = assess_counts_t_reuse(
+        root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
+    )
+    assert ok.outcome == "reusable"
+    stored = load_count_matrix_plan(root["RNA/counts"])
+    assert stored["policy"]["unitBytes"] == 2_000_000_000
+
+    for node in (root["RNA"], root["RNA/counts"], root["RNA/countsT"]):
+        if COUNT_MATRIX_LAYOUT_KEY in node.attrs:
+            del node.attrs[COUNT_MATRIX_LAYOUT_KEY]
+    missing = assess_counts_t_reuse(
+        root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
+    )
+    assert missing.outcome == "rewrite-layout"
 
 
 def test_subset_preserves_gene_activity_alias(tmp_path):

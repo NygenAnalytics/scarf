@@ -1,6 +1,7 @@
 """One async coordinator for Scarf-owned Zarr array operations."""
 
 import asyncio
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -33,13 +34,15 @@ def resolve_execution_plan(
     chunksPerShard: int = 10,
     readGroupsInFlight: int = 1,
     destinationCommitsInFlight: int = 1,
+    computeWorkerLimit: int = 1,
 ) -> ExecutionPlan:
     workers = max(1, int(resources.workers))
     codec_workers = max(1, workers - 1) if workers > 1 else 1
+    compute_workers = min(workers, max(1, int(computeWorkerLimit)))
     return ExecutionPlan(
         codecWorkerLimit=codec_workers,
         zarrAsyncConcurrency=min(codec_workers, max(1, int(chunksPerShard))),
-        computeWorkerLimit=1,
+        computeWorkerLimit=compute_workers,
         readGroupsInFlight=max(1, int(readGroupsInFlight)),
         destinationCommitsInFlight=max(1, int(destinationCommitsInFlight)),
         chunksPerShard=max(1, int(chunksPerShard)),
@@ -71,6 +74,11 @@ def install_zarr_runtime(plan: ExecutionPlan, *, _explicit: bool = False) -> Non
 
 def ensure_zarr_runtime(plan: ExecutionPlan) -> None:
     install_zarr_runtime(plan)
+
+
+def zarr_runtime_installed() -> bool:
+    """Return True when this process already has a Zarr executor."""
+    return _INSTALLED_RUNTIME is not None
 
 
 def configure_zarr_runtime(
@@ -166,6 +174,7 @@ class AsyncStorageRunner:
         chunksPerShard: int = 10,
         readGroupsInFlight: int = 1,
         destinationCommitsInFlight: int = 1,
+        computeWorkerLimit: int = 1,
     ):
         self.resources = resources
         self.plan = resolve_execution_plan(
@@ -173,6 +182,7 @@ class AsyncStorageRunner:
             chunksPerShard=chunksPerShard,
             readGroupsInFlight=readGroupsInFlight,
             destinationCommitsInFlight=destinationCommitsInFlight,
+            computeWorkerLimit=computeWorkerLimit,
         )
         if (
             _EXPLICIT_RUNTIME
@@ -194,10 +204,21 @@ class AsyncStorageRunner:
             asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(self._run(operation))
-        raise RuntimeError(
-            "AsyncStorageRunner.run cannot nest inside a running event loop; "
-            "await the operation on the existing runner instead"
-        )
+        error: list[BaseException] = []
+        result: list[T] = []
+
+        def _in_thread() -> None:
+            try:
+                result.append(asyncio.run(self._run(operation)))
+            except BaseException as exc:
+                error.append(exc)
+
+        thread = threading.Thread(target=_in_thread)
+        thread.start()
+        thread.join()
+        if error:
+            raise error[0]
+        return result[0]
 
     async def _run(
         self,

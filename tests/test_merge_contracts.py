@@ -24,7 +24,7 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    DataStoreMerge: "8d5e4c00d6b678298c8bd60aacb7293a9e382936b0a7c17ba824a56edc191b09",
+    DataStoreMerge: "96cfe6d07ac5536f04d1cd333a42f58957fe3ab5d89c69b65acea72b2d5bf5f6",
 }
 _FACADE_METHODS = {
     MergePlan: (),
@@ -68,6 +68,7 @@ def test_merge_plan_and_result_fields_are_stable():
     expected = {
         AssayMergePlan: (
             "assayName",
+            "assayType",
             "sourcePresent",
             "missingSources",
             "nFeatures",

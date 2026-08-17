@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 
 from ..readers import CrReader
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -41,8 +43,8 @@ class CrToZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -54,6 +56,8 @@ class CrToZarr:
 
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.policy = policy
+        self.io = io
         self.cr = cr
         mark_schema_captured = getattr(self.cr, "_mark_schema_captured", None)
         if callable(mark_schema_captured):
@@ -81,8 +85,7 @@ class CrToZarr:
                 feat_names=self.cr.feature_names(assay_name),
                 dtype=dtype,
                 profile=self.profile,
-                targetChunkBytes=targetChunkBytes,
-                targetShardBytes=targetShardBytes,
+                policy=policy,
             )
         self._write_reader_metadata(cell_group, assay_names)
 
@@ -359,6 +362,8 @@ class CrToZarr:
                 self.workspace,
                 resources=self.resources,
                 profile=self.profile,
+                policy=self.policy,
+                io=self.io,
             )
         finally:
             if callable(release):

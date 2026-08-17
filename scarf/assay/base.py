@@ -70,11 +70,13 @@ class Assay:
         min_cells_per_feature: int = 10,
         matrix_root: zarr.Group | None = None,
         resources: ResourceBudget | None = None,
+        storageIo: Any | None = None,
     ) -> None:
         self.name = name
         self.cells = cell_data
         self.resources = resources or resolve_budget(workers=nthreads)
         self.nthreads = self.resources.workers
+        self.storageIo = storageIo
         matrix_root = z if matrix_root is None else matrix_root
         if workspace is None:
             counts_path = f"{name}/counts"
@@ -101,6 +103,7 @@ class Assay:
             )
             self.feats = MetaData(z[f"{workspace}/{name}/featureData"])  # type: ignore
             self.z = as_zarr_group(z[f"{workspace}/{name}"], name=f"{workspace}/{name}")
+        self.matrixGroup = matrix_group
         self.rawDataT: zarr.Array | None = None
         if "countsT" in matrix_group:
             try:

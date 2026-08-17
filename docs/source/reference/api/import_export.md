@@ -184,10 +184,9 @@ Explicit positive values remain supported.
 
 Use `DataStoreMerge` to merge DataStores.
 Pass `assays=["RNA"]` when only one assay type is needed.
-RNA assays always receive a strip-sharded feature-major `countsT` matrix (roughly doubles stored
-counts for those assays). Non-RNA assays never write `countsT`.
-Interrupted merges resume at whole-component boundaries (`cellData`, each assay `counts`, and each
-RNA `countsT`) rather than mid-matrix shards.
+RNA assays write both `counts` and a gene-major `countsT` copy, which roughly doubles stored counts for those assays.
+Non-RNA assays never write `countsT`.
+Interrupted merges resume at whole-component boundaries (`cellData`, each assay `counts`, and each RNA `countsT`) rather than mid-matrix.
 
 ```{eval-rst}
 .. autoclass:: scarf.merge.DataStoreMerge

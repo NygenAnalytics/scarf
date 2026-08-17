@@ -4,15 +4,17 @@ import zarr
 
 from profiling import stages as profiling_stages
 from profiling.config import (
-    CountMatrixLayout,
-    ExecutionPolicy,
+    CountMatrixConfig,
     StageResources,
+    StorageIoConfig,
     WorkflowParameters,
 )
-from profiling.lattice_experiment import SCALED_POLICY, copy_candidate_counts
 from profiling.stages import run_stage
-from scarf.storage.budget import ResourceBudget
-from scarf.storage.sharding import write_counts_t
+from scarf.storage.count_matrix import (
+    CountMatrixPolicy,
+    persist_count_matrix_plan,
+    plan_count_matrix_pair,
+)
 
 
 def _resources() -> StageResources:
@@ -28,15 +30,39 @@ def _resources() -> StageResources:
     )
 
 
-def test_write_counts_t_rewrites_incomplete_array(tmp_path):
-    root_path = tmp_path / "store.zarr"
+def _seed_counts(root_path, values: np.ndarray) -> None:
+    policy = CountMatrixPolicy(unitBytes=2_000, chunkBytes=200)
+    plan = plan_count_matrix_pair(
+        values.shape[0],
+        values.shape[1],
+        values.dtype,
+        policy=policy,
+    )
     root = zarr.open_group(str(root_path), mode="w")
     group = root.create_group("RNA")
-    values = np.arange(24, dtype=np.uint32).reshape(6, 4)
-    counts = group.create_array("counts", shape=values.shape, dtype=values.dtype)
+    counts = group.create_array(
+        "counts",
+        shape=plan.counts.shape,
+        chunks=plan.counts.chunks,
+        shards=plan.counts.shards,
+        dtype=values.dtype,
+        overwrite=True,
+    )
     counts[:] = values
+    persist_count_matrix_plan(group, plan)
+    persist_count_matrix_plan(counts, plan)
+
+
+def test_write_counts_t_rewrites_incomplete_array(tmp_path):
+    from scarf.storage.sharding import write_counts_t
+
+    root_path = tmp_path / "store.zarr"
+    values = np.arange(24, dtype=np.uint32).reshape(6, 4)
+    _seed_counts(root_path, values)
+    root = zarr.open_group(str(root_path), mode="r+")
+    group = root["RNA"]
+    counts = group["counts"]
     counts_t = write_counts_t(counts, group)
-    assert counts_t is not None
     counts_t.attrs["complete"] = False
     counts_t[0, 0] = 999
 
@@ -61,11 +87,8 @@ def test_write_counts_t_rewrites_incomplete_array(tmp_path):
 
 def test_write_counts_t_runs_as_standard_profile_stage(tmp_path):
     root_path = tmp_path / "store.zarr"
-    root = zarr.open_group(str(root_path), mode="w")
-    group = root.create_group("RNA")
     values = np.arange(24, dtype=np.uint32).reshape(6, 4)
-    counts = group.create_array("counts", shape=values.shape, dtype=values.dtype)
-    counts[:] = values
+    _seed_counts(root_path, values)
 
     result = run_stage(
         "writeCountsT",
@@ -88,54 +111,39 @@ def test_write_counts_t_runs_as_standard_profile_stage(tmp_path):
     np.testing.assert_array_equal(reopened["RNA/countsT"][:], values.T)
 
 
-def test_experimental_profile_writer_uses_candidate_counts(tmp_path):
+def test_write_counts_t_forwards_storage_io(tmp_path):
+    from scarf.storage.async_execution import reset_zarr_runtime_for_tests
+
+    reset_zarr_runtime_for_tests()
     root_path = tmp_path / "store.zarr"
-    root = zarr.open_group(str(root_path), mode="w")
-    group = root.create_group("RNA")
-    values = np.arange(221 * 37, dtype=np.uint16).reshape(221, 37)
-    counts = group.create_array(
-        "counts",
-        shape=values.shape,
-        chunks=(50, 37),
-        shards=(100, 37),
-        dtype=values.dtype,
-    )
-    counts[:] = values
-    copy_candidate_counts(
-        group,
-        counts,
-        policy=SCALED_POLICY,
-        profile="fast_local",
-        resources=ResourceBudget(2 * 1024**3, 1),
-    )
+    values = np.arange(24, dtype=np.uint32).reshape(6, 4)
+    _seed_counts(root_path, values)
 
     result = run_stage(
         "writeCountsT",
-        nRows=values.shape[0],
+        nRows=6,
         storeUri=str(root_path),
-        workflow=WorkflowParameters(countMatrixWriter="experimental"),
+        workflow=WorkflowParameters(),
         resources=_resources(),
-        countMatrixLayout=CountMatrixLayout(
-            targetReadUnitBytes=SCALED_POLICY.targetReadUnitBytes,
-            targetChunkBytes=SCALED_POLICY.targetChunkBytes,
-        ),
-        executionPolicy=ExecutionPolicy(
-            codecWorkerLimit=1,
-            zarrAsyncConcurrency=1,
-            computeWorkerLimit=1,
-            readGroupsInFlight=1,
-            destinationCommitsInFlight=1,
-            readGroupChunks=1,
+        countMatrix=CountMatrixConfig(unitBytes=2_000, chunkBytes=200),
+        storageIo=StorageIoConfig(
+            sourceReadsInFlight=2,
+            destShardsInFlight=2,
+            destCommitsInFlight=2,
+            computeWorkers=1,
         ),
         sampleIntervalSeconds=0.01,
     )
 
     assert result.status == "ok", result.error
     assert result.details is not None
-    assert result.details["writer"] == "experimental"
-    assert result.details["metrics"]["peakLedgerBytes"] > 0
+    assert result.details["writer"] == "product"
+    metrics = result.details["metrics"]
+    assert metrics["requestedDestShardsInFlight"] == 2
+    assert metrics["requestedDestCommitsInFlight"] == 2
     reopened = zarr.open_group(str(root_path), mode="r")
     np.testing.assert_array_equal(reopened["RNA/countsT"][:], values.T)
+    reset_zarr_runtime_for_tests()
 
 
 def test_create_store_defers_counts_t_to_write_stage(tmp_path):
@@ -207,11 +215,8 @@ def test_write_counts_t_clears_complete_when_validation_fails(
     tmp_path,
 ):
     root_path = tmp_path / "store.zarr"
-    root = zarr.open_group(str(root_path), mode="w")
-    group = root.create_group("RNA")
     values = np.arange(24, dtype=np.uint32).reshape(6, 4)
-    counts = group.create_array("counts", shape=values.shape, dtype=values.dtype)
-    counts[:] = values
+    _seed_counts(root_path, values)
     original_write = profiling_stages._write_counts_t
 
     def corrupt_counts_t(*args, **kwargs):

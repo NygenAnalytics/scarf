@@ -11,6 +11,8 @@ from ..metadata.rows import (
     read_metadata_rows_chunkwise,
 )
 from ..storage.budget import ResourceBudget, admitted_worker_split
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.layout import ZarrArraySpec
 from ..storage.partition import affordable_width
 from ..storage.profiles import StorageProfile
@@ -143,8 +145,7 @@ def create_assay_counts(
     dtype: str,
     *,
     profile: StorageProfile,
-    targetChunkBytes: int | None,
-    targetShardBytes: int | None,
+    policy: CountMatrixPolicy | None,
 ) -> zarr.Array:
     counts = create_zarr_count_assay(
         z=root,
@@ -155,8 +156,7 @@ def create_assay_counts(
         feat_names=np.array(alignment.mergedFeatsMap["names"]),
         dtype=dtype,
         profile=profile,
-        targetChunkBytes=targetChunkBytes,
-        targetShardBytes=targetShardBytes,
+        policy=policy,
     )
     matrix_group = as_zarr_group(
         root[_matrix_group_path(assay_name, workspace)],
@@ -464,7 +464,9 @@ def write_assay_counts_t(
     profile: StorageProfile,
     resources: ResourceBudget,
     residentBytes: int = 0,
-) -> zarr.Array | None:
+    policy: CountMatrixPolicy | None = None,
+    io: StorageIoPolicy | None = None,
+) -> zarr.Array:
     counts = load_count_array(root, assay_name, workspace)
     group_path = _matrix_group_path(assay_name, workspace)
     group = as_zarr_group(root[group_path], name=group_path)
@@ -480,12 +482,9 @@ def write_assay_counts_t(
         profile=profile,
         resources=resources,
         residentBytes=residentBytes,
+        policy=policy,
+        io=io,
     )
-    if result is None:
-        raise ValueError(
-            "countsT could not be written for this destination. "
-            "Use a Zarr v3 store and repack if needed."
-        )
     logger.debug(f"Wrote countsT for assay {assay_name}")
     return result
 
@@ -636,12 +635,13 @@ def assess_counts_t_reuse(
     """Classify whether an existing ``countsT`` can be reused by merge.
 
     Outcomes:
-    - ``reusable``: complete strip layout matching shape and dtype
-    - ``rewrite-layout``: present but not a valid strip layout
+    - ``reusable``: complete paired layout matching the planned geometry
+    - ``rewrite-layout``: present but not the locked rotateOnce layout
     - ``incomplete``: missing or ``complete`` is not True
-    - ``block-shape/dtype``: complete strip that disagrees with the merge plan
+    - ``block-shape/dtype``: complete array that disagrees with the merge plan
     """
-    from ..storage.sharding import is_strip_counts_t_layout
+    from ..storage.count_matrix import require_count_matrix_layout
+    from ..storage.schema import load_count_array
 
     matrix_path = _matrix_group_path(assay_name, workspace)
     if matrix_path not in root:
@@ -682,19 +682,12 @@ def assess_counts_t_reuse(
                 f"expected {np.dtype(dtype)}"
             ),
         )
-    shards = array_metadata_shards(counts_t)
-    if not is_strip_counts_t_layout(
-        shape=actual_shape,
-        chunks=tuple(int(value) for value in counts_t.chunks),
-        shards=None if shards is None else tuple(int(value) for value in shards),
-        dtype=counts_t.dtype,
-    ):
+    try:
+        counts = load_count_array(root, assay_name, workspace)
+        require_count_matrix_layout(matrix_group, counts, counts_t)
+    except ValueError as exc:
         return CountsTReuseAssessment(
             outcome="rewrite-layout",
-            reason=(
-                f"countsT for {assay_name!r} must be strip-sharded "
-                "(geneStrip x allCells); unsharded or non-strip layouts "
-                "cannot be resumed"
-            ),
+            reason=str(exc),
         )
     return CountsTReuseAssessment(outcome="reusable", reason=None)

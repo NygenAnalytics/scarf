@@ -10,6 +10,7 @@ from zarr.storage import MemoryStore
 
 from scarf.readers import CrH5Reader, H5adReader
 from scarf.storage.budget import ResourceBudget
+from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.storage.layout import ZarrArraySpec, array_shard_rows, get_compressors
 from scarf.storage.sharding import (
     resolve_sparse_import_batch,
@@ -217,8 +218,7 @@ def test_crtozarr_automatic_rows_and_preflight_before_consume(
         MemoryStore(),
         dtype="uint16",
         mem_budget="64M",
-        targetChunkBytes=16,
-        targetShardBytes=32,
+        policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
     )
     writer.dump()
 
@@ -234,8 +234,7 @@ def test_crtozarr_automatic_rows_and_preflight_before_consume(
         MemoryStore(),
         dtype="uint16",
         mem_budget=1,
-        targetChunkBytes=16,
-        targetShardBytes=32,
+        policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
     )
     with pytest.raises(MemoryError, match="one source row"):
         writer.dump()
@@ -264,8 +263,7 @@ def test_h5ad_and_sparse_preflight_before_source_iteration(
         reader,
         MemoryStore(),
         mem_budget="64M",
-        targetChunkBytes=16,
-        targetShardBytes=32,
+        policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
     )
     consumed = False
 
@@ -290,8 +288,7 @@ def test_h5ad_and_sparse_preflight_before_source_iteration(
         cell_ids=[f"cell-{index}" for index in range(values.shape[0])],
         feature_ids=[f"feature-{index}" for index in range(values.shape[1])],
         mem_budget="64M",
-        targetChunkBytes=16,
-        targetShardBytes=32,
+        policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
     )
     sparse_writer.resources = ResourceBudget(1, 1)
     with pytest.raises(MemoryError, match="one source row"):
@@ -405,16 +402,14 @@ def test_cellranger_h5_automatic_matches_explicit_and_caches_planning(
             stores[0],
             dtype="uint16",
             mem_budget="64M",
-            targetChunkBytes=24,
-            targetShardBytes=48,
+            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=24),
         )
         explicit = CrToZarr(
             readers[1],
             stores[1],
             dtype="uint16",
             mem_budget="64M",
-            targetChunkBytes=24,
-            targetShardBytes=48,
+            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=24),
         )
         automatic.dump()
         explicit.dump(batch_size=3)
@@ -483,16 +478,14 @@ def test_h5ad_automatic_matches_explicit_for_split_assays(
             stores[0],
             assay_split_key="feature_types",
             mem_budget="64M",
-            targetChunkBytes=24,
-            targetShardBytes=48,
+            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=24),
         )
         explicit = H5adToZarr(
             readers[1],
             stores[1],
             assay_split_key="feature_types",
             mem_budget="64M",
-            targetChunkBytes=24,
-            targetShardBytes=48,
+            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=24),
         )
         automatic.dump()
         explicit.dump(batch_size=3)
@@ -545,8 +538,7 @@ def test_sparse_automatic_matches_explicit() -> None:
             cell_ids=[f"cell-{index}" for index in range(values.shape[0])],
             feature_ids=[f"feature-{index}" for index in range(values.shape[1])],
             mem_budget="64M",
-            targetChunkBytes=24,
-            targetShardBytes=48,
+            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=24),
         )
         for store in stores
     ]

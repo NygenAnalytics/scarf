@@ -4,6 +4,8 @@ import numpy as np
 
 from ..storage.types import as_zarr_group
 from ..readers import LoomReader
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -38,8 +40,8 @@ class LoomToZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import create_zarr_count_assay, validate_assay_name
@@ -49,6 +51,8 @@ class LoomToZarr:
         self.loom = loom
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.policy = policy
+        self.io = io
         self.workspace = workspace
         self.storage_options = storage_options
         if assay_name is None:
@@ -68,8 +72,7 @@ class LoomToZarr:
             feat_names=self.loom.feature_names(),
             dtype=self.loom.matrixDtype,
             profile=self.profile,
-            targetChunkBytes=targetChunkBytes,
-            targetShardBytes=targetShardBytes,
+            policy=policy,
         )
         self._ini_feature_data()
 
@@ -181,4 +184,6 @@ class LoomToZarr:
             self.workspace,
             resources=self.resources,
             profile=self.profile,
+            policy=self.policy,
+            io=self.io,
         )

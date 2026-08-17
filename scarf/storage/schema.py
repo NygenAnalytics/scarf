@@ -9,6 +9,7 @@ from .arrays import (
     create_numeric_array,
     create_zarr_obj_array,
 )
+from .count_matrix import CountMatrixPolicy, create_product_counts_array
 from .layout import _group_zarr_format, count_array_spec
 from .profiles import StorageProfile, resolve_storage_profile
 
@@ -66,8 +67,7 @@ def create_zarr_count_assay(
     dtype: str = "uint32",
     *,
     profile: StorageProfile | None = None,
-    targetChunkBytes: int | None = None,
-    targetShardBytes: int | None = None,
+    policy: CountMatrixPolicy | None = None,
 ) -> zarr.Array:
     validate_assay_name(assay_name)
     if workspace is None:
@@ -100,16 +100,25 @@ def create_zarr_count_assay(
         group = z.create_group(f"matrices/{assay_name}", overwrite=True)
     n_feats = len(feat_ids)
     zarr_format = _group_zarr_format(group)
-    spec = count_array_spec(
-        n_cells,
-        n_feats,
-        dtype=dtype,
-        profile=resolved_profile,
-        targetChunkBytes=targetChunkBytes,
-        targetShardBytes=targetShardBytes,
-        zarrFormat=zarr_format,
-    )
-    counts = create_numeric_array(group, "counts", spec)
+    if zarr_format >= 3:
+        counts = create_product_counts_array(
+            group,
+            n_cells,
+            n_feats,
+            dtype,
+            profile=resolved_profile,
+            policy=policy,
+        )
+    else:
+        spec = count_array_spec(
+            n_cells,
+            n_feats,
+            dtype=dtype,
+            profile=resolved_profile,
+            policy=policy,
+            zarrFormat=zarr_format,
+        )
+        counts = create_numeric_array(group, "counts", spec)
     stored_shards = array_metadata_shards(counts)
     group.attrs["scarf:zarr_spec"] = {
         "profile": resolved_profile,
@@ -132,8 +141,7 @@ def create_empty_zarr_count_assay(
     dtype: Any = "uint32",
     *,
     profile: StorageProfile | None = None,
-    targetChunkBytes: int | None = None,
-    targetShardBytes: int | None = None,
+    policy: CountMatrixPolicy | None = None,
 ) -> tuple[zarr.Array, zarr.Group]:
     """Create an assay whose feature metadata can be filled blockwise."""
     validate_assay_name(assay_name)
@@ -177,16 +185,25 @@ def create_empty_zarr_count_assay(
         else z.create_group(f"matrices/{assay_name}", overwrite=True)
     )
     zarr_format = _group_zarr_format(matrix_group)
-    spec = count_array_spec(
-        n_cells,
-        n_features,
-        dtype=dtype,
-        profile=resolved_profile,
-        targetChunkBytes=targetChunkBytes,
-        targetShardBytes=targetShardBytes,
-        zarrFormat=zarr_format,
-    )
-    counts = create_numeric_array(matrix_group, "counts", spec)
+    if zarr_format >= 3:
+        counts = create_product_counts_array(
+            matrix_group,
+            n_cells,
+            n_features,
+            dtype,
+            profile=resolved_profile,
+            policy=policy,
+        )
+    else:
+        spec = count_array_spec(
+            n_cells,
+            n_features,
+            dtype=dtype,
+            profile=resolved_profile,
+            policy=policy,
+            zarrFormat=zarr_format,
+        )
+        counts = create_numeric_array(matrix_group, "counts", spec)
     stored_shards = array_metadata_shards(counts)
     matrix_group.attrs["scarf:zarr_spec"] = {
         "profile": resolved_profile,

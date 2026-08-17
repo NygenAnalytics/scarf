@@ -13,11 +13,12 @@ from scarf.storage.async_execution import (
 )
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.count_matrix import (
-    CountMatrixLayoutPolicy,
+    CountMatrixPolicy,
     persist_count_matrix_plan,
     plan_count_matrix_pair,
 )
-from scarf.storage.sharding import write_counts_t_experimental
+from scarf.storage.io_policy import StorageIoPolicy
+from scarf.storage.sharding import write_counts_t
 
 
 @pytest.fixture(autouse=True)
@@ -31,11 +32,8 @@ def _root() -> zarr.Group:
     return zarr.open_group(store=MemoryStore(), mode="w")
 
 
-def _scaled_policy() -> CountMatrixLayoutPolicy:
-    return CountMatrixLayoutPolicy(
-        targetReadUnitBytes=2_000,
-        targetChunkBytes=200,
-    )
+def _scaled_policy() -> CountMatrixPolicy:
+    return CountMatrixPolicy(unitBytes=2_000, chunkBytes=200)
 
 
 def _write_counts(values: np.ndarray) -> tuple[zarr.Group, zarr.Array]:
@@ -61,12 +59,12 @@ def _write_counts(values: np.ndarray) -> tuple[zarr.Group, zarr.Array]:
     return group, counts
 
 
-def test_experimental_writer_transposes_multiple_chunks_and_edges() -> None:
+def test_writer_transposes_multiple_chunks_and_edges() -> None:
     values = (
         np.arange(17 * 41, dtype=np.uint16).reshape(17, 41) % np.iinfo(np.uint16).max
     )
     group, counts = _write_counts(values)
-    counts_t = write_counts_t_experimental(
+    counts_t = write_counts_t(
         counts,
         group,
         policy=_scaled_policy(),
@@ -75,6 +73,117 @@ def test_experimental_writer_transposes_multiple_chunks_and_edges() -> None:
     assert counts_t.attrs["complete"] is True
     np.testing.assert_array_equal(np.asarray(counts_t[:]), values.T)
     assert counts_t.shape == (41, 17)
+
+
+def test_writer_pipelines_destination_shards_and_commits() -> None:
+    values = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    group, counts = _write_counts(values)
+    metrics: dict[str, object] = {}
+    counts_t = write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(32 * 1024 * 1024, 4),
+        io=StorageIoPolicy(
+            sourceReadsInFlight=2,
+            destShardsInFlight=2,
+            destCommitsInFlight=2,
+            computeWorkers=2,
+        ),
+        metrics=metrics,
+    )
+    assert counts_t.attrs["complete"] is True
+    np.testing.assert_array_equal(np.asarray(counts_t[:]), values.T)
+    plan = plan_count_matrix_pair(64, 64, values.dtype, policy=_scaled_policy())
+    assert plan.countsT.shards is not None
+    feat_shards = -(-64 // int(plan.countsT.shards[0]))
+    cell_shards = -(-64 // int(plan.countsT.shards[1]))
+    expected_owners = feat_shards * cell_shards
+    assert expected_owners > 1
+    assert int(metrics["destinationOwners"]) == expected_owners
+    assert int(metrics["destinationCommits"]) == expected_owners
+    assert int(metrics["requestedDestShardsInFlight"]) == 2
+    assert int(metrics["effectiveDestShardsInFlight"]) == 2
+    assert int(metrics["requestedDestCommitsInFlight"]) == 2
+    assert int(metrics["requestedComputeWorkers"]) == 2
+    assert int(metrics["effectiveComputeWorkers"]) == 2
+
+
+def test_writer_reuses_complete_matching_destination() -> None:
+    values = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    group, counts = _write_counts(values)
+    first = write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(32 * 1024 * 1024, 2),
+    )
+    first.attrs["reuseSentinel"] = "keep"
+    second = write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(32 * 1024 * 1024, 2),
+    )
+    assert second.attrs.get("reuseSentinel") == "keep"
+    assert second.attrs["complete"] is True
+    np.testing.assert_array_equal(np.asarray(second[:]), values.T)
+
+
+def test_writer_resident_bytes_reduce_destination_width() -> None:
+    values = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    group, counts = _write_counts(values)
+    plan = plan_count_matrix_pair(
+        values.shape[0],
+        values.shape[1],
+        values.dtype,
+        policy=_scaled_policy(),
+    )
+    budget = 32 * 1024 * 1024
+    assert plan.countsT.shards is not None
+    dest_unit = (
+        int(plan.countsT.shards[0])
+        * int(plan.countsT.shards[1])
+        * int(values.dtype.itemsize)
+    )
+    per_dest = dest_unit + int(plan.sourceBufferBytes)
+    resident = budget - per_dest
+    metrics: dict[str, object] = {}
+    write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(budget, 8),
+        residentBytes=resident,
+        io=StorageIoPolicy(
+            sourceReadsInFlight=1,
+            destShardsInFlight=4,
+        ),
+        metrics=metrics,
+    )
+    assert int(metrics["requestedDestShardsInFlight"]) == 4
+    assert int(metrics["effectiveDestShardsInFlight"]) == 1
+    assert int(metrics["peakLedgerBytes"]) + resident <= budget
+
+
+def test_writer_keeps_source_reads_per_destination_shard() -> None:
+    values = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    group, counts = _write_counts(values)
+    metrics: dict[str, object] = {}
+    write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(64 * 1024 * 1024, 8),
+        io=StorageIoPolicy(
+            sourceReadsInFlight=3,
+            destShardsInFlight=2,
+        ),
+        metrics=metrics,
+    )
+    assert int(metrics["requestedSourceReadsInFlight"]) == 3
+    assert int(metrics["effectiveSourceReadsInFlight"]) > 1
+    assert int(metrics["effectiveDestShardsInFlight"]) == 2
 
 
 def test_retry_replaces_incomplete_destination() -> None:
@@ -90,7 +199,7 @@ def test_retry_replaces_incomplete_destination() -> None:
     )
     partial.attrs["complete"] = False
     partial[:] = 0
-    counts_t = write_counts_t_experimental(
+    counts_t = write_counts_t(
         counts,
         group,
         policy=_scaled_policy(),
@@ -100,7 +209,7 @@ def test_retry_replaces_incomplete_destination() -> None:
     np.testing.assert_array_equal(np.asarray(counts_t[:]), values.T)
 
 
-def test_experimental_writer_rejects_mismatched_persisted_plan() -> None:
+def test_writer_rejects_mismatched_persisted_plan() -> None:
     values = np.arange(20, dtype=np.uint16).reshape(4, 5)
     group, counts = _write_counts(values)
     recorded = dict(counts.attrs["scarf:countMatrixLayout"])
@@ -108,7 +217,7 @@ def test_experimental_writer_rejects_mismatched_persisted_plan() -> None:
     counts.attrs["scarf:countMatrixLayout"] = recorded
 
     with pytest.raises(ValueError, match="metadata does not match"):
-        write_counts_t_experimental(
+        write_counts_t(
             counts,
             group,
             policy=_scaled_policy(),
@@ -128,7 +237,7 @@ def test_byte_ledger_is_empty_after_success() -> None:
 
     AsyncStorageRunner.run = wrapped  # type: ignore[method-assign]
     try:
-        write_counts_t_experimental(
+        write_counts_t(
             counts,
             group,
             policy=_scaled_policy(),

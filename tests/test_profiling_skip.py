@@ -5,7 +5,7 @@ import pytest
 from profiling.config import (
     CORE_STAGE_ORDER,
     SELECTED_STAGE_ORDER,
-    StorageLayout,
+    CountMatrixConfig,
     WorkflowParameters,
     _normalize_raw_config,
     load_profiling_config,
@@ -39,11 +39,15 @@ def test_run_tag_isolates_store_and_result_uris():
     config = load_profiling_config(_EXAMPLE_CONFIG).model_copy(
         update={
             "runTag": "chunk256m",
-            "storageLayout": StorageLayout(targetChunkBytes=256 * 1024 * 1024),
+            "countMatrix": CountMatrixConfig(
+                unitBytes=256 * 1024 * 1024,
+                chunkBytes=128 * 1024 * 1024,
+            ),
         }
     )
     assert config.runTag == "chunk256m"
-    assert config.storageLayout.targetChunkBytes == 256 * 1024 * 1024
+    assert config.countMatrix is not None
+    assert config.countMatrix.unitBytes == 256 * 1024 * 1024
     assert config.storeUri(100_000).endswith("/stores/chunk256m/100000.zarr")
     assert config.resultUri(100_000, "markHvgs").endswith(
         "/results/chunk256m/100000/markHvgs.json"
@@ -150,10 +154,10 @@ def test_selected_stage_graph_is_available_and_rejects_gaps() -> None:
         ProfilingConfig.model_validate(payload)
 
 
-def test_partial_execution_policy_is_rejected() -> None:
+def test_partial_storage_io_is_rejected() -> None:
     from profiling.config import ProfilingConfig
 
     payload = load_profiling_config(_EXAMPLE_CONFIG).model_dump(mode="python")
-    payload["executionPolicy"] = {"readGroupsInFlight": 1}
+    payload["storageIo"] = {"sourceReadsInFlight": 0}
     with pytest.raises(Exception):
         ProfilingConfig.model_validate(payload)

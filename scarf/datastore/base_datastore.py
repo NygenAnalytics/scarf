@@ -127,6 +127,7 @@ class BaseDataStore:
         resources: ResourceBudget,
         storage_profile: StorageProfile,
         storage_options: dict[str, Any] | None = None,
+        storageIo: Any | None = None,
     ):
         self.zarr_mode = zarr_mode
         self.zarr_loc = zarr_loc
@@ -161,6 +162,7 @@ class BaseDataStore:
         self.nthreads = self.resources.workers
         self.memoryBytes = self.resources.memoryBytes
         self.storageProfile = storage_profile
+        self.storageIo = storageIo
         _ = self.assay_names
         # The order is critical here:
         self.cells = self._load_cells()
@@ -455,6 +457,7 @@ class BaseDataStore:
                     nthreads=self.nthreads,
                     matrix_root=self._matrix_z,
                     resources=self.resources,
+                    storageIo=self.storageIo,
                 )
             setattr(self, i, loaded_assay)
         if self.zw.attrs["assayTypes"] != z_attrs:

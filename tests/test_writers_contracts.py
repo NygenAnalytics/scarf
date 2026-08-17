@@ -59,13 +59,13 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    CrToZarr: "6ddc400f3edcce221a338b60bc528a83f086409ee59b7d3e6baebfa0980f8f75",
-    H5adToZarr: "c1993f1caa8cdb973c1bee9969cf107a3f39dbf2a2269d3e0a86f6c5f0b1d94b",
-    LoomToZarr: "a840271f303b73a2187148efb1e4651a6671b4283af83c0f28251d449f5754dd",
-    SparseToZarr: "78dcbc0d0d7d48a3d971ba0654260be39fd69157a5d3cb87f4d7191f0dee450d",
-    CSVtoZarr: "30b241f964ead70d6a44e0f09be571ea88d227cd78335651b3f1a38cadf3268e",
-    SubsetZarr: "ae6eb9a73c50d32b3716ea33002993bcd005461c68e0e784aec87a66ac3061e5",
-    SeuratToZarr: "824c0169d8b921397643c54fd57b8d238720669da376e02c21d226be87adb86f",
+    CrToZarr: "7b24b552fb00d9624015641a4b9d5bfa715288afcd9943e80601402ec622e37d",
+    H5adToZarr: "a8ca36670b32911cd32ab66370a8f5cc9b972a574e694f7a4f8e3dbdeae9d341",
+    LoomToZarr: "49707df259ee16c345fdb533866697da4dd1830638425a39e1ca0f4d24072fcf",
+    SparseToZarr: "a535ea51f1b26618f234d248af1e7e6900ba6f50a7aa14223079d95a8e0b68bb",
+    CSVtoZarr: "d2904c1662d71f2822ccd0b373d624eddd28938bf99bb4294c6f3badc72eb224",
+    SubsetZarr: "336779f81466725dacedd61a10ed267ab6514fff8ef4773efb49936ceff92e6d",
+    SeuratToZarr: "f004e56b22727b4d229824a37b8b877655a650c8b4bab235693a4449acaf7111",
 }
 _MODULE_FUNCTIONS = (
     "create_zarr_count_assay",
@@ -78,7 +78,7 @@ _MODULE_FUNCTIONS = (
     "write_renorm_subset_to_zarr",
 )
 _MODULE_SIGNATURE_DIGEST = (
-    "dbe97d2ed890118780c3618b3c3433ea56954dc3ed23b67c93b665cbae46debf"
+    "a1ddc69d7539a6a75d46f708e20a1c7ca842131782e9fda4da93c6c2fae11aea"
 )
 
 

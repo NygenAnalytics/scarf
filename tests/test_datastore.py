@@ -14,6 +14,7 @@ from scarf.datastore.datastore import DataStore
 from scarf.datastore.mapping_datastore import MappingDatastore
 from scarf.metadata import MetaData
 from scarf.storage.artifacts import ArtifactRef
+from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.trajectory.results import (
     PseudotimeAggregationResult,
     PseudotimeScoreResult,
@@ -60,8 +61,7 @@ def _qc_store() -> tuple[RecordingStore, int]:
         feat_names=_QC_FEATURE_NAMES,
         dtype="uint32",
         profile="fast_local",
-        targetChunkBytes=16,
-        targetShardBytes=48,
+        policy=CountMatrixPolicy(unitBytes=48, chunkBytes=16),
     )
     counts[:] = _QC_VALUES
     assert counts.shards is not None
@@ -1182,7 +1182,6 @@ class TestDataStore:
             yield from original(*args, **kwargs)
 
         monkeypatch.setattr(feature_stream, "map_feature_cell_bands", counted)
-        assay._experimentalFeatureConsume = "bounded"
         assay._streaming_feature_stats(cell_idx, feat_idx)
         assert calls["n"] == 1
         assert expected >= 1

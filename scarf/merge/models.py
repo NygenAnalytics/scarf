@@ -17,6 +17,7 @@ class AssayMergePlan:
     """
 
     assayName: str
+    assayType: str
     sourcePresent: tuple[bool, ...]
     missingSources: tuple[str, ...]
     nFeatures: int

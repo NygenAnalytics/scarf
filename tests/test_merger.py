@@ -10,6 +10,7 @@ from scarf.matrix import ChunkedArray
 from scarf.metadata import MetaData
 from scarf.merge import DataStoreMerge
 from scarf.storage.budget import ResourceBudget
+from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.storage.layout import count_array_spec
 
 
@@ -220,6 +221,7 @@ def test_dataset_merge(datastore, rna_raw_total, tmp_path):
     rna_count = zarr.open(fn + "/RNA/counts")
     assert rna_count.shape[0] == 2 * datastore.cells.N
     assert int(rna_count[...].sum()) == rna_raw_total * 2
+    assert zarr.open_group(fn, mode="r").attrs["assayTypes"]["RNA"] == "RNA"
 
 
 def test_dataset_merge_maps_features_and_preserves_row_order(tmp_path):
@@ -820,6 +822,7 @@ def test_dataset_merge_workspace_and_counts_t(datastore, rna_raw_total, tmp_path
     assert int(counts[...].sum()) == 2 * rna_raw_total
     assert "countsT" in root["matrices/RNA"]
     assert root["matrices/RNA/countsT"].attrs["complete"] is True
+    assert root["merged"].attrs["assayTypes"]["RNA"] == "RNA"
 
 
 def test_dataset_merge_plan_is_side_effect_free():
@@ -1257,8 +1260,8 @@ def test_dataset_merge_plan_reports_destination_conflict(tmp_path):
         ("metadata_missing_chunks", "missing mask", "block"),
         ("counts_t_shape", "countsT shape", "block"),
         ("counts_t_dtype", "countsT dtype", "block"),
-        ("counts_t_chunks", "must be strip-sharded", "rewrite"),
-        ("counts_t_shards", "must be strip-sharded", "rewrite"),
+        ("counts_t_chunks", "paired rotateOnce", "rewrite"),
+        ("counts_t_shards", "paired rotateOnce", "rewrite"),
         ("component_marker", "marked complete", "block"),
         ("import_source", "foreign import source", "block"),
         ("root_import_complete", "marked complete", "block"),
@@ -1273,7 +1276,7 @@ def test_dataset_merge_plan_blocks_tampered_components(
 ):
     path = str(tmp_path / f"tampered_{case}.zarr")
     merge_kwargs = (
-        {"targetChunkBytes": 16, "targetShardBytes": 32}
+        {"policy": CountMatrixPolicy(unitBytes=32, chunkBytes=16)}
         if case
         in {
             "counts_shards",
@@ -2044,6 +2047,7 @@ def test_dataset_merge_skips_counts_t_for_generic_assay_named_rna(tmp_path):
     ).dump()
     root = zarr.open_group(out, mode="r")
     assert "countsT" not in root["RNA"]
+    assert root.attrs["assayTypes"]["RNA"] == "Assay"
 
 
 def test_dataset_merge_resumes_after_partial_counts_band(tmp_path, monkeypatch):
@@ -2344,8 +2348,7 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
         overwrite=True,
         mem_budget=256 * 1024,
         nthreads=1,
-        targetChunkBytes=32,
-        targetShardBytes=64,
+        policy=CountMatrixPolicy(unitBytes=64, chunkBytes=32),
     ).dump()
 
     nnz_widths: list[int] = []
@@ -2407,8 +2410,7 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
         overwrite=True,
         mem_budget=256 * 1024,
         nthreads=1,
-        targetChunkBytes=32,
-        targetShardBytes=64,
+        policy=CountMatrixPolicy(unitBytes=64, chunkBytes=32),
     ).dump()
 
     assert batch_rows

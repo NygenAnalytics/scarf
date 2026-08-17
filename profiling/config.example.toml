@@ -8,10 +8,18 @@ r2EndpointUrl = "https://replace-with-account-id.r2.cloudflarestorage.com"
 datasetPrefixUri = "s3://example-bucket/scarf-profiling/datasets"
 resultsUri = "s3://example-bucket/scarf-profiling"
 # Optional: isolate stores/results under stores/<runTag>/ and results/<runTag>/.
-# runTag = "chunk256m"
-# [storageLayout]
-# targetChunkBytes = 268435456
-# targetShardBytes = 805306368
+# runTag = "rotateonce-1m-u2g-dest8-c4-20260817"
+#
+# [countMatrix]
+# unitBytes = 2000000000
+# chunkBytes = 100000000
+#
+# [storageIo]
+# sourceReadsInFlight = 8
+# sourceGroupChunks = 1
+# destShardsInFlight = 8
+# destCommitsInFlight = 4
+# computeWorkers = 4
 targetSizes = [
     10000,
     25000,
@@ -71,8 +79,8 @@ graphLocalCache = "auto"
 
 # Tune memory before large runs. Values are examples.
 
-# Strip countsT gate: pin createStore / writeCountsT / markHvgs / findMarkers
-# to 8 CPU / 32 GiB (scarf budget ~24 GiB). Other stages keep larger envelopes.
+# Pin createStore / writeCountsT / markHvgs / findMarkers to 8 CPU / 32 GiB
+# (scarf budget ~24 GiB). Other stages keep larger envelopes.
 [stageResources.createStore]
 modalMemoryRequestMb = 32768
 modalMemoryLimitMb = 32768

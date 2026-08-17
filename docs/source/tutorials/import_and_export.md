@@ -31,6 +31,11 @@ Export paths write Matrix Market or H5AD.
 Scarf does not write Seurat `.rds` or `.h5seurat` files.
 See {doc}`../scanpy_and_seurat` for Scanpy and Seurat workflow mapping.
 
+RNA writers write both a cell-major `counts` array and a gene-major `countsT` copy.
+That second copy is what later HVG and marker stages stream from.
+Non-RNA assays write `counts` only.
+See {doc}`../concepts/memory_and_execution` for why the two orientations exist.
+
 ## Prerequisites
 
 - Scarf installed with the optional dependencies required by the source format
@@ -459,6 +464,7 @@ ds_sparse
 ## 10. Merge DataStores
 
 `DataStoreMerge` merges multiple full DataStores (all assays per dataset) into one Zarr file.
+Merged RNA assays receive both `counts` and `countsT`.
 The example below merges two tiny stores created with `SparseToZarr`.
 For single-assay merges pass `assays=["RNA"]` (or the assay name you need).
 
@@ -529,6 +535,7 @@ writer.dump()
 - Fetching a prepared Zarr store when the aim is to demonstrate source-format conversion
 - Reusing an existing Zarr output path without confirming that it can be overwritten
 - Exporting normalized values when a downstream method requires raw counts
+- Expecting an older RNA Zarr store without `countsT` to open in the current Scarf version
 - Using `DataStoreMerge` without `assays=` when you only need one modality from multi-assay stores
 - Assuming an H5AD file uses `X` for raw counts without inspecting its layers
 - Expecting sparse or malformed `obsm` arrays to be imported as embeddings

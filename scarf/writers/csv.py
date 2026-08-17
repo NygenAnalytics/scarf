@@ -5,6 +5,8 @@ import numpy as np
 
 from ..storage.types import as_zarr_group
 from ..readers import CSVReader
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -40,8 +42,8 @@ class CSVtoZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -56,6 +58,8 @@ class CSVtoZarr:
         validate_assay_name(self.assayName)
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.policy = policy
+        self.io = io
         self.workspace = workspace
         self.storage_options = storage_options
         self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
@@ -80,8 +84,7 @@ class CSVtoZarr:
             feat_names=self.csvr.feature_ids(),
             dtype=str(self.dtype),
             profile=self.profile,
-            targetChunkBytes=targetChunkBytes,
-            targetShardBytes=targetShardBytes,
+            policy=policy,
         )
 
     def dump(self) -> None:
@@ -154,4 +157,6 @@ class CSVtoZarr:
             self.workspace,
             resources=self.resources,
             profile=self.profile,
+            policy=self.policy,
+            io=self.io,
         )

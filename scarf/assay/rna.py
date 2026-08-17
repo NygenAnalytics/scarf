@@ -189,23 +189,18 @@ class RNAassay(Assay):
             self.sf = 1000
             self.attrs["size_factor"] = self.sf
         self.scalar: np.ndarray | None = None
-        self._require_strip_counts_t()
+        self._require_counts_t()
 
-    def _require_strip_counts_t(self) -> None:
-        """RNA assays require complete strip-sharded ``countsT`` on Zarr v3."""
-        from ..storage.count_matrix import experimental_layout_reads_enabled
-        from ..storage.sharding import (
-            is_readable_counts_t_layout,
-            is_strip_counts_t_layout,
-        )
-        from ..storage.types import array_metadata_shards
+    def _require_counts_t(self) -> None:
+        """RNA assays require complete sharded ``countsT`` on Zarr v3."""
+        from ..storage.count_matrix import require_count_matrix_layout
 
         # Stub construction (tests that monkeypatch Assay.__init__) skips load.
         if not hasattr(self, "rawDataT"):
             return
         if self.rawDataT is None:
             raise ValueError(
-                f"RNA assay {self.name!r} requires a complete strip-sharded "
+                f"RNA assay {self.name!r} requires a complete sharded "
                 "countsT matrix. Rebuild with ingest/subset/merge on Zarr v3, "
                 "or run repack_zarr / write_counts_t."
             )
@@ -213,50 +208,12 @@ class RNAassay(Assay):
         zarr_format = int(getattr(counts_t.metadata, "zarr_format", 3) or 3)
         if zarr_format < 3:
             raise ValueError(
-                f"RNA assay {self.name!r} requires Zarr v3 for strip-sharded "
+                f"RNA assay {self.name!r} requires Zarr v3 for sharded "
                 "countsT. Repack the store to Zarr v3."
             )
-        shards = array_metadata_shards(counts_t)
-        if shards is None:
-            raise ValueError(
-                f"RNA assay {self.name!r} has an unsupported countsT layout "
-                "(unsharded or non-strip). Rebuild countsT with the current "
-                "Scarf strip writer (repack_zarr or write_counts_t)."
-            )
-        shape = tuple(int(v) for v in counts_t.shape)
-        chunks = tuple(int(v) for v in counts_t.chunks)
-        shard_shape = tuple(int(v) for v in shards)
-        if is_strip_counts_t_layout(
-            shape=shape,
-            chunks=chunks,
-            shards=shard_shape,
-            dtype=counts_t.dtype,
-        ):
-            return
-        if experimental_layout_reads_enabled() and is_readable_counts_t_layout(
-            shape=shape,
-            chunks=chunks,
-            shards=shard_shape,
-            dtype=counts_t.dtype,
-        ):
-            return
-        if not is_strip_counts_t_layout(
-            shape=shape,
-            chunks=chunks,
-            shards=shard_shape,
-            dtype=counts_t.dtype,
-        ):
-            raise ValueError(
-                f"RNA assay {self.name!r} has an unsupported countsT layout "
-                "(unsharded or non-strip). Rebuild countsT with the current "
-                "Scarf strip writer (repack_zarr or write_counts_t)."
-            )
-
-    def _feature_consume_mode(self) -> str:
-        mode = getattr(self, "_experimentalFeatureConsume", "bounded")
-        if mode not in {"wholeStrip", "bounded"}:
-            raise ValueError(f"unsupported experimental feature consumer {mode!r}")
-        return str(mode)
+        counts = as_zarr_array(self.rawData._backing, name="counts")
+        matrix_group = as_zarr_group(self.matrixGroup, name="matrix")
+        require_count_matrix_layout(matrix_group, counts, counts_t)
 
     def iter_normed_feature_wise(
         self,
@@ -303,7 +260,7 @@ class RNAassay(Assay):
         counts_t = self.rawDataT
         if counts_t is None:
             raise ValueError(
-                f"RNA assay {self.name!r} requires strip-sharded countsT "
+                f"RNA assay {self.name!r} requires sharded countsT "
                 "for feature-wise streaming"
             )
         scalar_values = np.asarray(scalar, dtype=np.float32)
@@ -312,64 +269,23 @@ class RNAassay(Assay):
         dest_of = np.full(n_feats, -1, dtype=np.int64)
         dest_of[feat_idx] = np.arange(len(feat_idx), dtype=np.int64)
         feat_labels = np.asarray(feat_idx)
-        mode = self._feature_consume_mode()
-        loaded_groups: Any
-        if mode == "wholeStrip":
-            from ..storage.feature_shards import (
-                map_feature_shards,
-                plan_feature_shard_consume_for_array,
-                selected_strip_starts,
-                shard_values_for_selection,
-            )
+        from ..storage.feature_stream import (
+            map_feature_read_groups,
+            selected_feature_values,
+        )
 
-            starts = selected_strip_starts(counts_t, feat_idx)
-            geometry = array_geometry(counts_t)
-            if geometry is None:
-                raise ValueError(
-                    f"RNA assay {self.name!r} requires strip-sharded countsT "
-                    "for feature-wise streaming"
-                )
-            gene_strip = geometry.axisChunk(0)
-            n_sel_cells = int(np.asarray(cell_idx).shape[0])
-            extra_bytes = n_sel_cells * gene_strip * (4 + 8 + 8)
-            plan = plan_feature_shard_consume_for_array(
-                counts_t,
-                resources=self.resources,
-                cell_idx=cell_idx,
-                feat_idx=feat_idx,
-                extraBytesPerShard=extra_bytes,
-            )
-            loaded_groups = map_feature_shards(
-                counts_t,
-                lambda loaded: loaded,
-                cell_idx=cell_idx,
-                feat_idx=feat_idx,
-                feat_starts=starts,
-                plan=plan,
-                resources=self.resources,
-                progress=msg or None,
-            )
+        loaded_groups = map_feature_read_groups(
+            counts_t,
+            lambda loaded: loaded,
+            cell_idx=cell_idx,
+            feat_idx=feat_idx,
+            resources=self.resources,
+            progress=msg or None,
+            io=getattr(self, "storageIo", None),
+        )
 
-            def selected_values(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
-                return shard_values_for_selection(values, keep)
-
-        else:
-            from ..storage.feature_stream import (
-                map_feature_read_groups,
-                selected_feature_values,
-            )
-
-            loaded_groups = map_feature_read_groups(
-                counts_t,
-                lambda loaded: loaded,
-                cell_idx=cell_idx,
-                feat_idx=feat_idx,
-                resources=self.resources,
-                progress=msg or None,
-            )
-
-            def selected_values(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
-                return selected_feature_values(values, keep)
+        def selected_values(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
+            return selected_feature_values(values, keep)
 
         resolved_batch = None if batch_size is None else max(1, int(batch_size))
         pending_cols: list[np.ndarray] = []
@@ -916,125 +832,6 @@ class RNAassay(Assay):
                 out[key][start:end] = normed[:, pos].mean(axis=1)
         return out
 
-    def _streaming_feature_stats_whole_strip(
-        self,
-        cell_idx: np.ndarray,
-        feat_idx: np.ndarray,
-    ) -> dict[str, np.ndarray]:
-        """Compute feature statistics with the current whole-shard consumer."""
-        import time
-
-        import numba
-        from numba import set_num_threads
-
-        from ..storage.feature_shards import (
-            map_feature_shards,
-            plan_feature_shard_consume_for_array,
-            selected_strip_starts,
-            shard_values_for_selection,
-        )
-        from ..utils.process import process_rss_mb
-
-        cell_idx = np.asarray(cell_idx)
-        feat_idx = np.asarray(feat_idx)
-        if self.normMethod is norm_lib_size and self.sf is None:
-            raise ValueError(
-                "RNA library-size normalization requires a size factor (sf), got None"
-            )
-        sf = float(self.sf) if self.sf is not None else 1.0
-        scalar = np.asarray(
-            self.cells.fetch_all(self.name + "_nCounts")[cell_idx], dtype=np.float64
-        )
-        scalar[scalar == 0] = 1
-        inv_scalar = 1.0 / scalar
-
-        n_features = len(feat_idx)
-        n_cells = len(cell_idx)
-        nz = np.zeros(n_features, dtype=np.float64)
-        s1 = np.zeros(n_features, dtype=np.float64)
-        s2 = np.zeros(n_features, dtype=np.float64)
-        if n_cells == 0 or n_features == 0:
-            return {"normed_tot": s1, "normed_n": nz, "sigmas": s2}
-
-        counts_t = self.rawDataT
-        if counts_t is None:
-            raise ValueError(
-                f"RNA assay {self.name!r} requires strip-sharded countsT "
-                "for feature statistics"
-            )
-        n_feats = int(counts_t.shape[0])
-        dest_of = np.full(n_feats, -1, dtype=np.int64)
-        dest_of[feat_idx] = np.arange(n_features, dtype=np.int64)
-        starts = selected_strip_starts(counts_t, feat_idx)
-        consume = plan_feature_shard_consume_for_array(
-            counts_t,
-            resources=self.resources,
-            cell_idx=cell_idx,
-            feat_idx=feat_idx,
-        )
-        threads = min(
-            consume.numbaThreads,
-            max(1, int(numba.config.NUMBA_NUM_THREADS)),
-        )
-        previous_threads = numba.get_num_threads()
-        logger.info(
-            f"({self.name}) feature stats consume "
-            f"prefetchDepth={consume.prefetchDepth} "
-            f"(requested={consume.requestedPrefetchDepth}) "
-            f"readConcurrency={consume.readConcurrency} "
-            f"(requested={consume.requestedReadConcurrency}) "
-            f"numbaThreads={threads} "
-            f"inFlight={consume.inFlight} "
-            f"estBytes={consume.estimatedResidentBytes} "
-            f"source={consume.source}"
-        )
-
-        def process_shard(shard: Any) -> None:
-            local_dest = dest_of[shard.featStart : shard.featEnd]
-            keep = local_dest >= 0
-            if not np.any(keep):
-                return None
-            raw = shard_values_for_selection(shard.values, keep)
-            destinations = local_dest[keep].astype(np.int64, copy=False)
-            t_compute = time.perf_counter()
-            _hvg_stats_gene_major(
-                raw,
-                inv_scalar,
-                float(sf),
-                destinations,
-                nz,
-                s1,
-                s2,
-            )
-            compute_sec = time.perf_counter() - t_compute
-            logger.debug(
-                f"({self.name}) feature stats shard "
-                f"{shard.featStart}:{shard.featEnd}: "
-                f"read {shard.readSec:.1f}s compute {compute_sec:.1f}s "
-                f"rss {process_rss_mb():.0f} MiB"
-            )
-            return None
-
-        try:
-            set_num_threads(threads)
-            for _ in map_feature_shards(
-                counts_t,
-                process_shard,
-                cell_idx=cell_idx,
-                feat_idx=feat_idx,
-                feat_starts=starts,
-                plan=consume,
-                resources=self.resources,
-                progress="Calculating feature statistics",
-            ):
-                pass
-        finally:
-            set_num_threads(previous_threads)
-
-        mean = s1 / n_cells
-        sigmas = s2 / n_cells - np.square(mean)
-        return {"normed_tot": s1, "normed_n": nz, "sigmas": sigmas}
-
     def _streaming_feature_stats(
         self,
         cell_idx: np.ndarray,
@@ -1046,9 +843,6 @@ class RNAassay(Assay):
         sums, and squared sums in deterministic band order, and returns
         ``normed_tot``, ``normed_n``, and ``sigmas`` matching ``norm_lib_size``.
         """
-        if self._feature_consume_mode() == "wholeStrip":
-            return self._streaming_feature_stats_whole_strip(cell_idx, feat_idx)
-
         import time
 
         import numba
@@ -1081,7 +875,7 @@ class RNAassay(Assay):
         counts_t = self.rawDataT
         if counts_t is None:
             raise ValueError(
-                f"RNA assay {self.name!r} requires strip-sharded countsT "
+                f"RNA assay {self.name!r} requires sharded countsT "
                 "for feature statistics"
             )
         n_feats = int(counts_t.shape[0])
@@ -1133,6 +927,7 @@ class RNAassay(Assay):
                 feat_idx=feat_idx,
                 resources=self.resources,
                 progress="Calculating feature statistics",
+                io=getattr(self, "storageIo", None),
             ):
                 pass
         finally:

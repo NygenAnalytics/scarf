@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from ..storage.types import ZarrMode
 from ..assay import Assay
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.stores import create_matrix_source
 from ._operations.features import _FeatureOperationsMixin
@@ -111,6 +112,7 @@ class DataStore(
         zarrProfile: StorageProfile | None = None,
         storage_options: dict[str, Any] | None = None,
         mem_budget: int | str | None = None,
+        storageIo: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.profiles import resolve_storage_profile
@@ -134,6 +136,7 @@ class DataStore(
             resources=resources,
             storage_profile=profile,
             storage_options=storage_options,
+            storageIo=storageIo,
         )
 
     @property
@@ -178,4 +181,5 @@ class DataStore(
             assay_types=assay_types,
             nthreads=nthreads,
             mem_budget=self.memoryBytes,
+            storageIo=getattr(self, "storageIo", None),
         )

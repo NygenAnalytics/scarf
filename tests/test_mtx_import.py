@@ -13,6 +13,7 @@ from zarr.storage import MemoryStore
 
 from scarf import DataStore
 from scarf.readers import CrH5Reader, MtxCandidate, MtxReader, inspect_mtx
+from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.writers import CrToZarr, MtxToZarr
 
 
@@ -485,15 +486,13 @@ def test_feature_major_disk_csr_parity_filtering_and_cleanup(tmp_path: Path) -> 
         feature_reader,
         stores[0],
         mem_budget="64M",
-        targetChunkBytes=16,
-        targetShardBytes=32,
+        policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
     ).dump(lines_in_mem=2)
     MtxToZarr(
         cell_reader,
         stores[1],
         mem_budget="64M",
-        targetChunkBytes=16,
-        targetShardBytes=32,
+        policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
     ).dump(lines_in_mem=2)
 
     first = zarr.open_group(store=stores[0], mode="r")["RNA/counts"][:]
@@ -540,8 +539,7 @@ def test_parse_orientation_duplicate_sum_and_metadata(tmp_path: Path) -> None:
         reader,
         store,
         mem_budget="64M",
-        targetChunkBytes=8,
-        targetShardBytes=16,
+        policy=CountMatrixPolicy(unitBytes=16, chunkBytes=8),
     ).dump(lines_in_mem=2)
 
     root = zarr.open_group(store=store, mode="r")
@@ -884,8 +882,7 @@ def test_feature_major_cleanup_after_planning_and_write_failures(
         planning_reader,
         MemoryStore(),
         mem_budget=1,
-        targetChunkBytes=8,
-        targetShardBytes=8,
+        policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
     )
     with pytest.raises(MemoryError, match="one source row"):
         writer.dump(lines_in_mem=1)
@@ -909,8 +906,7 @@ def test_feature_major_cleanup_after_planning_and_write_failures(
         write_reader,
         MemoryStore(),
         mem_budget="64M",
-        targetChunkBytes=8,
-        targetShardBytes=8,
+        policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
     )
     with pytest.raises(RuntimeError, match="injected cancellation"):
         writer.dump(lines_in_mem=1)
@@ -983,8 +979,7 @@ def test_multimodal_mex_names_feature_reference_and_related_files(
         reader,
         store,
         mem_budget="64M",
-        targetChunkBytes=8,
-        targetShardBytes=8,
+        policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
     ).dump(lines_in_mem=2)
 
     root = zarr.open_group(store=store, mode="r")
@@ -1073,8 +1068,7 @@ def test_cellranger_h5_preserves_guide_feature_tags(tmp_path: Path) -> None:
             reader,
             store,
             mem_budget="64M",
-            targetChunkBytes=8,
-            targetShardBytes=8,
+            policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
         ).dump()
     finally:
         reader.close()

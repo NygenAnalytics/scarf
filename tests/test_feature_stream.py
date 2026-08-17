@@ -5,7 +5,13 @@ from zarr.storage import MemoryStore
 
 from scarf.storage.async_execution import reset_zarr_runtime_for_tests
 from scarf.storage.budget import ResourceBudget
+from scarf.storage.count_matrix import (
+    CountMatrixPolicy,
+    persist_count_matrix_plan,
+    plan_count_matrix_pair,
+)
 from scarf.storage.feature_stream import plan_feature_stream
+from scarf.storage.io_policy import StorageIoPolicy
 
 
 def setup_function() -> None:
@@ -202,18 +208,39 @@ def test_feature_stream_packs_many_single_feature_bins() -> None:
     assert plan.blocks[0].bins[-1] == 1_999
 
 
+def _counts_t_with_plan(
+    values: np.ndarray,
+    *,
+    policy: CountMatrixPolicy | None = None,
+) -> zarr.Array:
+    resolved = policy or CountMatrixPolicy(unitBytes=2_000, chunkBytes=200)
+    plan = plan_count_matrix_pair(
+        values.shape[0],
+        values.shape[1],
+        values.dtype,
+        policy=resolved,
+    )
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    group = root.create_group("RNA")
+    counts_t = group.create_array(
+        "countsT",
+        shape=plan.countsT.shape,
+        chunks=plan.countsT.chunks,
+        shards=plan.countsT.shards,
+        dtype=values.dtype,
+        overwrite=True,
+    )
+    counts_t[:] = values.T
+    persist_count_matrix_plan(group, plan)
+    persist_count_matrix_plan(counts_t, plan)
+    return counts_t
+
+
 def test_map_feature_read_groups_preserves_unsorted_cell_order() -> None:
     from scarf.storage.feature_stream import map_feature_read_groups
 
-    store = MemoryStore()
-    root = zarr.open_group(store=store, mode="w")
     values = np.arange(24, dtype=np.uint16).reshape(6, 4)
-    counts_t = root.create_array(
-        "countsT",
-        data=values.T,
-        chunks=(2, 3),
-        shards=(2, 6),
-    )
+    counts_t = _counts_t_with_plan(values)
     cell_idx = np.array([5, 0, 3])
     loaded = list(
         map_feature_read_groups(
@@ -232,15 +259,8 @@ def test_map_feature_read_groups_preserves_unsorted_cell_order() -> None:
 def test_map_feature_cell_bands_reduces_in_band_order() -> None:
     from scarf.storage.feature_stream import map_feature_cell_bands
 
-    store = MemoryStore()
-    root = zarr.open_group(store=store, mode="w")
     values = np.arange(24, dtype=np.uint16).reshape(6, 4)
-    counts_t = root.create_array(
-        "countsT",
-        data=values.T,
-        chunks=(2, 3),
-        shards=(2, 6),
-    )
+    counts_t = _counts_t_with_plan(values)
     cell_idx = np.array([5, 0, 3])
     dest = np.zeros((4, 3), dtype=np.uint16)
     seen: list[tuple[int, int]] = []
@@ -264,87 +284,175 @@ def test_map_feature_cell_bands_reduces_in_band_order() -> None:
     assert seen == sorted(seen)
 
 
-def test_load_feature_strip_and_selected_values_preserve_order() -> None:
+def test_selected_values_and_persisted_groups_preserve_order() -> None:
     from scarf.storage.feature_stream import (
-        load_feature_strip,
         map_feature_read_groups,
+        persisted_read_group,
         selected_feature_chunk_starts,
         selected_feature_values,
     )
-    from scarf.storage.sharding import write_counts_t
 
-    store = MemoryStore()
-    root = zarr.open_group(store=store, mode="w")
     n_cells, n_feats = 12, 40
     values = np.arange(n_cells * n_feats, dtype=np.uint16).reshape(n_cells, n_feats)
-    counts = root.create_array(
-        "counts",
-        shape=values.shape,
-        chunks=(4, 8),
-        dtype=values.dtype,
-        fill_value=0,
-    )
-    counts[:] = values
-    write_counts_t(
-        counts,
-        root,
-        resources=ResourceBudget(8 * 1024**3, 2),
-        maxShardBytes=192,
-    )
-    counts_t = root["countsT"]
+    counts_t = _counts_t_with_plan(values)
     starts = selected_feature_chunk_starts(counts_t)
-    assert len(starts) > 1
-    first = load_feature_strip(counts_t, starts[0])
+    assert starts
+    groups = list(
+        map_feature_read_groups(
+            counts_t,
+            lambda group: group,
+            resources=ResourceBudget(64 * 1024 * 1024, 2),
+            progress="test-progress",
+        )
+    )
+    first = groups[0]
     keep = np.ones(first.values.shape[0], dtype=bool)
     assert selected_feature_values(first.values, keep) is first.values
     keep[0] = False
     filtered = selected_feature_values(first.values, keep)
     assert filtered.shape[0] == first.values.shape[0] - 1
-    seen = list(
+    feature_width, _bytes = persisted_read_group(counts_t)
+    assert first.featEnd - first.featStart <= feature_width
+    assert [group.featStart for group in groups] == sorted(
+        group.featStart for group in groups
+    )
+
+
+def test_consume_uses_persisted_two_gib_read_group() -> None:
+    from scarf.storage.feature_stream import (
+        map_feature_read_groups,
+        persisted_read_group,
+    )
+
+    values = np.arange(20 * 8, dtype=np.uint16).reshape(20, 8)
+    policy = CountMatrixPolicy(unitBytes=2_000_000_000, chunkBytes=100_000_000)
+    counts_t = _counts_t_with_plan(values, policy=policy)
+    feature_width, _bytes = persisted_read_group(counts_t)
+    widths = list(
         map_feature_read_groups(
             counts_t,
-            lambda group: group.featStart,
-            resources=ResourceBudget(64 * 1024 * 1024, 2),
-            progress="test-progress",
-            readGroupChunks=1,
+            lambda group: group.featEnd - group.featStart,
+            resources=ResourceBudget(8 * 1024**3, 2),
         )
     )
-    assert seen == starts
+    assert widths
+    assert all(width <= feature_width for width in widths)
+    assert widths[0] == min(8, feature_width)
 
 
-def test_planned_read_group_chunks_uses_the_target_unit() -> None:
-    from scarf.storage.feature_stream import planned_read_group_chunks
+def test_consume_uses_persisted_read_group_not_default_unit() -> None:
+    from scarf.storage.feature_stream import (
+        map_feature_read_groups,
+        persisted_read_group,
+    )
 
-    array = _array(shape=(40, 50), chunks=(10, 25))
-    assert planned_read_group_chunks(array, targetReadUnitBytes=4_000) == 2
-    assert planned_read_group_chunks(array, targetReadUnitBytes=1) == 1
+    values = np.arange(80 * 50_001, dtype=np.uint16).reshape(80, 50_001)
+    policy = CountMatrixPolicy(unitBytes=20_000, chunkBytes=2_000)
+    counts_t = _counts_t_with_plan(values, policy=policy)
+    feature_width, _bytes = persisted_read_group(counts_t)
+    metrics: dict[str, object] = {}
+    widths = list(
+        map_feature_read_groups(
+            counts_t,
+            lambda group: group.featEnd - group.featStart,
+            resources=ResourceBudget(8 * 1024**3, 2),
+            metrics=metrics,
+        )
+    )
+    assert widths
+    assert all(width <= feature_width for width in widths)
+    assert widths[-1] < feature_width or 50_001 % feature_width == 0
+    assert int(metrics["featureWidth"]) == feature_width
+
+
+def test_persisted_read_group_requires_read_group_bytes() -> None:
+    from scarf.storage.feature_stream import persisted_read_group
+
+    values = np.arange(24, dtype=np.uint16).reshape(6, 4)
+    counts_t = _counts_t_with_plan(values)
+    payload = dict(counts_t.attrs["scarf:countMatrixLayout"])
+    payload["readGroup"] = dict(payload["readGroup"])
+    payload["readGroup"].pop("readGroupBytes")
+    counts_t.attrs["scarf:countMatrixLayout"] = payload
+    with pytest.raises(ValueError, match="missing a persisted read group"):
+        persisted_read_group(counts_t)
+
+
+def test_persisted_read_group_rejects_byte_mismatch() -> None:
+    from scarf.storage.feature_stream import persisted_read_group
+
+    values = np.arange(24, dtype=np.uint16).reshape(6, 4)
+    counts_t = _counts_t_with_plan(values)
+    payload = dict(counts_t.attrs["scarf:countMatrixLayout"])
+    payload["readGroup"] = dict(payload["readGroup"])
+    payload["readGroup"]["readGroupBytes"] = int(payload["readGroup"]["featureWidth"])
+    counts_t.attrs["scarf:countMatrixLayout"] = payload
+    with pytest.raises(ValueError, match="does not match live geometry"):
+        persisted_read_group(counts_t)
+
+
+def test_map_feature_read_groups_early_close_does_not_block() -> None:
+    from scarf.storage.feature_stream import map_feature_read_groups
+
+    values = np.arange(40 * 80, dtype=np.uint16).reshape(40, 80)
+    counts_t = _counts_t_with_plan(values)
+    iterator = map_feature_read_groups(
+        counts_t,
+        lambda group: group.featStart,
+        resources=ResourceBudget(8 * 1024 * 1024, 2),
+        io=StorageIoPolicy(groupsInFlight=2),
+    )
+    assert next(iterator) == 0
+    iterator.close()
+
+
+def test_groups_in_flight_is_clamped_and_handoff_is_bounded() -> None:
+    from scarf.storage.feature_stream import map_feature_read_groups
+
+    values = np.arange(40 * 80, dtype=np.uint16).reshape(40, 80)
+    counts_t = _counts_t_with_plan(values)
+    live = 0
+    peak = 0
+
+    def watch(group):  # type: ignore[no-untyped-def]
+        nonlocal live, peak
+        live += 1
+        peak = max(peak, live)
+        live -= 1
+        return group.featStart
+
+    metrics: dict[str, object] = {}
+    list(
+        map_feature_read_groups(
+            counts_t,
+            watch,
+            resources=ResourceBudget(8 * 1024 * 1024, 4),
+            io=StorageIoPolicy(groupsInFlight=8),
+            metrics=metrics,
+        )
+    )
+    assert int(metrics["requestedGroupsInFlight"]) == 8
+    assert int(metrics["effectiveGroupsInFlight"]) <= 8
+    assert peak <= int(metrics["effectiveGroupsInFlight"])
 
 
 def test_map_feature_read_groups_parallel_matches_sequential() -> None:
     from scarf.storage.feature_stream import map_feature_read_groups
 
-    store = MemoryStore()
-    root = zarr.open_group(store=store, mode="w")
     values = np.arange(120, dtype=np.uint16).reshape(10, 12)
-    counts_t = root.create_array(
-        "countsT",
-        data=values.T,
-        chunks=(3, 5),
-        shards=(3, 10),
-    )
+    counts_t = _counts_t_with_plan(values)
     cell_idx = np.array([9, 0, 4, 2])
     kwargs = {
         "cell_idx": cell_idx,
         "feat_idx": np.arange(12),
         "resources": ResourceBudget(8 * 1024 * 1024, 2),
-        "readGroupChunks": 1,
     }
     sequential = {
         group.featStart: np.asarray(group.values).copy()
         for group in map_feature_read_groups(
             counts_t,
             lambda group: group,
-            readGroupsInFlight=1,
+            io=StorageIoPolicy(groupsInFlight=1),
             **kwargs,
         )
     }
@@ -353,7 +461,7 @@ def test_map_feature_read_groups_parallel_matches_sequential() -> None:
         for group in map_feature_read_groups(
             counts_t,
             lambda group: group,
-            readGroupsInFlight=3,
+            io=StorageIoPolicy(groupsInFlight=3),
             **kwargs,
         )
     }
@@ -365,18 +473,11 @@ def test_map_feature_read_groups_parallel_matches_sequential() -> None:
 def test_map_feature_cell_bands_parallel_matches_sequential() -> None:
     from scarf.storage.feature_stream import map_feature_cell_bands
 
-    store = MemoryStore()
-    root = zarr.open_group(store=store, mode="w")
     values = np.arange(120, dtype=np.uint16).reshape(10, 12)
-    counts_t = root.create_array(
-        "countsT",
-        data=values.T,
-        chunks=(3, 5),
-        shards=(3, 10),
-    )
+    counts_t = _counts_t_with_plan(values)
     cell_idx = np.array([9, 0, 4, 2])
 
-    def collect(read_groups_in_flight: int) -> list[tuple[int, int, np.ndarray]]:
+    def collect(groups_in_flight: int) -> list[tuple[int, int, np.ndarray]]:
         collected: list[tuple[int, int, np.ndarray]] = []
 
         def capture(band):  # type: ignore[no-untyped-def]
@@ -395,8 +496,7 @@ def test_map_feature_cell_bands_parallel_matches_sequential() -> None:
                 capture,
                 cell_idx=cell_idx,
                 resources=ResourceBudget(8 * 1024 * 1024, 2),
-                readGroupChunks=1,
-                readGroupsInFlight=read_groups_in_flight,
+                io=StorageIoPolicy(groupsInFlight=groups_in_flight),
             )
         )
         return collected

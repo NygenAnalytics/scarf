@@ -154,11 +154,6 @@ class WorkflowParameters(BaseModel):
     parisMinClusterSize: int | None = None
     clusterSourceUri: str | None = None
     clusterLabelColumn: str = "RNA_leiden_cluster"
-    countMatrixWriter: Literal["current", "experimental"] = "current"
-    featureConsume: Literal["wholeStrip", "bounded"] = "bounded"
-    # Optional strip countsT layout target for canonical-layout gates.
-    countsTMaxShardBytes: int | None = None
-    countsTTargetChunkBytes: int | None = None
 
     @property
     def resolvedHvgKey(self) -> str:
@@ -183,13 +178,6 @@ class WorkflowParameters(BaseModel):
                 raise ValueError("parisMinClusterSize must be >= 2")
             if self.parisNClusters != "auto":
                 raise ValueError("parisMinClusterSize requires parisNClusters='auto'")
-        if self.countsTMaxShardBytes is not None and self.countsTMaxShardBytes <= 0:
-            raise ValueError("countsTMaxShardBytes must be positive when set")
-        if (
-            self.countsTTargetChunkBytes is not None
-            and self.countsTTargetChunkBytes <= 0
-        ):
-            raise ValueError("countsTTargetChunkBytes must be positive when set")
         if self.clusterSourceUri is not None:
             uri = self.clusterSourceUri.strip()
             if not uri:
@@ -267,60 +255,44 @@ class PrepareResources(BaseModel):
         return self
 
 
-class StorageLayout(BaseModel):
+class CountMatrixConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    targetChunkBytes: int | None = None
-    targetShardBytes: int | None = None
+    unitBytes: int = 1_000_000_000
+    chunkBytes: int = 100_000_000
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Self:
-        if self.targetChunkBytes is not None and self.targetChunkBytes <= 0:
-            raise ValueError("targetChunkBytes must be positive when set")
-        if self.targetShardBytes is not None and self.targetShardBytes <= 0:
-            raise ValueError("targetShardBytes must be positive when set")
+        if min(self.unitBytes, self.chunkBytes) < 1:
+            raise ValueError("countMatrix values must be positive")
+        if self.unitBytes < self.chunkBytes:
+            raise ValueError("unitBytes must be at least chunkBytes")
         return self
 
 
-class CountMatrixLayout(BaseModel):
+class StorageIoConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    targetReadUnitBytes: int
-    targetChunkBytes: int
+    sourceReadsInFlight: int = 1
+    sourceGroupChunks: int = 1
+    destShardsInFlight: int = 1
+    destCommitsInFlight: int = 1
+    computeWorkers: int = 1
+    groupsInFlight: int | None = None
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Self:
-        if min(self.targetReadUnitBytes, self.targetChunkBytes) < 1:
-            raise ValueError("countMatrixLayout values must be positive")
-        if self.targetReadUnitBytes < self.targetChunkBytes:
-            raise ValueError("targetReadUnitBytes must be at least targetChunkBytes")
-        return self
-
-
-class ExecutionPolicy(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    codecWorkerLimit: int
-    zarrAsyncConcurrency: int
-    computeWorkerLimit: int
-    readGroupsInFlight: int
-    destinationCommitsInFlight: int
-    readGroupChunks: int
-
-    @model_validator(mode="after")
-    def _check_bounds(self) -> Self:
-        if (
-            min(
-                self.codecWorkerLimit,
-                self.zarrAsyncConcurrency,
-                self.computeWorkerLimit,
-                self.readGroupsInFlight,
-                self.destinationCommitsInFlight,
-                self.readGroupChunks,
-            )
-            < 1
+        for name in (
+            "sourceReadsInFlight",
+            "sourceGroupChunks",
+            "destShardsInFlight",
+            "destCommitsInFlight",
+            "computeWorkers",
         ):
-            raise ValueError("executionPolicy values must be positive")
+            if int(getattr(self, name)) < 1:
+                raise ValueError(f"{name} must be positive")
+        if self.groupsInFlight is not None and int(self.groupsInFlight) < 1:
+            raise ValueError("groupsInFlight must be positive when set")
         return self
 
 
@@ -356,9 +328,8 @@ class ProfilingConfig(BaseModel):
     # When set, stage jobs read/write this store instead of stores/{runTag}/...
     # Useful for consume A/B runs against an existing store with a fresh result tag.
     storeUriOverride: str | None = None
-    storageLayout: StorageLayout = Field(default_factory=StorageLayout)
-    countMatrixLayout: CountMatrixLayout | None = None
-    executionPolicy: ExecutionPolicy | None = None
+    countMatrix: CountMatrixConfig | None = None
+    storageIo: StorageIoConfig | None = None
     clusterSources: tuple[ClusterSourceRef, ...] = ()
     targetSizes: tuple[int, ...] = Field(default_factory=lambda: DEFAULT_TARGET_SIZES)
     samplingSeed: int = 0
@@ -443,107 +414,6 @@ class ProfilingConfig(BaseModel):
 
     def e2eClaimUri(self) -> str:
         return f"{self._tagged_prefix('results')}/e2e-claim.json"
-
-    def phaseCheckPrefix(self, phase: str) -> str:
-        return f"{self._tagged_prefix('phase-checks')}/{phase}"
-
-    def phaseClaimUri(self, phase: str) -> str:
-        return f"{self.phaseCheckPrefix(phase)}/claim.json"
-
-    def phaseWorkerResultUri(self, phase: str) -> str:
-        return f"{self.phaseCheckPrefix(phase)}/worker.json"
-
-    def phaseReopenResultUri(self, phase: str) -> str:
-        return f"{self.phaseCheckPrefix(phase)}/reopen.json"
-
-    def phaseFinalResultUri(self, phase: str) -> str:
-        return f"{self.phaseCheckPrefix(phase)}/final.json"
-
-    def phaseSyntheticStoreUri(self, phase: str) -> str:
-        return f"{self.phaseCheckPrefix(phase)}/synthetic.zarr"
-
-    def phaseFailureStoreUri(self, phase: str) -> str:
-        return f"{self.phaseCheckPrefix(phase)}/failure.zarr"
-
-    def phaseSweepStoreUri(
-        self,
-        phase: str,
-        *,
-        readGroupsInFlight: int,
-        destinationCommitsInFlight: int,
-    ) -> str:
-        return (
-            f"{self.phaseCheckPrefix(phase)}/sweeps/"
-            f"reads-{int(readGroupsInFlight)}-commits-"
-            f"{int(destinationCommitsInFlight)}.zarr"
-        )
-
-    def phaseInputManifestUri(self, phase: str, nRows: int) -> str:
-        return f"{self.phaseCheckPrefix(phase)}/inputs/{nRows}.h5ad.manifest.json"
-
-    def phaseClusterInventoryUri(self, phase: str) -> str:
-        return f"{self.phaseCheckPrefix(phase)}/cluster-inventory.json"
-
-    def phaseClusterSourcesTomlUri(self, phase: str) -> str:
-        return f"{self.phaseCheckPrefix(phase)}/cluster-sources.toml"
-
-    def phase3ValidationUri(self, repetition: int, variant: str) -> str:
-        return (
-            f"{self.phaseCheckPrefix('phase3')}/variants/"
-            f"rep-{int(repetition)}/{variant}/reopen.json"
-        )
-
-    def phase3ScheduleUri(self) -> str:
-        return f"{self.phaseCheckPrefix('phase3')}/schedule.json"
-
-    def phase3ReferenceUri(self) -> str:
-        return f"{self.phaseCheckPrefix('phase3')}/reference.json"
-
-    def phase3ReferenceArraysUri(self) -> str:
-        return f"{self.phaseCheckPrefix('phase3')}/reference-hvg.npz"
-
-    def scaleCheckPrefix(self, nRows: int) -> str:
-        return f"{self._tagged_prefix('scale-checks')}/{int(nRows)}"
-
-    def scaleClaimUri(self, nRows: int) -> str:
-        return f"{self.scaleCheckPrefix(nRows)}/claim.json"
-
-    def scaleScheduleUri(self, nRows: int) -> str:
-        return f"{self.scaleCheckPrefix(nRows)}/schedule.json"
-
-    def scaleVariantResultUri(
-        self,
-        nRows: int,
-        repetition: int,
-        variant: str,
-    ) -> str:
-        return (
-            f"{self.scaleCheckPrefix(nRows)}/variants/"
-            f"rep-{int(repetition)}/{variant}/result.json"
-        )
-
-    def scaleReferenceUri(self, nRows: int) -> str:
-        return f"{self.scaleCheckPrefix(nRows)}/reference.json"
-
-    def scaleReferenceArraysUri(self, nRows: int) -> str:
-        return f"{self.scaleCheckPrefix(nRows)}/reference-hvg.npz"
-
-    def scaleBatchValidationUri(
-        self,
-        nRows: int,
-        batch: str,
-    ) -> str:
-        return f"{self.scaleCheckPrefix(nRows)}/validation/{batch}.json"
-
-    def scaleCallReceiptUri(
-        self,
-        nRows: int,
-        operation: str,
-    ) -> str:
-        return f"{self.scaleCheckPrefix(nRows)}/calls/{operation}.json"
-
-    def scaleFinalResultUri(self, nRows: int) -> str:
-        return f"{self.scaleCheckPrefix(nRows)}/final.json"
 
     def resourcesFor(self, stage: StageName) -> StageResources:
         return self.stageResources[stage]

@@ -8,6 +8,8 @@ from scipy.sparse import coo_matrix
 from ..storage.types import as_zarr_group
 from ..readers import H5adReader
 from ..readers.h5ad import _H5adAssayFeatures
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -54,8 +56,8 @@ class H5adToZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
         assay_split_key: str | None = None,
         assay_name_map: dict[str, str] | None = None,
     ) -> None:
@@ -92,6 +94,8 @@ class H5adToZarr:
         _validate_assay_names(self.assayNames)
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.policy = policy
+        self.io = io
         self.h5ad.infer_storage_dtype(self.resources.memoryBytes)
         csc_peak = self.h5ad.csc_conversion_peak_bytes()
         if csc_peak > self.resources.memoryBytes:
@@ -125,8 +129,7 @@ class H5adToZarr:
                 feat_names=feature_names,
                 dtype=self.storageDtype,
                 profile=self.profile,
-                targetChunkBytes=targetChunkBytes,
-                targetShardBytes=targetShardBytes,
+                policy=policy,
             )
         self._ini_feature_data()
 
@@ -201,6 +204,8 @@ class H5adToZarr:
             self.workspace,
             resources=self.resources,
             profile=self.profile,
+            policy=self.policy,
+            io=self.io,
         )
 
     def _write_counts(self, batch_size: int | None = None) -> None:
@@ -311,7 +316,7 @@ class H5adToZarr:
                     "Please report this issue"
                 )
         # counts is the durable physical orientation for H5AD imports. Public
-        # dump() always finalizes strip-sharded RNA countsT after this step.
+        # dump() always finalizes paired RNA countsT after this step.
         logger.debug(f"Counts written in {counts_seconds:.1f}s")
         logger.info(
             f"Wrote {self.h5ad.nCells} cells and {self.h5ad.nFeatures} features "

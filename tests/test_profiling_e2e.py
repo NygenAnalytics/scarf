@@ -137,6 +137,8 @@ def test_e2e_funnel_runs_graph_construction_core_once_on_r2(
     assert all(kwargs["containerCpuRequest"] == 16.0 for _stage, kwargs in calls)
     assert all(kwargs["containerCpuLimit"] == 16.0 for _stage, kwargs in calls)
     assert all(kwargs["resetCgroupPeak"] is False for _stage, kwargs in calls)
+    assert all(kwargs["storageIo"] is None for _stage, kwargs in calls)
+    assert all(kwargs["countMatrix"] is None for _stage, kwargs in calls)
     assert [result.stage for result in stage_results] == list(CORE_STAGE_ORDER)
     assert summary["status"] == "ok"
     assert summary["completedStages"] == list(CORE_STAGE_ORDER)
@@ -153,6 +155,38 @@ def test_e2e_funnel_runs_graph_construction_core_once_on_r2(
         "timeoutSeconds": 86_400,
     }
     assert funnel_payloads == [summary]
+
+
+def test_e2e_funnel_forwards_storage_io(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from profiling.config import StorageIoConfig
+
+    policy = StorageIoConfig(
+        sourceReadsInFlight=4,
+        destShardsInFlight=2,
+        destCommitsInFlight=2,
+        computeWorkers=1,
+    )
+    config = _config(runTag="e2e-policy").model_copy(update={"storageIo": policy})
+    _mock_e2e_dependencies(monkeypatch, tmp_path)
+    calls: list[dict[str, Any]] = []
+
+    def run_stage(stage: StageName, **kwargs: Any) -> StageRunResult:
+        calls.append(kwargs)
+        return _stage_result(stage)
+
+    monkeypatch.setattr(modal_app, "run_stage", run_stage)
+
+    summary = modal_app.run_e2e_funnel_body(
+        config.model_dump(mode="python"),
+        10_000,
+    )
+
+    assert summary["status"] == "ok"
+    assert calls
+    assert all(kwargs["storageIo"] == policy for kwargs in calls)
 
 
 def test_e2e_funnel_stops_and_persists_failure(
@@ -377,3 +411,28 @@ def test_targeted_run_requires_force_to_overwrite_an_existing_result(
     assert n_rows == 10_000
     assert stage == "findMarkers"
     assert force is True
+
+
+def test_stage_zarr_runtime_is_installed_once() -> None:
+    from scarf.storage.async_execution import (
+        configure_zarr_runtime,
+        reset_zarr_runtime_for_tests,
+    )
+
+    from profiling.config import StageResources
+    from profiling.stages import install_stage_zarr_runtime
+
+    reset_zarr_runtime_for_tests()
+    configure_zarr_runtime(codecWorkers=1, asyncConcurrency=1)
+    later = StageResources(
+        modalMemoryRequestMb=4096,
+        modalMemoryLimitMb=4096,
+        modalCpuRequest=4.0,
+        modalCpuLimit=4.0,
+        scarfMemoryBudget=2 * 1024**3,
+        workers=8,
+        timeoutSeconds=600,
+        ephemeralDiskMb=1024,
+    )
+    install_stage_zarr_runtime(later)
+    reset_zarr_runtime_for_tests()

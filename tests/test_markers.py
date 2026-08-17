@@ -761,12 +761,27 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
             self.sf = 1_000.0
             self.name = "RNA"
             self.resources = ResourceBudget(1024**3, 2)
+            from scarf.storage.count_matrix import (
+                persist_count_matrix_plan,
+                plan_count_matrix_pair,
+            )
+
             root = zarr.open_group(store=MemoryStore(), mode="w")
+            values = data.astype(np.uint32)
+            plan = plan_count_matrix_pair(
+                values.shape[0], values.shape[1], values.dtype
+            )
             self.raw = root.create_array(
                 "counts",
-                data=data.astype(np.uint32),
-                chunks=(2, 2),
+                shape=plan.counts.shape,
+                chunks=plan.counts.chunks,
+                shards=plan.counts.shards,
+                dtype=values.dtype,
+                overwrite=True,
             )
+            self.raw[:] = values
+            persist_count_matrix_plan(root, plan)
+            persist_count_matrix_plan(self.raw, plan)
             counts_t = write_counts_t(self.raw, root)
             assert counts_t is not None
             self.rawDataT = counts_t

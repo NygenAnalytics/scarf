@@ -6,6 +6,8 @@ import numpy as np
 import zarr
 
 from ..storage.budget import resolve_budget
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.layout import _group_zarr_format, count_array_spec
 from ..storage.profiles import (
     StorageProfile,
@@ -130,8 +132,8 @@ class DataStoreMerge:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
         missing_assay_policy: MissingAssayPolicy = "zero_fill",
     ) -> None:
         validate_workspace_name(out_workspace)
@@ -160,8 +162,8 @@ class DataStoreMerge:
         self.storageOptions = storage_options
         self.sourceColumn = source_column
         self.missingAssayPolicy = missing_assay_policy
-        self.targetChunkBytes = targetChunkBytes
-        self.targetShardBytes = targetShardBytes
+        self.policy = policy
+        self.io = io
         self.resources = resolve_budget(
             mem_budget
             if mem_budget is not None
@@ -301,35 +303,33 @@ class DataStoreMerge:
             self._assaySources[assay_name] = sources
             self._alignments[assay_name] = align_features(sources, self.names)
 
-    def _should_write_counts_t(self, assay_name: str, sources: list[Any]) -> bool:
+    def _resolve_assay_type(self, assay_name: str, sources: list[Any]) -> str:
         from ..assay.base import Assay
-        from ..assay.classification import is_rna_assay_type
+        from ..assay.classification import (
+            is_rna_assay_type,
+            resolve_persisted_assay_type,
+        )
 
-        saw_present = False
         for source in sources:
             if isinstance(source, MissingAssay):
                 continue
-            saw_present = True
-            # Scarf Assay instances: class is authoritative over the group name.
             if isinstance(source, Assay):
+                source_type = getattr(source, "assayType", None)
+                if isinstance(source_type, str):
+                    return resolve_persisted_assay_type(assay_name, source_type)
                 if is_rna_assay_type(source):
-                    logger.debug(
-                        f"countsT enabled for assay {assay_name} from source class"
-                    )
-                    return True
-                continue
-            # Untyped merge fixtures / foreign objects: fall back to names.
-            source_name = getattr(source, "name", None)
-            if isinstance(source_name, str) and is_rna_assay_type(source_name):
-                logger.debug(f"countsT enabled for assay {assay_name} from source name")
-                return True
-            if is_rna_assay_type(assay_name):
-                logger.debug(f"countsT enabled for assay {assay_name} by assay name")
-                return True
-        if not saw_present and is_rna_assay_type(assay_name):
-            logger.debug(f"countsT enabled for assay {assay_name} by assay name")
+                    return resolve_persisted_assay_type(assay_name, "RNA")
+                return resolve_persisted_assay_type(assay_name, "Assay")
+        return resolve_persisted_assay_type(assay_name)
+
+    def _should_write_counts_t(self, assay_name: str, sources: list[Any]) -> bool:
+        from ..assay.classification import is_rna_assay_type
+
+        type_name = self._resolve_assay_type(assay_name, sources)
+        if is_rna_assay_type(type_name):
+            logger.debug(f"countsT enabled for assay {assay_name} typed as {type_name}")
             return True
-        logger.debug(f"countsT disabled for assay {assay_name}")
+        logger.debug(f"countsT disabled for assay {assay_name} typed as {type_name}")
         return False
 
     def _build_manifest(self) -> dict[str, Any]:
@@ -355,8 +355,12 @@ class DataStoreMerge:
             "sourceColumn": self.sourceColumn,
             "dtype": self.dtype,
             "profile": self.profile,
-            "targetChunkBytes": self.targetChunkBytes,
-            "targetShardBytes": self.targetShardBytes,
+            "countMatrixPolicy": None
+            if self.policy is None
+            else {
+                "unitBytes": self.policy.unitBytes,
+                "chunkBytes": self.policy.chunkBytes,
+            },
             "missingAssayPolicy": self.missingAssayPolicy,
             "outWorkspace": self.outWorkspace,
             "nCells": self._rowPlan.nCells,
@@ -636,7 +640,7 @@ class DataStoreMerge:
                         "rebuild it.",
                     )
                 else:
-                    # incomplete or rewrite-layout: rewrite strip countsT.
+                    # incomplete or rewrite-layout: rewrite paired countsT.
                     actions[f"countsT:{assay_name}"] = "resume"
             else:
                 actions[f"countsT:{assay_name}"] = "resume"
@@ -710,8 +714,7 @@ class DataStoreMerge:
                 alignment.nFeats,
                 dtype=dtype,
                 profile=self.profile,
-                targetChunkBytes=self.targetChunkBytes,
-                targetShardBytes=self.targetShardBytes,
+                policy=self.policy,
                 zarrFormat=zarr_format,
             )
             count_specs[assay_name] = count_spec
@@ -722,6 +725,7 @@ class DataStoreMerge:
             preliminary_plans.append(
                 AssayMergePlan(
                     assayName=assay_name,
+                    assayType=self._resolve_assay_type(assay_name, sources),
                     sourcePresent=present,
                     missingSources=missing,
                     nFeatures=alignment.nFeats,
@@ -953,6 +957,17 @@ class DataStoreMerge:
         else:
             components.append(ComponentResult("cellData", "skip"))
 
+        attr_root = self._attr_root(root)
+        raw_types = attr_root.attrs.get("assayTypes", {})
+        assay_types = (
+            {str(key): str(value) for key, value in raw_types.items()}
+            if isinstance(raw_types, dict)
+            else {}
+        )
+        for assay_plan in plan.assays:
+            assay_types[assay_plan.assayName] = assay_plan.assayType
+        attr_root.attrs["assayTypes"] = assay_types
+
         for assay_plan in plan.assays:
             assay_name = assay_plan.assayName
             sources = self._assaySources[assay_name]
@@ -967,8 +982,7 @@ class DataStoreMerge:
                     alignment,
                     assay_plan.dtype,
                     profile=self.profile,
-                    targetChunkBytes=self.targetChunkBytes,
-                    targetShardBytes=self.targetShardBytes,
+                    policy=self.policy,
                 )
                 write_assay_counts(
                     root,
@@ -1005,6 +1019,8 @@ class DataStoreMerge:
                             item.resident_bytes() for item in self._alignments.values()
                         )
                     ),
+                    policy=self.policy,
+                    io=self.io,
                 )
                 components.append(
                     ComponentResult(f"countsT:{assay_name}", counts_t_action)

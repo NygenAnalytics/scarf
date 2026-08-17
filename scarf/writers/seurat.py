@@ -19,6 +19,8 @@ from ..readers.seurat import (
     SeuratRMatrix,
     SeuratReduction,
 )
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.refs import ArtifactRef
 
@@ -95,8 +97,8 @@ class SeuratToZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -204,6 +206,8 @@ class SeuratToZarr:
         from ..storage.profiles import resolve_storage_profile
 
         self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.policy = policy
+        self.io = io
         self.assayNames = assay_names
         self.defaultAssay = inspection.activeAssay
         self._assays = assays
@@ -260,8 +264,7 @@ class SeuratToZarr:
                 feature_dtype,
                 dtype=assay.counts.dtype,
                 profile=self.profile,
-                targetChunkBytes=targetChunkBytes,
-                targetShardBytes=targetShardBytes,
+                policy=policy,
             )
             self.counts[assay.name] = counts
             self.featureData[assay.name] = feature_data
@@ -333,6 +336,8 @@ class SeuratToZarr:
                     assay_type=assay.name,
                     resources=self.resources,
                     profile=self.profile,
+                    policy=self.policy,
+                    io=self.io,
                 )
             cell_selection = self._write_cell_selection()
             reduction_artifacts = self._write_reductions(

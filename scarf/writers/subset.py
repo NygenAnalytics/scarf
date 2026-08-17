@@ -6,6 +6,8 @@ import zarr
 
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..storage.arrays import create_numeric_array, create_zarr_obj_array
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.layout import count_array_spec
 from ..storage.profiles import (
     StorageProfile,
@@ -48,8 +50,7 @@ def subset_assay_zarr(
     mem_budget: int | str | None = None,
     nthreads: int | None = None,
     profile: StorageProfile | None = None,
-    targetChunkBytes: int | None = None,
-    targetShardBytes: int | None = None,
+    policy: CountMatrixPolicy | None = None,
 ) -> None:
     """Selects a subset of the data in an assay in the specified Zarr
     hierarchy.
@@ -77,8 +78,7 @@ def subset_assay_zarr(
         len(feat_idx),
         dtype="uint32",
         profile=resolved_profile,
-        targetChunkBytes=targetChunkBytes,
-        targetShardBytes=targetShardBytes,
+        policy=policy,
     )
     og = create_numeric_array(z, out_grp, spec)
     write_dense_in_shard_rows(
@@ -125,8 +125,8 @@ class SubsetZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
 
@@ -160,8 +160,8 @@ class SubsetZarr:
             ),
         )
         self.profile = resolve_storage_profile(zarr_loc, profile)
-        self.targetChunkBytes = targetChunkBytes
-        self.targetShardBytes = targetShardBytes
+        self.policy = policy
+        self.io = io
         self.z = self._check_files(zarr_loc)
         self.assays = self._check_assays(assays)
         self.cellIdx = self._check_idx(cell_key, cell_idx)
@@ -281,8 +281,7 @@ class SubsetZarr:
                 feat_names=assay.feats.fetch_all("names"),
                 dtype=assay.rawData.dtype,
                 profile=self.profile,
-                targetChunkBytes=self.targetChunkBytes,
-                targetShardBytes=self.targetShardBytes,
+                policy=self.policy,
             )
 
     def dump(self) -> None:
@@ -324,6 +323,8 @@ class SubsetZarr:
                     ),
                     resources=self.resources,
                     profile=self.profile,
+                    policy=self.policy,
+                    io=self.io,
                 )
         logger.info(
             f"Wrote a subset of {len(self.cellIdx)} cells across "

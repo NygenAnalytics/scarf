@@ -1,4 +1,4 @@
-"""Test and phase-check recording of Zarr Store operations.
+"""Test recording of Zarr Store operations.
 
 This wrapper is instrumentation only. It is not a product request limiter.
 """

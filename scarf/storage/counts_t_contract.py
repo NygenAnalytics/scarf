@@ -1,8 +1,9 @@
-"""Raw-Zarr contracts for mandatory RNA strip ``countsT``.
+"""Raw-Zarr contracts for mandatory RNA ``countsT``.
 
 These helpers inspect and gate stores without constructing ``RNAassay`` or
 ``DataStore``, so migration and mount paths can fail early with a concrete
-repack remedy.
+repack remedy. Callers pass the resolved assay type; this module does not
+import assay classification.
 """
 
 from dataclasses import dataclass
@@ -11,9 +12,8 @@ from typing import Literal
 import numpy as np
 import zarr
 
-from ..assay.classification import is_rna_assay_type, lookup_persisted_assay_type
-from .sharding import is_strip_counts_t_layout
-from .types import array_metadata_shards, as_zarr_array, as_zarr_group
+from .count_matrix import REBUILD_REMEDY, require_count_matrix_layout
+from .types import as_zarr_array, as_zarr_group
 
 
 CountsTInspectStatus = Literal[
@@ -24,7 +24,11 @@ CountsTInspectStatus = Literal[
     "zarr-v2",
     "unsupported-layout",
     "shape-dtype-mismatch",
+    "missing-layout-metadata",
+    "layout-mismatch",
 ]
+
+_RNA_ASSAY_TYPES = frozenset({"RNA", "GeneActivity", "GeneScores", "URNA"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +47,19 @@ def _workspace_root(root: zarr.Group, workspace: str | None) -> zarr.Group:
     return as_zarr_group(root[workspace], name=workspace)
 
 
+def _resolve_assay_type(
+    assay_name: str,
+    attr_root: zarr.Group,
+    assay_type: str | None,
+) -> str:
+    if assay_type is not None:
+        return str(assay_type)
+    raw_types = attr_root.attrs.get("assayTypes", {})
+    if isinstance(raw_types, dict) and assay_name in raw_types:
+        return str(raw_types[assay_name])
+    return assay_name
+
+
 def inspect_counts_t(
     root: zarr.Group,
     assay_name: str,
@@ -52,18 +69,8 @@ def inspect_counts_t(
 ) -> CountsTInspectResult:
     """Classify ``countsT`` readiness from raw Zarr metadata."""
     attr_root = _workspace_root(root, workspace)
-    raw_types = attr_root.attrs.get("assayTypes", {})
-    type_map = (
-        {str(k): str(v) for k, v in raw_types.items()}
-        if isinstance(raw_types, dict)
-        else {}
-    )
-    type_name = lookup_persisted_assay_type(
-        assay_name,
-        type_map,
-        assay_type=assay_type,
-    )
-    if not is_rna_assay_type(type_name):
+    type_name = _resolve_assay_type(assay_name, attr_root, assay_type)
+    if type_name not in _RNA_ASSAY_TYPES:
         return CountsTInspectResult(
             assayName=assay_name,
             assayType=type_name,
@@ -104,7 +111,7 @@ def inspect_counts_t(
             assayType=type_name,
             status="zarr-v2",
             reason=(
-                f"RNA assay {assay_name!r} requires Zarr v3 for strip-sharded "
+                f"RNA assay {assay_name!r} requires Zarr v3 for sharded "
                 "countsT. Repack the store to Zarr v3."
             ),
         )
@@ -134,31 +141,28 @@ def inspect_counts_t(
                 f"{expected_shape} dtype {np.dtype(counts.dtype)}"
             ),
         )
-    shards = array_metadata_shards(counts_t)
-    shape = tuple(int(v) for v in counts_t.shape)
-    chunks = tuple(int(v) for v in counts_t.chunks)
-    shard_shape = None if shards is None else tuple(int(v) for v in shards)
-    if shards is None or not is_strip_counts_t_layout(
-        shape=shape,
-        chunks=chunks,
-        shards=shard_shape,
-        dtype=counts_t.dtype,
-    ):
+    try:
+        require_count_matrix_layout(matrix_group, counts, counts_t)
+    except ValueError as exc:
+        message = str(exc)
+        status: CountsTInspectStatus = (
+            "missing-layout-metadata"
+            if "missing" in message or "retired keys" in message
+            else "layout-mismatch"
+        )
         return CountsTInspectResult(
             assayName=assay_name,
             assayType=type_name,
-            status="unsupported-layout",
-            reason=(
-                f"RNA assay {assay_name!r} has an unsupported countsT layout "
-                "(unsharded or non-strip). Rebuild with repack_zarr or "
-                "write_counts_t."
-            ),
+            status=status,
+            reason=f"{message} {REBUILD_REMEDY}"
+            if REBUILD_REMEDY not in message
+            else message,
         )
     return CountsTInspectResult(
         assayName=assay_name,
         assayType=type_name,
         status="ready",
-        reason=f"countsT for {assay_name!r} is complete strip-sharded Zarr v3",
+        reason=f"countsT for {assay_name!r} is complete sharded Zarr v3",
     )
 
 
@@ -169,7 +173,7 @@ def require_rna_counts_t_ready(
     *,
     assay_type: str | None = None,
 ) -> None:
-    """Raise when an RNA assay lacks a mount-safe strip ``countsT``."""
+    """Raise when an RNA assay lacks a mount-safe sharded ``countsT``."""
     result = inspect_counts_t(
         root,
         assay_name,

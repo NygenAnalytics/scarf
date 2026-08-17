@@ -1,17 +1,10 @@
-"""Paired counts / countsT layout policy for the experimental geometry.
-
-This module is additive. Public writers keep the current planners until a
-later phase selects this policy as the product path.
-"""
+"""Paired counts / countsT rotateOnce layout policy."""
 
 import hashlib
 import json
 import math
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Any
 
 import numpy as np
 import zarr
@@ -20,105 +13,32 @@ from .layout import _CODEC_MAX_BYTES, ZarrArraySpec, get_compressors
 from .profiles import StorageProfile
 from .types import array_metadata_shards, as_zarr_array
 
-TARGET_READ_UNIT_BYTES = 1_000_000_000
-TARGET_CHUNK_BYTES = 100_000_000
-
-LayoutStrategy = Literal["keepAspect", "rotateEach", "rotateOnce"]
-LAYOUT_STRATEGIES: tuple[LayoutStrategy, ...] = (
-    "keepAspect",
-    "rotateEach",
-    "rotateOnce",
-)
-# Locked after the scaled 1M/5M write/read comparison. keepAspect and
-# rotateOnce are identical through 1M cells. Past that, rotateOnce keeps
-# consumer read groups near U with a 10x write-decode cap. rotateEach is
-# kept as a planner variant only; its 100x write cost at 100M is not the
-# experimental default.
-DEFAULT_LAYOUT_STRATEGY: LayoutStrategy = "rotateOnce"
+UNIT_BYTES = 1_000_000_000
+CHUNK_BYTES = 100_000_000
+COUNT_MATRIX_LAYOUT_KEY = "scarf:countMatrixLayout"
+REBUILD_REMEDY = "Rebuild the store with repack_zarr or write_counts_t."
 
 
 @dataclass(frozen=True, slots=True)
-class CountMatrixLayoutPolicy:
-    targetReadUnitBytes: int
-    targetChunkBytes: int
+class CountMatrixPolicy:
+    unitBytes: int
+    chunkBytes: int
 
     def __post_init__(self) -> None:
-        if min(self.targetReadUnitBytes, self.targetChunkBytes) < 1:
+        if min(self.unitBytes, self.chunkBytes) < 1:
             raise ValueError("layout policy values must be positive")
-        if self.targetReadUnitBytes < self.targetChunkBytes:
-            raise ValueError("targetReadUnitBytes must be at least targetChunkBytes")
+        if self.unitBytes < self.chunkBytes:
+            raise ValueError("unitBytes must be at least chunkBytes")
 
     @property
     def chunksPerShard(self) -> int:
-        return max(
-            1,
-            (self.targetReadUnitBytes + self.targetChunkBytes // 2)
-            // self.targetChunkBytes,
-        )
+        return max(1, (self.unitBytes + self.chunkBytes // 2) // self.chunkBytes)
 
 
-EXPERIMENTAL_POLICY = CountMatrixLayoutPolicy(
-    targetReadUnitBytes=TARGET_READ_UNIT_BYTES,
-    targetChunkBytes=TARGET_CHUNK_BYTES,
+DEFAULT_COUNT_MATRIX_POLICY = CountMatrixPolicy(
+    unitBytes=UNIT_BYTES,
+    chunkBytes=CHUNK_BYTES,
 )
-
-# Product writes stay on the current layout until a later phase records a switch.
-ACCEPTED_LAYOUT_BRANCH: str = "current"
-_EXPERIMENTAL_LAYOUT_READS: ContextVar[bool] = ContextVar(
-    "scarf_experimental_layout_reads",
-    default=False,
-)
-
-
-def accepted_layout_branch() -> str:
-    """Return the recorded product-layout branch, or ``current`` before a switch."""
-    return ACCEPTED_LAYOUT_BRANCH
-
-
-def apply_recorded_layout_branch(branch: str) -> str:
-    """Map a recorded experiment branch onto the product layout switch.
-
-    Only Branch A replaces the on-disk counts/countsT geometry. Every other
-    recorded outcome keeps the current layout.
-    """
-    global ACCEPTED_LAYOUT_BRANCH
-    if branch == "A":
-        ACCEPTED_LAYOUT_BRANCH = "A"
-    elif branch in {"B", "C", "D", "E", "current"}:
-        ACCEPTED_LAYOUT_BRANCH = "current"
-    else:
-        raise ValueError(f"unsupported layout branch {branch!r}")
-    return ACCEPTED_LAYOUT_BRANCH
-
-
-@contextmanager
-def override_accepted_layout_branch(branch: str) -> Iterator[str]:
-    """Temporarily apply a recorded branch, then restore the previous value."""
-    global ACCEPTED_LAYOUT_BRANCH
-    previous = ACCEPTED_LAYOUT_BRANCH
-    try:
-        yield apply_recorded_layout_branch(branch)
-    finally:
-        ACCEPTED_LAYOUT_BRANCH = previous
-
-
-def uses_experimental_product_layout() -> bool:
-    return accepted_layout_branch() == "A"
-
-
-def experimental_layout_reads_enabled() -> bool:
-    """Return whether the current experimental operation may open paired arrays."""
-    return _EXPERIMENTAL_LAYOUT_READS.get()
-
-
-@contextmanager
-def allow_experimental_layout_reads() -> Iterator[None]:
-    """Temporarily allow private experiment code to open paired countsT arrays."""
-    token = _EXPERIMENTAL_LAYOUT_READS.set(True)
-    try:
-        yield
-    finally:
-        _EXPERIMENTAL_LAYOUT_READS.reset(token)
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,8 +57,7 @@ class CountsTReadGroupSpec:
 
 @dataclass(frozen=True, slots=True)
 class CountMatrixPairPlan:
-    policy: CountMatrixLayoutPolicy
-    strategy: str
+    policy: CountMatrixPolicy
     nCells: int
     nFeats: int
     itemsize: int
@@ -153,33 +72,11 @@ class CountMatrixPairPlan:
     fingerprint: str
 
 
-def _positive(value: int, name: str) -> int:
+def _non_negative(value: int, name: str) -> int:
     resolved = int(value)
-    if resolved < 1:
-        raise ValueError(f"{name} must be positive")
+    if resolved < 0:
+        raise ValueError(f"{name} must be non-negative")
     return resolved
-
-
-def _nearest_divisor(value: int, target: int, *, multipleOf: int = 1) -> int:
-    resolved = max(1, int(value))
-    wanted = min(max(1, int(target)), resolved)
-    step = max(1, int(multipleOf))
-    best = 1
-    best_key = (abs(1 - wanted), 1)
-    candidate = 1
-    while candidate * candidate <= resolved:
-        if resolved % candidate == 0:
-            for item in (candidate, resolved // candidate):
-                if item != resolved and step > 1 and item % step:
-                    continue
-                key = (abs(item - wanted), item)
-                if key < best_key:
-                    best = item
-                    best_key = key
-        candidate += 1
-    if best == 1 and resolved > 1 and wanted > 1:
-        return resolved
-    return best
 
 
 def _check_codec_limit(chunks: tuple[int, int], itemsize: int, *, name: str) -> None:
@@ -244,35 +141,18 @@ def _counts_t_aspect(
     *,
     unit_bytes: int,
     k: int,
-    strategy: LayoutStrategy,
-) -> tuple[int, int, int]:
+) -> tuple[int, int]:
     base_cells = max(1, unit_bytes // max(1, counts_chunk_feats * itemsize))
     if n_cells <= base_cells:
         shard_cells = n_cells
-        raw_feats = max(1, unit_bytes // max(1, n_cells * itemsize))
-        shard_feats = min(n_feats, raw_feats)
-        shard_feats = _nearest_divisor(n_feats, shard_feats)
-        return shard_cells, shard_feats, 0
-
+        shard_feats = min(n_feats, max(1, unit_bytes // max(1, n_cells * itemsize)))
+        return shard_cells, shard_feats
     shard_cells = base_cells
     shard_feats = counts_chunk_feats
-    rotations = 0
-    if strategy == "keepAspect":
-        max_rotations = 0
-    elif strategy == "rotateOnce":
-        max_rotations = 1
-    else:
-        max_rotations = 64
-    while (
-        rotations < max_rotations
-        and n_cells > k * shard_cells
-        and shard_feats >= k
-        and shard_feats % k == 0
-    ):
+    if n_cells > k * shard_cells and shard_feats >= k:
         shard_cells *= k
-        shard_feats //= k
-        rotations += 1
-    return shard_cells, shard_feats, rotations
+        shard_feats = max(1, shard_feats // k)
+    return shard_cells, shard_feats
 
 
 def _counts_t_chunks(
@@ -286,24 +166,128 @@ def _counts_t_chunks(
     itemsize: int,
 ) -> tuple[int, int]:
     ratio = max(1, math.ceil(n_cells / max(1, shard_cells)))
-    if ratio <= k and shard_feats % max(1, _factor_k(k, ratio)[1]) == 0:
+    gene_parts = max(1, _factor_k(k, ratio)[1])
+    if ratio <= k and shard_feats % gene_parts == 0:
         cell_parts, gene_parts = _factor_k(k, ratio)
         if (
             shard_cells % max(1, cell_parts) == 0
             and shard_feats % max(1, gene_parts) == 0
         ):
-            chunk_cells = max(1, shard_cells // cell_parts)
-            chunk_feats = max(1, shard_feats // gene_parts)
-            return chunk_feats, chunk_cells
+            return max(1, shard_feats // gene_parts), max(1, shard_cells // cell_parts)
 
-    target_feats = max(1, unit_bytes // max(1, n_cells * itemsize))
-    chunk_feats = _nearest_divisor(shard_feats, min(shard_feats, target_feats))
+    chunk_feats = max(1, min(shard_feats, unit_bytes // max(1, n_cells * itemsize)))
     chunk_cells = shard_cells
     nominal = chunk_feats * chunk_cells * itemsize
     if nominal > chunk_bytes * 2 and shard_cells > 1:
-        cell_target = max(1, chunk_bytes // max(1, chunk_feats * itemsize))
-        chunk_cells = _nearest_divisor(shard_cells, min(shard_cells, cell_target))
+        chunk_cells = max(
+            1, min(shard_cells, chunk_bytes // max(1, chunk_feats * itemsize))
+        )
     return chunk_feats, chunk_cells
+
+
+def _empty_plan(
+    n_cells: int,
+    n_feats: int,
+    dtype: Any,
+    *,
+    policy: CountMatrixPolicy,
+    profile: StorageProfile,
+) -> CountMatrixPairPlan:
+    itemsize = int(np.dtype(dtype).itemsize)
+    counts_chunks = (1, 1)
+    counts_shards = (1, 1)
+    counts_t_chunks = (max(1, n_feats), 1)
+    counts_t_shards = (max(1, n_feats), 1)
+    counts = _spec(
+        (n_cells, n_feats),
+        counts_chunks,
+        counts_shards,
+        dtype,
+        profile=profile,
+    )
+    counts_t = _spec(
+        (n_feats, n_cells),
+        counts_t_chunks,
+        counts_t_shards,
+        dtype,
+        profile=profile,
+    )
+    read_group = CountsTReadGroupSpec(
+        featureWidth=max(0, n_feats),
+        cellExtent=n_cells,
+        chunkFeatures=counts_t_chunks[0],
+        chunkCells=counts_t_chunks[1],
+        shardFeatures=counts_t_shards[0],
+        shardCells=counts_t_shards[1],
+        shardsTouched=1,
+        chunksTouched=1,
+        readGroupBytes=0,
+        physicalShardBytes=0,
+    )
+    return _finish_plan(
+        policy=policy,
+        n_cells=n_cells,
+        n_feats=n_feats,
+        itemsize=itemsize,
+        dtype=dtype,
+        counts=counts,
+        counts_t=counts_t,
+        read_group=read_group,
+        amplification=1.0,
+        destination_bytes=0,
+        source_bytes=0,
+    )
+
+
+def _finish_plan(
+    *,
+    policy: CountMatrixPolicy,
+    n_cells: int,
+    n_feats: int,
+    itemsize: int,
+    dtype: Any,
+    counts: ZarrArraySpec,
+    counts_t: ZarrArraySpec,
+    read_group: CountsTReadGroupSpec,
+    amplification: float,
+    destination_bytes: int,
+    source_bytes: int,
+) -> CountMatrixPairPlan:
+    resolved = {
+        "policy": {"unitBytes": policy.unitBytes, "chunkBytes": policy.chunkBytes},
+        "nCells": n_cells,
+        "nFeats": n_feats,
+        "itemsize": itemsize,
+        "dtype": np.dtype(dtype).name,
+        "chunksPerShard": policy.chunksPerShard,
+        "countsChunks": list(counts.chunks),
+        "countsShards": list(counts.shards or ()),
+        "countsTChunks": list(counts_t.chunks),
+        "countsTShards": list(counts_t.shards or ()),
+        "readGroup": {
+            "featureWidth": read_group.featureWidth,
+            "cellExtent": read_group.cellExtent,
+            "chunkFeatures": read_group.chunkFeatures,
+            "chunkCells": read_group.chunkCells,
+            "shardFeatures": read_group.shardFeatures,
+            "shardCells": read_group.shardCells,
+        },
+    }
+    return CountMatrixPairPlan(
+        policy=policy,
+        nCells=n_cells,
+        nFeats=n_feats,
+        itemsize=itemsize,
+        dtype=np.dtype(dtype).name,
+        chunksPerShard=policy.chunksPerShard,
+        counts=counts,
+        countsT=counts_t,
+        readGroup=read_group,
+        sourceDecodeAmplification=amplification,
+        destinationBufferBytes=destination_bytes,
+        sourceBufferBytes=source_bytes,
+        fingerprint=_fingerprint(resolved),
+    )
 
 
 def plan_count_matrix_pair(
@@ -311,40 +295,44 @@ def plan_count_matrix_pair(
     nFeats: int,
     dtype: Any,
     *,
-    policy: CountMatrixLayoutPolicy = EXPERIMENTAL_POLICY,
-    strategy: LayoutStrategy = DEFAULT_LAYOUT_STRATEGY,
+    policy: CountMatrixPolicy = DEFAULT_COUNT_MATRIX_POLICY,
     profile: StorageProfile = "cloud",
 ) -> CountMatrixPairPlan:
-    if strategy not in LAYOUT_STRATEGIES:
-        raise ValueError(f"unsupported layout strategy {strategy!r}")
-    n_cells = _positive(nCells, "nCells")
-    n_feats = _positive(nFeats, "nFeats")
+    n_cells = _non_negative(nCells, "nCells")
+    n_feats = _non_negative(nFeats, "nFeats")
     itemsize = int(np.dtype(dtype).itemsize)
     if itemsize < 1:
         raise ValueError("itemsize must be positive")
+    if n_cells == 0 or n_feats == 0:
+        return _empty_plan(
+            n_cells,
+            n_feats,
+            dtype,
+            policy=policy,
+            profile=profile,
+        )
 
-    unit_bytes = int(policy.targetReadUnitBytes)
-    chunk_bytes = int(policy.targetChunkBytes)
+    unit_bytes = int(policy.unitBytes)
+    chunk_bytes = int(policy.chunkBytes)
     k = policy.chunksPerShard
     row_bytes = n_feats * itemsize
     counts_shard_cells = max(1, min(n_cells, unit_bytes // max(1, row_bytes)))
-    target_chunk_feats = max(1, chunk_bytes // max(1, counts_shard_cells * itemsize))
-    counts_chunk_feats = _nearest_divisor(
-        n_feats,
-        min(n_feats, target_chunk_feats),
-        multipleOf=k if n_feats % k == 0 else 1,
+    counts_chunk_feats = max(
+        1, min(n_feats, chunk_bytes // max(1, counts_shard_cells * itemsize))
     )
     counts_chunks = (counts_shard_cells, counts_chunk_feats)
-    counts_shards = (counts_shard_cells, n_feats)
+    counts_shards = (
+        counts_shard_cells,
+        _pad_to_multiple(n_feats, counts_chunk_feats),
+    )
 
-    shard_cells, shard_feats, _rotations = _counts_t_aspect(
+    shard_cells, shard_feats = _counts_t_aspect(
         n_cells,
         n_feats,
         counts_chunk_feats,
         itemsize,
         unit_bytes=unit_bytes,
         k=k,
-        strategy=strategy,
     )
     chunk_feats, chunk_cells = _counts_t_chunks(
         n_cells,
@@ -381,7 +369,6 @@ def plan_count_matrix_pair(
     )
 
     read_feats = min(n_feats, max(1, unit_bytes // max(1, n_cells * itemsize)))
-    read_feats = _nearest_divisor(n_feats, read_feats)
     if read_feats > shard_feats:
         read_feats = min(n_feats, max(chunk_feats, shard_feats))
     cell_shards = max(1, math.ceil(n_cells / shard_cells))
@@ -405,58 +392,55 @@ def plan_count_matrix_pair(
     amplification = max(1.0, counts_chunk_feats / max(1, shard_feats))
     destination_bytes = min(shard_cells, n_cells) * min(shard_feats, n_feats) * itemsize
     source_bytes = counts_shard_cells * counts_chunk_feats * itemsize
-    resolved = {
-        "policy": asdict(policy),
-        "strategy": strategy,
-        "nCells": n_cells,
-        "nFeats": n_feats,
-        "itemsize": itemsize,
-        "dtype": np.dtype(dtype).name,
-        "chunksPerShard": k,
-        "countsChunks": list(counts.chunks),
-        "countsShards": list(counts.shards or ()),
-        "countsTChunks": list(counts_t.chunks),
-        "countsTShards": list(counts_t.shards or ()),
-        "readGroup": asdict(read_group),
-        "sourceDecodeAmplification": amplification,
-    }
-    return CountMatrixPairPlan(
+    return _finish_plan(
         policy=policy,
-        strategy=strategy,
-        nCells=n_cells,
-        nFeats=n_feats,
+        n_cells=n_cells,
+        n_feats=n_feats,
         itemsize=itemsize,
-        dtype=np.dtype(dtype).name,
-        chunksPerShard=k,
+        dtype=dtype,
         counts=counts,
-        countsT=counts_t,
-        readGroup=read_group,
-        sourceDecodeAmplification=amplification,
-        destinationBufferBytes=destination_bytes,
-        sourceBufferBytes=source_bytes,
-        fingerprint=_fingerprint(resolved),
+        counts_t=counts_t,
+        read_group=read_group,
+        amplification=amplification,
+        destination_bytes=destination_bytes,
+        source_bytes=source_bytes,
     )
 
 
-def plan_layout_candidates(
+def policy_from_payload(payload: dict[str, Any]) -> CountMatrixPolicy:
+    policy = payload.get("policy")
+    if not isinstance(policy, dict):
+        raise ValueError(
+            f"count matrix layout metadata is missing a policy. {REBUILD_REMEDY}"
+        )
+    if "targetReadUnitBytes" in policy or "targetChunkBytes" in policy:
+        raise ValueError("count matrix layout uses retired keys. " + REBUILD_REMEDY)
+    if "unitBytes" not in policy or "chunkBytes" not in policy:
+        raise ValueError(
+            f"count matrix layout metadata is incomplete. {REBUILD_REMEDY}"
+        )
+    return CountMatrixPolicy(
+        unitBytes=int(policy["unitBytes"]),
+        chunkBytes=int(policy["chunkBytes"]),
+    )
+
+
+def replay_count_matrix_plan(
+    payload: dict[str, Any],
+    *,
     nCells: int,
     nFeats: int,
     dtype: Any,
-    *,
-    policy: CountMatrixLayoutPolicy = EXPERIMENTAL_POLICY,
     profile: StorageProfile = "cloud",
-) -> dict[str, CountMatrixPairPlan]:
-    return {
-        strategy: plan_count_matrix_pair(
-            nCells,
-            nFeats,
-            dtype,
-            policy=policy,
-            strategy=strategy,
-            profile=profile,
-        )
-        for strategy in LAYOUT_STRATEGIES
-    }
+) -> CountMatrixPairPlan:
+    policy = policy_from_payload(payload)
+    return plan_count_matrix_pair(
+        nCells,
+        nFeats,
+        dtype,
+        policy=policy,
+        profile=profile,
+    )
 
 
 def validate_count_matrix_pair(
@@ -482,29 +466,61 @@ def validate_count_matrix_pair(
         raise ValueError("counts dtype mismatch")
 
 
+def _array_geometry(
+    array: zarr.Array,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...] | None]:
+    stored = array_metadata_shards(array)
+    return (
+        tuple(int(value) for value in array.shape),
+        tuple(int(value) for value in array.chunks),
+        None if stored is None else tuple(int(value) for value in stored),
+    )
+
+
 def validate_count_matrix_source(
     counts: zarr.Array,
     *,
     expected: CountMatrixPairPlan,
 ) -> None:
-    """Validate an experimental counts array and its persisted paired plan."""
-    actual_shards = array_metadata_shards(counts)
-    if tuple(int(value) for value in counts.shape) != expected.counts.shape:
-        raise ValueError("experimental counts shape does not match the paired plan")
+    """Validate a counts array against the paired plan and persisted payload."""
+    shape, chunks, shards = _array_geometry(counts)
+    if shape != expected.counts.shape:
+        raise ValueError("counts shape does not match the paired plan")
     if np.dtype(counts.dtype) != np.dtype(expected.counts.dtype):
-        raise ValueError("experimental counts dtype does not match the paired plan")
-    if tuple(int(value) for value in counts.chunks) != expected.counts.chunks:
-        raise ValueError("experimental counts chunks do not match the paired plan")
-    if (
-        actual_shards is None
-        or tuple(int(value) for value in actual_shards) != expected.counts.shards
-    ):
-        raise ValueError("experimental counts shards do not match the paired plan")
+        raise ValueError("counts dtype does not match the paired plan")
+    if chunks != expected.counts.chunks:
+        raise ValueError("counts chunks do not match the paired plan")
+    if shards is None or shards != expected.counts.shards:
+        raise ValueError("counts shards do not match the paired plan")
     recorded = load_count_matrix_plan(counts)
     if recorded.get("fingerprint") != expected.fingerprint:
         raise ValueError(
-            "experimental counts metadata does not match the expected paired plan"
+            "counts metadata does not match the expected paired plan. " + REBUILD_REMEDY
         )
+
+
+def validate_live_count_matrix_geometry(
+    array: zarr.Array,
+    *,
+    expected_shape: tuple[int, ...],
+    expected_chunks: tuple[int, ...],
+    expected_shards: tuple[int, ...] | None,
+    dtype: Any,
+    name: str,
+) -> None:
+    shape, chunks, shards = _array_geometry(array)
+    if shape != tuple(int(value) for value in expected_shape):
+        raise ValueError(f"{name} shape does not match the persisted plan")
+    if np.dtype(array.dtype) != np.dtype(dtype):
+        raise ValueError(f"{name} dtype does not match the persisted plan")
+    if chunks != tuple(int(value) for value in expected_chunks):
+        raise ValueError(f"{name} chunks do not match the persisted plan")
+    if shards != (
+        None
+        if expected_shards is None
+        else tuple(int(value) for value in expected_shards)
+    ):
+        raise ValueError(f"{name} shards do not match the persisted plan")
 
 
 def create_count_matrix_array(group: Any, name: str, spec: ZarrArraySpec) -> zarr.Array:
@@ -525,8 +541,10 @@ def create_count_matrix_array(group: Any, name: str, spec: ZarrArraySpec) -> zar
 
 def persist_count_matrix_plan(group: Any, plan: CountMatrixPairPlan) -> None:
     payload = {
-        "policy": asdict(plan.policy),
-        "strategy": plan.strategy,
+        "policy": {
+            "unitBytes": plan.policy.unitBytes,
+            "chunkBytes": plan.policy.chunkBytes,
+        },
         "nCells": plan.nCells,
         "nFeats": plan.nFeats,
         "dtype": plan.dtype,
@@ -548,40 +566,99 @@ def persist_count_matrix_plan(group: Any, plan: CountMatrixPairPlan) -> None:
         "sourceDecodeAmplification": plan.sourceDecodeAmplification,
         "fingerprint": plan.fingerprint,
     }
-    group.attrs["scarf:countMatrixLayout"] = payload
+    group.attrs[COUNT_MATRIX_LAYOUT_KEY] = payload
 
 
 def load_count_matrix_plan(group: Any) -> dict[str, Any]:
-    payload = group.attrs.get("scarf:countMatrixLayout")
+    payload = group.attrs.get(COUNT_MATRIX_LAYOUT_KEY)
     if not isinstance(payload, dict):
-        raise ValueError("experimental count matrix layout metadata is missing")
+        raise ValueError(f"count matrix layout metadata is missing. {REBUILD_REMEDY}")
+    policy_from_payload(payload)
     return dict(payload)
 
 
-def product_counts_spec(
-    nCells: int,
-    nFeats: int,
-    dtype: Any,
-    *,
-    profile: StorageProfile,
-    targetChunkBytes: int | None = None,
-    targetShardBytes: int | None = None,
-    zarrFormat: int = 3,
-) -> ZarrArraySpec:
-    """Return the counts spec for a new write under the accepted branch."""
-    if uses_experimental_product_layout() and int(zarrFormat) >= 3:
-        return plan_count_matrix_pair(nCells, nFeats, dtype, profile=profile).counts
-    from .layout import count_array_spec
+def require_matching_count_matrix_plans(
+    *groups: Any,
+) -> dict[str, Any]:
+    payloads = [load_count_matrix_plan(group) for group in groups]
+    fingerprints = {payload.get("fingerprint") for payload in payloads}
+    if len(fingerprints) != 1 or None in fingerprints:
+        raise ValueError(
+            "count matrix layout metadata does not agree across anchors. "
+            + REBUILD_REMEDY
+        )
+    return payloads[0]
 
-    return count_array_spec(
-        nCells,
-        nFeats,
-        dtype,
+
+def read_group_from_payload(payload: dict[str, Any]) -> tuple[int, int]:
+    """Return persisted ``(featureWidth, readGroupBytes)`` or raise."""
+    read_group = payload.get("readGroup")
+    if (
+        not isinstance(read_group, dict)
+        or "featureWidth" not in read_group
+        or "readGroupBytes" not in read_group
+    ):
+        raise ValueError(
+            "count matrix layout is missing a persisted read group. " + REBUILD_REMEDY
+        )
+    feature_width = int(read_group["featureWidth"])
+    read_group_bytes = int(read_group["readGroupBytes"])
+    if feature_width < 0 or read_group_bytes < 0:
+        raise ValueError(
+            "count matrix layout has an invalid persisted read group. " + REBUILD_REMEDY
+        )
+    return feature_width, read_group_bytes
+
+
+def require_count_matrix_layout(
+    group: Any,
+    counts: Any,
+    counts_t: Any | None = None,
+    *,
+    profile: StorageProfile = "cloud",
+) -> CountMatrixPairPlan:
+    """Load, agree, and replay persisted layout metadata against live arrays."""
+    anchors = [group, counts]
+    if counts_t is not None:
+        anchors.append(counts_t)
+    payload = require_matching_count_matrix_plans(*anchors)
+    plan = replay_count_matrix_plan(
+        payload,
+        nCells=int(counts.shape[0]),
+        nFeats=int(counts.shape[1]),
+        dtype=counts.dtype,
         profile=profile,
-        targetChunkBytes=targetChunkBytes,
-        targetShardBytes=targetShardBytes,
-        zarrFormat=zarrFormat,
     )
+    if payload.get("fingerprint") != plan.fingerprint:
+        raise ValueError(
+            "persisted count matrix plan does not replay against live "
+            f"geometry. {REBUILD_REMEDY}"
+        )
+    feature_width, read_group_bytes = read_group_from_payload(payload)
+    if feature_width != int(plan.readGroup.featureWidth) or read_group_bytes != int(
+        plan.readGroup.readGroupBytes
+    ):
+        raise ValueError(
+            "persisted read group does not match live geometry. " + REBUILD_REMEDY
+        )
+    validate_live_count_matrix_geometry(
+        counts,
+        expected_shape=plan.counts.shape,
+        expected_chunks=plan.counts.chunks,
+        expected_shards=plan.counts.shards,
+        dtype=plan.counts.dtype,
+        name="counts",
+    )
+    if counts_t is not None:
+        validate_live_count_matrix_geometry(
+            counts_t,
+            expected_shape=plan.countsT.shape,
+            expected_chunks=plan.countsT.chunks,
+            expected_shards=plan.countsT.shards,
+            dtype=plan.countsT.dtype,
+            name="countsT",
+        )
+    return plan
 
 
 def create_product_counts_array(
@@ -591,44 +668,20 @@ def create_product_counts_array(
     dtype: Any,
     *,
     profile: StorageProfile,
-    targetChunkBytes: int | None = None,
-    targetShardBytes: int | None = None,
+    policy: CountMatrixPolicy | None = None,
     zarrFormat: int = 3,
 ) -> zarr.Array:
-    """Create a ``counts`` array using the accepted product layout."""
-    if uses_experimental_product_layout() and int(zarrFormat) >= 3:
-        plan = plan_count_matrix_pair(
-            nCells,
-            nFeats,
-            dtype,
-            profile=profile,
-        )
-        counts = create_count_matrix_array(group, "counts", plan.counts)
-        persist_count_matrix_plan(group, plan)
-        return as_zarr_array(counts, name="counts")
-    from .arrays import create_numeric_array
-    from .layout import count_array_spec
-
-    spec = count_array_spec(
+    """Create a ``counts`` array using the rotateOnce product layout."""
+    if int(zarrFormat) < 3:
+        raise ValueError("paired count matrices require Zarr format 3")
+    plan = plan_count_matrix_pair(
         nCells,
         nFeats,
         dtype,
+        policy=policy or DEFAULT_COUNT_MATRIX_POLICY,
         profile=profile,
-        targetChunkBytes=targetChunkBytes,
-        targetShardBytes=targetShardBytes,
-        zarrFormat=zarrFormat,
     )
-    return create_numeric_array(group, "counts", spec)
-
-
-def reject_noncanonical_write_destination(group: Any) -> None:
-    """Reject old layouts when the accepted branch requires paired metadata."""
-    if not uses_experimental_product_layout():
-        return
-    try:
-        load_count_matrix_plan(group)
-    except ValueError as exc:
-        raise ValueError(
-            "This operation requires the accepted paired counts/countsT layout. "
-            "Repack the store with repack_zarr before writing."
-        ) from exc
+    counts = create_count_matrix_array(group, "counts", plan.counts)
+    persist_count_matrix_plan(group, plan)
+    persist_count_matrix_plan(counts, plan)
+    return as_zarr_array(counts, name="counts")

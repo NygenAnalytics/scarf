@@ -1,4 +1,4 @@
-"""Helpers for mandatory RNA strip ``countsT`` at ingest and subset."""
+"""Helpers for mandatory RNA ``countsT`` at ingest and subset."""
 
 from typing import Any
 
@@ -9,6 +9,8 @@ from ..assay.classification import (
     resolve_persisted_assay_type,
 )
 from ..storage.budget import ResourceBudget
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.counts_t_contract import (
     CountsTInspectResult as CountsTInspectResult,
 )
@@ -72,8 +74,10 @@ def finalize_writer_counts_t(
     profile: StorageProfile | None = None,
     mem_budget: int | str | None = None,
     nthreads: int | None = None,
+    policy: CountMatrixPolicy | None = None,
+    io: StorageIoPolicy | None = None,
 ) -> zarr.Array | None:
-    """Write strip ``countsT`` when the assay type is RNA; seed ``assayTypes``.
+    """Write paired ``countsT`` when the assay type is RNA; seed ``assayTypes``.
 
     When ``assay_type`` is omitted, ``assay_name`` is used only if it is a
     recognized preset (``RNA``, ``ADT``, …). Unknown names persist as
@@ -95,14 +99,10 @@ def finalize_writer_counts_t(
         resources=resources,
         mem_budget=mem_budget,
         nthreads=nthreads,
+        policy=policy,
+        io=io,
     )
-    if counts_t is None:
-        raise ValueError(
-            f"RNA assay {assay_name!r} requires Zarr v3 for strip-sharded "
-            "countsT. Repack the store to Zarr v3, or create the store with "
-            "zarr_format=3."
-        )
-    logger.debug(f"Wrote strip countsT for RNA assay {assay_name}")
+    logger.debug(f"Wrote paired countsT for RNA assay {assay_name}")
     return counts_t
 
 
@@ -114,6 +114,8 @@ def finalize_writer_counts_t_many(
     assay_types: dict[str, str] | None = None,
     resources: ResourceBudget | None = None,
     profile: StorageProfile | None = None,
+    policy: CountMatrixPolicy | None = None,
+    io: StorageIoPolicy | None = None,
 ) -> dict[str, Any]:
     """Finalize ``countsT`` for each assay name (RNA only)."""
     written: dict[str, Any] = {}
@@ -126,6 +128,8 @@ def finalize_writer_counts_t_many(
             assay_type=type_map.get(name),
             resources=resources,
             profile=profile,
+            policy=policy,
+            io=io,
         )
         if result is not None:
             written[name] = result

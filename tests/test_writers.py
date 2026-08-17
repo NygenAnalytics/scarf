@@ -4,6 +4,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.readers import CSVReader
+from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.writers import (
     CSVtoZarr,
     CrToZarr,
@@ -96,8 +97,7 @@ def test_crtozarr_preserves_exact_counts_metadata_and_transpose():
         ExactReader(),
         zarr_loc=store,
         dtype="uint16",
-        targetChunkBytes=12,
-        targetShardBytes=12,
+        policy=CountMatrixPolicy(unitBytes=12, chunkBytes=12),
     )
     writer.dump(batch_size=2)
 
@@ -190,8 +190,7 @@ def test_h5adtozarr_splits_noncontiguous_feature_types():
                 zarr_loc=store,
                 assay_name="ignored",
                 assay_split_key="feature_types",
-                targetChunkBytes=8,
-                targetShardBytes=8,
+                policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
             )
             writer.dump(batch_size=2)
         finally:
@@ -264,8 +263,7 @@ def _write_h5ad(
 _SHARD_BAND_BUDGET = {
     "mem_budget": 1024**2,
     "nthreads": 4,
-    "targetChunkBytes": 48,
-    "targetShardBytes": 48,
+    "policy": CountMatrixPolicy(unitBytes=48, chunkBytes=48),
 }
 
 
@@ -342,8 +340,7 @@ def test_h5adtozarr_uses_smallest_lossless_dtype_for_float_counts(
             zarr_loc=store,
             mem_budget=1024**2,
             nthreads=2,
-            targetChunkBytes=48,
-            targetShardBytes=48,
+            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=48),
         ).dump(batch_size=4)
     finally:
         reader.h5.close()
@@ -383,8 +380,7 @@ def test_h5adtozarr_preserves_duplicate_coordinate_sums(tmp_path, encoding):
             zarr_loc=store,
             mem_budget=1024**2,
             nthreads=2,
-            targetChunkBytes=16,
-            targetShardBytes=16,
+            policy=CountMatrixPolicy(unitBytes=16, chunkBytes=16),
         ).dump(batch_size=1)
     finally:
         reader.h5.close()
@@ -432,8 +428,7 @@ def test_h5adtozarr_reduces_duplicates_before_explicit_dtype_cast(
             zarr_loc=store,
             mem_budget=1024**2,
             nthreads=1,
-            targetChunkBytes=16,
-            targetShardBytes=16,
+            policy=CountMatrixPolicy(unitBytes=16, chunkBytes=16),
         ).dump(batch_size=1)
     finally:
         reader.h5.close()
@@ -606,8 +601,7 @@ def test_loomtozarr_preserves_exact_counts_and_transpose(tmp_path):
         writer = LoomToZarr(
             reader,
             zarr_loc=store,
-            targetChunkBytes=8,
-            targetShardBytes=8,
+            policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
         )
         writer.dump(batch_size=2)
     finally:
@@ -781,8 +775,7 @@ def test_subset_assay_zarr_selects_ordered_rows_and_columns():
         out_grp="selected",
         cells_idx=cells,
         feat_idx=features,
-        targetChunkBytes=8,
-        targetShardBytes=8,
+        policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
     )
 
     selected = root["selected"]
@@ -1143,8 +1136,7 @@ def test_h5adtozarr_applies_storage_resources_and_chunk_controls(tmp_path):
             zarr_loc=MemoryStore(),
             mem_budget="2G",
             nthreads=3,
-            targetChunkBytes=4_096,
-            targetShardBytes=20_480,
+            policy=CountMatrixPolicy(unitBytes=20_480, chunkBytes=4_096),
         )
     finally:
         reader.h5.close()
@@ -1154,8 +1146,7 @@ def test_h5adtozarr_applies_storage_resources_and_chunk_controls(tmp_path):
         50,
         dtype=np.uint16,
         profile="fast_local",
-        targetChunkBytes=4_096,
-        targetShardBytes=20_480,
+        policy=CountMatrixPolicy(unitBytes=20_480, chunkBytes=4_096),
     )
     counts = writer.z["RNA/counts"]
     assert writer.resources.memoryBytes == 2 * 1024**3
