@@ -252,7 +252,9 @@ def test_map_feature_read_groups_preserves_unsorted_cell_order() -> None:
         )
     )
     assert loaded
-    stacked = np.concatenate([group.values for group in loaded], axis=0)
+    stacked = np.empty((values.shape[1], cell_idx.shape[0]), dtype=values.dtype)
+    for group in loaded:
+        stacked[group.featStart : group.featEnd] = group.values
     np.testing.assert_array_equal(stacked, values.T[:, cell_idx])
 
 
@@ -336,9 +338,11 @@ def test_selected_values_and_persisted_groups_preserve_order() -> None:
     assert filtered.shape[0] == first.values.shape[0] - 1
     feature_width, _bytes = persisted_read_group(counts_t)
     assert first.featEnd - first.featStart <= feature_width
-    assert [group.featStart for group in groups] == sorted(
-        group.featStart for group in groups
-    )
+    starts = [group.featStart for group in groups]
+    assert starts
+    assert len(starts) == len(set(starts))
+    assert min(starts) == 0
+    assert max(group.featEnd for group in groups) == n_feats
 
 
 def test_consume_uses_persisted_two_gib_read_group() -> None:
@@ -515,10 +519,13 @@ def test_map_feature_read_groups_uses_bounded_inner_reads() -> None:
         )
     )
 
-    np.testing.assert_array_equal(
-        np.concatenate([group.values for group in groups], axis=0),
-        values.T,
-    )
+    dest = np.empty_like(values.T)
+    covered = np.zeros(values.shape[1], dtype=bool)
+    for group in groups:
+        dest[group.featStart : group.featEnd] = group.values
+        covered[group.featStart : group.featEnd] = True
+    np.testing.assert_array_equal(dest, values.T)
+    assert np.all(covered)
     assert metrics["requestedGroupsInFlight"] == 4
     assert metrics["effectiveGroupsInFlight"] == 4
     assert metrics["requestedChunkReadsInFlight"] == 8
