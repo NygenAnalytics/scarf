@@ -23,22 +23,41 @@ T = TypeVar("T")
 _HOST_THREAD_CEILING: int | None = None
 
 
+_NUMBA_THREAD_LOCK = threading.Lock()
+_WORKER_NUMBA_CAP = threading.local()
+
+
 def _install_numba_thread_cap(threads: int) -> Callable[[], None] | None:
-    """Cap Numba once per runner. Concurrent set_num_threads deadlocks."""
+    """Cap Numba threads. Concurrent set_num_threads can deadlock.
+
+    The setter is serialized. Each compute worker also applies the cap because
+    Numba's thread mask is thread-local on some builds. Profiled runs can already
+    look capped when Numba shares a process-wide thread count.
+    """
     try:
         import numba as numba_mod
     except ImportError:
         return None
     getter = getattr(numba_mod, "get_num_threads")
     setter = getattr(numba_mod, "set_num_threads")
-    previous = int(getter())
     cap = max(1, int(getattr(numba_mod.config, "NUMBA_NUM_THREADS")))
-    setter(min(max(1, int(threads)), cap))
+    target = min(max(1, int(threads)), cap)
+    with _NUMBA_THREAD_LOCK:
+        previous = int(getter())
+        setter(target)
 
     def _restore() -> None:
-        setter(previous)
+        with _NUMBA_THREAD_LOCK:
+            setter(previous)
 
     return _restore
+
+
+def _ensure_worker_numba_cap(threads: int) -> None:
+    if getattr(_WORKER_NUMBA_CAP, "applied", None) == threads:
+        return
+    _install_numba_thread_cap(threads)
+    _WORKER_NUMBA_CAP.applied = threads
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +309,7 @@ class AsyncStorageRunner:
         threads = max(1, int(self.plan.threadsPerComputeWorker))
 
         def _limited() -> T:
+            _ensure_worker_numba_cap(threads)
             with threadpool_limits(limits=threads):
                 return fn()
 

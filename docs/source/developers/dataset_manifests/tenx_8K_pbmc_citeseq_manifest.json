@@ -1,6 +1,6 @@
 {
-  "archiveBytes": 59575143,
-  "archiveSha256": "fcc6f36b1824a1fbde2c4f297716f40b78057a03304b61e838cf503c49471bca",
+  "archiveBytes": 79754209,
+  "archiveSha256": "c672ef12eb5db9eca2ba572598014f8e3d0cc19229a35d7a6f6129292cae7f3f",
   "artifacts": [
     {
       "artifactId": "9c314b62b4abb29f930dbfd6673b7c8aaa99f6b673e777fd409b6a472e491964",
@@ -255,8 +255,8 @@
     "names"
   ],
   "dataset": "tenx_8K_pbmc_citeseq",
-  "generatedAt": "2026-08-17T19:56:42.019000+00:00",
-  "generatorCommit": "818f019636718bf4af886ef7a4f461900b24f984",
+  "generatedAt": "2026-08-20T13:47:40.216951+00:00",
+  "generatorCommit": "46aeaa5b5f1e187fdf831464afbc3ea99c985d01",
   "nCellsActive": 7399,
   "nCellsTotal": 7865,
   "publishNotes": [
@@ -270,5 +270,5 @@
   "sourceFiles": [
     "data.h5"
   ],
-  "storeBytes": 98982372
+  "storeBytes": 143528445
 }

@@ -7,7 +7,12 @@ from numba import set_num_threads
 from scipy.special import ndtr
 
 from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
-from ...assay.normalization import norm_clr, norm_dummy, norm_tf_idf
+from ...assay.normalization import (
+    norm_clr,
+    norm_dummy,
+    norm_tf_idf,
+    reject_unknown_normalization_params,
+)
 from ...utils.logging import logger
 from ...utils.numba import restore_numba_threads
 from .correction import _bh_adjusted_pvalues
@@ -96,6 +101,10 @@ def find_markers_by_rank(
     **norm_params: Any,
 ) -> dict[Any, pd.DataFrame]:
     """Identify marker features for groups with rank-based statistics."""
+    reject_unknown_normalization_params(
+        norm_params,
+        caller="find_markers_by_rank",
+    )
     groups = assay.cells.fetch(group_key, cell_key)
     group_set = np.array(sorted(set(groups)))
     n_groups = len(group_set)
@@ -280,6 +289,11 @@ def find_markers_by_rank(
             n_groups=n_groups,
             nthreads=threads,
         )
+        extra_itemsize = (
+            0
+            if adapter == "rna_lib_size_unsigned"
+            else int(np.dtype(np.float64).itemsize)
+        )
         try:
             for _ in map_feature_read_groups(
                 counts_t,
@@ -291,6 +305,7 @@ def find_markers_by_rank(
                 io=getattr(assay, "storageIo", None),
                 metrics=consume_metrics,
                 scratchBytes=scratch,
+                extraItemsize=extra_itemsize,
                 orderedCompute=False,
             ):
                 pass
@@ -364,6 +379,10 @@ def find_markers_by_regression(
     **norm_params: Any,
 ) -> pd.DataFrame:
     """Find features correlated with a continuous variable."""
+    reject_unknown_normalization_params(
+        norm_params,
+        caller="find_markers_by_regression",
+    )
     regressor = np.asarray(regressor, dtype=np.float64)
     if regressor.ndim != 1:
         raise ValueError("regressor must be one-dimensional")

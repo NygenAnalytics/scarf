@@ -404,6 +404,28 @@ def test_runner_splits_ledger_wait_from_held_time() -> None:
     assert runner.readerWaitSeconds >= 0.04
 
 
+def test_compute_workers_apply_local_numba_cap() -> None:
+    import numba
+
+    observed: list[int] = []
+    runner = AsyncStorageRunner(
+        ResourceBudget(1024 * 1024, 4),
+        computeWorkerLimit=4,
+        threadsPerComputeWorker=1,
+    )
+
+    async def operation(active: AsyncStorageRunner) -> None:
+        def probe() -> int:
+            observed.append(int(numba.get_num_threads()))
+            return 0
+
+        await asyncio.gather(*[active.compute(probe) for _ in range(4)])
+
+    runner.run(operation)
+    assert observed
+    assert all(threads == 1 for threads in observed)
+
+
 def test_writer_completes_when_numba_and_many_compute_workers() -> None:
     """Concurrent compute must not deadlock on Numba thread caps."""
     import numba

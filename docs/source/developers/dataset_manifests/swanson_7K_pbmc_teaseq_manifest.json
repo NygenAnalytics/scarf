@@ -49,8 +49,8 @@
       "sizeFactor": 1000
     }
   },
-  "archiveBytes": 488457639,
-  "archiveSha256": "e50d9411cd6232be8587df498b36ad903659ad5ac28e03d794b8cfb8de01dfae",
+  "archiveBytes": 488339232,
+  "archiveSha256": "450e02d7d0088e4d40039bf83fee9709a72a24d2537378980abc32793e98ae83",
   "artifacts": [
     {
       "artifactId": "2a2fdc8755aa597ab837b23500f0a3ce232e527cfff1c118340e1cc2c9d5f8bd",
@@ -449,8 +449,8 @@
       "url": "https://cdn.elifesciences.org/articles/63632/elife-63632-fig4-data2-v1.zip"
     }
   ],
-  "generatedAt": "2026-08-17T20:16:43.617687+00:00",
-  "generatorCommit": "818f019636718bf4af886ef7a4f461900b24f984",
+  "generatedAt": "2026-08-20T13:53:23.459595+00:00",
+  "generatorCommit": "46aeaa5b5f1e187fdf831464afbc3ea99c985d01",
   "memoryBudgets": {
     "analysisBytes": 8589934592,
     "importBytes": 8589934592
@@ -469,5 +469,5 @@
     "GSM5123951_PBMC_permcells_TEA-seq_SeuratObject.rds",
     "elife-63632-fig4-data2-v1.zip"
   ],
-  "storeBytes": 785790468
+  "storeBytes": 787332144
 }

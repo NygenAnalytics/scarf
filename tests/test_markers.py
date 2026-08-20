@@ -1756,3 +1756,16 @@ def test_marker_search_does_not_accept_gene_batch_size(
             gene_batch_size=100,
             skip_save=True,
         )
+
+
+def test_marker_search_does_not_accept_n_threads(
+    datastore_ephemeral,
+):
+    groups = np.arange(datastore_ephemeral.cells.N) % 2
+    datastore_ephemeral.cells.insert("thread_contract_groups", groups, overwrite=True)
+    with pytest.raises(TypeError, match="n_threads"):
+        datastore_ephemeral.run_marker_search(
+            group_key="thread_contract_groups",
+            n_threads=4,
+            skip_save=True,
+        )

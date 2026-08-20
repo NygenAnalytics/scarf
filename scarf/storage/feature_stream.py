@@ -417,8 +417,10 @@ def _iter_bounded_handoff(
             item = handoff.get()
             if item is sentinel:
                 break
-            release.put(None)
-            yield item
+            try:
+                yield item
+            finally:
+                release.put(None)
     finally:
         stop.set()
         while thread.is_alive():
@@ -463,6 +465,7 @@ def map_feature_read_groups(
     io: StorageIoPolicy | None = None,
     metrics: dict[str, Any] | None = None,
     scratchBytes: int = 0,
+    extraItemsize: int = 0,
     orderedCompute: bool = False,
 ) -> Iterator[T]:
     """Map ``process`` over persisted read groups with bounded handoff."""
@@ -529,11 +532,15 @@ def map_feature_read_groups(
         ),
         default=1,
     )
+    if extraItemsize < 0:
+        raise ValueError("extraItemsize must not be negative")
+    extra_itemsize = operator.index(extraItemsize)
+    extra_unit_bytes = extra_itemsize * feature_width * n_selected
     plan = _plan_feature_consume(
         budget,
         io=group_io,
         nUnits=len(merged),
-        unitBytes=read_group_bytes,
+        unitBytes=read_group_bytes + extra_unit_bytes,
         scratchBytes=scratchBytes,
         innerReadBytes=max_band_bytes,
         maxInnerReads=requested_inner_reads,
@@ -587,7 +594,8 @@ def map_feature_read_groups(
                         turn.notify_all()
                     return
                 n_local = feat_end - feat_start
-                destination_bytes = max(1, n_local * n_selected * itemsize)
+                extra_live = extra_itemsize * n_local * n_selected
+                destination_bytes = max(1, n_local * n_selected * itemsize + extra_live)
                 async with runner.reserve_bytes(destination_bytes):
                     dest = np.empty((n_local, n_selected), dtype=array.dtype)
 

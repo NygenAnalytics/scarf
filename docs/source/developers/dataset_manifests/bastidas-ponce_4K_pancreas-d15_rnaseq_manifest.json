@@ -1,6 +1,6 @@
 {
-  "archiveBytes": 43695338,
-  "archiveSha256": "7e5d3de7c77d9fb2885a66742b426b850e4de3f328f66c3aebff8f65d1cd628d",
+  "archiveBytes": 43423201,
+  "archiveSha256": "640c77cc4288e4999c3cdadab8cd0586ab353263bd43f02bbcea3bc6fb1c40ab",
   "artifacts": [
     {
       "artifactId": "0eda5a25a5b8b0eaa3eeb3c9968aaa17b15aaf46e24fb3a8599f37920edf016c",
@@ -136,8 +136,8 @@
     "names"
   ],
   "dataset": "bastidas-ponce_4K_pancreas-d15_rnaseq",
-  "generatedAt": "2026-08-17T19:56:06.615129+00:00",
-  "generatorCommit": "818f019636718bf4af886ef7a4f461900b24f984",
+  "generatedAt": "2026-08-20T13:46:48.562984+00:00",
+  "generatorCommit": "46aeaa5b5f1e187fdf831464afbc3ea99c985d01",
   "nCellsActive": 3696,
   "nCellsTotal": 3696,
   "publishNotes": [
@@ -151,5 +151,5 @@
   "sourceFiles": [
     "data.h5ad"
   ],
-  "storeBytes": 63049417
+  "storeBytes": 63132008
 }

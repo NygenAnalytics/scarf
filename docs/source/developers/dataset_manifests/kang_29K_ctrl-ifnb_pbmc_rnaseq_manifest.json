@@ -1,6 +1,6 @@
 {
-  "archiveBytes": 99579280,
-  "archiveSha256": "96b6c006fb09cd5d0a287cae371e950d6efc4603ea87a72686e6dafa9cc562e7",
+  "archiveBytes": 97971591,
+  "archiveSha256": "9a0be1f148762b8862b03a07487d7f641725141e9556cd6fa60b6460b58aa460",
   "artifacts": [
     {
       "artifactId": "8495597ae350378dd81e14eaee3b04188c75bbd7642cc7b0bb31588161718347",
@@ -117,8 +117,8 @@
     "sample_id"
   ],
   "dataset": "kang_29K_ctrl-ifnb_pbmc_rnaseq",
-  "generatedAt": "2026-08-17T20:00:56.474983+00:00",
-  "generatorCommit": "818f019636718bf4af886ef7a4f461900b24f984",
+  "generatedAt": "2026-08-20T13:49:10.863796+00:00",
+  "generatorCommit": "46aeaa5b5f1e187fdf831464afbc3ea99c985d01",
   "nCellsActive": 18597,
   "nCellsTotal": 18598,
   "publishNotes": [
@@ -133,5 +133,5 @@
     "kang_14K_ifnb-pbmc_rnaseq"
   ],
   "sourceFiles": [],
-  "storeBytes": 160858211
+  "storeBytes": 158250220
 }

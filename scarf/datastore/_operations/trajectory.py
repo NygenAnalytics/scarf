@@ -5,6 +5,7 @@ import pandas as pd
 from scipy.sparse import coo_matrix
 
 from ...assay import Assay
+from ...assay.normalization import reject_unknown_normalization_params
 from ...graph.state import resolve_stored_graph_input, validate_legacy_graph_selection
 from ...matrix import ChunkedArray
 from ...metadata.arguments import (
@@ -935,6 +936,10 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         """
         from ...features.markers import find_markers_by_regression
 
+        reject_unknown_normalization_params(
+            norm_params,
+            caller="run_pseudotime_marker_search",
+        )
         if pseudotime_key is None:
             raise ValueError(
                 "ERROR: Please provide a value for `pseudotime_key`. This should be the name of a column from "
@@ -1299,6 +1304,10 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         """
         from ...trajectory.feature_dynamics import knn_clustering
 
+        reject_unknown_normalization_params(
+            norm_params,
+            caller="run_pseudotime_aggregation",
+        )
         feat_key = feat_key or "I"
         from_assay, cell_key, _ = self._get_latest_keys(
             from_assay,

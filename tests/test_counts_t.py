@@ -316,6 +316,42 @@ def test_iter_normed_feature_wise_on_strip_counts_t(monkeypatch):
     )
 
 
+def test_iter_normed_feature_wise_log_transform_matches_log1p():
+    root = _memory_root()
+    values = np.array(
+        [
+            [4, 0, 1, 2],
+            [3, 0, 1, 0],
+            [0, 5, 1, 2],
+            [0, 6, 1, 2],
+        ],
+        dtype=np.uint32,
+    )
+    _write_small_assay(root, workspace=None, values=values)
+    cells = MetaData(root["cellData"])
+    n_counts = values.sum(axis=1).astype(np.float64)
+    cells.insert("RNA_nCounts", n_counts, overwrite=True)
+    assay = RNAassay(
+        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
+    )
+    assay.sf = 1000.0
+    batches = list(
+        assay.iter_normed_feature_wise(
+            cell_key="I",
+            feat_key="I",
+            batch_size=2,
+            msg=None,
+            as_dataframe=True,
+            log_transform=True,
+        )
+    )
+    joined = np.concatenate([batch.to_numpy() for batch in batches], axis=1)
+    expected = np.log1p(1000.0 * values / n_counts[:, None])
+    np.testing.assert_allclose(joined, expected, rtol=1e-5, atol=1e-6)
+    log2_expected = np.log2(1000.0 * values / n_counts[:, None] + 1.0)
+    assert not np.allclose(joined, log2_expected, rtol=1e-3)
+
+
 def test_regression_on_strip_counts_t():
     root = _memory_root()
     values = np.array(

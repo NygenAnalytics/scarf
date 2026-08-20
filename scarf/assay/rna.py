@@ -274,6 +274,9 @@ class RNAassay(Assay):
             selected_feature_values,
         )
 
+        extra_itemsize = int(np.dtype(np.float32).itemsize) + int(
+            np.dtype(np.float64).itemsize
+        )
         loaded_groups = map_feature_read_groups(
             counts_t,
             lambda loaded: loaded,
@@ -282,6 +285,7 @@ class RNAassay(Assay):
             resources=self.resources,
             progress=msg or None,
             io=getattr(self, "storageIo", None),
+            extraItemsize=extra_itemsize,
             orderedCompute=True,
         )
 
@@ -289,9 +293,8 @@ class RNAassay(Assay):
             return selected_feature_values(values, keep)
 
         resolved_batch = None if batch_size is None else max(1, int(batch_size))
-        pending_cols: list[np.ndarray] = []
-        pending_labels: list[np.ndarray] = []
-        pending_n = 0
+        pending_cols: np.ndarray | None = None
+        pending_labels: np.ndarray | None = None
 
         def emit(
             cols: np.ndarray, labels: np.ndarray
@@ -312,35 +315,41 @@ class RNAassay(Assay):
             mat *= float(sf)
             mat /= scalar_values[:, None]
             if log_transform:
-                np.log2(mat + 1.0, out=mat)
+                np.log1p(mat, out=mat)
             labels = feat_labels[destinations]
             cols = np.asarray(mat, dtype=np.float64)
+            del mat, raw
             if resolved_batch is None:
                 yield emit(cols, labels)
-                del mat, raw
                 continue
-            pending_cols.append(cols)
-            pending_labels.append(labels)
-            pending_n += int(labels.shape[0])
-            while pending_n >= resolved_batch:
-                stacked = np.concatenate(pending_cols, axis=1)
-                stacked_labels = np.concatenate(pending_labels)
-                yield emit(stacked[:, :resolved_batch], stacked_labels[:resolved_batch])
-                remainder = stacked[:, resolved_batch:]
-                remainder_labels = stacked_labels[resolved_batch:]
-                if remainder.shape[1] == 0:
-                    pending_cols = []
-                    pending_labels = []
-                    pending_n = 0
+            if pending_cols is not None:
+                assert pending_labels is not None
+                need = resolved_batch - int(pending_cols.shape[1])
+                if cols.shape[1] >= need:
+                    yield emit(
+                        np.concatenate((pending_cols, cols[:, :need]), axis=1),
+                        np.concatenate((pending_labels, labels[:need])),
+                    )
+                    cols = cols[:, need:]
+                    labels = labels[need:]
+                    pending_cols = None
+                    pending_labels = None
                 else:
-                    pending_cols = [remainder]
-                    pending_labels = [remainder_labels]
-                    pending_n = int(remainder_labels.shape[0])
-            del mat, raw
-        if pending_n > 0:
-            stacked = np.concatenate(pending_cols, axis=1)
-            stacked_labels = np.concatenate(pending_labels)
-            yield emit(stacked, stacked_labels)
+                    pending_cols = np.concatenate((pending_cols, cols), axis=1)
+                    pending_labels = np.concatenate((pending_labels, labels))
+                    continue
+            start = 0
+            n_cols = int(cols.shape[1])
+            while start + resolved_batch <= n_cols:
+                stop = start + resolved_batch
+                yield emit(cols[:, start:stop], labels[start:stop])
+                start = stop
+            if start < n_cols:
+                pending_cols = cols[:, start:]
+                pending_labels = labels[start:]
+        if pending_cols is not None:
+            assert pending_labels is not None
+            yield emit(pending_cols, pending_labels)
 
     def save_normalized_data(
         self,

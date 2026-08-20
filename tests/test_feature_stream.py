@@ -528,6 +528,39 @@ def test_map_feature_read_groups_uses_bounded_inner_reads() -> None:
     assert int(metrics["peakHeldBytes"]) <= resources.memoryBytes
 
 
+def test_map_feature_read_groups_charges_extra_itemsize() -> None:
+    from scarf.storage.feature_stream import map_feature_read_groups
+
+    values = np.arange(24, dtype=np.uint16).reshape(6, 4)
+    counts_t = _counts_t_with_plan(values)
+    resources = ResourceBudget(8 * 1024 * 1024, 2)
+    baseline: dict[str, object] = {}
+    extra: dict[str, object] = {}
+    list(
+        map_feature_read_groups(
+            counts_t,
+            lambda group: group,
+            resources=resources,
+            metrics=baseline,
+        )
+    )
+    list(
+        map_feature_read_groups(
+            counts_t,
+            lambda group: group,
+            resources=resources,
+            metrics=extra,
+            extraItemsize=12,
+        )
+    )
+    feature_width = int(extra["featureWidth"])
+    assert int(extra["unitBytes"]) == int(baseline["unitBytes"]) + (
+        12 * feature_width * values.shape[0]
+    )
+    assert int(extra["peakHeldBytes"]) <= resources.memoryBytes
+    assert int(extra["peakHeldBytes"]) >= int(baseline["peakHeldBytes"])
+
+
 def test_map_feature_cell_bands_parallel_matches_sequential() -> None:
     from scarf.storage.feature_stream import map_feature_cell_bands
 

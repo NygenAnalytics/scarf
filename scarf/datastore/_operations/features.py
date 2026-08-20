@@ -24,6 +24,7 @@ from ...storage.artifacts import (
 from ...storage.selections import resolve_selection_artifact
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...assay import RNAassay, lib_size_feature_stream_eligible
+from ...assay.normalization import reject_unknown_normalization_params
 from ...features.enrichment.results import EnrichmentResult
 from ...features.markers.table import (
     MARKER_ADJUSTMENT_METHOD,
@@ -995,11 +996,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         """
         from ...features.markers import find_markers_by_rank
 
-        if "gene_batch_size" in norm_params:
-            raise TypeError(
-                "run_marker_search() got an unexpected keyword argument "
-                "'gene_batch_size'"
-            )
+        reject_unknown_normalization_params(
+            norm_params,
+            caller="run_marker_search",
+        )
         if group_key is None:
             raise ValueError(
                 "ERROR: Please provide a value for `group_key`. This should be the name of a column from "

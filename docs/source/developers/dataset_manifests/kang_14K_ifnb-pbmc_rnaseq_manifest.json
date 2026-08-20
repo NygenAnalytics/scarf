@@ -1,6 +1,6 @@
 {
-  "archiveBytes": 53937553,
-  "archiveSha256": "4a2e8a18c8202a2e6ecb44de9af85d41b9f4c7cab9bb8d799cfa2ba7d7715866",
+  "archiveBytes": 53938394,
+  "archiveSha256": "f4156cd1a2a553baeaedec361776a6e14421fe632b36fa7cd8a783f7f173dd44",
   "artifacts": [
     {
       "artifactId": "fb9b10ff2320a128aca0349b0d83e32f0ae7962c2583ef007fb5c05e6acb2256",
@@ -107,8 +107,8 @@
     "names"
   ],
   "dataset": "kang_14K_ifnb-pbmc_rnaseq",
-  "generatedAt": "2026-08-17T19:59:31.793718+00:00",
-  "generatorCommit": "818f019636718bf4af886ef7a4f461900b24f984",
+  "generatedAt": "2026-08-20T13:48:28.700282+00:00",
+  "generatorCommit": "46aeaa5b5f1e187fdf831464afbc3ea99c985d01",
   "nCellsActive": 10111,
   "nCellsTotal": 10111,
   "publishNotes": [
@@ -122,5 +122,5 @@
     "kang_14K_ifnb-pbmc_rnaseq_legacy_master"
   ],
   "sourceFiles": [],
-  "storeBytes": 89977479
+  "storeBytes": 89243075
 }

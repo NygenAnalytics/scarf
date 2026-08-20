@@ -189,6 +189,33 @@ def test_repack_preserves_root_attrs(tmp_path):
     assert result.attrs["complete"] is True
 
 
+def test_repack_preserves_non_count_completion_attrs(tmp_path):
+    source = tmp_path / "source.zarr"
+    output = tmp_path / "output.zarr"
+    root = zarr.open_group(str(source), mode="w")
+    assay = root.create_group("RNA")
+    assay.attrs["is_assay"] = True
+    assay.create_array(
+        "counts",
+        data=np.arange(6, dtype=np.uint32).reshape(2, 3),
+        chunks=(2, 3),
+    )
+    cell = root.create_group("cellData")
+    cell.attrs["complete"] = True
+    cell.create_array("ids", data=np.array(["c1", "c2"]))
+    artifacts = root.create_group("artifacts")
+    table = artifacts.create_group("marker_table")
+    slot = table.create_group("slot")
+    slot.attrs["complete"] = True
+    slot.create_array("values", data=np.array([1.0, 2.0]))
+
+    repack_store(str(source), str(output))
+
+    result = zarr.open_group(str(output), mode="r")
+    assert result["cellData"].attrs["complete"] is True
+    assert result["artifacts/marker_table/slot"].attrs["complete"] is True
+
+
 def test_repack_skips_copying_counts_t_when_sharding(tmp_path, monkeypatch):
     source = tmp_path / "source.zarr"
     output = tmp_path / "output.zarr"

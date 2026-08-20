@@ -1,6 +1,6 @@
 {
-  "archiveBytes": 48216334,
-  "archiveSha256": "3b885e8efe69802735bb144a77a7cf2c2baca94b796556178307204d9ed31df7",
+  "archiveBytes": 48357614,
+  "archiveSha256": "66e20049e353f99489089f316e5465e965c4171ca2ba509d1e6900a3ee343172",
   "artifacts": [
     {
       "artifactId": "63f5e42cc5c343476a88ae60b6df9bc2c519d7b4435558cc7c1e9a3b898cdc9a",
@@ -183,8 +183,8 @@
     "names"
   ],
   "dataset": "tenx_5K_pbmc_rnaseq",
-  "generatedAt": "2026-08-17T19:55:02.991574+00:00",
-  "generatorCommit": "818f019636718bf4af886ef7a4f461900b24f984",
+  "generatedAt": "2026-08-20T13:46:31.335900+00:00",
+  "generatorCommit": "46aeaa5b5f1e187fdf831464afbc3ea99c985d01",
   "nCellsActive": 3940,
   "nCellsTotal": 5025,
   "publishNotes": [
@@ -198,5 +198,5 @@
   "sourceFiles": [
     "data.h5"
   ],
-  "storeBytes": 71008626
+  "storeBytes": 70937294
 }

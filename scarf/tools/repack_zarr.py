@@ -248,8 +248,9 @@ def _copy_group(
             continue
         if isinstance(node, zarr.Group):
             new_group = dst.create_group(key, overwrite=True)
+            rewritten_counts = f"{child_path}/counts" in shardedCounts
             for attr_key, attr_val in node.attrs.items():
-                if attr_key in _STRIPPED_COUNT_ATTRS:
+                if rewritten_counts and attr_key in _STRIPPED_COUNT_ATTRS:
                     continue
                 new_group.attrs[attr_key] = attr_val
             _copy_group(

@@ -11,6 +11,19 @@ if TYPE_CHECKING:
 
 type NormMethod = Callable[["Assay", ChunkedArray], ChunkedArray]
 
+NORMALIZATION_PARAM_NAMES = frozenset({"log_transform", "renormalize_subset"})
+
+
+def reject_unknown_normalization_params(
+    params: dict[str, Any],
+    *,
+    caller: str,
+) -> None:
+    """Reject execution and other unknown keywords before they enter provenance."""
+    for name in params:
+        if name not in NORMALIZATION_PARAM_NAMES:
+            raise TypeError(f"{caller}() got an unexpected keyword argument {name!r}")
+
 
 def norm_dummy(_: "Assay", counts: ChunkedArray) -> ChunkedArray:
     """A dummy normalizer. Doesn't perform any normalization. This is useful
