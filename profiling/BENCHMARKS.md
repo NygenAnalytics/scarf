@@ -204,7 +204,7 @@ reliable sub-30-minute wall time.
 
 The accepted product changes widen memory-admitted I/O independently of
 compute workers, use merge-tree accumulation, run independent H5AD producers,
-bound `countsT` work to two destination shards per set, reuse a datastore
+bound `countsT` work to one destination shard per set, reuse a datastore
 session, and reuse keyed graph data within the product pipeline. The first
 gate's `countsT` stage used eight destination lanes, seven one-chunk source
 reads per lane, and reached 44 concurrent store operations. Its byte ledger
@@ -222,6 +222,72 @@ Repeated full gates matched the active-cell and HVG selections exactly.
 Parallel ANN and UMAP remain enabled for the timing gate, so graph-derived
 embeddings and cluster assignments are not bitwise reproducible. The timing
 result does not claim otherwise.
+
+## 2026-08-20 5M and larger-box validation
+
+A single fresh 5M funnel completed on a non-preemptible 16 CPU / 64 GiB
+container with a 48 GiB Scarf budget. It used 1 GB count-matrix units, 100 MB
+chunks, a 64-reader ceiling, and parallel ANN and UMAP. The complete funnel
+took 9,195.7 s (2.55 h), including a 144.6 s dataset download, and reached a
+50.44 GiB sampled cgroup peak.
+
+This run came from a dirty source tree based on commit `39f4860`. It is a
+diagnostic reference, not a release benchmark or a matching replicate of the
+2026-08-02 5M measurements. The layout, code, and storage conditions differ.
+
+Average CPU cores below are process plus child CPU seconds divided by stage
+wall time. Peak memory is sampled `memory.current`.
+
+| Stage | Wall time (s) | Peak cgroup memory (GiB) | Average CPU cores |
+| --- | ---: | ---: | ---: |
+| Create count store | 537.0 | 18.68 | 6.79 |
+| Write `countsT` | 1,119.0 | 23.50 | 2.76 |
+| Initialize datastore | 499.5 | 20.80 | 2.92 |
+| Reopen datastore | 11.6 | 2.98 | 0.23 |
+| Filter cells | 40.5 | 5.49 | 0.45 |
+| Mark HVGs | 214.4 | 8.53 | 6.10 |
+| Normalize | 435.3 | 12.50 | 2.82 |
+| PCA | 372.2 | 17.32 | 4.53 |
+| Build embedding initialization | 115.7 | 7.00 | 2.41 |
+| Build ANN index | 381.3 | 9.06 | 2.03 |
+| Query neighbours | 143.6 | 9.68 | 4.30 |
+| Build connectivity map | 76.4 | 8.48 | 0.79 |
+| UMAP | 943.0 | 14.25 | 11.26 |
+| Leiden | 2,025.7 | 22.07 | 1.04 |
+| Paris | 447.8 | 16.31 | 1.12 |
+| Marker search | 1,085.2 | 50.44 | 2.62 |
+| **Funnel total** | **9,195.7** | **50.44** | **n/a** |
+
+Isolated same-box checks then tested the scalable planner against stages from
+that funnel. Initialization and PCA reused the completed 5M store. Count-store
+creation and transpose used a separate fresh store.
+
+| Operation | Baseline wall / peak / CPU | Candidate wall / peak / CPU | Wall change | Decision |
+| --- | --- | --- | ---: | --- |
+| Initialize datastore | 499.5 s / 20.80 GiB / 2.92 cores | 384.3 s / 21.31 GiB / 3.34 cores | -23.1% | Keep scalable nested reads |
+| PCA | 372.2 s / 17.32 GiB / 4.53 cores | 249.5 s / 22.26 GiB / 5.84 cores | -33.0% | Keep the reader cap removal |
+| Create count store | 537.0 s / 18.68 GiB / 6.79 cores | 323.0 s / 18.02 GiB / 5.89 cores | -39.9% | Retain as an observation |
+| Write `countsT` | 1,119.0 s / 23.50 GiB / 2.76 cores | 1,174.3 s / 34.06 GiB / 2.57 cores | +4.9% | Reject automatic widening |
+
+These are one-sample diagnostics, so the table records observed movement rather
+than attributing every difference to one code path. The accepted default asks
+for eight read lanes per compute worker before memory admission. Transpose is
+the measured exception: its automatic outer width remains the compute-worker
+count, while an explicit higher width is still honored.
+
+The 1M marker checks used the same 8 CPU / 32 GiB box and completed store:
+
+| Marker policy | Wall time (s) | Peak cgroup memory (GiB) | Average CPU cores |
+| --- | ---: | ---: | ---: |
+| Previous 25-group path | 217.9 | 25.31 | 1.82 |
+| 16 outer groups | 185.4 | 15.77 | 2.08 |
+| 20 outer groups | 334.2 | 19.66 | 1.64 |
+| 16 outer groups with four inner reads | 158.1 | 11.51 | 1.91 |
+
+The 20-group check overlapped the 5M run and is not a clean comparison. The
+bounded inner-read path was 27.4% faster than the previous path and reduced the
+sampled peak by 54.5%. CPU stayed below two average cores, so storage and codec
+service time remained the limiting factor.
 
 ## Running the profiler
 
