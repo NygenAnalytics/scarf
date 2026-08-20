@@ -3,6 +3,7 @@
 import argparse
 import gzip
 import hashlib
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -195,7 +196,9 @@ def build_citeseq_zarr_fixture(*, force: bool = False) -> None:
                 "Built 1K_pbmc_citeseq.zarr.tar.gz is not a current RNA store"
             )
         archive.parent.mkdir(parents=True, exist_ok=True)
-        staging.replace(archive)
+        # Path.replace is rename(2) and fails when /tmp and the workspace
+        # are different filesystems (GitHub Actions: Errno 18).
+        shutil.move(staging, archive)
 
 
 def download_fixtures(*, force: bool = False) -> None:
