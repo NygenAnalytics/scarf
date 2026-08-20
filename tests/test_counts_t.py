@@ -46,6 +46,7 @@ def _write_small_assay(
     *,
     workspace: str | None,
     values: np.ndarray,
+    policy: CountMatrixPolicy | None = None,
 ) -> zarr.Array:
     n_cells, n_feats = values.shape
     create_cell_data(
@@ -62,6 +63,7 @@ def _write_small_assay(
         feat_ids=np.array([f"f{i}" for i in range(n_feats)]),
         feat_names=np.array([f"g{i}" for i in range(n_feats)]),
         dtype="uint32",
+        policy=policy,
     )
     if workspace is None:
         counts = root["RNA/counts"]
@@ -350,6 +352,57 @@ def test_iter_normed_feature_wise_log_transform_matches_log1p():
     np.testing.assert_allclose(joined, expected, rtol=1e-5, atol=1e-6)
     log2_expected = np.log2(1000.0 * values / n_counts[:, None] + 1.0)
     assert not np.allclose(joined, log2_expected, rtol=1e-3)
+
+
+def test_iter_normed_feature_wise_batches_and_rejects_missing_inputs():
+    root = _memory_root()
+    values = (np.arange(8 * 32, dtype=np.uint32) % 7).reshape(8, 32)
+    _write_small_assay(
+        root,
+        workspace=None,
+        values=values,
+        policy=CountMatrixPolicy(unitBytes=2_000, chunkBytes=200),
+    )
+    cells = MetaData(root["cellData"])
+    n_counts = values.sum(axis=1).astype(np.float64)
+    cells.insert("RNA_nCounts", n_counts, overwrite=True)
+    assay = RNAassay(
+        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
+    )
+    assay.sf = 1000.0
+    matrices = list(
+        assay.iter_normed_feature_wise(
+            cell_key="I",
+            feat_key="I",
+            batch_size=1,
+            msg=None,
+            as_dataframe=False,
+        )
+    )
+    assert matrices
+    joined = np.concatenate([matrix for matrix, _labels in matrices], axis=0)
+    assert joined.shape == (values.shape[1], values.shape[0])
+    wide = list(
+        assay.iter_normed_feature_wise(
+            cell_key="I",
+            feat_key="I",
+            batch_size=3,
+            msg=None,
+            as_dataframe=True,
+        )
+    )
+    assert sum(batch.shape[1] for batch in wide) == values.shape[1]
+
+    assay.rawDataT = None
+    with pytest.raises(ValueError, match="requires sharded countsT"):
+        list(
+            assay.iter_normed_feature_wise(
+                cell_key="I",
+                feat_key="I",
+                batch_size=1,
+                msg=None,
+            )
+        )
 
 
 def test_regression_on_strip_counts_t():
@@ -796,13 +849,16 @@ def test_write_counts_t_stays_incomplete_when_the_write_fails(monkeypatch):
         "scarf.storage.async_execution.AsyncStorageRunner.run",
         boom,
     )
+    metrics: dict[str, object] = {}
     with pytest.raises(RuntimeError, match="boom"):
         write_counts_t(
             counts,
             group,
             resources=ResourceBudget(8 * 1024**3, 2),
+            metrics=metrics,
         )
     assert group["countsT"].attrs.get("complete") is False
+    assert metrics["terminalStatus"] == "error"
 
 
 def test_repack_rebuilds_complete_counts_t(tmp_path):
@@ -925,7 +981,7 @@ def test_inspect_counts_t_reports_retired_layout_keys(tmp_path):
 
 
 def test_assess_counts_t_reuse_outcomes(tmp_path):
-    from scarf.merge.writer import assess_counts_t_reuse
+    from scarf.merge.writer import assess_counts_t_reuse, validate_counts_t
 
     path = tmp_path / "reuse.zarr"
     root = zarr.open_group(str(path), mode="w")
@@ -936,6 +992,10 @@ def test_assess_counts_t_reuse_outcomes(tmp_path):
         root, "RNA", None, n_cells=3, n_features=4, dtype="uint32"
     )
     assert ok.outcome == "reusable"
+    assert (
+        validate_counts_t(root, "RNA", None, n_cells=3, n_features=4, dtype="uint32")
+        is None
+    )
 
     root["RNA/countsT"].attrs["complete"] = False
     incomplete = assess_counts_t_reuse(
@@ -1047,3 +1107,137 @@ def test_subset_preserves_gene_activity_alias(tmp_path):
     subset_root = zarr.open_group(out, mode="r")
     assert subset_root.attrs["assayTypes"]["GeneActivity"] == "GeneActivity"
     assert subset_root["GeneActivity/countsT"].attrs["complete"] is True
+
+
+def test_inspect_counts_t_reports_not_rna_incomplete_and_zarr_v2() -> None:
+    from scarf.storage.counts_t_contract import inspect_counts_t
+    from scarf.writers.counts_t import seed_assay_type
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    missing = inspect_counts_t(root, "RNA")
+    assert missing.status == "missing"
+    typed = inspect_counts_t(root, "RNA", assay_type="ADT")
+    assert typed.status == "not-rna"
+    group = root.create_group("RNA")
+    group.create_array(
+        "countsT",
+        shape=(4, 3),
+        chunks=(2, 3),
+        shards=(2, 3),
+        dtype=np.uint16,
+    )
+    incomplete = inspect_counts_t(root, "RNA")
+    assert incomplete.status == "incomplete"
+    seed_assay_type(root, "RNA", None, "RNA")
+    seed_assay_type(root, "RNA", None, "RNA")
+    assert root.attrs["assayTypes"]["RNA"] == "RNA"
+    v2 = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=2)
+    v2_group = v2.create_group("RNA")
+    v2_counts_t = v2_group.create_array(
+        "countsT",
+        shape=(4, 3),
+        chunks=(4, 3),
+        dtype=np.uint16,
+    )
+    v2_counts_t.attrs["complete"] = True
+    seed_assay_type(v2, "RNA", None, "RNA")
+    assert inspect_counts_t(v2, "RNA").status == "zarr-v2"
+
+
+def test_paired_layout_predicates_and_preflight_failures() -> None:
+    from dataclasses import replace
+
+    from scarf.storage.sharding import (
+        SparseShardBuffer,
+        is_paired_counts_t_layout,
+        preflight_counts_t_spec,
+    )
+
+    assert (
+        is_paired_counts_t_layout(
+            shape=(4,), chunks=(2, 2), shards=(2, 2), dtype="uint16"
+        )
+        is False
+    )
+    assert (
+        is_paired_counts_t_layout(
+            shape=(4, 4), chunks=(2, 2), shards=None, dtype="uint16"
+        )
+        is False
+    )
+    assert (
+        is_paired_counts_t_layout(
+            shape=(-1, 4), chunks=(2, 2), shards=(2, 2), dtype="uint16"
+        )
+        is False
+    )
+    assert (
+        is_paired_counts_t_layout(
+            shape=(4, 4), chunks=(0, 2), shards=(2, 2), dtype="uint16"
+        )
+        is False
+    )
+    assert (
+        is_paired_counts_t_layout(
+            shape=(4, 4), chunks=(2, 2), shards=(3, 2), dtype="uint16"
+        )
+        is False
+    )
+    spec = plan_count_matrix_pair(8, 6, "uint16").counts
+    with pytest.raises(ValueError, match="two-dimensional"):
+        preflight_counts_t_spec(
+            replace(spec, shape=(8,)),
+            profile="cloud",
+            resources=ResourceBudget(1024, 1),
+        )
+    with pytest.raises(MemoryError):
+        preflight_counts_t_spec(
+            spec,
+            profile="cloud",
+            resources=ResourceBudget(8, 1),
+        )
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    dest = root.create_array(
+        "counts",
+        shape=(4, 2),
+        chunks=(2, 2),
+        shards=(2, 2),
+        dtype=np.uint32,
+    )
+    with pytest.raises(ValueError, match="outside the destination"):
+        SparseShardBuffer(dest, startRow=3, endRow=1)
+    empty = SparseShardBuffer(dest, startRow=2, endRow=2)
+    assert empty.rows == 2
+
+
+def test_counts_t_matches_plan_rejects_incomplete_or_stale_layout() -> None:
+    from scarf.storage.sharding import _counts_t_matches_plan
+
+    policy = CountMatrixPolicy(unitBytes=2_000, chunkBytes=200)
+    plan = plan_count_matrix_pair(8, 6, "uint16", policy=policy)
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    incomplete = root.create_array(
+        "incomplete_t",
+        shape=plan.countsT.shape,
+        chunks=plan.countsT.chunks,
+        shards=plan.countsT.shards,
+        dtype="uint16",
+    )
+    assert _counts_t_matches_plan(incomplete, plan) is False
+    incomplete.attrs["complete"] = True
+    assert _counts_t_matches_plan(incomplete, plan) is False
+    persist_count_matrix_plan(incomplete, plan)
+    payload = dict(incomplete.attrs[COUNT_MATRIX_LAYOUT_KEY])
+    payload["fingerprint"] = "not-the-replayed-plan"
+    incomplete.attrs[COUNT_MATRIX_LAYOUT_KEY] = payload
+    incomplete.attrs["complete"] = True
+    assert _counts_t_matches_plan(incomplete, plan) is False
+
+
+def test_validate_counts_t_returns_reason_when_missing() -> None:
+    from scarf.merge.writer import validate_counts_t
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    assert validate_counts_t(root, "RNA", None, n_cells=3, n_features=4, dtype="uint16")
+    root.create_group("RNA")
+    assert validate_counts_t(root, "RNA", None, n_cells=3, n_features=4, dtype="uint16")

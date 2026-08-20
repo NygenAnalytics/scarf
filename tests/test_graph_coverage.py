@@ -259,6 +259,10 @@ def test_graph_memory_cache_is_keyed_and_scoped(
         assert raw is not symmetric
         assert raw is not reduced
         assert reads == 3
+        with store._graph_memory_cache_scope():
+            nested = store.load_graph(graph_loc=graph_loc)
+            assert nested is raw
+            assert reads == 3
 
     assert store._graphMemoryCache is None
     uncached = store.load_graph(graph_loc=graph_loc)

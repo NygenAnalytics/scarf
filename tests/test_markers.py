@@ -1769,3 +1769,120 @@ def test_marker_search_does_not_accept_n_threads(
             n_threads=4,
             skip_save=True,
         )
+
+
+def test_marker_feature_value_adapters_and_non_rna_rank_paths() -> None:
+    from types import SimpleNamespace
+
+    from scarf.assay.normalization import (
+        norm_clr,
+        norm_dummy,
+        norm_lib_size,
+        norm_tf_idf,
+    )
+    from scarf.features.markers.search import (
+        _clr_feature_values,
+        _lib_size_feature_values,
+        _tfidf_feature_values,
+    )
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.feature_stream import FeatureReadGroup
+    from tests.test_feature_stream import _counts_t_with_plan
+
+    raw = np.array([[1, 0], [3, 4], [2, 0]], dtype=np.uint16)
+    tfidf = _tfidf_feature_values(raw, np.array([2.0, 4.0]), np.array([1.0, 0.5, 2.0]))
+    assert tfidf.shape == (2, 3)
+    clr = _clr_feature_values(raw)
+    assert clr.shape == (2, 3)
+    linear = _lib_size_feature_values(raw, np.array([1.0, 2.0]), 10.0, False)
+    logged = _lib_size_feature_values(raw, np.array([1.0, 2.0]), 10.0, True)
+    assert logged.shape == linear.shape
+    assert logged[0, 0] != linear[0, 0]
+
+    values = np.arange(8 * 12, dtype=np.uint32).reshape(8, 12)
+    counts_t = _counts_t_with_plan(values)
+
+    class Cells:
+        @staticmethod
+        def fetch(_group_key, _cell_key):
+            return np.array(["a", "a", "a", "a", "b", "b", "b", "b"])
+
+        @staticmethod
+        def active_index(_cell_key):
+            return np.arange(8)
+
+        @staticmethod
+        def fetch_all(_key):
+            return values.sum(axis=1)
+
+    class Feats:
+        @staticmethod
+        def active_index(_feat_key):
+            return np.array([10, 11])
+
+    class FakeAssay:
+        def __init__(self, method) -> None:
+            self.cells = Cells()
+            self.feats = Feats()
+            self.normMethod = method
+            self.sf = 1000.0
+            self.name = "RNA"
+            self.resources = ResourceBudget(8 * 1024 * 1024, 2)
+            self.rawDataT = counts_t
+            self.n_term_per_doc = np.ones(8)
+            self.n_docs_per_term = np.ones(12)
+            self.n_docs = 8
+
+        def normed(self, cell_idx, feat_idx, **_kwargs):
+            self.n_term_per_doc = np.ones(len(cell_idx))
+            self.n_docs_per_term = np.ones(len(feat_idx))
+            self.n_docs = len(cell_idx)
+
+    for method in (norm_clr, norm_dummy, norm_tf_idf):
+        results = find_markers_by_rank(
+            FakeAssay(method),
+            group_key="cluster",
+            cell_key="I",
+            feat_key="I",
+            nthreads=1,
+        )
+        assert set(results) == {"a", "b"}
+
+    import scarf.storage.feature_stream as feature_stream_module
+
+    class SignedRNA(FakeAssay):
+        def _raw_feature_stream_source(self):
+            return SimpleNamespace(dtype=np.float32), 1, 0
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(marker_search_module, "RNAassay", SignedRNA)
+    original_map = feature_stream_module.map_feature_read_groups
+
+    def map_with_empty_group(counts_t, process, **kwargs):
+        process(
+            FeatureReadGroup(
+                featStart=0,
+                featEnd=1,
+                values=np.zeros((1, 8), dtype=np.float32),
+                readSec=0.0,
+                blockBytes=1,
+            )
+        )
+        yield from original_map(counts_t, process, **kwargs)
+
+    monkeypatch.setattr(
+        feature_stream_module, "map_feature_read_groups", map_with_empty_group
+    )
+    try:
+        signed = SignedRNA(norm_lib_size)
+        signed.rawDataT = _counts_t_with_plan(values.astype(np.float32))
+        results = find_markers_by_rank(
+            signed,
+            group_key="cluster",
+            cell_key="I",
+            feat_key="I",
+            nthreads=1,
+        )
+        assert set(results) == {"a", "b"}
+    finally:
+        monkeypatch.undo()

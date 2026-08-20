@@ -208,3 +208,163 @@ def test_atac_legacy_cache_rejects_missing_normalizer_identity(
     assay.save_normalized_data(**kwargs)
 
     assert calls == 2
+
+
+def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None:
+    from types import SimpleNamespace
+
+    import pytest
+    import zarr
+    from zarr.storage import MemoryStore
+
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.feature_stream import FeatureCellBand
+    from scarf.storage.materialize import (
+        _counts_t_renormalized_batches,
+        write_renorm_subset_to_zarr,
+    )
+    from tests.test_feature_stream import _counts_t_with_plan
+
+    values = np.arange(6 * 4, dtype=np.uint16).reshape(6, 4)
+    counts_t = _counts_t_with_plan(values)
+    assay = SimpleNamespace(rawDataT=None)
+    with pytest.raises(ValueError, match="requires countsT"):
+        list(
+            _counts_t_renormalized_batches(
+                assay,
+                np.arange(6),
+                np.arange(4),
+                scaleFactor=1.0,
+                logTransform=False,
+            )
+        )
+    assay = SimpleNamespace(rawDataT=counts_t)
+    with pytest.raises(ValueError, match="sorted unique cells"):
+        list(
+            _counts_t_renormalized_batches(
+                assay,
+                np.array([2, 0, 1]),
+                np.arange(4),
+                scaleFactor=1.0,
+                logTransform=False,
+            )
+        )
+
+    import scarf.storage.feature_stream as feature_stream_module
+
+    ready = SimpleNamespace(
+        rawDataT=counts_t,
+        resources=ResourceBudget(8 * 1024 * 1024, 1),
+        storageIo=None,
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        feature_stream_module, "map_feature_cell_bands", lambda *_a, **_k: iter(())
+    )
+    try:
+        with pytest.raises(RuntimeError, match="did not cover every selected cell"):
+            list(
+                _counts_t_renormalized_batches(
+                    ready,
+                    np.arange(6),
+                    np.arange(4),
+                    scaleFactor=1.0,
+                    logTransform=False,
+                )
+            )
+    finally:
+        monkeypatch.undo()
+
+    def empty_feature_group(_counts_t, process, **_kwargs):
+        yield process(
+            FeatureCellBand(
+                featStart=0,
+                featEnd=1,
+                cellStart=0,
+                cellEnd=2,
+                values=np.zeros((1, 2), dtype=np.uint16),
+                selectedLocal=np.array([0, 1], dtype=np.int64),
+                selectedDestinations=np.array([0, 1], dtype=np.int64),
+                readSec=0.0,
+                blockBytes=1,
+            )
+        )
+
+    monkeypatch.setattr(
+        feature_stream_module, "map_feature_cell_bands", empty_feature_group
+    )
+    try:
+        with pytest.raises(RuntimeError, match="did not contain selected features"):
+            list(
+                _counts_t_renormalized_batches(
+                    SimpleNamespace(
+                        rawDataT=counts_t,
+                        resources=ResourceBudget(8 * 1024 * 1024, 1),
+                        storageIo=None,
+                    ),
+                    np.arange(6),
+                    np.array([2, 3], dtype=np.int64),
+                    scaleFactor=1.0,
+                    logTransform=False,
+                )
+            )
+    finally:
+        monkeypatch.undo()
+
+    def split_cells(_counts_t, process, **_kwargs):
+        yield process(
+            FeatureCellBand(
+                featStart=0,
+                featEnd=4,
+                cellStart=0,
+                cellEnd=2,
+                values=np.zeros((4, 2), dtype=np.uint16),
+                selectedLocal=np.array([0, 1], dtype=np.int64),
+                selectedDestinations=np.array([0, 2], dtype=np.int64),
+                readSec=0.0,
+                blockBytes=1,
+            )
+        )
+
+    monkeypatch.setattr(feature_stream_module, "map_feature_cell_bands", split_cells)
+    try:
+        with pytest.raises(ValueError, match="contiguous selected-cell bands"):
+            list(
+                _counts_t_renormalized_batches(
+                    ready,
+                    np.arange(6),
+                    np.arange(4),
+                    scaleFactor=1.0,
+                    logTransform=False,
+                )
+            )
+    finally:
+        monkeypatch.undo()
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    raw = np.arange(12, dtype=np.float32).reshape(3, 4)
+    missing_sf = SimpleNamespace(rawData=raw, rawDataT=None, sf=None)
+    with pytest.raises(ValueError, match="size factor"):
+        write_renorm_subset_to_zarr(
+            missing_sf,
+            np.arange(3),
+            np.arange(4),
+            root,
+            "missing_sf",
+            1,
+        )
+    write_renorm_subset_to_zarr(
+        SimpleNamespace(
+            rawData=raw,
+            rawDataT=None,
+            sf=1000.0,
+            resources=ResourceBudget(8 * 1024 * 1024, 1),
+            storageIo=None,
+        ),
+        np.arange(3),
+        np.arange(4),
+        root,
+        "from_counts",
+        1,
+    )
+    assert "from_counts" in root

@@ -265,6 +265,9 @@ def test_detect_external_thread_caps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
     caps = detect_external_thread_caps()
     assert caps["NUMBA_NUM_THREADS"] == 3
+    monkeypatch.setenv("OMP_NUM_THREADS", "not-an-int")
+    caps = detect_external_thread_caps()
+    assert "OMP_NUM_THREADS" not in caps
 
 
 def test_write_counts_t_records_execution_report() -> None:
@@ -555,3 +558,68 @@ def test_pairwise_merge_tree_is_independent_of_completion_order() -> None:
     expected = add_stat_arrays(paired, third)
     for observed, value in zip(first, expected, strict=True):
         np.testing.assert_array_equal(observed, value)
+
+
+def test_pairwise_merge_tree_rejects_empty_and_mismatched_stats() -> None:
+    from scarf.utils.compute import add_stat_arrays, pairwise_merge_tree
+
+    with pytest.raises(ValueError, match="at least one value"):
+        pairwise_merge_tree([], lambda left, right: left + right)
+    assert pairwise_merge_tree([1, 2, 3], lambda left, right: left + right) == 6
+    with pytest.raises(ValueError, match="same length"):
+        add_stat_arrays((np.ones(2),), (np.ones(2), np.ones(2)))
+
+
+def test_plan_operation_error_and_reason_branches() -> None:
+    from types import SimpleNamespace
+
+    with pytest.raises(ValueError, match="must be positive"):
+        plan_operation(
+            ResourceBudget(1024 * 1024, 2),
+            WorkShape(nUnits=2, unitBytes=64, writes=True),
+            policy=StorageIoPolicy(readWorkers=0),
+        )
+    with pytest.raises(ValueError, match="must be positive"):
+        plan_operation(
+            ResourceBudget(1024 * 1024, 2),
+            WorkShape(nUnits=2, unitBytes=64),
+            policy=SimpleNamespace(
+                readWorkers=0, computeWorkers=None, writeWorkers=None
+            ),
+        )
+    with pytest.raises(MemoryError):
+        plan_operation(
+            ResourceBudget(20, 2),
+            WorkShape(
+                nUnits=4,
+                unitBytes=16,
+                innerReadBytes=16,
+                chunksPerShard=4,
+            ),
+        )
+    plan = plan_operation(
+        ResourceBudget(512, 8),
+        WorkShape(nUnits=2, unitBytes=32, writes=False),
+        policy=StorageIoPolicy(readWorkers=8, computeWorkers=8),
+    )
+    assert plan.readWorkers <= 2
+    assert plan.reductionReason is not None
+    with pytest.raises(MemoryError, match="Resident data"):
+        plan_operation(
+            ResourceBudget(8, 2),
+            WorkShape(nUnits=2, unitBytes=4, residentBytes=16),
+        )
+    ordered = plan_operation(
+        ResourceBudget(1024, 8),
+        WorkShape(nUnits=2, unitBytes=32, ordered=True),
+        policy=StorageIoPolicy(computeWorkers=8),
+    )
+    assert ordered.reductionReason is not None
+    assert "accumulate in order" in ordered.reductionReason
+    compute_capped = plan_operation(
+        ResourceBudget(1024, 2),
+        WorkShape(nUnits=32, unitBytes=16),
+        policy=StorageIoPolicy(computeWorkers=8),
+    )
+    assert compute_capped.reductionReason is not None
+    assert "compute workers used" in compute_capped.reductionReason

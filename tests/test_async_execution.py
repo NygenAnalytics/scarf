@@ -507,3 +507,132 @@ def test_async_runner_reports_failure_ledger_leaks() -> None:
         isinstance(error, RuntimeError) and "still holds 40 bytes" in str(error)
         for error in raised.value.exceptions
     )
+
+
+def test_async_runner_nested_loop_bounded_io_and_leaks() -> None:
+    from scarf.storage.async_execution import (
+        _install_numba_thread_cap,
+        resolve_execution_plan,
+    )
+
+    with pytest.raises(ValueError, match="must be positive"):
+        ByteLedger(0)
+    with pytest.raises(ValueError, match="must be positive"):
+        configure_zarr_runtime(codecWorkers=0, asyncConcurrency=1)
+    with pytest.raises(ValueError, match="must be positive"):
+        StorageIoPolicy(readWorkers=0)
+
+    runner = AsyncStorageRunner(ResourceBudget(64, 1))
+
+    async def leak(active: AsyncStorageRunner) -> None:
+        await active.ledger.acquire(8)
+
+    with pytest.raises(RuntimeError, match="still holds"):
+        runner.run(leak)
+
+    runner = AsyncStorageRunner(ResourceBudget(256, 1))
+
+    async def io_ops(active: AsyncStorageRunner) -> int:
+        async def factory() -> int:
+            return 7
+
+        first = await active.bounded_read(8, factory)
+        second = await active.bounded_commit(8, factory)
+        return first + second
+
+    assert runner.run(io_ops) == 14
+
+    nested = AsyncStorageRunner(ResourceBudget(64, 1))
+
+    async def outer() -> int:
+        async def inner(active: AsyncStorageRunner) -> int:
+            return 3
+
+        return nested.run(inner)
+
+    assert asyncio.run(outer()) == 3
+
+    with pytest.raises(RuntimeError, match="compute pool is not installed"):
+        asyncio.run(AsyncStorageRunner(ResourceBudget(64, 1)).compute(lambda: 1))
+
+    with pytest.raises(MemoryError, match="One buffer needs"):
+        asyncio.run(ByteLedger(8).acquire(32))
+
+    asyncio.run(ByteLedger(16).acquire(0))
+    with pytest.raises(ValueError, match="must not be negative"):
+        asyncio.run(ByteLedger(16).release(-1))
+    runner = AsyncStorageRunner(ResourceBudget(64, 1))
+    with pytest.raises(RuntimeError, match="read slots"):
+        asyncio.run(runner.read_slot())
+    with pytest.raises(RuntimeError, match="commit slots"):
+        asyncio.run(runner.commit_slot())
+
+    nested = AsyncStorageRunner(ResourceBudget(64, 1))
+
+    async def nested_outer() -> None:
+        async def boom(_active: AsyncStorageRunner) -> None:
+            raise ValueError("nested failure")
+
+        nested.run(boom)
+
+    with pytest.raises(ValueError, match="nested failure"):
+        asyncio.run(nested_outer())
+
+    import sys
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setitem(sys.modules, "numba", None)
+    try:
+        assert _install_numba_thread_cap(2) is None
+    finally:
+        monkeypatch.undo()
+
+    shrunk = resolve_execution_plan(
+        ResourceBudget(1024, 4),
+        computeWorkerLimit=4,
+        threadsPerComputeWorker=4,
+    )
+    assert shrunk.threadsPerComputeWorker == 1
+
+
+def test_shared_source_decode_cache_errors_and_sharing() -> None:
+    from scarf.storage.sharding import _SharedSourceDecode
+
+    cache = _SharedSourceDecode()
+    runner = AsyncStorageRunner(ResourceBudget(1024, 2))
+
+    async def decode_ops(active: AsyncStorageRunner) -> None:
+        owner_started = asyncio.Event()
+        allow_failure = asyncio.Event()
+
+        async def boom() -> np.ndarray:
+            owner_started.set()
+            await allow_failure.wait()
+            raise RuntimeError("decode fail")
+
+        failed_key = (0, 1, 0, 1)
+        owner = asyncio.create_task(cache.get(failed_key, 8, active, boom))
+        await owner_started.wait()
+        waiter = asyncio.create_task(cache.get(failed_key, 8, active, boom))
+        await asyncio.sleep(0)
+        assert cache._users[failed_key] == 2
+        allow_failure.set()
+        failures = await asyncio.gather(owner, waiter, return_exceptions=True)
+        assert all(
+            isinstance(failure, RuntimeError) and str(failure) == "decode fail"
+            for failure in failures
+        )
+
+        async def load() -> np.ndarray:
+            await asyncio.sleep(0.01)
+            return np.ones(4, dtype=np.uint16)
+
+        first, second = await asyncio.gather(
+            cache.get((1, 2, 3, 4), 8, active, load),
+            cache.get((1, 2, 3, 4), 8, active, load),
+        )
+        assert {first[1], second[1]} == {True, False}
+        await cache.release((1, 2, 3, 4), active)
+        await cache.release((1, 2, 3, 4), active)
+
+    runner.run(decode_ops)

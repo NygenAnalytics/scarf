@@ -3127,3 +3127,18 @@ def test_dataset_merge_blocks_tampered_completed_assay_components(case, reason):
     assert plan.assays[0].countsAction == "blocked"
     assert plan.blockedReason is not None
     assert reason in plan.blockedReason
+
+
+def test_resolve_assay_type_classifies_rna_instances_without_type_attr() -> None:
+    from types import SimpleNamespace
+
+    from scarf.assay.rna import RNAassay
+
+    class TinyRNA(RNAassay):
+        def __init__(self) -> None:
+            self.assayType = None
+
+    assert (
+        DataStoreMerge._resolve_assay_type(SimpleNamespace(), "custom", [TinyRNA()])
+        == "RNA"
+    )

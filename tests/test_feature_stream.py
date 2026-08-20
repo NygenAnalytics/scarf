@@ -435,6 +435,84 @@ def test_map_feature_read_groups_early_close_does_not_block() -> None:
     iterator.close()
 
 
+def test_map_feature_cell_bands_early_close_does_not_block() -> None:
+    from scarf.storage.feature_stream import map_feature_cell_bands
+
+    values = np.arange(40 * 80, dtype=np.uint16).reshape(40, 80)
+    counts_t = _counts_t_with_plan(values)
+    bands = map_feature_cell_bands(
+        counts_t,
+        lambda band: band.featStart,
+        resources=ResourceBudget(8 * 1024 * 1024, 2),
+        io=StorageIoPolicy(readWorkers=4),
+        orderedCompute=True,
+    )
+    next(bands)
+    bands.close()
+
+
+def test_feature_stream_empty_selection_and_keep_guard() -> None:
+    from scarf.storage.feature_stream import (
+        map_feature_cell_bands,
+        map_feature_read_groups,
+        selected_feature_chunk_starts,
+        selected_feature_values,
+    )
+
+    values = np.arange(20 * 8, dtype=np.uint16).reshape(20, 8)
+    counts_t = _counts_t_with_plan(values)
+    assert selected_feature_chunk_starts(counts_t, np.array([], dtype=np.int64)) == []
+    with pytest.raises(ValueError, match="1-D mask"):
+        selected_feature_values(np.zeros((3, 4)), np.ones(2, dtype=bool))
+    assert (
+        list(
+            map_feature_read_groups(
+                counts_t,
+                lambda group: group.featStart,
+                feat_idx=np.array([], dtype=np.int64),
+                resources=ResourceBudget(1024 * 1024, 1),
+            )
+        )
+        == []
+    )
+    with pytest.raises(ValueError, match="extraItemsize"):
+        list(
+            map_feature_read_groups(
+                counts_t,
+                lambda group: group.featStart,
+                resources=ResourceBudget(1024 * 1024, 1),
+                extraItemsize=-1,
+            )
+        )
+    assert (
+        list(
+            map_feature_cell_bands(
+                counts_t,
+                lambda band: band.featStart,
+                cell_idx=np.array([], dtype=np.int64),
+                resources=ResourceBudget(1024 * 1024, 1),
+            )
+        )
+        == []
+    )
+
+
+def test_feature_group_ranges_skips_overlap_and_merges_adjacent() -> None:
+    from scarf.storage.feature_stream import _feature_group_ranges
+
+    overlapping = _counts_t_with_plan(
+        np.arange(40 * 80, dtype=np.uint16).reshape(40, 80)
+    )
+    merged = _feature_group_ranges(
+        overlapping,
+        feat_idx=None,
+        feat_starts=[0, 0, overlapping.chunks[0], 2 * overlapping.chunks[0]],
+        featureWidth=10_000,
+    )
+    expected_end = min(3 * int(overlapping.chunks[0]), int(overlapping.shape[0]))
+    assert merged == [(0, expected_end)]
+
+
 def test_groups_in_flight_is_clamped_and_handoff_is_bounded() -> None:
     from scarf.storage.feature_stream import map_feature_read_groups
 

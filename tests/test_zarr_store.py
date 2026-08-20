@@ -332,6 +332,23 @@ def test_new_assay_in_zarr_v2_stays_chunk_only():
     np.testing.assert_array_equal(counts[:], values)
 
 
+def test_empty_assay_schema_on_zarr_v2_stays_chunk_only() -> None:
+    from scarf.storage.schema import create_empty_zarr_count_assay
+
+    v2_assay = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=2)
+    create_empty_zarr_count_assay(
+        v2_assay,
+        "RNA",
+        None,
+        3,
+        4,
+        "U10",
+        "U10",
+        "uint16",
+    )
+    assert "counts" in v2_assay["RNA"]
+
+
 def test_normed_plan_respects_codec_limit():
     spec = normed_array_spec(
         10_000_000,
