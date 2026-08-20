@@ -313,8 +313,7 @@ def test_mounted_store_computes_markers_without_writing_source(tmp_path):
         cell_key="I",
         feat_key="I",
         group_key="marker_groups",
-        gene_batch_size=None,
-        n_threads=1,
+        nthreads=1,
         skip_save=True,
     )
 

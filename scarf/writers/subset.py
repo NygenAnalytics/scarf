@@ -51,6 +51,7 @@ def subset_assay_zarr(
     nthreads: int | None = None,
     profile: StorageProfile | None = None,
     policy: CountMatrixPolicy | None = None,
+    io: StorageIoPolicy | None = None,
 ) -> None:
     """Selects a subset of the data in an assay in the specified Zarr
     hierarchy.
@@ -88,6 +89,7 @@ def subset_assay_zarr(
         ),
         msg="Subsetting assay",
         resources=resources,
+        io=io,
     )
     return None
 
@@ -304,6 +306,7 @@ class SubsetZarr:
                 lambda start, end: raw_data[start:end, :].compute(),
                 msg=f"Subsetting assay: {assay.name}",
                 resources=self.resources,
+                io=self.io,
             )
             from ..assay.classification import (
                 is_rna_assay_type,

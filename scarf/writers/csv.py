@@ -139,6 +139,7 @@ class CSVtoZarr:
             count_batches(),
             msg="Writing CSV counts",
             resources=self.resources,
+            io=self.io,
         )
         if e != self.csvr.nCells:
             raise AssertionError(

@@ -102,6 +102,20 @@ def _assert_one_counts_stream(store: RecordingStore, expected_reads: int) -> Non
 def test_initialization_fuses_qc_stats_in_one_counts_stream():
     store, expected_reads = _qc_store()
     datastore = _open_qc_store(store)
+    report = datastore.last_execution_report
+
+    assert report is not None
+    assert report.unitKind == "initializationRowBand"
+    assert report.actualReadWorkers == min(expected_reads, report.plan.readWorkers)
+    assert report.actualComputeWorkers == 1
+    assert report.extra["effectiveChunkReadsInFlight"] == (
+        report.actualReadWorkers * report.plan.ioConcurrency
+    )
+    assert report.plan.reservedBytes <= datastore.memoryBytes
+    assert report.unitsCompleted == expected_reads
+    assert report.fetchSeconds >= 0
+    assert report.computeSeconds >= 0
+    assert report.extra["fusedReadCompute"] is True
 
     expected_n_counts = _QC_VALUES.sum(axis=1).astype(np.float64)
     expected_n_features = (_QC_VALUES > 0).sum(axis=1).astype(np.float64)
@@ -151,6 +165,24 @@ def test_initialization_fuses_qc_stats_in_one_counts_stream():
         assert "source_artifact" not in datastore.zw["cellData"][column].attrs
     for column in ("nCells", "dropOuts"):
         assert "source_artifact" not in datastore.RNA.z["featureData"][column].attrs
+
+
+def test_initialization_concurrency_respects_a_tight_memory_budget():
+    store, expected_reads = _qc_store()
+    datastore = _open_qc_store(
+        store,
+        mem_budget=300,
+        nthreads=4,
+    )
+    report = datastore.last_execution_report
+
+    assert report is not None
+    assert report.unitKind == "initializationRowBand"
+    assert report.plan.reservedBytes <= 300
+    assert report.actualReadWorkers == 1
+    assert report.actualComputeWorkers == 1
+    assert report.unitsCompleted == expected_reads
+    _assert_one_counts_stream(store, expected_reads)
 
 
 def test_cached_initialization_is_read_and_write_free():
@@ -1159,6 +1191,25 @@ class TestDataStore:
             tiled["normed_tot"], legacy_tot, rtol=1e-6, atol=1e-6
         )
         np.testing.assert_allclose(tiled["sigmas"], legacy_sigmas, rtol=1e-5, atol=1e-6)
+
+    def test_streaming_feature_stats_match_across_read_widths(self, datastore):
+        from scarf.storage.io_policy import StorageIoPolicy
+
+        assay = datastore.RNA
+        cell_idx, feat_idx = assay._get_cell_feat_idx("I", "I")
+        results = []
+        original = getattr(assay, "storageIo", None)
+        try:
+            for width in (2, 8, 32):
+                assay.storageIo = StorageIoPolicy(readWorkers=width)
+                results.append(assay._streaming_feature_stats(cell_idx, feat_idx))
+        finally:
+            assay.storageIo = original
+        first = results[0]
+        for other in results[1:]:
+            np.testing.assert_array_equal(first["normed_n"], other["normed_n"])
+            np.testing.assert_array_equal(first["normed_tot"], other["normed_tot"])
+            np.testing.assert_array_equal(first["sigmas"], other["sigmas"])
 
     def test_streaming_feature_stats_uses_cell_band_counts_t(
         self, datastore, monkeypatch

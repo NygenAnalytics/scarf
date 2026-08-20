@@ -1,6 +1,7 @@
 """Geometry-aware planning and bounded reads for feature-column streams."""
 
 import asyncio
+import math
 import operator
 import queue
 import threading
@@ -13,6 +14,14 @@ import numpy as np
 
 from .async_execution import AsyncStorageRunner
 from .budget import ResourceBudget, admit_stream, resolve_budget
+from .execution import (
+    ExecutionReport,
+    OperationPlan,
+    WorkShape,
+    auto_read_width,
+    plan_operation,
+    record_execution_report,
+)
 from .count_matrix import (
     REBUILD_REMEDY,
     load_count_matrix_plan,
@@ -66,6 +75,7 @@ class FeatureReadGroup:
     values: np.ndarray
     readSec: float
     blockBytes: int
+    unitIndex: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +96,7 @@ class FeatureCellBand:
     selectedDestinations: np.ndarray
     readSec: float
     blockBytes: int
+    unitIndex: int = 0
 
 
 def _axis(value: int, *, name: str) -> int:
@@ -306,13 +317,11 @@ def _feature_group_ranges(
     group_width = max(1, int(featureWidth))
     if feat_starts is None:
         starts = selected_feature_chunk_starts(array, feat_idx)
-        width = group_width
     else:
         starts = [int(value) for value in feat_starts]
-        width = group_width
     merged: list[tuple[int, int]] = []
     for start in starts:
-        feat_end = min(start + width, n_feats)
+        feat_end = min(start + geometry.axisChunk(0), n_feats)
         if merged and start < merged[-1][1]:
             continue
         if (
@@ -326,17 +335,32 @@ def _feature_group_ranges(
     return merged
 
 
-def _admit_groups_in_flight(
+def _plan_feature_consume(
     budget: ResourceBudget,
     *,
     io: StorageIoPolicy,
-    readGroupBytes: int,
-) -> tuple[int, int | None]:
-    memory_max = max(1, int(budget.memoryBytes) // max(1, int(readGroupBytes)))
-    requested = io.groupsInFlight
-    if requested is None:
-        return min(memory_max, max(1, int(budget.workers))), None
-    return min(int(requested), memory_max), int(requested)
+    nUnits: int,
+    unitBytes: int,
+    scratchBytes: int = 0,
+    innerReadBytes: int = 0,
+    maxInnerReads: int | None = None,
+    chunksPerShard: int = 1,
+    ordered: bool,
+) -> OperationPlan:
+    return plan_operation(
+        budget,
+        WorkShape(
+            nUnits=max(1, int(nUnits)),
+            unitBytes=max(1, int(unitBytes)),
+            scratchBytes=max(0, int(scratchBytes)),
+            innerReadBytes=max(0, int(innerReadBytes)),
+            maxInnerReads=maxInnerReads,
+            ordered=ordered,
+            writes=False,
+            chunksPerShard=max(1, int(chunksPerShard)),
+        ),
+        policy=io,
+    )
 
 
 def _iter_bounded_handoff(
@@ -438,6 +462,8 @@ def map_feature_read_groups(
     progress: str | None = None,
     io: StorageIoPolicy | None = None,
     metrics: dict[str, Any] | None = None,
+    scratchBytes: int = 0,
+    orderedCompute: bool = False,
 ) -> Iterator[T]:
     """Map ``process`` over persisted read groups with bounded handoff."""
     array = as_zarr_array(counts_t)
@@ -468,19 +494,71 @@ def map_feature_read_groups(
         n_cells=n_cells,
         cell_chunk=cell_chunk,
     )
-    in_flight, requested = _admit_groups_in_flight(
-        budget,
-        io=resolved_io,
-        readGroupBytes=read_group_bytes,
+    requested_chunk_reads = (
+        int(resolved_io.readWorkers)
+        if resolved_io.readWorkers is not None
+        else auto_read_width(budget.workers)
     )
+    compute_width = (
+        1
+        if orderedCompute
+        else min(
+            budget.workers,
+            int(resolved_io.computeWorkers or budget.workers),
+        )
+    )
+    requested_group_reads = min(
+        requested_chunk_reads,
+        max(1, 2 * compute_width),
+    )
+    available_group_reads = max(1, min(len(merged), requested_group_reads))
+    requested_inner_reads = min(
+        max(1, len(bands)),
+        max(1, math.ceil(requested_chunk_reads / available_group_reads)),
+    )
+    group_io = StorageIoPolicy(
+        readWorkers=requested_group_reads,
+        computeWorkers=resolved_io.computeWorkers,
+        writeWorkers=resolved_io.writeWorkers,
+    )
+    max_band_bytes = max(
+        (
+            (feat_end - feat_start) * (cell_end - cell_start) * itemsize
+            for feat_start, feat_end in merged
+            for cell_start, cell_end, _local, _destinations in bands
+        ),
+        default=1,
+    )
+    plan = _plan_feature_consume(
+        budget,
+        io=group_io,
+        nUnits=len(merged),
+        unitBytes=read_group_bytes,
+        scratchBytes=scratchBytes,
+        innerReadBytes=max_band_bytes,
+        maxInnerReads=requested_inner_reads,
+        chunksPerShard=max(1, len(bands)),
+        ordered=orderedCompute,
+    )
+    in_flight = plan.readWorkers
+    fetch_seconds = 0.0
+    compute_seconds = 0.0
+    compute_wait_seconds = 0.0
+    units_completed = 0
     if metrics is not None:
         metrics.clear()
+        metrics.update(plan.as_metrics())
         metrics.update(
             {
-                "requestedGroupsInFlight": requested,
+                "requestedGroupsInFlight": requested_group_reads,
                 "effectiveGroupsInFlight": in_flight,
+                "requestedChunkReadsInFlight": requested_chunk_reads,
+                "effectiveChunkReadsInFlight": in_flight * plan.innerReads,
                 "readGroupBytes": read_group_bytes,
+                "cellBandBytes": max_band_bytes,
+                "cellBandCount": len(bands),
                 "featureWidth": feature_width,
+                "unitKind": "countsTReadGroup",
             }
         )
 
@@ -489,13 +567,18 @@ def map_feature_read_groups(
     progress_bar = tqdmbar(desc=progress, total=len(merged)) if progress else None
 
     def _run(deliver: Callable[[T], None], stop: threading.Event) -> None:
+        nonlocal fetch_seconds, compute_seconds, compute_wait_seconds, units_completed
+
         async def _operation(runner: AsyncStorageRunner) -> None:
+            nonlocal fetch_seconds, compute_seconds, compute_wait_seconds
+            nonlocal units_completed
             source = array.async_array
             turn = asyncio.Condition()
             next_idx = 0
 
             async def _one_group(idx: int, feat_start: int, feat_end: int) -> None:
-                nonlocal next_idx
+                nonlocal next_idx, fetch_seconds, compute_seconds
+                nonlocal compute_wait_seconds, units_completed
                 if stop.is_set():
                     async with turn:
                         while next_idx != idx:
@@ -507,11 +590,17 @@ def map_feature_read_groups(
                 destination_bytes = max(1, n_local * n_selected * itemsize)
                 async with runner.reserve_bytes(destination_bytes):
                     dest = np.empty((n_local, n_selected), dtype=array.dtype)
-                    started = time.perf_counter()
-                    for cell_start, cell_end, local, destinations in bands:
+
+                    async def _read_band(
+                        cell_start: int,
+                        cell_end: int,
+                        local: np.ndarray,
+                        destinations: np.ndarray,
+                    ) -> float:
                         read_bytes = n_local * (cell_end - cell_start) * itemsize
-                        async with runner.reserve_bytes(read_bytes):
-                            async with runner.read_lane():
+                        async with runner.read_lane():
+                            async with runner.reserve_bytes(read_bytes):
+                                started = time.perf_counter()
                                 block = np.asarray(
                                     await source.getitem(
                                         (
@@ -520,23 +609,42 @@ def map_feature_read_groups(
                                         )
                                     )
                                 )
-                            dest[:, destinations] = block[:, local]
+                                read_seconds = time.perf_counter() - started
+                                dest[:, destinations] = block[:, local]
+                        return read_seconds
+
+                    read_seconds = sum(
+                        await asyncio.gather(*(_read_band(*band) for band in bands))
+                    )
                     group = FeatureReadGroup(
                         featStart=int(feat_start),
                         featEnd=int(feat_end),
                         values=dest,
-                        readSec=time.perf_counter() - started,
+                        readSec=read_seconds,
                         blockBytes=int(dest.nbytes),
+                        unitIndex=idx,
                     )
-                    async with turn:
-                        while next_idx != idx:
-                            await turn.wait()
-                        item = process(group)
+                    fetch_seconds += group.readSec
+                    wait_started = time.perf_counter()
+                    if orderedCompute:
+                        async with turn:
+                            while next_idx != idx:
+                                await turn.wait()
+                            compute_wait_seconds += time.perf_counter() - wait_started
+                            compute_started = time.perf_counter()
+                            item = await runner.compute(lambda: process(group))
+                            compute_seconds += time.perf_counter() - compute_started
+                            await asyncio.to_thread(deliver, item)
+                            next_idx += 1
+                            turn.notify_all()
+                    else:
+                        compute_started = time.perf_counter()
+                        item = await runner.compute(lambda: process(group))
+                        compute_seconds += time.perf_counter() - compute_started
                         await asyncio.to_thread(deliver, item)
-                        next_idx += 1
-                        turn.notify_all()
-                        if progress_bar is not None:
-                            progress_bar.update(1)
+                    units_completed += 1
+                    if progress_bar is not None:
+                        progress_bar.update(1)
 
             pending: set[asyncio.Task[None]] = set()
             async with asyncio.TaskGroup() as tasks:
@@ -554,15 +662,44 @@ def map_feature_read_groups(
                         for completed in done:
                             completed.result()
 
+        runner = AsyncStorageRunner(
+            budget,
+            operation=plan,
+            chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
+            readGroupsInFlight=in_flight,
+        )
         try:
-            AsyncStorageRunner(
-                budget,
-                chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
-                readGroupsInFlight=in_flight,
-            ).run(_operation)
+            runner.run(_operation)
         finally:
             if progress_bar is not None:
                 progress_bar.close()
+            report = record_execution_report(
+                ExecutionReport(
+                    plan=plan,
+                    unitKind="countsTReadGroup",
+                    actualReadWorkers=in_flight,
+                    actualComputeWorkers=runner.plan.computeWorkerLimit,
+                    actualWriteWorkers=1,
+                    fetchSeconds=fetch_seconds,
+                    computeSeconds=compute_seconds,
+                    readerWaitSeconds=runner.readerWaitSeconds,
+                    computeWaitSeconds=compute_wait_seconds,
+                    unitsCompleted=units_completed,
+                    peakHeldBytes=runner.ledger.peak_bytes(),
+                    extra={
+                        "requestedGroupsInFlight": requested_group_reads,
+                        "effectiveGroupsInFlight": in_flight,
+                        "requestedChunkReadsInFlight": requested_chunk_reads,
+                        "effectiveChunkReadsInFlight": in_flight * plan.innerReads,
+                        "readGroupBytes": read_group_bytes,
+                        "cellBandBytes": max_band_bytes,
+                        "cellBandCount": len(bands),
+                        "featureWidth": feature_width,
+                    },
+                )
+            )
+            if metrics is not None:
+                metrics.update(report.as_metrics())
 
     return _iter_bounded_handoff(in_flight=in_flight, run=_run)
 
@@ -578,8 +715,11 @@ def map_feature_cell_bands(
     progress: str | None = None,
     io: StorageIoPolicy | None = None,
     metrics: dict[str, Any] | None = None,
+    scratchBytes: int = 0,
+    orderedCompute: bool = True,
+    cellMajorOrder: bool = False,
 ) -> Iterator[T]:
-    """Map ``process`` over cell-band slices in deterministic feature order."""
+    """Map ``process`` over cell-band slices in deterministic traversal order."""
     array = as_zarr_array(counts_t)
     geometry = _plane(array)
     _n_feats, n_cells = (int(value) for value in geometry.shape)
@@ -604,30 +744,55 @@ def map_feature_cell_bands(
         n_cells=n_cells,
         cell_chunk=cell_chunk,
     )
-    work = [
-        (feat_start, feat_end, cell_start, cell_end, local, destinations)
-        for feat_start, feat_end in merged
-        for cell_start, cell_end, local, destinations in bands
-    ]
+    if cellMajorOrder:
+        work = [
+            (feat_start, feat_end, cell_start, cell_end, local, destinations)
+            for cell_start, cell_end, local, destinations in bands
+            for feat_start, feat_end in merged
+        ]
+    else:
+        work = [
+            (feat_start, feat_end, cell_start, cell_end, local, destinations)
+            for feat_start, feat_end in merged
+            for cell_start, cell_end, local, destinations in bands
+        ]
     if not work:
         return iter(())
 
     budget = resources or resolve_budget()
     resolved_io = io or DEFAULT_STORAGE_IO_POLICY
     itemsize = geometry.itemsize
-    in_flight, requested = _admit_groups_in_flight(
+    max_band_bytes = max(
+        (feat_end - feat_start) * (cell_end - cell_start) * itemsize
+        for feat_start, feat_end, cell_start, cell_end, _local, _destinations in work
+    )
+    plan = _plan_feature_consume(
         budget,
         io=resolved_io,
-        readGroupBytes=read_group_bytes,
+        nUnits=len(work),
+        unitBytes=max_band_bytes,
+        scratchBytes=scratchBytes,
+        ordered=orderedCompute,
     )
+    in_flight = plan.readWorkers
+    fetch_seconds = 0.0
+    compute_seconds = 0.0
+    compute_wait_seconds = 0.0
+    units_completed = 0
     if metrics is not None:
         metrics.clear()
+        metrics.update(plan.as_metrics())
         metrics.update(
             {
-                "requestedGroupsInFlight": requested,
+                "requestedGroupsInFlight": plan.requestedReadWorkers,
                 "effectiveGroupsInFlight": in_flight,
                 "readGroupBytes": read_group_bytes,
+                "cellBandBytes": max_band_bytes,
                 "featureWidth": feature_width,
+                "featureGroupCount": len(merged),
+                "cellBandCount": len(bands),
+                "cellMajorOrder": cellMajorOrder,
+                "unitKind": "countsTCellBand",
             }
         )
 
@@ -636,7 +801,11 @@ def map_feature_cell_bands(
     progress_bar = tqdmbar(desc=progress, total=len(work)) if progress else None
 
     def _run(deliver: Callable[[T], None], stop: threading.Event) -> None:
+        nonlocal fetch_seconds, compute_seconds, compute_wait_seconds, units_completed
+
         async def _operation(runner: AsyncStorageRunner) -> None:
+            nonlocal fetch_seconds, compute_seconds, compute_wait_seconds
+            nonlocal units_completed
             source = array.async_array
             turn = asyncio.Condition()
             next_idx = 0
@@ -650,7 +819,8 @@ def map_feature_cell_bands(
                 local: np.ndarray,
                 destinations: np.ndarray,
             ) -> None:
-                nonlocal next_idx
+                nonlocal next_idx, fetch_seconds, compute_seconds
+                nonlocal compute_wait_seconds, units_completed
                 if stop.is_set():
                     async with turn:
                         while next_idx != idx:
@@ -660,9 +830,9 @@ def map_feature_cell_bands(
                     return
                 n_local = feat_end - feat_start
                 read_bytes = max(1, n_local * (cell_end - cell_start) * itemsize)
-                started = time.perf_counter()
                 async with runner.reserve_bytes(read_bytes):
                     async with runner.read_lane():
+                        started = time.perf_counter()
                         block = np.asarray(
                             await source.getitem(
                                 (
@@ -671,6 +841,7 @@ def map_feature_cell_bands(
                                 )
                             )
                         )
+                        read_seconds = time.perf_counter() - started
                     band = FeatureCellBand(
                         featStart=int(feat_start),
                         featEnd=int(feat_end),
@@ -679,18 +850,31 @@ def map_feature_cell_bands(
                         values=block,
                         selectedLocal=local,
                         selectedDestinations=destinations,
-                        readSec=time.perf_counter() - started,
+                        readSec=read_seconds,
                         blockBytes=int(block.nbytes),
+                        unitIndex=idx,
                     )
-                    async with turn:
-                        while next_idx != idx:
-                            await turn.wait()
-                        item = process(band)
+                    fetch_seconds += band.readSec
+                    wait_started = time.perf_counter()
+                    if orderedCompute:
+                        async with turn:
+                            while next_idx != idx:
+                                await turn.wait()
+                            compute_wait_seconds += time.perf_counter() - wait_started
+                            compute_started = time.perf_counter()
+                            item = await runner.compute(lambda: process(band))
+                            compute_seconds += time.perf_counter() - compute_started
+                            await asyncio.to_thread(deliver, item)
+                            next_idx += 1
+                            turn.notify_all()
+                    else:
+                        compute_started = time.perf_counter()
+                        item = await runner.compute(lambda: process(band))
+                        compute_seconds += time.perf_counter() - compute_started
                         await asyncio.to_thread(deliver, item)
-                        next_idx += 1
-                        turn.notify_all()
-                        if progress_bar is not None:
-                            progress_bar.update(1)
+                    units_completed += 1
+                    if progress_bar is not None:
+                        progress_bar.update(1)
 
             pending: set[asyncio.Task[None]] = set()
             async with asyncio.TaskGroup() as tasks:
@@ -706,14 +890,33 @@ def map_feature_cell_bands(
                         for completed in done:
                             completed.result()
 
+        runner = AsyncStorageRunner(
+            budget,
+            operation=plan,
+            chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
+            readGroupsInFlight=in_flight,
+        )
         try:
-            AsyncStorageRunner(
-                budget,
-                chunksPerShard=max(1, geometry.axisShard(0) // feat_chunk),
-                readGroupsInFlight=in_flight,
-            ).run(_operation)
+            runner.run(_operation)
         finally:
             if progress_bar is not None:
                 progress_bar.close()
+            report = record_execution_report(
+                ExecutionReport(
+                    plan=plan,
+                    unitKind="countsTCellBand",
+                    actualReadWorkers=in_flight,
+                    actualComputeWorkers=runner.plan.computeWorkerLimit,
+                    actualWriteWorkers=1,
+                    fetchSeconds=fetch_seconds,
+                    computeSeconds=compute_seconds,
+                    readerWaitSeconds=runner.readerWaitSeconds,
+                    computeWaitSeconds=compute_wait_seconds,
+                    unitsCompleted=units_completed,
+                    peakHeldBytes=runner.ledger.peak_bytes(),
+                )
+            )
+            if metrics is not None:
+                metrics.update(report.as_metrics())
 
     return _iter_bounded_handoff(in_flight=in_flight, run=_run)

@@ -4,6 +4,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, cast
 from weakref import WeakKeyDictionary
 
@@ -216,6 +217,30 @@ class _GraphOperationsMixin(_GraphOperationsBase):
     _annStreamNeighborPaths: WeakKeyDictionary[AnnStream, str]
     _normalizedArtifactCache: dict[ArtifactRef, ChunkedArray]
     _artifactExecutionContext: dict[str, Any]
+    _graphMemoryCache: dict[tuple[str, bool, bool, int | None], csr_matrix] | None
+    _graphMemoryCacheLock: Any
+
+    @contextmanager
+    def _graph_memory_cache_scope(self) -> Iterator[None]:
+        """Bound graph reuse to one product pipeline section."""
+        existing = getattr(self, "_graphMemoryCache", None)
+        if existing is not None:
+            yield
+            return
+
+        cache: dict[tuple[str, bool, bool, int | None], csr_matrix] = {}
+        lock = getattr(self, "_graphMemoryCacheLock", None)
+        if lock is None:
+            lock = RLock()
+            self._graphMemoryCacheLock = lock
+        self._graphMemoryCache = cache
+        try:
+            yield
+        finally:
+            with lock:
+                cache.clear()
+                if self._graphMemoryCache is cache:
+                    self._graphMemoryCache = None
 
     if TYPE_CHECKING:
 
@@ -2354,6 +2379,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     dtype=np.float32,
                     msg="Writing reduced coordinates",
                     resources=self.resources,
+                    io=self.storageIo,
                 )
             finish_artifact(reduction_group, planned)
         if show_elbow_plot and method == "pca":
@@ -3037,7 +3063,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 ef=resolved_ann_ef,
                 m=resolved_ann_m,
                 rand_state=resolved_rand_state,
-                ann_threads=(self.nthreads if ann_parallel else 1),
+                nthreads=(self.nthreads if ann_parallel else 1),
             )
             group = start_artifact(self.zw, planned)
             self._persist_ann_index(
@@ -3455,11 +3481,28 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 f"{graph_loc} not found in zarr location. "
                 f"Build graph artifacts for assay {from_assay}"
             )
+        cache_key = (
+            graph_loc,
+            symmetric is True,
+            symmetric is True and upper_only is True,
+            use_k,
+        )
+        cache = getattr(self, "_graphMemoryCache", None)
+        if cache is not None:
+            with self._graphMemoryCacheLock:
+                cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
         n_cells, graph = self._store_to_sparse(graph_loc, "csr", use_k)
         if symmetric is True:
             graph = symmetrize(graph)
             if upper_only is True:
                 graph = triu(graph)
+        if cache is not None:
+            with self._graphMemoryCacheLock:
+                active_cache = getattr(self, "_graphMemoryCache", None)
+                if active_cache is cache:
+                    graph = active_cache.setdefault(cache_key, graph)
         return graph
 
     def integrate_assays(

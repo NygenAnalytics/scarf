@@ -48,7 +48,7 @@ uv run --group profiling modal run --env scarf_profiling \
 `run-e2e`.
 
 Use `run --stage ...` for a targeted stage, including repair of an incomplete `countsT`; use
-`run-local` for the Modal ephemeral-disk comparison and `io-baseline` for read-pattern diagnostics.
+`run-local` for the Modal ephemeral-disk comparison.
 
 ## 1M R2 gate
 

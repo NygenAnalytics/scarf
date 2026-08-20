@@ -1,6 +1,8 @@
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
+import threading
+import time
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -87,6 +89,7 @@ class Assay:
                 nthreads=self.nthreads,
                 resources=self.resources,
             )
+            self.rawData._io = self.storageIo
             self.feats = MetaData(z[f"{name}/featureData"])  # type: ignore
             self.z = as_zarr_group(z[name], name=name)
         else:
@@ -101,6 +104,7 @@ class Assay:
                 nthreads=self.nthreads,
                 resources=self.resources,
             )
+            self.rawData._io = self.storageIo
             self.feats = MetaData(z[f"{workspace}/{name}/featureData"])  # type: ignore
             self.z = as_zarr_group(z[f"{workspace}/{name}"], name=f"{workspace}/{name}")
         self.matrixGroup = matrix_group
@@ -247,31 +251,166 @@ class Assay:
         for name in percent_feature_indices:
             stats[name] = np.empty(n_cells, dtype=sum_dtype)
 
-        row_start = 0
-        for raw in self.rawData._stream_blocks(
-            nthreads=self.nthreads,
+        from ..storage.execution import (
+            ExecutionReport,
+            WorkShape,
+            plan_operation,
+            record_execution_report,
+        )
+        from ..storage.parallel import map_shards
+        from ..utils.compute import pairwise_merge_tree
+
+        ranges = self.rawData._ranges()
+        largest_rows = max((end - start for start, end in ranges), default=1)
+        matrix_elements = largest_rows * max(1, n_features)
+        geometry = self.rawData._geometry()
+        chunks_per_range = (
+            1
+            if geometry is None
+            else max(
+                1,
+                -(-largest_rows // geometry.axisChunk(0))
+                * -(-n_features // geometry.axisChunk(1)),
+            )
+        )
+        decode_bytes = self.rawData._max_decode_bytes()
+        unit_bytes = matrix_elements * max(1, int(self.rawData.dtype.itemsize))
+        if compute_n_features or compute_n_cells:
+            unit_bytes += matrix_elements
+        if compute_n_counts:
+            unit_bytes += largest_rows * max(1, int(sum_dtype.itemsize))
+        if compute_n_features:
+            unit_bytes += largest_rows * np.dtype(np.int64).itemsize
+        if compute_n_cells:
+            unit_bytes += n_features * np.dtype(np.int64).itemsize
+        unit_bytes += (
+            len(percent_feature_indices)
+            * largest_rows
+            * max(1, int(sum_dtype.itemsize))
+        )
+        plan = plan_operation(
+            self.resources,
+            WorkShape(
+                nUnits=max(1, len(ranges)),
+                unitBytes=max(1, unit_bytes),
+                innerReadBytes=decode_bytes,
+                chunksPerShard=chunks_per_range,
+                ordered=False,
+            ),
+            policy=self.storageIo,
+        )
+        compute_slots = threading.Semaphore(plan.computeWorkers)
+
+        def produce(
+            index: int, start: int, end: int
+        ) -> tuple[
+            int,
+            int,
+            int,
+            np.ndarray | None,
+            np.ndarray | None,
+            np.ndarray | None,
+            dict[str, np.ndarray],
+            float,
+            float,
+        ]:
+            fetch_started = time.perf_counter()
+            raw = self.rawData._materialize_range(start, end)
+            fetch_seconds = time.perf_counter() - fetch_started
+            with compute_slots:
+                compute_started = time.perf_counter()
+                n_counts = raw.sum(axis=1) if compute_n_counts else None
+                positive = None
+                if compute_n_features or compute_n_cells:
+                    positive = raw > 0
+                n_features = (
+                    positive.sum(axis=1)
+                    if compute_n_features and positive is not None
+                    else None
+                )
+                n_cells_partial = (
+                    positive.sum(axis=0)
+                    if compute_n_cells and positive is not None
+                    else None
+                )
+                percents = {
+                    name: raw[:, feat_idx].sum(axis=1)
+                    for name, feat_idx in percent_feature_indices.items()
+                }
+                compute_seconds = time.perf_counter() - compute_started
+            return (
+                index,
+                start,
+                end,
+                n_counts,
+                n_features,
+                n_cells_partial,
+                percents,
+                fetch_seconds,
+                compute_seconds,
+            )
+
+        worker_count = min(plan.readWorkers, max(1, len(ranges)))
+        results = map_shards(
+            ranges,
+            produce,
+            workers=worker_count,
+            within_block_threads=plan.threadsPerComputeWorker,
+            io_concurrency=plan.ioConcurrency,
             msg=f"Computing {self.name} initialization statistics",
-            prefetch=None,
-            row_mask=None,
-            resident_bytes=sum(value.nbytes for value in stats.values()),
-        ):
-            row_stop = row_start + raw.shape[0]
+        )
+        covered = 0
+        fetch_seconds = 0.0
+        compute_seconds = 0.0
+        n_cell_partials: list[tuple[int, np.ndarray]] = []
+        for (
+            index,
+            start,
+            end,
+            n_counts,
+            n_features,
+            n_cells_partial,
+            percents,
+            unit_fetch_seconds,
+            unit_compute_seconds,
+        ) in results:
+            covered += end - start
+            fetch_seconds += unit_fetch_seconds
+            compute_seconds += unit_compute_seconds
             if compute_n_counts:
-                stats["nCounts"][row_start:row_stop] = raw.sum(axis=1)
-
-            positive = None
-            if compute_n_features or compute_n_cells:
-                positive = raw > 0
+                assert n_counts is not None
+                stats["nCounts"][start:end] = n_counts
             if compute_n_features:
-                assert positive is not None
-                stats["nFeatures"][row_start:row_stop] = positive.sum(axis=1)
+                assert n_features is not None
+                stats["nFeatures"][start:end] = n_features
             if compute_n_cells:
-                assert positive is not None
-                stats["nCells"] += positive.sum(axis=0)
-
-            for name, feat_idx in percent_feature_indices.items():
-                stats[name][row_start:row_stop] = raw[:, feat_idx].sum(axis=1)
-            row_start = row_stop
+                assert n_cells_partial is not None
+                n_cell_partials.append((index, np.asarray(n_cells_partial)))
+            for name, values in percents.items():
+                stats[name][start:end] = values
+        record_execution_report(
+            ExecutionReport(
+                plan=plan,
+                unitKind="initializationRowBand",
+                actualReadWorkers=worker_count,
+                actualComputeWorkers=min(plan.computeWorkers, worker_count),
+                actualWriteWorkers=1,
+                fetchSeconds=fetch_seconds,
+                computeSeconds=compute_seconds,
+                unitsCompleted=len(results),
+                extra={
+                    "effectiveChunkReadsInFlight": (worker_count * plan.ioConcurrency),
+                    "fusedReadCompute": True,
+                },
+            )
+        )
+        if compute_n_cells and n_cell_partials:
+            n_cell_partials.sort(key=lambda item: item[0])
+            stats["nCells"] = pairwise_merge_tree(
+                [item[1] for item in n_cell_partials],
+                lambda left, right: left + right,
+            )
+        row_start = covered
 
         if row_start != n_cells:
             raise RuntimeError(

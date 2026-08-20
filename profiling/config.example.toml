@@ -15,11 +15,9 @@ resultsUri = "s3://example-bucket/scarf-profiling"
 # chunkBytes = 100000000
 #
 # [storageIo]
-# sourceReadsInFlight = 8
-# sourceGroupChunks = 1
-# destShardsInFlight = 8
-# destCommitsInFlight = 4
+# readWorkers = 8
 # computeWorkers = 4
+# writeWorkers = 4
 targetSizes = [
     10000,
     25000,
@@ -73,8 +71,6 @@ leidenResolution = 1.0
 leidenSeed = 4444
 leidenLabel = "leiden_cluster"
 markerFeatureKey = "I"
-# When omitted or null, Scarf chooses a budget-safe batch from on-disk feature chunks.
-# markerGeneBatchSize = 50
 graphLocalCache = "auto"
 
 # Tune memory before large runs. Values are examples.

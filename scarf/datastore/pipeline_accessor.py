@@ -711,29 +711,30 @@ class PipelineAccessor:
             )
             artifacts["embedding_initialization"] = initialization
 
-        if umap is not False:
-            with events.stage("umap"):
-                umap_options = self._options(umap)
-                artifacts["umap"] = store.run_umap(
-                    graph,
-                    from_assay=assay_name,
-                    cell_key=cell_key,
-                    feat_key=hvg_name,
-                    **umap_options,
-                )
+        with store._graph_memory_cache_scope():
+            if umap is not False:
+                with events.stage("umap"):
+                    umap_options = self._options(umap)
+                    artifacts["umap"] = store.run_umap(
+                        graph,
+                        from_assay=assay_name,
+                        cell_key=cell_key,
+                        feat_key=hvg_name,
+                        **umap_options,
+                    )
 
-        leiden_options = dict(_DEFAULT_LEIDEN) if leiden is None else dict(leiden)
-        paris_options = None if paris is False else self._options(paris)
-        cluster_columns, cluster_artifacts = self._run_clustering_jobs(
-            graph=graph,
-            assay_name=assay_name,
-            cell_key=cell_key,
-            feat_key=hvg_name,
-            leiden_options=leiden_options,
-            paris_options=paris_options,
-            clustering_concurrency=clustering_concurrency,
-            events=events,
-        )
+            leiden_options = dict(_DEFAULT_LEIDEN) if leiden is None else dict(leiden)
+            paris_options = None if paris is False else self._options(paris)
+            cluster_columns, cluster_artifacts = self._run_clustering_jobs(
+                graph=graph,
+                assay_name=assay_name,
+                cell_key=cell_key,
+                feat_key=hvg_name,
+                leiden_options=leiden_options,
+                paris_options=paris_options,
+                clustering_concurrency=clustering_concurrency,
+                events=events,
+            )
         artifacts.update(cluster_artifacts)
 
         doublet_options = (

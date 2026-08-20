@@ -189,6 +189,9 @@ def _marker_stats_gene_major(
     n_cells = raw.shape[1]
     n_groups = group_counts.shape[0]
     for g in prange(n_genes):
+        row = destination_rows[g]
+        if row < 0:
+            continue
         nz_values = np.empty(n_cells, dtype=np.float32)
         nz_cells = np.empty(n_cells, dtype=np.int64)
         zero_g = np.zeros(n_groups)
@@ -256,7 +259,6 @@ def _marker_stats_gene_major(
             rank_total += rank_values[x]
         tie_correction = tie_sum / (n_total * (n_total - 1.0)) if n_total > 1 else 0.0
 
-        row = destination_rows[g]
         for x in range(n_groups):
             count = group_counts[x]
             rest = n_total - count
@@ -299,12 +301,12 @@ def gene_major_rank_scratch_bytes(
     *,
     n_cells: int,
     n_groups: int,
-    n_threads: int,
+    nthreads: int,
 ) -> int:
     """Return the worst-case scratch owned by active gene workers."""
     cells = max(0, int(n_cells))
     groups = max(0, int(n_groups))
-    threads = max(1, int(n_threads))
+    threads = max(1, int(nthreads))
     per_thread = (
         cells * (np.dtype(np.float32).itemsize + 2 * np.dtype(np.int64).itemsize)
         + groups * 6 * np.dtype(np.float64).itemsize

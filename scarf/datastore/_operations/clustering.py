@@ -181,7 +181,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             )
             hierarchy = fit_paris_hierarchy(
                 fitted_graph,
-                n_threads=budget.workers,
+                nthreads=budget.workers,
             )
             plateau_forest = collapse_equal_height_plateaus(hierarchy)
             hierarchy_group = start_artifact(self.zw, hierarchy_plan)

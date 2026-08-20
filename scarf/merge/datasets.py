@@ -998,6 +998,7 @@ class DataStoreMerge:
                         for name, item in self._alignments.items()
                         if name != assay_name
                     ),
+                    io=self.io,
                 )
                 components.append(
                     ComponentResult(f"counts:{assay_name}", counts_action)

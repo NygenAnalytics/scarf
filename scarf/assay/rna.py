@@ -282,6 +282,7 @@ class RNAassay(Assay):
             resources=self.resources,
             progress=msg or None,
             io=getattr(self, "storageIo", None),
+            orderedCompute=True,
         )
 
         def selected_values(values: np.ndarray, keep: np.ndarray) -> np.ndarray:
@@ -893,19 +894,39 @@ class RNAassay(Assay):
             f"memoryBytes={self.resources.memoryBytes}"
         )
 
-        def process_band(band: Any) -> None:
+        from collections import defaultdict
+
+        from ..utils.compute import add_stat_arrays, pairwise_merge_tree
+
+        partials: dict[
+            tuple[int, int],
+            list[tuple[int, np.ndarray, np.ndarray, np.ndarray]],
+        ] = defaultdict(list)
+
+        def process_band(
+            band: Any,
+        ) -> tuple[int, int, int, np.ndarray, np.ndarray, np.ndarray] | None:
             destinations = dest_of[band.featStart : band.featEnd]
             if not np.any(destinations >= 0):
                 return None
+            n_local = int(band.featEnd - band.featStart)
+            local_nz = np.zeros(n_local, dtype=np.float64)
+            local_s1 = np.zeros(n_local, dtype=np.float64)
+            local_s2 = np.zeros(n_local, dtype=np.float64)
+            local_dest = np.where(
+                destinations >= 0,
+                np.arange(n_local, dtype=np.int64),
+                np.int64(-1),
+            )
             t_compute = time.perf_counter()
             _hvg_stats_gene_major(
                 band.values,
                 inv_scalar[band.selectedDestinations],
                 float(sf),
-                destinations,
-                nz,
-                s1,
-                s2,
+                local_dest,
+                local_nz,
+                local_s1,
+                local_s2,
                 selected=band.selectedLocal,
             )
             compute_sec = time.perf_counter() - t_compute
@@ -916,11 +937,19 @@ class RNAassay(Assay):
                 f"read {band.readSec:.1f}s compute {compute_sec:.1f}s "
                 f"rss {process_rss_mb():.0f} MiB"
             )
-            return None
+            return (
+                int(band.unitIndex),
+                int(band.featStart),
+                int(band.featEnd),
+                local_nz,
+                local_s1,
+                local_s2,
+            )
 
+        consume_metrics: dict[str, object] = {}
         try:
             set_num_threads(threads)
-            for _ in map_feature_cell_bands(
+            for item in map_feature_cell_bands(
                 counts_t,
                 process_band,
                 cell_idx=cell_idx,
@@ -928,10 +957,36 @@ class RNAassay(Assay):
                 resources=self.resources,
                 progress="Calculating feature statistics",
                 io=getattr(self, "storageIo", None),
+                metrics=consume_metrics,
+                orderedCompute=False,
             ):
-                pass
+                if item is None:
+                    continue
+                unit_index, feat_start, feat_end, local_nz, local_s1, local_s2 = item
+                partials[(feat_start, feat_end)].append(
+                    (unit_index, local_nz, local_s1, local_s2)
+                )
+            for (feat_start, feat_end), items in partials.items():
+                items.sort(key=lambda row: row[0])
+                merged = pairwise_merge_tree(
+                    [(row[1], row[2], row[3]) for row in items],
+                    add_stat_arrays,
+                )
+                destinations = dest_of[feat_start:feat_end]
+                keep = destinations >= 0
+                nz[destinations[keep]] = merged[0][keep]
+                s1[destinations[keep]] = merged[1][keep]
+                s2[destinations[keep]] = merged[2][keep]
         finally:
             set_num_threads(previous_threads)
+            if consume_metrics:
+                logger.info(
+                    f"({self.name}) feature stats execution "
+                    f"read={consume_metrics.get('actualReadWorkers')} "
+                    f"compute={consume_metrics.get('actualComputeWorkers')} "
+                    f"fetch={consume_metrics.get('fetchSeconds')}s "
+                    f"computeSec={consume_metrics.get('computeSeconds')}s"
+                )
 
         mean = s1 / n_cells
         sigmas = s2 / n_cells - np.square(mean)

@@ -35,7 +35,6 @@ def test_basic_rna_pipeline_returns_only_named_artifact_refs(
         doublet_scoring=False,
         markers={
             "clusters": {"leiden": 1.0},
-            "gene_batch_size": 100,
         },
     )
 
@@ -343,9 +342,22 @@ def test_pipeline_requires_highly_variable_features(datastore_ephemeral) -> None
         )
 
 
-def test_pipeline_selects_clusters_by_pca_silhouette(datastore_ephemeral) -> None:
+def test_pipeline_selects_clusters_by_pca_silhouette(
+    datastore_ephemeral,
+    monkeypatch,
+) -> None:
     events: list[PipelineEvent] = []
-    artifacts = datastore_ephemeral.pipeline.run(
+    store = datastore_ephemeral
+    original = store._store_to_sparse
+    graph_reads = 0
+
+    def counted_store_to_sparse(*args, **kwargs):
+        nonlocal graph_reads
+        graph_reads += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_store_to_sparse", counted_store_to_sparse)
+    artifacts = store.pipeline.run(
         filtering={},
         cell_cycle_scoring=False,
         highly_variable_features={
@@ -362,9 +374,7 @@ def test_pipeline_selects_clusters_by_pca_silhouette(datastore_ephemeral) -> Non
         paris={"n_clusters": 3, "label": "pipeline_silhouette_paris"},
         clustering_concurrency=2,
         doublet_scoring=False,
-        markers={
-            "gene_batch_size": 100,
-        },
+        markers={},
         callback=events.append,
     )
 
@@ -377,13 +387,14 @@ def test_pipeline_selects_clusters_by_pca_silhouette(datastore_ephemeral) -> Non
     }
     assert selected in candidates
     assert artifacts["markers"].kind == "marker_table"
+    assert graph_reads == 1
+    assert store._graphMemoryCache is None
     for stage in ("cluster_selection", "markers"):
         assert [event.kind for event in events if event.stage == stage] == [
             "stage_started",
             "stage_completed",
         ]
 
-    store = datastore_ephemeral
     labels = store.cells.fetch("RNA_clusters")
     assert (labels == store.cells.fetch(candidates[selected])).all()
     column = store.zw["cellData"]["RNA_clusters"]
@@ -437,7 +448,7 @@ def test_pipeline_rejects_downstream_steps_without_clustering(
             leiden={},
             paris=False,
             doublet_scoring=False,
-            markers={"gene_batch_size": 100},
+            markers={},
         )
 
 
@@ -788,7 +799,6 @@ def test_basic_rna_pipeline_runs_score_steps_after_clustering(
         },
         markers={
             "clusters": {"leiden": 0.5},
-            "gene_batch_size": 100,
         },
         callback=events.append,
     )

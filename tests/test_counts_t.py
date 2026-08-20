@@ -263,14 +263,15 @@ def test_marker_results_on_strip_counts_t():
         group_key="cluster",
         cell_key="I",
         feat_key="I",
-        batch_size=2,
-        n_threads=1,
+        nthreads=1,
     )
     assert set(results) == {"a", "b"}
     assert len(results["a"]) == 4
 
 
-def test_iter_normed_feature_wise_on_strip_counts_t():
+def test_iter_normed_feature_wise_on_strip_counts_t(monkeypatch):
+    from scarf.storage import feature_stream
+
     root = _memory_root()
     values = np.array(
         [
@@ -288,6 +289,14 @@ def test_iter_normed_feature_wise_on_strip_counts_t():
         root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
     )
     assay.sf = 1000.0
+    original = feature_stream.map_feature_read_groups
+    ordered_calls: list[bool] = []
+
+    def checked_map(*args, **kwargs):
+        ordered_calls.append(bool(kwargs.get("orderedCompute")))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(feature_stream, "map_feature_read_groups", checked_map)
     batches = list(
         assay.iter_normed_feature_wise(
             cell_key="I",
@@ -300,6 +309,11 @@ def test_iter_normed_feature_wise_on_strip_counts_t():
     assert batches
     joined = np.concatenate([batch.to_numpy() for batch in batches], axis=1)
     assert joined.shape[0] == 4
+    assert ordered_calls == [True]
+    np.testing.assert_array_equal(
+        np.concatenate([batch.columns.to_numpy() for batch in batches]),
+        np.arange(values.shape[1]),
+    )
 
 
 def test_regression_on_strip_counts_t():

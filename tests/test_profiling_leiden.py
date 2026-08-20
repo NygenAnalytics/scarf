@@ -41,6 +41,7 @@ def _request(
     tmpPath: Path,
     *,
     workflow: WorkflowParameters | None = None,
+    invalidateCache: bool = False,
 ) -> tuple[Path, Path]:
     status_path = tmpPath / "status.json"
     request_path = tmpPath / "request.json"
@@ -51,6 +52,7 @@ def _request(
                 "workflow": (workflow or WorkflowParameters()).model_dump(mode="json"),
                 "resources": _resources().model_dump(mode="json"),
                 "statusPath": str(status_path),
+                "invalidateCache": invalidateCache,
             }
         ),
         encoding="utf-8",
@@ -81,7 +83,7 @@ def test_worker_runs_leiden(
         return store
 
     monkeypatch.setattr(leiden_worker, "_open_datastore", fake_open)
-    request_path, status_path = _request(tmp_path)
+    request_path, status_path = _request(tmp_path, invalidateCache=True)
 
     leiden_worker.run_leiden_worker(request_path)
 
@@ -94,6 +96,7 @@ def test_worker_runs_leiden(
         "resolution": 1.0,
         "label": "leiden_cluster",
         "random_seed": 4444,
+        "invalidate_cache": True,
     }
     status = json.loads(status_path.read_text(encoding="utf-8"))
     assert status["status"] == "ok"
@@ -193,11 +196,13 @@ def test_parent_starts_worker_module(
         workflow=WorkflowParameters(),
         resources=_resources(),
         workDir=tmp_path,
+        invalidateCache=True,
     )
 
     assert commands[0][1:3] == ["-m", "profiling.leiden_worker"]
     request = json.loads((tmp_path / "request.json").read_text(encoding="utf-8"))
     assert request["storeUri"] == "s3://bucket/store.zarr"
+    assert request["invalidateCache"] is True
     assert "leidenBackend" not in request["workflow"]
 
 
@@ -213,6 +218,8 @@ def test_run_stage_routes_leiden_to_child(
             "inputSetupSeconds": 0.5,
             "operationSeconds": 1.5,
             "wholeWorkerSeconds": 2.25,
+            "childCpuSeconds": 1.1,
+            "processCpuSeconds": 1.05,
         }
 
     def unexpected_open(*_args: object, **_kwargs: object) -> None:
@@ -229,6 +236,7 @@ def test_run_stage_routes_leiden_to_child(
         resources=_resources(),
         workDir=tmp_path,
         sampleIntervalSeconds=0.01,
+        invalidateCache=True,
     )
 
     assert result.status == "ok"
@@ -236,5 +244,8 @@ def test_run_stage_routes_leiden_to_child(
     assert result.seconds == 1.5
     assert result.details is not None
     assert result.details["workerWholeSeconds"] == 2.25
+    assert result.details["workerProcessCpuSeconds"] == 1.05
+    assert result.childCpuSeconds == 1.1
     assert called["storeUri"] == "s3://bucket/store.zarr"
     assert called["workDir"] == tmp_path
+    assert called["invalidateCache"] is True

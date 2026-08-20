@@ -116,15 +116,41 @@ def _fingerprint(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _factor_k(k: int, ratio: int) -> tuple[int, int]:
-    """Return ``(cellParts, geneParts)`` whose product is ``k``."""
-    target = min(max(1, int(k)), max(1, int(ratio)))
-    gene_parts = int(k)
-    for divisor in range(target, int(k) + 1):
-        if int(k) % divisor == 0:
-            gene_parts = divisor
-            break
-    return int(k) // gene_parts, gene_parts
+def _aligned_feature_widths(
+    source_limit: int,
+    read_limit: int,
+    n_feats: int,
+) -> tuple[int, int]:
+    """Return compatible counts-chunk and all-cell read widths."""
+    source_cap = max(1, min(int(n_feats), int(source_limit)))
+    read_cap = max(1, min(int(n_feats), int(read_limit)))
+    candidates: set[tuple[int, int]] = set()
+
+    if source_cap >= read_cap:
+        lower = max(1, source_cap // read_cap)
+        upper = max(1, (source_cap + read_cap - 1) // read_cap)
+        for ratio in {1, lower, upper}:
+            read_width = min(read_cap, source_cap // ratio, n_feats // ratio)
+            if read_width > 0:
+                candidates.add((ratio * read_width, read_width))
+    else:
+        lower = max(1, read_cap // source_cap)
+        upper = max(1, (read_cap + source_cap - 1) // source_cap)
+        for ratio in {1, lower, upper}:
+            source_width = min(source_cap, read_cap // ratio, n_feats // ratio)
+            if source_width > 0:
+                candidates.add((source_width, ratio * source_width))
+
+    def score(widths: tuple[int, int]) -> tuple[int, int, int, int]:
+        source_width, read_width = widths
+        return (
+            min(source_width * read_cap, read_width * source_cap),
+            source_width * read_cap + read_width * source_cap,
+            read_width,
+            source_width,
+        )
+
+    return max(candidates, key=score)
 
 
 def _pad_to_multiple(extent: int, step: int) -> int:
@@ -133,56 +159,21 @@ def _pad_to_multiple(extent: int, step: int) -> int:
     return ((extent + step - 1) // step) * step
 
 
-def _counts_t_aspect(
-    n_cells: int,
-    n_feats: int,
-    counts_chunk_feats: int,
-    itemsize: int,
-    *,
-    unit_bytes: int,
-    k: int,
-) -> tuple[int, int]:
-    base_cells = max(1, unit_bytes // max(1, counts_chunk_feats * itemsize))
-    if n_cells <= base_cells:
-        shard_cells = n_cells
-        shard_feats = min(n_feats, max(1, unit_bytes // max(1, n_cells * itemsize)))
-        return shard_cells, shard_feats
-    shard_cells = base_cells
-    shard_feats = counts_chunk_feats
-    if n_cells > k * shard_cells and shard_feats >= k:
-        shard_cells *= k
-        shard_feats = max(1, shard_feats // k)
-    return shard_cells, shard_feats
-
-
-def _counts_t_chunks(
-    n_cells: int,
-    shard_cells: int,
-    shard_feats: int,
-    *,
-    unit_bytes: int,
-    chunk_bytes: int,
-    k: int,
-    itemsize: int,
-) -> tuple[int, int]:
-    ratio = max(1, math.ceil(n_cells / max(1, shard_cells)))
-    gene_parts = max(1, _factor_k(k, ratio)[1])
-    if ratio <= k and shard_feats % gene_parts == 0:
-        cell_parts, gene_parts = _factor_k(k, ratio)
-        if (
-            shard_cells % max(1, cell_parts) == 0
-            and shard_feats % max(1, gene_parts) == 0
-        ):
-            return max(1, shard_feats // gene_parts), max(1, shard_cells // cell_parts)
-
-    chunk_feats = max(1, min(shard_feats, unit_bytes // max(1, n_cells * itemsize)))
-    chunk_cells = shard_cells
-    nominal = chunk_feats * chunk_cells * itemsize
-    if nominal > chunk_bytes * 2 and shard_cells > 1:
-        chunk_cells = max(
-            1, min(shard_cells, chunk_bytes // max(1, chunk_feats * itemsize))
-        )
-    return chunk_feats, chunk_cells
+def _largest_divisor_at_most(value: int, limit: int) -> int:
+    resolved = max(1, int(value))
+    ceiling = max(1, min(resolved, int(limit)))
+    if ceiling == resolved:
+        return resolved
+    best = 1
+    for divisor in range(1, math.isqrt(resolved) + 1):
+        if resolved % divisor:
+            continue
+        if divisor <= ceiling:
+            best = max(best, divisor)
+        paired = resolved // divisor
+        if paired <= ceiling:
+            best = max(best, paired)
+    return best
 
 
 def _empty_plan(
@@ -253,13 +244,18 @@ def _finish_plan(
     destination_bytes: int,
     source_bytes: int,
 ) -> CountMatrixPairPlan:
+    counts_t_shards = counts_t.shards or counts_t.chunks
+    chunks_per_shard = math.prod(
+        max(1, int(shard) // max(1, int(chunk)))
+        for shard, chunk in zip(counts_t_shards, counts_t.chunks, strict=True)
+    )
     resolved = {
         "policy": {"unitBytes": policy.unitBytes, "chunkBytes": policy.chunkBytes},
         "nCells": n_cells,
         "nFeats": n_feats,
         "itemsize": itemsize,
         "dtype": np.dtype(dtype).name,
-        "chunksPerShard": policy.chunksPerShard,
+        "chunksPerShard": chunks_per_shard,
         "countsChunks": list(counts.chunks),
         "countsShards": list(counts.shards or ()),
         "countsTChunks": list(counts_t.chunks),
@@ -279,7 +275,7 @@ def _finish_plan(
         nFeats=n_feats,
         itemsize=itemsize,
         dtype=np.dtype(dtype).name,
-        chunksPerShard=policy.chunksPerShard,
+        chunksPerShard=chunks_per_shard,
         counts=counts,
         countsT=counts_t,
         readGroup=read_group,
@@ -314,11 +310,16 @@ def plan_count_matrix_pair(
 
     unit_bytes = int(policy.unitBytes)
     chunk_bytes = int(policy.chunkBytes)
-    k = policy.chunksPerShard
     row_bytes = n_feats * itemsize
     counts_shard_cells = max(1, min(n_cells, unit_bytes // max(1, row_bytes)))
-    counts_chunk_feats = max(
+    source_feature_limit = max(
         1, min(n_feats, chunk_bytes // max(1, counts_shard_cells * itemsize))
+    )
+    read_feature_limit = max(1, min(n_feats, unit_bytes // max(1, n_cells * itemsize)))
+    counts_chunk_feats, read_feats = _aligned_feature_widths(
+        source_feature_limit,
+        read_feature_limit,
+        n_feats,
     )
     counts_chunks = (counts_shard_cells, counts_chunk_feats)
     counts_shards = (
@@ -326,27 +327,21 @@ def plan_count_matrix_pair(
         _pad_to_multiple(n_feats, counts_chunk_feats),
     )
 
-    shard_cells, shard_feats = _counts_t_aspect(
-        n_cells,
-        n_feats,
-        counts_chunk_feats,
-        itemsize,
-        unit_bytes=unit_bytes,
-        k=k,
+    shard_feats = max(counts_chunk_feats, read_feats)
+    source_rows_per_shard = min(
+        math.ceil(n_cells / counts_shard_cells),
+        max(
+            1,
+            unit_bytes // max(1, shard_feats * counts_shard_cells * itemsize),
+        ),
     )
-    chunk_feats, chunk_cells = _counts_t_chunks(
-        n_cells,
-        shard_cells,
-        shard_feats,
-        unit_bytes=unit_bytes,
-        chunk_bytes=chunk_bytes,
-        k=k,
-        itemsize=itemsize,
+    shard_cells = source_rows_per_shard * counts_shard_cells
+    chunk_feats = read_feats
+    chunk_cell_limit = max(
+        1,
+        chunk_bytes // max(1, chunk_feats * itemsize),
     )
-    if shard_cells % chunk_cells:
-        shard_cells = _pad_to_multiple(shard_cells, chunk_cells)
-    if shard_feats % chunk_feats:
-        shard_feats = _pad_to_multiple(shard_feats, chunk_feats)
+    chunk_cells = _largest_divisor_at_most(shard_cells, chunk_cell_limit)
     counts_t_chunks = (chunk_feats, chunk_cells)
     counts_t_shards = (shard_feats, shard_cells)
 
@@ -368,9 +363,6 @@ def plan_count_matrix_pair(
         profile=profile,
     )
 
-    read_feats = min(n_feats, max(1, unit_bytes // max(1, n_cells * itemsize)))
-    if read_feats > shard_feats:
-        read_feats = min(n_feats, max(chunk_feats, shard_feats))
     cell_shards = max(1, math.ceil(n_cells / shard_cells))
     gene_shards = max(1, math.ceil(read_feats / shard_feats))
     shards_touched = cell_shards * gene_shards
@@ -389,7 +381,6 @@ def plan_count_matrix_pair(
         readGroupBytes=n_cells * read_feats * itemsize,
         physicalShardBytes=shard_cells * shard_feats * itemsize,
     )
-    amplification = max(1.0, counts_chunk_feats / max(1, shard_feats))
     destination_bytes = min(shard_cells, n_cells) * min(shard_feats, n_feats) * itemsize
     source_bytes = counts_shard_cells * counts_chunk_feats * itemsize
     return _finish_plan(
@@ -401,7 +392,7 @@ def plan_count_matrix_pair(
         counts=counts,
         counts_t=counts_t,
         read_group=read_group,
-        amplification=amplification,
+        amplification=1.0,
         destination_bytes=destination_bytes,
         source_bytes=source_bytes,
     )

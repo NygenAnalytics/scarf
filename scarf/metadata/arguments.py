@@ -180,8 +180,7 @@ class MarkerTableArguments(OperationArguments):
     group_key: str = execution()
     cell_key: str = execution()
     feat_key: str = execution()
-    gene_batch_size: int | None = execution()
-    n_threads: int = execution()
+    nthreads: int = execution()
     invalidate_cache: bool = execution()
 
 
@@ -251,7 +250,7 @@ class PseudotimeMarkerArguments(OperationArguments):
     feat_key: str = execution()
     pseudotime_key: str = execution()
     gene_batch_size: int | None = execution()
-    n_threads: int = execution()
+    nthreads: int = execution()
     invalidate_cache: bool = execution()
 
 
@@ -281,7 +280,7 @@ class PseudotimeAggregationArguments(OperationArguments):
     pseudotime_key: str = execution()
     cluster_label: str = execution()
     batch_size: int | None = execution()
-    n_threads: int = execution()
+    nthreads: int = execution()
     invalidate_cache: bool = execution()
 
 

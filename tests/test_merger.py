@@ -2366,12 +2366,12 @@ def test_dataset_merge_sparse_write_respects_admitted_batch_geometry(
             nnz_widths.append(int(np.asarray(rows).size))
         return original_read(table, column, rows)
 
-    def tracking_remap(block, order_map, n_feats, n_threads, destination_dtype=None):
+    def tracking_remap(block, order_map, n_feats, nthreads, destination_dtype=None):
         result = original_remap(
             block,
             order_map,
             n_feats,
-            n_threads,
+            nthreads,
             destination_dtype,
         )
         dense_rows.append(int(result.shape[0]))

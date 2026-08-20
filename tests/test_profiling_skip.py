@@ -158,6 +158,6 @@ def test_partial_storage_io_is_rejected() -> None:
     from profiling.config import ProfilingConfig
 
     payload = load_profiling_config(_EXAMPLE_CONFIG).model_dump(mode="python")
-    payload["storageIo"] = {"sourceReadsInFlight": 0}
+    payload["storageIo"] = {"readWorkers": 0}
     with pytest.raises(Exception):
         ProfilingConfig.model_validate(payload)

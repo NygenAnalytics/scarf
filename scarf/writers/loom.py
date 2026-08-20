@@ -166,6 +166,7 @@ class LoomToZarr:
             )
             + dense_source_bytes,
             msg="Writing Loom counts",
+            io=self.io,
         )
         if total_cells_written != self.loom.nCells:
             raise AssertionError(

@@ -195,7 +195,7 @@ def test_preflight_paris_fit_and_cached_cut_respect_budget():
         2,
         np.dtype(np.int32).itemsize,
         np.dtype(np.float64).itemsize,
-        n_threads=1,
+        nthreads=1,
     )
     assert cut_bytes == estimate_cached_paris_peak_bytes(
         root,

@@ -182,6 +182,7 @@ class SparseToZarr:
             residentBytes=resident_bytes,
             producerReserveBytes=plan.producerReserveBytes,
             msg="Writing sparse counts",
+            io=self.io,
         )
         if e != self.nCells:
             raise AssertionError(

@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -233,8 +234,9 @@ def download_file(
     *,
     chunkBytes: int = _DEFAULT_TRANSFER_CHUNK_BYTES,
     maxAttempts: int = 8,
+    maxWorkers: int | None = None,
 ) -> ObjectDownload:
-    """Download with ranged GETs so large objects can resume after timeouts."""
+    """Download with concurrent ranged GETs into a preallocated file."""
     if chunkBytes <= 0:
         raise ValueError("chunkBytes must be positive")
     if maxAttempts <= 0:
@@ -246,32 +248,58 @@ def download_file(
     meta = store.head(key)
     total = int(meta["size"])
     part_path = destination_path.with_name(f".{destination_path.name}.part")
-    offset = part_path.stat().st_size if part_path.is_file() else 0
-    if offset > total:
+    if part_path.is_file() and part_path.stat().st_size != total:
         part_path.unlink()
-        offset = 0
+    if total == 0:
+        part_path.write_bytes(b"")
+        os.replace(part_path, destination_path)
+        e_tag = meta.get("e_tag")
+        return ObjectDownload(fileBytes=0, eTag=str(e_tag) if e_tag else None)
 
-    attempts = 0
-    while offset < total:
-        end = min(offset + chunkBytes, total)
-        try:
-            chunk = bytes(store.get_range(key, start=offset, end=end))
-        except Exception:
-            attempts += 1
-            if attempts >= maxAttempts:
-                raise
-            time.sleep(min(60.0, 2.0**attempts))
-            store, key = open_r2_object(uri)
-            continue
-        if not chunk:
-            raise RuntimeError(f"Empty range response for {uri} at offset {offset}")
-        with part_path.open("ab" if offset else "wb") as handle:
-            handle.write(chunk)
-        offset += len(chunk)
+    ranges = [
+        (start, min(start + chunkBytes, total)) for start in range(0, total, chunkBytes)
+    ]
+    workers = max(1, int(maxWorkers) if maxWorkers is not None else min(8, len(ranges)))
+    with part_path.open("wb") as handle:
+        handle.truncate(total)
+
+    def fetch_range(start: int, end: int) -> None:
         attempts = 0
+        while True:
+            try:
+                local_store, local_key = open_r2_object(uri)
+                chunk = bytes(local_store.get_range(local_key, start=start, end=end))
+            except Exception:
+                attempts += 1
+                if attempts >= maxAttempts:
+                    raise
+                time.sleep(min(60.0, 2.0**attempts))
+                continue
+            if not chunk:
+                raise RuntimeError(f"Empty range response for {uri} at offset {start}")
+            if start + len(chunk) > end:
+                raise RuntimeError(
+                    f"Range response for {uri} at offset {start} exceeded "
+                    f"{end - start} bytes"
+                )
+            with part_path.open("r+b") as handle:
+                handle.seek(start)
+                handle.write(chunk)
+            return
 
-    if offset != total:
-        raise RuntimeError(f"Downloaded {offset} bytes from {uri}, expected {total}")
+    if workers == 1 or len(ranges) == 1:
+        for start, end in ranges:
+            fetch_range(start, end)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(fetch_range, start, end) for start, end in ranges]
+            for future in as_completed(futures):
+                future.result()
+
+    if part_path.stat().st_size != total:
+        raise RuntimeError(
+            f"Downloaded {part_path.stat().st_size} bytes from {uri}, expected {total}"
+        )
     os.replace(part_path, destination_path)
     e_tag = meta.get("e_tag")
     return ObjectDownload(fileBytes=total, eTag=str(e_tag) if e_tag else None)

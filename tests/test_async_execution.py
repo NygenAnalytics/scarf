@@ -12,7 +12,7 @@ from scarf.storage.async_execution import (
     ensure_zarr_host_ceiling,
     reset_zarr_runtime_for_tests,
 )
-from scarf.storage.budget import ResourceBudget
+from scarf.storage.budget import ResourceBudget, detect_workers
 from scarf.storage.count_matrix import (
     CountMatrixPolicy,
     persist_count_matrix_plan,
@@ -86,9 +86,8 @@ def test_writer_pipelines_destination_shards_and_commits() -> None:
         policy=_scaled_policy(),
         resources=ResourceBudget(32 * 1024 * 1024, 4),
         io=StorageIoPolicy(
-            sourceReadsInFlight=2,
-            destShardsInFlight=2,
-            destCommitsInFlight=2,
+            readWorkers=2,
+            writeWorkers=2,
             computeWorkers=2,
         ),
         metrics=metrics,
@@ -108,6 +107,47 @@ def test_writer_pipelines_destination_shards_and_commits() -> None:
     assert int(metrics["requestedDestCommitsInFlight"]) == 2
     assert int(metrics["requestedComputeWorkers"]) == 2
     assert int(metrics["effectiveComputeWorkers"]) == 2
+
+
+def test_writer_auto_width_matches_compute_workers() -> None:
+    values = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    group, counts = _write_counts(values)
+    metrics: dict[str, object] = {}
+    counts_t = write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(64 * 1024 * 1024, 4),
+        metrics=metrics,
+    )
+
+    assert int(metrics["effectiveDestShardsInFlight"]) == 4
+    assert int(metrics["effectiveComputeWorkers"]) == 4
+    assert int(metrics["sourceRepeatedDecodeCount"]) == 0
+    assert int(metrics["reservedBytes"]) <= 64 * 1024 * 1024
+    assert int(metrics["peakLedgerBytes"]) <= 64 * 1024 * 1024
+    np.testing.assert_array_equal(np.asarray(counts_t[:]), values.T)
+
+
+def test_writer_honors_explicit_read_width_above_compute_workers() -> None:
+    values = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    group, counts = _write_counts(values)
+    metrics: dict[str, object] = {}
+    counts_t = write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(64 * 1024 * 1024, 4),
+        io=StorageIoPolicy(readWorkers=8),
+        metrics=metrics,
+    )
+
+    assert int(metrics["effectiveDestShardsInFlight"]) == 8
+    assert int(metrics["effectiveComputeWorkers"]) == 4
+    assert int(metrics["sourceRepeatedDecodeCount"]) == 0
+    assert int(metrics["reservedBytes"]) <= 64 * 1024 * 1024
+    assert int(metrics["peakLedgerBytes"]) <= 64 * 1024 * 1024
+    np.testing.assert_array_equal(np.asarray(counts_t[:]), values.T)
 
 
 def test_writer_reuses_complete_matching_destination() -> None:
@@ -147,8 +187,8 @@ def test_writer_resident_bytes_reduce_destination_width() -> None:
         * int(plan.countsT.shards[1])
         * int(values.dtype.itemsize)
     )
-    per_dest = dest_unit + int(plan.sourceBufferBytes)
-    resident = budget - per_dest
+    per_destination_set = dest_unit + int(plan.sourceBufferBytes)
+    resident = budget - per_destination_set
     metrics: dict[str, object] = {}
     write_counts_t(
         counts,
@@ -157,17 +197,17 @@ def test_writer_resident_bytes_reduce_destination_width() -> None:
         resources=ResourceBudget(budget, 8),
         residentBytes=resident,
         io=StorageIoPolicy(
-            sourceReadsInFlight=1,
-            destShardsInFlight=4,
+            readWorkers=4,
         ),
         metrics=metrics,
     )
     assert int(metrics["requestedDestShardsInFlight"]) == 4
     assert int(metrics["effectiveDestShardsInFlight"]) == 1
+    assert int(metrics["plannedDestinationSetBytes"]) == dest_unit
     assert int(metrics["peakLedgerBytes"]) + resident <= budget
 
 
-def test_writer_keeps_source_reads_per_destination_shard() -> None:
+def test_writer_bounds_grouped_source_reads_by_inner_chunk_plan() -> None:
     values = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
     group, counts = _write_counts(values)
     metrics: dict[str, object] = {}
@@ -177,14 +217,19 @@ def test_writer_keeps_source_reads_per_destination_shard() -> None:
         policy=_scaled_policy(),
         resources=ResourceBudget(64 * 1024 * 1024, 8),
         io=StorageIoPolicy(
-            sourceReadsInFlight=3,
-            destShardsInFlight=2,
+            readWorkers=2,
         ),
         metrics=metrics,
     )
-    assert int(metrics["requestedSourceReadsInFlight"]) == 3
-    assert int(metrics["effectiveSourceReadsInFlight"]) > 1
     assert int(metrics["effectiveDestShardsInFlight"]) == 2
+    assert int(metrics["readGroupChunks"]) == 1
+    assert int(metrics["sourceReadsPerDestination"]) * int(
+        metrics["readGroupChunks"]
+    ) <= int(metrics["innerReads"])
+    assert int(metrics["effectiveSourceReadsInFlight"]) == (
+        int(metrics["effectiveDestShardsInFlight"])
+        * int(metrics["sourceReadsPerDestination"])
+    )
 
 
 def test_retry_replaces_incomplete_destination() -> None:
@@ -254,27 +299,29 @@ async def _current_async_concurrency(_active: AsyncStorageRunner) -> int:
 
 
 def test_host_ceiling_is_set_once_and_does_not_shrink() -> None:
-    assert ensure_zarr_host_ceiling(2) == 2
-    assert zarr.config.get("threading.max_workers") == 2
-    assert ensure_zarr_host_ceiling(8) == 2
-    assert zarr.config.get("threading.max_workers") == 2
+    first = ensure_zarr_host_ceiling(2)
+    assert first >= 2
+    assert zarr.config.get("threading.max_workers") == first
+    assert ensure_zarr_host_ceiling(8) == first
+    assert zarr.config.get("threading.max_workers") == first
 
 
 def test_sequential_runners_keep_their_own_plans() -> None:
+    host = detect_workers()
     first = AsyncStorageRunner(ResourceBudget(1024, 2), chunksPerShard=10)
     second = AsyncStorageRunner(ResourceBudget(1024, 4), chunksPerShard=1)
     third = AsyncStorageRunner(ResourceBudget(1024, 4), chunksPerShard=10)
 
-    assert first.plan.codecWorkerLimit == 1
-    assert first.plan.zarrAsyncConcurrency == 1
-    assert second.plan.codecWorkerLimit == 3
+    assert first.plan.codecWorkerLimit == host
+    assert first.plan.zarrAsyncConcurrency == min(host, 10)
+    assert second.plan.codecWorkerLimit == host
     assert second.plan.zarrAsyncConcurrency == 1
-    assert third.plan.codecWorkerLimit == 3
-    assert third.plan.zarrAsyncConcurrency == 3
+    assert third.plan.codecWorkerLimit == host
+    assert third.plan.zarrAsyncConcurrency == min(host, 10)
 
-    assert first.run(_current_async_concurrency) == 1
+    assert first.run(_current_async_concurrency) == first.plan.zarrAsyncConcurrency
     assert second.run(_current_async_concurrency) == 1
-    assert third.run(_current_async_concurrency) == 3
+    assert third.run(_current_async_concurrency) == third.plan.zarrAsyncConcurrency
     assert zarr.config.get("async.concurrency") == 10
 
 
@@ -288,14 +335,17 @@ def test_runner_scopes_async_concurrency_and_restores_configured_default() -> No
     assert runner.plan.zarrAsyncConcurrency == 1
     assert runner.run(_current_async_concurrency) == 1
     assert zarr.config.get("async.concurrency") == 3
-    assert zarr.config.get("threading.max_workers") == 3
+    assert int(zarr.config.get("threading.max_workers")) >= 3
 
 
 def test_runner_restores_async_concurrency_after_failure() -> None:
     runner = AsyncStorageRunner(ResourceBudget(1024, 4), chunksPerShard=10)
 
     async def boom(_active: AsyncStorageRunner) -> None:
-        assert int(zarr.config.get("async.concurrency")) == 3
+        assert (
+            int(zarr.config.get("async.concurrency"))
+            == runner.plan.zarrAsyncConcurrency
+        )
         raise ValueError("operation failed")
 
     with pytest.raises(ValueError, match="operation failed"):
@@ -334,6 +384,92 @@ def test_byte_ledger_rejects_over_release() -> None:
         assert ledger.is_empty()
 
     asyncio.run(exercise())
+
+
+def test_runner_splits_ledger_wait_from_held_time() -> None:
+    runner = AsyncStorageRunner(ResourceBudget(100, 2))
+
+    async def contend(active: AsyncStorageRunner) -> None:
+        async def hold() -> None:
+            async with active.reserve_bytes(80):
+                await asyncio.sleep(0.05)
+
+        async def wait_for_bytes() -> None:
+            async with active.reserve_bytes(80):
+                pass
+
+        await asyncio.gather(hold(), wait_for_bytes())
+
+    runner.run(contend)
+    assert runner.readerWaitSeconds >= 0.04
+
+
+def test_writer_completes_when_numba_and_many_compute_workers() -> None:
+    """Concurrent compute must not deadlock on Numba thread caps."""
+    import numba
+
+    assert numba.get_num_threads() >= 2
+    values = np.array(
+        [
+            [5, 0, 1, 0, 0, 2],
+            [0, 3, 0, 4, 0, 0],
+            [1, 2, 0, 0, 0, 0],
+            [0, 0, 0, 5, 0, 1],
+            [0, 0, 0, 0, 0, 0],
+            [2, 1, 3, 1, 0, 0],
+        ],
+        dtype=np.uint32,
+    )
+    from scarf.storage.count_matrix import CountMatrixPolicy
+    from scarf.writers import create_cell_data, create_zarr_count_assay
+    from scarf.writers.counts_t import finalize_writer_counts_t
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    create_cell_data(
+        root,
+        None,
+        ids=np.array([f"c{i}" for i in range(values.shape[0])]),
+        names=np.array([f"c{i}" for i in range(values.shape[0])]),
+        profile="fast_local",
+    )
+    counts = create_zarr_count_assay(
+        root,
+        "RNA",
+        None,
+        values.shape[0],
+        feat_ids=np.array([f"f{i}" for i in range(values.shape[1])]),
+        feat_names=np.array(["MT-CO1", "RPS3", "GENE_A", "RPL5", "ZERO", "GENE_B"]),
+        dtype="uint32",
+        profile="fast_local",
+        policy=CountMatrixPolicy(unitBytes=48, chunkBytes=16),
+    )
+    counts[:] = values
+    finalize_writer_counts_t(
+        root,
+        "RNA",
+        None,
+        profile="fast_local",
+        resources=ResourceBudget(64 * 1024 * 1024, 8),
+    )
+    np.testing.assert_array_equal(np.asarray(root["RNA/countsT"][:]), values.T)
+
+
+def test_writer_source_aligned_destinations_do_not_repeat_decodes() -> None:
+    values = np.arange(64 * 64, dtype=np.uint16).reshape(64, 64)
+    group, counts = _write_counts(values)
+    metrics: dict[str, object] = {}
+    counts_t = write_counts_t(
+        counts,
+        group,
+        policy=_scaled_policy(),
+        resources=ResourceBudget(32 * 1024 * 1024, 4),
+        io=StorageIoPolicy(readWorkers=6, writeWorkers=2, computeWorkers=2),
+        metrics=metrics,
+    )
+    np.testing.assert_array_equal(np.asarray(counts_t[:]), values.T)
+    assert int(metrics["sourceRepeatedDecodeCount"]) == 0
+    assert int(metrics["fusedDestinationStrips"]) == 0
+    assert int(metrics["destinationSets"]) == int(metrics["destinationOwners"])
 
 
 def test_async_runner_reports_failure_ledger_leaks() -> None:

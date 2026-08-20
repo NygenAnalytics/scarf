@@ -226,6 +226,46 @@ def test_load_graph_option_matrix(
     np.testing.assert_allclose(graph.toarray(), expected)
 
 
+def test_graph_memory_cache_is_keyed_and_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    graph_loc = _add_test_graph(store)
+    original = store._store_to_sparse
+    reads = 0
+
+    def counted_store_to_sparse(
+        location: str,
+        sparse_format: str = "csr",
+        use_k: int | None = None,
+    ):
+        nonlocal reads
+        reads += 1
+        return original(location, sparse_format, use_k)
+
+    monkeypatch.setattr(store, "_store_to_sparse", counted_store_to_sparse)
+
+    with store._graph_memory_cache_scope():
+        raw = store.load_graph(graph_loc=graph_loc)
+        equivalent = store.load_graph(
+            graph_loc=graph_loc,
+            symmetric=False,
+            upper_only=True,
+        )
+        symmetric = store.load_graph(graph_loc=graph_loc, symmetric=True)
+        reduced = store.load_graph(graph_loc=graph_loc, use_k=1)
+
+        assert raw is equivalent
+        assert raw is not symmetric
+        assert raw is not reduced
+        assert reads == 3
+
+    assert store._graphMemoryCache is None
+    uncached = store.load_graph(graph_loc=graph_loc)
+    assert uncached is not raw
+    assert reads == 4
+
+
 def test_load_graph_latest_location_formats_and_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -663,8 +703,8 @@ def test_run_marker_search_skip_save_and_errors(
     assert first_call["group_key"] == "ids"
     assert first_call["cell_key"] == "I"
     assert first_call["feat_key"] == "I"
-    assert first_call["batch_size"] is None
-    assert first_call["n_threads"] == store.nthreads
+    assert "batch_size" not in first_call
+    assert first_call["nthreads"] == store.nthreads
     assert "markers" not in store.zw["RNA"]
 
     finder.reset_mock()
@@ -672,15 +712,14 @@ def test_run_marker_search_skip_save_and_errors(
         group_key="ids",
         cell_key="I",
         feat_key="I",
-        gene_batch_size=2,
-        n_threads=3,
+        nthreads=3,
         skip_save=True,
         log_transform=False,
     )
     assert result is markers
     second_call = finder.call_args.kwargs
-    assert second_call["batch_size"] == 2
-    assert second_call["n_threads"] == 3
+    assert "batch_size" not in second_call
+    assert second_call["nthreads"] == 3
     assert second_call["log_transform"] is False
 
     finder.side_effect = RuntimeError("marker failure")

@@ -642,14 +642,14 @@ def test_memory_estimate_accounts_for_parallel_contraction_tables() -> None:
         7_500_000,
         4,
         4,
-        n_threads=1,
+        nthreads=1,
     )
     parallel = estimate_paris_peak_bytes(
         n_cells,
         7_500_000,
         4,
         4,
-        n_threads=8,
+        nthreads=8,
     )
 
     assert parallel > serial

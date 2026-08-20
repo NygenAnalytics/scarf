@@ -50,7 +50,6 @@ from profiling.modal_resources import (
     orchestrator_function_options,
     validate_modal_environment,
 )
-from profiling.io_baseline import run_io_baseline_body
 from profiling.provenance import attach_client_provenance, provenance_from_config
 from profiling.r2 import (
     download_file,
@@ -298,30 +297,6 @@ def prepare_fixture_datasets_job(
 @app.function(
     **COMMON_FUNCTION_OPTIONS,
     timeout=86_400,
-    memory=(65_536, 65_536),
-    cpu=(8.0, 8.0),
-    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
-)
-def io_baseline_job(
-    configDict: dict[str, Any],
-    nRows: int = 1_000_000,
-    resultLabel: str | None = None,
-    columnOnly: bool = False,
-) -> dict[str, Any]:
-    """No-compute R2 stream of HVG, marker, and graph read patterns."""
-    config = ProfilingConfig.model_validate(configDict)
-    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
-    return run_io_baseline_body(
-        config,
-        nRows=nRows,
-        resultLabel=resultLabel,
-        columnOnly=columnOnly,
-    )
-
-
-@app.function(
-    **COMMON_FUNCTION_OPTIONS,
-    timeout=86_400,
     memory=65_536,
     cpu=8.0,
     ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
@@ -421,6 +396,7 @@ def run_local_funnel_job(
         download_file(config.datasetUri(nRows), local_h5ad)
 
     outcomes: list[dict[str, Any]] = []
+    session: dict[str, Any] = {}
     for stage in selected_stages:
         failed = existing_error_result(config, nRows, stage)
         if failed is not None:
@@ -475,6 +451,7 @@ def run_local_funnel_job(
             storageIo=config.storageIo,
             workDir=work / stage,
             clientProvenance=config.clientProvenance,
+            session=session,
         )
         write_result(config, result)
         payload = result.to_json()
@@ -560,6 +537,7 @@ def run_e2e_funnel_body(
             flush=True,
         )
 
+        session: dict[str, Any] = {}
         for stage in CORE_STAGE_ORDER:
             failed_stage = stage
             resources = config.resourcesFor(stage)
@@ -581,6 +559,7 @@ def run_e2e_funnel_body(
                 containerCpuLimit=float(resource_envelope["modalCpuLimit"]),
                 resetCgroupPeak=False,
                 clientProvenance=config.clientProvenance,
+                session=session,
             )
             result_uri = write_result(config, result)
             payload = result.to_json()
@@ -980,18 +959,6 @@ def main(*arg_list: str) -> None:
         ),
     )
 
-    io_parser = sub.add_parser("io-baseline")
-    io_parser.add_argument("--config", required=True)
-    io_parser.add_argument("--size", type=int, default=1_000_000)
-    io_parser.add_argument("--result-label")
-    io_parser.add_argument("--column-only", action="store_true")
-    io_parser.add_argument("--wait", action="store_true")
-    io_parser.add_argument(
-        "--ephemeral",
-        action="store_true",
-        help="Spawn from this modal run app without a deploy.",
-    )
-
     args = parser.parse_args(list(arg_list))
     config = _load_config(args.config)
     payload = attach_client_provenance(
@@ -1132,33 +1099,4 @@ def main(*arg_list: str) -> None:
             .spawn(payload, args.size, stages)
         )
         _print_spawned(f"run_local_funnel_job {args.size}", call)
-        return
-
-    if args.command == "io-baseline":
-        resources = config.resourcesFor("markHvgs")
-        options = modal_function_options(config, resources, maxContainers=1)
-        target = (
-            io_baseline_job
-            if args.ephemeral
-            else _deployed_function(config, "io_baseline_job")
-        )
-        call = target.with_options(**options).spawn(
-            payload,
-            args.size,
-            args.result_label,
-            args.column_only,
-        )
-        _print_spawned(f"io_baseline_job size={args.size}", call)
-        if args.wait:
-            print(
-                await_function_call(
-                    call,
-                    deadlineSeconds=float(resources.timeoutSeconds),
-                )
-            )
-        print(
-            "result URI (when done): "
-            f"{config.resultsUri.rstrip('/')}/io-baseline/{config.runTag}"
-            f"{'-' + args.result_label if args.result_label else ''}.json"
-        )
         return

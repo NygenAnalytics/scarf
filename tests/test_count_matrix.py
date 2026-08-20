@@ -60,21 +60,21 @@ def test_uint16_50k_gene_examples_match_the_agreed_geometry() -> None:
         assert plan.chunksPerShard == 10
 
 
-def test_five_and_ten_million_rotate_once_locks() -> None:
+def test_large_cell_counts_keep_source_aligned_strips() -> None:
     five = plan_count_matrix_pair(5_000_000, 50_000, "uint16")
     ten = plan_count_matrix_pair(10_000_000, 50_000, "uint16")
-    assert _shape(five, "countsT") == ((100, 500_000), (500, 1_000_000))
-    assert five.readGroup.shardsTouched == 5
-    assert five.sourceDecodeAmplification == 10.0
-    assert _shape(ten, "countsT") == ((50, 1_000_000), (500, 1_000_000))
-    assert ten.readGroup.shardsTouched == 10
-    assert ten.sourceDecodeAmplification == 10.0
+    assert _shape(five, "countsT") == ((100, 100_000), (5_000, 100_000))
+    assert five.readGroup.shardsTouched == 50
+    assert five.sourceDecodeAmplification == 1.0
+    assert _shape(ten, "countsT") == ((50, 100_000), (5_000, 100_000))
+    assert ten.readGroup.shardsTouched == 100
+    assert ten.sourceDecodeAmplification == 1.0
 
 
-def test_one_hundred_million_stays_at_ten_x_decode() -> None:
+def test_one_hundred_million_stays_source_aligned() -> None:
     plan = plan_count_matrix_pair(100_000_000, 50_000, "uint16")
-    assert _shape(plan, "countsT") == ((5, 1_000_000), (500, 1_000_000))
-    assert plan.sourceDecodeAmplification == 10.0
+    assert _shape(plan, "countsT") == ((5, 100_000), (5_000, 100_000))
+    assert plan.sourceDecodeAmplification == 1.0
 
 
 def test_two_hundred_thousand_read_group_spans_two_shards() -> None:
@@ -104,8 +104,65 @@ def test_gene_width_and_dtype_change_the_cell_band() -> None:
     assert wide.counts.chunks[0] == 5_000
     assert uint16.countsT.shards == (2_500, 200_000)
     assert wide.counts.chunks == (5_000, 10_000)
-    assert wide.countsT.shards == (1_000, 500_000)
-    assert wide.sourceDecodeAmplification == 10.0
+    assert wide.countsT.shards == (10_000, 50_000)
+    assert wide.sourceDecodeAmplification == 1.0
+
+
+def test_two_gib_layout_back_calculates_one_shared_geometry() -> None:
+    policy = CountMatrixPolicy(
+        unitBytes=2_000_000_000,
+        chunkBytes=100_000_000,
+    )
+    plan = plan_count_matrix_pair(900_000, 45_525, "uint16", policy=policy)
+
+    assert plan.counts.chunks == (21_965, 2_222)
+    assert plan.counts.shards == (21_965, 46_662)
+    assert plan.countsT.chunks == (1_111, 43_930)
+    assert plan.countsT.shards == (2_222, 439_300)
+    assert plan.readGroup.featureWidth == 1_111
+    assert plan.chunksPerShard == 20
+    assert plan.sourceDecodeAmplification == 1.0
+    assert plan.countsT.shards[0] == plan.counts.chunks[1]
+    assert plan.countsT.shards[1] % plan.counts.chunks[0] == 0
+    assert plan.sourceBufferBytes <= policy.chunkBytes
+    assert plan.readGroup.readGroupBytes <= policy.unitBytes
+    assert plan.readGroup.physicalShardBytes <= policy.unitBytes
+
+
+@pytest.mark.parametrize(
+    ("n_cells", "n_feats", "dtype", "unit_bytes", "chunk_bytes"),
+    [
+        (17, 40, "uint16", 1_000, 100),
+        (100, 50_027, "uint16", 20_000_000, 2_000_000),
+        (1_000_000, 25_000, "uint32", 1_000_000_000, 100_000_000),
+        (5_000_000, 50_000, "uint16", 1_000_000_000, 100_000_000),
+        (900_000, 45_525, "uint16", 2_000_000_000, 100_000_000),
+    ],
+)
+def test_joint_geometry_honors_alignment_and_byte_limits(
+    n_cells: int,
+    n_feats: int,
+    dtype: str,
+    unit_bytes: int,
+    chunk_bytes: int,
+) -> None:
+    policy = CountMatrixPolicy(unitBytes=unit_bytes, chunkBytes=chunk_bytes)
+    plan = plan_count_matrix_pair(n_cells, n_feats, dtype, policy=policy)
+    itemsize = np.dtype(dtype).itemsize
+    counts_chunk_cells, counts_chunk_feats = plan.counts.chunks
+    counts_t_chunk_feats, counts_t_chunk_cells = plan.countsT.chunks
+    counts_t_shard_feats, counts_t_shard_cells = plan.countsT.shards
+
+    assert counts_chunk_cells * n_feats * itemsize <= unit_bytes
+    assert counts_chunk_cells * counts_chunk_feats * itemsize <= chunk_bytes
+    assert counts_t_shard_feats * counts_t_shard_cells * itemsize <= unit_bytes
+    assert counts_t_chunk_feats * counts_t_chunk_cells * itemsize <= chunk_bytes
+    assert plan.readGroup.readGroupBytes <= unit_bytes
+    assert counts_t_shard_feats % counts_chunk_feats == 0
+    assert counts_t_shard_cells % counts_chunk_cells == 0
+    assert counts_t_shard_feats % counts_t_chunk_feats == 0
+    assert counts_t_shard_cells % counts_t_chunk_cells == 0
+    assert plan.sourceDecodeAmplification == 1.0
 
 
 def test_tiny_policy_is_deterministic() -> None:

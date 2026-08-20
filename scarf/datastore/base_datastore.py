@@ -185,6 +185,13 @@ class BaseDataStore:
             ret_val: zarr.Group = self.z[self.workspace]  # type: ignore
         return ret_val
 
+    @property
+    def last_execution_report(self) -> Any:
+        """Return the most recent storage execution report, if any."""
+        from ..storage.execution import last_execution_report
+
+        return last_execution_report()
+
     def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus:
         """Inspect a logical artifact without mutating the store."""
         return inspect_artifact(self.zw, ref)

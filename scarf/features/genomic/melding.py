@@ -302,6 +302,7 @@ def create_counts_mat(
         block_stream(),
         resources=ResourceBudget(assay.resources.memoryBytes, 1),
         msg="Writing gene scores",
+        io=getattr(assay, "storageIo", None),
     )
 
 

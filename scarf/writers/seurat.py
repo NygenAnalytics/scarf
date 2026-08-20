@@ -656,6 +656,7 @@ class SeuratToZarr:
             residentBytes=self._residentSourceBytes,
             producerReserveBytes=plan.producerReserveBytes,
             msg=f"Writing {assay_name} counts",
+            io=self.io,
         )
         if rows != n_cells:
             raise ValueError(
@@ -769,6 +770,7 @@ class SeuratToZarr:
             dtype=destination.dtype,
             msg=f"Writing {assay_name} counts",
             resources=writer_resources,
+            io=self.io,
         )
         if written != n_cells:
             raise ValueError(

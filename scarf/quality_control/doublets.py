@@ -106,6 +106,7 @@ def write_doublet_target_zarr(
         lambda s, e: sim_counts[s:e].toarray().astype(dtype),
         msg="Writing simulated doublets",
         resources=resources,
+        io=io,
     )
     from ..assay.classification import (
         is_rna_assay_type,

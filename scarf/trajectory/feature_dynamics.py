@@ -127,7 +127,7 @@ def knn_clustering(
     d_array: "scarf.matrix.ChunkedArray",
     n_neighbours: int,
     n_clusters: int,
-    n_threads: int,
+    nthreads: int,
     ann_params: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """Cluster pseudotime-ordered feature profiles."""
@@ -212,7 +212,7 @@ def knn_clustering(
         logger.debug("Pseudotime modules: clustering modules")
         hierarchy = fit_paris_hierarchy(
             matrix,
-            n_threads=n_threads,
+            nthreads=nthreads,
         )
         dendrogram = hierarchy_to_dendrogram(hierarchy)
         return straight_cut(dendrogram, n_cluster)
@@ -265,13 +265,13 @@ def knn_clustering(
         M=int(default_ann_params["M"]),
         random_seed=int(default_ann_params["random_seed"]),
         ef=int(default_ann_params["ef"]),
-        num_threads=int(default_ann_params["num_threads"]),
+        nthreads=int(default_ann_params["num_threads"]),
     )
     return fix_cluster_order(
         d_array,
         make_clusters(
-            make_knn_mat(d_array, n_neighbours, n_threads),
+            make_knn_mat(d_array, n_neighbours, nthreads),
             n_clusters,
         ),
-        n_threads,
+        nthreads,
     )

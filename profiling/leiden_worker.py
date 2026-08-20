@@ -42,6 +42,7 @@ def run_leiden_worker(requestPath: Path) -> None:
         flush=True,
     )
     worker_started = time.perf_counter()
+    cpu_started = time.process_time()
     setup_started = worker_started
     input_setup_seconds: float | None = None
     operation_started: float | None = None
@@ -59,13 +60,18 @@ def run_leiden_worker(requestPath: Path) -> None:
             flush=True,
         )
         operation_started = time.perf_counter()
+        arguments: dict[str, Any] = {
+            "from_assay": workflow.assayName,
+            "cell_key": workflow.cellKey,
+            "feat_key": workflow.hvgKey,
+            "resolution": workflow.leidenResolution,
+            "label": workflow.leidenLabel,
+            "random_seed": workflow.leidenSeed,
+        }
+        if request.get("invalidateCache") is True:
+            arguments["invalidate_cache"] = True
         store.run_leiden_clustering(
-            from_assay=workflow.assayName,
-            cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
-            resolution=workflow.leidenResolution,
-            label=workflow.leidenLabel,
-            random_seed=workflow.leidenSeed,
+            **arguments,
         )
         operation_seconds = time.perf_counter() - operation_started
         del store
@@ -84,6 +90,7 @@ def run_leiden_worker(requestPath: Path) -> None:
                 "inputSetupSeconds": input_setup_seconds,
                 "operationSeconds": operation_seconds,
                 "wholeWorkerSeconds": now - worker_started,
+                "processCpuSeconds": time.process_time() - cpu_started,
             },
         )
         print(f"[leiden_worker] ERROR {error}", flush=True)
@@ -97,6 +104,7 @@ def run_leiden_worker(requestPath: Path) -> None:
             "inputSetupSeconds": input_setup_seconds,
             "operationSeconds": operation_seconds,
             "wholeWorkerSeconds": time.perf_counter() - worker_started,
+            "processCpuSeconds": time.process_time() - cpu_started,
         },
     )
     print("[leiden_worker] DONE run_leiden_clustering", flush=True)

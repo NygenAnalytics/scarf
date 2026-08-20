@@ -147,7 +147,6 @@ class WorkflowParameters(BaseModel):
     leidenSeed: int = 4444
     leidenLabel: str = "leiden_cluster"
     markerFeatureKey: str = "I"
-    markerGeneBatchSize: int | None = None
     graphLocalCache: bool | str = "auto"
     parisNClusters: int | Literal["auto"] = "auto"
     parisLabel: str = "paris_cluster"
@@ -273,26 +272,16 @@ class CountMatrixConfig(BaseModel):
 class StorageIoConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    sourceReadsInFlight: int = 1
-    sourceGroupChunks: int = 1
-    destShardsInFlight: int = 1
-    destCommitsInFlight: int = 1
-    computeWorkers: int = 1
-    groupsInFlight: int | None = None
+    readWorkers: int | None = None
+    computeWorkers: int | None = None
+    writeWorkers: int | None = None
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Self:
-        for name in (
-            "sourceReadsInFlight",
-            "sourceGroupChunks",
-            "destShardsInFlight",
-            "destCommitsInFlight",
-            "computeWorkers",
-        ):
-            if int(getattr(self, name)) < 1:
-                raise ValueError(f"{name} must be positive")
-        if self.groupsInFlight is not None and int(self.groupsInFlight) < 1:
-            raise ValueError("groupsInFlight must be positive when set")
+        for name in ("readWorkers", "computeWorkers", "writeWorkers"):
+            value = getattr(self, name)
+            if value is not None and int(value) < 1:
+                raise ValueError(f"{name} must be positive when set")
         return self
 
 

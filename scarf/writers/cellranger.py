@@ -344,6 +344,7 @@ class CrToZarr:
                 residentBytes=resident_reader_bytes,
                 producerReserveBytes=plan.producerReserveBytes,
                 total=plan.writeTasks,
+                io=self.io,
             )
             if any(buffer.rows != self.cr.nCells for buffer in buffers.values()):
                 raise AssertionError(

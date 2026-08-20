@@ -969,8 +969,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         group_key: str | None = None,
         cell_key: str | None = None,
         feat_key: str | None = None,
-        gene_batch_size: int | None = None,
-        n_threads: int | None = None,
+        nthreads: int | None = None,
         skip_save: bool = False,
         invalidate_cache: bool = False,
         **norm_params: Any,
@@ -987,10 +986,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             cell_key: To run the test on specific subset of cells, provide the name of a boolean column in
                         the cell metadata table. (Default value: 'I')
             feat_key: Boolean feature metadata column selecting features (default: ``'I'``).
-            gene_batch_size: Number of genes loaded per batch. When None,
-                selected genes are grouped into chunk-aligned blocks that fit
-                the operation memory budget.
-            n_threads: Threads for marker search.
+            nthreads: Threads for marker search.
             skip_save: If True, return results without writing to Zarr.
             **norm_params: Extra keyword arguments forwarded to ``normed``.
 
@@ -999,6 +995,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         """
         from ...features.markers import find_markers_by_rank
 
+        if "gene_batch_size" in norm_params:
+            raise TypeError(
+                "run_marker_search() got an unexpected keyword argument "
+                "'gene_batch_size'"
+            )
         if group_key is None:
             raise ValueError(
                 "ERROR: Please provide a value for `group_key`. This should be the name of a column from "
@@ -1011,8 +1012,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         )
         if feat_key is None:
             feat_key = "I"
-        if n_threads is None:
-            n_threads = self.nthreads
+        if nthreads is None:
+            nthreads = self.nthreads
         assay = self._get_assay(from_assay)
         resolved_norm_params = {
             **norm_params,
@@ -1027,7 +1028,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         logger.debug(
             f"Running marker search for {from_assay}/{slot_name} "
             f"(feat_key={feat_key}, "
-            f"batch_size={gene_batch_size if gene_batch_size is not None else 'auto'})"
+            f"nthreads={nthreads})"
         )
         planned = None
         group_cell_counts: dict[Any, tuple[int, int]] = {}
@@ -1135,8 +1136,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 group_key=group_key,
                 cell_key=cell_key,
                 feat_key=feat_key,
-                gene_batch_size=gene_batch_size,
-                n_threads=n_threads,
+                nthreads=nthreads,
                 invalidate_cache=invalidate_cache,
             )
             planned = arguments.plan(
@@ -1185,8 +1185,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             group_key=group_key,
             cell_key=cell_key,
             feat_key=feat_key,
-            batch_size=gene_batch_size,
-            n_threads=n_threads,
+            nthreads=nthreads,
             **resolved_norm_params,
         )
 
@@ -1199,7 +1198,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         t_save = time.perf_counter()
         assert planned is not None
         remote_slot = start_artifact(self.zw, planned)
-        workers = max(1, int(n_threads or self.nthreads))
+        workers = max(1, int(nthreads or self.nthreads))
         self._write_marker_slot(
             remote_slot,
             markers,
@@ -1572,6 +1571,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             lambda start, end: matrix[start:end, :],
             msg="Writing grouped assay",
             resources=self.resources,
+            io=self.storageIo,
         )
 
         self._load_assays(min_cells=0, custom_assay_types={assay_label: "Assay"})

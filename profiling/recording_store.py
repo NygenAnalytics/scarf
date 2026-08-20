@@ -55,11 +55,19 @@ class StoreProbe:
     Args:
         delay: Seconds every tracked operation awaits, making overlap observable.
         fail_on: Key whose write raises instead of storing bytes.
+        countOnly: Increment counters without retaining per-key logs.
     """
 
-    def __init__(self, *, delay: float = 0.0, fail_on: str | None = None):
+    def __init__(
+        self,
+        *,
+        delay: float = 0.0,
+        fail_on: str | None = None,
+        countOnly: bool = False,
+    ):
         self.delay = delay
         self.fail_on = fail_on
+        self.countOnly = countOnly
         self.ops: list[tuple[str, str]] = []
         self.byte_ranges: list[tuple[str, str, object | None]] = []
         self.requested_bytes: list[tuple[str, str, int | None]] = []
@@ -68,6 +76,12 @@ class StoreProbe:
         self._in_flight = 0
         self._in_flight_by_kind: dict[str, int] = {}
         self._max_in_flight_by_kind: dict[str, int] = {}
+        self._count_by_kind: dict[str, int] = {}
+        self._requested_total = 0
+        self._transferred_total = 0
+        self._read_requested_total = 0
+        self._read_transferred_total = 0
+        self._write_transferred_total = 0
         self._lock = threading.Lock()
 
     def reset(self) -> None:
@@ -80,6 +94,12 @@ class StoreProbe:
             self._in_flight = 0
             self._in_flight_by_kind.clear()
             self._max_in_flight_by_kind.clear()
+            self._count_by_kind.clear()
+            self._requested_total = 0
+            self._transferred_total = 0
+            self._read_requested_total = 0
+            self._read_transferred_total = 0
+            self._write_transferred_total = 0
 
     def chunk_ops(self, prefix: str) -> list[tuple[str, str]]:
         return [(kind, key) for kind, key in self.ops if key.startswith(prefix)]
@@ -91,10 +111,16 @@ class StoreProbe:
         byte_range: object | None = None,
         requestedBytes: int | None = None,
     ) -> None:
+        requested = int(requestedBytes or 0)
         with self._lock:
-            self.ops.append((kind, key))
-            self.byte_ranges.append((kind, key, byte_range))
-            self.requested_bytes.append((kind, key, requestedBytes))
+            self._count_by_kind[kind] = self._count_by_kind.get(kind, 0) + 1
+            self._requested_total += requested
+            if kind in {"get", "get_ranges", "get_partial_values"}:
+                self._read_requested_total += requested
+            if not self.countOnly:
+                self.ops.append((kind, key))
+                self.byte_ranges.append((kind, key, byte_range))
+                self.requested_bytes.append((kind, key, requestedBytes))
             self._in_flight += 1
             self.max_in_flight = max(self.max_in_flight, self._in_flight)
             self._in_flight_by_kind[kind] = self._in_flight_by_kind.get(kind, 0) + 1
@@ -104,8 +130,15 @@ class StoreProbe:
             )
 
     def record_transfer(self, kind: str, key: str, nbytes: int) -> None:
+        transferred = int(nbytes)
         with self._lock:
-            self.transferred_bytes.append((kind, key, int(nbytes)))
+            self._transferred_total += transferred
+            if kind in {"get", "get_ranges", "get_partial_values"}:
+                self._read_transferred_total += transferred
+            elif kind == "set":
+                self._write_transferred_total += transferred
+            if not self.countOnly:
+                self.transferred_bytes.append((kind, key, transferred))
 
     def leave(self, kind: str) -> None:
         with self._lock:
@@ -118,37 +151,21 @@ class StoreProbe:
 
     def summary(self) -> StoreOperationSummary:
         with self._lock:
-            requested = sum(value or 0 for _kind, _key, value in self.requested_bytes)
-            transferred = sum(value for _kind, _key, value in self.transferred_bytes)
             keys = {key for _kind, key in self.ops}
             return StoreOperationSummary(
-                gets=sum(1 for kind, _key in self.ops if kind == "get"),
-                sets=sum(1 for kind, _key in self.ops if kind == "set"),
-                deletes=sum(1 for kind, _key in self.ops if kind == "delete"),
-                rangeGets=sum(1 for kind, _key in self.ops if kind == "get_ranges"),
-                partialGets=sum(
-                    1 for kind, _key in self.ops if kind == "get_partial_values"
-                ),
-                requestedBytes=int(requested),
-                transferredBytes=int(transferred),
+                gets=int(self._count_by_kind.get("get", 0)),
+                sets=int(self._count_by_kind.get("set", 0)),
+                deletes=int(self._count_by_kind.get("delete", 0)),
+                rangeGets=int(self._count_by_kind.get("get_ranges", 0)),
+                partialGets=int(self._count_by_kind.get("get_partial_values", 0)),
+                requestedBytes=int(self._requested_total),
+                transferredBytes=int(self._transferred_total),
                 maxInFlight=int(self.max_in_flight),
                 keysTouched=len(keys),
             )
 
     def to_json(self) -> dict[str, int]:
         summary = self.summary()
-        read_kinds = {"get", "get_ranges", "get_partial_values"}
-        read_transferred = sum(
-            value for kind, _key, value in self.transferred_bytes if kind in read_kinds
-        )
-        write_transferred = sum(
-            value for kind, _key, value in self.transferred_bytes if kind == "set"
-        )
-        explicit_read_requested = sum(
-            value or 0
-            for kind, _key, value in self.requested_bytes
-            if kind in read_kinds
-        )
         return {
             "gets": summary.gets,
             "sets": summary.sets,
@@ -158,11 +175,11 @@ class StoreProbe:
             "requestedBytes": summary.requestedBytes,
             "transferredBytes": summary.transferredBytes,
             "readRequestedBytes": max(
-                int(explicit_read_requested),
-                int(read_transferred),
+                int(self._read_requested_total),
+                int(self._read_transferred_total),
             ),
-            "readTransferredBytes": int(read_transferred),
-            "writeTransferredBytes": int(write_transferred),
+            "readTransferredBytes": int(self._read_transferred_total),
+            "writeTransferredBytes": int(self._write_transferred_total),
             "maxInFlight": summary.maxInFlight,
             "keysTouched": summary.keysTouched,
         }

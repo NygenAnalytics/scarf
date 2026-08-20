@@ -23,7 +23,7 @@ def iter_column_blocks(
     worker_budget = max(1, int(workers))
     outer_workers = min(worker_budget, n_blocks)
     resolved_io = (
-        max(1, worker_budget // outer_workers)
+        max(1, min(n_blocks, worker_budget))
         if io_concurrency is None
         else max(1, int(io_concurrency))
     )

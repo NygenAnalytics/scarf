@@ -78,7 +78,7 @@ _MODULE_FUNCTIONS = (
     "write_renorm_subset_to_zarr",
 )
 _MODULE_SIGNATURE_DIGEST = (
-    "a1ddc69d7539a6a75d46f708e20a1c7ca842131782e9fda4da93c6c2fae11aea"
+    "eb25aec8f0b2ca2dd4ba3d9956bbcd87e5cbf6735ca39894525f1d47908f3321"
 )
 
 

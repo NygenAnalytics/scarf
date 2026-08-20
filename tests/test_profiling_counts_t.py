@@ -127,9 +127,8 @@ def test_write_counts_t_forwards_storage_io(tmp_path):
         resources=_resources(),
         countMatrix=CountMatrixConfig(unitBytes=2_000, chunkBytes=200),
         storageIo=StorageIoConfig(
-            sourceReadsInFlight=2,
-            destShardsInFlight=2,
-            destCommitsInFlight=2,
+            readWorkers=2,
+            writeWorkers=2,
             computeWorkers=1,
         ),
         sampleIntervalSeconds=0.01,
@@ -139,7 +138,7 @@ def test_write_counts_t_forwards_storage_io(tmp_path):
     assert result.details is not None
     assert result.details["writer"] == "product"
     metrics = result.details["metrics"]
-    assert metrics["requestedDestShardsInFlight"] == 2
+    assert metrics["requestedWriteWorkers"] == 2
     assert metrics["requestedDestCommitsInFlight"] == 2
     reopened = zarr.open_group(str(root_path), mode="r")
     np.testing.assert_array_equal(reopened["RNA/countsT"][:], values.T)

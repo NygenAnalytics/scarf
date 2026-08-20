@@ -907,3 +907,22 @@ def test_remote_store_requires_obstore(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", reject_obstore)
     with pytest.raises(ImportError, match="obstore"):
         make_store("s3://bucket/path")
+
+
+def test_store_probe_count_only_skips_per_key_logs() -> None:
+    from tests.store_probes import StoreProbe
+
+    probe = StoreProbe(countOnly=True)
+    probe.enter("get", "a/key", requestedBytes=12)
+    probe.record_transfer("get", "a/key", 12)
+    probe.enter("set", "b/key", requestedBytes=8)
+    probe.record_transfer("set", "b/key", 8)
+    payload = probe.to_json()
+    assert probe.ops == []
+    assert probe.transferred_bytes == []
+    assert payload["gets"] == 1
+    assert payload["sets"] == 1
+    assert payload["readTransferredBytes"] == 12
+    assert payload["writeTransferredBytes"] == 8
+    assert payload["requestedBytes"] == 20
+    assert payload["keysTouched"] == 0

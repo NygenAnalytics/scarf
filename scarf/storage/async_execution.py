@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -10,13 +11,34 @@ from typing import Any, TypeVar, cast
 
 import zarr
 
-from .budget import ResourceBudget, resolve_budget
+from threadpoolctl import threadpool_limits
+
+from .budget import ResourceBudget, detect_workers
+from .execution import OperationPlan
 
 T = TypeVar("T")
 
 # Zarr's sync ThreadPoolExecutor is created on first use and never resized.
 # This is the process thread ceiling, not an operation plan.
 _HOST_THREAD_CEILING: int | None = None
+
+
+def _install_numba_thread_cap(threads: int) -> Callable[[], None] | None:
+    """Cap Numba once per runner. Concurrent set_num_threads deadlocks."""
+    try:
+        import numba as numba_mod
+    except ImportError:
+        return None
+    getter = getattr(numba_mod, "get_num_threads")
+    setter = getattr(numba_mod, "set_num_threads")
+    previous = int(getter())
+    cap = max(1, int(getattr(numba_mod.config, "NUMBA_NUM_THREADS")))
+    setter(min(max(1, int(threads)), cap))
+
+    def _restore() -> None:
+        setter(previous)
+
+    return _restore
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +49,7 @@ class ExecutionPlan:
     readGroupsInFlight: int
     destinationCommitsInFlight: int
     chunksPerShard: int
+    threadsPerComputeWorker: int = 1
 
 
 def resolve_execution_plan(
@@ -36,31 +59,45 @@ def resolve_execution_plan(
     readGroupsInFlight: int = 1,
     destinationCommitsInFlight: int = 1,
     computeWorkerLimit: int = 1,
+    threadsPerComputeWorker: int = 1,
+    operation: OperationPlan | None = None,
 ) -> ExecutionPlan:
+    if operation is not None:
+        chunksPerShard = operation.chunksPerShard
+        readGroupsInFlight = operation.readWorkers * operation.innerReads
+        destinationCommitsInFlight = operation.writeWorkers
+        computeWorkerLimit = operation.computeWorkers
+        threadsPerComputeWorker = operation.threadsPerComputeWorker
     workers = max(1, int(resources.workers))
-    codec_workers = max(1, workers - 1) if workers > 1 else 1
+    host_cores = max(1, detect_workers())
+    codec_workers = host_cores
     compute_workers = min(workers, max(1, int(computeWorkerLimit)))
+    threads = max(1, int(threadsPerComputeWorker))
+    if compute_workers * threads > workers:
+        threads = max(1, workers // compute_workers)
+    lanes = max(1, int(readGroupsInFlight))
     return ExecutionPlan(
         codecWorkerLimit=codec_workers,
-        zarrAsyncConcurrency=min(codec_workers, max(1, int(chunksPerShard))),
+        zarrAsyncConcurrency=max(
+            lanes, min(codec_workers, max(1, int(chunksPerShard)))
+        ),
         computeWorkerLimit=compute_workers,
-        readGroupsInFlight=max(1, int(readGroupsInFlight)),
+        readGroupsInFlight=lanes,
         destinationCommitsInFlight=max(1, int(destinationCommitsInFlight)),
         chunksPerShard=max(1, int(chunksPerShard)),
+        threadsPerComputeWorker=threads,
     )
 
 
 def ensure_zarr_host_ceiling(maxWorkers: int | None = None) -> int:
-    """Set Zarr's process thread ceiling once. Later calls do not shrink it."""
+    """Install the host Zarr thread ceiling once. Later calls do not shrink it."""
     global _HOST_THREAD_CEILING
-    requested = (
-        max(1, int(maxWorkers))
-        if maxWorkers is not None
-        else max(1, resolve_budget().workers)
-    )
+    host = max(1, detect_workers())
+    requested = host if maxWorkers is None else max(1, int(maxWorkers))
     if _HOST_THREAD_CEILING is None:
-        zarr.config.set({"threading.max_workers": requested})
-        _HOST_THREAD_CEILING = requested
+        ceiling = max(host, requested)
+        zarr.config.set({"threading.max_workers": ceiling})
+        _HOST_THREAD_CEILING = ceiling
     return _HOST_THREAD_CEILING
 
 
@@ -158,6 +195,8 @@ class AsyncStorageRunner:
         readGroupsInFlight: int = 1,
         destinationCommitsInFlight: int = 1,
         computeWorkerLimit: int = 1,
+        threadsPerComputeWorker: int = 1,
+        operation: OperationPlan | None = None,
     ):
         self.resources = resources
         self.plan = resolve_execution_plan(
@@ -166,8 +205,11 @@ class AsyncStorageRunner:
             readGroupsInFlight=readGroupsInFlight,
             destinationCommitsInFlight=destinationCommitsInFlight,
             computeWorkerLimit=computeWorkerLimit,
+            threadsPerComputeWorker=threadsPerComputeWorker,
+            operation=operation,
         )
         self.ledger = ByteLedger(resources.memoryBytes)
+        self.readerWaitSeconds = 0.0
         self._compute_pool: ThreadPoolExecutor | None = None
         self._codec_pool: ThreadPoolExecutor | None = None
         self._read_slots: asyncio.Semaphore | None = None
@@ -213,6 +255,7 @@ class AsyncStorageRunner:
         self._commit_slots = asyncio.Semaphore(self.plan.destinationCommitsInFlight)
         result: Any = None
         operation_error: BaseException | None = None
+        restore_numba = _install_numba_thread_cap(self.plan.threadsPerComputeWorker)
         try:
             with zarr.config.set({"async.concurrency": self.plan.zarrAsyncConcurrency}):
                 result = await operation(self)
@@ -220,6 +263,8 @@ class AsyncStorageRunner:
             operation_error = exc
         finally:
             leftover = self.ledger.held_bytes()
+            if restore_numba is not None:
+                restore_numba()
             if self._compute_pool is not None:
                 self._compute_pool.shutdown(wait=True, cancel_futures=True)
             if self._codec_pool is not None:
@@ -242,7 +287,13 @@ class AsyncStorageRunner:
         if self._compute_pool is None:
             raise RuntimeError("compute pool is not installed")
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._compute_pool, fn)
+        threads = max(1, int(self.plan.threadsPerComputeWorker))
+
+        def _limited() -> T:
+            with threadpool_limits(limits=threads):
+                return fn()
+
+        return await loop.run_in_executor(self._compute_pool, _limited)
 
     async def read_slot(self) -> asyncio.Semaphore:
         if self._read_slots is None:
@@ -257,7 +308,9 @@ class AsyncStorageRunner:
     @asynccontextmanager
     async def reserve_bytes(self, nbytes: int) -> AsyncIterator[None]:
         """Hold a ledger charge for the complete lifetime of an owned buffer."""
+        started = time.perf_counter()
         await self.ledger.acquire(nbytes)
+        self.readerWaitSeconds += time.perf_counter() - started
         try:
             yield
         finally:
@@ -267,8 +320,13 @@ class AsyncStorageRunner:
     async def read_lane(self) -> AsyncIterator[None]:
         """Enter one bounded outer read lane without changing byte ownership."""
         slot = await self.read_slot()
-        async with slot:
+        started = time.perf_counter()
+        await slot.acquire()
+        self.readerWaitSeconds += time.perf_counter() - started
+        try:
             yield
+        finally:
+            slot.release()
 
     @asynccontextmanager
     async def commit_lane(self) -> AsyncIterator[None]:
@@ -283,11 +341,14 @@ class AsyncStorageRunner:
         factory: Callable[[], Coroutine[Any, Any, T]],
     ) -> T:
         slot = await self.read_slot()
+        started = time.perf_counter()
         await self.ledger.acquire(nbytes)
+        await slot.acquire()
+        self.readerWaitSeconds += time.perf_counter() - started
         try:
-            async with slot:
-                return await factory()
+            return await factory()
         finally:
+            slot.release()
             await self.ledger.release(nbytes)
 
     async def bounded_commit(

@@ -14,7 +14,7 @@ def to_h5ad(
     h5ad_filename: str,
     embeddings_cols: list[str] | None = None,
     skip_recalc_nfeats: bool = True,
-    n_threads: int = 4,
+    nthreads: int = 4,
 ) -> None:
     """Save an assay as H5ad file.
 
@@ -24,7 +24,7 @@ def to_h5ad(
         embeddings_cols: Columns in cell metadata to be treated as embeddings e. UMAP, tSNE
                          (Default value: ['UMAP', 'tSNE'])
         skip_recalc_nfeats: Skip recalculating nFeatures per cell. (Default value: True)
-        n_threads: Number of processing threads to use (Default value: 4)
+        nthreads: Number of processing threads to use (Default value: 4)
 
     Returns:
         None
@@ -56,7 +56,7 @@ def to_h5ad(
             show_dask_progress(
                 assay.rawData.count_nonzero(axis=1),
                 msg="Recalculating detected feature counts",
-                nthreads=n_threads,
+                nthreads=nthreads,
             ),
             overwrite=True,
         )
@@ -79,7 +79,7 @@ def to_h5ad(
 
     s, e = 0, 0
     for values in assay.rawData.stream_blocks(
-        nthreads=n_threads,
+        nthreads=nthreads,
         msg="Writing raw counts",
     ):
         block = csr_matrix(values)

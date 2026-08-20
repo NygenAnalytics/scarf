@@ -9,6 +9,7 @@ progress and failures the same way. ``profiling.stages`` polls this child every
 """
 
 import argparse
+import hashlib
 import json
 import time
 from collections.abc import Sequence
@@ -39,10 +40,13 @@ def run_paris_worker(requestPath: Path) -> None:
 
     print(f"[paris_worker] START store={store_uri}", flush=True)
     worker_started = time.perf_counter()
+    cpu_started = time.process_time()
     setup_started = worker_started
     input_setup_seconds: float | None = None
     operation_started: float | None = None
     operation_seconds: float | None = None
+    label_sha256: str | None = None
+    cluster_count: int | None = None
     try:
         store = _open_datastore(
             store_uri,
@@ -60,6 +64,8 @@ def run_paris_worker(requestPath: Path) -> None:
         }
         if workflow.parisMinClusterSize is not None:
             arguments["min_cluster_size"] = workflow.parisMinClusterSize
+        if request.get("invalidateCache") is True:
+            arguments["force_recalc"] = True
         print(
             f"[paris_worker] cut nClusters={workflow.parisNClusters} "
             f"minClusterSize={workflow.parisMinClusterSize}",
@@ -68,8 +74,14 @@ def run_paris_worker(requestPath: Path) -> None:
 
         print("[paris_worker] datastore open; ENTER run_paris_clustering", flush=True)
         operation_started = time.perf_counter()
-        store.run_paris_clustering(**arguments)
+        result = store.run_paris_clustering(**arguments)
         operation_seconds = time.perf_counter() - operation_started
+        labels = getattr(result, "labels", None)
+        if labels is not None:
+            label_sha256 = hashlib.sha256(labels.tobytes(order="C")).hexdigest()
+        result_cluster_count = getattr(result, "n_clusters", None)
+        if isinstance(result_cluster_count, int):
+            cluster_count = result_cluster_count
         del store
     except BaseException as exc:
         now = time.perf_counter()
@@ -86,6 +98,7 @@ def run_paris_worker(requestPath: Path) -> None:
                 "inputSetupSeconds": input_setup_seconds,
                 "operationSeconds": operation_seconds,
                 "wholeWorkerSeconds": now - worker_started,
+                "processCpuSeconds": time.process_time() - cpu_started,
             },
         )
         print(f"[paris_worker] ERROR {error}", flush=True)
@@ -99,6 +112,9 @@ def run_paris_worker(requestPath: Path) -> None:
             "inputSetupSeconds": input_setup_seconds,
             "operationSeconds": operation_seconds,
             "wholeWorkerSeconds": time.perf_counter() - worker_started,
+            "processCpuSeconds": time.process_time() - cpu_started,
+            "labelSha256": label_sha256,
+            "clusterCount": cluster_count,
         },
     )
     print("[paris_worker] DONE run_paris_clustering", flush=True)

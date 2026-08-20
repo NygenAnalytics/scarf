@@ -36,6 +36,7 @@ def _request(
     tmpPath: Path,
     *,
     workflow: WorkflowParameters | None = None,
+    invalidateCache: bool = False,
 ) -> tuple[Path, Path]:
     status_path = tmpPath / "status.json"
     request_path = tmpPath / "request.json"
@@ -46,6 +47,7 @@ def _request(
                 "workflow": (workflow or WorkflowParameters()).model_dump(mode="json"),
                 "resources": _resources().model_dump(mode="json"),
                 "statusPath": str(status_path),
+                "invalidateCache": invalidateCache,
             }
         ),
         encoding="utf-8",
@@ -112,6 +114,7 @@ def test_worker_straight_cut_uses_n_clusters(
     request_path, status_path = _request(
         tmp_path,
         workflow=WorkflowParameters(parisNClusters=12),
+        invalidateCache=True,
     )
 
     paris_worker.run_paris_worker(request_path)
@@ -122,6 +125,7 @@ def test_worker_straight_cut_uses_n_clusters(
         "feat_key": "hvgs",
         "label": "paris_cluster",
         "n_clusters": 12,
+        "force_recalc": True,
     }
     assert json.loads(status_path.read_text(encoding="utf-8"))["status"] == "ok"
 
@@ -155,9 +159,12 @@ def test_parent_starts_paris_worker_module(
         workflow=WorkflowParameters(),
         resources=_resources(),
         workDir=tmp_path,
+        invalidateCache=True,
     )
 
     assert commands[0][1:3] == ["-m", "profiling.paris_worker"]
+    request = json.loads((tmp_path / "request.json").read_text(encoding="utf-8"))
+    assert request["invalidateCache"] is True
 
 
 def test_run_stage_routes_paris_to_child(
@@ -183,8 +190,10 @@ def test_run_stage_routes_paris_to_child(
         resources=_resources(),
         workDir=tmp_path,
         sampleIntervalSeconds=0.01,
+        invalidateCache=True,
     )
 
     assert result.status == "ok"
     assert called["storeUri"] == "s3://bucket/store.zarr"
     assert called["workDir"] == tmp_path
+    assert called["invalidateCache"] is True

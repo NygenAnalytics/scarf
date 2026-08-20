@@ -162,6 +162,67 @@ These results establish execution and resource use for the recorded dataset,
 code revision, settings, and cloud conditions. They do not establish biological
 correctness, a hardware guarantee, or superiority over another package.
 
+## Sub-30 1M gate and float policy
+
+The 2026-08-18 same-box diagnostic ran the full 16-stage funnel in 3,209 s
+(53.5 min) with a 32.1 GiB peak on 8 CPU / 32 GiB. The first 2026-08-19 gate
+completed all stages in 1,646.8 s (27.45 min), with a 29.62 GiB peak sampled
+from `memory.current` and a 29.69 GiB peak RSS. This was a 48.7% wall-time
+reduction and passed the targets of less than 1,800 s and less than 30 GiB.
+The gate used one fresh object-store-backed Zarr store and one non-preemptible
+8 CPU / 32 GiB container.
+
+| Stage | Wall time (s) | Peak cgroup memory (GiB) |
+| --- | ---: | ---: |
+| Dataset download | 18.8 | n/a |
+| Create count store | 118.2 | 10.26 |
+| Write `countsT` | 151.9 | 18.71 |
+| Initialize datastore | 66.8 | 10.88 |
+| Reopen datastore | 7.1 | 1.49 |
+| Filter cells | 23.0 | 2.01 |
+| Mark HVGs | 85.3 | 8.02 |
+| Normalize | 76.9 | 11.72 |
+| PCA | 75.1 | 11.24 |
+| Build embedding initialization | 19.3 | 2.30 |
+| Build ANN index | 90.9 | 2.82 |
+| Query neighbours | 41.6 | 3.18 |
+| Build connectivity map | 40.3 | 2.57 |
+| UMAP | 280.2 | 3.40 |
+| Leiden | 191.4 | 5.70 |
+| Paris | 91.8 | 4.53 |
+| Marker search | 185.3 | 29.45 |
+| **Funnel total** | **1,646.8** | **29.62** |
+
+That first gate included a profiler-only graph file cache. The cache was later
+removed and replaced by the product's keyed, pipeline-scoped in-memory graph
+cache. Two fresh post-cleanup gates completed in 2,091.0 s (34.85 min) at
+29.69 GiB and 2,475.5 s (41.26 min) at 28.99 GiB. Both stayed within the memory
+target, but neither met the wall-time target. The large movement in both
+object-store fetch time and compute time means the single 27.45-minute result
+is not a hardware guarantee. Current evidence supports bounded memory, not a
+reliable sub-30-minute wall time.
+
+The accepted product changes widen memory-admitted I/O independently of
+compute workers, use merge-tree accumulation, run independent H5AD producers,
+bound `countsT` work to two destination shards per set, reuse a datastore
+session, and reuse keyed graph data within the product pipeline. The first
+gate's `countsT` stage used eight destination lanes, seven one-chunk source
+reads per lane, and reached 44 concurrent store operations. Its byte ledger
+peaked at 19.83 GiB and released all admitted bytes. It observed 104 repeated
+source-chunk decodes out of 1,116 decoded chunks, for an observed decode
+amplification of about 1.10.
+
+Highly variable gene statistics, initialization `nCells`, and marker group
+stats now reduce with a fixed pairwise merge tree. Those reductions stay
+deterministic for the same inputs. Floating-point values can differ once from
+the previous sequential accumulation order. That change is accepted in alpha;
+there is no compatibility shim.
+
+Repeated full gates matched the active-cell and HVG selections exactly.
+Parallel ANN and UMAP remain enabled for the timing gate, so graph-derived
+embeddings and cluster assignments are not bitwise reproducible. The timing
+result does not claim otherwise.
+
 ## Running the profiler
 
 Copy `profiling/config.example.toml` to the ignored

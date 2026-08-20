@@ -284,6 +284,29 @@ def test_map_feature_cell_bands_reduces_in_band_order() -> None:
     assert seen == sorted(seen)
 
 
+def test_cell_band_admission_charges_the_live_band_buffer() -> None:
+    from scarf.storage.feature_stream import map_feature_cell_bands
+
+    values = np.arange(120, dtype=np.uint16).reshape(10, 12)
+    counts_t = _counts_t_with_plan(values)
+    metrics: dict[str, object] = {}
+
+    list(
+        map_feature_cell_bands(
+            counts_t,
+            lambda _band: None,
+            resources=ResourceBudget(400, 2),
+            io=StorageIoPolicy(readWorkers=4),
+            metrics=metrics,
+        )
+    )
+
+    assert metrics["cellBandBytes"] == 200
+    assert metrics["unitBytes"] == 200
+    assert metrics["readGroupBytes"] == 200
+    assert metrics["actualReadWorkers"] == 2
+
+
 def test_selected_values_and_persisted_groups_preserve_order() -> None:
     from scarf.storage.feature_stream import (
         map_feature_read_groups,
@@ -361,7 +384,8 @@ def test_consume_uses_persisted_read_group_not_default_unit() -> None:
     )
     assert widths
     assert all(width <= feature_width for width in widths)
-    assert widths[-1] < feature_width or 50_001 % feature_width == 0
+    assert sum(widths) == 50_001, metrics
+    assert min(widths) < feature_width or 50_001 % feature_width == 0
     assert int(metrics["featureWidth"]) == feature_width
 
 
@@ -400,7 +424,8 @@ def test_map_feature_read_groups_early_close_does_not_block() -> None:
         counts_t,
         lambda group: group.featStart,
         resources=ResourceBudget(8 * 1024 * 1024, 2),
-        io=StorageIoPolicy(groupsInFlight=2),
+        io=StorageIoPolicy(readWorkers=2),
+        orderedCompute=True,
     )
     assert next(iterator) == 0
     iterator.close()
@@ -427,7 +452,7 @@ def test_groups_in_flight_is_clamped_and_handoff_is_bounded() -> None:
             counts_t,
             watch,
             resources=ResourceBudget(8 * 1024 * 1024, 4),
-            io=StorageIoPolicy(groupsInFlight=8),
+            io=StorageIoPolicy(readWorkers=8),
             metrics=metrics,
         )
     )
@@ -452,7 +477,7 @@ def test_map_feature_read_groups_parallel_matches_sequential() -> None:
         for group in map_feature_read_groups(
             counts_t,
             lambda group: group,
-            io=StorageIoPolicy(groupsInFlight=1),
+            io=StorageIoPolicy(readWorkers=1),
             **kwargs,
         )
     }
@@ -461,13 +486,46 @@ def test_map_feature_read_groups_parallel_matches_sequential() -> None:
         for group in map_feature_read_groups(
             counts_t,
             lambda group: group,
-            io=StorageIoPolicy(groupsInFlight=3),
+            io=StorageIoPolicy(readWorkers=3),
             **kwargs,
         )
     }
     assert sequential.keys() == parallel.keys()
     for start, expected in sequential.items():
         np.testing.assert_array_equal(parallel[start], expected)
+
+
+def test_map_feature_read_groups_uses_bounded_inner_reads() -> None:
+    from scarf.storage.feature_stream import map_feature_read_groups
+
+    values = np.arange(100 * 40, dtype=np.uint16).reshape(100, 40)
+    counts_t = _counts_t_with_plan(
+        values,
+        policy=CountMatrixPolicy(unitBytes=2_000, chunkBytes=200),
+    )
+    resources = ResourceBudget(1024 * 1024, 2)
+    metrics: dict[str, object] = {}
+    groups = list(
+        map_feature_read_groups(
+            counts_t,
+            lambda group: group,
+            resources=resources,
+            io=StorageIoPolicy(readWorkers=8),
+            metrics=metrics,
+        )
+    )
+
+    np.testing.assert_array_equal(
+        np.concatenate([group.values for group in groups], axis=0),
+        values.T,
+    )
+    assert metrics["requestedGroupsInFlight"] == 4
+    assert metrics["effectiveGroupsInFlight"] == 4
+    assert metrics["requestedChunkReadsInFlight"] == 8
+    assert metrics["effectiveChunkReadsInFlight"] == 8
+    assert metrics["innerReads"] == 2
+    assert metrics["cellBandCount"] == 10
+    assert int(metrics["peakHeldBytes"]) <= resources.memoryBytes
 
 
 def test_map_feature_cell_bands_parallel_matches_sequential() -> None:
@@ -496,7 +554,7 @@ def test_map_feature_cell_bands_parallel_matches_sequential() -> None:
                 capture,
                 cell_idx=cell_idx,
                 resources=ResourceBudget(8 * 1024 * 1024, 2),
-                io=StorageIoPolicy(groupsInFlight=groups_in_flight),
+                io=StorageIoPolicy(readWorkers=groups_in_flight),
             )
         )
         return collected

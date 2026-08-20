@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from profiling import modal_app
+from profiling import modal_app, stages
 from profiling.config import (
     CORE_STAGE_ORDER,
     ProfilingConfig,
@@ -139,6 +139,7 @@ def test_e2e_funnel_runs_graph_construction_core_once_on_r2(
     assert all(kwargs["resetCgroupPeak"] is False for _stage, kwargs in calls)
     assert all(kwargs["storageIo"] is None for _stage, kwargs in calls)
     assert all(kwargs["countMatrix"] is None for _stage, kwargs in calls)
+    assert all(isinstance(kwargs["session"], dict) for _stage, kwargs in calls)
     assert [result.stage for result in stage_results] == list(CORE_STAGE_ORDER)
     assert summary["status"] == "ok"
     assert summary["completedStages"] == list(CORE_STAGE_ORDER)
@@ -157,6 +158,91 @@ def test_e2e_funnel_runs_graph_construction_core_once_on_r2(
     assert funnel_payloads == [summary]
 
 
+def test_reopen_stage_preserves_initialized_store_in_shared_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    initialized_store = object()
+    reopened_store = object()
+    session: dict[str, Any] = {"store": initialized_store}
+    opened: list[tuple[str, bool]] = []
+
+    def open_datastore(
+        store_uri: str,
+        _workflow: Any,
+        _resources: Any,
+        *,
+        initialize: bool,
+        **_kwargs: Any,
+    ) -> Any:
+        opened.append((store_uri, initialize))
+        return reopened_store
+
+    monkeypatch.setattr(stages, "_open_datastore", open_datastore)
+    monkeypatch.setattr(stages, "install_stage_zarr_runtime", lambda _resources: None)
+    monkeypatch.setattr(stages, "ResourceSampler", _Sampler)
+    monkeypatch.setattr(
+        "profiling.metrics.child_cpu_seconds",
+        lambda: 0.0,
+    )
+    monkeypatch.setattr(
+        "profiling.provenance.collect_run_provenance",
+        lambda **_kwargs: {},
+    )
+
+    result = stages.run_stage(
+        "reopenStore",
+        nRows=10_000,
+        storeUri=config.storeUri(10_000),
+        workflow=config.workflow,
+        resources=config.resourcesFor("reopenStore"),
+        recordStoreOperations=False,
+        session=session,
+    )
+
+    assert result.status == "ok"
+    assert opened == [(config.storeUri(10_000), False)]
+    assert session["store"] is initialized_store
+
+
+def test_forced_initialize_resets_stats_before_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    events: list[str] = []
+
+    def reset_stats(_store_uri: str, _workflow: Any) -> None:
+        events.append("reset")
+
+    def open_datastore(*_args: Any, **kwargs: Any) -> object:
+        assert kwargs["initialize"] is True
+        events.append("open")
+        return object()
+
+    monkeypatch.setattr(stages, "_reset_initialization_stats", reset_stats)
+    monkeypatch.setattr(stages, "_open_datastore", open_datastore)
+    monkeypatch.setattr(stages, "install_stage_zarr_runtime", lambda _resources: None)
+    monkeypatch.setattr(stages, "ResourceSampler", _Sampler)
+    monkeypatch.setattr("profiling.metrics.child_cpu_seconds", lambda: 0.0)
+    monkeypatch.setattr(
+        "profiling.provenance.collect_run_provenance",
+        lambda **_kwargs: {},
+    )
+
+    result = stages.run_stage(
+        "initializeStore",
+        nRows=10_000,
+        storeUri=config.storeUri(10_000),
+        workflow=config.workflow,
+        resources=config.resourcesFor("initializeStore"),
+        recordStoreOperations=False,
+        invalidateCache=True,
+    )
+
+    assert result.status == "ok"
+    assert events == ["reset", "open"]
+
+
 def test_e2e_funnel_forwards_storage_io(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -164,9 +250,8 @@ def test_e2e_funnel_forwards_storage_io(
     from profiling.config import StorageIoConfig
 
     policy = StorageIoConfig(
-        sourceReadsInFlight=4,
-        destShardsInFlight=2,
-        destCommitsInFlight=2,
+        readWorkers=4,
+        writeWorkers=2,
         computeWorkers=1,
     )
     config = _config(runTag="e2e-policy").model_copy(update={"storageIo": policy})

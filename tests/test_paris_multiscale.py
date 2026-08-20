@@ -170,7 +170,7 @@ def test_extreme_coarse_intervals_do_not_hide_canonical_scale_substructure() -> 
 
 
 def test_nested_graph_keeps_four_durable_subcommunities() -> None:
-    hierarchy = fit_paris_hierarchy(_nested_block_graph(), n_threads=2)
+    hierarchy = fit_paris_hierarchy(_nested_block_graph(), nthreads=2)
     result = adaptive_cut(hierarchy, 10)
 
     assert result.n_clusters == 4

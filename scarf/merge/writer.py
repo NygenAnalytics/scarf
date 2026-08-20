@@ -115,11 +115,11 @@ def remap_block_to_coo(
     block: Any,
     order_map: np.ndarray,
     n_feats: int,
-    n_threads: int,
+    nthreads: int,
     destination_dtype: np.dtype[Any] | None = None,
 ) -> coo_matrix:
     """Dense-or-chunked block to COO with feature remapping and summation."""
-    computed = controlled_compute(block, n_threads)
+    computed = controlled_compute(block, nthreads)
     if order_map.shape[0] != computed.shape[1]:
         raise ValueError("Feature order does not match the source matrix width")
     source = coo_matrix(computed)
@@ -371,6 +371,7 @@ def write_assay_counts(
     resources: ResourceBudget,
     profile: StorageProfile,
     additionalResidentBytes: int = 0,
+    io: StorageIoPolicy | None = None,
 ) -> int:
     """Stream remapped source blocks into the destination counts array."""
     destination = load_count_array(root, assay_name, workspace)
@@ -444,6 +445,7 @@ def write_assay_counts(
         resources=resources,
         residentBytes=requirements.residentBytes,
         producerReserveBytes=plan.producerReserveBytes,
+        io=io,
     )
     if counter != row_plan.nCells or expected_start != row_plan.nCells:
         raise AssertionError(

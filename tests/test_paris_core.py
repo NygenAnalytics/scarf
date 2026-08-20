@@ -42,7 +42,7 @@ def _tie_free_graph() -> csr_matrix:
 
 def test_merge_distances_match_aggregated_graph_weights() -> None:
     graph = canonicalize_paris_graph(_tie_free_graph())
-    hierarchy = fit_paris_hierarchy(graph, n_threads=2)
+    hierarchy = fit_paris_hierarchy(graph, nthreads=2)
     total_weight = float(graph.data.sum())
     members = {
         node: np.asarray([node], dtype=np.int64) for node in range(hierarchy.n_leaves)
@@ -65,7 +65,7 @@ def test_merge_distances_match_aggregated_graph_weights() -> None:
 
 def test_tie_free_topology_matches_scikit_network() -> None:
     canonical = canonicalize_paris_graph(_tie_free_graph())
-    native = hierarchy_to_dendrogram(fit_paris_hierarchy(canonical, n_threads=4))
+    native = hierarchy_to_dendrogram(fit_paris_hierarchy(canonical, nthreads=4))
     reference = np.asarray(Paris(reorder=False).fit_transform(canonical))
     native_clades = _leaf_sets(native)
     reference_clades = _leaf_sets(reference)
@@ -81,9 +81,9 @@ def test_tie_free_topology_matches_scikit_network() -> None:
 
 def test_output_is_identical_across_thread_counts() -> None:
     graph = _tie_free_graph()
-    reference = fit_paris_hierarchy(graph, n_threads=1)
-    for n_threads in (2, 4, 8):
-        result = fit_paris_hierarchy(graph, n_threads=n_threads)
+    reference = fit_paris_hierarchy(graph, nthreads=1)
+    for nthreads in (2, 4, 8):
+        result = fit_paris_hierarchy(graph, nthreads=nthreads)
         assert np.array_equal(result.children, reference.children)
         assert np.array_equal(result.heights, reference.heights)
         assert np.array_equal(result.sizes, reference.sizes)
@@ -92,7 +92,7 @@ def test_output_is_identical_across_thread_counts() -> None:
 
 
 def test_contraction_diagnostics_account_for_each_phase() -> None:
-    hierarchy = fit_paris_hierarchy(_tie_free_graph(), n_threads=2)
+    hierarchy = fit_paris_hierarchy(_tie_free_graph(), nthreads=2)
     diagnostics = hierarchy.diagnostics
     assert diagnostics is not None
     assert diagnostics.rounds
@@ -174,7 +174,7 @@ def test_ties_use_smallest_logical_tree_id() -> None:
             dtype=np.float64,
         )
     )
-    hierarchy = fit_paris_hierarchy(graph, n_threads=4)
+    hierarchy = fit_paris_hierarchy(graph, nthreads=4)
     assert hierarchy.children[0].tolist() == [0, 1]
     assert hierarchy.children.tolist() == [[0, 1], [2, 4], [3, 5]]
 
@@ -333,7 +333,7 @@ def test_compact_weighted_path_contracts_parallel_pairs_before_root() -> None:
         )
     )
 
-    hierarchy = fit_paris_hierarchy(graph, n_threads=2)
+    hierarchy = fit_paris_hierarchy(graph, nthreads=2)
 
     assert hierarchy.children.tolist() == [[0, 1], [2, 3], [4, 5]]
     assert hierarchy.sizes.tolist() == [2, 2, 4]
@@ -402,5 +402,5 @@ def test_fit_stops_when_neighbor_scan_cannot_make_progress(
     )
 
     with pytest.raises(RuntimeError, match="made no progress"):
-        fit_paris_hierarchy(graph, n_threads=2)
+        fit_paris_hierarchy(graph, nthreads=2)
     assert scan_count == 1
