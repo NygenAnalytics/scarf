@@ -5,7 +5,11 @@ from typing import Any
 
 
 def preset_assay_types() -> dict[str, type]:
-    """Return the DataStore assay-type preset map (single source of truth)."""
+    """Return the DataStore assay-type preset map (single source of truth).
+
+    Returns:
+        Mapping from preset type strings to assay classes.
+    """
     from .adt import ADTassay
     from .atac import ATACassay
     from .base import Assay
@@ -27,7 +31,11 @@ def preset_assay_types() -> dict[str, type]:
 
 
 def rna_assay_type_names() -> frozenset[str]:
-    """Return preset type strings that map to ``RNAassay``."""
+    """Return preset type strings that map to ``RNAassay``.
+
+    Returns:
+        Names such as ``RNA``, ``GeneActivity``, ``GeneScores``, and ``URNA``.
+    """
     from .rna import RNAassay
 
     return frozenset(
@@ -46,6 +54,14 @@ def resolve_persisted_assay_type(
     Unknown assay names become ``Assay`` unless ``assay_type`` is an explicit
     recognized preset (for example declaring a custom group as ``RNA``).
     Unrecognized ``assay_type`` values also become ``Assay``.
+
+    Args:
+        assay_name: Assay group name in the store.
+        assay_type: Optional explicit preset to persist. Unrecognized values
+                    become ``Assay``.
+
+    Returns:
+        A key present in :func:`preset_assay_types`.
     """
     presets = preset_assay_types()
     if assay_type is not None:
@@ -65,6 +81,14 @@ def lookup_persisted_assay_type(
 
     Preference order: ``assay_type``, then ``assay_types[assay_name]``, then
     ``assay_name`` when it is a recognized preset.
+
+    Args:
+        assay_name: Assay group name in the store.
+        assay_types: Optional persisted ``assayTypes`` mapping.
+        assay_type: Optional explicit preset that wins over the mapping.
+
+    Returns:
+        A key present in :func:`preset_assay_types`.
     """
     if assay_type is not None:
         return resolve_persisted_assay_type(assay_name, assay_type)
@@ -80,6 +104,12 @@ def is_rna_assay_type(name_or_type: str | type | Any) -> bool:
     - preset type strings (``"RNA"``, ``"GeneActivity"``, …)
     - assay class objects (``RNAassay`` and subclasses)
     - assay instances (``isinstance(..., RNAassay)``)
+
+    Args:
+        name_or_type: Preset string, assay class, or assay instance.
+
+    Returns:
+        True when the value is an RNA-class assay.
     """
     from .rna import RNAassay
 

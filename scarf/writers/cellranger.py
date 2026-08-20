@@ -24,9 +24,18 @@ class CrToZarr:
         cr: A CrReader object, containing the Cellranger data.
         zarr_loc: The file name for the Zarr hierarchy or a store
         dtype: the dtype of the data.
+        workspace: Workspace name in the destination store. None uses the
+                   legacy layout without a workspace group.
+        storage_options: Backend options passed when opening the Zarr store.
         mem_budget: Memory available to the conversion. Accepts bytes, a
                     suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
         nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
 
     Attributes:
         cr: A CrReader object, containing the Cellranger data.

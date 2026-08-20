@@ -5,7 +5,16 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class StorageIoPolicy:
-    """Requested widths for one store or writer. Unset values mean automatic planning."""
+    """Requested widths for one store or writer. Unset values mean automatic planning.
+
+    Attributes:
+        readWorkers: Maximum concurrent read units. None uses automatic
+                     memory-admitted read width.
+        computeWorkers: Maximum concurrent compute workers. None uses the
+                        worker budget.
+        writeWorkers: Maximum concurrent destination writers. None uses
+                      automatic write width.
+    """
 
     readWorkers: int | None = None
     computeWorkers: int | None = None

@@ -112,6 +112,35 @@ class DataStoreMerge:
 
     Construction is side-effect free. Call :meth:`plan` to inspect the resolved
     merge, then :meth:`dump` to write or resume it.
+
+    Args:
+        datasets: Source DataStores to merge. At least two are required.
+        zarr_path: Destination Zarr path or store.
+        names: Unique name for each source, used in metadata and provenance.
+        assays: Optional assay-name filter. None merges every assay present
+                in any source.
+        out_workspace: Workspace name in the destination store. None uses
+                       the legacy layout without a workspace group.
+        dtype: Optional count dtype override. None promotes from sources.
+        overwrite: If True, replace a blocked or incompatible destination.
+        prepend_text: Prefix added to colliding metadata column names.
+        reset_cell_filter: If True, mark every merged cell as selected.
+        seed: RNG seed for cell interleaving. None keeps source order.
+        storage_options: Backend options passed when opening the destination.
+        source_column: Optional cell-metadata column storing source names.
+        mem_budget: Memory budget for the merge. Accepts bytes, a size such
+                    as ``8G``, or a fraction of detected system memory.
+                    When None, the tightest source budget is used.
+        nthreads: Maximum worker budget. When None, the tightest source
+                  worker count is used.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
+        missing_assay_policy: ``zero_fill`` writes zeros for a missing assay
+                              in a source. ``error`` rejects that merge.
     """
 
     def __init__(

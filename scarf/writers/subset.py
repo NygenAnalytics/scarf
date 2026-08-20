@@ -65,6 +65,16 @@ def subset_assay_zarr(
         out_grp: Group name in Zarr hierarchy to write subsetted assay to.
         cells_idx: Indices of cells to keep in the subset.
         feat_idx: Indices of features to keep in the subset.
+        storage_options: Backend options passed when opening the Zarr store.
+        mem_budget: Memory available to the conversion. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
+        nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
     Returns:
         None
     """
@@ -110,6 +120,16 @@ class SubsetZarr:
                            this parameter to False. (Default value: True)
         overwrite_existing_file: If True, then overwrites the existing data. (Default value: False)
         overwrite_cell_data: If True, then overwrites cell data (Default value: False)
+        storage_options: Backend options passed when opening the Zarr store.
+        mem_budget: Memory available to the conversion. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
+        nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
     """
 
     def __init__(
@@ -287,6 +307,11 @@ class SubsetZarr:
             )
 
     def dump(self) -> None:
+        """Write subsetted cell metadata and count matrices, including RNA ``countsT``.
+
+        Returns:
+            None
+        """
         self._prep_cell_data()
         self._prep_counts()
         for assay in self.assays:

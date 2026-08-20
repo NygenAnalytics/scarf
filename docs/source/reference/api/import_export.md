@@ -93,6 +93,22 @@ See {doc}`../../tutorials/import_and_export` for the worked contract and {doc}`.
     :members:
 ```
 
+## Storage controls
+
+Writers, merge, subset, and ``DataStore`` accept the same optional storage
+controls. ``profile`` chooses the physical encoding. ``policy`` chooses paired
+count-matrix geometry. ``io`` overrides automatic read, compute, and write
+widths. Unset values stay under automatic planning from ``mem_budget`` and
+``nthreads``.
+
+```{eval-rst}
+.. autoclass:: scarf.storage.io_policy.StorageIoPolicy
+    :members:
+
+.. autoclass:: scarf.storage.count_matrix.CountMatrixPolicy
+    :members:
+```
+
 ## Writers
 
 ```{eval-rst}

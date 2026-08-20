@@ -40,7 +40,14 @@ def seed_assay_type(
     workspace: str | None,
     assay_type: str,
 ) -> None:
-    """Persist ``assayTypes[assay_name]`` using a recognized preset key only."""
+    """Persist ``assayTypes[assay_name]`` using a recognized preset key only.
+
+    Args:
+        z: Root Zarr group.
+        assay_name: Assay group name.
+        workspace: Workspace name. None uses the legacy layout.
+        assay_type: Preset type to store. Unrecognized values become ``Assay``.
+    """
     type_name = resolve_persisted_assay_type(assay_name, assay_type)
     root = _workspace_root(z, workspace)
     raw = root.attrs.get("assayTypes", {})
@@ -56,6 +63,16 @@ def matrix_group_for_assay(
     assay_name: str,
     workspace: str | None,
 ) -> zarr.Group:
+    """Return the Zarr group that owns ``counts`` and RNA ``countsT``.
+
+    Args:
+        z: Root Zarr group.
+        assay_name: Assay group name.
+        workspace: Workspace name. None uses the legacy layout.
+
+    Returns:
+        The assay matrix group.
+    """
     if workspace is None:
         return as_zarr_group(z[assay_name], name=assay_name)
     return as_zarr_group(
@@ -85,6 +102,22 @@ def finalize_writer_counts_t(
     declare a custom assay group as RNA (or another modality).
 
     Returns ``None`` when skipped or when the store is Zarr format < 3.
+
+    Args:
+        z: Root Zarr group.
+        assay_name: Assay group to finalize.
+        workspace: Workspace name. None uses the legacy layout.
+        assay_type: Optional preset used to seed ``assayTypes``.
+        resources: Optional resolved memory and worker budget.
+        profile: Zarr encoding profile. When None, chosen from the store.
+        mem_budget: Memory budget used when ``resources`` is omitted.
+        nthreads: Worker budget used when ``resources`` is omitted.
+        policy: Count-matrix geometry policy. When None, the default plan
+                is used.
+        io: Optional explicit read, compute, and write widths.
+
+    Returns:
+        The ``countsT`` array, or None when the assay is not RNA.
     """
     type_name = resolve_persisted_assay_type(assay_name, assay_type)
     seed_assay_type(z, assay_name, workspace, type_name)
@@ -117,7 +150,22 @@ def finalize_writer_counts_t_many(
     policy: CountMatrixPolicy | None = None,
     io: StorageIoPolicy | None = None,
 ) -> dict[str, Any]:
-    """Finalize ``countsT`` for each assay name (RNA only)."""
+    """Finalize ``countsT`` for each assay name (RNA only).
+
+    Args:
+        z: Root Zarr group.
+        assay_names: Assay groups to consider.
+        workspace: Workspace name. None uses the legacy layout.
+        assay_types: Optional mapping of assay name to preset type.
+        resources: Optional resolved memory and worker budget.
+        profile: Zarr encoding profile. When None, chosen from the store.
+        policy: Count-matrix geometry policy. When None, the default plan
+                is used.
+        io: Optional explicit read, compute, and write widths.
+
+    Returns:
+        Mapping of RNA assay name to the written ``countsT`` array.
+    """
     written: dict[str, Any] = {}
     type_map = assay_types or {}
     for name in assay_names:

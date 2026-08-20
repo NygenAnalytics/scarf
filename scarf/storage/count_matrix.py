@@ -21,6 +21,14 @@ REBUILD_REMEDY = "Rebuild the store with repack_zarr or write_counts_t."
 
 @dataclass(frozen=True, slots=True)
 class CountMatrixPolicy:
+    """Byte targets that determine paired ``counts`` / ``countsT`` geometry.
+
+    Attributes:
+        unitBytes: Target bytes for one destination shard and one
+                   all-cell feature read group.
+        chunkBytes: Target bytes for one inner Zarr chunk.
+    """
+
     unitBytes: int
     chunkBytes: int
 
@@ -32,6 +40,7 @@ class CountMatrixPolicy:
 
     @property
     def chunksPerShard(self) -> int:
+        """Inner chunks packed into one shard from the byte targets."""
         return max(1, (self.unitBytes + self.chunkBytes // 2) // self.chunkBytes)
 
 

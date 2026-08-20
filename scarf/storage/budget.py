@@ -13,7 +13,12 @@ _CGROUP_UNLIMITED_THRESHOLD = 1 << 60
 
 @dataclass(frozen=True)
 class ResourceBudget:
-    """Memory and CPU limits for one operation."""
+    """Memory and CPU limits for one operation.
+
+    Attributes:
+        memoryBytes: Planning budget in bytes. Not a hard process RSS cap.
+        workers: Maximum compute-worker budget.
+    """
 
     memoryBytes: int
     workers: int

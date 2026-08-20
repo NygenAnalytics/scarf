@@ -103,9 +103,15 @@ class BaseDataStore:
         mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``MT-|mt``.
         ribo_pattern: Regex pattern to capture ribosomal genes. When None, uses
                       ``RPS|RPL|MRPS|MRPL``.
-        nthreads: Number of maximum threads to use in all multi-threaded functions
-        zarr_mode: For read-write mode use r+' or for read-only use 'r' (Default value: 'r+')
+        zarr_mode: For read-write mode use ``r+`` or for read-only use ``r``.
+                   (Default value: ``r+``)
         workspace: Workspace name within the Zarr store (None for legacy single-workspace layout).
+        resources: Resolved memory and worker budget for this datastore.
+        storage_profile: Zarr encoding profile used for new arrays written
+                         through this datastore.
+        storage_options: Backend options passed when opening the Zarr store.
+        storageIo: Optional explicit read, compute, and write widths for storage
+                   work. Unset values stay under automatic planning.
 
     Attributes:
         cells: MetaData object with cells and info about each cell (e. g. RNA_nCounts ids).

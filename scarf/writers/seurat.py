@@ -40,6 +40,16 @@ def _named_result_key(name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SeuratImportResult:
+    """Result of writing a Seurat object into a Scarf Zarr store.
+
+    Attributes:
+        assayNames: Assay groups written to the destination store.
+        defaultAssay: Active assay selected from the Seurat object.
+        cellSelection: Artifact for the imported cell filter column.
+        reductionArtifacts: Imported reductions keyed by result name.
+        notices: Non-fatal import notices collected from the reader.
+    """
+
     assayNames: tuple[str, ...]
     defaultAssay: str
     cellSelection: ArtifactRef
@@ -88,6 +98,27 @@ def _decode_text(value: str | bytes | None) -> str:
 
 
 class SeuratToZarr:
+    """Convert a serialized Seurat object into a Scarf Zarr store.
+
+    Args:
+        reader: Open ``SeuratReader`` for the source ``.rds`` file.
+        zarr_loc: Destination Zarr path or store.
+        workspace: Workspace name in the destination store. None uses the
+                   legacy layout without a workspace group.
+        storage_options: Backend options passed when opening the Zarr store.
+        mem_budget: Memory available to the conversion. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system
+                    memory (e.g. '0.6'). When None, auto-detected.
+        nthreads: Worker count for write-time concurrency. When None,
+                  auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
+    """
+
     def __init__(
         self,
         reader: SeuratReader,
@@ -307,6 +338,16 @@ class SeuratToZarr:
         )
 
     def dump(self, batch_size: int | None = None) -> SeuratImportResult:
+        """Write assays, RNA ``countsT``, and importable reductions.
+
+        Args:
+            batch_size: Number of source cells per batch. By default, a
+                        destination-aligned value is selected within the
+                        memory budget.
+
+        Returns:
+            Imported assay names, cell selection, and reduction artifacts.
+        """
         if batch_size is not None and (
             isinstance(batch_size, bool) or int(batch_size) <= 0
         ):

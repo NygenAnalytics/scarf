@@ -21,8 +21,10 @@ def to_h5ad(
     Args:
         assay: Assay to save in H5ad format
         h5ad_filename: Name for the H5ad file to be created.
-        embeddings_cols: Columns in cell metadata to be treated as embeddings e. UMAP, tSNE
-                         (Default value: ['UMAP', 'tSNE'])
+        embeddings_cols: Cell-metadata column prefixes treated as embeddings
+                         (for example UMAP, tSNE). When None, uses
+                         ``["UMAP", "tSNE"]``. Pass an empty list to skip
+                         embeddings.
         skip_recalc_nfeats: Skip recalculating nFeatures per cell. (Default value: True)
         nthreads: Number of processing threads to use (Default value: 4)
 

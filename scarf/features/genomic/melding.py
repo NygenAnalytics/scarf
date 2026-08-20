@@ -317,7 +317,23 @@ def coordinate_melding(
     peaks_coords: np.ndarray | None = None,
     idf_cell_idx: np.ndarray | None = None,
 ) -> None:
-    """Transfer coordinate-based assay values to overlapping external features."""
+    """Transfer coordinate-based assay values to overlapping external features.
+
+    Args:
+        assay: Source assay whose features have genomic coordinates.
+        workspace: Workspace name. None uses the legacy layout.
+        feature_bed: External interval table used as the meld target.
+        new_assay_name: Name of the assay group to create.
+        peaks_col: Feature-metadata column holding source coordinates.
+        scalar_coeff: Scaling coefficient applied during melding.
+        renormalization: If True, rescale melded values after mapping.
+        peaks_coords: Optional precomputed source coordinates. When None,
+                      values are read from ``peaks_col``.
+        idf_cell_idx: Optional cell indices used for IDF statistics.
+
+    Returns:
+        None
+    """
     if peaks_coords is None:
         peaks_coords = assay.feats.fetch_all(peaks_col)
     peaks_bed = create_bed_from_coord_ids(peaks_coords)

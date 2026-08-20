@@ -23,7 +23,19 @@ class CSVtoZarr:
         cr: A CSVReader object
         zarr_loc: The file name for the Zarr hierarchy.
         assay_name: A label for the assay. Ex. "RNA" or "ATAC"
+        workspace: Workspace name in the destination store. None uses the
+                   legacy layout without a workspace group.
         dtype: the dtype of the data.
+        storage_options: Backend options passed when opening the Zarr store.
+        mem_budget: Memory available to the conversion. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
+        nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
 
     Attributes:
         csvr: A CSVReader object
@@ -89,8 +101,6 @@ class CSVtoZarr:
 
     def dump(self) -> None:
         """Writes the count values into the Zarr matrix.
-
-        Args:
 
         Raises:
             AssertionError: Catches eventual bugs in the class, if number of cells does not match after transformation.

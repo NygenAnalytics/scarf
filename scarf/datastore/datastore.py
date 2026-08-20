@@ -32,6 +32,18 @@ def mount_datastore(
     The target store receives copied cell and feature metadata plus all new
     analysis artifacts. Count matrices remain in the read-only source and are
     remounted automatically when the target is reopened with ``DataStore``.
+
+    Args:
+        source: Read-only store that owns the count matrices.
+        at: Writable destination for metadata and analysis artifacts.
+        workspace: Workspace name to mount. None uses the source workspace.
+        storage_options: Backend options passed when opening both locations.
+        datastore_options: Keyword arguments forwarded to ``DataStore``.
+                           ``zarr_loc`` is rejected; ``zarr_mode`` must be
+                           ``r+`` when set.
+
+    Returns:
+        An open writable ``DataStore`` pointed at ``at``.
     """
     if "zarr_loc" in datastore_options:
         raise TypeError("mount_datastore takes the target location through 'at'")
@@ -89,12 +101,20 @@ class DataStore(
         nthreads: Maximum worker budget for multi-threaded methods. When None, auto-detected
                   (SCARF_WORKERS env var, else process CPU affinity and cgroup limits). An
                   explicit integer overrides environment detection.
-        zarr_mode: For read-write mode use r+' or for read-only use 'r'. (Default value: 'r+')
-        workspace: Workspace for the data
+        zarr_mode: For read-write mode use ``r+`` or for read-only use ``r``.
+                   (Default value: ``r+``)
+        workspace: Workspace name within the Zarr store. None uses the legacy
+                   layout without a workspace group.
+        zarrProfile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                     None, chosen from the store location. Changing it on open
+                     does not rewrite existing arrays.
+        storage_options: Backend options passed when opening the Zarr store.
         mem_budget: Memory budget bounding streaming and concurrency. Accepts bytes, a suffixed size
                     (e.g. '8G'), or a fraction of total system memory (e.g. '0.6'). When None, it is
                     auto-detected (SCARF_MEM_BUDGET env var, else total system memory). Override it to
                     simulate reading on a machine with a different memory size than the writer.
+        storageIo: Optional explicit read, compute, and write widths for storage
+                   work. Unset values stay under automatic planning.
     """
 
     def __init__(

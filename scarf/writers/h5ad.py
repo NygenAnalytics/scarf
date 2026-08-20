@@ -242,10 +242,18 @@ class H5adToZarr:
         assay_name: the name of the assay (e. g. 'RNA')
         assay_split_key: A var column used to split features into assays.
         assay_name_map: Feature type to assay name overrides.
-        workspace: An optional workspace id.
+        workspace: An optional workspace id. None uses the legacy layout
+                   without a workspace group.
+        storage_options: Backend options passed when opening the Zarr store.
         mem_budget: Memory available to the conversion. Accepts bytes, a
                     suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
         nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
 
     Attributes:
         h5ad: A h5ad object (h5 file with added AnnData structure).
