@@ -247,7 +247,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         from_assay: str | None = None,
         cell_key: str | None = None,
         min_cells: int = 20,
-        top_n: int = 2000,
+        top_n: int = 1000,
         min_var: float = -np.inf,
         max_var: float = np.inf,
         min_mean: float = -np.inf,
@@ -280,7 +280,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                        ``HVG_UBIQUITOUS_SLACK`` selected cells are excluded (``n_selected - 20``). Pass
                        ``inf`` to disable the ubiquitous-gene filter.
             top_n: Number of top most variable genes to be set as HVGs. This value is ignored if a value is provided
-                   for `min_var` parameter. (Default: 2000)
+                   for `min_var` parameter. (Default: 1000)
             min_var: Minimum variance threshold for HVG selection. (Default: -Infinity)
             max_var: Maximum variance threshold for HVG selection. (Default: Infinity)
             min_mean: Minimum mean value of expression threshold for HVG selection. (Default: -Infinity)

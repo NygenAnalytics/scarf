@@ -2408,7 +2408,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         normalized: ArtifactRef | None = None,
         *,
         from_assay: str | None = None,
-        dims: int = 25,
+        dims: int = 21,
         pca_cell_key: str | None = None,
         feat_scaling: bool = True,
         batch_size: int | None = None,
@@ -2423,7 +2423,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             normalized: Normalized artifact to reduce. Uses the selected assay
                 state when omitted.
             from_assay: Assay used to resolve the selected normalized artifact.
-            dims: Requested number of principal components.
+            dims: Requested number of principal components. (Default: 21)
             pca_cell_key: Optional boolean cell column used to fit PCA while
                 projecting every selected cell.
             feat_scaling: Whether to standardize features before fitting PCA.
@@ -3088,7 +3088,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         *,
         from_assay: str | None = None,
         coordinates: ArtifactRef | None = None,
-        k: int = 17,
+        k: int = 11,
         batch_size: int | None = None,
         update_state: bool = True,
         invalidate_cache: bool = False,

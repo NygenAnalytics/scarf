@@ -616,7 +616,7 @@ class PipelineAccessor:
             hvg_options = self._options(highly_variable_features)
             hvg_name = str(hvg_options.get("hvg_key_name", "hvgs"))
             hvg_options.setdefault("show_plot", False)
-            hvg_options.setdefault("top_n", 2000)
+            hvg_options.setdefault("top_n", 1000)
             hvg_options.setdefault("min_cells", 20)
             store.mark_hvgs(
                 from_assay=assay_name,
@@ -646,7 +646,7 @@ class PipelineAccessor:
             pca_options = self._options(pca)
             n_centroids = int(pca_options.pop("n_centroids", 1000))
             initialization_rand_state = int(pca_options.pop("rand_state", 4466))
-            pca_options.setdefault("dims", 25)
+            pca_options.setdefault("dims", 21)
             reduction = store.run_pca(
                 normalized,
                 update_state=False,
@@ -679,7 +679,7 @@ class PipelineAccessor:
 
         with events.stage("neighbors"):
             neighbor_options = self._options(neighbors)
-            neighbor_options.setdefault("k", 17)
+            neighbor_options.setdefault("k", 11)
             neighbor_ref = store.query_neighbors(
                 ann,
                 coordinates=coordinates,

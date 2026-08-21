@@ -129,11 +129,11 @@ class WorkflowParameters(BaseModel):
     minFeaturesPerCell: int = 10
     minCellsPerFeature: int = 20
     h5adBatchSize: int = 1000
-    topN: int = 2000
+    topN: int = 1000
     hvgMinCells: int = 20
     hvgKey: str = "hvgs"
-    k: int = 17
-    dims: int = 50
+    k: int = 11
+    dims: int = 21
     nCentroids: int = 1000
     graphSeed: int = 4466
     kmeansSampling: float = 0.1
