@@ -22,7 +22,7 @@ def test_example_config_loads():
     assert set(CORE_STAGE_ORDER) <= set(config.stageResources)
     assert config.effectiveStages == CORE_STAGE_ORDER
     assert "writeCountsT" in CORE_STAGE_ORDER
-    assert "runClustering" in CORE_STAGE_ORDER
+    assert CORE_STAGE_ORDER[-2:] == ("runLeiden", "findMarkers")
     assert config.datasetUri(10_000).endswith("/10000.h5ad")
     assert config.resultUri(10_000, "createStore").endswith(
         "/results/10000/createStore.json"

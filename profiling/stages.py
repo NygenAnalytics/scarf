@@ -363,26 +363,6 @@ def _run_leiden_in_subprocess(
     )
 
 
-def _run_paris_in_subprocess(
-    *,
-    storeUri: str,
-    workflow: WorkflowParameters,
-    resources: StageResources,
-    workDir: Path | None,
-    invalidateCache: bool = False,
-) -> dict[str, Any]:
-    return _run_worker_in_subprocess(
-        stageLabel="runClustering",
-        workerModule="profiling.paris_worker",
-        storeUri=storeUri,
-        workflow=workflow,
-        resources=resources,
-        workDir=workDir,
-        workDirPrefix="scarf-paris-",
-        invalidateCache=invalidateCache,
-    )
-
-
 def _peak_cgroup_bytes(measurement: ResourceMeasurement | None) -> int | None:
     if measurement is None:
         return None
@@ -823,15 +803,6 @@ def run_stage(
                 elif stage == "runLeiden":
                     with timer.operation():
                         worker_timings = _run_leiden_in_subprocess(
-                            storeUri=storeUri,
-                            workflow=workflow,
-                            resources=resources,
-                            workDir=workDir,
-                            invalidateCache=invalidateCache,
-                        )
-                elif stage == "runClustering":
-                    with timer.operation():
-                        worker_timings = _run_paris_in_subprocess(
                             storeUri=storeUri,
                             workflow=workflow,
                             resources=resources,
@@ -1338,8 +1309,6 @@ def _run_analysis(
                 unitKind="countsTReadGroup",
             )
         }
-    if stage == "runClustering":
-        raise AssertionError("runClustering must execute in its child process")
     if stage == "importClusters":
         return _import_cluster_labels(store, workflow)
     if stage == "validateExperiment":

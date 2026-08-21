@@ -220,16 +220,6 @@ workers = 2
 timeoutSeconds = 82800
 ephemeralDiskMb = 524288
 
-[stageResources.runClustering]
-modalMemoryRequestMb = 16384
-modalMemoryLimitMb = 16384
-modalCpuRequest = 2.0
-modalCpuLimit = 2.0
-scarfMemoryBudget = 12884901888
-workers = 2
-timeoutSeconds = 82800
-ephemeralDiskMb = 524288
-
 [stageResources.findMarkers]
 modalMemoryRequestMb = 32768
 modalMemoryLimitMb = 32768

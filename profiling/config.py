@@ -22,7 +22,6 @@ StageName = Literal[
     "buildConnectivityMap",
     "runUmap",
     "runLeiden",
-    "runClustering",
     "findMarkers",
     "importClusters",
     "validateExperiment",
@@ -47,7 +46,6 @@ CORE_STAGE_ORDER: tuple[StageName, ...] = (
     *GRAPH_CONSTRUCTION_STAGE_ORDER,
     "runUmap",
     "runLeiden",
-    "runClustering",
     "findMarkers",
 )
 
