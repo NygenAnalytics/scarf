@@ -53,6 +53,7 @@ dependencies = [
     "sgtsnepi",
     "huggingface-hub>=1.24.0",
     "zstandard>=0.25.0",
+    "igraph>=1.0.0",
 ]
 
 [project.optional-dependencies]

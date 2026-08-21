@@ -144,6 +144,7 @@ class WorkflowParameters(BaseModel):
     umapParallel: bool = False
     umapLabel: str = "UMAP"
     leidenResolution: float = 1.0
+    leidenBackend: Literal["igraph", "leidenalg"] = "igraph"
     leidenSeed: int = 4444
     leidenLabel: str = "leiden_cluster"
     markerFeatureKey: str = "I"

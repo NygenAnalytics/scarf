@@ -50,6 +50,7 @@ class _PreparedLeidenClustering:
     cell_key: str
     feat_key: str
     resolution: float
+    backend: Literal["igraph", "leidenalg"]
     symmetric_graph: bool
     graph_upper_only: bool
     random_seed: int
@@ -385,6 +386,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         cell_key: str | None = None,
         feat_key: str | None = None,
         resolution: float = 1.0,
+        backend: Literal["igraph", "leidenalg"] = "igraph",
         integrated_graph: str | None = None,
         symmetric_graph: bool = False,
         graph_upper_only: bool = False,
@@ -392,6 +394,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         random_seed: int = 4444,
         invalidate_cache: bool = False,
     ) -> _PreparedLeidenClustering:
+        if backend not in {"igraph", "leidenalg"}:
+            raise ValueError("backend must be 'igraph' or 'leidenalg'")
         graph_selection = resolve_graph_selection(
             self,
             graph,
@@ -422,6 +426,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         arguments = LeidenArguments(
             graph=graph_input,
             resolution=resolution,
+            backend=backend,
             symmetric_graph=symmetric_graph,
             graph_upper_only=graph_upper_only,
             random_seed=random_seed,
@@ -460,6 +465,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             cell_key=cell_key,
             feat_key=feat_key,
             resolution=resolution,
+            backend=backend,
             symmetric_graph=symmetric_graph,
             graph_upper_only=graph_upper_only,
             random_seed=random_seed,
@@ -494,6 +500,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             graph,
             prepared.resolution,
             prepared.random_seed,
+            backend=prepared.backend,
         )
 
     def _publish_prepared_leiden(
@@ -557,6 +564,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         cell_key: str | None = None,
         feat_key: str | None = None,
         resolution: float = 1.0,
+        backend: Literal["igraph", "leidenalg"] = "igraph",
         integrated_graph: str | None = None,
         symmetric_graph: bool = False,
         graph_upper_only: bool = False,
@@ -573,6 +581,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             cell_key: Cell key of the graph.
             feat_key: Feature key of the graph.
             resolution: Leiden resolution parameter.
+            backend: Leiden implementation. Native igraph is the default.
             integrated_graph: Label of an integrated graph to partition.
             symmetric_graph: Forwarded to `load_graph`.
             graph_upper_only: Forwarded to `load_graph`.
@@ -589,6 +598,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             cell_key=cell_key,
             feat_key=feat_key,
             resolution=resolution,
+            backend=backend,
             integrated_graph=integrated_graph,
             symmetric_graph=symmetric_graph,
             graph_upper_only=graph_upper_only,

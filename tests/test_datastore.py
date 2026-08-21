@@ -538,7 +538,7 @@ class TestDataStore:
         assert len(set(leiden_clustering)) == 10
         expected = cell_attrs["RNA_leiden_cluster"].values
         agreement = adjusted_rand_score(expected, leiden_clustering)
-        assert agreement == pytest.approx(0.8850162225, abs=1e-6)
+        assert agreement == pytest.approx(0.8939224525, abs=1e-6)
 
     def test_paris_values(self, paris_clustering):
         labels = np.asarray(paris_clustering, dtype=np.int32)
@@ -921,7 +921,7 @@ class TestDataStore:
     def test_make_bulk(self, leiden_clustering, datastore):
         df = datastore.make_bulk(group_key="RNA_leiden_cluster")
         assert df.shape == (18850, 10)
-        assert hash(tuple((df.values.flatten()))) == -3925915741848261436
+        assert hash(tuple((df.values.flatten()))) == 1092780585495194137
 
     def test_to_anndata(self, datastore):
         from scipy import sparse

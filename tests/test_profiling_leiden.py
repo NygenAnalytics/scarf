@@ -94,6 +94,7 @@ def test_worker_runs_leiden(
         "cell_key": "I",
         "feat_key": "hvgs",
         "resolution": 1.0,
+        "backend": "igraph",
         "label": "leiden_cluster",
         "random_seed": 4444,
         "invalidate_cache": True,
@@ -203,7 +204,7 @@ def test_parent_starts_worker_module(
     request = json.loads((tmp_path / "request.json").read_text(encoding="utf-8"))
     assert request["storeUri"] == "s3://bucket/store.zarr"
     assert request["invalidateCache"] is True
-    assert "leidenBackend" not in request["workflow"]
+    assert request["workflow"]["leidenBackend"] == "igraph"
 
 
 def test_run_stage_routes_leiden_to_child(

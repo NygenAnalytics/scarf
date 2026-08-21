@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from ..graph.arguments import (
     OperationArguments,
@@ -74,6 +74,7 @@ class LeidenArguments(OperationArguments):
 
     graph: Any = artifact_input()
     resolution: float = parameter()
+    backend: Literal["igraph", "leidenalg"] = parameter()
     symmetric_graph: bool = parameter()
     graph_upper_only: bool = parameter()
     random_seed: int = parameter()

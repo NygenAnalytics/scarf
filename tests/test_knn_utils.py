@@ -57,12 +57,39 @@ def _grouped_knn_indices(groups: list[list[int]]) -> np.ndarray:
     return graph.indices.reshape(graph.shape[0], degree)
 
 
-def test_leiden_membership_preserves_disconnected_partitions():
+@pytest.mark.parametrize("backend", ["igraph", "leidenalg"])
+def test_leiden_membership_preserves_disconnected_partitions(backend):
     graph = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]])
 
-    actual = leiden_membership(graph, resolution=1.0, random_seed=4444)
+    actual = leiden_membership(
+        graph,
+        resolution=1.0,
+        random_seed=4444,
+        backend=backend,
+    )
 
     assert adjusted_rand_score([1, 1, 1, 1, 2, 2, 2, 2], actual) == pytest.approx(1.0)
+
+
+def test_native_leiden_membership_is_seeded_and_repeatable():
+    graph = _simple_knn_graph(100)
+
+    first = leiden_membership(graph, resolution=1.0, random_seed=4444)
+    second = leiden_membership(graph, resolution=1.0, random_seed=4444)
+
+    np.testing.assert_array_equal(second, first)
+
+
+def test_leiden_membership_rejects_unknown_backend():
+    graph = _simple_knn_graph(10)
+
+    with pytest.raises(ValueError, match="backend"):
+        leiden_membership(
+            graph,
+            resolution=1.0,
+            random_seed=4444,
+            backend="unknown",  # type: ignore[arg-type]
+        )
 
 
 def test_diffusion_operator_matches_powered_row_normalization():
