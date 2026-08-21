@@ -1,5 +1,6 @@
 import functools
 import json
+import sys
 import warnings
 from pathlib import Path
 
@@ -89,6 +90,48 @@ def test_leiden_membership_rejects_unknown_backend():
             resolution=1.0,
             random_seed=4444,
             backend="unknown",  # type: ignore[arg-type]
+        )
+
+
+def test_igraph_leiden_ignores_explicit_zero_weight_edges():
+    solid = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]]).tocoo()
+    padded = coo_matrix(
+        (
+            np.concatenate([solid.data, np.zeros(4)]),
+            (
+                np.concatenate([solid.row, np.array([0, 1, 2, 3])]),
+                np.concatenate([solid.col, np.array([4, 5, 6, 7])]),
+            ),
+        ),
+        shape=solid.shape,
+    )
+
+    assert np.count_nonzero(padded.data) != padded.nnz
+
+    actual = leiden_membership(padded, resolution=1.0, random_seed=4444)
+    expected = leiden_membership(solid, resolution=1.0, random_seed=4444)
+
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_igraph_membership_requires_igraph(monkeypatch):
+    monkeypatch.setitem(sys.modules, "igraph", None)
+    graph = _simple_knn_graph(10)
+
+    with pytest.raises(ImportError, match="igraph"):
+        leiden_membership(graph, resolution=1.0, random_seed=4444)
+
+
+def test_leidenalg_membership_requires_leidenalg(monkeypatch):
+    monkeypatch.setitem(sys.modules, "leidenalg", None)
+    graph = _simple_knn_graph(10)
+
+    with pytest.raises(ImportError, match="leidenalg"):
+        leiden_membership(
+            graph,
+            resolution=1.0,
+            random_seed=4444,
+            backend="leidenalg",
         )
 
 

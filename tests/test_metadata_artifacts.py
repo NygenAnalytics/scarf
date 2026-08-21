@@ -420,6 +420,14 @@ def test_leiden_backend_is_part_of_artifact_identity(
     assert datastore.inspect_artifact(legacy).parameters["backend"] == "leidenalg"
 
 
+def test_run_leiden_rejects_unknown_backend(datastore_ephemeral) -> None:
+    with pytest.raises(ValueError, match="backend"):
+        datastore_ephemeral.run_leiden_clustering(
+            backend="unknown",  # type: ignore[arg-type]
+            label="bad_backend",
+        )
+
+
 def test_membership_and_smart_labels_are_artifact_backed_and_lisi_is_read_only(
     datastore_ephemeral,
     monkeypatch,
