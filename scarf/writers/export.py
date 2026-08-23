@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 
-from ..utils.compute import show_dask_progress
+from ..utils.compute import compute_with_progress
 from ..utils.logging import logger
 
 
@@ -55,7 +55,7 @@ def to_h5ad(
     if skip_recalc_nfeats is False:
         assay.cells.insert(
             f"{assay.name}_nFeatures",
-            show_dask_progress(
+            compute_with_progress(
                 assay.rawData.count_nonzero(axis=1),
                 msg="Recalculating detected feature counts",
                 nthreads=nthreads,

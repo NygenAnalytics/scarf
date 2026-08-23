@@ -508,9 +508,9 @@ ds_merged.cells.head()
 Loom import remains available through `LoomReader` and `LoomToZarr` with the same dump pattern as the readers above.
 This page does not execute a Loom example.
 
-### 11.2 Dask arrays
+### 11.2 Chunked arrays
 
-`dask_to_zarr` writes from a Dask array when lazy out-of-core conversion is needed.
+`chunked_to_zarr` writes from a Scarf `ChunkedArray` when lazy out-of-core conversion is needed.
 
 ### 11.3 Remote Zarr destinations
 

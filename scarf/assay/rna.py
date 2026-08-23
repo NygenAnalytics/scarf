@@ -13,7 +13,7 @@ from ..storage.feature_stream import FeatureStreamPlan, plan_feature_stream
 from ..storage.geometry import array_geometry
 from ..storage.partition import IndexBlock, row_band
 from ..storage.types import as_zarr_array, as_zarr_group
-from ..utils.compute import show_dask_progress
+from ..utils.compute import compute_with_progress
 from ..utils.logging import logger
 from .base import Assay
 from .normalization import (
@@ -502,7 +502,7 @@ class RNAassay(Assay):
             if log_transform:
                 self.normMethod = norm_lib_size_log
             if renormalize_subset:
-                scalar = show_dask_progress(
+                scalar = compute_with_progress(
                     counts.sum(axis=1),
                     "Normalizing with feature subset",
                     self.nthreads,
@@ -1030,17 +1030,17 @@ class RNAassay(Assay):
             tot = stats["normed_tot"]
             sigmas = stats["sigmas"]
         else:
-            n_cells = show_dask_progress(
+            n_cells = compute_with_progress(
                 (self.normed(cell_idx, feat_idx) > 0).sum(axis=0),
                 f"({self.name}) Computing nCells",
                 self.nthreads,
             )
-            tot = show_dask_progress(
+            tot = compute_with_progress(
                 self.normed(cell_idx, feat_idx).sum(axis=0),
                 f"({self.name}) Computing normed_tot",
                 self.nthreads,
             )
-            sigmas = show_dask_progress(
+            sigmas = compute_with_progress(
                 self.normed(cell_idx, feat_idx).var(axis=0),
                 f"({self.name}) Computing sigmas",
                 self.nthreads,

@@ -157,7 +157,7 @@ widths. Unset values stay under automatic planning from ``mem_budget`` and
 ```
 
 ```{eval-rst}
-.. autofunction:: scarf.writers.dask_to_zarr
+.. autofunction:: scarf.writers.chunked_to_zarr
 ```
 
 ```{eval-rst}

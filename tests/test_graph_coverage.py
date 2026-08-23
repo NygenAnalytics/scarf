@@ -127,6 +127,119 @@ def _add_complete_artifact(
     return ref
 
 
+def test_load_ann_stream_restores_legacy_paths_and_rebuilds_missing_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    store.resources = SimpleNamespace()
+    store.cells = SimpleNamespace(
+        fetch=lambda column, key: np.array(
+            ["a", "b", "a"] if column == "batch" else [True, True, True]
+        )
+    )
+
+    normed = store.zw.create_group("RNA/normed")
+    normed.create_array(
+        "data",
+        data=np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+    )
+    reduction = store.zw.create_group("RNA/reduction")
+    reduction.create_array("reduction", data=np.eye(2))
+    harmonized = reduction.create_array(
+        "harmonizedData",
+        data=np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+    )
+    harmonized.attrs["batches"] = ["batch"]
+    ann = store.zw.create_group("RNA/ann")
+    ann.attrs["featureScaling"] = True
+    ann.attrs["isHarmonized"] = True
+    store.zw.create_group("RNA/knn")
+
+    chain = SimpleNamespace(
+        normalized_group_path="RNA/normed",
+        reduction_group_path="RNA/reduction",
+        neighbor_index_group_path="RNA/ann",
+        nearest_neighbors_group_path="RNA/knn",
+    )
+
+    class FakeChunkedArray:
+        def __init__(self, array, **_kwargs):
+            self.shape = array.shape
+
+    class FakeAnnStream:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.annIdx = kwargs["ann_idx"] or object()
+
+    stored_index = object()
+    resolve_index = Mock(side_effect=[stored_index, None])
+    persist_index = Mock()
+    store._resolve_ann_index = resolve_index
+    store._persist_ann_index = persist_index
+    store._load_or_compute_norm_stats = Mock(return_value=(np.zeros(2), np.ones(2)))
+    store._load_artifact_ann_stream = Mock(return_value=None)
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.parse_artifact_path",
+        Mock(side_effect=ValueError("legacy path")),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.nearest_neighbor_paths_from_loc",
+        Mock(return_value=chain),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.lookup_latest_nearest_neighbor_paths",
+        Mock(return_value=chain),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.validate_legacy_graph_selection",
+        Mock(),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.parse_neighbor_index_group_path",
+        Mock(return_value=("l2", 50, 80, 16, 444, "I", "I")),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.parse_reduction_group_path",
+        Mock(return_value=("pca", 2, "I")),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.parse_nearest_neighbors_group_path",
+        Mock(return_value=2),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.ChunkedArray",
+        FakeChunkedArray,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.AnnStream",
+        FakeAnnStream,
+    )
+    state = SimpleNamespace(
+        normalized=object(),
+        matches=lambda _cell_key, _feat_key: True,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.read_assay_state",
+        Mock(return_value=state),
+    )
+    validate_artifact = Mock()
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.validate_normalized_artifact_selection",
+        validate_artifact,
+    )
+
+    reused = store._load_ann_stream("RNA", "I", "I", knn_loc="RNA/knn")
+    rebuilt = store._load_ann_stream("RNA", "I", "I")
+
+    assert reused.annIdx is stored_index
+    assert rebuilt.annIdx is not None
+    assert reused.kwargs["harmonize"] is True
+    assert reused.kwargs["batches"].columns.tolist() == ["batch"]
+    validate_artifact.assert_called_once()
+    persist_index.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("symmetric", "upper_only", "use_k", "expected"),
     [
@@ -428,7 +541,7 @@ def test_partial_normalization_statistics_cache_paths(
     data.mean.return_value = np.array([2.0, 4.0])
     data.std.return_value = np.array([1.5, 2.5])
     monkeypatch.setattr(
-        "scarf.datastore._operations.graph.show_dask_progress",
+        "scarf.datastore._operations.graph.compute_with_progress",
         lambda values, *_: values,
     )
 

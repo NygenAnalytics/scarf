@@ -51,7 +51,7 @@ _EXPECTED_EXPORTS = {
     "create_zarr_count_assay": "scarf.writers",
     "create_zarr_dataset": "scarf.writers",
     "create_zarr_obj_array": "scarf.writers",
-    "dask_to_zarr": "scarf.writers",
+    "chunked_to_zarr": "scarf.writers",
     "get_log_level": "scarf.utils",
     "inspect_h5ad": "scarf.readers",
     "inspect_mtx": "scarf.readers",
@@ -63,7 +63,7 @@ _EXPECTED_EXPORTS = {
     "rescale_array": "scarf.utils",
     "rolling_window": "scarf.utils",
     "set_verbosity": "scarf.utils",
-    "show_dask_progress": "scarf.utils",
+    "compute_with_progress": "scarf.utils",
     "subset_assay_zarr": "scarf.writers",
     "system_call": "scarf.utils",
     "to_h5ad": "scarf.writers",
@@ -103,7 +103,7 @@ _EXPECTED_UTILS_EXPORTS = [
     "clean_array",
     "load_zarr",
     "permute_into_chunks",
-    "show_dask_progress",
+    "compute_with_progress",
     "controlled_compute",
     "iter_column_blocks",
     "process_rss_mb",
@@ -514,6 +514,24 @@ def test_retired_merge_names_are_absent():
     for name in ("DatasetMerge", "AssayMerge"):
         assert not hasattr(scarf, name)
         assert not hasattr(merge_module, name)
+
+
+def test_retired_dask_names_are_absent():
+    import scarf
+    import scarf.storage.materialize as storage_materialize
+    import scarf.utils as utils_module
+    import scarf.utils.compute as compute_module
+    import scarf.writers as writers_module
+    import scarf.writers._materialize as writers_materialize
+
+    for name in ("show_dask_progress", "dask_to_zarr"):
+        assert not hasattr(scarf, name)
+        assert not hasattr(utils_module, name)
+        assert not hasattr(writers_module, name)
+    assert not hasattr(compute_module, "show_dask_progress")
+    assert not hasattr(storage_materialize, "dask_to_zarr")
+    assert not hasattr(writers_materialize, "dask_to_zarr")
+    assert "compute_with_progress" in dir(utils_module)
 
 
 def test_lazy_facades_clear_cached_exports_on_reload():

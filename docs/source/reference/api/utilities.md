@@ -41,7 +41,7 @@ Arguments that are omitted retain their current values.
 `configure_output` is the primary runtime interface:
 
 - `level` controls Scarf's log severity.
-- `progress` controls progress bars, including `show_dask_progress`.
+- `progress` controls progress bars, including `compute_with_progress`.
 - `timestamps` controls timestamps in Scarf's installed log sink.
 
 Progress is independent of log level.
@@ -85,7 +85,7 @@ Use it when a durable batch log is needed; use `configure_output` for ordinary n
 ```
 
 ```{eval-rst}
-.. autofunction:: scarf.show_dask_progress
+.. autofunction:: scarf.compute_with_progress
 ```
 
 ```{eval-rst}

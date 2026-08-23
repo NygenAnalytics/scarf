@@ -135,7 +135,7 @@ def knn_clustering(
     from scipy.sparse import csr_matrix
 
     from ..neighbors.index import fix_knn_query, instantiate_knn_index
-    from ..utils.compute import show_dask_progress
+    from ..utils.compute import compute_with_progress
 
     if len(d_array.shape) != 2:
         raise ValueError("d_array must be two-dimensional")
@@ -222,7 +222,7 @@ def knn_clustering(
         clusters: np.ndarray,
         threads: int,
     ) -> np.ndarray:
-        idxmax = show_dask_progress(
+        idxmax = compute_with_progress(
             data.argmax(axis=1),
             "Sorting clusters",
             threads,

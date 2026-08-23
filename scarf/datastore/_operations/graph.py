@@ -129,7 +129,7 @@ from ...storage.selections import (
     resolve_selection_artifact,
 )
 from ...utils.arrays import clean_array
-from ...utils.compute import show_dask_progress
+from ...utils.compute import compute_with_progress
 from ...utils.logging import logger
 
 if TYPE_CHECKING:
@@ -587,7 +587,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 logger.debug("Skipping mu/sigma persistence on read-only store")
         elif need_mu:
             mu = clean_array(
-                show_dask_progress(
+                compute_with_progress(
                     data.mean(axis=0),
                     "Calculating mean of norm. data",
                     self.nthreads,
@@ -600,7 +600,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 logger.debug("Skipping mu persistence on read-only store")
         elif need_sigma:
             sigma = clean_array(
-                show_dask_progress(
+                compute_with_progress(
                     data.std(axis=0),
                     "Calculating std. dev. of norm. data",
                     self.nthreads,

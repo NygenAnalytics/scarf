@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from . import full_path, remove, dask_total_sum
+from . import full_path, remove, chunked_total_sum
 
 
 def build_neighbourhood_graph(
@@ -201,12 +201,12 @@ def datastore(datastore_zarr_root):
 
 @pytest.fixture(scope="session")
 def rna_raw_total(datastore):
-    return dask_total_sum(datastore.RNA.rawData)
+    return chunked_total_sum(datastore.RNA.rawData)
 
 
 @pytest.fixture(scope="session")
 def assay2_raw_total(datastore):
-    return dask_total_sum(datastore.assay2.rawData)
+    return chunked_total_sum(datastore.assay2.rawData)
 
 
 @pytest.fixture

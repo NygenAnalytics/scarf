@@ -494,6 +494,25 @@ def test_terminal_progress_applies_backspace_and_ansi_controls(
     )
 
 
+def test_hash_bar_terminal_progress_freezes_to_static_output(tmp_path: Path) -> None:
+    docs_root = tmp_path / "docs"
+    _write_source(docs_root, "page")
+    source = _source(docs_root, "page")
+    notebook = _executed_notebook(source)
+    _first_code_cell(notebook).outputs = [
+        nbformat.v4.new_output(
+            "stream",
+            name="stderr",
+            text="Legacy task [##########] | 100% Completed\n",
+        )
+    ]
+
+    assert freeze_progress_outputs(notebook, source.uri) == 1
+    assert _first_code_cell(notebook).outputs[0].data["text/plain"] == (
+        "Legacy task: 100 / 100 complete"
+    )
+
+
 def test_incomplete_terminal_progress_is_rejected(tmp_path: Path) -> None:
     docs_root = tmp_path / "docs"
     _write_source(docs_root, "page")

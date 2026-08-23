@@ -5,7 +5,7 @@ import zarr
 
 from ..storage.budget import ResourceBudget
 from ..storage.materialize import (
-    dask_to_zarr as _dask_to_zarr,
+    chunked_to_zarr as _chunked_to_zarr,
     write_renorm_subset_to_zarr as _write_renorm_subset_to_zarr,
 )
 
@@ -50,7 +50,7 @@ def write_renorm_subset_to_zarr(
     )
 
 
-def dask_to_zarr(
+def chunked_to_zarr(
     df: Any,
     z: zarr.Group,
     loc: str,
@@ -71,7 +71,7 @@ def dask_to_zarr(
             during the same pass (local staging cache).
         resources: Optional memory and worker budget for the write.
     """
-    return _dask_to_zarr(
+    return _chunked_to_zarr(
         df,
         z,
         loc,

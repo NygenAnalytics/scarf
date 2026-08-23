@@ -9,7 +9,6 @@ scarf_toolkit.egg-info
 .venv
 .venv*/
 .ruff_cache
-dask-worker-space
 # zarr ":memory:" URL materialized as a local directory by older tests
 :memory:
 :memory:/

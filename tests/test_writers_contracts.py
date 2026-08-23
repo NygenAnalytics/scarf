@@ -71,14 +71,14 @@ _MODULE_FUNCTIONS = (
     "create_zarr_count_assay",
     "create_zarr_dataset",
     "create_zarr_obj_array",
-    "dask_to_zarr",
+    "chunked_to_zarr",
     "subset_assay_zarr",
     "to_h5ad",
     "to_mtx",
     "write_renorm_subset_to_zarr",
 )
 _MODULE_SIGNATURE_DIGEST = (
-    "eb25aec8f0b2ca2dd4ba3d9956bbcd87e5cbf6735ca39894525f1d47908f3321"
+    "ffb18630347ba23982f12fa6a6ce7ad202a5a680dae8789e8e2dd155014cfa05"
 )
 
 
@@ -88,7 +88,7 @@ def test_writers_facade_surface_is_stable():
         "create_zarr_obj_array",
         "create_zarr_count_assay",
         "subset_assay_zarr",
-        "dask_to_zarr",
+        "chunked_to_zarr",
         "write_renorm_subset_to_zarr",
         "SubsetZarr",
         "CrToZarr",
@@ -151,7 +151,9 @@ def test_writer_static_method_contracts_are_stable():
             assert isinstance(inspect.getattr_static(cls, name), staticmethod)
 
 
-def test_writer_storage_wrappers_remain_distinct_objects():
+def test_writer_storage_wrappers_remain_distinct_objects(
+    monkeypatch: pytest.MonkeyPatch,
+):
     assert writers_module.create_zarr_dataset is not storage_arrays.create_zarr_dataset
     assert (
         writers_module.create_zarr_obj_array is not storage_arrays.create_zarr_obj_array
@@ -161,11 +163,49 @@ def test_writer_storage_wrappers_remain_distinct_objects():
         is not storage_schema.create_zarr_count_assay
     )
     assert writers_module.create_cell_data is not storage_schema.create_cell_data
-    assert writers_module.dask_to_zarr is not storage_materialize.dask_to_zarr
+    assert writers_module.chunked_to_zarr is not storage_materialize.chunked_to_zarr
     assert (
         writers_module.write_renorm_subset_to_zarr
         is not storage_materialize.write_renorm_subset_to_zarr
     )
+    assert (
+        "stats_group"
+        in inspect.signature(storage_materialize.chunked_to_zarr).parameters
+    )
+    assert (
+        "stats_group"
+        not in inspect.signature(writers_module.chunked_to_zarr).parameters
+    )
+
+    forwarded: dict[str, object] = {}
+
+    def capture(*args, **kwargs):
+        forwarded["args"] = args
+        forwarded["kwargs"] = kwargs
+
+    monkeypatch.setattr("scarf.writers._materialize._chunked_to_zarr", capture)
+    data = object()
+    root = object()
+    mirror = object()
+    resources = object()
+    writers_module.chunked_to_zarr(
+        data,
+        root,
+        "normalized/data",
+        3,
+        msg="Writing",
+        mirror=mirror,
+        resources=resources,
+    )
+
+    assert forwarded == {
+        "args": (data, root, "normalized/data", 3),
+        "kwargs": {
+            "msg": "Writing",
+            "mirror": mirror,
+            "resources": resources,
+        },
+    }
 
 
 def test_writer_rejects_reserved_assay_name_before_mutation():

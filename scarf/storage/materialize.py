@@ -268,7 +268,7 @@ def write_renorm_subset_to_zarr(
     _write_feature_summaries(stats_group, summary)
 
 
-def dask_to_zarr(
+def chunked_to_zarr(
     data: Any,
     root: zarr.Group,
     loc: str,

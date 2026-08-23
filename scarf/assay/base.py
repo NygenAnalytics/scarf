@@ -16,7 +16,7 @@ from ..metadata import MetaData
 from ..storage.budget import ResourceBudget, resolve_budget
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.arrays import array_digest
-from ..utils.compute import controlled_compute, show_dask_progress
+from ..utils.compute import controlled_compute, compute_with_progress
 from ..utils.logging import logger
 from .normalization import NormMethod, norm_dummy, norm_lib_size
 
@@ -214,7 +214,7 @@ class Assay:
         if _DEFER_FEATURE_PROPS.get():
             self._deferred_min_cells_per_feature = min_cells
             return
-        ncells = show_dask_progress(
+        ncells = compute_with_progress(
             (self.rawData > 0).sum(axis=0),
             f"({self.name}) Computing nCells and dropOuts",
             self.nthreads,
@@ -478,7 +478,7 @@ class Assay:
         feat_idx = self._plan_percent_feature(feat_pattern, name)
         if feat_idx is None:
             return None
-        total = show_dask_progress(
+        total = compute_with_progress(
             self.rawData[:, feat_idx].sum(axis=1),
             f"({self.name}) Computing {name}",
             self.nthreads,
@@ -662,7 +662,7 @@ class Assay:
         Returns: A chunked array containing the normalized data
         """
 
-        from ..storage.materialize import dask_to_zarr
+        from ..storage.materialize import chunked_to_zarr
 
         # FIXME: Extensive documentation needed to justify the naming strategy of slots here
         # Because HVGs and other feature selections have cell key appended in their metadata
@@ -695,7 +695,7 @@ class Assay:
                 log_transform=log_transform,
                 renormalize_subset=renormalize_subset,
             )
-            dask_to_zarr(
+            chunked_to_zarr(
                 vals,
                 self.z,
                 location + "/data",
@@ -741,7 +741,7 @@ class Assay:
             log_transform=log_transform,
             renormalize_subset=renormalize_subset,
         )
-        dask_to_zarr(
+        chunked_to_zarr(
             vals,
             self.z,
             location + "/data",

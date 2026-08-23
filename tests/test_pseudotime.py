@@ -511,6 +511,32 @@ def test_regressor_validation_points_to_component_validity_key():
         )
 
 
+@pytest.mark.parametrize(
+    ("values", "expected_size", "error_type", "match"),
+    [
+        (["early", "late"], 2, TypeError, "must be numeric"),
+        (np.array([[0.0, 1.0]]), 1, ValueError, "one-dimensional"),
+        (np.array([0.0]), 2, ValueError, "selects 2 cells"),
+        (np.array([0.0, np.inf]), 2, ValueError, "non-finite"),
+        (np.array([0.5, 0.5]), 2, ValueError, "distinct values"),
+    ],
+)
+def test_regressor_validation_rejects_invalid_columns(
+    values,
+    expected_size,
+    error_type,
+    match,
+):
+    with pytest.raises(error_type, match=match):
+        _validated_pseudotime_regressor(
+            values,
+            expected_size,
+            "ptime",
+            "I",
+            has_validity_column=False,
+        )
+
+
 class _AggregationCells:
     def __init__(self, ordering: np.ndarray):
         self.ordering = ordering
@@ -539,6 +565,44 @@ class _AggregationAssay:
         yield pd.DataFrame(
             self.expression,
             columns=np.arange(self.expression.shape[1]),
+        )
+
+
+@pytest.mark.parametrize(
+    ("ordering", "window_size", "chunk_size", "error_type", "match"),
+    [
+        (np.array([[0.0, 1.0]]), 2, 2, ValueError, "one-dimensional"),
+        (np.array([0.0, np.nan]), 2, 2, ValueError, "finite values"),
+        (np.array([0.0, 1.0]), True, 2, TypeError, "window_size"),
+        (np.array([0.0, 1.0]), 2, True, TypeError, "chunk_size"),
+        (np.array([0.0, 1.0]), 0, 2, ValueError, "window_size"),
+        (np.array([0.0, 1.0]), 2, 0, ValueError, "chunk_size"),
+    ],
+)
+def test_aggregation_rejects_invalid_ordering_and_sizes(
+    ordering,
+    window_size,
+    chunk_size,
+    error_type,
+    match,
+):
+    assay = _AggregationAssay(
+        np.ones((ordering.shape[0], 2)),
+        ordering,
+    )
+
+    with pytest.raises(error_type, match=match):
+        Assay._prepare_aggregated_ordering(
+            assay,
+            "I",
+            "I",
+            "ptime",
+            min_exp=0.0,
+            window_size=window_size,
+            chunk_size=chunk_size,
+            smoothen=False,
+            z_scale=False,
+            norm_params={},
         )
 
 
@@ -605,13 +669,17 @@ def test_incomplete_aggregation_cache_is_rebuilt():
 
 
 class _ShapeOnlyArray:
-    def __init__(self, shape: tuple[int, int]):
+    def __init__(self, shape: tuple[int, ...]):
         self.shape = shape
 
 
 def test_knn_clustering_rejects_infeasible_parameters():
+    with pytest.raises(ValueError, match="two-dimensional"):
+        knn_clustering(_ShapeOnlyArray((3,)), 1, 1, 1)
     with pytest.raises(ValueError, match="At least two"):
         knn_clustering(_ShapeOnlyArray((1, 3)), 1, 1, 1)
+    with pytest.raises(TypeError, match="n_neighbours"):
+        knn_clustering(_ShapeOnlyArray((3, 3)), True, 2, 1)
     with pytest.raises(ValueError, match="n_neighbours"):
         knn_clustering(_ShapeOnlyArray((3, 3)), np.int64(3), np.int32(2), 1)
     with pytest.raises(ValueError, match="n_clusters"):
@@ -629,6 +697,8 @@ def test_feature_cluster_scatter_honors_custom_unassigned_value():
     )
 
     assert np.array_equal(values, [0, 1, 0, 2, 0])
+    with pytest.raises(ValueError, match="misaligned"):
+        _scatter_feature_clusters(3, np.array([0, 1]), np.array([1]), 0)
     with pytest.raises(ValueError, match="conflicts"):
         _scatter_feature_clusters(3, np.array([0]), np.array([1]), 1)
 

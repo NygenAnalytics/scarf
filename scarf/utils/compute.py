@@ -15,7 +15,7 @@ def controlled_compute(arr: Any, nthreads: int) -> np.ndarray:
     return np.asarray(arr)
 
 
-def show_dask_progress(
+def compute_with_progress(
     arr: Any,
     msg: str | None = None,
     nthreads: int = 1,

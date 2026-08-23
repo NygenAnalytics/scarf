@@ -679,3 +679,154 @@ def test_peak_prevalence_rejects_empty_cell_corpus(atac_tfidf_store):
         match="Peak prevalence requires selected cells and features",
     ):
         store.ATAC.set_feature_stats("empty")
+
+
+def test_atac_normed_validates_boolean_options_and_default_indices(
+    atac_tfidf_store,
+):
+    store, _ = atac_tfidf_store
+    assay = store.ATAC
+
+    with pytest.raises(TypeError, match="log_transform must be a boolean"):
+        assay.normed(log_transform=1)
+    with pytest.raises(TypeError, match="renormalize_subset must be a boolean"):
+        assay.normed(renormalize_subset="yes")
+
+
+def test_subset_term_counts_require_data_and_handle_empty_corpora(
+    atac_tfidf_store,
+):
+    store, _ = atac_tfidf_store
+    assay = store.ATAC
+    empty_cells = np.array([], dtype=np.int64)
+
+    with pytest.raises(ValueError, match="Selected counts are required"):
+        assay._terms_per_document(
+            empty_cells,
+            counts=None,
+            renormalize_subset=True,
+        )
+
+    terms = assay._terms_per_document(
+        empty_cells,
+        counts=ChunkedArray.from_numpy(np.empty((0, 2))),
+        renormalize_subset=True,
+    )
+    assert terms.shape == (0,)
+
+
+def test_tfidf_identity_requires_the_normalizer_contract(
+    atac_tfidf_store,
+    monkeypatch,
+):
+    store, _ = atac_tfidf_store
+    monkeypatch.delattr(norm_tf_idf, "artifact_identity")
+
+    with pytest.raises(RuntimeError, match="must define artifact_identity"):
+        store.ATAC._normalization_identity()
+
+
+def test_cached_document_frequency_skips_malformed_candidates(
+    atac_tfidf_store,
+):
+    store, _ = atac_tfidf_store
+    assay = store.ATAC
+    cell_idx = np.array([1, 0], dtype=np.int64)
+    feat_idx = np.array([assay.feats.N], dtype=np.int64)
+    attrs = {
+        "cell_index_digest": assay._cell_index_digest(cell_idx),
+        "normalization_identity": assay._normalization_identity(),
+    }
+
+    assay.z.create_array(
+        "summary_stats_coverage_array",
+        data=np.array([1.0]),
+        overwrite=True,
+    )
+    group_node = assay.z.create_group(
+        "summary_stats_coverage_group_node",
+        overwrite=True,
+    )
+    group_node.attrs.update(attrs)
+    group_node.create_group("document_frequency")
+
+    wrong_shape = assay.z.create_group(
+        "summary_stats_coverage_wrong_shape",
+        overwrite=True,
+    )
+    wrong_shape.attrs.update(attrs)
+    wrong_shape.create_array("document_frequency", data=np.array([1.0]))
+
+    invalid_index = assay.z.create_group(
+        "summary_stats_coverage_invalid_index",
+        overwrite=True,
+    )
+    invalid_index.attrs.update(attrs)
+    invalid_index.create_array(
+        "document_frequency",
+        data=np.ones(assay.feats.N),
+    )
+
+    assert assay._cached_document_frequency(cell_idx, feat_idx) is None
+
+
+def test_tfidf_cache_validation_rejects_unreadable_arrays(
+    atac_tfidf_store,
+    monkeypatch,
+):
+    store, _ = atac_tfidf_store
+    assay = store.ATAC
+    cell_idx = store.cells.active_index("subset")
+    feat_idx = assay.feats.active_index("I")
+    attrs = {
+        "cell_index_digest": assay._cell_index_digest(cell_idx),
+        "normalization_identity": assay._normalization_identity(),
+    }
+    monkeypatch.setattr(assay, "_validate_stats_loc", lambda *_args, **_kwargs: True)
+
+    assert not assay._valid_tfidf_stats("missing_stats", cell_idx, feat_idx)
+
+    group_node = assay.z.create_group("coverage_stats_group_node", overwrite=True)
+    group_node.attrs.update(attrs)
+    group_node.create_group("prevalence")
+    group_node.create_array(
+        "document_frequency",
+        data=np.ones(assay.feats.N),
+    )
+    assert not assay._valid_tfidf_stats(
+        "coverage_stats_group_node",
+        cell_idx,
+        feat_idx,
+    )
+
+    invalid_index = assay.z.create_group("coverage_stats_invalid_index", overwrite=True)
+    invalid_index.attrs.update(attrs)
+    invalid_index.create_array("prevalence", data=np.ones(assay.feats.N))
+    invalid_index.create_array(
+        "document_frequency",
+        data=np.ones(assay.feats.N),
+    )
+    assert not assay._valid_tfidf_stats(
+        "coverage_stats_invalid_index",
+        cell_idx,
+        np.array([assay.feats.N], dtype=np.int64),
+    )
+
+
+def test_legacy_prevalent_peak_metadata_and_argument_validation(
+    atac_tfidf_store,
+):
+    store, _ = atac_tfidf_store
+    assay = store.ATAC
+
+    with pytest.raises(ValueError, match="less than total number"):
+        assay._prevalent_peak_mask("subset", assay.feats.N)
+    with pytest.raises(TypeError, match="positive integer"):
+        assay._prevalent_peak_mask("subset", 0)
+
+    with pytest.warns(DeprecationWarning):
+        assay.mark_prevalent_peaks("subset", 2, "top_peaks")
+
+    values = assay.feats.fetch_all("subset__top_peaks")
+    assert values.dtype == bool
+    assert int(values.sum()) == 2

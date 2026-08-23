@@ -20,7 +20,7 @@ from scarf.utils import (
     rescale_array,
     rolling_window,
     set_verbosity,
-    show_dask_progress,
+    compute_with_progress,
     tqdmbar,
 )
 from scarf.utils.arrays import canonicalize_sparse, checked_sparse_cast
@@ -113,7 +113,7 @@ def test_tqdmbar_uses_explicit_progress_independently_of_severity(monkeypatch):
     assert captured == [False, False, True, True, True]
 
 
-def test_show_dask_progress_uses_explicit_progress_setting():
+def test_compute_with_progress_uses_explicit_progress_setting():
     calls: list[tuple[int, str | None]] = []
 
     class Deferred:
@@ -123,13 +123,17 @@ def test_show_dask_progress_uses_explicit_progress_setting():
 
     try:
         configure_output(progress=False)
-        show_dask_progress(Deferred(), "Computing", 2)
+        compute_with_progress(Deferred(), "Computing", 2)
         configure_output(progress=True)
-        show_dask_progress(Deferred(), "Computing", 3)
+        compute_with_progress(Deferred(), "Computing", 3)
     finally:
         configure_output(progress=False)
 
     assert calls == [(2, None), (3, "Computing")]
+    np.testing.assert_array_equal(
+        compute_with_progress(np.array([2, 3])),
+        np.array([2, 3]),
+    )
 
 
 def test_progress_iterator_releases_consumed_values():
