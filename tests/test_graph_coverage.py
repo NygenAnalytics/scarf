@@ -127,6 +127,119 @@ def _add_complete_artifact(
     return ref
 
 
+def test_load_ann_stream_restores_legacy_paths_and_rebuilds_missing_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    store.resources = SimpleNamespace()
+    store.cells = SimpleNamespace(
+        fetch=lambda column, key: np.array(
+            ["a", "b", "a"] if column == "batch" else [True, True, True]
+        )
+    )
+
+    normed = store.zw.create_group("RNA/normed")
+    normed.create_array(
+        "data",
+        data=np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+    )
+    reduction = store.zw.create_group("RNA/reduction")
+    reduction.create_array("reduction", data=np.eye(2))
+    harmonized = reduction.create_array(
+        "harmonizedData",
+        data=np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]),
+    )
+    harmonized.attrs["batches"] = ["batch"]
+    ann = store.zw.create_group("RNA/ann")
+    ann.attrs["featureScaling"] = True
+    ann.attrs["isHarmonized"] = True
+    store.zw.create_group("RNA/knn")
+
+    chain = SimpleNamespace(
+        normalized_group_path="RNA/normed",
+        reduction_group_path="RNA/reduction",
+        neighbor_index_group_path="RNA/ann",
+        nearest_neighbors_group_path="RNA/knn",
+    )
+
+    class FakeChunkedArray:
+        def __init__(self, array, **_kwargs):
+            self.shape = array.shape
+
+    class FakeAnnStream:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.annIdx = kwargs["ann_idx"] or object()
+
+    stored_index = object()
+    resolve_index = Mock(side_effect=[stored_index, None])
+    persist_index = Mock()
+    store._resolve_ann_index = resolve_index
+    store._persist_ann_index = persist_index
+    store._load_or_compute_norm_stats = Mock(return_value=(np.zeros(2), np.ones(2)))
+    store._load_artifact_ann_stream = Mock(return_value=None)
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.parse_artifact_path",
+        Mock(side_effect=ValueError("legacy path")),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.nearest_neighbor_paths_from_loc",
+        Mock(return_value=chain),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.lookup_latest_nearest_neighbor_paths",
+        Mock(return_value=chain),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.validate_legacy_graph_selection",
+        Mock(),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.parse_neighbor_index_group_path",
+        Mock(return_value=("l2", 50, 80, 16, 444, "I", "I")),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.parse_reduction_group_path",
+        Mock(return_value=("pca", 2, "I")),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.parse_nearest_neighbors_group_path",
+        Mock(return_value=2),
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.ChunkedArray",
+        FakeChunkedArray,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.AnnStream",
+        FakeAnnStream,
+    )
+    state = SimpleNamespace(
+        normalized=object(),
+        matches=lambda _cell_key, _feat_key: True,
+    )
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.read_assay_state",
+        Mock(return_value=state),
+    )
+    validate_artifact = Mock()
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.validate_normalized_artifact_selection",
+        validate_artifact,
+    )
+
+    reused = store._load_ann_stream("RNA", "I", "I", knn_loc="RNA/knn")
+    rebuilt = store._load_ann_stream("RNA", "I", "I")
+
+    assert reused.annIdx is stored_index
+    assert rebuilt.annIdx is not None
+    assert reused.kwargs["harmonize"] is True
+    assert reused.kwargs["batches"].columns.tolist() == ["batch"]
+    validate_artifact.assert_called_once()
+    persist_index.assert_called_once()
+
+
 @pytest.mark.parametrize(
     ("symmetric", "upper_only", "use_k", "expected"),
     [
@@ -224,6 +337,50 @@ def test_load_graph_option_matrix(
     )
 
     np.testing.assert_allclose(graph.toarray(), expected)
+
+
+def test_graph_memory_cache_is_keyed_and_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _memory_graph_store()
+    graph_loc = _add_test_graph(store)
+    original = store._store_to_sparse
+    reads = 0
+
+    def counted_store_to_sparse(
+        location: str,
+        sparse_format: str = "csr",
+        use_k: int | None = None,
+    ):
+        nonlocal reads
+        reads += 1
+        return original(location, sparse_format, use_k)
+
+    monkeypatch.setattr(store, "_store_to_sparse", counted_store_to_sparse)
+
+    with store._graph_memory_cache_scope():
+        raw = store.load_graph(graph_loc=graph_loc)
+        equivalent = store.load_graph(
+            graph_loc=graph_loc,
+            symmetric=False,
+            upper_only=True,
+        )
+        symmetric = store.load_graph(graph_loc=graph_loc, symmetric=True)
+        reduced = store.load_graph(graph_loc=graph_loc, use_k=1)
+
+        assert raw is equivalent
+        assert raw is not symmetric
+        assert raw is not reduced
+        assert reads == 3
+        with store._graph_memory_cache_scope():
+            nested = store.load_graph(graph_loc=graph_loc)
+            assert nested is raw
+            assert reads == 3
+
+    assert store._graphMemoryCache is None
+    uncached = store.load_graph(graph_loc=graph_loc)
+    assert uncached is not raw
+    assert reads == 4
 
 
 def test_load_graph_latest_location_formats_and_errors(
@@ -384,7 +541,7 @@ def test_partial_normalization_statistics_cache_paths(
     data.mean.return_value = np.array([2.0, 4.0])
     data.std.return_value = np.array([1.5, 2.5])
     monkeypatch.setattr(
-        "scarf.datastore._operations.graph.show_dask_progress",
+        "scarf.datastore._operations.graph.compute_with_progress",
         lambda values, *_: values,
     )
 
@@ -663,8 +820,8 @@ def test_run_marker_search_skip_save_and_errors(
     assert first_call["group_key"] == "ids"
     assert first_call["cell_key"] == "I"
     assert first_call["feat_key"] == "I"
-    assert first_call["batch_size"] is None
-    assert first_call["n_threads"] == store.nthreads
+    assert "batch_size" not in first_call
+    assert first_call["nthreads"] == store.nthreads
     assert "markers" not in store.zw["RNA"]
 
     finder.reset_mock()
@@ -672,15 +829,14 @@ def test_run_marker_search_skip_save_and_errors(
         group_key="ids",
         cell_key="I",
         feat_key="I",
-        gene_batch_size=2,
-        n_threads=3,
+        nthreads=3,
         skip_save=True,
         log_transform=False,
     )
     assert result is markers
     second_call = finder.call_args.kwargs
-    assert second_call["batch_size"] == 2
-    assert second_call["n_threads"] == 3
+    assert "batch_size" not in second_call
+    assert second_call["nthreads"] == 3
     assert second_call["log_transform"] is False
 
     finder.side_effect = RuntimeError("marker failure")

@@ -93,6 +93,22 @@ See {doc}`../../tutorials/import_and_export` for the worked contract and {doc}`.
     :members:
 ```
 
+## Storage controls
+
+Writers, merge, subset, and ``DataStore`` accept the same optional storage
+controls. ``profile`` chooses the physical encoding. ``policy`` chooses paired
+count-matrix geometry. ``io`` overrides automatic read, compute, and write
+widths. Unset values stay under automatic planning from ``mem_budget`` and
+``nthreads``.
+
+```{eval-rst}
+.. autoclass:: scarf.storage.io_policy.StorageIoPolicy
+    :members:
+
+.. autoclass:: scarf.storage.count_matrix.CountMatrixPolicy
+    :members:
+```
+
 ## Writers
 
 ```{eval-rst}
@@ -141,7 +157,7 @@ See {doc}`../../tutorials/import_and_export` for the worked contract and {doc}`.
 ```
 
 ```{eval-rst}
-.. autofunction:: scarf.writers.dask_to_zarr
+.. autofunction:: scarf.writers.chunked_to_zarr
 ```
 
 ```{eval-rst}
@@ -184,8 +200,9 @@ Explicit positive values remain supported.
 
 Use `DataStoreMerge` to merge DataStores.
 Pass `assays=["RNA"]` when only one assay type is needed.
-By default RNA assays also receive a feature-major `countsT` matrix for faster gene-wise reads, which roughly doubles stored counts for those assays.
-Interrupted merges resume at whole-component boundaries (`cellData`, each assay `counts`, and each requested `countsT`) rather than mid-matrix shards.
+RNA assays write both `counts` and a gene-major `countsT` copy, which roughly doubles stored counts for those assays.
+Non-RNA assays never write `countsT`.
+Interrupted merges resume at whole-component boundaries (`cellData`, each assay `counts`, and each RNA `countsT`) rather than mid-matrix.
 
 ```{eval-rst}
 .. autoclass:: scarf.merge.DataStoreMerge

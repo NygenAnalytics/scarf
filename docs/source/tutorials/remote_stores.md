@@ -75,7 +75,9 @@ ds.plots.embedding(
 Use `mount_datastore` when count matrices must remain in a shared source store, but each analysis needs its own writable store.
 Scarf copies cell and feature metadata into the target.
 Mount validates and reads primary `counts` for matrix identity.
-`countsT` is optional and is picked up later if present.
+For RNA sources, the matching gene-major `countsT` copy must already be present on Zarr v3.
+It is mounted with `counts` and is not rewritten into the target.
+Non-RNA assays have no `countsT`.
 New metadata and analysis artifacts are written only to the target.
 
 The mounted target below lives in a temporary local directory, but its count source is the public remote URI.
@@ -113,13 +115,13 @@ print('Source URI:', matrix_source['location'])
 print('Mounted assays:', sorted(matrix_source['assays']))
 ```
 
-Counts and optional `countsT` stay in the source.
+Counts and RNA `countsT` stay in the source.
 Cell and feature metadata are copied once, while new analysis artifacts are written to the target.
 The printed `matrixSource` record is what later reopen uses to resolve the remote counts.
 
 ```{mermaid}
 flowchart LR
-    source["Read-only remote source<br/>counts (countsT optional)"]
+    source["Read-only remote source<br/>counts and RNA countsT"]
     mount["Mounted DataStore"]
     target["Writable target<br/>metadata and new artifacts"]
     source -->|stream count blocks| mount
@@ -335,8 +337,9 @@ Resource planning controls are in {doc}`../concepts/memory_and_execution`.
 
 ## 6. Repack older stores
 
-New Scarf writers emit Zarr v3 with profile-specific sharding.
-Repack a local or remote store when you want cloud-oriented layout without re-importing counts:
+New Scarf writers emit Zarr v3.
+An RNA store that predates the paired `counts` / `countsT` layout, or that is still Zarr v2, will not open as an RNA assay.
+Repack writes a new store with the current layout and storage profile, locally or on object storage:
 
 ```bash
 uv run python -m scarf.tools.repack_zarr \
@@ -349,6 +352,7 @@ uv run python -m scarf.tools.repack_zarr \
 Paths stay as URIs (do not pass them through `pathlib.Path`).
 Use `--storage-options` for backend credentials or public reads (`skip_signature` for anonymous S3/GCS).
 Point `DataStore` at the output URI afterward.
-Repacking rewrites layout for a storage profile; it is not an analysis step.
+Repacking rewrites physical layout; it is not an analysis step.
+After a rewrite, recompute HVG, normalization, PCA, graph, and marker results rather than resuming them from the input store.
 
 For custom statistics over mounted graphs or count blocks, followed by a supported selective export, continue with {doc}`custom_analyses`.

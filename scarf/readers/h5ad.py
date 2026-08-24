@@ -81,6 +81,7 @@ class H5adReader:
         category_names_key: str = "__categories",
         dtype: str | None = None,
     ) -> None:
+        self.h5adFn = h5ad_fn
         self.h5: h5py.File = h5py.File(h5ad_fn, mode="r")
         self.matrixKey = matrix_key
         self.cellAttrsKey, self.featureAttrsKey, self.obsmAttrsKey = (
@@ -110,6 +111,34 @@ class H5adReader:
         self.matrixDtype: Any = self.sourceMatrixDtype if dtype is None else dtype
         self.storageDtype: Any = self.matrixDtype
         self._dtypeOverridden = dtype is not None
+
+    def _clone_kwargs(self) -> dict[str, Any]:
+        return {
+            "h5ad_fn": self.h5adFn,
+            "cell_attrs_key": self.cellAttrsKey,
+            "cell_ids_key": self.cellIdsKey,
+            "feature_attrs_key": self.featureAttrsKey,
+            "feature_ids_key": self.featIdsKey,
+            "feature_name_key": self.featNamesKey,
+            "matrix_key": self.matrixKey,
+            "obsm_attrs_key": self.obsmAttrsKey,
+            "category_names_key": self.catNamesKey,
+            "dtype": self.matrixDtype if self._dtypeOverridden else None,
+        }
+
+    def open_clone(self) -> "H5adReader":
+        """Open an independent h5py handle on the same file."""
+        clone = type(self)(**self._clone_kwargs())
+        clone.storageDtype = self.storageDtype
+        clone.matrixDtype = self.matrixDtype
+        clone.sourceMatrixDtype = self.sourceMatrixDtype
+        if self._convertedCsr is not None:
+            clone._convertedCsr = self._convertedCsr
+        if self._indptrCache is not None:
+            clone._indptrCache = self._indptrCache
+        if self._cumulativeRowNnz is not None:
+            clone._cumulativeRowNnz = self._cumulativeRowNnz
+        return clone
 
     @classmethod
     def from_inspect(
@@ -526,16 +555,20 @@ class H5adReader:
 
     # noinspection DuplicatedCode
     def consume_dataset(
-        self, batch_size: int = 1000
+        self,
+        batch_size: int = 1000,
+        row_start: int = 0,
+        row_end: int | None = None,
     ) -> Generator[coo_matrix, None, None]:
         """Returns a generator that yield chunks of data."""
         dset = self.h5[self.matrixKey]
-        s = 0
-        for e in range(batch_size, dset.shape[0] + batch_size, batch_size):
-            if e > dset.shape[0]:
-                e = dset.shape[0]
-            yield coo_matrix(dset[s:e])
-            s = e
+        start = max(0, int(row_start))
+        stop = int(dset.shape[0] if row_end is None else row_end)
+        if stop < start or stop > int(dset.shape[0]):
+            raise ValueError("consume row range is outside the matrix")
+        for offset in range(start, stop, batch_size):
+            end = min(offset + batch_size, stop)
+            yield coo_matrix(dset[offset:end])
 
     def _sparse_indices_are_strictly_sorted(self, maxValues: int) -> bool:
         group = self.h5[self.matrixKey]
@@ -774,26 +807,35 @@ class H5adReader:
             f"dtype={self.storageDtype}"
         )
 
-    def consume_group(self, batch_size: int) -> Generator[coo_matrix, None, None]:
+    def consume_group(
+        self,
+        batch_size: int,
+        row_start: int = 0,
+        row_end: int | None = None,
+    ) -> Generator[coo_matrix, None, None]:
         """Returns a generator that yield chunks of data."""
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        start = max(0, int(row_start))
+        stop = int(self.nCells if row_end is None else row_end)
+        if stop < start or stop > self.nCells:
+            raise ValueError("consume row range is outside the matrix")
 
         if self._convertedCsr is not None or self.matrixOrientation == "csc":
-            yield from self._consume_converted_csr(batch_size)
+            yield from self._consume_converted_csr(batch_size, start, stop)
             return
 
         grp = self.h5[self.matrixKey]
         source_indptr = self._csr_indptr()
         if source_indptr is None:
             raise RuntimeError("CSR row pointers are unavailable")
-        for row_start in range(0, self.nCells, batch_size):
-            row_end = min(row_start + batch_size, self.nCells)
-            indptr = source_indptr[row_start : row_end + 1]
+        for offset in range(start, stop, batch_size):
+            end = min(offset + batch_size, stop)
+            indptr = source_indptr[offset : end + 1]
             data_start = int(indptr[0])
             data_end = int(indptr[-1])
             local_indptr = indptr - data_start
-            n_rows = row_end - row_start
+            n_rows = end - offset
             batch = csr_matrix(
                 (
                     np.asarray(grp["data"][data_start:data_end]),
@@ -807,23 +849,35 @@ class H5adReader:
     def _consume_converted_csr(
         self,
         batch_size: int,
+        row_start: int = 0,
+        row_end: int | None = None,
     ) -> Generator[coo_matrix, None, None]:
         """Convert the complete CSC matrix once before yielding row batches."""
         if self._convertedCsr is None:
             self.materialize_csc()
         if self._convertedCsr is None:
             raise RuntimeError("CSC materialization did not produce a CSR matrix")
+        start = max(0, int(row_start))
+        stop = int(self.nCells if row_end is None else row_end)
+        for offset in range(start, stop, batch_size):
+            end = min(offset + batch_size, stop)
+            yield self._convertedCsr[offset:end].tocoo(copy=False)
 
-        for row_start in range(0, self.nCells, batch_size):
-            row_end = min(row_start + batch_size, self.nCells)
-            yield self._convertedCsr[row_start:row_end].tocoo(copy=False)
-
-    def consume(self, batch_size: int) -> Generator[coo_matrix, None, None]:
-        """Returns a generator that yield chunks of data."""
+    def consume_row_range(
+        self,
+        batch_size: int,
+        row_start: int,
+        row_end: int,
+    ) -> Generator[coo_matrix, None, None]:
+        """Yield source batches covering ``[row_start, row_end)``."""
         if self.groupCodes[self.matrixKey] == 1:
-            return self.consume_dataset(batch_size)
-        elif self.groupCodes[self.matrixKey] == 2:
-            return self.consume_group(batch_size)
+            return self.consume_dataset(batch_size, row_start, row_end)
+        if self.groupCodes[self.matrixKey] == 2:
+            return self.consume_group(batch_size, row_start, row_end)
         raise ValueError(
             f"ERROR: {self.matrixKey} is neither Dataset or Group type. Will not consume data"
         )
+
+    def consume(self, batch_size: int) -> Generator[coo_matrix, None, None]:
+        """Returns a generator that yield chunks of data."""
+        return self.consume_row_range(batch_size, 0, self.nCells)

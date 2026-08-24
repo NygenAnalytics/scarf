@@ -391,6 +391,49 @@ def test_gene_major_python_kernel_matches_compiled_kernel() -> None:
     np.testing.assert_allclose(compiled, python, rtol=1e-7, atol=1e-12)
 
 
+def test_gene_major_kernel_skips_unselected_source_rows() -> None:
+    raw = np.array(
+        [
+            [0, 2, 0, 4],
+            [1, 2, 0, 0],
+            [1, 0, 3, 4],
+            [0, 0, 3, 0],
+        ],
+        dtype=np.uint32,
+    ).T
+    scalar = np.array([2, 4, 6, 8], dtype=np.float32)
+    groups = np.array([0, 0, 1, 1], dtype=np.int64)
+    group_counts = np.array([2, 2], dtype=np.float32)
+    destinations = np.array([1, -1, 0, -1], dtype=np.int64)
+    observed = np.zeros((2, 2, 8), dtype=np.float64)
+
+    _marker_stats_gene_major(
+        raw,
+        scalar,
+        np.float32(1000),
+        False,
+        groups,
+        group_counts,
+        np.float32(4),
+        destinations,
+        observed,
+    )
+    expected = np.zeros_like(observed)
+    _marker_stats_gene_major(
+        raw[[2, 0]],
+        scalar,
+        np.float32(1000),
+        False,
+        groups,
+        group_counts,
+        np.float32(4),
+        np.arange(2, dtype=np.int64),
+        expected,
+    )
+
+    np.testing.assert_array_equal(observed, expected)
+
+
 def test_sort_marker_results_adds_deterministic_tie_breakers():
     named = pd.DataFrame(
         {
@@ -596,8 +639,7 @@ def test_find_markers_by_rank_rejects_fast_path_for_non_rna_assay():
             group_key="cluster",
             cell_key="I",
             feat_key="I",
-            batch_size=2,
-            n_threads=1,
+            nthreads=1,
         )
     assert numba.get_num_threads() == previous_threads
 
@@ -638,8 +680,7 @@ def test_find_markers_by_rank_slow_path_returns_groupwise_statistics():
         group_key="cluster",
         cell_key="I",
         feat_key="I",
-        batch_size=2,
-        n_threads=1,
+        nthreads=1,
     )
     group_a = results["a"].set_index("feature_index")
     group_b = results["b"].set_index("feature_index")
@@ -711,8 +752,7 @@ def test_find_markers_by_rank_rejects_nonfinite_slow_batches(
             group_key="cluster",
             cell_key="I",
             feat_key="I",
-            batch_size=2,
-            n_threads=1,
+            nthreads=1,
         )
 
 
@@ -722,6 +762,7 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
     import zarr
     from zarr.storage import MemoryStore
 
+    from scarf.storage import feature_stream
     from scarf.storage.budget import ResourceBudget
 
     data = np.array(
@@ -749,22 +790,42 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
     class Feats:
         @staticmethod
         def active_index(_feat_key):
-            return np.arange(4)
+            return np.array([0, 2, 3])
 
     class FakeRNA:
         def __init__(self):
+            from scarf.storage.sharding import write_counts_t
+
             self.cells = Cells()
             self.feats = Feats()
             self.normMethod = norm_lib_size
             self.sf = 1_000.0
             self.name = "RNA"
             self.resources = ResourceBudget(1024**3, 2)
+            from scarf.storage.count_matrix import (
+                persist_count_matrix_plan,
+                plan_count_matrix_pair,
+            )
+
             root = zarr.open_group(store=MemoryStore(), mode="w")
+            values = data.astype(np.uint32)
+            plan = plan_count_matrix_pair(
+                values.shape[0], values.shape[1], values.dtype
+            )
             self.raw = root.create_array(
                 "counts",
-                data=data.astype(np.uint32),
-                chunks=(2, 2),
+                shape=plan.counts.shape,
+                chunks=plan.counts.chunks,
+                shards=plan.counts.shards,
+                dtype=values.dtype,
+                overwrite=True,
             )
+            self.raw[:] = values
+            persist_count_matrix_plan(root, plan)
+            persist_count_matrix_plan(self.raw, plan)
+            counts_t = write_counts_t(self.raw, root)
+            assert counts_t is not None
+            self.rawDataT = counts_t
 
         def _raw_feature_stream_source(self):
             return self.raw, 1, 0
@@ -782,18 +843,26 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
                 )
 
     monkeypatch.setattr(marker_search_module, "RNAassay", FakeRNA)
+
+    def reject_selected_copy(_values, _keep):
+        raise AssertionError("fast marker search copied selected feature rows")
+
+    monkeypatch.setattr(
+        feature_stream,
+        "selected_feature_values",
+        reject_selected_copy,
+    )
     results = find_markers_by_rank(
         FakeRNA(),
         group_key="cluster",
         cell_key="I",
         feat_key="I",
-        batch_size=2,
-        n_threads=1,
+        nthreads=1,
     )
 
     assert set(results) == {"a", "b"}
     for frame in results.values():
-        assert len(frame) == data.shape[1]
+        assert len(frame) == 3
         assert np.isfinite(frame["p_value"]).all()
 
 
@@ -1345,8 +1414,7 @@ def test_marker_cache_reuse_revalidates_canonical_payload(
         "group_key": group_key,
         "cell_key": "I",
         "feat_key": feat_key,
-        "gene_batch_size": 4,
-        "n_threads": 1,
+        "nthreads": 1,
     }
     datastore_ephemeral.run_marker_search(**arguments)
     marker_index = assay.z["markers"].attrs["artifacts"]
@@ -1637,8 +1705,7 @@ def test_find_markers_by_rank_rejects_invalid_group_sizes():
             group_key="cluster",
             cell_key="I",
             feat_key="I",
-            batch_size=1,
-            n_threads=1,
+            nthreads=1,
         )
     with pytest.raises(ValueError, match="at least two cells in every group"):
         find_markers_by_rank(
@@ -1646,8 +1713,7 @@ def test_find_markers_by_rank_rejects_invalid_group_sizes():
             group_key="cluster",
             cell_key="I",
             feat_key="I",
-            batch_size=1,
-            n_threads=1,
+            nthreads=1,
         )
 
 
@@ -1679,34 +1745,144 @@ def test_pseudotime_bh_excludes_untested_features():
     assert np.isnan(result.loc["untested", "p_value_adjusted"])
 
 
-def test_explicit_marker_gene_batch_size_reaches_search(
+def test_marker_search_does_not_accept_gene_batch_size(
     datastore_ephemeral,
-    monkeypatch,
 ):
     groups = np.arange(datastore_ephemeral.cells.N) % 2
     datastore_ephemeral.cells.insert("batch_contract_groups", groups, overwrite=True)
-    captured = {}
-    expected = {"group": pd.DataFrame()}
+    with pytest.raises(TypeError, match="gene_batch_size"):
+        datastore_ephemeral.run_marker_search(
+            group_key="batch_contract_groups",
+            gene_batch_size=100,
+            skip_save=True,
+        )
 
-    def capture_marker_search(**kwargs):
-        captured.update(kwargs)
-        return expected
+
+def test_marker_search_does_not_accept_n_threads(
+    datastore_ephemeral,
+):
+    groups = np.arange(datastore_ephemeral.cells.N) % 2
+    datastore_ephemeral.cells.insert("thread_contract_groups", groups, overwrite=True)
+    with pytest.raises(TypeError, match="n_threads"):
+        datastore_ephemeral.run_marker_search(
+            group_key="thread_contract_groups",
+            n_threads=4,
+            skip_save=True,
+        )
+
+
+def test_marker_feature_value_adapters_and_non_rna_rank_paths() -> None:
+    from types import SimpleNamespace
+
+    from scarf.assay.normalization import (
+        norm_clr,
+        norm_dummy,
+        norm_lib_size,
+        norm_tf_idf,
+    )
+    from scarf.features.markers.search import (
+        _clr_feature_values,
+        _lib_size_feature_values,
+        _tfidf_feature_values,
+    )
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.feature_stream import FeatureReadGroup
+    from tests.test_feature_stream import _counts_t_with_plan
+
+    raw = np.array([[1, 0], [3, 4], [2, 0]], dtype=np.uint16)
+    tfidf = _tfidf_feature_values(raw, np.array([2.0, 4.0]), np.array([1.0, 0.5, 2.0]))
+    assert tfidf.shape == (2, 3)
+    clr = _clr_feature_values(raw)
+    assert clr.shape == (2, 3)
+    linear = _lib_size_feature_values(raw, np.array([1.0, 2.0]), 10.0, False)
+    logged = _lib_size_feature_values(raw, np.array([1.0, 2.0]), 10.0, True)
+    assert logged.shape == linear.shape
+    assert logged[0, 0] != linear[0, 0]
+
+    values = np.arange(8 * 12, dtype=np.uint32).reshape(8, 12)
+    counts_t = _counts_t_with_plan(values)
+
+    class Cells:
+        @staticmethod
+        def fetch(_group_key, _cell_key):
+            return np.array(["a", "a", "a", "a", "b", "b", "b", "b"])
+
+        @staticmethod
+        def active_index(_cell_key):
+            return np.arange(8)
+
+        @staticmethod
+        def fetch_all(_key):
+            return values.sum(axis=1)
+
+    class Feats:
+        @staticmethod
+        def active_index(_feat_key):
+            return np.array([10, 11])
+
+    class FakeAssay:
+        def __init__(self, method) -> None:
+            self.cells = Cells()
+            self.feats = Feats()
+            self.normMethod = method
+            self.sf = 1000.0
+            self.name = "RNA"
+            self.resources = ResourceBudget(8 * 1024 * 1024, 2)
+            self.rawDataT = counts_t
+            self.n_term_per_doc = np.ones(8)
+            self.n_docs_per_term = np.ones(12)
+            self.n_docs = 8
+
+        def normed(self, cell_idx, feat_idx, **_kwargs):
+            self.n_term_per_doc = np.ones(len(cell_idx))
+            self.n_docs_per_term = np.ones(len(feat_idx))
+            self.n_docs = len(cell_idx)
+
+    for method in (norm_clr, norm_dummy, norm_tf_idf):
+        results = find_markers_by_rank(
+            FakeAssay(method),
+            group_key="cluster",
+            cell_key="I",
+            feat_key="I",
+            nthreads=1,
+        )
+        assert set(results) == {"a", "b"}
+
+    import scarf.storage.feature_stream as feature_stream_module
+
+    class SignedRNA(FakeAssay):
+        def _raw_feature_stream_source(self):
+            return SimpleNamespace(dtype=np.float32), 1, 0
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(marker_search_module, "RNAassay", SignedRNA)
+    original_map = feature_stream_module.map_feature_read_groups
+
+    def map_with_empty_group(counts_t, process, **kwargs):
+        process(
+            FeatureReadGroup(
+                featStart=0,
+                featEnd=1,
+                values=np.zeros((1, 8), dtype=np.float32),
+                readSec=0.0,
+                blockBytes=1,
+            )
+        )
+        yield from original_map(counts_t, process, **kwargs)
 
     monkeypatch.setattr(
-        "scarf.features.markers.find_markers_by_rank",
-        capture_marker_search,
+        feature_stream_module, "map_feature_read_groups", map_with_empty_group
     )
-    monkeypatch.setattr(
-        datastore_ephemeral,
-        "_get_latest_keys",
-        lambda from_assay, cell_key, feat_key: ("RNA", "I", "I"),
-    )
-
-    result = datastore_ephemeral.run_marker_search(
-        group_key="batch_contract_groups",
-        gene_batch_size=100,
-        skip_save=True,
-    )
-
-    assert result is expected
-    assert captured["batch_size"] == 100
+    try:
+        signed = SignedRNA(norm_lib_size)
+        signed.rawDataT = _counts_t_with_plan(values.astype(np.float32))
+        results = find_markers_by_rank(
+            signed,
+            group_key="cluster",
+            cell_key="I",
+            feat_key="I",
+            nthreads=1,
+        )
+        assert set(results) == {"a", "b"}
+    finally:
+        monkeypatch.undo()

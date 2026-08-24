@@ -1,12 +1,12 @@
 import os
 import shutil
 
-__all__ = ["full_path", "remove", "dask_total_sum"]
+__all__ = ["full_path", "remove", "chunked_total_sum"]
 
 _DATASETS_DIR = os.path.join(os.path.dirname(__file__), "datasets")
 
 
-def dask_total_sum(raw_data) -> int:
+def chunked_total_sum(raw_data) -> int:
     total = 0
     for block in raw_data.blocks:
         total += int(block.compute().sum())

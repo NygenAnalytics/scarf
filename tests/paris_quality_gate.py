@@ -1157,14 +1157,14 @@ def _best_cpm_partition(
 def evaluate_quality_gate(
     seed_count: int = DEFAULT_SEED_COUNT,
     *,
-    n_threads: int = 4,
+    nthreads: int = 4,
 ) -> QualityGateReport:
     if seed_count < 1:
         raise ValueError("seed_count must be positive")
     outcomes: list[SeedQuality] = []
     for seed in range(seed_count):
         graph, truth = unequal_depth_block_graph(seed)
-        hierarchy = fit_paris_hierarchy(graph, n_threads=n_threads)
+        hierarchy = fit_paris_hierarchy(graph, nthreads=nthreads)
         forest = collapse_equal_height_plateaus(hierarchy)
         split_gate = modularity_split_gains(hierarchy, forest, graph)
         adaptive = adaptive_cut(
@@ -1220,7 +1220,7 @@ def main() -> None:
     parser.add_argument("--seeds", type=int, default=DEFAULT_SEED_COUNT)
     parser.add_argument("--threads", type=int, default=4)
     arguments = parser.parse_args()
-    report = evaluate_quality_gate(arguments.seeds, n_threads=arguments.threads)
+    report = evaluate_quality_gate(arguments.seeds, nthreads=arguments.threads)
     print(json.dumps(asdict(report), indent=2))
     if not report.passed:
         raise SystemExit(1)

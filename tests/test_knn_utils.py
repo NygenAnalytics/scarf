@@ -1,5 +1,6 @@
 import functools
 import json
+import sys
 import warnings
 from pathlib import Path
 
@@ -57,12 +58,81 @@ def _grouped_knn_indices(groups: list[list[int]]) -> np.ndarray:
     return graph.indices.reshape(graph.shape[0], degree)
 
 
-def test_leiden_membership_preserves_disconnected_partitions():
+@pytest.mark.parametrize("backend", ["igraph", "leidenalg"])
+def test_leiden_membership_preserves_disconnected_partitions(backend):
     graph = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]])
 
-    actual = leiden_membership(graph, resolution=1.0, random_seed=4444)
+    actual = leiden_membership(
+        graph,
+        resolution=1.0,
+        random_seed=4444,
+        backend=backend,
+    )
 
     assert adjusted_rand_score([1, 1, 1, 1, 2, 2, 2, 2], actual) == pytest.approx(1.0)
+
+
+def test_native_leiden_membership_is_seeded_and_repeatable():
+    graph = _simple_knn_graph(100)
+
+    first = leiden_membership(graph, resolution=1.0, random_seed=4444)
+    second = leiden_membership(graph, resolution=1.0, random_seed=4444)
+
+    np.testing.assert_array_equal(second, first)
+
+
+def test_leiden_membership_rejects_unknown_backend():
+    graph = _simple_knn_graph(10)
+
+    with pytest.raises(ValueError, match="backend"):
+        leiden_membership(
+            graph,
+            resolution=1.0,
+            random_seed=4444,
+            backend="unknown",  # type: ignore[arg-type]
+        )
+
+
+def test_igraph_leiden_ignores_explicit_zero_weight_edges():
+    solid = _grouped_knn_graph([[0, 1, 2, 3], [4, 5, 6, 7]]).tocoo()
+    padded = coo_matrix(
+        (
+            np.concatenate([solid.data, np.zeros(4)]),
+            (
+                np.concatenate([solid.row, np.array([0, 1, 2, 3])]),
+                np.concatenate([solid.col, np.array([4, 5, 6, 7])]),
+            ),
+        ),
+        shape=solid.shape,
+    )
+
+    assert np.count_nonzero(padded.data) != padded.nnz
+
+    actual = leiden_membership(padded, resolution=1.0, random_seed=4444)
+    expected = leiden_membership(solid, resolution=1.0, random_seed=4444)
+
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_igraph_membership_requires_igraph(monkeypatch):
+    monkeypatch.setitem(sys.modules, "igraph", None)
+    graph = _simple_knn_graph(10)
+
+    with pytest.raises(ImportError, match="igraph"):
+        leiden_membership(graph, resolution=1.0, random_seed=4444)
+
+
+def test_leidenalg_membership_requires_leidenalg(monkeypatch):
+    monkeypatch.setitem(sys.modules, "leidenalg", None)
+    graph = _simple_knn_graph(10)
+
+    with pytest.raises(ImportError, match="leidenalg"):
+        leiden_membership(
+            graph,
+            resolution=1.0,
+            random_seed=4444,
+            backend="leidenalg",
+        )
 
 
 def test_diffusion_operator_matches_powered_row_normalization():
@@ -580,7 +650,7 @@ def test_wnn_integration_handles_extreme_affinities_without_runtime_warnings():
             "ADT",
             indices2,
             ld2,
-            n_threads=1,
+            nthreads=1,
         )
 
     assert isinstance(merged, coo_matrix)
@@ -611,7 +681,7 @@ def test_wnn_integration_is_invariant_to_cell_order():
         "ADT",
         indices2,
         ld2,
-        n_threads=1,
+        nthreads=1,
     )
 
     permutation = np.array([5, 0, 7, 2, 6, 1, 4, 3])
@@ -623,7 +693,7 @@ def test_wnn_integration_is_invariant_to_cell_order():
         "ADT",
         old_to_new[indices2[permutation]],
         ld2[permutation],
-        n_threads=1,
+        nthreads=1,
     )
     inverse = np.argsort(permutation)
     restored = permuted.tocsr()[inverse][:, inverse]
@@ -644,7 +714,7 @@ def test_wnn_integration_rejects_mismatched_neighbor_rows():
             "ADT",
             indices2,
             np.zeros((7, 2)),
-            n_threads=1,
+            nthreads=1,
         )
 
 
@@ -657,7 +727,7 @@ def test_two_input_wnn_adapter_preserves_duplicate_diagnostic_names():
         "second",
         indices2,
         ld2,
-        n_threads=1,
+        nthreads=1,
     )
     actual, actual_weights = wnn_integration(
         "same",
@@ -666,7 +736,7 @@ def test_two_input_wnn_adapter_preserves_duplicate_diagnostic_names():
         "same",
         indices2,
         ld2,
-        n_threads=1,
+        nthreads=1,
     )
 
     np.testing.assert_array_equal(actual.row, expected.row)
@@ -736,7 +806,7 @@ def test_wnn_integration_rejects_invalid_neighbor_matrices(indices, error, match
             "ADT",
             valid,
             embeddings,
-            n_threads=1,
+            nthreads=1,
         )
 
 
@@ -766,7 +836,7 @@ def test_wnn_integration_rejects_invalid_embeddings(embedding, match):
             "ADT",
             indices,
             valid_embedding,
-            n_threads=1,
+            nthreads=1,
         )
 
 
@@ -788,7 +858,7 @@ def test_wnn_integration_uses_minimum_neighbor_count_for_mismatched_graphs():
             "ADT",
             indices2,
             ld2,
-            n_threads=1,
+            nthreads=1,
         )
         swapped, swapped_weights = wnn_integration(
             "ADT",
@@ -797,7 +867,7 @@ def test_wnn_integration_uses_minimum_neighbor_count_for_mismatched_graphs():
             "RNA",
             indices1,
             ld1,
-            n_threads=1,
+            nthreads=1,
         )
     finally:
         logger.remove(sink)
@@ -824,7 +894,7 @@ def test_wnn_integration_is_invariant_to_per_modality_scale(
         "ADT",
         indices2,
         ld2,
-        n_threads=1,
+        nthreads=1,
         l2_normalize=l2_normalize,
     )
     if modality == 1:
@@ -839,7 +909,7 @@ def test_wnn_integration_is_invariant_to_per_modality_scale(
         "ADT",
         indices2,
         ld2,
-        n_threads=1,
+        nthreads=1,
         l2_normalize=l2_normalize,
     )
 
@@ -865,7 +935,7 @@ def test_wnn_integration_uses_nearest_to_kth_distance_span_for_bandwidth():
         "ADT",
         indices,
         embedding,
-        n_threads=1,
+        nthreads=1,
         l2_normalize=False,
     )
     row_zero = graph.data[graph.row == 0]
@@ -890,7 +960,7 @@ def test_wnn_integration_handles_degenerate_bandwidth_deterministically():
         "ADT",
         indices2,
         embedding2,
-        n_threads=1,
+        nthreads=1,
     )
     second, second_weights = wnn_integration(
         "RNA",
@@ -899,7 +969,7 @@ def test_wnn_integration_handles_degenerate_bandwidth_deterministically():
         "ADT",
         indices2,
         embedding2,
-        n_threads=1,
+        nthreads=1,
     )
 
     np.testing.assert_array_equal(first.row, second.row)
@@ -927,7 +997,7 @@ def test_wnn_integration_matches_scalar_affinity_reference():
         "ADT",
         indices2,
         ld2,
-        n_threads=1,
+        nthreads=1,
     )
 
     np.testing.assert_array_equal(
@@ -957,7 +1027,7 @@ def test_wnn_many_matches_independent_scalar_reference():
 
     actual, actual_weights = _wnn_integration_many(
         modalities,
-        n_threads=1,
+        nthreads=1,
     )
 
     assert actual_weights.shape == (len(expected_indices), 3)
@@ -982,12 +1052,12 @@ def test_wnn_many_matches_independent_scalar_reference():
 
 def test_wnn_many_is_equivariant_to_modality_permutation():
     modalities = _three_way_wnn_inputs()
-    expected, expected_weights = _wnn_integration_many(modalities, n_threads=1)
+    expected, expected_weights = _wnn_integration_many(modalities, nthreads=1)
     permutation = [2, 0, 1]
 
     actual, actual_weights = _wnn_integration_many(
         [modalities[index] for index in permutation],
-        n_threads=1,
+        nthreads=1,
     )
 
     np.testing.assert_allclose(actual.toarray(), expected.toarray())
@@ -1001,7 +1071,7 @@ def test_wnn_many_is_equivariant_to_modality_permutation():
 
 def test_wnn_many_is_invariant_to_cell_order():
     modalities = _three_way_wnn_inputs()
-    expected, expected_weights = _wnn_integration_many(modalities, n_threads=1)
+    expected, expected_weights = _wnn_integration_many(modalities, nthreads=1)
     permutation = np.array([5, 0, 7, 2, 6, 1, 4, 3])
     old_to_new = np.argsort(permutation)
     permuted_modalities = [
@@ -1015,7 +1085,7 @@ def test_wnn_many_is_invariant_to_cell_order():
 
     actual, actual_weights = _wnn_integration_many(
         permuted_modalities,
-        n_threads=1,
+        nthreads=1,
     )
     inverse = np.argsort(permutation)
 
@@ -1032,7 +1102,7 @@ def test_wnn_many_handles_degenerate_bandwidths():
         for name, indices, embedding in _three_way_wnn_inputs()
     ]
 
-    graph, weights = _wnn_integration_many(modalities, n_threads=1)
+    graph, weights = _wnn_integration_many(modalities, nthreads=1)
 
     np.testing.assert_array_equal(graph.data, np.ones(graph.nnz, dtype=np.float32))
     np.testing.assert_allclose(weights, 1 / 3, rtol=0, atol=1e-7)
@@ -1042,11 +1112,11 @@ def test_wnn_many_rejects_too_few_or_duplicate_modalities():
     modalities = _three_way_wnn_inputs()
 
     with pytest.raises(ValueError, match="at least two modalities"):
-        _wnn_integration_many(modalities[:1], n_threads=1)
+        _wnn_integration_many(modalities[:1], nthreads=1)
     with pytest.raises(ValueError, match="names must be unique"):
         _wnn_integration_many(
             [modalities[0], ("RNA", modalities[1][1], modalities[1][2])],
-            n_threads=1,
+            nthreads=1,
         )
 
 
@@ -1105,7 +1175,7 @@ def test_wnn_integration_follows_informative_modality_across_numeric_scales():
         "ADT",
         indices2,
         noisy,
-        n_threads=1,
+        nthreads=1,
         l2_normalize=False,
     )
     selected = graph.col.reshape(len(indices1), -1)
@@ -1165,7 +1235,7 @@ def test_wnn_integration_is_scale_invariant_at_near_degenerate_bandwidth():
             "ADT",
             indices2,
             ld2,
-            n_threads=1,
+            nthreads=1,
             l2_normalize=False,
         )
         for scale in (1.0, 1e6, 1e9)
@@ -1203,7 +1273,7 @@ def _seurat_golden_wnn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         "ADT",
         indices2,
         np.asarray(inputs["adtEmbedding"], dtype=np.float64),
-        n_threads=1,
+        nthreads=1,
         l2_normalize=fixture["provenance"]["l2Normalize"],
     )
     shape = indices1.shape
@@ -1233,7 +1303,7 @@ def _seurat_three_way_golden_wnn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     ]
     graph, weights = _wnn_integration_many(
         modalities,
-        n_threads=1,
+        nthreads=1,
         l2_normalize=fixture["provenance"]["l2Normalize"],
     )
     shape = modalities[0][1].shape
@@ -1353,7 +1423,7 @@ def test_wnn_integration_output_contract():
         "ADT",
         indices2,
         ld2,
-        n_threads=1,
+        nthreads=1,
     )
 
     assert not np.any(graph.row == graph.col)

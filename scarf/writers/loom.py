@@ -4,6 +4,8 @@ import numpy as np
 
 from ..storage.types import as_zarr_group
 from ..readers import LoomReader
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -20,6 +22,18 @@ class LoomToZarr:
         loom: LoomReader object used to open Loom format file
         zarr_loc: Output Zarr filename with path
         assay_name: Name for the output assay. If not provided then automatically set to RNA
+        workspace: Workspace name in the destination store. None uses the
+                   legacy layout without a workspace group.
+        storage_options: Backend options passed when opening the Zarr store.
+        mem_budget: Memory available to the conversion. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
+        nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
 
     Attributes:
         loom: A scarf.LoomReader object used to open Loom format file.
@@ -38,8 +52,8 @@ class LoomToZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import create_zarr_count_assay, validate_assay_name
@@ -49,6 +63,8 @@ class LoomToZarr:
         self.loom = loom
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.policy = policy
+        self.io = io
         self.workspace = workspace
         self.storage_options = storage_options
         if assay_name is None:
@@ -68,8 +84,7 @@ class LoomToZarr:
             feat_names=self.loom.feature_names(),
             dtype=self.loom.matrixDtype,
             profile=self.profile,
-            targetChunkBytes=targetChunkBytes,
-            targetShardBytes=targetShardBytes,
+            policy=policy,
         )
         self._ini_feature_data()
 
@@ -163,6 +178,7 @@ class LoomToZarr:
             )
             + dense_source_bytes,
             msg="Writing Loom counts",
+            io=self.io,
         )
         if total_cells_written != self.loom.nCells:
             raise AssertionError(
@@ -172,4 +188,15 @@ class LoomToZarr:
         logger.info(
             f"Wrote {self.loom.nCells} cells and {self.loom.nFeatures} features "
             f"from Loom to assay {self.assayName}"
+        )
+        from .counts_t import finalize_writer_counts_t
+
+        finalize_writer_counts_t(
+            self.z,
+            self.assayName,
+            self.workspace,
+            resources=self.resources,
+            profile=self.profile,
+            policy=self.policy,
+            io=self.io,
         )

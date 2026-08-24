@@ -37,52 +37,6 @@ def _divisors(value: int) -> tuple[int, ...]:
     return tuple(small + large[::-1])
 
 
-def _aligned_count_layout(
-    nCells: int,
-    nFeats: int,
-    itemsize: int,
-    *,
-    targetChunkBytes: int,
-    targetShardBytes: int,
-) -> tuple[tuple[int, int], tuple[int, int]]:
-    n_cells = max(1, int(nCells))
-    n_feats = max(1, int(nFeats))
-    stored_bytes = max(1, int(itemsize))
-    chunk_target = max(stored_bytes, int(targetChunkBytes))
-    shard_target = max(stored_bytes, int(targetShardBytes))
-    inner_limit = min(chunk_target, _CODEC_MAX_BYTES)
-
-    candidates = tuple(
-        divisor
-        for divisor in _divisors(n_feats)
-        if (n_feats // divisor) * stored_bytes <= inner_limit
-    )
-    if not candidates:
-        raise ValueError(
-            f"A single stored value requires {stored_bytes} bytes, exceeding "
-            f"the codec input limit of {inner_limit} bytes"
-        )
-    feature_chunks = min(
-        candidates,
-        key=lambda divisor: (
-            abs(divisor * chunk_target - shard_target),
-            divisor,
-        ),
-    )
-    feature_chunk = n_feats // feature_chunks
-    row_bytes = n_feats * stored_bytes
-    inner_row_bytes = feature_chunk * stored_bytes
-    shard_rows = max(
-        1,
-        min(
-            n_cells,
-            inner_limit // inner_row_bytes,
-            shard_target // row_bytes,
-        ),
-    )
-    return (shard_rows, feature_chunk), (shard_rows, n_feats)
-
-
 @dataclass(frozen=True, slots=True)
 class ZarrArraySpec:
     """Specification for creating a numeric Zarr array."""
@@ -151,35 +105,37 @@ def count_array_spec(
     dtype: Any = "uint32",
     *,
     profile: StorageProfile,
-    targetChunkBytes: int | None = None,
-    targetShardBytes: int | None = None,
+    policy: Any | None = None,
     zarrFormat: int = 3,
 ) -> ZarrArraySpec:
-    """Build an array specification for an assay count matrix."""
+    """Build an array specification for an assay count matrix.
+
+    Zarr v3 uses the paired rotateOnce U/Q geometry. Zarr v2 stores plain
+    chunks without shards.
+    """
+    if int(zarrFormat) >= 3:
+        from .count_matrix import DEFAULT_COUNT_MATRIX_POLICY, plan_count_matrix_pair
+
+        return plan_count_matrix_pair(
+            nCells,
+            nFeats,
+            dtype,
+            policy=policy or DEFAULT_COUNT_MATRIX_POLICY,
+            profile=profile,
+        ).counts
+    n_cells = max(0, int(nCells))
+    n_feats = max(0, int(nFeats))
     itemsize = int(np.dtype(dtype).itemsize)
-    chunk_target = (
-        DEFAULT_TARGET_CHUNK_BYTES
-        if targetChunkBytes is None
-        else int(targetChunkBytes)
-    )
-    shard_target = (
-        DEFAULT_TARGET_SHARD_BYTES
-        if targetShardBytes is None
-        else int(targetShardBytes)
-    )
-    if chunk_target <= 0 or shard_target <= 0:
-        raise ValueError("Chunk and shard targets must be positive")
-    chunks, shards = _aligned_count_layout(
-        nCells,
-        nFeats,
-        itemsize,
-        targetChunkBytes=chunk_target,
-        targetShardBytes=shard_target,
-    )
+    if n_cells == 0 or n_feats == 0:
+        chunks = (1, 1)
+    else:
+        row_bytes = max(1, n_feats * itemsize)
+        chunk_rows = max(1, min(n_cells, DEFAULT_TARGET_CHUNK_BYTES // row_bytes))
+        chunks = (chunk_rows, n_feats)
     return ZarrArraySpec(
         shape=(nCells, nFeats),
         chunks=chunks,
-        shards=shards if zarrFormat >= 3 else None,
+        shards=None,
         dtype=dtype,
         compressors=get_compressors(profile, zarrFormat=zarrFormat),
         fillValue=0,

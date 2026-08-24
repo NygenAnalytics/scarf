@@ -151,9 +151,11 @@ def test_forced_profile_stages_invalidate_reusable_artifacts() -> None:
             _resources(),
             invalidateCache=True,
         )
+        assert store.calls
         assert all(
             kwargs.get("invalidate_cache") is True
-            for _method, _args, kwargs in store.calls
+            for method, _args, kwargs in store.calls
+            if not method.startswith("_")
         )
 
 
@@ -241,3 +243,72 @@ def test_graph_construction_profile_stages_chain_through_persisted_assay_state(
     assert state.ann_index is not None
     assert state.neighbors is not None
     assert state.connectivity_map is not None
+
+
+def test_run_stage_persists_every_execution_report_and_wire_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.execution import (
+        ExecutionReport,
+        WorkShape,
+        clear_execution_reports,
+        plan_operation,
+        record_execution_report,
+    )
+
+    from profiling.stages import run_stage
+
+    clear_execution_reports()
+    plan = plan_operation(
+        ResourceBudget(8 * 1024 * 1024, 4),
+        WorkShape(nUnits=4, unitBytes=1024),
+    )
+
+    def open_store(*_args: Any, **_kwargs: Any) -> object:
+        return object()
+
+    def run_analysis(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        record_execution_report(
+            ExecutionReport(
+                plan=plan,
+                unitKind="countsRowBlock",
+                actualReadWorkers=1,
+                actualComputeWorkers=1,
+                actualWriteWorkers=1,
+            )
+        )
+        record_execution_report(
+            ExecutionReport(
+                plan=plan,
+                unitKind="countsTCellBand",
+                actualReadWorkers=2,
+                actualComputeWorkers=1,
+                actualWriteWorkers=1,
+                fetchSeconds=0.5,
+                readerWaitSeconds=0.25,
+            )
+        )
+        return {"consume": {"unitKind": "countsTCellBand"}}
+
+    monkeypatch.setattr("profiling.stages._open_datastore", open_store)
+    monkeypatch.setattr("profiling.stages._run_analysis", run_analysis)
+
+    result = run_stage(
+        "markHvgs",
+        nRows=1000,
+        storeUri=str(tmp_path / "store.zarr"),
+        workflow=WorkflowParameters(),
+        resources=_resources(),
+        sampleIntervalSeconds=0.01,
+    )
+
+    assert result.status == "ok"
+    assert result.details is not None
+    reports = result.details["executionReports"]
+    assert "countsRowBlock" in reports
+    assert reports["countsTCellBand"][-1]["fetchSeconds"] == 0.5
+    assert reports["countsTCellBand"][-1]["readerWaitSeconds"] == 0.25
+    assert result.details["storeOperations"]["gets"] == 0
+    assert result.details["consume"]["unitKind"] == "countsTCellBand"

@@ -11,10 +11,10 @@ from .balanced_cut import BalancedCut
 def fit_paris_hierarchy(
     graph: spmatrix,
     *,
-    n_threads: int | None = None,
+    nthreads: int | None = None,
 ) -> ParisHierarchy:
     """Fit the canonical component-aware Paris hierarchy."""
-    return _fit_paris_hierarchy(graph, n_threads=n_threads)
+    return _fit_paris_hierarchy(graph, nthreads=nthreads)
 
 
 def hierarchy_to_dendrogram(
@@ -35,10 +35,10 @@ def hierarchy_to_dendrogram(
 def paris_dendrogram(
     graph: spmatrix,
     *,
-    n_threads: int | None = None,
+    nthreads: int | None = None,
 ) -> np.ndarray:
     """Fit Paris and map synthetic component joins to zero."""
-    hierarchy = fit_paris_hierarchy(graph, n_threads=n_threads)
+    hierarchy = fit_paris_hierarchy(graph, nthreads=nthreads)
     return hierarchy_to_dendrogram(hierarchy, compatibility=True)
 
 

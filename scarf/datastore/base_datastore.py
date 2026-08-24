@@ -17,7 +17,7 @@ from ..storage.artifacts import (
 )
 from ..storage.types import ZarrMode, as_zarr_array, as_zarr_group
 from ..storage.budget import ResourceBudget
-from ..assay import RNAassay, ATACassay, ADTassay, Assay
+from ..assay import RNAassay, ATACassay, ADTassay, Assay, preset_assay_types
 from ..assay.base import _defer_feature_props
 from ..metadata import MetaData
 from ..metadata.artifacts import (
@@ -103,9 +103,15 @@ class BaseDataStore:
         mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``MT-|mt``.
         ribo_pattern: Regex pattern to capture ribosomal genes. When None, uses
                       ``RPS|RPL|MRPS|MRPL``.
-        nthreads: Number of maximum threads to use in all multi-threaded functions
-        zarr_mode: For read-write mode use r+' or for read-only use 'r' (Default value: 'r+')
+        zarr_mode: For read-write mode use ``r+`` or for read-only use ``r``.
+                   (Default value: ``r+``)
         workspace: Workspace name within the Zarr store (None for legacy single-workspace layout).
+        resources: Resolved memory and worker budget for this datastore.
+        storage_profile: Zarr encoding profile used for new arrays written
+                         through this datastore.
+        storage_options: Backend options passed when opening the Zarr store.
+        storageIo: Optional explicit read, compute, and write widths for storage
+                   work. Unset values stay under automatic planning.
 
     Attributes:
         cells: MetaData object with cells and info about each cell (e. g. RNA_nCounts ids).
@@ -127,6 +133,7 @@ class BaseDataStore:
         resources: ResourceBudget,
         storage_profile: StorageProfile,
         storage_options: dict[str, Any] | None = None,
+        storageIo: Any | None = None,
     ):
         self.zarr_mode = zarr_mode
         self.zarr_loc = zarr_loc
@@ -161,6 +168,7 @@ class BaseDataStore:
         self.nthreads = self.resources.workers
         self.memoryBytes = self.resources.memoryBytes
         self.storageProfile = storage_profile
+        self.storageIo = storageIo
         _ = self.assay_names
         # The order is critical here:
         self.cells = self._load_cells()
@@ -182,6 +190,13 @@ class BaseDataStore:
         else:
             ret_val: zarr.Group = self.z[self.workspace]  # type: ignore
         return ret_val
+
+    @property
+    def last_execution_report(self) -> Any:
+        """Return the most recent storage execution report, if any."""
+        from ..storage.execution import last_execution_report
+
+        return last_execution_report()
 
     def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus:
         """Inspect a logical artifact without mutating the store."""
@@ -389,19 +404,7 @@ class BaseDataStore:
         Returns:
         """
 
-        preset_assay_types = {
-            "RNA": RNAassay,
-            "ATAC": ATACassay,
-            "ADT": ADTassay,
-            "HTO": ADTassay,
-            "CRISPR": Assay,
-            "ANTIGEN": Assay,
-            "CUSTOM": Assay,
-            "GeneActivity": RNAassay,
-            "GeneScores": RNAassay,
-            "URNA": RNAassay,
-            "Assay": Assay,
-        }
+        preset_assay_types_map = preset_assay_types()
         caution_statement = (
             "%s was set as a generic Assay with no normalization. If this is unintended "
             "then please make sure that you provide a correct assay type for this assay using "
@@ -425,13 +428,13 @@ class BaseDataStore:
             custom_assay_types = {}
         for i in self.assay_names:
             if i in custom_assay_types:
-                if custom_assay_types[i] in preset_assay_types:
-                    assay = preset_assay_types[custom_assay_types[i]]
+                if custom_assay_types[i] in preset_assay_types_map:
+                    assay = preset_assay_types_map[custom_assay_types[i]]
                     assay_name = custom_assay_types[i]
                 else:
                     logger.warning(
                         f"{custom_assay_types[i]} is not a recognized assay type. Has to be one of "
-                        f"{', '.join(list(preset_assay_types.keys()))}\nPLease note that the names are"
+                        f"{', '.join(list(preset_assay_types_map.keys()))}\nPLease note that the names are"
                         f" case-sensitive."
                     )
                     logger.warning(caution_statement % i)
@@ -443,10 +446,10 @@ class BaseDataStore:
                     z_attrs[i] = assay_name
                     logger.debug(f"Setting assay {i} to assay type: {assay.__name__}")
             elif i in z_attrs:
-                assay = preset_assay_types[z_attrs[i]]
+                assay = preset_assay_types_map[z_attrs[i]]
             else:
-                if i in preset_assay_types:
-                    assay = preset_assay_types[i]
+                if i in preset_assay_types_map:
+                    assay = preset_assay_types_map[i]
                     assay_name = i
                 else:
                     logger.warning(caution_statement % i)
@@ -467,6 +470,7 @@ class BaseDataStore:
                     nthreads=self.nthreads,
                     matrix_root=self._matrix_z,
                     resources=self.resources,
+                    storageIo=self.storageIo,
                 )
             setattr(self, i, loaded_assay)
         if self.zw.attrs["assayTypes"] != z_attrs:

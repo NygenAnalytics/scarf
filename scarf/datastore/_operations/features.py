@@ -24,6 +24,7 @@ from ...storage.artifacts import (
 from ...storage.selections import resolve_selection_artifact
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...assay import RNAassay, lib_size_feature_stream_eligible
+from ...assay.normalization import reject_unknown_normalization_params
 from ...features.enrichment.results import EnrichmentResult
 from ...features.markers.table import (
     MARKER_ADJUSTMENT_METHOD,
@@ -144,6 +145,12 @@ def _load_marker_cluster_frame(
     )
 
 
+def _aligned_feature_labels(values: np.ndarray, index: pd.Index) -> np.ndarray:
+    """Return feature labels as a hashable NumPy array aligned to ``index``."""
+    labels = np.asarray(values, dtype=object).reshape(-1)
+    return labels[np.asarray(index, dtype=np.intp)]
+
+
 def _group_assignment_digest(values: np.ndarray) -> str:
     return array_digest(np.asarray(values).astype(str))
 
@@ -240,7 +247,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         from_assay: str | None = None,
         cell_key: str | None = None,
         min_cells: int = 20,
-        top_n: int = 2000,
+        top_n: int = 1000,
         min_var: float = -np.inf,
         max_var: float = np.inf,
         min_mean: float = -np.inf,
@@ -273,7 +280,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                        ``HVG_UBIQUITOUS_SLACK`` selected cells are excluded (``n_selected - 20``). Pass
                        ``inf`` to disable the ubiquitous-gene filter.
             top_n: Number of top most variable genes to be set as HVGs. This value is ignored if a value is provided
-                   for `min_var` parameter. (Default: 2000)
+                   for `min_var` parameter. (Default: 1000)
             min_var: Minimum variance threshold for HVG selection. (Default: -Infinity)
             max_var: Maximum variance threshold for HVG selection. (Default: Infinity)
             min_mean: Minimum mean value of expression threshold for HVG selection. (Default: -Infinity)
@@ -963,8 +970,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         group_key: str | None = None,
         cell_key: str | None = None,
         feat_key: str | None = None,
-        gene_batch_size: int | None = None,
-        n_threads: int | None = None,
+        nthreads: int | None = None,
         skip_save: bool = False,
         invalidate_cache: bool = False,
         **norm_params: Any,
@@ -981,10 +987,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             cell_key: To run the test on specific subset of cells, provide the name of a boolean column in
                         the cell metadata table. (Default value: 'I')
             feat_key: Boolean feature metadata column selecting features (default: ``'I'``).
-            gene_batch_size: Number of genes loaded per batch. When None,
-                selected genes are grouped into chunk-aligned blocks that fit
-                the operation memory budget.
-            n_threads: Threads for marker search.
+            nthreads: Threads for marker search.
             skip_save: If True, return results without writing to Zarr.
             **norm_params: Extra keyword arguments forwarded to ``normed``.
 
@@ -993,6 +996,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         """
         from ...features.markers import find_markers_by_rank
 
+        reject_unknown_normalization_params(
+            norm_params,
+            caller="run_marker_search",
+        )
         if group_key is None:
             raise ValueError(
                 "ERROR: Please provide a value for `group_key`. This should be the name of a column from "
@@ -1005,8 +1012,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         )
         if feat_key is None:
             feat_key = "I"
-        if n_threads is None:
-            n_threads = self.nthreads
+        if nthreads is None:
+            nthreads = self.nthreads
         assay = self._get_assay(from_assay)
         resolved_norm_params = {
             **norm_params,
@@ -1021,7 +1028,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         logger.debug(
             f"Running marker search for {from_assay}/{slot_name} "
             f"(feat_key={feat_key}, "
-            f"batch_size={gene_batch_size if gene_batch_size is not None else 'auto'})"
+            f"nthreads={nthreads})"
         )
         planned = None
         group_cell_counts: dict[Any, tuple[int, int]] = {}
@@ -1129,8 +1136,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 group_key=group_key,
                 cell_key=cell_key,
                 feat_key=feat_key,
-                gene_batch_size=gene_batch_size,
-                n_threads=n_threads,
+                nthreads=nthreads,
                 invalidate_cache=invalidate_cache,
             )
             planned = arguments.plan(
@@ -1179,8 +1185,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             group_key=group_key,
             cell_key=cell_key,
             feat_key=feat_key,
-            batch_size=gene_batch_size,
-            n_threads=n_threads,
+            nthreads=nthreads,
             **resolved_norm_params,
         )
 
@@ -1193,7 +1198,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         t_save = time.perf_counter()
         assert planned is not None
         remote_slot = start_artifact(self.zw, planned)
-        workers = max(1, int(n_threads or self.nthreads))
+        workers = max(1, int(nthreads or self.nthreads))
         self._write_marker_slot(
             remote_slot,
             markers,
@@ -1566,6 +1571,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             lambda start, end: matrix[start:end, :],
             msg="Writing grouped assay",
             resources=self.resources,
+            io=self.storageIo,
         )
 
         self._load_assays(min_cells=0, custom_assay_types={assay_label: "Assay"})
@@ -1691,6 +1697,17 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             renormalization=renormalization,
             peaks_coords=peaks_coords,
             idf_cell_idx=idf_cell_idx,
+        )
+
+        from ...storage.stores import zarr_group_root
+        from ...writers.counts_t import finalize_writer_counts_t
+
+        finalize_writer_counts_t(
+            zarr_group_root(self.z, mode="r+"),
+            assay_label,
+            self.workspace,
+            assay_type=assay_type,
+            resources=self.resources,
         )
 
         self._load_assays(min_cells=10, custom_assay_types={assay_label: assay_type})
@@ -1833,13 +1850,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         if feature_label == "id":
             vals_df.set_index(
-                pd.Series(assay.feats.fetch_all("ids")).reindex(vals_df.index).values,
+                _aligned_feature_labels(assay.feats.fetch_all("ids"), vals_df.index),
                 inplace=True,
                 drop=True,
             )
         elif feature_label == "name":
             vals_df.set_index(
-                pd.Series(assay.feats.fetch_all("names")).reindex(vals_df.index).values,
+                _aligned_feature_labels(assay.feats.fetch_all("names"), vals_df.index),
                 inplace=True,
                 drop=True,
             )

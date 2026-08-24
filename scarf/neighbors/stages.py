@@ -266,7 +266,7 @@ class AnnIndexStage:
         ef: int,
         m: int,
         rand_state: int,
-        ann_threads: int,
+        nthreads: int,
     ) -> Any:
         return instantiate_knn_index(
             metric,
@@ -276,7 +276,7 @@ class AnnIndexStage:
             m,
             rand_state,
             ef,
-            ann_threads,
+            nthreads,
         )
 
     @staticmethod
@@ -297,7 +297,7 @@ class AnnIndexStage:
         ef: int,
         m: int,
         rand_state: int,
-        ann_threads: int,
+        nthreads: int,
     ) -> Any:
         index = cls.create(
             metric=metric,
@@ -307,7 +307,7 @@ class AnnIndexStage:
             ef=ef,
             m=m,
             rand_state=rand_state,
-            ann_threads=ann_threads,
+            nthreads=nthreads,
         )
         return cls.populate(index, coordinates)
 

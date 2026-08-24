@@ -86,3 +86,50 @@ div.navbar-brand-box a.navbar-brand img,
         gap: 0.25rem;
     }
 }
+
+/* Side-by-side benchmark embedding comparison. */
+.benchmark-gallery {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.9rem;
+    margin: 1rem 0 0.5rem;
+}
+.benchmark-gallery > figure {
+    min-width: 0;
+    margin: 0;
+    padding: 0.5rem;
+    background: #fff;
+    border: 1px solid var(--pst-color-border, #d9d9d9);
+    border-radius: 0.55rem;
+}
+.benchmark-gallery > figure img {
+    display: block;
+    width: 100% !important;
+    height: auto;
+}
+.benchmark-gallery > figure figcaption {
+    margin-top: 0.35rem;
+    color: #222;
+    font-size: 0.82rem;
+    line-height: 1.35;
+    text-align: center;
+}
+.benchmark-gallery > figure figcaption p {
+    margin: 0;
+}
+img.benchmark-gallery-legend {
+    display: block;
+    margin: 0.4rem auto 1rem;
+    padding: 0.25rem;
+    background: #fff;
+    border-radius: 0.35rem;
+}
+@media (max-width: 767px) {
+    .benchmark-gallery {
+        grid-template-columns: 1fr;
+    }
+    .benchmark-gallery > figure {
+        width: min(100%, 30rem);
+        margin: 0 auto;
+    }
+}

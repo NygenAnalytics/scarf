@@ -110,6 +110,17 @@ ds.plots.cluster_tree(
 )
 ```
 
+## Why will my existing RNA Zarr store not open?
+
+Current Scarf versions write RNA counts twice: cell-major `counts` and a gene-major `countsT` copy.
+Opening an RNA assay fails if that copy is missing, incomplete, still Zarr v2, or does not match `counts`.
+There is no silent rewrite on open.
+
+Re-import the source, or write a new store with `python -m scarf.tools.repack_zarr`.
+After a rewrite, recompute HVG, normalization, PCA, graph, and marker results.
+Non-RNA assays do not use `countsT`.
+See {doc}`../concepts/memory_and_execution`.
+
 ## How do I create a count matrix for my single-cell data?
 
 Generating count matrices is the primary step of single-cell data analysis.

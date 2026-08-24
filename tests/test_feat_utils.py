@@ -333,6 +333,60 @@ def test_hvg_cell_count_bounds_include_minimum_and_exclude_maximum():
     )
 
 
+def _hvg_kwargs(**overrides):
+    values = dict(
+        min_cells=0,
+        max_cells=np.inf,
+        min_var=-np.inf,
+        max_var=np.inf,
+        min_mean=-np.inf,
+        max_mean=np.inf,
+        blacklist="",
+        keep_bounds=False,
+    )
+    values.update(overrides)
+    return values
+
+
+def test_hvg_exact_top_n_selects_all_when_top_n_equals_valid_count():
+    selected = select_highly_variable_features(
+        corrected_variance=np.array([3.0, 1.0, 2.0]),
+        normalized_cell_counts=np.full(3, 5),
+        mean_nonzero=np.ones(3),
+        active_features=np.ones(3, dtype=bool),
+        feature_names=np.array(["a", "b", "c"]),
+        top_n=3,
+        **_hvg_kwargs(),
+    )
+    np.testing.assert_array_equal(selected, np.array([True, True, True]))
+
+
+def test_hvg_exact_top_n_selects_the_sole_candidate():
+    selected = select_highly_variable_features(
+        corrected_variance=np.array([3.0, 1.0, 2.0]),
+        normalized_cell_counts=np.full(3, 5),
+        mean_nonzero=np.ones(3),
+        active_features=np.array([False, True, False]),
+        feature_names=np.array(["a", "b", "c"]),
+        top_n=10,
+        **_hvg_kwargs(),
+    )
+    np.testing.assert_array_equal(selected, np.array([False, True, False]))
+
+
+def test_hvg_exact_top_n_tie_breaks_by_feature_index():
+    selected = select_highly_variable_features(
+        corrected_variance=np.array([5.0, 5.0, 1.0]),
+        normalized_cell_counts=np.full(3, 5),
+        mean_nonzero=np.ones(3),
+        active_features=np.ones(3, dtype=bool),
+        feature_names=np.array(["a", "b", "c"]),
+        top_n=1,
+        **_hvg_kwargs(),
+    )
+    np.testing.assert_array_equal(selected, np.array([True, False, False]))
+
+
 def test_binned_sampling_excludes_query_genes():
     rng = np.random.default_rng(1)
     gene_names = [f"gene_{i}" for i in range(120)]

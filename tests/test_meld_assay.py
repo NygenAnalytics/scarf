@@ -617,6 +617,60 @@ def test_add_melded_assay_uses_cell_key_for_idf_and_keeps_all_rows(tmp_path):
     assert store.GeneScores.z.attrs["tfDenominator"] == "total_counts"
 
 
+def test_add_melded_assay_rna_writes_complete_counts_t(tmp_path):
+    raw = np.array(
+        [
+            [2, 0, 1],
+            [0, 3, 0],
+            [1, 0, 4],
+        ],
+        dtype=np.uint32,
+    )
+    peak_ids = ["chr1:100-200", "chr1:250-350", "chr2:100-200"]
+    store_path = tmp_path / "atac_gene_scores.zarr"
+    SparseToZarr(
+        csr_matrix(raw),
+        zarr_loc=str(store_path),
+        cell_ids=["cell_0", "cell_1", "cell_2"],
+        feature_ids=peak_ids,
+        assay_name="ATAC",
+        nthreads=1,
+    ).dump(batch_size=2)
+    store = DataStore(
+        str(store_path),
+        default_assay="ATAC",
+        min_features_per_cell=0,
+        min_cells_per_feature=0,
+        nthreads=1,
+    )
+    feature_bed = _features_bed(
+        [
+            ("chr1", 120, 300, "gene_a", "GENE_A", "+"),
+            ("chr2", 120, 180, "gene_b", "GENE_B", "+"),
+        ]
+    )
+    bed_path = tmp_path / "genes.bed"
+    feature_bed.to_csv(bed_path, sep="\t", header=False, index=False)
+
+    store.add_melded_assay(
+        from_assay="ATAC",
+        external_bed_fn=str(bed_path),
+        assay_label="GeneScores",
+        assay_type="RNA",
+        renormalization=False,
+    )
+
+    from scarf.assay import RNAassay
+
+    assert isinstance(store.GeneScores, RNAassay)
+    counts_t = store.z["GeneScores"]["countsT"]
+    assert counts_t.attrs["complete"] is True
+    np.testing.assert_array_equal(
+        np.asarray(counts_t[:]),
+        np.vstack(list(store.GeneScores.rawData.stream_blocks(nthreads=1, msg=None))).T,
+    )
+
+
 def test_create_counts_mat_with_renormalization_and_zero_sum_cell():
     assay, mapping, raw, n_counts, n_cells_peak = _build_melding_scenario()
     written = _run_create_counts_mat(
@@ -638,3 +692,98 @@ def test_create_counts_mat_with_renormalization_and_zero_sum_cell():
     # Non-empty cells are rescaled to sum to scalar_coeff.
     np.testing.assert_allclose(written[0].sum(), 1e4)
     np.testing.assert_allclose(written[1].sum(), 1e4)
+
+
+def test_meld_band_fits_four_gib_tenx_atac_scale() -> None:
+    from scarf.features.genomic.melding import (
+        _max_meld_band_rows,
+        _meld_count_matrix_policy,
+    )
+    from scarf.storage.count_matrix import (
+        DEFAULT_COUNT_MATRIX_POLICY,
+        plan_count_matrix_pair,
+    )
+
+    rows = _max_meld_band_rows(
+        memoryBytes=4 * 1024**3,
+        nDocs=10_000,
+        nSourceFeatures=140_000,
+        nTargetFeatures=60_000,
+        sourceItemsize=4,
+        storeItemsize=8,
+        mappingBytes=80 * 1024**2,
+        decodeBytes=256 * 1024**2,
+        extraResidentBytes=10_000 * 16,
+        preferredRows=2_000,
+        maxRows=10_000,
+    )
+    assert rows >= 1
+    policy = _meld_count_matrix_policy(
+        nCells=10_000,
+        nFeats=60_000,
+        dtype="float64",
+        bandRows=rows,
+    )
+    plan = plan_count_matrix_pair(10_000, 60_000, np.float64, policy=policy)
+    assert plan.counts.chunks[0] == rows
+    assert policy.unitBytes < DEFAULT_COUNT_MATRIX_POLICY.unitBytes
+
+
+def test_create_counts_mat_writes_under_budget_sparse_admission_rejected() -> None:
+    from scipy.sparse import csc_matrix
+
+    from scarf.features.genomic.melding import create_counts_mat
+    from scarf.storage.sharding import sparse_producer_peak_bytes
+
+    n_cells = 40
+    n_peaks = 80
+    n_genes = 20_000
+    rng = np.random.default_rng(0)
+    raw = rng.poisson(1, size=(n_cells, n_peaks)).astype(np.float64)
+    mapping = csc_matrix(
+        (
+            np.ones(n_peaks, dtype=np.float64),
+            (np.arange(n_peaks), np.arange(n_peaks) * (n_genes // n_peaks)),
+        ),
+        shape=(n_peaks, n_genes),
+    )
+    n_counts = np.maximum(raw.sum(axis=1), 1.0)
+    n_cells_peak = np.maximum((raw > 0).sum(axis=0).astype(np.float64), 1.0)
+    assay = _FakeAssay(
+        _FakeMeta({"ATAC_nCounts": n_counts}),
+        _FakeMeta({"nCells": n_cells_peak}),
+        _FakeRawData([raw[:20], raw[20:]]),
+    )
+    assay.resources = ResourceBudget(96 * 1024 * 1024, 1)
+
+    shard_rows = n_cells
+    dense_shard = shard_rows * n_genes * 8
+    write_headroom = max(64 * 1024 * 1024, 4 * dense_shard)
+    producer = sparse_producer_peak_bytes(
+        (1 + shard_rows) * n_genes,
+        n_genes,
+        8,
+    )
+    assert write_headroom + producer > assay.resources.memoryBytes
+
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    store = create_zarr_dataset(
+        group, "counts", (n_cells, n_genes), "float", (n_cells, n_genes)
+    )
+    create_counts_mat(
+        assay=assay,
+        store=store,
+        mapping=mapping,
+        scalar_coeff=1e4,
+        renormalization=False,
+    )
+    assert store.shape == (n_cells, n_genes)
+    assert np.isfinite(store[:]).all()
+    assert store[:].sum() > 0
+
+
+def test_create_counts_mat_rejects_unaffordable_one_cell_band() -> None:
+    assay, mapping, *_ = _build_melding_scenario()
+    assay.resources = ResourceBudget(8, 1)
+    with pytest.raises(MemoryError, match="Gene-score melding needs about"):
+        _run_create_counts_mat(assay, mapping, 1e4, False)

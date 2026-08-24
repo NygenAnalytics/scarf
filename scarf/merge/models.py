@@ -3,7 +3,6 @@ from typing import Any, Literal
 
 from ..storage.profiles import StorageProfile
 
-type CountsTPolicy = Literal["rna", "all", "none"]
 type MissingAssayPolicy = Literal["zero_fill", "error"]
 type ComponentAction = Literal["write", "resume", "skip", "blocked"]
 
@@ -18,6 +17,7 @@ class AssayMergePlan:
     """
 
     assayName: str
+    assayType: str
     sourcePresent: tuple[bool, ...]
     missingSources: tuple[str, ...]
     nFeatures: int
@@ -42,7 +42,6 @@ class MergePlan:
     assays: tuple[AssayMergePlan, ...]
     profile: StorageProfile
     seed: int | None
-    countsT: CountsTPolicy
     missingAssayPolicy: MissingAssayPolicy
     willResume: bool
     canDump: bool

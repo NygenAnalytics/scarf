@@ -265,7 +265,7 @@ def test_oracle_gap_recovery(
 
 
 def test_unequal_depth_quality_gate_preserves_the_rare_branch() -> None:
-    report = evaluate_quality_gate(seed_count=5, n_threads=2)
+    report = evaluate_quality_gate(seed_count=5, nthreads=2)
 
     assert report.passed
     accepted = [result for result in report.seeds if result.accepted]

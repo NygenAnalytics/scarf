@@ -24,7 +24,7 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    DataStoreMerge: "c1caccb38334f196e3b9925e75ddf3e6f22f617136a06c02464ceaf07ec51daa",
+    DataStoreMerge: "96cfe6d07ac5536f04d1cd333a42f58957fe3ab5d89c69b65acea72b2d5bf5f6",
 }
 _FACADE_METHODS = {
     MergePlan: (),
@@ -68,6 +68,7 @@ def test_merge_plan_and_result_fields_are_stable():
     expected = {
         AssayMergePlan: (
             "assayName",
+            "assayType",
             "sourcePresent",
             "missingSources",
             "nFeatures",
@@ -88,7 +89,6 @@ def test_merge_plan_and_result_fields_are_stable():
             "assays",
             "profile",
             "seed",
-            "countsT",
             "missingAssayPolicy",
             "willResume",
             "canDump",
@@ -131,7 +131,7 @@ def test_dataset_merge_type_hints_resolve_lazily():
     hints = get_type_hints(DataStoreMerge.__init__)
     assert "datasets" in hints
     assert "zarr_path" in hints
-    assert "counts_t" in hints
+    assert "counts_t" not in hints
     assert "missing_assay_policy" in hints
 
 

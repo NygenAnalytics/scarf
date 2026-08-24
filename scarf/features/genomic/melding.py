@@ -3,16 +3,17 @@ from collections.abc import Iterator
 import numpy as np
 import pandas as pd
 import zarr
-from scipy.sparse import coo_matrix, csc_matrix, csr_matrix, diags
+from scipy.sparse import csc_matrix
 
 from ...assay import Assay
+from ...storage.budget import ResourceBudget
+from ...storage.count_matrix import (
+    DEFAULT_COUNT_MATRIX_POLICY,
+    CountMatrixPolicy,
+)
 from ...storage.layout import array_shard_rows
 from ...storage.schema import create_zarr_count_assay
-from ...storage.sharding import (
-    accumulate_sparse_to_shards,
-    sparse_matrix_bytes,
-    sparse_producer_peak_bytes,
-)
+from ...storage.sharding import sparse_matrix_bytes, write_dense_from_row_batches
 from ...utils.arrays import array_digest
 from .intervals import create_bed_from_coord_ids, get_feature_mappings
 
@@ -23,90 +24,115 @@ def _source_working_bytes(
     source_rows: int,
     n_source_features: int,
     source_itemsize: int,
+    *,
+    nTargetFeatures: int = 0,
+    storeItemsize: int = 0,
 ) -> int:
-    source_elements = max(0, int(source_rows)) * max(0, int(n_source_features))
+    rows = max(0, int(source_rows))
+    source_elements = rows * max(0, int(n_source_features))
+    dest_elements = rows * max(0, int(nTargetFeatures))
+    float_bytes = np.dtype(np.float64).itemsize
+    dest_itemsize = max(1, int(storeItemsize)) if storeItemsize else float_bytes
     return (
-        source_elements * (source_itemsize + 4 * np.dtype(np.float64).itemsize)
-        + (max(0, int(source_rows)) + 1) * np.dtype(np.int64).itemsize
+        source_elements * (max(1, int(source_itemsize)) + 2 * float_bytes)
+        + dest_elements * dest_itemsize
+        + (rows + 1) * np.dtype(np.int64).itemsize
     )
 
 
-def _producer_reserve_bytes(
-    *,
+def _dest_band_hold_bytes(n_rows: int, n_cols: int, itemsize: int) -> int:
+    """Align buffer plus one dense destination write of that band."""
+    dense = max(1, int(n_rows)) * max(1, int(n_cols)) * max(1, int(itemsize))
+    encoded = dense + dense // 128 + 1024
+    write_peak = dense + dense + 2 * encoded + 1024
+    return dense + write_peak
+
+
+def _meld_band_cost(
     source_rows: int,
-    shard_rows: int,
-    n_docs: int,
-    n_source_features: int,
-    n_target_features: int,
-    source_itemsize: int,
-    store_itemsize: int,
-    decode_bytes: int,
-) -> int:
-    buffered_rows = min(n_docs, max(0, int(source_rows)) + max(1, int(shard_rows)))
-    return (
-        sparse_producer_peak_bytes(
-            buffered_rows * n_target_features,
-            max(0, int(source_rows)) * n_target_features,
-            store_itemsize,
-        )
-        + _source_working_bytes(
-            source_rows,
-            n_source_features,
-            source_itemsize,
-        )
-        + max(0, int(decode_bytes))
-    )
-
-
-def _max_source_rows_for_budget(
     *,
-    available_bytes: int,
-    shard_rows: int,
-    n_docs: int,
-    n_source_features: int,
-    n_target_features: int,
-    source_itemsize: int,
-    store_itemsize: int,
-    preferred_rows: int,
-    decode_bytes: int,
+    nSourceFeatures: int,
+    nTargetFeatures: int,
+    sourceItemsize: int,
+    storeItemsize: int,
+    destRows: int | None = None,
 ) -> int:
-    preferred = max(1, min(int(preferred_rows), int(n_docs)))
-    if preferred <= 1:
-        return 1
-    if (
-        _producer_reserve_bytes(
-            source_rows=preferred,
-            shard_rows=shard_rows,
-            n_docs=n_docs,
-            n_source_features=n_source_features,
-            n_target_features=n_target_features,
-            source_itemsize=source_itemsize,
-            store_itemsize=store_itemsize,
-            decode_bytes=decode_bytes,
-        )
-        <= available_bytes
-    ):
-        return preferred
+    dest_rows = int(source_rows) if destRows is None else max(1, int(destRows))
+    return _source_working_bytes(
+        source_rows,
+        nSourceFeatures,
+        sourceItemsize,
+        nTargetFeatures=nTargetFeatures,
+        storeItemsize=storeItemsize,
+    ) + _dest_band_hold_bytes(dest_rows, nTargetFeatures, storeItemsize)
 
+
+def _max_meld_band_rows(
+    *,
+    memoryBytes: int,
+    nDocs: int,
+    nSourceFeatures: int,
+    nTargetFeatures: int,
+    sourceItemsize: int,
+    storeItemsize: int,
+    mappingBytes: int,
+    decodeBytes: int,
+    extraResidentBytes: int,
+    preferredRows: int,
+    maxRows: int,
+    destRows: int | None = None,
+) -> int:
+    resident = (
+        max(0, int(mappingBytes))
+        + max(0, int(decodeBytes))
+        + max(0, int(extraResidentBytes))
+    )
+    available = int(memoryBytes) - resident
+    limit = max(1, min(int(nDocs), int(maxRows)))
+
+    def cost(rows: int) -> int:
+        return _meld_band_cost(
+            rows,
+            nSourceFeatures=nSourceFeatures,
+            nTargetFeatures=nTargetFeatures,
+            sourceItemsize=sourceItemsize,
+            storeItemsize=storeItemsize,
+            destRows=destRows,
+        )
+
+    if available < cost(1):
+        raise MemoryError(
+            "Gene-score melding needs about "
+            f"{resident + cost(1)} bytes, but the operation limit is "
+            f"{memoryBytes} bytes"
+        )
+    preferred = max(1, min(int(preferredRows), limit))
+    if cost(preferred) <= available:
+        return preferred
     low = 1
     high = preferred
     while low < high:
         mid = (low + high + 1) // 2
-        reserve = _producer_reserve_bytes(
-            source_rows=mid,
-            shard_rows=shard_rows,
-            n_docs=n_docs,
-            n_source_features=n_source_features,
-            n_target_features=n_target_features,
-            source_itemsize=source_itemsize,
-            store_itemsize=store_itemsize,
-            decode_bytes=decode_bytes,
-        )
-        if reserve <= available_bytes:
+        if cost(mid) <= available:
             low = mid
         else:
             high = mid - 1
     return max(1, low)
+
+
+def _meld_count_matrix_policy(
+    *,
+    nCells: int,
+    nFeats: int,
+    dtype: str,
+    bandRows: int,
+) -> CountMatrixPolicy:
+    itemsize = max(1, int(np.dtype(dtype).itemsize))
+    rows = max(1, min(int(bandRows), max(1, int(nCells))))
+    cols = max(1, int(nFeats))
+    unit_bytes = max(1, rows * cols * itemsize)
+    chunk_bytes = min(unit_bytes, DEFAULT_COUNT_MATRIX_POLICY.chunkBytes)
+    return CountMatrixPolicy(unitBytes=unit_bytes, chunkBytes=max(1, chunk_bytes))
 
 
 def create_counts_mat(
@@ -218,53 +244,32 @@ def create_counts_mat(
 
     shard_rows = array_shard_rows(store)
     store_itemsize = np.dtype(store.dtype).itemsize
-    preferred_rows = min(int(assay.rawData.chunksize[0]), n_docs)
     resident_bytes = mapping_bytes + n_term_per_doc.nbytes + idf.nbytes
-    available_bytes = max(1, int(assay.resources.memoryBytes) - resident_bytes)
-    # Leave headroom above the static producer estimate for sparse band bytes
-    # that accumulate in write_sparse_bands and for densifying one destination
-    # shard when it is flushed (_sparse_task_working_bytes).
-    dense_shard_bytes = max(1, int(shard_rows)) * n_target_features * store_itemsize
-    write_headroom = max(64 * 1024 * 1024, 4 * dense_shard_bytes)
-    producer_budget = max(1, available_bytes - write_headroom)
-    source_rows = _max_source_rows_for_budget(
-        available_bytes=producer_budget,
-        shard_rows=shard_rows,
-        n_docs=n_docs,
-        n_source_features=n_source_features,
-        n_target_features=n_target_features,
-        source_itemsize=source_itemsize,
-        store_itemsize=store_itemsize,
-        preferred_rows=preferred_rows,
-        decode_bytes=decode_bytes,
+    source_rows = _max_meld_band_rows(
+        memoryBytes=int(assay.resources.memoryBytes),
+        nDocs=n_docs,
+        nSourceFeatures=n_source_features,
+        nTargetFeatures=n_target_features,
+        sourceItemsize=source_itemsize,
+        storeItemsize=store_itemsize,
+        mappingBytes=mapping_bytes,
+        decodeBytes=decode_bytes,
+        extraResidentBytes=n_term_per_doc.nbytes + idf.nbytes,
+        preferredRows=min(int(assay.rawData.chunksize[0]), n_docs, shard_rows),
+        maxRows=min(n_docs, shard_rows),
+        destRows=shard_rows,
     )
-    producer_reserve = _producer_reserve_bytes(
-        source_rows=source_rows,
-        shard_rows=shard_rows,
-        n_docs=n_docs,
-        n_source_features=n_source_features,
-        n_target_features=n_target_features,
-        source_itemsize=source_itemsize,
-        store_itemsize=store_itemsize,
-        decode_bytes=decode_bytes,
-    )
-    if producer_reserve > producer_budget:
-        raise MemoryError(
-            "Gene-score melding needs about "
-            f"{resident_bytes + producer_reserve + write_headroom} bytes, but "
-            f"the operation limit is {assay.resources.memoryBytes} bytes"
-        )
 
     source_data = assay.rawData._with_block_size(source_rows)
-    stream_charged_bytes = (
-        source_rows * n_source_features * source_itemsize + decode_bytes
-    )
-    source_stream_resident = resident_bytes + max(
-        0,
-        producer_reserve - stream_charged_bytes,
+    source_stream_resident = resident_bytes + _source_working_bytes(
+        source_rows,
+        n_source_features,
+        source_itemsize,
+        nTargetFeatures=n_target_features,
+        storeItemsize=store_itemsize,
     )
 
-    def block_stream() -> Iterator[coo_matrix]:
+    def block_stream() -> Iterator[np.ndarray]:
         start = 0
         for block_values in source_data._stream_blocks(
             nthreads=1,
@@ -276,28 +281,28 @@ def create_counts_mat(
             row = 0
             while row < block_values.shape[0]:
                 stop = min(row + source_rows, block_values.shape[0])
-                values = block_values[row:stop]
+                values = np.asarray(block_values[row:stop])
                 tf = values / n_term_per_doc[start : start + values.shape[0]].reshape(
                     -1, 1
                 )
                 tfidf = tf * idf
-                block = (csr_matrix(tfidf) @ mapping).tocsr()
+                block = np.asarray(tfidf @ mapping, dtype=np.float64)
                 if renormalization:
-                    row_sums = np.asarray(block.sum(axis=1)).reshape(-1)
+                    row_sums = block.sum(axis=1)
                     scale = np.zeros(row_sums.shape[0], dtype=np.float64)
                     nonzero = row_sums != 0
                     scale[nonzero] = scalar_coeff / row_sums[nonzero]
-                    block = diags(scale) @ block
-                yield block.tocoo()
+                    block *= scale[:, None]
+                yield block
                 start += values.shape[0]
                 row = stop
 
-    accumulate_sparse_to_shards(
+    write_dense_from_row_batches(
         store,
         block_stream(),
-        resources=assay.resources,
-        residentBytes=resident_bytes,
-        producerReserveBytes=producer_reserve,
+        resources=ResourceBudget(assay.resources.memoryBytes, 1),
+        msg="Writing gene scores",
+        io=getattr(assay, "storageIo", None),
     )
 
 
@@ -312,7 +317,23 @@ def coordinate_melding(
     peaks_coords: np.ndarray | None = None,
     idf_cell_idx: np.ndarray | None = None,
 ) -> None:
-    """Transfer coordinate-based assay values to overlapping external features."""
+    """Transfer coordinate-based assay values to overlapping external features.
+
+    Args:
+        assay: Source assay whose features have genomic coordinates.
+        workspace: Workspace name. None uses the legacy layout.
+        feature_bed: External interval table used as the meld target.
+        new_assay_name: Name of the assay group to create.
+        peaks_col: Feature-metadata column holding source coordinates.
+        scalar_coeff: Scaling coefficient applied during melding.
+        renormalization: If True, rescale melded values after mapping.
+        peaks_coords: Optional precomputed source coordinates. When None,
+                      values are read from ``peaks_col``.
+        idf_cell_idx: Optional cell indices used for IDF statistics.
+
+    Returns:
+        None
+    """
     if peaks_coords is None:
         peaks_coords = assay.feats.fetch_all(peaks_col)
     peaks_bed = create_bed_from_coord_ids(peaks_coords)
@@ -321,16 +342,42 @@ def coordinate_melding(
     from ...storage.stores import zarr_group_root
     from ...storage.profiles import resolve_storage_profile
 
+    n_cells = int(assay.rawData.shape[0])
+    n_source_features = int(mapping.shape[0])
+    n_target_features = int(len(feat_ids))
+    store_dtype = "float"
+    band_rows = _max_meld_band_rows(
+        memoryBytes=int(assay.resources.memoryBytes),
+        nDocs=n_cells,
+        nSourceFeatures=n_source_features,
+        nTargetFeatures=n_target_features,
+        sourceItemsize=int(np.dtype(assay.rawData.dtype).itemsize),
+        storeItemsize=int(np.dtype(store_dtype).itemsize),
+        mappingBytes=sparse_matrix_bytes(mapping),
+        decodeBytes=assay.rawData._max_decode_bytes(),
+        extraResidentBytes=(
+            n_cells * np.dtype(np.float64).itemsize
+            + n_source_features * np.dtype(np.float64).itemsize
+        ),
+        preferredRows=min(int(assay.rawData.chunksize[0]), n_cells),
+        maxRows=n_cells,
+    )
     store_root = zarr_group_root(assay.z, mode="r+")
     group = create_zarr_count_assay(
         z=store_root,
         assay_name=new_assay_name,
         workspace=workspace,
-        n_cells=assay.rawData.shape[0],
+        n_cells=n_cells,
         feat_ids=feat_ids,
         feat_names=feat_names,
-        dtype="float",
+        dtype=store_dtype,
         profile=resolve_storage_profile(store_root.store),
+        policy=_meld_count_matrix_policy(
+            nCells=n_cells,
+            nFeats=n_target_features,
+            dtype=store_dtype,
+            bandRows=band_rows,
+        ),
     )
 
     create_counts_mat(

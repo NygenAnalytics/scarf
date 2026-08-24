@@ -345,6 +345,7 @@ def test_umap_matrix_and_leiden_columns_link_authoritative_artifacts(
     assert display["maximum"] == float(values.max())
     assert datastore.load_artifact(umap_ref)["values"].shape[1] == 2
     assert leiden_ref.kind == "cluster_labels"
+    assert datastore.inspect_artifact(leiden_ref).parameters["backend"] == "igraph"
     leiden_display = dict(
         datastore.zw["cellData"]["RNA_metadata_leiden"].attrs["display"]
     )
@@ -400,6 +401,31 @@ def test_umap_matrix_and_leiden_columns_link_authoritative_artifacts(
     assert list(categorical_scales[0].order) == keep
     assert set(categorical_scales[1].order) == {"a", "b"}
     grouped.close()
+
+
+def test_leiden_backend_is_part_of_artifact_identity(
+    datastore_ephemeral,
+) -> None:
+    datastore = datastore_ephemeral
+    _ensure_graph(datastore)
+
+    native = datastore.run_leiden_clustering(label="native_leiden")
+    legacy = datastore.run_leiden_clustering(
+        backend="leidenalg",
+        label="legacy_leiden",
+    )
+
+    assert native != legacy
+    assert datastore.inspect_artifact(native).parameters["backend"] == "igraph"
+    assert datastore.inspect_artifact(legacy).parameters["backend"] == "leidenalg"
+
+
+def test_run_leiden_rejects_unknown_backend(datastore_ephemeral) -> None:
+    with pytest.raises(ValueError, match="backend"):
+        datastore_ephemeral.run_leiden_clustering(
+            backend="unknown",  # type: ignore[arg-type]
+            label="bad_backend",
+        )
 
 
 def test_membership_and_smart_labels_are_artifact_backed_and_lisi_is_read_only(

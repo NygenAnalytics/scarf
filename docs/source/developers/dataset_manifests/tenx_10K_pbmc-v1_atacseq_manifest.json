@@ -1,109 +1,109 @@
 {
-  "archiveBytes": 509075527,
-  "archiveSha256": "4e87d1fab4c7763fbbd8b74a64e4610faa31c9291718893af7728da94d86e4ab",
+  "archiveBytes": 509101815,
+  "archiveSha256": "799d5fd782f76c818e4af48d47523f2dcde5bd3ced2969b2503a34d82bf9c089",
   "artifacts": [
     {
-      "artifactId": "3f3506fa5737d28692d2e6b56b2716309fbf18279d1dffcd360204de0dc0c48a",
-      "assay": null,
-      "kind": "cell_selection",
-      "operation": "filter_cells",
-      "path": "artifacts/cell_selection/3f3506fa5737d28692d2e6b56b2716309fbf18279d1dffcd360204de0dc0c48a",
-      "scope": "datastore"
-    },
-    {
-      "artifactId": "50e46bf5ebe94636388949ec75e9f6bd27cce9a734efbc29cc4182885ac33159",
+      "artifactId": "adaaf8f4f7881f0c5a48f3e49eedea7ac506192b18a8c19137ff1d59ed894bbe",
       "assay": null,
       "kind": "cell_selection",
       "operation": "auto_filter_cells",
-      "path": "artifacts/cell_selection/50e46bf5ebe94636388949ec75e9f6bd27cce9a734efbc29cc4182885ac33159",
+      "path": "artifacts/cell_selection/adaaf8f4f7881f0c5a48f3e49eedea7ac506192b18a8c19137ff1d59ed894bbe",
       "scope": "datastore"
     },
     {
-      "artifactId": "ec88367401184e91bd9465d117fbdfedea916b00fe7a906e7e7896b9d58d7a33",
+      "artifactId": "f557066e71aaa41c630bbf3c60b79dc6f8edb01d1843755cdf66381171bf449b",
+      "assay": null,
+      "kind": "cell_selection",
+      "operation": "filter_cells",
+      "path": "artifacts/cell_selection/f557066e71aaa41c630bbf3c60b79dc6f8edb01d1843755cdf66381171bf449b",
+      "scope": "datastore"
+    },
+    {
+      "artifactId": "0367bad5e7f6b66fa8fdb38d78c9e05bf9e68a09a15cd6ae539fa2f4639e8467",
       "assay": "ATAC",
       "kind": "ann_index",
       "operation": "build_ann_index",
-      "path": "ATAC/artifacts/ann_index/ec88367401184e91bd9465d117fbdfedea916b00fe7a906e7e7896b9d58d7a33",
+      "path": "ATAC/artifacts/ann_index/0367bad5e7f6b66fa8fdb38d78c9e05bf9e68a09a15cd6ae539fa2f4639e8467",
       "scope": "assay"
     },
     {
-      "artifactId": "348d1538288818bc153a4a19d7ba192c38295c4b30021f624c7d4f5ccd375295",
+      "artifactId": "4f2fd182c7dce1127938ada3f43fe85f40c4cb9d17e513033f11d7e5e2a1cba0",
       "assay": "ATAC",
       "kind": "cluster_labels",
       "operation": "run_leiden_clustering",
-      "path": "ATAC/artifacts/cluster_labels/348d1538288818bc153a4a19d7ba192c38295c4b30021f624c7d4f5ccd375295",
+      "path": "ATAC/artifacts/cluster_labels/4f2fd182c7dce1127938ada3f43fe85f40c4cb9d17e513033f11d7e5e2a1cba0",
       "scope": "assay"
     },
     {
-      "artifactId": "1504a67b9e1824d375dd5abc3947a4edf4698f69138e9d689a62a69c2c1f9e93",
+      "artifactId": "f86a89f16c32d54492fbcf654cc043878c1336b0e518eeb12eb7d72ea9f5a2e1",
       "assay": "ATAC",
       "kind": "connectivity_map",
       "operation": "build_connectivity_map",
-      "path": "ATAC/artifacts/connectivity_map/1504a67b9e1824d375dd5abc3947a4edf4698f69138e9d689a62a69c2c1f9e93",
+      "path": "ATAC/artifacts/connectivity_map/f86a89f16c32d54492fbcf654cc043878c1336b0e518eeb12eb7d72ea9f5a2e1",
       "scope": "assay"
     },
     {
-      "artifactId": "efc9a5832517732871b76573edd1378798a7e5d6f7f9486ec27e23bb98480969",
+      "artifactId": "1755a251e354f6f32c73e8f784490cdbcc39b77defff0449a273d6538e31f92c",
       "assay": "ATAC",
       "kind": "embedding",
       "operation": "run_umap",
-      "path": "ATAC/artifacts/embedding/efc9a5832517732871b76573edd1378798a7e5d6f7f9486ec27e23bb98480969",
+      "path": "ATAC/artifacts/embedding/1755a251e354f6f32c73e8f784490cdbcc39b77defff0449a273d6538e31f92c",
       "scope": "assay"
     },
     {
-      "artifactId": "dcd89172f8cf8f5ce1ce6edeafabfda808f6d9eb63441ea44f652394b56dbce5",
+      "artifactId": "df14d9fa13676c6d1dc63c8988ea66b34f4b8ab8da54504644f8500572c2cfcb",
       "assay": "ATAC",
       "kind": "embedding_initialization",
       "operation": "build_embedding_initialization",
-      "path": "ATAC/artifacts/embedding_initialization/dcd89172f8cf8f5ce1ce6edeafabfda808f6d9eb63441ea44f652394b56dbce5",
+      "path": "ATAC/artifacts/embedding_initialization/df14d9fa13676c6d1dc63c8988ea66b34f4b8ab8da54504644f8500572c2cfcb",
       "scope": "assay"
     },
     {
-      "artifactId": "400fd57cd752347bcaa569d326a3a657fef78facde443d503fa7a83e448c76d4",
+      "artifactId": "b7b19c98b9376e338737845903c39e7dc08729a6987ff65b339d615a55799d55",
       "assay": "ATAC",
       "kind": "feature_scaling",
       "operation": "calculate_feature_scaling",
-      "path": "ATAC/artifacts/feature_scaling/400fd57cd752347bcaa569d326a3a657fef78facde443d503fa7a83e448c76d4",
+      "path": "ATAC/artifacts/feature_scaling/b7b19c98b9376e338737845903c39e7dc08729a6987ff65b339d615a55799d55",
       "scope": "assay"
     },
     {
-      "artifactId": "136dc6f028f84cdfd17f89d93ebb6fd9b4a11736309e113c036cb40f8e2f39fd",
-      "assay": "ATAC",
-      "kind": "feature_selection",
-      "operation": "manual_selection",
-      "path": "ATAC/artifacts/feature_selection/136dc6f028f84cdfd17f89d93ebb6fd9b4a11736309e113c036cb40f8e2f39fd",
-      "scope": "assay"
-    },
-    {
-      "artifactId": "fc92c5170d7a74dbcd055ca16bd33fbea201e7303abe163ed5828b90854db570",
+      "artifactId": "1861e5e649a44ce4d9fa0047c98dc2ff71a06de7f502490d7db164a0401d31bc",
       "assay": "ATAC",
       "kind": "feature_selection",
       "operation": "mark_prevalent_peaks",
-      "path": "ATAC/artifacts/feature_selection/fc92c5170d7a74dbcd055ca16bd33fbea201e7303abe163ed5828b90854db570",
+      "path": "ATAC/artifacts/feature_selection/1861e5e649a44ce4d9fa0047c98dc2ff71a06de7f502490d7db164a0401d31bc",
       "scope": "assay"
     },
     {
-      "artifactId": "cbd26f6fbd868a1a3ba51a9f7eb0ea53654b5f1d2ebb41bb2d9e4c9edc2a0b52",
+      "artifactId": "d17d6aa69302d49554c88f69a95b384cba893531032289b5f66d84bcec8e3bc8",
+      "assay": "ATAC",
+      "kind": "feature_selection",
+      "operation": "manual_selection",
+      "path": "ATAC/artifacts/feature_selection/d17d6aa69302d49554c88f69a95b384cba893531032289b5f66d84bcec8e3bc8",
+      "scope": "assay"
+    },
+    {
+      "artifactId": "a9f65d64ca7ebf703bc935354f06b8518ad9a04e4e71ccd00a6464e50a134a88",
       "assay": "ATAC",
       "kind": "neighbors",
       "operation": "query_neighbors",
-      "path": "ATAC/artifacts/neighbors/cbd26f6fbd868a1a3ba51a9f7eb0ea53654b5f1d2ebb41bb2d9e4c9edc2a0b52",
+      "path": "ATAC/artifacts/neighbors/a9f65d64ca7ebf703bc935354f06b8518ad9a04e4e71ccd00a6464e50a134a88",
       "scope": "assay"
     },
     {
-      "artifactId": "06bc2648701da6dfebc365b51eca912f15a115911e854483d73105a9bfe6c60d",
+      "artifactId": "1b332605683507a0633b542b06bb9f9ceba3e6c21e40f7c88a65eadb2aea78fb",
       "assay": "ATAC",
       "kind": "normalized",
       "operation": "run_normalization",
-      "path": "ATAC/artifacts/normalized/06bc2648701da6dfebc365b51eca912f15a115911e854483d73105a9bfe6c60d",
+      "path": "ATAC/artifacts/normalized/1b332605683507a0633b542b06bb9f9ceba3e6c21e40f7c88a65eadb2aea78fb",
       "scope": "assay"
     },
     {
-      "artifactId": "c9d7bfb9a4521c62f311e6c5d7292b0c0a908affda2b7e6ee885ded7d3c7f3fa",
+      "artifactId": "ed3dd1e2d0e81a6d575790032d35fab7d54927e6ef6daacced8a803729e50432",
       "assay": "ATAC",
       "kind": "reduction",
       "operation": "run_lsi",
-      "path": "ATAC/artifacts/reduction/c9d7bfb9a4521c62f311e6c5d7292b0c0a908affda2b7e6ee885ded7d3c7f3fa",
+      "path": "ATAC/artifacts/reduction/ed3dd1e2d0e81a6d575790032d35fab7d54927e6ef6daacced8a803729e50432",
       "scope": "assay"
     }
   ],
@@ -119,8 +119,8 @@
     "names"
   ],
   "dataset": "tenx_10K_pbmc-v1_atacseq",
-  "generatedAt": "2026-08-01T01:04:27.814972+00:00",
-  "generatorCommit": "013241c21b8c2d1a2c8a1bbfe98cb084007dcbd1",
+  "generatedAt": "2026-08-17T20:02:27.162630+00:00",
+  "generatorCommit": "818f019636718bf4af886ef7a4f461900b24f984",
   "nCellsActive": 8426,
   "nCellsTotal": 8728,
   "publishNotes": [
@@ -129,9 +129,10 @@
   ],
   "recipe": "25000 prevalent peaks, TF-IDF normalization, LSI 50, k=21 graph, UMAP, Leiden 0.6",
   "repository": "scarf_docs",
-  "scarfVersion": "1.0.0rc1",
+  "scarfVersion": "1.0.0rc5.dev5+g818f01963.d20260817",
+  "sourceDatasets": [],
   "sourceFiles": [
     "data.h5"
   ],
-  "storeBytes": 727092713
+  "storeBytes": 731546862
 }

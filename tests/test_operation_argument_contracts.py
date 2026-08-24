@@ -295,7 +295,7 @@ _CONTRACTS = (
             "pseudotime",
             "size_factor",
         )
-        | _classified("execution", "n_threads"),
+        | _classified("execution", "nthreads"),
     ),
     OperationContract(
         DataStore.run_pseudotime_marker_search,
@@ -316,7 +316,7 @@ _CONTRACTS = (
             "adjustment_method",
             "adjustment_scope",
         )
-        | _classified("execution", "n_threads"),
+        | _classified("execution", "nthreads"),
     ),
     OperationContract(
         DataStore.run_pseudotime_scoring,

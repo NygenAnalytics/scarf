@@ -4,6 +4,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
+from threading import RLock
 from typing import TYPE_CHECKING, Any, Literal, cast
 from weakref import WeakKeyDictionary
 
@@ -128,7 +129,7 @@ from ...storage.selections import (
     resolve_selection_artifact,
 )
 from ...utils.arrays import clean_array
-from ...utils.compute import show_dask_progress
+from ...utils.compute import compute_with_progress
 from ...utils.logging import logger
 
 if TYPE_CHECKING:
@@ -216,6 +217,30 @@ class _GraphOperationsMixin(_GraphOperationsBase):
     _annStreamNeighborPaths: WeakKeyDictionary[AnnStream, str]
     _normalizedArtifactCache: dict[ArtifactRef, ChunkedArray]
     _artifactExecutionContext: dict[str, Any]
+    _graphMemoryCache: dict[tuple[str, bool, bool, int | None], csr_matrix] | None
+    _graphMemoryCacheLock: Any
+
+    @contextmanager
+    def _graph_memory_cache_scope(self) -> Iterator[None]:
+        """Bound graph reuse to one product pipeline section."""
+        existing = getattr(self, "_graphMemoryCache", None)
+        if existing is not None:
+            yield
+            return
+
+        cache: dict[tuple[str, bool, bool, int | None], csr_matrix] = {}
+        lock = getattr(self, "_graphMemoryCacheLock", None)
+        if lock is None:
+            lock = RLock()
+            self._graphMemoryCacheLock = lock
+        self._graphMemoryCache = cache
+        try:
+            yield
+        finally:
+            with lock:
+                cache.clear()
+                if self._graphMemoryCache is cache:
+                    self._graphMemoryCache = None
 
     if TYPE_CHECKING:
 
@@ -562,7 +587,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 logger.debug("Skipping mu/sigma persistence on read-only store")
         elif need_mu:
             mu = clean_array(
-                show_dask_progress(
+                compute_with_progress(
                     data.mean(axis=0),
                     "Calculating mean of norm. data",
                     self.nthreads,
@@ -575,7 +600,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 logger.debug("Skipping mu persistence on read-only store")
         elif need_sigma:
             sigma = clean_array(
-                show_dask_progress(
+                compute_with_progress(
                     data.std(axis=0),
                     "Calculating std. dev. of norm. data",
                     self.nthreads,
@@ -2354,6 +2379,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                     dtype=np.float32,
                     msg="Writing reduced coordinates",
                     resources=self.resources,
+                    io=self.storageIo,
                 )
             finish_artifact(reduction_group, planned)
         if show_elbow_plot and method == "pca":
@@ -2382,7 +2408,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         normalized: ArtifactRef | None = None,
         *,
         from_assay: str | None = None,
-        dims: int = 25,
+        dims: int = 21,
         pca_cell_key: str | None = None,
         feat_scaling: bool = True,
         batch_size: int | None = None,
@@ -2397,7 +2423,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             normalized: Normalized artifact to reduce. Uses the selected assay
                 state when omitted.
             from_assay: Assay used to resolve the selected normalized artifact.
-            dims: Requested number of principal components.
+            dims: Requested number of principal components. (Default: 21)
             pca_cell_key: Optional boolean cell column used to fit PCA while
                 projecting every selected cell.
             feat_scaling: Whether to standardize features before fitting PCA.
@@ -3037,7 +3063,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 ef=resolved_ann_ef,
                 m=resolved_ann_m,
                 rand_state=resolved_rand_state,
-                ann_threads=(self.nthreads if ann_parallel else 1),
+                nthreads=(self.nthreads if ann_parallel else 1),
             )
             group = start_artifact(self.zw, planned)
             self._persist_ann_index(
@@ -3062,7 +3088,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         *,
         from_assay: str | None = None,
         coordinates: ArtifactRef | None = None,
-        k: int = 17,
+        k: int = 11,
         batch_size: int | None = None,
         update_state: bool = True,
         invalidate_cache: bool = False,
@@ -3455,11 +3481,28 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 f"{graph_loc} not found in zarr location. "
                 f"Build graph artifacts for assay {from_assay}"
             )
+        cache_key = (
+            graph_loc,
+            symmetric is True,
+            symmetric is True and upper_only is True,
+            use_k,
+        )
+        cache = getattr(self, "_graphMemoryCache", None)
+        if cache is not None:
+            with self._graphMemoryCacheLock:
+                cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
         n_cells, graph = self._store_to_sparse(graph_loc, "csr", use_k)
         if symmetric is True:
             graph = symmetrize(graph)
             if upper_only is True:
                 graph = triu(graph)
+        if cache is not None:
+            with self._graphMemoryCacheLock:
+                active_cache = getattr(self, "_graphMemoryCache", None)
+                if active_cache is cache:
+                    graph = active_cache.setdefault(cache_key, graph)
         return graph
 
     def integrate_assays(

@@ -16,7 +16,6 @@ on:
       - "docs/**"
       - "profiling/.env.example"
       - "profiling/AGENTS.md"
-      - "profiling/BENCHMARKS.md"
   pull_request:
     branches:
       - master
@@ -31,7 +30,6 @@ on:
       - "docs/**"
       - "profiling/.env.example"
       - "profiling/AGENTS.md"
-      - "profiling/BENCHMARKS.md"
 
 jobs:
   quality:

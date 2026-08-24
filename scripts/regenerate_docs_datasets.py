@@ -33,6 +33,10 @@ MANIFEST_DIR = REPO_ROOT / "docs/source/developers/dataset_manifests"
 STORE_NAME = "data.zarr"
 ARCHIVE_NAME = f"{STORE_NAME}.tar.gz"
 LEGACY_SUFFIX = "_legacy_master"
+# Convert and analysis share one process. Two workers pin the Zarr
+# executor to one codec thread and async concurrency 1, which every
+# later stage can reuse.
+ZARR_NTHREADS = 2
 
 PBMC_FILTERS = {
     "method": "manual",
@@ -99,7 +103,7 @@ def _convert_cellranger_h5(source: Path, store: Path) -> None:
     import scarf
 
     reader = scarf.CrH5Reader(str(source / "data.h5"))
-    scarf.CrToZarr(reader, zarr_loc=str(store)).dump()
+    scarf.CrToZarr(reader, zarr_loc=str(store), nthreads=ZARR_NTHREADS).dump()
 
 
 def _convert_h5ad(source: Path, store: Path) -> None:
@@ -107,13 +111,34 @@ def _convert_h5ad(source: Path, store: Path) -> None:
 
     inspection = scarf.inspect_h5ad(str(source / "data.h5ad"))
     reader = scarf.H5adReader.from_inspect(inspection)
-    scarf.H5adToZarr(reader, zarr_loc=str(store)).dump()
+    scarf.H5adToZarr(reader, zarr_loc=str(store), nthreads=ZARR_NTHREADS).dump()
 
 
 def _labelled_cluster_mask(values: Any) -> np.ndarray:
     labels = np.asarray(values).astype(str)
     labels = np.char.strip(labels)
     return (labels != "") & (np.char.lower(labels) != "nan")
+
+
+def _openable_rna_store(source_path: Path, work: Path) -> Path:
+    """Return a store DataStore can open, repacking a legacy snapshot if needed."""
+    import zarr
+
+    from scarf.storage.counts_t_contract import inspect_counts_t
+    from scarf.tools.repack_zarr import repack_store
+
+    store = source_path / STORE_NAME
+    root = zarr.open_group(str(store), mode="r")
+    if inspect_counts_t(root, "RNA").status == "ready":
+        return store
+
+    work.mkdir(parents=True, exist_ok=True)
+    repacked = work / f"{source_path.name}_repacked.zarr"
+    if repacked.exists():
+        shutil.rmtree(repacked)
+    print(f"Repacking {store} so the current RNA layout can open")
+    repack_store(str(store), str(repacked), nthreads=ZARR_NTHREADS)
+    return repacked
 
 
 def _derive_labelled_kang_store(
@@ -126,8 +151,8 @@ def _derive_labelled_kang_store(
         raise ValueError("A labelled Kang store requires exactly one source")
     source_dataset, source_path = next(iter(source_paths.items()))
     source = scarf.DataStore(
-        str(source_path / STORE_NAME),
-        nthreads=4,
+        str(_openable_rna_store(source_path, store.parent / "_repack")),
+        nthreads=ZARR_NTHREADS,
         zarr_mode="r",
     )
     keep = _labelled_cluster_mask(source.cells.fetch_all("cluster_labels"))
@@ -140,7 +165,7 @@ def _derive_labelled_kang_store(
         cell_idx=np.flatnonzero(keep),
         reset_cell_filter=True,
         overwrite_existing_file=True,
-        nthreads=4,
+        nthreads=ZARR_NTHREADS,
     ).dump()
     kept = int(keep.sum())
     removed = int((~keep).sum())
@@ -218,7 +243,7 @@ def _merge_kang(source_paths: dict[str, Path], store: Path) -> None:
     sources = [
         scarf.DataStore(
             str(source_paths[dataset] / STORE_NAME),
-            nthreads=4,
+            nthreads=ZARR_NTHREADS,
         )
         for dataset in (KANG_CONTROL_DATASET, KANG_STIMULATED_DATASET)
     ]
@@ -232,7 +257,7 @@ def _merge_kang(source_paths: dict[str, Path], store: Path) -> None:
         reset_cell_filter=False,
         source_column="sample_id",
         overwrite=True,
-        nthreads=4,
+        nthreads=ZARR_NTHREADS,
     ).dump()
 
 
@@ -431,8 +456,8 @@ def _convert_teaseq(source: Path, store: Path) -> None:
         SeuratToZarr(
             reader,
             str(store),
-            mem_budget=4 * (1 << 30),
-            nthreads=4,
+            mem_budget=8 * (1 << 30),
+            nthreads=ZARR_NTHREADS,
         ).dump()
 
     import scarf
@@ -683,7 +708,7 @@ RECIPES: dict[str, DatasetRecipe] = {
             "matches to the 6,333 Figure 4 labels from well W3. The pinned "
             "Zenodo RDS omits 139 publication-labelled barcodes."
         ),
-        import_memory_bytes=4 * (1 << 30),
+        import_memory_bytes=8 * (1 << 30),
         analysis_memory_bytes=8 * (1 << 30),
         analysis_parameters=(
             (
@@ -964,7 +989,7 @@ def build_store(
     datastore = DataStore(
         str(store),
         default_assay=recipe.default_assay,
-        nthreads=4,
+        nthreads=ZARR_NTHREADS,
         **datastore_options,
     )
     recipe.analyze(datastore)

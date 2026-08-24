@@ -1,4 +1,3 @@
-import time
 from typing import Any
 
 import numba
@@ -8,10 +7,14 @@ from numba import set_num_threads
 from scipy.special import ndtr
 
 from ...assay import Assay, RNAassay, lib_size_feature_stream_eligible
-from ...storage.feature_stream import plan_feature_stream
+from ...assay.normalization import (
+    norm_clr,
+    norm_dummy,
+    norm_tf_idf,
+    reject_unknown_normalization_params,
+)
 from ...utils.logging import logger
 from ...utils.numba import restore_numba_threads
-from ...utils.process import process_rss_mb
 from .correction import _bh_adjusted_pvalues
 from .rank import (
     _batch_stats,
@@ -41,6 +44,37 @@ _KERNEL_STAT_COLUMNS = (
 )
 
 
+def _tfidf_feature_values(
+    raw: np.ndarray,
+    cell_scale: np.ndarray,
+    feature_scale: np.ndarray,
+) -> np.ndarray:
+    cells = np.asarray(raw.T, dtype=np.float64)
+    denom = np.asarray(cell_scale, dtype=np.float64).reshape(-1, 1)
+    scale = np.asarray(feature_scale, dtype=np.float64).reshape(1, -1)
+    return np.asarray((cells / denom) * scale, dtype=np.float64)
+
+
+def _clr_feature_values(raw: np.ndarray) -> np.ndarray:
+    cells = np.asarray(raw.T, dtype=np.float64)
+    scale = np.exp(np.log1p(cells).sum(axis=0) / max(1, cells.shape[0]))
+    return np.asarray(np.log1p(cells / scale), dtype=np.float64)
+
+
+def _lib_size_feature_values(
+    raw: np.ndarray,
+    scalar: np.ndarray,
+    size_factor: float,
+    log_transform: bool,
+) -> np.ndarray:
+    cells = (
+        np.float32(size_factor) * raw.T.astype(np.float32, copy=False)
+    ) / np.asarray(scalar, dtype=np.float32).reshape(-1, 1)
+    if log_transform:
+        cells = np.log1p(cells)
+    return np.asarray(cells, dtype=np.float32)
+
+
 def _validate_rank_marker_groups(group_counts: np.ndarray, n_total: int) -> None:
     populated = np.asarray(group_counts, dtype=np.float64)
     if populated.size < 2:
@@ -63,11 +97,14 @@ def find_markers_by_rank(
     group_key: str,
     cell_key: str,
     feat_key: str,
-    batch_size: int | None = None,
-    n_threads: int = 1,
+    nthreads: int = 1,
     **norm_params: Any,
 ) -> dict[Any, pd.DataFrame]:
     """Identify marker features for groups with rank-based statistics."""
+    reject_unknown_normalization_params(
+        norm_params,
+        caller="find_markers_by_rank",
+    )
     groups = assay.cells.fetch(group_key, cell_key)
     group_set = np.array(sorted(set(groups)))
     n_groups = len(group_set)
@@ -78,11 +115,11 @@ def find_markers_by_rank(
     worker_limit = getattr(
         getattr(assay, "resources", None),
         "workers",
-        n_threads,
+        nthreads,
     )
     set_num_threads(
         min(
-            max(1, n_threads),
+            max(1, nthreads),
             max(1, int(worker_limit)),
             numba.config.NUMBA_NUM_THREADS,
         )
@@ -100,102 +137,190 @@ def find_markers_by_rank(
     if use_fast and isinstance(assay, RNAassay):
         raw_source, _, _ = assay._raw_feature_stream_source()
         use_fast = np.issubdtype(raw_source.dtype, np.unsignedinteger)
+    elif use_fast:
+        raise TypeError("Fast raw-count marker search requires an RNAassay instance")
 
-    if use_fast:
-        if not isinstance(assay, RNAassay):
-            raise TypeError(
-                "Fast raw-count marker search requires an RNAassay instance"
-            )
-        cell_idx = assay.cells.active_index(cell_key)
-        feat_idx = assay.feats.active_index(feat_key)
+    counts_t = getattr(assay, "rawDataT", None)
+    has_selection = hasattr(assay.cells, "active_index") and hasattr(
+        assay.feats, "active_index"
+    )
+    cell_idx = assay.cells.active_index(cell_key) if has_selection else None
+    feat_idx = assay.feats.active_index(feat_key) if has_selection else None
+    adapter: str | None = None
+    cell_scale: np.ndarray | None = None
+    feature_scale: np.ndarray | None = None
+    scalar_values: np.ndarray | None = None
+    size_factor = 1.0
+    if (
+        use_fast
+        and isinstance(assay, RNAassay)
+        and counts_t is not None
+        and cell_idx is not None
+        and feat_idx is not None
+    ):
+        adapter = "rna_lib_size_unsigned"
         scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
-        sf = assay.sf
-        if sf is None:
+        size_factor = float(assay.sf) if assay.sf is not None else 1.0
+        if assay.sf is None:
             raise ValueError("RNA library-size normalization requires a size factor")
         scalar_values = np.asarray(scalar, dtype=np.float32)
         scalar_values[scalar_values == 0] = 1
+    elif (
+        counts_t is not None
+        and cell_idx is not None
+        and feat_idx is not None
+        and assay.normMethod is norm_tf_idf
+    ):
+        adapter = "tfidf"
+        assay.normed(cell_idx, feat_idx, **norm_params)
+        cell_scale = np.asarray(assay.n_term_per_doc, dtype=np.float64)
+        docs = float(getattr(assay, "n_docs", len(cell_idx)))
+        feature_scale = np.log2(
+            1.0 + (docs / (np.asarray(assay.n_docs_per_term, dtype=np.float64) + 1.0))
+        )
+    elif (
+        counts_t is not None
+        and cell_idx is not None
+        and feat_idx is not None
+        and assay.normMethod is norm_clr
+    ):
+        adapter = "clr"
+    elif (
+        counts_t is not None
+        and cell_idx is not None
+        and feat_idx is not None
+        and assay.normMethod is norm_dummy
+    ):
+        adapter = "dummy"
+    elif (
+        counts_t is not None
+        and cell_idx is not None
+        and feat_idx is not None
+        and lib_size_feature_stream_eligible(
+            assay, renormalize_subset=renormalize_subset
+        )
+        and not use_fast
+    ):
+        adapter = "lib_size"
+        scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
+        size_factor = float(assay.sf) if assay.sf is not None else 1.0
+        scalar_values = np.asarray(scalar, dtype=np.float32)
+        scalar_values[scalar_values == 0] = 1
+
+    if adapter is not None:
+        if counts_t is None or cell_idx is None or feat_idx is None:
+            raise ValueError(
+                f"Assay {assay.name!r} requires sharded countsT for marker search"
+            )
+        from ...storage.budget import resolve_budget
+        from ...storage.feature_stream import (
+            map_feature_read_groups,
+            selected_feature_values,
+        )
+
+        stats_matrix = np.zeros((len(feat_idx), n_groups, 8), dtype=np.float64)
+        n_feats = int(counts_t.shape[0])
+        dest_of = np.full(n_feats, -1, dtype=np.int64)
+        dest_of[feat_idx] = np.arange(len(feat_idx), dtype=np.int64)
+        resources = getattr(assay, "resources", None) or resolve_budget(
+            workers=nthreads
+        )
+        threads = min(
+            max(1, int(resources.workers)),
+            max(1, int(numba.config.NUMBA_NUM_THREADS)),
+        )
         group_counts32 = np.asarray(group_counts, dtype=np.float32)
-        stats_matrix = np.zeros(
-            (len(feat_idx), n_groups, 8),
-            dtype=np.float64,
-        )
-        raw_source, feature_axis, cell_axis = assay._raw_feature_stream_source()
-        active_threads = numba.get_num_threads()
-        resident_bytes = (
-            scalar_values.nbytes
-            + int_indices.nbytes
-            + group_counts32.nbytes
-            + stats_matrix.nbytes
-            + gene_major_rank_scratch_bytes(
-                n_cells=len(cell_idx),
-                n_groups=n_groups,
-                n_threads=active_threads,
-            )
-        )
-        orientation_buffers = 1 if feature_axis == 0 else 2
-        raw_itemsize = max(1, int(np.dtype(raw_source.dtype).itemsize))
-        plan = plan_feature_stream(
-            raw_source,
-            featureAxis=feature_axis,
-            cellAxis=cell_axis,
-            featureIndices=feat_idx,
-            cellIndices=cell_idx,
-            resources=assay.resources,
-            residentBytes=resident_bytes,
-            blockBytes=lambda width: max(
-                1,
-                len(cell_idx) * width * raw_itemsize * orientation_buffers,
-            ),
-            requestedBatchSize=batch_size,
-        )
+        previous_threads = numba.get_num_threads()
+        set_num_threads(threads)
         logger.debug(
-            f"Marker search plan: features={len(feat_idx)} groups={n_groups} "
-            f"blocks={len(plan.blocks)} readWorkers={plan.readWorkers} "
-            f"ioConcurrency={plan.ioConcurrency} numbaThreads={active_threads} "
-            f"repeatedDecodes={plan.repeatedDecodeCount}"
+            f"Marker search bounded groups: features={len(feat_idx)} "
+            f"groups={n_groups} adapter={adapter} workers={resources.workers} "
+            f"numbaThreads={threads} memoryBytes={resources.memoryBytes}"
         )
-        block_idx = 0
-        for block, raw, read_sec, source in assay.iter_raw_feature_major_blocks(
-            cell_idx=cell_idx,
-            plan=plan,
-            msg="Finding markers",
-        ):
-            block_idx += 1
-            compute_started = time.perf_counter()
-            cpu_started = time.process_time()
-            _marker_stats_gene_major(
-                raw,
-                scalar_values,
-                np.float32(sf),
-                log_transform,
+
+        def process_group(group: Any) -> None:
+            local_dest = dest_of[group.featStart : group.featEnd]
+            selected = local_dest >= 0
+            if not np.any(selected):
+                return None
+            if adapter == "rna_lib_size_unsigned":
+                assert scalar_values is not None
+                _marker_stats_gene_major(
+                    group.values,
+                    scalar_values,
+                    np.float32(size_factor),
+                    log_transform,
+                    int_indices,
+                    group_counts32,
+                    np.float32(n_total),
+                    local_dest,
+                    stats_matrix,
+                )
+                return None
+            raw = selected_feature_values(group.values, selected)
+            destinations = local_dest[selected].astype(np.int64, copy=False)
+            if adapter == "tfidf":
+                assert cell_scale is not None
+                assert feature_scale is not None
+                values = _tfidf_feature_values(
+                    raw, cell_scale, feature_scale[destinations]
+                )
+            elif adapter == "clr":
+                values = _clr_feature_values(raw)
+            elif adapter == "dummy":
+                values = np.asarray(raw.T)
+            else:
+                assert scalar_values is not None
+                values = _lib_size_feature_values(
+                    raw, scalar_values, size_factor, log_transform
+                )
+            stats_matrix[destinations] = _batch_stats(
+                values,
                 int_indices,
-                group_counts32,
-                np.float32(n_total),
-                block.destinations,
-                stats_matrix,
+                group_counts,
+                n_total,
+                feature_labels=destinations,
             )
-            compute_seconds = time.perf_counter() - compute_started
-            cpu_seconds = time.process_time() - cpu_started
-            effective_cores = (
-                cpu_seconds / compute_seconds if compute_seconds > 0 else 0.0
-            )
-            logger.debug(
-                f"Marker block {block_idx}/{len(plan.blocks)}: "
-                f"width={block.indices.size} read={read_sec:.1f}s ({source}) "
-                f"compute={compute_seconds:.1f}s cpu={cpu_seconds:.1f}s "
-                f"effectiveCores={effective_cores:.2f} "
-                f"rss={process_rss_mb():.0f} MiB"
-            )
-            del raw
-        z_values = np.asarray(stats_matrix[:, :, 6], dtype=np.float64)
-        stats_matrix[:, :, 6] = 2.0 * ndtr(-np.abs(z_values))
+            return None
+
+        consume_metrics: dict[str, object] = {}
+        scratch = int(stats_matrix.nbytes) + gene_major_rank_scratch_bytes(
+            n_cells=n_total,
+            n_groups=n_groups,
+            nthreads=threads,
+        )
+        extra_itemsize = (
+            0
+            if adapter == "rna_lib_size_unsigned"
+            else int(np.dtype(np.float64).itemsize)
+        )
+        try:
+            for _ in map_feature_read_groups(
+                counts_t,
+                process_group,
+                cell_idx=cell_idx,
+                feat_idx=feat_idx,
+                resources=resources,
+                progress="Finding markers",
+                io=getattr(assay, "storageIo", None),
+                metrics=consume_metrics,
+                scratchBytes=scratch,
+                extraItemsize=extra_itemsize,
+                orderedCompute=False,
+            ):
+                pass
+        finally:
+            set_num_threads(previous_threads)
+        if adapter == "rna_lib_size_unsigned":
+            z_values = np.asarray(stats_matrix[:, :, 6], dtype=np.float64)
+            stats_matrix[:, :, 6] = 2.0 * ndtr(-np.abs(z_values))
     else:
         batch_stats = []
         iterator = iter(
             assay.iter_normed_feature_wise(
                 cell_key=cell_key,
                 feat_key=feat_key,
-                batch_size=batch_size,
+                batch_size=None,
                 msg="Finding markers",
                 **norm_params,
             )
@@ -254,6 +379,10 @@ def find_markers_by_regression(
     **norm_params: Any,
 ) -> pd.DataFrame:
     """Find features correlated with a continuous variable."""
+    reject_unknown_normalization_params(
+        norm_params,
+        caller="find_markers_by_regression",
+    )
     regressor = np.asarray(regressor, dtype=np.float64)
     if regressor.ndim != 1:
         raise ValueError("regressor must be one-dimensional")
@@ -264,8 +393,8 @@ def find_markers_by_regression(
     if min_cells < 1:
         raise ValueError("min_cells must be at least 1")
 
-    n_threads = getattr(assay, "nthreads", 1)
-    set_num_threads(min(max(1, int(n_threads)), numba.config.NUMBA_NUM_THREADS))
+    nthreads = getattr(assay, "nthreads", 1)
+    set_num_threads(min(max(1, int(nthreads)), numba.config.NUMBA_NUM_THREADS))
     x_centered = regressor - regressor.mean()
     ssxm = float(np.dot(x_centered, x_centered) / regressor.shape[0])
 

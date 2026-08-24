@@ -100,7 +100,7 @@ def _resolve_plan(
     if backend == "serial" or in_shard_context():
         return 1, 1, 1
     outer_workers = min(max(1, int(workers)), max(1, int(n_shards)))
-    return outer_workers, 1, 1
+    return outer_workers, outer_workers, 1
 
 
 def _progress(
@@ -152,6 +152,8 @@ def map_shards(
     produce: RangeProduce,
     *,
     workers: int,
+    within_block_threads: int | None = None,
+    io_concurrency: int | None = None,
     msg: str | None = None,
     backend: Backend = "thread",
 ) -> list[Any]:
@@ -159,11 +161,15 @@ def map_shards(
     n_ranges = len(ranges)
     if n_ranges == 0:
         return []
-    worker_count, io_concurrency, within_block_threads = _resolve_plan(
+    worker_count, planned_io, planned_within = _resolve_plan(
         workers,
         n_ranges,
         backend,
     )
+    if io_concurrency is None:
+        io_concurrency = planned_io
+    if within_block_threads is None:
+        within_block_threads = planned_within
     indexed = list(enumerate(ranges))
 
     def call(item: tuple[int, tuple[int, int]]) -> Any:

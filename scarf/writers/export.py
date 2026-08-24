@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix
 
-from ..utils.compute import show_dask_progress
+from ..utils.compute import compute_with_progress
 from ..utils.logging import logger
 
 
@@ -14,17 +14,19 @@ def to_h5ad(
     h5ad_filename: str,
     embeddings_cols: list[str] | None = None,
     skip_recalc_nfeats: bool = True,
-    n_threads: int = 4,
+    nthreads: int = 4,
 ) -> None:
     """Save an assay as H5ad file.
 
     Args:
         assay: Assay to save in H5ad format
         h5ad_filename: Name for the H5ad file to be created.
-        embeddings_cols: Columns in cell metadata to be treated as embeddings e. UMAP, tSNE
-                         (Default value: ['UMAP', 'tSNE'])
+        embeddings_cols: Cell-metadata column prefixes treated as embeddings
+                         (for example UMAP, tSNE). When None, uses
+                         ``["UMAP", "tSNE"]``. Pass an empty list to skip
+                         embeddings.
         skip_recalc_nfeats: Skip recalculating nFeatures per cell. (Default value: True)
-        n_threads: Number of processing threads to use (Default value: 4)
+        nthreads: Number of processing threads to use (Default value: 4)
 
     Returns:
         None
@@ -53,10 +55,10 @@ def to_h5ad(
     if skip_recalc_nfeats is False:
         assay.cells.insert(
             f"{assay.name}_nFeatures",
-            show_dask_progress(
+            compute_with_progress(
                 assay.rawData.count_nonzero(axis=1),
                 msg="Recalculating detected feature counts",
-                nthreads=n_threads,
+                nthreads=nthreads,
             ),
             overwrite=True,
         )
@@ -79,7 +81,7 @@ def to_h5ad(
 
     s, e = 0, 0
     for values in assay.rawData.stream_blocks(
-        nthreads=n_threads,
+        nthreads=nthreads,
         msg="Writing raw counts",
     ):
         block = csr_matrix(values)

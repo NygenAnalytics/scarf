@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     )
     from scarf.utils.compute import (
         controlled_compute as controlled_compute,
-        show_dask_progress as show_dask_progress,
+        compute_with_progress as compute_with_progress,
     )
     from scarf.utils.logging import (
         configure_output as configure_output,
@@ -45,7 +45,7 @@ __all__ = [
     "clean_array",
     "load_zarr",
     "permute_into_chunks",
-    "show_dask_progress",
+    "compute_with_progress",
     "controlled_compute",
     "iter_column_blocks",
     "process_rss_mb",
@@ -66,7 +66,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "clean_array": (".arrays", "clean_array"),
     "load_zarr": ("..storage.stores", "load_zarr"),
     "permute_into_chunks": (".arrays", "permute_into_chunks"),
-    "show_dask_progress": (".compute", "show_dask_progress"),
+    "compute_with_progress": (".compute", "compute_with_progress"),
     "controlled_compute": (".compute", "controlled_compute"),
     "iter_column_blocks": (".prefetch", "iter_column_blocks"),
     "process_rss_mb": (".process", "process_rss_mb"),

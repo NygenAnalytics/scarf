@@ -4,6 +4,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.readers import CSVReader
+from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.writers import (
     CSVtoZarr,
     CrToZarr,
@@ -96,14 +97,14 @@ def test_crtozarr_preserves_exact_counts_metadata_and_transpose():
         ExactReader(),
         zarr_loc=store,
         dtype="uint16",
-        targetChunkBytes=12,
-        targetShardBytes=12,
+        policy=CountMatrixPolicy(unitBytes=12, chunkBytes=12),
     )
     writer.dump(batch_size=2)
 
     root = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
     np.testing.assert_array_equal(root["cellData/ids"][:], ["c1", "c2", "c3"])
     np.testing.assert_array_equal(root["RNA/featureData/ids"][:], ["f1", "f2", "f3"])
 
@@ -189,8 +190,7 @@ def test_h5adtozarr_splits_noncontiguous_feature_types():
                 zarr_loc=store,
                 assay_name="ignored",
                 assay_split_key="feature_types",
-                targetChunkBytes=8,
-                targetShardBytes=8,
+                policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
             )
             writer.dump(batch_size=2)
         finally:
@@ -200,7 +200,8 @@ def test_h5adtozarr_splits_noncontiguous_feature_types():
     assert set(root.group_keys()) == {"cellData", "RNA", "ADT"}
     np.testing.assert_array_equal(root["RNA/counts"][:], values[:, [0, 2]])
     np.testing.assert_array_equal(root["ADT/counts"][:], values[:, [1, 3]])
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
     assert "countsT" not in root["ADT"]
     np.testing.assert_array_equal(root["cellData/batch"][:], ["A", "A", "B"])
     np.testing.assert_array_equal(root["RNA/featureData/ids"][:], ["f1", "f2"])
@@ -259,12 +260,35 @@ def _write_h5ad(
 
 
 # Sizes a 12-row uint32 assay into (4, n_feats) row shards.
+def test_aligned_row_windows_are_shard_aligned() -> None:
+    from scarf.storage.sharding import aligned_row_windows
+
+    windows = aligned_row_windows(12, 4, 3)
+    assert windows == [(0, 4), (4, 8), (8, 12)]
+    assert aligned_row_windows(0, 4, 2) == []
+    assert aligned_row_windows(5, 4, 8) == [(0, 4), (4, 5)]
+
+
 _SHARD_BAND_BUDGET = {
     "mem_budget": 1024**2,
     "nthreads": 4,
-    "targetChunkBytes": 48,
-    "targetShardBytes": 48,
+    "policy": CountMatrixPolicy(unitBytes=48, chunkBytes=48),
 }
+
+
+class _Pipe:
+    def __init__(self, *, fail_send: bool = False) -> None:
+        self.messages: list[object] = []
+        self.closed = False
+        self.fail_send = fail_send
+
+    def send(self, item: object) -> None:
+        if self.fail_send:
+            raise OSError("closed")
+        self.messages.append(item)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def _band_counts(n_cells: int, n_feats: int) -> np.ndarray:
@@ -272,6 +296,110 @@ def _band_counts(n_cells: int, n_feats: int) -> np.ndarray:
     values = rng.integers(0, 5, size=(n_cells, n_feats), dtype=np.uint32)
     values[4:8] = 0
     return values
+
+
+def test_h5ad_parallel_producers_stop_when_consumer_closes(tmp_path):
+    from threading import Event, Thread
+
+    from scarf.readers import H5adReader
+    from scarf.storage.schema import load_count_array
+    from scarf.writers import H5adToZarr
+
+    values = _band_counts(12, 3)
+    path = _write_h5ad(tmp_path / "early_close.h5ad", values, encoding="csr")
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = MemoryStore()
+    try:
+        writer = H5adToZarr(reader, zarr_loc=store, **_SHARD_BAND_BUDGET)
+        destination = load_count_array(writer.z, "RNA", None)
+        iterator = writer._parallel_count_bands(
+            2,
+            {"RNA": destination},
+            None,
+            [(0, 4), (4, 8), (8, 12)],
+        )
+        next(iterator)
+        closed = Event()
+
+        def close() -> None:
+            iterator.close()
+            closed.set()
+
+        closer = Thread(target=close, daemon=True)
+        closer.start()
+        assert closed.wait(timeout=2.0)
+        closer.join(timeout=0.1)
+    finally:
+        reader.h5.close()
+
+
+def test_h5ad_parallel_producer_count_is_memory_admitted(tmp_path):
+    from scarf.readers import H5adReader
+    from scarf.storage.budget import ResourceBudget
+    from scarf.writers import H5adToZarr
+
+    values = _band_counts(12, 3)
+    path = _write_h5ad(tmp_path / "admitted_producers.h5ad", values, encoding="csr")
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = MemoryStore()
+    try:
+        writer = H5adToZarr(reader, zarr_loc=store, **_SHARD_BAND_BUDGET)
+        writer.resources = ResourceBudget(7_000, 4)
+        writer._write_counts(batch_size=2)
+        assert writer._lastImportProducerCount == 2
+    finally:
+        reader.h5.close()
+
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], values)
+
+
+def test_h5ad_direct_parallel_writers_cover_disjoint_windows(tmp_path):
+    from scarf.readers import H5adReader
+    from scarf.storage.io_policy import StorageIoPolicy
+    from scarf.writers import H5adToZarr
+
+    values = _band_counts(12, 3)
+    path = _write_h5ad(tmp_path / "direct_writers.h5ad", values, encoding="csr")
+    destination = tmp_path / "direct_writers.zarr"
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    try:
+        writer = H5adToZarr(
+            reader,
+            zarr_loc=str(destination),
+            io=StorageIoPolicy(readWorkers=2),
+            **_SHARD_BAND_BUDGET,
+        )
+        writer._write_counts(batch_size=2)
+        assert writer._lastImportProducerCount == 2
+        assert writer._lastImportWorkersPerProcess == 2
+    finally:
+        reader.h5.close()
+
+    root = zarr.open_group(store=str(destination), mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], values)
+
+
+def test_h5ad_read_width_caps_parallel_producers(tmp_path):
+    from scarf.readers import H5adReader
+    from scarf.storage.io_policy import StorageIoPolicy
+    from scarf.writers import H5adToZarr
+
+    values = _band_counts(12, 3)
+    path = _write_h5ad(tmp_path / "read_width.h5ad", values, encoding="csr")
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    try:
+        writer = H5adToZarr(
+            reader,
+            zarr_loc=MemoryStore(),
+            io=StorageIoPolicy(readWorkers=1),
+            **_SHARD_BAND_BUDGET,
+        )
+        writer._write_counts(batch_size=2)
+        assert writer._lastImportProducerCount == 1
+        assert writer._lastImportWriteWorkers == 4
+    finally:
+        reader.h5.close()
 
 
 @pytest.mark.parametrize("encoding", ["csr", "csc", "dense"])
@@ -293,6 +421,27 @@ def test_h5adtozarr_writes_shard_bands_for_every_encoding(tmp_path, encoding):
     counts = root["RNA/counts"]
     assert array_metadata_shards(counts) == (4, 3)
     np.testing.assert_array_equal(counts[:], values)
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
+
+
+def test_h5adtozarr_write_counts_defers_counts_t(tmp_path):
+    from scarf.readers import H5adReader
+    from scarf.writers import H5adToZarr
+
+    values = _band_counts(12, 3)
+    path = _write_h5ad(tmp_path / "defer_counts_t.h5ad", values, encoding="csr")
+    reader = H5adReader(str(path), feature_name_key="feature_name")
+    store = MemoryStore()
+    try:
+        H5adToZarr(reader, zarr_loc=store, **_SHARD_BAND_BUDGET)._write_counts(
+            batch_size=5,
+        )
+    finally:
+        reader.h5.close()
+
+    root = zarr.open_group(store=store, mode="r")
+    np.testing.assert_array_equal(root["RNA/counts"][:], values)
     assert "countsT" not in root["RNA"]
 
 
@@ -319,8 +468,7 @@ def test_h5adtozarr_uses_smallest_lossless_dtype_for_float_counts(
             zarr_loc=store,
             mem_budget=1024**2,
             nthreads=2,
-            targetChunkBytes=48,
-            targetShardBytes=48,
+            policy=CountMatrixPolicy(unitBytes=48, chunkBytes=48),
         ).dump(batch_size=4)
     finally:
         reader.h5.close()
@@ -328,7 +476,8 @@ def test_h5adtozarr_uses_smallest_lossless_dtype_for_float_counts(
     root = zarr.open_group(store=store, mode="r")
     assert np.dtype(root["RNA/counts"].dtype) == expected_dtype
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 @pytest.mark.parametrize("encoding", ["csr", "csc"])
@@ -359,8 +508,7 @@ def test_h5adtozarr_preserves_duplicate_coordinate_sums(tmp_path, encoding):
             zarr_loc=store,
             mem_budget=1024**2,
             nthreads=2,
-            targetChunkBytes=16,
-            targetShardBytes=16,
+            policy=CountMatrixPolicy(unitBytes=16, chunkBytes=16),
         ).dump(batch_size=1)
     finally:
         reader.h5.close()
@@ -408,8 +556,7 @@ def test_h5adtozarr_reduces_duplicates_before_explicit_dtype_cast(
             zarr_loc=store,
             mem_budget=1024**2,
             nthreads=1,
-            targetChunkBytes=16,
-            targetShardBytes=16,
+            policy=CountMatrixPolicy(unitBytes=16, chunkBytes=16),
         ).dump(batch_size=1)
     finally:
         reader.h5.close()
@@ -437,14 +584,15 @@ def test_h5adtozarr_reads_the_source_once_for_all_assays(tmp_path, monkeypatch):
         ],
     )
 
-    consumed: list[int] = []
-    original = H5adReader.consume
+    consumed: list[tuple[int, int]] = []
+    original = H5adReader.consume_row_range
 
-    def spy(self, batch_size):
-        consumed.append(batch_size)
-        return original(self, batch_size)
+    def spy(self, batch_size, row_start=0, row_end=None):
+        stop = self.nCells if row_end is None else int(row_end)
+        consumed.append((int(row_start), stop))
+        return original(self, batch_size, row_start, stop)
 
-    monkeypatch.setattr(H5adReader, "consume", spy)
+    monkeypatch.setattr(H5adReader, "consume_row_range", spy)
 
     reader = H5adReader(str(path), feature_name_key="feature_name")
     store = MemoryStore()
@@ -453,17 +601,25 @@ def test_h5adtozarr_reads_the_source_once_for_all_assays(tmp_path, monkeypatch):
             reader,
             zarr_loc=store,
             assay_split_key="feature_types",
-            **_SHARD_BAND_BUDGET,
+            mem_budget=_SHARD_BAND_BUDGET["mem_budget"],
+            nthreads=1,
+            policy=_SHARD_BAND_BUDGET["policy"],
         ).dump(batch_size=5)
     finally:
         reader.h5.close()
 
-    assert consumed == [5]
+    assert consumed
+    covered = 0
+    for start, stop in sorted(consumed):
+        assert start == covered
+        covered = stop
+    assert covered == values.shape[0]
     root = zarr.open_group(store=store, mode="r")
     assert set(root.group_keys()) == {"cellData", "RNA", "ADT"}
     np.testing.assert_array_equal(root["RNA/counts"][:], values[:, [0, 2]])
     np.testing.assert_array_equal(root["ADT/counts"][:], values[:, [1, 3]])
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
     assert "countsT" not in root["ADT"]
     assert root["RNA/counts"].dtype == values.dtype
 
@@ -581,8 +737,7 @@ def test_loomtozarr_preserves_exact_counts_and_transpose(tmp_path):
         writer = LoomToZarr(
             reader,
             zarr_loc=store,
-            targetChunkBytes=8,
-            targetShardBytes=8,
+            policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
         )
         writer.dump(batch_size=2)
     finally:
@@ -590,7 +745,8 @@ def test_loomtozarr_preserves_exact_counts_and_transpose(tmp_path):
 
     root = zarr.open_group(store=store, mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_sparsetozarr(tmp_path):
@@ -615,7 +771,8 @@ def test_sparsetozarr(tmp_path):
     writer.dump()
     root = zarr.open_group(fn, mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], mat.toarray())
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_sparsetozarr_sharded_layout(tmp_path):
@@ -683,7 +840,8 @@ def test_csv_to_zarr_round_trip(tmp_path):
         dtype=np.uint16,
     )
     np.testing.assert_array_equal(root["RNA/counts"][:], expected)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
     np.testing.assert_array_equal(
         root["RNA/featureData/ids"][:],
         np.array(["geneA", "geneB", "geneC"]),
@@ -753,8 +911,7 @@ def test_subset_assay_zarr_selects_ordered_rows_and_columns():
         out_grp="selected",
         cells_idx=cells,
         feat_idx=features,
-        targetChunkBytes=8,
-        targetShardBytes=8,
+        policy=CountMatrixPolicy(unitBytes=8, chunkBytes=8),
     )
 
     selected = root["selected"]
@@ -942,6 +1099,19 @@ def test_zarr_subset(datastore, tmp_path):
         zarr_loc=zarr_path, assays=[datastore.RNA], cell_idx=np.array([1, 10, 100, 500])
     )
     writer.dump()
+    root = zarr.open_group(zarr_path, mode="r")
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
+    np.testing.assert_array_equal(
+        root["RNA/countsT"][:],
+        np.asarray(root["RNA/counts"][:]).T,
+    )
+    # Subset store must open as RNAassay under the strip contract.
+    from scarf import DataStore
+
+    subset_ds = DataStore(zarr_path, default_assay="RNA", assay_types={"RNA": "RNA"})
+    assert subset_ds.RNA.rawDataT is not None
+    assert subset_ds.RNA.rawDataT.shape == (root["RNA/counts"].shape[1], 4)
 
 
 def test_subset_zarr_rejects_invalid_assay_inputs():
@@ -1102,8 +1272,7 @@ def test_h5adtozarr_applies_storage_resources_and_chunk_controls(tmp_path):
             zarr_loc=MemoryStore(),
             mem_budget="2G",
             nthreads=3,
-            targetChunkBytes=4_096,
-            targetShardBytes=20_480,
+            policy=CountMatrixPolicy(unitBytes=20_480, chunkBytes=4_096),
         )
     finally:
         reader.h5.close()
@@ -1113,11 +1282,302 @@ def test_h5adtozarr_applies_storage_resources_and_chunk_controls(tmp_path):
         50,
         dtype=np.uint16,
         profile="fast_local",
-        targetChunkBytes=4_096,
-        targetShardBytes=20_480,
+        policy=CountMatrixPolicy(unitBytes=20_480, chunkBytes=4_096),
     )
     counts = writer.z["RNA/counts"]
     assert writer.resources.memoryBytes == 2 * 1024**3
     assert writer.resources.workers == 3
     assert counts.chunks == expected.chunks
     assert counts.metadata.shards == expected.shards
+
+
+def test_count_matrix_bands_project_and_reject_uninitialized_split() -> None:
+    from scipy.sparse import coo_matrix
+
+    from scarf.storage.sharding import SparseShardBuffer
+    from scarf.writers.h5ad import _count_matrix_bands, _finished_count_bands
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    rna = root.create_array(
+        "RNA",
+        shape=(4, 2),
+        chunks=(2, 2),
+        shards=(2, 2),
+        dtype=np.uint32,
+    )
+    adt = root.create_array(
+        "ADT",
+        shape=(4, 2),
+        chunks=(2, 2),
+        shards=(2, 2),
+        dtype=np.uint32,
+    )
+    buffers = {
+        "RNA": SparseShardBuffer(rna, startRow=0, endRow=4),
+        "ADT": SparseShardBuffer(adt, startRow=0, endRow=4),
+    }
+    chunk = coo_matrix(np.arange(16, dtype=np.uint32).reshape(4, 4))
+    with pytest.raises(RuntimeError, match="Multi-assay projection"):
+        list(
+            _count_matrix_bands(
+                chunk,
+                buffers,
+                ("RNA", "ADT"),
+                None,
+            )
+        )
+    codes = np.array([0, 1, 0, 1], dtype=np.int64)
+    columns = np.array([0, 0, 1, 1], dtype=np.int64)
+    projected = list(
+        _count_matrix_bands(
+            chunk,
+            buffers,
+            ("RNA", "ADT"),
+            (codes, columns),
+        )
+    )
+    finished = list(_finished_count_bands(buffers))
+    assert projected or finished
+
+
+def test_h5ad_process_windows_run_in_the_parent_process(tmp_path) -> None:
+    import threading
+
+    from scarf.readers import H5adReader
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.count_matrix import plan_count_matrix_pair
+    from scarf.writers import H5adToZarr
+    from scarf.writers.h5ad import (
+        _read_h5ad_process_window,
+        _write_h5ad_process_window,
+    )
+
+    values = np.arange(8 * 4, dtype=np.uint32).reshape(8, 4)
+    h5ad_path = _write_h5ad(tmp_path / "cells.h5ad", values)
+    zarr_loc = str(tmp_path / "cells.zarr")
+    reader = H5adReader(str(h5ad_path))
+    try:
+        H5adToZarr(reader, zarr_loc=zarr_loc, **_SHARD_BAND_BUDGET).dump(batch_size=2)
+        plan = plan_count_matrix_pair(
+            values.shape[0],
+            values.shape[1],
+            values.dtype,
+            policy=_SHARD_BAND_BUDGET["policy"],
+        )
+        stop = threading.Event()
+        conn = _Pipe()
+        _read_h5ad_process_window(
+            reader._clone_kwargs(),
+            2,
+            0,
+            values.shape[0],
+            {"RNA": plan.counts},
+            ("RNA",),
+            None,
+            conn,
+            stop,
+        )
+        assert conn.closed
+        assert any(kind == "done" for kind, _payload in conn.messages)
+
+        stopped = threading.Event()
+        stopped.set()
+        _read_h5ad_process_window(
+            reader._clone_kwargs(),
+            2,
+            0,
+            values.shape[0],
+            {"RNA": plan.counts},
+            ("RNA",),
+            None,
+            _Pipe(),
+            stopped,
+        )
+
+        boom = _Pipe(fail_send=True)
+        _read_h5ad_process_window(
+            {"h5ad_fn": str(tmp_path / "missing.h5ad")},
+            1,
+            0,
+            1,
+            {"RNA": plan.counts},
+            ("RNA",),
+            None,
+            boom,
+            threading.Event(),
+        )
+        assert boom.closed
+
+        class _StopOnCall:
+            def __init__(self, trigger: int) -> None:
+                self.calls = 0
+                self.trigger = trigger
+
+            def is_set(self) -> bool:
+                self.calls += 1
+                return self.calls >= self.trigger
+
+        _read_h5ad_process_window(
+            reader._clone_kwargs(),
+            2,
+            0,
+            values.shape[0],
+            {"RNA": plan.counts},
+            ("RNA",),
+            None,
+            _Pipe(),
+            _StopOnCall(5),
+        )
+        _write_h5ad_process_window(
+            reader._clone_kwargs(),
+            2,
+            0,
+            values.shape[0],
+            zarr_loc,
+            None,
+            None,
+            ("RNA",),
+            None,
+            ResourceBudget(1024 * 1024, 2),
+            0,
+            1,
+            None,
+            _Pipe(),
+            _StopOnCall(5),
+        )
+
+        write_conn = _Pipe()
+        _write_h5ad_process_window(
+            reader._clone_kwargs(),
+            2,
+            0,
+            values.shape[0],
+            zarr_loc,
+            None,
+            None,
+            ("RNA",),
+            None,
+            ResourceBudget(1024 * 1024, 2),
+            0,
+            1,
+            None,
+            write_conn,
+            threading.Event(),
+        )
+        assert any(kind == "done" for kind, _payload in write_conn.messages)
+
+        _write_h5ad_process_window(
+            reader._clone_kwargs(),
+            2,
+            0,
+            values.shape[0],
+            zarr_loc,
+            None,
+            None,
+            ("RNA",),
+            None,
+            ResourceBudget(1024 * 1024, 2),
+            0,
+            1,
+            None,
+            _Pipe(),
+            stopped,
+        )
+        _write_h5ad_process_window(
+            {"h5ad_fn": str(tmp_path / "missing.h5ad")},
+            1,
+            0,
+            1,
+            zarr_loc,
+            None,
+            None,
+            ("RNA",),
+            None,
+            ResourceBudget(1024 * 1024, 2),
+            0,
+            1,
+            None,
+            _Pipe(fail_send=True),
+            threading.Event(),
+        )
+
+        _read_h5ad_process_window(
+            reader._clone_kwargs(),
+            2,
+            0,
+            values.shape[0],
+            {"RNA": plan.counts},
+            ("RNA",),
+            None,
+            _Pipe(),
+            _StopOnCall(2),
+        )
+
+        band_count = sum(kind == "band" for kind, _payload in conn.messages)
+        assert values.shape[0] % int(plan.counts.shards[0]) != 0
+
+        final_conn = _Pipe()
+
+        class _StopAfterBands:
+            def is_set(self) -> bool:
+                sent = sum(kind == "band" for kind, _payload in final_conn.messages)
+                return sent >= band_count
+
+        _read_h5ad_process_window(
+            reader._clone_kwargs(),
+            2,
+            0,
+            values.shape[0],
+            {"RNA": plan.counts},
+            ("RNA",),
+            None,
+            final_conn,
+            _StopAfterBands(),
+        )
+        assert (
+            sum(kind == "band" for kind, _payload in final_conn.messages) == band_count
+        )
+        assert not any(kind == "done" for kind, _payload in final_conn.messages)
+
+        source_batch_count = (values.shape[0] + 2 - 1) // 2
+        before_finished_writes = _StopOnCall(source_batch_count + 1)
+        _write_h5ad_process_window(
+            reader._clone_kwargs(),
+            2,
+            0,
+            values.shape[0],
+            zarr_loc,
+            None,
+            None,
+            ("RNA",),
+            None,
+            ResourceBudget(1024 * 1024, 2),
+            0,
+            1,
+            None,
+            _Pipe(),
+            before_finished_writes,
+        )
+        assert before_finished_writes.calls >= source_batch_count + 1
+    finally:
+        reader.h5.close()
+
+
+def test_source_assay_types_tolerates_missing_parent() -> None:
+    from types import SimpleNamespace
+
+    from scarf.writers.subset import _source_assay_types
+
+    class _Broken:
+        @property
+        def parent(self):
+            raise RuntimeError("no parent")
+
+    assert _source_assay_types(SimpleNamespace(z=_Broken())) == {}
+    assert _source_assay_types(SimpleNamespace(z=SimpleNamespace(parent=None))) == {}
+    parent = SimpleNamespace(attrs={"assayTypes": ["RNA"]})
+    assert _source_assay_types(SimpleNamespace(z=SimpleNamespace(parent=parent))) == {}
+    typed = SimpleNamespace(attrs={"assayTypes": {"RNA": "RNA"}})
+    assert _source_assay_types(SimpleNamespace(z=SimpleNamespace(parent=typed))) == {
+        "RNA": "RNA"
+    }

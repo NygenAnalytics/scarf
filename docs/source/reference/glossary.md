@@ -39,7 +39,8 @@ update_state
 
 count matrix
   Sparse matrix of primary counts stored cell-major (`n_cells` × `n_features`), for features such as genes, peaks, or ADTs.
-  Scarf stores counts in a Zarr assay group; `countsT` is an optional feature-major layout.
+  Scarf stores that array as `counts` in the assay Zarr group.
+  RNA assays also store `countsT`, the same values in gene-major order, so gene-wise stages can stream without scanning every cell.
 
 highly variable genes
   Features selected with `mark_hvgs` for neighbourhood-graph construction.

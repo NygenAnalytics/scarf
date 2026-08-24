@@ -10,9 +10,8 @@ from numpy.typing import NDArray
 from ..storage.budget import (
     DEFAULT_READ_AHEAD_BLOCKS,
     ResourceBudget,
-    admit_stream,
-    admitted_worker_count,
 )
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.geometry import ArrayGeometry, array_geometry
 from ._indexing import is_contiguous, local_positions
 from ._operations import (
@@ -53,6 +52,7 @@ class ChunkedArray:
         self._cols = None if cols is None else np.asarray(cols)
         self._ops: list[_Op] = list(ops) if ops else []
         self._resources = resources
+        self._io: StorageIoPolicy | None = None
         self._nthreads = (
             max(1, min(int(nthreads), resources.workers))
             if resources is not None
@@ -231,19 +231,51 @@ class ChunkedArray:
         nthreads: int | None,
         msg: str | None,
     ) -> list[NDArray[Any]]:
+        from ..storage.execution import (
+            ExecutionReport,
+            WorkShape,
+            plan_operation,
+            record_execution_report,
+        )
         from ..storage.parallel import map_shards
 
         ranges = self._ranges()
-        requested = self._nthreads if nthreads is None else max(1, int(nthreads))
-        workers = requested
+        workers = self._nthreads if nthreads is None else max(1, int(nthreads))
+        within = 1
+        io_concurrency: int | None = None
+        planned = None
         if self._resources is not None:
-            # map_shards pins Zarr to one decode per worker, so one chunk is exact.
-            workers = admitted_worker_count(
+            planned = plan_operation(
                 self._resources,
-                taskBytes=self._block_task_bytes(),
-                requested=requested,
+                WorkShape(
+                    nUnits=max(1, len(ranges)),
+                    unitBytes=self._block_task_bytes(),
+                    ordered=False,
+                ),
+                policy=self._io,
             )
-        results = map_shards(ranges, fn, workers=workers, msg=msg)
+            workers = planned.computeWorkers
+            within = planned.threadsPerComputeWorker
+            io_concurrency = planned.ioConcurrency
+        results = map_shards(
+            ranges,
+            fn,
+            workers=workers,
+            within_block_threads=within,
+            io_concurrency=io_concurrency,
+            msg=msg,
+        )
+        if planned is not None:
+            record_execution_report(
+                ExecutionReport(
+                    plan=planned,
+                    unitKind="countsRowBlock",
+                    actualReadWorkers=workers,
+                    actualComputeWorkers=workers,
+                    actualWriteWorkers=1,
+                    unitsCompleted=len(results),
+                )
+            )
         return [np.asarray(result) for result in results]
 
     def stream_blocks(
@@ -270,13 +302,10 @@ class ChunkedArray:
         row_mask: np.ndarray | None,
         resident_bytes: int = 0,
     ) -> Iterator[np.ndarray]:
+        from ..storage.execution import WorkShape, plan_operation
         from ..storage.parallel import stream_shards
 
         threads = self._nthreads if nthreads is None else max(1, int(nthreads))
-        requested = (
-            DEFAULT_READ_AHEAD_BLOCKS if prefetch is None else max(1, int(prefetch))
-        )
-        depth = min(threads, requested)
         ranges = self._ranges()
         mask = None if row_mask is None else np.asarray(row_mask)
         if mask is not None:
@@ -289,24 +318,40 @@ class ChunkedArray:
             ]
 
         io_concurrency: int | None = None
+        planned = None
         if self._resources is not None:
-            admission = admit_stream(
+            planned = plan_operation(
                 self._resources,
-                nBlocks=min(depth, max(1, len(ranges))),
-                blockBytes=self._block_owned_bytes(),
-                decodeBytes=self._max_decode_bytes(),
-                residentBytes=max(0, int(resident_bytes)),
+                WorkShape(
+                    nUnits=max(1, len(ranges)),
+                    unitBytes=self._block_owned_bytes(),
+                    decodeBytes=self._max_decode_bytes(),
+                    residentBytes=max(0, int(resident_bytes)),
+                    ordered=True,
+                ),
+                policy=self._io,
             )
-            depth = admission.outerWorkers
-            io_concurrency = admission.ioConcurrency
-        within = max(1, threads // depth)
+            depth = planned.readWorkers
+            if prefetch is not None:
+                depth = min(depth, max(1, int(prefetch)))
+            within = planned.threadsPerComputeWorker
+            io_concurrency = planned.ioConcurrency
+        else:
+            requested = (
+                max(1, int(prefetch))
+                if prefetch is not None
+                else DEFAULT_READ_AHEAD_BLOCKS
+            )
+            depth = min(threads, requested, max(1, len(ranges)))
+            within = 1
 
         def materialize(interval: tuple[int, int]) -> np.ndarray:
             start, end = interval
             values = self._materialize_range(start, end)
             return values if mask is None else values[mask[start:end]]
 
-        yield from stream_shards(
+        completed = 0
+        for block in stream_shards(
             ranges,
             materialize,
             workers=depth,
@@ -314,7 +359,22 @@ class ChunkedArray:
             io_concurrency=io_concurrency,
             msg=msg,
             total=len(ranges),
-        )
+        ):
+            completed += 1
+            yield block
+        if planned is not None:
+            from ..storage.execution import ExecutionReport, record_execution_report
+
+            record_execution_report(
+                ExecutionReport(
+                    plan=planned,
+                    unitKind="countsRowBlock",
+                    actualReadWorkers=depth,
+                    actualComputeWorkers=planned.computeWorkers,
+                    actualWriteWorkers=1,
+                    unitsCompleted=completed,
+                )
+            )
 
     def map_blocks(
         self,
@@ -348,36 +408,44 @@ class ChunkedArray:
         for start, end in self._ranges():
             yield Block(self, start, end)
 
+    def _with_io(self, array: "ChunkedArray") -> "ChunkedArray":
+        array._io = self._io
+        return array
+
     def _with_op(
         self,
         operation: _Op,
         out_cols: int | None = None,
     ) -> "ChunkedArray":
-        return ChunkedArray(
-            self._backing,
-            rows=self._rows,
-            cols=self._cols,
-            ops=self._ops + [operation],
-            out_cols=self._out_cols if out_cols is None else out_cols,
-            block_size=self._block_size,
-            nthreads=self._nthreads,
-            resources=self._resources,
-            is_numpy=self._is_numpy,
+        return self._with_io(
+            ChunkedArray(
+                self._backing,
+                rows=self._rows,
+                cols=self._cols,
+                ops=self._ops + [operation],
+                out_cols=self._out_cols if out_cols is None else out_cols,
+                block_size=self._block_size,
+                nthreads=self._nthreads,
+                resources=self._resources,
+                is_numpy=self._is_numpy,
+            )
         )
 
     def _with_block_size(self, block_size: int) -> "ChunkedArray":
         if block_size < 1:
             raise ValueError("block_size must be greater than zero")
-        return ChunkedArray(
-            self._backing,
-            rows=self._rows,
-            cols=self._cols,
-            ops=self._ops,
-            out_cols=self._out_cols,
-            block_size=block_size,
-            nthreads=self._nthreads,
-            resources=self._resources,
-            is_numpy=self._is_numpy,
+        return self._with_io(
+            ChunkedArray(
+                self._backing,
+                rows=self._rows,
+                cols=self._cols,
+                ops=self._ops,
+                out_cols=self._out_cols,
+                block_size=block_size,
+                nthreads=self._nthreads,
+                resources=self._resources,
+                is_numpy=self._is_numpy,
+            )
         )
 
     def _unary(self, func: Callable[..., NDArray[Any]]) -> "ChunkedArray":
@@ -496,16 +564,18 @@ class ChunkedArray:
             n_rows = int(row_positions.size)
 
         block_size = n_rows if self._is_numpy and n_rows > 0 else self._block_size
-        return ChunkedArray(
-            self._backing,
-            rows=rows,
-            cols=cols,
-            ops=operations,
-            out_cols=out_cols,
-            block_size=block_size,
-            nthreads=self._nthreads,
-            resources=self._resources,
-            is_numpy=self._is_numpy,
+        return self._with_io(
+            ChunkedArray(
+                self._backing,
+                rows=rows,
+                cols=cols,
+                ops=operations,
+                out_cols=out_cols,
+                block_size=block_size,
+                nthreads=self._nthreads,
+                resources=self._resources,
+                is_numpy=self._is_numpy,
+            )
         )
 
     def sum(self, axis: int | None = None) -> _Reduction:

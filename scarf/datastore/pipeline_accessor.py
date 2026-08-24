@@ -616,7 +616,7 @@ class PipelineAccessor:
             hvg_options = self._options(highly_variable_features)
             hvg_name = str(hvg_options.get("hvg_key_name", "hvgs"))
             hvg_options.setdefault("show_plot", False)
-            hvg_options.setdefault("top_n", 2000)
+            hvg_options.setdefault("top_n", 1000)
             hvg_options.setdefault("min_cells", 20)
             store.mark_hvgs(
                 from_assay=assay_name,
@@ -646,7 +646,7 @@ class PipelineAccessor:
             pca_options = self._options(pca)
             n_centroids = int(pca_options.pop("n_centroids", 1000))
             initialization_rand_state = int(pca_options.pop("rand_state", 4466))
-            pca_options.setdefault("dims", 25)
+            pca_options.setdefault("dims", 21)
             reduction = store.run_pca(
                 normalized,
                 update_state=False,
@@ -679,7 +679,7 @@ class PipelineAccessor:
 
         with events.stage("neighbors"):
             neighbor_options = self._options(neighbors)
-            neighbor_options.setdefault("k", 17)
+            neighbor_options.setdefault("k", 11)
             neighbor_ref = store.query_neighbors(
                 ann,
                 coordinates=coordinates,
@@ -711,29 +711,30 @@ class PipelineAccessor:
             )
             artifacts["embedding_initialization"] = initialization
 
-        if umap is not False:
-            with events.stage("umap"):
-                umap_options = self._options(umap)
-                artifacts["umap"] = store.run_umap(
-                    graph,
-                    from_assay=assay_name,
-                    cell_key=cell_key,
-                    feat_key=hvg_name,
-                    **umap_options,
-                )
+        with store._graph_memory_cache_scope():
+            if umap is not False:
+                with events.stage("umap"):
+                    umap_options = self._options(umap)
+                    artifacts["umap"] = store.run_umap(
+                        graph,
+                        from_assay=assay_name,
+                        cell_key=cell_key,
+                        feat_key=hvg_name,
+                        **umap_options,
+                    )
 
-        leiden_options = dict(_DEFAULT_LEIDEN) if leiden is None else dict(leiden)
-        paris_options = None if paris is False else self._options(paris)
-        cluster_columns, cluster_artifacts = self._run_clustering_jobs(
-            graph=graph,
-            assay_name=assay_name,
-            cell_key=cell_key,
-            feat_key=hvg_name,
-            leiden_options=leiden_options,
-            paris_options=paris_options,
-            clustering_concurrency=clustering_concurrency,
-            events=events,
-        )
+            leiden_options = dict(_DEFAULT_LEIDEN) if leiden is None else dict(leiden)
+            paris_options = None if paris is False else self._options(paris)
+            cluster_columns, cluster_artifacts = self._run_clustering_jobs(
+                graph=graph,
+                assay_name=assay_name,
+                cell_key=cell_key,
+                feat_key=hvg_name,
+                leiden_options=leiden_options,
+                paris_options=paris_options,
+                clustering_concurrency=clustering_concurrency,
+                events=events,
+            )
         artifacts.update(cluster_artifacts)
 
         doublet_options = (

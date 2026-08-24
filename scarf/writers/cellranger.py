@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 
 from ..readers import CrReader
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -22,9 +24,18 @@ class CrToZarr:
         cr: A CrReader object, containing the Cellranger data.
         zarr_loc: The file name for the Zarr hierarchy or a store
         dtype: the dtype of the data.
+        workspace: Workspace name in the destination store. None uses the
+                   legacy layout without a workspace group.
+        storage_options: Backend options passed when opening the Zarr store.
         mem_budget: Memory available to the conversion. Accepts bytes, a
                     suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
         nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
 
     Attributes:
         cr: A CrReader object, containing the Cellranger data.
@@ -41,8 +52,8 @@ class CrToZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -54,6 +65,8 @@ class CrToZarr:
 
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.policy = policy
+        self.io = io
         self.cr = cr
         mark_schema_captured = getattr(self.cr, "_mark_schema_captured", None)
         if callable(mark_schema_captured):
@@ -81,8 +94,7 @@ class CrToZarr:
                 feat_names=self.cr.feature_names(assay_name),
                 dtype=dtype,
                 profile=self.profile,
-                targetChunkBytes=targetChunkBytes,
-                targetShardBytes=targetShardBytes,
+                policy=policy,
             )
         self._write_reader_metadata(cell_group, assay_names)
 
@@ -341,6 +353,7 @@ class CrToZarr:
                 residentBytes=resident_reader_bytes,
                 producerReserveBytes=plan.producerReserveBytes,
                 total=plan.writeTasks,
+                io=self.io,
             )
             if any(buffer.rows != self.cr.nCells for buffer in buffers.values()):
                 raise AssertionError(
@@ -350,6 +363,17 @@ class CrToZarr:
                 f"Wrote {self.cr.nCells} cells and "
                 f"{sum(buffer.nColumns for buffer in buffers.values())} features "
                 f"from Cell Ranger to {len(stores)} assay(s)"
+            )
+            from .counts_t import finalize_writer_counts_t_many
+
+            finalize_writer_counts_t_many(
+                self.z,
+                tuple(stores),
+                self.workspace,
+                resources=self.resources,
+                profile=self.profile,
+                policy=self.policy,
+                io=self.io,
             )
         finally:
             if callable(release):

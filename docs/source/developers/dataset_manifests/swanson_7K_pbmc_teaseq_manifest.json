@@ -49,319 +49,319 @@
       "sizeFactor": 1000
     }
   },
-  "archiveBytes": 475687619,
-  "archiveSha256": "d6895a00b9e3aaed5348492b663600ba43bd00a2ec7aae0e813e35ddb555d04b",
+  "archiveBytes": 488339232,
+  "archiveSha256": "450e02d7d0088e4d40039bf83fee9709a72a24d2537378980abc32793e98ae83",
   "artifacts": [
     {
-      "artifactId": "1f315f1bc3598d70e32f2a7208e2bf61ecb10e97640b4c65d628311b7688a25d",
+      "artifactId": "2a2fdc8755aa597ab837b23500f0a3ce232e527cfff1c118340e1cc2c9d5f8bd",
       "assay": null,
       "kind": "cell_selection",
       "operation": "import_cell_selection",
-      "path": "artifacts/cell_selection/1f315f1bc3598d70e32f2a7208e2bf61ecb10e97640b4c65d628311b7688a25d",
+      "path": "artifacts/cell_selection/2a2fdc8755aa597ab837b23500f0a3ce232e527cfff1c118340e1cc2c9d5f8bd",
       "scope": "datastore"
     },
     {
-      "artifactId": "ef99329f72cd9d29e08bca47a817e9d72698f4a6d3e3ef874cd44fe6e4a5b8e1",
+      "artifactId": "c9f07aa970da7868a0c8581422fa2e1ced4c2dd302d2005e15f9b6d53ad10056",
       "assay": null,
       "kind": "cell_selection",
       "operation": "manual_selection",
-      "path": "artifacts/cell_selection/ef99329f72cd9d29e08bca47a817e9d72698f4a6d3e3ef874cd44fe6e4a5b8e1",
+      "path": "artifacts/cell_selection/c9f07aa970da7868a0c8581422fa2e1ced4c2dd302d2005e15f9b6d53ad10056",
       "scope": "datastore"
     },
     {
-      "artifactId": "b67fc6d319bcd56718f2aeecbf242e1ec215750c9a53c294f3c9f89f4df28294",
+      "artifactId": "5f56794d5ee9bc849bd282f313ea84c15c52c5aed20cb8ab3e7b5b6d043965be",
       "assay": null,
       "kind": "cluster_labels",
       "operation": "run_leiden_clustering",
-      "path": "artifacts/cluster_labels/b67fc6d319bcd56718f2aeecbf242e1ec215750c9a53c294f3c9f89f4df28294",
+      "path": "artifacts/cluster_labels/5f56794d5ee9bc849bd282f313ea84c15c52c5aed20cb8ab3e7b5b6d043965be",
       "scope": "datastore"
     },
     {
-      "artifactId": "dfe60d786e4651f1b9f42a813d609ee3cb9a1fee82bed52992b4f7cc7a69c54a",
+      "artifactId": "db850fd1c62d4aaa4f83ea5298957d38b090b20230cf958c5a992ca5b73880ac",
       "assay": null,
       "kind": "cluster_labels",
       "operation": "run_leiden_clustering",
-      "path": "artifacts/cluster_labels/dfe60d786e4651f1b9f42a813d609ee3cb9a1fee82bed52992b4f7cc7a69c54a",
+      "path": "artifacts/cluster_labels/db850fd1c62d4aaa4f83ea5298957d38b090b20230cf958c5a992ca5b73880ac",
       "scope": "datastore"
     },
     {
-      "artifactId": "2b9eaf301f1cdade846208af28e953b62488587974e844d053fc75d7813cd271",
+      "artifactId": "004f4e3c192038784a9c1b2d354c6419aa5ace9290daa88823ac2e1f47b8d4ed",
       "assay": null,
       "kind": "embedding",
       "operation": "run_umap",
-      "path": "artifacts/embedding/2b9eaf301f1cdade846208af28e953b62488587974e844d053fc75d7813cd271",
+      "path": "artifacts/embedding/004f4e3c192038784a9c1b2d354c6419aa5ace9290daa88823ac2e1f47b8d4ed",
       "scope": "datastore"
     },
     {
-      "artifactId": "ac219ebaef3b202eb7baa5b528b2c7bc137cd2d2036ae61ca4ebd467924f6a12",
+      "artifactId": "c51ecb756f36306f036717d7afb7449b93bedde7b8842e4474e395eaf28fbaec",
       "assay": null,
       "kind": "embedding",
       "operation": "run_umap",
-      "path": "artifacts/embedding/ac219ebaef3b202eb7baa5b528b2c7bc137cd2d2036ae61ca4ebd467924f6a12",
+      "path": "artifacts/embedding/c51ecb756f36306f036717d7afb7449b93bedde7b8842e4474e395eaf28fbaec",
       "scope": "datastore"
     },
     {
-      "artifactId": "30bbb48cf20184553945558a0b760971f36d02d6cfa509f6f5fb873eabe2df2e",
+      "artifactId": "353f5aa9d56e27b3b5448e8cb48d0d7d9a9a31fd14b29135e4713c2efbbc8a09",
       "assay": null,
       "kind": "integrated_graph",
       "operation": "integrate_assays",
-      "path": "artifacts/integrated_graph/30bbb48cf20184553945558a0b760971f36d02d6cfa509f6f5fb873eabe2df2e",
+      "path": "artifacts/integrated_graph/353f5aa9d56e27b3b5448e8cb48d0d7d9a9a31fd14b29135e4713c2efbbc8a09",
       "scope": "datastore"
     },
     {
-      "artifactId": "4476be95c42c9d67f46c78050c0529ff2482b810cc9cd26940d6952e6c76f438",
+      "artifactId": "a9b02b468784df0f35707f1109c5036ad1685646c186a6145d21c41f8f32c3f0",
       "assay": null,
       "kind": "integrated_graph",
       "operation": "integrate_assays",
-      "path": "artifacts/integrated_graph/4476be95c42c9d67f46c78050c0529ff2482b810cc9cd26940d6952e6c76f438",
+      "path": "artifacts/integrated_graph/a9b02b468784df0f35707f1109c5036ad1685646c186a6145d21c41f8f32c3f0",
       "scope": "datastore"
     },
     {
-      "artifactId": "352cd3aaa3f0bb9af8981bb9d9c622ef5386cdc22ac09d7d0be530a7c5f52638",
+      "artifactId": "d68de691874d4bf4d56e360e8b8e14c19b9f8d5e4eba84c3b70eca284b4120c9",
       "assay": "ADT",
       "kind": "ann_index",
       "operation": "build_ann_index",
-      "path": "ADT/artifacts/ann_index/352cd3aaa3f0bb9af8981bb9d9c622ef5386cdc22ac09d7d0be530a7c5f52638",
+      "path": "ADT/artifacts/ann_index/d68de691874d4bf4d56e360e8b8e14c19b9f8d5e4eba84c3b70eca284b4120c9",
       "scope": "assay"
     },
     {
-      "artifactId": "e822e5ed59cad3e768b16e24364ef8c27b258e69d2b161b6621d5cfb6fdd0f32",
+      "artifactId": "4501d9d33ac81221d1b7f8ab842432d65ac959ba4d5f05c14165e2fcae1fe130",
       "assay": "ADT",
       "kind": "cluster_labels",
       "operation": "run_leiden_clustering",
-      "path": "ADT/artifacts/cluster_labels/e822e5ed59cad3e768b16e24364ef8c27b258e69d2b161b6621d5cfb6fdd0f32",
+      "path": "ADT/artifacts/cluster_labels/4501d9d33ac81221d1b7f8ab842432d65ac959ba4d5f05c14165e2fcae1fe130",
       "scope": "assay"
     },
     {
-      "artifactId": "f52a02f162e39c998a2bec51f75cfb5e6243ec85cc70671649390b745622c968",
+      "artifactId": "445e67763e55dc705373b78a202c96093d43cbf8d2c2574311f1a6c5de83de9f",
       "assay": "ADT",
       "kind": "connectivity_map",
       "operation": "build_connectivity_map",
-      "path": "ADT/artifacts/connectivity_map/f52a02f162e39c998a2bec51f75cfb5e6243ec85cc70671649390b745622c968",
+      "path": "ADT/artifacts/connectivity_map/445e67763e55dc705373b78a202c96093d43cbf8d2c2574311f1a6c5de83de9f",
       "scope": "assay"
     },
     {
-      "artifactId": "01fbe28afa2d5adf14246758b6b836368d18f3ae067ba81fc64d86454e219266",
+      "artifactId": "471a35e5b01b1295d3d0ba372890e17d3c210e6ffc4e804b59664a4eeb6fa159",
       "assay": "ADT",
       "kind": "embedding",
       "operation": "run_umap",
-      "path": "ADT/artifacts/embedding/01fbe28afa2d5adf14246758b6b836368d18f3ae067ba81fc64d86454e219266",
+      "path": "ADT/artifacts/embedding/471a35e5b01b1295d3d0ba372890e17d3c210e6ffc4e804b59664a4eeb6fa159",
       "scope": "assay"
     },
     {
-      "artifactId": "490cd248a46e54b5b4d9f552bd3bfb097fc782782285fd6ba80f277d97c5ed2e",
+      "artifactId": "dbdb31695625a6dc111a111cfa642f16877b7c0b3c8a96878aeda5e9c3f3f73f",
       "assay": "ADT",
       "kind": "embedding_initialization",
       "operation": "build_embedding_initialization",
-      "path": "ADT/artifacts/embedding_initialization/490cd248a46e54b5b4d9f552bd3bfb097fc782782285fd6ba80f277d97c5ed2e",
+      "path": "ADT/artifacts/embedding_initialization/dbdb31695625a6dc111a111cfa642f16877b7c0b3c8a96878aeda5e9c3f3f73f",
       "scope": "assay"
     },
     {
-      "artifactId": "371c2e347bfbdc7a860a04844c7391279a3e7377bd2fcc21fc3f3a5caeadf09c",
+      "artifactId": "64b2e1a85a698a94747c3b186587be6963e9ae275982a23145f153963e5058e8",
       "assay": "ADT",
       "kind": "feature_scaling",
       "operation": "calculate_feature_scaling",
-      "path": "ADT/artifacts/feature_scaling/371c2e347bfbdc7a860a04844c7391279a3e7377bd2fcc21fc3f3a5caeadf09c",
+      "path": "ADT/artifacts/feature_scaling/64b2e1a85a698a94747c3b186587be6963e9ae275982a23145f153963e5058e8",
       "scope": "assay"
     },
     {
-      "artifactId": "52d6b6af4289a343ca17da5a38e101697820860389dfaa377403a23dc1333f03",
+      "artifactId": "597fe05f8f6705b2011610f8617265ade2b74513bae49f39be54df8f00627d8d",
       "assay": "ADT",
       "kind": "feature_selection",
       "operation": "manual_selection",
-      "path": "ADT/artifacts/feature_selection/52d6b6af4289a343ca17da5a38e101697820860389dfaa377403a23dc1333f03",
+      "path": "ADT/artifacts/feature_selection/597fe05f8f6705b2011610f8617265ade2b74513bae49f39be54df8f00627d8d",
       "scope": "assay"
     },
     {
-      "artifactId": "e781ee258b2d67ad32c4795e5cddaa60127e3aad06441f5b11355db1aa711b6e",
+      "artifactId": "4d34a414ea1ffa7aaad82e64ca28e5deb2ee20f950ae1eb2151cbcb03bf3357a",
       "assay": "ADT",
       "kind": "neighbors",
       "operation": "query_neighbors",
-      "path": "ADT/artifacts/neighbors/e781ee258b2d67ad32c4795e5cddaa60127e3aad06441f5b11355db1aa711b6e",
+      "path": "ADT/artifacts/neighbors/4d34a414ea1ffa7aaad82e64ca28e5deb2ee20f950ae1eb2151cbcb03bf3357a",
       "scope": "assay"
     },
     {
-      "artifactId": "4cea7cfc538a567427f75f6b18bd2b06a0d195d7595f0813010ed610cb5b33e4",
+      "artifactId": "39175689204b8b9e9f16a5d3f9ec758151027837537473f16a5d7c7d6bdd9788",
       "assay": "ADT",
       "kind": "normalized",
       "operation": "run_normalization",
-      "path": "ADT/artifacts/normalized/4cea7cfc538a567427f75f6b18bd2b06a0d195d7595f0813010ed610cb5b33e4",
+      "path": "ADT/artifacts/normalized/39175689204b8b9e9f16a5d3f9ec758151027837537473f16a5d7c7d6bdd9788",
       "scope": "assay"
     },
     {
-      "artifactId": "ff4247dad081af8fbe1780c9a747df69401f96489fe84079454befbbb8e566b1",
+      "artifactId": "183bcfffd2df64aa7fd0d609dc6e0da88150c5399b703c0fdc4e804dc3258013",
       "assay": "ADT",
       "kind": "reduction",
       "operation": "run_pca",
-      "path": "ADT/artifacts/reduction/ff4247dad081af8fbe1780c9a747df69401f96489fe84079454befbbb8e566b1",
+      "path": "ADT/artifacts/reduction/183bcfffd2df64aa7fd0d609dc6e0da88150c5399b703c0fdc4e804dc3258013",
       "scope": "assay"
     },
     {
-      "artifactId": "05d2267d1f71a00844ca3ca79d4eb94aed9b94394e3af20c063dc90dd19c021d",
+      "artifactId": "ac087e2b58d428467c90fab215618bf5acc789814ed9d86f9224a78dfc34eee1",
       "assay": "ATAC",
       "kind": "ann_index",
       "operation": "build_ann_index",
-      "path": "ATAC/artifacts/ann_index/05d2267d1f71a00844ca3ca79d4eb94aed9b94394e3af20c063dc90dd19c021d",
+      "path": "ATAC/artifacts/ann_index/ac087e2b58d428467c90fab215618bf5acc789814ed9d86f9224a78dfc34eee1",
       "scope": "assay"
     },
     {
-      "artifactId": "f3716092ec18a2e026fcfdccd0aae7e01c7c7ec733dc11420864b24f64486a95",
+      "artifactId": "ece6640e5f91fbbab71fa6a29eac28be7030e6305938e40c1cfbdd430f314605",
       "assay": "ATAC",
       "kind": "cluster_labels",
       "operation": "run_leiden_clustering",
-      "path": "ATAC/artifacts/cluster_labels/f3716092ec18a2e026fcfdccd0aae7e01c7c7ec733dc11420864b24f64486a95",
+      "path": "ATAC/artifacts/cluster_labels/ece6640e5f91fbbab71fa6a29eac28be7030e6305938e40c1cfbdd430f314605",
       "scope": "assay"
     },
     {
-      "artifactId": "0c3d1cccf60d7d1fe005e92a70032e6f868a0a83af176b849c71b8f513587b09",
+      "artifactId": "74f92964b72f509b5c30ad9240aed3697c33c7470313ee922a47e442e9b9ce39",
       "assay": "ATAC",
       "kind": "connectivity_map",
       "operation": "build_connectivity_map",
-      "path": "ATAC/artifacts/connectivity_map/0c3d1cccf60d7d1fe005e92a70032e6f868a0a83af176b849c71b8f513587b09",
+      "path": "ATAC/artifacts/connectivity_map/74f92964b72f509b5c30ad9240aed3697c33c7470313ee922a47e442e9b9ce39",
       "scope": "assay"
     },
     {
-      "artifactId": "54add7d5c0f73ef0a9d4bcf9d1123948357894dc38a6094f852d12b832449868",
+      "artifactId": "c2d258a5fb94fab7c85f212fb7b1acae0a9f96c9c2fc815e14b898383e72993e",
       "assay": "ATAC",
       "kind": "embedding",
       "operation": "run_umap",
-      "path": "ATAC/artifacts/embedding/54add7d5c0f73ef0a9d4bcf9d1123948357894dc38a6094f852d12b832449868",
+      "path": "ATAC/artifacts/embedding/c2d258a5fb94fab7c85f212fb7b1acae0a9f96c9c2fc815e14b898383e72993e",
       "scope": "assay"
     },
     {
-      "artifactId": "1d60ef9c393eeaa98d0f2fb18bd901d791b14d7abd83256c06958389e4c6fae6",
+      "artifactId": "9c7d071155419fb8caf99da855d868f0d32ad4b6571f67fde5912b88ce8c1a26",
       "assay": "ATAC",
       "kind": "embedding_initialization",
       "operation": "build_embedding_initialization",
-      "path": "ATAC/artifacts/embedding_initialization/1d60ef9c393eeaa98d0f2fb18bd901d791b14d7abd83256c06958389e4c6fae6",
+      "path": "ATAC/artifacts/embedding_initialization/9c7d071155419fb8caf99da855d868f0d32ad4b6571f67fde5912b88ce8c1a26",
       "scope": "assay"
     },
     {
-      "artifactId": "99f2b7e90a9506bc05cfb99d487d1a6de2e51f148d507d325bdf8c05e70fe6a3",
+      "artifactId": "cd367a58a07588f7c6fbc1ec777c44f04e0ce9e9b7fbf155fc6f4c5eff89ed85",
       "assay": "ATAC",
       "kind": "feature_scaling",
       "operation": "calculate_feature_scaling",
-      "path": "ATAC/artifacts/feature_scaling/99f2b7e90a9506bc05cfb99d487d1a6de2e51f148d507d325bdf8c05e70fe6a3",
+      "path": "ATAC/artifacts/feature_scaling/cd367a58a07588f7c6fbc1ec777c44f04e0ce9e9b7fbf155fc6f4c5eff89ed85",
       "scope": "assay"
     },
     {
-      "artifactId": "b5efc82b3c3eff786eeaa9dec320df1301ff06bd9bca5555587cbbb3dfd38197",
+      "artifactId": "802c145b65ba57758986b5a260ca1844d99610bbfb7aa5b9b24a21ce9761a382",
       "assay": "ATAC",
       "kind": "feature_selection",
       "operation": "mark_prevalent_peaks",
-      "path": "ATAC/artifacts/feature_selection/b5efc82b3c3eff786eeaa9dec320df1301ff06bd9bca5555587cbbb3dfd38197",
+      "path": "ATAC/artifacts/feature_selection/802c145b65ba57758986b5a260ca1844d99610bbfb7aa5b9b24a21ce9761a382",
       "scope": "assay"
     },
     {
-      "artifactId": "e62b4a93b696a95f0678ad2759922009272fb0e7e2f9472884c2768163f5f589",
+      "artifactId": "8da1d49adb15da0d6aee42afac560b3910c52f2c936de9e50a4c339d5e66751a",
       "assay": "ATAC",
       "kind": "feature_selection",
       "operation": "manual_selection",
-      "path": "ATAC/artifacts/feature_selection/e62b4a93b696a95f0678ad2759922009272fb0e7e2f9472884c2768163f5f589",
+      "path": "ATAC/artifacts/feature_selection/8da1d49adb15da0d6aee42afac560b3910c52f2c936de9e50a4c339d5e66751a",
       "scope": "assay"
     },
     {
-      "artifactId": "ad53906890244cb59deb16a9407ffa76fb7a782ef9a9b48b7e6fde9d3ad1ed94",
+      "artifactId": "d691fad1e5b7299a4049944106542088f734c4956813fc7cb8d95a0be822f59d",
       "assay": "ATAC",
       "kind": "neighbors",
       "operation": "query_neighbors",
-      "path": "ATAC/artifacts/neighbors/ad53906890244cb59deb16a9407ffa76fb7a782ef9a9b48b7e6fde9d3ad1ed94",
+      "path": "ATAC/artifacts/neighbors/d691fad1e5b7299a4049944106542088f734c4956813fc7cb8d95a0be822f59d",
       "scope": "assay"
     },
     {
-      "artifactId": "1c3c640b8492d6e00e94c632b9bbba7021031bc0355c5e1983e4bd32449cf49a",
+      "artifactId": "5bd6a76b0efcd41ae65b4b9d28d2217df7d9946d8deb2aa385ed1f78c59aab86",
       "assay": "ATAC",
       "kind": "normalized",
       "operation": "run_normalization",
-      "path": "ATAC/artifacts/normalized/1c3c640b8492d6e00e94c632b9bbba7021031bc0355c5e1983e4bd32449cf49a",
+      "path": "ATAC/artifacts/normalized/5bd6a76b0efcd41ae65b4b9d28d2217df7d9946d8deb2aa385ed1f78c59aab86",
       "scope": "assay"
     },
     {
-      "artifactId": "5d923092ca37305d2fd7cc47bfcf05d5debfea67519fa8641630d66621484cbc",
+      "artifactId": "b765b1bd914b0b6e7037058e591a7df0a046da56cd16e6814177a4310c24ddd9",
       "assay": "ATAC",
       "kind": "reduction",
       "operation": "run_lsi",
-      "path": "ATAC/artifacts/reduction/5d923092ca37305d2fd7cc47bfcf05d5debfea67519fa8641630d66621484cbc",
+      "path": "ATAC/artifacts/reduction/b765b1bd914b0b6e7037058e591a7df0a046da56cd16e6814177a4310c24ddd9",
       "scope": "assay"
     },
     {
-      "artifactId": "9c863ead3f1ce1111ae4aa01699c1c0c6fd929b372bbacf25177406e00bb2627",
+      "artifactId": "3f3150eeb629b1f8ce882956c939e7f2093aea70f1aef0b74f2269393f1957ec",
       "assay": "RNA",
       "kind": "ann_index",
       "operation": "build_ann_index",
-      "path": "RNA/artifacts/ann_index/9c863ead3f1ce1111ae4aa01699c1c0c6fd929b372bbacf25177406e00bb2627",
+      "path": "RNA/artifacts/ann_index/3f3150eeb629b1f8ce882956c939e7f2093aea70f1aef0b74f2269393f1957ec",
       "scope": "assay"
     },
     {
-      "artifactId": "35e9d18a928042e2ec446590cc9f604b49d1c5e37449bb00280f862eb8848731",
+      "artifactId": "8d24ddba4a992f30b84a7d6d0e47fa2e4995b43438dcba79f6bf79f7fb37c2e1",
       "assay": "RNA",
       "kind": "cluster_labels",
       "operation": "run_leiden_clustering",
-      "path": "RNA/artifacts/cluster_labels/35e9d18a928042e2ec446590cc9f604b49d1c5e37449bb00280f862eb8848731",
+      "path": "RNA/artifacts/cluster_labels/8d24ddba4a992f30b84a7d6d0e47fa2e4995b43438dcba79f6bf79f7fb37c2e1",
       "scope": "assay"
     },
     {
-      "artifactId": "88705339dbb8e5886090ed715d8ef5fc745d6bd7fc5b8405eab8a2be231232df",
+      "artifactId": "e751bc9a5cb6085ccb057aae4850c92a5b6524c2bb58bb8c467e716874834e31",
       "assay": "RNA",
       "kind": "connectivity_map",
       "operation": "build_connectivity_map",
-      "path": "RNA/artifacts/connectivity_map/88705339dbb8e5886090ed715d8ef5fc745d6bd7fc5b8405eab8a2be231232df",
+      "path": "RNA/artifacts/connectivity_map/e751bc9a5cb6085ccb057aae4850c92a5b6524c2bb58bb8c467e716874834e31",
       "scope": "assay"
     },
     {
-      "artifactId": "7ee98d23c4edaff24ab09b1465ee8e340e7d93651bf8ea5c3af29ee58b3a25c2",
+      "artifactId": "abd533e8a506400628675c4ba42aa2c6a4f2ac9eb2234d2e6f9eb2a90e7e6678",
       "assay": "RNA",
       "kind": "embedding",
       "operation": "run_umap",
-      "path": "RNA/artifacts/embedding/7ee98d23c4edaff24ab09b1465ee8e340e7d93651bf8ea5c3af29ee58b3a25c2",
+      "path": "RNA/artifacts/embedding/abd533e8a506400628675c4ba42aa2c6a4f2ac9eb2234d2e6f9eb2a90e7e6678",
       "scope": "assay"
     },
     {
-      "artifactId": "9548ccb8cd97af69a26ff29a3b6f542d611fcb5996954d786b4151fdde46456b",
+      "artifactId": "02108fd17a05c4a2bf3a29d9c30c49fba3a5a79490bf213e5384f44df3afd661",
       "assay": "RNA",
       "kind": "embedding_initialization",
       "operation": "build_embedding_initialization",
-      "path": "RNA/artifacts/embedding_initialization/9548ccb8cd97af69a26ff29a3b6f542d611fcb5996954d786b4151fdde46456b",
+      "path": "RNA/artifacts/embedding_initialization/02108fd17a05c4a2bf3a29d9c30c49fba3a5a79490bf213e5384f44df3afd661",
       "scope": "assay"
     },
     {
-      "artifactId": "606463db1b348dcf792dbfeba054bb345ed4a3239b288d93e1538e1bf003b086",
+      "artifactId": "35886c49f06facc202d4b221d9831e6921eadd96b40509f8d0f05ff21ffad640",
       "assay": "RNA",
       "kind": "feature_scaling",
       "operation": "calculate_feature_scaling",
-      "path": "RNA/artifacts/feature_scaling/606463db1b348dcf792dbfeba054bb345ed4a3239b288d93e1538e1bf003b086",
+      "path": "RNA/artifacts/feature_scaling/35886c49f06facc202d4b221d9831e6921eadd96b40509f8d0f05ff21ffad640",
       "scope": "assay"
     },
     {
-      "artifactId": "c076d3be2ffc960081b8f74cb4bc11e6210b2f0bef0471daca086cc2deffd0bf",
+      "artifactId": "adf27bceb122a5100e60fb9a5c1ca2dff9d71e657cd9ce118d3c8b6b278b8a5a",
       "assay": "RNA",
       "kind": "feature_selection",
       "operation": "mark_hvgs",
-      "path": "RNA/artifacts/feature_selection/c076d3be2ffc960081b8f74cb4bc11e6210b2f0bef0471daca086cc2deffd0bf",
+      "path": "RNA/artifacts/feature_selection/adf27bceb122a5100e60fb9a5c1ca2dff9d71e657cd9ce118d3c8b6b278b8a5a",
       "scope": "assay"
     },
     {
-      "artifactId": "1ec3b90e85096c493d138790042b7e59f9a249a365495d2fc228135dbbc7a06d",
+      "artifactId": "20622541a710b8c285d737d7ab9a6a5c1f7bf3266bdde2826967c69a42d37fb9",
       "assay": "RNA",
       "kind": "neighbors",
       "operation": "query_neighbors",
-      "path": "RNA/artifacts/neighbors/1ec3b90e85096c493d138790042b7e59f9a249a365495d2fc228135dbbc7a06d",
+      "path": "RNA/artifacts/neighbors/20622541a710b8c285d737d7ab9a6a5c1f7bf3266bdde2826967c69a42d37fb9",
       "scope": "assay"
     },
     {
-      "artifactId": "62d351efeeca93d847cd891d5df644c5d061e046b14c53cc59f3bed05b730254",
+      "artifactId": "afe171e3e1710c575e4abdf485ce21404a02c57737a4d358a173ba1b09a7004b",
       "assay": "RNA",
       "kind": "normalized",
       "operation": "run_normalization",
-      "path": "RNA/artifacts/normalized/62d351efeeca93d847cd891d5df644c5d061e046b14c53cc59f3bed05b730254",
+      "path": "RNA/artifacts/normalized/afe171e3e1710c575e4abdf485ce21404a02c57737a4d358a173ba1b09a7004b",
       "scope": "assay"
     },
     {
-      "artifactId": "ec30b76fc07df7d09c2cdf1017146ce786ae489c1ae3b72475854d57bb8a67db",
+      "artifactId": "663732ed5bce6252ba0034874e72cf65bcc35f28ba4b0b7066c84bc99fecfe2d",
       "assay": "RNA",
       "kind": "reduction",
       "operation": "run_pca",
-      "path": "RNA/artifacts/reduction/ec30b76fc07df7d09c2cdf1017146ce786ae489c1ae3b72475854d57bb8a67db",
+      "path": "RNA/artifacts/reduction/663732ed5bce6252ba0034874e72cf65bcc35f28ba4b0b7066c84bc99fecfe2d",
       "scope": "assay"
     }
   ],
@@ -449,11 +449,11 @@
       "url": "https://cdn.elifesciences.org/articles/63632/elife-63632-fig4-data2-v1.zip"
     }
   ],
-  "generatedAt": "2026-08-03T22:25:27.611751+00:00",
-  "generatorCommit": "64f1c42a3f501f532f808c786e0eb738393eed5f",
+  "generatedAt": "2026-08-20T13:53:23.459595+00:00",
+  "generatorCommit": "46aeaa5b5f1e187fdf831464afbc3ea99c985d01",
   "memoryBudgets": {
     "analysisBytes": 8589934592,
-    "importBytes": 4294967296
+    "importBytes": 8589934592
   },
   "nCellsActive": 6194,
   "nCellsTotal": 7069,
@@ -463,11 +463,11 @@
   ],
   "recipe": "RNA PCA, ATAC TF-IDF and LSI, ADT CLR and PCA, modality UMAPs, three-way SNN and WNN, integrated UMAPs, and Leiden labels",
   "repository": "scarf_docs",
-  "scarfVersion": "1.0.0rc1",
+  "scarfVersion": "1.0.0rc5.dev5+g818f01963.d20260817",
   "sourceDatasets": [],
   "sourceFiles": [
     "GSM5123951_PBMC_permcells_TEA-seq_SeuratObject.rds",
     "elife-63632-fig4-data2-v1.zip"
   ],
-  "storeBytes": 745813513
+  "storeBytes": 787332144
 }

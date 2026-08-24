@@ -484,7 +484,7 @@ def _fit_component(
 def fit_paris_hierarchy(
     graph: spmatrix,
     *,
-    n_threads: int | None = None,
+    nthreads: int | None = None,
 ) -> ParisHierarchy:
     """Fit a deterministic Paris hierarchy with reciprocal-neighbor rounds."""
     start = time.perf_counter()
@@ -511,9 +511,7 @@ def fit_paris_hierarchy(
     np.cumsum(component_counts, out=component_offsets[1:])
     component_seconds = time.perf_counter() - component_start
 
-    requested_threads = (
-        get_num_threads() if n_threads is None else max(1, int(n_threads))
-    )
+    requested_threads = get_num_threads() if nthreads is None else max(1, int(nthreads))
     previous_threads = get_num_threads()
     set_num_threads(min(requested_threads, config.NUMBA_NUM_THREADS))
     fit_start = time.perf_counter()

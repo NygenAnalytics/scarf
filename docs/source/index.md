@@ -61,7 +61,9 @@ See {doc}`tutorials/remote_stores`.
 ## Planning memory, compute, and I/O
 
 Scarf treats memory, CPU time, storage layout, and network access as one planning problem rather than optimising memory alone.
-Counts are streamed in blocks; an optional feature-major `countsT` orientation speeds up gene-wise stages such as highly variable feature selection and marker search; and `mem_budget` shapes block geometry, write concurrency, and automatically sized feature batches.
+Counts are streamed in blocks.
+RNA assays also store a gene-major `countsT` copy so gene-wise stages such as highly variable feature selection and marker search can stream by gene.
+`mem_budget` shapes block size, write concurrency, and automatically sized feature batches.
 
 `mem_budget` is a planning input, not a hard cap on process memory.
 Graph structures, native libraries, Python objects, and allocator overhead consume memory in addition to the streamed blocks, so leave host headroom.

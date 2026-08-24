@@ -9,6 +9,7 @@ from profiling.metrics import (
     ResourceMeasurement,
     ResourceSampler,
     StageTimer,
+    child_cpu_seconds,
     read_process_tree_rss_bytes,
 )
 
@@ -345,3 +346,18 @@ def test_stage_timer_records_four_independent_scopes():
         "validationPersistenceSeconds": 2.0,
         "wholeFunctionSeconds": 15.0,
     }
+
+
+def test_child_cpu_seconds_counts_finished_children() -> None:
+    import subprocess
+    import sys
+
+    before = child_cpu_seconds()
+    completed = subprocess.run(
+        [sys.executable, "-c", "sum(range(2_000_000))"],
+        check=True,
+    )
+    assert completed.returncode == 0
+    after = child_cpu_seconds()
+    assert after >= before
+    assert after - before > 0.0

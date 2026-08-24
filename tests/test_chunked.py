@@ -2,7 +2,7 @@
 
 These verify that ChunkedArray reproduces NumPy semantics for the operations
 Scarf relies on, and that the documented datastore access patterns from the
-vignettes keep working after Dask was removed.
+vignettes keep working.
 """
 
 import numpy as np

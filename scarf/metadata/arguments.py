@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from ..graph.arguments import (
     OperationArguments,
@@ -74,6 +74,7 @@ class LeidenArguments(OperationArguments):
 
     graph: Any = artifact_input()
     resolution: float = parameter()
+    backend: Literal["igraph", "leidenalg"] = parameter()
     symmetric_graph: bool = parameter()
     graph_upper_only: bool = parameter()
     random_seed: int = parameter()
@@ -180,8 +181,7 @@ class MarkerTableArguments(OperationArguments):
     group_key: str = execution()
     cell_key: str = execution()
     feat_key: str = execution()
-    gene_batch_size: int | None = execution()
-    n_threads: int = execution()
+    nthreads: int = execution()
     invalidate_cache: bool = execution()
 
 
@@ -251,7 +251,7 @@ class PseudotimeMarkerArguments(OperationArguments):
     feat_key: str = execution()
     pseudotime_key: str = execution()
     gene_batch_size: int | None = execution()
-    n_threads: int = execution()
+    nthreads: int = execution()
     invalidate_cache: bool = execution()
 
 
@@ -281,7 +281,7 @@ class PseudotimeAggregationArguments(OperationArguments):
     pseudotime_key: str = execution()
     cluster_label: str = execution()
     batch_size: int | None = execution()
-    n_threads: int = execution()
+    nthreads: int = execution()
     invalidate_cache: bool = execution()
 
 

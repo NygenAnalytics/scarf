@@ -20,8 +20,61 @@ jobs:
       uses: astral-sh/setup-uv@v9.0.0
       with:
         python-version: "3.14"
+        version: "0.12.5"
+    - name: Require clean git state before build
+      run: |
+        echo "::group::git status --porcelain=v1"
+        status="$(git status --porcelain=v1)"
+        if [[ -z "$status" ]]; then echo "(clean)"; else printf '%s\n' "$status"; fi
+        echo "::endgroup::"
+        echo "::group::git describe"
+        git describe --tags --dirty --long
+        echo "::endgroup::"
+        echo "::group::git diff --stat"
+        diffstat="$(git diff --stat)"
+        if [[ -z "$diffstat" ]]; then echo "(no unstaged diff)"; else printf '%s\n' "$diffstat"; fi
+        echo "::endgroup::"
+        if [[ -n "$status" ]]; then
+          echo "::error::Release checkout is not clean before the build"
+          exit 1
+        fi
     - name: Build a binary wheel and a source tarball
-      run: uv build --clear
+      env:
+        SETUPTOOLS_SCM_DEBUG: "true"
+        SETUPTOOLS_SCM_OVERRIDES_FOR_SCARF: >-
+          {local_scheme = "no-local-version-strict"}
+      run: uv build --clear --build-constraints .github/build-constraints.txt
+    - name: Require clean git state after build
+      if: always()
+      run: |
+        echo "::group::git status --porcelain=v1"
+        status="$(git status --porcelain=v1)"
+        if [[ -z "$status" ]]; then echo "(clean)"; else printf '%s\n' "$status"; fi
+        echo "::endgroup::"
+        echo "::group::git describe"
+        git describe --tags --dirty --long
+        echo "::endgroup::"
+        echo "::group::git diff --stat"
+        diffstat="$(git diff --stat)"
+        if [[ -z "$diffstat" ]]; then echo "(no unstaged diff)"; else printf '%s\n' "$diffstat"; fi
+        echo "::endgroup::"
+        echo "::group::generated version file"
+        ls -l scarf/_version.py || echo "scarf/_version.py not present"
+        git check-ignore -v scarf/_version.py || echo "scarf/_version.py is not gitignored"
+        echo "::endgroup::"
+        if [[ -n "$status" ]]; then
+          echo "::error::Release checkout is not clean after the build"
+          exit 1
+        fi
+    - name: Validate release artifact metadata
+      env:
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
+      run: >-
+        uv run --no-project --with packaging==26.3
+        python tests/validate_release_artifacts.py
+        --release-tag "$RELEASE_TAG"
+        --distribution scarf
+        dist/*.whl dist/*.tar.gz
     - name: Smoke-test wheel
       run: uv run --no-project python tests/smoke_wheel.py dist/*.whl
     - name: Store the distribution packages

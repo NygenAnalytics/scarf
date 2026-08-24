@@ -1,5 +1,6 @@
 import math
 import os
+import resource
 import shutil
 import threading
 import time
@@ -1100,6 +1101,12 @@ class StageTimer:
         )
 
 
+def child_cpu_seconds() -> float:
+    """Return finished-child user plus system CPU seconds for this process."""
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return float(usage.ru_utime) + float(usage.ru_stime)
+
+
 __all__ = [
     "DiskUsage",
     "LimitValue",
@@ -1108,6 +1115,7 @@ __all__ = [
     "ResourceSampler",
     "StageTimer",
     "StageTimings",
+    "child_cpu_seconds",
     "parse_memory_events",
     "read_process_tree_rss_bytes",
 ]

@@ -17,7 +17,7 @@ Scarf is a Python framework for analysing single-cell RNA, ATAC, protein, and mu
 
 | Problem | How Scarf solves it | What you get |
 | :-- | :-- | :-- |
-| Your **dataset is larger than RAM** | Out-of-core algorithms, and neighbour search streams from cell-major and gene-major layouts, inside a memory budget you set | No subsampling, so rare populations survive, [benchmarked to 10M cells](profiling/BENCHMARKS.md) |
+| Your **dataset is larger than RAM** | Out-of-core algorithms, and neighbour search streams from cell-major and gene-major layouts, inside a memory budget you set | No subsampling, so rare populations survive, [benchmarked to 10M cells](https://scarf.readthedocs.io/en/latest/concepts/benchmarks.html) |
 | The **data is stored remotely** and requires downloading | Fetches only the chunks an operation touches, and writes results to a store you own | Start analysing immediately, with one authoritative copy |
 | A **single parameter change costs hours** of computation | Each step is fingerprinted by its settings and inputs, so reuse is by content, not by layer name | Only what changed recomputes, and the old version stays for comparison |
 | Sub-population analysis leaves **scattered copies that nobody can trace back** | Subsets are masks in one file, and every result carries the cells and parameters behind it | A year later, a result still explains itself |

@@ -5,6 +5,7 @@ import pandas as pd
 from scipy.sparse import coo_matrix
 
 from ...assay import Assay
+from ...assay.normalization import reject_unknown_normalization_params
 from ...graph.state import resolve_stored_graph_input, validate_legacy_graph_selection
 from ...matrix import ChunkedArray
 from ...metadata.arguments import (
@@ -935,6 +936,10 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         """
         from ...features.markers import find_markers_by_regression
 
+        reject_unknown_normalization_params(
+            norm_params,
+            caller="run_pseudotime_marker_search",
+        )
         if pseudotime_key is None:
             raise ValueError(
                 "ERROR: Please provide a value for `pseudotime_key`. This should be the name of a column from "
@@ -1021,7 +1026,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 feat_key=feat_key,
                 pseudotime_key=pseudotime_key,
                 gene_batch_size=gene_batch_size,
-                n_threads=int(
+                nthreads=int(
                     getattr(
                         assay,
                         "nthreads",
@@ -1299,6 +1304,10 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         """
         from ...trajectory.feature_dynamics import knn_clustering
 
+        reject_unknown_normalization_params(
+            norm_params,
+            caller="run_pseudotime_aggregation",
+        )
         feat_key = feat_key or "I"
         from_assay, cell_key, _ = self._get_latest_keys(
             from_assay,
@@ -1398,7 +1407,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             pseudotime_key=pseudotime_key,
             cluster_label=cluster_label,
             batch_size=batch_size,
-            n_threads=self.nthreads,
+            nthreads=self.nthreads,
             invalidate_cache=invalidate_cache,
         )
         planned = arguments.plan(
@@ -1503,7 +1512,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 d_array=valid_data,
                 n_neighbours=n_neighbours,
                 n_clusters=n_clusters,
-                n_threads=self.nthreads,
+                nthreads=self.nthreads,
                 ann_params=resolved_ann_params,
             )
             stored_feature_clusters = np.full(

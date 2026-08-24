@@ -11,7 +11,7 @@ def instantiate_knn_index(
     M: int,
     random_seed: int,
     ef: int,
-    num_threads: int,
+    nthreads: int,
 ) -> Any:
     """Create and configure an hnswlib KNN index."""
     import hnswlib
@@ -24,7 +24,7 @@ def instantiate_knn_index(
         random_seed=random_seed,
     )
     ann_idx.set_ef(ef)
-    ann_idx.set_num_threads(num_threads)
+    ann_idx.set_num_threads(nthreads)
     return ann_idx
 
 

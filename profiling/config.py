@@ -22,8 +22,9 @@ StageName = Literal[
     "buildConnectivityMap",
     "runUmap",
     "runLeiden",
-    "runClustering",
     "findMarkers",
+    "importClusters",
+    "validateExperiment",
 ]
 
 GRAPH_CONSTRUCTION_STAGE_ORDER: tuple[StageName, ...] = (
@@ -45,11 +46,69 @@ CORE_STAGE_ORDER: tuple[StageName, ...] = (
     *GRAPH_CONSTRUCTION_STAGE_ORDER,
     "runUmap",
     "runLeiden",
-    "runClustering",
     "findMarkers",
 )
 
+SELECTED_STAGE_ORDER: tuple[StageName, ...] = (
+    "createStore",
+    "writeCountsT",
+    "initializeStore",
+    "reopenStore",
+    "filterCells",
+    "markHvgs",
+    "runNormalization",
+    "runPca",
+    "importClusters",
+    "findMarkers",
+    "validateExperiment",
+)
+
+SELECTED_STAGE_DEPENDENCIES: dict[StageName, tuple[StageName, ...]] = {
+    "createStore": (),
+    "writeCountsT": ("createStore",),
+    "initializeStore": ("writeCountsT",),
+    "reopenStore": ("initializeStore",),
+    "filterCells": ("reopenStore",),
+    "markHvgs": ("filterCells",),
+    "runNormalization": ("markHvgs",),
+    "runPca": ("runNormalization",),
+    "importClusters": ("filterCells",),
+    "findMarkers": ("importClusters",),
+    "validateExperiment": ("runPca", "findMarkers"),
+}
+
+ALL_STAGE_CHOICES: tuple[StageName, ...] = tuple(
+    dict.fromkeys((*CORE_STAGE_ORDER, *SELECTED_STAGE_ORDER))
+)
+
+
+def validate_requested_stages(stages: tuple[StageName, ...]) -> None:
+    if not stages:
+        raise ValueError("stages must not be empty")
+    if len(set(stages)) != len(stages):
+        raise ValueError("stages must be unique")
+    selected = set(stages)
+    positions = {stage: index for index, stage in enumerate(stages)}
+    core_set = set(CORE_STAGE_ORDER)
+    if selected <= core_set:
+        core_index = {stage: index for index, stage in enumerate(CORE_STAGE_ORDER)}
+        ordered = tuple(sorted(stages, key=lambda stage: core_index[stage]))
+        if stages != ordered:
+            raise ValueError("CORE stages must appear in CORE_STAGE_ORDER")
+        return
+    for stage in stages:
+        deps = SELECTED_STAGE_DEPENDENCIES.get(stage)
+        if deps is None:
+            raise ValueError(f"{stage} is not in the selected-stage graph")
+        for dep in deps:
+            if dep not in selected:
+                raise ValueError(f"{stage} requires {dep}")
+            if positions[dep] >= positions[stage]:
+                raise ValueError(f"{dep} must precede {stage}")
+
+
 MAX_TIMEOUT_SECONDS = 86_400
+CLUSTER_SOURCES_PATH = Path(__file__).resolve().parent / "cluster_sources.toml"
 
 
 class WorkflowParameters(BaseModel):
@@ -68,11 +127,11 @@ class WorkflowParameters(BaseModel):
     minFeaturesPerCell: int = 10
     minCellsPerFeature: int = 20
     h5adBatchSize: int = 1000
-    topN: int = 2000
+    topN: int = 1000
     hvgMinCells: int = 20
     hvgKey: str = "hvgs"
-    k: int = 17
-    dims: int = 50
+    k: int = 11
+    dims: int = 21
     nCentroids: int = 1000
     graphSeed: int = 4466
     kmeansSampling: float = 0.1
@@ -83,15 +142,16 @@ class WorkflowParameters(BaseModel):
     umapParallel: bool = False
     umapLabel: str = "UMAP"
     leidenResolution: float = 1.0
+    leidenBackend: Literal["igraph", "leidenalg"] = "igraph"
     leidenSeed: int = 4444
     leidenLabel: str = "leiden_cluster"
     markerFeatureKey: str = "I"
-    markerGeneBatchSize: int | None = None
-    countsTLayout: Literal["source", "featureMajor"] = "source"
     graphLocalCache: bool | str = "auto"
     parisNClusters: int | Literal["auto"] = "auto"
     parisLabel: str = "paris_cluster"
     parisMinClusterSize: int | None = None
+    clusterSourceUri: str | None = None
+    clusterLabelColumn: str = "RNA_leiden_cluster"
 
     @property
     def resolvedHvgKey(self) -> str:
@@ -116,6 +176,18 @@ class WorkflowParameters(BaseModel):
                 raise ValueError("parisMinClusterSize must be >= 2")
             if self.parisNClusters != "auto":
                 raise ValueError("parisMinClusterSize requires parisNClusters='auto'")
+        if self.clusterSourceUri is not None:
+            uri = self.clusterSourceUri.strip()
+            if not uri:
+                raise ValueError("clusterSourceUri must be non-empty when set")
+            if not (
+                uri.startswith("s3://")
+                or uri.startswith("/")
+                or uri.startswith("file://")
+            ):
+                raise ValueError("clusterSourceUri must be an s3:// URI or local path")
+        if not self.clusterLabelColumn:
+            raise ValueError("clusterLabelColumn must be non-empty")
         return self
 
 
@@ -181,18 +253,52 @@ class PrepareResources(BaseModel):
         return self
 
 
-class StorageLayout(BaseModel):
+class CountMatrixConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    targetChunkBytes: int | None = None
-    targetShardBytes: int | None = None
+    unitBytes: int = 1_000_000_000
+    chunkBytes: int = 100_000_000
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Self:
-        if self.targetChunkBytes is not None and self.targetChunkBytes <= 0:
-            raise ValueError("targetChunkBytes must be positive when set")
-        if self.targetShardBytes is not None and self.targetShardBytes <= 0:
-            raise ValueError("targetShardBytes must be positive when set")
+        if min(self.unitBytes, self.chunkBytes) < 1:
+            raise ValueError("countMatrix values must be positive")
+        if self.unitBytes < self.chunkBytes:
+            raise ValueError("unitBytes must be at least chunkBytes")
+        return self
+
+
+class StorageIoConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    readWorkers: int | None = None
+    computeWorkers: int | None = None
+    writeWorkers: int | None = None
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> Self:
+        for name in ("readWorkers", "computeWorkers", "writeWorkers"):
+            value = getattr(self, name)
+            if value is not None and int(value) < 1:
+                raise ValueError(f"{name} must be positive when set")
+        return self
+
+
+class ClusterSourceRef(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    nRows: int
+    storeUri: str
+    labelColumn: str = "RNA_leiden_cluster"
+
+    @model_validator(mode="after")
+    def _check_ref(self) -> Self:
+        if self.nRows <= 0:
+            raise ValueError("cluster source nRows must be positive")
+        if not self.storeUri.startswith("s3://"):
+            raise ValueError("cluster source storeUri must be an s3:// URI")
+        if not self.labelColumn:
+            raise ValueError("cluster source labelColumn must be non-empty")
         return self
 
 
@@ -207,7 +313,12 @@ class ProfilingConfig(BaseModel):
     datasetPrefixUri: str
     resultsUri: str
     runTag: str = ""
-    storageLayout: StorageLayout = Field(default_factory=StorageLayout)
+    # When set, stage jobs read/write this store instead of stores/{runTag}/...
+    # Useful for consume A/B runs against an existing store with a fresh result tag.
+    storeUriOverride: str | None = None
+    countMatrix: CountMatrixConfig | None = None
+    storageIo: StorageIoConfig | None = None
+    clusterSources: tuple[ClusterSourceRef, ...] = ()
     targetSizes: tuple[int, ...] = Field(default_factory=lambda: DEFAULT_TARGET_SIZES)
     samplingSeed: int = 0
     workflow: WorkflowParameters = Field(default_factory=WorkflowParameters)
@@ -215,6 +326,8 @@ class ProfilingConfig(BaseModel):
     stageResources: dict[StageName, StageResources]
     # If unset, the complete current funnel runs.
     stages: tuple[StageName, ...] | None = None
+    # Filled by the submitting client before Modal spawn; not a TOML setting.
+    clientProvenance: dict[str, Any] | None = None
 
     @property
     def effectiveStages(self) -> tuple[StageName, ...]:
@@ -228,6 +341,18 @@ class ProfilingConfig(BaseModel):
             raise ValueError("datasetPrefixUri must be an s3:// URI")
         if not self.resultsUri.startswith("s3://"):
             raise ValueError("resultsUri must be an s3:// URI")
+        if self.storeUriOverride is not None:
+            override = self.storeUriOverride.strip()
+            if not override:
+                raise ValueError("storeUriOverride must be non-empty when set")
+            if not (
+                override.startswith("s3://")
+                or override.startswith("/")
+                or override.startswith("file://")
+            ):
+                raise ValueError(
+                    "storeUriOverride must be an s3:// URI or a local filesystem path"
+                )
         if "/" in self.runTag or "\\" in self.runTag or self.runTag in {".", ".."}:
             raise ValueError("runTag must be a single path segment")
         if not self.targetSizes:
@@ -246,6 +371,10 @@ class ProfilingConfig(BaseModel):
         missing = [stage for stage in selected if stage not in self.stageResources]
         if missing:
             raise ValueError(f"Missing stageResources for: {', '.join(missing)}")
+        validate_requested_stages(selected)
+        cluster_sizes = [item.nRows for item in self.clusterSources]
+        if len(set(cluster_sizes)) != len(cluster_sizes):
+            raise ValueError("clusterSources nRows must be unique")
         return self
 
     def datasetUri(self, nRows: int) -> str:
@@ -261,6 +390,8 @@ class ProfilingConfig(BaseModel):
         return base
 
     def storeUri(self, nRows: int) -> str:
+        if self.storeUriOverride is not None:
+            return self.storeUriOverride.rstrip("/")
         return f"{self._tagged_prefix('stores')}/{nRows}.zarr"
 
     def resultUri(self, nRows: int, stage: StageName) -> str:
@@ -275,11 +406,41 @@ class ProfilingConfig(BaseModel):
     def resourcesFor(self, stage: StageName) -> StageResources:
         return self.stageResources[stage]
 
+    def clusterSourceFor(self, nRows: int) -> ClusterSourceRef | None:
+        for item in self.clusterSources:
+            if item.nRows == nRows:
+                return item
+        return None
+
 
 def load_profiling_config(path: str | Path) -> ProfilingConfig:
     config_path = Path(path)
     raw = tomllib.loads(config_path.read_text())
-    return ProfilingConfig.model_validate(_normalize_raw_config(raw))
+    config = ProfilingConfig.model_validate(_normalize_raw_config(raw))
+    if config.clusterSources or not CLUSTER_SOURCES_PATH.is_file():
+        return config
+    extra = tomllib.loads(CLUSTER_SOURCES_PATH.read_text())
+    refs = tuple(
+        ClusterSourceRef.model_validate(item)
+        for item in extra.get("clusterSources", [])
+    )
+    if not refs:
+        return config
+    return config.model_copy(update={"clusterSources": refs})
+
+
+def bind_cluster_source(config: ProfilingConfig, nRows: int) -> WorkflowParameters:
+    if config.workflow.clusterSourceUri:
+        return config.workflow
+    source = config.clusterSourceFor(nRows)
+    if source is None:
+        return config.workflow
+    return config.workflow.model_copy(
+        update={
+            "clusterSourceUri": source.storeUri,
+            "clusterLabelColumn": source.labelColumn,
+        }
+    )
 
 
 def _normalize_raw_config(raw: dict[str, Any]) -> dict[str, Any]:

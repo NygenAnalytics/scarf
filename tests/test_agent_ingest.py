@@ -326,7 +326,7 @@ def test_ingest_10x_h5(tmp_path: Path) -> None:
     if not fixture.is_file():
         pytest.skip("10x H5 fixture not downloaded")
     result = ingest(path=fixture, zarrPath=tmp_path / "pbmc.zarr")
-    assert result.status == "done"
+    assert result.status == "done", result.notes
     assert result.format == "10x_h5"
     assert "RNA" in result.assayNames
     assert result.acceptedActions

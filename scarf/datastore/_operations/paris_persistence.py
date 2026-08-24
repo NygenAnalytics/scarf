@@ -74,7 +74,7 @@ def estimate_paris_peak_bytes(
     edge_itemsize: int,
     weight_itemsize: int,
     *,
-    n_threads: int = 1,
+    nthreads: int = 1,
 ) -> int:
     """Conservatively estimate peak bytes for canonical Paris fitting."""
     (
@@ -94,7 +94,7 @@ def estimate_paris_peak_bytes(
     )
     contraction_workspaces = canonical_csr
     contraction_layout = n_cells * (6 * index_bytes)
-    contraction_thread_tables = max(1, n_threads) * n_cells * 8
+    contraction_thread_tables = max(1, nthreads) * n_cells * 8
     contraction_peak = (
         directed_csr
         + canonical_csr
@@ -233,7 +233,7 @@ def preflight_paris_fit(
         edge_count,
         np.dtype(edges.dtype).itemsize,
         np.dtype(weights.dtype).itemsize,
-        n_threads=budget.workers,
+        nthreads=budget.workers,
     )
     _raise_if_over_budget(estimate, budget, "Paris hierarchy fit")
     return estimate

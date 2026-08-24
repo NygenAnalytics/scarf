@@ -27,11 +27,13 @@ from typing import Any
 import modal
 
 from profiling.config import (
+    ALL_STAGE_CHOICES,
     CORE_STAGE_ORDER,
     MAX_TIMEOUT_SECONDS,
     ProfilingConfig,
     StageName,
     StageResources,
+    bind_cluster_source,
     load_profiling_config,
 )
 from profiling.datasets import (
@@ -48,7 +50,7 @@ from profiling.modal_resources import (
     orchestrator_function_options,
     validate_modal_environment,
 )
-from profiling.io_baseline import run_io_baseline_body
+from profiling.provenance import attach_client_provenance, provenance_from_config
 from profiling.r2 import (
     download_file,
     object_exists,
@@ -57,13 +59,14 @@ from profiling.r2 import (
     upload_file,
 )
 from profiling.results import (
+    existing_error_result,
+    load_result,
     result_exists,
     write_funnel_result,
     write_result,
 )
 from profiling.spawn_wait import (
     DEFAULT_GRACE_SECONDS,
-    DEFAULT_STAGE_SPAWN_ATTEMPTS,
     await_function_call,
     await_many_function_calls,
     await_stage_result,
@@ -294,33 +297,11 @@ def prepare_fixture_datasets_job(
 @app.function(
     **COMMON_FUNCTION_OPTIONS,
     timeout=86_400,
-    memory=(65_536, 65_536),
-    cpu=(8.0, 8.0),
-    ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
-)
-def io_baseline_job(
-    configDict: dict[str, Any],
-    nRows: int = 1_000_000,
-    resultLabel: str | None = None,
-    columnOnly: bool = False,
-) -> dict[str, Any]:
-    """No-compute R2 stream of HVG, marker, and graph read patterns."""
-    config = ProfilingConfig.model_validate(configDict)
-    os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
-    return run_io_baseline_body(
-        config,
-        nRows=nRows,
-        resultLabel=resultLabel,
-        columnOnly=columnOnly,
-    )
-
-
-@app.function(
-    **COMMON_FUNCTION_OPTIONS,
-    timeout=86_400,
     memory=65_536,
     cpu=8.0,
     ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+    # Targeted writeCountsT / long stages: avoid worker preemption.
+    nonpreemptible=True,
 )
 def run_stage_job(
     configDict: dict[str, Any],
@@ -331,6 +312,7 @@ def run_stage_job(
     config = ProfilingConfig.model_validate(configDict)
     resources = config.resourcesFor(stage)
     os.environ.setdefault("R2_ENDPOINT", config.r2EndpointUrl)
+    workflow = bind_cluster_source(config, nRows)
     if result_exists(config, nRows, stage) and not force:
         return {
             "nRows": nRows,
@@ -357,14 +339,16 @@ def run_stage_job(
         stage,
         nRows=nRows,
         storeUri=config.storeUri(nRows),
-        workflow=config.workflow,
+        workflow=workflow,
         resources=resources,
         localH5adPath=local_h5ad,
-        storageLayout=config.storageLayout,
+        countMatrix=config.countMatrix,
+        storageIo=config.storageIo,
         workDir=work,
         invalidateCache=force,
+        clientProvenance=config.clientProvenance,
     )
-    write_result(config, result)
+    write_result(config, result, overwrite=force)
     return result.to_json()
 
 
@@ -412,7 +396,28 @@ def run_local_funnel_job(
         download_file(config.datasetUri(nRows), local_h5ad)
 
     outcomes: list[dict[str, Any]] = []
+    session: dict[str, Any] = {}
     for stage in selected_stages:
+        failed = existing_error_result(config, nRows, stage)
+        if failed is not None:
+            return {
+                "nRows": nRows,
+                "stopped": True,
+                "storeBackend": "local",
+                "storeUri": store_uri,
+                "failed": failed,
+                "outcomes": [
+                    *outcomes,
+                    {
+                        "nRows": nRows,
+                        "stage": stage,
+                        "status": "error",
+                        "resultUri": config.resultUri(nRows, stage),
+                        "storeBackend": "local",
+                        "terminalExistingError": True,
+                    },
+                ],
+            }
         if result_exists(config, nRows, stage):
             outcomes.append(
                 {
@@ -439,11 +444,14 @@ def run_local_funnel_job(
             stage,
             nRows=nRows,
             storeUri=store_uri,
-            workflow=config.workflow,
+            workflow=bind_cluster_source(config, nRows),
             resources=resources,
             localH5adPath=local_h5ad if stage == "createStore" else None,
-            storageLayout=config.storageLayout,
+            countMatrix=config.countMatrix,
+            storageIo=config.storageIo,
             workDir=work / stage,
+            clientProvenance=config.clientProvenance,
+            session=session,
         )
         write_result(config, result)
         payload = result.to_json()
@@ -529,6 +537,7 @@ def run_e2e_funnel_body(
             flush=True,
         )
 
+        session: dict[str, Any] = {}
         for stage in CORE_STAGE_ORDER:
             failed_stage = stage
             resources = config.resourcesFor(stage)
@@ -542,12 +551,15 @@ def run_e2e_funnel_body(
                 workflow=config.workflow,
                 resources=resources,
                 localH5adPath=local_h5ad if stage == "createStore" else None,
-                storageLayout=config.storageLayout,
+                countMatrix=config.countMatrix,
+                storageIo=config.storageIo,
                 workDir=stage_work,
                 containerMemoryMb=int(resource_envelope["modalMemoryLimitMb"]),
                 containerCpuRequest=float(resource_envelope["modalCpuRequest"]),
                 containerCpuLimit=float(resource_envelope["modalCpuLimit"]),
                 resetCgroupPeak=False,
+                clientProvenance=config.clientProvenance,
+                session=session,
             )
             result_uri = write_result(config, result)
             payload = result.to_json()
@@ -591,6 +603,7 @@ def run_e2e_funnel_body(
         "claimUri": config.e2eClaimUri(),
         "funnelResultUri": config.funnelResultUri(nRows),
         **summarize_resource_measurement(measurement),
+        "provenance": provenance_from_config(config, nonpreemptible=True),
     }
     write_funnel_result(config, nRows, summary)
     return summary
@@ -602,6 +615,8 @@ def run_e2e_funnel_body(
     memory=32_768,
     cpu=8.0,
     ephemeral_disk=BASE_EPHEMERAL_DISK_MB,
+    # Long 1M+ funnels: avoid worker preemption (Modal bills ~3x CPU/memory).
+    nonpreemptible=True,
 )
 def run_e2e_funnel_job(
     configDict: dict[str, Any],
@@ -632,6 +647,23 @@ def run_size_jobs(
     outcomes: list[dict[str, Any]] = []
 
     for stage in selected_stages:
+        failed = existing_error_result(config, nRows, stage)
+        if failed is not None:
+            return {
+                "nRows": nRows,
+                "stopped": True,
+                "failed": failed,
+                "outcomes": [
+                    *outcomes,
+                    {
+                        "nRows": nRows,
+                        "stage": stage,
+                        "status": "error",
+                        "resultUri": config.resultUri(nRows, stage),
+                        "terminalExistingError": True,
+                    },
+                ],
+            }
         if result_exists(config, nRows, stage):
             outcomes.append(
                 {
@@ -643,26 +675,36 @@ def run_size_jobs(
             )
             continue
         resources = config.resourcesFor(stage)
-        options = (
-            modal_function_options(
-                config,
-                resources,
-                maxContainers=parallel_sizes,
-                retries=0,
-            )
-            if stage == "writeCountsT"
-            else modal_function_options(
-                config,
-                resources,
-                maxContainers=parallel_sizes,
-            )
+        options = modal_function_options(
+            config,
+            resources,
+            maxContainers=parallel_sizes,
+            retries=0,
         )
         deadline_seconds = float(resources.timeoutSeconds) + DEFAULT_GRACE_SECONDS
         result: dict[str, Any] | None = None
         last_error: BaseException | None = None
-        spawn_attempts = 1 if stage == "writeCountsT" else DEFAULT_STAGE_SPAWN_ATTEMPTS
+        spawn_attempts = 1
         for attempt in range(1, spawn_attempts + 1):
             if result_exists(config, nRows, stage):
+                recovered = load_result(config, nRows, stage) or {}
+                if recovered.get("status") == "error":
+                    return {
+                        "nRows": nRows,
+                        "stopped": True,
+                        "failed": recovered,
+                        "outcomes": [
+                            *outcomes,
+                            {
+                                "nRows": nRows,
+                                "stage": stage,
+                                "status": "error",
+                                "resultUri": config.resultUri(nRows, stage),
+                                "terminalExistingError": True,
+                                "spawnAttempt": attempt,
+                            },
+                        ],
+                    }
                 result = {
                     "nRows": nRows,
                     "stage": stage,
@@ -689,6 +731,25 @@ def run_size_jobs(
             except Exception as exc:  # noqa: BLE001 - Modal surfaces many failure types
                 last_error = exc
                 if result_exists(config, nRows, stage):
+                    recovered = load_result(config, nRows, stage) or {}
+                    if recovered.get("status") == "error":
+                        return {
+                            "nRows": nRows,
+                            "stopped": True,
+                            "failed": recovered,
+                            "outcomes": [
+                                *outcomes,
+                                {
+                                    "nRows": nRows,
+                                    "stage": stage,
+                                    "status": "error",
+                                    "resultUri": config.resultUri(nRows, stage),
+                                    "terminalExistingError": True,
+                                    "spawnAttempt": attempt,
+                                    "callError": str(exc),
+                                },
+                            ],
+                        }
                     result = {
                         "nRows": nRows,
                         "stage": stage,
@@ -842,7 +903,7 @@ def main(*arg_list: str) -> None:
     run_parser = sub.add_parser("run")
     run_parser.add_argument("--config", required=True)
     run_parser.add_argument("--size", type=int, required=True)
-    run_parser.add_argument("--stage", choices=CORE_STAGE_ORDER, required=True)
+    run_parser.add_argument("--stage", choices=ALL_STAGE_CHOICES, required=True)
     run_parser.add_argument(
         "--force",
         action="store_true",
@@ -861,7 +922,7 @@ def main(*arg_list: str) -> None:
     all_parser.add_argument("--config", required=True)
     all_parser.add_argument("--sizes", nargs="*", type=int, default=None)
     all_parser.add_argument(
-        "--stages", nargs="*", choices=CORE_STAGE_ORDER, default=None
+        "--stages", nargs="*", choices=ALL_STAGE_CHOICES, default=None
     )
     all_parser.add_argument(
         "--ephemeral",
@@ -879,7 +940,7 @@ def main(*arg_list: str) -> None:
     local_parser.add_argument("--config", required=True)
     local_parser.add_argument("--size", type=int, required=True)
     local_parser.add_argument(
-        "--stages", nargs="*", choices=CORE_STAGE_ORDER, default=None
+        "--stages", nargs="*", choices=ALL_STAGE_CHOICES, default=None
     )
 
     e2e_parser = sub.add_parser(
@@ -888,22 +949,22 @@ def main(*arg_list: str) -> None:
     )
     e2e_parser.add_argument("--config", required=True)
     e2e_parser.add_argument("--size", type=int, required=True)
-
-    io_parser = sub.add_parser("io-baseline")
-    io_parser.add_argument("--config", required=True)
-    io_parser.add_argument("--size", type=int, default=1_000_000)
-    io_parser.add_argument("--result-label")
-    io_parser.add_argument("--column-only", action="store_true")
-    io_parser.add_argument("--wait", action="store_true")
-    io_parser.add_argument(
+    e2e_parser.add_argument(
         "--ephemeral",
         action="store_true",
-        help="Spawn from this modal run app without a deploy.",
+        help=(
+            "Spawn from this modal run app (no deploy). Prefer --detach. "
+            "Needed to pick up decorator changes such as nonpreemptible "
+            "before redeploying."
+        ),
     )
 
     args = parser.parse_args(list(arg_list))
     config = _load_config(args.config)
-    payload = config.model_dump(mode="python")
+    payload = attach_client_provenance(
+        config.model_dump(mode="python"),
+        configPath=args.config,
+    )
 
     if args.command == "smoke":
         smoke_options = orchestrator_function_options(config)
@@ -948,6 +1009,18 @@ def main(*arg_list: str) -> None:
     if args.command == "run":
         if args.size not in config.targetSizes:
             raise SystemExit(f"size {args.size} is not in config.targetSizes")
+        failed = existing_error_result(config, args.size, args.stage)
+        if failed is not None and not args.force:
+            print(
+                {
+                    "nRows": args.size,
+                    "stage": args.stage,
+                    "status": "error",
+                    "resultUri": config.resultUri(args.size, args.stage),
+                    "terminalExistingError": True,
+                }
+            )
+            raise SystemExit(1)
         if result_exists(config, args.size, args.stage) and not args.force:
             print(
                 {
@@ -959,13 +1032,7 @@ def main(*arg_list: str) -> None:
             )
             return
         resources = config.resourcesFor(args.stage)
-        # retries=0 for writeCountsT: a retry that overlaps the original write
-        # leaves countsT marked incomplete again.
-        options = (
-            modal_function_options(config, resources, retries=0)
-            if args.stage == "writeCountsT"
-            else modal_function_options(config, resources)
-        )
+        options = modal_function_options(config, resources, retries=0)
         target = (
             run_stage_job
             if args.ephemeral
@@ -1001,11 +1068,12 @@ def main(*arg_list: str) -> None:
         if not config.runTag.strip():
             raise SystemExit("run-e2e requires a non-empty runTag")
         options = _e2e_function_options(config)
-        call = (
-            _deployed_function(config, "run_e2e_funnel_job")
-            .with_options(**options)
-            .spawn(payload, args.size)
+        target = (
+            run_e2e_funnel_job
+            if args.ephemeral
+            else _deployed_function(config, "run_e2e_funnel_job")
         )
+        call = target.with_options(**options).spawn(payload, args.size)
         _print_spawned(f"run_e2e_funnel_job {args.size}", call)
         print(f"result URI (when done): {config.funnelResultUri(args.size)}")
         return
@@ -1031,33 +1099,4 @@ def main(*arg_list: str) -> None:
             .spawn(payload, args.size, stages)
         )
         _print_spawned(f"run_local_funnel_job {args.size}", call)
-        return
-
-    if args.command == "io-baseline":
-        resources = config.resourcesFor("markHvgs")
-        options = modal_function_options(config, resources, maxContainers=1)
-        target = (
-            io_baseline_job
-            if args.ephemeral
-            else _deployed_function(config, "io_baseline_job")
-        )
-        call = target.with_options(**options).spawn(
-            payload,
-            args.size,
-            args.result_label,
-            args.column_only,
-        )
-        _print_spawned(f"io_baseline_job size={args.size}", call)
-        if args.wait:
-            print(
-                await_function_call(
-                    call,
-                    deadlineSeconds=float(resources.timeoutSeconds),
-                )
-            )
-        print(
-            "result URI (when done): "
-            f"{config.resultsUri.rstrip('/')}/io-baseline/{config.runTag}"
-            f"{'-' + args.result_label if args.result_label else ''}.json"
-        )
         return

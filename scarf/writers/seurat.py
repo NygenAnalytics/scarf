@@ -19,6 +19,8 @@ from ..readers.seurat import (
     SeuratRMatrix,
     SeuratReduction,
 )
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile, ZarrLocation
 from ..storage.refs import ArtifactRef
 
@@ -38,6 +40,16 @@ def _named_result_key(name: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class SeuratImportResult:
+    """Result of writing a Seurat object into a Scarf Zarr store.
+
+    Attributes:
+        assayNames: Assay groups written to the destination store.
+        defaultAssay: Active assay selected from the Seurat object.
+        cellSelection: Artifact for the imported cell filter column.
+        reductionArtifacts: Imported reductions keyed by result name.
+        notices: Non-fatal import notices collected from the reader.
+    """
+
     assayNames: tuple[str, ...]
     defaultAssay: str
     cellSelection: ArtifactRef
@@ -86,6 +98,27 @@ def _decode_text(value: str | bytes | None) -> str:
 
 
 class SeuratToZarr:
+    """Convert a serialized Seurat object into a Scarf Zarr store.
+
+    Args:
+        reader: Open ``SeuratReader`` for the source ``.rds`` file.
+        zarr_loc: Destination Zarr path or store.
+        workspace: Workspace name in the destination store. None uses the
+                   legacy layout without a workspace group.
+        storage_options: Backend options passed when opening the Zarr store.
+        mem_budget: Memory available to the conversion. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system
+                    memory (e.g. '0.6'). When None, auto-detected.
+        nthreads: Worker count for write-time concurrency. When None,
+                  auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
+    """
+
     def __init__(
         self,
         reader: SeuratReader,
@@ -95,8 +128,8 @@ class SeuratToZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -204,6 +237,8 @@ class SeuratToZarr:
         from ..storage.profiles import resolve_storage_profile
 
         self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.policy = policy
+        self.io = io
         self.assayNames = assay_names
         self.defaultAssay = inspection.activeAssay
         self._assays = assays
@@ -260,8 +295,7 @@ class SeuratToZarr:
                 feature_dtype,
                 dtype=assay.counts.dtype,
                 profile=self.profile,
-                targetChunkBytes=targetChunkBytes,
-                targetShardBytes=targetShardBytes,
+                policy=policy,
             )
             self.counts[assay.name] = counts
             self.featureData[assay.name] = feature_data
@@ -304,6 +338,16 @@ class SeuratToZarr:
         )
 
     def dump(self, batch_size: int | None = None) -> SeuratImportResult:
+        """Write assays, RNA ``countsT``, and importable reductions.
+
+        Args:
+            batch_size: Number of source cells per batch. By default, a
+                        destination-aligned value is selected within the
+                        memory budget.
+
+        Returns:
+            Imported assay names, cell selection, and reduction artifacts.
+        """
         if batch_size is not None and (
             isinstance(batch_size, bool) or int(batch_size) <= 0
         ):
@@ -323,6 +367,19 @@ class SeuratToZarr:
                 self._write_feature_data(assay, metadata_rows)
             for assay in self._assays:
                 self._write_counts(assay, requested_rows)
+            from .counts_t import finalize_writer_counts_t
+
+            for assay in self._assays:
+                finalize_writer_counts_t(
+                    self.z,
+                    assay.name,
+                    self.workspace,
+                    assay_type=assay.name,
+                    resources=self.resources,
+                    profile=self.profile,
+                    policy=self.policy,
+                    io=self.io,
+                )
             cell_selection = self._write_cell_selection()
             reduction_artifacts = self._write_reductions(
                 cell_selection,
@@ -640,6 +697,7 @@ class SeuratToZarr:
             residentBytes=self._residentSourceBytes,
             producerReserveBytes=plan.producerReserveBytes,
             msg=f"Writing {assay_name} counts",
+            io=self.io,
         )
         if rows != n_cells:
             raise ValueError(
@@ -753,6 +811,7 @@ class SeuratToZarr:
             dtype=destination.dtype,
             msg=f"Writing {assay_name} counts",
             resources=writer_resources,
+            io=self.io,
         )
         if written != n_cells:
             raise ValueError(

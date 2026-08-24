@@ -313,8 +313,7 @@ def test_mounted_store_computes_markers_without_writing_source(tmp_path):
         cell_key="I",
         feat_key="I",
         group_key="marker_groups",
-        gene_batch_size=None,
-        n_threads=1,
+        nthreads=1,
         skip_save=True,
     )
 
@@ -378,14 +377,14 @@ def test_matrix_source_count_identity_mismatch_fails_closed(
 
 
 @pytest.mark.parametrize(
-    ("parent_path", "name"),
+    ("parent_path", "name", "error_type"),
     [
-        ("", "cellData"),
-        ("RNA", "featureData"),
-        ("RNA", "counts"),
+        ("", "cellData", KeyError),
+        ("RNA", "featureData", KeyError),
+        ("RNA", "counts", ValueError),
     ],
 )
-def test_invalid_source_does_not_create_target(tmp_path, parent_path, name):
+def test_invalid_source_does_not_create_target(tmp_path, parent_path, name, error_type):
     source = str(tmp_path / "source.zarr")
     target = str(tmp_path / "target.zarr")
     _write_source_store(source, workspace=None)
@@ -393,7 +392,7 @@ def test_invalid_source_does_not_create_target(tmp_path, parent_path, name):
     parent = source_root if not parent_path else source_root[parent_path]
     del parent[name]
 
-    with pytest.raises(KeyError):
+    with pytest.raises(error_type):
         create_matrix_source(source, target, workspace=None)
     assert not Path(target).exists()
 

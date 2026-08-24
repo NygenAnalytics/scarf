@@ -14,6 +14,7 @@ from scarf.datastore.datastore import DataStore
 from scarf.datastore.mapping_datastore import MappingDatastore
 from scarf.metadata import MetaData
 from scarf.storage.artifacts import ArtifactRef
+from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.trajectory.results import (
     PseudotimeAggregationResult,
     PseudotimeScoreResult,
@@ -60,11 +61,13 @@ def _qc_store() -> tuple[RecordingStore, int]:
         feat_names=_QC_FEATURE_NAMES,
         dtype="uint32",
         profile="fast_local",
-        targetChunkBytes=16,
-        targetShardBytes=48,
+        policy=CountMatrixPolicy(unitBytes=48, chunkBytes=16),
     )
     counts[:] = _QC_VALUES
     assert counts.shards is not None
+    from scarf.writers.counts_t import finalize_writer_counts_t
+
+    finalize_writer_counts_t(root, "RNA", None, profile="fast_local")
     expected_reads = int(np.ceil(n_cells / counts.shards[0]))
     store.reset()
     return store, expected_reads
@@ -99,6 +102,20 @@ def _assert_one_counts_stream(store: RecordingStore, expected_reads: int) -> Non
 def test_initialization_fuses_qc_stats_in_one_counts_stream():
     store, expected_reads = _qc_store()
     datastore = _open_qc_store(store)
+    report = datastore.last_execution_report
+
+    assert report is not None
+    assert report.unitKind == "initializationRowBand"
+    assert report.actualReadWorkers == min(expected_reads, report.plan.readWorkers)
+    assert report.actualComputeWorkers == 1
+    assert report.extra["effectiveChunkReadsInFlight"] == (
+        report.actualReadWorkers * report.plan.ioConcurrency
+    )
+    assert report.plan.reservedBytes <= datastore.memoryBytes
+    assert report.unitsCompleted == expected_reads
+    assert report.fetchSeconds >= 0
+    assert report.computeSeconds >= 0
+    assert report.extra["fusedReadCompute"] is True
 
     expected_n_counts = _QC_VALUES.sum(axis=1).astype(np.float64)
     expected_n_features = (_QC_VALUES > 0).sum(axis=1).astype(np.float64)
@@ -148,6 +165,24 @@ def test_initialization_fuses_qc_stats_in_one_counts_stream():
         assert "source_artifact" not in datastore.zw["cellData"][column].attrs
     for column in ("nCells", "dropOuts"):
         assert "source_artifact" not in datastore.RNA.z["featureData"][column].attrs
+
+
+def test_initialization_concurrency_respects_a_tight_memory_budget():
+    store, expected_reads = _qc_store()
+    datastore = _open_qc_store(
+        store,
+        mem_budget=300,
+        nthreads=4,
+    )
+    report = datastore.last_execution_report
+
+    assert report is not None
+    assert report.unitKind == "initializationRowBand"
+    assert report.plan.reservedBytes <= 300
+    assert report.actualReadWorkers == 1
+    assert report.actualComputeWorkers == 1
+    assert report.unitsCompleted == expected_reads
+    _assert_one_counts_stream(store, expected_reads)
 
 
 def test_cached_initialization_is_read_and_write_free():
@@ -503,7 +538,7 @@ class TestDataStore:
         assert len(set(leiden_clustering)) == 10
         expected = cell_attrs["RNA_leiden_cluster"].values
         agreement = adjusted_rand_score(expected, leiden_clustering)
-        assert agreement == pytest.approx(0.8850162225, abs=1e-6)
+        assert agreement == pytest.approx(0.8939224525, abs=1e-6)
 
     def test_paris_values(self, paris_clustering):
         labels = np.asarray(paris_clustering, dtype=np.int32)
@@ -886,7 +921,7 @@ class TestDataStore:
     def test_make_bulk(self, leiden_clustering, datastore):
         df = datastore.make_bulk(group_key="RNA_leiden_cluster")
         assert df.shape == (18850, 10)
-        assert hash(tuple((df.values.flatten()))) == -3925915741848261436
+        assert hash(tuple((df.values.flatten()))) == 1092780585495194137
 
     def test_to_anndata(self, datastore):
         from scipy import sparse
@@ -1157,28 +1192,50 @@ class TestDataStore:
         )
         np.testing.assert_allclose(tiled["sigmas"], legacy_sigmas, rtol=1e-5, atol=1e-6)
 
-    def test_streaming_feature_stats_one_decode_per_physical_chunk(
-        self, datastore, monkeypatch
-    ):
-        import scarf.assay as assay_mod
+    def test_streaming_feature_stats_match_across_read_widths(self, datastore):
+        from scarf.storage.io_policy import StorageIoPolicy
 
         assay = datastore.RNA
         cell_idx, feat_idx = assay._get_cell_feat_idx("I", "I")
-        zarr_arr = assay.rawData._backing
-        row_chunk, col_chunk = zarr_arr.chunks[:2]
-        expected = len({int(i) // row_chunk for i in cell_idx}) * len(
-            {int(i) // col_chunk for i in feat_idx}
-        )
+        results = []
+        original = getattr(assay, "storageIo", None)
+        try:
+            for width in (2, 8, 32):
+                assay.storageIo = StorageIoPolicy(readWorkers=width)
+                results.append(assay._streaming_feature_stats(cell_idx, feat_idx))
+        finally:
+            assay.storageIo = original
+        first = results[0]
+        for other in results[1:]:
+            np.testing.assert_array_equal(first["normed_n"], other["normed_n"])
+            np.testing.assert_array_equal(first["normed_tot"], other["normed_tot"])
+            np.testing.assert_array_equal(first["sigmas"], other["sigmas"])
+
+    def test_streaming_feature_stats_uses_cell_band_counts_t(
+        self, datastore, monkeypatch
+    ):
+        import scarf.storage.feature_stream as feature_stream
+
+        assay = datastore.RNA
+        cell_idx, feat_idx = assay._get_cell_feat_idx("I", "I")
+        counts_t = assay.rawDataT
+        assert counts_t is not None
+        from scarf.storage.types import array_metadata_shards
+
+        shards = array_metadata_shards(counts_t)
+        assert shards is not None
+        expected = int(np.ceil(int(counts_t.shape[0]) / int(counts_t.chunks[0])))
         calls = {"n": 0}
-        original = assay_mod._read_block
+        original = feature_stream.map_feature_cell_bands
 
-        def counted(zarr_arr_arg, rows, cols):
+        def counted(*args, **kwargs):
             calls["n"] += 1
-            return original(zarr_arr_arg, rows, cols)
+            yield from original(*args, **kwargs)
 
-        monkeypatch.setattr(assay_mod, "_read_block", counted)
+        monkeypatch.setattr(feature_stream, "map_feature_cell_bands", counted)
         assay._streaming_feature_stats(cell_idx, feat_idx)
-        assert calls["n"] == expected
+        assert calls["n"] == 1
+        assert expected >= 1
 
     def test_streaming_feature_stats_requires_sf(self, datastore):
         import pytest

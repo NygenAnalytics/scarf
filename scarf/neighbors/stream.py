@@ -196,7 +196,7 @@ class AnnStream:
             ef=self.annEf,
             m=self.annM,
             rand_state=self.randState,
-            ann_threads=self.annThreads,
+            nthreads=self.annThreads,
         )
         coordinates: CoordinateSource = self.transform_stream
         if self.batch_correction is not None:

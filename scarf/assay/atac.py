@@ -8,7 +8,7 @@ from ..matrix import ChunkedArray
 from ..metadata import MetaData
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..utils.arrays import array_digest
-from ..utils.compute import show_dask_progress
+from ..utils.compute import compute_with_progress
 from ..utils.logging import logger
 from .base import Assay
 from .normalization import norm_tf_idf
@@ -116,7 +116,7 @@ class ATACassay(Assay):
         else:
             document_frequency = self._cached_document_frequency(cell_idx, feat_idx)
             if document_frequency is None:
-                document_frequency = show_dask_progress(
+                document_frequency = compute_with_progress(
                     counts.count_nonzero(axis=0),
                     f"({self.name}) Computing document frequency across selected cells",
                     self.nthreads,
@@ -141,7 +141,7 @@ class ATACassay(Assay):
                 terms = np.zeros(0, dtype=np.float64)
             else:
                 terms = np.asarray(
-                    show_dask_progress(
+                    compute_with_progress(
                         counts.sum(axis=1),
                         f"({self.name}) Recomputing counts across selected peaks",
                         self.nthreads,
@@ -365,7 +365,7 @@ class ATACassay(Assay):
                 feat_idx,
             )
         else:
-            prevalence = show_dask_progress(
+            prevalence = compute_with_progress(
                 self.normed(cell_idx, feat_idx).sum(axis=0),
                 f"({self.name}) Calculating peak prevalence across cells",
                 self.nthreads,

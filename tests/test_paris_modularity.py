@@ -212,7 +212,7 @@ def test_guard_reduces_erdos_renyi_null_fragmentation() -> None:
     guarded_counts: list[int] = []
     for seed in range(3):
         graph = _erdos_renyi_null_graph(seed)
-        hierarchy = fit_paris_hierarchy(graph, n_threads=2)
+        hierarchy = fit_paris_hierarchy(graph, nthreads=2)
         forest = collapse_equal_height_plateaus(hierarchy)
         assert hierarchy.component_roots.size == 1
 

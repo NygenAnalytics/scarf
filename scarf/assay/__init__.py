@@ -13,6 +13,11 @@ from .adt import ADTassay as ADTassay
 from .atac import ATACassay as ATACassay
 from .base import Assay as Assay
 from .base import PercentFeatures as PercentFeatures
+from .classification import is_rna_assay_type as is_rna_assay_type
+from .classification import lookup_persisted_assay_type as lookup_persisted_assay_type
+from .classification import preset_assay_types as preset_assay_types
+from .classification import resolve_persisted_assay_type as resolve_persisted_assay_type
+from .classification import rna_assay_type_names as rna_assay_type_names
 from .normalization import NormMethod as NormMethod
 from .normalization import (
     lib_size_feature_stream_eligible as lib_size_feature_stream_eligible,
@@ -25,7 +30,17 @@ from .normalization import norm_tf_idf as norm_tf_idf
 from .persistence import _read_block as _read_block
 from .rna import RNAassay as RNAassay
 
-__all__ = ["Assay", "RNAassay", "ATACassay", "ADTassay"]
+__all__ = [
+    "Assay",
+    "RNAassay",
+    "ATACassay",
+    "ADTassay",
+    "is_rna_assay_type",
+    "lookup_persisted_assay_type",
+    "preset_assay_types",
+    "resolve_persisted_assay_type",
+    "rna_assay_type_names",
+]
 
 
 def _normalize_public_metadata() -> None:

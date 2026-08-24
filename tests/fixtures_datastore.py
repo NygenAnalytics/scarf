@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from . import full_path, remove, dask_total_sum
+from . import full_path, remove, chunked_total_sum
 
 
 def build_neighbourhood_graph(
@@ -201,12 +201,12 @@ def datastore(datastore_zarr_root):
 
 @pytest.fixture(scope="session")
 def rna_raw_total(datastore):
-    return dask_total_sum(datastore.RNA.rawData)
+    return chunked_total_sum(datastore.RNA.rawData)
 
 
 @pytest.fixture(scope="session")
 def assay2_raw_total(datastore):
-    return dask_total_sum(datastore.assay2.rawData)
+    return chunked_total_sum(datastore.assay2.rawData)
 
 
 @pytest.fixture
@@ -288,6 +288,15 @@ def leiden_clustering(graph_artifacts, datastore):
 
 
 @pytest.fixture(scope="session")
+def legacy_leiden_clustering(graph_artifacts, datastore):
+    label = "legacy_leiden_cluster"
+    column = f"RNA_{label}"
+    if not _cell_has(datastore, column):
+        datastore.run_leiden_clustering(backend="leidenalg", label=label)
+    yield datastore.cells.fetch(column)
+
+
+@pytest.fixture(scope="session")
 def paris_clustering(graph_artifacts, datastore):
     if not _cell_has(datastore, "RNA_cluster"):
         datastore.run_paris_clustering(n_clusters=10, label="cluster")
@@ -324,10 +333,12 @@ def marker_search(datastore, paris_clustering):
 
 
 @pytest.fixture(scope="session")
-def pseudotime_scoring(datastore, leiden_clustering):
+def pseudotime_scoring(datastore, legacy_leiden_clustering):
     if not _cell_has(datastore, "RNA_pseudotime"):
         datastore.run_pseudotime_scoring(
-            source_sink_key="RNA_leiden_cluster", sources=[6], sinks=[3]
+            source_sink_key="RNA_legacy_leiden_cluster",
+            sources=[6],
+            sinks=[3],
         )
     yield datastore.cells.fetch("RNA_pseudotime")
 

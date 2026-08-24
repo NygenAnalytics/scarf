@@ -44,7 +44,7 @@ flowchart TB
     cells["Shared cell metadata"]
     rna["RNA assay<br/>feature metadata and results<br/>(default assay)"]
     atac["ATAC assay<br/>feature metadata and results"]
-    source["Optional mounted source<br/>counts and countsT"]
+    source["Optional mounted source<br/>counts and RNA countsT"]
     ds --> cells
     ds --> rna
     ds --> atac
@@ -142,7 +142,7 @@ ds.show_zarr_tree(start='RNA/artifacts', depth=1)
 
 Stores written before this layout encoded the whole chain into nested group names such as `RNA/normed__I__hvgs/reduction__pca__15__I/...`.
 Scarf still reads those.
-{doc}`../developers/zarr_internals` covers repacking older stores to Zarr v3 with sharded counts; that does not migrate nested path trees into artifacts.
+{doc}`../developers/zarr_internals` covers the on-disk layout and how to repack an older store to Zarr v3; that does not migrate nested path trees into artifacts.
 
 ## 2. Inspect cell and feature attributes
 
@@ -262,7 +262,8 @@ See the `MetaData` API in {doc}`../reference/api/assays` for update and delete h
 
 Raw counts are a Zarr array (often sharded), exposed as `rawData`, a chunked array with a NumPy-like interface that streams by row.
 Location depends on layout: default `{assay}/counts`, workspace `matrices/{assay}/counts`, or the mounted source when counts stay there.
-Routine analysis does not need to touch this object directly.
+RNA assays also store `countsT`, a gene-major copy used by HVG and marker stages.
+Routine analysis does not need to touch either array directly.
 
 ```{code-cell} ipython3
 ds.RNA.rawData
@@ -368,7 +369,9 @@ pd.read_csv(markers_csv).iloc[:5, :6]
 ## 7. Zarr versions and storage profiles
 
 Current Scarf versions write new datasets as Zarr v3.
-Existing v2 stores remain readable.
+RNA assays also write a gene-major `countsT` copy next to `counts`.
+An older RNA store that is still Zarr v2, or that lacks that copy, will not open until you re-import it or repack it.
+
 Count matrices from the writers use sharded arrays (default profile `fast_local`).
 Set the profile with `SCARF_ZARR_PROFILE` (`fast_local` or `cloud`) or `zarrProfile=` when opening a `DataStore`.
 
@@ -377,7 +380,7 @@ uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_l
 ```
 
 Storage profiles and conversion belong to the physical store, while `mem_budget` and `nthreads` control execution.
-See {doc}`../concepts/memory_and_execution` for memory planning and {doc}`remote_stores` for object storage and local scratch.
+See {doc}`../concepts/memory_and_execution` for why RNA stores two orientations, and {doc}`remote_stores` for object storage and local scratch.
 
 ## Common mistakes
 
@@ -386,6 +389,7 @@ See {doc}`../concepts/memory_and_execution` for memory planning and {doc}`remote
 - Using `fetch` when values for inactive cells are also required (`fetch_all`)
 - Treating a result reference as an in-memory matrix
 - Editing artifact groups directly instead of using Scarf's analysis methods
+- Expecting an older RNA Zarr v2 store, or one without `countsT`, to open without a re-import or `repack_zarr`
 
 Metadata changes and artifacts are written into the Zarr store.
 Low-level layout details intended for contributors remain in {doc}`../developers/zarr_internals`.

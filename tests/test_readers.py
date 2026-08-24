@@ -903,7 +903,8 @@ def test_h5ad_reader_converts_csc_sparse_encoding(tmp_path):
 
     root = zarr.open_group(str(zarr_path), mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
@@ -933,7 +934,8 @@ def test_h5ad_to_zarr_preserves_exact_sparse_batch(tmp_path):
 
     root = zarr.open_group(str(zarr_path), mode="r")
     np.testing.assert_array_equal(root["RNA/counts"][:], values)
-    assert "countsT" not in root["RNA"]
+    assert "countsT" in root["RNA"]
+    assert root["RNA/countsT"].attrs["complete"] is True
 
 
 def test_h5ad_reader_streams_cell_and_feature_metadata(h5ad_reader):
@@ -1255,3 +1257,33 @@ def test_csv_reader_rejects_non_mapping_pandas_kwargs(tmp_path):
     path.write_text("g1,g2\n1,2\n", encoding="utf-8")
     with pytest.raises(TypeError, match="pandas_kwargs must be a dictionary"):
         CSVReader(str(path), pandas_kwargs=["header"])
+
+
+def test_h5ad_reader_clone_and_range_guards(tmp_path) -> None:
+    from scarf.readers import H5adReader
+    from tests.test_writers import _write_h5ad
+
+    values = np.arange(6 * 3, dtype=np.uint32).reshape(6, 3)
+    path = _write_h5ad(tmp_path / "dense.h5ad", values, encoding="dense")
+    reader = H5adReader(str(path))
+    try:
+        reader._convertedCsr = object()
+        reader._indptrCache = np.array([0, 1, 2], dtype=np.int64)
+        reader._cumulativeRowNnz = np.array([0, 1, 2], dtype=np.int64)
+        clone = reader.open_clone()
+        try:
+            assert clone._indptrCache is not None
+            with pytest.raises(ValueError, match="outside the matrix"):
+                list(clone.consume_dataset(batch_size=2, row_start=2, row_end=1))
+        finally:
+            clone.h5.close()
+    finally:
+        reader.h5.close()
+
+    sparse = _write_h5ad(tmp_path / "sparse.h5ad", values)
+    sparse_reader = H5adReader(str(sparse))
+    try:
+        with pytest.raises(ValueError, match="outside the matrix"):
+            list(sparse_reader.consume_group(2, row_start=4, row_end=9))
+    finally:
+        sparse_reader.h5.close()
