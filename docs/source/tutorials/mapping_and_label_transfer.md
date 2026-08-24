@@ -135,19 +135,26 @@ mapping = ds_stim.run_mapping(
 `reference_mean` fills an absent query feature with the reference mean, which becomes zero after reference scaling.
 Use `zero` to fill with a normalized zero, or `error` when complete feature overlap is required.
 
-Reload the projection with neighbour arrays to confirm the write: one row per mapped query cell, `save_k` reference neighbours, and finite distances.
-
-```{code-cell} ipython3
-peek = ds_stim.get_mapping_result(mapping, load_arrays=True)
-peek.n_cells, int(peek.indices.shape[1]), peek.indices[:3], peek.distances[:3]
-```
-
-`mapping.diagnostics["queryScaledDispersion"]` compares query spread with the reference after scaling.
+`mapping.diagnostics["queryScaledDispersion"]` calculated from comparing query spread with the reference after scaling.
 Values near 1 mean the query occupies a similar region of feature space.
 Values much below 1 mean the query is compressed toward the centre of the reference cloud and neighbour labels become less trustworthy.
 
 ```{code-cell} ipython3
 mapping.diagnostics
+```
+
+To check the neighbour arrays, reload the projection with `get_mapping_results()`. 
+Use `load_arrays=True` to get two arrays with one row per query cell and `save_k` columns. 
+`indices` identifies the nearest reference cells. 
+`distances` finite distances between the query cell and the neighbour reference cells.
+
+```{code-cell} ipython3
+peek = ds_stim.get_mapping_result(mapping, load_arrays=True)
+peek.n_cells, int(peek.indices.shape[1]), peek.indices[:3], peek.distances[:3]
+
+# n_cells: number of mapped query cells
+# indices.shape[1]: save_k value used
+# indices / distances: reference neighbour ids and distances
 ```
 
 ## 4. Where did the query land?
