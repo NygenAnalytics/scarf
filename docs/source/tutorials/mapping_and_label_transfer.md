@@ -18,7 +18,7 @@ kernelspec:
 # Mapping cells and transferring labels
 
 Mapping is the fixed-reference alternative to merging datasets and rebuilding a joint graph.
-Keep one reference atlas unchanged, place new query cells onto it, and transfer labels from reference neighbours.
+This allows you to keep one reference atlas unchanged, place new query cells onto it, and transfer labels from reference neighbours.
 
 It does three things in order:
 
@@ -29,12 +29,13 @@ It does three things in order:
 It does not merge count matrices, retrain the reference graph, or move reference cells.
 When sources must be analysed together in one store, start with {doc}`dataset_merging` and {doc}`batch_correction` instead.
 
-This tutorial maps interferon-stimulated PBMCs onto a control PBMC reference from the same Kang study.
+In this tutorial, we will be mapping interferon-stimulated PBMCs onto a control PBMC reference from the same Kang study.
 The shared author labels let us evaluate the result.
-For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
 
 Mapping currently supports RNA queries.
-The prepared reference may be reopened read-only, but the query must be a different writable store.
+The prepared reference may be opened as read-only, but the query must be a different writable store.
+
+For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
 
 ## 1. Open the reference and query
 
@@ -132,6 +133,16 @@ mapping = ds_stim.run_mapping(
 )
 ```
 
+To check the neighbour arrays, reload the projection with `get_mapping_results()`. 
+Use `load_arrays=True` to get two arrays with one row per query cell and `save_k` columns. 
+`indices` identifies the nearest reference cells. 
+`distances` finite distances between the query cell and the neighbour reference cells.
+
+```{code-cell} ipython3
+peek = ds_stim.get_mapping_result(mapping, load_arrays=True)
+peek.n_cells, int(peek.indices.shape[1]), peek.indices[:3], peek.distances[:3]
+```
+
 `reference_mean` fills an absent query feature with the reference mean, which becomes zero after reference scaling.
 Use `zero` to fill with a normalized zero, or `error` when complete feature overlap is required.
 
@@ -143,15 +154,7 @@ Values much below 1 mean the query is compressed toward the centre of the refere
 mapping.diagnostics
 ```
 
-To check the neighbour arrays, reload the projection with `get_mapping_results()`. 
-Use `load_arrays=True` to get two arrays with one row per query cell and `save_k` columns. 
-`indices` identifies the nearest reference cells. 
-`distances` finite distances between the query cell and the neighbour reference cells.
 
-```{code-cell} ipython3
-peek = ds_stim.get_mapping_result(mapping, load_arrays=True)
-peek.n_cells, int(peek.indices.shape[1]), peek.indices[:3], peek.distances[:3]
-```
 
 ## 4. Where did the query land?
 
