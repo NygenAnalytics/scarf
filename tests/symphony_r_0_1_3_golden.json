@@ -1,0 +1,80 @@
+{
+  "provenance": {
+    "package": "symphony",
+    "packageVersion": "0.1.3",
+    "sourceRepository": "https://github.com/immunogenomics/symphony",
+    "sourceCommit": "7c5905988734d9cfe6e1e97a658664717c4ba7b7",
+    "function": "mapQuery",
+    "doNormalize": false,
+    "doUmap": false,
+    "sigma": 0.1
+  },
+  "reference": {
+    "featureMeans": [0.0, 0.0],
+    "featureScales": [1.0, 1.0],
+    "loadings": [[1.0, 0.0], [0.0, 1.0]],
+    "centroids": [[-1.0, 0.0], [1.0, 0.0]],
+    "rawCentroids": [[-1.0, 0.0], [1.0, 0.0]],
+    "correctedCentroids": [[-1.0, 0.0], [1.0, 0.0]],
+    "clusterMass": [4.0, 4.0],
+    "sigma": [0.1, 0.1],
+    "correctionRidge": 1.0
+  },
+  "query": [
+    [-1.5, 0.2],
+    [-0.5, -0.2],
+    [0.5, 0.2],
+    [1.5, -0.2]
+  ],
+  "batchCodes": [0, 0, 0, 0],
+  "expectedProjected": [
+    [-1.5, 0.2],
+    [-0.5, -0.2],
+    [0.5, 0.2],
+    [1.5, -0.2]
+  ],
+  "expectedAssignments": [
+    [1.0, 6.0340367874094217e-18],
+    [1.0, 7.4251990982146727e-17],
+    [7.4251990982146727e-17, 1.0],
+    [6.0340367874094217e-18, 1.0]
+  ],
+  "expectedCorrected": [
+    [-1.5, 0.2],
+    [-0.5, -0.2],
+    [0.5, 0.2],
+    [1.5, -0.2]
+  ],
+  "nonzeroCorrection": {
+    "reference": {
+      "featureMeans": [0.0, 0.0],
+      "featureScales": [1.0, 1.0],
+      "loadings": [[1.0, 0.0], [0.0, 1.0]],
+      "centroids": [[1.0, 0.0]],
+      "rawCentroids": [[0.0, 0.0]],
+      "correctedCentroids": [[0.0, 0.0]],
+      "clusterMass": [4.0],
+      "sigma": [0.1],
+      "correctionRidge": 2.0
+    },
+    "query": [
+      [2.0, -2.0],
+      [4.0, -2.0],
+      [1.0, -1.0],
+      [5.0, -3.0]
+    ],
+    "batchCodes": [0, 0, 0, 0],
+    "expectedAssignments": [
+      [1.0],
+      [1.0],
+      [1.0],
+      [1.0]
+    ],
+    "expectedCorrected": [
+      [0.0, -0.6666666666666667],
+      [2.0, -0.6666666666666667],
+      [-1.0, 0.33333333333333326],
+      [3.0, -1.6666666666666667]
+    ]
+  }
+}

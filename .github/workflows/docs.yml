@@ -1,0 +1,59 @@
+name: Docs
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - "docs/**"
+      - "scarf/**"
+      - "LICENSE"
+      - "README.md"
+      - "pyproject.toml"
+      - "tests/test_docs_cache.py"
+      - "tests/test_docs_structure.py"
+      - "uv.lock"
+      - ".readthedocs.yml"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    branches:
+      - master
+    paths:
+      - "docs/**"
+      - "scarf/**"
+      - "LICENSE"
+      - "README.md"
+      - "pyproject.toml"
+      - "tests/test_docs_cache.py"
+      - "tests/test_docs_structure.py"
+      - "uv.lock"
+      - ".readthedocs.yml"
+      - ".github/workflows/docs.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    env:
+      HNSWLIB_NO_NATIVE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libfftw3-dev libmetis-dev
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: "3.14"
+      - name: Install documentation dependencies
+        run: uv sync --extra docs --extra test --extra extra
+      - name: Documentation tests
+        run: uv run pytest -n 0 tests/test_docs_cache.py tests/test_docs_structure.py
+      - name: Validate committed notebook cache
+        run: uv run python docs/execute_all_vignettes.py --validate
+      - name: Sphinx HTML build (nitpicky, warnings as errors)
+        run: uv run sphinx-build -b html -n -W docs/source docs/build/html
+      - name: Reference coverage (every public symbol documented exactly once)
+        run: uv run python docs/check_reference_coverage.py

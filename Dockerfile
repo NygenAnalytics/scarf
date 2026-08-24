@@ -1,28 +1,19 @@
-FROM ubuntu:22.04
+FROM ubuntu:26.04
 
 RUN apt update -y && apt autoremove -y && apt clean -y && apt autoclean -y && apt upgrade -y
-RUN apt install -y wget build-essential git nano
+RUN apt install -y wget build-essential git nano curl libfftw3-dev libmetis-dev libtbb-dev
 
-# The following is done to make sure that tzdata package doesnt prompt for timezone during installation
 ARG TZ="Europe/Stockholm"
 RUN DEBIAN_FRONTEND="noninteractive" TZ=$TZ apt-get -y install tzdata
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone &
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-#Installing dependencies for sgtsne
-RUN apt install -y libmetis-dev libtbb-dev libfftw3-dev lib32gcc-7-dev libflann-dev libcilkrts5
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
-# Installing lastest Miniconda3
-RUN wget -O miniconda_inst "https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh" && \
-	bash miniconda_inst -b && \
-	rm miniconda_inst
+WORKDIR /workspace
+COPY . /workspace
 
-# Exporting PATH and also saving it in bashrc for next session
-# /workspace/bin is so that sgtsne can be found
-RUN echo "export PATH=$PATH:/root/miniconda3/bin:/workspace/bin" >> /root/.bashrc
-ENV PATH=$PATH:/root/miniconda3/bin:/workspace/bin
+RUN uv python install 3.14 && uv sync --extra extra
+ENV PATH="/workspace/.venv/bin:$PATH"
 
-# Installing numpy and pybind11 beforehand because sometimes they don't install so well from requirements.txt
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -U numpy pybind11
-
-RUN pip install scarf
+RUN echo "export PATH=/workspace/.venv/bin:/workspace/bin:$PATH" >> /root/.bashrc
+ENV PATH=/workspace/.venv/bin:/workspace/bin:$PATH

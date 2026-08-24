@@ -1,56 +1,137 @@
 root: index
 subtrees:
-  - entries:
-      - file: install
+  - caption: Get started
+    entries:
+      - file: installation
         title: Installation
-      - file: contributions
-        title: For developers
-      - file: faq
-        title: Frequently asked questions
-      - file: colab
-        title: Interactive tutorials on Colab
-  - caption: Basic pipelines
+      - file: quickstart
+        title: Quick start
+      - file: analysis_with_agents
+        title: Analysis with AI agents
+      - file: scanpy_and_seurat
+        title: Scanpy and Seurat users
+  - caption: Assay workflows
     entries:
-      - file: vignettes/basic_tutorial_scRNAseq
-        title: Workflow for scRNA-Seq data
-      - file: vignettes/basic_tutorial_scATACseq
-        title: Workflow for scATAC-Seq data
-  - caption: Multi-omics/Multimodal analysis
-    entries: 
-      - file: vignettes/multiple_modalities
-        title: Transcriptome + Surface Proteome
-  - caption: Data integration tutorials
+      - file: tutorials/scrna_seq
+        title: scRNA-seq heterogeneity
+      - file: tutorials/scatac_seq
+        title: scATAC-seq
+      - file: tutorials/cite_seq
+        title: CITE-seq
+      - file: tutorials/multimodal_diagnostics
+        title: Multimodal diagnostics
+      - file: tutorials/tea_seq
+        title: TEA-seq
+      - file: tutorials/hto_demultiplexing
+        title: HTO demultiplexing
+  - caption: Trajectories
     entries:
-      - file: vignettes/data_projection
-        title: Integration through projection
-      - file: vignettes/merging_datasets
-        title: Merging samples and datasets
-  - caption: Trajectory analysis tutorials
+      - file: tutorials/pseudotime
+        title: Pseudotime
+      - file: tutorials/expression_dynamics
+        title: Expression dynamics
+      - file: tutorials/fate_mapping
+        title: Fate mapping
+      - file: tutorials/trajectory_validation
+        title: Trajectory validation
+  - caption: Integration and mapping
     entries:
-      - file: vignettes/pseudotime_dynamics.md
-        title: Pseudotime dynamics
-  - caption: Vignettes
+      - file: tutorials/dataset_merging
+        title: Dataset merging
+      - file: tutorials/batch_correction
+        title: Batch correction
+      - file: tutorials/mapping_and_label_transfer
+        title: Mapping and label transfer
+      - file: tutorials/reference_atlases
+        title: Reference atlases
+  - caption: Annotation and biology
     entries:
-      - file: vignettes/zarr_explanation
-        title: Data organization in Scarf
-      - file: vignettes/download_conversion
-        title: Data import and export
-      - file: vignettes/cell_subsampling_tutorial
-        title: Automated cell downsampling
-      - file: vignettes/cell_cycle
-        title: Estimate cell-cycle phases
-      - file: vignettes/mnist
-        title: Exploring MNIST dataset
-  - caption: Useful links
+      - file: tutorials/annotation
+        title: Cell type annotation
+      - file: tutorials/cell_cycle
+        title: Cell cycle
+      - file: tutorials/gene_set_scoring
+        title: Gene-set scoring
+      - file: tutorials/pseudobulk_and_differential_expression
+        title: Pseudobulk and DE
+  - caption: Building blocks
     entries:
-        - url: https://www.nature.com/articles/s41467-022-32097-3
-          title: Scarf paper in Nature Comm
-        - url: https://github.com/parashardhapola/scarf/discussions
-          title: Discussion page
-        - url: https://github.com/parashardhapola/scarf/issues
-          title: Report bug
-  - caption: Reference manual
+      - file: tutorials/plotting
+        title: Plotting
+      - file: tutorials/quality_control
+        title: Quality control
+      - file: tutorials/feature_selection
+        title: Feature selection
+      - file: tutorials/graph_construction
+        title: Graph construction
+      - file: tutorials/dimensionality_reduction
+        title: Dimensionality reduction
+      - file: tutorials/clustering
+        title: Clustering
+      - file: tutorials/imputation
+        title: Imputation by graph diffusion
+      - file: tutorials/downsampling
+        title: Cell downsampling
+      - file: tutorials/custom_analyses
+        title: Custom analyses
+  - caption: Stores, scale, and provenance
     entries:
-      - file: api
-      - file: license
-      - file: genindex
+      - file: tutorials/import_and_export
+        title: Import and export
+      - file: tutorials/data_organization
+        title: Data organization
+      - file: tutorials/remote_stores
+        title: Remote stores
+      - file: concepts/provenance
+        title: Provenance
+      - file: tutorials/reuse_and_tracing
+        title: Reuse and tracing
+      - file: concepts/memory_and_execution
+        title: Memory and execution
+      - file: concepts/benchmarks
+        title: Benchmarks
+  - caption: Reference
+    entries:
+      - file: reference/api
+        title: API reference
+        entries:
+          - file: reference/api/datastore
+            title: DataStore
+          - file: reference/api/graph_construction
+            title: Graph construction
+          - file: reference/api/artifacts
+            title: Artifacts and state
+          - file: reference/api/pipeline
+            title: Pipeline
+          - file: reference/api/import_export
+            title: Import and export
+          - file: reference/api/assays
+            title: Assays and metadata
+          - file: reference/api/integration
+            title: Integration and metrics
+          - file: reference/api/mapping
+            title: Mapping
+          - file: reference/api/plotting
+            title: Plotting
+          - file: reference/api/utilities
+            title: Datasets and utilities
+      - file: reference/faq
+        title: FAQ
+      - file: reference/glossary
+        title: Glossary
+      - file: reference/citation
+        title: Citation
+      - file: reference/license
+        title: License
+      - url: https://github.com/NygenAnalytics/scarf/discussions
+        title: Ask a question
+      - url: https://github.com/NygenAnalytics/scarf/issues
+        title: Report a bug
+  - caption: Developers
+    entries:
+      - file: developers/contributing
+        title: Contributing
+      - file: developers/architecture
+        title: Architecture
+      - file: developers/zarr_internals
+        title: Zarr internals

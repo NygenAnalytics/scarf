@@ -7,39 +7,96 @@ on:
 jobs:
   build:
     name: Build distribution
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v5
+    - uses: actions/checkout@v7
       with:
-        python-version: 3.11.9
-    - name: Install dependencies
+        ref: ${{ github.event.release.tag_name }}
+        fetch-depth: 0
+    - name: Install uv
+      uses: astral-sh/setup-uv@v9.0.0
+      with:
+        python-version: "3.14"
+        version: "0.12.5"
+    - name: Require clean git state before build
       run: |
-        python -m pip install --upgrade pip
-        python -m pip install --upgrade setuptools wheel build
+        echo "::group::git status --porcelain=v1"
+        status="$(git status --porcelain=v1)"
+        if [[ -z "$status" ]]; then echo "(clean)"; else printf '%s\n' "$status"; fi
+        echo "::endgroup::"
+        echo "::group::git describe"
+        git describe --tags --dirty --long
+        echo "::endgroup::"
+        echo "::group::git diff --stat"
+        diffstat="$(git diff --stat)"
+        if [[ -z "$diffstat" ]]; then echo "(no unstaged diff)"; else printf '%s\n' "$diffstat"; fi
+        echo "::endgroup::"
+        if [[ -n "$status" ]]; then
+          echo "::error::Release checkout is not clean before the build"
+          exit 1
+        fi
     - name: Build a binary wheel and a source tarball
-      run: python -m build
+      env:
+        SETUPTOOLS_SCM_DEBUG: "true"
+        SETUPTOOLS_SCM_OVERRIDES_FOR_SCARF: >-
+          {local_scheme = "no-local-version-strict"}
+      run: uv build --clear --build-constraints .github/build-constraints.txt
+    - name: Require clean git state after build
+      if: always()
+      run: |
+        echo "::group::git status --porcelain=v1"
+        status="$(git status --porcelain=v1)"
+        if [[ -z "$status" ]]; then echo "(clean)"; else printf '%s\n' "$status"; fi
+        echo "::endgroup::"
+        echo "::group::git describe"
+        git describe --tags --dirty --long
+        echo "::endgroup::"
+        echo "::group::git diff --stat"
+        diffstat="$(git diff --stat)"
+        if [[ -z "$diffstat" ]]; then echo "(no unstaged diff)"; else printf '%s\n' "$diffstat"; fi
+        echo "::endgroup::"
+        echo "::group::generated version file"
+        ls -l scarf/_version.py || echo "scarf/_version.py not present"
+        git check-ignore -v scarf/_version.py || echo "scarf/_version.py is not gitignored"
+        echo "::endgroup::"
+        if [[ -n "$status" ]]; then
+          echo "::error::Release checkout is not clean after the build"
+          exit 1
+        fi
+    - name: Validate release artifact metadata
+      env:
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
+      run: >-
+        uv run --no-project --with packaging==26.3
+        python tests/validate_release_artifacts.py
+        --release-tag "$RELEASE_TAG"
+        --distribution scarf
+        dist/*.whl dist/*.tar.gz
+    - name: Smoke-test wheel
+      run: uv run --no-project python tests/smoke_wheel.py dist/*.whl
     - name: Store the distribution packages
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: python-package-distributions
         path: dist/
+        if-no-files-found: error
 
   publish-to-pypi:
     name: Publish to PyPI
     needs:
       - build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-26.04
     environment:
       name: pypi
       url: https://pypi.org/p/scarf
     permissions:
-      id-token: write  # IMPORTANT: mandatory for trusted publishing
+      id-token: write
     steps:
       - name: Download all the dists
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: python-package-distributions
           path: dist/

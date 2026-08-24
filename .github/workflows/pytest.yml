@@ -1,38 +1,155 @@
 name: Tests
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - master
-      - development
+    paths-ignore:
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/workflows/docs.yml"
+      - ".gitignore"
+      - ".readthedocs.yml"
+      - "AGENTS.md"
+      - "LICENSE"
+      - "README.md"
+      - "docs/**"
+      - "profiling/.env.example"
+      - "profiling/AGENTS.md"
   pull_request:
     branches:
       - master
-      - development
+    paths-ignore:
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/workflows/docs.yml"
+      - ".gitignore"
+      - ".readthedocs.yml"
+      - "AGENTS.md"
+      - "LICENSE"
+      - "README.md"
+      - "docs/**"
+      - "profiling/.env.example"
+      - "profiling/AGENTS.md"
 
 jobs:
-  test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-22.04, windows-2019]
-        python-version: [3.11.9]
+  quality:
+    runs-on: ubuntu-26.04
+    env:
+      HNSWLIB_NO_NATIVE: "1"
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Install system build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libfftw3-dev libmetis-dev
+    - name: Install uv
+      uses: astral-sh/setup-uv@v9.0.0
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: uv sync --group dev --group profiling --extra test --extra extra --extra agent
+    - name: Lint and check formatting
+      run: |
+        uv run ruff check scarf profiling tests
+        uv run ruff format --check scarf profiling tests
+    - name: Type check
+      run: uv run mypy scarf profiling
+
+  visual:
+    runs-on: ubuntu-26.04
+    env:
+      HNSWLIB_NO_NATIVE: "1"
+      MPLBACKEND: Agg
+      SCARF_RUN_VISUAL_REGRESSION: "1"
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Install system build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libfftw3-dev libmetis-dev
+    - name: Install uv
+      uses: astral-sh/setup-uv@v9.0.0
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: uv sync --group profiling --extra test --extra extra --extra agent
+    - name: Download test fixtures
+      run: uv run python -m tests.download_fixtures --with-h5ad
+    - name: Compare publication plotting references
+      run: uv run pytest -n 0 -m visual tests/test_plotting_showcase.py
+
+  test:
+    runs-on: ubuntu-26.04
+    env:
+      HNSWLIB_NO_NATIVE: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+        resolution: [locked]
+        include:
+          - python-version: "3.12"
+            resolution: lowest-direct
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Install system build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libfftw3-dev libmetis-dev
+    - name: Install uv
+      uses: astral-sh/setup-uv@v9.0.0
       with:
         python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
+    - name: Install dependencies (locked)
+      if: matrix.resolution == 'locked'
+      run: uv sync --group profiling --extra test --extra extra --extra agent
+    - name: Install dependencies (lowest-direct)
+      if: matrix.resolution == 'lowest-direct'
       run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install -r requirements_extra.txt
-        pip install pytest pytest-cov topacedo anndata==0.11.4 pcst_fast
-    - name: Test with pytest
+        uv venv --python "${{ matrix.python-version }}"
+        uv pip install --resolution lowest-direct -e ".[test,extra,agent]" --group profiling
+    - name: Download test fixtures
       run: |
-        pytest --cov=.
+        if [ "${{ matrix.resolution }}" = "lowest-direct" ]; then
+          uv run --no-sync python -m tests.download_fixtures --with-h5ad
+        else
+          uv run python -m tests.download_fixtures --with-h5ad
+        fi
+    - name: Report runner CPU capacity
+      run: |
+        echo "available_cpu_count=$(nproc)"
+        echo "installed_cpu_count=$(nproc --all)"
+    - name: Test with pytest (parallel)
+      run: |
+        if [ "${{ matrix.resolution }}" = "lowest-direct" ]; then
+          uv run --no-sync pytest \
+            --durations=25 \
+            --cov=scarf \
+            --cov-report=xml \
+            --cov-report=term
+        else
+          uv run pytest \
+            --durations=25 \
+            --cov=scarf \
+            --cov-report=xml \
+            --cov-report=term
+        fi
+    - name: Build and smoke-test wheel
+      if: matrix.resolution == 'locked' && matrix.python-version == '3.14'
+      run: |
+        uv build
+        uv run --no-project python tests/smoke_wheel.py dist/*.whl
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
+      if: matrix.resolution == 'locked' && matrix.python-version == '3.14'
+      uses: codecov/codecov-action@v5
       with:
-        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: coverage.xml
+        disable_search: true
+        fail_ci_if_error: true

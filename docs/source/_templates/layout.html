@@ -1,4 +1,10 @@
 {% extends "!layout.html" %}
 {% block extrahead %}
     <link href="{{ pathto("_static/styles.css", True) }}" rel="stylesheet" type="text/css">
+    {% if pagename == "index" %}
+    <meta name="description" content="Scarf: memory-efficient single-cell RNA-seq, ATAC-seq, and CITE-seq analysis in Python. Harmony batch correction, WNN integration, LISI metrics, and Zarr-backed atlas-scale workflows.">
+    {% endif %}
+    <meta property="og:title" content="{{ title|striptags|e }} | Scarf documentation">
+    <meta property="og:type" content="website">
+    <meta property="og:image" content="https://scarf.readthedocs.io/en/latest/_static/scarf-logo-blue.png">
 {% endblock %}

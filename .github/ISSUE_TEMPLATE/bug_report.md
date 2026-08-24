@@ -9,7 +9,7 @@ assignees: ''
 
 **Describe the bug**
 
-*A clear and concise description of what the bug is. If you have a question or suggestion then please use the [Discussions](https://github.com/parashardhapola/scarf/discussions) page instead.*
+*A clear and concise description of what the bug is. If you have a question or suggestion then please use the [Discussions](https://github.com/NygenAnalytics/scarf/discussions) page instead.*
 
 ```
 Please paste here the traceback (complete error output). Remove this line

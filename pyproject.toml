@@ -1,19 +1,137 @@
-[build.system]
-requires = [
-    "setuptools",
-    "wheel"
-]
+[build-system]
+requires = ["setuptools>=80", "setuptools-scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "scarf"
+dynamic = ["version"]
+description = "Out-of-core, graph-first workflows for million-cell RNA-seq and CITE-seq"
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.12"
+license = "BSD-3-Clause"
+authors = [
+    {name = "Parashar Dhapola", email = "parashar.dhapola@gmail.com"},
+]
+keywords = [
+    "single-cell",
+    "scRNA-seq",
+    "scATAC-seq",
+    "CITE-seq",
+    "Harmony",
+    "WNN",
+    "batch-correction",
+    "Zarr",
+    "memory-efficient",
+]
+classifiers = [
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "h5py>=3.11",
+    "hnswlib>=0.8",
+    "leidenalg>=0.12",
+    "loguru>=0.7",
+    "networkx>=3",
+    "numba>=0.60",
+    "numcodecs>=0.16",
+    "numpy>=2",
+    "packaging",
+    "pandas>=2.2.2",
+    "scikit-learn>=1.5",
+    "scipy>=1.13,!=1.17.0",
+    "setuptools>=61",
+    "statsmodels>=0.14.2",
+    "threadpoolctl",
+    "tqdm>=4.60",
+    "umap-learn>=0.5.12",
+    "zarr>=3.2.0",
+    "obstore>=0.5.1",
+    "sgtsnepi",
+    "huggingface-hub>=1.24.0",
+    "zstandard>=0.25.0",
+    "igraph>=1.0.0",
+]
+
+[project.optional-dependencies]
+agent = [
+    "pydantic-ai-slim[openai]>=2.0",
+]
+extra = [
+    "anndata>=0.12",
+    "kneed>=0.8",
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
+    "ipython-autotime>=0.3",
+    "ipywidgets>=8",
+]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4",
+    "pytest-xdist>=3",
+    "topacedo>=0.2.10",
+    "anndata>=0.12",
+    "scikit-network>=0.33.1",
+    "rdata>=1.1.0",
+    "pydantic-ai-slim[openai]>=2.0",
+]
+docs = [
+    "jinja2",
+    "jedi",
+    "myst-parser",
+    "myst-nb",
+    "sphinx",
+    "sphinx_autodoc_typehints",
+    "sphinx-book-theme",
+    "sphinx-copybutton",
+    "sphinx-external-toc",
+    "sphinx-tabs",
+    "topacedo",
+    "nbclient",
+    "jupyter-cache>=1.0.1",
+    "sphinx-reredirects>=1.1.0",
+    "sphinxcontrib-mermaid>=2.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/NygenAnalytics/scarf"
+Documentation = "https://scarf.readthedocs.io/en/latest/"
+Installation = "https://scarf.readthedocs.io/en/latest/installation.html"
+Issues = "https://github.com/NygenAnalytics/scarf/issues"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["scarf*"]
+exclude = ["profiling*", "scripts*", "tests*", "docs*", "bin*"]
+
+[tool.setuptools_scm]
+version_file = "scarf/_version.py"
 
 [tool.pytest.ini_options]
 minversion = "6.0"
-addopts = "-ra -v"
+addopts = "-ra -v -n auto --dist loadfile"
+markers = [
+    "integration: live network tests",
+    "slow: tests that build graphs or run iterative numerical workflows",
+    "visual: deterministic image comparison tests",
+]
 testpaths = [
-    "scarf/tests",
+    "tests",
 ]
 norecursedirs = [
-    "scarf/tests"
+    "datasets",
 ]
+
+[tool.coverage.run]
+source = ["scarf"]
+omit = ["scarf/_version.py"]
+parallel = true
 
 [tool.interrogate]
 ignore-init-method = true
@@ -30,7 +148,7 @@ fail-under = 50
 exclude = [
     "setup.py",
     "docs",
-    "scarf/tests"
+    "tests"
 ]
 ignore-regex = [
     "^get$",
@@ -43,3 +161,108 @@ whitelist-regex = []
 color = true
 generate-badge = '.'
 badge-format = "svg"
+
+[dependency-groups]
+profiling = [
+    "anndata>=0.12.18",
+    "modal>=1.5.2",
+    "pydantic>=2.13.4",
+]
+dev = [
+    "mypy>=2.1.0",
+    "ruff>=0.15.20",
+]
+docs-modal = [
+    "modal>=1.5.2",
+]
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "setup.py" },
+    { git = { commit = true, tags = true } },
+]
+no-binary-package = ["pcst-fast", "hnswlib"]
+extra-build-variables = { hnswlib = { HNSWLIB_NO_NATIVE = "1" } }
+
+[tool.uv.pip]
+no-binary = ["hnswlib"]
+extra-build-variables = { hnswlib = { HNSWLIB_NO_NATIVE = "1" } }
+
+[tool.uv.extra-build-dependencies]
+pcst-fast = ["pybind11>=2.11"]
+
+[tool.ruff]
+exclude = [
+    ".git",
+    ".venv",
+    "docs/.jupyter_cache",
+    "docs/build",
+    "docs/source/tutorials/scarf_datasets",
+    "scarf/_version.py",
+]
+
+# Keep the pre-0.16 default rule set until the wider 0.16 defaults are triaged.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.mypy]
+strict = false
+
+python_version = "3.12"
+exclude = ["^docs/", "^setup\\.py$", "^scarf/_version\\.py$"]
+
+disable_error_code = ["import-untyped"]
+
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+check_untyped_defs = true
+disallow_untyped_calls = true
+no_implicit_optional = true
+
+warn_return_any = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+
+ignore_missing_imports = false
+
+[[tool.mypy.overrides]]
+module = [
+    "scarf.plotting",
+    "scarf.plotting.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = [
+    "numba",
+    "numba.*",
+    "pydantic_ai",
+    "pydantic_ai.*",
+]
+ignore_missing_imports = true
+
+# Numba primitives are untyped and expose runtime-only attributes.
+[[tool.mypy.overrides]]
+module = [
+    "scarf.utils.numba",
+    "scarf.clustering._paris_core",
+    "scarf.embeddings.umap",
+    "scarf.assay.rna",
+    "scarf.features.markers.*",
+    "scarf.features.enrichment.aucell",
+    "scarf.datastore._operations.features",
+]
+disallow_untyped_calls = false
+disable_error_code = ["attr-defined", "arg-type"]
+
+[[tool.mypy.overrides]]
+module = ["profiling.*"]
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+disallow_untyped_calls = false
+check_untyped_defs = false
+warn_return_any = false
+ignore_errors = true

@@ -1,0 +1,251 @@
+# Copy to profiling/config.toml and replace secret, region, endpoint, bucket, and prefixes.
+
+modalEnvironmentName = "scarf_profiling"
+modalAppName = "scarf-profiling"
+modalSecretName = "replace-with-modal-secret"
+modalRegion = "eu"
+r2EndpointUrl = "https://replace-with-account-id.r2.cloudflarestorage.com"
+datasetPrefixUri = "s3://example-bucket/scarf-profiling/datasets"
+resultsUri = "s3://example-bucket/scarf-profiling"
+# Optional: isolate stores/results under stores/<runTag>/ and results/<runTag>/.
+# runTag = "replace-with-a-fresh-run-tag"
+#
+# [countMatrix]
+# unitBytes = 1000000000
+# chunkBytes = 100000000
+#
+# Leave storageIo unset to use the memory-admitted product defaults. Set all
+# three values only for an isolated policy experiment.
+# [storageIo]
+# readWorkers = 8
+# computeWorkers = 4
+# writeWorkers = 4
+targetSizes = [
+    10000,
+    25000,
+    50000,
+    100000,
+    250000,
+    500000,
+    1000000,
+    2500000,
+    5000000,
+    10000000,
+]
+samplingSeed = 0
+
+# Full Cellxgene prepare loads CSR into RAM (indices downcast to int32).
+[prepareResources]
+modalMemoryRequestMb = 196608
+modalMemoryLimitMb = 212992
+modalCpuRequest = 8.0
+modalCpuLimit = 16.0
+timeoutSeconds = 86400
+ephemeralDiskMb = 524288
+
+[workflow]
+assayName = "RNA"
+cellKey = "I"
+filterAttrs = [
+    "RNA_nCounts",
+    "RNA_nFeatures",
+    "RNA_percentMito",
+    "RNA_percentRibo",
+]
+filterMinQuantile = 0.01
+filterMaxQuantile = 0.99
+minFeaturesPerCell = 10
+minCellsPerFeature = 20
+h5adBatchSize = 1000
+topN = 1000
+hvgMinCells = 20
+hvgKey = "hvgs"
+k = 11
+dims = 21
+nCentroids = 1000
+graphSeed = 4466
+annParallel = false
+umapEpochs = 300
+umapSeed = 4444
+umapParallel = false
+umapLabel = "UMAP"
+leidenResolution = 1.0
+leidenBackend = "igraph"
+leidenSeed = 4444
+leidenLabel = "leiden_cluster"
+markerFeatureKey = "I"
+graphLocalCache = "auto"
+
+# Tune memory before large runs. Values are examples.
+
+# Pin createStore / writeCountsT / markHvgs / findMarkers to 8 CPU / 32 GiB
+# (scarf budget ~24 GiB). Other stages keep larger envelopes.
+[stageResources.createStore]
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.writeCountsT]
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.initializeStore]
+modalMemoryRequestMb = 65536
+modalMemoryLimitMb = 73728
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 51539607552
+workers = 8
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.reopenStore]
+modalMemoryRequestMb = 16384
+modalMemoryLimitMb = 20480
+modalCpuRequest = 4.0
+modalCpuLimit = 4.0
+scarfMemoryBudget = 12884901888
+workers = 4
+timeoutSeconds = 3600
+ephemeralDiskMb = 524288
+
+[stageResources.filterCells]
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 40960
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
+timeoutSeconds = 14400
+ephemeralDiskMb = 524288
+
+[stageResources.markHvgs]
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
+timeoutSeconds = 43200
+ephemeralDiskMb = 524288
+
+[stageResources.runNormalization]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.runPca]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.buildEmbeddingInitialization]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.buildAnnIndex]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.queryNeighbors]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.buildConnectivityMap]
+modalMemoryRequestMb = 131072
+modalMemoryLimitMb = 147456
+modalCpuRequest = 16.0
+modalCpuLimit = 16.0
+scarfMemoryBudget = 120259084288
+workers = 16
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.runUmap]
+modalMemoryRequestMb = 65536
+modalMemoryLimitMb = 73728
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 51539607552
+workers = 8
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.runLeiden]
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 2.0
+modalCpuLimit = 2.0
+scarfMemoryBudget = 25769803776
+workers = 2
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.findMarkers]
+modalMemoryRequestMb = 32768
+modalMemoryLimitMb = 32768
+modalCpuRequest = 8.0
+modalCpuLimit = 8.0
+scarfMemoryBudget = 25769803776
+workers = 8
+timeoutSeconds = 82800
+ephemeralDiskMb = 524288
+
+[stageResources.importClusters]
+modalMemoryRequestMb = 16384
+modalMemoryLimitMb = 20480
+modalCpuRequest = 4.0
+modalCpuLimit = 4.0
+scarfMemoryBudget = 12884901888
+workers = 4
+timeoutSeconds = 3600
+ephemeralDiskMb = 524288
+
+[stageResources.validateExperiment]
+modalMemoryRequestMb = 16384
+modalMemoryLimitMb = 20480
+modalCpuRequest = 4.0
+modalCpuLimit = 4.0
+scarfMemoryBudget = 12884901888
+workers = 4
+timeoutSeconds = 3600
+ephemeralDiskMb = 524288

@@ -1,0 +1,33 @@
+import os
+
+# Bound Scarf worker auto-detection before pytest plugins import NumPy or Scarf.
+os.environ["SCARF_WORKERS"] = "2"
+
+import sys
+
+import pytest
+
+from scarf.utils import configure_output, logger
+
+pytest_plugins = [
+    "tests.fixtures_downloader",
+    "tests.fixtures_readers",
+    "tests.fixtures_datastore",
+]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _quiet_test_logs() -> None:
+    """Keep pytest output readable while standalone CLIs retain INFO logs."""
+    configure_output(progress=False)
+    logger.remove()
+    logger.add(sys.stderr, level="ERROR")
+
+
+@pytest.fixture(autouse=True)
+def _reset_zarr_runtime() -> None:
+    from scarf.storage.async_execution import reset_zarr_runtime_for_tests
+
+    reset_zarr_runtime_for_tests()
+    yield
+    reset_zarr_runtime_for_tests()
