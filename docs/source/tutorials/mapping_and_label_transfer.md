@@ -151,10 +151,6 @@ Use `load_arrays=True` to get two arrays with one row per query cell and `save_k
 ```{code-cell} ipython3
 peek = ds_stim.get_mapping_result(mapping, load_arrays=True)
 peek.n_cells, int(peek.indices.shape[1]), peek.indices[:3], peek.distances[:3]
-
-# n_cells: number of mapped query cells
-# indices.shape[1]: save_k value used
-# indices / distances: reference neighbour ids and distances
 ```
 
 ## 4. Where did the query land?
