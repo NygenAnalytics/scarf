@@ -7,6 +7,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 import scarf.graph.feature_projection as feature_projection_module
+from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.embeddings.imported import write_imported_coordinates
 from scarf.graph.errors import IncompatibleAnalysisStateError
 from scarf.graph.feature_projection import (
@@ -16,12 +17,14 @@ from scarf.graph.feature_projection import (
     resolve_graph_assay_inputs,
     resolve_native_graph_inputs,
 )
+from scarf.graph.state import AssayState, write_assay_state
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_path,
     fingerprint_array,
     fingerprint_stored_arrays,
     fingerprint_stored_strings,
+    inspect_artifact,
     make_provenance,
     new_artifact_id,
 )
@@ -201,6 +204,13 @@ def _native_chain(
     return connectivity, neighbors, coordinates
 
 
+def _bare_embedding_store(root: zarr.Group) -> GraphDataStore:
+    store = object.__new__(GraphDataStore)
+    store.z = root
+    store.workspace = None
+    return store
+
+
 @pytest.fixture
 def root() -> zarr.Group:
     return zarr.open_group(store=MemoryStore(), mode="w")
@@ -278,6 +288,66 @@ def test_native_projection_rejects_scalar_embedded_in_coordinate_ref(
     with pytest.raises(IncompatibleAnalysisStateError) as caught:
         resolve_native_graph_inputs(root, connectivity)
     assert caught.value.code == "legacy_feature_contract"
+
+
+def test_native_graph_classifies_missing_incomplete_and_malformed_records(
+    root: zarr.Group,
+) -> None:
+    cells = _cell_selection(root)
+    connectivity, _neighbors, _coordinates = _native_chain(
+        root,
+        "RNA",
+        cell_selection=cells,
+    )
+    missing = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="connectivity_map",
+        artifact_id="0" * 64,
+    )
+
+    with pytest.raises(ArtifactResolutionError) as missing_error:
+        resolve_native_graph_inputs(root, missing)
+    assert missing_error.value.code == "missing_artifact"
+
+    root[artifact_path(connectivity)].attrs["complete"] = False
+    with pytest.raises(ArtifactResolutionError) as incomplete:
+        resolve_native_graph_inputs(root, connectivity)
+    assert incomplete.value.code == "incomplete_artifact"
+
+    root[artifact_path(connectivity)].attrs["complete"] = "yes"
+    with pytest.raises(ArtifactResolutionError) as malformed:
+        resolve_native_graph_inputs(root, connectivity)
+    assert malformed.value.code == "corrupt_payload"
+
+
+def test_neighbors_string_coordinates_use_the_legacy_contract(
+    root: zarr.Group,
+) -> None:
+    cells = _cell_selection(root)
+    connectivity, neighbors, _coordinates = _native_chain(
+        root,
+        "RNA",
+        cell_selection=cells,
+    )
+    group = root[artifact_path(neighbors)]
+    provenance = dict(group.attrs["provenance"])
+    inputs = dict(provenance["inputs"])
+    inputs["coordinates"] = "RNA/normed__I__hvgs/reduction__pca"
+    provenance["inputs"] = inputs
+    group.attrs["provenance"] = provenance
+
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        resolve_native_graph_inputs(root, connectivity)
+    assert caught.value.code == "legacy_feature_contract"
+
+    inputs["feat_key"] = "I__hvgs"
+    del inputs["coordinates"]
+    provenance["inputs"] = inputs
+    group.attrs["provenance"] = provenance
+    with pytest.raises(IncompatibleAnalysisStateError) as missing_with_feat_key:
+        resolve_native_graph_inputs(root, connectivity)
+    assert missing_with_feat_key.value.code == "legacy_feature_contract"
 
 
 @pytest.mark.parametrize(
@@ -817,3 +887,52 @@ def test_integrated_wnn_rejects_imported_coordinates(root: zarr.Group) -> None:
     with pytest.raises(ArtifactResolutionError) as caught:
         project_normalized_feature_selections(root, integrated)
     assert caught.value.code == "wrong_kind"
+
+
+def test_ini_embed_requires_state_initialization_from_the_graph_reduction(
+    root: zarr.Group,
+) -> None:
+    cells = _cell_selection(root)
+    features = _feature_selection(root, "RNA")
+    graph, _neighbors, coordinates = _native_chain(
+        root,
+        "RNA",
+        cell_selection=cells,
+        feature_selection=features,
+    )
+    other_graph, _other_neighbors, other_coordinates = _native_chain(
+        root,
+        "RNA",
+        cell_selection=cells,
+        feature_selection=features,
+    )
+    store = _bare_embedding_store(root)
+    with pytest.raises(KeyError, match="no embedding initialization"):
+        store._get_ini_embed("RNA", "I", graph, 2)
+
+    raw_normalized = (inspect_artifact(root, coordinates).inputs or {}).get(
+        "normalized"
+    )
+    assert isinstance(raw_normalized, dict)
+    initialization = _artifact(
+        root,
+        "embedding_initialization",
+        assay="RNA",
+        inputs={"reduction": coordinates},
+    )
+    write_assay_state(
+        root,
+        AssayState(
+            assay="RNA",
+            cell_key="I",
+            normalized=ArtifactRef.from_dict(raw_normalized),
+            reduction=coordinates,
+            embedding_initialization=initialization,
+        ),
+    )
+    with pytest.raises(
+        ValueError,
+        match="does not belong to the graph reduction",
+    ):
+        store._get_ini_embed("RNA", "I", other_graph, 2)
+    assert other_coordinates != coordinates

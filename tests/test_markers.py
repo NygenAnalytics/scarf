@@ -1,10 +1,15 @@
 import numpy as np
 import pandas as pd
 import pytest
+import zarr
+from zarr.storage import MemoryStore
 
 import scarf.features.markers.search as marker_search_module
 from scarf.assay import norm_lib_size
-from scarf.datastore._operations.features import _select_indexed_marker_artifact
+from scarf.datastore._operations.features import (
+    _marker_artifact_index,
+    _select_indexed_marker_artifact,
+)
 from scipy.stats import linregress
 from scipy.stats import mannwhitneyu
 
@@ -51,6 +56,28 @@ def test_marker_index_fails_closed_for_multiple_feature_selections() -> None:
     index["I"]["clusters"]["features-2"] = second.to_dict()
     with pytest.raises(ValueError, match="Multiple feature-specific marker tables"):
         _select_indexed_marker_artifact(index, "I", "clusters")
+
+
+def test_marker_artifact_index_rejects_malformed_payloads() -> None:
+    group = zarr.open_group(store=MemoryStore(), mode="w")
+    payloads: list[object] = [
+        ["not-a-dict"],
+        {"I": "not-groups"},
+        {"I": {"clusters": "not-selections"}},
+        {"I": {"clusters": {"features": "not-a-ref"}}},
+        {"I": {"clusters": {"features": {"kind": "marker_table"}}}},
+    ]
+    for payload in payloads:
+        group.attrs["artifacts"] = payload
+        with pytest.raises(ValueError, match="invalid"):
+            _marker_artifact_index(group)
+
+
+def test_select_indexed_marker_artifact_missing_slot() -> None:
+    with pytest.raises(KeyError, match="was not found"):
+        _select_indexed_marker_artifact({}, "I", "clusters")
+    with pytest.raises(KeyError, match="was not found"):
+        _select_indexed_marker_artifact({"I": {}}, "I", "clusters")
 
 
 def _reference_calc(

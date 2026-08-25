@@ -12,6 +12,7 @@ import scarf.graph.state as graph_state
 from scarf.datastore._operations.graph import _sampling_fraction
 from scarf.datastore.graph_datastore import GraphDataStore
 from scarf.graph.feature_projection import resolve_native_graph_inputs
+from scarf.graph.state import GraphSelection
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_path,
@@ -1055,3 +1056,32 @@ def test_neighbor_query_and_connectivity_fail_before_expensive_work(
     )
     with pytest.raises(ValueError, match="Neighbors artifact has no assay"):
         store.build_connectivity_map(detached_neighbors, update_state=False)
+
+
+def test_run_umap_rejects_cell_key_that_does_not_match_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _bare_store()
+    graph = _complete_artifact(store, "connectivity_map")
+    cells = _complete_artifact(store, "cell_selection", assay=None)
+    other_cells = _complete_artifact(store, "cell_selection", assay=None)
+    monkeypatch.setattr(
+        "scarf.datastore._operations.embeddings.resolve_graph_selection",
+        lambda *_args, **_kwargs: GraphSelection(
+            graph_loc=artifact_path(graph),
+            graph_ref=graph,
+            from_assay="RNA",
+            cell_key="I",
+            integrated_label=None,
+        ),
+    )
+    monkeypatch.setattr(store, "load_graph", Mock(return_value=np.eye(2)))
+    monkeypatch.setattr(
+        store,
+        "_get_ini_embed",
+        Mock(return_value=(np.zeros((2, 2)), graph)),
+    )
+    monkeypatch.setattr(store, "_ensure_cell_selection", Mock(return_value=cells))
+    monkeypatch.setattr(store, "_graph_cell_selection", Mock(return_value=other_cells))
+    with pytest.raises(ValueError, match="cell_key does not match the graph"):
+        store.run_umap(graph, n_epochs=1)
