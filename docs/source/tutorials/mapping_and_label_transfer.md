@@ -18,7 +18,7 @@ kernelspec:
 # Mapping cells and transferring labels
 
 Mapping is the fixed-reference alternative to merging datasets and rebuilding a joint graph.
-Keep one reference atlas unchanged, place new query cells onto it, and transfer labels from reference neighbours.
+This allows you to keep one reference atlas unchanged, place new query cells onto it, and transfer labels from reference neighbours.
 
 It does three things in order:
 
@@ -29,12 +29,13 @@ It does three things in order:
 It does not merge count matrices, retrain the reference graph, or move reference cells.
 When sources must be analysed together in one store, start with {doc}`dataset_merging` and {doc}`batch_correction` instead.
 
-This tutorial maps interferon-stimulated PBMCs onto a control PBMC reference from the same Kang study.
+In this tutorial, we will be mapping interferon-stimulated PBMCs onto a control PBMC reference from the same Kang study.
 The shared author labels let us evaluate the result.
-For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
 
 Mapping currently supports RNA queries.
 The downloaded stores are immutable data sources. This tutorial mounts each one into a fresh writable analysis store so the artifact-era pipeline never reuses legacy analysis state. The reference and query must remain different stores.
+
+For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
 
 ## 1. Open the reference and query
 
@@ -154,17 +155,20 @@ mapping = ds_stim.run_mapping(
 )
 ```
 
-`reference_mean` fills an absent query feature with the reference mean, which becomes zero after reference scaling.
-Use `zero` to fill with a normalized zero, or `error` when complete feature overlap is required.
-
-Reload the projection with neighbour arrays to confirm the write: one row per mapped query cell, `save_k` reference neighbours, and finite distances.
+To check the neighbour arrays, reload the projection with `get_mapping_results()`. 
+Use `load_arrays=True` to get two arrays with one row per query cell and `save_k` columns. 
+`indices` identifies the nearest reference cells. 
+`distances` finite distances between the query cell and the neighbour reference cells.
 
 ```{code-cell} ipython3
 peek = ds_stim.get_mapping_result(mapping, load_arrays=True)
 peek.n_cells, int(peek.indices.shape[1]), peek.indices[:3], peek.distances[:3]
 ```
 
-`mapping.diagnostics["queryScaledDispersion"]` compares query spread with the reference after scaling.
+`reference_mean` fills an absent query feature with the reference mean, which becomes zero after reference scaling.
+Use `zero` to fill with a normalized zero, or `error` when complete feature overlap is required.
+
+`mapping.diagnostics["queryScaledDispersion"]` is calculated from comparing query spread with the reference after scaling.
 Values near 1 mean the query occupies a similar region of feature space.
 Values much below 1 mean the query is compressed toward the centre of the reference cloud and neighbour labels become less trustworthy.
 
@@ -174,10 +178,9 @@ mapping.diagnostics
 
 ## 4. Where did the query land?
 
-A mapping score tells you which reference cells received neighbour weight from the query.
-Plot it on the reference UMAP.
-One panel for the whole query is hard to read because the weight is spread across many cells.
-Split by a few known query populations to see whether each population lands on the matching reference region.
+A mapping score tells you which reference cells received neighbour weight from the query. This can be plotted on the reference UMAP.
+Since one panel for the whole query becomes hard to read due to the weight being spread across many cells,
+we can split by a few known query populations to see whether each population lands on the matching reference region.
 
 ```{code-cell} ipython3
 query_labels = np.asarray(ds_stim.cells.fetch("cluster_labels")).astype(str)
@@ -195,10 +198,10 @@ ds_stim.plots.mapping_score(
 )
 ```
 
-Grey points received no weight from that query group.
-Coloured points are the reference cells that attracted it; point size scales with score so sparse hits stay visible.
-A useful map lights up the matching reference population.
-Concentration in an unrelated pocket suggests a domain shift or a feature-alignment problem.
+Each panel here shows grey points which received no weight from that query group.
+Coloured points are the reference cells that are neighbours to the cells in the query group; point size scales with score so sparse hits stay visible.
+A useful mapping of the query group will light up the matching reference population.
+Alternatively, concentration in an unrelated pocket suggests a domain shift or a feature-alignment problem.
 
 ## 5. Transfer labels and inspect evidence
 
@@ -225,7 +228,13 @@ accepted.value_counts().rename(
 ```
 
 Plot the transferred labels on the query UMAP.
-The `NA` category is abstention geography: those cells did not clear the vote threshold.
+In the plot below, the `NA` category is abstention geography, i.e. those cells did not clear the vote threshold.
+
+`get_target_classes()` sets `NA` under the circumstances when:
+- the winning vote fraction is below `threshold_fraction`
+- neighbour votes tie, or
+- the cell is uninformative.
+
 
 ```{code-cell} ipython3
 ds_stim.plots.embedding(
@@ -235,7 +244,6 @@ ds_stim.plots.embedding(
 )
 ```
 
-`get_target_classes` sets `NA` when the winning vote fraction is below `threshold_fraction`, when neighbour votes tie, or when the cell is uninformative.
 `mapping_evidence` plots diagnostics from `get_target_label_evidence`; they do not trigger abstention on their own:
 
 - `voteFraction`: how much neighbour weight supports the winning label
@@ -256,7 +264,7 @@ ds_stim.plots.mapping_evidence(
 )
 ```
 
-Because this query carries author labels, we can compare known labels with transferred labels.
+Because this query daatset also carries orginal author labels, we can compare these known labels with our transferred labels.
 
 ```{code-cell} ipython3
 ds_stim.plots.mapping_confusion(
@@ -270,11 +278,11 @@ ds_stim.plots.mapping_confusion(
 
 The diagonal is recall within each known query label.
 Off-diagonal blocks are systematic swaps.
-The `NA` column is abstention.
-Watch the monocyte rows: stimulated CD14 Mono and DC often spill into CD16 Mono rather than a clean match, which is a domain-shift failure mode rather than a plotting artifact.
+The `NA` predicted label here represents the abstention, cells that did not receive a transferred label.
+Take note of the monocyte rows in this figure: stimulated CD14 Mono and DC often spill into CD16 Mono rather than a clean match, which is a domain-shift failure mode rather than a plotting artifact.
 
 Because known labels are available, `mapping_calibration` shows how label accuracy trades off against retained coverage as the vote threshold rises.
-The marker is the `threshold_fraction` used above.
+The red marker is the `threshold_fraction` used above.
 Higher thresholds keep fewer cells and usually raise accuracy among the cells that remain.
 
 ```{code-cell} ipython3
@@ -288,11 +296,12 @@ ds_stim.plots.mapping_calibration(
 
 ## 6. Mapping scores by reference cluster
 
-For a focused query population, ask which reference clusters absorbed the mapping weight.
+For a focused query population, you can find which reference clusters absorbed the mapping weight.
 Per-reference-cell scores are mostly zero, so cell-level box plots collapse to a flat line even when a few reference cells carry real weight.
-Sum the raw (non-log) scores within each reference cluster instead.
-That score mass is readable, and the sized embedding below keeps the same sparse scores on the reference UMAP.
-The monocyte columns are the place to connect back to the confusion off-diagonals.
+Instead, we can sum the raw (non-log) scores within each reference cluster.
+That score now becomes readable, and still keep the same sparse scores on the reference UMAP as shown in the embeddings below.
+
+Here we will focus on the monocyte groups we saw in the confusion matrix which were off-diagonal. We will also include NK group to use as a comparison.
 
 ```{code-cell} ipython3
 focus_labels = ("CD 14 Mono", "CD16 Mono", "NK")
@@ -336,9 +345,9 @@ ds_stim.plots.mapping_score(
 )
 ```
 
-NK should put most score mass on the matching reference NK cluster and light up that pocket on the UMAP.
-CD14 Mono often spreads toward CD16 Mono rather than a tight CD14-only peak; that matches the monocyte swaps in the confusion matrix.
-Diffuse score mass across many unrelated clusters is a reason to inspect feature coverage or the query composition.
+Most of the NK scores matches the reference NK cluster and has clearly lit up in the reference NK cluster on the UMAP.
+CD14 Mono scores have spread toward CD16 Mono rather than CD14 Mono; this matches the monocyte swaps seen previously in the confusion matrix.
+If the scores were spread across multiple unrelated clusters, then it would be reasonable to inspect feature coverage or the composition of the query dataset.
 
 ```{raw} html
 <span id="reference-atlas-mapping"></span>
@@ -346,7 +355,7 @@ Diffuse score mass across many unrelated clusters is a reason to inspect feature
 
 ## 7. Reload a prepared mapping
 
-In a later session you reopen the reference store and load the named mapping reference, then reload the query mapping by name:
+In a later session you may reopen the reference store and load the named mapping reference, then reload the query mapping by name:
 
 ```{code-cell} ipython3
 reference = ds_ctrl.get_mapping_reference()
@@ -360,6 +369,6 @@ reloaded_mapping.mapping_name, reloaded_mapping.n_cells
 
 Building and reusing a Symphony-style fixed reference is covered in {doc}`reference_atlases`.
 
-Common failures include mapping before the reference exists, ignoring feature mismatch, treating vote support as a probability, using a biological condition as a correction batch, and transferring labels without an abstention path.
+For troubleshooting, common failures include mapping before the reference exists, ignoring feature mismatch, treating vote support as a probability, using a biological condition as a correction batch, and transferring labels without an abstention path.
 
 See {doc}`../reference/api/mapping` for method contracts and {doc}`../reference/api/plotting` for the diagnostic plotting signatures used above.
