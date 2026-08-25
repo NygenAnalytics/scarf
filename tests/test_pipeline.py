@@ -812,6 +812,7 @@ def test_basic_rna_pipeline_runs_score_steps_after_clustering(
         },
         markers={
             "clusters": {"leiden": 0.5},
+            "features": "pipeline_full_hvgs",
         },
         callback=events.append,
     )

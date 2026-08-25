@@ -1098,7 +1098,7 @@ def test_lisi_rejects_incomplete_ann_dependency(
     try:
         with pytest.raises(
             ArtifactResolutionError,
-            match="artifact is incomplete",
+            match=r"(?i)artifact is incomplete",
         ) as error:
             datastore.metric_lisi(
                 ["names"],

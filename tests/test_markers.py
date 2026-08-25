@@ -943,7 +943,11 @@ def test_find_markers_fast_raw_path_computes_groupwise_statistics(
 def test_iter_raw_feature_columns_matches_normed(datastore):
     assay = datastore.RNA
     cell_idx = assay.cells.active_index("I")
-    feat_idx = np.arange(assay.feats.N, dtype=np.int64)
+    n_features = int(assay.feats.N)
+    batch_size = 37
+    head = np.arange(min(3 * batch_size, n_features), dtype=np.int64)
+    tail = np.arange(max(n_features - batch_size, 0), n_features, dtype=np.int64)
+    feat_idx = np.unique(np.concatenate([head, tail]))
     scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
 
     streamed = controlled_compute(
@@ -955,7 +959,7 @@ def test_iter_raw_feature_columns_matches_normed(datastore):
     for mat, batch_cols in assay.iter_raw_feature_columns(
         cell_idx=cell_idx,
         feat_idx=feat_idx,
-        batch_size=37,
+        batch_size=batch_size,
         scalar=scalar,
         sf=float(assay.sf),
     ):

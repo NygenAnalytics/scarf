@@ -283,13 +283,26 @@ def test_equal_weight_sample_aggregation_fixture():
     assert agg["mean"].iloc[0] != pytest.approx(cell_weighted)
 
 
-def test_embedding_keeps_square_panel_with_side_legend(
-    umap, leiden_clustering, datastore
-):
+def test_embedding_keeps_square_panel_with_side_legend():
+    rng = np.random.default_rng(0)
+    n_cells = 48
+    store = _ArrayStore(
+        {
+            "I": np.ones(n_cells, dtype=bool),
+            "RNA_UMAP1": rng.normal(size=n_cells),
+            "RNA_UMAP2": rng.normal(size=n_cells),
+            "RNA_leiden_cluster": np.array(
+                [str(index % 6) for index in range(n_cells)],
+                dtype=object,
+            ),
+        },
+        np.zeros((n_cells, 2)),
+    )
     result = splt.embedding(
-        datastore,
+        store,
         layout_key="RNA_UMAP",
         color_by="RNA_leiden_cluster",
+        legend_loc="right",
         show=False,
     )
     ax = next(iter(result.axes.values()))

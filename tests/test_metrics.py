@@ -38,6 +38,21 @@ def _uniform_self_free_knn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return distances, indices, labels
 
 
+def test_compute_lisi_single_category_is_one():
+    metadata = pd.DataFrame({"batch": np.zeros(4, dtype=np.int8)})
+    distances, indices, _labels = _uniform_self_free_knn()
+
+    scores = compute_lisi(
+        distances,
+        indices,
+        metadata,
+        label_colnames=["batch"],
+        perplexity=1,
+    )
+
+    assert np.allclose(scores[:, 0], 1.0)
+
+
 def test_compute_lisi_uses_all_stored_neighbors():
     metadata = pd.DataFrame({"batch": [1, 0, 0, 0]})
     indices = np.tile(np.array([0, 1, 2]), (4, 1))
@@ -327,20 +342,6 @@ def test_graph_connectivity_validates_inputs():
             np.array([[0, 1]]),
             np.array([0, np.nan]),
         )
-
-
-def test_metric_lisi_single_category_is_one(datastore, graph_artifacts):
-    labels = np.zeros(datastore.cells.N, dtype=np.int8)
-    datastore.cells.insert(
-        column_name="single_batch",
-        values=labels,
-        overwrite=True,
-    )
-    lisi = datastore.metric_lisi(
-        label_columns=["single_batch"],
-    )
-
-    assert np.allclose(lisi["single_batch"], 1)
 
 
 def test_knn_without_affinities_preserves_distances():
@@ -815,6 +816,15 @@ def test_datastore_scib_metrics(datastore, graph_artifacts, leiden_clustering):
     state = datastore.get_assay_state("RNA")
     assert state is not None
     assert state.connectivity_map is not None
+
+    labels = np.zeros(datastore.cells.N, dtype=np.int8)
+    datastore.cells.insert(
+        column_name="single_batch",
+        values=labels,
+        overwrite=True,
+    )
+    lisi = datastore.metric_lisi(label_columns=["single_batch"])
+    assert np.allclose(lisi["single_batch"], 1)
 
     ilisi = datastore.metric_ilisi(label_colname)
     clisi = datastore.metric_clisi(label_colname)

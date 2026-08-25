@@ -1,6 +1,7 @@
 import ast
 import subprocess
 import sys
+from functools import cache
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -120,11 +121,20 @@ def _root_imports(path: Path) -> set[str]:
     return imports
 
 
+@cache
+def _root_imports_by_path() -> dict[str, set[str]]:
+    return {
+        path.relative_to(_SCARF_ROOT).as_posix(): _root_imports(path)
+        for path in _SCARF_ROOT.rglob("*.py")
+        if path != _SCARF_ROOT / "__init__.py"
+    }
+
+
 def _facade_importers(facade_name: str) -> set[str]:
     return {
-        path.relative_to(_SCARF_ROOT).as_posix()
-        for path in _SCARF_ROOT.rglob("*.py")
-        if path != _SCARF_ROOT / "__init__.py" and facade_name in _root_imports(path)
+        relative
+        for relative, imports in _root_imports_by_path().items()
+        if facade_name in imports
     }
 
 
@@ -497,24 +507,27 @@ def test_mapping_does_not_import_orchestration_or_general_io():
 
 
 def test_internal_modules_use_canonical_storage_and_utility_paths():
-    assert _facade_importers("ann") == set()
-    assert _facade_importers("dendrogram") == set()
-    assert _facade_importers("knn_utils") == set()
-    assert _facade_importers("results") == set()
-    assert _facade_importers("umap") == set()
-    assert _facade_importers("writers") == set()
-    assert _facade_importers("parallel") == set()
-    assert _facade_importers("storage.zarr_store") == set()
-    assert _facade_importers("utils") == set()
-    for retired_module in (
+    for facade_name in (
+        "ann",
+        "dendrogram",
+        "knn_utils",
+        "results",
+        "umap",
+        "writers",
+        "parallel",
+        "storage.zarr_store",
+        "utils",
         "bio_data",
         "doublet_utils",
         "feat_utils",
         "meld_assay",
+        "utils.blocks",
+        "utils.memory",
+        "utils.storage",
+        "utils.system",
+        "utils.windows",
     ):
-        assert _facade_importers(retired_module) == set()
-    for retired_module in ("blocks", "memory", "storage", "system", "windows"):
-        assert _facade_importers(f"utils.{retired_module}") == set()
+        assert _facade_importers(facade_name) == set()
 
 
 def test_internal_modules_do_not_use_moved_symbols_from_hybrid_facades():
