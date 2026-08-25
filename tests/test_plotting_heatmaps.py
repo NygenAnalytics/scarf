@@ -141,6 +141,7 @@ def test_marker_heatmap_returns_owned_result(
 
     result = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=3,
         figsize=(4, 6),
@@ -171,7 +172,12 @@ def test_marker_heatmap_selects_features_by_named_score(
     from scarf.features.markers.table import load_marker_table
 
     assay = datastore.RNA
-    marker_slot = datastore._resolve_marker_group("RNA", "I", "RNA_cluster")
+    marker_slot = datastore._resolve_marker_group(
+        "RNA",
+        "I",
+        "RNA_cluster",
+        marker_search,
+    )
     feature_names = np.asarray(assay.feats.fetch_all("names"))
     feature_ids = np.asarray(assay.feats.fetch_all("ids"))
     expected_by_group: dict[str, list[str]] = {}
@@ -192,6 +198,7 @@ def test_marker_heatmap_selects_features_by_named_score(
 
     result = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_rows=False,
@@ -214,13 +221,19 @@ def test_marker_heatmap_propagates_marker_metadata_errors(
     marker_search,
     datastore,
 ):
-    marker_slot = datastore._resolve_marker_group("RNA", "I", "RNA_cluster")
+    marker_slot = datastore._resolve_marker_group(
+        "RNA",
+        "I",
+        "RNA_cluster",
+        marker_search,
+    )
     original_method = marker_slot.attrs["method"]
     marker_slot.attrs["method"] = "ttest"
     try:
         with pytest.raises(ValueError, match="Canonical marker metadata 'method'"):
             splt.marker_heatmap(
                 datastore,
+                marker=marker_search,
                 group_key="RNA_cluster",
                 topn=2,
                 show=False,
@@ -282,6 +295,7 @@ def test_marker_heatmap_accepts_explicit_order_annotations_and_target(
 
     baseline = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_rows=False,
@@ -299,6 +313,7 @@ def test_marker_heatmap_accepts_explicit_order_annotations_and_target(
 
     result = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         row_order=row_order,
@@ -424,6 +439,7 @@ def test_clustermap_annotation_legend_reserves_space_with_column_tree(
 ):
     baseline = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_columns=False,
@@ -442,6 +458,7 @@ def test_clustermap_annotation_legend_reserves_space_with_column_tree(
 
     result = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_columns=True,
@@ -478,6 +495,7 @@ def test_clustermap_annotation_legend_without_dendrogram_is_owned_and_closed(
 
     baseline = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_rows=False,
@@ -494,6 +512,7 @@ def test_clustermap_annotation_legend_without_dendrogram_is_owned_and_closed(
 
     result = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_rows=False,

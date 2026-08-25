@@ -211,7 +211,7 @@ def _expression_matrix_figures(
     markers: dict[str, list[str]],
 ) -> list[Path]:
     outputs: list[Path] = []
-    store.run_marker_search(
+    marker_table = store.run_marker_search(
         group_key=_CLUSTER_KEY,
         features="all_features",
     )
@@ -220,6 +220,7 @@ def _expression_matrix_figures(
     heatmap = splt.marker_heatmap(
         store,
         group_key=_CLUSTER_KEY,
+        marker=marker_table,
         topn=4,
         figsize=(6.0, 7.5),
         fontsize=8,
