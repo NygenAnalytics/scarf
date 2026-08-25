@@ -34,15 +34,19 @@ The shared author labels let us evaluate the result.
 For a reusable Symphony-style atlas, see {doc}`reference_atlases`.
 
 Mapping currently supports RNA queries.
-The prepared reference may be reopened read-only, but the query must be a different writable store.
+The downloaded stores are immutable data sources. This tutorial mounts each one into a fresh writable analysis store so the artifact-era pipeline never reuses legacy analysis state. The reference and query must remain different stores.
 
 ## 1. Open the reference and query
 
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import numpy as np
 import pandas as pd
 
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="WARNING", progress=True)
 
@@ -58,17 +62,34 @@ stim_path = repository.download_dataset(
     zarr=True,
 )
 
-ds_ctrl = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+ctrl_counts = Path(analysis_directory.name) / "control_counts.zarr"
+stim_counts = Path(analysis_directory.name) / "stimulated_counts.zarr"
+repack_store(
     f"{ctrl_path}/data.zarr",
-    nthreads=4,
-    zarr_mode="r+",
+    str(ctrl_counts),
+    nthreads=2,
 )
-ds_stim = scarf.DataStore(
+repack_store(
     f"{stim_path}/data.zarr",
+    str(stim_counts),
+    nthreads=2,
+)
+ds_ctrl = scarf.mount_datastore(
+    str(ctrl_counts),
+    at=str(Path(analysis_directory.name) / "control_analysis.zarr"),
+    default_assay="RNA",
     nthreads=4,
-    zarr_mode="r+",
+)
+ds_stim = scarf.mount_datastore(
+    str(stim_counts),
+    at=str(Path(analysis_directory.name) / "stimulated_analysis.zarr"),
+    default_assay="RNA",
+    nthreads=4,
 )
 ```
+
+The structural repack rebuilds the RNA transpose required for streaming and does not migrate analysis state. Mounting the repacked counts into separate targets keeps the new reference and query lineage clean.
 
 ```{code-cell} ipython3
 ds_ctrl.plots.embedding(
@@ -112,6 +133,7 @@ reference = ds_ctrl.build_mapping_reference(artifacts["neighbors"])
 ```
 
 The completed `MappingReference` is immutable.
+Its `feature_selection` field pins the exact reference feature artifact rather than a metadata key.
 Its feature order, scaling, PCA loadings, neighbour index, and selected cells stay fixed in the reference datastore.
 This example uses a plain PCA reference.
 A Symphony reference instead passes Harmony-corrected neighbours into `build_mapping_reference`.

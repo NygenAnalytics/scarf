@@ -2,8 +2,8 @@
 
 These tests download a genuine master-format (Zarr v2) RNA store from the
 public cytebase bucket. Opening that archive as RNA must fail closed and ask
-for a rebuild. A repacked copy must preserve graph and marker layout while the
-untouched legacy archive digest stays identical.
+for a rebuild. Structural repacking keeps the old bytes available, but does
+not migrate encoded feature selections or graph state into artifact lineage.
 
 The corpus lives under a ``_legacy_master`` dataset. Cytebase publishes the
 current-format store under the plain dataset name, and the archive it replaced
@@ -17,14 +17,6 @@ import pytest
 
 _FROZEN_DATASET = "tenx_5K_pbmc_rnaseq_legacy_master"
 _ASSAY = "RNA"
-_CELL_KEY = "I"
-_FEAT_KEY = "hvgs"
-_EXPECTED_GRAPH_LOC = (
-    "RNA/normed__I__hvgs/reduction__pca__15__I/"
-    "ann__l2__50__50__48__4466/knn__11/graph__1.0__1.5"
-)
-_EXPECTED_KNN_LOC = _EXPECTED_GRAPH_LOC.rsplit("/", 1)[0]
-_EXPECTED_NORMED_LOC = "RNA/normed__I__hvgs"
 
 
 def _tree_digest(root: str) -> str:
@@ -95,7 +87,7 @@ def test_frozen_master_rna_open_hard_breaks_without_strip_counts_t(
 
 
 @pytest.mark.integration
-def test_frozen_master_repack_preserves_graph_schema_and_legacy_digest(
+def test_frozen_master_repack_preserves_data_but_not_legacy_analysis_state(
     frozen_master_store: str,
     tmp_path,
 ) -> None:
@@ -114,39 +106,26 @@ def test_frozen_master_repack_preserves_graph_schema_and_legacy_digest(
     inspected = inspect_counts_t(root, _ASSAY)
     assert inspected.status == "ready"
 
+    repacked_before_open = _tree_digest(repacked)
     datastore = DataStore(repacked, default_assay=_ASSAY, zarr_mode="r")
-    assert (
-        datastore.get_latest_graph_loc(_ASSAY, _CELL_KEY, _FEAT_KEY)
-        == _EXPECTED_GRAPH_LOC
-    )
-    assert (
-        datastore.get_normalized_group_path(_ASSAY, _CELL_KEY, _FEAT_KEY)
-        == _EXPECTED_NORMED_LOC
-    )
-    stored = datastore._lookup_stored_graph(_ASSAY, _CELL_KEY, _FEAT_KEY)
-    assert stored.paths.cell_graph_group_path == _EXPECTED_GRAPH_LOC
-    assert stored.ann_metric == "l2"
-    assert stored.k == 11
+    assert datastore.RNA.rawData.shape == (datastore.cells.N, datastore.RNA.feats.N)
+    assert datastore.cells.N == 5025
+    assert len(datastore.cells.active_index("I")) == 3940
+    assert len(datastore.cells.fetch_all("ids")) == datastore.cells.N
+    assert len(datastore.RNA.feats.fetch_all("names")) == datastore.RNA.feats.N
 
-    latest_graph = datastore.load_graph(
-        from_assay=_ASSAY, cell_key=_CELL_KEY, feat_key=_FEAT_KEY
-    )
-    explicit_graph = datastore.load_graph(graph_loc=_EXPECTED_GRAPH_LOC)
-    assert latest_graph.shape == (3940, 3940)
-    assert latest_graph.nnz == 43340
-    assert (latest_graph != explicit_graph).nnz == 0
-    assert datastore._keys_from_knn_path(_ASSAY, _EXPECTED_KNN_LOC) == (
-        _CELL_KEY,
-        _FEAT_KEY,
-    )
+    assert not hasattr(datastore, "get_latest_graph_loc")
+    assert not hasattr(datastore, "get_normalized_group_path")
+    assert not hasattr(datastore, "_lookup_stored_graph")
 
-    markers = datastore.get_markers(
-        from_assay=_ASSAY,
-        cell_key=_CELL_KEY,
-        group_key="RNA_cluster",
-        group_id=1,
-        min_score=0,
-        min_frac_exp=0,
-    )
-    assert not markers.empty
+    from scarf.storage import ArtifactResolutionError
+
+    with pytest.raises(ArtifactResolutionError) as caught:
+        datastore.load_graph(from_assay=_ASSAY)
+    assert caught.value.code == "missing_current_graph"
+    with pytest.raises(ArtifactResolutionError) as caught:
+        datastore.resolve_features(_ASSAY, "hvgs")
+    assert caught.value.code == "missing_label"
+
+    assert _tree_digest(repacked) == repacked_before_open
     assert _tree_digest(frozen_master_store) == before

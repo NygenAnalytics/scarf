@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 from scarf import DataStore, H5adReader, H5adToZarr, configure_output
+from scarf.storage import ArtifactRef
 from scarf.storage.budget import resolve_budget
 from scarf.storage.stores import open_store
 from scarf.storage.types import as_zarr_array, as_zarr_group
@@ -127,7 +128,6 @@ def _open_datastore(
                 "assay_types": {workflow.assayName: "RNA"},
                 "default_assay": workflow.assayName,
                 "min_features_per_cell": workflow.minFeaturesPerCell,
-                "min_cells_per_feature": workflow.minCellsPerFeature,
             }
         )
     return DataStore(location, **arguments)
@@ -635,6 +635,7 @@ def run_stage(
     invalidateCache: bool = False,
     recordStoreOperations: bool = True,
     clientProvenance: dict[str, Any] | None = None,
+    hvgRef: ArtifactRef | None = None,
     session: dict[str, Any] | None = None,
 ) -> StageRunResult:
     install_stage_zarr_runtime(resources)
@@ -676,6 +677,11 @@ def run_stage(
     def _keep_store(opened: DataStore | None) -> None:
         if session is not None and opened is not None:
             session["store"] = opened
+
+    if hvgRef is None and session is not None:
+        session_hvg_ref = session.get("hvgRef")
+        if isinstance(session_hvg_ref, ArtifactRef):
+            hvgRef = session_hvg_ref
 
     from profiling.metrics import child_cpu_seconds as read_child_cpu_seconds
 
@@ -847,12 +853,20 @@ def run_stage(
                                 workflow,
                                 resources,
                                 invalidateCache=invalidateCache,
+                                hvgRef=hvgRef,
                             )
                             if analysis_details:
                                 details = {
                                     **(details or {}),
                                     **analysis_details,
                                 }
+                                if stage == "markHvgs" and session is not None:
+                                    artifact = analysis_details.get("artifact")
+                                    if not isinstance(artifact, dict):
+                                        raise ValueError(
+                                            "markHvgs did not return an artifact reference"
+                                        )
+                                    session["hvgRef"] = ArtifactRef.from_dict(artifact)
                             print(
                                 f"[run_stage] analysis DONE stage={stage}",
                                 flush=True,
@@ -1182,6 +1196,7 @@ def _run_analysis(
     resources: StageResources,
     *,
     invalidateCache: bool = False,
+    hvgRef: ArtifactRef | None = None,
 ) -> dict[str, Any] | None:
     if stage == "filterCells":
         store.auto_filter_cells(
@@ -1193,38 +1208,34 @@ def _run_analysis(
         )
         return None
     if stage == "markHvgs":
-        if invalidateCache:
-            assay = store._get_assay(workflow.assayName)
-            identifier, stats_loc = assay._get_summary_stats_loc(workflow.cellKey)
-            if stats_loc in assay.z:
-                del assay.z[stats_loc]
-                print(
-                    f"[run_stage] cleared cached feature stats at {stats_loc}",
-                    flush=True,
-                )
-            if identifier in assay.feats.locations:
-                del assay.feats.locations[identifier]
-        store.mark_hvgs(
+        ref = store.mark_hvgs(
             from_assay=workflow.assayName,
             cell_key=workflow.cellKey,
             min_cells=workflow.hvgMinCells,
             top_n=workflow.topN,
             show_plot=False,
-            hvg_key_name=workflow.hvgKey,
+            label=workflow.hvgLabel,
             invalidate_cache=invalidateCache,
         )
         return {
+            "artifact": ref.to_dict(),
             "consume": _feature_consume_details(
                 workflow,
                 resources,
                 unitKind="countsTCellBand",
-            )
+            ),
         }
     if stage == "runNormalization":
+        feature_selection = hvgRef
+        if feature_selection is None:
+            feature_selection = store.resolve_features(
+                workflow.assayName,
+                workflow.hvgLabel,
+            )
         store.run_normalization(
             from_assay=workflow.assayName,
             cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
+            features=feature_selection,
             update_state=True,
             invalidate_cache=invalidateCache,
         )
@@ -1281,7 +1292,6 @@ def _run_analysis(
         store.run_umap(
             from_assay=workflow.assayName,
             cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
             n_epochs=workflow.umapEpochs,
             random_seed=workflow.umapSeed,
             label=workflow.umapLabel,
@@ -1293,11 +1303,22 @@ def _run_analysis(
     if stage == "runLeiden":
         raise AssertionError("runLeiden must execute in its child process")
     if stage == "findMarkers":
+        if workflow.markerFeatures == "all_features":
+            store._ensure_all_features(store._get_assay(workflow.assayName))
+            feature_selection = store.resolve_features(
+                workflow.assayName,
+                "all_features",
+            )
+        else:
+            feature_selection = store.resolve_features(
+                workflow.assayName,
+                workflow.markerFeatures,
+            )
         store.run_marker_search(
             from_assay=workflow.assayName,
             group_key=workflow.resolvedMarkerGroupKey,
             cell_key=workflow.cellKey,
-            feat_key=workflow.markerFeatureKey,
+            features=feature_selection,
             nthreads=resources.workers,
             skip_save=False,
             invalidate_cache=invalidateCache,

@@ -71,7 +71,8 @@ def test_fixed_resource_map_expands_the_current_funnel():
 def test_marker_group_key_matches_leiden_column():
     workflow = WorkflowParameters()
     assert workflow.resolvedMarkerGroupKey == "RNA_leiden_cluster"
-    assert workflow.resolvedHvgKey == "I__hvgs"
+    assert workflow.hvgLabel == "hvgs"
+    assert workflow.markerFeatures == "all_features"
     assert workflow.topN == 1000
     assert workflow.dims == 21
     assert workflow.k == 11

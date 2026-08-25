@@ -6,7 +6,7 @@
 
 analysis chain
   Record, kept per assay, of which results a workflow is currently building on.
-  `AssayState` tracks `normalized`, `feature_scaling`, `reduction`, `batch_correction`, `ann_index`, `embedding_initialization`, `neighbors`, and `connectivity_map` (plus cell and feature keys).
+  `AssayState` tracks `normalized`, `feature_scaling`, `reduction`, `batch_correction`, `ann_index`, `embedding_initialization`, `neighbors`, `connectivity_map`, and `named_results`, together with the assay and cell key.
   ANN and neighbors are separate fields.
   A method called without an explicit input takes its input from this chain, which is what lets `ds.run_umap()` know which graph to lay out.
 
@@ -19,10 +19,15 @@ ArtifactRef
   It identifies a stored result without loading it, so it can be passed to the next step or held for later comparison.
   Read the data with `load_artifact`, and the parameters and status with `inspect_artifact`.
 
-feat_key
-  Argument naming which feature selection a step should use.
-  Selections are stored per cell key, so `mark_hvgs` under cell key `I` writes the column `I__hvgs` and later calls pass `feat_key='hvgs'`.
-  Scarf supplies the prefix.
+feature selection
+  Immutable Boolean artifact aligned to the complete feature order of one assay.
+  Producers such as `mark_hvgs` return an `ArtifactRef` and may publish the same values under a plain metadata label such as `hvgs`.
+  Direct feature consumers require `features=` and accept either the exact label or the returned reference.
+
+all features
+  Assay-wide all-true feature-selection artifact, published internally as `all_features`.
+  Use `ds.resolve_features(assay, "all_features")` when an analysis should include the complete feature universe.
+  It is distinct from the physical feature metadata column `I`, which is also all true in newly created stores.
 
 provenance
   Record stored with every artifact naming the operation that produced it, the scientific parameters it used, and the artifacts it consumed.

@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from ...matrix import ChunkedArray
+from ...storage.refs import ArtifactRef
 
 __all__ = ["EnrichmentResult"]
 
@@ -20,7 +21,7 @@ class EnrichmentResult:
         storage_path: Zarr path that owns the result.
         assay: Name of the RNA assay used for scoring.
         cell_key: Cell selection used when the result was created.
-        feature_key: Feature selection used when the result was created.
+        feature_selection: Feature-selection artifact used for scoring.
         method: Enrichment method, either ``"waggr"`` or ``"aucell"``.
     """
 
@@ -32,10 +33,19 @@ class EnrichmentResult:
     storage_path: str
     assay: str
     cell_key: str
-    feature_key: str
+    feature_selection: ArtifactRef
     method: str
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.feature_selection, ArtifactRef)
+            or self.feature_selection.kind != "feature_selection"
+            or self.feature_selection.scope != "assay"
+            or self.feature_selection.assay != self.assay
+        ):
+            raise ValueError(
+                "Enrichment feature_selection must belong to the result assay"
+            )
         if len(self.data.shape) != 2:
             raise ValueError("Enrichment data must be two-dimensional")
         if (

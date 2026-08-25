@@ -69,7 +69,7 @@ Feature selections work the same way within each assay.
 
 ## 1. Inspect QC distributions
 
-On open, Scarf streams the count matrix once to compute initialization statistics: columns such as `RNA_nCounts`, `RNA_nFeatures`, and mito/ribo fractions when gene names match the configured patterns, plus per-feature cell counts for feature filtering.
+On open, Scarf streams the count matrix once to compute initialization statistics: columns such as `RNA_nCounts`, `RNA_nFeatures`, and mito/ribo fractions when gene names match the configured patterns, plus per-feature detection statistics used by explicit selection producers.
 
 ```{code-cell} ipython3
 qc_cols = [
@@ -223,8 +223,8 @@ It does not remove cells automatically.
 It requires an existing cluster column.
 
 ```{code-cell} ipython3
-ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
-ds.run_normalization(feat_key='hvgs')
+hvg_ref = ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
+ds.run_normalization(features=hvg_ref)
 ds.run_pca(dims=15)
 ds.build_embedding_initialization()
 ds.build_ann_index()
@@ -284,7 +284,7 @@ The post-filter embedding should lose the highest-scoring hotspot cells from the
 
 ## 8. ATAC quality control
 
-Scarf initializes per-cell ATAC fragment or cut-site counts and accessible-peak counts, and it records per-peak prevalence for feature filtering.
+Scarf initializes per-cell ATAC fragment or cut-site counts and accessible-peak counts, and it records per-peak detection statistics for explicit prevalent-peak selection.
 `mark_prevalent_peaks` selects peaks for LSI and graph construction.
 Scarf does not currently calculate FRiP or TSS enrichment, so those metrics must be imported as metadata or computed with an external tool rather than implied by the available columns.
 

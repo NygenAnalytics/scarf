@@ -115,38 +115,6 @@ class PipelineAccessor:
             )
         return value_name
 
-    def _feature_ref(self, assay_name: str, column: str) -> ArtifactRef:
-        assay = self._store._get_assay(assay_name)
-        feature_data = as_zarr_group(
-            assay.z["featureData"],
-            name="featureData",
-        )
-        raw_ref = as_zarr_array(
-            feature_data[column],
-            name=column,
-        ).attrs.get("source_artifact")
-        if not isinstance(raw_ref, dict):
-            raise RuntimeError(
-                f"Pipeline feature column {column!r} has no artifact ref"
-            )
-        return ArtifactRef.from_dict(raw_ref)
-
-    def _marker_ref(
-        self,
-        assay_name: str,
-        cell_key: str,
-        group_key: str,
-    ) -> ArtifactRef:
-        assay = self._store._get_assay(assay_name)
-        markers = as_zarr_group(assay.z["markers"], name="markers")
-        raw_artifacts = markers.attrs.get("artifacts", {})
-        if not isinstance(raw_artifacts, dict):
-            raise RuntimeError("Marker artifact index is invalid")
-        raw_ref = raw_artifacts.get(f"{cell_key}__{group_key}")
-        if not isinstance(raw_ref, dict):
-            raise RuntimeError("Marker search did not write an artifact")
-        return ArtifactRef.from_dict(raw_ref)
-
     @staticmethod
     def _options(value: StepOptions) -> dict[str, Any]:
         return {} if value is None or value is False else dict(value)
@@ -272,7 +240,6 @@ class PipelineAccessor:
         graph: ArtifactRef,
         assay_name: str,
         cell_key: str,
-        feat_key: str,
         leiden_options: dict[float, dict[str, Any]],
         paris_options: dict[str, Any] | None,
         clustering_concurrency: int,
@@ -327,7 +294,6 @@ class PipelineAccessor:
                     graph,
                     from_assay=assay_name,
                     cell_key=cell_key,
-                    feat_key=feat_key,
                     resolution=resolution,
                     label=label,
                     **options,
@@ -379,7 +345,6 @@ class PipelineAccessor:
                                 graph,
                                 from_assay=assay_name,
                                 cell_key=cell_key,
-                                feat_key=feat_key,
                                 label=paris_job["label"],
                                 **paris_job["options"],
                             )
@@ -614,20 +579,15 @@ class PipelineAccessor:
 
         with events.stage("highly_variable_features"):
             hvg_options = self._options(highly_variable_features)
-            hvg_name = str(hvg_options.get("hvg_key_name", "hvgs"))
             hvg_options.setdefault("show_plot", False)
             hvg_options.setdefault("top_n", 1000)
             hvg_options.setdefault("min_cells", 20)
-            store.mark_hvgs(
+            hvg_ref = store.mark_hvgs(
                 from_assay=assay_name,
                 cell_key=cell_key,
                 **hvg_options,
             )
-            feature_column = f"{cell_key}__{hvg_name}"
-            artifacts["highly_variable_features"] = self._feature_ref(
-                assay_name,
-                feature_column,
-            )
+            artifacts["highly_variable_features"] = hvg_ref
 
         with events.stage("normalization"):
             normalization_options = self._options(normalization)
@@ -636,7 +596,7 @@ class PipelineAccessor:
             normalized = store.run_normalization(
                 from_assay=assay_name,
                 cell_key=cell_key,
-                feat_key=hvg_name,
+                features=hvg_ref,
                 update_state=False,
                 **normalization_options,
             )
@@ -719,7 +679,6 @@ class PipelineAccessor:
                         graph,
                         from_assay=assay_name,
                         cell_key=cell_key,
-                        feat_key=hvg_name,
                         **umap_options,
                     )
 
@@ -729,7 +688,6 @@ class PipelineAccessor:
                 graph=graph,
                 assay_name=assay_name,
                 cell_key=cell_key,
-                feat_key=hvg_name,
                 leiden_options=leiden_options,
                 paris_options=paris_options,
                 clustering_concurrency=clustering_concurrency,
@@ -782,7 +740,7 @@ class PipelineAccessor:
                     cluster_key=_cluster_column(options, "Doublet"),
                     from_assay=assay_name,
                     cell_key=cell_key,
-                    feat_key=hvg_name,
+                    graph=graph,
                     **options,
                 )
                 artifacts["doublets"] = self._column_ref(score_column)
@@ -791,17 +749,20 @@ class PipelineAccessor:
             with events.stage("markers"):
                 options = dict(marker_options)
                 group_key = _cluster_column(options, "Marker")
-                options.setdefault("feat_key", "I")
-                store.run_marker_search(
+                if "features" not in options:
+                    store._ensure_all_features(store._get_assay(assay_name))
+                    options["features"] = store.resolve_features(
+                        assay_name,
+                        "all_features",
+                    )
+                marker_ref = store.run_marker_search(
                     from_assay=assay_name,
                     cell_key=cell_key,
                     group_key=group_key,
                     **options,
                 )
-                artifacts["markers"] = self._marker_ref(
-                    assay_name,
-                    cell_key,
-                    group_key,
-                )
+                if not isinstance(marker_ref, ArtifactRef):
+                    raise RuntimeError("Marker search did not return an artifact")
+                artifacts["markers"] = marker_ref
         logger.info(f"Pipeline completed with {len(artifacts)} artifacts")
         return artifacts

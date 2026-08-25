@@ -1001,7 +1001,6 @@ def test_multimodal_mex_names_feature_reference_and_related_files(
         store,
         default_assay="RNA",
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         mem_budget="64M",
         nthreads=1,
     )

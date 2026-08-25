@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 
 from ...assay import ATACassay, RNAassay
-from ...graph.state import read_assay_state, validate_artifact_graph_selection
+from ...assay.feature_summary import (
+    ensure_feature_summary,
+    feature_summary_selected_count,
+    feature_summary_values,
+)
+from ...graph.feature_projection import resolve_graph_assay_inputs
+from ...graph.state import read_assay_state, resolve_graph_selection
 from ...quality_control.cell_cycle import assign_cell_cycle_phase
 from ...quality_control.filtering import (
     _metric_policy,
@@ -21,9 +27,7 @@ from ...metadata.artifacts import (
     categorical_display,
     column_display,
     continuous_display,
-    feature_column_display,
     link_cell_data_column,
-    link_feature_data_column,
     plan_cell_data_artifact,
     write_cell_data_artifact,
 )
@@ -36,15 +40,22 @@ from ...metadata.arguments import (
 from ...storage.artifacts import (
     artifact_path,
     canonical_bytes,
-    callable_identity,
     fingerprint_array,
     fingerprint_strings,
 )
+from ...storage.feature_selection import (
+    publish_feature_selection_alias,
+    validate_feature_selection_label,
+)
 from ...storage.refs import ArtifactRef
-from ...storage.selections import resolve_generated_selection_artifact
 from ...storage.types import as_zarr_group
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
+from ...storage.feature_selection import (
+    _feature_selection_plan,
+    _ordered_feature_ids_fingerprint,
+    _write_feature_selection,
+)
 
 if TYPE_CHECKING:
     from ...storage.profiles import ZarrLocation
@@ -525,7 +536,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         cluster_key: str,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        feat_key: str | None = None,
         cluster_sample_fraction: float = 0.05,
         max_cells_per_cluster: int = 100,
         simulation_ratio: float = 1.0,
@@ -536,6 +546,8 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         label: str = "doublet_score",
         random_seed: int = 4444,
         invalidate_cache: bool = False,
+        *,
+        graph: ArtifactRef | None = None,
     ) -> str:
         """Flag potential doublets by simulating and mapping synthetic doublets.
 
@@ -553,11 +565,11 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         Args:
             cluster_key: Cell metadata column with cluster or group labels used
                 to stratify the candidate pool (for example ``'RNA_cluster'``).
-            from_assay: Assay to use. Defaults to the latest used assay. Only
+            from_assay: Assay to use. Defaults to the configured default assay. Only
                 RNAassay type assays are supported.
             cell_key: Cell key matching the desired graph (default: ``'I'``).
-            feat_key: Feature key matching the desired graph. Defaults to the
-                latest used feature key for the assay.
+            graph: Connectivity-map or integrated-graph artifact. The assay's
+                current connectivity map is used when omitted.
             cluster_sample_fraction: Fraction of cells sampled from each cluster
                 to build the candidate pool. (Default value: 0.05)
             max_cells_per_cluster: Cap on the number of cells sampled per cluster.
@@ -591,9 +603,15 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             write_doublet_target_zarr,
         )
 
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay, cell_key, feat_key
+        graph_selection = resolve_graph_selection(
+            self,
+            graph,
+            from_assay=from_assay,
+            cell_key=cell_key,
         )
+        from_assay = graph_selection.from_assay
+        cell_key = graph_selection.cell_key
+        connectivity = graph_selection.graph_ref
         source_assay = self._get_assay(from_assay)
         if type(source_assay) != RNAassay:  # noqa: E721
             raise TypeError(
@@ -611,60 +629,28 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             cell_key=cell_key,
         )
         state = read_assay_state(self.zw, from_assay)
-        if (
-            state is None
-            or not state.matches(cell_key, feat_key)
-            or state.connectivity_map is None
-        ):
-            raise ValueError(
-                "Doublet detection requires the selected RNA graph to be an "
-                "artifact-backed connectivity chain. Rebuild and select the graph "
-                "with query_neighbors(...) and build_connectivity_map(...)."
-            )
-        connectivity = state.connectivity_map
         connectivity_status = self._require_complete_artifact(
             connectivity,
-            "connectivity_map",
-            assay=from_assay,
+            connectivity.kind,
+            assay=(from_assay if connectivity.scope == "assay" else None),
         )
-        if connectivity_status.operation != "build_connectivity_map":
+        if connectivity.kind == "connectivity_map" and (
+            connectivity_status.operation != "build_connectivity_map"
+        ):
             raise ValueError(
                 "Doublet detection requires a build_connectivity_map artifact. "
                 "Rebuild and select the RNA graph before running doublet detection."
             )
-        validate_artifact_graph_selection(
+        lineage = resolve_graph_assay_inputs(
             self.zw,
             connectivity,
-            cell_key,
-            feat_key,
+            from_assay,
         )
-        neighbors = self._artifact_input_ref(
-            connectivity,
-            "neighbors",
-            "neighbors",
-        )
-        if (
-            neighbors.scope != "assay"
-            or neighbors.assay != from_assay
-            or state.neighbors != neighbors
-        ):
-            raise ValueError(
-                "The selected connectivity artifact does not match the selected "
-                "RNA neighbors chain. Rebuild and select the graph before running "
-                "doublet detection."
-            )
-        graph_selection = self._graph_cell_selection(connectivity)
-        if not self._selection_artifacts_match(graph_selection, selection):
+        neighbors = lineage.neighbors
+        graph_cell_selection = self._graph_cell_selection(connectivity)
+        if not self._selection_artifacts_match(graph_cell_selection, selection):
             raise ValueError("cell_key does not match the graph cell selection")
-        neighbors_status = self._require_complete_artifact(
-            neighbors,
-            "neighbors",
-            assay=from_assay,
-        )
-        raw_coordinates = (neighbors_status.inputs or {}).get("coordinates")
-        if not isinstance(raw_coordinates, dict):
-            raise ValueError("The selected neighbors have no coordinate provenance")
-        coordinates = ArtifactRef.from_dict(raw_coordinates)
+        coordinates = lineage.coordinates
         if coordinates.kind != "reduction":
             raise ValueError(
                 "Doublet detection requires a plain scaled-PCA mapping reference. "
@@ -675,6 +661,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         arguments = DoubletScoreArguments(
             clusters=cluster_input,
             connectivity_map=connectivity,
+            neighbors=neighbors,
             cluster_sample_fraction=cluster_sample_fraction,
             max_cells_per_cluster=max_cells_per_cluster,
             simulation_ratio=simulation_ratio,
@@ -685,7 +672,6 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             random_seed=random_seed,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
             label=label,
             invalidate_cache=invalidate_cache,
         )
@@ -728,7 +714,14 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             return final_col
 
         reference = None
-        named_reference = state.named_results.get("mapping_reference")
+        feature_selection = lineage.feature_selection
+        if feature_selection is None:
+            raise ValueError(
+                "Doublet detection requires normalized feature-selection ancestry"
+            )
+        named_reference = (
+            state.named_results.get("mapping_reference") if state is not None else None
+        )
         if named_reference is not None:
             try:
                 candidate = self.get_mapping_reference(
@@ -742,7 +735,7 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                     candidate.neighbors == neighbors
                     and candidate.assay_name == from_assay
                     and candidate.cell_key == cell_key
-                    and candidate.feature_key == feat_key
+                    and candidate.feature_selection == feature_selection
                     and candidate.method == "pca"
                     and candidate.batch_correction is None
                     and candidate.symphony_state is None
@@ -750,18 +743,19 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                     reference = candidate
         if reference is None:
             reference = self.build_mapping_reference(neighbors)
-            named_results = dict(state.named_results)
-            named_results["mapping_reference"] = reference.ref
-            self._publish_current_artifact(
-                connectivity,
-                update_state=True,
-                named_results=named_results,
-            )
+            if state is not None and state.neighbors == neighbors:
+                named_results = dict(state.named_results)
+                named_results["mapping_reference"] = reference.ref
+                self._publish_current_artifact(
+                    state.connectivity_map or neighbors,
+                    update_state=True,
+                    named_results=named_results,
+                )
         if (
             reference.neighbors != neighbors
             or reference.assay_name != from_assay
             or reference.cell_key != cell_key
-            or reference.feature_key != feat_key
+            or reference.feature_selection != feature_selection
             or reference.method != "pca"
             or reference.batch_correction is not None
             or reference.symphony_state is not None
@@ -846,10 +840,10 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             self.cells.insert(temp_col, raw_scores, key=cell_key, overwrite=True)
             try:
                 smoothed = self.get_imputed(
+                    temp_col,
+                    connectivity,
                     from_assay=from_assay,
                     cell_key=cell_key,
-                    feature_name=temp_col,
-                    feat_key=feat_key,
                     t=smoothing_t,
                 )
             finally:
@@ -886,9 +880,9 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
         from_assay: str | None = None,
         cell_key: str | None = None,
         top_n: int = 10000,
-        prevalence_key_name: str = "prevalent_peaks",
+        label: str = "prevalent_peaks",
         invalidate_cache: bool = False,
-    ) -> None:
+    ) -> ArtifactRef:
         """Feature selection method for ATACassay type assays.
 
         This method first calculates prevalence of each peak by computing sum of TF-IDF normalized values for each peak
@@ -900,12 +894,16 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                       'I' will be used. The provided value for `cell_key` should be a column in cell metadata table
                       with boolean values.
             top_n: Number of top prevalent peaks to be selected. (Default: 10000)
-            prevalence_key_name: Base label for marking prevalent peaks in the features metadata column. The value for
-                                'cell_key' parameter is prepended to this value. (Default value: 'prevalent_peaks')
+            label: Feature-selection label to publish. (Default: 'prevalent_peaks')
 
         Returns:
-            None
+            The persisted prevalent-peak feature-selection artifact.
         """
+        if self.zarr_mode != "r+":
+            raise PermissionError(
+                "mark_prevalent_peaks requires a DataStore opened with zarr_mode='r+'"
+            )
+        validate_feature_selection_label(label)
         if cell_key is None:
             cell_key = "I"
         assay = self._get_assay(from_assay)
@@ -914,63 +912,60 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
                 f"ERROR: This method of feature selection can only be applied to ATACassay type of assay. "
                 f"The provided assay is {type(assay)} type"
             )
-        output_key = f"{cell_key}__{prevalence_key_name}"
-        preserved_display = feature_column_display(assay.z, output_key)
+        cast(Any, self)._ensure_all_features(assay)
         cell_selection = self._ensure_cell_selection(cell_key)
-        feature_values = np.asarray(assay.feats.fetch_all("I"), dtype=bool)
-        feature_selection = self._resolve_selection_input(
-            metadata_group=as_zarr_group(
-                assay.z["featureData"],
-                name="featureData",
-            ),
-            column="I",
-            values=feature_values,
-            row_ids=np.asarray(assay.feats.fetch_all("ids")),
-            scope="assay",
-            kind="feature_selection",
-            assay=assay.name,
-            invalidate_cache=False,
+        summary_ref = ensure_feature_summary(
+            self.zw,
+            assay,
+            cell_selection,
+            invalidate_cache=invalidate_cache,
         )
         arguments = PrevalentPeakArguments(
-            cell_selection=cell_selection,
-            feature_selection=feature_selection,
-            normalization_method=callable_identity(assay.normMethod),
-            algorithm_version=1,
+            feature_summary=summary_ref,
             top_n=top_n,
             from_assay=assay.name,
             cell_key=cell_key,
-            prevalence_key_name=prevalence_key_name,
+            label=label,
             invalidate_cache=invalidate_cache,
         )
         record = arguments.to_record()
-        values = assay._prevalent_peak_mask(cell_key, top_n)
-        selection, values = resolve_generated_selection_artifact(
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        planned = _feature_selection_plan(
             self.zw,
-            scope="assay",
             assay=assay.name,
-            kind=arguments.artifact_kind,
-            values=values,
-            row_ids=np.asarray(assay.feats.fetch_all("ids")),
+            n_features=assay.feats.N,
+            ordered_feature_ids_fingerprint=feature_ids_fingerprint,
             operation=arguments.operation,
             parameters=record.parameters,
             inputs=record.inputs,
-            source_column=output_key,
+            execution_options=record.execution_options,
             invalidate_cache=invalidate_cache,
         )
-        assay.feats.insert(
-            output_key,
-            values,
-            fill_value=False,
-            overwrite=True,
+        if not planned.reused:
+            n_selected = feature_summary_selected_count(
+                self.zw,
+                cell_selection,
+                n_cells=assay.cells.N,
+            )
+            summary = feature_summary_values(
+                self.zw,
+                summary_ref,
+                n_selected=n_selected,
+            )
+            values = assay._prevalent_peak_mask(summary["prevalence"], top_n)
+            _write_feature_selection(
+                self.zw,
+                planned,
+                ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+                payload={"values": values},
+            )
+        publish_feature_selection_alias(
+            self.zw,
+            assay.name,
+            label,
+            planned.ref,
         )
-        link_feature_data_column(
-            assay.z,
-            output_key,
-            selection,
-            value_name="values",
-            default_display=categorical_display(values),
-            preserved_display=preserved_display,
-        )
+        return planned.ref
 
     def run_cell_cycle_scoring(
         self,
@@ -1016,9 +1011,21 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
 
         Returns: None
         """
+        if self.zarr_mode != "r+":
+            raise PermissionError(
+                "Cell-cycle scoring requires a DataStore opened with zarr_mode='r+'"
+            )
         if from_assay is None:
             from_assay = self._defaultAssay
         assay = self._get_assay(from_assay)
+        if not isinstance(assay, RNAassay):
+            raise TypeError(
+                "Cell-cycle scoring can only be applied to an RNAassay; "
+                f"received {type(assay).__name__}"
+            )
+        from ...graph.state import read_assay_state_document
+
+        read_assay_state_document(self.zw, assay.name)
         if cell_key is None:
             cell_key = "I"
         if s_genes is None:
@@ -1041,12 +1048,22 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             None,
         ).tolist()
         selection = self._ensure_cell_selection(cell_key)
-        n_cells = len(self.cells.active_index(cell_key))
+        summary_ref = ensure_feature_summary(
+            self.zw,
+            assay,
+            selection,
+            invalidate_cache=invalidate_cache,
+        )
+        n_cells = feature_summary_selected_count(
+            self.zw,
+            selection,
+            n_cells=assay.cells.N,
+        )
         arguments = CellCycleArguments(
+            feature_summary=summary_ref,
+            cell_selection=selection,
             s_gene_indices=tuple(s_gene_indices),
             g2m_gene_indices=tuple(g2m_gene_indices),
-            normalization_method=callable_identity(assay.normMethod),
-            size_factor=getattr(assay, "sf", None),
             control_size=control_size,
             n_bins=n_bins,
             rand_seed=rand_seed,
@@ -1084,23 +1101,27 @@ class _QualityControlOperationsMixin(_QualityControlOperationsBase):
             g2m_score = artifact_values(artifact_group, "g2m_score")
             phase = artifact_values(artifact_group, "phase")
         else:
-            try:
-                assay._load_stats_loc(cell_key)
-            except KeyError:
-                cast(Any, assay).set_feature_stats(cell_key)
-            s_score = assay.score_features(
-                s_genes,
-                cell_key,
-                control_size,
-                n_bins,
-                rand_seed,
+            summary = feature_summary_values(
+                self.zw,
+                summary_ref,
+                n_selected=n_cells,
             )
-            g2m_score = assay.score_features(
-                g2m_genes,
-                cell_key,
-                control_size,
-                n_bins,
-                rand_seed,
+            cell_idx = np.asarray(self.cells.active_index(cell_key), dtype=np.int64)
+            s_score = assay._score_feature_indices(
+                np.asarray(s_gene_indices, dtype=np.int64),
+                cell_idx,
+                summary["avg"],
+                ctrl_size=control_size,
+                n_bins=n_bins,
+                rand_seed=rand_seed,
+            )
+            g2m_score = assay._score_feature_indices(
+                np.asarray(g2m_gene_indices, dtype=np.int64),
+                cell_idx,
+                summary["avg"],
+                ctrl_size=control_size,
+                n_bins=n_bins,
+                rand_seed=rand_seed,
             )
             phase = np.asarray(assign_cell_cycle_phase(s_score, g2m_score))
             write_cell_data_artifact(

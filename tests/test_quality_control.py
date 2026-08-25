@@ -6,6 +6,7 @@ import pytest
 from scarf.quality_control.cell_cycle import assign_cell_cycle_phase
 from scarf.quality_control.doublets import sample_cluster_pool, simulate_doublet_pairs
 from scarf.quality_control.filtering import gaussian_quantile_bounds
+from scarf.graph import IncompatibleAnalysisStateError
 
 
 def test_simulate_doublet_pairs_is_seeded_and_heterotypic():
@@ -258,19 +259,21 @@ def test_doublet_detection_rejects_legacy_graph_without_following_it(
     def fail_legacy_lookup(*_args, **_kwargs):
         raise AssertionError("Legacy graph lookup must not run")
 
-    monkeypatch.setattr(datastore, "get_latest_graph_loc", fail_legacy_lookup)
+    monkeypatch.setattr(
+        datastore,
+        "get_latest_graph_loc",
+        fail_legacy_lookup,
+        raising=False,
+    )
 
-    with pytest.raises(
-        ValueError,
-        match="artifact-backed connectivity chain.*Rebuild",
-    ):
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
         datastore.run_doublet_detection(
             cluster_key=cluster_key,
             from_assay="RNA",
             cell_key="I",
-            feat_key="hvgs",
             simulation_ratio=0.01,
         )
+    assert caught.value.code == "invalid_analysis_state"
 
 
 def test_doublet_detection_rejects_symphony_connectivity_chain(

@@ -125,11 +125,10 @@ class WorkflowParameters(BaseModel):
     filterMinQuantile: float = 0.01
     filterMaxQuantile: float = 0.99
     minFeaturesPerCell: int = 10
-    minCellsPerFeature: int = 20
     h5adBatchSize: int = 1000
     topN: int = 1000
     hvgMinCells: int = 20
-    hvgKey: str = "hvgs"
+    hvgLabel: str = "hvgs"
     k: int = 11
     dims: int = 21
     nCentroids: int = 1000
@@ -145,17 +144,13 @@ class WorkflowParameters(BaseModel):
     leidenBackend: Literal["igraph", "leidenalg"] = "igraph"
     leidenSeed: int = 4444
     leidenLabel: str = "leiden_cluster"
-    markerFeatureKey: str = "I"
+    markerFeatures: str = "all_features"
     graphLocalCache: bool | str = "auto"
     parisNClusters: int | Literal["auto"] = "auto"
     parisLabel: str = "paris_cluster"
     parisMinClusterSize: int | None = None
     clusterSourceUri: str | None = None
     clusterLabelColumn: str = "RNA_leiden_cluster"
-
-    @property
-    def resolvedHvgKey(self) -> str:
-        return f"{self.cellKey}__{self.hvgKey}"
 
     @property
     def resolvedMarkerGroupKey(self) -> str:

@@ -32,8 +32,15 @@ Read {doc}`../concepts/provenance` for the rules that decide which of the two ha
 
 ## Dataset
 
+Structurally repack the published store into a temporary source with the current RNA count layout, then mount its count matrices into a fresh page-local target.
+This keeps the published source untouched and ensures every lineage node below is created under the current artifact contract.
+
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
 
@@ -42,8 +49,18 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination='scarf_datasets',
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts_path = Path(analysis_directory.name) / 'counts.zarr'
+analysis_path = Path(analysis_directory.name) / 'reuse_and_tracing.zarr'
+repack_store(
     f'{dataset}/data.zarr',
+    str(repacked_counts_path),
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    str(repacked_counts_path),
+    at=str(analysis_path),
+    default_assay='RNA',
     nthreads=4,
     min_features_per_cell=10,
 )
@@ -55,7 +72,7 @@ ds.filter_cells(
 )
 # Remake HVGs after this tutorial's cell filter so lineage does not pull in a
 # feature selection that was computed under an earlier cell mask on the store.
-ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
+hvg_ref = ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
 ```
 
 ## 1. Build a baseline chain
@@ -64,7 +81,7 @@ Keep `update_state=False` so side comparisons do not replace the current {term}`
 
 ```{code-cell} ipython3
 normalized = ds.run_normalization(
-    feat_key='hvgs',
+    features=hvg_ref,
     update_state=False,
 )
 pca = ds.run_pca(normalized, dims=15, update_state=False)
@@ -82,7 +99,7 @@ The normalization, PCA, and ANN references are unchanged.
 neighbors_k15 = ds.query_neighbors(ann, k=15, update_state=False)
 graph_k15 = ds.build_connectivity_map(neighbors_k15, update_state=False)
 
-print('normalization reused:', ds.run_normalization(feat_key='hvgs', update_state=False) == normalized)
+print('normalization reused:', ds.run_normalization(features=hvg_ref, update_state=False) == normalized)
 print('PCA reused:', ds.run_pca(normalized, dims=15, update_state=False) == pca)
 print('ANN index reused:', ds.build_ann_index(pca, update_state=False) == ann)
 print('neighbors recomputed:', neighbors_k15 != neighbors_k11)
@@ -94,8 +111,8 @@ Degree and edge-weight distributions shift with `k` even though the upstream art
 ```{code-cell} ipython3
 import scarf.plotting as splt
 
-matrix_k11 = ds.load_graph(graph_loc=ds.inspect_artifact(graph_k11).path)
-matrix_k15 = ds.load_graph(graph_loc=ds.inspect_artifact(graph_k15).path)
+matrix_k11 = ds.load_graph(graph=graph_k11)
+matrix_k15 = ds.load_graph(graph=graph_k15)
 print('edges (nnz):', {'k11': matrix_k11.nnz, 'k15': matrix_k15.nnz})
 splt.graph_qc(matrix_k11)
 splt.graph_qc(matrix_k15)
@@ -116,7 +133,7 @@ print('PCA recomputed:', pca_dims20 != pca)
 print('ANN index recomputed:', ann_dims20 != ann)
 print('neighbors recomputed:', neighbors_dims20 != neighbors_k11)
 print('graph recomputed:', graph_dims20 != graph_k11)
-print('normalization reused:', ds.run_normalization(feat_key='hvgs', update_state=False) == normalized)
+print('normalization reused:', ds.run_normalization(features=hvg_ref, update_state=False) == normalized)
 ```
 
 ## 4. Force recompute
@@ -126,12 +143,11 @@ Previously completed artifacts remain on disk.
 The new reference has a different id and path.
 The operation and parameters stay the same.
 
-For normalization, `invalidate_cache` also writes fresh cell and feature selection snapshots and records those new selection artifacts as inputs.
-The input roles stay the same (`cell_selection`, `feature_selection`), but the selection artifact ids differ:
+For normalization, `invalidate_cache` writes a fresh normalized artifact while retaining the exact immutable `cell_selection` and `feature_selection` inputs:
 
 ```{code-cell} ipython3
 forced = ds.run_normalization(
-    feat_key='hvgs',
+    features=hvg_ref,
     update_state=False,
     invalidate_cache=True,
 )
@@ -148,15 +164,6 @@ print('baseline path:', baseline.path)
 print('same parameters:', status.parameters == baseline.parameters)
 print('same input roles:', set(baseline_inputs) == set(forced_inputs))
 print('same inputs:', forced_inputs == baseline_inputs)
-for name in sorted(set(baseline_inputs) | set(forced_inputs)):
-    left = baseline_inputs.get(name)
-    right = forced_inputs.get(name)
-    if left == right:
-        print(f'{name}: same')
-        continue
-    print(f'{name}: different artifact id')
-    print('  baseline:', left)
-    print('  forced:', right)
 ```
 
 ## 5. Compare lineage

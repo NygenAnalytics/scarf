@@ -20,7 +20,7 @@ It assumes the reader already understands the recommended CITE-seq path in {doc}
 
 ## Standalone setup
 
-The published CITE-seq store carries the independent RNA and ADT {term}`analysis chains <analysis chain>` and both integrated graphs, built exactly as {doc}`cite_seq` describes: matched active cells, `k=21` for each modality, control antibodies already marked inactive.
+The published CITE-seq store carries the independent RNA and ADT {term}`analysis chains <analysis chain>` and both integrated graphs, built exactly as {doc}`cite_seq` describes: matched active cells, `k=21` for each modality, and an explicit non-control ADT feature-selection artifact.
 This page reads those results rather than reproducing them.
 
 ```{code-cell} ipython3

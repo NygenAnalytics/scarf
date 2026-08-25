@@ -2,6 +2,16 @@
 
 Prefer the `DataStore` methods below in analysis code.
 
+`integrate_assays` captures its inputs from each named assay's `AssayState` before planning.
+SNN captures each current connectivity map; WNN captures each current neighbor artifact and its exact native reduction or batch-correction coordinates.
+The returned integrated-graph reference is the downstream `graph=` argument.
+WNN does not accept imported-coordinate ancestry.
+`coordinates` is a named provenance input on neighbor and ANN artifacts, not an artifact kind.
+
+Neighbor-based metrics accept `neighbors=`; `None` resolves the assay's current neighbors.
+Graph metrics accept `graph=`; `None` resolves the current connectivity map.
+Neither interface accepts storage paths or an implicit latest-result selector.
+
 ## DataStore methods
 
 ```{eval-rst}

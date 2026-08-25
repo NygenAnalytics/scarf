@@ -11,10 +11,10 @@ if TYPE_CHECKING:
     from . import cytebase as cytebase
     from .datastore.datastore import DataStore as DataStore
     from .datastore.summary import DataStoreSummary as DataStoreSummary
-    from .graph.state import (
-        ArtifactSelectionError as ArtifactSelectionError,
-        AssayState as AssayState,
+    from .graph.errors import (
+        IncompatibleAnalysisStateError as IncompatibleAnalysisStateError,
     )
+    from .graph.state import AssayState as AssayState
     from .storage.lineage import ArtifactLineage as ArtifactLineage
     from .features.enrichment import (
         EnrichmentResult as EnrichmentResult,
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .mapping.models import MappingResult as MappingResult
     from .mapping.reference import MappingReference as MappingReference
     from .storage.artifacts import ArtifactStatus as ArtifactStatus
+    from .storage.errors import ArtifactResolutionError as ArtifactResolutionError
     from .storage.refs import ArtifactRef as ArtifactRef
     from .features.genomic.gff import GffReader as GffReader
     from .features.genomic.melding import coordinate_melding as coordinate_melding
@@ -115,7 +116,7 @@ __version__ = _resolve_version()
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ArtifactLineage": (".storage.lineage", "ArtifactLineage"),
     "ArtifactRef": (".storage.refs", "ArtifactRef"),
-    "ArtifactSelectionError": (".graph.state", "ArtifactSelectionError"),
+    "ArtifactResolutionError": (".storage.errors", "ArtifactResolutionError"),
     "ArtifactStatus": (".storage.artifacts", "ArtifactStatus"),
     "AssayState": (".graph.state", "AssayState"),
     "CSVReader": (".readers", "CSVReader"),
@@ -133,6 +134,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "H5adInspectResult": (".readers", "H5adInspectResult"),
     "H5adReader": (".readers", "H5adReader"),
     "H5adToZarr": (".writers", "H5adToZarr"),
+    "IncompatibleAnalysisStateError": (
+        ".graph.errors",
+        "IncompatibleAnalysisStateError",
+    ),
     "LoomReader": (".readers", "LoomReader"),
     "LoomToZarr": (".writers", "LoomToZarr"),
     "MtxReader": (".readers", "MtxReader"),

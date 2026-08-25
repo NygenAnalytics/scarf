@@ -186,7 +186,11 @@ def test_plot_accessor_type_hints_match_standalone_functions(name: str):
         ),
         ("run_recipe", ("recipe.toml",), {"show": False}),
         ("cluster_tree", (), {"width": 2.5}),
-        ("pseudotime_heatmap", (), {"vmax": 3.0}),
+        (
+            "pseudotime_heatmap",
+            (),
+            {"features": "all_features", "vmax": 3.0},
+        ),
     ],
 )
 def test_plot_accessor_forwards_to_canonical_function(
@@ -267,7 +271,6 @@ def test_datastore_rejects_reserved_assay_before_store_mutation(
             default_assay=assay_name,
             workspace=workspace,
             min_features_per_cell=0,
-            min_cells_per_feature=0,
         )
 
     assert "defaultAssay" not in active.attrs

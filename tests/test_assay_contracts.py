@@ -42,17 +42,10 @@ _PUBLIC_CLASS_METHODS = {
         "normed",
         "iter_raw_column_blocks",
         "iter_raw_feature_columns",
-        "set_feature_stats",
-        "get_feature_stats",
-        "set_summary_stats",
-        "set_hvgs",
-        "mark_hvgs",
     ),
     ATACassay: (
         "__init__",
         "normed",
-        "set_feature_stats",
-        "mark_prevalent_peaks",
     ),
     ADTassay: (
         "__init__",
@@ -60,10 +53,10 @@ _PUBLIC_CLASS_METHODS = {
     ),
 }
 _PUBLIC_CLASS_SIGNATURE_DIGESTS = {
-    Assay: "fb2d878f78b4b561da78a1fad09efaf34f2e3c6cc47cf359021816a1adbf5ddf",
-    RNAassay: "26951c69d48c7cb169d8d59014850ff1cf47cdb7dc4cff63e3daf8851f74c604",
-    ATACassay: "491bb1c63ad83fa5d9634200c5b3778a3018e39abdd3ae87208eb3e85659633c",
-    ADTassay: "a1ff1bebdd8fcd3f30a1b64a42dbf2931f6b8031ddce75abcf362750eb4e9c34",
+    Assay: "129440304c5c88a7c5324ffb215346eccb9c4474b0468fa0a4db1cce46711147",
+    RNAassay: "d9948b1bd0cea16d9d8728b1c6f8012635f130e569b13bc3cceec43314da1674",
+    ATACassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
+    ADTassay: "1732f9ac8b4f368185e0965becb94b9472186db4ee53d372a8a2852d30dd42a4",
 }
 _MODULE_FUNCTIONS = (
     "lib_size_feature_stream_eligible",
@@ -156,11 +149,7 @@ def test_assay_subclass_and_static_method_contracts_are_stable():
     assert issubclass(RNAassay, Assay)
     assert issubclass(ATACassay, Assay)
     assert issubclass(ADTassay, Assay)
-    for name in (
-        "_create_subset_hash",
-        "_finalize_staged_mirror",
-        "_get_summary_stats_loc",
-    ):
+    for name in ("_create_subset_hash",):
         assert isinstance(inspect.getattr_static(Assay, name), staticmethod)
 
 
@@ -244,81 +233,6 @@ def test_assay_read_block_facade_remains_patchable(monkeypatch):
     np.testing.assert_array_equal(blocks[0][1], expected)
 
 
-@pytest.mark.parametrize(
-    ("include_adaptive", "expected_column", "expected_variance"),
-    [
-        (False, "c_var__200__0.1", np.array([40.0, 20.0])),
-        (True, "c_var__adaptive__200__0.1", np.array([400.0, 200.0])),
-    ],
-)
-def test_get_feature_stats_reads_cached_columns_in_feature_key_order(
-    include_adaptive,
-    expected_column,
-    expected_variance,
-):
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    stats = root.create_group("summary_stats_I")
-    stats.create_array("nz_mean", data=np.array([1.0, 2.0, 3.0, 4.0]))
-    stats.create_array(
-        "c_var__200__0.1",
-        data=np.array([10.0, 20.0, 30.0, 40.0]),
-    )
-    if include_adaptive:
-        stats.create_array(
-            "c_var__adaptive__200__0.1",
-            data=np.array([100.0, 200.0, 300.0, 400.0]),
-        )
-    stats.create_array("normed_n", data=np.array([5.0, 6.0, 7.0, 8.0]))
-
-    rna = RNAassay.__new__(RNAassay)
-    rna.z = root
-    rna.feats = SimpleNamespace(
-        active_index=lambda key: np.array([3, 1]) if key == "selected" else None
-    )
-    rna._get_cell_feat_idx = lambda cell_key, feat_key: (
-        np.array([0, 2]),
-        np.arange(4),
-    )
-    validation_calls = []
-
-    def validate(stats_loc, cell_idx, feat_idx, delete_on_fail=True):
-        validation_calls.append((stats_loc, cell_idx, feat_idx, delete_on_fail))
-        return True
-
-    rna._validate_stats_loc = validate
-    values = rna.get_feature_stats("I", feat_key="selected")
-
-    assert list(values) == ["nz_mean", expected_column, "normed_n"]
-    np.testing.assert_array_equal(values["nz_mean"], np.array([4.0, 2.0]))
-    np.testing.assert_array_equal(values[expected_column], expected_variance)
-    np.testing.assert_array_equal(values["normed_n"], np.array([8.0, 6.0]))
-    assert validation_calls[0][3] is False
-
-
-def test_get_feature_stats_does_not_recompute_or_delete_invalid_cache():
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    root.create_group("summary_stats_subset")
-
-    rna = RNAassay.__new__(RNAassay)
-    rna.z = root
-    rna.feats = SimpleNamespace(active_index=lambda key: np.arange(2))
-    rna._get_cell_feat_idx = lambda cell_key, feat_key: (
-        np.array([0]),
-        np.arange(2),
-    )
-    rna._validate_stats_loc = (
-        lambda stats_loc, cell_idx, feat_idx, delete_on_fail=True: False
-    )
-    rna.set_feature_stats = lambda cell_key: pytest.fail(
-        "get_feature_stats must not compute statistics"
-    )
-
-    with pytest.raises(KeyError, match="have not been calculated"):
-        rna.get_feature_stats("subset", columns=["nz_mean"])
-
-    assert "summary_stats_subset" in root
-
-
 def test_base_assay_defaults_validation_and_representation():
     cells = SimpleNamespace(
         active_index=lambda _key: np.array([0, 1]),
@@ -326,6 +240,7 @@ def test_base_assay_defaults_validation_and_representation():
         get_dtype=lambda _key: bool,
     )
     feats = SimpleNamespace(
+        N=3,
         active_index=lambda _key: np.array([0, 2]),
         columns=["I"],
         get_dtype=lambda _key: bool,
@@ -343,19 +258,14 @@ def test_base_assay_defaults_validation_and_representation():
     assert Assay._percent_features(assay) == {}
     np.testing.assert_array_equal(
         Assay.normed(assay),
-        np.array([[0, 2], [3, 5]]),
+        np.array([[0, 1, 2], [3, 4, 5]]),
     )
-    assert "toy with 2(3) features" in Assay.__repr__(assay)
+    assert "toy with 3 features" in Assay.__repr__(assay)
 
     invalid_cells = SimpleNamespace(columns=[], get_dtype=lambda _key: bool)
     invalid = SimpleNamespace(cells=invalid_cells, feats=feats)
     with pytest.raises(ValueError, match="missing_cell"):
-        Assay._verify_keys(invalid, "missing_cell", "I")
-
-    invalid.cells = cells
-    invalid.feats = SimpleNamespace(columns=[], get_dtype=lambda _key: bool)
-    with pytest.raises(ValueError, match="missing_feature"):
-        Assay._verify_keys(invalid, "I", "missing_feature")
+        Assay._get_cell_idx(invalid, "missing_cell")
 
 
 def test_base_assay_sparse_export_combines_streamed_blocks():
@@ -406,29 +316,16 @@ def test_base_assay_percent_feature_helpers_cover_noop_and_write_paths():
     np.testing.assert_array_equal(writes[0][1], np.array([2, 0]))
 
 
-def test_base_assay_cache_and_staged_mirror_helpers():
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    stale = root.create_group("summary_stats")
-    stale.attrs["subset_hash"] = "stale"
-    assay = SimpleNamespace(
-        z=root,
-        _create_subset_hash=lambda _cells, _features: "current",
+def test_base_assay_subset_hash_encodes_order_and_axis_boundary():
+    first = Assay._create_subset_hash(np.array([0, 1]), np.array([2, 3]))
+    reordered = Assay._create_subset_hash(np.array([1, 0]), np.array([2, 3]))
+    different_boundary = Assay._create_subset_hash(
+        np.array([0, 1, 2]),
+        np.array([3]),
     )
 
-    assert not Assay._validate_stats_loc(
-        assay,
-        "summary_stats",
-        np.array([0]),
-        np.array([0]),
-    )
-    assert "summary_stats" not in root
-
-    mirror = root.create_array("mirror", data=np.zeros((2, 2)))
-    params = {"log_transform": True}
-    Assay._finalize_staged_mirror(mirror, "digest", params)
-    assert mirror.attrs["staged_subset_hash"] == "digest"
-    assert mirror.attrs["staged_subset_params"] == params
-    assert mirror.attrs["staged_complete"] is True
+    assert first != reordered
+    assert first != different_boundary
 
 
 def test_base_assay_mean_features_validates_requests_and_generic_path():
@@ -446,10 +343,7 @@ def test_base_assay_mean_features_validates_requests_and_generic_path():
     feats = SimpleNamespace(fetch_all=lambda _key: feature_names)
     assay = SimpleNamespace(
         feats=feats,
-        _get_cell_feat_idx=lambda _cell_key, _feat_key: (
-            np.array([0, 1]),
-            np.arange(3),
-        ),
+        _get_cell_idx=lambda _cell_key: np.array([0, 1]),
         normed=lambda **_kwargs: DeferredMean(),
     )
 
@@ -476,29 +370,25 @@ def test_base_assay_mean_features_validates_requests_and_generic_path():
 def test_base_assay_score_features_covers_generic_normalization(
     monkeypatch,
 ):
-    class DeferredMean:
-        def __init__(self, value):
-            self.value = value
+    class DeferredMatrix:
+        def __init__(self, feature_index):
+            self.values = np.tile(np.asarray(feature_index), (2, 1))
 
         def mean(self, axis):
-            assert axis == 1
-            return self
-
-        def compute(self):
-            return np.full(2, self.value)
+            return SimpleNamespace(compute=lambda: self.values.mean(axis=axis))
 
     feats = SimpleNamespace(
+        N=3,
         get_index_by=lambda _values, _column, _key: np.array([], dtype=int),
         fetch_all=lambda _key: np.array([0.1, 0.2, 0.3]),
     )
     assay = SimpleNamespace(
         feats=feats,
-        _load_stats_loc=lambda _cell_key: "stats",
-        _get_cell_feat_idx=lambda _cell_key, _feat_key: (
-            np.array([0, 1]),
-            np.arange(3),
-        ),
-        normed=lambda *, cell_idx, feat_idx: DeferredMean(float(feat_idx.mean())),
+        _get_cell_idx=lambda _cell_key: np.array([0, 1]),
+        normed=lambda *, cell_idx, feat_idx: DeferredMatrix(feat_idx),
+    )
+    assay._score_feature_indices = lambda *args, **kwargs: Assay._score_feature_indices(
+        assay, *args, **kwargs
     )
 
     with pytest.raises(ValueError, match="No feature ids found"):
@@ -753,56 +643,6 @@ def test_rna_streaming_stats_and_group_means_handle_missing_inputs():
         )
 
 
-def test_rna_feature_stat_arguments_and_missing_columns():
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    stats = root.create_group("summary_stats_I")
-    stats.attrs["subset_hash"] = "valid"
-    rna = RNAassay.__new__(RNAassay)
-    rna.z = root
-    rna.feats = SimpleNamespace(active_index=lambda _key: np.array([0]))
-    rna._get_cell_feat_idx = lambda _cell_key, _feat_key: (
-        np.array([0]),
-        np.array([0]),
-    )
-    rna._validate_stats_loc = lambda *_args, **_kwargs: True
-
-    with pytest.raises(TypeError, match="not a string"):
-        rna.get_feature_stats("I", columns="nz_mean")
-    with pytest.raises(TypeError, match="only strings"):
-        rna.get_feature_stats("I", columns=["nz_mean", 1])
-    with pytest.raises(KeyError, match="not available"):
-        rna.get_feature_stats("I", columns=["missing"])
-
-
-def test_rna_summary_and_hvg_validation_paths():
-    inserted = {}
-    feats = SimpleNamespace(
-        N=3,
-        columns=[],
-        grep=lambda _pattern: [],
-        get_index_by=lambda _values, _column: np.array([], dtype=np.int64),
-        insert=lambda name, values, **_kwargs: inserted.update({name: values}),
-    )
-    rna = RNAassay.__new__(RNAassay)
-    rna.feats = feats
-    rna.set_feature_stats = lambda _cell_key: None
-    rna._load_stats_loc = lambda _cell_key: "stats"
-
-    with pytest.raises(KeyError, match="stats_normed_tot"):
-        rna.set_summary_stats(cell_key=None)
-    with pytest.raises(TypeError, match="mask must be a NumPy array"):
-        rna.set_hvgs("I", mask=[True, False, False])
-
-    rna.set_summary_stats = lambda *_args, **_kwargs: ("stats", "c_var")
-    column = rna.set_hvgs(
-        "I",
-        mask=np.array([True, False, False]),
-        blacklist="",
-    )
-    assert column == "I__hvgs"
-    np.testing.assert_array_equal(inserted[column], np.array([True, False, False]))
-
-
 def test_rna_feature_stream_defaults_require_a_size_factor(monkeypatch):
     monkeypatch.setattr(
         "scarf.assay.rna.lib_size_feature_stream_eligible",
@@ -823,43 +663,9 @@ def test_rna_feature_stream_defaults_require_a_size_factor(monkeypatch):
     with pytest.raises(ValueError, match="requires a size factor"):
         list(
             rna.iter_normed_feature_wise(
-                cell_key=None,
-                feat_key=None,
+                cell_idx=np.array([0, 1]),
+                feat_idx=np.array([0, 1]),
                 batch_size=None,
                 msg=None,
             )
         )
-
-
-def test_rna_generic_feature_statistics_compute_all_reductions():
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    inserted = {}
-    locations = {"stats_I": object()}
-    feats = SimpleNamespace(
-        locations=locations,
-        mount_location=lambda _group, _identifier: None,
-        insert=lambda name, values, **_kwargs: inserted.update({name: values}),
-        active_index=lambda _key: np.array([0, 1]),
-        unmount_location=lambda _identifier: None,
-    )
-    rna = RNAassay.__new__(RNAassay)
-    rna.name = "RNA"
-    rna.z = root
-    rna.feats = feats
-    rna.nthreads = 1
-    rna.normMethod = lambda _assay, values: values
-    rna._get_cell_feat_idx = lambda _cell_key, _feat_key: (
-        np.array([0, 1]),
-        np.array([0, 1]),
-    )
-    rna._get_summary_stats_loc = lambda _cell_key: ("stats_I", "summary_stats_I")
-    rna._validate_stats_loc = lambda *_args, **_kwargs: False
-    rna._create_subset_hash = lambda _cells, _features: "digest"
-    rna.normed = lambda *_args, **_kwargs: np.array([[1.0, 0.0], [3.0, 4.0]])
-
-    rna.set_feature_stats("I")
-
-    assert "stats_I" not in locations
-    np.testing.assert_array_equal(inserted["normed_n"], np.array([2.0, 1.0]))
-    np.testing.assert_array_equal(inserted["normed_tot"], np.array([4.0, 4.0]))
-    np.testing.assert_allclose(inserted["sigmas"], np.array([1.0, 4.0]))

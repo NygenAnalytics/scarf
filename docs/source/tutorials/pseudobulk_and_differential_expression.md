@@ -36,11 +36,15 @@ Those adjusted values are still cell-level marker statistics, not replicate-awar
 
 This page uses the Kang control PBMC store and Leiden clusters as groups.
 For multi-sample designs, merge samples first ({doc}`dataset_merging`) and pass sample and cell-type columns to `make_bulk`.
+The catalog snapshot is structurally repacked in a temporary directory and mounted into a clean writable analysis target, preserving literal cluster and UMAP metadata without reusing legacy analysis state.
 
 ```{code-cell} ipython3
+from tempfile import TemporaryDirectory
+
 import pandas as pd
 
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
 
@@ -49,9 +53,18 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination='scarf_datasets',
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = f'{analysis_directory.name}/counts.zarr'
+repack_store(
     f'{dataset}/data.zarr',
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=f'{analysis_directory.name}/analysis.zarr',
     nthreads=4,
+    default_assay='RNA',
 )
 ```
 
@@ -70,8 +83,19 @@ Leiden clusters on the published UMAP; these labels are the grouping key for `ma
 ## 1. Inspect marker ranks separately from DE
 
 ```{code-cell} ipython3
-ds.run_marker_search(group_key='RNA_clusters')
+ds.set_feature_selection(
+    feature_indexes=range(ds.RNA.feats.N),
+    label='all_for_markers',
+)
+all_features = ds.resolve_features('RNA', 'all_features')
+marker_ref = ds.run_marker_search(
+    group_key='RNA_clusters',
+    cell_key='I',
+    features=all_features,
+)
 markers = ds.get_markers(
+    marker=marker_ref,
+    cell_key='I',
     group_key='RNA_clusters',
     group_id='1',
     min_score=-1,
@@ -91,7 +115,9 @@ markers[
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
+    marker=marker_ref,
     group_key='RNA_clusters',
+    cell_key='I',
     topn=2,
     figsize=(8, 8),
 )

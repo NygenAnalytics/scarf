@@ -51,6 +51,10 @@ Pipeline-local keys are consumed first:
 - `pca`: `n_centroids` and `rand_state` are popped for embedding initialization; remaining keys go to `run_pca`.
 - `doublet_scoring` and `markers`: `clusters` is consumed to pick the grouping column; remaining keys go to the detection or marker-search call.
 
+The pipeline retains the `ArtifactRef` returned by HVG selection and passes it directly to normalization.
+The `label` option inside `highly_variable_features` is therefore a publication name, not a reconstructed feature key.
+Marker options may supply `features` explicitly; otherwise the pipeline resolves the `all_features` artifact so the marker universe is unambiguous.
+
 ### Other notes
 
 - `clustering_concurrency` defaults to `2`.

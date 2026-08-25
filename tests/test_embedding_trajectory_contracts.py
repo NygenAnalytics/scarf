@@ -13,7 +13,9 @@ from scarf.datastore._operations.trajectory import (
     _validate_assay_pseudotime,
 )
 from scarf.embeddings.sgtsne import run_sgtsne
+from scarf.graph.state import GraphSelection
 from scarf.neighbors.stream import AnnStream
+from scarf.storage.artifacts import ArtifactRef, artifact_path
 from scarf.trajectory.feature_dynamics import validate_pseudotime_regressor
 from scarf.trajectory.results import PseudotimeScoreResult
 from tests.signature_contracts import signature_digest
@@ -34,7 +36,7 @@ def test_embedding_and_trajectory_entry_point_signatures_are_stable():
         "assay",
         "graph_cell_key",
         "result_cell_key",
-        "feature_key",
+        "graph",
         "values",
         "valid",
     ]
@@ -92,20 +94,56 @@ class _TrajectoryValidationStore:
         self.cells = _TrajectoryCells(values)
         self.assay = SimpleNamespace(cells=self.cells)
         self.graph = graph
-
-    @staticmethod
-    def _get_latest_keys(_from_assay, _cell_key, _feat_key):
-        return "RNA", "I", "I"
+        self.graph_ref = ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="connectivity_map",
+            artifact_id="e" * 64,
+        )
+        self.selection_ref = ArtifactRef(
+            scope="datastore",
+            kind="cell_selection",
+            artifact_id="d" * 64,
+        )
 
     def _get_assay(self, _from_assay):
         return self.assay
 
-    def load_graph(self, **_kwargs):
+    def load_graph(self, _graph=None, **_kwargs):
         return self.graph.copy()
+
+    def _ensure_cell_selection(self, _column):
+        return self.selection_ref
+
+    def _graph_cell_selection(self, _graph):
+        return self.selection_ref
+
+    @staticmethod
+    def _selection_artifacts_match(first, second):
+        return first == second
+
+    @staticmethod
+    def _resolve_cell_data_provenance_input(column, *, cell_key):
+        return {"column": column, "cell_key": cell_key}
 
     @staticmethod
     def _col_renamer(from_assay, cell_key, suffix):
         return f"{from_assay}_{cell_key}_{suffix}"
+
+
+@pytest.fixture(autouse=True)
+def _resolve_trajectory_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    def resolve(store, graph, *, from_assay, cell_key):
+        ref = graph or store.graph_ref
+        return GraphSelection(
+            graph_loc=artifact_path(ref),
+            graph_ref=ref,
+            from_assay=from_assay or "RNA",
+            cell_key=cell_key or "I",
+            integrated_label=None,
+        )
+
+    monkeypatch.setattr(trajectory_operations, "resolve_graph_selection", resolve)
 
 
 def _chain_graph(size):
@@ -265,17 +303,6 @@ def test_pseudotime_operation_validates_small_graph_and_source_inputs(
         "state": np.array(["A", "middle", "middle", "B"][:size]),
     }
     store = _TrajectoryValidationStore(values, graph=_chain_graph(size))
-    monkeypatch.setattr(
-        trajectory_operations,
-        "_stored_graph_input",
-        lambda *_args: ("graph", object()),
-    )
-    monkeypatch.setattr(
-        trajectory_operations,
-        "validate_legacy_graph_selection",
-        lambda *_args: None,
-    )
-
     with pytest.raises((TypeError, ValueError), match=message):
         _TrajectoryOperationsMixin.run_pseudotime_scoring(store, **kwargs)
 
@@ -288,6 +315,23 @@ def test_fate_operation_rejects_backend_label_mismatch_before_writes(monkeypatch
         "state": np.array(["A", "middle", "A"]),
     }
     store = _TrajectoryValidationStore(values, graph=_chain_graph(size))
+    store.zw = object()
+    fate_ref = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="fate_map",
+        artifact_id="c" * 64,
+    )
+    monkeypatch.setattr(
+        trajectory_operations,
+        "plan_cell_data_artifact",
+        lambda *_args, **_kwargs: SimpleNamespace(ref=fate_ref, reused=False),
+    )
+    monkeypatch.setattr(
+        trajectory_operations,
+        "column_display",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         trajectory_operations,
         "_compute_fate_probabilities_impl",

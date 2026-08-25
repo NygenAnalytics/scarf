@@ -81,7 +81,6 @@ def _store_with_design(tmp_path: Path) -> DataStore:
         str(location),
         default_assay="RNA",
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
         mem_budget=64 * 1024 * 1024,
     )

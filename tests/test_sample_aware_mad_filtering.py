@@ -480,7 +480,7 @@ def test_pipeline_passes_sample_column_through(datastore_ephemeral):
         cell_cycle_scoring=False,
         highly_variable_features={
             "top_n": 50,
-            "hvg_key_name": "mad_pipeline_hvgs",
+            "label": "mad_pipeline_hvgs",
         },
         pca={"dims": 5, "n_centroids": 10},
         ann_index={"ann_m": 16},

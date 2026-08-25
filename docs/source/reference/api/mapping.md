@@ -1,5 +1,8 @@
 # Mapping API reference
 
+A `MappingReference` retains an immutable `feature_selection` reference rather than a feature-key string.
+Query overlap is itself a feature-selection artifact, so mapping provenance follows exact references without reconstructing metadata paths.
+
 ```{eval-rst}
 .. autoclass:: scarf.MappingReference
     :members:

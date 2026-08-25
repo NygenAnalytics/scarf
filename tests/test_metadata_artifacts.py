@@ -19,27 +19,27 @@ from scarf.metadata.artifacts import (
 from scarf.plotting._contracts import CategoricalScale, ColorScale
 from scarf.plotting.embedding import _continuous_limits
 from scarf.storage.artifacts import ArtifactRef, artifact_path, inspect_artifact
+from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.selections import resolve_selection_artifact
 from tests.fixtures_datastore import build_neighbourhood_graph
 
 
 def _ensure_graph(datastore) -> None:
     datastore.auto_filter_cells(show_qc_plots=False)
-    if "I__metadata_hvgs" not in datastore.RNA.feats.columns:
-        datastore.mark_hvgs(
-            from_assay="RNA",
-            cell_key="I",
-            top_n=100,
-            hvg_key_name="metadata_hvgs",
-            show_plot=False,
-            min_cells=int(0.01 * datastore.cells.N),
-            max_cells=np.inf,
-            blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
-        )
+    feature_selection = datastore.mark_hvgs(
+        from_assay="RNA",
+        cell_key="I",
+        top_n=100,
+        label="metadata_hvgs",
+        show_plot=False,
+        min_cells=int(0.01 * datastore.cells.N),
+        max_cells=np.inf,
+        blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
+    )
     build_neighbourhood_graph(
         datastore,
         from_assay="RNA",
-        feat_key="metadata_hvgs",
+        features=feature_selection,
         dims=5,
         k=3,
         n_centroids=10,
@@ -309,10 +309,10 @@ def test_umap_matrix_and_leiden_columns_link_authoritative_artifacts(
 ) -> None:
     datastore = datastore_ephemeral
     _ensure_graph(datastore)
-    hvg_display = dict(
-        datastore.RNA.z["featureData"]["I__metadata_hvgs"].attrs["display"]
-    )
-    assert hvg_display["kind"] == "categorical"
+    hvg_column = datastore.RNA.z["featureData"]["metadata_hvgs"]
+    assert ArtifactRef.from_dict(
+        hvg_column.attrs["source_artifact"]
+    ) == datastore.resolve_features("RNA", "metadata_hvgs")
     returned_umap = datastore.run_umap(n_epochs=10, label="metadata_umap")
     returned_leiden = datastore.run_leiden_clustering(label="metadata_leiden")
 
@@ -437,16 +437,14 @@ def test_membership_and_smart_labels_are_artifact_backed_and_lisi_is_read_only(
     datastore.run_leiden_clustering(label="independent_leiden")
     cluster_key = "RNA_independent_leiden"
 
-    datastore.calc_membership_strength(
-        "RNA",
-        "I",
-        "metadata_hvgs",
-        cluster_key,
-    )
+    datastore.calc_membership_strength(cluster_key)
     membership_key = "RNA_I_cluster_membership_strength"
     membership_ref = _column_ref(datastore, membership_key)
     assert membership_ref.kind == "membership_strength"
-    graph_loc = datastore.get_latest_graph_loc("RNA", "I", "metadata_hvgs")
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    assert state.connectivity_map is not None
+    graph_loc = artifact_path(state.connectivity_map)
     n_cells, k = datastore._get_graph_ncells_k(graph_loc)
     edges = np.asarray(datastore.zw[graph_loc]["edges"][:]).reshape(n_cells, k, 2)
     clusters = np.asarray(datastore.cells.fetch(cluster_key, key="I"))
@@ -1077,7 +1075,7 @@ def test_graph_consumers_accept_an_explicit_connectivity_map(
     assert "RNA_side_leiden" in datastore.cells.columns
     assert datastore.get_assay_state("RNA").connectivity_map == graph
 
-    with pytest.raises(ValueError, match="does not match the graph"):
+    with pytest.raises(TypeError, match="feat_key"):
         datastore.run_leiden_clustering(graph, feat_key="I", label="mismatched")
     with pytest.raises(TypeError, match="artifact reference"):
         datastore.run_umap("RNA/graph", n_epochs=10, label="not_a_ref")
@@ -1098,13 +1096,16 @@ def test_lisi_rejects_incomplete_ann_dependency(
     ann_group.attrs["complete"] = False
 
     try:
-        with pytest.raises(ValueError, match="ann_index artifact"):
+        with pytest.raises(
+            ArtifactResolutionError,
+            match="artifact is incomplete",
+        ) as error:
             datastore.metric_lisi(
                 ["names"],
-                use_latest_knn=False,
-                knn_loc=artifact_path(state.neighbors),
+                neighbors=state.neighbors,
                 perplexity=1,
             )
+        assert error.value.code == "incomplete_artifact"
     finally:
         ann_group.attrs["complete"] = True
 

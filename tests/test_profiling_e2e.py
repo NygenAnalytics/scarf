@@ -13,12 +13,43 @@ from profiling.config import (
 )
 from profiling.metrics import ResourceMeasurement
 from profiling.stages import StageRunResult
+from scarf.storage import ArtifactRef
 
 _EXAMPLE_CONFIG = Path(__file__).parents[1] / "profiling" / "config.example.toml"
+_HVG_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="feature_selection",
+    artifact_id="a" * 64,
+)
 
 
 def _config(*, runTag: str = "e2e-test") -> ProfilingConfig:
     return load_profiling_config(_EXAMPLE_CONFIG).model_copy(update={"runTag": runTag})
+
+
+def test_load_hvg_ref_from_prior_stage_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config()
+    monkeypatch.setattr(
+        modal_app,
+        "load_result",
+        lambda *_args: {
+            "status": "ok",
+            "details": {"artifact": _HVG_REF.to_dict()},
+        },
+    )
+
+    assert modal_app._load_hvg_ref(config, 10_000) == _HVG_REF
+
+
+def test_load_hvg_ref_allows_an_unprofiled_hvg_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(modal_app, "load_result", lambda *_args: None)
+
+    assert modal_app._load_hvg_ref(_config(), 10_000) is None
 
 
 class _Sampler:

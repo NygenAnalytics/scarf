@@ -1,4 +1,5 @@
 import os
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
@@ -14,6 +15,7 @@ from .profiles import (
 MATRIX_SOURCE_ATTR = "matrixSource"
 _ASSAY_COPY_ATTRS = ("is_assay", "misc", "percentFeatures", "size_factor")
 _WORKSPACE_COPY_ATTRS = ("defaultAssay", "assayTypes")
+_PENDING_FEATURE_ALIASES_ATTR = "pending_feature_selection_aliases"
 
 
 def zarr_group_root(group: zarr.Group, mode: ZarrMode = "r+") -> zarr.Group:
@@ -256,6 +258,25 @@ def _validate_assay_identity(
         )
 
 
+def _feature_analysis_aliases(feature_data: zarr.Group) -> frozenset[str]:
+    """Return feature columns owned by, or pending publication from, artifacts."""
+    aliases = {
+        name
+        for name in feature_data.array_keys()
+        if "source_artifact" in as_zarr_array(feature_data[name], name=name).attrs
+    }
+    raw_pending = feature_data.attrs.get(_PENDING_FEATURE_ALIASES_ATTR)
+    if raw_pending is not None:
+        if not isinstance(raw_pending, Mapping) or any(
+            not isinstance(name, str) for name in raw_pending
+        ):
+            raise ValueError(
+                "pending_feature_selection_aliases must be a mapping with string labels"
+            )
+        aliases.update(raw_pending)
+    return frozenset(aliases)
+
+
 def create_matrix_source(
     source: str,
     at: ZarrLocation,
@@ -264,6 +285,7 @@ def create_matrix_source(
     storage_options: dict[str, Any] | None = None,
 ) -> zarr.Group:
     """Create a writable store that mounts count matrices from ``source``."""
+    from .arrays import create_metadata_column
     from .copy import copy_zarr_group_tree
 
     if not isinstance(source, str) or not source:
@@ -337,9 +359,32 @@ def create_matrix_source(
                 if key in source_assay.attrs:
                     target_assay.attrs[key] = source_assay.attrs[key]
             feature_data = target_assay.create_group("featureData")
+            source_feature_data = as_zarr_group(
+                source_assay["featureData"],
+                name="featureData",
+            )
+            excluded_feature_members = set(
+                _feature_analysis_aliases(source_feature_data)
+            )
+            # A mounted target is a newly created assay metadata store. Its
+            # physical baseline must cover every feature row regardless of a
+            # filtered or artifact-owned ``I`` column in the source.
+            excluded_feature_members.add("I")
             copy_zarr_group_tree(
-                as_zarr_group(source_assay["featureData"], name="featureData"),
+                source_feature_data,
                 feature_data,
+                exclude_members=excluded_feature_members,
+            )
+            source_feature_ids = as_zarr_array(
+                source_feature_data["ids"],
+                name="ids",
+            )
+            create_metadata_column(
+                feature_data,
+                "I",
+                data=np.ones(int(source_feature_ids.shape[0]), dtype=bool),
+                dtype=bool,
+                chunkSize=100_000,
             )
 
         target.attrs[MATRIX_SOURCE_ATTR] = {

@@ -94,18 +94,35 @@ def _validate_rank_marker_groups(group_counts: np.ndarray, n_total: int) -> None
 @restore_numba_threads
 def find_markers_by_rank(
     assay: Assay,
-    group_key: str,
-    cell_key: str,
-    feat_key: str,
+    groups: np.ndarray,
+    cell_idx: np.ndarray,
+    feat_idx: np.ndarray,
     nthreads: int = 1,
     **norm_params: Any,
 ) -> dict[Any, pd.DataFrame]:
-    """Identify marker features for groups with rank-based statistics."""
+    """Identify marker features for explicit cells and features."""
     reject_unknown_normalization_params(
         norm_params,
         caller="find_markers_by_rank",
     )
-    groups = assay.cells.fetch(group_key, cell_key)
+    groups = np.asarray(groups)
+    cell_idx = np.asarray(cell_idx, dtype=np.int64)
+    feat_idx = np.asarray(feat_idx, dtype=np.int64)
+    if groups.ndim != 1 or cell_idx.ndim != 1 or feat_idx.ndim != 1:
+        raise ValueError("groups, cell_idx, and feat_idx must be one-dimensional")
+    if len(groups) != len(cell_idx):
+        raise ValueError("groups must align with cell_idx")
+    if len(cell_idx) == 0 or len(feat_idx) == 0:
+        raise ValueError("Marker search requires non-empty cell and feature indices")
+    if (
+        np.any(cell_idx < 0)
+        or np.unique(cell_idx).size != len(cell_idx)
+        or np.any(feat_idx < 0)
+        or np.unique(feat_idx).size != len(feat_idx)
+    ):
+        raise ValueError(
+            "cell_idx and feat_idx must contain unique non-negative indices"
+        )
     group_set = np.array(sorted(set(groups)))
     n_groups = len(group_set)
     idx_map = dict(zip(group_set, range(n_groups)))
@@ -141,23 +158,12 @@ def find_markers_by_rank(
         raise TypeError("Fast raw-count marker search requires an RNAassay instance")
 
     counts_t = getattr(assay, "rawDataT", None)
-    has_selection = hasattr(assay.cells, "active_index") and hasattr(
-        assay.feats, "active_index"
-    )
-    cell_idx = assay.cells.active_index(cell_key) if has_selection else None
-    feat_idx = assay.feats.active_index(feat_key) if has_selection else None
     adapter: str | None = None
     cell_scale: np.ndarray | None = None
     feature_scale: np.ndarray | None = None
     scalar_values: np.ndarray | None = None
     size_factor = 1.0
-    if (
-        use_fast
-        and isinstance(assay, RNAassay)
-        and counts_t is not None
-        and cell_idx is not None
-        and feat_idx is not None
-    ):
+    if use_fast and isinstance(assay, RNAassay) and counts_t is not None:
         adapter = "rna_lib_size_unsigned"
         scalar = assay.cells.fetch_all(assay.name + "_nCounts")[cell_idx]
         size_factor = float(assay.sf) if assay.sf is not None else 1.0
@@ -165,12 +171,7 @@ def find_markers_by_rank(
             raise ValueError("RNA library-size normalization requires a size factor")
         scalar_values = np.asarray(scalar, dtype=np.float32)
         scalar_values[scalar_values == 0] = 1
-    elif (
-        counts_t is not None
-        and cell_idx is not None
-        and feat_idx is not None
-        and assay.normMethod is norm_tf_idf
-    ):
+    elif counts_t is not None and assay.normMethod is norm_tf_idf:
         adapter = "tfidf"
         assay.normed(cell_idx, feat_idx, **norm_params)
         cell_scale = np.asarray(assay.n_term_per_doc, dtype=np.float64)
@@ -178,24 +179,12 @@ def find_markers_by_rank(
         feature_scale = np.log2(
             1.0 + (docs / (np.asarray(assay.n_docs_per_term, dtype=np.float64) + 1.0))
         )
-    elif (
-        counts_t is not None
-        and cell_idx is not None
-        and feat_idx is not None
-        and assay.normMethod is norm_clr
-    ):
+    elif counts_t is not None and assay.normMethod is norm_clr:
         adapter = "clr"
-    elif (
-        counts_t is not None
-        and cell_idx is not None
-        and feat_idx is not None
-        and assay.normMethod is norm_dummy
-    ):
+    elif counts_t is not None and assay.normMethod is norm_dummy:
         adapter = "dummy"
     elif (
         counts_t is not None
-        and cell_idx is not None
-        and feat_idx is not None
         and lib_size_feature_stream_eligible(
             assay, renormalize_subset=renormalize_subset
         )
@@ -208,7 +197,7 @@ def find_markers_by_rank(
         scalar_values[scalar_values == 0] = 1
 
     if adapter is not None:
-        if counts_t is None or cell_idx is None or feat_idx is None:
+        if counts_t is None:
             raise ValueError(
                 f"Assay {assay.name!r} requires sharded countsT for marker search"
             )
@@ -318,8 +307,8 @@ def find_markers_by_rank(
         batch_stats = []
         iterator = iter(
             assay.iter_normed_feature_wise(
-                cell_key=cell_key,
-                feat_key=feat_key,
+                cell_idx=cell_idx,
+                feat_idx=feat_idx,
                 batch_size=None,
                 msg="Finding markers",
                 **norm_params,
@@ -345,13 +334,12 @@ def find_markers_by_rank(
             )
             batch_stats.append(stats)
         stats_matrix = np.vstack(batch_stats)
-    feat_index = assay.feats.active_index(feat_key)
     pval_col = "p_value"
     for n, i in enumerate(group_set):
         kernel = pd.DataFrame(
             stats_matrix[:, n, :],
             columns=list(_KERNEL_STAT_COLUMNS),
-            index=feat_index,
+            index=feat_idx,
         )
         adjusted = _bh_adjusted_pvalues(
             kernel[pval_col].to_numpy(dtype=np.float64, copy=False)
@@ -371,8 +359,8 @@ def find_markers_by_rank(
 @restore_numba_threads
 def find_markers_by_regression(
     assay: Assay,
-    cell_key: str,
-    feat_key: str,
+    cell_idx: np.ndarray,
+    feat_idx: np.ndarray,
     regressor: np.ndarray,
     min_cells: int,
     batch_size: int | None = None,
@@ -383,9 +371,26 @@ def find_markers_by_regression(
         norm_params,
         caller="find_markers_by_regression",
     )
+    cell_idx = np.asarray(cell_idx, dtype=np.int64)
+    feat_idx = np.asarray(feat_idx, dtype=np.int64)
+    if cell_idx.ndim != 1 or feat_idx.ndim != 1:
+        raise ValueError("cell_idx and feat_idx must be one-dimensional")
+    if len(cell_idx) == 0 or len(feat_idx) == 0:
+        raise ValueError("Marker regression requires non-empty indices")
+    if (
+        np.any(cell_idx < 0)
+        or np.unique(cell_idx).size != len(cell_idx)
+        or np.any(feat_idx < 0)
+        or np.unique(feat_idx).size != len(feat_idx)
+    ):
+        raise ValueError(
+            "cell_idx and feat_idx must contain unique non-negative indices"
+        )
     regressor = np.asarray(regressor, dtype=np.float64)
     if regressor.ndim != 1:
         raise ValueError("regressor must be one-dimensional")
+    if len(regressor) != len(cell_idx):
+        raise ValueError("regressor must align with cell_idx")
     if not np.isfinite(regressor).all():
         raise ValueError("regressor must contain only finite values")
     if regressor.size < 2 or np.unique(regressor).size < 2:
@@ -403,8 +408,8 @@ def find_markers_by_regression(
     p_parts: list[np.ndarray] = []
     status_parts: list[np.ndarray] = []
     for feature_batch in assay.iter_normed_feature_wise(
-        cell_key=cell_key,
-        feat_key=feat_key,
+        cell_idx=cell_idx,
+        feat_idx=feat_idx,
         batch_size=batch_size,
         msg="Finding correlated features",
         **norm_params,

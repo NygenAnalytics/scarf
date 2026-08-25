@@ -33,18 +33,23 @@ This notebook uses pancreatic endocrine differentiation to estimate Alpha, Beta,
 ## Dataset
 
 ```{code-cell} ipython3
+from tempfile import TemporaryDirectory
+
 import matplotlib.pyplot as plt
 import pandas as pd
 
 import scarf
 import scarf.plotting as splt
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
 ```
 
 ## 1. Load the preprocessed dataset
 
-The prepared Zarr store from the `scarf_docs` Cytebase catalog contains a KNN graph, UMAP coordinates, Scarf clusters, and the provided cell-type annotations.
+The prepared Zarr store from the `scarf_docs` Cytebase catalog contains counts, UMAP coordinates, Scarf clusters, and the provided cell-type annotations.
+The setup mounts those inputs into a temporary writable analysis store and builds a current graph lineage locally.
+The temporary structural repack supplies the current RNA count layout, while the mounted target starts without the snapshot's legacy analysis state.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -55,11 +60,29 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 ```
 
 ```{code-cell} ipython3
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = f'{analysis_directory.name}/counts.zarr'
+repack_store(
     f'{dataset}/data.zarr',
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=f'{analysis_directory.name}/analysis.zarr',
     nthreads=4,
     default_assay='RNA',
 )
+hvg_ref = ds.mark_hvgs(
+    top_n=2000,
+    show_plot=False,
+    label='fate_hvgs',
+)
+normalized = ds.run_normalization(features=hvg_ref)
+reduction = ds.run_pca(normalized, dims=15)
+ann_index = ds.build_ann_index(reduction)
+neighbors = ds.query_neighbors(ann_index, k=11)
+graph = ds.build_connectivity_map(neighbors)
 ds.plots.embedding(
     layout_key='RNA_UMAP',
     color_by='clusters',
@@ -137,6 +160,7 @@ The terminal cell types are used as sinks so the ordering covers the branches an
 
 ```{code-cell} ipython3
 pseudotime = ds.run_pseudotime_scoring(
+    graph,
     source_sink_key='clusters',
     sources=progenitors,
     sinks=terminal_cell_types,
@@ -173,6 +197,7 @@ Since that subset key is not `I`, Scarf includes it in the saved fate column nam
 
 ```{code-cell} ipython3
 fate = ds.run_fate_mapping(
+    graph,
     cell_key='I',
     subset_cell_key=pseudotime.validity_key,
     pseudotime_key=pseudotime.pseudotime_key,
@@ -191,6 +216,8 @@ pd.Series(
     }
 )
 ```
+
+The returned `FateMappingResult.graph` pins the graph used for both pseudotime bias and absorption probabilities.
 
 ```{code-cell} ipython3
 figure, axes = plt.subplots(1, 3, figsize=(11, 4))

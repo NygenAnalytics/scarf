@@ -44,6 +44,10 @@ A `DataStore` can contain several assays, such as `RNA` and `ADT`.
 Most methods use the default assay unless you select another one.
 Local paths and `s3://` or `gs://` locations use the same analysis API.
 
+Feature selection is artifact-first: `features = ds.mark_hvgs(...)` returns an immutable reference, and `ds.run_normalization(features=features)` consumes it.
+Direct feature analyses such as marker search likewise require `features=`; use `ds.resolve_features("RNA", "all_features")` for the complete universe.
+Graph-derived methods use `graph=` or the current connectivity map from `AssayState`, not a separate feature selector.
+
 ## Scanpy workflow map
 
 Scanpy commonly composes the stages as separate `sc.pp`, `sc.tl`, and `sc.pl` calls.

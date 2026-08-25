@@ -122,19 +122,7 @@ def _write_projection(
         inputs={},
         source_column=cell_key,
     )
-    feature_mask = np.asarray(query.RNA.feats.fetch_all("I"), dtype=bool)
-    feature_selection = resolve_selection_artifact(
-        query.zw,
-        scope="assay",
-        assay="RNA",
-        kind="feature_selection",
-        values=feature_mask,
-        row_ids=np.asarray(query.RNA.feats.fetch_all("ids")),
-        operation="manual_selection",
-        parameters={},
-        inputs={},
-        source_column="I",
-    )
+    feature_selection = query._ensure_all_features("RNA")
     planned = plan_projection(
         query.zw,
         query_assay="RNA",

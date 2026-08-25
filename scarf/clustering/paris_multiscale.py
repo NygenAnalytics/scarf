@@ -151,7 +151,7 @@ def _validate_hierarchy(
             child_index = child - n_leaves
             if hierarchy.synthetic_joins[child_index]:
                 raise ValueError("A finite merge cannot contain a synthetic join")
-            if heights[child_index] > parent_height:
+            if heights[child_index] > np.nextafter(parent_height, np.inf):
                 raise ValueError("Paris merge distances must be monotone")
 
     candidate_roots: list[int] = []

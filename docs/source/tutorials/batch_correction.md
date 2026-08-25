@@ -19,13 +19,17 @@ kernelspec:
 Batch correction changes the reduced coordinates used to build a neighbourhood graph.
 Counts remain unchanged.
 A useful correction should increase source mixing without dissolving biological populations.
-This guide resumes the persisted uncorrected analysis from {doc}`dataset_merging` and compares it with partial PCA and Harmony.
+This guide structurally repacks the published count store, reconstructs the uncorrected analysis in a separate mounted store, then compares it with partial PCA and Harmony.
 
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import matplotlib.pyplot as plt
 import pandas as pd
 
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="ERROR", progress=True)
 
@@ -35,7 +39,42 @@ merged_path = repository.download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(f"{merged_path}/data.zarr", nthreads=4)
+analysis_directory = TemporaryDirectory()
+repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
+repack_store(
+    f"{merged_path}/data.zarr",
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=str(Path(analysis_directory.name) / "batch_analysis.zarr"),
+    default_assay="RNA",
+    nthreads=4,
+)
+ds.pipeline.run(
+    filtering=False,
+    cell_cycle_scoring=False,
+    highly_variable_features={
+        "min_cells": 10,
+        "top_n": 2000,
+        "min_mean": -3,
+        "max_mean": 2,
+        "max_var": 6,
+    },
+    pca={"dims": 25},
+    neighbors={"k": 21},
+    umap={
+        "n_epochs": 250,
+        "spread": 5,
+        "min_dist": 1,
+        "parallel": True,
+    },
+    leiden={1.0: {"label": "integration_clusters"}},
+    paris=False,
+    doublet_scoring=False,
+    markers=False,
+)
 
 baseline = ds.get_assay_state("RNA")
 normalized = baseline.normalized
@@ -45,24 +84,20 @@ uncorrected_graph = baseline.connectivity_map
 
 
 def integration_scores(neighbors, graph):
-    knn_path = ds.inspect_artifact(neighbors).path
-    graph_path = ds.inspect_artifact(graph).path
     return {
         "iLISI": ds.metric_ilisi(
             batch_colname="sample_id",
-            use_latest_knn=False,
-            knn_loc=knn_path,
+            neighbors=neighbors,
             perplexity=7,
         ),
         "cLISI": ds.metric_clisi(
             label_colname="orig_cluster_labels",
-            use_latest_knn=False,
-            knn_loc=knn_path,
+            neighbors=neighbors,
             perplexity=7,
         ),
         "graph connectivity": ds.metric_graph_connectivity(
             label_colname="orig_cluster_labels",
-            graph_loc=graph_path,
+            graph=graph,
         ),
     }
 
@@ -140,7 +175,7 @@ partial_neighbors = ds.query_neighbors(
 )
 partial_graph = ds.build_connectivity_map(partial_neighbors)
 ds.run_umap(
-    partial_graph,
+    graph=partial_graph,
     n_epochs=250,
     spread=5,
     min_dist=1,
@@ -148,7 +183,7 @@ ds.run_umap(
     label="partial_UMAP",
 )
 ds.run_leiden_clustering(
-    partial_graph,
+    graph=partial_graph,
     resolution=1.0,
     label="partial_clusters",
 )
@@ -186,7 +221,7 @@ harmony_neighbors = ds.query_neighbors(
 )
 harmony_graph = ds.build_connectivity_map(harmony_neighbors)
 ds.run_umap(
-    harmony_graph,
+    graph=harmony_graph,
     n_epochs=250,
     spread=5,
     min_dist=1,
@@ -194,7 +229,7 @@ ds.run_umap(
     label="harmony_UMAP",
 )
 ds.run_leiden_clustering(
-    harmony_graph,
+    graph=harmony_graph,
     resolution=1.0,
     label="harmony_clusters",
 )

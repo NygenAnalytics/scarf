@@ -15,7 +15,7 @@ class UmapArguments(OperationArguments):
     operation: ClassVar[str] = "run_umap"
     artifact_kind: ClassVar[str] = "embedding"
 
-    graph: Any = artifact_input()
+    graph: ArtifactRef = artifact_input()
     initialization: Any = artifact_input()
     symmetric_graph: bool | None = parameter()
     graph_upper_only: bool | None = parameter()
@@ -36,8 +36,6 @@ class UmapArguments(OperationArguments):
     label: str = execution()
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
-    integrated_graph: str | None = execution()
     invalidate_cache: bool = execution()
 
 
@@ -46,7 +44,7 @@ class TsneArguments(OperationArguments):
     operation: ClassVar[str] = "run_tsne"
     artifact_kind: ClassVar[str] = "embedding"
 
-    graph: Any = artifact_input()
+    graph: ArtifactRef = artifact_input()
     initialization: Any = artifact_input()
     symmetric_graph: bool = parameter()
     graph_upper_only: bool = parameter()
@@ -61,7 +59,6 @@ class TsneArguments(OperationArguments):
     label: str = execution()
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
     temp_file_loc: str = execution()
     verbose: bool = execution()
     invalidate_cache: bool = execution()
@@ -72,7 +69,7 @@ class LeidenArguments(OperationArguments):
     operation: ClassVar[str] = "run_leiden_clustering"
     artifact_kind: ClassVar[str] = "cluster_labels"
 
-    graph: Any = artifact_input()
+    graph: ArtifactRef = artifact_input()
     resolution: float = parameter()
     backend: Literal["igraph", "leidenalg"] = parameter()
     symmetric_graph: bool = parameter()
@@ -81,8 +78,6 @@ class LeidenArguments(OperationArguments):
     label: str = execution()
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
-    integrated_graph: str | None = execution()
     invalidate_cache: bool = execution()
 
 
@@ -91,7 +86,7 @@ class TopacedoArguments(OperationArguments):
     operation: ClassVar[str] = "run_topacedo_sampler"
     artifact_kind: ClassVar[str] = "sampling"
 
-    graph: Any = artifact_input()
+    graph: ArtifactRef = artifact_input()
     clusters: Any = artifact_input()
     dendrogram: Any = artifact_input()
     cell_selection: ArtifactRef = artifact_input()
@@ -109,8 +104,6 @@ class TopacedoArguments(OperationArguments):
     rand_state: int = parameter()
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
-    integrated_graph: str | None = execution()
     cluster_key: str = execution()
     save_sampling_key: str = execution()
     save_density_key: str = execution()
@@ -125,7 +118,8 @@ class DoubletScoreArguments(OperationArguments):
     artifact_kind: ClassVar[str] = "doublet_score"
 
     clusters: Any = artifact_input()
-    connectivity_map: Any = artifact_input()
+    connectivity_map: ArtifactRef = artifact_input()
+    neighbors: ArtifactRef = artifact_input()
     cluster_sample_fraction: float = parameter()
     max_cells_per_cluster: int = parameter()
     simulation_ratio: float = parameter()
@@ -136,7 +130,6 @@ class DoubletScoreArguments(OperationArguments):
     random_seed: int = parameter()
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
     label: str = execution()
     invalidate_cache: bool = execution()
 
@@ -146,10 +139,10 @@ class CellCycleArguments(OperationArguments):
     operation: ClassVar[str] = "run_cell_cycle_scoring"
     artifact_kind: ClassVar[str] = "cell_cycle"
 
-    s_gene_indices: tuple[int, ...] = artifact_input()
-    g2m_gene_indices: tuple[int, ...] = artifact_input()
-    normalization_method: dict[str, str] = parameter()
-    size_factor: float | None = parameter()
+    feature_summary: ArtifactRef = artifact_input()
+    cell_selection: ArtifactRef = artifact_input()
+    s_gene_indices: tuple[int, ...] = parameter()
+    g2m_gene_indices: tuple[int, ...] = parameter()
     control_size: int = parameter()
     n_bins: int = parameter()
     rand_seed: int = parameter()
@@ -180,7 +173,6 @@ class MarkerTableArguments(OperationArguments):
     adjustment_scope: str = parameter()
     group_key: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
     nthreads: int = execution()
     invalidate_cache: bool = execution()
 
@@ -190,7 +182,7 @@ class PseudotimeScoringArguments(OperationArguments):
     operation: ClassVar[str] = "run_pseudotime_scoring"
     artifact_kind: ClassVar[str] = "pseudotime"
 
-    connectivity_map: Any = artifact_input()
+    connectivity_map: ArtifactRef = artifact_input()
     source_sink: Any = artifact_input()
     cell_selection: ArtifactRef = artifact_input()
     n_singular_vals: int = parameter()
@@ -202,7 +194,6 @@ class PseudotimeScoringArguments(OperationArguments):
     from_assay: str = execution()
     cell_key: str = execution()
     subset_cell_key: str = execution()
-    feat_key: str = execution()
     label: str = execution()
     invalidate_cache: bool = execution()
 
@@ -212,7 +203,7 @@ class FateMappingArguments(OperationArguments):
     operation: ClassVar[str] = "run_fate_mapping"
     artifact_kind: ClassVar[str] = "fate_map"
 
-    connectivity_map: Any = artifact_input()
+    connectivity_map: ArtifactRef = artifact_input()
     pseudotime: Any = artifact_input()
     sink_labels: Any = artifact_input()
     cell_selection: ArtifactRef = artifact_input()
@@ -223,7 +214,6 @@ class FateMappingArguments(OperationArguments):
     from_assay: str = execution()
     cell_key: str = execution()
     subset_cell_key: str = execution()
-    feat_key: str = execution()
     pseudotime_key: str = execution()
     sink_key: str = execution()
     label: str = execution()
@@ -248,7 +238,6 @@ class PseudotimeMarkerArguments(OperationArguments):
     min_cells: int = parameter()
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
     pseudotime_key: str = execution()
     gene_batch_size: int | None = execution()
     nthreads: int = execution()
@@ -277,7 +266,6 @@ class PseudotimeAggregationArguments(OperationArguments):
     nan_cluster_value: int = parameter()
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
     pseudotime_key: str = execution()
     cluster_label: str = execution()
     batch_size: int | None = execution()
@@ -290,14 +278,11 @@ class PrevalentPeakArguments(OperationArguments):
     operation: ClassVar[str] = "mark_prevalent_peaks"
     artifact_kind: ClassVar[str] = "feature_selection"
 
-    cell_selection: ArtifactRef = artifact_input()
-    feature_selection: ArtifactRef = artifact_input()
-    normalization_method: dict[str, str] = parameter()
-    algorithm_version: int = parameter()
+    feature_summary: ArtifactRef = artifact_input()
     top_n: int = parameter()
     from_assay: str = execution()
     cell_key: str = execution()
-    prevalence_key_name: str = execution()
+    label: str = execution()
     invalidate_cache: bool = execution()
 
 
@@ -317,7 +302,6 @@ class WaggrArguments(OperationArguments):
     size_factor: float = parameter()
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
     label: str = execution()
     overwrite: bool = execution()
     invalidate_cache: bool = execution()
@@ -337,7 +321,6 @@ class AucellArguments(OperationArguments):
     tie_seed: int = parameter()
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
     label: str = execution()
     overwrite: bool = execution()
     invalidate_cache: bool = execution()
@@ -363,14 +346,13 @@ class MembershipStrengthArguments(OperationArguments):
     operation: ClassVar[str] = "calc_membership_strength"
     artifact_kind: ClassVar[str] = "membership_strength"
 
-    connectivity_map: Any = artifact_input()
+    connectivity_map: ArtifactRef = artifact_input()
     clusters: Any = artifact_input()
     cell_selection: ArtifactRef = artifact_input()
     algorithm_version: int = parameter()
     decimals: int = parameter()
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
     clust_key: str = execution()
     output_key: str = execution()
     invalidate_cache: bool = execution()

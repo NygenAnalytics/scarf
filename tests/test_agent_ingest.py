@@ -1134,7 +1134,6 @@ def test_ingest_existing_zarr_readonly_does_not_mutate(tmp_path: Path) -> None:
         str(location),
         default_assay="RNA",
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
         mem_budget=64 * 1024 * 1024,
     )

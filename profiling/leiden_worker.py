@@ -63,7 +63,6 @@ def run_leiden_worker(requestPath: Path) -> None:
         arguments: dict[str, Any] = {
             "from_assay": workflow.assayName,
             "cell_key": workflow.cellKey,
-            "feat_key": workflow.hvgKey,
             "resolution": workflow.leidenResolution,
             "backend": workflow.leidenBackend,
             "label": workflow.leidenLabel,

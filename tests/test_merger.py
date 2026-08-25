@@ -2016,7 +2016,6 @@ def test_dataset_merge_skips_counts_t_for_generic_assay_named_rna(tmp_path):
             default_assay="RNA",
             assay_types={"RNA": "Assay"},
             min_features_per_cell=0,
-            min_cells_per_feature=0,
         )
 
     left = _generic_named_rna(

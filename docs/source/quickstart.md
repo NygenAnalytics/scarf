@@ -109,6 +109,7 @@ ds.cells.to_pandas_dataframe(
 
 The return value maps each result name to an {term}`ArtifactRef`: a handle on a stored result that names it without loading it.
 Every result the pipeline wrote is an {term}`artifact` in the Zarr store, saved together with the {term}`provenance` record of what produced it.
+`artifacts["highly_variable_features"]` is the exact immutable feature selection passed to normalization; the plain `hvgs` label is its published convenience name.
 `RNA_leiden_0.5` is one of the Leiden partitions kept alongside the selected `RNA_clusters` labels.
 
 ```{code-cell} ipython3
@@ -151,6 +152,7 @@ Marker search ran on the same partition, so its table is already in the store:
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
+    marker=artifacts["markers"],
     group_key="RNA_clusters",
     topn=5,
     figsize=(5, 9),
@@ -168,7 +170,11 @@ cluster_id = (
     .index[0]
 )
 print(f"Markers for cluster {cluster_id}")
-ds.get_markers(group_key="RNA_clusters", group_id=cluster_id).head(10)
+ds.get_markers(
+    marker=artifacts["markers"],
+    group_key="RNA_clusters",
+    group_id=cluster_id,
+).head(10)
 ```
 
 The Zarr store now holds the UMAP coordinates, cluster labels, marker tables, and every intermediate result.

@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from scarf.storage.artifacts import ArtifactRef
+
 from . import full_path, remove, chunked_total_sum
 
 
@@ -14,7 +16,7 @@ def build_neighbourhood_graph(
     *,
     from_assay: str | None = None,
     cell_key: str = "I",
-    feat_key: str,
+    features: ArtifactRef | str,
     reduction_method: str = "pca",
     dims: int = 11,
     pca_cell_key: str | None = None,
@@ -39,11 +41,11 @@ def build_neighbourhood_graph(
     local_cache: bool | str = "auto",
     update_state: bool = True,
     invalidate_cache: bool = False,
-):
+) -> ArtifactRef:
     normalized = datastore.run_normalization(
         from_assay=from_assay,
         cell_key=cell_key,
-        feat_key=feat_key,
+        features=features,
         log_transform=log_transform,
         renormalize_subset=renormalize_subset,
         update_state=False,
@@ -148,15 +150,8 @@ def _datastore_tar_path() -> str:
 
 
 def _has_graph(datastore) -> bool:
-    try:
-        datastore.get_latest_graph_loc(
-            from_assay="RNA",
-            cell_key="I",
-            feat_key="hvgs",
-        )
-        return True
-    except KeyError:
-        return False
+    state = datastore.get_assay_state("RNA")
+    return state is not None and state.connectivity_map is not None
 
 
 def _cell_has(datastore, column: str) -> bool:
@@ -227,17 +222,17 @@ def analyzed_datastore_zarr_root(datastore_zarr_root, tmp_path_factory):
     shutil.copytree(datastore_zarr_root, zarr_root)
     datastore = DataStore(str(zarr_root), default_assay="RNA")
     datastore.auto_filter_cells(show_qc_plots=False)
-    datastore.mark_hvgs(
+    hvg_ref = datastore.mark_hvgs(
         top_n=100,
         show_plot=False,
         bin_strategy="fixed",
-        min_cells=int(0.01 * datastore.cells.N),
+        min_cells=max(20, int(0.01 * datastore.cells.N)),
         max_cells=np.inf,
         blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
     )
     build_neighbourhood_graph(
         datastore,
-        feat_key="hvgs",
+        features=hvg_ref,
         local_cache=False,
     )
     state = datastore.get_assay_state("RNA")
@@ -262,19 +257,29 @@ def auto_filter_cells(datastore):
 
 @pytest.fixture(scope="session")
 def mark_hvgs(auto_filter_cells, datastore):
-    datastore.mark_hvgs(
+    return datastore.mark_hvgs(
         top_n=100,
         show_plot=False,
         bin_strategy="fixed",
-        min_cells=int(0.01 * datastore.cells.N),
+        min_cells=max(20, int(0.01 * datastore.cells.N)),
         max_cells=np.inf,
         blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
     )
 
 
 @pytest.fixture(scope="session")
+def detected_features(auto_filter_cells, datastore):
+    del auto_filter_cells
+    return datastore.select_detected_features(
+        cell_key="I",
+        min_cells=20,
+        label="detected_features",
+    )
+
+
+@pytest.fixture(scope="session")
 def graph_artifacts(mark_hvgs, datastore):
-    build_neighbourhood_graph(datastore, feat_key="hvgs")
+    build_neighbourhood_graph(datastore, features=mark_hvgs)
     state = datastore.get_assay_state("RNA")
     assert state is not None and state.neighbors is not None
     yield datastore.inspect_artifact(state.neighbors).path
@@ -324,12 +329,11 @@ def umap(graph_artifacts, datastore):
 
 
 @pytest.fixture(scope="session")
-def marker_search(datastore, paris_clustering):
-    if (
-        "markers" not in datastore.z["RNA"]
-        or "I__RNA_cluster" not in datastore.z["RNA"]["markers"]
-    ):
-        datastore.run_marker_search(group_key="RNA_cluster")
+def marker_search(datastore, paris_clustering, detected_features):
+    return datastore.run_marker_search(
+        group_key="RNA_cluster",
+        features=detected_features,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -344,22 +348,18 @@ def pseudotime_scoring(datastore, legacy_leiden_clustering):
 
 
 @pytest.fixture(scope="session")
-def pseudotime_markers(datastore, pseudotime_scoring):
-    marker_key = "I__RNA_pseudotime__r"
-    if (
-        marker_key not in datastore.RNA.feats.columns
-        or "source_artifact" not in datastore.RNA.z["featureData"][marker_key].attrs
-    ):
-        datastore.run_pseudotime_marker_search(pseudotime_key="RNA_pseudotime")
-    df = datastore.RNA.feats.to_pandas_dataframe(
-        ["names", "I__RNA_pseudotime__r"], key="I"
+def pseudotime_markers(datastore, pseudotime_scoring, detected_features):
+    result = datastore.run_pseudotime_marker_search(
+        pseudotime_key="RNA_pseudotime",
+        features=detected_features,
     )
-    yield df
+    yield result
 
 
 @pytest.fixture(scope="session")
-def pseudotime_aggregation(datastore, pseudotime_scoring):
+def pseudotime_aggregation(datastore, pseudotime_scoring, detected_features):
     result = datastore.run_pseudotime_aggregation(
+        features=detected_features,
         pseudotime_key="RNA_pseudotime",
         cluster_label="pseudotime_clusters",
         n_clusters=15,
@@ -412,14 +412,14 @@ def atac_datastore():
 
 @pytest.fixture(scope="session")
 def mark_prevalent_peaks(atac_datastore):
-    atac_datastore.mark_prevalent_peaks(top_n=5000)
+    return atac_datastore.mark_prevalent_peaks(top_n=5000)
 
 
 @pytest.fixture(scope="session")
 def make_atac_graph(mark_prevalent_peaks, atac_datastore):
     build_neighbourhood_graph(
         atac_datastore,
-        feat_key="prevalent_peaks",
+        features=mark_prevalent_peaks,
         reduction_method="lsi",
         feat_scaling=False,
     )

@@ -6,21 +6,16 @@ import zarr
 
 from ..matrix import ChunkedArray
 from ..metadata import MetaData
-from ..storage.types import as_zarr_array, as_zarr_group
-from ..utils.arrays import array_digest
 from ..utils.compute import compute_with_progress
-from ..utils.logging import logger
 from .base import Assay
 from .normalization import norm_tf_idf
-
-_CELL_INDEX_DIGEST_ATTR = "cell_index_digest"
-_NORMALIZATION_IDENTITY_ATTR = "normalization_identity"
-_DOCUMENT_FREQUENCY_COLUMN = "document_frequency"
 
 
 class ATACassay(Assay):
     """This subclass of Assay is designed for feature selection and
     normalization of scATAC-Seq data."""
+
+    _feature_summary_operation = "summarize_atac_features"
 
     def __init__(
         self,
@@ -30,7 +25,6 @@ class ATACassay(Assay):
         *,
         workspace: str | None = None,
         nthreads: int = 1,
-        min_cells_per_feature: int = 10,
         **kwargs: Any,
     ) -> None:
         """This Assay subclass is designed for feature selection and
@@ -54,7 +48,6 @@ class ATACassay(Assay):
             name=name,
             cell_data=cell_data,
             nthreads=nthreads,
-            min_cells_per_feature=min_cells_per_feature,
             **kwargs,
         )
         self.normMethod = norm_tf_idf
@@ -80,9 +73,8 @@ class ATACassay(Assay):
             cell_idx: Indices of cells to be included in the normalized matrix
                       (Default value: All those marked True in 'I' column of cell
                       attribute table)
-            feat_idx: Indices of features to be included in the normalized matrix
-                      (Default value: All those marked True in 'I' column of
-                      feature attribute table)
+            feat_idx: Indices of features to be included in the normalized matrix.
+                      Defaults to the complete physical feature axis.
             **kwargs: `log_transform` must be false. `renormalize_subset` uses
                       counts among `feat_idx` as the term-frequency denominator.
 
@@ -91,7 +83,7 @@ class ATACassay(Assay):
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:
-            feat_idx = self.feats.active_index("I")
+            feat_idx = np.arange(self.feats.N, dtype=np.int64)
         log_transform = kwargs.get("log_transform", False)
         renormalize_subset = kwargs.get("renormalize_subset", False)
         if not isinstance(log_transform, (bool, np.bool_)):
@@ -114,13 +106,11 @@ class ATACassay(Assay):
         elif self.n_docs == 0:
             self.n_docs_per_term = np.zeros(len(feat_idx), dtype=np.int64)
         else:
-            document_frequency = self._cached_document_frequency(cell_idx, feat_idx)
-            if document_frequency is None:
-                document_frequency = compute_with_progress(
-                    counts.count_nonzero(axis=0),
-                    f"({self.name}) Computing document frequency across selected cells",
-                    self.nthreads,
-                )
+            document_frequency = compute_with_progress(
+                counts.count_nonzero(axis=0),
+                f"({self.name}) Computing document frequency across selected cells",
+                self.nthreads,
+            )
             self.n_docs_per_term = np.asarray(document_frequency)
         return self.normMethod(self, counts)
 
@@ -155,110 +145,6 @@ class ATACassay(Assay):
             )
         terms[terms == 0] = 1
         return terms
-
-    @staticmethod
-    def _normalization_identity() -> str:
-        identity = getattr(norm_tf_idf, "artifact_identity", None)
-        if identity is None:
-            raise RuntimeError("norm_tf_idf must define artifact_identity")
-        return str(identity)
-
-    @staticmethod
-    def _cell_index_digest(cell_idx: np.ndarray) -> str:
-        return array_digest(np.asarray(cell_idx, dtype=np.int64))
-
-    def _cached_document_frequency(
-        self,
-        cell_idx: np.ndarray,
-        feat_idx: np.ndarray,
-    ) -> np.ndarray | None:
-        """Return cached document frequency for an identical ordered cell corpus."""
-        if self.normMethod is not norm_tf_idf:
-            return None
-        expected_digest = self._cell_index_digest(cell_idx)
-        expected_identity = self._normalization_identity()
-        for stats_loc in sorted(
-            str(key) for key in self.z.keys() if str(key).startswith("summary_stats_")
-        ):
-            try:
-                stats_group = as_zarr_group(self.z[stats_loc], name=stats_loc)
-            except TypeError:
-                continue
-            if (
-                stats_group.attrs.get(_CELL_INDEX_DIGEST_ATTR) != expected_digest
-                or stats_group.attrs.get(_NORMALIZATION_IDENTITY_ATTR)
-                != expected_identity
-                or _DOCUMENT_FREQUENCY_COLUMN not in stats_group
-            ):
-                continue
-            try:
-                stored = as_zarr_array(
-                    stats_group[_DOCUMENT_FREQUENCY_COLUMN],
-                    name=f"{stats_loc}/{_DOCUMENT_FREQUENCY_COLUMN}",
-                )
-            except TypeError:
-                continue
-            if stored.shape != (self.feats.N,):
-                continue
-            try:
-                values = np.asarray(stored[:], dtype=np.float64)[feat_idx]
-            except (IndexError, TypeError, ValueError):
-                continue
-            if (
-                np.isfinite(values).all()
-                and np.all(values >= 0)
-                and np.all(values <= len(cell_idx))
-            ):
-                return np.asarray(values)
-        return None
-
-    def _valid_tfidf_stats(
-        self,
-        stats_loc: str,
-        cell_idx: np.ndarray,
-        feat_idx: np.ndarray,
-    ) -> bool:
-        if not self._validate_stats_loc(
-            stats_loc,
-            cell_idx,
-            feat_idx,
-            delete_on_fail=False,
-        ):
-            return False
-        try:
-            stats_group = as_zarr_group(self.z[stats_loc], name=stats_loc)
-        except (KeyError, TypeError):
-            return False
-        if (
-            stats_group.attrs.get(_CELL_INDEX_DIGEST_ATTR)
-            != self._cell_index_digest(cell_idx)
-            or stats_group.attrs.get(_NORMALIZATION_IDENTITY_ATTR)
-            != self._normalization_identity()
-        ):
-            return False
-        for column in ("prevalence", _DOCUMENT_FREQUENCY_COLUMN):
-            if column not in stats_group:
-                return False
-            try:
-                stored = as_zarr_array(
-                    stats_group[column],
-                    name=f"{stats_loc}/{column}",
-                )
-            except TypeError:
-                return False
-            if stored.shape != (self.feats.N,):
-                return False
-            try:
-                values = np.asarray(stored[:], dtype=np.float64)[feat_idx]
-            except (IndexError, TypeError, ValueError):
-                return False
-            if not np.isfinite(values).all():
-                return False
-            if column == _DOCUMENT_FREQUENCY_COLUMN and (
-                np.any(values < 0) or np.any(values > len(cell_idx))
-            ):
-                return False
-        return True
 
     def _streaming_tfidf_feature_stats(
         self,
@@ -323,128 +209,57 @@ class ATACassay(Assay):
         idf = np.log2(1 + (n_docs / (document_frequency + 1)))
         return document_frequency, term_frequency_sum * idf
 
-    def set_feature_stats(self, cell_key: str) -> None:
-        """Calculates prevalence of each valid feature of the assay using only
-        cells that are marked True by the 'cell_key' parameter. Prevalence of a
-        feature is the sum of all its TF-IDF normalized values across cells.
-
-        Args:
-            cell_key: Name of the key (column) from cell attribute table.
-
-        Returns: None
-        """
-        feat_key = "I"  # Here we choose to calculate stats for all the features
-        cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
-        identifier, stats_loc = self._get_summary_stats_loc(cell_key)
-        if self.normMethod is norm_tf_idf:
-            cache_is_valid = self._valid_tfidf_stats(
-                stats_loc,
-                cell_idx,
-                feat_idx,
-            )
-        else:
-            cache_is_valid = self._validate_stats_loc(
-                stats_loc,
-                cell_idx,
-                feat_idx,
-                delete_on_fail=False,
-            )
-        if cache_is_valid:
-            logger.debug(f"Using cached feature stats for cell_key {cell_key}")
-            return None
-        if identifier in self.feats.locations:
-            self.feats.unmount_location(identifier)
-        if stats_loc in self.z:
-            del self.z[stats_loc]
+    def _compute_feature_summary(
+        self,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Compute peak sufficient statistics without persisting metadata."""
+        cell_idx = np.asarray(cell_idx, dtype=np.int64)
+        feat_idx = np.asarray(feat_idx, dtype=np.int64)
         if len(cell_idx) == 0 or len(feat_idx) == 0:
-            raise ValueError("Peak prevalence requires selected cells and features")
-        document_frequency: np.ndarray | None = None
-        if self.normMethod is norm_tf_idf:
+            document_frequency = np.zeros(len(feat_idx), dtype=np.float64)
+            prevalence = np.zeros(len(feat_idx), dtype=np.float64)
+        elif self.normMethod is norm_tf_idf:
             document_frequency, prevalence = self._streaming_tfidf_feature_stats(
                 cell_idx,
                 feat_idx,
             )
         else:
+            normed = self.normed(cell_idx, feat_idx)
+            document_frequency = compute_with_progress(
+                (normed > 0).sum(axis=0),
+                f"({self.name}) Computing document frequency",
+                self.nthreads,
+            )
             prevalence = compute_with_progress(
-                self.normed(cell_idx, feat_idx).sum(axis=0),
+                normed.sum(axis=0),
                 f"({self.name}) Calculating peak prevalence across cells",
                 self.nthreads,
             )
-        self.z.create_group(stats_loc, overwrite=True)
-        self.feats.mount_location(
-            as_zarr_group(self.z[stats_loc], name=stats_loc), identifier
-        )
-        self.feats.insert(
-            "prevalence", prevalence.astype(float), overwrite=True, location=identifier
-        )
-        if document_frequency is not None:
-            self.feats.insert(
-                _DOCUMENT_FREQUENCY_COLUMN,
-                document_frequency.astype(float),
-                overwrite=True,
-                location=identifier,
-            )
-        self.z[stats_loc].attrs["subset_hash"] = self._create_subset_hash(
-            cell_idx, feat_idx
-        )
-        if document_frequency is not None:
-            self.z[stats_loc].attrs[_CELL_INDEX_DIGEST_ATTR] = self._cell_index_digest(
-                cell_idx
-            )
-            self.z[stats_loc].attrs[_NORMALIZATION_IDENTITY_ATTR] = (
-                self._normalization_identity()
-            )
-        self.feats.unmount_location(identifier)
-        return None
-
-    def mark_prevalent_peaks(
-        self, cell_key: str, top_n: int, prevalence_key_name: str
-    ) -> None:
-        """Marks `top_n` peaks with highest prevalence as prevalent peaks.
-
-        Args:
-           cell_key: Cells to use for selection of most prevalent peaks. The provided value for `cell_key` should be a
-                     column in cell attributes table with boolean values.
-           top_n: Number of top prevalent peaks to be selected. (Default: 500)
-           prevalence_key_name: Base label for marking prevalent peaks in the features attributes column. The value for
-                                'cell_key' parameter is prepended to this value.
-
-        Returns: None
-        """
-        import warnings
-
-        warnings.warn(
-            "ATACassay.mark_prevalent_peaks writes legacy metadata directly; "
-            "use DataStore.mark_prevalent_peaks for artifact-backed persistence.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        values = self._prevalent_peak_mask(cell_key, top_n)
-        prevalence_key_name = cell_key + "__" + prevalence_key_name
-        self.feats.insert(
-            prevalence_key_name,
-            values,
-            fill_value=False,
-            overwrite=True,
-        )
-        return None
+        return {
+            "prevalence": np.asarray(prevalence, dtype=np.float64),
+            "document_frequency": np.asarray(
+                document_frequency,
+                dtype=np.float64,
+            ),
+        }
 
     def _prevalent_peak_mask(
         self,
-        cell_key: str,
+        prevalence: np.ndarray,
         top_n: int,
     ) -> np.ndarray:
+        prevalence = np.asarray(prevalence, dtype=np.float64)
+        if prevalence.shape != (self.feats.N,):
+            raise ValueError(
+                f"prevalence must have shape ({self.feats.N},), got {prevalence.shape}"
+            )
         if top_n >= self.feats.N:
             raise ValueError(
                 f"ERROR: n_top should be less than total number of features ({self.feats.N})]"
             )
         if isinstance(top_n, int) is False or top_n < 1:
             raise TypeError("ERROR: n_top must a positive integer value")
-        self.set_feature_stats(cell_key)
-        identifier = self._load_stats_loc(cell_key)
-        idx = (
-            pd.Series(self.feats.fetch_all(f"{identifier}_prevalence"))
-            .sort_values(ascending=False)
-            .index.values[:top_n]
-        )
+        idx = pd.Series(prevalence).sort_values(ascending=False).index.values[:top_n]
         return np.asarray(self.feats.index_to_bool(idx), dtype=bool)

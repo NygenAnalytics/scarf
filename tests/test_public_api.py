@@ -10,7 +10,7 @@ from typing import cast
 _EXPECTED_EXPORTS = {
     "ArtifactLineage": "scarf.storage.lineage",
     "ArtifactRef": "scarf.storage.refs",
-    "ArtifactSelectionError": "scarf.graph.state",
+    "ArtifactResolutionError": "scarf.storage.errors",
     "ArtifactStatus": "scarf.storage.artifacts",
     "AssayState": "scarf.graph.state",
     "CSVReader": "scarf.readers",
@@ -28,6 +28,7 @@ _EXPECTED_EXPORTS = {
     "H5adInspectResult": "scarf.readers",
     "H5adReader": "scarf.readers",
     "H5adToZarr": "scarf.writers",
+    "IncompatibleAnalysisStateError": "scarf.graph.errors",
     "LoomReader": "scarf.readers",
     "LoomToZarr": "scarf.writers",
     "MtxReader": "scarf.readers",

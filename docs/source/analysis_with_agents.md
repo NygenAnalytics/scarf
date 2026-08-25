@@ -27,7 +27,8 @@ Stop rather than claim an identified treatment, disease, or batch effect when th
 ### DataStore, selections, and artifacts
 
 A `DataStore` contains count matrices, cell metadata, feature metadata, and persisted results.
-Boolean {term}`cell key` and {term}`feat_key` columns define the exact rows used by an operation.
+A Boolean {term}`cell key` selects cells, while an immutable {term}`feature selection` artifact selects assay features.
+Feature producers publish plain labels such as `hvgs`; consumers accept either that exact label or its returned {py:class}`~scarf.ArtifactRef`.
 Filtering changes a selection rather than deleting counts.
 
 Persisted results are immutable {term}`artifacts <artifact>`.
@@ -54,8 +55,8 @@ Mount behavior is documented in {doc}`tutorials/remote_stores`; general layout i
 Start with `snapshot = ds.summary()`.
 It reports the workspace, default assay, resource budget, metadata column names, assay state, and complete or incomplete artifact inventory without exposing a store location.
 `active_cells` and each assay's `active_features` count the literal `I` columns.
-They do not follow another `cell_key` or `feat_key` selected in `AssayState`.
-Inspect and count those columns separately when evaluating a branch.
+They do not follow the feature selection recorded by a normalized artifact in `AssayState`.
+Resolve and inspect feature-selection artifacts separately when evaluating a branch.
 Use `snapshot.to_dict()` for a deterministic JSON-safe record.
 
 Before choosing the next operation:
@@ -80,7 +81,7 @@ Use the format-specific import guides for other inputs.
 Before the first mutating operation, make a short execution record containing:
 
 - the scientific question and unit of inference;
-- the selected cell and feature keys plus input artifact references;
+- the selected cell key, feature-selection reference, and other input artifact references;
 - the operations that will publish state, metadata columns, or other persisted results;
 - the alternatives and independent evidence that will be compared;
 - the criteria for selecting a branch, preserving uncertainty, or stopping.
@@ -190,8 +191,8 @@ Do not write arbitrary artifact groups directly.
 Classify the problem before retrying:
 
 - **Input or schema:** inspect the source format and verify assay, feature, and cell identifiers.
-- **State or provenance:** inspect the selected `AssayState`, explicit artifact status, selection keys, and lineage.
-  `ArtifactSelectionError.code` distinguishes missing, incomplete, or changed selection inputs.
+- **State or provenance:** inspect the selected `AssayState`, cell selection, feature-selection references, explicit artifact status, and lineage.
+  `ArtifactResolutionError.code` distinguishes missing, incomplete, or changed selection inputs.
   Do not consume incomplete artifacts.
 - **Resource or I/O:** inspect the configured memory budget, worker count, storage profile, and remote latency.
   If an RNA store fails to open, treat it as a missing or outdated count layout and rebuild or `repack_zarr` rather than retrying the analysis stage.
@@ -217,7 +218,7 @@ A layout can vary in orientation or spacing without representing different biolo
 A useful handoff reports:
 
 - the scientific question and unit of inference;
-- the store workspace, active cell and feature keys, and relevant artifact refs;
+- the store workspace, active cell key, resolved feature selections, and relevant artifact refs;
 - metadata roles and any confounding;
 - alternatives considered and the evidence used to compare them;
 - the selected result and why it is fit for the question;

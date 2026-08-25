@@ -6,7 +6,7 @@ from scipy.sparse import coo_matrix
 
 from ...assay import Assay
 from ...assay.normalization import reject_unknown_normalization_params
-from ...graph.state import resolve_stored_graph_input, validate_legacy_graph_selection
+from ...graph.state import resolve_graph_selection
 from ...matrix import ChunkedArray
 from ...metadata.arguments import (
     FateMappingArguments,
@@ -101,45 +101,56 @@ def _validate_assay_pseudotime(
     )
 
 
-def _stored_graph_input(
+def _resolve_feature_indices(
     store: Any,
-    from_assay: str,
-    cell_key: str,
-    feat_key: str,
-) -> tuple[str, object]:
-    graph_loc = store.get_latest_graph_loc(from_assay, cell_key, feat_key)
-    return graph_loc, resolve_stored_graph_input(store.zw, graph_loc)
+    assay: Assay,
+    features: ArtifactRef | str,
+) -> tuple[ArtifactRef, np.ndarray]:
+    feature_selection = store.resolve_features(assay.name, features)
+    selection_group = as_zarr_group(
+        store.zw[artifact_path(feature_selection)],
+        name=artifact_path(feature_selection),
+    )
+    values = np.asarray(
+        as_zarr_array(selection_group["values"], name="values")[:],
+        dtype=bool,
+    )
+    feature_indices = np.flatnonzero(values).astype(np.int64, copy=False)
+    if len(feature_indices) == 0:
+        raise ValueError("Feature selection contains no active features")
+    return feature_selection, feature_indices
 
 
 class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
     def get_diffusion_operator(
         self,
+        graph: ArtifactRef | None = None,
+        *,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        feat_key: str | None = None,
         t: int = 2,
-        *,
         cache_operator: bool = True,
         invalidate_cache: bool = False,
     ) -> coo_matrix:
         """Load or calculate the sparse MAGIC diffusion operator."""
         from ...neighbors.diffusion import diffusion_operator
 
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay,
-            cell_key,
-            feat_key,
+        selection = resolve_graph_selection(
+            self,
+            graph,
+            from_assay=from_assay,
+            cell_key=cell_key,
         )
-        graph_loc = self.get_latest_graph_loc(from_assay, cell_key, feat_key)
-        graph_input: object = resolve_stored_graph_input(self.zw, graph_loc)
+        graph_ref = selection.graph_ref
+        graph_loc = selection.graph_loc
         planned = plan_artifact(
             self.zw,
-            scope="assay",
-            assay=from_assay,
+            scope=graph_ref.scope,
+            assay=graph_ref.assay,
             kind="diffusion_operator",
             operation="get_diffusion_operator",
             parameters={"t": t},
-            inputs={"connectivity_map": graph_input},
+            inputs={"connectivity_map": graph_ref},
             execution_options={
                 "cache_operator": cache_operator,
                 "invalidate_cache": invalidate_cache,
@@ -169,29 +180,14 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         if self.zarr_mode != "r+" and not planned.reused:
             if cache_operator and not invalidate_cache and cached is not None:
                 return cast(coo_matrix, cached)
-            legacy_path = f"{graph_loc}/magic_{t}"
-            if not invalidate_cache and legacy_path in self.zw:
-                legacy = as_zarr_group(self.zw[legacy_path], name=legacy_path)
-                n_cells, _ = self._get_graph_ncells_k(graph_loc)
-                diff_op = coo_matrix(
-                    (
-                        np.asarray(as_zarr_array(legacy["data"], name="data")[:]),
-                        (
-                            np.asarray(as_zarr_array(legacy["row"], name="row")[:]),
-                            np.asarray(as_zarr_array(legacy["col"], name="col")[:]),
-                        ),
-                    ),
-                    shape=(n_cells, n_cells),
-                )
-            else:
-                graph = self.load_graph(
-                    from_assay=from_assay,
-                    cell_key=cell_key,
-                    feat_key=feat_key,
-                    symmetric=True,
-                    upper_only=False,
-                )
-                diff_op = diffusion_operator(graph, t)
+            graph_matrix = self.load_graph(
+                graph_ref,
+                from_assay=selection.from_assay,
+                cell_key=selection.cell_key,
+                symmetric=True,
+                upper_only=False,
+            )
+            diff_op = diffusion_operator(graph_matrix, t)
             if cache_operator:
                 self._cachedMagicOperator = diff_op
                 self._cachedMagicOperatorLoc = read_only_magic_loc  # type: ignore[assignment]
@@ -214,14 +210,14 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                     shape=(n_cells, n_cells),
                 )
         else:
-            graph = self.load_graph(
-                from_assay=from_assay,
-                cell_key=cell_key,
-                feat_key=feat_key,
+            graph_matrix = self.load_graph(
+                graph_ref,
+                from_assay=selection.from_assay,
+                cell_key=selection.cell_key,
                 symmetric=True,
                 upper_only=False,
             )
-            diff_op = diffusion_operator(graph, t)
+            diff_op = diffusion_operator(graph_matrix, t)
             shape = diff_op.data.shape
             store = start_artifact(self.zw, planned)
             for name, dtype in zip(
@@ -231,7 +227,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             ):
                 array = create_zarr_dataset(store, name, (1000000,), dtype, shape)
                 array[:] = getattr(diff_op, name)
-            store.attrs["n_cells"] = int(graph.shape[0])
+            store.attrs["n_cells"] = int(graph_matrix.shape[0])
             finish_artifact(store, planned)
 
         if cache_operator:
@@ -244,10 +240,11 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
     def get_imputed(
         self,
+        feature_name: str,
+        graph: ArtifactRef | None = None,
+        *,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        feature_name: str | None = None,
-        feat_key: str | None = None,
         t: int = 2,
         cache_operator: bool = True,
         invalidate_cache: bool = False,
@@ -257,9 +254,9 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
             cell_key: Cell key. Should be same as the one that was used in the desired graph. (Default value: 'I')
-            feature_name: Name of the feature to be imputed
-            feat_key: Feature key. Should be same as the one that was used in the desired graph. By default, the latest
-                       used feature for the given assay will be used.
+            feature_name: Name of the feature to be imputed.
+            graph: Connectivity-map or integrated-graph artifact. The assay's
+                current connectivity map is used when omitted.
             t: Same as the t parameter in MAGIC. Higher values lead to larger diffusion of values. Too large values
                can slow down the algorithm and cause over-smoothening. (Default value: 2)
             cache_operator: Whether to keep the diffusion operator in memory after the method returns. Can be useful
@@ -271,21 +268,21 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
         """
 
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay, cell_key, feat_key
-        )
-        if feature_name is None:
-            raise ValueError(
-                "ERROR: Please provide name for the feature to be imputed. It can, for example, "
-                "be a gene name."
-            )
-        data = self.get_cell_vals(
-            from_assay=from_assay, cell_key=cell_key, k=feature_name
-        )
-        diff_op = self.get_diffusion_operator(
+        selection = resolve_graph_selection(
+            self,
+            graph,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
+        )
+        data = self.get_cell_vals(
+            from_assay=selection.from_assay,
+            cell_key=selection.cell_key,
+            k=feature_name,
+        )
+        diff_op = self.get_diffusion_operator(
+            selection.graph_ref,
+            from_assay=selection.from_assay,
+            cell_key=selection.cell_key,
             t=t,
             cache_operator=cache_operator,
             invalidate_cache=invalidate_cache,
@@ -294,10 +291,11 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
     def run_pseudotime_scoring(
         self,
+        graph: ArtifactRef | None = None,
+        *,
         from_assay: str | None = None,
         cell_key: str | None = None,
         subset_cell_key: str | None = None,
-        feat_key: str | None = None,
         n_singular_vals: int = 30,
         source_sink_key: str | None = None,
         sources: list[Any] | None = None,
@@ -319,8 +317,8 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
             cell_key: Cell key. Should be same as the one that was used in the desired graph. (Default value: 'I')
             subset_cell_key: Cell key for the subset of cells for which pseudotime scoring is to be performed.
-            feat_key: Feature key. Should be same as the one that was used in the desired graph. By default, the latest
-                        used feature for the given assay will be used.
+            graph: Connectivity-map or integrated-graph artifact. The assay's
+                current connectivity map is used when omitted.
             n_singular_vals: Number of the smallest singular values to save.
             source_sink_key: Cell metadata column containing source and sink
                 group labels. Required with ``sources`` or ``sinks`` and omitted
@@ -343,9 +341,15 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             Pseudotime values, validity mask, and their saved metadata keys.
         """
 
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay, cell_key, feat_key
+        graph_selection = resolve_graph_selection(
+            self,
+            graph,
+            from_assay=from_assay,
+            cell_key=cell_key,
         )
+        from_assay = graph_selection.from_assay
+        cell_key = graph_selection.cell_key
+        graph_ref = graph_selection.graph_ref
         if subset_cell_key is None:
             subset_cell_key = cell_key
             cell_idx = self.cells.fetch(subset_cell_key, key=cell_key)
@@ -356,42 +360,28 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
         logger.info(
             f"Pseudotime scoring: loading graph "
-            f"({from_assay}, cell_key={cell_key}, feat_key={feat_key})"
+            f"({from_assay}, cell_key={cell_key}, graph={graph_ref.artifact_id})"
         )
-        graph_loc, graph_input = _stored_graph_input(
-            self,
-            from_assay,
-            cell_key,
-            feat_key,
-        )
-        if not isinstance(graph_input, ArtifactRef):
-            validate_legacy_graph_selection(
-                self,
-                graph_loc,
-                from_assay,
-                cell_key,
-                feat_key,
-            )
-        graph = self.load_graph(
+        graph_matrix = self.load_graph(
+            graph_ref,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
             symmetric=True,
             upper_only=False,
         )
         if cell_idx.shape[0] != cell_idx.sum():
-            graph = graph[cell_idx][:, cell_idx]
+            graph_matrix = graph_matrix[cell_idx][:, cell_idx]
 
-        if graph.shape[0] == 0:
+        if graph_matrix.shape[0] == 0:
             raise ValueError("No cells were selected for pseudotime scoring")
         parent_cell_indices = self.cells.active_index(cell_key)
         selected_cell_indices = parent_cell_indices[np.asarray(cell_idx, dtype=bool)]
         retained_mask, component_sizes = _select_pseudotime_component_impl(
-            graph,
+            graph_matrix,
             selected_cell_indices,
             component_policy,
         )
-        retained_graph = graph[retained_mask][:, retained_mask].tocsr()
+        retained_graph = graph_matrix[retained_mask][:, retained_mask].tocsr()
         if len(component_sizes) > 1:
             logger.warning(
                 f"Selected graph components have sizes {component_sizes}. "
@@ -431,7 +421,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         if ss_vec is not None:
             full_source_sink = _validate_source_sink_vector_impl(
                 ss_vec,
-                graph.shape[0],
+                graph_matrix.shape[0],
                 "ss_vec",
             )
             source_sink_input: object = full_source_sink
@@ -482,17 +472,16 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 cell_key=cell_key,
             )
 
-        graph_selection = self._ensure_cell_selection(cell_key)
-        if isinstance(graph_input, ArtifactRef):
-            stored_selection = self._graph_cell_selection(graph_input)
-            if not self._selection_artifacts_match(
-                stored_selection,
-                graph_selection,
-            ):
-                raise ValueError("cell_key does not match the graph cell selection")
+        current_cell_selection = self._ensure_cell_selection(cell_key)
+        stored_selection = self._graph_cell_selection(graph_ref)
+        if not self._selection_artifacts_match(
+            stored_selection,
+            current_cell_selection,
+        ):
+            raise ValueError("cell_key does not match the graph cell selection")
         result_selection = self._ensure_cell_selection(subset_cell_key)
         arguments = PseudotimeScoringArguments(
-            connectivity_map=graph_input,
+            connectivity_map=graph_ref,
             source_sink=source_sink_input,
             cell_selection=result_selection,
             n_singular_vals=n_singular_vals,
@@ -504,20 +493,17 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             from_assay=from_assay,
             cell_key=cell_key,
             subset_cell_key=subset_cell_key,
-            feat_key=feat_key,
             label=label,
             invalidate_cache=invalidate_cache,
         )
         record = arguments.to_record()
-        artifact_scope = (
-            graph_input.scope if isinstance(graph_input, ArtifactRef) else "assay"
-        )
+        artifact_scope = graph_ref.scope
         planned = plan_cell_data_artifact(
             self.zw,
             scope=artifact_scope,
             assay=(
-                graph_input.assay
-                if isinstance(graph_input, ArtifactRef) and graph_input.scope == "assay"
+                graph_ref.assay
+                if graph_ref.scope == "assay"
                 else from_assay
                 if artifact_scope == "assay"
                 else None
@@ -529,8 +515,8 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             execution_options=record.execution_options,
             cell_selection=result_selection,
             arrays={
-                "pseudotime": ((graph.shape[0],), "f"),
-                "valid": ((graph.shape[0],), "b"),
+                "pseudotime": ((graph_matrix.shape[0],), "f"),
+                "valid": ((graph_matrix.shape[0],), "b"),
             },
             invalidate_cache=invalidate_cache,
         )
@@ -588,7 +574,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
                 assay=from_assay,
                 graph_cell_key=cell_key,
                 result_cell_key=subset_cell_key,
-                feature_key=feat_key,
+                graph=graph_ref,
                 values=values,
                 valid=valid,
             )
@@ -620,7 +606,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             if not np.isfinite(retained_ptime).all():
                 raise ValueError("Pseudotime normalization produced non-finite values")
 
-        ptime = np.full(graph.shape[0], np.nan, dtype=float)
+        ptime = np.full(graph_matrix.shape[0], np.nan, dtype=float)
         ptime[retained_mask] = retained_ptime
         write_cell_data_artifact(
             self.zw,
@@ -635,10 +621,11 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
 
     def run_fate_mapping(
         self,
+        graph: ArtifactRef | None = None,
+        *,
         from_assay: str | None = None,
         cell_key: str | None = None,
         subset_cell_key: str | None = None,
-        feat_key: str | None = None,
         pseudotime_key: str | None = None,
         sink_key: str | None = None,
         sinks: list[Any] | None = None,
@@ -656,7 +643,8 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             subset_cell_key: Cell key restricting the graph for this calculation.
                              Use the pseudotime validity key when unscored cells
                              contain non-finite pseudotime.
-            feat_key: Feature key used to create the neighborhood graph.
+            graph: Connectivity-map or integrated-graph artifact. The assay's
+                current connectivity map is used when omitted.
             pseudotime_key: Numeric cell metadata column containing pseudotime.
             sink_key: Cell metadata column containing the sink labels.
             sinks: Ordered sink labels. Every matching selected cell becomes a
@@ -685,11 +673,15 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
         if not label:
             raise ValueError("label must not be empty")
 
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay,
-            cell_key,
-            feat_key,
+        graph_selection = resolve_graph_selection(
+            self,
+            graph,
+            from_assay=from_assay,
+            cell_key=cell_key,
         )
+        from_assay = graph_selection.from_assay
+        cell_key = graph_selection.cell_key
+        graph_ref = graph_selection.graph_ref
         if subset_cell_key is None:
             subset_cell_key = cell_key
         cell_idx = np.asarray(self.cells.fetch(subset_cell_key, key=cell_key))
@@ -707,52 +699,28 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             pseudotime_key,
         )
         sink_values = np.asarray(assay.cells.fetch(sink_key, key=subset_cell_key))
-        storage_backed = all(
-            hasattr(self, name)
-            for name in (
-                "zw",
-                "get_latest_graph_loc",
-                "_ensure_cell_selection",
-                "_resolve_cell_data_provenance_input",
-            )
+        pseudotime_input = self._resolve_cell_data_provenance_input(
+            pseudotime_key,
+            cell_key=subset_cell_key,
         )
-        if storage_backed:
-            graph_loc, graph_input = _stored_graph_input(
-                self,
-                from_assay,
-                cell_key,
-                feat_key,
-            )
-            if not isinstance(graph_input, ArtifactRef):
-                validate_legacy_graph_selection(
-                    self,
-                    graph_loc,
-                    from_assay,
-                    cell_key,
-                    feat_key,
-                )
-            pseudotime_input = self._resolve_cell_data_provenance_input(
-                pseudotime_key,
-                cell_key=subset_cell_key,
-            )
-            sink_input = self._resolve_cell_data_provenance_input(
-                sink_key,
-                cell_key=subset_cell_key,
-            )
+        sink_input = self._resolve_cell_data_provenance_input(
+            sink_key,
+            cell_key=subset_cell_key,
+        )
 
         logger.info(
             f"Fate mapping: loading graph "
-            f"({from_assay}, cell_key={cell_key}, feat_key={feat_key})"
+            f"({from_assay}, cell_key={cell_key}, graph={graph_ref.artifact_id})"
         )
-        graph = self.load_graph(
+        graph_matrix = self.load_graph(
+            graph_ref,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
             symmetric=True,
             upper_only=False,
         )
         if cell_idx.shape[0] != int(cell_idx.sum()):
-            graph = graph[cell_idx][:, cell_idx].tocsr()
+            graph_matrix = graph_matrix[cell_idx][:, cell_idx].tocsr()
 
         sink_labels = tuple(sinks)
         output_base = self._col_renamer(from_assay, subset_cell_key, label)
@@ -760,78 +728,64 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             f"{output_base}_{token}" for token in _make_sink_tokens_impl(sink_labels)
         )
         validity_key = f"{output_base}__valid"
-        planned = None
         preserved_displays: dict[str, dict[str, Any] | None] = {}
-        if storage_backed:
-            graph_selection = self._ensure_cell_selection(cell_key)
-            if isinstance(graph_input, ArtifactRef):
-                stored_selection = self._graph_cell_selection(graph_input)
-                if not self._selection_artifacts_match(
-                    stored_selection,
-                    graph_selection,
-                ):
-                    raise ValueError("cell_key does not match the graph cell selection")
-            result_selection = self._ensure_cell_selection(subset_cell_key)
-            arguments = FateMappingArguments(
-                connectivity_map=graph_input,
-                pseudotime=pseudotime_input,
-                sink_labels=sink_input,
-                cell_selection=result_selection,
-                sinks=sink_labels,
-                beta=beta,
-                solver_tol=solver_tol,
-                max_iterations=max_iterations,
-                from_assay=from_assay,
-                cell_key=cell_key,
-                subset_cell_key=subset_cell_key,
-                feat_key=feat_key,
-                pseudotime_key=pseudotime_key,
-                sink_key=sink_key,
-                label=label,
-                invalidate_cache=invalidate_cache,
-            )
-            record = arguments.to_record()
-            artifact_scope = (
-                graph_input.scope if isinstance(graph_input, ArtifactRef) else "assay"
-            )
-            planned = plan_cell_data_artifact(
-                self.zw,
-                scope=artifact_scope,
-                assay=(
-                    graph_input.assay
-                    if isinstance(graph_input, ArtifactRef)
-                    and graph_input.scope == "assay"
-                    else from_assay
-                    if artifact_scope == "assay"
-                    else None
+        current_selection = self._ensure_cell_selection(cell_key)
+        stored_selection = self._graph_cell_selection(graph_ref)
+        if not self._selection_artifacts_match(
+            stored_selection,
+            current_selection,
+        ):
+            raise ValueError("cell_key does not match the graph cell selection")
+        result_selection = self._ensure_cell_selection(subset_cell_key)
+        arguments = FateMappingArguments(
+            connectivity_map=graph_ref,
+            pseudotime=pseudotime_input,
+            sink_labels=sink_input,
+            cell_selection=result_selection,
+            sinks=sink_labels,
+            beta=beta,
+            solver_tol=solver_tol,
+            max_iterations=max_iterations,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            subset_cell_key=subset_cell_key,
+            pseudotime_key=pseudotime_key,
+            sink_key=sink_key,
+            label=label,
+            invalidate_cache=invalidate_cache,
+        )
+        record = arguments.to_record()
+        planned = plan_cell_data_artifact(
+            self.zw,
+            scope=graph_ref.scope,
+            assay=graph_ref.assay,
+            kind=arguments.artifact_kind,
+            operation=arguments.operation,
+            parameters=record.parameters,
+            inputs=record.inputs,
+            execution_options=record.execution_options,
+            cell_selection=result_selection,
+            arrays={
+                "probabilities": (
+                    (graph_matrix.shape[0], len(sink_labels)),
+                    "f",
                 ),
-                kind=arguments.artifact_kind,
-                operation=arguments.operation,
-                parameters=record.parameters,
-                inputs=record.inputs,
-                execution_options=record.execution_options,
-                cell_selection=result_selection,
-                arrays={
-                    "probabilities": (
-                        (graph.shape[0], len(sink_labels)),
-                        "f",
-                    ),
-                    "valid": ((graph.shape[0],), "b"),
-                },
-                invalidate_cache=invalidate_cache,
-            )
-            preserved_displays = {
-                column: column_display(self.zw, column)
-                for column in (*fate_keys, validity_key)
-            }
-        if planned is not None and planned.reused:
+                "valid": ((graph_matrix.shape[0],), "b"),
+            },
+            invalidate_cache=invalidate_cache,
+        )
+        preserved_displays = {
+            column: column_display(self.zw, column)
+            for column in (*fate_keys, validity_key)
+        }
+        if planned.reused:
             artifact_group = reused_artifact_group(self.zw, planned)
             probabilities = artifact_values(artifact_group, "probabilities")
             valid = artifact_values(artifact_group, "valid").astype(bool)
         else:
             probabilities, valid, computed_sink_labels = (
                 _compute_fate_probabilities_impl(
-                    graph,
+                    graph_matrix,
                     pseudotime,
                     sink_values,
                     sinks,
@@ -843,15 +797,14 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             )
             if computed_sink_labels != sink_labels:
                 raise ValueError("Computed fate labels do not match requested sinks")
-            if planned is not None:
-                write_cell_data_artifact(
-                    self.zw,
-                    planned,
-                    {
-                        "probabilities": probabilities,
-                        "valid": valid,
-                    },
-                )
+            write_cell_data_artifact(
+                self.zw,
+                planned,
+                {
+                    "probabilities": probabilities,
+                    "valid": valid,
+                },
+            )
 
         logger.debug("Fate mapping: saving probabilities")
         for index, fate_key in enumerate(fate_keys):
@@ -868,25 +821,24 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             key=subset_cell_key,
             overwrite=True,
         )
-        if planned is not None:
-            for index, fate_key in enumerate(fate_keys):
-                link_cell_data_column(
-                    self.zw,
-                    fate_key,
-                    planned.ref,
-                    value_name="probabilities",
-                    value_index=index,
-                    default_display=continuous_display(probabilities[:, index]),
-                    preserved_display=preserved_displays[fate_key],
-                )
+        for index, fate_key in enumerate(fate_keys):
             link_cell_data_column(
                 self.zw,
-                validity_key,
+                fate_key,
                 planned.ref,
-                value_name="valid",
-                default_display=categorical_display(valid),
-                preserved_display=preserved_displays[validity_key],
+                value_name="probabilities",
+                value_index=index,
+                default_display=continuous_display(probabilities[:, index]),
+                preserved_display=preserved_displays[fate_key],
             )
+        link_cell_data_column(
+            self.zw,
+            validity_key,
+            planned.ref,
+            value_name="valid",
+            default_display=categorical_display(valid),
+            preserved_display=preserved_displays[validity_key],
+        )
         logger.info(
             f"Stored fate probabilities for {len(fate_keys)} sinks "
             f"across {int(valid.sum())}/{len(valid)} cells"
@@ -898,7 +850,7 @@ class _TrajectoryOperationsMixin(_TrajectoryOperationsBase):
             assay=from_assay,
             graph_cell_key=cell_key,
             result_cell_key=subset_cell_key,
-            feature_key=feat_key,
+            graph=graph_ref,
             pseudotime_key=pseudotime_key,
             sink_key=sink_key,
             values=probabilities,
@@ -911,7 +863,8 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         self,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        feat_key: str | None = None,
+        *,
+        features: ArtifactRef | str,
         pseudotime_key: str | None = None,
         min_cells: int = 10,
         gene_batch_size: int | None = None,
@@ -923,7 +876,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         Args:
             from_assay: Name of the assay to use. The default assay is used when omitted.
             cell_key: Boolean cell metadata column selecting cells.
-            feat_key: Boolean feature metadata column selecting features.
+            features: Feature-selection artifact or exact published label.
             pseudotime_key: Numeric cell metadata column containing pseudotime values.
             min_cells: Minimum number of expressing cells required for a feature.
             gene_batch_size: Number of features loaded per batch. When None,
@@ -948,9 +901,16 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             )
         if cell_key is None:
             cell_key = "I"
-        if feat_key is None:
-            feat_key = "I"
         assay = self._get_assay(from_assay)
+        feature_selection, feature_index = _resolve_feature_indices(
+            self,
+            assay,
+            features,
+        )
+        cell_index = np.asarray(
+            assay.cells.active_index(cell_key),
+            dtype=np.int64,
+        )
         ptime = _validate_assay_pseudotime(
             assay,
             cell_key,
@@ -964,8 +924,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
                 False,
             ),
         }
-        n_cells = len(assay.cells.active_index(cell_key))
-        feature_index = assay.feats.active_index(feat_key)
+        n_cells = len(cell_index)
         n_feats = len(feature_index)
         logger.info(
             f"Pseudotime markers: correlating features "
@@ -975,185 +934,84 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         correlation_key = f"{cell_key}__{pseudotime_key}__r"
         p_value_key = f"{cell_key}__{pseudotime_key}__p"
         p_value_adjusted_key = f"{cell_key}__{pseudotime_key}__padj"
-        storage_backed = all(
-            hasattr(self, name)
-            for name in (
-                "zw",
-                "_ensure_cell_selection",
-                "_resolve_cell_data_provenance_input",
-            )
-        ) and hasattr(assay, "z")
-        planned = None
-        legacy_planned = None
-        preserved_displays: dict[str, dict[str, Any] | None] = {}
-        if storage_backed:
-            cell_selection = self._ensure_cell_selection(cell_key)
-            pseudotime_input = self._resolve_cell_data_provenance_input(
-                pseudotime_key,
-                cell_key=cell_key,
-            )
-            feature_values = np.asarray(
-                assay.feats.fetch_all(feat_key),
-                dtype=bool,
-            )
-            feature_selection = self._resolve_selection_input(
-                metadata_group=as_zarr_group(
-                    assay.z["featureData"],
-                    name="featureData",
-                ),
-                column=feat_key,
-                values=feature_values,
-                row_ids=np.asarray(assay.feats.fetch_all("ids")),
-                scope="assay",
-                kind="feature_selection",
-                assay=assay.name,
-                invalidate_cache=False,
-            )
-            arguments = PseudotimeMarkerArguments(
-                cell_selection=cell_selection,
-                feature_selection=feature_selection,
-                pseudotime=pseudotime_input,
-                normalization=resolved_norm_params,
-                normalization_method=callable_identity(assay.normMethod),
-                size_factor=getattr(assay, "sf", None),
-                association_method="pearson",
-                p_value_method="student_t",
-                adjustment_method="fdr_bh",
-                adjustment_scope="tested_features",
-                min_cells=min_cells,
-                from_assay=assay.name,
-                cell_key=cell_key,
-                feat_key=feat_key,
-                pseudotime_key=pseudotime_key,
-                gene_batch_size=gene_batch_size,
-                nthreads=int(
-                    getattr(
-                        assay,
-                        "nthreads",
-                        getattr(self, "nthreads", 1),
-                    )
-                ),
-                invalidate_cache=invalidate_cache,
-            )
-            record = arguments.to_record()
-            planned = arguments.plan(
-                self.zw,
-                scope="assay",
-                assay=assay.name,
-                invalidate_cache=invalidate_cache,
-                required_arrays=(
-                    ArrayRequirement(
-                        "r_value",
-                        shape=(n_feats,),
-                        dtype_kind="f",
-                    ),
-                    ArrayRequirement(
-                        "p_value",
-                        shape=(n_feats,),
-                        dtype_kind="f",
-                    ),
-                    ArrayRequirement(
-                        "p_value_adjusted",
-                        shape=(n_feats,),
-                        dtype_kind="f",
-                    ),
-                ),
-            )
-            if not planned.reused and not invalidate_cache:
-                legacy_parameters = dict(record.parameters)
-                for field_name in (
-                    "association_method",
-                    "p_value_method",
-                    "adjustment_method",
-                    "adjustment_scope",
-                ):
-                    legacy_parameters.pop(field_name)
-                legacy_planned = plan_artifact(
-                    self.zw,
-                    scope="assay",
-                    assay=assay.name,
-                    kind=arguments.artifact_kind,
-                    operation=arguments.operation,
-                    parameters=legacy_parameters,
-                    inputs=record.inputs,
-                    execution_options=record.execution_options,
-                    required_arrays=(
-                        ArrayRequirement(
-                            "r_value",
-                            shape=(n_feats,),
-                            dtype_kind="f",
-                        ),
-                        ArrayRequirement(
-                            "p_value",
-                            shape=(n_feats,),
-                            dtype_kind="f",
-                        ),
-                    ),
+        cell_selection = self._ensure_cell_selection(cell_key)
+        pseudotime_input = self._resolve_cell_data_provenance_input(
+            pseudotime_key,
+            cell_key=cell_key,
+        )
+        arguments = PseudotimeMarkerArguments(
+            cell_selection=cell_selection,
+            feature_selection=feature_selection,
+            pseudotime=pseudotime_input,
+            normalization=resolved_norm_params,
+            normalization_method=callable_identity(assay.normMethod),
+            size_factor=getattr(assay, "sf", None),
+            association_method="pearson",
+            p_value_method="student_t",
+            adjustment_method="fdr_bh",
+            adjustment_scope="tested_features",
+            min_cells=min_cells,
+            from_assay=assay.name,
+            cell_key=cell_key,
+            pseudotime_key=pseudotime_key,
+            gene_batch_size=gene_batch_size,
+            nthreads=int(
+                getattr(
+                    assay,
+                    "nthreads",
+                    getattr(self, "nthreads", 1),
                 )
-                if not legacy_planned.reused:
-                    legacy_planned = None
-            else:
-                legacy_planned = None
-            preserved_displays = {
-                correlation_key: feature_column_display(
-                    assay.z,
-                    correlation_key,
-                ),
-                p_value_key: feature_column_display(
-                    assay.z,
-                    p_value_key,
-                ),
-                p_value_adjusted_key: feature_column_display(
-                    assay.z,
-                    p_value_adjusted_key,
-                ),
-            }
-        if planned is not None and planned.reused:
+            ),
+            invalidate_cache=invalidate_cache,
+        )
+        planned = arguments.plan(
+            self.zw,
+            scope="assay",
+            assay=assay.name,
+            invalidate_cache=invalidate_cache,
+            required_arrays=tuple(
+                ArrayRequirement(
+                    name,
+                    shape=(assay.feats.N,),
+                    dtype_kind="f",
+                )
+                for name in ("r_value", "p_value", "p_value_adjusted")
+            ),
+        )
+        preserved_displays = {
+            correlation_key: feature_column_display(assay.z, correlation_key),
+            p_value_key: feature_column_display(assay.z, p_value_key),
+            p_value_adjusted_key: feature_column_display(
+                assay.z,
+                p_value_adjusted_key,
+            ),
+        }
+        if planned.reused:
             artifact_group = reused_artifact_group(self.zw, planned)
-            r_values = artifact_values(artifact_group, "r_value")
-            p_values = artifact_values(artifact_group, "p_value")
-            p_values_adjusted = artifact_values(
+            full_r_values = artifact_values(artifact_group, "r_value")
+            full_p_values = artifact_values(artifact_group, "p_value")
+            full_p_values_adjusted = artifact_values(
                 artifact_group,
                 "p_value_adjusted",
             )
             markers = pd.DataFrame(
                 {
-                    "r_value": r_values,
-                    "p_value": p_values,
-                    "p_value_adjusted": p_values_adjusted,
+                    "r_value": full_r_values[feature_index],
+                    "p_value": full_p_values[feature_index],
+                    "p_value_adjusted": full_p_values_adjusted[feature_index],
                 },
                 index=feature_index,
             )
-        elif legacy_planned is not None and legacy_planned.reused:
-            from ...features.markers.correction import _bh_adjusted_pvalues
-
-            artifact_group = reused_artifact_group(self.zw, legacy_planned)
-            r_values = artifact_values(artifact_group, "r_value")
-            p_values = artifact_values(artifact_group, "p_value")
-            p_values_adjusted = _bh_adjusted_pvalues(p_values)
-            markers = pd.DataFrame(
-                {
-                    "r_value": r_values,
-                    "p_value": p_values,
-                    "p_value_adjusted": p_values_adjusted,
-                },
-                index=feature_index,
-            )
-            if planned is not None and getattr(self, "zarr_mode", "r+") == "r+":
-                write_cell_data_artifact(
-                    self.zw,
-                    planned,
-                    {
-                        "r_value": r_values,
-                        "p_value": p_values,
-                        "p_value_adjusted": p_values_adjusted,
-                    },
-                )
         else:
+            if getattr(self, "zarr_mode", "r+") != "r+":
+                raise ValueError(
+                    "Pseudotime marker search requires a DataStore opened with "
+                    "zarr_mode='r+' when no reusable artifact exists"
+                )
             markers = find_markers_by_regression(
                 assay=assay,
-                cell_key=cell_key,
-                feat_key=feat_key,
+                cell_idx=cell_index,
+                feat_idx=feature_index,
                 regressor=ptime,
                 min_cells=min_cells,
                 batch_size=gene_batch_size,
@@ -1162,74 +1020,64 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             markers = markers.reindex(feature_index)
             if markers["r_value"].isna().any():
                 raise ValueError(
-                    "Pseudotime marker results are not aligned to feat_key"
+                    "Pseudotime marker results are not aligned to feature selection"
                 )
             r_values = np.asarray(markers["r_value"].values)
             p_values = np.asarray(markers["p_value"].values)
             p_values_adjusted = np.asarray(markers["p_value_adjusted"].values)
-            if planned is not None and getattr(self, "zarr_mode", "r+") == "r+":
-                write_cell_data_artifact(
-                    self.zw,
-                    planned,
-                    {
-                        "r_value": r_values,
-                        "p_value": p_values,
-                        "p_value_adjusted": p_values_adjusted,
-                    },
-                )
-        publish_metadata = (
-            not storage_backed
-            or getattr(
-                self,
-                "zarr_mode",
-                "r+",
+            full_r_values = np.full(assay.feats.N, np.nan, dtype=np.float64)
+            full_p_values = np.full(assay.feats.N, np.nan, dtype=np.float64)
+            full_p_values_adjusted = np.full(
+                assay.feats.N,
+                np.nan,
+                dtype=np.float64,
             )
-            == "r+"
-        )
+            full_r_values[feature_index] = r_values
+            full_p_values[feature_index] = p_values
+            full_p_values_adjusted[feature_index] = p_values_adjusted
+            write_cell_data_artifact(
+                self.zw,
+                planned,
+                {
+                    "r_value": full_r_values,
+                    "p_value": full_p_values,
+                    "p_value_adjusted": full_p_values_adjusted,
+                },
+            )
+        publish_metadata = getattr(self, "zarr_mode", "r+") == "r+"
         if publish_metadata:
             logger.debug("Pseudotime markers: saving marker scores")
             assay.feats.insert(
                 correlation_key,
-                r_values,
-                key=feat_key,
+                full_r_values,
                 overwrite=True,
             )
             assay.feats.insert(
                 p_value_key,
-                p_values,
-                key=feat_key,
+                full_p_values,
                 overwrite=True,
             )
             assay.feats.insert(
                 p_value_adjusted_key,
-                p_values_adjusted,
-                key=feat_key,
+                full_p_values_adjusted,
                 overwrite=True,
             )
-            if planned is not None:
-                link_feature_data_column(
-                    assay.z,
-                    correlation_key,
-                    planned.ref,
-                    value_name="r_value",
-                    default_display=continuous_display(r_values),
-                    preserved_display=preserved_displays[correlation_key],
-                )
-                link_feature_data_column(
-                    assay.z,
-                    p_value_key,
-                    planned.ref,
-                    value_name="p_value",
-                    default_display=continuous_display(p_values),
-                    preserved_display=preserved_displays[p_value_key],
-                )
-                link_feature_data_column(
-                    assay.z,
+            for key, value_name, values in (
+                (correlation_key, "r_value", full_r_values),
+                (p_value_key, "p_value", full_p_values),
+                (
                     p_value_adjusted_key,
+                    "p_value_adjusted",
+                    full_p_values_adjusted,
+                ),
+            ):
+                link_feature_data_column(
+                    assay.z,
+                    key,
                     planned.ref,
-                    value_name="p_value_adjusted",
-                    default_display=continuous_display(p_values_adjusted),
-                    preserved_display=preserved_displays[p_value_adjusted_key],
+                    value_name=value_name,
+                    default_display=continuous_display(values),
+                    preserved_display=preserved_displays[key],
                 )
         table = markers.rename_axis("feature_index").reset_index()
         feature_names = np.asarray(assay.feats.fetch_all("names"), dtype=object)
@@ -1251,7 +1099,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             p_value_key=p_value_key,
             assay=assay.name,
             cell_key=cell_key,
-            feature_key=feat_key,
+            feature_selection=feature_selection,
             pseudotime_key=pseudotime_key,
         )
 
@@ -1259,7 +1107,8 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         self,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        feat_key: str | None = None,
+        *,
+        features: ArtifactRef | str,
         pseudotime_key: str | None = None,
         cluster_label: str | None = None,
         min_exp: float = 1e-3,
@@ -1280,7 +1129,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         Args:
             from_assay: Name of the assay to use. The default assay is used when omitted.
             cell_key: Boolean cell metadata column selecting cells.
-            feat_key: Boolean feature metadata column selecting features.
+            features: Feature-selection artifact or exact published label.
             pseudotime_key: Required numeric cell metadata column containing
                 pseudotime values.
             cluster_label: Required new or existing feature metadata column where
@@ -1308,13 +1157,19 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             norm_params,
             caller="run_pseudotime_aggregation",
         )
-        feat_key = feat_key or "I"
-        from_assay, cell_key, _ = self._get_latest_keys(
-            from_assay,
-            cell_key,
-            feat_key,
-        )
         assay = self._get_assay(from_assay)
+        from_assay = assay.name
+        if cell_key is None:
+            cell_key = self._get_latest_cell_key(from_assay)
+        feature_selection, feature_indices = _resolve_feature_indices(
+            self,
+            assay,
+            features,
+        )
+        cell_indices = np.asarray(
+            assay.cells.active_index(cell_key),
+            dtype=np.int64,
+        )
 
         if pseudotime_key is None:
             raise ValueError(
@@ -1334,7 +1189,11 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         ):
             raise TypeError("nan_cluster_value must be an integer")
         nan_cluster_value = int(nan_cluster_value)
-        _validate_assay_pseudotime(assay, cell_key, pseudotime_key)
+        cell_ordering = _validate_assay_pseudotime(
+            assay,
+            cell_key,
+            pseudotime_key,
+        )
         resolved_norm_params = {
             **norm_params,
             "log_transform": norm_params.get("log_transform", False),
@@ -1346,16 +1205,16 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         resolved_ann_params = {} if ann_params is None else dict(ann_params)
         (
             cell_ordering,
-            _cell_indices,
+            cell_indices,
             feature_indices,
             effective_window,
             effective_bins,
             input_fingerprints,
             _legacy_parameters,
         ) = assay._prepare_aggregated_ordering(
-            cell_key,
-            feat_key,
-            pseudotime_key,
+            cell_indices,
+            feature_indices,
+            cell_ordering,
             min_exp=min_exp,
             window_size=window_size,
             chunk_size=chunk_size,
@@ -1367,23 +1226,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
         pseudotime_input = self._resolve_cell_data_provenance_input(
             pseudotime_key,
             cell_key=cell_key,
-        )
-        feature_values = np.asarray(
-            assay.feats.fetch_all(feat_key),
-            dtype=bool,
-        )
-        feature_selection = self._resolve_selection_input(
-            metadata_group=as_zarr_group(
-                assay.z["featureData"],
-                name="featureData",
-            ),
-            column=feat_key,
-            values=feature_values,
-            row_ids=np.asarray(assay.feats.fetch_all("ids")),
-            scope="assay",
-            kind="feature_selection",
-            assay=assay.name,
-            invalidate_cache=False,
         )
         arguments = PseudotimeAggregationArguments(
             cell_selection=cell_selection,
@@ -1403,7 +1245,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             nan_cluster_value=nan_cluster_value,
             from_assay=assay.name,
             cell_key=cell_key,
-            feat_key=feat_key,
             pseudotime_key=pseudotime_key,
             cluster_label=cluster_label,
             batch_size=batch_size,
@@ -1493,8 +1334,7 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             full_data, stored_feature_indices, valid_features = (
                 assay._write_aggregated_ordering_group(
                     aggregation_group,
-                    cell_key=cell_key,
-                    feat_key=feat_key,
+                    cell_idx=cell_indices,
                     cell_ordering=cell_ordering,
                     feat_idx=feature_indices,
                     min_exp=min_exp,
@@ -1599,6 +1439,6 @@ class _TrajectoryFeatureOperationsMixin(_TrajectoryFeatureOperationsBase):
             ),
             assay=assay.name,
             cell_key=cell_key,
-            feature_key=feat_key,
+            feature_selection=feature_selection,
             pseudotime_key=pseudotime_key,
         )

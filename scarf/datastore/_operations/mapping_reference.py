@@ -5,9 +5,14 @@ import numpy as np
 
 from ...assay import RNAassay
 from ...graph.distances import validate_distance_provenance
-from ...graph.state import read_assay_state, validate_normalized_artifact_selection
+from ...graph.state import (
+    read_assay_state,
+    read_assay_state_document,
+    validate_normalized_artifact_selection,
+)
 from ...mapping.artifact import (
     MAPPING_REFERENCE_REBUILD_MESSAGE,
+    _selected_feature_ids,
     load_artifact_mapping_reference,
     write_artifact_mapping_reference,
 )
@@ -26,7 +31,6 @@ from ...storage.artifact_writer import (
 from ...storage.artifacts import (
     ArtifactRef,
     artifact_group,
-    artifact_path,
 )
 from ...storage.types import as_zarr_array
 
@@ -105,6 +109,7 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
         assay = self._get_assay(assay_name)
         if not isinstance(assay, RNAassay):
             raise TypeError("Mapping references currently support RNA assays only")
+        read_assay_state_document(self.zw, assay_name)
 
         neighbors_status = self._require_complete_artifact(
             neighbors,
@@ -229,21 +234,12 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
 
         normalized_execution = normalized_status.execution_options or {}
         cell_key = normalized_execution.get("cell_key")
-        feature_key = normalized_execution.get("feat_key")
-        if (
-            not isinstance(cell_key, str)
-            or not cell_key
-            or not isinstance(feature_key, str)
-            or not feature_key
-        ):
-            raise ValueError(
-                "Normalized artifact is missing its cell or feature selection key"
-            )
+        if not isinstance(cell_key, str) or not cell_key:
+            raise ValueError("Normalized artifact is missing its cell selection key")
         validate_normalized_artifact_selection(
             self.zw,
             normalized,
             cell_key,
-            feature_key,
         )
 
         ann_metric = (ann_status.parameters or {}).get("ann_metric")
@@ -280,10 +276,11 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
             ),
             loadings=loadings,
         )
-        feature_column = (
-            feature_key if feature_key == "I" else f"{cell_key}__{feature_key}"
+        feature_ids = _selected_feature_ids(
+            self.zw,
+            assay_name,
+            feature_selection,
         )
-        feature_ids = np.asarray(assay.feats.fetch("ids", key=feature_column))
         if len(feature_ids) != model.n_features:
             raise ValueError("Selected reference features do not match PCA loadings")
         selected_cell_count = len(self.cells.fetch("ids", key=cell_key))
@@ -336,14 +333,13 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
                     "Harmony correction dimensions do not match PCA loadings"
                 )
 
-        validate_distance_provenance(self.zw, artifact_path(neighbors))
+        validate_distance_provenance(self.zw, neighbors)
         distance_quantiles, distance_values = _distance_quantile_summary(distances)
         dataset_fingerprint = self._ensure_dataset_fingerprint(assay_name)
         metadata: dict[str, Any] = {
             "method": method,
             "assay": assay_name,
             "cell_key": cell_key,
-            "feature_key": feature_key,
             "selected_cell_count": selected_cell_count,
             "ann_metric": ann_metric,
             "normalization_parameters": dict(normalization_parameters),
@@ -434,13 +430,10 @@ class _MappingReferenceOperationsMixin(_MappingReferenceOperationsBase):
                 distance_values,
             )
             finish_artifact(group, planned)
-        previous = read_assay_state(self.zw, assay_name)
-        named = dict(previous.named_results) if previous is not None else {}
-        named["mapping_reference"] = planned.ref
         self._publish_current_artifact(
             neighbors,
             update_state=True,
-            named_results=named,
+            named_result_updates={"mapping_reference": planned.ref},
         )
         return load_artifact_mapping_reference(self, planned.ref)
 

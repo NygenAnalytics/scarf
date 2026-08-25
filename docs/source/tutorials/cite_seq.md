@@ -78,7 +78,8 @@ ds
 ```
 
 The summary lists both assays with their own feature counts, and the cell count reads as active followed by total in brackets.
-Every barcode is still active here because no filter has run yet, while the RNA feature count is already reduced: opening a store drops features detected in too few cells.
+Every barcode and feature is still active here because no filter has run yet.
+Opening computes feature detection statistics but does not filter the physical feature column `I`.
 Cell metadata is shared across assays: one row per cell, whichever assay wrote the column.
 
 ```{code-cell} ipython3
@@ -98,7 +99,7 @@ Because the key is shared, the ADT assay analyzes the same cells.
 These are the steps from {doc}`scrna_seq`, so the narrative here is brief.
 
 ```{code-cell} ipython3
-ds.mark_hvgs(
+hvg_ref = ds.mark_hvgs(
     min_cells=20,
     top_n=1000,
     min_mean=-3,
@@ -107,7 +108,7 @@ ds.mark_hvgs(
     show_plot=False,
 )
 
-ds.run_normalization(feat_key='hvgs')
+ds.run_normalization(features=hvg_ref)
 ds.run_pca(dims=15)
 ds.build_embedding_initialization()
 ds.build_ann_index()
@@ -148,7 +149,7 @@ Colouring by `RNA_nCounts` shows whether a dominant region aligns with low libra
 
 ## 3. Process the ADT assay
 
-ADT panels hold tens of antibodies rather than thousands of genes, which changes two things: there is no feature selection step, and control antibodies have to be removed by hand.
+ADT panels hold tens of antibodies rather than thousands of genes, so they usually need no variability model, while control antibodies still have to be removed explicitly.
 
 Scarf recognizes an assay named `ADT` as an `ADTassay`, which normalizes with a centred log ratio rather than the library-size scaling used for RNA.
 
@@ -165,12 +166,16 @@ adt_panel['is_control'] = adt_panel['names'].str.contains('control')
 adt_panel[adt_panel['is_control']]
 ```
 
-`update_key` takes a boolean array and marks features `False` as inactive, so pass the inverse of the control flag.
+Publish the non-control mask as an immutable feature-selection artifact:
 
 ```{code-cell} ipython3
-ds.ADT.feats.update_key(~adt_panel['is_control'].values, 'I')
+adt_features = ds.set_feature_selection(
+    from_assay='ADT',
+    mask=~adt_panel['is_control'].values,
+    label='adt_panel',
+)
 print(
-    f"Active ADT features: {int(ds.ADT.feats.fetch_all('I').sum())}"
+    f"Selected ADT features: {int(ds.ADT.feats.fetch_all('adt_panel').sum())}"
     f" of {len(adt_panel)}"
 )
 ```
@@ -179,11 +184,14 @@ Now build the ADT graph.
 Arguments differ from the RNA chain:
 
 - `from_assay='ADT'` targets the non-default assay on every step
-- `feat_key='I'` uses every active antibody, since there is no feature selection column
+- `features=adt_features` pins the exact non-control antibody selection
 - `run_custom_reduction` with an identity loading matrix keeps neighbours in the normalized antibody space
 
 ```{code-cell} ipython3
-normalized_adt = ds.run_normalization(from_assay='ADT', feat_key='I')
+normalized_adt = ds.run_normalization(
+    from_assay='ADT',
+    features=adt_features,
+)
 n_adt_features = int(ds.load_artifact(normalized_adt)['data'].shape[1])
 ds.run_custom_reduction(
     np.eye(n_adt_features, dtype=np.float64),
@@ -278,29 +286,29 @@ The {doc}`multimodal_diagnostics` guide evaluates those possibilities with norma
 Comparing clusters is descriptive.
 Integration goes further and produces a single graph, so one embedding and one set of clusters describe both modalities.
 
-`integrate_assays` takes the latest graph of each named assay, merges their edges, then prunes by shared nearest neighbors until each cell keeps exactly the shared input degree `nk`.
+`integrate_assays` captures each named assay's current connectivity-map reference once, merges their edges, then prunes by shared nearest neighbors until each cell keeps exactly the shared input degree `nk`.
 
 ```{code-cell} ipython3
-ds.integrate_assays(
+snn_graph = ds.integrate_assays(
     assays=['RNA', 'ADT'],
     label='RNA+ADT',
     method='snn',
 )
 ```
 
-The merged graph is stored under its `label`.
-Downstream steps reach it through `integrated_graph` instead of `from_assay`, and write columns using the same label as prefix.
+The merged graph is stored under its `label` and returned as an exact artifact reference.
+Pass it through `graph=` to downstream steps; output columns still use the integrated label as their prefix.
 
 ```{code-cell} ipython3
 ds.run_umap(
-    integrated_graph='RNA+ADT',
+    graph=snn_graph,
     n_epochs=250,
     spread=5,
     min_dist=1,
     parallel=True
 )
 ds.run_leiden_clustering(
-    integrated_graph='RNA+ADT',
+    graph=snn_graph,
     resolution=1.75
 )
 ```
@@ -340,21 +348,21 @@ This RNA and ADT workflow is its two-modality special case.
 Scarf implements the affinity and per-cell weighting equations from [Hao et al., Cell 2021](https://doi.org/10.1016/j.cell.2021.04.048), with the scaling choices described below.
 
 ```{code-cell} ipython3
-ds.integrate_assays(
+wnn_graph = ds.integrate_assays(
     assays=['RNA', 'ADT'],
     label='RNA+ADT_wnn',
     method='wnn',
     l2_normalize=True,
 )
 ds.run_umap(
-    integrated_graph='RNA+ADT_wnn',
+    graph=wnn_graph,
     n_epochs=250,
     spread=5,
     min_dist=1,
     parallel=True
 )
 ds.run_leiden_clustering(
-    integrated_graph='RNA+ADT_wnn',
+    graph=wnn_graph,
     resolution=1.75
 )
 ```

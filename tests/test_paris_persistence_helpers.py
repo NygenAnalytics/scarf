@@ -12,7 +12,6 @@ from scarf.datastore._operations.paris_persistence import (
     generation_location,
     load_hierarchy_generation,
     load_hierarchy_group,
-    resolve_compatibility_dendrogram,
 )
 from scarf.storage.budget import ResourceBudget
 
@@ -105,29 +104,6 @@ def test_load_hierarchy_generation_rejects_incomplete_and_missing_arrays():
     assert hierarchy.n_leaves == 2
     assert forest.n_leaves == 2
     assert hierarchy.children.tolist() == [[0, 1]]
-
-
-def test_resolve_compatibility_dendrogram_falls_back_and_errors():
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    graph_loc = "RNA/graph"
-    graph = root.create_group(graph_loc)
-    budget = ResourceBudget(memoryBytes=1024**3, workers=1)
-
-    with pytest.raises(KeyError, match="No Paris hierarchy"):
-        resolve_compatibility_dendrogram(root, graph_loc, budget)
-
-    legacy = f"{graph_loc}/dendrogram"
-    root.create_array(legacy, data=np.zeros((1, 4)))
-    path, generation = resolve_compatibility_dendrogram(root, graph_loc, budget)
-    assert path == legacy
-    assert generation is None
-
-    alias = "RNA/graph/custom_dendrogram"
-    root.create_array(alias, data=np.ones((1, 4)))
-    graph.attrs["latest_dendrogram"] = alias
-    path, generation = resolve_compatibility_dendrogram(root, graph_loc, budget)
-    assert path == alias
-    assert generation is None
 
 
 def test_preflight_paris_fit_and_cached_cut_respect_budget():

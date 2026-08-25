@@ -5,7 +5,7 @@ Public Scarf surfaces for analysts:
 
 - `DataStore` and its documented methods
 - Graph-construction methods and `ds.pipeline.run`
-- `ArtifactRef`, `ArtifactStatus`, and `AssayState`
+- `ArtifactRef`, `ArtifactStatus`, `AssayState`, and strict artifact/state errors
 - `EnrichmentResult` and `read_gmt` for gene-set scoring
 - Readers that ingest source formats; writers that create or export Zarr stores (and other exports)
 - `scarf.plotting`

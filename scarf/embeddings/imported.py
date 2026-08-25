@@ -7,11 +7,13 @@ import zarr
 
 from ..graph.state import (
     ArtifactRef,
-    ArtifactSelectionError,
+    ArtifactResolutionError,
     AssayState,
     ImportedArtifactStorage,
     fingerprint_selected_stored_strings,
+    named_result_mismatch,
     read_assay_state,
+    read_assay_state_document,
     validate_cell_selection_artifact,
     validate_imported_coordinates_artifact,
     write_assay_state,
@@ -234,7 +236,7 @@ def _selection_alignment(
         "artifact_id": cell_selection.artifact_id,
     }
     if source_count != coordinate_rows:
-        raise ArtifactSelectionError(
+        raise ArtifactResolutionError(
             "Imported coordinates do not match the source cell count",
             code="dimreduc_row_count_mismatch",
             context=context,
@@ -248,7 +250,7 @@ def _selection_alignment(
         source_stop = source_start + selected
         if source_stop > source_count:
             context["selected_count"] = source_stop
-            raise ArtifactSelectionError(
+            raise ArtifactResolutionError(
                 "Imported coordinates do not match the selected cell count",
                 code="dimreduc_row_count_mismatch",
                 context=context,
@@ -261,7 +263,7 @@ def _selection_alignment(
         )
         if not np.array_equal(expected, actual):
             context["selected_count"] = selected_count + selected
-            raise ArtifactSelectionError(
+            raise ArtifactResolutionError(
                 "Imported cell IDs do not match the selected cell order",
                 code="dimreduc_cell_identity_mismatch",
                 context=context,
@@ -270,7 +272,7 @@ def _selection_alignment(
         selected_count += selected
     context["selected_count"] = selected_count
     if selected_count != coordinate_rows or source_start != source_count:
-        raise ArtifactSelectionError(
+        raise ArtifactResolutionError(
             "Imported coordinates do not match the selected cell count",
             code="dimreduc_row_count_mismatch",
             context=context,
@@ -464,29 +466,61 @@ def _register_named_result(
     name: str,
     *,
     cell_key: str,
-    feat_key: str | None,
 ) -> None:
     if not isinstance(name, str) or not name:
         raise ValueError("named_result must be a non-empty string")
     if ref.assay is None:
         raise ValueError("Named imported results must be assay-scoped")
-    state = read_assay_state(root, ref.assay)
+    state = _recoverable_import_state(root, ref.assay)
     if state is None:
-        if feat_key is None:
-            raise ValueError(
-                "feat_key is required to register a named result without AssayState"
-            )
         state = AssayState(
             assay=ref.assay,
             cell_key=cell_key,
-            feat_key=feat_key,
         )
-    named_results = dict(state.named_results)
+    elif state.cell_key != cell_key:
+        raise ValueError(
+            f"Imported result cell_key {cell_key!r} does not match "
+            f"AssayState cell_key {state.cell_key!r}"
+        )
+    named_results = {}
+    for existing_name, existing_ref in state.named_results.items():
+        try:
+            fits = (
+                named_result_mismatch(
+                    root,
+                    existing_name,
+                    existing_ref,
+                    state,
+                )
+                is None
+            )
+        except (KeyError, RuntimeError, TypeError, ValueError):
+            continue
+        if fits:
+            named_results[existing_name] = existing_ref
     named_results[name] = ref
     write_assay_state(
         root,
         replace(state, named_results=named_results),
     )
+
+
+def _recoverable_import_state(
+    root: zarr.Group,
+    assay: str,
+) -> AssayState | None:
+    """Read state while allowing an unavailable current chain to be replaced."""
+    document = read_assay_state_document(root, assay)
+    if document is None:
+        return None
+    try:
+        return read_assay_state(root, assay)
+    except ArtifactResolutionError:
+        return AssayState(
+            assay=document.assay,
+            cell_key=document.cell_key,
+            named_results=document.named_results,
+        )
 
 
 def write_imported_coordinates(
@@ -513,11 +547,11 @@ def write_imported_coordinates(
     stdev_shape: tuple[int] | None = None,
     stdev_dtype: Any | None = None,
     named_result: str | None = None,
-    feat_key: str | None = None,
     block_rows: int = 100_000,
     invalidate_cache: bool = False,
 ) -> ArtifactRef:
     storage = ImportedArtifactStorage(root)
+    _recoverable_import_state(root, assay)
     source_digest = _validate_source_digest(source_digest)
     if not isinstance(dimreduc_key, str) or not dimreduc_key:
         raise ValueError("dimreduc_key must be a non-empty string")
@@ -689,7 +723,6 @@ def write_imported_coordinates(
             planned.ref,
             named_result,
             cell_key=cell_key,
-            feat_key=feat_key,
         )
     if selected_count != data_source.shape[0]:
         raise RuntimeError("Imported coordinate selection changed during writing")
@@ -869,11 +902,11 @@ def write_imported_embedding(
     metadata_columns: Sequence[str] | None = None,
     cell_data: zarr.Group | None = None,
     named_result: str | None = None,
-    feat_key: str | None = None,
     block_rows: int = 100_000,
     invalidate_cache: bool = False,
 ) -> ArtifactRef:
     storage = ImportedArtifactStorage(root)
+    _recoverable_import_state(root, assay)
     if not isinstance(role, str):
         raise TypeError("role must be a string")
     normalized_role = role.lower()
@@ -978,6 +1011,5 @@ def write_imported_embedding(
             planned.ref,
             named_result,
             cell_key=cell_key,
-            feat_key=feat_key,
         )
     return planned.ref

@@ -71,7 +71,7 @@ writer.dump()
 ## 2. Filter cells
 
 Load the Zarr store with `DataStore`, which is the main interface for the rest of the analysis.
-On first load, Scarf streams the count matrix once to compute initialization statistics: accessible peaks per cell (`nFeatures`), total fragments or cut sites per cell (`nCounts`), and the per-peak cell counts used for feature filtering.
+On first load, Scarf streams the count matrix once to compute initialization statistics: accessible peaks per cell (`nFeatures`), total fragments or cut sites per cell (`nCounts`), and per-peak detection counts used by explicit selection producers.
 
 ```{code-cell} ipython3
 ds = scarf.DataStore(
@@ -113,8 +113,8 @@ The top features are marked as `prevalent_peaks` for downstream steps.
 Here we retain 25,000 peaks, slightly more than one quarter of the available peaks.
 
 ```{code-cell} ipython3
-ds.mark_prevalent_peaks(top_n=25000)
-print('Selected peaks:', int(ds.ATAC.feats.fetch_all('I__prevalent_peaks').sum()))
+peak_features = ds.mark_prevalent_peaks(top_n=25000)
+print('Selected peaks:', int(ds.ATAC.feats.fetch_all('prevalent_peaks').sum()))
 ```
 
 The retained peaks should be present across enough cells to support stable neighbour comparisons without collapsing the assay onto only the most common open regions.
@@ -130,7 +130,7 @@ LSI reduction of scATAC-Seq is known to capture the sequencing depth of cells in
 `run_lsi` skips that component by default (`skip_first=True`).
 
 ```{code-cell} ipython3
-ds.run_normalization(feat_key='prevalent_peaks')
+ds.run_normalization(features=peak_features)
 ds.run_lsi(dims=50, skip_first=True)
 ds.build_embedding_initialization()
 ds.build_ann_index()
@@ -255,4 +255,3 @@ A uniformly flat score can indicate coordinate-build mismatch or poor overlap be
 - Assuming `tenx_10K_pbmc-v1_atacseq` has no prepared Zarr and skipping `zarr=True`
 - Using RNA normalization or PCA assumptions for ATAC data
 - Setting `skip_first=False` on `run_lsi` without checking whether sequencing depth dominates the first LSI component
-

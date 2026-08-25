@@ -31,7 +31,6 @@ class ADTassay(Assay):
         *,
         workspace: str | None = None,
         nthreads: int = 1,
-        min_cells_per_feature: int = 10,
         **kwargs: Any,
     ) -> None:
         """Initialize ADTassay with CLR normalization.
@@ -48,7 +47,6 @@ class ADTassay(Assay):
             name=name,
             cell_data=cell_data,
             nthreads=nthreads,
-            min_cells_per_feature=min_cells_per_feature,
             **kwargs,
         )
         self.normMethod = norm_clr
@@ -69,9 +67,8 @@ class ADTassay(Assay):
             cell_idx: Indices of cells to be included in the normalized matrix
                       (Default value: All those marked True in 'I' column of cell
                       attribute table)
-            feat_idx: Indices of features to be included in the normalized matrix
-                      (Default value: All those marked True in 'I' column of
-                      feature attribute table)
+            feat_idx: Indices of features to be included in the normalized matrix.
+                      Defaults to the complete physical feature axis.
             **kwargs:
 
         Returns: A chunked array (delayed matrix) containing normalized data.
@@ -79,6 +76,6 @@ class ADTassay(Assay):
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:
-            feat_idx = self.feats.active_index("I")
+            feat_idx = np.arange(self.feats.N, dtype=np.int64)
         counts = self.rawData[:, feat_idx][cell_idx, :]
         return self.normMethod(self, counts)

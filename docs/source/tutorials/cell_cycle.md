@@ -32,8 +32,12 @@ Score S-phase and G2M-phase gene sets to assign a cell-cycle phase to each cell.
 ## Dataset
 
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import scarf
 import scarf.plotting as splt
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
 ```
@@ -43,7 +47,8 @@ scarf.configure_output(level='WARNING', progress=True)
 Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://journals.biologists.com/dev/article/146/12/dev173849/19483/) for E15.5 stage of differentiation of endocrine cells from a pool of endocrine progenitors-precursors.
 
 The prepared Zarr store is available from the `scarf_docs` Cytebase catalog.
-It already includes the top 2000 highly variable genes, a neighbourhood graph, and a UMAP embedding.
+It includes cluster and UMAP columns for visualization.
+The source is structurally repacked to supply the current count layout, then mounted read-only while this page writes cell-cycle artifacts and score columns to a separate analysis store.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -52,8 +57,16 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     zarr=True,
 )
 
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = str(Path(analysis_directory.name) / 'counts.zarr')
+repack_store(
     f'{dataset}/data.zarr',
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=str(Path(analysis_directory.name) / 'cell_cycle_analysis.zarr'),
     nthreads=4,
     default_assay='RNA'
 )
@@ -87,6 +100,11 @@ ds.run_cell_cycle_scoring()
 
 The bundled list contains one marker that is absent from this assay.
 The warning about one unmatched name is expected, and Scarf scores the cells with the remaining markers.
+
+`DataStore.run_cell_cycle_scoring` owns persistence.
+Its cell-cycle artifact has exactly the `feature_summary` and `cell_selection` artifact inputs; resolved S and G2M feature indexes plus `control_size`, `n_bins`, and `rand_seed` are parameters.
+It requires a writable datastore and fails before planning with `Cell-cycle scoring requires a DataStore opened with zarr_mode='r+'` when opened read-only.
+In contrast, a direct `Assay.score_features(...)` call computes blockwise in memory and does not create summaries, artifacts, or metadata columns.
 
 ## 3. Visualize cell-cycle phases
 

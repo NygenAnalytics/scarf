@@ -44,7 +44,6 @@ def _store(
         str(location),
         default_assay=assay_name,
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
         mem_budget=64 * 1024 * 1024,
     )

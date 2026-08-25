@@ -14,10 +14,12 @@ from ..storage.artifacts import (
     ArtifactRef,
     ArtifactStatus,
     artifact_group,
-    artifact_path,
     inspect_artifact,
 )
-from ..storage.types import as_zarr_array
+from ..storage.feature_selection import resolve_feature_selection
+from ..storage.geometry import array_geometry
+from ..storage.partition import row_band
+from ..storage.types import as_zarr_array, as_zarr_group
 from .models import ScaledPCAProjectionModel, SymphonyCorrectionModel
 from .reference import MappingReference
 
@@ -43,6 +45,55 @@ _SYMPHONY_ARRAYS = frozenset(
         "sigma",
     }
 )
+_COMMON_METADATA = frozenset(
+    {
+        "method",
+        "assay",
+        "cell_key",
+        "selected_cell_count",
+        "ann_metric",
+        "normalization_parameters",
+        "dataset_fingerprint",
+    }
+)
+_SYMPHONY_METADATA = frozenset(
+    {
+        "batch_columns",
+        "harmony_parameters",
+        "batch_levels",
+    }
+)
+
+
+def _selected_feature_ids(
+    root: zarr.Group,
+    assay: str,
+    feature_selection: ArtifactRef,
+) -> np.ndarray:
+    """Read selected feature IDs in exact assay row order, blockwise."""
+    resolve_feature_selection(root, assay, feature_selection)
+    feature_data = as_zarr_group(
+        root[f"{assay}/featureData"],
+        name=f"{assay}/featureData",
+    )
+    ids = as_zarr_array(feature_data["ids"], name="ids")
+    values = as_zarr_array(
+        artifact_group(root, feature_selection)["values"],
+        name="values",
+    )
+    block_rows = min(
+        row_band(array_geometry(ids), unit="chunk", fallback=1),
+        row_band(array_geometry(values), unit="chunk", fallback=1),
+    )
+    selected: list[np.ndarray] = []
+    for start in range(0, int(values.shape[0]), block_rows):
+        stop = min(start + block_rows, int(values.shape[0]))
+        mask = np.asarray(values[start:stop], dtype=bool)
+        if np.any(mask):
+            selected.append(np.asarray(ids[start:stop])[mask])
+    if not selected:
+        return np.asarray(ids[:0])
+    return np.concatenate(selected)
 
 
 def write_artifact_mapping_reference(
@@ -248,9 +299,19 @@ def load_artifact_mapping_reference(
         for name in ("schemaVersion", "schema_version", "modelVersion", "model_version")
     ):
         raise _contract_error("Mapping reference metadata uses a versioned contract")
+    if "feature_key" in metadata:
+        raise _contract_error(
+            "Mapping reference metadata uses the removed feature-key contract"
+        )
+    expected_metadata = set(_COMMON_METADATA)
+    if method == "symphony":
+        expected_metadata.update(_SYMPHONY_METADATA)
+    if set(metadata) != expected_metadata:
+        raise _contract_error(
+            "Mapping reference metadata does not match the current contract"
+        )
     assay_name = _metadata_string(metadata, "assay")
     cell_key = _metadata_string(metadata, "cell_key")
-    feature_key = _metadata_string(metadata, "feature_key")
     if assay_name != ref.assay or metadata.get("method") != method:
         raise _contract_error("Mapping reference metadata does not match its artifact")
 
@@ -315,7 +376,6 @@ def load_artifact_mapping_reference(
             datastore.zw,
             normalized,
             cell_key,
-            feature_key,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise _contract_error(
@@ -335,10 +395,13 @@ def load_artifact_mapping_reference(
         raise _contract_error("Mapping reference feature IDs do not match PCA loadings")
     if np.asarray(feature_ids).dtype.kind not in {"O", "S", "U"}:
         raise _contract_error("Mapping reference feature IDs must contain strings")
-    feature_column = feature_key if feature_key == "I" else f"{cell_key}__{feature_key}"
     if not np.array_equal(
         feature_ids.astype(str),
-        np.asarray(assay.feats.fetch("ids", key=feature_column)).astype(str),
+        _selected_feature_ids(
+            datastore.zw,
+            assay_name,
+            feature_selection,
+        ).astype(str),
     ):
         raise _contract_error(
             "Mapping reference feature IDs do not match the selected features"
@@ -379,7 +442,7 @@ def load_artifact_mapping_reference(
     ):
         raise _contract_error("Mapping reference distance summary is invalid")
     try:
-        validate_distance_provenance(datastore.zw, artifact_path(neighbors))
+        validate_distance_provenance(datastore.zw, neighbors)
     except (KeyError, TypeError, ValueError) as exc:
         raise _contract_error(
             "Mapping reference neighbor distances are invalid"
@@ -390,7 +453,6 @@ def load_artifact_mapping_reference(
         ref=ref,
         assay_name=assay_name,
         cell_key=cell_key,
-        feature_key=feature_key,
         reduction=reduction,
         ann_index=ann_index,
         neighbors=neighbors,

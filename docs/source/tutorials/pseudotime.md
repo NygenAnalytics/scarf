@@ -33,7 +33,10 @@ It does not infer terminal states or prove lineage relationships.
 ## Dataset
 
 ```{code-cell} ipython3
+from tempfile import TemporaryDirectory
+
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
 ```
@@ -44,7 +47,9 @@ scarf.configure_output(level='WARNING', progress=True)
 Here we use the data from [Bastidas-Ponce et al., 2019 Development](https://journals.biologists.com/dev/article/146/12/dev173849/19483/) for E15.5 stage of differentiation of endocrine cells from a pool of endocrine progenitors-precursors.
 
 The prepared Zarr store is available from the `scarf_docs` Cytebase catalog.
-It already includes the top 2000 highly variable genes, a neighbourhood graph, and a UMAP embedding.
+It supplies counts, literal annotations, and a UMAP embedding.
+The setup mounts them into a temporary writable analysis store and rebuilds a current graph lineage from 2000 highly variable genes.
+The catalog snapshot is structurally repacked inside the temporary directory first so it has the current RNA count layout; the mounted target does not reuse legacy analysis state.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -53,11 +58,30 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     zarr=True,
 )
 
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = f'{analysis_directory.name}/counts.zarr'
+repack_store(
     f'{dataset}/data.zarr',
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=f'{analysis_directory.name}/analysis.zarr',
     nthreads=4,
     default_assay='RNA'
 )
+hvg_ref = ds.mark_hvgs(
+    top_n=2000,
+    show_plot=False,
+    label='pseudotime_hvgs',
+)
+normalized = ds.run_normalization(features=hvg_ref)
+reduction = ds.run_pca(normalized, dims=15)
+ann_index = ds.build_ann_index(reduction)
+neighbors = ds.query_neighbors(ann_index, k=11)
+graph = ds.build_connectivity_map(neighbors)
+all_features = ds.resolve_features('RNA', 'all_features')
 ```
 
 The store includes cell-type annotations in the `clusters` column:
@@ -89,6 +113,7 @@ Here, ductal cells represent the progenitor pool and the hormone-expressing stat
 
 ```{code-cell} ipython3
 pseudotime = ds.run_pseudotime_scoring(
+    graph,
     source_sink_key='clusters',
     sources=['Ductal'],
     sinks=['Alpha', 'Beta', 'Delta'],
@@ -101,6 +126,7 @@ Every group named in `sources` or `sinks` has to be present among the scored cel
 
 The scores are stored under the generated column named by `pseudotime.pseudotime_key` (by default `RNA_pseudotime`).
 The companion key `pseudotime.validity_key` identifies cells that were scored.
+`pseudotime.graph` records the exact graph artifact used to calculate the ordering.
 
 ```{code-cell} ipython3
 {
@@ -143,6 +169,7 @@ Benjamini-Hochberg adjustment runs only over tested features.
 
 ```{code-cell} ipython3
 markers = ds.run_pseudotime_marker_search(
+    features=all_features,
     cell_key=pseudotime.validity_key,
     pseudotime_key=pseudotime.pseudotime_key,
 )
@@ -150,7 +177,7 @@ markers = ds.run_pseudotime_marker_search(
 
 The correlations, raw p-values, and adjusted p-values are saved in feature metadata.
 Their generated column names are available as `markers.correlation_key`, `markers.p_value_key`, and `markers.p_value_adjusted_key`.
-The returned `markers.table` contains the same values with feature names.
+The returned `markers.table` contains the same values with feature names, and `markers.feature_selection` retains the exact tested universe.
 
 Count how many features were tested versus left as `NaN`:
 

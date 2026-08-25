@@ -30,6 +30,8 @@ Clustering guidance from the former combined page now lives in {doc}`clustering`
 
 ```{code-cell} ipython3
 from itertools import combinations
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -37,6 +39,7 @@ import pandas as pd
 
 import scarf
 import scarf.plotting as splt
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="WARNING", progress=True)
 
@@ -45,8 +48,17 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
+repack_store(
     f"{dataset}/data.zarr",
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=str(Path(analysis_directory.name) / "dimensionality_analysis.zarr"),
+    default_assay="RNA",
     nthreads=4,
     min_features_per_cell=10,
 )
@@ -56,16 +68,15 @@ ds.filter_cells(
     lows=[1000, 500, 0],
     reset_previous=True,
 )
-if "I__hvgs" not in ds.RNA.feats.columns:
-    ds.mark_hvgs(
-        min_cells=20,
-        top_n=500,
-        show_plot=False,
-    )
-normalized = ds.run_normalization(feat_key="hvgs")
+hvg_ref = ds.mark_hvgs(
+    min_cells=20,
+    top_n=500,
+    show_plot=False,
+)
+normalized = ds.run_normalization(features=hvg_ref)
 ```
 
-This section reconstructs the selected cells, features, and normalization from {doc}`scrna_seq` so the page can run independently.
+This section structurally repacks and mounts the source counts, then reconstructs the selected cells, features, and normalization from {doc}`scrna_seq` without reusing persisted analysis state.
 
 ## 2. Compare PCA dimension counts
 
@@ -90,7 +101,7 @@ for dimensions in (10, 30, 15):
 
     label = f"leiden_pca_{dimensions}"
     ds.run_leiden_clustering(
-        graph,
+        graph=graph,
         resolution=0.5,
         label=label,
     )

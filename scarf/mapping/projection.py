@@ -24,6 +24,8 @@ from ..storage.artifacts import (
     inspect_artifact,
     list_artifacts,
 )
+from ..storage.errors import ArtifactResolutionError
+from ..storage.feature_selection import resolve_feature_selection
 from ..storage.geometry import array_geometry
 from ..storage.partition import row_band
 from ..storage.profiles import StorageProfile
@@ -312,13 +314,7 @@ def plan_projection(
     selected_cells = _selection_count(root, cell_selection)
     if selected_cells != resolved_n_cells:
         raise ValueError("n_cells must equal the selected row count in cell_selection")
-    _validate_local_selection(
-        root,
-        feature_selection,
-        kind="feature_selection",
-        scope="assay",
-        assay=assay,
-    )
+    resolve_feature_selection(root, assay, feature_selection)
     external = _validate_external_mapping_reference(mapping_reference)
 
     def valid_projection(_ref: ArtifactRef, group: zarr.Group) -> bool:
@@ -403,6 +399,8 @@ def load_projection(
             load_arrays=load_arrays,
             reference=reference,
         )
+    except ArtifactResolutionError:
+        raise
     except (KeyError, RuntimeError, TypeError, ValueError) as exc:
         raise _contract_error(str(exc)) from None
 
@@ -469,7 +467,7 @@ def _load_projection(
     load_arrays: bool,
     reference: MappingReference | None,
 ) -> MappingResult:
-    _validate_projection_ref(ref)
+    assay = _validate_projection_ref(ref)
     status = inspect_artifact(root, ref)
     if not status.exists or not status.complete:
         raise ValueError("Projection artifact is missing or incomplete")
@@ -507,7 +505,7 @@ def _load_projection(
         "feature_selection",
         kind="feature_selection",
         scope="assay",
-        assay=ref.assay,
+        assay=assay,
     )
     _nonempty_string(
         inputs["selected_expression_fingerprint"],
@@ -543,13 +541,7 @@ def _load_projection(
         scope="datastore",
         assay=None,
     )
-    _validate_local_selection(
-        root,
-        feature_selection,
-        kind="feature_selection",
-        scope="assay",
-        assay=ref.assay,
-    )
+    resolve_feature_selection(root, assay, feature_selection)
 
     group = artifact_group(root, ref)
     n_cells, diagnostics = _validate_payload(
@@ -728,7 +720,7 @@ def _validated_diagnostics(
     }
 
 
-def _validate_projection_ref(ref: ArtifactRef) -> None:
+def _validate_projection_ref(ref: ArtifactRef) -> str:
     if (
         not isinstance(ref, ArtifactRef)
         or ref.scope != "assay"
@@ -736,6 +728,7 @@ def _validate_projection_ref(ref: ArtifactRef) -> None:
         or ref.kind != "projection"
     ):
         raise ValueError("Expected an assay-scoped projection ArtifactRef")
+    return ref.assay
 
 
 def _validate_external_mapping_reference(

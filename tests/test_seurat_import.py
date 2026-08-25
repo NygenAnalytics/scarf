@@ -353,7 +353,6 @@ def test_imported_store_is_readable_by_datastore(tmp_path: Path) -> None:
     store = DataStore(
         destination,
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
         mem_budget="64M",
     )
@@ -397,7 +396,6 @@ def test_chromatin_assay_streams_counts_and_round_trips_to_zarr(
     store = DataStore(
         destination,
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
         mem_budget="64M",
     )
@@ -504,7 +502,6 @@ def test_reader_must_remain_open_until_dump_finishes(tmp_path: Path) -> None:
         DataStore(
             destination,
             min_features_per_cell=0,
-            min_cells_per_feature=0,
             nthreads=1,
             mem_budget="64M",
         )
@@ -858,7 +855,6 @@ def test_failed_conversion_stays_incomplete_and_retry_replaces_partial_output(
             DataStore(
                 destination,
                 min_features_per_cell=0,
-                min_cells_per_feature=0,
                 nthreads=1,
                 mem_budget="64M",
             )

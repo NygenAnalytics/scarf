@@ -22,13 +22,14 @@ It is not required to build the neighbourhood graph.
 
 ## Downstream methods
 
-Downstream UMAP, t-SNE, clustering, and sampling read the current analysis chain when they are called without a graph.
-Each also accepts a connectivity map or integrated graph as its first argument, so a side branch can be analysed without changing the selected chain.
+Downstream UMAP, t-SNE, clustering, and sampling read the current `AssayState.connectivity_map` when `graph=None`.
+Each also accepts an exact connectivity-map or integrated-graph reference through `graph=`, so a side branch can be analysed without changing the selected chain.
+They do not accept an independent feature selection: named lineage edges project the normalized feature selections used to construct the graph.
 Leiden and UMAP return the {py:class}`~scarf.ArtifactRef` they wrote; Paris clustering returns a {py:class}`~scarf.clustering.ParisClusteringResult` whose ``ref`` field holds that artifact:
 
 ```python
 graph_k21 = ds.build_connectivity_map(neighbors_k21, update_state=False)
-ds.run_leiden_clustering(graph_k21, resolution=0.5, label="leiden_k21")
+ds.run_leiden_clustering(graph=graph_k21, resolution=0.5, label="leiden_k21")
 ```
 
 ## Methods

@@ -20,7 +20,7 @@ def test_basic_rna_pipeline_returns_only_named_artifact_refs(
         cell_cycle_scoring=False,
         highly_variable_features={
             "top_n": 100,
-            "hvg_key_name": "pipeline_hvgs",
+            "label": "pipeline_hvgs",
         },
         pca={"dims": 5, "n_centroids": 10},
         ann_index={"ann_m": 16},
@@ -59,6 +59,19 @@ def test_basic_rna_pipeline_returns_only_named_artifact_refs(
     assert all(
         datastore_ephemeral.inspect_artifact(ref).complete for ref in artifacts.values()
     )
+    assert (
+        datastore_ephemeral.resolve_features("RNA", "pipeline_hvgs")
+        == artifacts["highly_variable_features"]
+    )
+    assay = datastore_ephemeral.get_assay("RNA")
+    assert "pipeline_hvgs" in assay.feats.columns
+    assert "I__pipeline_hvgs" not in assay.feats.columns
+    marker_status = datastore_ephemeral.inspect_artifact(artifacts["markers"])
+    assert marker_status.inputs is not None
+    marker_features = ArtifactRef.from_dict(marker_status.inputs["feature_selection"])
+    assert marker_features == datastore_ephemeral.resolve_features(
+        "RNA", "all_features"
+    )
     cluster_column = "RNA_leiden_1.0"
     edited = datastore_ephemeral.cells.fetch(
         cluster_column,
@@ -95,7 +108,7 @@ def test_pipeline_emits_ordered_events_and_omits_skipped_stages(
             cell_cycle_scoring=False,
             highly_variable_features={
                 "top_n": 50,
-                "hvg_key_name": "pipeline_callback_hvgs",
+                "label": "pipeline_callback_hvgs",
             },
             pca={"dims": 3, "n_centroids": 5},
             neighbors={"k": 3},
@@ -163,7 +176,7 @@ def test_pipeline_emits_failed_stage_and_reraises_original_error(
             cell_cycle_scoring=False,
             highly_variable_features={
                 "top_n": 50,
-                "hvg_key_name": "pipeline_callback_failure_hvgs",
+                "label": "pipeline_callback_failure_hvgs",
             },
             pca={"dims": 3, "n_centroids": 5},
             umap=False,
@@ -240,7 +253,7 @@ def test_pipeline_retry_reuses_completed_artifacts_after_stage_failure(
         "cell_cycle_scoring": False,
         "highly_variable_features": {
             "top_n": 50,
-            "hvg_key_name": "pipeline_resume_hvgs",
+            "label": "pipeline_resume_hvgs",
         },
         "pca": {"dims": 3, "n_centroids": 5},
         "neighbors": {"k": 3},
@@ -308,7 +321,7 @@ def test_pipeline_logs_callback_errors_and_continues(
         cell_cycle_scoring=False,
         highly_variable_features={
             "top_n": 50,
-            "hvg_key_name": "pipeline_broken_callback_hvgs",
+            "label": "pipeline_broken_callback_hvgs",
         },
         pca={"dims": 3, "n_centroids": 5},
         neighbors={"k": 3},
@@ -362,7 +375,7 @@ def test_pipeline_selects_clusters_by_pca_silhouette(
         cell_cycle_scoring=False,
         highly_variable_features={
             "top_n": 100,
-            "hvg_key_name": "pipeline_silhouette_hvgs",
+            "label": "pipeline_silhouette_hvgs",
         },
         pca={"dims": 5, "n_centroids": 10},
         neighbors={"k": 3},
@@ -417,7 +430,7 @@ def test_pipeline_names_a_single_partition_without_silhouette(
     artifacts = datastore_ephemeral.pipeline.run(
         filtering={},
         cell_cycle_scoring=False,
-        highly_variable_features={"top_n": 100, "hvg_key_name": "pipeline_single_hvgs"},
+        highly_variable_features={"top_n": 100, "label": "pipeline_single_hvgs"},
         pca={"dims": 5, "n_centroids": 10},
         neighbors={"k": 3},
         umap=False,
@@ -441,7 +454,7 @@ def test_pipeline_rejects_downstream_steps_without_clustering(
         datastore_ephemeral.pipeline.run(
             filtering={},
             cell_cycle_scoring=False,
-            highly_variable_features={"top_n": 100, "hvg_key_name": "pipeline_no_hvgs"},
+            highly_variable_features={"top_n": 100, "label": "pipeline_no_hvgs"},
             pca={"dims": 5, "n_centroids": 10},
             neighbors={"k": 3},
             umap=False,
@@ -474,7 +487,7 @@ def test_pipeline_reuses_leiden_without_recomputing(
         "cell_cycle_scoring": False,
         "highly_variable_features": {
             "top_n": 100,
-            "hvg_key_name": "pipeline_cached_leiden_hvgs",
+            "label": "pipeline_cached_leiden_hvgs",
         },
         "pca": {"dims": 3, "n_centroids": 5},
         "neighbors": {"k": 3},
@@ -532,7 +545,7 @@ def test_pipeline_computes_leiden_with_requested_graph_options(
         cell_cycle_scoring=False,
         highly_variable_features={
             "top_n": 100,
-            "hvg_key_name": "pipeline_graph_options_hvgs",
+            "label": "pipeline_graph_options_hvgs",
         },
         pca={"dims": 3, "n_centroids": 5},
         neighbors={"k": 3},
@@ -577,7 +590,7 @@ def test_pipeline_reports_failed_and_aborted_clustering_jobs(
             cell_cycle_scoring=False,
             highly_variable_features={
                 "top_n": 100,
-                "hvg_key_name": "pipeline_failed_clustering_hvgs",
+                "label": "pipeline_failed_clustering_hvgs",
             },
             pca={"dims": 3, "n_centroids": 5},
             neighbors={"k": 3},
@@ -675,7 +688,7 @@ def test_pipeline_overlaps_paris_compute_but_serializes_leiden_publish(
             cell_cycle_scoring=False,
             highly_variable_features={
                 "top_n": 100,
-                "hvg_key_name": "pipeline_concurrency_hvgs",
+                "label": "pipeline_concurrency_hvgs",
             },
             pca={"dims": 3, "n_centroids": 5},
             neighbors={"k": 3},
@@ -735,7 +748,7 @@ def test_basic_rna_pipeline_supports_optional_harmony(
         cell_cycle_scoring=False,
         highly_variable_features={
             "top_n": 50,
-            "hvg_key_name": "pipeline_harmony_hvgs",
+            "label": "pipeline_harmony_hvgs",
         },
         pca={"dims": 3, "n_centroids": 5},
         harmony={
@@ -781,7 +794,7 @@ def test_basic_rna_pipeline_runs_score_steps_after_clustering(
         cell_cycle_scoring={},
         highly_variable_features={
             "top_n": 50,
-            "hvg_key_name": "pipeline_full_hvgs",
+            "label": "pipeline_full_hvgs",
         },
         pca={"dims": 3, "n_centroids": 5},
         neighbors={"k": 3},

@@ -92,7 +92,6 @@ def test_worker_runs_leiden(
     assert store.arguments == {
         "from_assay": "RNA",
         "cell_key": "I",
-        "feat_key": "hvgs",
         "resolution": 1.0,
         "backend": "igraph",
         "label": "leiden_cluster",

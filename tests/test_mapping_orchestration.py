@@ -182,10 +182,20 @@ def test_plain_mapping_is_query_owned_and_reuses_exact_projection(
         np.isin(query_feature_ids, reference.feature_ids),
     )
     feature_status = query.inspect_artifact(feature_selection)
-    assert isinstance(
-        (feature_status.inputs or {}).get("alignment_map_hash"),
-        str,
+    assert feature_status.operation == "select_mapping_overlap"
+    assert feature_status.parameters == {}
+    assert set(feature_status.inputs or {}) == {
+        "mapping_reference",
+        "all_features",
+    }
+    assert (
+        ExternalArtifactRef.from_dict(feature_status.inputs["mapping_reference"])
+        == reference.external_ref
     )
+    all_features = ArtifactRef.from_dict(feature_status.inputs["all_features"])
+    all_features_status = query.inspect_artifact(all_features)
+    assert all_features_status.operation == "create_all_features"
+    assert all_features_status.inputs == {}
     group = artifact_group(query.zw, result.ref)
     assert set(group.array_keys()) == {"indices", "distances", "uninformative"}
     assert set(group.group_keys()) == set()

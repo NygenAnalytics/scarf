@@ -13,10 +13,15 @@ Typical top-level groups include:
 - cell metadata
 - one or more assay groups (for example `RNA`, `ADT`, `ATAC`)
 - per-assay feature metadata
-- normalized matrices, reductions, and graph artefacts under assay-specific paths
+- immutable feature selections, summaries, normalized matrices, reductions, and graph artifacts under assay-specific artifact paths
 
-Exact group names depend on the assay and the graph-stage parameters.
+Artifact group names use kind and identity, not encoded graph-stage parameters.
 Prefer inspecting a store with `zarr.open` or Scarf's `DataStore` summary rather than hard-coding internal paths in analysis scripts.
+
+Feature selection columns under `featureData` are publication aliases backed by `source_artifact` references.
+The exact reserved `all_features` label names the complete assay feature universe.
+`pending_feature_selection_aliases` is an internal crash-recovery journal, not an analysis selector.
+Consumers validate the referenced artifact, row identity, and payload before using a published label.
 
 ## Count arrays
 

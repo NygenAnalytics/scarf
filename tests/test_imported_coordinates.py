@@ -14,11 +14,13 @@ from scarf.embeddings.imported import (
     write_imported_embedding,
 )
 from scarf.graph.state import (
-    ArtifactSelectionError,
+    AssayState,
     read_assay_state,
     validate_imported_coordinates_artifact,
     validate_neighbors_artifact_selection,
 )
+from scarf.graph.errors import IncompatibleAnalysisStateError
+from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.artifacts import (
     artifact_group,
     artifact_path,
@@ -222,7 +224,6 @@ def test_imported_coordinates_write_blockwise_with_honest_provenance() -> None:
         feature_ids=feature_ids,
         stdev=stdev,
         named_result="seurat_pca",
-        feat_key="I",
         block_rows=2,
     )
 
@@ -243,15 +244,88 @@ def test_imported_coordinates_write_blockwise_with_honest_provenance() -> None:
     validate_imported_coordinates_artifact(root, ref, cell_key="I")
     state = read_assay_state(root, "RNA")
     assert state is not None
+    assert state.normalized is None
     assert state.reduction is None
+    assert not hasattr(state, "feat_key")
     assert state.named_results["seurat_pca"] == ref
+
+
+def test_imported_coordinates_replace_an_unavailable_current_graph() -> None:
+    root, selection, cell_ids, mask = _root_with_selection()
+    missing_graph = ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="connectivity_map",
+        artifact_id="f" * 64,
+    )
+    state_group = root["RNA"].create_group("state")
+    state_group.attrs["state"] = AssayState(
+        assay="RNA",
+        cell_key="I",
+        connectivity_map=missing_graph,
+    ).to_dict()
+
+    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
+    ref = write_imported_coordinates(
+        root,
+        assay="RNA",
+        dimreduc_key="pca",
+        role="pca",
+        coordinates=coordinates,
+        source_digest=_SOURCE_DIGEST,
+        payload_fingerprints={"data": fingerprint_array(coordinates)},
+        source_cell_ids=cell_ids[mask],
+        cell_selection=selection,
+        cell_key="I",
+        named_result="seurat_pca",
+    )
+
+    state = read_assay_state(root, "RNA")
+    assert state is not None
+    assert state.connectivity_map is None
+    assert state.named_results == {"seurat_pca": ref}
+
+
+def test_imported_coordinates_reject_legacy_state_before_writing() -> None:
+    root, selection, cell_ids, mask = _root_with_selection()
+    legacy_state = AssayState(assay="RNA", cell_key="I").to_dict()
+    legacy_state["feat_key"] = "I"
+    state_group = root["RNA"].create_group("state")
+    state_group.attrs["state"] = legacy_state
+    coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
+
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        write_imported_coordinates(
+            root,
+            assay="RNA",
+            dimreduc_key="pca",
+            role="pca",
+            coordinates=coordinates,
+            source_digest=_SOURCE_DIGEST,
+            payload_fingerprints={"data": fingerprint_array(coordinates)},
+            source_cell_ids=cell_ids[mask],
+            cell_selection=selection,
+            cell_key="I",
+            named_result="seurat_pca",
+        )
+
+    assert caught.value.code == "legacy_feature_contract"
+    assert (
+        list_artifacts(
+            root,
+            scope="assay",
+            assay="RNA",
+            kind="imported_coordinates",
+        )
+        == []
+    )
 
 
 def test_imported_coordinates_validate_alignment_before_artifact_creation() -> None:
     root, selection, cell_ids, mask = _root_with_selection()
     coordinates = np.arange(24, dtype=np.float32).reshape(8, 3)
 
-    with pytest.raises(ArtifactSelectionError) as caught:
+    with pytest.raises(ArtifactResolutionError) as caught:
         write_imported_coordinates(
             root,
             assay="RNA",
@@ -480,23 +554,25 @@ def test_ann_and_neighbor_query_accept_detached_imported_coordinates() -> None:
     )
     store = _graph_store(root)
 
-    with pytest.raises(ValueError, match="pass update_state=False"):
-        store.build_ann_index(imported, update_state=True)
-    assert read_assay_state(root, "RNA") is None
-
     ann = store.build_ann_index(
         imported,
         ann_efc=10,
         ann_ef=10,
         ann_m=4,
-        update_state=False,
+        update_state=True,
     )
-    with pytest.raises(ValueError, match="pass update_state=False"):
-        store.query_neighbors(ann, k=3, update_state=True)
-    assert read_assay_state(root, "RNA") is None
+    state = read_assay_state(root, "RNA")
+    assert state is not None
+    assert state.normalized is None
+    assert state.ann_index == ann
 
-    neighbors = store.query_neighbors(ann, k=3, update_state=False)
-    validate_neighbors_artifact_selection(root, neighbors, "I", "unused")
+    neighbors = store.query_neighbors(ann, k=3, update_state=True)
+    state = read_assay_state(root, "RNA")
+    assert state is not None
+    assert state.normalized is None
+    assert state.ann_index == ann
+    assert state.neighbors == neighbors
+    validate_neighbors_artifact_selection(root, neighbors, "I")
     group = artifact_group(root, neighbors)
     assert group["indices"].shape == (8, 3)
     assert group["distances"].shape == (8, 3)
@@ -656,7 +732,7 @@ def test_imported_coordinates_report_selected_row_count_mismatch() -> None:
     root, selection, cell_ids, _mask = _root_with_selection()
     coordinates = np.arange(21, dtype=np.float32).reshape(7, 3)
 
-    with pytest.raises(ArtifactSelectionError) as caught:
+    with pytest.raises(ArtifactResolutionError) as caught:
         write_imported_coordinates(
             root,
             assay="RNA",
@@ -795,8 +871,14 @@ def test_imported_coordinate_validator_rejects_provenance_tampering(
     )
     _tamper_artifact_attribute(root, ref, attribute, path, value)
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ArtifactResolutionError, match=message) as caught:
         validate_imported_coordinates_artifact(root, ref)
+    expected_code = (
+        "dimreduc_cell_identity_mismatch"
+        if path == ("inputs", "ordered_cell_ids_fingerprint")
+        else "corrupt_payload"
+    )
+    assert caught.value.code == expected_code
 
 
 def test_imported_coordinate_validator_rejects_scope_and_kind_mismatches() -> None:
@@ -819,11 +901,12 @@ def test_imported_coordinate_validator_rejects_scope_and_kind_mismatches() -> No
         artifact_id=ref.artifact_id,
     )
 
-    with pytest.raises(ArtifactSelectionError) as caught:
+    with pytest.raises(ArtifactResolutionError) as caught:
         validate_imported_coordinates_artifact(root, wrong_kind)
     assert caught.value.code == "artifact_reference_mismatch"
-    with pytest.raises(ValueError, match="has no assay"):
+    with pytest.raises(ArtifactResolutionError) as caught:
         validate_imported_coordinates_artifact(root, wrong_scope)
+    assert caught.value.code == "artifact_reference_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -871,8 +954,9 @@ def test_imported_coordinate_validator_rejects_payload_shape_and_dtype_tampering
         overwrite=True,
     )
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ArtifactResolutionError, match=message) as caught:
         validate_imported_coordinates_artifact(root, ref)
+    assert caught.value.code == "corrupt_payload"
 
 
 def test_imported_coordinate_validator_checks_optional_flags_and_fingerprints() -> None:
@@ -891,8 +975,12 @@ def test_imported_coordinate_validator_checks_optional_flags_and_fingerprints() 
         ("parameters", "loadings_stored"),
         False,
     )
-    with pytest.raises(ValueError, match="storage flag does not match payload"):
+    with pytest.raises(
+        ArtifactResolutionError,
+        match="storage flag does not match payload",
+    ) as caught:
         validate_imported_coordinates_artifact(root, ref)
+    assert caught.value.code == "corrupt_payload"
 
     _tamper_artifact_attribute(
         root,
@@ -902,8 +990,12 @@ def test_imported_coordinate_validator_checks_optional_flags_and_fingerprints() 
         True,
     )
     artifact_group(root, ref)["loadings"][0, 0] = -1.0
-    with pytest.raises(ValueError, match="fingerprint for 'loadings' does not match"):
+    with pytest.raises(
+        ArtifactResolutionError,
+        match="fingerprint for 'loadings' does not match",
+    ) as caught:
         validate_imported_coordinates_artifact(root, ref)
+    assert caught.value.code == "corrupt_payload"
 
 
 def test_imported_coordinate_validation_detects_selection_and_cell_key_changes() -> (
@@ -917,11 +1009,15 @@ def test_imported_coordinate_validation_detects_selection_and_cell_key_changes()
         mask,
     )
 
-    with pytest.raises(ValueError, match="does not match imported coordinates"):
+    with pytest.raises(
+        ArtifactResolutionError,
+        match="does not match imported coordinates",
+    ) as caught:
         validate_imported_coordinates_artifact(root, ref, cell_key="other")
+    assert caught.value.code == "row_mismatch"
 
     root["cellData"]["I"][0] = False
-    with pytest.raises(ArtifactSelectionError) as caught:
+    with pytest.raises(ArtifactResolutionError) as caught:
         validate_imported_coordinates_artifact(root, ref)
     assert caught.value.code == "selection_values_changed"
 
@@ -934,11 +1030,26 @@ def test_imported_coordinate_validation_rechecks_exact_selection_size() -> None:
         cell_ids,
         mask,
     )
-    artifact_group(root, selection)["values"][0] = False
-    root["cellData"]["I"][0] = False
+    replacement = np.asarray(artifact_group(root, ref)["data"][:-1])
+    artifact_group(root, ref).create_array(
+        "data",
+        data=replacement,
+        overwrite=True,
+    )
+    _tamper_artifact_attribute(
+        root,
+        ref,
+        "provenance",
+        ("inputs", "payload_fingerprints"),
+        {"data": fingerprint_array(replacement)},
+    )
 
-    with pytest.raises(ValueError, match="rows do not match the exact cell selection"):
+    with pytest.raises(
+        ArtifactResolutionError,
+        match="rows do not match the exact cell selection",
+    ) as caught:
         validate_imported_coordinates_artifact(root, ref)
+    assert caught.value.code == "dimreduc_row_count_mismatch"
 
 
 def test_imported_coordinates_reuse_without_consuming_coordinate_blocks() -> None:
@@ -1237,8 +1348,19 @@ def test_imported_embedding_validation_rechecks_selection_and_cell_key() -> None
     with pytest.raises(ValueError, match="cell_key does not match"):
         validate_imported_embedding_artifact(root, ref, cell_key="other")
 
-    artifact_group(root, selection)["values"][0] = False
-    root["cellData"]["I"][0] = False
+    replacement = np.asarray(artifact_group(root, ref)["values"][:-1])
+    artifact_group(root, ref).create_array(
+        "values",
+        data=replacement,
+        overwrite=True,
+    )
+    _tamper_artifact_attribute(
+        root,
+        ref,
+        "provenance",
+        ("inputs", "payload_fingerprints"),
+        {"values": fingerprint_array(replacement)},
+    )
     with pytest.raises(ValueError, match="rows do not match its cell selection"):
         validate_imported_embedding_artifact(root, ref)
 

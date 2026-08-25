@@ -23,7 +23,6 @@ class MappingReference:
     ref: ArtifactRef
     assay_name: str
     cell_key: str
-    feature_key: str
     reduction: ArtifactRef
     ann_index: ArtifactRef
     neighbors: ArtifactRef

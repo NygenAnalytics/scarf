@@ -570,7 +570,6 @@ def test_add_melded_assay_uses_cell_key_for_idf_and_keeps_all_rows(tmp_path):
         str(store_path),
         default_assay="ATAC",
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
     )
     train_mask = np.array([False, True, True])
@@ -640,7 +639,6 @@ def test_add_melded_assay_rna_writes_complete_counts_t(tmp_path):
         str(store_path),
         default_assay="ATAC",
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
     )
     feature_bed = _features_bed(

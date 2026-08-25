@@ -64,22 +64,15 @@ def test_save_normalized_data_renorm_uses_fused_path(toy_crdir_ds, monkeypatch):
         return orig_normed(self, *args, **kwargs)
 
     monkeypatch.setattr(RNAassay, "normed", fake_normed)
-    monkeypatch.setattr(
-        rna,
-        "_get_cell_feat_idx",
-        lambda cell_key, feat_key: _subset_indices(rna),
-    )
-
+    cell_idx, feat_idx = _subset_indices(rna)
     rna.save_normalized_data(
-        cell_key="I",
-        feat_key="I",
+        cell_idx,
+        feat_idx,
         location="normed_fused_test",
         log_transform=False,
         renormalize_subset=True,
-        update_keys=False,
     )
     assert called["normed"] == 0
-    cell_idx, feat_idx = _subset_indices(rna)
     expected = _reference_renorm_subset(rna, cell_idx, feat_idx)
     np.testing.assert_allclose(rna.z["normed_fused_test/data"][:], expected, rtol=1e-5)
 
@@ -104,26 +97,17 @@ def test_save_normalized_data_without_renorm_still_uses_normed(
         "scarf.storage.materialize.write_renorm_subset_to_zarr",
         fake_fused,
     )
-    monkeypatch.setattr(
-        rna,
-        "_get_cell_feat_idx",
-        lambda cell_key, feat_key: _subset_indices(rna),
-    )
-
+    cell_idx, feat_idx = _subset_indices(rna)
     rna.save_normalized_data(
-        cell_key="I",
-        feat_key="I",
+        cell_idx,
+        feat_idx,
         location="normed_standard_test",
         log_transform=False,
         renormalize_subset=False,
-        update_keys=False,
     )
     assert called["normed"] == 1
     assert called["fused"] == 0
-    assert (
-        "normalization_identity"
-        not in rna.z["normed_standard_test"].attrs["subset_params"]
-    )
+    assert "subset_params" not in rna.z["normed_standard_test"].attrs
 
 
 def test_save_normalized_data_renorm_cache_hit(toy_crdir_ds, monkeypatch):
@@ -143,38 +127,26 @@ def test_save_normalized_data_renorm_cache_hit(toy_crdir_ds, monkeypatch):
         "scarf.storage.materialize.write_renorm_subset_to_zarr",
         counting_fused,
     )
-    monkeypatch.setattr(
-        rna,
-        "_get_cell_feat_idx",
-        lambda cell_key, feat_key: _subset_indices(rna),
-    )
-
+    cell_idx, feat_idx = _subset_indices(rna)
     kwargs = dict(
-        cell_key="I",
-        feat_key="I",
+        cell_idx=cell_idx,
+        feat_idx=feat_idx,
         location="normed_cache_test",
         log_transform=False,
         renormalize_subset=True,
-        update_keys=False,
     )
     rna.save_normalized_data(**kwargs)
     rna.save_normalized_data(**kwargs)
     assert called["fused"] == 1
 
 
-def test_atac_legacy_cache_rejects_missing_normalizer_identity(
+def test_atac_materialization_reuses_existing_explicit_location(
     atac_datastore,
     monkeypatch,
 ):
     assay = atac_datastore.ATAC
     cell_idx = np.arange(8, dtype=np.int64)
-    feat_idx = assay.feats.active_index("I")[:4]
-    monkeypatch.setattr(
-        assay,
-        "_get_cell_feat_idx",
-        lambda cell_key, feat_key: (cell_idx, feat_idx),
-    )
-
+    feat_idx = np.arange(min(4, assay.feats.N), dtype=np.int64)
     original = assay.normed
     calls = 0
 
@@ -185,29 +157,20 @@ def test_atac_legacy_cache_rejects_missing_normalizer_identity(
 
     monkeypatch.setattr(assay, "normed", counting_normed)
     kwargs = dict(
-        cell_key="I",
-        feat_key="I",
+        cell_idx=cell_idx,
+        feat_idx=feat_idx,
         location="atac_normalizer_identity_cache_test",
         log_transform=False,
         renormalize_subset=False,
-        update_keys=False,
     )
 
     assay.save_normalized_data(**kwargs)
     group = assay.z["atac_normalizer_identity_cache_test"]
-    current_params = dict(group.attrs["subset_params"])
-    assert current_params["normalization_identity"] == getattr(
-        assay.normMethod,
-        "artifact_identity",
-    )
-
-    legacy_params = dict(current_params)
-    del legacy_params["normalization_identity"]
-    group.attrs["subset_params"] = legacy_params
+    assert "subset_params" not in group.attrs
     assay.save_normalized_data(**kwargs)
     assay.save_normalized_data(**kwargs)
 
-    assert calls == 2
+    assert calls == 1
 
 
 def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None:

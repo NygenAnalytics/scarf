@@ -29,35 +29,20 @@ from ...graph.arguments import (
     PcaArguments,
     _positive_integer,
 )
-from ...graph.encoded_paths import (
-    is_integrated_graph_path,
-    lookup_latest_assay_graph,
-    lookup_latest_nearest_neighbor_paths,
-    lookup_stored_integrated_graph,
-    make_integrated_graph_path,
-    make_normalized_group_path,
-    nearest_neighbor_paths_from_loc,
-    nearest_neighbors_group_path_from_cell_graph,
-    parse_assay_graph_paths,
-    parse_nearest_neighbors_group_path,
-    parse_neighbor_index_group_path,
-    parse_reduction_group_path,
-)
 from ...graph.distances import validate_distance_provenance
-from ...graph.paths import StoredAssayGraph, StoredGraph
+from ...graph.feature_projection import (
+    graph_cell_selection,
+    resolve_native_graph_inputs,
+)
 from ...graph.state import (
     AssayState,
     named_result_mismatch,
-    normalized_path_from_state,
     read_assay_state,
-    stored_assay_graph_from_ref,
-    stored_assay_graph_from_state,
-    validate_artifact_graph_selection,
+    read_assay_state_document,
     validate_cell_selection_artifact,
     validate_imported_coordinates_artifact,
-    validate_legacy_graph_selection,
-    validate_neighbors_artifact_selection,
     validate_normalized_artifact_selection,
+    validate_assay_state,
     write_assay_state,
 )
 from ...matrix import ChunkedArray
@@ -81,9 +66,7 @@ from ...neighbors.stages import (
 from ...neighbors.stream import AnnStream
 from ...storage.ann_index import (
     has_ann_index,
-    legacy_ann_index_path,
     load_ann_index,
-    load_ann_index_from_path,
     save_ann_index,
 )
 from ...storage.arrays import create_numeric_array, create_zarr_dataset
@@ -100,15 +83,13 @@ from ...storage.artifacts import (
     ArtifactScope,
     artifact_group,
     artifact_path,
-    fingerprint_array,
-    fingerprint_stored_arrays,
     fingerprint_strings,
     group_at,
     inspect_artifact,
-    parse_artifact_path,
     require_complete_artifact,
     serialize_artifact_value,
 )
+from ...storage.errors import ArtifactResolutionError
 from ...storage.copy import (
     copy_zarr_array,
     create_or_open_staged_normed_array,
@@ -123,7 +104,7 @@ from ...storage.layout import (
 )
 from ...storage.profiles import resolve_storage_profile
 from ...storage.sharding import write_dense_from_row_batches
-from ...storage.stores import is_remote_datastore, zarr_root_path
+from ...storage.stores import is_remote_datastore
 from ...storage.selections import (
     resolve_metadata_snapshot,
     resolve_selection_artifact,
@@ -171,6 +152,194 @@ def _row_block(
             "them. Leave batch_size unset to follow the stored layout."
         )
     return resolved
+
+
+def _integration_payload_error(
+    ref: ArtifactRef,
+    message: str,
+    *,
+    payload: str | None = None,
+) -> ArtifactResolutionError:
+    context: dict[str, Any] = {
+        "assay": ref.assay,
+        "artifact_id": ref.artifact_id,
+        "actual_kind": ref.kind,
+    }
+    if payload is not None:
+        context["payload"] = payload
+    return ArtifactResolutionError(
+        message,
+        code="corrupt_payload",
+        context=context,
+    )
+
+
+def _integration_array_block_rows(array: zarr.Array) -> int:
+    chunks = array.chunks
+    if chunks and chunks[0]:
+        return max(1, int(chunks[0]))
+    return max(1, min(int(array.shape[0]), 100_000))
+
+
+def _integration_payload_dimensions(
+    group: zarr.Group,
+    ref: ArtifactRef,
+) -> tuple[int, int]:
+    raw_cells = group.attrs.get("n_cells")
+    raw_neighbors = group.attrs.get("n_neighbors")
+    if (
+        isinstance(raw_cells, bool)
+        or not isinstance(raw_cells, int | np.integer)
+        or int(raw_cells) < 1
+        or isinstance(raw_neighbors, bool)
+        or not isinstance(raw_neighbors, int | np.integer)
+        or int(raw_neighbors) < 1
+    ):
+        raise _integration_payload_error(
+            ref,
+            f"{ref.kind} artifact has invalid n_cells or n_neighbors metadata",
+        )
+    n_cells = int(raw_cells)
+    n_neighbors = int(raw_neighbors)
+    if n_neighbors >= n_cells:
+        raise _integration_payload_error(
+            ref,
+            f"{ref.kind} artifact has an invalid neighbor count",
+        )
+    return n_cells, n_neighbors
+
+
+def _validate_integration_connectivity_payload(
+    root: zarr.Group,
+    ref: ArtifactRef,
+) -> int:
+    try:
+        group = artifact_group(root, ref)
+        edges = as_zarr_array(group["edges"], name="edges")
+        weights = as_zarr_array(group["weights"], name="weights")
+    except Exception as error:
+        raise _integration_payload_error(
+            ref,
+            "Connectivity-map artifact payload is unreadable",
+        ) from error
+    n_cells, n_neighbors = _integration_payload_dimensions(group, ref)
+    expected_edges = n_cells * n_neighbors
+    if (
+        edges.ndim != 2
+        or tuple(map(int, edges.shape)) != (expected_edges, 2)
+        or np.dtype(edges.dtype) != np.dtype(np.uint32)
+        or weights.ndim != 1
+        or tuple(map(int, weights.shape)) != (expected_edges,)
+        or np.dtype(weights.dtype) != np.dtype(np.float32)
+    ):
+        raise _integration_payload_error(
+            ref,
+            "Connectivity-map arrays do not match their stored dimensions",
+        )
+
+    row_counts = np.zeros(n_cells, dtype=np.uint64)
+    block_rows = _integration_array_block_rows(edges)
+    for start in range(0, expected_edges, block_rows):
+        stop = min(start + block_rows, expected_edges)
+        try:
+            edge_block = np.asarray(edges[start:stop])
+            weight_block = np.asarray(weights[start:stop])
+        except Exception as error:
+            raise _integration_payload_error(
+                ref,
+                "Connectivity-map arrays are unreadable",
+            ) from error
+        if (
+            np.any(edge_block >= n_cells)
+            or not np.all(np.isfinite(weight_block))
+            or np.any(weight_block < 0)
+        ):
+            raise _integration_payload_error(
+                ref,
+                "Connectivity-map arrays contain invalid edge or weight values",
+            )
+        row_counts += np.bincount(
+            edge_block[:, 0],
+            minlength=n_cells,
+        ).astype(np.uint64, copy=False)
+    if np.any(row_counts != n_neighbors):
+        raise _integration_payload_error(
+            ref,
+            "Connectivity-map rows do not match n_neighbors",
+        )
+    return n_cells
+
+
+def _validate_integration_neighbors_payload(
+    root: zarr.Group,
+    ref: ArtifactRef,
+) -> int:
+    try:
+        group = artifact_group(root, ref)
+        indices = as_zarr_array(group["indices"], name="indices")
+        distances = as_zarr_array(group["distances"], name="distances")
+    except Exception as error:
+        raise _integration_payload_error(
+            ref,
+            "Neighbors artifact payload is unreadable",
+        ) from error
+    n_cells, n_neighbors = _integration_payload_dimensions(group, ref)
+    expected_shape = (n_cells, n_neighbors)
+    raw_self_hit_rate = group.attrs.get("self_hit_rate")
+    if (
+        isinstance(raw_self_hit_rate, bool)
+        or not isinstance(raw_self_hit_rate, int | float | np.integer | np.floating)
+        or not math.isfinite(float(raw_self_hit_rate))
+        or not 0 <= float(raw_self_hit_rate) <= 100
+        or indices.ndim != 2
+        or tuple(map(int, indices.shape)) != expected_shape
+        or np.dtype(indices.dtype) != np.dtype(np.uint32)
+        or distances.ndim != 2
+        or tuple(map(int, distances.shape)) != expected_shape
+        or np.dtype(distances.dtype) != np.dtype(np.float32)
+    ):
+        raise _integration_payload_error(
+            ref,
+            "Neighbors arrays or metadata do not match their stored dimensions",
+        )
+
+    block_rows = _integration_array_block_rows(indices)
+    for start in range(0, n_cells, block_rows):
+        stop = min(start + block_rows, n_cells)
+        try:
+            index_block = np.asarray(indices[start:stop])
+            distance_block = np.asarray(distances[start:stop])
+        except Exception as error:
+            raise _integration_payload_error(
+                ref,
+                "Neighbors arrays are unreadable",
+            ) from error
+        row_ids = np.arange(start, stop, dtype=np.uint32)[:, None]
+        if (
+            np.any(index_block >= n_cells)
+            or np.any(index_block == row_ids)
+            or not np.all(np.isfinite(distance_block))
+            or np.any(distance_block < 0)
+        ):
+            raise _integration_payload_error(
+                ref,
+                "Neighbors arrays contain invalid indices or distances",
+            )
+    return n_cells
+
+
+def _validate_integration_source_payload(
+    root: zarr.Group,
+    ref: ArtifactRef,
+) -> int:
+    if ref.kind == "connectivity_map":
+        return _validate_integration_connectivity_payload(root, ref)
+    if ref.kind == "neighbors":
+        return _validate_integration_neighbors_payload(root, ref)
+    raise _integration_payload_error(
+        ref,
+        "Integration source has an unsupported artifact kind",
+    )
 
 
 def _streaming_lsi_block_rows(
@@ -244,6 +413,14 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
     if TYPE_CHECKING:
 
+        def _ensure_all_features(self, assay: Any) -> ArtifactRef: ...
+
+        def resolve_features(
+            self,
+            assay: str,
+            features: ArtifactRef | str,
+        ) -> ArtifactRef: ...
+
         def _build_mapping_reference_artifact(
             self,
             *,
@@ -274,260 +451,84 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             self._annStreamNeighborPaths = paths
         paths[ann_obj] = path
 
-    def _get_latest_keys(
-        self,
-        from_assay: str | None,
-        cell_key: str | None,
-        feat_key: str | None,
-    ) -> tuple[str, str, str]:
-        if from_assay is None:
-            from_assay = self._defaultAssay
-        if from_assay is None:
-            raise ValueError("No default assay is configured")
-        if cell_key is None:
-            cell_key = self._get_latest_cell_key(from_assay)
-        if feat_key is None:
-            feat_key = self._get_latest_feat_key(from_assay)
-        return from_assay, cell_key, feat_key
-
-    def get_normalized_group_path(
-        self, from_assay: str, cell_key: str, feat_key: str
-    ) -> str:
-        """Return the selected normalized artifact or released-layout path.
-
-        Args:
-            from_assay: Name of the assay.
-            cell_key: Cell key used (or to be used) for the graph.
-            feat_key: Feature key used (or to be used) for the graph.
-
-        Explicit keys use matching assay state when present, then the historical
-        ``normed__`` convention.
-        """
-        state_path = normalized_path_from_state(
-            self.zw,
-            from_assay,
-            cell_key,
-            feat_key,
-        )
-        if state_path is not None:
-            return state_path
-        return make_normalized_group_path(from_assay, cell_key, feat_key)
-
-    def get_latest_graph_loc(
-        self, from_assay: str, cell_key: str, feat_key: str
-    ) -> str:
-        """Return the location of the latest graph in the Zarr hierarchy.
-
-        Args:
-            from_assay: Name of the assay.
-            cell_key: Cell key used to create the graph.
-            feat_key: Feature key used to create the graph.
-
-        Returns:
-            Path of graph in the Zarr hierarchy
-        """
-        stored = self._lookup_stored_graph(from_assay, cell_key, feat_key)
-        if not isinstance(stored, StoredAssayGraph):
-            raise TypeError("Latest assay graph lookup returned a non-assay graph")
-        return stored.paths.cell_graph_group_path
-
-    def _resolve_integrated_graph_path(self, label: str) -> str:
-        index_path = self._integratedGraphsLoc
-        if index_path in self.zw:
-            index_group = as_zarr_group(self.zw[index_path], name=index_path)
-            raw_artifacts = index_group.attrs.get("artifacts", {})
-            if "artifacts" in index_group.attrs and not isinstance(
-                raw_artifacts,
-                dict,
-            ):
-                raise RuntimeError("Integrated graph artifact index is invalid")
-            if isinstance(raw_artifacts, dict):
-                raw_ref = raw_artifacts.get(label)
-                if label in raw_artifacts and not isinstance(raw_ref, dict):
-                    raise RuntimeError(
-                        f"Integrated graph index for {label!r} is invalid"
-                    )
-                if isinstance(raw_ref, dict):
-                    try:
-                        ref = ArtifactRef.from_dict(raw_ref)
-                        if ref.scope != "datastore" or ref.kind != "integrated_graph":
-                            raise ValueError(
-                                "Integrated graph index has an invalid ref"
-                            )
-                        status = inspect_artifact(self.zw, ref)
-                    except (KeyError, TypeError, ValueError) as exc:
-                        raise RuntimeError(
-                            f"Integrated graph index for {label!r} is invalid"
-                        ) from exc
-                    if not status.exists or not status.complete:
-                        raise RuntimeError(
-                            f"Integrated graph index for {label!r} is incomplete"
-                        )
-                    return status.path
-        return make_integrated_graph_path(index_path, label)
-
-    def _lookup_stored_graph(
-        self,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
-        feat_key: str | None = None,
-        graph_loc: str | None = None,
-    ) -> StoredGraph:
-        """Return a stored assay or integrated graph without mutating the store.
-
-        When ``graph_loc`` is omitted, resolves assay state before released
-        ``latest_*`` pointers. Explicit logical and encoded locations remain
-        readable without changing state.
-        """
-        if graph_loc is not None:
-            if is_integrated_graph_path(graph_loc, self._integratedGraphsLoc):
-                return lookup_stored_integrated_graph(self.zw, graph_loc)
-            try:
-                ref = parse_artifact_path(graph_loc)
-            except ValueError:
-                explicit_stored = parse_assay_graph_paths(graph_loc)
-                validate_legacy_graph_selection(
-                    self,
-                    graph_loc,
-                    explicit_stored.from_assay,
-                    explicit_stored.cell_key,
-                    explicit_stored.feat_key,
-                )
-                return explicit_stored
-            if ref.scope == "datastore" and ref.kind == "integrated_graph":
-                status = inspect_artifact(self.zw, ref)
-                if not status.exists or not status.complete:
-                    raise RuntimeError(
-                        f"Integrated graph artifact is incomplete: {graph_loc}"
-                    )
-                return lookup_stored_integrated_graph(self.zw, graph_loc)
-            if ref.scope != "assay" or ref.kind != "connectivity_map":
-                raise ValueError(f"Not an assay connectivity-map artifact: {graph_loc}")
-            return stored_assay_graph_from_ref(self.zw, ref)
-
-        state_assay = from_assay or self._defaultAssay
-        if state_assay is not None:
-            state = read_assay_state(self.zw, state_assay)
-            if (
-                state is not None
-                and (cell_key is None or cell_key == state.cell_key)
-                and (feat_key is None or feat_key == state.feat_key)
-            ):
-                selected_cell_key = cell_key or state.cell_key
-                selected_feat_key = feat_key or state.feat_key
-                state_stored = stored_assay_graph_from_state(
-                    self.zw,
-                    state_assay,
-                    selected_cell_key,
-                    selected_feat_key,
-                )
-                if state_stored is not None:
-                    return state_stored
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay,
-            cell_key,
-            feat_key,
-        )
-        legacy_stored = lookup_latest_assay_graph(
-            self.zw,
-            from_assay,
-            cell_key,
-            feat_key,
-        )
-        validate_legacy_graph_selection(
-            self,
-            legacy_stored.paths.cell_graph_group_path,
-            from_assay,
-            cell_key,
-            feat_key,
-        )
-        return legacy_stored
-
-    def _get_latest_knn_loc(self, from_assay: str | None = None) -> str:
-        """Convenience function to identify location of the latest KNN graph in
-        the Zarr hierarchy.
-
-        Args:
-            from_assay: Name of the assay.
-
-        Returns:
-            Path of KNN graph in the Zarr hierarchy
-        """
-        if from_assay is None:
-            logger.debug("Using the default assay for the KNN graph")
-            from_assay = self._load_default_assay()
-
-        if from_assay not in self.assay_names:
-            raise ValueError(f"ERROR: Assay {from_assay} does not exist")
-
-        state = read_assay_state(self.zw, from_assay)
-        if state is not None:
-            if state.neighbors is None:
-                raise RuntimeError("AssayState has no neighbors artifact")
-            status = inspect_artifact(self.zw, state.neighbors)
-            if not status.exists or not status.complete:
-                raise RuntimeError("AssayState selects incomplete neighbors")
-            return status.path
-
-        latest_cell_key = cast(
-            str,
-            as_zarr_group(self.zw[from_assay], name=from_assay).attrs[
-                "latest_cell_key"
-            ],
-        )
-        latest_feat_key = cast(
-            str,
-            as_zarr_group(self.zw[from_assay], name=from_assay).attrs[
-                "latest_feat_key"
-            ],
-        )
-        paths = lookup_latest_nearest_neighbor_paths(
-            self.zw,
-            from_assay,
-            latest_cell_key,
-            latest_feat_key,
-        )
-        reduction_loc = paths.reduction_group_path
-        reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
-        if "reduction" not in reduction_grp:
-            raise ValueError(f"ERROR: PCA Reduction not found in {reduction_loc}")
-        return paths.nearest_neighbors_group_path
-
     def _resolve_ann_index(
         self,
-        ann_loc: str,
+        ann_ref: ArtifactRef,
         ann_metric: str,
         dim: int,
         expected_count: int | None = None,
     ) -> Any:
-        """Load an ANN index from Zarr or a legacy file."""
-        ann_group: zarr.Group | None = (
-            as_zarr_group(self.zw[ann_loc], name=ann_loc)
-            if ann_loc in self.zw
-            else None
-        )
-
-        if ann_group is not None and has_ann_index(ann_group):
+        """Load the persisted Zarr bytes for a complete ANN artifact."""
+        context = {
+            "assay": ann_ref.assay,
+            "artifact_id": ann_ref.artifact_id,
+            "actual_kind": ann_ref.kind,
+        }
+        if ann_ref.kind != "ann_index":
+            raise ArtifactResolutionError(
+                "Expected an ann_index artifact",
+                code="wrong_kind",
+                context={**context, "expected_kind": "ann_index"},
+            )
+        if ann_ref.scope != "assay":
+            raise ArtifactResolutionError(
+                "ANN index artifact must be assay-scoped",
+                code="wrong_scope",
+                context={**context, "expected_scope": "assay"},
+            )
+        try:
+            status = inspect_artifact(self.zw, ann_ref)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ArtifactResolutionError(
+                "ANN artifact record is malformed",
+                code="corrupt_payload",
+                context=context,
+            ) from error
+        if not status.exists:
+            raise ArtifactResolutionError(
+                "ANN artifact does not exist",
+                code="missing_artifact",
+                context=context,
+            )
+        if not status.complete:
+            raise ArtifactResolutionError(
+                "ANN artifact is incomplete",
+                code="incomplete_artifact",
+                context=context,
+            )
+        try:
+            ann_group = as_zarr_group(self.zw[status.path], name=status.path)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ArtifactResolutionError(
+                "ANN artifact payload is malformed",
+                code="corrupt_payload",
+                context=context,
+            ) from error
+        if not has_ann_index(ann_group):
+            raise ArtifactResolutionError(
+                "ANN artifact has no persisted Zarr index bytes",
+                code="corrupt_payload",
+                context=context,
+            )
+        try:
             return load_ann_index(
                 ann_group,
                 ann_metric,
                 dim,
                 expected_count=expected_count,
             )
-
-        legacy = legacy_ann_index_path(zarr_root_path(self.zw), ann_loc)
-        if legacy is not None and os.path.exists(legacy):
-            return load_ann_index_from_path(
-                legacy,
-                ann_metric,
-                dim,
-                expected_count=expected_count,
-            )
-
-        logger.debug(
-            "ANN index not found in store; will rebuild from normalized data and loadings"
-        )
-        return None
+        except (
+            FileNotFoundError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise ArtifactResolutionError(
+                "ANN artifact has unreadable Zarr index bytes",
+                code="corrupt_payload",
+                context=context,
+            ) from error
 
     def _persist_ann_index(
         self,
@@ -620,47 +621,28 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         self,
         from_assay: str,
         cell_key: str,
-        feat_key: str,
         feat_scaling: bool,
-        neighbors_ref: ArtifactRef | None = None,
-    ) -> AnnStream | None:
-        def input_ref(owner: ArtifactRef, name: str) -> ArtifactRef:
-            value = (inspect_artifact(self.zw, owner).inputs or {}).get(name)
-            if not isinstance(value, dict):
-                raise ValueError(f"{owner.kind} has no {name!r} artifact input")
-            return ArtifactRef.from_dict(value)
-
+        neighbors_ref: ArtifactRef,
+    ) -> AnnStream:
+        if neighbors_ref.scope != "assay" or neighbors_ref.assay != from_assay:
+            raise ValueError("neighbors does not belong to from_assay")
+        lineage = resolve_native_graph_inputs(self.zw, neighbors_ref)
+        if lineage.normalized is None or lineage.reduction is None:
+            raise ValueError(
+                "Graph silhouette requires neighbors built from normalized data"
+            )
         correction_ref = None
-        if neighbors_ref is None:
-            state = read_assay_state(self.zw, from_assay)
-            if state is None or not state.matches(cell_key, feat_key):
-                return None
-            if (
-                state.normalized is None
-                or state.feature_scaling is None
-                or state.reduction is None
-                or state.ann_index is None
-                or state.neighbors is None
-            ):
-                raise KeyError("AssayState has no complete ANN stream")
-            normalized_ref = state.normalized
-            scaling_ref = state.feature_scaling
-            reduction_ref = state.reduction
-            ann_ref = state.ann_index
-            neighbors_ref = state.neighbors
-            correction_ref = state.batch_correction
-        else:
-            ann_ref = input_ref(neighbors_ref, "ann_index")
-            coordinates_ref = input_ref(neighbors_ref, "coordinates")
-            if coordinates_ref.kind == "batch_correction":
-                correction_ref = coordinates_ref
-                reduction_ref = input_ref(correction_ref, "reduction")
-            elif coordinates_ref.kind == "reduction":
-                reduction_ref = coordinates_ref
-            else:
-                raise ValueError("Unsupported neighbor coordinate artifact")
-            normalized_ref = input_ref(reduction_ref, "normalized")
-            scaling_ref = input_ref(reduction_ref, "feature_scaling")
+        ann_ref = lineage.ann_index
+        reduction_ref = lineage.reduction
+        normalized_ref = lineage.normalized
+        coordinates_ref = lineage.coordinates
+        if coordinates_ref.kind == "batch_correction":
+            correction_ref = coordinates_ref
+        reduction_status = inspect_artifact(self.zw, reduction_ref)
+        raw_scaling = (reduction_status.inputs or {}).get("feature_scaling")
+        if not isinstance(raw_scaling, dict):
+            raise ValueError("reduction has no 'feature_scaling' artifact input")
+        scaling_ref = ArtifactRef.from_dict(raw_scaling)
         normalized_group = artifact_group(self.zw, normalized_ref)
         scaling_group = artifact_group(self.zw, scaling_ref)
         reduction_group = artifact_group(self.zw, reduction_ref)
@@ -723,12 +705,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             else data.shape[1]
         )
         ann_idx = self._resolve_ann_index(
-            artifact_path(ann_ref),
+            ann_ref,
             ann_metric,
             dims if dims > 0 else data.shape[1],
             expected_count=int(data.shape[0]),
         )
-        rebuilt_ann = ann_idx is None
         neighbor_indices = as_zarr_array(
             neighbors_group["indices"],
             name="indices",
@@ -783,204 +764,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             ann_obj,
             artifact_path(ann_ref),
         )
-        assert neighbors_ref is not None
         self._remember_ann_stream_neighbors(
             ann_obj,
             artifact_path(neighbors_ref),
         )
-        if rebuilt_ann and self.zarr_mode == "r+":
-            self._persist_ann_index(
-                artifact_path(ann_ref),
-                ann_obj.annIdx,
-                ann_metric=ann_metric,
-                dimensions=dims if dims > 0 else data.shape[1],
-                element_count=int(data.shape[0]),
-            )
-        return ann_obj
-
-    def _load_ann_stream(
-        self,
-        from_assay: str,
-        cell_key: str,
-        feat_key: str,
-        feat_scaling: bool = True,
-        knn_loc: str | None = None,
-    ) -> AnnStream:
-        """Load an AnnStream from an existing graph without recomputing KNN."""
-
-        artifact_neighbors = None
-        if knn_loc is not None:
-            try:
-                candidate = parse_artifact_path(knn_loc)
-            except ValueError:
-                pass
-            else:
-                if candidate.kind == "neighbors":
-                    artifact_neighbors = candidate
-                    self._artifact_chain_state(
-                        candidate,
-                        cell_key_override=cell_key,
-                        feat_key_override=feat_key,
-                    )
-        if knn_loc is None:
-            state = read_assay_state(self.zw, from_assay)
-            if (
-                state is not None
-                and state.matches(cell_key, feat_key)
-                and state.normalized is not None
-            ):
-                validate_normalized_artifact_selection(
-                    self.zw,
-                    state.normalized,
-                    cell_key,
-                    feat_key,
-                )
-        if knn_loc is None or artifact_neighbors is not None:
-            artifact_stream = self._load_artifact_ann_stream(
-                from_assay,
-                cell_key,
-                feat_key,
-                feat_scaling,
-                neighbors_ref=artifact_neighbors,
-            )
-            if artifact_stream is not None:
-                return artifact_stream
-        if knn_loc is None:
-            chain = lookup_latest_nearest_neighbor_paths(
-                self.zw,
-                from_assay,
-                cell_key,
-                feat_key,
-            )
-            normed_loc = chain.normalized_group_path
-            if normed_loc not in self.zw:
-                raise KeyError(f"No normalized data at {normed_loc}")
-            reduction_loc = chain.reduction_group_path
-            ann_loc = chain.neighbor_index_group_path
-            knn_loc = chain.nearest_neighbors_group_path
-        else:
-            chain = nearest_neighbor_paths_from_loc(knn_loc)
-            validate_legacy_graph_selection(
-                self,
-                knn_loc,
-                from_assay,
-                cell_key,
-                feat_key,
-            )
-            ann_loc = chain.neighbor_index_group_path
-            reduction_loc = chain.reduction_group_path
-            normed_loc = chain.normalized_group_path
-
-        if knn_loc not in self.zw:
-            raise KeyError(f"KNN graph not found at {knn_loc}")
-
-        (
-            ann_metric,
-            ann_efc,
-            ann_ef,
-            ann_m,
-            rand_state,
-            _,
-            _,
-        ) = parse_neighbor_index_group_path(ann_loc)
-        reduction_method, dims, pca_cell_key = parse_reduction_group_path(reduction_loc)
-        k = parse_nearest_neighbors_group_path(knn_loc)
-
-        data = ChunkedArray(
-            as_zarr_array(
-                as_zarr_group(self.zw[normed_loc], name=normed_loc)["data"],
-                name="data",
-            ),
-            nthreads=self.nthreads,
-            resources=self.resources,
-        )
-        mu, sigma = self._load_or_compute_norm_stats(normed_loc, data, reduction_method)
-
-        loadings: NDArray[Any] | None = None
-        reduction_grp = as_zarr_group(self.zw[reduction_loc], name=reduction_loc)
-        if "reduction" in reduction_grp:
-            loadings = np.asarray(
-                as_zarr_array(reduction_grp["reduction"], name="reduction")[:]
-            )
-
-        ann_grp = as_zarr_group(self.zw[ann_loc], name=ann_loc)
-        cached_scaling = bool(ann_grp.attrs.get("featureScaling", True))
-        if cached_scaling != feat_scaling:
-            raise ValueError(
-                f"ANN index at {ann_loc} was built with featureScaling="
-                f"{cached_scaling}, not {feat_scaling}. Rebuild the graph."
-            )
-        harmonize = cast(bool, ann_grp.attrs.get("isHarmonized", False))
-        harmonized_data = None
-        batches = None
-        if harmonize and "harmonizedData" in reduction_grp:
-            harmonized_arr = as_zarr_array(
-                reduction_grp["harmonizedData"], name="harmonizedData"
-            )
-            harmonized_data = ChunkedArray(
-                harmonized_arr,
-                nthreads=self.nthreads,
-                resources=self.resources,
-            )
-            batch_columns = cast(list[str] | None, harmonized_arr.attrs.get("batches"))
-            if batch_columns:
-                batches = pd.DataFrame(
-                    {
-                        x: self.cells.fetch(x, key=cell_key).astype(object)
-                        for x in batch_columns
-                    }
-                )
-
-        temp_dim = dims if dims > 0 else data.shape[1]
-        ann_idx = self._resolve_ann_index(
-            ann_loc,
-            ann_metric,
-            temp_dim,
-            expected_count=int(data.shape[0]),
-        )
-        rebuilt_ann = ann_idx is None
-
-        use_for_pca = self.cells.fetch(pca_cell_key, key=cell_key)
-        ann_obj = AnnStream(
-            data=data,
-            k=k,
-            n_cluster=2,
-            reduction_method=reduction_method,
-            dims=dims,
-            loadings=loadings,
-            use_for_pca=use_for_pca,
-            mu=mu,
-            sigma=sigma,
-            ann_metric=ann_metric,
-            ann_efc=ann_efc,
-            ann_ef=ann_ef,
-            ann_m=ann_m,
-            nthreads=self.nthreads,
-            ann_parallel=False,
-            rand_state=rand_state,
-            do_kmeans_fit=False,
-            disable_scaling=not feat_scaling,
-            ann_idx=ann_idx,
-            lsi_skip_first=True,
-            lsi_params={},
-            harmonize=harmonize,
-            harmonized_data=harmonized_data,
-            batches=batches,
-        )
-        self._remember_ann_stream_path(ann_obj, ann_loc)
-        self._remember_ann_stream_neighbors(ann_obj, knn_loc)
-        if rebuilt_ann and self.zarr_mode == "r+":
-            self._persist_ann_index(
-                ann_loc,
-                ann_obj.annIdx,
-                ann_metric=ann_metric,
-                dimensions=int(temp_dim),
-                element_count=int(data.shape[0]),
-            )
-        if rebuilt_ann:
-            logger.info(f"Built ANN index for {data.shape[0]} cells")
-        else:
-            logger.info(f"Reused stored ANN index for {data.shape[0]} cells")
         return ann_obj
 
     def _get_graph_ncells_k(self, graph_loc: str) -> tuple[int, int]:
@@ -992,23 +779,13 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         Returns:
 
         """
-        if is_integrated_graph_path(graph_loc, self._integratedGraphsLoc):
-            stored = lookup_stored_integrated_graph(self.zw, graph_loc)
-            if stored.n_cells is None or stored.n_neighbors is None:
-                raise KeyError(
-                    f"Integrated graph at {graph_loc} is missing n_cells/n_neighbors"
-                )
-            return stored.n_cells, stored.n_neighbors
         graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
-        if "n_cells" in graph_group.attrs and "n_neighbors" in graph_group.attrs:
-            return (
-                int(cast(int | float | str, graph_group.attrs["n_cells"])),
-                int(cast(int | float | str, graph_group.attrs["n_neighbors"])),
-            )
-        knn_loc = nearest_neighbors_group_path_from_cell_graph(graph_loc)
-        knn_grp = as_zarr_group(self.zw[knn_loc], name=knn_loc)
-        indices = as_zarr_array(knn_grp["indices"], name="indices")
-        return indices.shape[0], indices.shape[1]
+        if "n_cells" not in graph_group.attrs or "n_neighbors" not in graph_group.attrs:
+            raise ValueError("Graph artifact is missing n_cells or n_neighbors")
+        return (
+            int(cast(int | float | str, graph_group.attrs["n_cells"])),
+            int(cast(int | float | str, graph_group.attrs["n_neighbors"])),
+        )
 
     def _store_to_sparse(
         self, graph_loc: str, sparse_format: str = "csr", use_k: int | None = None
@@ -1209,7 +986,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         embedding_initialization: ArtifactRef | None = None,
         named_results: dict[str, ArtifactRef] | None = None,
         cell_key_override: str | None = None,
-        feat_key_override: str | None = None,
     ) -> AssayState:
         normalized = feature_scaling = reduction = None
         batch_correction = ann_index = neighbors = connectivity_map = None
@@ -1261,10 +1037,55 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 raise ValueError("ANN artifact has no coordinates input")
             current = ArtifactRef.from_dict(raw_coordinates)
         if current.kind == "imported_coordinates":
-            raise ValueError(
-                "Imported coordinates are not part of the normalized AssayState "
-                "graph chain; pass update_state=False"
+            imported_status = self._require_complete_artifact(
+                current,
+                "imported_coordinates",
             )
+            if current.assay is None:
+                raise ValueError("Imported-coordinate artifact has no assay")
+            execution = imported_status.execution_options or {}
+            cell_key = execution.get("cell_key")
+            if not isinstance(cell_key, str):
+                raise ValueError("Imported-coordinate artifact has no cell_key")
+            if cell_key_override is not None:
+                cell_key = cell_key_override
+            validate_imported_coordinates_artifact(
+                self.zw,
+                current,
+                cell_key=cell_key,
+            )
+            imported_state = AssayState(
+                assay=current.assay,
+                cell_key=cell_key,
+                ann_index=ann_index,
+                neighbors=neighbors,
+                connectivity_map=connectivity_map,
+                named_results=named_results or {},
+            )
+            previous = read_assay_state_document(self.zw, current.assay)
+            if named_results is None and previous is not None:
+                carried = {}
+                for name, ref in previous.named_results.items():
+                    try:
+                        fits = (
+                            named_result_mismatch(
+                                self.zw,
+                                name,
+                                ref,
+                                imported_state,
+                            )
+                            is None
+                        )
+                    except (KeyError, RuntimeError, TypeError, ValueError):
+                        continue
+                    if fits:
+                        carried[name] = ref
+                if carried:
+                    imported_state = replace(
+                        imported_state,
+                        named_results=carried,
+                    )
+            return imported_state
         if current.kind == "batch_correction":
             batch_correction = current
             current = self._artifact_input_ref(
@@ -1279,11 +1100,22 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 "normalized",
                 "normalized",
             )
-            feature_scaling = self._artifact_input_ref(
+            reduction_status = self._require_complete_artifact(
                 current,
-                "feature_scaling",
-                "feature_scaling",
+                "reduction",
             )
+            raw_scaling = (reduction_status.inputs or {}).get("feature_scaling")
+            if raw_scaling is not None:
+                if not isinstance(raw_scaling, dict):
+                    raise ValueError(
+                        "Reduction feature_scaling input is not an artifact ref"
+                    )
+                feature_scaling = ArtifactRef.from_dict(raw_scaling)
+                self._require_complete_artifact(
+                    feature_scaling,
+                    "feature_scaling",
+                    assay=current.assay,
+                )
         elif current.kind == "normalized":
             normalized = current
         else:
@@ -1295,35 +1127,30 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         execution = normalized_status.execution_options or {}
         cell_key = execution.get("cell_key")
-        feat_key = execution.get("feat_key")
-        if not isinstance(cell_key, str) or not isinstance(feat_key, str):
-            raise ValueError("Normalized artifact is missing cell_key or feat_key")
+        if not isinstance(cell_key, str):
+            raise ValueError("Normalized artifact is missing cell_key")
         if normalized.assay is None:
             raise ValueError("Normalized artifact has no assay")
-        previous = read_assay_state(self.zw, normalized.assay)
-        if (cell_key_override is None) != (feat_key_override is None):
-            raise ValueError(
-                "cell_key and feat_key overrides must be provided together"
-            )
-        if cell_key_override is not None and feat_key_override is not None:
+        previous = read_assay_state_document(self.zw, normalized.assay)
+        if cell_key_override is not None:
             cell_key = cell_key_override
-            feat_key = feat_key_override
         elif previous is not None and previous.normalized == normalized:
             cell_key = previous.cell_key
-            feat_key = previous.feat_key
         validate_normalized_artifact_selection(
             self.zw,
             normalized,
             cell_key,
-            feat_key,
         )
         if embedding_initialization is None and reduction is not None:
             if previous is not None and previous.embedding_initialization is not None:
-                previous_reduction = self._artifact_input_ref(
-                    previous.embedding_initialization,
-                    "reduction",
-                    "reduction",
-                )
+                try:
+                    previous_reduction = self._artifact_input_ref(
+                        previous.embedding_initialization,
+                        "reduction",
+                        "reduction",
+                    )
+                except (KeyError, RuntimeError, TypeError, ValueError):
+                    previous_reduction = None
                 if previous_reduction == reduction:
                     embedding_initialization = previous.embedding_initialization
         if connectivity_map is None and neighbors is not None:
@@ -1343,7 +1170,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         state = AssayState(
             assay=normalized.assay,
             cell_key=cell_key,
-            feat_key=feat_key,
             normalized=normalized,
             feature_scaling=feature_scaling,
             reduction=reduction,
@@ -1374,21 +1200,29 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         update_state: bool,
         embedding_initialization: ArtifactRef | None = None,
         named_results: dict[str, ArtifactRef] | None = None,
+        named_result_updates: dict[str, ArtifactRef] | None = None,
         cell_key_override: str | None = None,
-        feat_key_override: str | None = None,
     ) -> None:
         if not update_state:
             return
+        if named_results is not None and named_result_updates is not None:
+            raise ValueError(
+                "named_results and named_result_updates cannot both be provided"
+            )
         candidate = self._artifact_chain_state(
             ref,
             embedding_initialization=embedding_initialization,
             named_results=named_results,
             cell_key_override=cell_key_override,
-            feat_key_override=feat_key_override,
         )
-        previous = read_assay_state(self.zw, candidate.assay)
+        if named_result_updates is not None:
+            merged_results = dict(candidate.named_results)
+            merged_results.update(named_result_updates)
+            candidate = replace(candidate, named_results=merged_results)
+        previous = read_assay_state_document(self.zw, candidate.assay)
         field_name = {
             "normalized": "normalized",
+            "embedding_initialization": "embedding_initialization",
             "reduction": "reduction",
             "batch_correction": "batch_correction",
             "ann_index": "ann_index",
@@ -1397,13 +1231,21 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         }.get(ref.kind)
         if (
             previous is not None
-            and previous.matches(candidate.cell_key, candidate.feat_key)
+            and previous.matches(candidate.cell_key)
             and field_name is not None
             and getattr(previous, field_name) == ref
             and embedding_initialization is None
             and named_results is None
+            and named_result_updates is None
         ):
-            candidate = previous
+            try:
+                validate_assay_state(self.zw, previous)
+            except ArtifactResolutionError:
+                # An unavailable artifact in the previous current chain must
+                # not prevent this complete chain from becoming current.
+                pass
+            else:
+                candidate = previous
         write_assay_state(
             self.zw,
             candidate,
@@ -1413,42 +1255,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         self,
         graph_ref: ArtifactRef,
     ) -> ArtifactRef:
-        if graph_ref.kind == "connectivity_map":
-            state = self._artifact_chain_state(graph_ref)
-            if state.normalized is None:
-                raise ValueError("Graph has no normalized input")
-            selection = self._artifact_input_ref(
-                state.normalized,
-                "cell_selection",
-                "cell_selection",
-                require_input_complete=False,
-            )
-            validate_cell_selection_artifact(self.zw, selection, state.cell_key)
-            return selection
-        if graph_ref.kind == "integrated_graph":
-            status = self._require_complete_artifact(
-                graph_ref,
-                "integrated_graph",
-            )
-            raw_selection = (status.inputs or {}).get("cell_selection")
-            if not isinstance(raw_selection, dict):
-                raise ValueError("Integrated graph has no shared cell selection")
-            selection = ArtifactRef.from_dict(raw_selection)
-            selection_status = inspect_artifact(self.zw, selection)
-            source_column = (selection_status.execution_options or {}).get(
-                "source_column"
-            )
-            if not isinstance(source_column, str):
-                if not selection_status.exists or not selection_status.complete:
-                    validate_cell_selection_artifact(self.zw, selection, "")
-                raise ValueError("Integrated graph cell selection key is unavailable")
-            validate_cell_selection_artifact(
-                self.zw,
-                selection,
-                source_column,
-            )
-            return selection
-        raise ValueError("Graph ref must be connectivity_map or integrated_graph")
+        return graph_cell_selection(self.zw, graph_ref)
 
     def _load_normalized_artifact(
         self,
@@ -1787,8 +1594,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         self,
         from_assay: str | None = None,
         cell_key: str = "I",
-        feat_key: str | None = None,
         *,
+        features: ArtifactRef | str,
         log_transform: bool | None = None,
         renormalize_subset: bool | None = None,
         update_state: bool = True,
@@ -1803,9 +1610,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         Args:
             from_assay: Assay to normalize. Uses the default assay when omitted.
             cell_key: Boolean cell metadata column selecting rows.
-            feat_key: Boolean feature metadata key selecting columns. For a
-                non-``I`` key, the stored feature column is
-                ``{cell_key}__{feat_key}``.
+            features: Exact published feature label or feature-selection ref.
             log_transform: Whether to apply the assay log transform. When
                 omitted, reuse the selected artifact setting or default to
                 true. ATAC defaults to false and rejects true.
@@ -1822,39 +1627,58 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             Reference to the normalized artifact.
 
         Raises:
-            KeyError: If the feature selection does not exist.
+            ArtifactResolutionError: If the feature selection is invalid.
             TypeError: If a selection is not boolean.
-            ValueError: If the assay, feature key, or selected data is invalid.
+            ValueError: If the assay or selected data is invalid.
         """
         assay_name = from_assay or self._defaultAssay
         if assay_name is None:
             raise ValueError("No assay was provided and no default is configured")
-        if feat_key is None:
-            raise ValueError("feat_key is required for normalization")
         assay = self._get_assay(assay_name)
-        stored_feat_key = feat_key if feat_key == "I" else f"{cell_key}__{feat_key}"
-        if stored_feat_key not in assay.feats.columns:
-            raise KeyError(
-                f"Feature selection column {stored_feat_key!r} does not exist"
-            )
+        state = read_assay_state_document(self.zw, assay_name)
+        self._ensure_all_features(assay)
+        feature_selection = self.resolve_features(assay_name, features)
         cell_values = np.asarray(self.cells.fetch_all(cell_key))
-        feature_values = np.asarray(assay.feats.fetch_all(stored_feat_key))
+        feature_group = artifact_group(self.zw, feature_selection)
+        feature_values = np.asarray(
+            as_zarr_array(feature_group["values"], name="values")[:],
+            dtype=bool,
+        )
         if cell_values.dtype != bool or feature_values.dtype != bool:
             raise TypeError("Cell and feature selections must be boolean")
         n_cells = int(cell_values.sum())
         n_features = int(feature_values.sum())
         if n_cells < 1 or n_features < 1:
             raise ValueError("Normalization requires selected cells and features")
-        state = read_assay_state(self.zw, assay_name)
+        cell_selection = self._ensure_cell_selection(cell_key)
         stored_parameters: dict[str, Any] = {}
-        if (
-            state is not None
-            and state.matches(cell_key, feat_key)
-            and state.normalized is not None
-        ):
-            stored_parameters = (
-                inspect_artifact(self.zw, state.normalized).parameters or {}
-            )
+        if state is not None and state.cell_key == cell_key and state.normalized:
+            candidate_parameters: dict[str, Any] = {}
+            try:
+                normalized_status = inspect_artifact(self.zw, state.normalized)
+                if not normalized_status.exists or not normalized_status.complete:
+                    raise ValueError("Current normalized artifact is unavailable")
+                validate_normalized_artifact_selection(
+                    self.zw,
+                    state.normalized,
+                    cell_key,
+                )
+                normalized_inputs = normalized_status.inputs or {}
+                stored_cell_selection = ArtifactRef.from_dict(
+                    cast(dict[str, Any], normalized_inputs["cell_selection"])
+                )
+                stored_feature_selection = ArtifactRef.from_dict(
+                    cast(dict[str, Any], normalized_inputs["feature_selection"])
+                )
+                candidate_parameters = normalized_status.parameters or {}
+            except (KeyError, RuntimeError, TypeError, ValueError):
+                stored_cell_selection = None
+                stored_feature_selection = None
+            if (
+                stored_cell_selection == cell_selection
+                and stored_feature_selection == feature_selection
+            ):
+                stored_parameters = candidate_parameters
         from ...assay import ATACassay
 
         if isinstance(assay, ATACassay):
@@ -1892,31 +1716,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 renormalize_subset = bool(
                     stored_parameters.get("renormalize_subset", True)
                 )
-        cell_data = as_zarr_group(self.zw["cellData"], name="cellData")
-        feature_data = as_zarr_group(
-            assay.z["featureData"],
-            name="featureData",
-        )
-        cell_selection = self._resolve_selection_input(
-            metadata_group=cell_data,
-            column=cell_key,
-            values=cell_values,
-            row_ids=np.asarray(self.cells.fetch_all("ids")),
-            scope="datastore",
-            kind="cell_selection",
-            assay=None,
-            invalidate_cache=invalidate_cache,
-        )
-        feature_selection = self._resolve_selection_input(
-            metadata_group=feature_data,
-            column=stored_feat_key,
-            values=feature_values,
-            row_ids=np.asarray(assay.feats.fetch_all("ids")),
-            scope="assay",
-            kind="feature_selection",
-            assay=assay_name,
-            invalidate_cache=invalidate_cache,
-        )
         normalization_method = assay.normMethod
         if callable(normalization_method):
             method_qualname = str(getattr(normalization_method, "__qualname__", ""))
@@ -1931,7 +1730,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         arguments = NormalizationArguments(
             from_assay=assay_name,
             cell_key=cell_key,
-            feat_key=feat_key,
             cell_selection=cell_selection,
             feature_selection=feature_selection,
             normalization_method=normalization_method,
@@ -1972,20 +1770,17 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             group = start_artifact(self.zw, planned)
             relative_path = artifact_path(planned.ref).removeprefix(f"{assay_name}/")
             assay.save_normalized_data(
-                cell_key,
-                feat_key,
+                np.flatnonzero(cell_values),
+                np.flatnonzero(feature_values),
                 relative_path,
-                log_transform,
-                renormalize_subset,
-                False,
-                artifact_mode=True,
+                log_transform=log_transform,
+                renormalize_subset=renormalize_subset,
             )
             finish_artifact(group, planned)
         self._publish_current_artifact(
             planned.ref,
             update_state=update_state,
             cell_key_override=cell_key,
-            feat_key_override=feat_key,
         )
         action = "Reused" if planned.reused else "Stored"
         logger.info(
@@ -2023,6 +1818,9 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             "normalized",
         )
         status = self._require_complete_artifact(normalized_ref, "normalized")
+        if normalized_ref.assay is None:
+            raise ValueError("Normalized artifact has no assay")
+        read_assay_state_document(self.zw, normalized_ref.assay)
         group = group_at(self.zw, status.path)
         data = as_zarr_array(group["data"], name="data")
         effective_batch_size = _row_block(
@@ -2102,18 +1900,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         assay_name = normalized_ref.assay
         execution = normalized_status.execution_options or {}
         cell_key = execution.get("cell_key")
-        feat_key = execution.get("feat_key")
-        if not isinstance(cell_key, str) or not isinstance(feat_key, str):
-            raise ValueError("Normalized artifact has no cell_key or feat_key")
-        state = read_assay_state(self.zw, assay_name)
+        if not isinstance(cell_key, str):
+            raise ValueError("Normalized artifact has no cell_key")
+        state = read_assay_state_document(self.zw, assay_name)
         if state is not None and state.normalized == normalized_ref:
             cell_key = state.cell_key
-            feat_key = state.feat_key
         validate_normalized_artifact_selection(
             self.zw,
             normalized_ref,
             cell_key,
-            feat_key,
         )
         data_group = as_zarr_group(
             self.zw[normalized_status.path],
@@ -2293,6 +2088,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 normalized=normalized_ref,
                 feature_scaling=scaling_plan.ref,
                 loadings=custom_loadings,
+                dims=effective_dims,
+                feat_scaling=feat_scaling,
                 update_state=update_state,
                 invalidate_cache=invalidate_cache,
             )
@@ -2614,18 +2411,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         execution = normalized_status.execution_options or {}
         cell_key = execution.get("cell_key")
-        feat_key = execution.get("feat_key")
-        if not isinstance(cell_key, str) or not isinstance(feat_key, str):
-            raise ValueError("Normalized artifact has no cell_key or feat_key")
-        state = read_assay_state(self.zw, reduction_ref.assay)
+        if not isinstance(cell_key, str):
+            raise ValueError("Normalized artifact has no cell_key")
+        state = read_assay_state_document(self.zw, reduction_ref.assay)
         if state is not None and state.normalized == normalized_ref:
             cell_key = state.cell_key
-            feat_key = state.feat_key
         validate_normalized_artifact_selection(
             self.zw,
             normalized_ref,
             cell_key,
-            feat_key,
         )
         if not isinstance(batch_columns, list) or not batch_columns:
             raise ValueError("batch_columns must be a non-empty list")
@@ -2928,6 +2722,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             if state is None or state.reduction is None:
                 raise KeyError(f"AssayState for {assay!r} has no selected reduction")
             reduction = state.reduction
+        elif reduction.assay is not None:
+            read_assay_state_document(self.zw, reduction.assay)
         initialization = self._build_embedding_initialization(
             reduction,
             n_centroids=n_centroids,
@@ -2940,8 +2736,16 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         if update_state:
             if reduction.assay is None:
                 raise ValueError("Reduction artifact has no assay")
-            state = read_assay_state(self.zw, reduction.assay)
-            if state is not None and state.reduction == reduction:
+            state_document = read_assay_state_document(self.zw, reduction.assay)
+            state = None
+            if state_document is not None and state_document.reduction == reduction:
+                try:
+                    validate_assay_state(self.zw, state_document)
+                except ArtifactResolutionError:
+                    pass
+                else:
+                    state = state_document
+            if state is not None:
                 write_assay_state(
                     self.zw,
                     replace(
@@ -2987,11 +2791,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             )
         if coordinates.assay is None:
             raise ValueError("Coordinate artifact has no assay")
-        if coordinates.kind == "imported_coordinates" and update_state:
-            raise ValueError(
-                "Imported coordinates cannot activate AssayState; "
-                "pass update_state=False"
-            )
+        read_assay_state_document(self.zw, coordinates.assay)
         if ann_metric not in {"l2", "cosine"}:
             raise ValueError("ann_metric must be one of: l2, cosine")
         resolved_ann_efc = _positive_integer(ann_efc, "ann_efc")
@@ -3105,6 +2905,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if ann_ref.assay is None:
             raise ValueError("ANN artifact has no assay")
+        read_assay_state_document(self.zw, ann_ref.assay)
         raw_coordinates = (ann_status.inputs or {}).get("coordinates")
         if not isinstance(raw_coordinates, dict):
             raise ValueError("ANN artifact has no coordinates input")
@@ -3124,11 +2925,6 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if coordinates is not None and coordinates != stored_coordinates:
             raise ValueError("coordinates do not match the ANN artifact input")
-        if stored_coordinates.kind == "imported_coordinates" and update_state:
-            raise ValueError(
-                "Neighbors from imported coordinates cannot activate AssayState; "
-                "pass update_state=False"
-            )
         requested_k = _positive_integer(k, "k")
         resolved_batch_size = (
             None if batch_size is None else _positive_integer(batch_size, "batch_size")
@@ -3181,13 +2977,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if not planned.reused:
             ann_idx = self._resolve_ann_index(
-                ann_status.path,
+                ann_ref,
                 str(ann_metric),
                 dims,
                 expected_count=n_cells,
             )
-            if ann_idx is None:
-                raise RuntimeError("ANN artifact has no readable index")
             ann_idx = AnnIndexStage.configure(
                 ann_idx,
                 ef=int(ann_parameters.get("ann_ef", 50)),
@@ -3301,10 +3095,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         )
         if neighbors_ref.assay is None:
             raise ValueError("Neighbors artifact has no assay")
+        read_assay_state_document(self.zw, neighbors_ref.assay)
         group = group_at(self.zw, status.path)
         indices = as_zarr_array(group["indices"], name="indices")
         n_cells, n_neighbors = map(int, indices.shape)
-        validate_distance_provenance(self.zw, status.path)
+        validate_distance_provenance(self.zw, neighbors_ref)
         arguments = ConnectivityMapArguments(
             neighbors=neighbors_ref,
             local_connectivity=local_connectivity,
@@ -3383,35 +3178,15 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         logger.info(f"{action} connectivity map for {n_cells} cells")
         return planned.ref
 
-    def load_graph(
+    def _load_graph_artifact(
         self,
-        from_assay: str | None = None,
-        cell_key: str | None = None,
-        feat_key: str | None = None,
-        symmetric: bool | None = None,
-        upper_only: bool | None = None,
-        use_k: int | None = None,
-        graph_loc: str | None = None,
+        graph: ArtifactRef,
+        *,
+        symmetric: bool | None,
+        upper_only: bool | None,
+        use_k: int | None,
     ) -> csr_matrix:
-        """Load the cell neighbourhood as a scipy sparse matrix.
-
-        Args:
-            from_assay: Name of the assay. If None then the default assay is used.
-            cell_key: Cell key used to create the graph. If None then the latest feature key used for creating a
-                      KNN graph is used.
-            feat_key: Feature key used to create the graph. If None then the latest feature key used for creating a
-                      KNN graph is used.
-            symmetric: If True, makes the graph symmetric by adding it to its transpose.
-            upper_only: If True, then only the values from upper triangular of the matrix are returned. This is only
-                       used when symmetric is True.
-            use_k: Number of top k-nearest neighbours to keep in the graph. This value must be greater than 0 and less
-                   the parameter k used. By default, all neighbours are used. (Default value: None)
-            graph_loc: Zarr hierarchy where the graph is stored. If no value is provided then graph location is
-                       obtained from `get_latest_graph_loc` method.
-
-        Returns:
-            A scipy sparse matrix representing cell neighbourhood graph.
-        """
+        """Load one already captured and validated graph reference."""
 
         def symmetrize(g: csr_matrix) -> csr_matrix:
             t = g + g.T
@@ -3420,67 +3195,11 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         from scipy.sparse import triu
 
-        if graph_loc is None:
-            stored = self._lookup_stored_graph(from_assay, cell_key, feat_key)
-            if not isinstance(stored, StoredAssayGraph):
-                raise TypeError("Expected an assay graph for load_graph lookup")
-            graph_loc = stored.paths.cell_graph_group_path
-        try:
-            explicit_ref = parse_artifact_path(graph_loc)
-        except ValueError:
-            if not is_integrated_graph_path(
-                graph_loc,
-                self._integratedGraphsLoc,
-            ):
-                stored = self._lookup_stored_graph(graph_loc=graph_loc)
-                if not isinstance(stored, StoredAssayGraph):
-                    raise ValueError("Expected an assay graph")
-                if from_assay is not None and from_assay != stored.from_assay:
-                    raise ValueError("from_assay does not match the graph location")
-                if cell_key is not None and cell_key != stored.cell_key:
-                    raise ValueError("cell_key does not match the graph location")
-                if feat_key is not None and feat_key != stored.feat_key:
-                    raise ValueError("feat_key does not match the graph location")
-        else:
-            status = inspect_artifact(self.zw, explicit_ref)
-            if not status.exists or not status.complete:
-                raise RuntimeError(f"Graph artifact is incomplete: {graph_loc}")
-            if (
-                explicit_ref.scope == "assay"
-                and explicit_ref.kind == "connectivity_map"
-            ):
-                stored = stored_assay_graph_from_ref(self.zw, explicit_ref)
-                if from_assay is not None and from_assay != stored.from_assay:
-                    raise ValueError("from_assay does not match the graph artifact")
-                if cell_key is not None and cell_key != stored.cell_key:
-                    raise ValueError("cell_key does not match the graph artifact")
-                if feat_key is not None and feat_key != stored.feat_key:
-                    raise ValueError("feat_key does not match the graph artifact")
-            elif (
-                explicit_ref.scope == "datastore"
-                and explicit_ref.kind == "integrated_graph"
-            ):
-                selection = self._graph_cell_selection(explicit_ref)
-                source_column = (
-                    inspect_artifact(self.zw, selection).execution_options or {}
-                ).get("source_column")
-                selected_cell_key = cell_key or source_column
-                if not isinstance(selected_cell_key, str):
-                    raise ValueError(
-                        "Integrated graph cell selection key is unavailable"
-                    )
-                validate_cell_selection_artifact(
-                    self.zw,
-                    selection,
-                    selected_cell_key,
-                )
-            else:
-                raise ValueError(f"Not a graph artifact: {graph_loc}")
-        if graph_loc not in self.zw:
+        if graph.kind not in {"connectivity_map", "integrated_graph"}:
             raise ValueError(
-                f"{graph_loc} not found in zarr location. "
-                f"Build graph artifacts for assay {from_assay}"
+                "Graph reference must be connectivity_map or integrated_graph"
             )
+        graph_loc = require_complete_artifact(self.zw, graph).path
         cache_key = (
             graph_loc,
             symmetric is True,
@@ -3493,17 +3212,60 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 cached = cache.get(cache_key)
             if cached is not None:
                 return cached
-        n_cells, graph = self._store_to_sparse(graph_loc, "csr", use_k)
+        _n_cells, matrix = self._store_to_sparse(graph_loc, "csr", use_k)
+        assert isinstance(matrix, csr_matrix)
         if symmetric is True:
-            graph = symmetrize(graph)
+            matrix = symmetrize(matrix)
             if upper_only is True:
-                graph = triu(graph)
+                matrix = triu(matrix).tocsr()
         if cache is not None:
             with self._graphMemoryCacheLock:
                 active_cache = getattr(self, "_graphMemoryCache", None)
                 if active_cache is cache:
-                    graph = active_cache.setdefault(cache_key, graph)
-        return graph
+                    matrix = active_cache.setdefault(cache_key, matrix)
+        return matrix
+
+    def load_graph(
+        self,
+        graph: ArtifactRef | None = None,
+        *,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
+        symmetric: bool | None = None,
+        upper_only: bool | None = None,
+        use_k: int | None = None,
+    ) -> csr_matrix:
+        """Load the cell neighbourhood as a scipy sparse matrix.
+
+        Args:
+            graph: Connectivity-map or integrated-graph artifact. The current
+                assay graph is used when omitted.
+            from_assay: Name of the assay used for current-state resolution.
+            cell_key: Optional cell key, validated against the graph lineage.
+            symmetric: If True, makes the graph symmetric by adding it to its transpose.
+            upper_only: If True, then only the values from upper triangular of the matrix are returned. This is only
+                       used when symmetric is True.
+            use_k: Number of top k-nearest neighbours to keep in the graph. This value must be greater than 0 and less
+                   the parameter k used. By default, all neighbours are used. (Default value: None)
+
+        Returns:
+            A scipy sparse matrix representing cell neighbourhood graph.
+        """
+
+        from ...graph.state import resolve_graph_selection
+
+        selection = resolve_graph_selection(
+            self,
+            graph,
+            from_assay=from_assay,
+            cell_key=cell_key,
+        )
+        return self._load_graph_artifact(
+            selection.graph_ref,
+            symmetric=symmetric,
+            upper_only=upper_only,
+            use_k=use_k,
+        )
 
     def integrate_assays(
         self,
@@ -3514,7 +3276,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         invalidate_cache: bool = False,
         l2_normalize: bool = True,
     ) -> ArtifactRef:
-        """Integrate the latest neighbourhood graphs for selected assays.
+        """Integrate the current state-selected graphs for selected assays.
 
         SNN combines shared edge support across two or more assays. WNN accepts
         two or more assays and uses Hao-inspired per-cell modality weights.
@@ -3524,7 +3286,8 @@ class _GraphOperationsMixin(_GraphOperationsBase):
         and SNN-far bandwidth.
 
         Args:
-            assays: Name of the input assays. The latest constructed graph from each assay is used.
+            assays: Input assay names. Each assay's current state-selected graph
+                or neighbors artifact is captured once.
             label: Label for integrated graph
             method: Choose a method for modality integration. Available options: 'snn': Shared nearest neighbour
                     approach and 'wnn': Hao-inspired weighted nearest neighbor integration.
@@ -3535,8 +3298,7 @@ class _GraphOperationsMixin(_GraphOperationsBase):
 
         Returns:
             Reference to the integrated-graph artifact. Pass it to `run_umap`,
-            `run_tsne`, or the clustering methods as their ``graph`` argument,
-            or keep using ``integrated_graph=label``.
+            `run_tsne`, or the clustering methods as their ``graph`` argument.
 
         WNN stores one modality-weight column per assay, named
         ``{label}_{assay}_weight`` in cell metadata.
@@ -3549,10 +3311,10 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             raise ValueError(
                 f"Method {method} not supported, choose one of these: 'snn', 'wnn'"
             )
-        if method == "wnn" and len(assays) < 2:
-            raise ValueError("WNN integration requires at least two assays")
-        if method == "wnn" and len(set(assays)) != len(assays):
-            raise ValueError("WNN integration requires unique assay names")
+        if len(assays) < 2:
+            raise ValueError("Assay integration requires at least two assays")
+        if len(set(assays)) != len(assays):
+            raise ValueError("Assay integration requires unique assay names")
         if method == "wnn" and not isinstance(l2_normalize, bool | np.bool_):
             raise TypeError("l2_normalize must be a boolean")
 
@@ -3584,143 +3346,83 @@ class _GraphOperationsMixin(_GraphOperationsBase):
                 raise ValueError("WNN coordinate stream did not cover every cell")
             return coordinates
 
-        def neighbor_coordinates_ref(neighbors: ArtifactRef) -> ArtifactRef:
-            raw_coordinates = (inspect_artifact(self.zw, neighbors).inputs or {}).get(
-                "coordinates"
-            )
-            if not isinstance(raw_coordinates, dict):
-                raise ValueError("Neighbors artifact has no coordinates input")
-            coordinates = ArtifactRef.from_dict(raw_coordinates)
-            if coordinates.kind not in {"reduction", "batch_correction"}:
-                raise ValueError(
-                    "Neighbor coordinates must be reduction or batch_correction"
-                )
-            self._require_complete_artifact(coordinates, coordinates.kind)
-            return coordinates
-
         source_inputs: dict[str, Any] = {}
-        legacy_wnn_coordinates: dict[str, np.ndarray] = {}
-        legacy_wnn_neighbor_paths: dict[str, str] = {}
+        captured_sources: list[ArtifactRef] = []
+        captured_coordinates: list[ArtifactRef | None] = []
         shared_selection: ArtifactRef | None = None
         shared_cell_key: str | None = None
-        for assay_name in assays:
+        shared_source_n_cells: int | None = None
+        for index, assay_name in enumerate(assays):
             if assay_name not in self.assay_names:
                 raise ValueError(f"ERROR: Assay {assay_name} was not found.")
             state = read_assay_state(self.zw, assay_name)
-            artifact_source = state is not None and (
-                (method == "wnn" and state.neighbors is not None)
-                or (method == "snn" and state.connectivity_map is not None)
+            source = (
+                None
+                if state is None
+                else (state.neighbors if method == "wnn" else state.connectivity_map)
             )
-            if artifact_source:
-                assert state is not None
-                if state.normalized is None:
-                    raise ValueError(
-                        f"Assay {assay_name!r} has no normalized graph input"
-                    )
-                if method == "wnn":
-                    assert state.neighbors is not None
-                    self._require_complete_artifact(state.neighbors, "neighbors")
-                    validate_neighbors_artifact_selection(
-                        self.zw,
-                        state.neighbors,
-                        state.cell_key,
-                        state.feat_key,
-                    )
-                else:
-                    assert state.connectivity_map is not None
-                    validate_artifact_graph_selection(
-                        self.zw,
-                        state.connectivity_map,
-                        state.cell_key,
-                        state.feat_key,
-                    )
-                selection = self._artifact_input_ref(
-                    state.normalized,
-                    "cell_selection",
-                    "cell_selection",
+            if source is None:
+                code = (
+                    "missing_current_neighbors"
+                    if method == "wnn"
+                    else "missing_current_graph"
                 )
-                if method == "wnn":
-                    assert state.neighbors is not None
-                    coordinates_ref = neighbor_coordinates_ref(state.neighbors)
-                    source_inputs[assay_name] = {
-                        "neighbors": state.neighbors,
-                        "coordinates": coordinates_ref,
-                    }
-                else:
-                    assert state.connectivity_map is not None
-                    source_inputs[assay_name] = state.connectivity_map
-                cell_key = state.cell_key
-            else:
-                legacy_graph_path = self.get_latest_graph_loc(
-                    assay_name,
-                    self._get_latest_cell_key(assay_name),
-                    self._get_latest_feat_key(assay_name),
+                noun = "neighbors" if method == "wnn" else "connectivity map"
+                raise ArtifactResolutionError(
+                    f"Assay {assay_name!r} has no current {noun}",
+                    code=code,
+                    context={"assay": assay_name},
                 )
-                legacy_graph = as_zarr_group(
-                    self.zw[legacy_graph_path],
-                    name=legacy_graph_path,
+            assert state is not None
+            ancestry = resolve_native_graph_inputs(self.zw, source)
+            if method == "wnn" and ancestry.coordinates.kind not in {
+                "reduction",
+                "batch_correction",
+            }:
+                raise ArtifactResolutionError(
+                    "WNN coordinates must be reduction or batch_correction",
+                    code="wrong_kind",
+                    context={
+                        "assay": assay_name,
+                        "artifact_id": ancestry.coordinates.artifact_id,
+                        "actual_kind": ancestry.coordinates.kind,
+                        "expected_kind": "reduction,batch_correction",
+                    },
                 )
-                cell_key = self._get_latest_cell_key(assay_name)
-                selection = self._ensure_cell_selection(cell_key)
-                if method == "wnn":
-                    neighbors_path = nearest_neighbors_group_path_from_cell_graph(
-                        legacy_graph_path
-                    )
-                    neighbors_group = as_zarr_group(
-                        self.zw[neighbors_path],
-                        name=neighbors_path,
-                    )
-                    legacy_wnn_neighbor_paths[assay_name] = neighbors_path
-                    legacy_input: dict[str, Any] = {
-                        "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                            neighbors_group,
-                            ("indices",),
-                        ),
-                    }
-                    feat_key = self._get_latest_feat_key(assay_name)
-                    ann = self._load_ann_stream(
-                        assay_name,
-                        cell_key,
-                        feat_key,
-                    )
-                    if ann.harmonizedData is not None:
-                        coordinates = materialize_coordinate_blocks(
-                            (
-                                np.asarray(block.compute())
-                                for block in ann.harmonizedData.blocks
-                            ),
-                            ann.nCells,
-                        )
-                    else:
-                        coordinates = materialize_coordinate_blocks(
-                            (
-                                ann.reducer(block)
-                                for block in ann.iter_blocks(
-                                    f"Loading {assay_name} coordinates"
-                                )
-                            ),
-                            ann.nCells,
-                        )
-                    legacy_wnn_coordinates[assay_name] = coordinates
-                    legacy_input["legacy_coordinates_fingerprint"] = fingerprint_array(
-                        coordinates
-                    )
-                else:
-                    legacy_input = {
-                        "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                            legacy_graph,
-                            ("edges", "weights"),
-                        ),
-                    }
-                source_inputs[assay_name] = legacy_input
+            validate_cell_selection_artifact(
+                self.zw,
+                ancestry.cell_selection,
+                state.cell_key,
+            )
+            source_n_cells = _validate_integration_source_payload(self.zw, source)
+            if shared_source_n_cells is None:
+                shared_source_n_cells = source_n_cells
+            elif source_n_cells != shared_source_n_cells:
+                raise _integration_payload_error(
+                    source,
+                    "Integration sources contain different cell counts",
+                )
+            selection = ancestry.cell_selection
+            captured_sources.append(source)
+            captured_coordinates.append(
+                ancestry.coordinates if method == "wnn" else None
+            )
+            source_inputs[f"source_{index}"] = (
+                {
+                    "neighbors": source,
+                    "coordinates": ancestry.coordinates,
+                }
+                if method == "wnn"
+                else source
+            )
+            cell_key = state.cell_key
             if shared_selection is None:
                 shared_selection = selection
                 shared_cell_key = cell_key
-            elif not self._selection_artifacts_match(
-                shared_selection,
-                selection,
-            ):
-                raise ValueError("Integrated graphs require one shared cell selection")
+            elif shared_selection != selection:
+                raise ValueError(
+                    "Integrated graphs require one exact shared cell selection"
+                )
         if shared_selection is None:
             raise ValueError("No assay cell selection was resolved")
         if shared_cell_key is None:
@@ -3826,68 +3528,59 @@ class _GraphOperationsMixin(_GraphOperationsBase):
             publish_modality_weights()
             return integrated_plan.ref
 
-        def load_wnn_inputs(assay_name: str) -> tuple[np.ndarray, NDArray[Any]]:
-            state = read_assay_state(self.zw, assay_name)
-            if state is not None and state.neighbors is not None:
-                neighbors_group = artifact_group(self.zw, state.neighbors)
-                indices = np.asarray(
-                    as_zarr_array(
-                        neighbors_group["indices"],
-                        name="indices",
-                    )[:]
-                )
-                coordinates_ref = neighbor_coordinates_ref(state.neighbors)
-                coordinate_source, _n_cells, _dims = self._coordinate_source(
-                    coordinates_ref,
-                    batch_size=None,
-                )
-                coordinates = materialize_coordinate_blocks(
-                    (
-                        np.asarray(block)
-                        for block in coordinate_source.iter_coordinate_blocks(
-                            f"Loading {assay_name} coordinates",
-                        )
-                    ),
-                    _n_cells,
-                    expected_dims=_dims,
-                )
-                if indices.shape[0] != _n_cells:
-                    raise ValueError(
-                        f"WNN neighbors and coordinates for {assay_name} "
-                        "contain different cell counts"
-                    )
-                return indices, coordinates
-            neighbors_path = legacy_wnn_neighbor_paths[assay_name]
-            neighbors_group = as_zarr_group(
-                self.zw[neighbors_path],
-                name=neighbors_path,
-            )
+        def load_wnn_inputs(
+            index: int,
+            assay_name: str,
+        ) -> tuple[np.ndarray, NDArray[Any]]:
+            neighbors = captured_sources[index]
+            coordinates_ref = captured_coordinates[index]
+            if neighbors.kind != "neighbors" or coordinates_ref is None:
+                raise RuntimeError("Captured WNN source is invalid")
+            neighbors_group = artifact_group(self.zw, neighbors)
             indices = np.asarray(
                 as_zarr_array(
                     neighbors_group["indices"],
                     name="indices",
                 )[:]
             )
-            return indices, legacy_wnn_coordinates[assay_name]
+            coordinate_source, n_cells, dims = self._coordinate_source(
+                coordinates_ref,
+                batch_size=None,
+            )
+            coordinates = materialize_coordinate_blocks(
+                (
+                    np.asarray(block)
+                    for block in coordinate_source.iter_coordinate_blocks(
+                        f"Loading {assay_name} coordinates",
+                    )
+                ),
+                n_cells,
+                expected_dims=dims,
+            )
+            if indices.shape[0] != n_cells:
+                raise ValueError(
+                    f"WNN neighbors and coordinates for {assay_name} "
+                    "contain different cell counts"
+                )
+            return indices, coordinates
 
         modality_weights: np.ndarray | None = None
         if method == "snn":
-            graphs: list[csr_matrix] = []
-            for assay in assays:
-                if assay not in self.assay_names:
-                    raise ValueError(f"ERROR: Assay {assay} was not found.")
-                graphs.append(
-                    self.load_graph(
-                        from_assay=assay,
-                        cell_key=None,
-                        feat_key=None,
-                        symmetric=False,
-                        upper_only=False,
-                    ).tocsr()
-                )
+            graphs = [
+                self._load_graph_artifact(
+                    source,
+                    symmetric=None,
+                    upper_only=None,
+                    use_k=None,
+                ).tocsr()
+                for source in captured_sources
+            ]
             merged_graph = merge_graphs(graphs)
         elif method == "wnn":
-            modalities = [(assay, *load_wnn_inputs(assay)) for assay in assays]
+            modalities = [
+                (assay, *load_wnn_inputs(index, assay))
+                for index, assay in enumerate(assays)
+            ]
             merged_graph, modality_weights = _wnn_integration_many(
                 modalities,
                 self.nthreads,

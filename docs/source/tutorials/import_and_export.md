@@ -32,6 +32,8 @@ Scarf does not write Seurat `.rds` or `.h5seurat` files.
 See {doc}`../scanpy_and_seurat` for Scanpy and Seurat workflow mapping.
 
 RNA writers write both a cell-major `counts` array and a gene-major `countsT` copy.
+Every newly written assay starts with an all-true physical feature column `I`.
+Opening computes `nCells` and `dropOuts` but does not turn feature rows off; use a feature-selection producer for analysis filtering.
 That second copy is what later HVG and marker stages stream from.
 Non-RNA assays write `counts` only.
 See {doc}`../concepts/memory_and_execution` for why the two orientations exist.

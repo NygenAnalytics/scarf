@@ -9,6 +9,7 @@ from zarr.codecs import BloscCodec, ZstdCodec
 from zarr.storage import ObjectStore
 
 from scarf.datastore.datastore import DataStore, mount_datastore
+from scarf.storage.artifacts import ArtifactRef, artifact_group
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.sharding import write_counts_t
 from scarf.storage.stores import (
@@ -116,7 +117,6 @@ def test_mount_datastore_creates_and_reopens(tmp_path, workspace):
         workspace=workspace,
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
     )
     assert ds.workspace == workspace
     assert "counts" not in ds.z["RNA" if workspace is None else f"{workspace}/RNA"]
@@ -126,7 +126,6 @@ def test_mount_datastore_creates_and_reopens(tmp_path, workspace):
         target,
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
     )
     assert reopened.workspace == workspace
     np.testing.assert_array_equal(reopened.RNA.rawData.compute(), values)
@@ -147,7 +146,6 @@ def test_mount_datastore_multiple_assays(tmp_path):
         at=target,
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
     )
     np.testing.assert_array_equal(ds.RNA.rawData.compute(), rna_values)
     np.testing.assert_array_equal(ds.ADT.rawData.compute(), adt_values)
@@ -166,7 +164,6 @@ def test_mounted_store_reopens_from_another_directory(monkeypatch, tmp_path):
         at="target.zarr",
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
     )
     target = str(tmp_path / "target.zarr")
     location = zarr.open_group(target, mode="r").attrs[MATRIX_SOURCE_ATTR]["location"]
@@ -177,7 +174,6 @@ def test_mounted_store_reopens_from_another_directory(monkeypatch, tmp_path):
         target,
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
     )
     np.testing.assert_array_equal(reopened.RNA.rawData.compute(), values)
 
@@ -231,7 +227,6 @@ def test_mount_datastore_rejects_conflicting_options(tmp_path, options, error):
             at=target,
             default_assay="RNA",
             min_features_per_cell=1,
-            min_cells_per_feature=1,
             **options,
         )
     assert not Path(target).exists()
@@ -246,7 +241,6 @@ def test_mount_datastore_rejects_existing_target(tmp_path):
         at=target,
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
     )
     with pytest.raises(FileExistsError):
         mount_datastore(
@@ -254,7 +248,6 @@ def test_mount_datastore_rejects_existing_target(tmp_path):
             at=target,
             default_assay="RNA",
             min_features_per_cell=1,
-            min_cells_per_feature=1,
         )
 
 
@@ -269,7 +262,6 @@ def test_mounted_store_writes_only_to_target(tmp_path):
         at=target,
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
     )
     ds.cells.insert("mounted_flag", np.ones(ds.cells.N, dtype=bool), overwrite=True)
     mask = np.zeros(ds.cells.N, dtype=bool)
@@ -279,6 +271,164 @@ def test_mounted_store_writes_only_to_target(tmp_path):
     assert _snapshot_store_files(source) == source_before
     assert "mounted_flag" in zarr.open_group(target, mode="r")["cellData"]
     assert int(np.asarray(ds.cells.fetch_all("I")).sum()) == 3
+
+
+def test_mount_copies_literal_feature_metadata_but_not_artifact_aliases(tmp_path):
+    source = str(tmp_path / "source.zarr")
+    target = str(tmp_path / "target.zarr")
+    _write_source_store(source, workspace=None)
+    source_ds = DataStore(source, default_assay="RNA", min_features_per_cell=1)
+    source_ds.RNA.feats.insert(
+        "literal_flag",
+        np.array([True, False, True, False]),
+        overwrite=True,
+    )
+    selected = source_ds.set_feature_selection(
+        mask=np.array([True, True, False, False]),
+        label="selected_features",
+    )
+    source_features = source_ds.zw["RNA/featureData"]
+    source_features["I"][:] = np.array([True, False, True, False])
+    source_features["I"].attrs["source_artifact"] = selected.to_dict()
+    source_features.create_array(
+        "half_published",
+        data=np.array([True, False, False, True]),
+    )
+    source_features.attrs["pending_feature_selection_aliases"] = {
+        "half_published": selected.to_dict()
+    }
+
+    mounted = mount_datastore(source, at=target, default_assay="RNA")
+
+    assert "literal_flag" in mounted.RNA.feats.columns
+    np.testing.assert_array_equal(
+        mounted.RNA.feats.fetch_all("literal_flag"),
+        np.array([True, False, True, False]),
+    )
+    assert "all_features" not in mounted.RNA.feats.columns
+    assert "selected_features" not in mounted.RNA.feats.columns
+    assert "half_published" not in mounted.RNA.feats.columns
+    np.testing.assert_array_equal(
+        mounted.RNA.feats.fetch_all("I"),
+        np.ones(mounted.RNA.feats.N, dtype=bool),
+    )
+    assert (
+        "pending_feature_selection_aliases"
+        not in mounted.RNA.feats.locations["primary"].attrs
+    )
+
+    created = mounted.set_feature_selection(
+        mask=np.array([True, False, True, False]),
+        label="mounted_features",
+    )
+    assert mounted.resolve_features("RNA", "mounted_features") == created
+
+
+def test_mounted_store_loads_assays_written_to_the_target(tmp_path):
+    source = str(tmp_path / "source.zarr")
+    target = str(tmp_path / "target.zarr")
+    values = np.arange(1, 41, dtype=np.uint32).reshape(10, 4)
+    _write_source_store(source, workspace=None, values=values)
+    source_before = _snapshot_store_files(source)
+
+    mounted = mount_datastore(
+        source,
+        at=target,
+        default_assay="RNA",
+        min_features_per_cell=1,
+    )
+    mounted.RNA.feats.insert(
+        "modules",
+        np.array([0, 0, 1, 1]),
+        overwrite=True,
+    )
+    mounted.add_grouped_assay(
+        from_assay="RNA",
+        group_key="modules",
+        assay_label="MODULES",
+    )
+
+    assert mounted.MODULES.rawData.shape == (10, 2)
+    np.testing.assert_array_equal(
+        mounted.MODULES.feats.fetch_all("I"),
+        np.ones(2, dtype=bool),
+    )
+    assert "MODULES" not in zarr.open_group(source, mode="r")
+
+    reopened = DataStore(
+        target,
+        default_assay="RNA",
+        min_features_per_cell=1,
+    )
+    assert reopened.RNA.rawData.shape == (10, 4)
+    assert reopened.MODULES.rawData.shape == (10, 2)
+    assert _snapshot_store_files(source) == source_before
+
+
+def test_workspace_mounted_store_loads_assays_written_to_the_target(tmp_path):
+    source = str(tmp_path / "source.zarr")
+    target = str(tmp_path / "target.zarr")
+    workspace = "analysis"
+    values = np.arange(1, 41, dtype=np.uint32).reshape(10, 4)
+    _write_source_store(source, workspace=workspace, values=values)
+    source_before = _snapshot_store_files(source)
+
+    mounted = mount_datastore(
+        source,
+        at=target,
+        workspace=workspace,
+        default_assay="RNA",
+        min_features_per_cell=1,
+    )
+    mounted.RNA.feats.insert(
+        "modules",
+        np.array([0, 0, 1, 1]),
+        overwrite=True,
+    )
+    mounted.add_grouped_assay(
+        from_assay="RNA",
+        group_key="modules",
+        assay_label="MODULES",
+    )
+
+    assert mounted.RNA.rawData.shape == (10, 4)
+    assert mounted.MODULES.rawData.shape == (10, 2)
+    np.testing.assert_array_equal(
+        mounted.MODULES.feats.fetch_all("I"),
+        np.ones(2, dtype=bool),
+    )
+    source_root = zarr.open_group(source, mode="r")
+    assert "MODULES" not in source_root[workspace]
+    assert "MODULES" not in source_root["matrices"]
+
+    reopened = DataStore(
+        target,
+        default_assay="RNA",
+        min_features_per_cell=1,
+    )
+    assert reopened.workspace == workspace
+    assert reopened.RNA.rawData.shape == (10, 4)
+    assert reopened.MODULES.rawData.shape == (10, 2)
+    assert _snapshot_store_files(source) == source_before
+
+
+def test_mount_rejects_malformed_pending_feature_alias_journal(tmp_path):
+    source = str(tmp_path / "source.zarr")
+    target = str(tmp_path / "target.zarr")
+    _write_source_store(source, workspace=None)
+    source_root = zarr.open_group(source, mode="r+")
+    source_root["RNA/featureData"].attrs["pending_feature_selection_aliases"] = [
+        "not",
+        "a",
+        "mapping",
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match="pending_feature_selection_aliases must be a mapping",
+    ):
+        create_matrix_source(source, target)
+    assert not Path(target).exists()
 
 
 def test_mounted_store_computes_markers_without_writing_source(tmp_path):
@@ -300,7 +450,6 @@ def test_mounted_store_computes_markers_without_writing_source(tmp_path):
         at=target,
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
     )
     ds.cells.insert(
         "marker_groups",
@@ -311,7 +460,10 @@ def test_mounted_store_computes_markers_without_writing_source(tmp_path):
     markers = ds.run_marker_search(
         from_assay="RNA",
         cell_key="I",
-        feat_key="I",
+        features=ds.set_feature_selection(
+            mask=np.ones(ds.RNA.feats.N, dtype=bool),
+            label="marker_features",
+        ),
         group_key="marker_groups",
         nthreads=1,
         skip_save=True,
@@ -454,7 +606,6 @@ def test_mount_profile_applies_to_store_target(tmp_path):
         at=target_store,
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
         zarrProfile="cloud",
     )
 
@@ -462,22 +613,13 @@ def test_mount_profile_applies_to_store_target(tmp_path):
     assert isinstance(target_ids.compressors[0], ZstdCodec)
 
 
-_STATS_COLUMNS = ("normed_tot", "avg", "nz_mean", "sigmas", "normed_n")
-
-
-def test_mounted_datastore_reads_remote_counts_as_remote(monkeypatch, tmp_path):
+def test_mounted_datastore_reads_remote_counts_and_persists_summary_locally(
+    monkeypatch,
+    tmp_path,
+):
     values = np.arange(1, 41, dtype=np.uint32).reshape(10, 4)
     reference_path = str(tmp_path / "reference.zarr")
     _write_source_store(reference_path, workspace=None, values=values)
-    reference = DataStore(
-        reference_path,
-        default_assay="RNA",
-        min_features_per_cell=1,
-        min_cells_per_feature=1,
-    )
-    reference.RNA.set_feature_stats("I")
-    expected_stats = reference.RNA.get_feature_stats("I", columns=_STATS_COLUMNS)
-
     remote_store = ObjectStore(store=ObjectMemoryStore())
     _write_source_store(remote_store, workspace=None, values=values)
     location = "s3://atlas/pbmc.zarr"
@@ -501,7 +643,6 @@ def test_mounted_datastore_reads_remote_counts_as_remote(monkeypatch, tmp_path):
         at=str(tmp_path / "target.zarr"),
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
     )
     assert is_remote_datastore(None, ds.RNA.rawData._backing) is True
 
@@ -517,11 +658,18 @@ def test_mounted_datastore_reads_remote_counts_as_remote(monkeypatch, tmp_path):
     observed = np.concatenate([raw for _, raw, _, _, _ in blocks], axis=1)
     np.testing.assert_array_equal(observed, values[np.ix_(cell_idx, feat_idx)])
 
-    ds.RNA.set_feature_stats("I")
-    mounted_stats = ds.RNA.get_feature_stats("I", columns=_STATS_COLUMNS)
-    for column in _STATS_COLUMNS:
-        np.testing.assert_allclose(mounted_stats[column], expected_stats[column])
-    assert "summary_stats_I" in zarr.open_group(str(tmp_path / "target.zarr"))["RNA"]
+    selection = ds.select_detected_features(min_cells=1)
+    selection_status = ds.inspect_artifact(selection)
+    summary_ref = ArtifactRef.from_dict(selection_status.inputs["feature_summary"])
+    summary = artifact_group(ds.zw, summary_ref)
+    assert set(summary.array_keys()) == {"normed_tot", "normed_n", "sigmas"}
+    assert summary.attrs["complete"] is True
+    np.testing.assert_array_equal(
+        np.asarray(summary["normed_n"][:]),
+        (values > 0).sum(axis=0),
+    )
+    target_assay = zarr.open_group(str(tmp_path / "target.zarr"))["RNA"]
+    assert not any(name.startswith("summary_stats_") for name in target_assay.keys())
 
 
 def test_workspace_mismatch_raises(tmp_path):
@@ -545,15 +693,14 @@ def test_mounted_store_normalization_and_graph(tmp_path):
         at=target,
         default_assay="RNA",
         min_features_per_cell=1,
-        min_cells_per_feature=1,
     )
     # Guarantee enough selected features for IncrementalPCA(dims).
     feature_mask = np.zeros(ds.RNA.feats.N, dtype=bool)
     feature_mask[:12] = True
-    ds.RNA.feats.insert("I__hvgs", feature_mask, overwrite=True)
+    features = ds.set_feature_selection(mask=feature_mask, label="hvgs")
     build_neighbourhood_graph(
         ds,
-        feat_key="hvgs",
+        features=features,
         k=3,
         dims=3,
         batch_size=25,
@@ -573,10 +720,10 @@ def test_mounted_store_build_mapping_reference(datastore_zarr_root, tmp_path):
         at=target,
         default_assay="RNA",
     )
-    ds.mark_hvgs(top_n=50, show_plot=False, bin_strategy="fixed")
+    features = ds.mark_hvgs(top_n=50, show_plot=False, bin_strategy="fixed")
     build_neighbourhood_graph(
         ds,
-        feat_key="hvgs",
+        features=features,
         k=3,
         dims=5,
         n_centroids=10,

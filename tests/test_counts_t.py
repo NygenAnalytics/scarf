@@ -256,15 +256,13 @@ def test_marker_results_on_strip_counts_t():
     cells = MetaData(root["cellData"])
     cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
     cells.insert("cluster", np.array(["a", "a", "b", "b"]), overwrite=True)
-    assay = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
+    assay = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
     assay.sf = 1000.0
     results = find_markers_by_rank(
         assay,
-        group_key="cluster",
-        cell_key="I",
-        feat_key="I",
+        groups=np.asarray(cells.fetch_all("cluster")),
+        cell_idx=np.arange(values.shape[0], dtype=np.int64),
+        feat_idx=np.arange(values.shape[1], dtype=np.int64),
         nthreads=1,
     )
     assert set(results) == {"a", "b"}
@@ -287,9 +285,7 @@ def test_iter_normed_feature_wise_on_strip_counts_t(monkeypatch):
     _write_small_assay(root, workspace=None, values=values)
     cells = MetaData(root["cellData"])
     cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
-    assay = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
+    assay = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
     assay.sf = 1000.0
     original = feature_stream.map_feature_read_groups
     ordered_calls: list[bool] = []
@@ -301,8 +297,8 @@ def test_iter_normed_feature_wise_on_strip_counts_t(monkeypatch):
     monkeypatch.setattr(feature_stream, "map_feature_read_groups", checked_map)
     batches = list(
         assay.iter_normed_feature_wise(
-            cell_key="I",
-            feat_key="I",
+            cell_idx=np.arange(values.shape[0], dtype=np.int64),
+            feat_idx=np.arange(values.shape[1], dtype=np.int64),
             batch_size=2,
             msg=None,
             as_dataframe=True,
@@ -333,14 +329,12 @@ def test_iter_normed_feature_wise_log_transform_matches_log1p():
     cells = MetaData(root["cellData"])
     n_counts = values.sum(axis=1).astype(np.float64)
     cells.insert("RNA_nCounts", n_counts, overwrite=True)
-    assay = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
+    assay = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
     assay.sf = 1000.0
     batches = list(
         assay.iter_normed_feature_wise(
-            cell_key="I",
-            feat_key="I",
+            cell_idx=np.arange(values.shape[0], dtype=np.int64),
+            feat_idx=np.arange(values.shape[1], dtype=np.int64),
             batch_size=2,
             msg=None,
             as_dataframe=True,
@@ -366,14 +360,12 @@ def test_iter_normed_feature_wise_batches_and_rejects_missing_inputs():
     cells = MetaData(root["cellData"])
     n_counts = values.sum(axis=1).astype(np.float64)
     cells.insert("RNA_nCounts", n_counts, overwrite=True)
-    assay = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
+    assay = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
     assay.sf = 1000.0
     matrices = list(
         assay.iter_normed_feature_wise(
-            cell_key="I",
-            feat_key="I",
+            cell_idx=np.arange(values.shape[0], dtype=np.int64),
+            feat_idx=np.arange(values.shape[1], dtype=np.int64),
             batch_size=1,
             msg=None,
             as_dataframe=False,
@@ -384,8 +376,8 @@ def test_iter_normed_feature_wise_batches_and_rejects_missing_inputs():
     assert joined.shape == (values.shape[1], values.shape[0])
     wide = list(
         assay.iter_normed_feature_wise(
-            cell_key="I",
-            feat_key="I",
+            cell_idx=np.arange(values.shape[0], dtype=np.int64),
+            feat_idx=np.arange(values.shape[1], dtype=np.int64),
             batch_size=3,
             msg=None,
             as_dataframe=True,
@@ -397,8 +389,8 @@ def test_iter_normed_feature_wise_batches_and_rejects_missing_inputs():
     with pytest.raises(ValueError, match="requires sharded countsT"):
         list(
             assay.iter_normed_feature_wise(
-                cell_key="I",
-                feat_key="I",
+                cell_idx=np.arange(values.shape[0], dtype=np.int64),
+                feat_idx=np.arange(values.shape[1], dtype=np.int64),
                 batch_size=1,
                 msg=None,
             )
@@ -419,15 +411,13 @@ def test_regression_on_strip_counts_t():
     _write_small_assay(root, workspace=None, values=values)
     cells = MetaData(root["cellData"])
     cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
-    assay = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
+    assay = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
     assay.sf = 1000.0
     regressor = np.linspace(0.0, 1.0, values.shape[0])
     table = find_markers_by_regression(
         assay,
-        cell_key="I",
-        feat_key="I",
+        cell_idx=np.arange(values.shape[0], dtype=np.int64),
+        feat_idx=np.arange(values.shape[1], dtype=np.int64),
         regressor=regressor,
         min_cells=1,
         batch_size=2,
@@ -449,9 +439,7 @@ def test_iter_normed_feature_wise_uses_base_path_when_ineligible(monkeypatch):
     _write_small_assay(root, workspace=None, values=values)
     cells = MetaData(root["cellData"])
     cells.insert("RNA_nCounts", values.sum(axis=1).astype(np.float64), overwrite=True)
-    assay = RNAassay(
-        root, "RNA", cells, workspace=None, nthreads=1, min_cells_per_feature=1
-    )
+    assay = RNAassay(root, "RNA", cells, workspace=None, nthreads=1)
     assay.sf = 1000.0
     called = {"base": False}
 
@@ -463,8 +451,8 @@ def test_iter_normed_feature_wise_uses_base_path_when_ineligible(monkeypatch):
     monkeypatch.setattr(Assay, "iter_normed_feature_wise", fake_base)
     list(
         assay.iter_normed_feature_wise(
-            cell_key="I",
-            feat_key="I",
+            cell_idx=np.arange(values.shape[0], dtype=np.int64),
+            feat_idx=np.arange(values.shape[1], dtype=np.int64),
             batch_size=2,
             msg=None,
             renormalize_subset=True,
@@ -485,13 +473,12 @@ def test_renormalize_subset_path_batches_features():
         cells,
         workspace=None,
         nthreads=1,
-        min_cells_per_feature=1,
     )
     assay.sf = 1000.0
     frames = list(
         assay.iter_normed_feature_wise(
-            "I",
-            "I",
+            np.arange(values.shape[0], dtype=np.int64),
+            np.arange(values.shape[1], dtype=np.int64),
             4,
             None,
             renormalize_subset=True,
@@ -536,7 +523,7 @@ def test_coordinate_melding_leaves_counts_t_on_demand():
     n_cells_per_peak = (values > 0).sum(axis=0).astype(np.float64)
     cells.insert("ATAC_nFeatures", n_features, overwrite=True)
     cells.insert("ATAC_nCounts", n_counts, overwrite=True)
-    assay = Assay(root, None, "ATAC", cells, nthreads=1, min_cells_per_feature=1)
+    assay = Assay(root, None, "ATAC", cells, nthreads=1)
     assay.feats.insert("nCells", n_cells_per_peak, overwrite=True)
 
     feature_bed = pd.DataFrame(
@@ -622,7 +609,6 @@ def test_custom_assay_name_seeds_generic_type_and_loads(tmp_path):
         path,
         default_assay="CUSTOM_NAME",
         min_features_per_cell=0,
-        min_cells_per_feature=0,
     )
     assert type(store.CUSTOM_NAME).__name__ == "Assay"
 
@@ -1095,7 +1081,6 @@ def test_subset_preserves_gene_activity_alias(tmp_path):
         src,
         default_assay="GeneActivity",
         min_features_per_cell=0,
-        min_cells_per_feature=0,
     )
     out = str(tmp_path / "subset.zarr")
     SubsetZarr(

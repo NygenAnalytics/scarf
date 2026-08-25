@@ -418,6 +418,7 @@ def test_extracted_domains_have_only_narrow_storage_dependencies():
     forbidden = {"datastore", "plotting", "readers", "writers"}
     storage_exceptions = {
         "features": {
+            "enrichment/results.py",
             "genomic/melding.py",
             "markers/batching.py",
             "markers/search.py",

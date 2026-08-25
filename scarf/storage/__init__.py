@@ -13,10 +13,12 @@ from .artifacts import (
     inspect_artifact as inspect_artifact,
     list_artifacts as list_artifacts,
 )
+from .errors import ArtifactResolutionError as ArtifactResolutionError
 
 __all__ = [
     "ARTIFACT_KINDS",
     "ArtifactRef",
+    "ArtifactResolutionError",
     "ArtifactStatus",
     "inspect_artifact",
     "list_artifacts",

@@ -166,7 +166,6 @@ class NormalizationArguments(OperationArguments):
 
     from_assay: str = execution()
     cell_key: str = execution()
-    feat_key: str = execution()
     cell_selection: ArtifactRef = artifact_input()
     feature_selection: ArtifactRef = artifact_input()
     normalization_method: Callable[..., Any] | str = parameter()
@@ -231,6 +230,8 @@ class CustomReductionArguments(OperationArguments):
     normalized: ArtifactRef = artifact_input()
     feature_scaling: ArtifactRef = artifact_input()
     loadings: np.ndarray = artifact_input()
+    dims: int = parameter()
+    feat_scaling: bool = parameter()
     update_state: bool = execution()
     invalidate_cache: bool = execution(False)
 

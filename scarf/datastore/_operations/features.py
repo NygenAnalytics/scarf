@@ -9,6 +9,11 @@ import zarr
 from numpy.typing import NDArray
 
 from ...features.variability import DEFAULT_HVG_BLACKLIST, HVG_UBIQUITOUS_SLACK
+from ...assay.feature_summary import (
+    ensure_feature_summary,
+    feature_summary_selected_count,
+    feature_summary_values,
+)
 from ...storage.artifact_writer import (
     ArrayRequirement,
     AttributeRequirement,
@@ -19,9 +24,17 @@ from ...storage.artifacts import (
     ArtifactRef,
     artifact_path,
     callable_identity,
+    fingerprint_array,
     inspect_artifact,
 )
-from ...storage.selections import resolve_selection_artifact
+from ...storage.feature_selection import (
+    _feature_selection_plan,
+    _feature_selection_values,
+    _ordered_feature_ids_fingerprint,
+    _write_feature_selection,
+    publish_feature_selection_alias,
+    validate_feature_selection_label,
+)
 from ...storage.types import as_zarr_array, as_zarr_group
 from ...assay import RNAassay, lib_size_feature_stream_eligible
 from ...assay.normalization import reject_unknown_normalization_params
@@ -38,11 +51,6 @@ from ...features.markers.table import (
     load_marker_table,
 )
 from ...metadata.arguments import AucellArguments, MarkerTableArguments, WaggrArguments
-from ...metadata.artifacts import (
-    categorical_display,
-    feature_column_display,
-    link_feature_data_column,
-)
 from ...utils.arrays import array_digest
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
@@ -52,8 +60,6 @@ from .enrichment_store import (
     _EnrichmentScorer,
     _enrichment_artifact_matches,
     _enrichment_artifact_ref,
-    _execution_digest,
-    _legacy_enrichment_slot,
     _load_enrichment_result,
     _publish_enrichment_artifact,
     _validate_enrichment_label,
@@ -67,6 +73,60 @@ else:
 
 _MARKER_STAT_COLUMNS = MARKER_STAT_COLUMNS
 _MARKER_OUT_COLUMNS = ("feature_index", *_MARKER_STAT_COLUMNS)
+
+
+def _marker_artifact_index(group: zarr.Group) -> dict[str, Any]:
+    """Return a validated, detached marker index.
+
+    The three nested keys are cell key, group key, and feature-selection
+    artifact id. Keeping the feature identity in the index prevents one marker
+    search from silently replacing a table computed over another universe.
+    """
+
+    raw_index = group.attrs.get("artifacts", {})
+    if not isinstance(raw_index, dict):
+        raise ValueError("Marker artifact index is invalid")
+    index: dict[str, Any] = {}
+    for cell_key, raw_groups in raw_index.items():
+        if not isinstance(cell_key, str) or not isinstance(raw_groups, dict):
+            raise ValueError("Marker artifact index is invalid")
+        groups: dict[str, Any] = {}
+        for group_key, raw_selections in raw_groups.items():
+            if not isinstance(group_key, str) or not isinstance(
+                raw_selections,
+                dict,
+            ):
+                raise ValueError("Marker artifact index is invalid")
+            selections: dict[str, Any] = {}
+            for feature_id, raw_ref in raw_selections.items():
+                if not isinstance(feature_id, str) or not isinstance(raw_ref, dict):
+                    raise ValueError("Marker artifact index is invalid")
+                try:
+                    ref = ArtifactRef.from_dict(raw_ref)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("Marker artifact index is invalid") from exc
+                selections[feature_id] = ref.to_dict()
+            groups[group_key] = selections
+        index[cell_key] = groups
+    return index
+
+
+def _select_indexed_marker_artifact(
+    index: dict[str, Any],
+    cell_key: str,
+    group_key: str,
+) -> tuple[str, ArtifactRef]:
+    selections = index.get(cell_key, {}).get(group_key, {})
+    if not selections:
+        raise KeyError(f"Marker artifact for {cell_key!r}/{group_key!r} was not found")
+    if len(selections) != 1:
+        raise ValueError(
+            "Multiple feature-specific marker tables exist for this cell and "
+            "group key; pass the ArtifactRef returned by run_marker_search "
+            "as marker="
+        )
+    feature_id, raw_ref = next(iter(selections.items()))
+    return feature_id, ArtifactRef.from_dict(raw_ref)
 
 
 def _shared_marker_feature_index(markers: dict[Any, pd.DataFrame]) -> np.ndarray:
@@ -156,91 +216,203 @@ def _group_assignment_digest(values: np.ndarray) -> str:
 
 
 class _FeatureOperationsMixin(_FeatureOperationsBase):
-    def set_hvgs(
+    def _require_feature_write(self, operation: str) -> None:
+        if self.zarr_mode != "r+":
+            raise PermissionError(
+                f"{operation} requires a DataStore opened with zarr_mode='r+'"
+            )
+
+    def _ensure_all_features(self, assay: Any) -> ArtifactRef:
+        """Create or reuse the canonical all-true feature universe."""
+        self._require_feature_write("Feature selection")
+        resolved_assay = self._get_assay(assay) if isinstance(assay, str) else assay
+        from ...graph.state import read_assay_state_document
+
+        # Reject malformed or legacy state before mutation without requiring an
+        # unrelated current graph chain to remain available. A newly published
+        # normalized artifact can then replace a damaged older chain.
+        read_assay_state_document(self.zw, resolved_assay.name)
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(resolved_assay)
+        values = np.ones(resolved_assay.feats.N, dtype=bool)
+        payload_fingerprint = fingerprint_array(values)
+        planned = _feature_selection_plan(
+            self.zw,
+            assay=resolved_assay.name,
+            n_features=resolved_assay.feats.N,
+            ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+            operation="create_all_features",
+            parameters={
+                "dataset_fingerprint": self._ensure_dataset_fingerprint(
+                    resolved_assay.name
+                ),
+                "ordered_feature_ids_fingerprint": feature_ids_fingerprint,
+            },
+            inputs={},
+            execution_options={"label": "all_features"},
+            expected_payload_fingerprint=payload_fingerprint,
+        )
+        _write_feature_selection(
+            self.zw,
+            planned,
+            ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+            payload={"values": values},
+        )
+        publish_feature_selection_alias(
+            self.zw,
+            resolved_assay.name,
+            "all_features",
+            planned.ref,
+        )
+        return planned.ref
+
+    def set_feature_selection(
         self,
         *,
         from_assay: str | None = None,
-        cell_key: str,
         mask: np.ndarray | None = None,
         feature_indexes: Sequence[int] | None = None,
-        hvg_key_name: str = "hvgs",
-        n_bins: int = 200,
-        lowess_frac: float = 0.1,
-        bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
-        blacklist: str | None = None,
-        blacklist_exclusions: str | None = None,
-        blacklist_indexes: Sequence[int] | None = None,
+        label: str,
         invalidate_cache: bool = False,
-    ) -> str:
-        """Install a supplied HVG selection on an RNA assay."""
+    ) -> ArtifactRef:
+        """Persist and publish an explicit feature mask."""
+        self._require_feature_write("set_feature_selection")
+        validate_feature_selection_label(label)
         assay = self._get_assay(from_assay)
-        if not isinstance(assay, RNAassay):
-            raise TypeError(
-                "set_hvgs can only be applied to an RNAassay; "
-                f"received {type(assay).__name__}"
-            )
-        expected_key = f"{cell_key}__{hvg_key_name}"
-        storage_backed = (
-            hasattr(self, "z") and hasattr(self, "cells") and hasattr(assay, "z")
-        )
-        preserved_display = (
-            feature_column_display(assay.z, expected_key) if storage_backed else None
-        )
-        stored_key = assay.set_hvgs(
-            cell_key,
-            mask=mask,
-            feature_indexes=feature_indexes,
-            hvg_key_name=hvg_key_name,
-            n_bins=n_bins,
-            lowess_frac=lowess_frac,
-            bin_strategy=bin_strategy,
-            blacklist=blacklist,
-            blacklist_exclusions=blacklist_exclusions,
-            blacklist_indexes=blacklist_indexes,
-        )
-        if not storage_backed:
-            return stored_key
-        cell_selection = self._linked_cell_selection(cell_key)
-        if cell_selection is None:
-            cell_selection = self._record_cell_selection(
-                column=cell_key,
-                operation="manual_selection",
-                parameters={},
-                inputs={},
-            )
-        feature_selection = resolve_selection_artifact(
+        all_features = self._ensure_all_features(assay)
+        if (mask is None) == (feature_indexes is None):
+            raise ValueError("Provide exactly one of mask or feature_indexes")
+        if mask is not None:
+            if not isinstance(mask, np.ndarray):
+                raise TypeError("mask must be a NumPy array")
+            if mask.shape != (assay.feats.N,):
+                raise ValueError(f"mask must have shape ({assay.feats.N},)")
+            if mask.dtype != np.dtype(bool):
+                raise TypeError("mask must have boolean dtype")
+            values = mask.copy()
+        else:
+            assert feature_indexes is not None
+            indexes = np.asarray(feature_indexes)
+            if indexes.ndim != 1:
+                raise ValueError("feature_indexes must be one-dimensional")
+            if indexes.size and not np.issubdtype(indexes.dtype, np.integer):
+                raise TypeError("feature_indexes must contain only integers")
+            indexes = indexes.astype(np.int64, copy=False)
+            if np.any(indexes < 0) or np.any(indexes >= assay.feats.N):
+                raise IndexError("feature_indexes contains an out-of-range index")
+            if np.unique(indexes).size != indexes.size:
+                raise ValueError("feature_indexes contains duplicate indexes")
+            values = np.zeros(assay.feats.N, dtype=bool)
+            values[indexes] = True
+        if not values.any():
+            raise ValueError("Feature selection must contain at least one feature")
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        values_fingerprint = fingerprint_array(values)
+        planned = _feature_selection_plan(
             self.zw,
-            scope="assay",
             assay=assay.name,
-            kind="feature_selection",
-            values=np.asarray(assay.feats.fetch_all(stored_key)),
-            row_ids=np.asarray(assay.feats.fetch_all("ids")),
-            operation="set_hvgs",
-            parameters={
-                "n_bins": n_bins,
-                "lowess_frac": lowess_frac,
-                "bin_strategy": bin_strategy,
-                "blacklist": blacklist,
-                "blacklist_exclusions": blacklist_exclusions,
-                "blacklist_indexes": list(blacklist_indexes)
-                if blacklist_indexes is not None
-                else None,
+            n_features=assay.feats.N,
+            ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+            operation="set_feature_selection",
+            parameters={"values_fingerprint": values_fingerprint},
+            inputs={"all_features": all_features},
+            execution_options={
+                "label": label,
+                "invalidate_cache": invalidate_cache,
             },
-            inputs={"cell_selection": cell_selection},
-            source_column=stored_key,
+            expected_payload_fingerprint=values_fingerprint,
             invalidate_cache=invalidate_cache,
         )
-        link_feature_data_column(
-            assay.z,
-            stored_key,
-            feature_selection,
-            value_name="values",
-            default_display=categorical_display(
-                np.asarray(assay.feats.fetch_all(stored_key))
-            ),
-            preserved_display=preserved_display,
+        _write_feature_selection(
+            self.zw,
+            planned,
+            ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+            payload={"values": values},
         )
-        return stored_key
+        publish_feature_selection_alias(
+            self.zw,
+            assay.name,
+            label,
+            planned.ref,
+        )
+        return planned.ref
+
+    def select_detected_features(
+        self,
+        from_assay: str | None = None,
+        cell_key: str = "I",
+        min_cells: int = 20,
+        label: str = "detected_features",
+        invalidate_cache: bool = False,
+    ) -> ArtifactRef:
+        """Select features detected in at least ``min_cells`` selected cells."""
+        self._require_feature_write("select_detected_features")
+        validate_feature_selection_label(label)
+        if isinstance(min_cells, bool) or not isinstance(min_cells, int):
+            raise TypeError("min_cells must be an integer")
+        if min_cells < 0:
+            raise ValueError("min_cells must be non-negative")
+        assay = self._get_assay(from_assay)
+        self._ensure_all_features(assay)
+        cell_selection = self._ensure_cell_selection(cell_key)
+        summary_ref = ensure_feature_summary(
+            self.zw,
+            assay,
+            cell_selection,
+            invalidate_cache=invalidate_cache,
+        )
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        planned = _feature_selection_plan(
+            self.zw,
+            assay=assay.name,
+            n_features=assay.feats.N,
+            ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+            operation="select_detected_features",
+            parameters={"min_cells": min_cells},
+            inputs={"feature_summary": summary_ref},
+            execution_options={
+                "label": label,
+                "invalidate_cache": invalidate_cache,
+            },
+            invalidate_cache=invalidate_cache,
+        )
+        if planned.reused:
+            detected_values = np.asarray(
+                _feature_selection_values(self.zw, planned.ref),
+                dtype=bool,
+            )
+        else:
+            n_selected = feature_summary_selected_count(
+                self.zw,
+                cell_selection,
+                n_cells=assay.cells.N,
+            )
+            summary = feature_summary_values(
+                self.zw,
+                summary_ref,
+                n_selected=n_selected,
+            )
+            detected = summary.get("normed_n")
+            if detected is None:
+                detected = summary["document_frequency"]
+            detected_values = np.asarray(detected >= min_cells, dtype=bool)
+        if not detected_values.any():
+            raise ValueError(
+                "Detected-feature selection contains no features; lower min_cells"
+            )
+        if not planned.reused:
+            _write_feature_selection(
+                self.zw,
+                planned,
+                ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+                payload={"values": detected_values},
+            )
+        publish_feature_selection_alias(
+            self.zw,
+            assay.name,
+            label,
+            planned.ref,
+        )
+        return planned.ref
 
     def mark_hvgs(
         self,
@@ -257,12 +429,12 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         blacklist: str = DEFAULT_HVG_BLACKLIST,
         keep_bounds: bool = False,
         show_plot: bool = True,
-        hvg_key_name: str = "hvgs",
+        label: str = "hvgs",
         max_cells: float | None = None,
         bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
         invalidate_cache: bool = False,
         **plot_kwargs: Any,
-    ) -> None:
+    ) -> ArtifactRef:
         """Identify and mark genes as highly variable genes (HVGs). This is a
         critical and required feature selection step and is only applicable to
         RNAassay type of assays.
@@ -296,15 +468,16 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             keep_bounds: If True, retain upper cell-count and expression-statistic bounds.
                          The ``min_cells`` boundary is always inclusive. (Default: False)
             show_plot: If True then a diagnostic scatter plot is shown with HVGs highlighted. (Default: True)
-            hvg_key_name: Base label for HVGs in the features metadata column. The value for
-                          'cell_key' parameter is prepended to this value. (Default value: 'hvgs')
+            label: Feature-selection label to publish. (Default: 'hvgs')
             plot_kwargs: Named parameters forwarded to ``plotting.highly_variable_features``
                          (``figsize``, ``label_size``, ``point_sizes``, ``colormaps``).
 
         Returns:
-            None
+            The persisted HVG feature-selection artifact.
         """
 
+        self._require_feature_write("mark_hvgs")
+        validate_feature_selection_label(label)
         if cell_key is None:
             cell_key = "I"
         assay = self._get_assay(from_assay)
@@ -313,7 +486,19 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 f"ERROR: This method of feature selection can only be applied to RNAassay type of assay. "
                 f"The provided assay is {type(assay)} type"
             )
-        n_selected = int(np.asarray(self.cells.fetch_all(cell_key), dtype=bool).sum())
+        self._ensure_all_features(assay)
+        cell_selection = self._ensure_cell_selection(cell_key)
+        summary_ref = ensure_feature_summary(
+            self.zw,
+            assay,
+            cell_selection,
+            invalidate_cache=invalidate_cache,
+        )
+        n_selected = feature_summary_selected_count(
+            self.zw,
+            cell_selection,
+            n_cells=assay.cells.N,
+        )
         if max_cells is None:
             candidate_max = n_selected - HVG_UBIQUITOUS_SLACK
             if candidate_max <= min_cells:
@@ -335,44 +520,12 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             max_cells_int = np.inf
         else:
             max_cells_int = int(max_cells)
-        stored_key = f"{cell_key}__{hvg_key_name}"
-        preserved_display = feature_column_display(
-            assay.z,
-            stored_key,
-        )
-        assay.mark_hvgs(
-            cell_key=cell_key,
-            min_cells=min_cells,
-            max_cells=max_cells_int,
-            top_n=top_n,
-            min_var=min_var,
-            max_var=max_var,
-            min_mean=min_mean,
-            max_mean=max_mean,
-            n_bins=n_bins,
-            lowess_frac=lowess_frac,
-            bin_strategy=bin_strategy,
-            blacklist=blacklist,
-            hvg_key_name=hvg_key_name,
-            keep_bounds=keep_bounds,
-            show_plot=show_plot,
-            **plot_kwargs,
-        )
-        cell_selection = self._linked_cell_selection(cell_key)
-        if cell_selection is None:
-            cell_selection = self._record_cell_selection(
-                column=cell_key,
-                operation="manual_selection",
-                parameters={},
-                inputs={},
-            )
-        feature_selection = resolve_selection_artifact(
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        planned = _feature_selection_plan(
             self.zw,
-            scope="assay",
             assay=assay.name,
-            kind="feature_selection",
-            values=np.asarray(assay.feats.fetch_all(stored_key)),
-            row_ids=np.asarray(assay.feats.fetch_all("ids")),
+            n_features=assay.feats.N,
+            ordered_feature_ids_fingerprint=feature_ids_fingerprint,
             operation="mark_hvgs",
             parameters={
                 "min_cells": min_cells,
@@ -388,20 +541,89 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "keep_bounds": keep_bounds,
                 "bin_strategy": bin_strategy,
             },
-            inputs={"cell_selection": cell_selection},
-            source_column=stored_key,
+            inputs={"feature_summary": summary_ref},
+            execution_options={
+                "show_plot": show_plot,
+                "plot_kwargs": plot_kwargs,
+                "nthreads": assay.nthreads,
+                "label": label,
+                "invalidate_cache": invalidate_cache,
+            },
+            payload_names=("values", "corrected_variance"),
             invalidate_cache=invalidate_cache,
         )
-        link_feature_data_column(
-            assay.z,
-            stored_key,
-            feature_selection,
-            value_name="values",
-            default_display=categorical_display(
-                np.asarray(assay.feats.fetch_all(stored_key))
-            ),
-            preserved_display=preserved_display,
+        summary: dict[str, np.ndarray] | None = None
+        selected_values: np.ndarray
+        if not planned.reused:
+            summary = feature_summary_values(
+                self.zw,
+                summary_ref,
+                n_selected=n_selected,
+            )
+            values, corrected_variance = assay._select_hvgs(
+                summary,
+                n_selected=n_selected,
+                min_cells=min_cells,
+                max_cells=max_cells_int,
+                top_n=top_n,
+                min_var=min_var,
+                max_var=max_var,
+                min_mean=min_mean,
+                max_mean=max_mean,
+                n_bins=n_bins,
+                lowess_frac=lowess_frac,
+                blacklist=blacklist,
+                keep_bounds=keep_bounds,
+                bin_strategy=bin_strategy,
+            )
+            selected_values = np.asarray(values, dtype=bool)
+            if not selected_values.any():
+                raise ValueError(
+                    "HVG selection contains no features; adjust the HVG filters"
+                )
+            _write_feature_selection(
+                self.zw,
+                planned,
+                ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+                payload={
+                    "values": selected_values,
+                    "corrected_variance": corrected_variance,
+                },
+                payload_names=("values", "corrected_variance"),
+            )
+        else:
+            selected_values = np.asarray(
+                _feature_selection_values(self.zw, planned.ref),
+                dtype=bool,
+            )
+            if not selected_values.any():
+                raise ValueError(
+                    "HVG selection contains no features; adjust the HVG filters"
+                )
+        if show_plot:
+            if summary is None:
+                summary = feature_summary_values(
+                    self.zw,
+                    summary_ref,
+                    n_selected=n_selected,
+                )
+            assay._plot_hvgs(
+                summary,
+                selected_values,
+                _feature_selection_values(
+                    self.zw,
+                    planned.ref,
+                    "corrected_variance",
+                ),
+                **plot_kwargs,
+            )
+        publish_feature_selection_alias(
+            self.zw,
+            assay.name,
+            label,
+            planned.ref,
         )
+        return planned.ref
 
     def _run_enrichment(
         self,
@@ -409,7 +631,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         assay: RNAassay,
         label: str,
         cell_key: str,
-        feat_key: str,
         overwrite: bool,
         invalidate_cache: bool,
         scorer: _EnrichmentScorer,
@@ -424,22 +645,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             "cell_key": cell_key,
             "complete": False,
             "feature_digest": feature_digest,
-            "feat_key": feat_key,
             "layout": _ENRICHMENT_LAYOUT,
             "method": scorer.method,
             **scorer.method_payload,
         }
-        execution = _execution_digest(
-            {
-                "algorithm_version": scorer.algorithm_version,
-                "cell_digest": cell_digest,
-                "cell_key": cell_key,
-                "feature_digest": feature_digest,
-                "feat_key": feat_key,
-                "method": scorer.method,
-                **scorer.method_payload,
-            }
-        )
         required_arrays = (
             ArrayRequirement(
                 "scores",
@@ -485,9 +694,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             ),
         )
         existing_ref = _enrichment_artifact_ref(assay, label)
-        legacy_slot = (
-            _legacy_enrichment_slot(assay, label) if existing_ref is None else None
-        )
         if existing_ref is not None:
             existing_status = inspect_artifact(self.zw, existing_ref)
             if (
@@ -503,38 +709,12 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                     f"{existing_status.operation!r} execution; pass overwrite=True "
                     "to replace it"
                 )
-        elif legacy_slot is not None:
-            same_legacy_execution = (
-                str(legacy_slot.attrs.get("execution_digest", "")) == execution
-            )
-            if (
-                legacy_slot.attrs.get("complete") is True
-                and same_legacy_execution
-                and not invalidate_cache
-            ):
-                return _load_enrichment_result(
-                    assay,
-                    label=label,
-                    sources=None,
-                    artifact_root=self.zw,
-                )
-            if (
-                legacy_slot.attrs.get("complete") is True
-                and not same_legacy_execution
-                and not overwrite
-            ):
-                method = legacy_slot.attrs.get("method", "unknown")
-                raise ValueError(
-                    f"Enrichment label {label!r} already contains a different "
-                    f"{method!r} execution; pass overwrite=True to replace it"
-                )
         if planned.reused:
             _publish_enrichment_artifact(
                 assay,
                 label,
                 planned.ref,
                 cell_key=cell_key,
-                feat_key=feat_key,
             )
             return _load_enrichment_result(
                 assay,
@@ -561,7 +741,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             label,
             planned.ref,
             cell_key=cell_key,
-            feat_key=feat_key,
         )
         return _load_enrichment_result(
             assay,
@@ -576,9 +755,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         display_name: str,
         from_assay: str | None,
         cell_key: str,
-        feat_key: str,
+        features: ArtifactRef | str,
         overwrite: bool,
-    ) -> tuple[RNAassay, np.ndarray, np.ndarray]:
+    ) -> tuple[RNAassay, np.ndarray, np.ndarray, ArtifactRef]:
         if self.zarr_mode != "r+":
             raise ValueError(
                 f"{display_name} requires a DataStore opened with zarr_mode='r+'"
@@ -588,30 +767,15 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         assay = self._get_assay(from_assay)
         if not isinstance(assay, RNAassay):
             raise TypeError(f"{display_name} can only be run on an RNAassay")
-        cell_index, feature_index = assay._get_cell_feat_idx(cell_key, feat_key)
-        cell_index = np.asarray(cell_index, dtype=np.int64)
-        feature_index = np.asarray(feature_index, dtype=np.int64)
+        feature_selection = self.resolve_features(assay.name, features)
+        feature_values = _feature_selection_values(self.zw, feature_selection)
+        feature_index = np.flatnonzero(feature_values).astype(np.int64, copy=False)
+        cell_index = np.asarray(assay.cells.active_index(cell_key), dtype=np.int64)
         if len(cell_index) == 0:
             raise ValueError(f"Cell key {cell_key!r} selects no active cells")
-        return assay, cell_index, feature_index
-
-    def _enrichment_feature_selection(
-        self, assay: RNAassay, feat_key: str
-    ) -> ArtifactRef:
-        feature_values = np.asarray(assay.feats.fetch_all(feat_key), dtype=bool)
-        return self._resolve_selection_input(
-            metadata_group=as_zarr_group(
-                assay.z["featureData"],
-                name="featureData",
-            ),
-            column=feat_key,
-            values=feature_values,
-            row_ids=np.asarray(assay.feats.fetch_all("ids")),
-            scope="assay",
-            kind="feature_selection",
-            assay=assay.name,
-            invalidate_cache=False,
-        )
+        if len(feature_index) == 0:
+            raise ValueError("Feature selection contains no active features")
+        return assay, cell_index, feature_index, feature_selection
 
     def run_waggr(
         self,
@@ -620,7 +784,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         *,
         from_assay: str | None = None,
         cell_key: str = "I",
-        feat_key: str = "I",
+        features: ArtifactRef | str,
         mode: Literal["wmean", "wsum"] = "wmean",
         tmin: int = 5,
         log_transform: bool = False,
@@ -640,7 +804,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             label: Name used to persist and retrieve the result.
             from_assay: RNA assay to score. The default assay is used when omitted.
             cell_key: Cell metadata key that selects score rows.
-            feat_key: Feature metadata key that defines the matching universe.
+            features: Feature-selection artifact or exact published label.
             mode: ``"wmean"`` divides each weighted sum by the sum of absolute
                 source weights. ``"wsum"`` returns the weighted sum.
             tmin: Minimum number of matched targets required per source.
@@ -667,12 +831,14 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             raise ValueError("mode must be 'wmean' or 'wsum'")
         if not isinstance(log_transform, bool):
             raise TypeError("log_transform must be a boolean")
-        assay, cell_index, feature_index = self._prepare_enrichment_assay(
-            display_name="WAGGR",
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=feat_key,
-            overwrite=overwrite,
+        assay, cell_index, feature_index, feature_selection = (
+            self._prepare_enrichment_assay(
+                display_name="WAGGR",
+                from_assay=from_assay,
+                cell_key=cell_key,
+                features=features,
+                overwrite=overwrite,
+            )
         )
         feature_names = np.asarray(assay.feats.fetch_all("names"))[feature_index]
         network = prepare_network(
@@ -697,7 +863,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         arguments = WaggrArguments(
             cell_selection=self._ensure_cell_selection(cell_key),
-            feature_selection=self._enrichment_feature_selection(assay, feat_key),
+            feature_selection=feature_selection,
             network_digest=network.network_digest,
             algorithm_version=WAGGR_ALGORITHM_VERSION,
             mode=mode,
@@ -707,7 +873,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             size_factor=size_factor,
             from_assay=assay.name,
             cell_key=cell_key,
-            feat_key=feat_key,
             label=label,
             overwrite=overwrite,
             invalidate_cache=invalidate_cache,
@@ -749,7 +914,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             assay=assay,
             label=label,
             cell_key=cell_key,
-            feat_key=feat_key,
             overwrite=overwrite,
             invalidate_cache=invalidate_cache,
             scorer=_EnrichmentScorer(
@@ -782,7 +946,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         *,
         from_assay: str | None = None,
         cell_key: str = "I",
-        feat_key: str = "I",
+        features: ArtifactRef | str,
         tmin: int = 5,
         n_up: int | None = None,
         tie_seed: int = 0,
@@ -791,7 +955,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
     ) -> EnrichmentResult:
         """Score gene sets by recovery among each cell's top-ranked RNA features.
 
-        AUCell ranks every feature selected by ``feat_key`` from raw counts. Network
+        AUCell ranks every feature selected by ``features`` from raw counts. Network
         weights are ignored. Targets are matched without case sensitivity, then
         sources with fewer than ``tmin`` matched targets are removed.
 
@@ -800,7 +964,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             label: Name used to persist and retrieve the result.
             from_assay: RNA assay to score. The default assay is used when omitted.
             cell_key: Cell metadata key that selects score rows.
-            feat_key: Feature metadata key that defines the ranking universe.
+            features: Feature-selection artifact or exact published label.
             tmin: Minimum number of matched targets required per source.
             n_up: Number of top-ranked features used for recovery. When omitted,
                 five percent of the ranking universe is used, clipped to its valid
@@ -826,12 +990,14 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         from ...features.enrichment.net import prepare_network
 
         _validate_enrichment_label(label)
-        assay, cell_index, feature_index = self._prepare_enrichment_assay(
-            display_name="AUCell",
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=feat_key,
-            overwrite=overwrite,
+        assay, cell_index, feature_index, feature_selection = (
+            self._prepare_enrichment_assay(
+                display_name="AUCell",
+                from_assay=from_assay,
+                cell_key=cell_key,
+                features=features,
+                overwrite=overwrite,
+            )
         )
         resolved_n_up = resolve_n_up(len(feature_index), n_up)
         feature_names = np.asarray(assay.feats.fetch_all("names"))[feature_index]
@@ -848,7 +1014,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         arguments = AucellArguments(
             cell_selection=self._ensure_cell_selection(cell_key),
-            feature_selection=self._enrichment_feature_selection(assay, feat_key),
+            feature_selection=feature_selection,
             network_digest=network.network_digest,
             algorithm_version=AUCELL_ALGORITHM_VERSION,
             tmin=tmin,
@@ -856,7 +1022,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             tie_seed=tie_seed,
             from_assay=assay.name,
             cell_key=cell_key,
-            feat_key=feat_key,
             label=label,
             overwrite=overwrite,
             invalidate_cache=invalidate_cache,
@@ -904,7 +1069,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             assay=assay,
             label=label,
             cell_key=cell_key,
-            feat_key=feat_key,
             overwrite=overwrite,
             invalidate_cache=invalidate_cache,
             scorer=_EnrichmentScorer(
@@ -969,12 +1133,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         from_assay: str | None = None,
         group_key: str | None = None,
         cell_key: str | None = None,
-        feat_key: str | None = None,
+        *,
+        features: ArtifactRef | str,
         nthreads: int | None = None,
         skip_save: bool = False,
         invalidate_cache: bool = False,
         **norm_params: Any,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any] | ArtifactRef:
         """Identifies group specific features for a given assay.
 
         Please check out the ``find_markers_by_rank`` function for further details of how marker features for groups
@@ -986,13 +1151,15 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                        how the cells will be grouped. Usually this would be a column denoting cell clusters.
             cell_key: To run the test on specific subset of cells, provide the name of a boolean column in
                         the cell metadata table. (Default value: 'I')
-            feat_key: Boolean feature metadata column selecting features (default: ``'I'``).
+            features: Feature-selection artifact or exact published label.
             nthreads: Threads for marker search.
             skip_save: If True, return results without writing to Zarr.
             **norm_params: Extra keyword arguments forwarded to ``normed``.
 
         Returns:
-            Marker dict if ``skip_save`` is True, else None.
+            Marker dict when ``skip_save`` is true. Saved searches return the
+            immutable marker-table artifact reference, which can be passed to
+            :meth:`get_markers` to select that exact feature-specific result.
         """
         from ...features.markers import find_markers_by_rank
 
@@ -1005,16 +1172,23 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 "ERROR: Please provide a value for `group_key`. This should be the name of a column from "
                 "cell metadata object that has information on how cells should be grouped."
             )
-        from_assay, cell_key, _ = self._get_latest_keys(
-            from_assay,
-            cell_key,
-            feat_key if feat_key is not None else "I",
+        assay = self._get_assay(from_assay)
+        from_assay = assay.name
+        if cell_key is None:
+            cell_key = self._get_latest_cell_key(from_assay)
+        cell_index = np.asarray(assay.cells.active_index(cell_key), dtype=np.int64)
+        feature_selection = self.resolve_features(from_assay, features)
+        feature_values = np.asarray(
+            _feature_selection_values(self.zw, feature_selection),
+            dtype=bool,
         )
-        if feat_key is None:
-            feat_key = "I"
+        feature_index = np.flatnonzero(feature_values).astype(np.int64, copy=False)
+        if len(cell_index) == 0:
+            raise ValueError(f"Cell key {cell_key!r} selects no active cells")
+        if len(feature_index) == 0:
+            raise ValueError("Feature selection contains no active features")
         if nthreads is None:
             nthreads = self.nthreads
-        assay = self._get_assay(from_assay)
         resolved_norm_params = {
             **norm_params,
             "log_transform": norm_params.get("log_transform", False),
@@ -1024,10 +1198,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             ),
         }
 
-        slot_name = f"{cell_key}__{group_key}"
         logger.debug(
-            f"Running marker search for {from_assay}/{slot_name} "
-            f"(feat_key={feat_key}, "
+            f"Running marker search for {from_assay}/{cell_key}/{group_key} "
+            f"(feature_selection={feature_selection.artifact_id[:12]}, "
             f"nthreads={nthreads})"
         )
         planned = None
@@ -1037,41 +1210,16 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             if "markers" not in assay_grp:
                 assay_grp.create_group("markers")
             markers_grp = as_zarr_group(assay_grp["markers"], name="markers")
+            try:
+                _marker_artifact_index(markers_grp)
+            except ValueError as exc:
+                raise RuntimeError("Marker artifact index is invalid") from exc
             cell_selection = self._ensure_cell_selection(cell_key)
             cluster_input = self._resolve_cell_data_provenance_input(
                 group_key,
                 cell_key=cell_key,
             )
-            feature_values = np.asarray(
-                assay.feats.fetch_all(feat_key),
-                dtype=bool,
-            )
-            preserved_feature_display = feature_column_display(
-                assay.z,
-                feat_key,
-            )
-            feature_selection = resolve_selection_artifact(
-                self.zw,
-                scope="assay",
-                assay=from_assay,
-                kind="feature_selection",
-                values=feature_values,
-                row_ids=np.asarray(assay.feats.fetch_all("ids")),
-                operation="manual_selection",
-                parameters={},
-                inputs={},
-                source_column=feat_key,
-                invalidate_cache=False,
-            )
-            link_feature_data_column(
-                assay.z,
-                feat_key,
-                feature_selection,
-                value_name="values",
-                default_display=categorical_display(feature_values),
-                preserved_display=preserved_feature_display,
-            )
-            group_labels = assay.cells.fetch(group_key, cell_key)
+            group_labels = np.asarray(assay.cells.fetch_all(group_key))[cell_index]
             group_sizes = pd.Series(group_labels).value_counts()
             n_selected = int(len(group_labels))
             group_cell_counts = {
@@ -1135,7 +1283,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 adjustment_scope=MARKER_ADJUSTMENT_SCOPE,
                 group_key=group_key,
                 cell_key=cell_key,
-                feat_key=feat_key,
                 nthreads=nthreads,
                 invalidate_cache=invalidate_cache,
             )
@@ -1161,30 +1308,26 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             )
 
             def select_marker_artifact(ref: ArtifactRef) -> None:
-                raw_artifacts = markers_grp.attrs.get(
-                    "artifacts",
-                    {},
-                )
-                if "artifacts" in markers_grp.attrs and not isinstance(
-                    raw_artifacts,
-                    dict,
-                ):
-                    raise RuntimeError("Marker artifact index is invalid")
-                artifacts = (
-                    dict(raw_artifacts) if isinstance(raw_artifacts, dict) else {}
-                )
-                artifacts[slot_name] = ref.to_dict()
+                try:
+                    artifacts = _marker_artifact_index(markers_grp)
+                except ValueError as exc:
+                    raise RuntimeError("Marker artifact index is invalid") from exc
+                assay_slots = dict(artifacts.get(cell_key, {}))
+                group_slots = dict(assay_slots.get(group_key, {}))
+                group_slots[feature_selection.artifact_id] = ref.to_dict()
+                assay_slots[group_key] = group_slots
+                artifacts[cell_key] = assay_slots
                 markers_grp.attrs["artifacts"] = artifacts
 
             if planned.reused:
                 select_marker_artifact(planned.ref)
-                return None
+                return planned.ref
 
         markers = find_markers_by_rank(
             assay=assay,
-            group_key=group_key,
-            cell_key=cell_key,
-            feat_key=feat_key,
+            groups=np.asarray(assay.cells.fetch_all(group_key))[cell_index],
+            cell_idx=cell_index,
+            feat_idx=feature_index,
             nthreads=nthreads,
             **resolved_norm_params,
         )
@@ -1212,7 +1355,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             f"Saved marker results to {artifact_path(planned.ref)} "
             f"in {time.perf_counter() - t_save:.1f}s"
         )
-        return None
+        return planned.ref
 
     @staticmethod
     def _write_marker_slot(
@@ -1288,61 +1431,83 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         from_assay: str | None,
         cell_key: str,
         group_key: str,
+        marker: ArtifactRef | None = None,
     ) -> zarr.Group:
         assay = self._get_assay(from_assay)
-        markers_group = as_zarr_group(
-            assay.z["markers"],
-            name="markers",
-        )
-        slot_name = f"{cell_key}__{group_key}"
-        raw_artifacts = markers_group.attrs.get("artifacts", {})
-        if "artifacts" in markers_group.attrs and not isinstance(
-            raw_artifacts,
-            dict,
-        ):
-            raise ValueError("Marker artifact index is invalid")
-        artifacts = dict(raw_artifacts) if isinstance(raw_artifacts, dict) else {}
-        raw_ref = artifacts.get(slot_name)
-        if slot_name in artifacts and not isinstance(raw_ref, dict):
-            raise ValueError("Marker artifact index is invalid")
-        if isinstance(raw_ref, dict):
-            ref = ArtifactRef.from_dict(raw_ref)
-            if (
-                ref.kind != "marker_table"
-                or ref.scope != "assay"
-                or ref.assay != assay.name
-            ):
-                raise ValueError("Marker artifact ref is invalid")
-            status = self.inspect_artifact(ref)
-            if not status.complete:
-                raise ValueError("Marker artifact is incomplete")
-            inputs = status.inputs or {}
-            current_selection = self._ensure_cell_selection(cell_key)
-            stored_selection = inputs.get("cell_selection")
-            if not isinstance(stored_selection, dict) or not (
-                self._selection_artifacts_match(
-                    ArtifactRef.from_dict(stored_selection),
-                    current_selection,
-                )
-            ):
-                raise ValueError("Marker artifact cell selection is stale")
-            current_clusters = self._resolve_cell_data_provenance_input(
+        indexed_feature_id: str | None = None
+        if marker is None:
+            markers_group = as_zarr_group(
+                assay.z["markers"],
+                name="markers",
+            )
+            artifacts = _marker_artifact_index(markers_group)
+            indexed_feature_id, ref = _select_indexed_marker_artifact(
+                artifacts,
+                cell_key,
                 group_key,
-                cell_key=cell_key,
             )
-            stored_clusters = inputs.get("clusters")
-            if (
-                stored_clusters != current_clusters
-                and stored_clusters != current_clusters["artifact"]
-            ):
-                raise ValueError("Marker artifact cluster labels are stale")
-            return as_zarr_group(
-                self.zw[artifact_path(ref)],
-                name=artifact_path(ref),
+        else:
+            ref = marker
+        if (
+            ref.kind != "marker_table"
+            or ref.scope != "assay"
+            or ref.assay != assay.name
+        ):
+            raise ValueError("Marker artifact ref is invalid")
+        status = self.inspect_artifact(ref)
+        if not status.exists:
+            raise ValueError("Marker artifact does not exist")
+        if not status.complete:
+            raise ValueError("Marker artifact is incomplete")
+        execution = status.execution_options or {}
+        if (
+            execution.get("cell_key") != cell_key
+            or execution.get("group_key") != group_key
+        ):
+            raise ValueError("Marker artifact route does not match the request")
+        inputs = status.inputs or {}
+        stored_selection = inputs.get("cell_selection")
+        if not isinstance(stored_selection, dict):
+            raise ValueError("Marker artifact cell selection is stale")
+        from ...graph.state import validate_cell_selection_artifact
+
+        try:
+            validate_cell_selection_artifact(
+                self.zw,
+                ArtifactRef.from_dict(stored_selection),
+                cell_key,
             )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Marker artifact cell selection is stale") from exc
+        stored_features = inputs.get("feature_selection")
+        if not isinstance(stored_features, dict):
+            raise ValueError("Marker artifact feature selection is missing")
+        try:
+            stored_feature_ref = ArtifactRef.from_dict(stored_features)
+            self.resolve_features(
+                assay.name,
+                stored_feature_ref,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Marker artifact feature selection is invalid") from exc
+        if (
+            indexed_feature_id is not None
+            and stored_feature_ref.artifact_id != indexed_feature_id
+        ):
+            raise ValueError("Marker artifact index has the wrong feature selection")
+        current_clusters = self._resolve_cell_data_provenance_input(
+            group_key,
+            cell_key=cell_key,
+        )
+        stored_clusters = inputs.get("clusters")
+        if (
+            stored_clusters != current_clusters
+            and stored_clusters != current_clusters["artifact"]
+        ):
+            raise ValueError("Marker artifact cluster labels are stale")
         return as_zarr_group(
-            markers_group[slot_name],
-            name=slot_name,
+            self.zw[artifact_path(ref)],
+            name=artifact_path(ref),
         )
 
     def get_markers(
@@ -1353,6 +1518,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         group_id: str | int | None = None,
         min_score: float = 0.25,
         min_frac_exp: float = 0.2,
+        *,
+        marker: ArtifactRef | None = None,
     ) -> pd.DataFrame:
         """Return marker features from `run_marker_search`.
 
@@ -1374,24 +1541,60 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                        1 (Default value: 0.25)
             min_frac_exp: Minimum fraction of cells in a group that must have a non-zero value for a gene to be
                           considered a marker for that group.
+            marker: Exact marker-table artifact returned by
+                    ``run_marker_search``. When supplied, omitted assay, cell,
+                    and group routing is recovered from that artifact.
 
         Returns:
             Pandas dataframe with marker statistics. All-group results include a ``group_id`` column.
         """
 
+        if marker is not None:
+            if not isinstance(marker, ArtifactRef):
+                raise TypeError("marker must be an ArtifactRef")
+            if (
+                marker.kind != "marker_table"
+                or marker.scope != "assay"
+                or marker.assay is None
+            ):
+                raise ValueError("marker must identify an assay marker_table artifact")
+            if from_assay is not None and from_assay != marker.assay:
+                raise ValueError("marker belongs to a different assay")
+            status = self.inspect_artifact(marker)
+            if not status.exists:
+                raise ValueError("Marker artifact does not exist")
+            if not status.complete:
+                raise ValueError("Marker artifact is incomplete")
+            execution = status.execution_options or {}
+            stored_cell_key = execution.get("cell_key")
+            stored_group_key = execution.get("group_key")
+            if not isinstance(stored_cell_key, str) or not isinstance(
+                stored_group_key,
+                str,
+            ):
+                raise ValueError("Marker artifact has no valid execution route")
+            if cell_key is not None and cell_key != stored_cell_key:
+                raise ValueError("marker uses a different cell_key")
+            if group_key is not None and group_key != stored_group_key:
+                raise ValueError("marker uses a different group_key")
+            from_assay = marker.assay
+            cell_key = stored_cell_key
+            group_key = stored_group_key
+        assay = self._get_assay(from_assay)
+        from_assay = assay.name
         if cell_key is None:
-            from_assay, cell_key, _ = self._get_latest_keys(from_assay, cell_key, None)
+            cell_key = self._get_latest_cell_key(from_assay)
         if group_key is None:
             raise ValueError(
                 "ERROR: Please provide a value for group_key. "
                 "This should be same as used for `run_marker_search`"
             )
-        assay = self._get_assay(from_assay)
         try:
             g = self._resolve_marker_group(
                 from_assay,
                 cell_key,
                 group_key,
+                marker,
             )
         except KeyError:
             raise KeyError(
@@ -1445,6 +1648,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         csv_filename: str | None = None,
         min_score: float = 0.25,
         min_frac_exp: float = 0.2,
+        *,
+        marker: ArtifactRef | None = None,
     ) -> None:
         """Export markers of each cluster/group to a CSV file where each column
         contains the marker names sorted by score (descending order, highest
@@ -1464,6 +1669,9 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                        1 (Default value: 0.25)
             min_frac_exp: Minimum fraction of cells in a group that must have a non-zero value for a gene to be
                           considered a marker for that group.
+            marker: Exact marker-table artifact returned by
+                    ``run_marker_search``. Required to disambiguate when the
+                    same grouping has marker tables for multiple feature sets.
 
         Returns:
         """
@@ -1477,7 +1685,10 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             raise ValueError(
                 "ERROR: Please provide a value for parameter `csv_filename`"
             )
-        from_assay, cell_key, _ = self._get_latest_keys(from_assay, cell_key, None)
+        assay = self._get_assay(from_assay)
+        from_assay = assay.name
+        if cell_key is None:
+            cell_key = self._get_latest_cell_key(from_assay)
         clusters = self.cells.fetch(group_key, key=cell_key)
         markers_table = {}
         for group_id in sorted(set(clusters)):
@@ -1488,6 +1699,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 group_id=group_id,
                 min_score=min_score,
                 min_frac_exp=min_frac_exp,
+                marker=marker,
             )
             if len(m) > 0:
                 markers_table[group_id] = m["feature_name"].reset_index(drop=True)
@@ -1506,8 +1718,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         """Add a new assay to the DataStore by grouping together multiple
         features and taking their means. This method requires that the features
         are already assigned a group/cluster identity. The new assay will have
-        all the cells but only features that marked by 'feat_key' and contain a
-        group identity not present in `exclude_values`.
+        all cells and one feature per group identity not present in
+        ``exclude_values``.
 
         Args:
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
@@ -1544,7 +1756,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
 
         module_ids = [f"group_{x}" for x in group_set]
         g = create_zarr_count_assay(
-            z=self.zw,
+            z=self.z,
             assay_name=assay_label,
             workspace=self.workspace,
             n_cells=assay.cells.N,
@@ -1574,7 +1786,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             io=self.storageIo,
         )
 
-        self._load_assays(min_cells=0, custom_assay_types={assay_label: "Assay"})
+        self._load_assays(custom_assay_types={assay_label: "Assay"})
         self._ini_cell_props(min_features=0, mito_pattern="", ribo_pattern="")
         grouped_assay = self._get_assay(assay_label)
         grouped_assay.attrs["grouped_from_assay"] = assay.name
@@ -1710,7 +1922,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             resources=self.resources,
         )
 
-        self._load_assays(min_cells=10, custom_assay_types={assay_label: assay_type})
+        self._load_assays(custom_assay_types={assay_label: assay_type})
         self._ini_cell_props(min_features=0, mito_pattern=None, ribo_pattern=None)
 
     def make_bulk(

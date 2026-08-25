@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 import numpy as np
 import pandas as pd
 
-from ...graph.paths import StoredAssayGraph
-from ...graph.state import resolve_graph_selection, validate_legacy_graph_selection
+from ...graph.errors import IncompatibleAnalysisStateError
+from ...graph.state import resolve_graph_selection
 from ...metadata.artifacts import (
     artifact_values,
     categorical_display,
@@ -19,7 +19,6 @@ from ...metadata.arguments import LeidenArguments, TopacedoArguments
 from ...storage.artifacts import (
     ArtifactRef,
     artifact_path,
-    fingerprint_array,
     inspect_artifact,
 )
 from ...storage.artifact_writer import (
@@ -44,11 +43,11 @@ else:
 @dataclass(frozen=True, slots=True)
 class _PreparedLeidenClustering:
     planned: PlannedArtifact
+    graph: ArtifactRef
     graph_loc: str
     from_assay: str
     label_assay: str
     cell_key: str
-    feat_key: str
     resolution: float
     backend: Literal["igraph", "leidenalg"]
     symmetric_graph: bool
@@ -70,7 +69,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
     def _run_paris_from_artifacts(
         self,
         *,
-        graph_ref: Any,
+        graph_ref: ArtifactRef,
         graph_loc: str,
         from_assay: str,
         label_assay: str,
@@ -100,20 +99,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             write_hierarchy_group,
         )
 
-        artifact_scope = (
-            graph_ref.scope
-            if isinstance(graph_ref, ArtifactRef)
-            else "datastore"
-            if label_assay != from_assay
-            else "assay"
-        )
-        artifact_assay = (
-            graph_ref.assay
-            if isinstance(graph_ref, ArtifactRef)
-            else None
-            if artifact_scope == "datastore"
-            else from_assay
-        )
+        artifact_scope = graph_ref.scope
+        artifact_assay = graph_ref.assay
         n_cells, _effective_k = self._get_graph_ncells_k(graph_loc)
         cut_mode: Literal["adaptive", "fixed"] = (
             "fixed" if fixed_cluster_count is not None else "adaptive"
@@ -174,11 +161,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 budget,
             )
             fitted_graph = self.load_graph(
+                graph_ref,
                 from_assay=from_assay,
                 cell_key=cell_key,
                 symmetric=False,
                 upper_only=False,
-                graph_loc=graph_loc,
             )
             hierarchy = fit_paris_hierarchy(
                 fitted_graph,
@@ -202,15 +189,12 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             }
         )
         current_selection = self._ensure_cell_selection(cell_key)
-        if isinstance(graph_ref, ArtifactRef):
-            cell_selection = self._graph_cell_selection(graph_ref)
-            if not self._selection_artifacts_match(
-                cell_selection,
-                current_selection,
-            ):
-                raise ValueError("cell_key does not match the graph cell selection")
-        else:
-            cell_selection = current_selection
+        cell_selection = self._graph_cell_selection(graph_ref)
+        if not self._selection_artifacts_match(
+            cell_selection,
+            current_selection,
+        ):
+            raise ValueError("cell_key does not match the graph cell selection")
         cut_inputs = {
             "cluster_hierarchy": hierarchy_plan.ref,
             "connectivity_map": graph_ref,
@@ -286,7 +270,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                         n_cells,
                         budget,
                     )
-                    fitted_graph = self.load_graph(graph_loc=graph_loc)
+                    fitted_graph = self.load_graph(
+                        graph_ref,
+                        from_assay=from_assay,
+                        cell_key=cell_key,
+                    )
                 split_gate = modularity_split_gains(
                     hierarchy,
                     plateau_forest,
@@ -384,10 +372,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         *,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        feat_key: str | None = None,
         resolution: float = 1.0,
         backend: Literal["igraph", "leidenalg"] = "igraph",
-        integrated_graph: str | None = None,
         symmetric_graph: bool = False,
         graph_upper_only: bool = False,
         label: str = "leiden_cluster",
@@ -401,28 +387,17 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             graph,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
-            integrated_graph=integrated_graph,
         )
         from_assay = graph_selection.from_assay
         cell_key = graph_selection.cell_key
-        feat_key = graph_selection.feat_key
-        integrated_graph = graph_selection.integrated_label
         n_cells, _effective_k = self._get_graph_ncells_k(graph_selection.graph_loc)
-        graph_input: object = graph_selection.graph_input
-        artifact_scope = (
-            graph_input.scope
-            if isinstance(graph_input, ArtifactRef)
-            else "datastore"
-            if integrated_graph is not None
-            else "assay"
-        )
+        graph_input = graph_selection.graph_ref
+        artifact_scope = graph_input.scope
         selection = self._ensure_cell_selection(cell_key)
-        if isinstance(graph_input, ArtifactRef):
-            graph_cell_selection = self._graph_cell_selection(graph_input)
-            if not self._selection_artifacts_match(graph_cell_selection, selection):
-                raise ValueError("cell_key does not match the graph cell selection")
-            selection = graph_cell_selection
+        graph_cell_selection = self._graph_cell_selection(graph_input)
+        if not self._selection_artifacts_match(graph_cell_selection, selection):
+            raise ValueError("cell_key does not match the graph cell selection")
+        selection = graph_cell_selection
         arguments = LeidenArguments(
             graph=graph_input,
             resolution=resolution,
@@ -433,8 +408,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             label=label,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
-            integrated_graph=integrated_graph,
             invalidate_cache=invalidate_cache,
         )
         record = arguments.to_record()
@@ -443,7 +416,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             scope=artifact_scope,
             assay=(
                 graph_input.assay
-                if isinstance(graph_input, ArtifactRef) and graph_input.scope == "assay"
+                if graph_input.scope == "assay"
                 else from_assay
                 if artifact_scope == "assay"
                 else None
@@ -459,11 +432,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         )
         return _PreparedLeidenClustering(
             planned=planned,
+            graph=graph_input,
             graph_loc=graph_selection.graph_loc,
             from_assay=from_assay,
             label_assay=graph_selection.output_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
             resolution=resolution,
             backend=backend,
             symmetric_graph=symmetric_graph,
@@ -478,12 +451,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         prepared: _PreparedLeidenClustering,
     ) -> Any:
         graph = self.load_graph(
+            prepared.graph,
             from_assay=prepared.from_assay,
             cell_key=prepared.cell_key,
-            feat_key=prepared.feat_key,
             symmetric=prepared.symmetric_graph,
             upper_only=prepared.graph_upper_only,
-            graph_loc=prepared.graph_loc,
         )
         return graph.tocsr()
 
@@ -562,10 +534,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         *,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        feat_key: str | None = None,
         resolution: float = 1.0,
         backend: Literal["igraph", "leidenalg"] = "igraph",
-        integrated_graph: str | None = None,
         symmetric_graph: bool = False,
         graph_upper_only: bool = False,
         label: str = "leiden_cluster",
@@ -579,10 +549,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 current analysis chain of the assay is used when omitted.
             from_assay: Assay whose current graph should be used.
             cell_key: Cell key of the graph.
-            feat_key: Feature key of the graph.
             resolution: Leiden resolution parameter.
             backend: Leiden implementation. Native igraph is the default.
-            integrated_graph: Label of an integrated graph to partition.
             symmetric_graph: Forwarded to `load_graph`.
             graph_upper_only: Forwarded to `load_graph`.
             label: Base name of the cell-metadata column that receives labels.
@@ -596,10 +564,8 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             graph,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
             resolution=resolution,
             backend=backend,
-            integrated_graph=integrated_graph,
             symmetric_graph=symmetric_graph,
             graph_upper_only=graph_upper_only,
             label=label,
@@ -619,9 +585,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         *,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        feat_key: str | None = None,
         n_clusters: int | Literal["auto"] = "auto",
-        integrated_graph: str | None = None,
         min_cluster_size: int | None = None,
         force_recalc: bool = False,
         invalidate_cache: bool = False,
@@ -654,18 +618,10 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             graph,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
-            integrated_graph=integrated_graph,
         )
         from_assay = graph_selection.from_assay
         cell_key = graph_selection.cell_key
         graph_loc = graph_selection.graph_loc
-        if graph_selection.integrated_label is None and not isinstance(
-            self._lookup_stored_graph(graph_loc=graph_loc),
-            StoredAssayGraph,
-        ):
-            raise TypeError("Paris clustering requires an assay graph")
-
         n_cells, effective_k = self._get_graph_ncells_k(graph_loc)
         active_cell_count = int(np.count_nonzero(self.cells.fetch_all(cell_key)))
         if active_cell_count != n_cells:
@@ -692,7 +648,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             effective_min_cluster_size = None
 
         return self._run_paris_from_artifacts(
-            graph_ref=graph_selection.graph_input,
+            graph_ref=graph_selection.graph_ref,
             graph_loc=graph_loc,
             from_assay=from_assay,
             label_assay=graph_selection.output_assay,
@@ -709,8 +665,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
         *,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        feat_key: str | None = None,
-        integrated_graph: str | None = None,
         cluster_key: str | None = None,
         use_k: int | None = None,
         density_depth: int = 2,
@@ -741,9 +695,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                    analysis chain of the assay is used when omitted.
             from_assay: Name of assay to be used. If no value is provided then the default assay will be used.
             cell_key: Cell key. Should be same as the one that was used in the desired graph. (Default value: 'I')
-            feat_key: Feature key. Should be same as the one that was used in the desired graph. By default, the latest
-                       used feature for the given assay will be used.
-            integrated_graph: Integrated graph label. By default, use the latest assay graph.
             cluster_key: Name of the column in cell metadata table where cluster information is stored.
             use_k: Number of top k-nearest neighbours to retain in the graph over which downsampling is performed.
                    BY default all neighbours are used. (Default value: None)
@@ -785,65 +736,35 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             graph,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
-            integrated_graph=integrated_graph,
         )
         from_assay = graph_selection.from_assay
         cell_key = graph_selection.cell_key
-        feat_key = graph_selection.feat_key
-        integrated_graph = graph_selection.integrated_label
-        graph_loc = graph_selection.graph_loc
         output_assay = graph_selection.output_assay
         if cluster_key is None:
             raise ValueError("ERROR: Please provide a value for cluster key")
         clusters = pd.Series(self.cells.fetch(cluster_key, key=cell_key))
-        if integrated_graph is None and not isinstance(
-            self._lookup_stored_graph(graph_loc=graph_loc),
-            StoredAssayGraph,
-        ):
-            raise TypeError("TopACeDo sampling requires an assay graph")
-        graph_input: object = graph_selection.graph_input
-        if not isinstance(graph_input, ArtifactRef) and integrated_graph is None:
-            validate_legacy_graph_selection(
-                self,
-                graph_loc,
-                from_assay,
-                cell_key,
-                feat_key,
-            )
-        graph_matrix = self.load_graph(
-            from_assay=from_assay,
-            cell_key=cell_key,
-            feat_key=feat_key,
-            symmetric=False,
-            upper_only=False,
-            use_k=use_k,
-            graph_loc=graph_loc,
-        )
-        resolver = getattr(self, "_resolve_cell_data_provenance_input", None)
-        cluster_input_is_descriptor = callable(resolver)
-        if callable(resolver):
-            cluster_input: object = resolver(cluster_key, cell_key=cell_key)
-        else:
-            cluster_input = {"value_fingerprint": fingerprint_array(clusters.values)}
+        graph_input = graph_selection.graph_ref
         cluster_column = as_zarr_array(
             as_zarr_group(self.zw["cellData"], name="cellData")[cluster_key],
             name=cluster_key,
         )
         raw_cut_ref = cluster_column.attrs.get("source_artifact")
-        if (
-            isinstance(raw_cut_ref, dict)
-            and (cut_ref := ArtifactRef.from_dict(raw_cut_ref)).kind == "cluster_cut"
-        ):
-            if not cluster_input_is_descriptor:
-                cluster_input = cut_ref
+        if isinstance(raw_cut_ref, dict):
+            try:
+                cut_ref = ArtifactRef.from_dict(raw_cut_ref)
+            except (TypeError, ValueError) as error:
+                raise IncompatibleAnalysisStateError(
+                    "TopACeDo cluster state has a malformed artifact reference",
+                    code="invalid_analysis_state",
+                    context={"cluster_key": cluster_key},
+                ) from error
+        else:
+            cut_ref = None
+        if cut_ref is not None and cut_ref.kind == "cluster_cut":
+            cluster_input: object = cut_ref
             cut_inputs = inspect_artifact(self.zw, cut_ref).inputs or {}
             raw_hierarchy_ref = cut_inputs.get("cluster_hierarchy")
-            current_graph_input = (
-                graph_input.to_dict()
-                if isinstance(graph_input, ArtifactRef)
-                else graph_input
-            )
+            current_graph_input = graph_input.to_dict()
             if cut_inputs.get("connectivity_map") != current_graph_input:
                 raise ValueError("Cluster cut does not belong to the requested graph")
             cut_group = as_zarr_group(
@@ -854,7 +775,14 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 np.asarray(as_zarr_array(cut_group["labels"], name="labels")[:])
             )
         else:
-            raw_hierarchy_ref = None
+            raise IncompatibleAnalysisStateError(
+                "TopACeDo requires a cluster_cut artifact from Paris clustering",
+                code="invalid_analysis_state",
+                context={
+                    "cluster_key": cluster_key,
+                    "artifact_kind": None if cut_ref is None else cut_ref.kind,
+                },
+            )
         if isinstance(raw_hierarchy_ref, dict):
             from ...clustering.paris import hierarchy_to_dendrogram
             from .paris_persistence import load_hierarchy_group
@@ -901,28 +829,20 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             )
             dendrogram_input: object = dendrogram_plan.ref
         else:
-            from .paris_persistence import resolve_compatibility_dendrogram
+            raise IncompatibleAnalysisStateError(
+                "TopACeDo cluster state does not name its Paris hierarchy",
+                code="invalid_analysis_state",
+                context={"cluster_key": cluster_key},
+            )
 
-            try:
-                dendrogram_loc, _generation_id = resolve_compatibility_dendrogram(
-                    self.zw,
-                    graph_loc,
-                    self.resources,
-                )
-                dendrogram = np.asarray(
-                    as_zarr_array(
-                        self.zw[dendrogram_loc],
-                        name=dendrogram_loc,
-                    )[:]
-                )
-            except KeyError:
-                raise KeyError(
-                    "ERROR: Couldn't find the dendrogram for clustering. Please note "
-                    "that TopACeDo requires a dendrogram from Paris clustering."
-                )
-            dendrogram_input = {
-                "value_fingerprint": fingerprint_array(dendrogram),
-            }
+        graph_matrix = self.load_graph(
+            graph_input,
+            from_assay=from_assay,
+            cell_key=cell_key,
+            symmetric=False,
+            upper_only=False,
+            use_k=use_k,
+        )
 
         if len(clusters) != graph_matrix.shape[0]:
             raise ValueError(
@@ -930,18 +850,11 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
                 f"{graph_matrix.shape[0]} cells."
             )
         selection = self._ensure_cell_selection(cell_key)
-        if isinstance(graph_input, ArtifactRef):
-            graph_cell_selection = self._graph_cell_selection(graph_input)
-            if not self._selection_artifacts_match(graph_cell_selection, selection):
-                raise ValueError("cell_key does not match the graph cell selection")
-            selection = graph_cell_selection
-        artifact_scope = (
-            graph_input.scope
-            if isinstance(graph_input, ArtifactRef)
-            else "datastore"
-            if integrated_graph is not None
-            else "assay"
-        )
+        graph_cell_selection = self._graph_cell_selection(graph_input)
+        if not self._selection_artifacts_match(graph_cell_selection, selection):
+            raise ValueError("cell_key does not match the graph cell selection")
+        selection = graph_cell_selection
+        artifact_scope = graph_input.scope
         arguments = TopacedoArguments(
             graph=graph_input,
             clusters=cluster_input,
@@ -961,8 +874,6 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             rand_state=rand_state,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
-            integrated_graph=integrated_graph,
             cluster_key=cluster_key,
             save_sampling_key=save_sampling_key,
             save_density_key=save_density_key,
@@ -975,7 +886,7 @@ class _ClusteringOperationsMixin(_ClusteringOperationsBase):
             scope=artifact_scope,
             assay=(
                 graph_input.assay
-                if isinstance(graph_input, ArtifactRef) and graph_input.scope == "assay"
+                if graph_input.scope == "assay"
                 else from_assay
                 if artifact_scope == "assay"
                 else None

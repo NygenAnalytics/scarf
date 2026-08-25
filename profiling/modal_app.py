@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 import modal
+from scarf.storage import ArtifactRef
 
 from profiling.config import (
     ALL_STAGE_CHOICES,
@@ -78,6 +79,31 @@ from profiling.stages import (
 )
 
 _WORK = Path("/tmp/scarf-profiling")
+
+
+def _load_hvg_ref(
+    config: ProfilingConfig,
+    nRows: int,
+) -> ArtifactRef | None:
+    payload = load_result(config, nRows, "markHvgs")
+    if payload is None:
+        return None
+    if payload.get("status") != "ok":
+        raise ValueError("markHvgs stage result is not complete")
+    details = payload.get("details")
+    if not isinstance(details, dict):
+        raise ValueError("markHvgs stage result has no details")
+    artifact = details.get("artifact")
+    if not isinstance(artifact, dict):
+        raise ValueError("markHvgs stage result has no artifact reference")
+    ref = ArtifactRef.from_dict(artifact)
+    if (
+        ref.scope != "assay"
+        or ref.assay != config.workflow.assayName
+        or ref.kind != "feature_selection"
+    ):
+        raise ValueError("markHvgs stage result has an invalid feature selection")
+    return ref
 
 
 def _e2e_conflicting_uris(
@@ -347,6 +373,7 @@ def run_stage_job(
         workDir=work,
         invalidateCache=force,
         clientProvenance=config.clientProvenance,
+        hvgRef=(_load_hvg_ref(config, nRows) if stage == "runNormalization" else None),
     )
     write_result(config, result, overwrite=force)
     return result.to_json()

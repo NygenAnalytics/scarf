@@ -42,7 +42,6 @@ def test_normalization_arguments_partition_every_value() -> None:
     arguments = NormalizationArguments(
         from_assay="RNA",
         cell_key="I",
-        feat_key="hvgs",
         cell_selection=_ref("cell_selection", "2", scope="datastore"),
         feature_selection=_ref("feature_selection", "3"),
         normalization_method="norm_lib_size",
@@ -64,7 +63,6 @@ def test_normalization_arguments_partition_every_value() -> None:
     assert record.execution_options == {
         "from_assay": "RNA",
         "cell_key": "I",
-        "feat_key": "hvgs",
         "update_state": True,
         "invalidate_cache": False,
     }
@@ -74,7 +72,6 @@ def test_execution_options_do_not_change_provenance_hash() -> None:
     common = {
         "from_assay": "RNA",
         "cell_key": "I",
-        "feat_key": "hvgs",
         "cell_selection": _ref("cell_selection", "2", scope="datastore"),
         "feature_selection": _ref("feature_selection", "3"),
         "normalization_method": "norm_lib_size",
@@ -109,6 +106,8 @@ def test_reduction_fingerprints_custom_loadings_as_input() -> None:
     common = {
         "normalized": _ref("normalized", "a"),
         "feature_scaling": _ref("feature_scaling", "c"),
+        "dims": 2,
+        "feat_scaling": False,
         "update_state": False,
         "invalidate_cache": False,
     }
@@ -290,7 +289,6 @@ def test_dynamic_callable_requires_explicit_identity() -> None:
         NormalizationArguments(
             from_assay="RNA",
             cell_key="I",
-            feat_key="hvgs",
             cell_selection=_ref(
                 "cell_selection",
                 "2",

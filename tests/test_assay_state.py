@@ -9,31 +9,26 @@ from zarr.storage import MemoryStore
 
 from scarf.datastore.datastore import DataStore
 from scarf.datastore.graph_datastore import GraphDataStore
-from scarf.graph.encoded_paths import (
-    make_cell_graph_group_path,
-    make_kmeans_initialization_group_path,
-    make_nearest_neighbors_group_path,
-    make_neighbor_index_group_path,
-    make_normalized_group_path,
-    make_reduction_group_path,
-)
-from scarf.graph.paths import AssayGraphPaths, StoredAssayGraph, StoredIntegratedGraph
+from scarf.embeddings.imported import write_imported_coordinates
+from scarf.graph.errors import IncompatibleAnalysisStateError
+from scarf.graph.feature_projection import resolve_native_graph_inputs
 from scarf.graph.state import (
-    ArtifactSelectionError,
     AssayState,
-    _legacy_subset_hash,
+    embedding_initialization_path_from_state,
+    normalized_path_from_state,
     read_assay_state,
-    stored_assay_graph_from_state,
-    validate_legacy_graph_selection,
+    resolve_graph_selection,
     write_assay_state,
 )
+from scarf.storage.errors import ArtifactResolutionError
 from scarf.storage.artifacts import (
     ArtifactRef,
     ArtifactScope,
     artifact_path,
-    fingerprint_strings,
+    fingerprint_array,
+    fingerprint_stored_arrays,
+    fingerprint_stored_strings,
     inspect_artifact,
-    list_artifacts,
     make_provenance,
     new_artifact_id,
 )
@@ -51,212 +46,6 @@ def _ref(kind: str, token: str) -> ArtifactRef:
         assay="RNA",
         kind=kind,
         artifact_id=token * 64,
-    )
-
-
-def _compose_assay_graph_paths(
-    *,
-    from_assay: str,
-    cell_key: str,
-    feat_key: str,
-    reduction_method: str,
-    dims: int,
-    pca_cell_key: str,
-    ann_metric: str,
-    ann_efc: int,
-    ann_ef: int,
-    ann_m: int,
-    rand_state: int,
-    k: int,
-    local_connectivity: float,
-    bandwidth: float,
-    n_centroids: int | None = None,
-    feat_scaling: bool = True,
-    harmony_contract_hash: str | None = None,
-) -> AssayGraphPaths:
-    normalized = make_normalized_group_path(from_assay, cell_key, feat_key)
-    reduction = make_reduction_group_path(
-        normalized, reduction_method, dims, pca_cell_key
-    )
-    neighbor_index = make_neighbor_index_group_path(
-        reduction,
-        ann_metric,
-        ann_efc,
-        ann_ef,
-        ann_m,
-        rand_state,
-        feat_scaling=feat_scaling,
-        harmony_contract_hash=harmony_contract_hash,
-    )
-    nearest_neighbors = make_nearest_neighbors_group_path(neighbor_index, k)
-    cell_graph = make_cell_graph_group_path(
-        nearest_neighbors, local_connectivity, bandwidth
-    )
-    kmeans = None
-    if n_centroids is not None:
-        kmeans = make_kmeans_initialization_group_path(
-            reduction, n_centroids, rand_state
-        )
-    return AssayGraphPaths(
-        normalized_group_path=normalized,
-        reduction_group_path=reduction,
-        neighbor_index_group_path=neighbor_index,
-        nearest_neighbors_group_path=nearest_neighbors,
-        cell_graph_group_path=cell_graph,
-        kmeans_initialization_group_path=kmeans,
-    )
-
-
-def test_legacy_graph_without_selection_provenance_fails_closed(
-    datastore_ephemeral,
-) -> None:
-    paths = _compose_assay_graph_paths(
-        from_assay="RNA",
-        cell_key="I",
-        feat_key="I",
-        reduction_method="pca",
-        dims=5,
-        pca_cell_key="I",
-        ann_metric="l2",
-        ann_efc=50,
-        ann_ef=50,
-        ann_m=16,
-        rand_state=1,
-        k=3,
-        local_connectivity=1.0,
-        bandwidth=1.0,
-    )
-    datastore_ephemeral.zw.require_group(paths.normalized_group_path)
-
-    with pytest.raises(ValueError, match="selection provenance is missing"):
-        validate_legacy_graph_selection(
-            datastore_ephemeral,
-            paths.nearest_neighbors_group_path,
-            "RNA",
-            "I",
-            "I",
-        )
-
-
-@pytest.mark.parametrize("hash_format", ["current", "legacy"])
-def test_legacy_graph_accepts_supported_selection_hashes(
-    datastore_ephemeral,
-    hash_format: str,
-) -> None:
-    paths = _compose_assay_graph_paths(
-        from_assay="RNA",
-        cell_key="I",
-        feat_key="I",
-        reduction_method="pca",
-        dims=5,
-        pca_cell_key="I",
-        ann_metric="l2",
-        ann_efc=50,
-        ann_ef=50,
-        ann_m=16,
-        rand_state=1,
-        k=3,
-        local_connectivity=1.0,
-        bandwidth=1.0,
-    )
-    normalized = datastore_ephemeral.zw.require_group(paths.normalized_group_path)
-    assay = datastore_ephemeral._get_assay("RNA")
-    cell_indices = datastore_ephemeral.cells.active_index("I")
-    feature_indices = assay.feats.active_index("I")
-    normalized.attrs["subset_hash"] = (
-        assay._create_subset_hash(cell_indices, feature_indices)
-        if hash_format == "current"
-        else _legacy_subset_hash(cell_indices, feature_indices)
-    )
-
-    validate_legacy_graph_selection(
-        datastore_ephemeral,
-        paths.nearest_neighbors_group_path,
-        "RNA",
-        "I",
-        "I",
-    )
-
-
-def test_legacy_graph_rejects_mismatched_or_invalid_selection_hash(
-    datastore_ephemeral,
-) -> None:
-    paths = _compose_assay_graph_paths(
-        from_assay="RNA",
-        cell_key="I",
-        feat_key="I",
-        reduction_method="pca",
-        dims=5,
-        pca_cell_key="I",
-        ann_metric="l2",
-        ann_efc=50,
-        ann_ef=50,
-        ann_m=16,
-        rand_state=1,
-        k=3,
-        local_connectivity=1.0,
-        bandwidth=1.0,
-    )
-    normalized = datastore_ephemeral.zw.require_group(paths.normalized_group_path)
-    normalized.attrs["subset_hash"] = 0
-    with pytest.raises(ValueError, match="no longer matches"):
-        validate_legacy_graph_selection(
-            datastore_ephemeral,
-            paths.nearest_neighbors_group_path,
-            "RNA",
-            "I",
-            "I",
-        )
-
-    normalized.attrs["subset_hash"] = True
-    with pytest.raises(ValueError, match="invalid type"):
-        validate_legacy_graph_selection(
-            datastore_ephemeral,
-            paths.nearest_neighbors_group_path,
-            "RNA",
-            "I",
-            "I",
-        )
-
-
-def test_legacy_graph_qualifies_non_default_feature_key_exactly_once(
-    datastore_ephemeral,
-) -> None:
-    assay = datastore_ephemeral._get_assay("RNA")
-    qualified_key = "I__I__qualified"
-    assay.feats.insert(
-        qualified_key,
-        np.asarray(assay.feats.fetch_all("I"), dtype=bool),
-        overwrite=True,
-    )
-    paths = _compose_assay_graph_paths(
-        from_assay="RNA",
-        cell_key="I",
-        feat_key="I__qualified",
-        reduction_method="pca",
-        dims=5,
-        pca_cell_key="I",
-        ann_metric="l2",
-        ann_efc=50,
-        ann_ef=50,
-        ann_m=16,
-        rand_state=1,
-        k=3,
-        local_connectivity=1.0,
-        bandwidth=1.0,
-    )
-    normalized = datastore_ephemeral.zw.require_group(paths.normalized_group_path)
-    normalized.attrs["subset_hash"] = _legacy_subset_hash(
-        datastore_ephemeral.cells.active_index("I"),
-        assay.feats.active_index(qualified_key),
-    )
-
-    validate_legacy_graph_selection(
-        datastore_ephemeral,
-        paths.nearest_neighbors_group_path,
-        "RNA",
-        "I",
-        "I__qualified",
     )
 
 
@@ -314,15 +103,15 @@ def _state_store() -> tuple[_StateGraphStore, AssayState]:
     cell_data.create_array("I", data=np.ones(3, dtype=bool))
     feature_data = datastore.z.create_group("RNA/featureData")
     feature_data.create_array("ids", data=feature_ids)
-    feature_data.create_array("I__hvgs", data=np.ones(4, dtype=bool))
+    feature_data.create_array("I", data=np.ones(4, dtype=bool))
 
     cell_selection, cell_selection_group = _add_artifact(
         datastore.z,
         kind="cell_selection",
         operation="manual_selection",
         inputs={
-            "ordered_row_ids_fingerprint": fingerprint_strings(cell_ids),
-            "values_fingerprint": "cells",
+            "ordered_row_ids_fingerprint": fingerprint_stored_strings(cell_data["ids"]),
+            "values_fingerprint": fingerprint_array(np.ones(3, dtype=bool)),
         },
         execution_options={"source_column": "I"},
         scope="datastore",
@@ -331,20 +120,55 @@ def _state_store() -> tuple[_StateGraphStore, AssayState]:
         "values",
         data=np.ones(3, dtype=bool),
     )
+    all_features, all_features_group = _add_artifact(
+        datastore.z,
+        kind="feature_selection",
+        operation="create_all_features",
+        parameters={
+            "dataset_fingerprint": "test-dataset",
+            "ordered_feature_ids_fingerprint": fingerprint_stored_strings(
+                feature_data["ids"]
+            ),
+        },
+    )
+    all_features_group.create_array(
+        "values",
+        data=np.ones(4, dtype=bool),
+    )
+    all_features_group.attrs["ordered_feature_ids_fingerprint"] = (
+        fingerprint_stored_strings(feature_data["ids"])
+    )
+    all_features_group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+        all_features_group,
+        ("values",),
+    )
     feature_selection, feature_selection_group = _add_artifact(
         datastore.z,
         kind="feature_selection",
-        operation="manual_selection",
-        inputs={
-            "ordered_row_ids_fingerprint": fingerprint_strings(feature_ids),
-            "values_fingerprint": "features",
+        operation="set_feature_selection",
+        parameters={
+            "values_fingerprint": fingerprint_array(np.ones(4, dtype=bool)),
         },
-        execution_options={"source_column": "I__hvgs"},
+        inputs={"all_features": all_features},
+        execution_options={"label": "hvgs"},
     )
     feature_selection_group.create_array(
         "values",
         data=np.ones(4, dtype=bool),
     )
+    feature_selection_group.attrs["ordered_feature_ids_fingerprint"] = (
+        fingerprint_stored_strings(feature_data["ids"])
+    )
+    feature_selection_group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+        feature_selection_group,
+        ("values",),
+    )
+    feature_label = feature_data.create_array(
+        "hvgs",
+        data=np.ones(4, dtype=bool),
+    )
+    feature_label.attrs["source_value"] = "values"
+    feature_label.attrs["source_artifact"] = feature_selection.to_dict()
     normalized, normalized_group = _add_artifact(
         datastore.z,
         kind="normalized",
@@ -353,7 +177,7 @@ def _state_store() -> tuple[_StateGraphStore, AssayState]:
             "cell_selection": cell_selection,
             "feature_selection": feature_selection,
         },
-        execution_options={"cell_key": "I", "feat_key": "hvgs"},
+        execution_options={"cell_key": "I"},
     )
     normalized_group.create_array(
         "data",
@@ -473,7 +297,6 @@ def _state_store() -> tuple[_StateGraphStore, AssayState]:
     state = AssayState(
         assay="RNA",
         cell_key="I",
-        feat_key="hvgs",
         normalized=normalized,
         feature_scaling=scaling,
         reduction=reduction,
@@ -542,6 +365,19 @@ def _store_digest(root: zarr.Group) -> str:
 def test_assay_state_round_trip_and_validation() -> None:
     datastore, state = _state_store()
     assert AssayState.from_dict(state.to_dict()) == state
+    assert set(state.to_dict()) == {
+        "assay",
+        "cell_key",
+        "normalized",
+        "feature_scaling",
+        "reduction",
+        "batch_correction",
+        "ann_index",
+        "embedding_initialization",
+        "neighbors",
+        "connectivity_map",
+        "named_results",
+    }
     public_datastore = DataStore.__new__(DataStore)
     public_datastore.z = datastore.z
     public_datastore.workspace = None
@@ -552,225 +388,301 @@ def test_assay_state_round_trip_and_validation() -> None:
         AssayState(
             assay="RNA",
             cell_key="I",
-            feat_key="hvgs",
             normalized=_ref("neighbors", "a"),
         )
     with pytest.raises(ValueError, match="snake_case"):
         AssayState(
             assay="RNA",
             cell_key="I",
-            feat_key="hvgs",
             named_results={"UMAP 1": _ref("embedding", "a")},
         )
     malformed = state.to_dict()
     malformed["normalized"] = "not-a-reference"
-    with pytest.raises(TypeError, match="normalized must be"):
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
         AssayState.from_dict(malformed)
+    assert caught.value.code == "invalid_analysis_state"
     malformed = state.to_dict()
     malformed["cell_key"] = None
-    with pytest.raises(TypeError, match="must be strings"):
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
         AssayState.from_dict(malformed)
+    assert caught.value.code == "invalid_analysis_state"
+
+
+@pytest.mark.parametrize("legacy_field", ["feat_key", "feature_selection"])
+def test_assay_state_rejects_legacy_feature_fields_without_mutation(
+    legacy_field: str,
+) -> None:
+    datastore, state = _state_store()
+    malformed = state.to_dict()
+    malformed[legacy_field] = "hvgs"
+    datastore.z["RNA/state"].attrs["state"] = malformed
+    before = _store_digest(datastore.z)
+
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+
+    assert caught.value.code == "legacy_feature_contract"
+    assert caught.value.context["keys"] == legacy_field
+    assert _store_digest(datastore.z) == before
+
+
+def test_assay_state_rejects_unknown_fields() -> None:
+    _datastore, state = _state_store()
+    malformed = state.to_dict()
+    malformed["latest_graph"] = "path"
+
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        AssayState.from_dict(malformed)
+
+    assert caught.value.code == "invalid_analysis_state"
+    assert caught.value.context["keys"] == "latest_graph"
+
+    malformed_ref = state.to_dict()
+    raw_normalized = malformed_ref["normalized"]
+    assert isinstance(raw_normalized, dict)
+    raw_normalized["path"] = "RNA/legacy"
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        AssayState.from_dict(malformed_ref)
+    assert caught.value.code == "invalid_analysis_state"
 
 
 def test_state_first_graph_lookup_uses_artifacts() -> None:
     datastore, state = _state_store()
 
     assert read_assay_state(datastore.zw, "RNA") == state
-    assert datastore.get_normalized_group_path("RNA", "I", "hvgs") == artifact_path(
+    assert normalized_path_from_state(datastore.zw, "RNA", "I") == artifact_path(
         state.normalized
     )
-    assert datastore.get_latest_graph_loc("RNA", "I", "hvgs") == artifact_path(
-        state.connectivity_map
+    assert embedding_initialization_path_from_state(
+        datastore.zw,
+        "RNA",
+        "I",
+    ) == artifact_path(state.embedding_initialization)
+    selected = resolve_graph_selection(
+        datastore,
+        state.connectivity_map,
+        from_assay="RNA",
+        cell_key="I",
     )
-    assert datastore.load_graph().shape == (3, 3)
+    assert selected.graph_ref == state.connectivity_map
+    assert selected.graph_input == state.connectivity_map
+    assert selected.graph_loc == artifact_path(state.connectivity_map)
+    assert selected.from_assay == "RNA"
+    assert selected.cell_key == "I"
+    assert selected.integrated_label is None
 
-    stored = datastore._lookup_stored_graph("RNA", "I", "hvgs")
-    assert isinstance(stored, StoredAssayGraph)
-    assert stored.dims == 2
-    assert stored.k == 2
-    assert stored.ann_metric == "l2"
-    assert stored.local_connectivity == 1.0
-    assert stored.paths.kmeans_initialization_group_path == artifact_path(
-        state.embedding_initialization
+
+def test_state_classifies_missing_normalized_feature_selection_as_corruption() -> None:
+    datastore, state = _state_store()
+    assert state.normalized is not None
+    normalized = datastore.zw[artifact_path(state.normalized)]
+    provenance = dict(normalized.attrs["provenance"])
+    inputs = dict(provenance["inputs"])
+    del inputs["feature_selection"]
+    provenance["inputs"] = inputs
+    normalized.attrs["provenance"] = provenance
+
+    with pytest.raises(ArtifactResolutionError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+
+    assert caught.value.code == "corrupt_payload"
+    assert caught.value.context["field"] == "normalized.feature_selection"
+
+
+def test_state_reserves_legacy_code_for_removed_normalized_feature_keys() -> None:
+    datastore, state = _state_store()
+    assert state.normalized is not None
+    normalized = datastore.zw[artifact_path(state.normalized)]
+    provenance = dict(normalized.attrs["provenance"])
+    inputs = dict(provenance["inputs"])
+    del inputs["feature_selection"]
+    inputs["feat_key"] = "I__hvgs"
+    provenance["inputs"] = inputs
+    normalized.attrs["provenance"] = provenance
+
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+
+    assert caught.value.code == "legacy_feature_contract"
+
+
+def test_state_validates_normalized_feature_selection_payload() -> None:
+    datastore, state = _state_store()
+    assert state.normalized is not None
+    inputs = inspect_artifact(datastore.zw, state.normalized).inputs or {}
+    raw_selection = inputs["feature_selection"]
+    assert isinstance(raw_selection, dict)
+    selection = ArtifactRef.from_dict(raw_selection)
+    datastore.zw[artifact_path(selection)]["values"][0] = False
+
+    with pytest.raises(ArtifactResolutionError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+
+    assert caught.value.code == "corrupt_payload"
+
+
+def test_imported_coordinate_state_does_not_require_normalized() -> None:
+    datastore, native_state = _state_store()
+    assert native_state.normalized is not None
+    normalized_inputs = (
+        inspect_artifact(
+            datastore.zw,
+            native_state.normalized,
+        ).inputs
+        or {}
     )
-
-
-def test_state_graph_summary_rejects_missing_required_provenance() -> None:
-    datastore, state = _state_store()
-    assert state.ann_index is not None
-    ann_group = datastore.zw[artifact_path(state.ann_index)]
-    provenance = dict(ann_group.attrs["provenance"])
-    parameters = dict(provenance["parameters"])
-    del parameters["ann_efc"]
-    provenance["parameters"] = parameters
-    ann_group.attrs["provenance"] = provenance
-
-    with pytest.raises(ValueError, match="ann_index provenance is missing 'ann_efc'"):
-        datastore._lookup_stored_graph("RNA", "I", "hvgs")
-
-
-def test_state_graph_summary_rejects_invalid_optional_provenance_type() -> None:
-    datastore, state = _state_store()
-    assert state.reduction is not None
-    reduction_group = datastore.zw[artifact_path(state.reduction)]
-    provenance = dict(reduction_group.attrs["provenance"])
-    parameters = dict(provenance["parameters"])
-    parameters["feat_scaling"] = "false"
-    provenance["parameters"] = parameters
-    reduction_group.attrs["provenance"] = provenance
-
-    with pytest.raises(TypeError, match="must be boolean"):
-        datastore._lookup_stored_graph("RNA", "I", "hvgs")
-
-
-def test_explicit_artifact_graph_path_loads_without_latest_attrs() -> None:
-    datastore, state = _state_store()
-    graph_path = artifact_path(state.connectivity_map)
-
-    graph = datastore.load_graph(graph_loc=graph_path)
-    stored = datastore._lookup_stored_graph(graph_loc=graph_path)
-
-    assert graph.shape == (3, 3)
-    assert graph.nnz == 6
-    assert isinstance(stored, StoredAssayGraph)
-    assert stored.paths.cell_graph_group_path == graph_path
-
-    older_ref, older = _add_artifact(
+    raw_cells = normalized_inputs["cell_selection"]
+    assert isinstance(raw_cells, dict)
+    cell_selection = ArtifactRef.from_dict(raw_cells)
+    cell_ids = np.asarray(datastore.z["cellData/ids"][:])
+    coordinate_values = np.arange(6, dtype=np.float32).reshape(3, 2)
+    coordinates = write_imported_coordinates(
+        datastore.z,
+        assay="RNA",
+        dimreduc_key="pca",
+        role="pca",
+        coordinates=coordinate_values,
+        source_digest=hashlib.sha256(b"state-import").digest(),
+        payload_fingerprints={"data": fingerprint_array(coordinate_values)},
+        source_cell_ids=cell_ids,
+        cell_selection=cell_selection,
+        cell_key="I",
+        block_rows=2,
+    )
+    ann_index, _ann_group = _add_artifact(
+        datastore.z,
+        kind="ann_index",
+        operation="build_ann_index",
+        inputs={"coordinates": coordinates},
+    )
+    neighbors, _neighbors_group = _add_artifact(
+        datastore.z,
+        kind="neighbors",
+        operation="query_neighbors",
+        inputs={
+            "ann_index": ann_index,
+            "coordinates": coordinates,
+        },
+    )
+    connectivity, _connectivity_group = _add_artifact(
         datastore.z,
         kind="connectivity_map",
         operation="build_connectivity_map",
-        parameters={"local_connectivity": 0.5, "bandwidth": 1.0},
-        inputs={"neighbors": state.neighbors},
+        inputs={"neighbors": neighbors},
     )
-    older.attrs["n_cells"] = 3
-    older.attrs["n_neighbors"] = 2
-    selected = datastore.z[graph_path]
-    older.create_array("edges", data=np.asarray(selected["edges"][:]))
-    older.create_array("weights", data=np.asarray(selected["weights"][:]) * 0.5)
+    imported_state = AssayState(
+        assay="RNA",
+        cell_key="I",
+        ann_index=ann_index,
+        neighbors=neighbors,
+        connectivity_map=connectivity,
+    )
 
-    explicit_older = datastore.load_graph(graph_loc=artifact_path(older_ref))
-    stored_older = datastore._lookup_stored_graph(graph_loc=artifact_path(older_ref))
-    assert explicit_older.shape == (3, 3)
-    assert explicit_older.nnz == 6
-    assert isinstance(stored_older, StoredAssayGraph)
-    assert stored_older.local_connectivity == 0.5
+    write_assay_state(datastore.zw, imported_state)
+
+    assert read_assay_state(datastore.zw, "RNA") == imported_state
+    assert imported_state.normalized is None
 
 
-def test_explicit_integrated_artifact_loads_without_legacy_slot() -> None:
-    datastore, state = _state_store()
-    assert state.normalized is not None
-    normalized_inputs = inspect_artifact(datastore.zw, state.normalized).inputs or {}
-    raw_selection = normalized_inputs.get("cell_selection")
-    assert isinstance(raw_selection, dict)
-    cell_selection = ArtifactRef.from_dict(raw_selection)
-    ref, group = _add_artifact(
+def test_state_validates_ann_index_coordinates_without_a_graph() -> None:
+    datastore, native_state = _state_store()
+    assert native_state.ann_index is not None
+    ann_only = AssayState(
+        assay="RNA",
+        cell_key="I",
+        ann_index=native_state.ann_index,
+    )
+    datastore.z["RNA/state"].attrs["state"] = ann_only.to_dict()
+
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+
+    assert caught.value.code == "invalid_analysis_state"
+    assert caught.value.context["field"] == "ann_index.coordinates"
+
+
+def test_native_graph_resolution_fully_validates_imported_coordinates() -> None:
+    datastore, native_state = _state_store()
+    assert native_state.normalized is not None
+    normalized_inputs = (
+        inspect_artifact(
+            datastore.zw,
+            native_state.normalized,
+        ).inputs
+        or {}
+    )
+    raw_cells = normalized_inputs["cell_selection"]
+    assert isinstance(raw_cells, dict)
+    cell_selection = ArtifactRef.from_dict(raw_cells)
+    cell_ids = np.asarray(datastore.z["cellData/ids"][:])
+    coordinate_values = np.arange(6, dtype=np.float32).reshape(3, 2)
+    coordinates = write_imported_coordinates(
         datastore.z,
-        kind="integrated_graph",
-        operation="integrate_assays",
-        parameters={"method": "wnn"},
-        inputs={
-            "rna": state.connectivity_map,
-            "cell_selection": cell_selection,
-        },
-        scope="datastore",
+        assay="RNA",
+        dimreduc_key="pca",
+        role="pca",
+        coordinates=coordinate_values,
+        source_digest=hashlib.sha256(b"projection-import").digest(),
+        payload_fingerprints={"data": fingerprint_array(coordinate_values)},
+        source_cell_ids=cell_ids,
+        cell_selection=cell_selection,
+        cell_key="I",
+        block_rows=2,
     )
-    group.attrs["n_cells"] = 3
-    group.attrs["n_neighbors"] = 2
-    group.create_array(
-        "edges",
-        data=np.array(
-            [[0, 1], [0, 2], [1, 0], [1, 2], [2, 0], [2, 1]],
-            dtype=np.uint64,
-        ),
-    )
-    group.create_array(
-        "weights",
-        data=np.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
-    )
-
-    graph = datastore.load_graph(graph_loc=artifact_path(ref))
-    stored = datastore._lookup_stored_graph(graph_loc=artifact_path(ref))
-
-    assert graph.shape == (3, 3)
-    assert graph.nnz == 6
-    assert isinstance(stored, StoredIntegratedGraph)
-    assert stored.cell_graph_group_path == artifact_path(ref)
-    assert stored.n_cells == 3
-    assert stored.n_neighbors == 2
-
-
-@pytest.mark.parametrize(
-    ("failure", "expected_code"),
-    [
-        ("missing", "artifact_missing"),
-        ("incomplete", "artifact_incomplete"),
-    ],
-)
-def test_integrated_graph_selection_failures_are_structured(
-    failure: str,
-    expected_code: str,
-) -> None:
-    datastore, state = _state_store()
-    assert state.normalized is not None
-    normalized_inputs = inspect_artifact(datastore.zw, state.normalized).inputs or {}
-    raw_selection = normalized_inputs.get("cell_selection")
-    assert isinstance(raw_selection, dict)
-    selection = ArtifactRef.from_dict(raw_selection)
-    graph_ref, _group = _add_artifact(
+    ann_index, _ann_group = _add_artifact(
         datastore.z,
-        kind="integrated_graph",
-        operation="integrate_assays",
-        inputs={"cell_selection": selection},
-        scope="datastore",
+        kind="ann_index",
+        operation="build_ann_index",
+        inputs={"coordinates": coordinates},
     )
-    if failure == "missing":
-        del datastore.z[artifact_path(selection)]
-    else:
-        datastore.z[artifact_path(selection)].attrs["complete"] = False
-    before = _store_digest(datastore.z)
-
-    with pytest.raises(ArtifactSelectionError) as caught:
-        datastore.load_graph(graph_loc=artifact_path(graph_ref))
-
-    assert caught.value.code == expected_code
-    assert caught.value.context["artifact_id"] == selection.artifact_id
-    assert _store_digest(datastore.z) == before
-
-
-def test_artifact_embedding_initialization_is_state_resolved() -> None:
-    datastore, _state = _state_store()
-    embedding = datastore._get_ini_embed("RNA", "I", "hvgs", 2)
-
-    assert embedding.shape == (3, 2)
-    assert np.isfinite(embedding).all()
-
-
-def test_state_mismatch_keeps_legacy_normalized_path_behavior(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    datastore, _state = _state_store()
-    monkeypatch.setattr(
-        "scarf.datastore._operations.graph.validate_legacy_graph_selection",
-        lambda *_args, **_kwargs: None,
+    neighbors, _neighbors_group = _add_artifact(
+        datastore.z,
+        kind="neighbors",
+        operation="query_neighbors",
+        inputs={"ann_index": ann_index, "coordinates": coordinates},
     )
-    assert datastore.get_normalized_group_path("RNA", "I", "legacy") == (
-        "RNA/normed__I__legacy"
-    )
-    stored = datastore._lookup_stored_graph("RNA", "I", "legacy")
-    assert isinstance(stored, StoredAssayGraph)
-    assert stored.paths.cell_graph_group_path.endswith("graph__1.0__1.5")
-    assert stored.dims == 5
-    assert stored.k == 3
+    datastore.z[artifact_path(coordinates)]["data"][0, 0] = -1.0
+
+    with pytest.raises(ArtifactResolutionError) as caught:
+        resolve_native_graph_inputs(datastore.zw, neighbors)
+
+    assert caught.value.code == "corrupt_payload"
+
+
+def test_read_assay_state_wraps_malformed_state_node() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    assay_group = root.create_group("RNA")
+    assay_group.create_array("state", data=np.asarray([1], dtype=np.int8))
+
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        read_assay_state(root, "RNA")
+
+    assert caught.value.code == "invalid_analysis_state"
+
+
+def test_read_assay_state_rejects_present_group_without_state_attribute() -> None:
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    root.create_group("RNA/state")
+
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        read_assay_state(root, "RNA")
+
+    assert caught.value.code == "invalid_analysis_state"
 
 
 def test_state_reads_do_not_mutate_artifacts_or_state() -> None:
-    datastore, _state = _state_store()
+    datastore, state = _state_store()
     before = _store_digest(datastore.z)
 
-    datastore.get_normalized_group_path("RNA", "I", "hvgs")
-    datastore.get_latest_graph_loc("RNA", "I", "hvgs")
-    datastore.load_graph(graph_loc=datastore.get_latest_graph_loc("RNA", "I", "hvgs"))
-    stored_assay_graph_from_state(datastore.zw, "RNA", "I", "hvgs")
+    read_assay_state(datastore.zw, "RNA")
+    normalized_path_from_state(datastore.zw, "RNA", "I")
+    embedding_initialization_path_from_state(datastore.zw, "RNA", "I")
+    resolve_graph_selection(
+        datastore,
+        state.connectivity_map,
+        from_assay="RNA",
+        cell_key="I",
+    )
 
     assert _store_digest(datastore.z) == before
 
@@ -779,13 +691,43 @@ def test_incomplete_selected_artifact_is_not_silently_used() -> None:
     datastore, state = _state_store()
     datastore.z[artifact_path(state.normalized)].attrs["complete"] = False
 
-    with pytest.raises(RuntimeError, match="incomplete"):
-        datastore.get_normalized_group_path("RNA", "I", "hvgs")
+    with pytest.raises(ArtifactResolutionError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+    assert caught.value.code == "incomplete_artifact"
 
     datastore.z[artifact_path(state.normalized)].attrs["complete"] = True
     datastore.z[artifact_path(state.connectivity_map)].attrs["complete"] = False
-    with pytest.raises(RuntimeError, match="Graph artifact is incomplete"):
-        datastore.load_graph(graph_loc=artifact_path(state.connectivity_map))
+    with pytest.raises(ArtifactResolutionError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+    assert caught.value.code == "incomplete_artifact"
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_code"),
+    [
+        ("missing", "missing_artifact"),
+        ("incomplete", "incomplete_artifact"),
+    ],
+)
+def test_state_read_tolerates_unavailable_optional_named_results_but_write_rejects(
+    failure: str,
+    expected_code: str,
+) -> None:
+    datastore, state = _state_store()
+    result = state.named_results["umap"]
+    if failure == "missing":
+        del datastore.z[artifact_path(result)]
+    else:
+        datastore.z[artifact_path(result)].attrs["complete"] = False
+    before = _store_digest(datastore.z)
+
+    assert read_assay_state(datastore.zw, "RNA") == state
+    with pytest.raises(ArtifactResolutionError) as caught:
+        write_assay_state(datastore.zw, state)
+
+    assert caught.value.code == expected_code
+    assert caught.value.context["field"] == "named_results['umap']"
+    assert _store_digest(datastore.z) == before
 
 
 @pytest.mark.parametrize(
@@ -811,8 +753,8 @@ def test_selection_artifact_failures_are_structured_through_state_lookup(
         datastore.z[artifact_path(selection)].attrs["complete"] = False
     before = _store_digest(datastore.z)
 
-    with pytest.raises(ArtifactSelectionError) as caught:
-        datastore.load_graph(from_assay="RNA", cell_key="I", feat_key="hvgs")
+    with pytest.raises(ArtifactResolutionError) as caught:
+        read_assay_state(datastore.zw, "RNA")
 
     assert caught.value.code == expected_code
     assert caught.value.context["artifact_id"] == selection.artifact_id
@@ -825,8 +767,9 @@ def test_matching_state_does_not_fall_back_to_stale_legacy_paths() -> None:
     state_without_normalized = replace(state, normalized=None)
     datastore.z["RNA/state"].attrs["state"] = state_without_normalized.to_dict()
 
-    with pytest.raises(KeyError, match="no selected normalized"):
-        datastore.get_normalized_group_path("RNA", "I", "hvgs")
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+    assert caught.value.code == "invalid_analysis_state"
 
 
 def test_state_rejects_unrelated_complete_artifact_chains() -> None:
@@ -844,151 +787,48 @@ def test_state_rejects_unrelated_complete_artifact_chains() -> None:
     mismatched = replace(state, neighbors=wrong_neighbors)
     datastore.z["RNA/state"].attrs["state"] = mismatched.to_dict()
 
-    with pytest.raises(ValueError, match="does not match AssayState"):
-        datastore.get_latest_graph_loc("RNA", "I", "hvgs")
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+    assert caught.value.code == "invalid_analysis_state"
 
 
 def test_state_rejects_incomplete_or_missing_graph_inputs() -> None:
     datastore, state = _state_store()
     datastore.z[artifact_path(state.feature_scaling)].attrs["complete"] = False
-    with pytest.raises(RuntimeError, match="Artifact is incomplete"):
-        datastore.get_latest_graph_loc("RNA", "I", "hvgs")
+    with pytest.raises(ArtifactResolutionError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+    assert caught.value.code == "incomplete_artifact"
 
     datastore.z[artifact_path(state.batch_correction)].attrs["complete"] = True
     without_scaling = replace(state, feature_scaling=None)
     datastore.z["RNA/state"].attrs["state"] = without_scaling.to_dict()
-    with pytest.raises(KeyError, match="feature_scaling"):
-        datastore.get_latest_graph_loc("RNA", "I", "hvgs")
+    with pytest.raises(IncompatibleAnalysisStateError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+    assert caught.value.code == "invalid_analysis_state"
 
     datastore.z["RNA/state"].attrs["state"] = state.to_dict()
     datastore.z[artifact_path(state.feature_scaling)].attrs["complete"] = True
     datastore.z[artifact_path(state.batch_correction)].attrs["complete"] = False
-    with pytest.raises(RuntimeError, match="Artifact is incomplete"):
-        datastore.get_latest_graph_loc("RNA", "I", "hvgs")
+    with pytest.raises(ArtifactResolutionError) as caught:
+        read_assay_state(datastore.zw, "RNA")
+    assert caught.value.code == "incomplete_artifact"
 
 
-def test_build_mapping_reference_preserves_existing_named_results(
-    analyzed_datastore_ephemeral,
-) -> None:
-    datastore = analyzed_datastore_ephemeral
-    start = datastore.get_assay_state("RNA")
-    assert start is not None
-    assert start.reduction is not None and start.neighbors is not None
-
-    planted = replace(
-        start,
-        named_results={**dict(start.named_results), "pca": start.reduction},
-    )
-    write_assay_state(datastore.zw, planted)
-
-    reference = datastore.build_mapping_reference(start.neighbors)
-    after = datastore.get_assay_state("RNA")
-    assert after is not None
-    assert after.named_results["pca"] == start.reduction
-    assert after.named_results["mapping_reference"] == reference.ref
-
-
-def test_mapping_reference_and_graph_do_not_clear_each_other(
-    analyzed_datastore_ephemeral,
-) -> None:
-    datastore = analyzed_datastore_ephemeral
-    start = datastore.get_assay_state("RNA")
-    assert start is not None
-    neighbors = start.neighbors
-    graph = start.connectivity_map
-    assert neighbors is not None and graph is not None
-
-    reference = datastore.build_mapping_reference(neighbors)
-    after_reference = datastore.get_assay_state("RNA")
-    assert after_reference is not None
-    assert after_reference.named_results["mapping_reference"] == reference.ref
-    # Publishing a mapping reference walks up to neighbors, so the graph is not
-    # in that lineage and used to be dropped.
-    assert after_reference.connectivity_map == graph
-    assert after_reference.embedding_initialization is not None
-
-    rebuilt = datastore.build_connectivity_map(neighbors, bandwidth=1.25)
-    assert rebuilt != graph
-    after_graph = datastore.get_assay_state("RNA")
-    assert after_graph is not None
-    assert after_graph.connectivity_map == rebuilt
-    # The named handle is not derived from the graph, so rebuilding the graph
-    # must leave it selectable.
-    assert after_graph.named_results["mapping_reference"] == reference.ref
-    assert datastore.get_mapping_reference().ref == reference.ref
-
-
-def test_publishing_recovers_from_an_incomplete_graph_artifact(
-    analyzed_datastore_ephemeral,
-) -> None:
-    datastore = analyzed_datastore_ephemeral
-    start = datastore.get_assay_state("RNA")
-    assert start is not None
-    assert start.neighbors is not None and start.connectivity_map is not None
-    datastore.z[artifact_path(start.connectivity_map)].attrs["complete"] = False
-
-    datastore.build_mapping_reference(start.neighbors)
-
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert "mapping_reference" in state.named_results
-    assert state.connectivity_map is None
-
-
-def test_named_result_is_dropped_when_the_chain_moves_underneath_it(
-    analyzed_datastore_ephemeral,
-) -> None:
-    datastore = analyzed_datastore_ephemeral
-    start = datastore.get_assay_state("RNA")
-    assert start is not None and start.neighbors is not None
-    datastore.build_mapping_reference(start.neighbors)
-
-    normalized = datastore.run_normalization(
-        cell_key="I",
-        feat_key="hvgs",
-        update_state=False,
-    )
-    reduction = datastore.run_pca(normalized, dims=5, update_state=False)
-    ann_index = datastore.build_ann_index(reduction, update_state=False)
-    moved = datastore.query_neighbors(ann_index, coordinates=reduction, k=3)
-
-    state = datastore.get_assay_state("RNA")
-    assert state is not None
-    assert state.neighbors == moved
-    # Carrying the handle here would describe a chain that no longer exists, so
-    # it is dropped rather than preserved into an inconsistent state.
-    assert "mapping_reference" not in state.named_results
-    assert state.connectivity_map is None
-
-
-def test_derived_writers_do_not_mutate_graph_artifacts() -> None:
+def test_republishing_same_normalized_ref_drops_unavailable_current_graph() -> None:
     datastore, state = _state_store()
-    graph_path = artifact_path(state.connectivity_map)
-    before = _store_digest(datastore.z[graph_path])
+    assert state.normalized is not None
+    assert state.connectivity_map is not None
+    del datastore.z[artifact_path(state.connectivity_map)]
 
-    datastore.get_diffusion_operator("RNA", "I", "hvgs", t=2)
-    diffusion_refs = list_artifacts(
-        datastore.z,
-        scope="assay",
-        assay="RNA",
-        kind="diffusion_operator",
-    )
-    assert len(diffusion_refs) == 1
-    # Artifact-backed Paris goes through _run_paris_from_artifacts. The stub
-    # store lacks MetaData, so label persistence may fail after hierarchy work;
-    # the connectivity artifact itself must stay unchanged either way.
-    try:
-        datastore._run_paris_from_artifacts(
-            graph_ref=state.connectivity_map,
-            graph_loc=artifact_path(state.connectivity_map),
-            from_assay="RNA",
-            label_assay="RNA",
-            cell_key="I",
-            fixed_cluster_count=2,
-            effective_min_cluster_size=None,
-            label="paris_cluster",
-            force_recalc=False,
-        )
-    except AttributeError:
-        pass
-    assert _store_digest(datastore.z[graph_path]) == before
+    datastore._publish_current_artifact(state.normalized, update_state=True)
+
+    recovered = read_assay_state(datastore.zw, "RNA")
+    assert recovered is not None
+    assert recovered.normalized == state.normalized
+    assert recovered.feature_scaling is None
+    assert recovered.reduction is None
+    assert recovered.batch_correction is None
+    assert recovered.ann_index is None
+    assert recovered.embedding_initialization is None
+    assert recovered.neighbors is None
+    assert recovered.connectivity_map is None

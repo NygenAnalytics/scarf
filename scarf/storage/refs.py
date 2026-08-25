@@ -103,11 +103,20 @@ class ArtifactRef:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ArtifactRef":
+        if not isinstance(value, Mapping):
+            raise TypeError("Artifact reference must be a mapping")
         if value.get("type") != "artifact":
             raise ValueError("Artifact reference type must be 'artifact'")
         scope = value.get("scope")
         if scope not in {"assay", "datastore"}:
             raise ValueError(f"Invalid artifact scope: {scope!r}")
+        expected_keys = {"type", "scope", "kind", "artifact_id"}
+        if scope == "assay":
+            expected_keys.add("assay")
+        if set(value) != expected_keys:
+            raise ValueError(
+                "Artifact reference fields do not match its declared scope"
+            )
         kind = value.get("kind")
         artifact_id = value.get("artifact_id")
         assay = value.get("assay")

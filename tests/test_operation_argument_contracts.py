@@ -80,7 +80,10 @@ _CONTRACTS = (
             **_classified("execution", "local_cache"),
             **_classified("routing", "from_assay"),
         },
-        model_only=_classified("resolved_input", "feature_scaling"),
+        model_only={
+            **_classified("resolved_input", "feature_scaling"),
+            **_classified("derived", "dims", "feat_scaling"),
+        },
     ),
     OperationContract(
         _GraphOperationsMixin._build_embedding_initialization,
@@ -141,11 +144,11 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_normalization,
         graph_arguments.NormalizationArguments,
+        aliases={"features": "feature_selection"},
         model_only={
             **_classified(
                 "resolved_input",
                 "cell_selection",
-                "feature_selection",
             ),
             **_classified(
                 "derived",
@@ -171,13 +174,15 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_aucell,
         metadata_arguments.AucellArguments,
-        aliases={"net": "network_digest"},
+        aliases={
+            "features": "feature_selection",
+            "net": "network_digest",
+        },
         model_only={
             **_classified("algorithm_version", "algorithm_version"),
             **_classified(
                 "resolved_input",
                 "cell_selection",
-                "feature_selection",
             ),
         },
     ),
@@ -191,23 +196,29 @@ _CONTRACTS = (
         model_only=_classified(
             "derived",
             "control_size",
-            "normalization_method",
-            "size_factor",
+        )
+        | _classified(
+            "resolved_input",
+            "cell_selection",
+            "feature_summary",
         ),
     ),
     OperationContract(
         DataStore.run_doublet_detection,
         metadata_arguments.DoubletScoreArguments,
-        aliases={"cluster_key": "clusters"},
-        model_only=_classified("resolved_input", "connectivity_map"),
+        aliases={
+            "cluster_key": "clusters",
+            "graph": "connectivity_map",
+        },
+        model_only=_classified("resolved_input", "neighbors"),
     ),
     OperationContract(
         DataStore.run_fate_mapping,
         metadata_arguments.FateMappingArguments,
+        aliases={"graph": "connectivity_map"},
         model_only=_classified(
             "resolved_input",
             "cell_selection",
-            "connectivity_map",
             "pseudotime",
             "sink_labels",
         ),
@@ -232,7 +243,10 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_marker_search,
         metadata_arguments.MarkerTableArguments,
-        aliases={"norm_params": "normalization"},
+        aliases={
+            "features": "feature_selection",
+            "norm_params": "normalization",
+        },
         signature_only={
             **_classified("routing", "from_assay"),
             **_classified("publication", "skip_save"),
@@ -241,7 +255,6 @@ _CONTRACTS = (
             "resolved_input",
             "cell_selection",
             "clusters",
-            "feature_selection",
             "normalization_method",
             "size_factor",
         )
@@ -258,13 +271,13 @@ _CONTRACTS = (
     OperationContract(
         DataStore.calc_membership_strength,
         metadata_arguments.MembershipStrengthArguments,
+        aliases={"graph": "connectivity_map"},
         model_only={
             **_classified("algorithm_version", "algorithm_version"),
             **_classified(
                 "resolved_input",
                 "cell_selection",
                 "clusters",
-                "connectivity_map",
             ),
             **_classified("derived", "decimals"),
             **_classified("output", "output_key"),
@@ -274,23 +287,22 @@ _CONTRACTS = (
         DataStore.mark_prevalent_peaks,
         metadata_arguments.PrevalentPeakArguments,
         model_only={
-            **_classified("algorithm_version", "algorithm_version"),
             **_classified(
                 "resolved_input",
-                "cell_selection",
-                "feature_selection",
+                "feature_summary",
             ),
-            **_classified("derived", "normalization_method"),
         },
     ),
     OperationContract(
         DataStore.run_pseudotime_aggregation,
         metadata_arguments.PseudotimeAggregationArguments,
-        aliases={"norm_params": "normalization"},
+        aliases={
+            "features": "feature_selection",
+            "norm_params": "normalization",
+        },
         model_only=_classified(
             "resolved_input",
             "cell_selection",
-            "feature_selection",
             "normalization_method",
             "pseudotime",
             "size_factor",
@@ -300,11 +312,13 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_pseudotime_marker_search,
         metadata_arguments.PseudotimeMarkerArguments,
-        aliases={"norm_params": "normalization"},
+        aliases={
+            "features": "feature_selection",
+            "norm_params": "normalization",
+        },
         model_only=_classified(
             "resolved_input",
             "cell_selection",
-            "feature_selection",
             "normalization_method",
             "pseudotime",
             "size_factor",
@@ -321,6 +335,7 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_pseudotime_scoring,
         metadata_arguments.PseudotimeScoringArguments,
+        aliases={"graph": "connectivity_map"},
         signature_only=_classified(
             "transformed",
             "source_sink_key",
@@ -329,7 +344,6 @@ _CONTRACTS = (
         model_only=_classified(
             "resolved_input",
             "cell_selection",
-            "connectivity_map",
             "source_sink",
         ),
     ),
@@ -376,13 +390,15 @@ _CONTRACTS = (
     OperationContract(
         DataStore.run_waggr,
         metadata_arguments.WaggrArguments,
-        aliases={"net": "network_digest"},
+        aliases={
+            "features": "feature_selection",
+            "net": "network_digest",
+        },
         model_only={
             **_classified("algorithm_version", "algorithm_version"),
             **_classified(
                 "resolved_input",
                 "cell_selection",
-                "feature_selection",
             ),
             **_classified(
                 "derived",

@@ -33,23 +33,6 @@ class _ClusterTreeStore(_PresentationOperationsMixin):
         self.graph_ref = graph_ref
 
     @staticmethod
-    def _get_latest_keys(
-        from_assay: str | None,
-        cell_key: str | None,
-        feat_key: str | None,
-    ) -> tuple[str, str, str]:
-        return from_assay or "RNA", cell_key or "I", feat_key or "hvgs"
-
-    def get_latest_graph_loc(
-        self,
-        from_assay: str,
-        cell_key: str,
-        feat_key: str,
-    ) -> str:
-        del from_assay, cell_key, feat_key
-        return artifact_path(self.graph_ref)
-
-    @staticmethod
     def get_cell_vals(
         *,
         from_assay: str,
@@ -174,11 +157,15 @@ def _artifact_cluster_tree_store(
 
 
 def _prepare_artifact_tree(store: _ClusterTreeStore, **kwargs: object):
-    return store._prepare_cluster_tree(
+    invalidate_cache = bool(kwargs.pop("invalidate_cache", False))
+    fill_by_value = kwargs.pop("fill_by_value", None)
+    return store._prepare_artifact_cluster_tree(
+        graph_ref=store.graph_ref,
         from_assay="RNA",
         cell_key="I",
-        feat_key="hvgs",
         cluster_key="clusters",
+        fill_by_value=fill_by_value,
+        invalidate_cache=invalidate_cache,
         **kwargs,
     )
 
@@ -217,7 +204,12 @@ def _prepared_plot_tree(color_values: np.ndarray | None) -> dict[str, object]:
         "color_values": color_values,
         "from_assay": "RNA",
         "cell_key": "I",
-        "feat_key": "hvgs",
+        "graph_ref": ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="connectivity_map",
+            artifact_id="9" * 64,
+        ),
         "cluster_key": "clusters",
         "coalesced_location": "RNA/artifacts/cluster_tree/example",
     }
@@ -263,10 +255,9 @@ def test_cluster_tree_renders_categorical_pies_into_external_axis() -> None:
 
     assert calls == [
         {
+            "graph": None,
             "from_assay": None,
             "cell_key": None,
-            "feat_key": None,
-            "integrated_graph": None,
             "cluster_key": "clusters",
             "fill_by_value": "cell_type",
         }
@@ -539,11 +530,8 @@ def test_artifact_cluster_tree_rejects_graph_from_different_selection(
     ):
         store._prepare_artifact_cluster_tree(
             graph_ref=other_graph,
-            graph_loc=artifact_path(other_graph),
             from_assay="RNA",
             cell_key="I",
-            feat_key="hvgs",
-            integrated_graph=None,
             cluster_key="clusters",
             fill_by_value=None,
             invalidate_cache=False,
@@ -574,11 +562,8 @@ def test_artifact_cluster_tree_rejects_graph_scope_mismatch(
     ):
         store._prepare_artifact_cluster_tree(
             graph_ref=datastore_graph,
-            graph_loc=artifact_path(datastore_graph),
             from_assay="RNA",
             cell_key="I",
-            feat_key="hvgs",
-            integrated_graph="joint",
             cluster_key="clusters",
             fill_by_value=None,
             invalidate_cache=False,

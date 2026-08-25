@@ -12,6 +12,15 @@ from profiling.config import (
 )
 from profiling.stages import _run_analysis, run_stage
 from scarf import DataStore
+from scarf.storage import ArtifactRef
+
+
+_FEATURE_REF = ArtifactRef(
+    scope="assay",
+    assay="RNA",
+    kind="feature_selection",
+    artifact_id="a" * 64,
+)
 
 
 def _resources() -> StageResources:
@@ -30,6 +39,19 @@ def _resources() -> StageResources:
 class _RecordingStore:
     def __init__(self) -> None:
         self.calls: list[tuple[str, tuple[Any, ...], dict[str, Any]]] = []
+        self.resolved_features: list[tuple[str, str]] = []
+
+    def resolve_features(self, assay: str, features: str) -> ArtifactRef:
+        self.resolved_features.append((assay, features))
+        return _FEATURE_REF
+
+    @staticmethod
+    def _get_assay(_assay: str) -> object:
+        return object()
+
+    @staticmethod
+    def _ensure_all_features(_assay: object) -> ArtifactRef:
+        return _FEATURE_REF
 
     def __getattr__(self, name: str) -> Any:
         def record(*args: Any, **kwargs: Any) -> object:
@@ -48,7 +70,7 @@ class _RecordingStore:
             {
                 "from_assay": "RNA",
                 "cell_key": "I",
-                "feat_key": "hvgs",
+                "features": _FEATURE_REF,
                 "update_state": True,
                 "invalidate_cache": False,
             },
@@ -138,6 +160,54 @@ def test_graph_construction_profile_stage_selects_state_and_preserves_parameters
     )
 
     assert store.calls == [(method, (), expected)]
+    if stage == "runNormalization":
+        assert store.resolved_features == [("RNA", "hvgs")]
+
+
+def test_profile_normalization_consumes_returned_hvg_ref() -> None:
+    store = _RecordingStore()
+
+    _run_analysis(
+        "runNormalization",
+        store,
+        WorkflowParameters(),
+        _resources(),
+        hvgRef=_FEATURE_REF,
+    )
+
+    assert store.resolved_features == []
+    assert store.calls == [
+        (
+            "run_normalization",
+            (),
+            {
+                "from_assay": "RNA",
+                "cell_key": "I",
+                "features": _FEATURE_REF,
+                "update_state": True,
+                "invalidate_cache": False,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("marker_features", ["all_features", "marker_panel"])
+def test_profile_marker_search_resolves_explicit_features(
+    marker_features: str,
+) -> None:
+    store = _RecordingStore()
+
+    _run_analysis(
+        "findMarkers",
+        store,
+        WorkflowParameters(markerFeatures=marker_features),
+        _resources(),
+    )
+
+    assert store.resolved_features == [("RNA", marker_features)]
+    marker_calls = [call for call in store.calls if call[0] == "run_marker_search"]
+    assert len(marker_calls) == 1
+    assert marker_calls[0][2]["features"] == _FEATURE_REF
 
 
 def test_forced_profile_stages_invalidate_reusable_artifacts() -> None:
@@ -200,23 +270,65 @@ def test_run_stage_reports_store_open_as_input_setup(
     assert analysis_kwargs["invalidateCache"] is True
 
 
+def test_run_stage_session_carries_hvg_ref_to_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = object()
+    seen_refs: list[ArtifactRef | None] = []
+
+    monkeypatch.setattr(
+        "profiling.stages._open_datastore",
+        lambda *_args, **_kwargs: store,
+    )
+
+    def run_analysis(
+        stage: StageName,
+        *_args: Any,
+        hvgRef: ArtifactRef | None = None,
+        **_kwargs: Any,
+    ) -> dict[str, Any] | None:
+        seen_refs.append(hvgRef)
+        if stage == "markHvgs":
+            return {"artifact": _FEATURE_REF.to_dict()}
+        return None
+
+    monkeypatch.setattr("profiling.stages._run_analysis", run_analysis)
+    session: dict[str, Any] = {}
+    common = {
+        "nRows": 10_000,
+        "storeUri": str(tmp_path / "store.zarr"),
+        "workflow": WorkflowParameters(),
+        "resources": _resources(),
+        "sampleIntervalSeconds": 0.005,
+        "recordStoreOperations": False,
+        "session": session,
+    }
+
+    marked = run_stage("markHvgs", **common)
+    normalized = run_stage("runNormalization", **common)
+
+    assert marked.status == "ok"
+    assert normalized.status == "ok"
+    assert seen_refs == [None, _FEATURE_REF]
+    assert session["hvgRef"] == _FEATURE_REF
+
+
 @pytest.mark.slow
 def test_graph_construction_profile_stages_chain_through_persisted_assay_state(
     datastore_ephemeral: DataStore,
 ) -> None:
     datastore_ephemeral.auto_filter_cells(show_qc_plots=False)
-    assay = datastore_ephemeral.get_assay("RNA")
-    if "I__profile_hvgs" not in assay.feats.columns:
-        datastore_ephemeral.mark_hvgs(
-            from_assay="RNA",
-            cell_key="I",
-            top_n=100,
-            hvg_key_name="profile_hvgs",
-            show_plot=False,
-        )
+    datastore_ephemeral.mark_hvgs(
+        from_assay="RNA",
+        cell_key="I",
+        top_n=100,
+        label="profile_hvgs",
+        show_plot=False,
+    )
     store_uri = str(datastore_ephemeral.zarr_loc)
     workflow = WorkflowParameters(
-        hvgKey="profile_hvgs",
+        hvgLabel="profile_hvgs",
         dims=5,
         nCentroids=20,
         k=3,

@@ -8,6 +8,7 @@ from scarf.datastore.datastore import DataStore
 from scarf.assay import norm_lib_size_log
 from scarf.matrix import ChunkedArray
 from scarf.storage.artifacts import ArtifactRef
+from scarf.storage.errors import ArtifactResolutionError
 from scarf.utils.arrays import array_digest
 from scarf.storage.budget import ResourceBudget
 from scarf.storage.sharding import write_counts_t
@@ -29,7 +30,7 @@ def _configure_enrichment_keys(datastore):
     all_names = np.asarray(assay.feats.fetch_all("names"))
     selected_features = []
     seen = set()
-    for index in assay.feats.active_index("I"):
+    for index in range(assay.feats.N):
         normalized = str(all_names[index]).upper()
         if normalized in seen:
             continue
@@ -38,9 +39,17 @@ def _configure_enrichment_keys(datastore):
         if len(selected_features) == 12:
             break
     selected_features = np.asarray(selected_features, dtype=np.int64)
-    feature_mask = np.zeros(assay.feats.N, dtype=bool)
-    feature_mask[selected_features] = True
-    assay.feats.insert("enrichment_features", feature_mask, overwrite=True)
+    feature_ref = datastore.set_feature_selection(
+        from_assay="RNA",
+        feature_indexes=selected_features,
+        label="enrichment_features",
+    )
+    alias_ref = datastore.set_feature_selection(
+        from_assay="RNA",
+        feature_indexes=selected_features,
+        label="enrichment_features_alias",
+    )
+    assert alias_ref == feature_ref
 
     target_index = selected_features[:6]
     target_names = all_names[target_index].astype(str)
@@ -75,7 +84,7 @@ def test_waggr_streaming_persistence_cache_and_lazy_subset(
             net,
             "waggr_unicode",
             cell_key="enrichment_cells",
-            feat_key="enrichment_features",
+            features="enrichment_features",
             tmin=3,
         )
 
@@ -116,51 +125,46 @@ def test_waggr_streaming_persistence_cache_and_lazy_subset(
         datastore_ephemeral.cells.fetch_all("enrichment_cells"),
         overwrite=True,
     )
-    datastore_ephemeral.RNA.feats.insert(
-        "enrichment_features_alias",
-        datastore_ephemeral.RNA.feats.fetch_all("enrichment_features"),
-        overwrite=True,
-    )
     with monkeypatch.context() as cache_patch:
         cache_patch.setattr(ChunkedArray, "stream_blocks", fail_if_streamed)
         cached = datastore_ephemeral.run_waggr(
             net,
             "waggr_unicode",
             cell_key="enrichment_cells",
-            feat_key="enrichment_features",
+            features="enrichment_features",
             tmin=3,
         )
         alias = datastore_ephemeral.run_waggr(
             net,
             "waggr_alias",
             cell_key="enrichment_cells",
-            feat_key="enrichment_features",
+            features="enrichment_features",
             tmin=3,
         )
         key_alias = datastore_ephemeral.run_waggr(
             net,
             "waggr_key_alias",
             cell_key="enrichment_cells_alias",
-            feat_key="enrichment_features_alias",
+            features="enrichment_features_alias",
             tmin=3,
         )
     assert cached.storage_path == result.storage_path
     assert alias.storage_path == result.storage_path
     assert key_alias.storage_path == result.storage_path
     assert key_alias.cell_key == "enrichment_cells_alias"
-    assert key_alias.feature_key == "enrichment_features_alias"
+    assert key_alias.feature_selection == datastore_ephemeral.resolve_features(
+        "RNA",
+        "enrichment_features_alias",
+    )
     enrichment_group = datastore_ephemeral.RNA.z["enrichment"]
     artifact_results = dict(enrichment_group.attrs["artifact_results"])
     alias_entry = dict(artifact_results["waggr_key_alias"])
     alias_entry["cell_key"] = "missing_enrichment_cells"
     artifact_results["waggr_key_alias"] = alias_entry
     enrichment_group.attrs["artifact_results"] = artifact_results
-    recovered_alias = datastore_ephemeral.get_enrichment("waggr_key_alias")
-    assert recovered_alias.cell_key != "missing_enrichment_cells"
-    np.testing.assert_array_equal(
-        datastore_ephemeral.cells.fetch_all(recovered_alias.cell_key),
-        datastore_ephemeral.cells.fetch_all("enrichment_cells"),
-    )
+    with pytest.raises(ArtifactResolutionError) as error:
+        datastore_ephemeral.get_enrichment("waggr_key_alias")
+    assert error.value.code == "selection_column_missing"
     alias_entry["cell_key"] = "enrichment_cells_alias"
     artifact_results["waggr_key_alias"] = alias_entry
     enrichment_group.attrs["artifact_results"] = artifact_results
@@ -173,7 +177,7 @@ def test_waggr_streaming_persistence_cache_and_lazy_subset(
         net,
         "waggr_unicode",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
         invalidate_cache=True,
     )
@@ -183,7 +187,7 @@ def test_waggr_streaming_persistence_cache_and_lazy_subset(
         net,
         "waggr_unicode",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
     )
     assert preferred.storage_path == invalidated.storage_path
@@ -211,7 +215,7 @@ def test_waggr_streaming_persistence_cache_and_lazy_subset(
         net,
         "waggr_logged",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
         log_transform=True,
     )
@@ -235,7 +239,7 @@ def test_waggr_streaming_persistence_cache_and_lazy_subset(
         net,
         "waggr_sum",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         mode="wsum",
         tmin=3,
     )
@@ -255,7 +259,7 @@ def test_waggr_streaming_persistence_cache_and_lazy_subset(
                 net,
                 "wrong_normalization",
                 cell_key="enrichment_cells",
-                feat_key="enrichment_features",
+                features="enrichment_features",
                 tmin=3,
             )
     finally:
@@ -265,11 +269,17 @@ def test_waggr_streaming_persistence_cache_and_lazy_subset(
             net,
             "wrong_assay",
             from_assay="assay2",
+            features="all_features",
             tmin=3,
         )
     for invalid_label in ("", ".", "..", "a/b", "a\\b", "bad\nlabel"):
         with pytest.raises(ValueError):
-            datastore_ephemeral.run_waggr(net, invalid_label, tmin=3)
+            datastore_ephemeral.run_waggr(
+                net,
+                invalid_label,
+                features="enrichment_features",
+                tmin=3,
+            )
 
     changed = net.copy()
     changed.loc[0, "weight"] = 4.0
@@ -278,7 +288,7 @@ def test_waggr_streaming_persistence_cache_and_lazy_subset(
             changed,
             "waggr_unicode",
             cell_key="enrichment_cells",
-            feat_key="enrichment_features",
+            features="enrichment_features",
             tmin=3,
         )
 
@@ -290,14 +300,16 @@ def test_waggr_streaming_persistence_cache_and_lazy_subset(
         mutated_mask,
         overwrite=True,
     )
-    historical = datastore_ephemeral.get_enrichment("waggr_unicode")
-    np.testing.assert_array_equal(historical.cell_index, old_cell_index)
+    with pytest.raises(ArtifactResolutionError) as error:
+        datastore_ephemeral.get_enrichment("waggr_unicode")
+    assert error.value.code == "selection_values_changed"
+    np.testing.assert_array_equal(result.cell_index, old_cell_index)
     with pytest.raises(ValueError, match="different"):
         datastore_ephemeral.run_waggr(
             net,
             "waggr_unicode",
             cell_key="enrichment_cells",
-            feat_key="enrichment_features",
+            features="enrichment_features",
             tmin=3,
         )
 
@@ -312,7 +324,7 @@ def test_aucell_ignores_weights_and_can_explicitly_replace_a_method(
         net,
         "activity",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
         n_up=4,
         tie_seed=7,
@@ -333,7 +345,7 @@ def test_aucell_ignores_weights_and_can_explicitly_replace_a_method(
             net,
             "activity",
             cell_key="enrichment_cells",
-            feat_key="enrichment_features",
+            features="enrichment_features",
             tmin=3,
             n_up=4,
             tie_seed=8,
@@ -350,7 +362,7 @@ def test_aucell_ignores_weights_and_can_explicitly_replace_a_method(
             weighted_differently.sample(frac=1.0, random_state=3),
             "activity",
             cell_key="enrichment_cells",
-            feat_key="enrichment_features",
+            features="enrichment_features",
             tmin=3,
             n_up=4,
             tie_seed=7,
@@ -362,14 +374,14 @@ def test_aucell_ignores_weights_and_can_explicitly_replace_a_method(
             net,
             "activity",
             cell_key="enrichment_cells",
-            feat_key="enrichment_features",
+            features="enrichment_features",
             tmin=3,
         )
     replacement = datastore_ephemeral.run_waggr(
         net,
         "activity",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
         overwrite=True,
     )
@@ -387,7 +399,7 @@ def test_incomplete_slots_and_read_only_access(
         net,
         "complete",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
     )
     original_scores = original.data.compute()
@@ -404,7 +416,12 @@ def test_incomplete_slots_and_read_only_access(
     loaded = read_only.get_enrichment("complete", sources=["Alpha"])
     assert loaded.data.shape == (8, 1)
     with pytest.raises(ValueError, match="zarr_mode='r\\+'"):
-        read_only.run_waggr(net, "read_only", tmin=3)
+        read_only.run_waggr(
+            net,
+            "read_only",
+            features="enrichment_features",
+            tmin=3,
+        )
 
     import scarf.datastore._operations.features as feature_operations
 
@@ -425,7 +442,7 @@ def test_incomplete_slots_and_read_only_access(
                 changed,
                 "complete",
                 cell_key="enrichment_cells",
-                feat_key="enrichment_features",
+                features="enrichment_features",
                 tmin=3,
                 overwrite=True,
             )
@@ -434,7 +451,7 @@ def test_incomplete_slots_and_read_only_access(
                 changed,
                 "broken",
                 cell_key="enrichment_cells",
-                feat_key="enrichment_features",
+                features="enrichment_features",
                 tmin=3,
             )
 
@@ -453,7 +470,7 @@ def test_incomplete_slots_and_read_only_access(
         changed,
         "broken",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
     )
     assert rebuilt.data.shape == (8, 2)
@@ -462,7 +479,7 @@ def test_incomplete_slots_and_read_only_access(
         changed,
         "complete",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
         overwrite=True,
     )
@@ -482,56 +499,12 @@ def test_incomplete_slots_and_read_only_access(
         datastore_ephemeral.get_enrichment("complete")
 
 
-def test_get_enrichment_reads_legacy_slots(datastore_ephemeral):
-    _, _, _, net = _configure_enrichment_keys(datastore_ephemeral)
-    expected = datastore_ephemeral.run_waggr(
-        net,
-        "artifact_source",
-        cell_key="enrichment_cells",
-        feat_key="enrichment_features",
-        tmin=3,
-    )
-    _, source = _enrichment_artifact(datastore_ephemeral, "artifact_source")
-    enrichment = datastore_ephemeral.RNA.z["enrichment"]
-    legacy = enrichment.create_group("legacy_waggr")
-    attr_names = (
-        "algorithm_version",
-        "cell_digest",
-        "cell_key",
-        "feature_digest",
-        "feat_key",
-        "layout",
-        "log_transform",
-        "method",
-        "network_digest",
-        "normalization",
-        "size_factor",
-        "tmin",
-        "waggr_mode",
-    )
-    attrs = {name: source.attrs[name] for name in attr_names}
-    attrs["execution_digest"] = "legacy-execution"
+def test_get_enrichment_rejects_unindexed_legacy_slots(datastore_ephemeral):
+    enrichment = datastore_ephemeral.RNA.z.create_group("enrichment")
+    enrichment.create_group("legacy_waggr")
 
-    from scarf.datastore._operations.features import _write_enrichment_slot
-
-    _write_enrichment_slot(
-        legacy,
-        attrs=attrs,
-        score_batches=iter([np.asarray(source["scores"][:])]),
-        n_cells=source["scores"].shape[0],
-        source_names=np.asarray(source["source_names"][:]),
-        source_sizes=np.asarray(source["source_sizes"][:]),
-        cell_index=np.asarray(source["cell_index"][:]),
-        matched_feature_index=np.asarray(source["matched_feature_index"][:]),
-        rank_feature_index=None,
-    )
-
-    loaded = datastore_ephemeral.get_enrichment("legacy_waggr")
-    assert loaded.storage_path.endswith("RNA/enrichment/legacy_waggr")
-    np.testing.assert_array_equal(
-        loaded.data.compute(),
-        expected.data.compute(),
-    )
+    with pytest.raises(KeyError, match="was not found"):
+        datastore_ephemeral.get_enrichment("legacy_waggr")
 
 
 def test_enrichment_rebuilds_wrong_score_dtype_and_validates_provenance(
@@ -542,7 +515,7 @@ def test_enrichment_rebuilds_wrong_score_dtype_and_validates_provenance(
         net,
         "validated",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
     )
     original_ref, _ = _enrichment_artifact(datastore_ephemeral, "validated")
@@ -557,7 +530,7 @@ def test_enrichment_rebuilds_wrong_score_dtype_and_validates_provenance(
         net,
         "validated",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
     )
     replacement_ref, _ = _enrichment_artifact(datastore_ephemeral, "validated")
@@ -621,7 +594,6 @@ def test_workspace_results_are_written_to_the_assay_shell(tmp_path):
         default_assay="RNA",
         workspace="ws",
         min_features_per_cell=0,
-        min_cells_per_feature=0,
     )
     net = pd.DataFrame(
         {
@@ -629,11 +601,22 @@ def test_workspace_results_are_written_to_the_assay_shell(tmp_path):
             "target": [f"g{i}" for i in range(6)],
         }
     )
+    feature_ref = datastore.set_feature_selection(
+        from_assay="RNA",
+        mask=np.ones(6, dtype=bool),
+        label="workspace_features",
+    )
 
-    result = datastore.run_waggr(net, "workspace", tmin=3)
+    result = datastore.run_waggr(
+        net,
+        "workspace",
+        features=feature_ref,
+        tmin=3,
+    )
     aucell = datastore.run_aucell(
         net,
         "workspace_aucell",
+        features=feature_ref,
         tmin=3,
         n_up=4,
         tie_seed=7,
@@ -656,72 +639,13 @@ def test_workspace_results_are_written_to_the_assay_shell(tmp_path):
     assert "enrichment" not in root["matrices/RNA"]
 
 
-def test_get_enrichment_rejects_poisoned_legacy_active_slot(datastore_ephemeral):
-    from scarf.datastore._operations.enrichment_store import _ENRICHMENT_ACTIVE_SLOT
-    from scarf.datastore._operations.features import _write_enrichment_slot
-
-    _, _, _, net = _configure_enrichment_keys(datastore_ephemeral)
-    expected = datastore_ephemeral.run_waggr(
-        net,
-        "active_source",
-        cell_key="enrichment_cells",
-        feat_key="enrichment_features",
-        tmin=3,
-    )
-    _, source = _enrichment_artifact(datastore_ephemeral, "active_source")
-    enrichment = datastore_ephemeral.RNA.z["enrichment"]
-    legacy = enrichment.create_group("active_legacy")
-    attr_names = (
-        "algorithm_version",
-        "cell_digest",
-        "cell_key",
-        "feature_digest",
-        "feat_key",
-        "layout",
-        "log_transform",
-        "method",
-        "network_digest",
-        "normalization",
-        "size_factor",
-        "tmin",
-        "waggr_mode",
-    )
-    attrs = {name: source.attrs[name] for name in attr_names}
-    attrs["execution_digest"] = "legacy-execution"
-    _write_enrichment_slot(
-        legacy,
-        attrs=attrs,
-        score_batches=iter([np.asarray(source["scores"][:])]),
-        n_cells=source["scores"].shape[0],
-        source_names=np.asarray(source["source_names"][:]),
-        source_sizes=np.asarray(source["source_sizes"][:]),
-        cell_index=np.asarray(source["cell_index"][:]),
-        matched_feature_index=np.asarray(source["matched_feature_index"][:]),
-        rank_feature_index=None,
-    )
-
-    loaded = datastore_ephemeral.get_enrichment("active_legacy")
-    np.testing.assert_array_equal(
-        loaded.data.compute(),
-        expected.data.compute(),
-    )
-
-    legacy.attrs[_ENRICHMENT_ACTIVE_SLOT] = "../escape"
-    with pytest.raises(ValueError, match="invalid active result"):
-        datastore_ephemeral.get_enrichment("active_legacy")
-
-    legacy.attrs[_ENRICHMENT_ACTIVE_SLOT] = "_run_missing"
-    with pytest.raises(ValueError, match="invalid active result"):
-        datastore_ephemeral.get_enrichment("active_legacy")
-
-
 def test_get_enrichment_rejects_unknown_method_and_missing_arrays(datastore_ephemeral):
     _, _, _, net = _configure_enrichment_keys(datastore_ephemeral)
     datastore_ephemeral.run_waggr(
         net,
         "method_poison",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
     )
     method_ref, _ = _enrichment_artifact(datastore_ephemeral, "method_poison")
@@ -735,7 +659,7 @@ def test_get_enrichment_rejects_unknown_method_and_missing_arrays(datastore_ephe
         net,
         "array_poison",
         cell_key="enrichment_cells",
-        feat_key="enrichment_features",
+        features="enrichment_features",
         tmin=3,
     )
     array_ref, _ = _enrichment_artifact(datastore_ephemeral, "array_poison")

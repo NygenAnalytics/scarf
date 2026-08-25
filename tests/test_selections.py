@@ -120,7 +120,7 @@ def test_resolve_selection_artifact_rejects_bad_masks_and_ids() -> None:
             operation="mark_hvgs",
             parameters={},
             inputs={},
-            source_column="I__hvgs",
+            source_column="hvgs",
         )
 
 
@@ -176,7 +176,7 @@ def test_changed_or_invalidated_selection_creates_another_random_artifact() -> N
         operation="select_hvgs",
         parameters={"top_n": 2},
         inputs={},
-        source_column="I__hvgs",
+        source_column="hvgs",
     )
     changed_ref = resolve_selection_artifact(
         root,
@@ -188,7 +188,7 @@ def test_changed_or_invalidated_selection_creates_another_random_artifact() -> N
         operation="select_hvgs",
         parameters={"top_n": 2},
         inputs={},
-        source_column="I__hvgs",
+        source_column="hvgs",
     )
     invalidated = resolve_selection_artifact(
         root,
@@ -200,7 +200,7 @@ def test_changed_or_invalidated_selection_creates_another_random_artifact() -> N
         operation="select_hvgs",
         parameters={"top_n": 2},
         inputs={},
-        source_column="I__hvgs",
+        source_column="hvgs",
         invalidate_cache=True,
     )
 
@@ -263,7 +263,7 @@ def test_generated_selection_identity_excludes_output_values() -> None:
         operation="mark_prevalent_peaks",
         parameters={"top_n": 2},
         inputs={"feature_selection": {"artifact_id": "input"}},
-        source_column="I__prevalent_peaks",
+        source_column="prevalent_peaks",
     )
     reused, reused_values = resolve_generated_selection_artifact(
         root,
@@ -300,20 +300,20 @@ def test_filter_and_hvg_columns_link_to_provenance_artifacts(
     assert cell_status.operation == "filter_cells"
     assert cell_status.parameters["attrs"] == ["RNA_nCounts"]
 
-    datastore.mark_hvgs(
+    feature_ref = datastore.mark_hvgs(
         from_assay="RNA",
         cell_key="I",
         top_n=50,
-        hvg_key_name="selection_test_hvgs",
+        label="selection_test_hvgs",
         show_plot=False,
     )
-    feature_column = datastore.get_assay("RNA").z["featureData"][
-        "I__selection_test_hvgs"
-    ]
-    feature_ref = ArtifactRef.from_dict(feature_column.attrs["source_artifact"])
+    feature_column = datastore.get_assay("RNA").z["featureData"]["selection_test_hvgs"]
+    assert ArtifactRef.from_dict(feature_column.attrs["source_artifact"]) == feature_ref
     feature_status = datastore.inspect_artifact(feature_ref)
     assert feature_status.operation == "mark_hvgs"
     assert feature_status.parameters["top_n"] == 50
+    summary_ref = ArtifactRef.from_dict(feature_status.inputs["feature_summary"])
+    summary_status = datastore.inspect_artifact(summary_ref)
     assert (
-        feature_status.inputs["cell_selection"]["artifact_id"] == cell_ref.artifact_id
+        summary_status.inputs["cell_selection"]["artifact_id"] == cell_ref.artifact_id
     )

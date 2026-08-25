@@ -297,6 +297,34 @@ def test_labels_are_contiguous_read_only_and_cover_every_leaf() -> None:
         result.labels[0] = 99
 
 
+def test_hierarchy_validation_allows_one_ulp_height_roundoff() -> None:
+    parent_height = 1.0
+    child_height = np.nextafter(parent_height, np.inf)
+    hierarchy = _hierarchy(
+        [(0, 1), (3, 2)],
+        [child_height, parent_height],
+    )
+
+    forest = collapse_equal_height_plateaus(hierarchy)
+
+    assert forest.representatives.size == 2
+
+
+def test_hierarchy_validation_rejects_more_than_one_ulp_height_inversion() -> None:
+    parent_height = 1.0
+    child_height = np.nextafter(
+        np.nextafter(parent_height, np.inf),
+        np.inf,
+    )
+    hierarchy = _hierarchy(
+        [(0, 1), (3, 2)],
+        [child_height, parent_height],
+    )
+
+    with pytest.raises(ValueError, match="merge distances must be monotone"):
+        collapse_equal_height_plateaus(hierarchy)
+
+
 def test_split_gate_rejects_misaligned_or_non_finite_values() -> None:
     hierarchy, _other = _plateau_variants()
     forest = collapse_equal_height_plateaus(hierarchy)

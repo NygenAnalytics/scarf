@@ -48,7 +48,6 @@ class Assay:
         name (str): A label/name for assay.
         cell_data: Metadata class object for the cell attributes.
         nthreads: number of threads to use for parallel computations
-        min_cells_per_feature: Minimum cells expressing a feature for it to be kept
 
     Attributes:
         name: A label for the assay instance
@@ -69,7 +68,6 @@ class Assay:
         name: str,  # FIXME change to assay_name
         cell_data: MetaData,
         nthreads: int,
-        min_cells_per_feature: int = 10,
         matrix_root: zarr.Group | None = None,
         resources: ResourceBudget | None = None,
         storageIo: Any | None = None,
@@ -139,8 +137,8 @@ class Assay:
         self.n_term_per_doc: np.ndarray | None = None
         self.n_docs: int | None = None
         self.n_docs_per_term: np.ndarray | None = None
-        self._deferred_min_cells_per_feature: int | None = None
-        self._ini_feature_props(min_cells_per_feature)
+        self._deferred_feature_props = False
+        self._ini_feature_props()
 
     def _percent_features(self) -> PercentFeatures:
         raw = self.attrs.get("percentFeatures", {})
@@ -161,9 +159,8 @@ class Assay:
             cell_idx: Indices of cells to be included in the normalized matrix
                       (Default value: All those marked True in 'I' column of cell
                       attribute table)
-            feat_idx: Indices of features to be included in the normalized matrix
-                      (Default value: All those marked True in 'I' column of
-                      feature attribute table)
+            feat_idx: Indices of features to be included in the normalized matrix.
+                      Defaults to the complete physical feature axis.
             **kwargs:
 
         Returns: A chunked array (delayed matrix) containing normalized data.
@@ -171,7 +168,7 @@ class Assay:
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:
-            feat_idx = self.feats.active_index("I")
+            feat_idx = np.arange(self.feats.N, dtype=np.int64)
         counts = self.rawData[:, feat_idx][cell_idx, :]
         return self.normMethod(self, counts)
 
@@ -199,37 +196,28 @@ class Assay:
                 sm = vstack([sm, s])
         return sm  # type: ignore
 
-    def _ini_feature_props(self, min_cells: int) -> None:
-        """
-
-        Args:
-            min_cells: Minimum number of cells per feature. Features below this
-                       number are marked invalid.
-
-        Returns:
-
-        """
+    def _ini_feature_props(self) -> None:
+        """ """
         if "nCells" in self.feats.columns and "dropOuts" in self.feats.columns:
             return
         if _DEFER_FEATURE_PROPS.get():
-            self._deferred_min_cells_per_feature = min_cells
+            self._deferred_feature_props = True
             return
         ncells = compute_with_progress(
             (self.rawData > 0).sum(axis=0),
             f"({self.name}) Computing nCells and dropOuts",
             self.nthreads,
         )
-        self._store_feature_props(ncells, min_cells)
+        self._store_feature_props(ncells)
 
-    def _store_feature_props(self, ncells: np.ndarray, min_cells: int) -> None:
+    def _store_feature_props(self, ncells: np.ndarray) -> None:
         self.feats.insert("nCells", ncells, overwrite=True)
         self.feats.insert(
             "dropOuts",
-            abs(self.cells.N - self.feats.fetch("nCells")),
+            abs(self.cells.N - self.feats.fetch_all("nCells")),
             overwrite=True,
         )
-        self.feats.update_key(ncells > min_cells, "I")
-        self._deferred_min_cells_per_feature = None
+        self._deferred_feature_props = False
 
     def _stream_initialization_stats(
         self,
@@ -485,49 +473,13 @@ class Assay:
         )
         self._write_percent_feature(name, total)
 
-    def _verify_keys(self, cell_key: str, feat_key: str) -> None:
-        """Checks if provided key names are present in cells and feature
-        attribute tables and that they are of boolean types.
-
-        Args:
-            cell_key: Name of the key (column) from cell attribute table
-            feat_key: Name of the key (column) from feature attribute table
-
-        Returns: None
-
-        Note on type checking /GA:
-        1. ds.cells.get_dtype(cell_key) == bool returns True because dtype('bool') (from numpy) is conceptually equivalent to Python's bool.
-        2. isinstance(ds.cells.get_dtype(cell_key), bool) returns False because dtype('bool') is a numpy.dtype object, not the native Python bool type.
-        3. Reason: dtype('bool') is a numpy object, and isinstance checks for the exact class, which is numpy.dtype, not bool.
-
-        """
+    def _get_cell_idx(self, cell_key: str) -> np.ndarray:
+        """Validate and return the physical indices selected by ``cell_key``."""
         if cell_key not in self.cells.columns or self.cells.get_dtype(cell_key) != bool:  # noqa: E721
             raise ValueError(
                 f"ERROR: Either {cell_key} does not exist or is not bool type"
             )
-        if feat_key not in self.feats.columns or self.feats.get_dtype(feat_key) != bool:  # noqa: E721
-            raise ValueError(
-                f"ERROR: Either {feat_key} does not exist or is not bool type"
-            )
-
-    def _get_cell_feat_idx(
-        self, cell_key: str, feat_key: str
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Verifies the provided key by calling _verify_keys and fetches the
-        indices of rows that have True value in respective column.
-
-        Args:
-            cell_key: Name of the key (column) from cell attribute table
-            feat_key: Name of the key (column) from feature attribute table
-
-        Returns: A tuple of two numpy arrays corresponding to cell and feature indices
-                 respectively.
-        """
-
-        self._verify_keys(cell_key, feat_key)
-        cell_idx = self.cells.active_index(cell_key)
-        feat_idx = self.feats.active_index(feat_key)
-        return cell_idx, feat_idx
+        return self.cells.active_index(cell_key)
 
     @staticmethod
     def _create_subset_hash(cell_idx: np.ndarray, feat_idx: np.ndarray) -> str:
@@ -544,197 +496,39 @@ class Assay:
         boundary = np.array([cells.shape[0]], dtype=np.int64)
         return array_digest(np.concatenate([boundary, cells, feats]))
 
-    @staticmethod
-    def _get_summary_stats_loc(cell_key: str) -> tuple[str, str]:
-        """A convenience method that returns the location of feature-wise
-        summary statistics Currently summaries are stored under pattern:
-        summary_stats_{cell_key}
-
-        Args:
-            cell_key: Name of the key (column) from cell attribute table
-
-        Returns: A tuple of two strings. First is the text that will be prepended to column
-                 names when summary statistics are loaded onto the feature attributes table. The
-                 second is the location of the summary statistics group in the zarr hierarchy of
-                 the assay.
-        """
-        return f"stats_{cell_key}", f"summary_stats_{cell_key}"
-
-    def _validate_stats_loc(
-        self,
-        stats_loc: str,
-        cell_idx: np.ndarray,
-        feat_idx: np.ndarray,
-        delete_on_fail: bool = True,
-    ) -> bool:
-        """Check whether the feature-wise summary statistics was previously
-        calculated on the same set of features and cells as preset in the
-        cell_idx and feat_idx parameters.
-
-        Args:
-            stats_loc: Location where the feature summary statistics are saved
-            cell_idx: The indices of the cell attribute table
-            feat_idx: The indices of the feature attribute table
-            delete_on_fail: Whether to delete the summary statistics group if the validity check fails (Default: True).
-
-        Returns: True is the validity test passes otherwise False
-        """
-        subset_hash = self._create_subset_hash(cell_idx, feat_idx)
-        if stats_loc in self.z:
-            attrs = self.z[stats_loc].attrs
-            if "subset_hash" in attrs and attrs["subset_hash"] == subset_hash:
-                return True
-            else:
-                # Reset stats loc
-                if delete_on_fail:
-                    del self.z[stats_loc]
-                return False
-        else:
-            return False
-
-    def _load_stats_loc(self, cell_key: str) -> str:
-        """Loads the feature-wise summary statistics calculated on the cells
-        that are True in the 'cell_key' column.
-
-        Args:
-            cell_key: Name of the key (column) from cell attribute table
-
-        Returns: Location of the group group that contains feature-wise summary statistics
-        """
-        cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, "I")
-        identifier, stats_loc = self._get_summary_stats_loc(cell_key)
-        if self._validate_stats_loc(stats_loc, cell_idx, feat_idx) is False:
-            raise KeyError(
-                f"Summary statistics have not been calculated for cell key: {cell_key}"
-            )
-        if identifier not in self.feats.locations:
-            self.feats.mount_location(
-                as_zarr_group(self.z[stats_loc], name=stats_loc), identifier
-            )
-        else:
-            logger.debug(f"Location ({stats_loc}) already mounted")
-        return identifier
-
-    @staticmethod
-    def _finalize_staged_mirror(
-        mirror: zarr.Array | None,
-        subset_hash: str,
-        subset_params: dict[str, Any],
-    ) -> None:
-        """Mark a mirrored staging array complete so staging reuses it as-is."""
-        if mirror is None:
-            return
-        mirror.attrs["staged_subset_hash"] = subset_hash
-        mirror.attrs["staged_subset_params"] = subset_params
-        mirror.attrs["staged_complete"] = True
-
     def save_normalized_data(
         self,
-        cell_key: str,
-        feat_key: str,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
         location: str,
+        *,
         log_transform: bool,
         renormalize_subset: bool,
-        update_keys: bool,
         mirror: zarr.Array | None = None,
-        artifact_mode: bool = False,
     ) -> ChunkedArray:
-        """Create a new zarr group and saves the normalized data in the group
-        for the selected features only.
-
-        Args:
-            cell_key: Name of the key (column) from cell attribute table. The data will be saved
-                      for only those cells that have a True value in this column.
-            feat_key: Name of the key (column) from feature attribute table. The data will be saved
-                      for only those features that have a True value in this column
-            location: Zarr group wherein to save the normalized values
-            log_transform: Whether to log transform the values. Is only used if the 'normed' method
-                           takes this parameter, ex. RNAassay
-            renormalize_subset: Only used if the 'normed' method takes this parameter. Please refer
-                                to the documentation of the 'normed' method of the RNAassay for
-                                further description of this parameter.
-            update_keys: Whether to update the keys. If True then the 'latest_feat_key' and
-                         'latest_cell_key' attributes of the assay will be updated. It can be useful
-                         to set False in case where you only need to save the normalized data but
-                         don't intend to use it directly. For example, when mapping onto a different
-                         dataset and aligning features to that dataset.
-
-        Returns: A chunked array containing the normalized data
-        """
+        """Materialize normalized values for explicit cell and feature indices."""
 
         from ..storage.materialize import chunked_to_zarr
 
-        # FIXME: Extensive documentation needed to justify the naming strategy of slots here
-        # Because HVGs and other feature selections have cell key appended in their metadata
-        if feat_key != "I":
-            feat_key = cell_key + "__" + feat_key
-        cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
-        subset_hash = self._create_subset_hash(cell_idx, feat_idx)
-        subset_params: dict[str, Any] = {
-            "log_transform": log_transform,
-            "renormalize_subset": renormalize_subset,
-        }
-        normalization_identity = getattr(self.normMethod, "artifact_identity", None)
-        if normalization_identity is not None:
-            subset_params["normalization_identity"] = str(normalization_identity)
-        if artifact_mode:
-            if location not in self.z:
-                raise KeyError(f"Artifact group does not exist at {location}")
-            if location + "/data" in self.z:
-                return ChunkedArray(
-                    as_zarr_array(
-                        self.z[location + "/data"],
-                        name=location + "/data",
-                    ),
-                    nthreads=self.nthreads,
-                    resources=self.resources,
-                )
-            vals = self.normed(
-                cell_idx,
-                feat_idx,
-                log_transform=log_transform,
-                renormalize_subset=renormalize_subset,
-            )
-            chunked_to_zarr(
-                vals,
-                self.z,
-                location + "/data",
-                self.nthreads,
-                mirror=mirror,
-                resources=self.resources,
-                stats_group=(
-                    as_zarr_group(self.z[location], name=location)
-                    if artifact_mode
-                    else None
-                ),
-            )
+        cell_idx = np.asarray(cell_idx, dtype=np.int64)
+        feat_idx = np.asarray(feat_idx, dtype=np.int64)
+        if cell_idx.ndim != 1 or feat_idx.ndim != 1:
+            raise ValueError("cell_idx and feat_idx must be one-dimensional")
+        if (
+            np.any(cell_idx < 0)
+            or np.any(cell_idx >= self.cells.N)
+            or np.any(feat_idx < 0)
+            or np.any(feat_idx >= self.feats.N)
+        ):
+            raise IndexError("cell_idx or feat_idx contains an out-of-range index")
+        if location not in self.z:
+            self.z.create_group(location)
+        if location + "/data" in self.z:
             return ChunkedArray(
                 as_zarr_array(self.z[location + "/data"], name=location + "/data"),
                 nthreads=self.nthreads,
                 resources=self.resources,
             )
-        if location in self.z:
-            attrs = self.z[location].attrs
-            if (
-                attrs.get("subset_hash") == subset_hash
-                and attrs.get("subset_params") == subset_params
-            ):
-                logger.debug(
-                    f"Using existing normalized data with cell key {cell_key} and feat key {feat_key}"
-                )
-                if update_keys:
-                    self.attrs["latest_feat_key"] = (
-                        feat_key.split("__", 1)[1] if feat_key != "I" else "I"
-                    )
-                    self.attrs["latest_cell_key"] = cell_key
-                return ChunkedArray(
-                    as_zarr_array(self.z[location + "/data"], name=location + "/data"),
-                    nthreads=self.nthreads,
-                    resources=self.resources,
-                )
-            else:
-                # Creating group here to overwrite all children
-                self.z.create_group(location, overwrite=True)
         vals = self.normed(
             cell_idx,
             feat_idx,
@@ -748,15 +542,8 @@ class Assay:
             self.nthreads,
             mirror=mirror,
             resources=self.resources,
+            stats_group=as_zarr_group(self.z[location], name=location),
         )
-        self.z[location].attrs["subset_hash"] = subset_hash
-        self.z[location].attrs["subset_params"] = subset_params
-        self._finalize_staged_mirror(mirror, subset_hash, subset_params)
-        if update_keys:
-            self.attrs["latest_feat_key"] = (
-                feat_key.split("__", 1)[1] if feat_key != "I" else "I"
-            )
-            self.attrs["latest_cell_key"] = cell_key
         return ChunkedArray(
             as_zarr_array(self.z[location + "/data"], name=location + "/data"),
             nthreads=self.nthreads,
@@ -765,22 +552,18 @@ class Assay:
 
     def iter_normed_feature_wise(
         self,
-        cell_key: str | None,
-        feat_key: str | None,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
         batch_size: int | None,
         msg: str | None,
         as_dataframe: bool = True,
         **norm_params: Any,
     ) -> Generator[pd.DataFrame | tuple[np.ndarray, np.ndarray], None, None]:
-        """This generator iterates over all the features marked by `feat_key`
-        in batches.
+        """Iterate over explicitly selected normalized features in batches.
 
         Args:
-            cell_key: Name of the key (column) from cell attribute table. The data will be fetched
-                      for only those cells that have a True value in this column. If None then all the cells are used
-            feat_key: Name of the key (column) from feature attribute table. The data will be fetched
-                      for only those features that have a True value in this column. If None then all the features are
-                      used
+            cell_idx: Ordered physical cell indices to include.
+            feat_idx: Ordered physical feature indices to include.
             batch_size: Number of genes loaded at a time. When None, selected
                 features are grouped into chunk-aligned blocks that fit the
                 operation memory budget.
@@ -794,15 +577,10 @@ class Assay:
         from ..storage.feature_stream import plan_feature_stream
         from ..utils.progress import iter_progress
 
-        if cell_key is None:
-            cell_idx = np.array(list(range(self.cells.N)))
-        else:
-            cell_idx = self.cells.active_index(cell_key)
-
-        if feat_key is None:
-            feat_idx = np.array(list(range(self.feats.N)))
-        else:
-            feat_idx = self.feats.active_index(feat_key)
+        cell_idx = np.asarray(cell_idx, dtype=np.int64)
+        feat_idx = np.asarray(feat_idx, dtype=np.int64)
+        if cell_idx.ndim != 1 or feat_idx.ndim != 1:
+            raise ValueError("cell_idx and feat_idx must be one-dimensional")
         if msg is None:
             msg = ""
         data: ChunkedArray = self.normed(
@@ -846,9 +624,9 @@ class Assay:
 
     def _prepare_aggregated_ordering(
         self,
-        cell_key: str,
-        feat_key: str,
-        ordering_key: str,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
+        cell_ordering: np.ndarray,
         *,
         min_exp: float,
         window_size: int,
@@ -865,16 +643,29 @@ class Assay:
         list[str],
         dict[str, Any],
     ]:
-        cell_ordering = np.asarray(
-            self.cells.fetch(ordering_key, key=cell_key),
-            dtype=float,
-        )
-        cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
+        cell_idx = np.asarray(cell_idx, dtype=np.int64)
+        feat_idx = np.asarray(feat_idx, dtype=np.int64)
+        cell_ordering = np.asarray(cell_ordering, dtype=float)
+        if cell_idx.ndim != 1 or feat_idx.ndim != 1:
+            raise ValueError("cell_idx and feat_idx must be one-dimensional")
+        if len(cell_idx) == 0 or len(feat_idx) == 0:
+            raise ValueError("Aggregation requires non-empty cell and feature indices")
+        if (
+            np.any(cell_idx < 0)
+            or np.any(cell_idx >= self.cells.N)
+            or np.unique(cell_idx).size != len(cell_idx)
+            or np.any(feat_idx < 0)
+            or np.any(feat_idx >= self.feats.N)
+            or np.unique(feat_idx).size != len(feat_idx)
+        ):
+            raise ValueError("Aggregation indices are invalid")
         n_cells = cell_ordering.shape[0]
         if cell_ordering.ndim != 1 or n_cells == 0:
             raise ValueError("Cell ordering must be a non-empty one-dimensional array")
         if not np.isfinite(cell_ordering).all():
             raise ValueError("Cell ordering must contain only finite values")
+        if n_cells != len(cell_idx):
+            raise ValueError("Cell ordering must align with cell_idx")
         if not isinstance(window_size, int) or isinstance(window_size, bool):
             raise TypeError("window_size must be an integer")
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool):
@@ -921,8 +712,7 @@ class Assay:
         self,
         group: zarr.Group,
         *,
-        cell_key: str,
-        feat_key: str,
+        cell_idx: np.ndarray,
         cell_ordering: np.ndarray,
         feat_idx: np.ndarray,
         min_exp: float,
@@ -954,8 +744,8 @@ class Assay:
         valid_feat_flags: list[bool] = []
         offset = 0
         for item in self.iter_normed_feature_wise(
-            cell_key,
-            feat_key,
+            cell_idx,
+            feat_idx,
             batch_size,
             "Binning over cell-ordering",
             True,
@@ -1007,9 +797,10 @@ class Assay:
 
     def save_aggregated_ordering(
         self,
-        cell_key: str,
-        feat_key: str,
-        ordering_key: str,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
+        cell_ordering: np.ndarray,
+        location: str,
         min_exp: float = 1e-3,
         window_size: int = 200,
         chunk_size: int = 50,
@@ -1021,9 +812,10 @@ class Assay:
         """Bin normalized expression along a cell ordering and cache the result.
 
         Args:
-            cell_key: Boolean column in cell metadata selecting cells.
-            feat_key: Boolean column in feature metadata selecting features.
-            ordering_key: Cell metadata column with pseudotime or ordering values.
+            cell_idx: Ordered physical cell indices.
+            feat_idx: Ordered physical feature indices.
+            cell_ordering: Ordering values aligned to ``cell_idx``.
+            location: Zarr group used for the explicit aggregation cache.
             min_exp: Minimum mean expression to retain a feature.
             window_size: Rolling window size for smoothing along ordering.
             chunk_size: Number of ordering bins stored per feature row.
@@ -1056,9 +848,9 @@ class Assay:
             params,
         ) = Assay._prepare_aggregated_ordering(
             self,
-            cell_key,
-            feat_key,
-            ordering_key,
+            cell_idx,
+            feat_idx,
+            cell_ordering,
             min_exp=min_exp,
             window_size=window_size,
             chunk_size=chunk_size,
@@ -1066,7 +858,6 @@ class Assay:
             z_scale=z_scale,
             norm_params=dict(norm_params),
         )
-        location = f"aggregated_{cell_key}_{feat_key}_{ordering_key}"
 
         def _cached_aggregation_valid() -> bool:
             if location not in self.z:
@@ -1100,8 +891,7 @@ class Assay:
             Assay._write_aggregated_ordering_group(
                 self,
                 group,
-                cell_key=cell_key,
-                feat_key=feat_key,
+                cell_idx=np.asarray(cell_idx, dtype=np.int64),
                 cell_ordering=cell_ordering,
                 feat_idx=feat_idx,
                 min_exp=min_exp,
@@ -1186,7 +976,7 @@ class Assay:
             if not feature_idx:
                 raise ValueError("No requested features were found")
 
-        cell_idx, _ = self._get_cell_feat_idx(cell_key, "I")
+        cell_idx = self._get_cell_idx(cell_key)
         feat_idx = np.asarray(feature_idx, dtype=int)
         if isinstance(self, RNAassay) and self.normMethod is norm_lib_size:
             means = self._mean_normed_feature_groups(
@@ -1223,50 +1013,110 @@ class Assay:
         Returns: Numpy array of the calculated scores
         """
 
-        from ..features.scoring import binned_sampling
         from .rna import RNAassay
 
-        def _names_to_idx(i: list[str]) -> np.ndarray:
-            return self.feats.get_index_by(i, "names", None)
-
-        def _calc_mean(i: np.ndarray | list[str] | list[int]) -> np.ndarray:
-            if isinstance(i, list):
-                if not i or isinstance(i[0], str):
-                    feat_selection = self.feats.get_index_by(i, "names", None)
-                else:
-                    feat_selection = np.asarray(i, dtype=int)
-            else:
-                feat_selection = i
-            return (
-                self.normed(cell_idx=cell_idx, feat_idx=np.sort(feat_selection))
-                .mean(axis=1)
-                .compute()
-            )
-
-        feature_idx = _names_to_idx(feature_names)
+        feature_idx = self.feats.get_index_by(feature_names, "names", None)
         if len(feature_idx) == 0:
             raise ValueError(
                 f"ERROR: No feature ids found for any of the provided {len(feature_names)} features"
             )
-
-        identifier = self._load_stats_loc(cell_key)
-        obs_avg = pd.Series(self.feats.fetch_all(f"{identifier}_avg"))
-        control_idx = binned_sampling(
-            obs_avg, list(feature_idx), ctrl_size, n_bins, rand_seed
+        cell_idx = self._get_cell_idx(cell_key)
+        if isinstance(self, RNAassay) and self.normMethod is norm_lib_size:
+            summary = self._compute_feature_summary(
+                cell_idx,
+                np.arange(self.feats.N, dtype=np.int64),
+            )
+            totals = np.asarray(summary["normed_tot"], dtype=np.float64)
+            obs_avg = (
+                totals / len(cell_idx)
+                if len(cell_idx) > 0
+                else np.zeros(self.feats.N, dtype=np.float64)
+            )
+        elif len(cell_idx) > 0:
+            obs_avg = np.asarray(
+                self.normed(
+                    cell_idx=cell_idx,
+                    feat_idx=np.arange(self.feats.N, dtype=np.int64),
+                )
+                .mean(axis=0)
+                .compute(),
+                dtype=np.float64,
+            )
+        else:
+            obs_avg = np.zeros(self.feats.N, dtype=np.float64)
+        return self._score_feature_indices(
+            np.asarray(feature_idx, dtype=np.int64),
+            cell_idx,
+            obs_avg,
+            ctrl_size=ctrl_size,
+            n_bins=n_bins,
+            rand_seed=rand_seed,
         )
-        cell_idx, _ = self._get_cell_feat_idx(cell_key, "I")
+
+    def _compute_feature_summary(
+        self,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Compute full-axis sufficient statistics for supported assay types."""
+        raise TypeError(
+            "Feature summaries are supported only for RNAassay and ATACassay"
+        )
+
+    def _score_feature_indices(
+        self,
+        feature_idx: np.ndarray,
+        cell_idx: np.ndarray,
+        feature_avg: np.ndarray,
+        *,
+        ctrl_size: int,
+        n_bins: int,
+        rand_seed: int,
+    ) -> np.ndarray:
+        """Score feature indexes against controls using supplied feature means."""
+        from ..features.scoring import binned_sampling
+        from .rna import RNAassay
+
+        feature_idx = np.asarray(feature_idx, dtype=np.int64)
+        cell_idx = np.asarray(cell_idx, dtype=np.int64)
+        feature_avg = np.asarray(feature_avg, dtype=np.float64)
+        if feature_idx.ndim != 1 or len(feature_idx) == 0:
+            raise ValueError("feature_idx must be a non-empty one-dimensional array")
+        if feature_avg.shape != (self.feats.N,):
+            raise ValueError(
+                f"feature_avg must have shape ({self.feats.N},), got "
+                f"{feature_avg.shape}"
+            )
+        control_idx = np.asarray(
+            binned_sampling(
+                pd.Series(feature_avg),
+                feature_idx.tolist(),
+                ctrl_size,
+                n_bins,
+                rand_seed,
+            ),
+            dtype=np.int64,
+        )
+
         if isinstance(self, RNAassay) and self.normMethod is norm_lib_size:
             means = self._mean_normed_feature_groups(
                 cell_idx,
                 {
-                    "target": np.asarray(feature_idx, dtype=int),
-                    "control": np.asarray(control_idx, dtype=int),
+                    "target": feature_idx,
+                    "control": control_idx,
                 },
             )
             return np.asarray(means["target"] - means["control"])
-        return np.asarray(_calc_mean(feature_idx) - _calc_mean(control_idx))
+
+        def calc_mean(index: np.ndarray) -> np.ndarray:
+            return np.asarray(
+                self.normed(cell_idx=cell_idx, feat_idx=np.sort(index))
+                .mean(axis=1)
+                .compute()
+            )
+
+        return np.asarray(calc_mean(feature_idx) - calc_mean(control_idx))
 
     def __repr__(self) -> str:
-        f = self.feats.fetch_all("I")
         assay_name = str(self.__class__).split(".")[-1][:-2]
-        return f"{assay_name} {self.name} with {f.sum()}({len(f)}) features"
+        return f"{assay_name} {self.name} with {self.feats.N} features"

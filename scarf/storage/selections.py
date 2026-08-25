@@ -15,10 +15,13 @@ from .artifacts import (
     ArtifactRef,
     ArtifactScope,
     ValueFingerprintBuilder,
+    artifact_group,
     fingerprint_array,
     fingerprint_stored_strings,
     fingerprint_strings,
+    inspect_artifact,
 )
+from .errors import ArtifactErrorContextValue, ArtifactResolutionError
 from .geometry import array_geometry
 from .partition import row_band
 from .types import as_zarr_array, as_zarr_group
@@ -39,6 +42,139 @@ def _stored_selection_fingerprint(array: zarr.Array) -> str:
         )
     builder.end_array("values")
     return builder.hexdigest()
+
+
+def validate_stored_selection_artifact(
+    root: zarr.Group,
+    ref: ArtifactRef,
+    *,
+    kind: str,
+    scope: ArtifactScope,
+    assay: str | None,
+    table_path: str,
+    column: str,
+) -> None:
+    """Validate a selection artifact and its exact live metadata source."""
+    context: dict[str, ArtifactErrorContextValue] = {
+        "scope": ref.scope,
+        "assay": ref.assay,
+        "kind": ref.kind,
+        "artifact_id": ref.artifact_id,
+        "table": table_path,
+        "column": column,
+    }
+    if ref.kind != kind or ref.scope != scope or ref.assay != assay:
+        raise ArtifactResolutionError(
+            f"Expected {scope}-scoped {kind} artifact",
+            code="artifact_reference_mismatch",
+            context={
+                **context,
+                "expected_scope": scope,
+                "expected_assay": assay,
+                "expected_kind": kind,
+                "actual_scope": ref.scope,
+                "actual_assay": ref.assay,
+                "actual_kind": ref.kind,
+            },
+        )
+    try:
+        status = inspect_artifact(root, ref)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ArtifactResolutionError(
+            f"{kind} artifact record is malformed",
+            code="artifact_missing",
+            context=context,
+        ) from exc
+    if not status.exists:
+        raise ArtifactResolutionError(
+            f"{kind} artifact does not exist",
+            code="artifact_missing",
+            context=context,
+        )
+    if not status.complete:
+        raise ArtifactResolutionError(
+            f"{kind} artifact is incomplete",
+            code="artifact_incomplete",
+            context=context,
+        )
+    if table_path not in root:
+        raise ArtifactResolutionError(
+            f"Selection table {table_path!r} is unavailable",
+            code="selection_table_missing",
+            context=context,
+        )
+    table = as_zarr_group(root[table_path], name=table_path)
+    if column not in table:
+        raise ArtifactResolutionError(
+            f"Selection source column {column!r} is unavailable",
+            code="selection_column_missing",
+            context=context,
+        )
+    if "ids" not in table:
+        raise ArtifactResolutionError(
+            "Selection row identifier column 'ids' is unavailable",
+            code="selection_row_ids_missing",
+            context=context,
+        )
+    selection_group = artifact_group(root, ref)
+    if "values" not in selection_group:
+        raise ArtifactResolutionError(
+            f"{kind} artifact has no values",
+            code="selection_values_missing",
+            context=context,
+        )
+    try:
+        stored_values = as_zarr_array(selection_group["values"], name="values")
+        current_values = as_zarr_array(table[column], name=column)
+        row_ids = as_zarr_array(table["ids"], name="ids")
+    except TypeError as exc:
+        raise ArtifactResolutionError(
+            f"{kind} selection payload is malformed",
+            code="selection_values_changed",
+            context=context,
+        ) from exc
+    expected_row_ids = (status.inputs or {}).get("ordered_row_ids_fingerprint")
+    if (
+        row_ids.ndim != 1
+        or row_ids.shape != stored_values.shape
+        or not isinstance(expected_row_ids, str)
+        or expected_row_ids != fingerprint_stored_strings(row_ids)
+    ):
+        raise ArtifactResolutionError(
+            f"{kind} row identity does not match its metadata table",
+            code="row_identity_mismatch",
+            context=context,
+        )
+    expected_values = (status.inputs or {}).get("values_fingerprint")
+    if (
+        stored_values.ndim != 1
+        or np.dtype(stored_values.dtype) != np.dtype(bool)
+        or current_values.ndim != 1
+        or np.dtype(current_values.dtype) != np.dtype(bool)
+        or stored_values.shape != current_values.shape
+        or not isinstance(expected_values, str)
+        or expected_values != _stored_selection_fingerprint(stored_values)
+    ):
+        raise ArtifactResolutionError(
+            f"Selection source column {column!r} no longer matches its artifact",
+            code="selection_values_changed",
+            context=context,
+        )
+    block_rows = min(
+        row_band(array_geometry(stored_values), unit="chunk", fallback=1),
+        row_band(array_geometry(current_values), unit="chunk", fallback=1),
+    )
+    for start in range(0, int(stored_values.shape[0]), block_rows):
+        stop = min(start + block_rows, int(stored_values.shape[0]))
+        if not np.array_equal(
+            np.asarray(stored_values[start:stop], dtype=bool),
+            np.asarray(current_values[start:stop], dtype=bool),
+        ):
+            raise ArtifactResolutionError(
+                f"Selection source column {column!r} no longer matches its artifact",
+                code="selection_values_changed",
+                context=context,
+            )
 
 
 def fingerprint_selected_stored_strings(

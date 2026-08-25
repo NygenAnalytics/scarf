@@ -977,7 +977,6 @@ class SeuratToZarr:
                     cell_key="I",
                     cell_data=self.cellData,
                     named_result=self._reductionResultNames[reduction.name],
-                    feat_key="I",
                     block_rows=block_rows,
                 )
             else:
@@ -1048,7 +1047,6 @@ class SeuratToZarr:
                     stdev_shape=stdev_shape,
                     stdev_dtype=stdev_dtype,
                     named_result=self._reductionResultNames[reduction.name],
-                    feat_key="I",
                     block_rows=block_rows,
                 )
             artifacts[reduction.name] = ref

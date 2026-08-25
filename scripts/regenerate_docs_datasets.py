@@ -208,7 +208,7 @@ def _analyze_pancreas(store: Any) -> None:
         doublet_scoring=False,
         markers=False,
     )
-    store.run_marker_search(group_key="clusters")
+    store.run_marker_search(group_key="clusters", features="all_features")
 
 
 def _analyze_kang(store: Any) -> None:
@@ -307,9 +307,16 @@ def _analyze_citeseq(store: Any) -> None:
 
     names = np.asarray(store.ADT.feats.fetch_all("names")).astype(str)
     is_control = np.char.find(np.char.lower(names), "control") >= 0
-    store.ADT.feats.update_key(~is_control, "I")
+    adt_features = store.set_feature_selection(
+        from_assay="ADT",
+        mask=~is_control,
+        label="non_control_features",
+    )
 
-    normalized = store.run_normalization(from_assay="ADT", feat_key="I")
+    normalized = store.run_normalization(
+        from_assay="ADT",
+        features=adt_features,
+    )
     n_features = int(store.load_artifact(normalized)["data"].shape[1])
     reduction = store.run_custom_reduction(
         np.eye(n_features, dtype=np.float64),
@@ -335,8 +342,8 @@ def _analyze_citeseq(store: Any) -> None:
 
 def _analyze_atac(store: Any) -> None:
     store.auto_filter_cells(show_qc_plots=False)
-    store.mark_prevalent_peaks(top_n=25000)
-    normalized = store.run_normalization(feat_key="prevalent_peaks")
+    prevalent_peaks = store.mark_prevalent_peaks(top_n=25000)
+    normalized = store.run_normalization(features=prevalent_peaks)
     reduction = store.run_lsi(normalized, dims=50, skip_first=True)
     store.build_embedding_initialization(reduction)
     ann = store.build_ann_index(reduction)
@@ -510,18 +517,18 @@ def _build_teaseq_graph(
 
 
 def _analyze_teaseq(store: Any) -> None:
-    store.mark_hvgs(
+    hvgs = store.mark_hvgs(
         from_assay="RNA",
         cell_key="I",
         min_cells=20,
         top_n=2_000,
         show_plot=False,
-        hvg_key_name="hvgs",
+        label="hvgs",
     )
     rna_normalized = store.run_normalization(
         from_assay="RNA",
         cell_key="I",
-        feat_key="hvgs",
+        features=hvgs,
     )
     rna_reduction = store.run_pca(
         rna_normalized,
@@ -530,16 +537,16 @@ def _analyze_teaseq(store: Any) -> None:
     )
     _build_teaseq_graph(store, reduction=rna_reduction)
 
-    store.mark_prevalent_peaks(
+    prevalent_peaks = store.mark_prevalent_peaks(
         from_assay="ATAC",
         cell_key="I",
         top_n=25_000,
-        prevalence_key_name="prevalent_peaks",
+        label="prevalent_peaks",
     )
     atac_normalized = store.run_normalization(
         from_assay="ATAC",
         cell_key="I",
-        feat_key="prevalent_peaks",
+        features=prevalent_peaks,
     )
     atac_reduction = store.run_lsi(
         atac_normalized,
@@ -552,11 +559,15 @@ def _analyze_teaseq(store: Any) -> None:
 
     adt_names = np.asarray(store.ADT.feats.fetch_all("names")).astype(str)
     adt_controls = np.char.find(np.char.lower(adt_names), "control") >= 0
-    store.ADT.feats.update_key(~adt_controls, "I")
+    adt_features = store.set_feature_selection(
+        from_assay="ADT",
+        mask=~adt_controls,
+        label="non_control_features",
+    )
     adt_normalized = store.run_normalization(
         from_assay="ADT",
         cell_key="I",
-        feat_key="I",
+        features=adt_features,
     )
     adt_reduction = store.run_pca(
         adt_normalized,

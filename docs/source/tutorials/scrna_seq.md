@@ -76,9 +76,9 @@ writer.dump()
 ```
 
 Open a `DataStore`.
-On first open Scarf streams the count matrix once to compute initialization statistics: per-cell QC columns such as `RNA_nCounts` and `RNA_nFeatures`, mito/ribo fractions when gene-name patterns match, and the per-feature cell counts used for feature filtering.
+On first open Scarf streams the count matrix once to compute initialization statistics: per-cell QC columns such as `RNA_nCounts` and `RNA_nFeatures`, mito/ribo fractions when gene-name patterns match, and per-feature `nCells` and `dropOuts` columns.
 `min_features_per_cell` marks cells inactive when they have fewer non-zero features than the threshold.
-Feature filtering uses `min_cells_per_feature` (default 20).
+The physical feature column `I` remains all true; feature filtering is an explicit artifact-producing step.
 
 Opening this store prints a message that the smallest cell count is below the RNA size factor of 1000.
 It refers to normalization, which is covered in step 3, and the QC filter in step 2 removes those cells.
@@ -150,9 +150,8 @@ After filtering, the same metrics are restricted to active cells (`I=True`).
 ## 3. Feature selection
 
 `mark_hvgs` ranks genes by corrected variance and marks highly variable genes.
-The feature column is named with the {term}`cell key` prefix (here `I__hvgs`).
-Pass `feat_key='hvgs'` later; Scarf resolves the prefix.
-See {term}`feat_key`.
+It returns an immutable {term}`feature selection` artifact and publishes the same Boolean values under the plain label `hvgs`.
+There is no cell-key prefix.
 
 By default, Scarf excludes common mitochondrial, ribosomal, cell-cycle, HLA/H2, histone, and sex-linked gene-name patterns, together with genes detected in nearly every selected cell.
 These defaults reduce technical and broadly shared signals in this teaching workflow.
@@ -160,7 +159,7 @@ Use `blacklist=""` to keep all names, pass a custom regular expression for a dat
 The {doc}`feature_selection` guide explains the exact patterns and how to compare feature sets.
 
 ```{code-cell} ipython3
-ds.mark_hvgs(
+hvg_ref = ds.mark_hvgs(
     min_cells=20,
     top_n=500,
     min_mean=-3,
@@ -168,7 +167,8 @@ ds.mark_hvgs(
     max_var=6,
     show_plot=True,
 )
-print('Selected genes:', int(ds.RNA.feats.fetch_all('I__hvgs').sum()))
+print('Selected genes:', int(ds.RNA.feats.fetch_all('hvgs').sum()))
+hvg_ref
 ```
 
 The selected genes should span the fitted mean-variance trend rather than being concentrated among only the most abundant genes.
@@ -181,10 +181,12 @@ Full `RNA_nCounts` library size is used only when `renormalize_subset=False`.
 The default size factor is 1000, and the earlier filter removes cells below that count.
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(feat_key='hvgs')
-opts = ds.inspect_artifact(normalized).execution_options or {}
+normalized = ds.run_normalization(features=hvg_ref)
+status = ds.inspect_artifact(normalized)
+opts = status.execution_options or {}
 print('Size factor (ds.RNA.sf):', ds.RNA.sf)
-print('cell_key:', opts.get('cell_key'), 'feat_key:', opts.get('feat_key'))
+print('cell_key:', opts.get('cell_key'))
+print('feature selection:', status.inputs['feature_selection'])
 ```
 
 The normalized {term}`artifact` records both the active cell selection and the `hvgs` feature selection.
@@ -235,7 +237,7 @@ See {doc}`graph_construction`.
 
 ## 7. UMAP
 
-Run UMAP on the latest graph.
+Run UMAP on the current graph recorded in `AssayState`.
 Results are stored as `RNA_UMAP1` and `RNA_UMAP2`.
 
 ```{code-cell} ipython3
@@ -327,11 +329,16 @@ The adjusted column is a cell-level marker correction for that group, not replic
 For condition-level DE with full workflows, export counts (see {doc}`pseudobulk_and_differential_expression`) and use an external tool.
 
 ```{code-cell} ipython3
-ds.run_marker_search(group_key='RNA_leiden_cluster')
+all_features = ds.resolve_features('RNA', 'all_features')
+marker_ref = ds.run_marker_search(
+    group_key='RNA_leiden_cluster',
+    features=all_features,
+)
 ```
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
+    marker=marker_ref,
     group_key='RNA_leiden_cluster',
     topn=5,
     figsize=(5, 9)
@@ -342,6 +349,7 @@ Rows are top marker genes per cluster; stronger scores mark more cluster-specifi
 
 ```{code-cell} ipython3
 df = ds.get_markers(
+    marker=marker_ref,
     group_key='RNA_leiden_cluster',
     group_id='1',
     min_score=-1,
@@ -354,6 +362,7 @@ Rank the same three lineage genes across all Leiden groups before plotting them 
 
 ```{code-cell} ipython3
 markers = ds.get_markers(
+    marker=marker_ref,
     group_key='RNA_leiden_cluster',
     group_id=None,
     min_score=-1,
@@ -398,4 +407,3 @@ See {doc}`imputation` for a focused comparison of observed and imputed expressio
 - Requesting marker tests for groups with fewer than two target or reference cells
 - Treating marker `p_value` or within-group `p_value_adjusted` columns as replicate-aware DE results
 - Expecting filtered cells to disappear from `ds.cells` (they remain, with `I=False`)
-

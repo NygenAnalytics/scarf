@@ -1,4 +1,4 @@
-from collections.abc import Generator, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -162,6 +162,8 @@ class RNAassay(Assay):
                 It is set to None until normed method is called.
     """
 
+    _feature_summary_operation = "summarize_rna_features"
+
     def __init__(
         self,
         z: zarr.Group,
@@ -170,7 +172,6 @@ class RNAassay(Assay):
         *,
         workspace: str | None = None,
         nthreads: int = 1,
-        min_cells_per_feature: int = 10,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -179,7 +180,6 @@ class RNAassay(Assay):
             name=name,
             cell_data=cell_data,
             nthreads=nthreads,
-            min_cells_per_feature=min_cells_per_feature,
             **kwargs,
         )
         self.normMethod = norm_lib_size
@@ -217,8 +217,8 @@ class RNAassay(Assay):
 
     def iter_normed_feature_wise(
         self,
-        cell_key: str | None,
-        feat_key: str | None,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
         batch_size: int | None,
         msg: str | None,
         as_dataframe: bool = True,
@@ -230,8 +230,8 @@ class RNAassay(Assay):
         ):
             yield from Assay.iter_normed_feature_wise(
                 self,
-                cell_key,
-                feat_key,
+                cell_idx,
+                feat_idx,
                 batch_size,
                 msg,
                 as_dataframe=as_dataframe,
@@ -239,15 +239,10 @@ class RNAassay(Assay):
             )
             return
 
-        if cell_key is None:
-            cell_idx = np.array(list(range(self.cells.N)))
-        else:
-            cell_idx = self.cells.active_index(cell_key)
-
-        if feat_key is None:
-            feat_idx = np.array(list(range(self.feats.N)))
-        else:
-            feat_idx = self.feats.active_index(feat_key)
+        cell_idx = np.asarray(cell_idx, dtype=np.int64)
+        feat_idx = np.asarray(feat_idx, dtype=np.int64)
+        if cell_idx.ndim != 1 or feat_idx.ndim != 1:
+            raise ValueError("cell_idx and feat_idx must be one-dimensional")
 
         if msg is None:
             msg = ""
@@ -353,89 +348,38 @@ class RNAassay(Assay):
 
     def save_normalized_data(
         self,
-        cell_key: str,
-        feat_key: str,
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
         location: str,
+        *,
         log_transform: bool,
         renormalize_subset: bool,
-        update_keys: bool,
         mirror: zarr.Array | None = None,
-        artifact_mode: bool = False,
     ) -> ChunkedArray:
         if not renormalize_subset:
             return super().save_normalized_data(
-                cell_key,
-                feat_key,
+                cell_idx,
+                feat_idx,
                 location,
-                log_transform,
-                renormalize_subset,
-                update_keys,
+                log_transform=log_transform,
+                renormalize_subset=renormalize_subset,
                 mirror=mirror,
-                artifact_mode=artifact_mode,
             )
 
         from ..storage.materialize import write_renorm_subset_to_zarr
 
-        if feat_key != "I":
-            feat_key = cell_key + "__" + feat_key
-        cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
-        if artifact_mode:
-            if location not in self.z:
-                raise KeyError(f"Artifact group does not exist at {location}")
-            if location + "/data" in self.z:
-                return ChunkedArray(
-                    as_zarr_array(
-                        self.z[location + "/data"],
-                        name=location + "/data",
-                    ),
-                    nthreads=self.nthreads,
-                    resources=self.resources,
-                )
-            write_renorm_subset_to_zarr(
-                self,
-                cell_idx,
-                feat_idx,
-                self.z,
-                location + "/data",
-                self.nthreads,
-                log_transform=log_transform,
-                mirror=mirror,
-                stats_group=(
-                    as_zarr_group(self.z[location], name=location)
-                    if artifact_mode
-                    else None
-                ),
-            )
+        cell_idx = np.asarray(cell_idx, dtype=np.int64)
+        feat_idx = np.asarray(feat_idx, dtype=np.int64)
+        if cell_idx.ndim != 1 or feat_idx.ndim != 1:
+            raise ValueError("cell_idx and feat_idx must be one-dimensional")
+        if location not in self.z:
+            self.z.create_group(location)
+        if location + "/data" in self.z:
             return ChunkedArray(
                 as_zarr_array(self.z[location + "/data"], name=location + "/data"),
                 nthreads=self.nthreads,
                 resources=self.resources,
             )
-        subset_hash = self._create_subset_hash(cell_idx, feat_idx)
-        subset_params = {
-            "log_transform": log_transform,
-            "renormalize_subset": renormalize_subset,
-        }
-        if location in self.z:
-            attrs = self.z[location].attrs
-            if (
-                attrs.get("subset_hash") == subset_hash
-                and attrs.get("subset_params") == subset_params
-            ):
-                logger.debug(
-                    f"Using existing normalized data with cell key {cell_key} and feat key {feat_key}"
-                )
-                if update_keys:
-                    self.attrs["latest_feat_key"] = (
-                        feat_key.split("__", 1)[1] if feat_key != "I" else "I"
-                    )
-                    self.attrs["latest_cell_key"] = cell_key
-                return ChunkedArray(
-                    as_zarr_array(self.z[location + "/data"], name=location + "/data"),
-                    nthreads=self.nthreads,
-                    resources=self.resources,
-                )
-            self.z.create_group(location, overwrite=True)
 
         write_renorm_subset_to_zarr(
             self,
@@ -446,15 +390,8 @@ class RNAassay(Assay):
             self.nthreads,
             log_transform=log_transform,
             mirror=mirror,
+            stats_group=as_zarr_group(self.z[location], name=location),
         )
-        self.z[location].attrs["subset_hash"] = subset_hash
-        self.z[location].attrs["subset_params"] = subset_params
-        self._finalize_staged_mirror(mirror, subset_hash, subset_params)
-        if update_keys:
-            self.attrs["latest_feat_key"] = (
-                feat_key.split("__", 1)[1] if feat_key != "I" else "I"
-            )
-            self.attrs["latest_cell_key"] = cell_key
         return ChunkedArray(
             as_zarr_array(self.z[location + "/data"], name=location + "/data"),
             nthreads=self.nthreads,
@@ -479,11 +416,10 @@ class RNAassay(Assay):
             cell_idx: Indices of cells to be included in the normalized matrix
                       (Default value: All those marked True in 'I' column of cell
                       attribute table)
-            feat_idx: Indices of features to be included in the normalized matrix
-                      (Default value: All those marked True in 'I' column of
-                      feature attribute table)
-            renormalize_subset: If True, then the data is normalized using only those features that are True in
-                                `feat_key` column rather using total expression of all features in a cell
+            feat_idx: Indices of features to be included in the normalized matrix.
+                      Defaults to the complete physical feature axis.
+            renormalize_subset: If true, normalize using only ``feat_idx`` rather
+                                than total expression across all features in a cell.
                                 (Default value: False)
             log_transform: If True, then the normalized data is log-transformed (Default value: False).
             **kwargs: kwargs have no effect here.
@@ -494,7 +430,7 @@ class RNAassay(Assay):
         if cell_idx is None:
             cell_idx = self.cells.active_index("I")
         if feat_idx is None:
-            feat_idx = self.feats.active_index("I")
+            feat_idx = np.arange(self.feats.N, dtype=np.int64)
         counts = self.rawData[:, feat_idx][cell_idx, :]
         norm_method_cache = self.normMethod
         scalar_cache = self.scalar
@@ -1001,289 +937,58 @@ class RNAassay(Assay):
         sigmas = s2 / n_cells - np.square(mean)
         return {"normed_tot": s1, "normed_n": nz, "sigmas": sigmas}
 
-    def set_feature_stats(self, cell_key: str) -> None:
-        """Calculates summary statistics for the features of the assay using
-        only cells that are marked True by the 'cell_key' parameter.
-
-        Args:
-            cell_key: Name of the key (column) from cell attribute table.
-
-        Returns: None
-        """
-        feat_key = "I"  # Here we choose to calculate stats for all the features
-        cell_idx, feat_idx = self._get_cell_feat_idx(cell_key, feat_key)
-        identifier, stats_loc = self._get_summary_stats_loc(cell_key)
-        if self._validate_stats_loc(stats_loc, cell_idx, feat_idx) is True:
-            logger.debug(f"Using cached feature stats for cell_key {cell_key}")
-            return None
-        else:
-            if identifier in self.feats.locations:
-                del self.feats.locations[identifier]
-        n_used = int(len(cell_idx))
-        # The single-pass streaming path only implements the library-size
-        # normalization formula (sf * raw / nCounts). Any other norm method
-        # (e.g. log-transformed or renormalized variants) falls back to the
-        # generic ChunkedArray reductions, which honour self.normMethod.
-        if self.normMethod is norm_lib_size:
-            stats = self._streaming_feature_stats(cell_idx, feat_idx)
-            n_cells = stats["normed_n"]
-            tot = stats["normed_tot"]
-            sigmas = stats["sigmas"]
-        else:
-            n_cells = compute_with_progress(
-                (self.normed(cell_idx, feat_idx) > 0).sum(axis=0),
-                f"({self.name}) Computing nCells",
-                self.nthreads,
-            )
-            tot = compute_with_progress(
-                self.normed(cell_idx, feat_idx).sum(axis=0),
-                f"({self.name}) Computing normed_tot",
-                self.nthreads,
-            )
-            sigmas = compute_with_progress(
-                self.normed(cell_idx, feat_idx).var(axis=0),
-                f"({self.name}) Computing sigmas",
-                self.nthreads,
-            )
-        # idx = n_cells > min_cells
-        # self.feats.update_key(idx, key=feat_key)
-        # n_cells, tot, sigmas = n_cells[idx], tot[idx], sigmas[idx]
-
-        self.z.create_group(stats_loc, overwrite=True)
-        self.feats.mount_location(
-            as_zarr_group(self.z[stats_loc], name=stats_loc), identifier
-        )
-        self.feats.insert(
-            "normed_tot", tot.astype(float), overwrite=True, location=identifier
-        )
-        # Mean over the cells actually used (cell_key subset), matching the
-        # denominator of the variance computed above. self.cells.N counts all
-        # primary cells, including those filtered out, so it is not used here.
-        self.feats.insert(
-            "avg",
-            (tot / max(1, n_used)).astype(float),
-            overwrite=True,
-            location=identifier,
-        )
-        nz_mean = np.divide(
-            tot, n_cells, out=np.zeros_like(tot).astype(float), where=n_cells != 0
-        )
-        self.feats.insert(
-            "nz_mean",
-            nz_mean.astype(float),
-            overwrite=True,
-            location=identifier,
-        )
-        self.feats.insert(
-            "sigmas", sigmas.astype(float), overwrite=True, location=identifier
-        )
-        self.feats.insert(
-            "normed_n", n_cells.astype(float), overwrite=True, location=identifier
-        )
-        self.z[stats_loc].attrs["subset_hash"] = self._create_subset_hash(
-            cell_idx, self.feats.active_index(feat_key)
-        )
-        self.feats.unmount_location(identifier)
-        return None
-
-    def get_feature_stats(
+    def _compute_feature_summary(
         self,
-        cell_key: str,
-        columns: Sequence[str] | None = None,
-        *,
-        feat_key: str = "I",
+        cell_idx: np.ndarray,
+        feat_idx: np.ndarray,
     ) -> dict[str, np.ndarray]:
-        """Return cached feature statistics aligned to ``feat_key``.
+        """Compute sufficient feature statistics without persisting metadata."""
+        cell_idx = np.asarray(cell_idx, dtype=np.int64)
+        feat_idx = np.asarray(feat_idx, dtype=np.int64)
+        if len(cell_idx) == 0 or len(feat_idx) == 0:
+            zeros = np.zeros(len(feat_idx), dtype=np.float64)
+            return {
+                "normed_tot": zeros.copy(),
+                "normed_n": zeros.copy(),
+                "sigmas": zeros.copy(),
+            }
+        if self.normMethod is norm_lib_size:
+            return self._streaming_feature_stats(cell_idx, feat_idx)
+        normed = self.normed(cell_idx, feat_idx)
+        return {
+            "normed_tot": np.asarray(
+                compute_with_progress(
+                    normed.sum(axis=0),
+                    f"({self.name}) Computing normed_tot",
+                    self.nthreads,
+                ),
+                dtype=np.float64,
+            ),
+            "normed_n": np.asarray(
+                compute_with_progress(
+                    (normed > 0).sum(axis=0),
+                    f"({self.name}) Computing nCells",
+                    self.nthreads,
+                ),
+                dtype=np.float64,
+            ),
+            "sigmas": np.asarray(
+                compute_with_progress(
+                    normed.var(axis=0),
+                    f"({self.name}) Computing sigmas",
+                    self.nthreads,
+                ),
+                dtype=np.float64,
+            ),
+        }
 
-        This method only reads an existing, valid summary-statistics group. It
-        does not calculate statistics or delete a stale cache. Default reads
-        prefer adaptive corrected variance and fall back to legacy fixed caches.
-        """
-        requested: tuple[str, ...] | None
-        if columns is None:
-            requested = None
-        elif isinstance(columns, str):
-            raise TypeError("columns must be a sequence of column names, not a string")
-        else:
-            requested = tuple(columns)
-        if requested is not None and not all(
-            isinstance(column, str) for column in requested
-        ):
-            raise TypeError("columns must contain only strings")
-
-        cell_idx, all_feat_idx = self._get_cell_feat_idx(cell_key, "I")
-        _, stats_loc = self._get_summary_stats_loc(cell_key)
-        if not self._validate_stats_loc(
-            stats_loc,
-            cell_idx,
-            all_feat_idx,
-            delete_on_fail=False,
-        ):
-            raise KeyError(
-                f"Summary statistics have not been calculated for cell key: {cell_key}"
-            )
-
-        stats_group = as_zarr_group(self.z[stats_loc], name=stats_loc)
-        if requested is None:
-            adaptive = _corrected_variance_column(200, 0.1, "adaptive")
-            fixed = _corrected_variance_column(200, 0.1, "fixed")
-            c_var_col = (
-                adaptive
-                if adaptive in stats_group or fixed not in stats_group
-                else fixed
-            )
-            requested = ("nz_mean", c_var_col, "normed_n")
-        feat_idx = self.feats.active_index(feat_key)
-        values: dict[str, np.ndarray] = {}
-        for column in requested:
-            if column not in stats_group:
-                raise KeyError(
-                    f"Feature statistic {column!r} is not available for cell key "
-                    f"{cell_key!r}"
-                )
-            array = as_zarr_array(stats_group[column], name=f"{stats_loc}/{column}")
-            values[column] = np.asarray(array[:])[feat_idx]
-        return values
-
-    def set_summary_stats(
+    def _select_hvgs(
         self,
-        cell_key: str | None = None,
-        n_bins: int = 200,
-        lowess_frac: float = 0.1,
+        summary: Mapping[str, np.ndarray],
         *,
-        bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
-    ) -> tuple[str, str]:
-        """Calculates summary statistics for the features of the assay using only cells that are marked True by the 'cell_key' parameter.
-
-        Args:
-            cell_key: Name of the key (column) from cell attribute table.
-            n_bins: Number of bins to divide the data into.
-            lowess_frac: Between 0 and 1. The fraction of the data used when estimating the fit between mean and
-                         variance. This is same as `frac` in statsmodels.nonparametric.smoothers_lowess.lowess
-            bin_strategy: Strategy used to construct bins and variance anchors.
-
-        Returns:
-            A tuple of two strings.
-            identifier: The text that will be prepended to column names when summary statistics are loaded onto the feature attributes table.
-            c_var_col: The name of the column in the feature attribute table that contains the corrected variance values.
-        """
-
-        def col_renamer(x: str) -> str:
-            return f"{identifier}_{x}"
-
-        if cell_key is None:
-            cell_key = "I"
-
-        c_var_col = _corrected_variance_column(
-            n_bins,
-            lowess_frac,
-            bin_strategy,
-        )
-        self.set_feature_stats(cell_key)
-        identifier = self._load_stats_loc(cell_key)
-        if col_renamer(c_var_col) in self.feats.columns:
-            logger.debug("Using existing corrected dispersion values")
-        else:
-            slots = ["normed_tot", "avg", "nz_mean", "sigmas", "normed_n"]
-            for i in slots:
-                i = col_renamer(i)
-                if i not in self.feats.columns:
-                    raise KeyError(f"ERROR: {i} not found in feature metadata")
-            from ..features.variability import fit_lowess
-
-            mean = self.feats.fetch(col_renamer("avg")).astype(float)
-            variance = self.feats.fetch(col_renamer("sigmas")).astype(float)
-            positive = mean > 0
-            c_var = np.zeros(mean.shape, dtype=float)
-            c_var[positive] = fit_lowess(
-                mean[positive],
-                variance[positive],
-                n_bins,
-                lowess_frac,
-                bin_strategy=bin_strategy,
-            )
-            self.feats.insert(c_var_col, c_var, overwrite=True, location=identifier)
-
-        return identifier, c_var_col
-
-    def set_hvgs(
-        self,
-        cell_key: str,
-        *,
-        mask: np.ndarray | None = None,
-        feature_indexes: Sequence[int] | None = None,
-        hvg_key_name: str = "hvgs",
-        n_bins: int = 200,
-        lowess_frac: float = 0.1,
-        bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
-        blacklist: str | None = None,
-        blacklist_exclusions: str | None = None,
-        blacklist_indexes: Sequence[int] | None = None,
-    ) -> str:
-        """Install a supplied HVG selection and ensure its summary statistics."""
-        if (mask is None) == (feature_indexes is None):
-            raise ValueError("Provide exactly one of mask or feature_indexes")
-
-        if mask is not None:
-            if not isinstance(mask, np.ndarray):
-                raise TypeError("mask must be a NumPy array")
-            if mask.shape != (self.feats.N,):
-                raise ValueError(f"mask must have shape ({self.feats.N},)")
-            if mask.dtype != bool:
-                raise TypeError("mask must have boolean dtype")
-            selected = mask.copy()
-        else:
-            assert feature_indexes is not None
-            indexes = _as_feature_indexes(
-                feature_indexes,
-                n_features=self.feats.N,
-                name="feature_indexes",
-                require_unique=True,
-            )
-            selected = self.feats.index_to_bool(indexes)
-
-        if not selected.any():
-            raise ValueError("HVG selection must contain at least one feature")
-
-        blocked = np.empty(0, dtype=np.int64)
-        if blacklist_indexes is not None:
-            blocked = _as_feature_indexes(
-                blacklist_indexes,
-                n_features=self.feats.N,
-                name="blacklist_indexes",
-                require_unique=False,
-            )
-        elif blacklist is not None:
-            blocked_names = (
-                set() if blacklist == "" else set(self.feats.grep(blacklist))
-            )
-            if blacklist_exclusions is None or blacklist_exclusions == "":
-                excluded_names: set[str] = set()
-            else:
-                excluded_names = set(self.feats.grep(blacklist_exclusions))
-            blocked = self.feats.get_index_by(
-                sorted(blocked_names - excluded_names),
-                "names",
-            ).astype(np.int64, copy=False)
-        elif blacklist_exclusions not in (None, ""):
-            raise ValueError("blacklist_exclusions requires blacklist")
-
-        self.set_summary_stats(
-            cell_key,
-            n_bins,
-            lowess_frac,
-            bin_strategy=bin_strategy,
-        )
-        selected[blocked] = False
-        column_name = f"{cell_key}__{hvg_key_name}"
-        self.feats.insert(column_name, selected, fill_value=False, overwrite=True)
-        return column_name
-
-    # maybe we should return plot here? If one wants to modify it. /raz
-    def mark_hvgs(
-        self,
-        cell_key: str,
+        n_selected: int,
         min_cells: int,
+        max_cells: int | float,
         top_n: int,
         min_var: float,
         max_var: float,
@@ -1292,78 +997,50 @@ class RNAassay(Assay):
         n_bins: int,
         lowess_frac: float,
         blacklist: str,
-        hvg_key_name: str,
         keep_bounds: bool,
-        show_plot: bool,
-        max_cells: int | float,
         bin_strategy: Literal["fixed", "adaptive"] = "adaptive",
-        **plot_kwargs: Any,
-    ) -> None:
-        """Identifies highly variable genes in the dataset.
-
-        The parameters govern the min/max variance (corrected) and mean expression threshold for calling genes highly
-        variable. The variance is corrected by first dividing genes into bins based on their mean expression values.
-        The fixed strategy fits a Lowess curve through minimum-variance genes, while the adaptive strategy uses balanced
-        bins and robust variance anchors. mark_hvgs will by default run on the default assay.
-        See `scarf.features.fit_lowess` for further details.
-
-        *Modifies the feats table*: adds a column named `<cell_key>__hvgs` to the feature table,
-        which contains a True value for genes marked HVGs. The prefix comes from the `cell_key` parameter,
-        the naming rule in Scarf dictates that cells used to identify HVGs are prepended to the column name
-        (with a double underscore delimiter).
-
-        Args:
-            cell_key: Specify which cells to use to identify the HVGs. (Default value 'I' use all non-filtered out
-                      cells).
-            min_cells: Minimum number of cells where a gene should have non-zero expression values for it to be
-                       considered a candidate for HVG selection. Large values for this parameter might make it difficult
-                       to identify rare populations of cells. Very small values might lead to higher signal to noise
-                       ratio in the selected features.
-            max_cells: Maximum number of cells where a gene should have non-zero expression values for it to be
-                       considered a candidate for HVG selection. This can be useful to filter out genes that are
-                       expressed in too many cells. Default value is infinity, meaning no upper limit.
-            top_n: Number of top most variable genes to be set as HVGs. This value is ignored if a value is provided
-                   for `min_var` parameter.
-            min_var: Minimum variance threshold for HVG selection.
-            max_var: Maximum variance threshold for HVG selection.
-            min_mean: Minimum mean value of expression threshold for HVG selection.
-            max_mean: Maximum mean value of expression threshold for HVG selection.
-            n_bins: Number of bins into which the mean expression is binned.
-            lowess_frac: Between 0 and 1. The fraction of the data used when estimating the fit between mean and
-                         variance. This is same as `frac` in statsmodels.nonparametric.smoothers_lowess.lowess
-            bin_strategy: Strategy used to construct bins and variance anchors.
-            blacklist: A regular expression string pattern. Gene names matching to this pattern will be excluded from
-                       the final highly variable genes list
-            hvg_key_name: The label for highly variable genes. This label will be used to mark the HVGs in the
-                          feature attribute table. The value for 'cell_key' parameter is prepended to this value.
-            keep_bounds: If True, retain upper cell-count and expression-statistic bounds.
-                         The ``min_cells`` boundary is always inclusive.
-            show_plot: If True, a plot is produced, that for each gene shows the corrected variance on the y-axis and
-                       the non-zero mean (means from cells where the gene had a non-zero value) on the x-axis. The
-                       genes are colored in two gradients which indicate the number of cells where the gene was
-                       expressed. The colors are yellow to dark red for HVGs, and blue to green for non-HVGs.
-            **plot_kwargs: Keyword arguments for ``scarf.plotting.highly_variable_features``
-                           (for example ``figsize``, ``label_size``, ``point_sizes``,
-                           ``colormaps``).
-        """
-
-        def col_renamer(x: str) -> str:
-            return f"{identifier}_{x}"
-
-        identifier, c_var_col = self.set_summary_stats(
-            cell_key,
-            n_bins,
-            lowess_frac,
-            bin_strategy=bin_strategy,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return an HVG mask and corrected variance from sufficient stats."""
+        from ..features.variability import (
+            fit_lowess,
+            select_highly_variable_features,
         )
-        from ..features.variability import select_highly_variable_features
 
-        hvgs = select_highly_variable_features(
-            corrected_variance=self.feats.fetch_all(col_renamer(c_var_col)),
-            normalized_cell_counts=self.feats.fetch_all(col_renamer("normed_n")),
-            mean_nonzero=self.feats.fetch_all(col_renamer("nz_mean")),
-            active_features=self.feats.fetch_all("I"),
-            feature_names=self.feats.fetch_all("names"),
+        normed_tot = np.asarray(summary["normed_tot"], dtype=np.float64)
+        normed_n = np.asarray(summary["normed_n"], dtype=np.float64)
+        sigmas = np.asarray(summary["sigmas"], dtype=np.float64)
+        expected = (self.feats.N,)
+        if any(values.shape != expected for values in (normed_tot, normed_n, sigmas)):
+            raise ValueError(
+                f"RNA feature-summary arrays must all have shape {expected}"
+            )
+        avg = (
+            normed_tot / n_selected
+            if n_selected > 0
+            else np.zeros_like(normed_tot, dtype=np.float64)
+        )
+        nz_mean = np.divide(
+            normed_tot,
+            normed_n,
+            out=np.zeros_like(normed_tot, dtype=np.float64),
+            where=normed_n != 0,
+        )
+        positive = avg > 0
+        corrected_variance = np.zeros(avg.shape, dtype=np.float64)
+        if positive.any():
+            corrected_variance[positive] = fit_lowess(
+                avg[positive],
+                sigmas[positive],
+                n_bins,
+                lowess_frac,
+                bin_strategy=bin_strategy,
+            )
+        values = select_highly_variable_features(
+            corrected_variance=corrected_variance,
+            normalized_cell_counts=normed_n,
+            mean_nonzero=nz_mean,
+            active_features=np.ones(self.feats.N, dtype=bool),
+            feature_names=np.asarray(self.feats.fetch_all("names")),
             min_cells=min_cells,
             max_cells=max_cells,
             top_n=top_n,
@@ -1374,24 +1051,32 @@ class RNAassay(Assay):
             blacklist=blacklist,
             keep_bounds=keep_bounds,
         )
-        hvg_key_name = cell_key + "__" + hvg_key_name
-        logger.info(f"{sum(hvgs)} genes marked as HVGs")
-        self.feats.insert(hvg_key_name, hvgs, fill_value=False, overwrite=True)
+        logger.info(f"{int(values.sum())} genes marked as HVGs")
+        return np.asarray(values, dtype=bool), corrected_variance
 
-        if show_plot:
-            from ..plotting import highly_variable_features
+    @staticmethod
+    def _plot_hvgs(
+        summary: Mapping[str, np.ndarray],
+        values: np.ndarray,
+        corrected_variance: np.ndarray,
+        **plot_kwargs: Any,
+    ) -> None:
+        """Plot an artifact-backed HVG result without mounted feature stats."""
+        from ..plotting import highly_variable_features
 
-            nzm, vf, nc = [
-                self.feats.fetch(x)
-                for x in [col_renamer("nz_mean"), col_renamer(c_var_col), "nCells"]
-            ]
-            highly_variable_features(
-                mean_nonzero=nzm,
-                corrected_variance=vf,
-                n_cells=nc,
-                selected=self.feats.fetch(hvg_key_name),
-                show=True,
-                **plot_kwargs,
-            )
-
-        return None
+        normed_tot = np.asarray(summary["normed_tot"], dtype=np.float64)
+        normed_n = np.asarray(summary["normed_n"], dtype=np.float64)
+        nz_mean = np.divide(
+            normed_tot,
+            normed_n,
+            out=np.zeros_like(normed_tot, dtype=np.float64),
+            where=normed_n != 0,
+        )
+        highly_variable_features(
+            mean_nonzero=nz_mean,
+            corrected_variance=np.asarray(corrected_variance, dtype=np.float64),
+            n_cells=normed_n,
+            selected=np.asarray(values, dtype=bool),
+            show=True,
+            **plot_kwargs,
+        )
