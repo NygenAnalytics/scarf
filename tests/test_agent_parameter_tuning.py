@@ -260,6 +260,8 @@ def test_prompts_include_only_explicit_candidate_context() -> None:
     assert '"candidateId": "baseline"' in planning_prompt
     assert '"harmony"' in planning_prompt
     assert "Maximum refined candidates: 3" in planning_prompt
+    assert "status=complete with candidates=[]" in planning_system_prompt
+    assert "status=refine with one or more candidates" in planning_system_prompt
     assert system_prompt.startswith("You are Scarf's parameter tuning selection agent.")
     assert "20 cells" in system_prompt
     assert '"candidateId": "baseline"' in user_prompt
@@ -391,6 +393,52 @@ def test_refinement_plan_is_bounded_by_initial_evidence_and_envelope() -> None:
             initial_candidate_ids=["baseline", "pca_15"],
             max_refined_candidates=2,
         )
+
+
+def test_refinement_plan_canonicalizes_status_from_candidate_presence() -> None:
+    store = _FakeStore()
+    candidates = [
+        ParameterCandidate.get_example(),
+        ParameterCandidate(candidateId="pca_15", dimensions=15),
+    ]
+    deps = _dependencies(store, candidates=candidates, max_candidates=3)
+    baseline = execute_parameter_candidate(deps, "baseline")
+    pca_15 = execute_parameter_candidate(deps, "pca_15")
+    plan = ParameterSearchPlan.model_validate(
+        {
+            "candidates": [
+                ParameterCandidate(
+                    candidateId="refined_pca_18",
+                    dimensions=18,
+                ).model_dump()
+            ],
+            "basedOnCandidateIds": ["baseline", "pca_15"],
+            "objectives": ["Resolve the dimension tradeoff."],
+            "rationale": (
+                "The initial candidates bracket a narrower dimension choice."
+            ),
+            "evidenceIds": [baseline.evidenceIds[0], pca_15.evidenceIds[0]],
+            "stoppingCriteria": ["Execute the proposed candidate once."],
+        }
+    )
+
+    validated = validate_parameter_search_plan(
+        plan,
+        deps,
+        initial_candidate_ids=["baseline", "pca_15"],
+        max_refined_candidates=2,
+    )
+    complete = validate_parameter_search_plan(
+        ParameterSearchPlan(status="refine"),
+        deps,
+        initial_candidate_ids=["baseline", "pca_15"],
+        max_refined_candidates=2,
+    )
+
+    assert "status" not in plan.model_fields_set
+    assert validated.status == "refine"
+    assert validated.candidates == plan.candidates
+    assert complete.status == "complete"
 
 
 def test_refinement_plan_requires_authorized_matched_harmony_evidence() -> None:
@@ -788,7 +836,7 @@ def test_parameter_tuning_agent_delegates_with_its_model_and_config(
     assert captured["config"] is agent.config
 
 
-def test_parameter_tuning_agent_executes_before_two_model_calls() -> None:
+def test_parameter_tuning_skips_unrequested_refinement_planning() -> None:
     model_calls = 0
     seen_function_tools: list[set[str]] = []
 
@@ -799,16 +847,6 @@ def test_parameter_tuning_agent_executes_before_two_model_calls() -> None:
         nonlocal model_calls
         model_calls += 1
         seen_function_tools.append({tool.name for tool in info.function_tools})
-        if model_calls == 1:
-            plan = ParameterSearchPlan(status="complete")
-            return ModelResponse(
-                parts=[
-                    ToolCallPart(
-                        tool_name=info.output_tools[0].name,
-                        args=plan.model_dump(),
-                    )
-                ]
-            )
         report = ParameterTuningReport(
             status="done",
             recommendedCandidateId="baseline",
@@ -839,11 +877,68 @@ def test_parameter_tuning_agent_executes_before_two_model_calls() -> None:
     assert result.recommendedCandidateId == "baseline"
     assert result.searchPlan is not None
     assert result.searchPlan.status == "complete"
-    assert result.searchPlan.runInfo.agentName == "parameter_search_planning"
+    assert result.searchPlan.rationale.startswith("Refinement was not authorized")
+    assert result.searchPlan.runInfo.usage.requests == 0
     assert result.runInfo.agentName == "parameter_tuning"
     assert result.runInfo.toolCalls == []
-    assert model_calls == 2
-    assert seen_function_tools == [set(), set()]
+    assert model_calls == 1
+    assert seen_function_tools == [set()]
+
+
+def test_default_parameter_screen_uses_one_selection_model_call() -> None:
+    candidate_ids = [
+        candidate.candidateId for candidate in get_default_parameter_candidates()
+    ]
+    model_calls = 0
+
+    async def reply(
+        _messages: list[ModelMessage],
+        info: AgentInfo,
+    ) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        selected_evidence = "candidate:baseline:clusters"
+        report = ParameterTuningReport(
+            status="done",
+            recommendedCandidateId="baseline",
+            confidence="medium",
+            rationale="The baseline is the most balanced eligible branch.",
+            evidenceIds=[selected_evidence],
+            comparisons=[
+                CandidateComparison(
+                    candidateId=candidate_id,
+                    summary="The baseline retains the preferred balance.",
+                    evidenceIds=[
+                        selected_evidence,
+                        f"candidate:{candidate_id}:clusters",
+                    ],
+                )
+                for candidate_id in candidate_ids
+                if candidate_id != "baseline"
+            ],
+            stopReason="The deterministic initial screen is complete.",
+        )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args=report.model_dump(),
+                )
+            ]
+        )
+
+    result = ParameterTuningAgent(FunctionModel(reply)).run(
+        _FakeStore(),
+        normalized=_artifact("normalized", 1),
+        from_assay="RNA",
+        experimental_handoff=ExperimentalTuningHandoff(batchAction="skip"),
+    )
+
+    assert model_calls == 1
+    assert [item.candidateId for item in result.evaluations] == candidate_ids
+    assert result.searchPlan is not None
+    assert result.searchPlan.status == "complete"
+    assert result.recommendedCandidateId == "baseline"
 
 
 def test_two_pass_tuning_pairs_exact_multicolumn_harmony_and_runs_refinement() -> None:
@@ -871,7 +966,7 @@ def test_two_pass_tuning_pairs_exact_multicolumn_harmony_and_runs_refinement() -
         assert info.function_tools == []
         if model_calls == 1:
             plan = ParameterSearchPlan(
-                status="refine",
+                status="complete",
                 candidates=[
                     ParameterCandidate(
                         candidateId=selected_id,
@@ -956,6 +1051,8 @@ def test_two_pass_tuning_pairs_exact_multicolumn_harmony_and_runs_refinement() -
     )
 
     assert model_calls == 2
+    assert result.searchPlan is not None
+    assert result.searchPlan.status == "refine"
     assert [evaluation.candidateId for evaluation in result.evaluations] == [
         *initial_ids,
         selected_id,

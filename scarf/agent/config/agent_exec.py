@@ -219,11 +219,12 @@ def run_agent_sync(
     """Run one synchronous agent loop and return its bounded audit record.
 
     Jupyter and other hosts already have a running event loop. Pydantic AI's
-    ``run_sync`` cannot drive that loop, so this hops to a worker thread with
-    its own idle loop in that case.
+    asynchronous runner cannot drive that loop synchronously, so this hops to
+    a worker thread in that case. Entering the agent context ensures provider
+    HTTP clients are closed on that worker's event loop before it exits.
     """
 
-    def execute() -> AgentExecutionResult:
+    async def execute() -> AgentExecutionResult:
         run_config = config or AgentRunConfig()
         agent = _build_agent(
             model=model,
@@ -237,12 +238,13 @@ def run_agent_sync(
             normalize_sync_function_model=True,
         )
         started = time.monotonic()
-        result = agent.run_sync(
-            user_prompt,
-            deps=deps,
-            message_history=message_history,
-            usage_limits=get_usage_limits(run_config),
-        )
+        async with agent:
+            result = await agent.run(
+                user_prompt,
+                deps=deps,
+                message_history=message_history,
+                usage_limits=get_usage_limits(run_config),
+            )
         return _execution_result(
             result=result,
             model=model,
@@ -254,10 +256,10 @@ def run_agent_sync(
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return execute()
+        return asyncio.run(execute())
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(execute).result()
+        return pool.submit(asyncio.run, execute()).result()
 
 
 async def run_agent(
@@ -288,12 +290,13 @@ async def run_agent(
         normalize_sync_function_model=False,
     )
     started = time.monotonic()
-    result = await agent.run(
-        user_prompt,
-        deps=deps,
-        message_history=message_history,
-        usage_limits=get_usage_limits(run_config),
-    )
+    async with agent:
+        result = await agent.run(
+            user_prompt,
+            deps=deps,
+            message_history=message_history,
+            usage_limits=get_usage_limits(run_config),
+        )
     return _execution_result(
         result=result,
         model=model,

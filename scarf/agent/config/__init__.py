@@ -2,6 +2,7 @@
 
 import re
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator
 
@@ -70,12 +71,12 @@ class Config:
 class AgentRunConfig(AgentDataModel):
     """Bound one agent run without selecting a scientific workflow."""
 
-    requestLimit: int = 128
-    toolCallLimit: int = 64
+    requestLimit: int = 6
+    toolCallLimit: int = 4
     inputTokenLimit: int | None = None
-    outputTokenLimit: int | None = None
+    outputTokenLimit: int | None = 32768
     totalTokenLimit: int | None = None
-    timeoutSeconds: float = 1800.0
+    timeoutSeconds: float = 600.0
     retries: int = 2
     temperature: float = 0.0
     seed: int = 4444
@@ -118,6 +119,30 @@ class AgentRunConfig(AgentDataModel):
             raise ValueError("timeoutSeconds must be positive")
         return float(value)
 
+    def with_limits(
+        self,
+        *,
+        request_limit: int,
+        tool_call_limit: int,
+        output_token_limit: int,
+        timeout_seconds: float,
+    ) -> "AgentRunConfig":
+        """Return a copy clamped to the supplied execution maxima."""
+        values = self.model_dump()
+        values.update(
+            {
+                "requestLimit": min(self.requestLimit, request_limit),
+                "toolCallLimit": min(self.toolCallLimit, tool_call_limit),
+                "outputTokenLimit": (
+                    output_token_limit
+                    if self.outputTokenLimit is None
+                    else min(self.outputTokenLimit, output_token_limit)
+                ),
+                "timeoutSeconds": min(self.timeoutSeconds, timeout_seconds),
+            }
+        )
+        return type(self).model_validate(values)
+
     @classmethod
     def get_example(cls) -> "AgentRunConfig":
         return cls(requestLimit=6, toolCallLimit=4, outputTokenLimit=2048)
@@ -128,46 +153,34 @@ def get_model_settings(
     *,
     model: Any = None,
 ) -> Any:
-    """Return provider-safe settings with model thinking disabled.
-
-    Pydantic AI's unified ``thinking=False`` handles official providers. The
-    expanded profiles retain the request-body variants needed by some local or
-    OpenAI-compatible servers, but only one compatible shape is sent at a time.
-    """
+    """Return settings that disable thinking across supported request shapes."""
     from pydantic_ai.settings import ModelSettings
 
     run_config = config or AgentRunConfig()
-    profile = run_config.thinkingOffProfile
-    if profile == "auto":
-        model_system = (
-            model.partition(":")[0]
-            if isinstance(model, str)
-            else str(getattr(model, "system", ""))
-        )
-        profile = "ollama" if model_system.casefold() == "ollama" else "unified"
-    # expanded_bodies: dict[str, dict[str, Any]] = {
-    #     "unified": {},
-    #     "ollama": {"think": False},
-    #     "chatTemplate": {"chat_template_kwargs": {"thinking": False}},
-    #     "thinkingBody": {"thinking": {"type": "disabled"}},
-    #     "reasoningBody": {"reasoning": {"enabled": False}},
-    # }
     extra_body = {
         "thinking": {"type": "disabled"},
-        "reasoning_effort": None,
+        "reasoning_effort": "none",
         "chat_template_kwargs": {"thinking": False},  # for together-ai
         "reasoning": {"enabled": False},  # for openrouter
     }
-    #  expanded_bodies[profile]
     settings = ModelSettings(
-        gtemperature=run_config.temperature,
+        temperature=run_config.temperature,
         seed=run_config.seed,
         timeout=run_config.timeoutSeconds,
         parallel_tool_calls=not run_config.sequentialTools,
         thinking=False,
-        **({"extra_body": extra_body} if extra_body else {}),
+        extra_body=extra_body,
     )
+    if run_config.outputTokenLimit is not None:
+        settings["max_tokens"] = run_config.outputTokenLimit
+
     resolved: dict[str, Any] = dict(settings)
+    base_url = str(getattr(model, "base_url", ""))
+    hostname = (urlparse(base_url).hostname or "").casefold()
+    if hostname == "baseten.co" or hostname.endswith(".baseten.co"):
+        # Pydantic AI maps this provider-specific setting to the top-level
+        # ``reasoning_effort`` field accepted by Baseten's OpenAI endpoint.
+        resolved["openai_reasoning_effort"] = "none"
     resolved.update(run_config.extraModelSettings)
     return resolved
 

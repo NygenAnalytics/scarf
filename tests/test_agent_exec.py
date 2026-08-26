@@ -1,17 +1,25 @@
 """Tests for shared Scarf agent execution and configuration."""
 
 import asyncio
+import json
 import threading
 
+import httpx
+import pydantic_ai.providers.openai as openai_provider_module
+from openai import AsyncOpenAI
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
     ToolCallPart,
     ToolReturnPart,
+    UserPromptPart,
 )
+from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.models.test import TestModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from scarf.agent import CovariateCharacterization, FeatureCharacterization, IngestResult
 from scarf.agent.config.agent_exec import _model_name, run_agent, run_agent_sync
@@ -86,23 +94,129 @@ def test_model_settings_disable_thinking_across_provider_shapes() -> None:
     assert settings["thinking"] is False
     assert settings["parallel_tool_calls"] is False
     assert settings["timeout"] == 42
+    assert settings["temperature"] == 0
     assert settings["max_tokens"] == 123
-    assert "extra_body" not in settings
+    assert "gtemperature" not in settings
+    assert "openai_reasoning_effort" not in settings
+    assert settings["extra_body"] == {
+        "thinking": {"type": "disabled"},
+        "reasoning_effort": "none",
+        "chat_template_kwargs": {"thinking": False},
+        "reasoning": {"enabled": False},
+    }
 
-    assert get_model_settings(model="ollama:qwen3")["extra_body"] == {"think": False}
-    assert get_model_settings(AgentRunConfig(thinkingOffProfile="chatTemplate"))[
-        "extra_body"
-    ] == {"chat_template_kwargs": {"thinking": False}}
-    assert get_model_settings(AgentRunConfig(thinkingOffProfile="thinkingBody"))[
-        "extra_body"
-    ] == {"thinking": {"type": "disabled"}}
-    assert get_model_settings(AgentRunConfig(thinkingOffProfile="reasoningBody"))[
-        "extra_body"
-    ] == {"reasoning": {"enabled": False}}
+    for profile in (
+        "auto",
+        "unified",
+        "ollama",
+        "chatTemplate",
+        "thinkingBody",
+        "reasoningBody",
+    ):
+        assert (
+            get_model_settings(AgentRunConfig(thinkingOffProfile=profile))["extra_body"]
+            == settings["extra_body"]
+        )
     assert get_model_settings(
         AgentRunConfig(extraModelSettings={"extra_body": {"custom": False}}),
         model="ollama:qwen3",
     )["extra_body"] == {"custom": False}
+
+
+def test_agent_run_config_clamps_per_stage_limits() -> None:
+    original = AgentRunConfig(
+        requestLimit=128,
+        toolCallLimit=64,
+        outputTokenLimit=None,
+        timeoutSeconds=1800,
+        extraModelSettings={"service_tier": "default"},
+    )
+
+    bounded = original.with_limits(
+        request_limit=6,
+        tool_call_limit=4,
+        output_token_limit=4096,
+        timeout_seconds=600,
+    )
+
+    assert bounded.requestLimit == 6
+    assert bounded.toolCallLimit == 4
+    assert bounded.outputTokenLimit == 4096
+    assert bounded.timeoutSeconds == 600
+    assert bounded.extraModelSettings == {"service_tier": "default"}
+    assert original.requestLimit == 128
+    assert original.outputTokenLimit is None
+
+    already_stricter = AgentRunConfig(
+        requestLimit=2,
+        toolCallLimit=1,
+        outputTokenLimit=512,
+        timeoutSeconds=30,
+    ).with_limits(
+        request_limit=6,
+        tool_call_limit=4,
+        output_token_limit=4096,
+        timeout_seconds=600,
+    )
+    assert already_stricter.requestLimit == 2
+    assert already_stricter.toolCallLimit == 1
+    assert already_stricter.outputTokenLimit == 512
+    assert already_stricter.timeoutSeconds == 30
+
+
+def test_baseten_request_disables_reasoning_at_wire_level() -> None:
+    bodies: list[dict[str, object]] = []
+
+    async def execute() -> dict[str, object]:
+        async def handle(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "done"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            openai_client = AsyncOpenAI(
+                api_key="test-key",
+                base_url="https://inference.baseten.co/v1",
+                http_client=client,
+            )
+            model = OpenAIChatModel(
+                "deepseek-ai/DeepSeek-V4-Flash-0731",
+                provider=OpenAIProvider(openai_client=openai_client),
+            )
+            settings = get_model_settings(model=model)
+            await model.request(
+                [ModelRequest(parts=[UserPromptPart("hello")])],
+                settings,
+                ModelRequestParameters(),
+            )
+            return settings
+
+    settings = asyncio.run(execute())
+
+    assert settings["openai_reasoning_effort"] == "none"
+    assert len(bodies) == 1
+    assert bodies[0]["reasoning_effort"] == "none"
+    assert bodies[0]["temperature"] == 0
+    assert bodies[0]["max_completion_tokens"] == 4096
 
 
 def test_model_name_preserves_string_model_identifier() -> None:
@@ -145,7 +259,7 @@ def test_sync_runner_records_only_function_tool_calls() -> None:
     async def inspect_value() -> dict[str, str]:
         return {"status": "observed"}
 
-    async def reply(
+    def reply(
         messages: list[ModelMessage],
         info: AgentInfo,
     ) -> ModelResponse:
@@ -237,7 +351,7 @@ def test_sync_runner_works_when_an_event_loop_is_already_running() -> None:
     async def inspect_value() -> dict[str, str]:
         return {"status": "observed"}
 
-    async def reply(
+    def reply(
         messages: list[ModelMessage],
         info: AgentInfo,
     ) -> ModelResponse:
@@ -275,6 +389,94 @@ def test_sync_runner_works_when_an_event_loop_is_already_running() -> None:
     assert result.output == ExampleOutput.get_example()
     assert result.runInfo.agentName == "notebook-host"
     assert [call.toolName for call in result.runInfo.toolCalls] == ["inspect_value"]
+
+
+def test_sync_runner_closes_and_reopens_owned_client_between_notebook_calls(
+    monkeypatch,
+) -> None:
+    clients: list[httpx.AsyncClient] = []
+    request_loops: list[asyncio.AbstractEventLoop] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        request_loops.append(asyncio.get_running_loop())
+        payload = json.loads(request.content)
+        output_tool_name = payload["tools"][-1]["function"]["name"]
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-scarf-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "mock-openai-compatible",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "call-result",
+                                    "type": "function",
+                                    "function": {
+                                        "name": output_tool_name,
+                                        "arguments": json.dumps(
+                                            ExampleOutput.get_example().model_dump()
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            },
+        )
+
+    def make_client(*_args, **_kwargs) -> httpx.AsyncClient:
+        client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        openai_provider_module,
+        "create_async_http_client",
+        make_client,
+    )
+    model = OpenAIChatModel(
+        "mock-openai-compatible",
+        provider=OpenAIProvider(
+            base_url="https://example.test/v1",
+            api_key="test-key",
+        ),
+    )
+
+    async def call_twice_from_running_loop() -> list[AgentExecutionResult]:
+        return [
+            run_agent_sync(
+                model=model,
+                output_type=ExampleOutput,
+                system_prompt="Return structured output.",
+                user_prompt="Return now.",
+            )
+            for _ in range(2)
+        ]
+
+    results = asyncio.run(call_twice_from_running_loop())
+
+    assert [result.output for result in results] == [
+        ExampleOutput.get_example(),
+        ExampleOutput.get_example(),
+    ]
+    assert len(clients) == 2
+    assert all(client.is_closed for client in clients)
+    assert len(request_loops) == 2
+    assert request_loops[0] is not request_loops[1]
 
 
 def test_async_runner_returns_structured_output() -> None:

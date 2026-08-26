@@ -21,6 +21,7 @@ except ImportError as exc:
 
 __all__ = [
     "AssayFeatureInspection",
+    "AssayFeatureInspectionBatch",
     "DataEnrichmentAgent",
     "DataEnrichmentContext",
     "DataEnrichmentDependencies",
@@ -29,11 +30,14 @@ __all__ = [
     "ExogenousFeatureEvidence",
     "FeatureFamilyEvidence",
     "FeatureLookupResult",
+    "FeatureLookupBatch",
     "FeatureMatch",
     "FeatureReference",
     "FeatureSelectionPolicy",
     "find_present_features",
+    "find_present_features_batch",
     "inspect_assay_features",
+    "inspect_assay_features_batch",
     "validate_data_enrichment_report",
 ]
 
@@ -47,14 +51,16 @@ _SYSTEM_PROMPT = (
         tissue references, cell-type references, and experimental details when
         species evidence is ambiguous. Supported species keys are: {supported_species}.
 
-        Never invent a feature. Call find_present_features before placing an
-        individual feature in a policy. Treat Ensembl release misses as unresolved,
-        not artificial. Mitochondrial, ribosomal, and histone families may be
-        exclusion candidates. Sex-linked and cell-cycle families are protected by
-        default in this initial implementation. Do not invent or rephrase tissue,
-        cell-type, or experiment labels. The validator copies those from the
-        supplied caller context. Return a bounded report with citations copied
-        from tool or context evidence IDs.
+        Call inspect_assay_features_batch once for all requested assays. Never
+        invent a feature. If individual features are needed, collect all proposed
+        names across assays and call find_present_features_batch once before
+        placing them in a policy. Treat Ensembl release misses as unresolved, not
+        artificial. Mitochondrial, ribosomal, and histone families may be exclusion
+        candidates. Sex-linked and cell-cycle families are protected by default in
+        this initial implementation. Do not invent or rephrase tissue, cell-type,
+        or experiment labels. The validator copies those from the supplied caller
+        context. Return a bounded report with citations copied from tool or context
+        evidence IDs.
         Do not write code, mutate the datastore, or request arbitrary Scarf calls.
         """
     )
@@ -177,6 +183,25 @@ class AssayFeatureInspection(AgentDataModel):
         )
 
 
+class AssayFeatureInspectionBatch(AgentDataModel):
+    """All requested assay inspections returned by one model tool call."""
+
+    inspections: list[AssayFeatureInspection] = Field(default_factory=list)
+    evidenceIds: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def get_blank(cls) -> "AssayFeatureInspectionBatch":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "AssayFeatureInspectionBatch":
+        inspection = AssayFeatureInspection.get_example()
+        return cls(
+            inspections=[inspection],
+            evidenceIds=list(inspection.evidenceIds),
+        )
+
+
 class FeatureReference(AgentDataModel):
     """An exact feature identifier and name observed in one assay."""
 
@@ -233,6 +258,22 @@ class FeatureLookupResult(AgentDataModel):
             results=[match],
             evidenceIds=list(match.evidenceIds),
         )
+
+
+class FeatureLookupBatch(AgentDataModel):
+    """Exact feature lookups for every requested assay in one tool result."""
+
+    lookups: list[FeatureLookupResult] = Field(default_factory=list)
+    evidenceIds: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def get_blank(cls) -> "FeatureLookupBatch":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "FeatureLookupBatch":
+        lookup = FeatureLookupResult.get_example()
+        return cls(lookups=[lookup], evidenceIds=list(lookup.evidenceIds))
 
 
 class FeatureSelectionPolicy(AgentDataModel):
@@ -474,6 +515,39 @@ async def inspect_assay_features(
     return inspection
 
 
+async def inspect_assay_features_batch(
+    ctx: RunContext[DataEnrichmentDependencies],
+) -> AssayFeatureInspectionBatch:
+    """Inspect every requested assay and return one bounded tool result."""
+    deps = ctx.deps
+    if not deps.assays:
+        raise ModelRetry("No assays were requested")
+    start = len(deps.toolCalls)
+    inspections = [
+        await inspect_assay_features(ctx, assay_name=assay_name)
+        for assay_name in deps.assays
+    ]
+    del deps.toolCalls[start:]
+    evidence_ids = list(
+        dict.fromkeys(
+            evidence_id
+            for inspection in inspections
+            for evidence_id in inspection.evidenceIds
+        )
+    )
+    deps.toolCalls.append(
+        DataEnrichmentToolCall(
+            name="inspect_assay_features_batch",
+            assay=",".join(deps.assays),
+            evidenceIds=evidence_ids,
+        )
+    )
+    return AssayFeatureInspectionBatch(
+        inspections=inspections,
+        evidenceIds=evidence_ids,
+    )
+
+
 async def find_present_features(
     ctx: RunContext[DataEnrichmentDependencies],
     assay_name: str,
@@ -487,7 +561,9 @@ async def find_present_features(
         raise ModelRetry(
             f"assay_name must be one of the requested assays: {deps.assays}"
         )
-    clean_queries = [value.strip() for value in queries if value.strip()]
+    clean_queries = list(
+        dict.fromkeys(value.strip() for value in queries if value.strip())
+    )
     if not clean_queries or len(clean_queries) > CONFIG._MAX_FEATURE_QUERIES:
         raise ModelRetry(
             f"queries must contain between 1 and {CONFIG._MAX_FEATURE_QUERIES} values"
@@ -554,6 +630,63 @@ async def find_present_features(
         )
     )
     return result
+
+
+async def find_present_features_batch(
+    ctx: RunContext[DataEnrichmentDependencies],
+    queries_by_assay: dict[str, list[str]],
+) -> FeatureLookupBatch:
+    """Resolve all proposed individual features through one model tool call."""
+    deps = ctx.deps
+    unknown_assays = sorted(set(queries_by_assay) - set(deps.assays))
+    if unknown_assays:
+        raise ModelRetry(f"Unknown requested assays: {unknown_assays}")
+    if not queries_by_assay:
+        raise ModelRetry("queries_by_assay must contain at least one assay")
+    clean_queries_by_assay = {
+        assay_name: list(
+            dict.fromkeys(value.strip() for value in queries if value.strip())
+        )
+        for assay_name, queries in queries_by_assay.items()
+    }
+    empty_assays = sorted(
+        assay_name
+        for assay_name, queries in clean_queries_by_assay.items()
+        if not queries
+    )
+    if empty_assays:
+        raise ModelRetry(f"Feature-query batches cannot be empty: {empty_assays}")
+    query_count = sum(len(queries) for queries in clean_queries_by_assay.values())
+    if query_count > CONFIG._MAX_FEATURE_QUERIES:
+        raise ModelRetry(
+            "The batch may contain at most "
+            f"{CONFIG._MAX_FEATURE_QUERIES} feature queries in total"
+        )
+
+    start = len(deps.toolCalls)
+    lookups = [
+        await find_present_features(
+            ctx,
+            assay_name=assay_name,
+            queries=clean_queries_by_assay[assay_name],
+        )
+        for assay_name in deps.assays
+        if assay_name in clean_queries_by_assay
+    ]
+    del deps.toolCalls[start:]
+    evidence_ids = list(
+        dict.fromkeys(
+            evidence_id for lookup in lookups for evidence_id in lookup.evidenceIds
+        )
+    )
+    deps.toolCalls.append(
+        DataEnrichmentToolCall(
+            name="find_present_features_batch",
+            assay=",".join(queries_by_assay),
+            evidenceIds=evidence_ids,
+        )
+    )
+    return FeatureLookupBatch(lookups=lookups, evidenceIds=evidence_ids)
 
 
 def validate_data_enrichment_report(
@@ -636,7 +769,7 @@ def validate_data_enrichment_report(
         unknown_features = cited_features - confirmed
         if unknown_features:
             raise ValueError(
-                "Call find_present_features before citing individual features: "
+                "Call find_present_features_batch before citing individual features: "
                 f"{sorted(unknown_features)}"
             )
         exogenous_evidence = {
@@ -694,7 +827,12 @@ class DataEnrichmentAgent:
         config: AgentRunConfig | None = None,
     ) -> None:
         self.model = model
-        self.config = config or AgentRunConfig()
+        self.config = (config or AgentRunConfig()).with_limits(
+            request_limit=5,
+            tool_call_limit=2,
+            output_token_limit=32768,
+            timeout_seconds=600.0,
+        )
 
     def run(
         self,
@@ -752,8 +890,11 @@ class DataEnrichmentAgent:
                 Cell-type references: {cell_type_references}
                 Experimental details: {experimental_details}
 
-                Start by inspecting every assay. Resolve individual feature names
-                through the lookup tool before returning them in a policy.
+                Call inspect_assay_features_batch exactly once to inspect every
+                assay together. If a policy needs individual features, collect all
+                proposed names for all assays and call
+                find_present_features_batch exactly once. Do not call a singular
+                assay tool or split lookups across calls.
                 """
             )
             .strip()
@@ -774,7 +915,7 @@ class DataEnrichmentAgent:
             output_type=DataEnrichmentReport,
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            tools=[inspect_assay_features, find_present_features],
+            tools=[inspect_assay_features_batch, find_present_features_batch],
             deps_type=DataEnrichmentDependencies,
             deps=deps,
             config=self.config,

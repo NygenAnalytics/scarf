@@ -27,12 +27,14 @@ from scarf.agent.biological_interpretation import (
     BiologicalInterpretationReport,
     ClusterCompositionEvidence,
     ClusterInterpretation,
+    ClusterMarkerBatchEvidence,
     ClusterMarkerEvidence,
     ConditionClusterSummary,
     FollowUpRecommendation,
     MarkerFeature,
     TreatmentObservation,
     inspect_cluster_composition,
+    inspect_cluster_markers_batch,
     inspect_cluster_markers,
     validate_biological_interpretation_report,
 )
@@ -172,6 +174,7 @@ def test_models_have_blank_and_example_constructors() -> None:
         ClusterCompositionEvidence,
         MarkerFeature,
         ClusterMarkerEvidence,
+        ClusterMarkerBatchEvidence,
         ClusterInterpretation,
         TreatmentObservation,
         FollowUpRecommendation,
@@ -192,6 +195,7 @@ def test_system_prompt_does_not_embed_fictional_output_values() -> None:
     assert "C1QA" not in _SYSTEM_PROMPT
     assert "alveolar macrophage" not in _SYSTEM_PROMPT
     assert "cluster-versus-rest marker specificity" in _SYSTEM_PROMPT
+    assert "inspect_cluster_markers_batch exactly once" in _SYSTEM_PROMPT
 
 
 def test_composition_is_sample_level_and_hides_sample_identifiers() -> None:
@@ -242,6 +246,22 @@ def test_marker_search_runs_once_only_when_authorized() -> None:
     asyncio.run(inspect_cluster_markers(run_context, cluster_id="1"))
 
     assert store.marker_calls == 1
+
+
+def test_marker_batch_returns_all_selected_clusters_in_one_result() -> None:
+    store = FakeStore()
+    run_context = context(store, marker=store.marker)
+    asyncio.run(inspect_cluster_composition(run_context))
+
+    result = asyncio.run(
+        inspect_cluster_markers_batch(run_context, cluster_ids=["0", "1"])
+    )
+
+    assert [cluster.clusterId for cluster in result.clusters] == ["0", "1"]
+    assert result.evidenceIds == [
+        f"markers:{'a' * 64}:clusters:{'b' * 64}:cluster:0",
+        f"markers:{'a' * 64}:clusters:{'b' * 64}:cluster:1",
+    ]
 
 
 def test_marker_artifact_must_use_the_exact_cluster_artifact() -> None:
@@ -482,8 +502,8 @@ def test_agent_waits_for_tools_and_returns_audited_report() -> None:
             return ModelResponse(
                 parts=[
                     ToolCallPart(
-                        tool_name="inspect_cluster_markers",
-                        args={"cluster_id": "0"},
+                        tool_name="inspect_cluster_markers_batch",
+                        args={"cluster_ids": ["0"]},
                     )
                 ]
             )
@@ -554,7 +574,7 @@ def test_agent_waits_for_tools_and_returns_audited_report() -> None:
     assert result.runInfo.usage.toolCalls == 2
     assert seen_tools == {
         "inspect_cluster_composition",
-        "inspect_cluster_markers",
+        "inspect_cluster_markers_batch",
     }
 
 

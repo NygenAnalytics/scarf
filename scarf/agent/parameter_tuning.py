@@ -188,8 +188,20 @@ class CandidateComparison(AgentDataModel):
 class ParameterSearchPlan(AgentDataModel):
     """Validated proposal for one bounded refinement pass."""
 
-    status: ParameterSearchStatus = "complete"
-    candidates: list[ParameterCandidate] = Field(default_factory=list)
+    status: ParameterSearchStatus = Field(
+        default="complete",
+        description=(
+            "Summary derived from candidates: refine when candidates is non-empty "
+            "and complete when it is empty"
+        ),
+    )
+    candidates: list[ParameterCandidate] = Field(
+        default_factory=list,
+        description=(
+            "Bounded unexecuted refinement candidates, or an empty list when the "
+            "initial screen is complete"
+        ),
+    )
     basedOnCandidateIds: list[str] = Field(default_factory=list)
     harmonyBatchColumns: list[str] = Field(default_factory=list)
     objectives: list[str] = Field(default_factory=list)
@@ -430,12 +442,15 @@ def parameter_search_system_prompt() -> str:
         The initial candidate screen has already finished. Do not request tools or
         claim that additional candidates ran.
 
-        Propose status=refine only when an untested candidate inside the initial
-        numeric search envelope can resolve a specific evidence-backed uncertainty.
-        Otherwise return status=complete with no candidates. A Harmony candidate
-        always uses the exact authorized batch columns supplied in the prompt.
-        You may choose between no correction and that approved Harmony
-        configuration, but you must not propose or modify batch columns.
+        Return exactly one of these two plan shapes:
+        1. status=complete with candidates=[] when the initial screen is sufficient.
+        2. status=refine with one or more candidates when an untested candidate
+           inside the initial numeric search envelope can resolve a specific
+           evidence-backed uncertainty.
+        Never return status=complete with candidates. A Harmony candidate always
+        uses the exact authorized batch columns supplied in the prompt. You may
+        choose between no correction and that approved Harmony configuration, but
+        you must not propose or modify batch columns.
 
         Cite only evidenceIds from the initial evaluations. Identify the successful
         initial candidates that motivate refinement, state focused objectives, and
@@ -939,14 +954,18 @@ def validate_parameter_search_plan(
             "Parameter search plan cannot modify the exact authorized Harmony "
             "batch columns"
         )
-    plan = plan.model_copy(update={"harmonyBatchColumns": authorized_batch_columns})
+    canonical_status: ParameterSearchStatus = (
+        "refine" if plan.candidates else "complete"
+    )
+    plan = plan.model_copy(
+        update={
+            "status": canonical_status,
+            "harmonyBatchColumns": authorized_batch_columns,
+        }
+    )
     if plan.status == "complete":
-        if plan.candidates:
-            raise ValueError("A complete parameter search plan must not add candidates")
         return plan
 
-    if not plan.candidates:
-        raise ValueError("A refinement plan must propose at least one candidate")
     if len(plan.candidates) > max_refined_candidates:
         raise ValueError(
             "Parameter search plan exceeds the refined candidate limit "
@@ -1225,7 +1244,12 @@ class ParameterTuningAgent:
         config: AgentRunConfig | None = None,
     ) -> None:
         self.model = model
-        self.config = config or AgentRunConfig()
+        self.config = (config or AgentRunConfig()).with_limits(
+            request_limit=3,
+            tool_call_limit=1,
+            output_token_limit=32768,
+            timeout_seconds=600.0,
+        )
 
     def run(
         self,
@@ -1239,10 +1263,10 @@ class ParameterTuningAgent:
         preservation_columns: Sequence[str] = (),
         experimental_handoff: ExperimentalTuningHandoff | None = None,
         max_candidates: int = 5,
-        max_refined_candidates: int = 5,
+        max_refined_candidates: int = 0,
         min_cluster_cells: int = 20,
     ) -> ParameterTuningReport:
-        """Run deterministic screening, refinement planning, and final selection."""
+        """Run deterministic screening, optional refinement, and final selection."""
         return tune_parameters(
             store,
             model=self.model,
@@ -1272,7 +1296,7 @@ def tune_parameters(
     preservation_columns: Sequence[str] = (),
     experimental_handoff: ExperimentalTuningHandoff | None = None,
     max_candidates: int = 5,
-    max_refined_candidates: int = 5,
+    max_refined_candidates: int = 0,
     min_cluster_cells: int = 20,
     config: AgentRunConfig | None = None,
 ) -> ParameterTuningReport:
@@ -1372,7 +1396,12 @@ def tune_parameters(
             "Initial and refined candidates may contain at most "
             f"{CONFIG._MAX_CANDIDATES_OFFERED} values"
         )
-    run_config = config or AgentRunConfig()
+    run_config = (config or AgentRunConfig()).with_limits(
+        request_limit=3,
+        tool_call_limit=1,
+        output_token_limit=32768,
+        timeout_seconds=600.0,
+    )
     candidate_map: dict[str, ParameterCandidate] = {}
     for candidate in candidate_values:
         if not CONFIG._CANDIDATE_ID.fullmatch(candidate.candidateId):
@@ -1421,38 +1450,51 @@ def tune_parameters(
         deps.evaluations[candidate_id] for candidate_id in initial_candidate_ids
     ]
 
-    planning_execution = run_agent_sync(
-        model=model,
-        output_type=ParameterSearchPlan,
-        system_prompt=parameter_search_system_prompt(),
-        user_prompt=parameter_search_prompt(
-            from_assay=from_assay,
-            cell_key=resolved_cell_key,
-            evaluations=initial_evaluations,
-            batch_columns=resolved_batch_columns,
-            preservation_columns=resolved_preservation_columns,
-            harmony_authorized=harmony_authorized,
-            max_refined_candidates=max_refined_candidates,
-        ),
-        deps_type=ParameterTuningDependencies,
-        deps=deps,
-        config=run_config,
-        name="parameter_search_planning",
-        output_validator=lambda plan: validate_parameter_search_plan(
-            plan,
+    if max_refined_candidates == 0:
+        plan = ParameterSearchPlan(
+            status="complete",
+            rationale=(
+                "Refinement was not authorized because max_refined_candidates is zero."
+            ),
+            stoppingCriteria=[
+                "Use the completed initial screen without a refinement pass."
+            ],
+        )
+    else:
+        planning_execution = run_agent_sync(
+            model=model,
+            output_type=ParameterSearchPlan,
+            system_prompt=parameter_search_system_prompt(),
+            user_prompt=parameter_search_prompt(
+                from_assay=from_assay,
+                cell_key=resolved_cell_key,
+                evaluations=initial_evaluations,
+                batch_columns=resolved_batch_columns,
+                preservation_columns=resolved_preservation_columns,
+                harmony_authorized=harmony_authorized,
+                max_refined_candidates=max_refined_candidates,
+            ),
+            deps_type=ParameterTuningDependencies,
+            deps=deps,
+            config=run_config,
+            name="parameter_search_planning",
+            output_validator=lambda proposed_plan: validate_parameter_search_plan(
+                proposed_plan,
+                deps,
+                initial_candidate_ids=initial_candidate_ids,
+                max_refined_candidates=max_refined_candidates,
+            ),
+        )
+        if not isinstance(planning_execution.output, ParameterSearchPlan):
+            raise TypeError(
+                "Parameter search planner returned an unexpected output type"
+            )
+        plan = validate_parameter_search_plan(
+            planning_execution.output,
             deps,
             initial_candidate_ids=initial_candidate_ids,
             max_refined_candidates=max_refined_candidates,
-        ),
-    )
-    if not isinstance(planning_execution.output, ParameterSearchPlan):
-        raise TypeError("Parameter search planner returned an unexpected output type")
-    plan = validate_parameter_search_plan(
-        planning_execution.output,
-        deps,
-        initial_candidate_ids=initial_candidate_ids,
-        max_refined_candidates=max_refined_candidates,
-    ).model_copy(update={"runInfo": planning_execution.runInfo})
+        ).model_copy(update={"runInfo": planning_execution.runInfo})
 
     for candidate in plan.candidates:
         deps.candidates[candidate.candidateId] = candidate

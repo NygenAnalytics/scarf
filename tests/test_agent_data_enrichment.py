@@ -10,6 +10,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from scarf.agent.characterize_features import FeatureCharacterization
 from scarf.agent.data_enrichment import (
     AssayFeatureInspection,
+    AssayFeatureInspectionBatch,
     DataEnrichmentAgent,
     DataEnrichmentContext,
     DataEnrichmentDependencies,
@@ -18,6 +19,7 @@ from scarf.agent.data_enrichment import (
     ExogenousFeatureEvidence,
     FeatureFamilyEvidence,
     FeatureLookupResult,
+    FeatureLookupBatch,
     FeatureMatch,
     FeatureReference,
     FeatureSelectionPolicy,
@@ -104,6 +106,8 @@ def test_data_enrichment_models_have_factories_and_camelcase_fields() -> None:
         FeatureReference,
         FeatureMatch,
         FeatureLookupResult,
+        FeatureLookupBatch,
+        AssayFeatureInspectionBatch,
         FeatureSelectionPolicy,
         DataEnrichmentToolCall,
         DataEnrichmentReport,
@@ -145,8 +149,8 @@ def test_data_enrichment_agent_uses_only_read_tools_and_context(
             return ModelResponse(
                 parts=[
                     ToolCallPart(
-                        tool_name="inspect_assay_features",
-                        args={"assay_name": "RNA"},
+                        tool_name="inspect_assay_features_batch",
+                        args={},
                     )
                 ]
             )
@@ -154,10 +158,9 @@ def test_data_enrichment_agent_uses_only_read_tools_and_context(
             return ModelResponse(
                 parts=[
                     ToolCallPart(
-                        tool_name="find_present_features",
+                        tool_name="find_present_features_batch",
                         args={
-                            "assay_name": "RNA",
-                            "queries": ["MT-CYB", "ERCC-00002"],
+                            "queries_by_assay": {"RNA": ["MT-CYB", "ERCC-00002"]},
                         },
                     )
                 ]
@@ -217,21 +220,24 @@ def test_data_enrichment_agent_uses_only_read_tools_and_context(
     assert result.policies[0].species == "homo_sapiens"
     assert result.policies[0].artificialFeatures == ["ERCC-00002"]
     assert [call.name for call in result.toolCalls] == [
-        "inspect_assay_features",
-        "find_present_features",
+        "inspect_assay_features_batch",
+        "find_present_features_batch",
     ]
     assert result.runInfo.agentName == "data_enrichment"
     assert result.runInfo.modelName.startswith("function:")
     assert [call.toolName for call in result.runInfo.toolCalls] == [
-        "inspect_assay_features",
-        "find_present_features",
+        "inspect_assay_features_batch",
+        "find_present_features_batch",
     ]
-    assert tool_names == {"inspect_assay_features", "find_present_features"}
+    assert tool_names == {
+        "inspect_assay_features_batch",
+        "find_present_features_batch",
+    }
     assert store.features.fetches == ["ids", "names"]
     assert characterization_calls[0]["model"] is None
     assert characterization_calls[0]["studyContext"].startswith("Treated human")
     assert settings[0]["parallel_tool_calls"] is False
-    assert "extra_body" not in settings[0]
+    assert settings[0]["extra_body"]["reasoning_effort"] == "none"
 
 
 def test_data_enrichment_retries_hallucinated_features(
@@ -257,8 +263,8 @@ def test_data_enrichment_retries_hallucinated_features(
             return ModelResponse(
                 parts=[
                     ToolCallPart(
-                        tool_name="inspect_assay_features",
-                        args={"assay_name": "RNA"},
+                        tool_name="inspect_assay_features_batch",
+                        args={},
                     )
                 ]
             )

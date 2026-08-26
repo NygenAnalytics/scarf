@@ -35,12 +35,14 @@ __all__ = [
     "BiologicalInterpretationReport",
     "ClusterCompositionEvidence",
     "ClusterInterpretation",
+    "ClusterMarkerBatchEvidence",
     "ClusterMarkerEvidence",
     "ConditionClusterSummary",
     "FollowUpRecommendation",
     "MarkerFeature",
     "TreatmentObservation",
     "inspect_cluster_composition",
+    "inspect_cluster_markers_batch",
     "inspect_cluster_markers",
     "validate_biological_interpretation_report",
 ]
@@ -194,6 +196,23 @@ class ClusterMarkerEvidence(AgentDataModel):
             ),
             evidenceId="markers:RNA_cluster:cluster:3",
         )
+
+
+class ClusterMarkerBatchEvidence(AgentDataModel):
+    """Markers for all model-selected clusters returned by one tool call."""
+
+    clusters: list[ClusterMarkerEvidence] = Field(default_factory=list)
+    evidenceIds: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+    @classmethod
+    def get_blank(cls) -> "ClusterMarkerBatchEvidence":
+        return cls()
+
+    @classmethod
+    def get_example(cls) -> "ClusterMarkerBatchEvidence":
+        cluster = ClusterMarkerEvidence.get_example()
+        return cls(clusters=[cluster], evidenceIds=[cluster.evidenceId])
 
 
 class ClusterInterpretation(AgentDataModel):
@@ -364,9 +383,11 @@ class BiologicalInterpretationDependencies(AgentDataModel):
 _SYSTEM_PROMPT = dedent(
     """
         You are Scarf's Biological Interpretation Agent. Use only the supplied
-        tools and caller context. First inspect cluster composition, then inspect
-        markers for every cluster you interpret. Tool calls execute Scarf
-        operations, so wait for their results before drawing conclusions.
+        tools and caller context. Call inspect_cluster_composition exactly once.
+        Then select every cluster you intend to interpret and call
+        inspect_cluster_markers_batch exactly once with all selected cluster IDs.
+        Tool calls execute Scarf operations, so wait for their results before
+        drawing conclusions. Do not split marker inspection across calls.
 
         Treat cell identities as hypotheses unless the caller supplied a trusted
         label. Do not invent genes, cell types, statistics, artifact identifiers,
@@ -725,6 +746,39 @@ async def inspect_cluster_markers(
     )
 
 
+async def inspect_cluster_markers_batch(
+    ctx: RunContext[BiologicalInterpretationDependencies],
+    cluster_ids: list[str],
+) -> ClusterMarkerBatchEvidence:
+    """Inspect every selected cluster in one bounded model tool call."""
+    if not ctx.deps.clusterValues:
+        raise ModelRetry("Call inspect_cluster_composition before inspecting markers.")
+    if not cluster_ids:
+        raise ModelRetry("cluster_ids must contain at least one observed cluster")
+    if len(cluster_ids) > ctx.deps.maxClusters:
+        raise ModelRetry(
+            f"cluster_ids may contain at most {ctx.deps.maxClusters} values"
+        )
+    if len(set(cluster_ids)) != len(cluster_ids):
+        raise ModelRetry("cluster_ids must not contain duplicates")
+
+    clusters = [
+        await inspect_cluster_markers(ctx, cluster_id=cluster_id)
+        for cluster_id in cluster_ids
+    ]
+    evidence_ids = [cluster.evidenceId for cluster in clusters if cluster.evidenceId]
+    warnings = [
+        f"Cluster {cluster.clusterId}: {warning}"
+        for cluster in clusters
+        for warning in cluster.warnings
+    ]
+    return ClusterMarkerBatchEvidence(
+        clusters=clusters,
+        evidenceIds=evidence_ids,
+        warnings=warnings,
+    )
+
+
 def _marker_feature(row: dict[str, Any]) -> MarkerFeature:
     raw_index = _finite_float(row.get("feature_index"))
     return MarkerFeature(
@@ -929,7 +983,12 @@ class BiologicalInterpretationAgent:
         config: AgentRunConfig | None = None,
     ) -> None:
         self.model = model
-        self.config = config or AgentRunConfig()
+        self.config = (config or AgentRunConfig()).with_limits(
+            request_limit=5,
+            tool_call_limit=2,
+            output_token_limit=32768,
+            timeout_seconds=600.0,
+        )
 
     def run(
         self,
@@ -1064,8 +1123,10 @@ class BiologicalInterpretationAgent:
                 Experimental design context:
                 {experimental_context}
 
-                Begin by calling inspect_cluster_composition. If markers cannot be
-                inspected, return needsInput and state the exact missing input.
+                Call inspect_cluster_composition once. Then send every cluster you
+                intend to interpret in one inspect_cluster_markers_batch call. If
+                markers cannot be inspected, return needsInput and state the exact
+                missing input.
                 """
             )
             .strip()
@@ -1090,7 +1151,7 @@ class BiologicalInterpretationAgent:
             output_type=BiologicalInterpretationReport,
             system_prompt=_SYSTEM_PROMPT,
             user_prompt=user_prompt,
-            tools=(inspect_cluster_composition, inspect_cluster_markers),
+            tools=(inspect_cluster_composition, inspect_cluster_markers_batch),
             deps_type=BiologicalInterpretationDependencies,
             deps=deps,
             config=self.config,

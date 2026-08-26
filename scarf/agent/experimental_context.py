@@ -1018,17 +1018,24 @@ class ExperimentalContextAgent:
         config: AgentRunConfig | None = None,
     ) -> None:
         self.model = model
-        self.config = config or AgentRunConfig()
+        self.config = (config or AgentRunConfig()).with_limits(
+            request_limit=6,
+            tool_call_limit=3,
+            output_token_limit=32768,
+            timeout_seconds=600.0,
+        )
         self.system_prompt = dedent(
             """
             You are Scarf's Experimental Context Agent. Work only through the
             provided read-only tools and return the structured decision schema.
 
-            First call inspect_cell_covariates. Then call
-            analyze_experimental_design with explicit domains, biological
-            coefficients, valid units of inference, and the exact batch columns
-            being considered. You may call score_current_representation when a
-            current graph can add evidence.
+            Call inspect_cell_covariates exactly once. Then call
+            analyze_experimental_design exactly once with all explicit domains,
+            all biological coefficients, every unit of inference, and the complete
+            exact batch-column set being considered. You may call
+            score_current_representation at most once when a current graph can add
+            evidence. Do not split metadata, coefficients, or batch columns across
+            calls, and do not repeat a tool call.
 
             A batch column must be categorical and technical. Never use donor,
             sample, observation-unit, independent-unit, biological, cluster, or
