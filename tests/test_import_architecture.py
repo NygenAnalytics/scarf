@@ -1,6 +1,7 @@
 import ast
 import subprocess
 import sys
+from functools import cache
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -120,11 +121,20 @@ def _root_imports(path: Path) -> set[str]:
     return imports
 
 
+@cache
+def _root_imports_by_path() -> dict[str, set[str]]:
+    return {
+        path.relative_to(_SCARF_ROOT).as_posix(): _root_imports(path)
+        for path in _SCARF_ROOT.rglob("*.py")
+        if path != _SCARF_ROOT / "__init__.py"
+    }
+
+
 def _facade_importers(facade_name: str) -> set[str]:
     return {
-        path.relative_to(_SCARF_ROOT).as_posix()
-        for path in _SCARF_ROOT.rglob("*.py")
-        if path != _SCARF_ROOT / "__init__.py" and facade_name in _root_imports(path)
+        relative
+        for relative, imports in _root_imports_by_path().items()
+        if facade_name in imports
     }
 
 
@@ -265,6 +275,7 @@ def test_storage_has_no_upward_dependencies():
         _upward_imports(
             "storage",
             {"assay", "datastore", "plotting", "writers"},
+            allowed_modules=frozenset({"assay.classification"}),
         )
         == set()
     )
@@ -417,6 +428,7 @@ def test_extracted_domains_have_only_narrow_storage_dependencies():
     forbidden = {"datastore", "plotting", "readers", "writers"}
     storage_exceptions = {
         "features": {
+            "enrichment/results.py",
             "genomic/melding.py",
             "markers/batching.py",
             "markers/search.py",
@@ -495,24 +507,27 @@ def test_mapping_does_not_import_orchestration_or_general_io():
 
 
 def test_internal_modules_use_canonical_storage_and_utility_paths():
-    assert _facade_importers("ann") == set()
-    assert _facade_importers("dendrogram") == set()
-    assert _facade_importers("knn_utils") == set()
-    assert _facade_importers("results") == set()
-    assert _facade_importers("umap") == set()
-    assert _facade_importers("writers") == set()
-    assert _facade_importers("parallel") == set()
-    assert _facade_importers("storage.zarr_store") == set()
-    assert _facade_importers("utils") == set()
-    for retired_module in (
+    for facade_name in (
+        "ann",
+        "dendrogram",
+        "knn_utils",
+        "results",
+        "umap",
+        "writers",
+        "parallel",
+        "storage.zarr_store",
+        "utils",
         "bio_data",
         "doublet_utils",
         "feat_utils",
         "meld_assay",
+        "utils.blocks",
+        "utils.memory",
+        "utils.storage",
+        "utils.system",
+        "utils.windows",
     ):
-        assert _facade_importers(retired_module) == set()
-    for retired_module in ("blocks", "memory", "storage", "system", "windows"):
-        assert _facade_importers(f"utils.{retired_module}") == set()
+        assert _facade_importers(facade_name) == set()
 
 
 def test_internal_modules_do_not_use_moved_symbols_from_hybrid_facades():
@@ -586,8 +601,18 @@ def test_retired_root_import_paths_do_not_resolve():
         "scarf.clustering.hierarchy",
         "scarf.features.lowess",
         "scarf.trajectory.aggregation",
+        "scarf.lineage",
     ):
         assert find_spec(module_name) is None
+
+
+def test_cytebase_and_lineage_live_in_packages():
+    cytebase_root = _SCARF_ROOT / "cytebase"
+    assert cytebase_root.is_dir()
+    assert not (_SCARF_ROOT / "cytebase.py").exists()
+    assert (cytebase_root / "__init__.py").is_file()
+    assert not (_SCARF_ROOT / "lineage.py").exists()
+    assert (_SCARF_ROOT / "storage" / "lineage.py").is_file()
 
 
 def test_utility_modules_use_domain_names():
@@ -837,6 +862,7 @@ def test_writer_implementations_are_runtime_isolated():
         "_materialize.py",
         "_store.py",
         "cellranger.py",
+        "counts_t.py",
         "csv.py",
         "export.py",
         "h5ad.py",
@@ -855,6 +881,8 @@ def test_writer_implementations_are_runtime_isolated():
     )
 
     forbidden_roots = {"assay", "datastore", "mapping", "merge", "plotting"}
+    # Shared RNA classifier is the intentional write/load boundary for countsT.
+    allowed_assay_imports = {"assay.classification"}
     format_modules = {
         "writers.cellranger",
         "writers.csv",
@@ -872,7 +900,7 @@ def test_writer_implementations_are_runtime_isolated():
         "writers.load_count_store",
         "writers.load_zarr",
     }
-    shared_edges = {"writers._materialize", "writers._store"}
+    shared_edges = {"writers._materialize", "writers._store", "writers.counts_t"}
     matching_reader_exports = {
         "cellranger.py": {"CrReader"},
         "csv.py": {"CSVReader"},
@@ -899,6 +927,7 @@ def test_writer_implementations_are_runtime_isolated():
             module_name
             for module_name in runtime_imports
             if module_name.split(".", 1)[0] in forbidden_roots
+            and module_name not in allowed_assay_imports
         }
         writer_edges = {
             module_name
@@ -963,6 +992,9 @@ def test_assay_implementations_are_runtime_isolated():
         allowed_function_local = {"plotting"}
         if path.name == "base.py":
             allowed_function_local.add("assay.rna")
+        if path.name == "classification.py":
+            # Classifier resolves preset strings to modality classes.
+            allowed_function_local |= modality_modules
         function_local_imports = (
             _runtime_import_modules(path)
             - module_scope_imports

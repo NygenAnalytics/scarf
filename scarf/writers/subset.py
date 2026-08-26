@@ -6,6 +6,8 @@ import zarr
 
 from ..storage.types import as_zarr_array, as_zarr_group
 from ..storage.arrays import create_numeric_array, create_zarr_obj_array
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.layout import count_array_spec
 from ..storage.profiles import (
     StorageProfile,
@@ -19,6 +21,25 @@ from ..storage.stores import load_zarr
 from ..utils.logging import logger
 
 
+def _source_assay_types(assay: Any, _in_workspace: str | None = None) -> dict[str, str]:
+    """Read persisted ``assayTypes`` from the source store when available.
+
+    ``assay.z`` is the assay group. For legacy stores its parent is the Zarr
+    root; for workspace stores the parent is the workspace group. Both places
+    hold ``assayTypes``.
+    """
+    try:
+        parent = assay.z.parent
+    except Exception:
+        return {}
+    if parent is None:
+        return {}
+    raw = parent.attrs.get("assayTypes", {})
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    return {}
+
+
 def subset_assay_zarr(
     zarr_loc: ZarrLocation,
     in_grp: str,
@@ -29,8 +50,8 @@ def subset_assay_zarr(
     mem_budget: int | str | None = None,
     nthreads: int | None = None,
     profile: StorageProfile | None = None,
-    targetChunkBytes: int | None = None,
-    targetShardBytes: int | None = None,
+    policy: CountMatrixPolicy | None = None,
+    io: StorageIoPolicy | None = None,
 ) -> None:
     """Selects a subset of the data in an assay in the specified Zarr
     hierarchy.
@@ -44,6 +65,16 @@ def subset_assay_zarr(
         out_grp: Group name in Zarr hierarchy to write subsetted assay to.
         cells_idx: Indices of cells to keep in the subset.
         feat_idx: Indices of features to keep in the subset.
+        storage_options: Backend options passed when opening the Zarr store.
+        mem_budget: Memory available to the conversion. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
+        nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
     Returns:
         None
     """
@@ -58,8 +89,7 @@ def subset_assay_zarr(
         len(feat_idx),
         dtype="uint32",
         profile=resolved_profile,
-        targetChunkBytes=targetChunkBytes,
-        targetShardBytes=targetShardBytes,
+        policy=policy,
     )
     og = create_numeric_array(z, out_grp, spec)
     write_dense_in_shard_rows(
@@ -69,6 +99,7 @@ def subset_assay_zarr(
         ),
         msg="Subsetting assay",
         resources=resources,
+        io=io,
     )
     return None
 
@@ -89,6 +120,16 @@ class SubsetZarr:
                            this parameter to False. (Default value: True)
         overwrite_existing_file: If True, then overwrites the existing data. (Default value: False)
         overwrite_cell_data: If True, then overwrites cell data (Default value: False)
+        storage_options: Backend options passed when opening the Zarr store.
+        mem_budget: Memory available to the conversion. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
+        nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
     """
 
     def __init__(
@@ -106,8 +147,8 @@ class SubsetZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
 
@@ -141,8 +182,8 @@ class SubsetZarr:
             ),
         )
         self.profile = resolve_storage_profile(zarr_loc, profile)
-        self.targetChunkBytes = targetChunkBytes
-        self.targetShardBytes = targetShardBytes
+        self.policy = policy
+        self.io = io
         self.z = self._check_files(zarr_loc)
         self.assays = self._check_assays(assays)
         self.cellIdx = self._check_idx(cell_key, cell_idx)
@@ -262,11 +303,15 @@ class SubsetZarr:
                 feat_names=assay.feats.fetch_all("names"),
                 dtype=assay.rawData.dtype,
                 profile=self.profile,
-                targetChunkBytes=self.targetChunkBytes,
-                targetShardBytes=self.targetShardBytes,
+                policy=self.policy,
             )
 
     def dump(self) -> None:
+        """Write subsetted cell metadata and count matrices, including RNA ``countsT``.
+
+        Returns:
+            None
+        """
         self._prep_cell_data()
         self._prep_counts()
         for assay in self.assays:
@@ -286,7 +331,29 @@ class SubsetZarr:
                 lambda start, end: raw_data[start:end, :].compute(),
                 msg=f"Subsetting assay: {assay.name}",
                 resources=self.resources,
+                io=self.io,
             )
+            from ..assay.classification import (
+                is_rna_assay_type,
+                lookup_persisted_assay_type,
+            )
+            from .counts_t import finalize_writer_counts_t
+
+            if is_rna_assay_type(assay):
+                source_types = _source_assay_types(assay, self.inWorkspace)
+                finalize_writer_counts_t(
+                    self.z,
+                    assay.name,
+                    self.outWorkspace,
+                    assay_type=lookup_persisted_assay_type(
+                        assay.name,
+                        source_types,
+                    ),
+                    resources=self.resources,
+                    profile=self.profile,
+                    policy=self.policy,
+                    io=self.io,
+                )
         logger.info(
             f"Wrote a subset of {len(self.cellIdx)} cells across "
             f"{len(self.assays)} assay(s)"

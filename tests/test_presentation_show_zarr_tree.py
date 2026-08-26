@@ -7,11 +7,11 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
-from networkx import DiGraph
 from scipy.sparse import csr_matrix
 from zarr.storage import MemoryStore
 
 from scarf.datastore._operations.presentation import _PresentationOperationsMixin
+from scarf.graph.state import GraphSelection
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_path,
@@ -86,6 +86,26 @@ def _write_complete_artifact(
     for name, values in (arrays or {}).items():
         group.create_array(name, data=values)
     return ref
+
+
+def _patch_graph_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    graph_ref: ArtifactRef,
+    *,
+    cell_key: str = "I",
+) -> None:
+    monkeypatch.setattr(
+        "scarf.datastore._operations.presentation.resolve_graph_selection",
+        Mock(
+            return_value=GraphSelection(
+                graph_loc=artifact_path(graph_ref),
+                graph_ref=graph_ref,
+                from_assay="RNA",
+                cell_key=cell_key,
+                integrated_label=None,
+            )
+        ),
+    )
 
 
 @pytest.mark.parametrize("start", ["branch", "/branch", "branch/", "/branch/"])
@@ -230,18 +250,19 @@ def test_membership_strength_rejects_a_different_graph_selection(
         kind="cell_selection",
         artifact_id="2" * 64,
     )
-    store.get_latest_graph_loc = Mock(return_value=artifact_path(graph_ref))
     store._get_graph_ncells_k = Mock(return_value=(2, 1))
     store._ensure_cell_selection = Mock(return_value=requested)
     store._graph_cell_selection = Mock(return_value=graph_selection)
     store._selection_artifacts_match = Mock(return_value=False)
-    monkeypatch.setattr(
-        "scarf.datastore._operations.presentation.resolve_stored_graph_input",
-        Mock(return_value=graph_ref),
-    )
+    _patch_graph_resolution(monkeypatch, graph_ref)
 
     with pytest.raises(ValueError, match="cell_key does not match"):
-        store.calc_membership_strength("RNA", "I", "I", "clusters")
+        store.calc_membership_strength(
+            "clusters",
+            graph=graph_ref,
+            from_assay="RNA",
+            cell_key="I",
+        )
 
 
 @pytest.mark.parametrize(
@@ -254,14 +275,17 @@ def test_membership_strength_rejects_a_different_graph_selection(
         ),
     ],
 )
-def test_membership_strength_validates_legacy_edge_layout(
+def test_membership_strength_validates_artifact_edge_layout(
     monkeypatch: pytest.MonkeyPatch,
     edges: np.ndarray,
     message: str,
 ) -> None:
     store, _backing = _presentation_store()
-    graph = store.zw.create_group("legacy_graph")
-    graph.create_array("edges", data=edges)
+    graph_ref = _write_complete_artifact(
+        store.zw,
+        "connectivity_map",
+        arrays={"edges": edges},
+    )
     selection = ArtifactRef(
         scope="datastore",
         kind="cell_selection",
@@ -273,19 +297,13 @@ def test_membership_strength_validates_legacy_edge_layout(
         kind="membership_strength",
         artifact_id="4" * 64,
     )
-    store.get_latest_graph_loc = Mock(return_value="legacy_graph")
     store._get_graph_ncells_k = Mock(return_value=(2, 1))
     store._ensure_cell_selection = Mock(return_value=selection)
+    store._graph_cell_selection = Mock(return_value=selection)
+    store._selection_artifacts_match = Mock(return_value=True)
     store._resolve_cell_data_provenance_input = Mock(return_value=selection)
     store.cells = SimpleNamespace(fetch=Mock(return_value=np.asarray([0, 1])))
-    monkeypatch.setattr(
-        "scarf.datastore._operations.presentation.resolve_stored_graph_input",
-        Mock(return_value={"legacy_graph_fingerprint": "a" * 64}),
-    )
-    monkeypatch.setattr(
-        "scarf.datastore._operations.presentation.validate_legacy_graph_selection",
-        Mock(),
-    )
+    _patch_graph_resolution(monkeypatch, graph_ref)
     monkeypatch.setattr(
         "scarf.datastore._operations.presentation.plan_cell_data_artifact",
         Mock(return_value=SimpleNamespace(ref=result, reused=False)),
@@ -296,7 +314,12 @@ def test_membership_strength_validates_legacy_edge_layout(
     )
 
     with pytest.raises(ValueError, match=message):
-        store.calc_membership_strength("RNA", "I", "I", "clusters")
+        store.calc_membership_strength(
+            "clusters",
+            graph=graph_ref,
+            from_assay="RNA",
+            cell_key="I",
+        )
 
 
 def test_membership_strength_reuses_values_and_display_contract(
@@ -320,7 +343,6 @@ def test_membership_strength_reuses_values_and_display_contract(
         "values",
         data=np.asarray([0.5, 1.0], dtype=np.float32),
     )
-    store.get_latest_graph_loc = Mock(return_value=artifact_path(graph_ref))
     store._get_graph_ncells_k = Mock(return_value=(2, 1))
     store._ensure_cell_selection = Mock(return_value=selection)
     store._graph_cell_selection = Mock(return_value=selection)
@@ -329,10 +351,7 @@ def test_membership_strength_reuses_values_and_display_contract(
     insert = Mock()
     store.cells = SimpleNamespace(insert=insert)
     link = Mock()
-    monkeypatch.setattr(
-        "scarf.datastore._operations.presentation.resolve_stored_graph_input",
-        Mock(return_value=graph_ref),
-    )
+    _patch_graph_resolution(monkeypatch, graph_ref)
     monkeypatch.setattr(
         "scarf.datastore._operations.presentation.plan_cell_data_artifact",
         Mock(return_value=SimpleNamespace(ref=result, reused=True)),
@@ -346,7 +365,15 @@ def test_membership_strength_reuses_values_and_display_contract(
         link,
     )
 
-    assert store.calc_membership_strength("RNA", "I", "I", "clusters") is None
+    assert (
+        store.calc_membership_strength(
+            "clusters",
+            graph=graph_ref,
+            from_assay="RNA",
+            cell_key="I",
+        )
+        is None
+    )
 
     inserted = insert.call_args.args[1]
     np.testing.assert_allclose(inserted, [0.5, 1.0])
@@ -370,18 +397,12 @@ def test_smart_label_handles_empty_and_unmatched_base_labels() -> None:
     assert store.smart_label("clusters", "base") == ["X-Ya", "X-Ya", "X-Ya"]
 
 
-def test_prepare_cluster_tree_rejects_unresolved_inputs() -> None:
+def test_prepare_cluster_tree_rejects_unresolved_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store, _backing = _presentation_store()
-    store._get_latest_keys = Mock(return_value=("RNA", "I", "I"))
     with pytest.raises(ValueError, match="provide a value for `cluster_key`"):
         store._prepare_cluster_tree()
-
-    store._resolve_integrated_graph_path = Mock(return_value=None)
-    with pytest.raises(KeyError, match="does not exist"):
-        store._prepare_cluster_tree(
-            integrated_graph="missing",
-            cluster_key="clusters",
-        )
 
     cell_data = store.zw.create_group("cellData")
     cell_data.create_array("clusters", data=np.asarray([0, 1]))
@@ -391,9 +412,9 @@ def test_prepare_cluster_tree_rejects_unresolved_inputs() -> None:
         kind="connectivity_map",
         artifact_id="7" * 64,
     )
-    store.get_latest_graph_loc = Mock(return_value=artifact_path(graph_ref))
-    with pytest.raises(ValueError, match="no source artifact for this graph"):
-        store._prepare_cluster_tree(cluster_key="clusters")
+    _patch_graph_resolution(monkeypatch, graph_ref)
+    with pytest.raises(ValueError, match="no source artifact"):
+        store._prepare_cluster_tree(graph=graph_ref, cluster_key="clusters")
 
 
 def test_artifact_cluster_tree_requires_cut_and_hierarchy_provenance() -> None:
@@ -413,11 +434,8 @@ def test_artifact_cluster_tree_requires_cut_and_hierarchy_provenance() -> None:
     with pytest.raises(ValueError, match="no source artifact"):
         store._prepare_artifact_cluster_tree(
             graph_ref=graph_ref,
-            graph_loc=artifact_path(graph_ref),
             from_assay="RNA",
             cell_key="I",
-            feat_key="I",
-            integrated_graph=None,
             cluster_key="clusters",
             fill_by_value=None,
             invalidate_cache=False,
@@ -433,88 +451,9 @@ def test_artifact_cluster_tree_requires_cut_and_hierarchy_provenance() -> None:
     with pytest.raises(ValueError, match="no hierarchy input"):
         store._prepare_artifact_cluster_tree(
             graph_ref=graph_ref,
-            graph_loc=artifact_path(graph_ref),
             from_assay="RNA",
             cell_key="I",
-            feat_key="I",
-            integrated_graph=None,
             cluster_key="clusters",
             fill_by_value=None,
             invalidate_cache=False,
         )
-
-
-def test_legacy_cluster_tree_materializes_and_reuses_table_cache(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store, _backing = _presentation_store()
-    store.zw.create_group("legacy_graph")
-    store.zw.create_array(
-        "legacy_dendrogram",
-        data=np.asarray([[0, 1, 1.0, 2]], dtype=np.float64),
-    )
-    cell_data = store.zw.create_group("cellData")
-    cell_data.create_array("clusters", data=np.asarray([0, 1]))
-    object_clusters = np.asarray(["A", "B"], dtype=object)
-    colors = np.asarray([0.25, 0.75])
-    store._get_latest_keys = Mock(return_value=("RNA", "I", "I"))
-    store.get_latest_graph_loc = Mock(return_value="legacy_graph")
-    store.resources = None
-    store.cells = SimpleNamespace(fetch=Mock(return_value=object_clusters))
-    store.get_cell_vals = Mock(return_value=colors)
-
-    coalesced = DiGraph()
-    coalesced.add_edges_from([(2, 0), (2, 1)])
-    coalesced.nodes[2]["nleaves"] = 2
-    coalesced.nodes[0].update({"nleaves": 1, "partition_id": "A"})
-    coalesced.nodes[1].update({"nleaves": 1, "partition_id": "B"})
-    make_digraph = Mock(return_value=object())
-    coalesce_tree = Mock(return_value=coalesced)
-    monkeypatch.setattr(
-        "scarf.datastore._operations.paris_persistence."
-        "resolve_compatibility_dendrogram",
-        Mock(return_value=("legacy_dendrogram", "generation-1")),
-    )
-    monkeypatch.setattr(
-        "scarf.clustering.cluster_tree.make_digraph",
-        make_digraph,
-    )
-    monkeypatch.setattr(
-        "scarf.clustering.cluster_tree.CoalesceTree",
-        coalesce_tree,
-    )
-
-    materialized = store._prepare_cluster_tree(
-        cluster_key="clusters",
-        fill_by_value="signal",
-    )
-
-    cache_path = materialized["coalesced_location"]
-    assert store.zw[cache_path].attrs["complete"] is True
-    assert materialized["graph"] is coalesced
-    np.testing.assert_array_equal(materialized["color_values"], colors)
-    make_digraph.assert_called_once()
-    coalesce_tree.assert_called_once()
-
-    make_digraph.reset_mock()
-    coalesce_tree.reset_mock()
-    make_digraph.side_effect = AssertionError("cached tree must not be rebuilt")
-    coalesce_tree.side_effect = AssertionError("cached tree must not be rebuilt")
-    cached = store._prepare_cluster_tree(
-        cluster_key="clusters",
-        fill_by_value="signal",
-    )
-
-    assert set(cached["graph"].edges) == {(2, 0), (2, 1)}
-    assert cached["graph"].nodes[0]["partition_id"] == "A"
-    assert cached["graph"].nodes[1]["partition_id"] == "B"
-    make_digraph.assert_not_called()
-    coalesce_tree.assert_not_called()
-
-    make_digraph.side_effect = None
-    coalesce_tree.side_effect = None
-    make_digraph.return_value = object()
-    coalesce_tree.return_value = coalesced
-    store.cells.fetch = Mock(return_value=np.asarray([0, 1]))
-    numeric = store._prepare_cluster_tree(cluster_key="clusters")
-    assert numeric["coalesced_location"] != cache_path

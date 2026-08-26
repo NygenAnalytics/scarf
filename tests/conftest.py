@@ -22,3 +22,12 @@ def _quiet_test_logs() -> None:
     configure_output(progress=False)
     logger.remove()
     logger.add(sys.stderr, level="ERROR")
+
+
+@pytest.fixture(autouse=True)
+def _reset_zarr_runtime() -> None:
+    from scarf.storage.async_execution import reset_zarr_runtime_for_tests
+
+    reset_zarr_runtime_for_tests()
+    yield
+    reset_zarr_runtime_for_tests()

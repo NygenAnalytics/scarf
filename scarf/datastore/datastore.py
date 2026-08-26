@@ -2,7 +2,10 @@ from typing import TYPE_CHECKING, Any, cast
 
 from ..storage.types import ZarrMode
 from ..assay import Assay
+from ..storage.feature_selection import resolve_feature_selection
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import StorageProfile, ZarrLocation
+from ..storage.refs import ArtifactRef
 from ..storage.stores import create_matrix_source
 from ._operations.features import _FeatureOperationsMixin
 from ._operations.integration_metrics import _IntegrationMetricsOperationsMixin
@@ -31,6 +34,18 @@ def mount_datastore(
     The target store receives copied cell and feature metadata plus all new
     analysis artifacts. Count matrices remain in the read-only source and are
     remounted automatically when the target is reopened with ``DataStore``.
+
+    Args:
+        source: Read-only store that owns the count matrices.
+        at: Writable destination for metadata and analysis artifacts.
+        workspace: Workspace name to mount. None uses the source workspace.
+        storage_options: Backend options passed when opening both locations.
+        datastore_options: Keyword arguments forwarded to ``DataStore``.
+                           ``zarr_loc`` is rejected; ``zarr_mode`` must be
+                           ``r+`` when set.
+
+    Returns:
+        An open writable ``DataStore`` pointed at ``at``.
     """
     if "zarr_loc" in datastore_options:
         raise TypeError("mount_datastore takes the target location through 'at'")
@@ -80,20 +95,26 @@ class DataStore(
                        when DataStore loads a Zarr file for the first time.
         min_features_per_cell: Minimum number of non-zero features in a cell. If lower than this then the cell
                                will be filtered out.
-        min_cells_per_feature: Minimum number of cells where a feature has a non-zero value. Genes with values
-                               less than this will be filtered out.
         mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``MT-|mt``.
         ribo_pattern: Regex pattern to capture ribosomal genes. When None, uses
                       ``RPS|RPL|MRPS|MRPL``.
         nthreads: Maximum worker budget for multi-threaded methods. When None, auto-detected
                   (SCARF_WORKERS env var, else process CPU affinity and cgroup limits). An
                   explicit integer overrides environment detection.
-        zarr_mode: For read-write mode use r+' or for read-only use 'r'. (Default value: 'r+')
-        workspace: Workspace for the data
+        zarr_mode: For read-write mode use ``r+`` or for read-only use ``r``.
+                   (Default value: ``r+``)
+        workspace: Workspace name within the Zarr store. None uses the legacy
+                   layout without a workspace group.
+        zarrProfile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                     None, chosen from the store location. Changing it on open
+                     does not rewrite existing arrays.
+        storage_options: Backend options passed when opening the Zarr store.
         mem_budget: Memory budget bounding streaming and concurrency. Accepts bytes, a suffixed size
                     (e.g. '8G'), or a fraction of total system memory (e.g. '0.6'). When None, it is
                     auto-detected (SCARF_MEM_BUDGET env var, else total system memory). Override it to
                     simulate reading on a machine with a different memory size than the writer.
+        storageIo: Optional explicit read, compute, and write widths for storage
+                   work. Unset values stay under automatic planning.
     """
 
     def __init__(
@@ -102,7 +123,6 @@ class DataStore(
         assay_types: dict[str, str] | None = None,
         default_assay: str | None = None,
         min_features_per_cell: int = 10,
-        min_cells_per_feature: int = 20,
         mito_pattern: str | None = None,
         ribo_pattern: str | None = None,
         nthreads: int | None = None,
@@ -111,6 +131,7 @@ class DataStore(
         zarrProfile: StorageProfile | None = None,
         storage_options: dict[str, Any] | None = None,
         mem_budget: int | str | None = None,
+        storageIo: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.profiles import resolve_storage_profile
@@ -126,7 +147,6 @@ class DataStore(
             assay_types=assay_types,
             default_assay=default_assay,
             min_features_per_cell=min_features_per_cell,
-            min_cells_per_feature=min_cells_per_feature,
             mito_pattern=mito_pattern,
             ribo_pattern=ribo_pattern,
             zarr_mode=zarr_mode,
@@ -134,6 +154,7 @@ class DataStore(
             resources=resources,
             storage_profile=profile,
             storage_options=storage_options,
+            storageIo=storageIo,
         )
 
     @property
@@ -164,6 +185,15 @@ class DataStore(
         else:
             return cast(Assay, getattr(self, assay_name))
 
+    def resolve_features(
+        self,
+        assay: str,
+        features: ArtifactRef | str,
+    ) -> ArtifactRef:
+        """Resolve an exact feature-selection reference or published label."""
+        resolved_assay = self.get_assay(assay)
+        return resolve_feature_selection(self.zw, resolved_assay.name, features)
+
     def _create_temporary_datastore(
         self,
         zarr_loc: ZarrLocation,
@@ -178,4 +208,5 @@ class DataStore(
             assay_types=assay_types,
             nthreads=nthreads,
             mem_budget=self.memoryBytes,
+            storageIo=getattr(self, "storageIo", None),
         )

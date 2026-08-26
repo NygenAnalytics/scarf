@@ -5,8 +5,8 @@ These instructions apply to local profiling diagnostics and the Modal end-to-end
 
 ## Before cloud work
 
-- Read `profiling/BENCHMARKS.md` for the current reference measurements and their interpretation
-  limits.
+- Read `docs/source/concepts/benchmarks.md` for the current reference measurements and their
+  interpretation limits.
 - Run local profiling tests before using cloud resources:
 
 ```bash
@@ -48,7 +48,33 @@ uv run --group profiling modal run --env scarf_profiling \
 `run-e2e`.
 
 Use `run --stage ...` for a targeted stage, including repair of an incomplete `countsT`; use
-`run-local` for the Modal ephemeral-disk comparison and `io-baseline` for read-pattern diagnostics.
+`run-local` for the Modal ephemeral-disk comparison.
+
+## 1M R2 gate
+
+The 1M gate is `run-e2e` on the product rotateOnce path. Use a fresh `runTag`, full funnel,
+size `1000000`, R2 backend (`scarf_profiling` env).
+
+`profiling/config.example.toml` pins **8 CPU / 32 GiB** (Scarf budget ~24 GiB) on
+`createStore`, `writeCountsT`, `markHvgs`, and `findMarkers`. Leave other stage envelopes as in
+the example so the gate does not claim the whole 1M funnel fits in 32 GiB.
+
+```bash
+# User action only; agents never deploy.
+uv run --group profiling modal deploy --env scarf_profiling \
+  -m profiling.modal_app
+
+uv run --group profiling modal run --env scarf_profiling \
+  -m profiling.modal_app -- prepare \
+  --config profiling/config.toml
+
+uv run --group profiling modal run --env scarf_profiling \
+  -m profiling.modal_app -- run-e2e \
+  --config profiling/config.toml --size 1000000
+```
+
+Success: all stages ok; paired `countsT` with `complete=True`; HVG and markers finish without OOM;
+result JSON under the run's `runTag`. Expect hours of Modal time and real cost.
 
 ## Durable execution
 

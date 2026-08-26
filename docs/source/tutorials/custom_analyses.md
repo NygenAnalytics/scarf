@@ -28,14 +28,20 @@ Scarf exposes graphs, bounded count streams, metadata tables, and export formats
 
 ## 1. Prepare a store
 
-The published PBMC store is enough for the examples below.
+The published PBMC store supplies the counts and active-cell metadata for the examples below.
+The page structurally repacks those counts, mounts them into a separate analysis store, and rebuilds the graph under the current artifact contract.
 Only the graph-statistic and `wellConnected` path uses `load_graph`.
-Streaming, `set_hvgs`, custom reduction, `to_anndata`, and `SubsetZarr` do not.
+Streaming, `set_feature_selection`, custom reduction, `to_anndata`, and `SubsetZarr` do not.
 See {doc}`graph_construction` to build a graph by hand.
 
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import numpy as np
+
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="WARNING", progress=True)
 
@@ -44,9 +50,35 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
+repack_store(
     f"{dataset}/data.zarr",
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=str(Path(analysis_directory.name) / "custom_analysis.zarr"),
+    default_assay="RNA",
     nthreads=4,
+)
+hvg_ref = ds.mark_hvgs(
+    min_cells=20,
+    top_n=500,
+    show_plot=False,
+)
+normalized = ds.run_normalization(features=hvg_ref)
+pca = ds.run_pca(normalized, dims=15)
+ds.build_embedding_initialization(pca)
+ann_index = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann_index, k=11)
+graph_ref = ds.build_connectivity_map(neighbors)
+ds.run_umap(
+    graph=graph_ref,
+    n_epochs=100,
+    parallel=True,
+    label="custom_UMAP",
 )
 ```
 
@@ -58,9 +90,7 @@ It is a graph statistic, not a biological confidence score.
 
 ```{code-cell} ipython3
 graph = ds.load_graph(
-    from_assay="RNA",
-    cell_key="I",
-    feat_key="hvgs",
+    graph=graph_ref,
     symmetric=True,
     upper_only=False,
 )
@@ -83,7 +113,7 @@ The summary confirms the CSR cover and that the new column is populated.
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout_key="RNA_custom_UMAP",
     color_by="customGraphStrength",
     sort_values=True,
 )
@@ -95,12 +125,13 @@ Rebuilds with another feature set or neighbour count need a new statistic.
 ## 3. Stream count blocks
 
 Avoid `.compute()` on a matrix that may exceed memory.
-Slice to the intended cell and feature keys, then process ordered row blocks.
+Slice to the intended cell index and the indexes from a validated feature-selection label, then process ordered row blocks.
 This example counts detected HVGs per active cell:
 
 ```{code-cell} ipython3
 cell_index = ds.cells.active_index("I")
-feature_index = ds.RNA.feats.active_index("I__hvgs")
+hvg_values = np.asarray(ds.load_artifact(hvg_ref)["values"][:], dtype=bool)
+feature_index = np.flatnonzero(hvg_values)
 selected_counts = ds.RNA.rawData[:, feature_index][cell_index, :]
 
 detected_blocks = []
@@ -146,7 +177,7 @@ ds.cells.insert(
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout_key="RNA_custom_UMAP",
     color_by=["customDetectedHVGs", "wellConnected"],
     n_columns=2,
     sort_values=True,
@@ -156,26 +187,24 @@ ds.plots.embedding(
 The first panel checks where the streamed count statistic varies.
 The second shows the lower-quartile graph-strength exclusion created from the same active cell order.
 
-Install a supplied RNA feature mask with `set_hvgs`.
-This records the cell-selection relationship and produces the feature key `wellConnected__customPanel`.
-Downstream methods take the short name `customPanel` as `feat_key`:
+Install a supplied RNA feature mask with `set_feature_selection`.
+This returns an immutable selection artifact and publishes the plain feature label `custom_panel`.
+The cell population is chosen separately by the consuming operation:
 
 ```{code-cell} ipython3
 panel_genes = ["CD3D", "MS4A1", "CD14", "LYZ", "NKG7", "GNLY"]
 feature_names = ds.RNA.feats.fetch_all("names").astype(str)
 panel_mask = np.isin(feature_names, panel_genes)
-custom_feature_key = ds.set_hvgs(
-    cell_key="wellConnected",
+custom_features = ds.set_feature_selection(
     mask=panel_mask,
-    hvg_key_name="customPanel",
-    blacklist="",
+    label="custom_panel",
 )
-custom_feature_key, int(ds.RNA.feats.fetch_all(custom_feature_key).sum())
+custom_features, int(ds.RNA.feats.fetch_all("custom_panel").sum())
 ```
 
 ```{code-cell} ipython3
 ds.plots.embedding(
-    layout_key="RNA_UMAP",
+    layout_key="RNA_custom_UMAP",
     color_by=panel_genes,
     cell_key="wellConnected",
     n_columns=3,
@@ -183,8 +212,8 @@ ds.plots.embedding(
 )
 ```
 
-The returned key is the full feature column.
-The plot checks the same panel on the `wellConnected` cells that the selection is linked to.
+The returned reference is safe to retain across label republishing.
+The plot checks the same panel on the separately selected `wellConnected` cells.
 
 ## 5. Register external feature loadings
 
@@ -196,7 +225,7 @@ Here an identity matrix stands in for loadings from an external tool:
 ```{code-cell} ipython3
 branch_normalized = ds.run_normalization(
     cell_key="wellConnected",
-    feat_key="customPanel",
+    features=custom_features,
     update_state=False,
 )
 n_features = int(ds.load_artifact(branch_normalized)["data"].shape[1])

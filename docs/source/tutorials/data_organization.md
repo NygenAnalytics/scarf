@@ -44,7 +44,7 @@ flowchart TB
     cells["Shared cell metadata"]
     rna["RNA assay<br/>feature metadata and results<br/>(default assay)"]
     atac["ATAC assay<br/>feature metadata and results"]
-    source["Optional mounted source<br/>counts and countsT"]
+    source["Optional mounted source<br/>counts and RNA countsT"]
     ds --> cells
     ds --> rna
     ds --> atac
@@ -56,15 +56,21 @@ The default assay supplies method defaults when `from_assay` is omitted.
 It does not merge assay-specific feature tables or results.
 
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import pandas as pd
 
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
 ```
 
-This page opens the pre-analyzed Bastidas-Ponce pancreas store also used in {doc}`plotting` and {doc}`cell_cycle`.
-It already includes HVGs, a neighbourhood graph, UMAP coordinates, cluster labels, and a marker table, so every group shown below is one a real analysis produced.
+This page uses the pre-analyzed Bastidas-Ponce pancreas store also used in {doc}`plotting` and {doc}`cell_cycle`.
+The published store contains literal UMAP coordinates and cluster labels together with analysis state from an older Scarf release.
+First repack it structurally into a temporary source with the current paired RNA count layout, then mount those count matrices into a fresh writable target.
+The published source stays untouched, and every artifact inspected below follows the current contract.
 
 ```{code-cell} ipython3
 dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
@@ -73,10 +79,28 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     zarr=True,
 )
 
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts_path = Path(analysis_directory.name) / 'counts.zarr'
+analysis_path = Path(analysis_directory.name) / 'data_organization.zarr'
+repack_store(
     f'{dataset}/data.zarr',
+    str(repacked_counts_path),
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    str(repacked_counts_path),
+    at=str(analysis_path),
     default_assay='RNA',
     nthreads=4,
+)
+
+hvg_ref = ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
+normalized = ds.run_normalization(features=hvg_ref)
+all_features = ds.resolve_features('RNA', 'all_features')
+marker_ref = ds.run_marker_search(
+    group_key='clusters',
+    cell_key='I',
+    features=all_features,
 )
 
 ds
@@ -140,9 +164,11 @@ Nothing here encodes parameters in the path, so a second PCA at different dimens
 ds.show_zarr_tree(start='RNA/artifacts', depth=1)
 ```
 
-Stores written before this layout encoded the whole chain into nested group names such as `RNA/normed__I__hvgs/reduction__pca__15__I/...`.
-Scarf still reads those.
-{doc}`../developers/zarr_internals` covers repacking older stores to Zarr v3 with sharded counts; that does not migrate nested path trees into artifacts.
+For diagnosis only, stores written before this layout may contain nested names such as `RNA/normed__I__hvgs/reduction__pca__15__I/...`.
+Current analysis does not resolve those paths or migrate them silently.
+Counts and literal metadata remain readable, while legacy analysis state fails closed with `IncompatibleAnalysisStateError` before computation or mutation.
+Opening also leaves a legacy feature `I` column byte-for-byte untouched; lazy `all_features` creation covers the complete current feature row order instead of inheriting that older filter.
+{doc}`../developers/zarr_internals` covers the on-disk layout and structural Zarr repacking; repacking does not migrate legacy analysis state into artifacts.
 
 ## 2. Inspect cell and feature attributes
 
@@ -262,15 +288,16 @@ See the `MetaData` API in {doc}`../reference/api/assays` for update and delete h
 
 Raw counts are a Zarr array (often sharded), exposed as `rawData`, a chunked array with a NumPy-like interface that streams by row.
 Location depends on layout: default `{assay}/counts`, workspace `matrices/{assay}/counts`, or the mounted source when counts stay there.
-Routine analysis does not need to touch this object directly.
+RNA assays also store `countsT`, a gene-major copy used by HVG and marker stages.
+Routine analysis does not need to touch either array directly.
 
 ```{code-cell} ipython3
 ds.RNA.rawData
 ```
 
-Normalized values are computed on demand through `normed()` from raw counts.
-`run_normalization` can also persist a normalized artifact.
-`normed()` drops inactive features, so its column count is smaller than `rawData`:
+Normalized values are computed on demand through the lower-level assay `normed()` view from raw counts.
+`run_normalization(features=...)` is the public persisted path and requires an exact feature-selection label or reference.
+The direct `normed()` view follows its explicit or literal metadata indexes; in a newly created store the physical feature `I` column is all true:
 
 ```{code-cell} ipython3
 ds.RNA.normed()
@@ -297,22 +324,24 @@ print('Current method:', ds.RNA.normMethod.__name__)
 ## 5. Inspect persisted analysis results
 
 Analysis methods return lightweight references to results stored in Zarr.
-Asking for the normalization the store already holds returns a reference to it rather than recomputing:
+The setup retained the HVG and normalization references it created in the mounted target.
+Asking for the same normalization again reuses that result rather than recomputing:
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(feat_key='hvgs')
-normalized
+reused_normalized = ds.run_normalization(features=hvg_ref)
+print('Reused:', reused_normalized == normalized)
+reused_normalized
 ```
 
 Inspect its status and open the underlying group only when a custom method needs direct access:
 
 ```{code-cell} ipython3
-status = ds.inspect_artifact(normalized)
+status = ds.inspect_artifact(reused_normalized)
 print('Complete:', status.complete)
 print('Operation:', status.operation)
 print('Parameters:', status.parameters)
 
-group = ds.load_artifact(normalized)
+group = ds.load_artifact(reused_normalized)
 print('Arrays:', list(group.array_keys())[:5])
 ```
 
@@ -321,9 +350,9 @@ Branching, invalidation, lineage, and the current {term}`analysis chain` are cov
 
 ## 6. Marker features
 
-`run_marker_search` writes a `marker_table` artifact like any other result.
+`run_marker_search` writes a `marker_table` artifact like any other result and returns its exact reference.
 The assay also keeps an index under `{assay}/markers`.
-In the attrs index layout, that group holds no arrays of its own; its `artifacts` attribute maps `{cell_key}__{group_key}` slots to those refs. Legacy `markers/{slot}` subgroups can hold arrays. That indirection is what lets `get_markers` find a table from a group key without knowing an artifact identifier.
+In the attrs index layout, that group holds no arrays of its own; its `artifacts` attribute nests refs by cell key, grouping column, and feature-selection artifact id. Legacy `markers/{slot}` subgroups can hold arrays.
 
 ```{code-cell} ipython3
 index = dict(ds.z['RNA/markers'].attrs.get('artifacts', {}))
@@ -331,14 +360,21 @@ index
 ```
 
 ```{code-cell} ipython3
-table = scarf.ArtifactRef.from_dict(index['I__clusters'])
+table = scarf.ArtifactRef.from_dict(
+    index['I']['clusters'][all_features.artifact_id]
+)
 print('Stored at:', ds.inspect_artifact(table).path)
 ```
+
+The nested feature-selection key prevents a marker search over one feature universe from replacing another.
+If multiple feature-specific tables exist for the same grouping, pass the exact returned ref to table, plot, and export accessors.
 
 Fetch one group with `get_markers`, plot the stored table with `marker_heatmap`, or export all groups with `export_markers_to_csv`.
 
 ```{code-cell} ipython3
 ds.get_markers(
+    marker=marker_ref,
+    cell_key='I',
     group_key='clusters',
     group_id=ds.cells.fetch('clusters')[0],
     min_score=0.1,
@@ -348,6 +384,8 @@ ds.get_markers(
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
+    marker=marker_ref,
+    cell_key='I',
     group_key='clusters',
     topn=5,
     figsize=(5, 9),
@@ -357,6 +395,8 @@ ds.plots.marker_heatmap(
 ```{code-cell} ipython3
 markers_csv = 'scarf_datasets/pancreas_cluster_markers.csv'
 ds.export_markers_to_csv(
+    marker=marker_ref,
+    cell_key='I',
     group_key='clusters',
     csv_filename=markers_csv,
     min_score=0.1,
@@ -368,7 +408,9 @@ pd.read_csv(markers_csv).iloc[:5, :6]
 ## 7. Zarr versions and storage profiles
 
 Current Scarf versions write new datasets as Zarr v3.
-Existing v2 stores remain readable.
+RNA assays also write a gene-major `countsT` copy next to `counts`.
+An older RNA store that is still Zarr v2, or that lacks that copy, will not open until you re-import it or repack it.
+
 Count matrices from the writers use sharded arrays (default profile `fast_local`).
 Set the profile with `SCARF_ZARR_PROFILE` (`fast_local` or `cloud`) or `zarrProfile=` when opening a `DataStore`.
 
@@ -377,7 +419,7 @@ uv run python -m scarf.tools.repack_zarr input.zarr output.zarr --profile fast_l
 ```
 
 Storage profiles and conversion belong to the physical store, while `mem_budget` and `nthreads` control execution.
-See {doc}`../concepts/memory_and_execution` for memory planning and {doc}`remote_stores` for object storage and local scratch.
+See {doc}`../concepts/memory_and_execution` for why RNA stores two orientations, and {doc}`remote_stores` for object storage and local scratch.
 
 ## Common mistakes
 
@@ -386,6 +428,7 @@ See {doc}`../concepts/memory_and_execution` for memory planning and {doc}`remote
 - Using `fetch` when values for inactive cells are also required (`fetch_all`)
 - Treating a result reference as an in-memory matrix
 - Editing artifact groups directly instead of using Scarf's analysis methods
+- Expecting an older RNA Zarr v2 store, or one without `countsT`, to open without a re-import or `repack_zarr`
 
 Metadata changes and artifacts are written into the Zarr store.
 Low-level layout details intended for contributors remain in {doc}`../developers/zarr_internals`.

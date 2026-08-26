@@ -26,8 +26,6 @@ _METHODS = {
         "build_embedding_initialization",
         "build_mapping_reference",
         "get_diffusion_operator",
-        "get_latest_graph_loc",
-        "get_normalized_group_path",
         "get_imputed",
         "get_mapping_reference",
         "integrate_assays",
@@ -77,6 +75,7 @@ _METHODS = {
         "metric_label_concordance",
         "metric_lisi",
         "metric_proportional_batch_mixing",
+        "resolve_features",
         "run_aucell",
         "run_cell_cycle_scoring",
         "run_doublet_detection",
@@ -84,7 +83,8 @@ _METHODS = {
         "run_pseudotime_aggregation",
         "run_pseudotime_marker_search",
         "run_waggr",
-        "set_hvgs",
+        "select_detected_features",
+        "set_feature_selection",
         "show_zarr_tree",
         "smart_label",
         "to_anndata",
@@ -92,10 +92,10 @@ _METHODS = {
 }
 
 _SIGNATURE_DIGESTS = {
-    BaseDataStore: "618821f381727cab2b5b19ec983871b486c5bdcab992435f3a0cb34033dfbcf4",
-    GraphDataStore: "eecfb41646f3b515e2979882a1afe56b0d1497775562110af406c8f178f7005a",
+    BaseDataStore: "4b362febb460fa3d4c23c6f79f9ea3a8878f17d1113944fe056e444f4d768f5f",
+    GraphDataStore: "9de75cc6814af055ec291c9cb6d83f68e7db0306f7a2fe663af9a53afff9cc73",
     MappingDatastore: "1be2723f0c659336ff3dba16d58f4c9a7aa2f73a9a4a33bf3af232a280f1d7ec",
-    DataStore: "1f1cfcc32db7daa61687f1620d80fa7cf74495c89747fe9ae99bc7864062d98c",
+    DataStore: "abc4cc784a9e042215b641322ce1e95b0963e0968df1987e03ce2dc60871f75b",
 }
 
 
@@ -119,9 +119,12 @@ def test_datastore_public_class_chain_is_stable():
     assert BaseDataStore.__module__ == "scarf.datastore.base_datastore"
 
 
-def test_stored_graph_lookup_remains_internal():
+def test_stored_graph_path_lookup_is_removed():
     assert not hasattr(GraphDataStore, "lookup_stored_graph")
-    assert hasattr(GraphDataStore, "_lookup_stored_graph")
+    assert not hasattr(GraphDataStore, "_lookup_stored_graph")
+    assert not hasattr(GraphDataStore, "get_latest_graph_loc")
+    assert not hasattr(GraphDataStore, "get_normalized_group_path")
+    assert not hasattr(DataStore, "set_hvgs")
 
 
 def test_datastore_property_contracts_are_stable():
@@ -310,6 +313,7 @@ def test_datastore_facades_only_own_composition_methods():
         "__init__",
         "_create_temporary_datastore",
         "get_assay",
+        "resolve_features",
     }
 
 

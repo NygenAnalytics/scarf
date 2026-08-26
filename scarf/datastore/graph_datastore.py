@@ -1,3 +1,4 @@
+from threading import RLock
 from typing import Any
 from weakref import WeakKeyDictionary
 
@@ -33,3 +34,7 @@ class GraphDataStore(
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._annStreamPaths: WeakKeyDictionary[AnnStream, str] = WeakKeyDictionary()
+        self._graphMemoryCache: dict[tuple[str, bool, bool, int | None], Any] | None = (
+            None
+        )
+        self._graphMemoryCacheLock = RLock()

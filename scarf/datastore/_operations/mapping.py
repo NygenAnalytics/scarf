@@ -11,6 +11,7 @@ from ...storage.artifacts import (
     ValueFingerprintBuilder,
     artifact_group,
     canonical_bytes,
+    fingerprint_array,
     inspect_artifact,
 )
 from ...storage.types import as_zarr_array
@@ -43,9 +44,13 @@ from ...neighbors.stages import (
 from ...storage.ann_index import has_ann_index, load_ann_index
 from ...storage.geometry import array_geometry
 from ...storage.partition import row_band
-from ...storage.selections import resolve_selection_artifact
 from ...storage.stores import zarr_root_path
 from ...utils.logging import logger
+from ...storage.feature_selection import (
+    _feature_selection_plan,
+    _ordered_feature_ids_fingerprint,
+    _write_feature_selection,
+)
 
 if TYPE_CHECKING:
     from ..graph_datastore import GraphDataStore as _MappingOperationsBase
@@ -362,6 +367,9 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         assay = self._get_assay(assay_name)
         if not isinstance(assay, RNAassay):
             raise TypeError("Mapping currently supports RNA query assays only")
+        from ...graph.state import read_assay_state_document
+
+        read_assay_state_document(self.zw, assay_name)
 
         cell_mask = np.asarray(self.cells.fetch_all(cell_key))
         if cell_mask.ndim != 1 or cell_mask.dtype != np.dtype(bool):
@@ -422,34 +430,32 @@ class _MappingOperationsMixin(_MappingOperationsBase):
         )
         selected_expression_fingerprint = stream.raw_expression_fingerprint
 
-        cell_selection = resolve_selection_artifact(
-            self.zw,
-            scope="datastore",
-            kind="cell_selection",
-            values=cell_mask,
-            row_ids=np.asarray(self.cells.fetch_all("ids")),
-            operation="manual_selection",
-            parameters={},
-            inputs={},
-            source_column=cell_key,
-        )
+        cell_selection = self._ensure_cell_selection(cell_key)
+        all_features = cast(Any, self)._ensure_all_features(assay)
         feature_mask = np.zeros(assay.feats.N, dtype=bool)
         feature_mask[stream.query_feature_indices] = True
-        feature_selection = resolve_selection_artifact(
+        feature_ids_fingerprint = _ordered_feature_ids_fingerprint(assay)
+        selection_plan = _feature_selection_plan(
             self.zw,
-            scope="assay",
             assay=assay_name,
-            kind="feature_selection",
-            values=feature_mask,
-            row_ids=np.asarray(assay.feats.fetch_all("ids")),
-            operation="map_query_feature_selection",
+            n_features=assay.feats.N,
+            ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+            operation="select_mapping_overlap",
             parameters={},
             inputs={
-                "alignment_map_hash": stream.alignment_map_hash,
                 "mapping_reference": reference.external_ref,
+                "all_features": all_features,
             },
-            source_column="mapping_reference_overlap",
+            execution_options={},
+            expected_payload_fingerprint=fingerprint_array(feature_mask),
         )
+        _write_feature_selection(
+            self.zw,
+            selection_plan,
+            ordered_feature_ids_fingerprint=feature_ids_fingerprint,
+            payload={"values": feature_mask},
+        )
+        feature_selection = selection_plan.ref
         projection_plan = plan_projection(
             self.zw,
             query_assay=assay_name,

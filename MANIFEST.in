@@ -2,7 +2,7 @@ recursive-exclude * __pycache__
 recursive-exclude * *.pyc
 recursive-exclude * *.pyo
 exclude .gitignore
-exclude .gitattribute
+exclude .gitattributes
 exclude .readthedocs.yml
 exclude Dockerfile
 prune scarf_toolkit.egg-info

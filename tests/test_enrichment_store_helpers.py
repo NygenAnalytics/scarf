@@ -24,7 +24,6 @@ from scarf.datastore._operations.enrichment_store import (
     _write_enrichment_slot,
 )
 from scarf.storage.artifacts import ArtifactRef
-from scarf.utils.arrays import array_digest
 
 
 def _assay(root: zarr.Group, name: str = "RNA") -> SimpleNamespace:
@@ -101,12 +100,11 @@ def test_enrichment_artifact_index_round_trip_and_validation():
         "scores",
         ref,
         cell_key="I",
-        feat_key="hvgs",
     )
     entry = _enrichment_artifact_entry(assay, "scores")
     assert entry is not None
     assert entry[0] == ref
-    assert entry[1:] == ("I", "hvgs")
+    assert entry[1] == "I"
     assert _enrichment_artifact_ref(assay, "scores") == ref
 
     enrichment = assay.z["enrichment"]
@@ -119,21 +117,16 @@ def test_enrichment_artifact_index_round_trip_and_validation():
         _enrichment_artifact_entry(assay, "scores")
 
     enrichment.attrs[_ENRICHMENT_ARTIFACT_RESULTS] = {
-        "scores": {"artifact": ref.to_dict(), "cell_key": "", "feat_key": "hvgs"}
+        "scores": {"artifact": ref.to_dict(), "cell_key": ""}
     }
     with pytest.raises(ValueError, match="invalid execution metadata"):
         _enrichment_artifact_entry(assay, "scores")
 
     del enrichment.attrs[_ENRICHMENT_ARTIFACT_RESULTS]
     enrichment.attrs[_ENRICHMENT_LEGACY_ARTIFACTS] = {"scores": ref.to_dict()}
-    legacy_entry = _enrichment_artifact_entry(assay, "scores")
-    assert legacy_entry is not None
-    assert legacy_entry[0] == ref
-    assert legacy_entry[1:] == (None, None)
-
+    assert _enrichment_artifact_entry(assay, "scores") is None
     enrichment.attrs[_ENRICHMENT_LEGACY_ARTIFACTS] = {"scores": "bad"}
-    with pytest.raises(ValueError, match="invalid artifact ref"):
-        _enrichment_artifact_entry(assay, "scores")
+    assert _enrichment_artifact_entry(assay, "scores") is None
 
 
 def test_write_enrichment_slot_persists_scores_and_rejects_bad_batches():
@@ -254,115 +247,17 @@ def test_legacy_enrichment_slot_resolves_active_child():
     assert _legacy_enrichment_slot(assay, "absent") is None
 
 
-def _write_valid_legacy_waggr(
-    assay: SimpleNamespace, label: str = "slot"
-) -> zarr.Group:
-    cells = np.array([0, 2], dtype=np.int64)
-    matched = np.array([1, 4], dtype=np.int64)
-    names = np.array(["Alpha", "Beta"])
-    sizes = np.array([2, 3], dtype=np.int64)
-    scores = np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float64)
-    attrs = {
-        "method": "waggr",
-        "algorithm_version": 1,
-        "tmin": 2,
-        "cell_key": "I",
-        "feat_key": "hvgs",
-        "cell_digest": array_digest(cells),
-        "feature_digest": array_digest(matched),
-        "network_digest": "net",
-        "execution_digest": "exec",
-        "normalization": "norm_lib_size",
-        "size_factor": 1000.0,
-        "waggr_mode": "wmean",
-        "log_transform": False,
-        "layout": "cells_by_sources",
-    }
-    if "enrichment" not in assay.z:
-        assay.z.create_group("enrichment")
-    slot = assay.z["enrichment"].create_group(label)
-    _write_enrichment_slot(
-        slot,
-        attrs=attrs,
-        score_batches=iter([scores]),
-        n_cells=2,
-        source_names=names,
-        source_sizes=sizes,
-        cell_index=cells,
-        matched_feature_index=matched,
-        rank_feature_index=None,
-    )
-    return slot
-
-
-def test_load_enrichment_result_reads_valid_legacy_slot_and_subsets_sources():
+def test_load_enrichment_result_rejects_unindexed_legacy_slot():
     root = zarr.open_group(store=MemoryStore(), mode="w")
     assay = _assay(root)
     assay.nthreads = 1
-    _write_valid_legacy_waggr(assay, "ok")
-
-    result = _load_enrichment_result(assay, label="ok", sources=None)
-    assert result.label == "ok"
-    assert result.assay == "RNA"
-    np.testing.assert_array_equal(result.source_names, ["Alpha", "Beta"])
-    np.testing.assert_allclose(
-        result.data.compute(),
-        np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
-    )
-
-    subset = _load_enrichment_result(assay, label="ok", sources=["Beta"])
-    np.testing.assert_array_equal(subset.source_names, ["Beta"])
-    np.testing.assert_allclose(subset.data.compute(), [[0.2], [0.4]])
-
-    with pytest.raises(TypeError, match="sequence of source names"):
-        _load_enrichment_result(assay, label="ok", sources="Beta")
-    with pytest.raises(ValueError, match="non-empty"):
-        _load_enrichment_result(assay, label="ok", sources=[])
-    with pytest.raises(KeyError, match="not found"):
-        _load_enrichment_result(assay, label="ok", sources=["Missing"])
-
-
-def test_load_enrichment_result_rejects_corrupt_legacy_metadata():
-    root = zarr.open_group(store=MemoryStore(), mode="w")
-    assay = _assay(root)
-    assay.nthreads = 1
-    slot = _write_valid_legacy_waggr(assay, "bad")
-
-    slot.attrs["complete"] = False
-    with pytest.raises(ValueError, match="incomplete"):
-        _load_enrichment_result(assay, label="bad", sources=None)
-    slot.attrs["complete"] = True
-
-    slot.attrs["method"] = "mystery"
-    with pytest.raises(ValueError, match="unknown method"):
-        _load_enrichment_result(assay, label="bad", sources=None)
-    slot.attrs["method"] = "waggr"
-
-    slot.attrs["algorithm_version"] = 2
-    with pytest.raises(ValueError, match="unsupported algorithm"):
-        _load_enrichment_result(assay, label="bad", sources=None)
-    slot.attrs["algorithm_version"] = 1
-
-    slot.attrs["tmin"] = 0
-    with pytest.raises(ValueError, match="invalid tmin"):
-        _load_enrichment_result(assay, label="bad", sources=None)
-    slot.attrs["tmin"] = 2
-
-    slot.attrs["size_factor"] = -1
-    with pytest.raises(ValueError, match="invalid method metadata"):
-        _load_enrichment_result(assay, label="bad", sources=None)
-    slot.attrs["size_factor"] = 1000.0
-
-    slot.attrs["cell_digest"] = "wrong"
-    with pytest.raises(ValueError, match="mismatched cell digest"):
-        _load_enrichment_result(assay, label="bad", sources=None)
-    slot.attrs["cell_digest"] = array_digest(
-        np.asarray(slot["cell_index"][:], dtype=np.int64)
-    )
-
-    del slot["source_sizes"]
-    with pytest.raises(ValueError, match="missing required arrays"):
-        _load_enrichment_result(assay, label="bad", sources=None)
+    enrichment = assay.z.create_group("enrichment")
+    enrichment.create_group("legacy")
 
     with pytest.raises(KeyError, match="was not found"):
-        _load_enrichment_result(assay, label="missing", sources=None)
+        _load_enrichment_result(
+            assay,
+            label="legacy",
+            sources=None,
+            artifact_root=root,
+        )

@@ -6,6 +6,7 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
+from ..storage.artifacts import ArtifactRef
 from ._contracts import CategoricalScale, ColorScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
 from ._figure import LegendSpec, PlotResult, normalize_axes_target
@@ -186,10 +187,9 @@ def _draw_tree_pie(
 def cluster_tree(
     store: Any,
     *,
+    graph: ArtifactRef | None = None,
     from_assay: str | None = None,
     cell_key: str | None = None,
-    feat_key: str | None = None,
-    integrated_graph: str | None = None,
     cluster_key: str | None = None,
     fill_by_value: str | None = None,
     force_ints_as_cats: bool = True,
@@ -219,14 +219,13 @@ def cluster_tree(
     import networkx as nx
 
     prepared = store._prepare_cluster_tree(
+        graph=graph,
         from_assay=from_assay,
         cell_key=cell_key,
-        feat_key=feat_key,
-        integrated_graph=integrated_graph,
         cluster_key=cluster_key,
         fill_by_value=fill_by_value,
     )
-    graph = prepared["graph"]
+    tree_graph: Any = prepared["graph"]
     clusters = np.asarray(prepared["clusters"])
     raw_color_values = (
         clusters
@@ -242,7 +241,7 @@ def cluster_tree(
     )
 
     angular_positions = _hierarchy_positions(
-        graph,
+        tree_graph,
         width=width * math.pi,
         leaf_vs_root_factor=lvr_factor,
         vert_gap=vert_gap,
@@ -285,11 +284,11 @@ def cluster_tree(
             vcenter=None,
         )
 
-    node_order = list(graph.nodes())
+    node_order = list(tree_graph.nodes())
     node_colors: list[str] = []
     node_sizes: list[float] = []
     for node in node_order:
-        node_data = graph.nodes[node]
+        node_data = tree_graph.nodes[node]
         if "partition_id" in node_data:
             cluster_id = node_data["partition_id"]
             if categorical and using_clusters:
@@ -320,7 +319,7 @@ def cluster_tree(
         )
         tree_ax = axes["tree"]
         nx.draw_networkx_edges(
-            graph,
+            tree_graph,
             pos=positions,
             ax=tree_ax,
             edge_color=edgecolors,
@@ -328,7 +327,7 @@ def cluster_tree(
             alpha=alpha,
         )
         nx.draw_networkx_nodes(
-            graph,
+            tree_graph,
             pos=positions,
             ax=tree_ax,
             nodelist=node_order,
@@ -342,7 +341,7 @@ def cluster_tree(
         if categorical and not using_clusters:
             assert palette is not None
             for node in node_order:
-                node_data = graph.nodes[node]
+                node_data = tree_graph.nodes[node]
                 if "partition_id" not in node_data:
                     continue
                 cluster_id = node_data["partition_id"]
@@ -358,7 +357,7 @@ def cluster_tree(
 
         if show_labels:
             for node in node_order:
-                node_data = graph.nodes[node]
+                node_data = tree_graph.nodes[node]
                 if "partition_id" not in node_data:
                     continue
                 cluster_id = node_data["partition_id"]
@@ -391,13 +390,13 @@ def cluster_tree(
         [
             {
                 "node": node,
-                "nleaves": graph.nodes[node]["nleaves"],
-                "partition_id": graph.nodes[node].get("partition_id"),
+                "nleaves": tree_graph.nodes[node]["nleaves"],
+                "partition_id": tree_graph.nodes[node].get("partition_id"),
             }
             for node in node_order
         ]
     )
-    edges = pd.DataFrame(graph.edges(), columns=["source", "target"])
+    edges = pd.DataFrame(tree_graph.edges(), columns=["source", "target"])
     position_table = pd.DataFrame(
         [{"node": node, "x": xy[0], "y": xy[1]} for node, xy in positions.items()]
     )
@@ -455,7 +454,7 @@ def cluster_tree(
             renderer="matplotlib",
             notes=("cluster_tree", "coalesced"),
             extras={
-                "feat_key": prepared["feat_key"],
+                "graph": cast(ArtifactRef, prepared["graph_ref"]).to_dict(),
                 "cluster_key": prepared["cluster_key"],
                 "fill_by_value": fill_by_value,
                 "coalesced_location": prepared["coalesced_location"],

@@ -1,3 +1,5 @@
+from inspect import Parameter, signature
+
 import matplotlib
 import networkx as nx
 import numpy as np
@@ -7,6 +9,7 @@ import pytest
 matplotlib.use("Agg")
 
 import scarf.plotting as splt
+from scarf.storage.artifacts import ArtifactRef
 from scarf.plotting.cluster_tree import _hierarchy_positions
 from scarf.plotting._heatmap_utils import (
     annotation_colors,
@@ -25,6 +28,35 @@ def test_hierarchy_positions_are_pure_and_complete():
     assert nx.utils.graphs_equal(graph, before)
     assert positions[4][1] == 0.0
     assert positions[0][1] < positions[2][1]
+
+
+def test_artifact_plot_signatures_match_datastore_accessor() -> None:
+    from scarf.datastore._plot_accessor import DataStorePlotAccessor
+    from scarf.plotting.cluster_connectivity import cluster_connectivity
+    from scarf.plotting.cluster_tree import cluster_tree
+    from scarf.plotting.heatmaps import pseudotime_heatmap
+
+    for name, function in (
+        ("cluster_connectivity", cluster_connectivity),
+        ("cluster_tree", cluster_tree),
+        ("pseudotime_heatmap", pseudotime_heatmap),
+    ):
+        accessor_parameters = list(
+            signature(getattr(DataStorePlotAccessor, name)).parameters.values()
+        )[1:]
+        function_parameters = list(signature(function).parameters.values())[1:]
+        assert [value.name for value in accessor_parameters] == [
+            value.name for value in function_parameters
+        ]
+        assert [value.default for value in accessor_parameters] == [
+            value.default for value in function_parameters
+        ]
+        assert "feat_key" not in {value.name for value in function_parameters}
+
+    heatmap_features = signature(pseudotime_heatmap).parameters["features"]
+    assert heatmap_features.default is Parameter.empty
+    assert "graph" in signature(cluster_connectivity).parameters
+    assert "graph" in signature(cluster_tree).parameters
 
 
 def test_hierarchy_positions_rejects_non_trees():
@@ -70,6 +102,37 @@ def test_cluster_tree_rejects_misaligned_color_values():
         cluster_tree(store, show=False)
 
 
+def test_writable_float64_accumulator_accepts_readonly_blocks() -> None:
+    from scarf.plotting.heatmaps import _writable_float64
+
+    first = np.array([1.0, 2.0], dtype=np.float64)
+    first.flags.writeable = False
+    second = np.array([3.0, 4.0], dtype=np.float64)
+    second.flags.writeable = False
+
+    total = _writable_float64(first)
+    total += _writable_float64(second)
+
+    np.testing.assert_allclose(total, [4.0, 6.0])
+    assert first.flags.writeable is False
+    np.testing.assert_array_equal(first, [1.0, 2.0])
+
+
+def test_clip_marker_means_does_not_write_through_readonly_values() -> None:
+    from scarf.plotting.heatmaps import _clip_marker_means
+
+    values = np.array([[-2.0, 0.5], [3.0, 1.0]], dtype=np.float64)
+    values.flags.writeable = False
+    group_means = pd.DataFrame(values, index=["a", "b"], columns=["g1", "g2"])
+
+    matrix = _clip_marker_means(group_means, vmin=-1.0, vmax=2.0)
+
+    assert list(matrix.index) == ["g1", "g2"]
+    assert list(matrix.columns) == ["a", "b"]
+    np.testing.assert_allclose(matrix.to_numpy(), [[-1.0, 2.0], [0.5, 1.0]])
+    assert values[0, 0] == -2.0
+
+
 def test_marker_heatmap_returns_owned_result(
     marker_search,
     datastore,
@@ -78,6 +141,7 @@ def test_marker_heatmap_returns_owned_result(
 
     result = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=3,
         figsize=(4, 6),
@@ -108,7 +172,12 @@ def test_marker_heatmap_selects_features_by_named_score(
     from scarf.features.markers.table import load_marker_table
 
     assay = datastore.RNA
-    marker_slot = datastore._resolve_marker_group("RNA", "I", "RNA_cluster")
+    marker_slot = datastore._resolve_marker_group(
+        "RNA",
+        "I",
+        "RNA_cluster",
+        marker_search,
+    )
     feature_names = np.asarray(assay.feats.fetch_all("names"))
     feature_ids = np.asarray(assay.feats.fetch_all("ids"))
     expected_by_group: dict[str, list[str]] = {}
@@ -129,6 +198,7 @@ def test_marker_heatmap_selects_features_by_named_score(
 
     result = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_rows=False,
@@ -151,13 +221,19 @@ def test_marker_heatmap_propagates_marker_metadata_errors(
     marker_search,
     datastore,
 ):
-    marker_slot = datastore._resolve_marker_group("RNA", "I", "RNA_cluster")
+    marker_slot = datastore._resolve_marker_group(
+        "RNA",
+        "I",
+        "RNA_cluster",
+        marker_search,
+    )
     original_method = marker_slot.attrs["method"]
     marker_slot.attrs["method"] = "ttest"
     try:
         with pytest.raises(ValueError, match="Canonical marker metadata 'method'"):
             splt.marker_heatmap(
                 datastore,
+                marker=marker_search,
                 group_key="RNA_cluster",
                 topn=2,
                 show=False,
@@ -166,11 +242,9 @@ def test_marker_heatmap_propagates_marker_metadata_errors(
         marker_slot.attrs["method"] = original_method
 
 
-def test_marker_heatmap_skips_unresolved_legacy_names_with_warning(
+def test_marker_heatmap_rejects_legacy_marker_group_without_mutation(
     datastore_ephemeral,
 ):
-    from scarf.utils import logger
-
     assay = datastore_ephemeral.RNA
     group_key = "legacy_heatmap_groups"
     groups = np.arange(datastore_ephemeral.cells.N) % 2
@@ -193,13 +267,12 @@ def test_marker_heatmap_skips_unresolved_legacy_names_with_warning(
         )
         cluster.create_array("scores", data=np.array([1.0, 0.9]))
 
-    warnings: list[str] = []
-    sink = logger.add(
-        lambda message: warnings.append(message.record["message"]),
-        level="WARNING",
-    )
-    try:
-        result = splt.marker_heatmap(
+    original_names = {
+        group_id: np.asarray(slot[group_id]["names"][:]).copy()
+        for group_id in ("0", "1")
+    }
+    with pytest.raises(KeyError, match="run `run_marker_search` first"):
+        splt.marker_heatmap(
             datastore_ephemeral,
             from_assay="RNA",
             group_key=group_key,
@@ -209,15 +282,9 @@ def test_marker_heatmap_skips_unresolved_legacy_names_with_warning(
             cluster_columns=False,
             show=False,
         )
-    finally:
-        logger.remove(sink)
 
-    assert set(result.tables["markers"]["feature_index"]) == {0, 1}
-    assert all(
-        "removed_feature" not in value for value in result.tables["matrix"].index
-    )
-    assert any("unresolved legacy marker" in message for message in warnings)
-    result.close()
+    for group_id, names in original_names.items():
+        np.testing.assert_array_equal(slot[group_id]["names"][:], names)
 
 
 def test_marker_heatmap_accepts_explicit_order_annotations_and_target(
@@ -228,6 +295,7 @@ def test_marker_heatmap_accepts_explicit_order_annotations_and_target(
 
     baseline = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_rows=False,
@@ -245,6 +313,7 @@ def test_marker_heatmap_accepts_explicit_order_annotations_and_target(
 
     result = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         row_order=row_order,
@@ -370,6 +439,7 @@ def test_clustermap_annotation_legend_reserves_space_with_column_tree(
 ):
     baseline = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_columns=False,
@@ -388,6 +458,7 @@ def test_clustermap_annotation_legend_reserves_space_with_column_tree(
 
     result = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_columns=True,
@@ -424,6 +495,7 @@ def test_clustermap_annotation_legend_without_dendrogram_is_owned_and_closed(
 
     baseline = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_rows=False,
@@ -440,6 +512,7 @@ def test_clustermap_annotation_legend_without_dendrogram_is_owned_and_closed(
 
     result = splt.marker_heatmap(
         datastore,
+        marker=marker_search,
         group_key="RNA_cluster",
         topn=2,
         cluster_rows=False,
@@ -495,7 +568,7 @@ def test_pseudotime_heatmap_returns_aligned_tables(
     result = splt.pseudotime_heatmap(
         datastore,
         cell_key="I",
-        feat_key="I",
+        features=pseudotime_aggregation.feature_selection,
         feature_cluster_key="pseudotime_clusters",
         pseudotime_key="RNA_pseudotime",
         show_features=["Wsb1", "Rest"],
@@ -536,7 +609,7 @@ def test_pseudotime_heatmap_accepts_composable_target(
     result = splt.pseudotime_heatmap(
         datastore,
         cell_key="I",
-        feat_key="I",
+        features=pseudotime_aggregation.feature_selection,
         feature_cluster_key="pseudotime_clusters",
         pseudotime_key="RNA_pseudotime",
         target=axes,
@@ -563,11 +636,11 @@ def test_pseudotime_heatmap_rejects_malformed_artifact_link(
     original_ref = dict(column.attrs["source_artifact"])
     column.attrs["source_artifact"] = "broken"
     try:
-        with pytest.raises(ValueError, match="malformed source artifact"):
+        with pytest.raises(ValueError, match="not artifact-backed"):
             splt.pseudotime_heatmap(
                 datastore,
                 cell_key="I",
-                feat_key="I",
+                features=pseudotime_aggregation.feature_selection,
                 feature_cluster_key="pseudotime_clusters",
                 pseudotime_key="RNA_pseudotime",
                 show=False,
@@ -589,7 +662,7 @@ def test_pseudotime_heatmap_validates_artifact_link_identity(
             splt.pseudotime_heatmap(
                 datastore,
                 cell_key="I",
-                feat_key="I",
+                features=pseudotime_aggregation.feature_selection,
                 feature_cluster_key="pseudotime_clusters",
                 pseudotime_key="RNA_pseudotime",
                 show=False,
@@ -601,7 +674,7 @@ def test_pseudotime_heatmap_validates_artifact_link_identity(
             splt.pseudotime_heatmap(
                 datastore,
                 cell_key="I",
-                feat_key="I",
+                features=pseudotime_aggregation.feature_selection,
                 feature_cluster_key="pseudotime_clusters",
                 pseudotime_key="RNA_pseudotime",
                 show=False,
@@ -629,7 +702,7 @@ def test_pseudotime_heatmap_validates_artifact_payload(
             datastore,
             from_assay="RNA",
             cell_key="I",
-            feat_key="I",
+            features=pseudotime_aggregation.feature_selection,
             feature_cluster_key="pseudotime_clusters",
             pseudotime_key="RNA_pseudotime",
         )
@@ -822,13 +895,20 @@ def test_heatmap_annotations_validate_empty_alignment_and_scales():
         )
 
 
-def test_marker_heatmap_rejects_empty_marker_groups(datastore_ephemeral):
+def test_marker_heatmap_rejects_empty_marker_groups(
+    datastore_ephemeral,
+    monkeypatch,
+):
     assay = datastore_ephemeral.RNA
     markers = (
         assay.z["markers"] if "markers" in assay.z else assay.z.create_group("markers")
     )
     slot = markers.create_group("I__empty_heatmap_groups")
-    slot.create_group("0")
+    monkeypatch.setattr(
+        datastore_ephemeral,
+        "_resolve_marker_group",
+        lambda *_args, **_kwargs: slot,
+    )
 
     with pytest.raises(ValueError, match="Marker list is empty"):
         splt.marker_heatmap(
@@ -999,7 +1079,12 @@ def test_pseudotime_heatmap_validates_orders_and_target_layout(
         "pseudotime": np.array([0.0, 0.25, 0.5, 0.75]),
         "assay": "RNA",
         "cell_key": "I",
-        "feat_key": "I",
+        "feature_selection": ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="feature_selection",
+            artifact_id="1" * 64,
+        ),
         "feature_cluster_key": "clusters",
         "pseudotime_key": "pseudotime",
         "aggregation_location": "artifact",
@@ -1014,7 +1099,7 @@ def test_pseudotime_heatmap_validates_orders_and_target_layout(
         heatmap_plotting.pseudotime_heatmap(
             object(),
             cell_key="I",
-            feat_key="I",
+            features="all_features",
             feature_cluster_key="clusters",
             pseudotime_key="pseudotime",
             feature_order=["gene1", "gene1", "gene3"],
@@ -1024,7 +1109,7 @@ def test_pseudotime_heatmap_validates_orders_and_target_layout(
         heatmap_plotting.pseudotime_heatmap(
             object(),
             cell_key="I",
-            feat_key="I",
+            features="all_features",
             feature_cluster_key="clusters",
             pseudotime_key="pseudotime",
             feature_cluster_order=["A"],
@@ -1037,7 +1122,7 @@ def test_pseudotime_heatmap_validates_orders_and_target_layout(
         heatmap_plotting.pseudotime_heatmap(
             object(),
             cell_key="I",
-            feat_key="I",
+            features="all_features",
             feature_cluster_key="clusters",
             pseudotime_key="pseudotime",
             target={
@@ -1050,7 +1135,7 @@ def test_pseudotime_heatmap_validates_orders_and_target_layout(
         heatmap_plotting.pseudotime_heatmap(
             object(),
             cell_key="I",
-            feat_key="I",
+            features="all_features",
             feature_cluster_key="clusters",
             pseudotime_key="pseudotime",
             target={
@@ -1079,7 +1164,12 @@ def test_pseudotime_heatmap_applies_explicit_order_scales_and_target_ownership(
         "pseudotime": np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0]),
         "assay": "RNA",
         "cell_key": "I",
-        "feat_key": "I",
+        "feature_selection": ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="feature_selection",
+            artifact_id="2" * 64,
+        ),
         "feature_cluster_key": "clusters",
         "pseudotime_key": "pseudotime",
         "aggregation_location": "artifact",
@@ -1100,7 +1190,7 @@ def test_pseudotime_heatmap_applies_explicit_order_scales_and_target_ownership(
     result = heatmap_plotting.pseudotime_heatmap(
         object(),
         cell_key="I",
-        feat_key="I",
+        features="all_features",
         feature_cluster_key="clusters",
         pseudotime_key="pseudotime",
         feature_order=("gene3", "gene1", "gene2"),

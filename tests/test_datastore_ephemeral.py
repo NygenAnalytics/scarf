@@ -208,7 +208,7 @@ def test_mapping_reference_rejects_unscaled_pca_chain(
     _ensure_graph(ds)
     build_neighbourhood_graph(
         ds,
-        feat_key="hvgs",
+        features="hvgs",
         feat_scaling=False,
         dims=5,
         k=3,

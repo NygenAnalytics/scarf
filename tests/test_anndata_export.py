@@ -18,7 +18,6 @@ def export_store(toy_crdir_writer, tmp_path):
         str(destination),
         default_assay="RNA",
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
     )
 

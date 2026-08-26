@@ -11,9 +11,7 @@ from ...storage.arrays import create_zarr_dataset
 from ...storage.artifacts import (
     ArtifactRef,
     artifact_path,
-    fingerprint_stored_arrays,
     inspect_artifact,
-    parse_artifact_path,
 )
 from ...storage.artifact_writer import (
     ArrayRequirement,
@@ -22,10 +20,7 @@ from ...storage.artifact_writer import (
     reused_artifact_group,
     start_artifact,
 )
-from ...graph.state import (
-    resolve_stored_graph_input,
-    validate_legacy_graph_selection,
-)
+from ...graph.state import resolve_graph_selection
 from ...metadata.arguments import (
     MembershipStrengthArguments,
     SmartLabelArguments,
@@ -222,58 +217,58 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
 
     def calc_membership_strength(
         self,
-        from_assay: str,
-        cell_key: str,
-        feat_key: str,
         clust_key: str,
+        *,
+        graph: ArtifactRef | None = None,
+        from_assay: str | None = None,
+        cell_key: str | None = None,
         invalidate_cache: bool = False,
     ) -> None:
-        """Store per-cell cluster membership strength from the latest KNN graph.
+        """Store per-cell cluster membership strength from a selected graph.
 
         For each cell, computes the fraction of KNN neighbors sharing the most
         common cluster label and saves it in cell metadata.
 
         Args:
-            from_assay: Assay used to locate the KNN graph.
-            cell_key: Boolean column selecting cells.
-            feat_key: Feature key used when the graph was built.
             clust_key: Cell metadata column with cluster assignments.
+            graph: Connectivity-map or integrated-graph artifact. The assay's
+                current connectivity map is used when omitted.
+            from_assay: Assay used to resolve the current graph.
+            cell_key: Optional cell key, validated against the graph lineage.
 
         Returns:
             None
         """
-        loc = self.get_latest_graph_loc(
-            from_assay=from_assay, cell_key=cell_key, feat_key=feat_key
+        graph_selection = resolve_graph_selection(
+            self,
+            graph,
+            from_assay=from_assay,
+            cell_key=cell_key,
         )
+        graph_ref = graph_selection.graph_ref
+        from_assay = graph_selection.from_assay
+        cell_key = graph_selection.cell_key
+        loc = graph_selection.graph_loc
         n_cells, k = self._get_graph_ncells_k(graph_loc=loc)
         selection = self._ensure_cell_selection(cell_key)
-        graph_input: object = resolve_stored_graph_input(self.zw, loc)
-        if isinstance(graph_input, ArtifactRef):
-            graph_selection = self._graph_cell_selection(graph_input)
-            if not self._selection_artifacts_match(graph_selection, selection):
-                raise ValueError("cell_key does not match the graph cell selection")
-        else:
-            validate_legacy_graph_selection(
-                self,
-                loc,
-                from_assay,
-                cell_key,
-                feat_key,
-            )
+        graph_cell_selection = self._graph_cell_selection(graph_ref)
+        if not self._selection_artifacts_match(graph_cell_selection, selection):
+            raise ValueError("cell_key does not match the graph cell selection")
         cluster_input = self._resolve_cell_data_provenance_input(
             clust_key,
             cell_key=cell_key,
         )
-        output_key = f"{from_assay}_{cell_key}_cluster_membership_strength"
+        output_key = (
+            f"{graph_selection.output_assay}_{cell_key}_cluster_membership_strength"
+        )
         arguments = MembershipStrengthArguments(
-            connectivity_map=graph_input,
+            connectivity_map=graph_ref,
             clusters=cluster_input,
             cell_selection=selection,
             algorithm_version=2,
             decimals=3,
             from_assay=from_assay,
             cell_key=cell_key,
-            feat_key=feat_key,
             clust_key=clust_key,
             output_key=output_key,
             invalidate_cache=invalidate_cache,
@@ -281,8 +276,8 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         record = arguments.to_record()
         planned = plan_cell_data_artifact(
             self.zw,
-            scope="assay",
-            assay=from_assay,
+            scope=graph_ref.scope,
+            assay=graph_ref.assay,
             kind=arguments.artifact_kind,
             operation=arguments.operation,
             parameters=record.parameters,
@@ -508,12 +503,9 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
     def _prepare_artifact_cluster_tree(
         self,
         *,
-        graph_ref: ArtifactRef | dict[str, Any],
-        graph_loc: str,
+        graph_ref: ArtifactRef,
         from_assay: str,
         cell_key: str,
-        feat_key: str,
-        integrated_graph: str | None,
         cluster_key: str,
         fill_by_value: str | None,
         invalidate_cache: bool,
@@ -532,9 +524,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
         cut_ref = ArtifactRef.from_dict(raw_cut_ref)
         cut_inputs = inspect_artifact(self.zw, cut_ref).inputs or {}
         raw_graph_ref = cut_inputs.get("connectivity_map")
-        expected_graph_input = (
-            graph_ref.to_dict() if isinstance(graph_ref, ArtifactRef) else graph_ref
-        )
+        expected_graph_input = graph_ref.to_dict()
         if raw_graph_ref != expected_graph_input:
             raise ValueError("Cluster cut does not belong to the requested graph")
         raw_hierarchy_ref = cut_inputs.get("cluster_hierarchy")
@@ -684,8 +674,7 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
             "color_values": color_values,
             "from_assay": from_assay,
             "cell_key": cell_key,
-            "feat_key": feat_key,
-            "integrated_graph": integrated_graph,
+            "graph_ref": graph_ref,
             "cluster_key": cluster_key,
             "coalesced_location": inspect_artifact(
                 self.zw,
@@ -696,214 +685,29 @@ class _PresentationOperationsMixin(_PresentationOperationsBase):
     def _prepare_cluster_tree(
         self,
         *,
+        graph: ArtifactRef | None = None,
         from_assay: str | None = None,
         cell_key: str | None = None,
-        feat_key: str | None = None,
-        integrated_graph: str | None = None,
         cluster_key: str | None = None,
         fill_by_value: str | None = None,
         invalidate_cache: bool = False,
     ) -> dict[str, Any]:
-        from networkx import DiGraph, to_pandas_edgelist
-
-        from ...clustering.cluster_tree import CoalesceTree, make_digraph
-        from ...utils.arrays import array_digest
-        from .paris_persistence import resolve_compatibility_dendrogram
-
-        from_assay, cell_key, feat_key = self._get_latest_keys(
-            from_assay, cell_key, feat_key
-        )
+        """Prepare an artifact-backed cluster tree for one exact graph."""
         if cluster_key is None:
             raise ValueError(
                 "ERROR: Please provide a value for `cluster_key` parameter"
             )
-
-        if integrated_graph is None:
-            graph_loc = self.get_latest_graph_loc(from_assay, cell_key, feat_key)
-        else:
-            graph_loc = self._resolve_integrated_graph_path(integrated_graph)
-            if graph_loc is None:
-                raise KeyError(
-                    f"An integrated graph with label {integrated_graph!r} does not exist"
-                )
-        cell_data = as_zarr_group(self.zw["cellData"], name="cellData")
-        cluster_column = as_zarr_array(cell_data[cluster_key], name=cluster_key)
-        raw_cut_ref = cluster_column.attrs.get("source_artifact")
-        if integrated_graph is None and isinstance(raw_cut_ref, dict):
-            cut_ref = ArtifactRef.from_dict(raw_cut_ref)
-            if cut_ref.kind == "cluster_cut":
-                cut_inputs = inspect_artifact(self.zw, cut_ref).inputs or {}
-                raw_graph_ref = cut_inputs.get("connectivity_map")
-                if isinstance(raw_graph_ref, dict):
-                    try:
-                        selected_graph_ref = ArtifactRef.from_dict(raw_graph_ref)
-                    except (KeyError, TypeError, ValueError):
-                        pass
-                    else:
-                        graph_loc = artifact_path(selected_graph_ref)
-        try:
-            graph_ref: ArtifactRef | dict[str, str] | None = parse_artifact_path(
-                graph_loc
-            )
-        except ValueError:
-            if isinstance(raw_cut_ref, dict):
-                graph_group = as_zarr_group(self.zw[graph_loc], name=graph_loc)
-                graph_ref = {
-                    "legacy_graph_fingerprint": fingerprint_stored_arrays(
-                        graph_group,
-                        ("edges", "weights"),
-                    )
-                }
-            else:
-                graph_ref = None
-        if isinstance(raw_cut_ref, dict):
-            assert graph_ref is not None
-            return self._prepare_artifact_cluster_tree(
-                graph_ref=graph_ref,
-                graph_loc=graph_loc,
-                from_assay=from_assay,
-                cell_key=cell_key,
-                feat_key=feat_key,
-                integrated_graph=integrated_graph,
-                cluster_key=cluster_key,
-                fill_by_value=fill_by_value,
-                invalidate_cache=invalidate_cache,
-            )
-        if isinstance(graph_ref, ArtifactRef):
-            raise ValueError("Cluster column has no source artifact for this graph")
-        clusters = np.asarray(self.cells.fetch(cluster_key, key=cell_key))
-        dendrogram_loc, generation_id = resolve_compatibility_dendrogram(
-            self.zw,
-            graph_loc,
-            self.resources,
+        selection = resolve_graph_selection(
+            self,
+            graph,
+            from_assay=from_assay,
+            cell_key=cell_key,
         )
-        if clusters.dtype.hasobject:
-            hashed_clusters = pd.util.hash_pandas_object(
-                pd.Series(clusters),
-                index=False,
-                categorize=True,
-            ).to_numpy(dtype=np.uint64)
-            cluster_digest = array_digest(hashed_clusters)
-        else:
-            cluster_digest = array_digest(clusters)
-        coalesced_loc = f"{dendrogram_loc}_coalesced_{cluster_digest}"
-        cache_hit = False
-        if coalesced_loc in self.zw:
-            coalesced_group = as_zarr_group(
-                self.zw[coalesced_loc],
-                name=coalesced_loc,
-            )
-            cache_hit = (
-                coalesced_group.attrs.get("complete") is True
-                and coalesced_group.attrs.get("cluster_digest") == cluster_digest
-                and coalesced_group.attrs.get("hierarchy_generation_id")
-                == (generation_id or "legacy")
-            )
-
-        if cache_hit:
-            subgraph = DiGraph()
-            subgraph.add_edges_from(
-                np.asarray(
-                    as_zarr_array(
-                        self.zw[coalesced_loc + "/edgelist"],
-                        name=f"{coalesced_loc}/edgelist",
-                    )[:]
-                )
-            )
-            nodelist = np.asarray(
-                as_zarr_array(
-                    self.zw[coalesced_loc + "/nodelist"],
-                    name=f"{coalesced_loc}/nodelist",
-                )[:]
-            )
-            partition_ids = np.asarray(
-                as_zarr_array(
-                    self.zw[coalesced_loc + "/partition_id"],
-                    name=f"{coalesced_loc}/partition_id",
-                )[:]
-            )
-            cluster_labels = {str(value): value for value in set(clusters)}
-            for node_data, partition_id in zip(
-                nodelist,
-                partition_ids,
-                strict=True,
-            ):
-                node = int(node_data[0])
-                subgraph.nodes[node]["nleaves"] = int(node_data[1])
-                partition_text = str(partition_id)
-                if partition_text != "-1":
-                    subgraph.nodes[node]["partition_id"] = cluster_labels.get(
-                        partition_text, partition_id
-                    )
-        else:
-            dendrogram = np.asarray(
-                as_zarr_array(self.zw[dendrogram_loc], name=dendrogram_loc)[:]
-            )
-            subgraph = CoalesceTree(make_digraph(dendrogram), clusters)
-            edge_list = to_pandas_edgelist(subgraph).values
-            coalesced_group = self.zw.create_group(coalesced_loc, overwrite=True)
-            coalesced_group.attrs.update(
-                {
-                    "complete": False,
-                    "cluster_digest": cluster_digest,
-                    "hierarchy_generation_id": generation_id or "legacy",
-                    "cluster_key": cluster_key,
-                }
-            )
-            store = create_zarr_dataset(
-                coalesced_group,
-                "edgelist",
-                (100000,),
-                "u8",
-                edge_list.shape,
-            )
-            store[:] = edge_list
-
-            node_list = []
-            partition_id_list = []
-            for node in subgraph.nodes():
-                node_data = subgraph.nodes[node]
-                partition_id = node_data.get("partition_id", -1)
-                node_list.append((node, node_data["nleaves"]))
-                partition_id_list.append(str(partition_id))
-
-            node_list_arr = np.asarray(node_list)
-            store = create_zarr_dataset(
-                coalesced_group,
-                "nodelist",
-                (100000,),
-                node_list_arr.dtype,
-                node_list_arr.shape,
-            )
-            store[:] = node_list_arr
-
-            store = create_zarr_dataset(
-                coalesced_group,
-                "partition_id",
-                (100000,),
-                str,
-                (len(partition_id_list),),
-            )
-            store[:] = partition_id_list
-            coalesced_group.attrs["complete"] = True
-
-        color_values = (
-            self.get_cell_vals(
-                from_assay=from_assay,
-                cell_key=cell_key,
-                k=fill_by_value,
-            )
-            if fill_by_value is not None
-            else None
+        return self._prepare_artifact_cluster_tree(
+            graph_ref=selection.graph_ref,
+            from_assay=selection.from_assay,
+            cell_key=selection.cell_key,
+            cluster_key=cluster_key,
+            fill_by_value=fill_by_value,
+            invalidate_cache=invalidate_cache,
         )
-        return {
-            "graph": subgraph,
-            "clusters": clusters,
-            "color_values": color_values,
-            "from_assay": from_assay,
-            "cell_key": cell_key,
-            "feat_key": feat_key,
-            "integrated_graph": integrated_graph,
-            "cluster_key": cluster_key,
-            "coalesced_location": coalesced_loc,
-        }

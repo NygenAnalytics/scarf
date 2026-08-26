@@ -171,7 +171,7 @@ def test_lazy_coordinate_stages_do_not_hide_a_cross_stage_cache() -> None:
         ef=50,
         m=16,
         rand_state=4466,
-        ann_threads=1,
+        nthreads=1,
     )
     initialization = KMeansInitializationStage.fit(
         stream=stream,

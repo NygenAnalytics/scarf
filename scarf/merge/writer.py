@@ -1,6 +1,6 @@
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import zarr
@@ -11,7 +11,9 @@ from ..metadata.rows import (
     read_metadata_rows_chunkwise,
 )
 from ..storage.budget import ResourceBudget, admitted_worker_split
-from ..storage.layout import ZarrArraySpec, array_shard_rows
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
+from ..storage.layout import ZarrArraySpec
 from ..storage.partition import affordable_width
 from ..storage.profiles import StorageProfile
 from ..storage.schema import create_zarr_count_assay, load_count_array
@@ -28,6 +30,22 @@ from ..utils.logging import logger
 from ..utils.progress import iter_progress
 from .features import FeatureAlignment
 from .row_plan import RowPlan, iter_row_plan_segments, max_row_plan_block_rows
+
+
+CountsTReuseOutcome = Literal[
+    "reusable",
+    "rewrite-layout",
+    "incomplete",
+    "block-shape/dtype",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class CountsTReuseAssessment:
+    """Structured merge decision for an existing ``countsT`` component."""
+
+    outcome: CountsTReuseOutcome
+    reason: str | None = None
 
 
 def _matrix_group_path(assay_name: str, workspace: str | None) -> str:
@@ -97,11 +115,11 @@ def remap_block_to_coo(
     block: Any,
     order_map: np.ndarray,
     n_feats: int,
-    n_threads: int,
+    nthreads: int,
     destination_dtype: np.dtype[Any] | None = None,
 ) -> coo_matrix:
     """Dense-or-chunked block to COO with feature remapping and summation."""
-    computed = controlled_compute(block, n_threads)
+    computed = controlled_compute(block, nthreads)
     if order_map.shape[0] != computed.shape[1]:
         raise ValueError("Feature order does not match the source matrix width")
     source = coo_matrix(computed)
@@ -127,8 +145,7 @@ def create_assay_counts(
     dtype: str,
     *,
     profile: StorageProfile,
-    targetChunkBytes: int | None,
-    targetShardBytes: int | None,
+    policy: CountMatrixPolicy | None,
 ) -> zarr.Array:
     counts = create_zarr_count_assay(
         z=root,
@@ -139,8 +156,7 @@ def create_assay_counts(
         feat_names=np.array(alignment.mergedFeatsMap["names"]),
         dtype=dtype,
         profile=profile,
-        targetChunkBytes=targetChunkBytes,
-        targetShardBytes=targetShardBytes,
+        policy=policy,
     )
     matrix_group = as_zarr_group(
         root[_matrix_group_path(assay_name, workspace)],
@@ -355,6 +371,7 @@ def write_assay_counts(
     resources: ResourceBudget,
     profile: StorageProfile,
     additionalResidentBytes: int = 0,
+    io: StorageIoPolicy | None = None,
 ) -> int:
     """Stream remapped source blocks into the destination counts array."""
     destination = load_count_array(root, assay_name, workspace)
@@ -428,6 +445,7 @@ def write_assay_counts(
         resources=resources,
         residentBytes=requirements.residentBytes,
         producerReserveBytes=plan.producerReserveBytes,
+        io=io,
     )
     if counter != row_plan.nCells or expected_start != row_plan.nCells:
         raise AssertionError(
@@ -448,7 +466,9 @@ def write_assay_counts_t(
     profile: StorageProfile,
     resources: ResourceBudget,
     residentBytes: int = 0,
-) -> zarr.Array | None:
+    policy: CountMatrixPolicy | None = None,
+    io: StorageIoPolicy | None = None,
+) -> zarr.Array:
     counts = load_count_array(root, assay_name, workspace)
     group_path = _matrix_group_path(assay_name, workspace)
     group = as_zarr_group(root[group_path], name=group_path)
@@ -456,8 +476,7 @@ def write_assay_counts_t(
 
     if _group_zarr_format(group) < 3:
         raise ValueError(
-            "countsT requires a Zarr v3 destination. Repack the store or choose "
-            "counts_t='none'."
+            "countsT requires a Zarr v3 destination. Repack the store to Zarr v3."
         )
     result = write_counts_t(
         counts,
@@ -465,12 +484,9 @@ def write_assay_counts_t(
         profile=profile,
         resources=resources,
         residentBytes=residentBytes,
+        policy=policy,
+        io=io,
     )
-    if result is None:
-        raise ValueError(
-            "countsT could not be written for this destination. "
-            "Choose counts_t='none' or use a Zarr v3 store."
-        )
     logger.debug(f"Wrote countsT for assay {assay_name}")
     return result
 
@@ -591,44 +607,89 @@ def validate_counts_t(
     n_features: int,
     dtype: str,
 ) -> str | None:
-    """Return why a completed countsT component cannot be reused."""
+    """Return why a completed countsT component cannot be reused.
+
+    Prefer :func:`assess_counts_t_reuse` for structured outcomes. This wrapper
+    keeps a human-readable reason for blocked-plan messages.
+    """
+    assessment = assess_counts_t_reuse(
+        root,
+        assay_name,
+        workspace,
+        n_cells=n_cells,
+        n_features=n_features,
+        dtype=dtype,
+    )
+    if assessment.outcome == "reusable":
+        return None
+    return assessment.reason
+
+
+def assess_counts_t_reuse(
+    root: zarr.Group,
+    assay_name: str,
+    workspace: str | None,
+    *,
+    n_cells: int,
+    n_features: int,
+    dtype: str,
+) -> CountsTReuseAssessment:
+    """Classify whether an existing ``countsT`` can be reused by merge.
+
+    Outcomes:
+    - ``reusable``: complete paired layout matching the planned geometry
+    - ``rewrite-layout``: present but not the locked rotateOnce layout
+    - ``incomplete``: missing or ``complete`` is not True
+    - ``block-shape/dtype``: complete array that disagrees with the merge plan
+    """
+    from ..storage.count_matrix import require_count_matrix_layout
+    from ..storage.schema import load_count_array
+
     matrix_path = _matrix_group_path(assay_name, workspace)
     if matrix_path not in root:
-        return f"matrix group {matrix_path!r} is missing"
+        return CountsTReuseAssessment(
+            outcome="incomplete",
+            reason=f"matrix group {matrix_path!r} is missing",
+        )
     matrix_group = as_zarr_group(root[matrix_path], name=matrix_path)
     if "countsT" not in matrix_group:
-        return f"countsT is missing for {assay_name!r}"
+        return CountsTReuseAssessment(
+            outcome="incomplete",
+            reason=f"countsT is missing for {assay_name!r}",
+        )
     counts_t = as_zarr_array(
         matrix_group["countsT"],
         name=f"{matrix_path}/countsT",
     )
     if counts_t.attrs.get("complete") is not True:
-        return f"countsT is not complete for {assay_name!r}"
+        return CountsTReuseAssessment(
+            outcome="incomplete",
+            reason=f"countsT is not complete for {assay_name!r}",
+        )
     expected_shape = (int(n_features), int(n_cells))
-    if tuple(int(value) for value in counts_t.shape) != expected_shape:
-        return (
-            f"countsT shape for {assay_name!r} is {tuple(counts_t.shape)}, "
-            f"expected {expected_shape}"
+    actual_shape = tuple(int(value) for value in counts_t.shape)
+    if actual_shape != expected_shape:
+        return CountsTReuseAssessment(
+            outcome="block-shape/dtype",
+            reason=(
+                f"countsT shape for {assay_name!r} is {actual_shape}, "
+                f"expected {expected_shape}"
+            ),
         )
     if np.dtype(counts_t.dtype) != np.dtype(dtype):
-        return (
-            f"countsT dtype for {assay_name!r} is {np.dtype(counts_t.dtype)}, "
-            f"expected {np.dtype(dtype)}"
+        return CountsTReuseAssessment(
+            outcome="block-shape/dtype",
+            reason=(
+                f"countsT dtype for {assay_name!r} is {np.dtype(counts_t.dtype)}, "
+                f"expected {np.dtype(dtype)}"
+            ),
         )
-    if array_metadata_shards(counts_t) is not None:
-        return f"countsT for {assay_name!r} must be unsharded"
-    if "counts" not in matrix_group:
-        return f"counts array is missing from {matrix_path!r}"
-    counts = as_zarr_array(matrix_group["counts"], name=f"{matrix_path}/counts")
-    source_rows = array_shard_rows(counts)
-    expected_chunks = (
-        max(1, min(int(n_features), int(counts.chunks[1]))),
-        max(1, min(int(n_cells), source_rows)),
-    )
-    actual_chunks = tuple(int(value) for value in counts_t.chunks)
-    if actual_chunks != expected_chunks:
-        return (
-            f"countsT chunks for {assay_name!r} are {actual_chunks}, "
-            f"expected {expected_chunks}"
+    try:
+        counts = load_count_array(root, assay_name, workspace)
+        require_count_matrix_layout(matrix_group, counts, counts_t)
+    except ValueError as exc:
+        return CountsTReuseAssessment(
+            outcome="rewrite-layout",
+            reason=str(exc),
         )
-    return None
+    return CountsTReuseAssessment(outcome="reusable", reason=None)

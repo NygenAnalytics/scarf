@@ -20,14 +20,25 @@ Feature selection decides which measured genes define PCA and the neighbourhood 
 This is distinct from cell quality control.
 A gene can be measured correctly and still be excluded because it contributes broad technical or confounding variation to the graph.
 
+For a simple detection threshold, `select_detected_features(min_cells=...)` publishes a selection from the same immutable feature summary.
+The threshold is inclusive and the method returns the selection reference.
+
 ## 1. Fit the mean-variance model
 
+The published PBMC store contains literal metadata from an earlier analysis.
+Structurally repack it into a temporary source with the current RNA count layout, then mount those count matrices into a fresh page-local store.
+The published source remains unchanged and the selections below are current immutable artifacts.
+
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="WARNING", progress=True)
 
@@ -36,8 +47,18 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts_path = Path(analysis_directory.name) / "counts.zarr"
+analysis_path = Path(analysis_directory.name) / "feature_selection.zarr"
+repack_store(
     f"{dataset}/data.zarr",
+    str(repacked_counts_path),
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    str(repacked_counts_path),
+    at=str(analysis_path),
+    default_assay="RNA",
     nthreads=4,
     min_features_per_cell=10,
 )
@@ -47,16 +68,17 @@ ds.filter_cells(
     lows=[1000, 500, 0],
     reset_previous=True,
 )
-ds.mark_hvgs(
+hvg_500 = ds.mark_hvgs(
     min_cells=20,
     top_n=500,
     show_plot=True,
-    hvg_key_name="hvgs_500",
+    label="hvgs_500",
 )
 print(
     "Selected genes:",
-    int(ds.RNA.feats.fetch_all("I__hvgs_500").sum()),
+    int(ds.RNA.feats.fetch_all("hvgs_500").sum()),
 )
+hvg_500
 ```
 
 The plot should retain genes above the fitted mean-variance trend across a useful expression range.
@@ -124,13 +146,13 @@ for key, kwargs in (
         min_cells=20,
         top_n=500,
         show_plot=False,
-        hvg_key_name=key,
+        label=key,
         **kwargs,
     )
 
 pd.Series(
     {
-        key: int(ds.RNA.feats.fetch_all(f"I__{key}").sum())
+        key: int(ds.RNA.feats.fetch_all(key).sum())
         for key in ("hvgs_default", "hvgs_no_blacklist")
     },
     name="selected genes",
@@ -140,8 +162,8 @@ pd.Series(
 ```{code-cell} ipython3
 feature_names = ds.RNA.feats.fetch_all("names")
 only_without_blacklist = feature_names[
-    ds.RNA.feats.fetch_all("I__hvgs_no_blacklist")
-    & ~ds.RNA.feats.fetch_all("I__hvgs_default")
+    ds.RNA.feats.fetch_all("hvgs_no_blacklist")
+    & ~ds.RNA.feats.fetch_all("hvgs_default")
 ]
 print("Genes selected only when blacklist is cleared:", len(only_without_blacklist))
 pd.Series(only_without_blacklist).head(15)
@@ -157,6 +179,12 @@ ds.mark_hvgs(blacklist=r"^MT-|^RPS|^RPL", top_n=2000)
 ds.mark_hvgs(max_cells=np.inf, top_n=2000)
 ```
 
+HVG reuse is based on the resolved algorithm inputs: `min_cells`, effective `max_cells`, `top_n`, variance and mean bounds, `n_bins`, `lowess_frac`, the resolved blacklist, `keep_bounds`, and `bin_strategy`.
+When `max_cells` is omitted, Scarf applies `n_selected - 20` unless that would be at or below `min_cells`, in which case the upper limit is infinite.
+The effective value is stored, so an omitted value and an explicitly equivalent value reuse the same artifact.
+The publication label, plotting options, threads, and `invalidate_cache` are not part of scientific identity.
+On reuse, an HVG plot reads stored corrected-variance diagnostics rather than recomputing the selection.
+
 ## 3. Compare feature-set size
 
 The number of selected genes changes the PCA basis and can change neighbourhood structure.
@@ -164,19 +192,20 @@ This small comparison keeps all other graph choices fixed.
 
 ```{code-cell} ipython3
 for top_n, key in ((300, "hvgs_300"), (1000, "hvgs_1000")):
-    ds.mark_hvgs(
+    feature_ref = ds.mark_hvgs(
         min_cells=20,
         top_n=top_n,
         show_plot=False,
-        hvg_key_name=key,
+        label=key,
     )
-    ds.run_normalization(feat_key=key)
-    ds.run_pca(dims=15)
-    ds.build_embedding_initialization()
-    ds.build_ann_index()
-    ds.query_neighbors(k=11)
-    ds.build_connectivity_map()
+    normalized_ref = ds.run_normalization(features=feature_ref)
+    pca_ref = ds.run_pca(normalized_ref, dims=15)
+    ds.build_embedding_initialization(pca_ref)
+    ann_ref = ds.build_ann_index(pca_ref)
+    neighbors_ref = ds.query_neighbors(ann_ref, k=11)
+    graph_ref = ds.build_connectivity_map(neighbors_ref)
     ds.run_umap(
+        graph=graph_ref,
         n_epochs=150,
         spread=5,
         min_dist=1,
@@ -184,6 +213,7 @@ for top_n, key in ((300, "hvgs_300"), (1000, "hvgs_1000")):
         label=f"{key}_UMAP",
     )
     ds.run_leiden_clustering(
+        graph=graph_ref,
         resolution=0.5,
         label=f"{key}_clusters",
     )
@@ -208,7 +238,7 @@ figure
 ```{code-cell} ipython3
 pd.Series(
     {
-        key: int(ds.RNA.feats.fetch_all(f"I__{key}").sum())
+        key: int(ds.RNA.feats.fetch_all(key).sum())
         for key in ("hvgs_300", "hvgs_1000")
     },
     name="selected genes",
@@ -264,8 +294,9 @@ Compare marker specificity and known biology instead of choosing the layout that
 
 ## 4. Install an externally chosen feature set
 
-`set_hvgs` accepts either a boolean mask aligned to feature metadata or physical feature indexes.
-It records the supplied selection so downstream {term}`artifacts <artifact>` can trace which genes were used.
+`set_feature_selection` accepts either a boolean mask aligned to the complete feature metadata order or physical feature indexes.
+It records an immutable selection artifact and publishes its values under one plain label, so downstream {term}`artifacts <artifact>` can trace which genes were used.
+Exactly one input form is required; duplicate or out-of-range indexes, misaligned masks, and empty selections are rejected.
 Verify the mask length and selected count before building a graph:
 
 ```{code-cell} ipython3
@@ -275,16 +306,31 @@ manual_mask = np.isin(
     panel_genes,
 )
 print("mask length:", len(manual_mask), "selected:", int(manual_mask.sum()))
-custom_feature_key = ds.set_hvgs(
-    cell_key="I",
+custom_features = ds.set_feature_selection(
     mask=manual_mask,
-    hvg_key_name="custom_features",
-    blacklist="",
+    label="custom_features",
 )
-custom_feature_key, int(ds.RNA.feats.fetch_all(custom_feature_key).sum())
+custom_features, int(ds.RNA.feats.fetch_all("custom_features").sum())
 ```
 
 Construct selections with Scarf's metadata helpers when possible: `sift` and `multi_sift` return boolean masks for `mask=`; `get_index_by` returns integer feature-table indexes for `feature_indexes=`.
+
+Both producer calls return an {term}`ArtifactRef`.
+Pass that reference directly when continuing a branch:
+
+```python
+normalized = ds.run_normalization(features=custom_features)
+```
+
+An exact published label is a convenience for resuming later:
+
+```python
+custom_features = ds.resolve_features("RNA", "custom_features")
+all_features = ds.resolve_features("RNA", "all_features")
+```
+
+`all_features` is the immutable all-true universe for the assay.
+Labels use lowercase snake case and are not prefixed with a cell key.
 
 The standard pipeline forwards the same choices:
 
@@ -300,4 +346,5 @@ ds.pipeline.run(
 ```
 
 For scATAC-seq, prevalent peak selection is the analogous step.
+`mark_prevalent_peaks` returns and publishes a feature-selection artifact whose scientific identity contains only its `feature_summary` input and `top_n` parameter.
 See {doc}`scatac_seq`; peak prevalence, not an RNA mean-variance model, defines the candidate accessibility features.

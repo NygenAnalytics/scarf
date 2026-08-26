@@ -23,14 +23,19 @@ It does not create new molecular observations and should not replace counts in d
 
 ## 1. Standalone setup
 
-Diffusion needs a neighbourhood graph, and the published PBMC store already carries one along with its UMAP.
-Opening it is the whole setup.
-Building the same {term}`analysis chain` from counts is covered in {doc}`scrna_seq`.
+Diffusion needs a neighbourhood graph.
+The published PBMC store supplies counts, literal metadata, and the UMAP used below.
+This setup mounts those inputs into a temporary writable analysis store and builds a current graph lineage locally.
+The catalog snapshot is structurally repacked inside the temporary directory first so the mounted counts satisfy the current RNA layout.
 
 ```{code-cell} ipython3
+from tempfile import TemporaryDirectory
+
 import pandas as pd
+
 import scarf
 import scarf.plotting as splt
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="WARNING", progress=True)
 
@@ -39,10 +44,29 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = f"{analysis_directory.name}/counts.zarr"
+repack_store(
     f"{dataset}/data.zarr",
-    nthreads=4,
+    repacked_counts,
+    nthreads=2,
 )
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=f"{analysis_directory.name}/analysis.zarr",
+    nthreads=4,
+    default_assay="RNA",
+)
+hvg_ref = ds.mark_hvgs(
+    top_n=2000,
+    show_plot=False,
+    label="imputation_hvgs",
+)
+normalized = ds.run_normalization(features=hvg_ref)
+reduction = ds.run_pca(normalized, dims=15)
+ann_index = ds.build_ann_index(reduction)
+neighbors = ds.query_neighbors(ann_index, k=11)
+graph = ds.build_connectivity_map(neighbors)
 ```
 
 ## 2. Diffuse one feature
@@ -54,7 +78,7 @@ A larger value mixes information over more graph steps and can erase real bounda
 for t in (1, 2, 4):
     ds.cells.insert(
         f"CD4_imputed_t{t}",
-        ds.get_imputed(feature_name="CD4", t=t),
+        ds.get_imputed(feature_name="CD4", graph=graph, t=t),
         overwrite=True,
     )
 ```

@@ -11,11 +11,11 @@ if TYPE_CHECKING:
     from . import cytebase as cytebase
     from .datastore.datastore import DataStore as DataStore
     from .datastore.summary import DataStoreSummary as DataStoreSummary
-    from .graph.state import (
-        ArtifactSelectionError as ArtifactSelectionError,
-        AssayState as AssayState,
+    from .graph.errors import (
+        IncompatibleAnalysisStateError as IncompatibleAnalysisStateError,
     )
-    from .lineage import ArtifactLineage as ArtifactLineage
+    from .graph.state import AssayState as AssayState
+    from .storage.lineage import ArtifactLineage as ArtifactLineage
     from .features.enrichment import (
         EnrichmentResult as EnrichmentResult,
         read_gmt as read_gmt,
@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .mapping.models import MappingResult as MappingResult
     from .mapping.reference import MappingReference as MappingReference
     from .storage.artifacts import ArtifactStatus as ArtifactStatus
+    from .storage.errors import ArtifactResolutionError as ArtifactResolutionError
     from .storage.refs import ArtifactRef as ArtifactRef
     from .features.genomic.gff import GffReader as GffReader
     from .features.genomic.melding import coordinate_melding as coordinate_melding
@@ -61,7 +62,7 @@ if TYPE_CHECKING:
         rescale_array as rescale_array,
         rolling_window as rolling_window,
         set_verbosity as set_verbosity,
-        show_dask_progress as show_dask_progress,
+        compute_with_progress as compute_with_progress,
         system_call as system_call,
         tqdmbar as tqdmbar,
         tqdm_params as tqdm_params,
@@ -79,7 +80,7 @@ if TYPE_CHECKING:
         create_zarr_count_assay as create_zarr_count_assay,
         create_zarr_dataset as create_zarr_dataset,
         create_zarr_obj_array as create_zarr_obj_array,
-        dask_to_zarr as dask_to_zarr,
+        chunked_to_zarr as chunked_to_zarr,
         subset_assay_zarr as subset_assay_zarr,
         to_h5ad as to_h5ad,
         to_mtx as to_mtx,
@@ -113,9 +114,9 @@ def _resolve_version(
 __version__ = _resolve_version()
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
-    "ArtifactLineage": (".lineage", "ArtifactLineage"),
+    "ArtifactLineage": (".storage.lineage", "ArtifactLineage"),
     "ArtifactRef": (".storage.refs", "ArtifactRef"),
-    "ArtifactSelectionError": (".graph.state", "ArtifactSelectionError"),
+    "ArtifactResolutionError": (".storage.errors", "ArtifactResolutionError"),
     "ArtifactStatus": (".storage.artifacts", "ArtifactStatus"),
     "AssayState": (".graph.state", "AssayState"),
     "CSVReader": (".readers", "CSVReader"),
@@ -133,6 +134,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "H5adInspectResult": (".readers", "H5adInspectResult"),
     "H5adReader": (".readers", "H5adReader"),
     "H5adToZarr": (".writers", "H5adToZarr"),
+    "IncompatibleAnalysisStateError": (
+        ".graph.errors",
+        "IncompatibleAnalysisStateError",
+    ),
     "LoomReader": (".readers", "LoomReader"),
     "LoomToZarr": (".writers", "LoomToZarr"),
     "MtxReader": (".readers", "MtxReader"),
@@ -165,7 +170,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "create_zarr_count_assay": (".writers", "create_zarr_count_assay"),
     "create_zarr_dataset": (".writers", "create_zarr_dataset"),
     "create_zarr_obj_array": (".writers", "create_zarr_obj_array"),
-    "dask_to_zarr": (".writers", "dask_to_zarr"),
+    "chunked_to_zarr": (".writers", "chunked_to_zarr"),
     "get_log_level": (".utils", "get_log_level"),
     "inspect_h5ad": (".readers", "inspect_h5ad"),
     "inspect_mtx": (".readers", "inspect_mtx"),
@@ -177,7 +182,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "rescale_array": (".utils", "rescale_array"),
     "rolling_window": (".utils", "rolling_window"),
     "set_verbosity": (".utils", "set_verbosity"),
-    "show_dask_progress": (".utils", "show_dask_progress"),
+    "compute_with_progress": (".utils", "compute_with_progress"),
     "subset_assay_zarr": (".writers", "subset_assay_zarr"),
     "system_call": (".utils", "system_call"),
     "to_h5ad": (".writers", "to_h5ad"),

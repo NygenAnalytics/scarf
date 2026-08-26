@@ -1,8 +1,8 @@
 """Run Leiden clustering in a child process so the parent container stays live.
 
 Modal's runner heartbeat interval is about 900 seconds and is not configurable.
-``leidenalg`` holds the GIL for the whole of a large partition, so a parent that
-called it inline would emit no heartbeat or progress until it returned.
+Leiden optimizers can hold the GIL for a large partition, so a parent that
+called one inline would emit no heartbeat or progress until it returned.
 ``profiling.stages`` polls this child every 30 seconds and warns at 1800 seconds
 without killing it. Keep this indirection instead of trying to extend the
 heartbeat threshold.
@@ -38,10 +38,11 @@ def run_leiden_worker(requestPath: Path) -> None:
     status_path = Path(str(request["statusPath"]))
 
     print(
-        f"[leiden_worker] START backend=leidenalg store={store_uri}",
+        f"[leiden_worker] START backend={workflow.leidenBackend} store={store_uri}",
         flush=True,
     )
     worker_started = time.perf_counter()
+    cpu_started = time.process_time()
     setup_started = worker_started
     input_setup_seconds: float | None = None
     operation_started: float | None = None
@@ -59,13 +60,18 @@ def run_leiden_worker(requestPath: Path) -> None:
             flush=True,
         )
         operation_started = time.perf_counter()
+        arguments: dict[str, Any] = {
+            "from_assay": workflow.assayName,
+            "cell_key": workflow.cellKey,
+            "resolution": workflow.leidenResolution,
+            "backend": workflow.leidenBackend,
+            "label": workflow.leidenLabel,
+            "random_seed": workflow.leidenSeed,
+        }
+        if request.get("invalidateCache") is True:
+            arguments["invalidate_cache"] = True
         store.run_leiden_clustering(
-            from_assay=workflow.assayName,
-            cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
-            resolution=workflow.leidenResolution,
-            label=workflow.leidenLabel,
-            random_seed=workflow.leidenSeed,
+            **arguments,
         )
         operation_seconds = time.perf_counter() - operation_started
         del store
@@ -84,6 +90,7 @@ def run_leiden_worker(requestPath: Path) -> None:
                 "inputSetupSeconds": input_setup_seconds,
                 "operationSeconds": operation_seconds,
                 "wholeWorkerSeconds": now - worker_started,
+                "processCpuSeconds": time.process_time() - cpu_started,
             },
         )
         print(f"[leiden_worker] ERROR {error}", flush=True)
@@ -97,6 +104,7 @@ def run_leiden_worker(requestPath: Path) -> None:
             "inputSetupSeconds": input_setup_seconds,
             "operationSeconds": operation_seconds,
             "wholeWorkerSeconds": time.perf_counter() - worker_started,
+            "processCpuSeconds": time.process_time() - cpu_started,
         },
     )
     print("[leiden_worker] DONE run_leiden_clustering", flush=True)

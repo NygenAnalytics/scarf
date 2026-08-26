@@ -14,6 +14,7 @@ _RETIRED_MODULES = {
     "scarf/bio_data.py",
     "scarf/chunked.py",
     "scarf/clustering/feature_graph.py",
+    "scarf/cytebase.py",
     "scarf/dendrogram.py",
     "scarf/downloader.py",
     "scarf/doublet_utils.py",
@@ -31,6 +32,7 @@ _RETIRED_MODULES = {
     "scarf/genomics/reference.py",
     "scarf/graph/build.py",
     "scarf/knn_utils.py",
+    "scarf/lineage.py",
     "scarf/mapping/coral.py",
     "scarf/mapping_reference.py",
     "scarf/mapping_utils.py",
@@ -115,6 +117,7 @@ from scarf.readers import (
     SeuratReader,
     inspect_seurat,
 )
+from scarf.storage.lineage import ArtifactLineage
 from scarf.trajectory.feature_dynamics import knn_clustering
 from scarf.writers import (
     CSVtoZarr,
@@ -128,7 +131,7 @@ from scarf.writers import (
     create_zarr_count_assay,
     create_zarr_dataset,
     create_zarr_obj_array,
-    dask_to_zarr,
+    chunked_to_zarr,
     subset_assay_zarr,
     to_h5ad,
     to_mtx,
@@ -157,6 +160,8 @@ assert scarf.CrToZarr is scarf.writers.CrToZarr
 assert scarf.cytebase.Repository is Repository
 assert scarf.cytebase.connect is connect
 assert scarf.cytebase.list_repositories is list_repositories
+assert scarf.ArtifactLineage is ArtifactLineage
+assert ArtifactLineage.__module__ == "scarf.storage.lineage"
 assert scarf.GffReader is GffReader
 assert scarf.coordinate_melding is coordinate_melding
 for feature_function in (
@@ -194,7 +199,7 @@ for writer_function in (
     create_zarr_obj_array,
     create_zarr_count_assay,
     subset_assay_zarr,
-    dask_to_zarr,
+    chunked_to_zarr,
     write_renorm_subset_to_zarr,
     to_h5ad,
     to_mtx,
@@ -228,6 +233,7 @@ for name in (
     "scarf.harmony",
     "scarf.genomics",
     "scarf.knn_utils",
+    "scarf.lineage",
     "scarf.mapping.coral",
     "scarf.mapping_reference",
     "scarf.mapping_utils",

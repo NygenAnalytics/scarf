@@ -1,8 +1,11 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 import scarf.mapping as mapping
 from scarf.datastore.datastore import DataStore
+from scarf.graph.state import write_assay_state
 from scarf.storage.artifacts import artifact_group
 
 
@@ -78,12 +81,23 @@ def test_plain_mapping_reference_packages_and_loads_existing_chain(
 ):
     datastore = analyzed_datastore_ephemeral
     neighbors = _selected_neighbors(datastore)
+    initial_state = datastore.get_assay_state("RNA")
+    assert initial_state is not None
+    assert initial_state.reduction is not None
+    write_assay_state(
+        datastore.zw,
+        replace(
+            initial_state,
+            named_results={"pca": initial_state.reduction},
+        ),
+    )
     before = set(datastore.list_artifacts(from_assay="RNA"))
     reference = datastore.build_mapping_reference(neighbors)
 
     assert reference.method == "pca"
     assert reference.symphony_state is None
     assert reference.neighbors == neighbors
+    assert not hasattr(reference, "feature_key")
     assert reference.dataset_fingerprint == datastore.RNA.attrs["dataset_fingerprint"]
     assert reference.selected_cell_count == len(
         datastore.cells.fetch("ids", key=reference.cell_key)
@@ -92,6 +106,7 @@ def test_plain_mapping_reference_packages_and_loads_existing_chain(
     assert reference.ann_metric in {"l2", "cosine"}
 
     group = artifact_group(datastore.zw, reference.ref)
+    assert "feature_key" not in group.attrs["reference_metadata"]
     assert set(group.array_keys()) == _COMMON_ARRAYS
     status = datastore.inspect_artifact(reference.ref)
     assert status.parameters == {"method": "pca"}
@@ -108,6 +123,7 @@ def test_plain_mapping_reference_packages_and_loads_existing_chain(
     state = datastore.get_assay_state("RNA")
     assert state is not None
     assert state.neighbors == neighbors
+    assert state.named_results["pca"] == initial_state.reduction
     assert state.named_results["mapping_reference"] == reference.ref
     assert datastore.get_mapping_reference().ref == reference.ref
     assert datastore.get_mapping_reference(reference.ref).ref == reference.ref

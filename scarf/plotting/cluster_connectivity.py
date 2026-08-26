@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 
+from ..graph.state import GraphSelection, resolve_graph_selection
+from ..storage.artifacts import ArtifactRef
 from ._contracts import CategoricalScale, PlotProvenance, SizeScale
 from ._deps import require_matplotlib
 from ._display import resolve_categorical_scale
@@ -199,36 +201,32 @@ def _load_graph(
     store: Any,
     *,
     n_cells: int,
-    from_assay: str | None,
-    cell_key: str,
-    feat_key: str | None,
-    graph_loc: str | None,
+    selection: GraphSelection,
 ) -> sparse.csr_matrix:
-    graph = store.load_graph(
-        from_assay=from_assay,
-        cell_key=cell_key,
-        feat_key=feat_key,
-        graph_loc=graph_loc,
+    graph_matrix = store.load_graph(
+        selection.graph_ref,
+        from_assay=selection.from_assay,
+        cell_key=selection.cell_key,
         symmetric=True,
     )
-    if not sparse.issparse(graph):
+    if not sparse.issparse(graph_matrix):
         raise TypeError("load_graph must return a scipy sparse matrix")
-    if graph.shape != (n_cells, n_cells):
+    if graph_matrix.shape != (n_cells, n_cells):
         raise ValueError(
             "Graph shape must match the selected cells; "
-            f"expected {(n_cells, n_cells)}, got {graph.shape}"
+            f"expected {(n_cells, n_cells)}, got {graph_matrix.shape}"
         )
 
-    graph = graph.tocsr(copy=True).astype(np.float64, copy=False)
-    graph.sum_duplicates()
-    graph.eliminate_zeros()
-    if not np.isfinite(graph.data).all():
+    graph_matrix = graph_matrix.tocsr(copy=True).astype(np.float64, copy=False)
+    graph_matrix.sum_duplicates()
+    graph_matrix.eliminate_zeros()
+    if not np.isfinite(graph_matrix.data).all():
         raise ValueError("Graph contains non-finite edge weights")
-    if (graph.data < 0).any():
+    if (graph_matrix.data < 0).any():
         raise ValueError("Graph edge weights must be non-negative")
-    graph.setdiag(0.0)
-    graph.eliminate_zeros()
-    return graph
+    graph_matrix.setdiag(0.0)
+    graph_matrix.eliminate_zeros()
+    return graph_matrix
 
 
 def _aggregate_intercluster_edges(
@@ -359,10 +357,9 @@ def cluster_connectivity(
     *,
     group_by: str,
     layout_key: str,
-    cell_key: str = "I",
+    graph: ArtifactRef | None = None,
+    cell_key: str | None = None,
     from_assay: str | None = None,
-    feat_key: str | None = None,
-    graph_loc: str | None = None,
     position: Literal["median", "mean"] = "median",
     positions: Mapping[Any, tuple[float, float]] | None = None,
     categorical_scale: CategoricalScale | None = None,
@@ -422,11 +419,17 @@ def cluster_connectivity(
             "edge_width_range must be finite and satisfy 0 <= minimum <= maximum"
         )
 
+    selection = resolve_graph_selection(
+        store,
+        graph,
+        from_assay=from_assay,
+        cell_key=cell_key,
+    )
     x, y, groups = _fetch_inputs(
         store,
         group_by=group_by,
         layout_key=layout_key,
-        cell_key=cell_key,
+        cell_key=selection.cell_key,
     )
     categorical_scale = resolve_categorical_scale(
         store,
@@ -446,16 +449,13 @@ def cluster_connectivity(
         positions=positions,
     )
 
-    graph = _load_graph(
+    graph_matrix = _load_graph(
         store,
         n_cells=len(x),
-        from_assay=from_assay,
-        cell_key=cell_key,
-        feat_key=feat_key,
-        graph_loc=graph_loc,
+        selection=selection,
     )
     source_index, target_index, raw_weights, normalized_weights = (
-        _aggregate_intercluster_edges(graph, codes, len(order))
+        _aggregate_intercluster_edges(graph_matrix, codes, len(order))
     )
     aggregated_edge_count = len(source_index)
     source_index, target_index, raw_weights, normalized_weights = _filter_edges(
@@ -620,16 +620,15 @@ def cluster_connectivity(
         ),
         scales=(resolved_categorical_scale, resolved_size_scale),
         provenance=PlotProvenance(
-            assay=from_assay or getattr(store, "_defaultAssay", None),
-            cell_key=cell_key,
+            assay=selection.from_assay,
+            cell_key=selection.cell_key,
             n_cells=len(groups),
             renderer="matplotlib",
             notes=("cluster_connectivity", "materialized", f"layout={layout_key}"),
             extras={
                 "group_by": group_by,
                 "layout_key": layout_key,
-                "feat_key": feat_key,
-                "graph_loc": graph_loc,
+                "graph": selection.graph_ref.to_dict(),
                 "position": "explicit" if positions is not None else position,
                 "minimum_edge_weight": minimum_edge_weight,
                 "max_edges_per_node": max_edges_per_node,

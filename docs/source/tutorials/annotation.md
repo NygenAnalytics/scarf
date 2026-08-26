@@ -32,14 +32,20 @@ This chapter starts from a clustered PBMC store and shows how to read marker tab
 
 ## Standalone setup
 
-Annotation starts from clusters and a marker table.
-The published PBMC store has both, so this page opens it and goes straight to reading the evidence.
+Annotation starts from a clustered layout and builds a marker table for it.
+The published PBMC store supplies the cluster and embedding columns as literal metadata.
+This page structurally repacks its counts, mounts them into a fresh analysis store, and computes a marker artifact under the current contract before reading the evidence.
 {doc}`clustering` covers how the partition is chosen and scored.
 
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import numpy as np
 import pandas as pd
+
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
 
@@ -48,9 +54,28 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination='scarf_datasets',
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = str(Path(analysis_directory.name) / 'counts.zarr')
+repack_store(
     f'{dataset}/data.zarr',
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=str(Path(analysis_directory.name) / 'annotation_analysis.zarr'),
+    default_assay='RNA',
     nthreads=4,
+)
+ds.set_feature_selection(
+    mask=np.ones(ds.RNA.feats.N, dtype=bool),
+    label='annotation_features',
+)
+marker_features = ds.resolve_features('RNA', 'all_features')
+marker_ref = ds.run_marker_search(
+    group_key='RNA_clusters',
+    cell_key='I',
+    features=marker_features,
 )
 ```
 
@@ -79,6 +104,8 @@ Columns include scores, expression fractions, fold change, a two-sided Mann-Whit
 
 ```{code-cell} ipython3
 markers = ds.get_markers(
+    marker=marker_ref,
+    cell_key='I',
     group_key='RNA_clusters',
     group_id='1',
     min_score=-1,
@@ -117,6 +144,8 @@ AUC may be missing until marker search is rerun.
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
+    marker=marker_ref,
+    cell_key='I',
     group_key='RNA_clusters',
     topn=5,
     figsize=(5, 9),
@@ -131,6 +160,8 @@ Before assigning labels, check where the panel genes rank across clusters, then 
 
 ```{code-cell} ipython3
 markers = ds.get_markers(
+    marker=marker_ref,
+    cell_key='I',
     group_key='RNA_clusters',
     group_id=None,
     min_score=-1,

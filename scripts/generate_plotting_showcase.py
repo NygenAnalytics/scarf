@@ -59,7 +59,7 @@ def _build_graph(store: DataStore) -> None:
     normalized = store.run_normalization(
         from_assay="RNA",
         cell_key="I",
-        feat_key="hvgs",
+        features="hvgs",
         update_state=False,
     )
     reduction = store.run_pca(
@@ -144,13 +144,8 @@ def _prepare_store(
             max_cells=np.inf,
             blacklist="^MT-|^RPS|^RPL|^MRPS|^MRPL|^CCN|^HLA-|^H2-|^HIST",
         )
-    try:
-        store.get_latest_graph_loc(
-            from_assay="RNA",
-            cell_key="I",
-            feat_key="hvgs",
-        )
-    except KeyError:
+    state = store.get_assay_state("RNA")
+    if state is None or state.connectivity_map is None:
         _build_graph(store)
     if _CLUSTER_KEY not in store.cells.columns:
         store.run_leiden_clustering()
@@ -216,12 +211,16 @@ def _expression_matrix_figures(
     markers: dict[str, list[str]],
 ) -> list[Path]:
     outputs: list[Path] = []
-    store.run_marker_search(group_key=_CLUSTER_KEY)
+    marker_table = store.run_marker_search(
+        group_key=_CLUSTER_KEY,
+        features="all_features",
+    )
     cycling_share = _relative_cycling_share_per_cluster(store)
     cycling_scale = splt.CategoricalScale(order=("low", "medium", "high"))
     heatmap = splt.marker_heatmap(
         store,
         group_key=_CLUSTER_KEY,
+        marker=marker_table,
         topn=4,
         figsize=(6.0, 7.5),
         fontsize=8,
@@ -380,7 +379,6 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
         store,
         group_by=cluster_key,
         layout_key="RNA_UMAP",
-        feat_key="hvgs",
         show_cells=True,
         cell_alpha=0.3,
         theme="paper",
@@ -483,7 +481,6 @@ def generate_showcase(store: DataStore, output_directory: Path) -> list[Path]:
             store,
             group_by=cluster_key,
             layout_key="RNA_UMAP",
-            feat_key="hvgs",
             show_cells=True,
             cell_alpha=0.3,
             target=axes["connectivity"],

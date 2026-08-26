@@ -25,9 +25,13 @@ from scarf.storage.artifacts import (
     ArtifactRef,
     ExternalArtifactRef,
     artifact_group,
+    fingerprint_array,
+    fingerprint_stored_arrays,
+    fingerprint_stored_strings,
     inspect_artifact,
     list_artifacts,
 )
+from scarf.storage.errors import ArtifactResolutionError
 
 
 def _selection(
@@ -58,6 +62,64 @@ def _selection(
     return planned.ref
 
 
+def _feature_selection(
+    root: zarr.Group,
+    *,
+    values: np.ndarray,
+    assay: str,
+) -> ArtifactRef:
+    selected = np.asarray(values, dtype=bool)
+    feature_data = root.create_group(f"{assay}/featureData")
+    ids = np.asarray([f"g{i}" for i in range(len(selected))])
+    feature_data.create_array("ids", data=ids)
+    feature_data.create_array("names", data=ids)
+    feature_data.create_array("I", data=np.ones(len(selected), dtype=bool))
+    row_fingerprint = fingerprint_stored_strings(feature_data["ids"])
+
+    all_values = np.ones(len(selected), dtype=bool)
+    all_plan = plan_artifact(
+        root,
+        scope="assay",
+        assay=assay,
+        kind="feature_selection",
+        operation="create_all_features",
+        parameters={
+            "dataset_fingerprint": "query-dataset",
+            "ordered_feature_ids_fingerprint": row_fingerprint,
+        },
+        inputs={},
+        execution_options={},
+    )
+    all_group = start_artifact(root, all_plan)
+    all_group.create_array("values", data=all_values)
+    all_group.attrs["ordered_feature_ids_fingerprint"] = row_fingerprint
+    all_group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+        all_group,
+        ("values",),
+    )
+    finish_artifact(all_group, all_plan)
+
+    selected_plan = plan_artifact(
+        root,
+        scope="assay",
+        assay=assay,
+        kind="feature_selection",
+        operation="set_feature_selection",
+        parameters={"values_fingerprint": fingerprint_array(selected)},
+        inputs={"all_features": all_plan.ref},
+        execution_options={},
+    )
+    selected_group = start_artifact(root, selected_plan)
+    selected_group.create_array("values", data=selected)
+    selected_group.attrs["ordered_feature_ids_fingerprint"] = row_fingerprint
+    selected_group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+        selected_group,
+        ("values",),
+    )
+    finish_artifact(selected_group, selected_plan)
+    return selected_plan.ref
+
+
 def _query_inputs(
     *,
     n_cells: int = 4,
@@ -69,9 +131,8 @@ def _query_inputs(
         values=np.ones(n_cells, dtype=bool),
         assay=None,
     )
-    feature_selection = _selection(
+    feature_selection = _feature_selection(
         root,
-        kind="feature_selection",
         values=np.array([True, False, True]),
         assay="RNA",
     )
@@ -113,7 +174,6 @@ def _mapping_reference(
         ref=_artifact_ref("mapping_reference", token),
         assay_name="RNA",
         cell_key="I",
-        feature_key="I",
         reduction=_artifact_ref("reduction", "1"),
         ann_index=_artifact_ref("ann_index", "2"),
         neighbors=_artifact_ref("neighbors", "3"),
@@ -1058,15 +1118,14 @@ def test_plan_projection_rejects_selection_reference_and_count_mismatches() -> N
             feature_selection,
             reference.external_ref,
         )
-    with pytest.raises(
-        ValueError, match="feature_selection.*wrong artifact kind or scope"
-    ):
+    with pytest.raises(ArtifactResolutionError) as caught:
         _plan(
             root,
             cell_selection,
             cell_selection,
             reference.external_ref,
         )
+    assert caught.value.code == "wrong_kind"
     with pytest.raises(TypeError, match="ExternalArtifactRef"):
         _plan(
             root,
@@ -1085,6 +1144,62 @@ def test_plan_projection_rejects_selection_reference_and_count_mismatches() -> N
             feature_selection,
             wrong_external,
         )
+
+
+def test_plan_projection_rejects_legacy_feature_selection_before_planning() -> None:
+    root, cell_selection, _ = _query_inputs()
+    reference, _ = _mapping_reference()
+    legacy = _selection(
+        root,
+        kind="feature_selection",
+        values=np.array([True, False, True]),
+        assay="RNA",
+    )
+    group = artifact_group(root, legacy)
+    group.attrs["ordered_feature_ids_fingerprint"] = fingerprint_stored_strings(
+        root["RNA/featureData/ids"]
+    )
+    group.attrs["payload_fingerprint"] = fingerprint_stored_arrays(
+        group,
+        ("values",),
+    )
+
+    with pytest.raises(ArtifactResolutionError) as caught:
+        _plan(
+            root,
+            cell_selection,
+            legacy,
+            reference.external_ref,
+        )
+
+    assert caught.value.code == "corrupt_payload"
+    assert not list_artifacts(
+        root,
+        scope="assay",
+        assay="RNA",
+        kind="projection",
+    )
+
+
+def test_load_projection_rejects_corrupt_feature_selection_with_stable_code() -> None:
+    root, cell_selection, feature_selection = _query_inputs()
+    reference, _ = _mapping_reference()
+    projection = _write(
+        root,
+        _plan(
+            root,
+            cell_selection,
+            feature_selection,
+            reference.external_ref,
+        ),
+    )
+    values = artifact_group(root, feature_selection)["values"]
+    values[0] = not bool(values[0])
+
+    with pytest.raises(ArtifactResolutionError) as caught:
+        load_projection(root, projection)
+
+    assert caught.value.code == "corrupt_payload"
 
 
 def test_resolve_projection_rejects_empty_mapping_name() -> None:

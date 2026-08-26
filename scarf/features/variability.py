@@ -260,17 +260,33 @@ def select_highly_variable_features(
                 f"(min_cells={min_cells}, max_cells={max_cells}, "
                 f"min_mean={min_mean}, max_mean={max_mean})."
             )
-        if top_n >= n_valid_features:
+        if top_n > n_valid_features:
             logger.warning(
-                f"WARNING: Number of valid features are less then value "
+                f"WARNING: Number of valid features is less than value "
                 f"of parameter `top_n`: {top_n}. Resetting `top_n` to "
-                f"{n_valid_features - 1}"
+                f"{n_valid_features}"
             )
-            top_n = n_valid_features - 1
-        min_var = (
-            pd.Series(corrected_variance)[candidates]
-            .sort_values(ascending=False)
-            .values[top_n]
+            top_n = n_valid_features
+        # Deterministic tie-break: higher variance first, then lower feature index.
+        candidate_idx = np.flatnonzero(candidates)
+        order = np.lexsort(
+            (
+                candidate_idx,
+                -corrected_variance[candidate_idx],
+            )
+        )
+        ranked = candidate_idx[order]
+        selected = np.zeros(size, dtype=bool)
+        selected[ranked[:top_n]] = True
+        return np.asarray(
+            selected
+            & _bounded(
+                corrected_variance,
+                -np.inf,
+                max_var,
+                keep_bounds=keep_bounds,
+            ),
+            dtype=bool,
         )
 
     return np.asarray(

@@ -1094,7 +1094,6 @@ def test_cluster_connectivity_runs_on_real_datastore_graph(
     result = datastore.plots.cluster_connectivity(
         group_by="RNA_leiden_cluster",
         layout_key="RNA_UMAP",
-        feat_key="hvgs",
         minimum_edge_weight=0,
         max_edges_per_node=3,
         show_cells=True,

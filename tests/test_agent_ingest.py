@@ -326,7 +326,7 @@ def test_ingest_10x_h5(tmp_path: Path) -> None:
     if not fixture.is_file():
         pytest.skip("10x H5 fixture not downloaded")
     result = ingest(path=fixture, zarrPath=tmp_path / "pbmc.zarr")
-    assert result.status == "done"
+    assert result.status == "done", result.notes
     assert result.format == "10x_h5"
     assert "RNA" in result.assayNames
     assert result.acceptedActions
@@ -1134,7 +1134,6 @@ def test_ingest_existing_zarr_readonly_does_not_mutate(tmp_path: Path) -> None:
         str(location),
         default_assay="RNA",
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
         mem_budget=64 * 1024 * 1024,
     )

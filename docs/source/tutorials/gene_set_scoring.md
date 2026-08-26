@@ -35,16 +35,19 @@ These methods do not calculate enrichment p-values.
 
 ## Dataset
 
-This page opens the published 5K PBMC store, which already carries the UMAP the score plots are drawn on.
+This page structurally repacks the published 5K PBMC snapshot into a temporary current count store, then mounts it into a clean writable analysis target.
+Literal metadata, including the UMAP used for score plots, is retained without reusing legacy analysis state.
 Signature scoring streams raw counts from `assay.rawData`, not a pre-normalized matrix or the graph.
 AUCell ranks those raw counts; WAGGR applies library-size normalization inside the scorer.
 
 ```{code-cell} ipython3
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
 
@@ -53,9 +56,18 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination='scarf_datasets',
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = f'{analysis_directory.name}/counts.zarr'
+repack_store(
     f'{dataset}/data.zarr',
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=f'{analysis_directory.name}/analysis.zarr',
     nthreads=4,
+    default_assay='RNA',
 )
 ```
 
@@ -98,6 +110,16 @@ WAGGR applies edge weights to library-size-normalized expression.
 `wmean` divides each weighted sum by the sum of absolute weights, while `wsum` leaves the weighted sum unscaled.
 Signed weights are supported.
 
+This comparison uses the complete assay feature universe for both methods:
+
+```{code-cell} ipython3
+ds.set_feature_selection(
+    feature_indexes=range(ds.RNA.feats.N),
+    label='all_for_scoring',
+)
+all_features = ds.resolve_features('RNA', 'all_features')
+```
+
 ```{code-cell} ipython3
 weighted_sets = gene_sets.assign(weight=1.0)
 weighted_sets.loc[
@@ -112,6 +134,7 @@ S100A8 and S100A9 carry weight 1.5; every other edge stays at 1.0.
 ```{code-cell} ipython3
 waggr = ds.run_waggr(
     weighted_sets,
+    features=all_features,
     label='pbmc_waggr',
     mode='wmean',
     tmin=3,
@@ -126,12 +149,14 @@ waggr_scores.describe().loc[['min', '50%', 'max']]
 
 Each column is one source.
 The ranges show that WAGGR tracks expression magnitude and is not confined to values between zero and one.
+The returned `EnrichmentResult.feature_selection` records the exact ranking and normalization universe.
 
 To see what the raised Myeloid weights change, run the same network with every weight at 1.0 and compare Myeloid summaries:
 
 ```{code-cell} ipython3
 waggr_unweighted = ds.run_waggr(
     gene_sets.assign(weight=1.0),
+    features=all_features,
     label='pbmc_waggr_unweighted',
     mode='wmean',
     tmin=3,
@@ -161,13 +186,14 @@ AUCell ranks the selected RNA features within each cell and measures how early a
 Scores range from zero to one.
 Network weights are ignored.
 
-The {term}`feat_key` defines the ranking universe.
-Here the default `I` feature key ranks all active features.
+The required `features` argument defines the ranking universe.
+Here the `all_features` artifact ranks the complete RNA feature order.
 `n_up=500` evaluates recovery within the top 500 ranks.
 
 ```{code-cell} ipython3
 aucell = ds.run_aucell(
     gene_sets,
+    features=all_features,
     label='pbmc_aucell',
     tmin=3,
     n_up=500,
@@ -291,7 +317,7 @@ Cells that rank high for Myeloid under AUCell also tend to score high under WAGG
 
 - Using identifiers that do not match the assay feature names
 - Setting `tmin` above the number of targets that remain after feature matching
-- Passing an HVG key to AUCell without intending to restrict its ranking universe
+- Passing an HVG selection to AUCell without intending to restrict its ranking universe
 - Comparing WAGGR runs that use different normalization or log-transform settings
 - Reusing a label for different inputs without `overwrite=True`
 - Editing the count matrix outside Scarf after a result has been cached

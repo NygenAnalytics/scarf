@@ -70,7 +70,7 @@ _EXPECTED_RESULT_FIELDS = {
         "storage_path",
         "assay",
         "cell_key",
-        "feature_key",
+        "feature_selection",
         "method",
     ),
     mapping.MappingResult: (
@@ -91,7 +91,7 @@ _EXPECTED_RESULT_FIELDS = {
         "assay",
         "graph_cell_key",
         "result_cell_key",
-        "feature_key",
+        "graph",
         "pseudotime_key",
         "sink_key",
         "values",
@@ -103,7 +103,7 @@ _EXPECTED_RESULT_FIELDS = {
         "assay",
         "graph_cell_key",
         "result_cell_key",
-        "feature_key",
+        "graph",
         "values",
         "valid",
     ),
@@ -113,7 +113,7 @@ _EXPECTED_RESULT_FIELDS = {
         "p_value_key",
         "assay",
         "cell_key",
-        "feature_key",
+        "feature_selection",
         "pseudotime_key",
     ),
     trajectory.PseudotimeAggregationResult: (
@@ -124,7 +124,7 @@ _EXPECTED_RESULT_FIELDS = {
         "storage_path",
         "assay",
         "cell_key",
-        "feature_key",
+        "feature_selection",
         "pseudotime_key",
     ),
 }
@@ -159,6 +159,18 @@ def test_result_facades_and_constructor_fields_are_stable():
 
 
 def test_result_records_reject_attribute_assignment():
+    feature_selection = scarf.ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="feature_selection",
+        artifact_id="f" * 64,
+    )
+    graph = scarf.ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="connectivity_map",
+        artifact_id="c" * 64,
+    )
     records = (
         feature_algorithms.EnrichmentResult(
             SimpleNamespace(shape=(2, 1)),
@@ -169,7 +181,7 @@ def test_result_records_reject_attribute_assignment():
             "RNA/enrichment/label",
             "RNA",
             "I",
-            "I",
+            feature_selection,
             "waggr",
         ),
         mapping.MappingResult(
@@ -191,7 +203,7 @@ def test_result_records_reject_attribute_assignment():
             "RNA",
             "I",
             "I",
-            "hvgs",
+            graph,
             "pseudotime",
             "clusters",
             np.array([[0.25, 0.75], [1.0, 0.0]]),
@@ -203,7 +215,7 @@ def test_result_records_reject_attribute_assignment():
             "RNA",
             "I",
             "I",
-            "hvgs",
+            graph,
             np.array([0.0, 1.0]),
             np.array([True, True]),
         ),
@@ -220,7 +232,7 @@ def test_result_records_reject_attribute_assignment():
             "p_value",
             "RNA",
             "I",
-            "hvgs",
+            feature_selection,
             "pseudotime",
         ),
         trajectory.PseudotimeAggregationResult(
@@ -231,7 +243,7 @@ def test_result_records_reject_attribute_assignment():
             "aggregated",
             "RNA",
             "I",
-            "hvgs",
+            feature_selection,
             "pseudotime",
         ),
     )
@@ -243,6 +255,18 @@ def test_result_records_reject_attribute_assignment():
 
 
 def test_pseudotime_result_shape_validation_is_stable():
+    feature_selection = scarf.ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="feature_selection",
+        artifact_id="f" * 64,
+    )
+    graph = scarf.ArtifactRef(
+        scope="assay",
+        assay="RNA",
+        kind="connectivity_map",
+        artifact_id="c" * 64,
+    )
     with pytest.raises(ValueError, match="rows must align"):
         trajectory.FateMappingResult(
             ("fate_A", "fate_B"),
@@ -251,7 +275,7 @@ def test_pseudotime_result_shape_validation_is_stable():
             "RNA",
             "I",
             "I",
-            "hvgs",
+            graph,
             "pseudotime",
             "clusters",
             np.array([[0.25, 0.75], [1.0, 0.0]]),
@@ -265,7 +289,7 @@ def test_pseudotime_result_shape_validation_is_stable():
             "RNA",
             "I",
             "I",
-            "hvgs",
+            graph,
             np.array([0.0, 1.0]),
             np.array([True]),
         )
@@ -277,7 +301,7 @@ def test_pseudotime_result_shape_validation_is_stable():
             "p_value",
             "RNA",
             "I",
-            "hvgs",
+            feature_selection,
             "pseudotime",
         )
 
@@ -290,7 +314,7 @@ def test_pseudotime_result_shape_validation_is_stable():
             "aggregated",
             "RNA",
             "I",
-            "hvgs",
+            feature_selection,
             "pseudotime",
         )
 

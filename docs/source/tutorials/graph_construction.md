@@ -22,7 +22,7 @@ Scarf builds that graph from a selected cell population and feature set through 
 Calling the stages directly is useful when you need to branch one parameter, insert batch correction, or {term}`reuse` an expensive reduction.
 
 Feature selection is covered in {doc}`feature_selection`.
-This guide begins once the feature key exists.
+This guide begins once a feature-selection artifact exists.
 
 ## 1. The standard graph workflow
 
@@ -45,7 +45,12 @@ The stage methods below expose the same persisted results with more control.
 
 ## 2. Build an RNA graph explicitly
 
+The downloaded store is structurally repacked and mounted as a count source so this page builds a complete current analysis chain without reading its persisted analysis state.
+
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -53,6 +58,7 @@ import pandas as pd
 import scarf
 import scarf.plotting as splt
 from scarf.embeddings import initial_embedding
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="WARNING", progress=True)
 
@@ -61,8 +67,17 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
+repack_store(
     f"{dataset}/data.zarr",
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=str(Path(analysis_directory.name) / "graph_analysis.zarr"),
+    default_assay="RNA",
     nthreads=4,
     min_features_per_cell=10,
 )
@@ -72,19 +87,18 @@ ds.filter_cells(
     lows=[1000, 500],
     reset_previous=True,
 )
-if "I__hvgs" not in ds.RNA.feats.columns:
-    ds.mark_hvgs(
-        min_cells=20,
-        top_n=500,
-        show_plot=False,
-    )
+hvg_ref = ds.mark_hvgs(
+    min_cells=20,
+    top_n=500,
+    show_plot=False,
+)
 ```
 
 Each method returns an {term}`ArtifactRef`.
 Passing it to the next method makes the dependency explicit.
 
 ```{code-cell} ipython3
-normalized = ds.run_normalization(feat_key="hvgs")
+normalized = ds.run_normalization(features=hvg_ref)
 pca = ds.run_pca(normalized, dims=15)
 initialization = ds.build_embedding_initialization(
     pca,
@@ -168,9 +182,10 @@ The public class representing it is `AssayState`.
 
 ```{code-cell} ipython3
 state = ds.get_assay_state("RNA")
+normalized_status = ds.inspect_artifact(state.normalized)
 {
     "cell selection": state.cell_key,
-    "feature selection": state.feat_key,
+    "feature selection": normalized_status.inputs["feature_selection"],
     "normalization": state.normalized,
     "reduction": state.reduction,
     "embedding initialization": state.embedding_initialization,
@@ -207,7 +222,7 @@ figure.tight_layout()
 figure
 ```
 
-`run_umap` and `run_tsne` resolve the current connectivity and initialization from this chain.
+`run_umap` and `run_tsne` resolve the current connectivity and initialization from this chain when `graph=None`.
 Leiden and Paris resolve only the connectivity graph.
 They write their cell-metadata columns as usual.
 UMAP, t-SNE, and Leiden return the artifact they wrote; Paris returns a `ParisClusteringResult` whose `.ref` holds that artifact.
@@ -256,7 +271,7 @@ Degree and edge weight both shift when every cell sees more neighbours:
 
 ```{code-cell} ipython3
 loaded_graph_k21 = ds.load_graph(
-    graph_loc=ds.inspect_artifact(graph_k21).path,
+    graph=graph_k21,
 )
 pd.Series(
     {
@@ -271,12 +286,12 @@ pd.Series(
 splt.graph_qc(loaded_graph_k21)
 ```
 
-To analyse the side branch, pass its graph as the first argument.
+To analyse the side branch, pass its exact graph reference.
 The current chain is untouched, so both partitions stay available for comparison.
 
 ```{code-cell} ipython3
 ds.run_leiden_clustering(
-    graph_k21,
+    graph=graph_k21,
     resolution=0.5,
     label="leiden_k21",
 )

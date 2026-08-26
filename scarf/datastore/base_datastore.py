@@ -17,7 +17,7 @@ from ..storage.artifacts import (
 )
 from ..storage.types import ZarrMode, as_zarr_array, as_zarr_group
 from ..storage.budget import ResourceBudget
-from ..assay import RNAassay, ATACassay, ADTassay, Assay
+from ..assay import RNAassay, ATACassay, ADTassay, Assay, preset_assay_types
 from ..assay.base import _defer_feature_props
 from ..metadata import MetaData
 from ..metadata.artifacts import (
@@ -35,7 +35,7 @@ from ..utils.logging import logger
 
 if TYPE_CHECKING:
     from ..graph.state import AssayState
-    from ..lineage import ArtifactLineage
+    from ..storage.lineage import ArtifactLineage
     from ..mapping.reference import MappingReference
     from .summary import DataStoreSummary
 
@@ -98,14 +98,18 @@ class BaseDataStore:
                        when DataStore loads a Zarr file for the first time
         min_features_per_cell: Minimum number of non-zero features in a cell. If lower than this then the cell
                                will be filtered out.
-        min_cells_per_feature: Minimum number of cells where a feature has a non-zero value. Genes with values
-                               less than this will be filtered out
         mito_pattern: Regex pattern to capture mitochondrial genes. When None, uses ``MT-|mt``.
         ribo_pattern: Regex pattern to capture ribosomal genes. When None, uses
                       ``RPS|RPL|MRPS|MRPL``.
-        nthreads: Number of maximum threads to use in all multi-threaded functions
-        zarr_mode: For read-write mode use r+' or for read-only use 'r' (Default value: 'r+')
+        zarr_mode: For read-write mode use ``r+`` or for read-only use ``r``.
+                   (Default value: ``r+``)
         workspace: Workspace name within the Zarr store (None for legacy single-workspace layout).
+        resources: Resolved memory and worker budget for this datastore.
+        storage_profile: Zarr encoding profile used for new arrays written
+                         through this datastore.
+        storage_options: Backend options passed when opening the Zarr store.
+        storageIo: Optional explicit read, compute, and write widths for storage
+                   work. Unset values stay under automatic planning.
 
     Attributes:
         cells: MetaData object with cells and info about each cell (e. g. RNA_nCounts ids).
@@ -119,7 +123,6 @@ class BaseDataStore:
         assay_types: dict[str, str],
         default_assay: str,
         min_features_per_cell: int,
-        min_cells_per_feature: int,
         mito_pattern: str,
         ribo_pattern: str,
         zarr_mode: ZarrMode,
@@ -127,6 +130,7 @@ class BaseDataStore:
         resources: ResourceBudget,
         storage_profile: StorageProfile,
         storage_options: dict[str, Any] | None = None,
+        storageIo: Any | None = None,
     ):
         self.zarr_mode = zarr_mode
         self.zarr_loc = zarr_loc
@@ -161,11 +165,12 @@ class BaseDataStore:
         self.nthreads = self.resources.workers
         self.memoryBytes = self.resources.memoryBytes
         self.storageProfile = storage_profile
+        self.storageIo = storageIo
         _ = self.assay_names
         # The order is critical here:
         self.cells = self._load_cells()
         self._defaultAssay = self._load_default_assay(default_assay)
-        self._load_assays(min_cells_per_feature, assay_types)
+        self._load_assays(assay_types)
         # TODO: Reset all attrs, pca, dendrogram etc
         self._ini_cell_props(min_features_per_cell, mito_pattern, ribo_pattern)
         self._cachedMagicOperator = None
@@ -183,6 +188,13 @@ class BaseDataStore:
             ret_val: zarr.Group = self.z[self.workspace]  # type: ignore
         return ret_val
 
+    @property
+    def last_execution_report(self) -> Any:
+        """Return the most recent storage execution report, if any."""
+        from ..storage.execution import last_execution_report
+
+        return last_execution_report()
+
     def inspect_artifact(self, ref: ArtifactRef) -> ArtifactStatus:
         """Inspect a logical artifact without mutating the store."""
         return inspect_artifact(self.zw, ref)
@@ -194,7 +206,7 @@ class BaseDataStore:
         references: "MappingReference | Sequence[MappingReference] | None" = None,
     ) -> "ArtifactLineage":
         """Build a read-only upstream lineage report for artifact outputs."""
-        from ..lineage import ArtifactLineage
+        from ..storage.lineage import ArtifactLineage
         from ..mapping.reference import MappingReference
 
         if references is None:
@@ -318,10 +330,25 @@ class BaseDataStore:
                     self.z,
                     i,
                     self.workspace,
-                    matrix_root=self._matrix_z,
+                    matrix_root=self._matrix_root_for_assay(i),
                 )
                 assays.append(i)
         return assays
+
+    def _matrix_root_for_assay(self, assay_name: str) -> zarr.Group | None:
+        """Return the local or mounted root that owns one assay's counts."""
+        if self.workspace is None:
+            if assay_name in self.z:
+                local_assay = self.z[assay_name]
+                if isinstance(local_assay, zarr.Group) and "counts" in local_assay:
+                    return self.z
+        elif "matrices" in self.z:
+            matrices = self.z["matrices"]
+            if isinstance(matrices, zarr.Group) and assay_name in matrices:
+                local_assay = matrices[assay_name]
+                if isinstance(local_assay, zarr.Group) and "counts" in local_assay:
+                    return self.z
+        return self._matrix_z
 
     def _load_default_assay(self, assay_name: str | None = None) -> str:
         """This function sets a given assay name as defaultAssay attribute. If
@@ -367,9 +394,7 @@ class BaseDataStore:
         assert assay_name is not None
         return assay_name
 
-    def _load_assays(
-        self, min_cells: int, custom_assay_types: dict | None = None
-    ) -> None:
+    def _load_assays(self, custom_assay_types: dict | None = None) -> None:
         """This function loads all the assay names present in attribute
         `assayNames` as Assay objects. An attempt is made to automatically
         determine the most appropriate Assay class for each assay based on
@@ -382,26 +407,12 @@ class BaseDataStore:
         overridden using `predefined_assays` parameter
 
         Args:
-            min_cells: Minimum number of cells that a feature in each assay must be present to not be discarded (i.e.
-                       receive False value in `I` column)
             custom_assay_types: A mapping of assay names to Assay class type to associated with.
 
         Returns:
         """
 
-        preset_assay_types = {
-            "RNA": RNAassay,
-            "ATAC": ATACassay,
-            "ADT": ADTassay,
-            "HTO": ADTassay,
-            "CRISPR": Assay,
-            "ANTIGEN": Assay,
-            "CUSTOM": Assay,
-            "GeneActivity": RNAassay,
-            "GeneScores": RNAassay,
-            "URNA": RNAassay,
-            "Assay": Assay,
-        }
+        preset_assay_types_map = preset_assay_types()
         caution_statement = (
             "%s was set as a generic Assay with no normalization. If this is unintended "
             "then please make sure that you provide a correct assay type for this assay using "
@@ -425,13 +436,13 @@ class BaseDataStore:
             custom_assay_types = {}
         for i in self.assay_names:
             if i in custom_assay_types:
-                if custom_assay_types[i] in preset_assay_types:
-                    assay = preset_assay_types[custom_assay_types[i]]
+                if custom_assay_types[i] in preset_assay_types_map:
+                    assay = preset_assay_types_map[custom_assay_types[i]]
                     assay_name = custom_assay_types[i]
                 else:
                     logger.warning(
                         f"{custom_assay_types[i]} is not a recognized assay type. Has to be one of "
-                        f"{', '.join(list(preset_assay_types.keys()))}\nPLease note that the names are"
+                        f"{', '.join(list(preset_assay_types_map.keys()))}\nPLease note that the names are"
                         f" case-sensitive."
                     )
                     logger.warning(caution_statement % i)
@@ -443,10 +454,10 @@ class BaseDataStore:
                     z_attrs[i] = assay_name
                     logger.debug(f"Setting assay {i} to assay type: {assay.__name__}")
             elif i in z_attrs:
-                assay = preset_assay_types[z_attrs[i]]
+                assay = preset_assay_types_map[z_attrs[i]]
             else:
-                if i in preset_assay_types:
-                    assay = preset_assay_types[i]
+                if i in preset_assay_types_map:
+                    assay = preset_assay_types_map[i]
                     assay_name = i
                 else:
                     logger.warning(caution_statement % i)
@@ -463,10 +474,10 @@ class BaseDataStore:
                     workspace=self.workspace,
                     name=i,
                     cell_data=self.cells,
-                    min_cells_per_feature=min_cells,
                     nthreads=self.nthreads,
-                    matrix_root=self._matrix_z,
+                    matrix_root=self._matrix_root_for_assay(i),
                     resources=self.resources,
+                    storageIo=self.storageIo,
                 )
             setattr(self, i, loaded_assay)
         if self.zw.attrs["assayTypes"] != z_attrs:
@@ -491,37 +502,19 @@ class BaseDataStore:
             Assay | RNAassay | ADTassay | ATACassay, self.__getattribute__(from_assay)
         )
 
-    def _get_latest_feat_key(self, from_assay: str) -> str:
-        """Looks up the value in assay level attributes for key
-        'latest_feat_key'.
-
-        Args:
-            from_assay: Assay whose latest feature is to be returned.
-
-        Returns:
-            Name of the latest feature that was used to run `save_normalized_data`
-        """
-        from ..graph.state import read_assay_state
-
-        state = read_assay_state(self.zw, from_assay)
-        if state is not None:
-            return state.feat_key
-        assay = self._get_assay(from_assay)
-        return cast(str, assay.attrs["latest_feat_key"])
-
     def _get_latest_cell_key(self, from_assay: str) -> str:
         """Looks up the value in assay level attributes for key
         'latest_cell_key'.
 
         Args:
-            from_assay: Assay whose latest feature is to be returned.
+            from_assay: Assay whose current state is inspected.
 
         Returns:
-            Name of the latest feature that was used to run `save_normalized_data`
+            Cell-selection key recorded by current analysis state.
         """
-        from ..graph.state import read_assay_state
+        from ..graph.state import read_assay_state_document
 
-        state = read_assay_state(self.zw, from_assay)
+        state = read_assay_state_document(self.zw, from_assay)
         if state is not None:
             return state.cell_key
         assay = self._get_assay(from_assay)
@@ -840,8 +833,7 @@ class BaseDataStore:
             compute_n_counts = n_counts_name not in self.cells.columns
             n_features_name = from_assay + "_nFeatures"
             compute_n_features = n_features_name not in self.cells.columns
-            pending_min_cells = assay._deferred_min_cells_per_feature
-            compute_n_cells = pending_min_cells is not None
+            compute_n_cells = assay._deferred_feature_props
 
             percent_feature_indices: dict[str, np.ndarray] = {}
             if isinstance(assay, RNAassay):
@@ -883,8 +875,8 @@ class BaseDataStore:
                     percent_feature_indices=percent_feature_indices,
                 )
 
-            if pending_min_cells is not None:
-                assay._store_feature_props(stats["nCells"], pending_min_cells)
+            if assay._deferred_feature_props:
+                assay._store_feature_props(stats["nCells"])
 
             computed_n_counts: np.ndarray | None = None
             if compute_n_counts:
@@ -917,7 +909,7 @@ class BaseDataStore:
                     n_counts=computed_n_counts,
                 )
 
-            if assay._deferred_min_cells_per_feature is not None:
+            if assay._deferred_feature_props:
                 raise RuntimeError(
                     f"({from_assay}) Deferred feature initialization was not completed"
                 )
@@ -1058,7 +1050,7 @@ class BaseDataStore:
         for i in self.assay_names:
             assay = self._get_assay(i)
             res += (
-                f"\n{htabs}{i} assay has {assay.feats.fetch_all('I').sum()} ({assay.feats.N}) "
+                f"\n{htabs}{i} assay has {assay.feats.N} "
                 f"features and following metadata:"
             )
             res += formatter(None, assay.feats.columns)

@@ -4,7 +4,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from ._materialize import dask_to_zarr, write_renorm_subset_to_zarr
+    from ._materialize import chunked_to_zarr, write_renorm_subset_to_zarr
     from ._store import (
         create_cell_data as create_cell_data,
         create_zarr_count_assay,
@@ -27,7 +27,7 @@ __all__ = [
     "create_zarr_obj_array",
     "create_zarr_count_assay",
     "subset_assay_zarr",
-    "dask_to_zarr",
+    "chunked_to_zarr",
     "write_renorm_subset_to_zarr",
     "SubsetZarr",
     "CrToZarr",
@@ -49,7 +49,7 @@ _LAZY_EXPORTS = {
     "create_zarr_obj_array": "_store",
     "load_count_store": "_store",
     "load_zarr": "_store",
-    "dask_to_zarr": "_materialize",
+    "chunked_to_zarr": "_materialize",
     "write_renorm_subset_to_zarr": "_materialize",
     "CrToZarr": "cellranger",
     "MtxToZarr": "cellranger",

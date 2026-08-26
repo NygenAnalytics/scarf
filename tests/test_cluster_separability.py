@@ -1,15 +1,30 @@
 import numpy as np
 import pytest
 
+from scarf.graph.errors import IncompatibleAnalysisStateError
 from scarf.metrics import (
     ClusterSeparabilityResult,
     evaluate_cluster_separability,
 )
+from scarf.storage import ArtifactRef, ArtifactResolutionError
+from scarf.storage.artifacts import artifact_path
 
 
 def _score_by_name(result: ClusterSeparabilityResult, name: str):
     rows = result.clustering_scores.set_index("clustering")
     return rows.loc[name]
+
+
+def _normalized_feature_selection(datastore, reduction: ArtifactRef):
+    reduction_status = datastore.inspect_artifact(reduction)
+    assert reduction_status.inputs is not None
+    normalized = ArtifactRef.from_dict(reduction_status.inputs["normalized"])
+    normalized_status = datastore.inspect_artifact(normalized)
+    assert normalized_status.inputs is not None
+    feature_selection = ArtifactRef.from_dict(
+        normalized_status.inputs["feature_selection"]
+    )
+    return normalized, feature_selection
 
 
 def test_sampling_is_deterministic_stratified_and_shared():
@@ -358,3 +373,90 @@ def test_datastore_wrapper_rejects_a_foreign_cell_selection(
             ["RNA_leiden_cluster"],
             cell_key="separability_subset",
         )
+
+
+def test_datastore_wrapper_revalidates_feature_selection_ancestry(
+    datastore,
+    graph_artifacts,
+    leiden_clustering,
+    monkeypatch,
+):
+    del graph_artifacts, leiden_clustering
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    assert state.reduction is not None
+    _normalized, feature_selection = _normalized_feature_selection(
+        datastore,
+        state.reduction,
+    )
+    values = datastore.zw[artifact_path(feature_selection)]["values"]
+    original = bool(values[0])
+    values[0] = not original
+    monkeypatch.setattr(
+        "scarf.datastore._operations.integration_metrics.read_assay_state",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def fail_if_computed(*_args, **_kwargs):
+        raise AssertionError("cluster separability computation must not start")
+
+    monkeypatch.setattr(
+        "scarf.metrics.evaluate_cluster_separability",
+        fail_if_computed,
+    )
+    try:
+        with pytest.raises(ArtifactResolutionError) as caught:
+            datastore.metric_cluster_separability(
+                state.reduction,
+                ["RNA_leiden_cluster"],
+            )
+        assert caught.value.code == "corrupt_payload"
+    finally:
+        values[0] = original
+
+
+def test_datastore_wrapper_rejects_legacy_feature_selection_ancestry(
+    datastore,
+    graph_artifacts,
+    leiden_clustering,
+    monkeypatch,
+):
+    del graph_artifacts, leiden_clustering
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    assert state.reduction is not None
+    normalized, _feature_selection = _normalized_feature_selection(
+        datastore,
+        state.reduction,
+    )
+    normalized_group = datastore.zw[artifact_path(normalized)]
+    original_provenance = dict(normalized_group.attrs["provenance"])
+    provenance = dict(original_provenance)
+    inputs = dict(provenance["inputs"])
+    raw_feature_selection = dict(inputs["feature_selection"])
+    raw_feature_selection["feat_key"] = "I__hvgs"
+    inputs["feature_selection"] = raw_feature_selection
+    provenance["inputs"] = inputs
+    normalized_group.attrs["provenance"] = provenance
+    monkeypatch.setattr(
+        "scarf.datastore._operations.integration_metrics.read_assay_state",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def fail_if_computed(*_args, **_kwargs):
+        raise AssertionError("cluster separability computation must not start")
+
+    monkeypatch.setattr(
+        "scarf.metrics.evaluate_cluster_separability",
+        fail_if_computed,
+    )
+    try:
+        with pytest.raises(IncompatibleAnalysisStateError) as caught:
+            datastore.metric_cluster_separability(
+                state.reduction,
+                ["RNA_leiden_cluster"],
+            )
+        assert caught.value.code == "legacy_feature_contract"
+        assert caught.value.context["input_name"] == "feature_selection"
+    finally:
+        normalized_group.attrs["provenance"] = original_provenance

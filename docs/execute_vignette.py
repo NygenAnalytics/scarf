@@ -54,7 +54,7 @@ _TQDM_PROGRESS_RE = re.compile(
     r"(?P<total>\d[\d.,]*(?:[kMGTPE]?))",
     re.IGNORECASE,
 )
-_DASK_PROGRESS_RE = re.compile(
+_HASH_BAR_PROGRESS_RE = re.compile(
     r"^(?P<label>.*?)\[[#=\-\s]+\]\s*\|\s*"
     r"(?P<percent>\d{1,3}(?:\.\d+)?)%\s+(?:Completed|complete)\b",
     re.IGNORECASE,
@@ -452,7 +452,7 @@ def _terminal_progress_snapshot(line: str) -> ProgressSnapshot | None:
             total_text=match.group("total"),
         )
 
-    match = _DASK_PROGRESS_RE.match(line.strip())
+    match = _HASH_BAR_PROGRESS_RE.match(line.strip())
     if match is not None:
         percent = float(match.group("percent"))
         return _completed_snapshot(

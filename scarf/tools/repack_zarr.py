@@ -13,10 +13,13 @@ import zarr
 from scarf.storage.arrays import create_numeric_array
 from scarf.storage.budget import ResourceBudget, resolve_budget
 from scarf.storage.copy import _copy_metadata_array
+from scarf.storage.count_matrix import (
+    COUNT_MATRIX_LAYOUT_KEY,
+    create_product_counts_array,
+)
 from scarf.storage.layout import (
     ZarrArraySpec,
     array_info,
-    count_array_spec,
     get_compressors,
     normalize_chunks,
 )
@@ -109,8 +112,18 @@ def _counts_t_path(counts_path: str) -> str:
     raise ValueError(f"Not a counts path: {counts_path!r}")
 
 
-def _copy_array_attrs(src: zarr.Array, dst: zarr.Array) -> None:
+_STRIPPED_COUNT_ATTRS = frozenset({"complete", COUNT_MATRIX_LAYOUT_KEY})
+
+
+def _copy_array_attrs(
+    src: zarr.Array,
+    dst: zarr.Array,
+    *,
+    strip_keys: frozenset[str] = frozenset(),
+) -> None:
     for attr_key, attr_val in src.attrs.items():
+        if attr_key in strip_keys:
+            continue
         dst.attrs[attr_key] = attr_val
 
 
@@ -235,7 +248,10 @@ def _copy_group(
             continue
         if isinstance(node, zarr.Group):
             new_group = dst.create_group(key, overwrite=True)
+            rewritten_counts = f"{child_path}/counts" in shardedCounts
             for attr_key, attr_val in node.attrs.items():
+                if rewritten_counts and attr_key in _STRIPPED_COUNT_ATTRS:
+                    continue
                 new_group.attrs[attr_key] = attr_val
             _copy_group(
                 node,
@@ -250,13 +266,13 @@ def _copy_group(
 
         array = as_zarr_array(node, name=child_path)
         if child_path in shardedCounts:
-            spec = count_array_spec(
+            dst_array = create_product_counts_array(
+                dst,
                 int(array.shape[0]),
                 int(array.shape[1]),
-                dtype=array.dtype,
+                array.dtype,
                 profile=profile,
             )
-            dst_array = create_numeric_array(dst, key, spec)
             write_dense_in_shard_rows(
                 dst_array,
                 _row_block_producer(array),
@@ -271,7 +287,8 @@ def _copy_group(
                 "shards": None if stored_shards is None else list(stored_shards),
                 "zarr_format": 3,
             }
-            _copy_array_attrs(array, dst_array)
+            dst.attrs.pop("complete", None)
+            _copy_array_attrs(array, dst_array, strip_keys=_STRIPPED_COUNT_ATTRS)
             continue
 
         if array.ndim == 1:
@@ -364,12 +381,23 @@ def repack_store(
         )
         group_path = assay_name if workspace is None else f"matrices/{assay_name}"
         counts = as_zarr_array(dst[counts_path], name=counts_path)
-        write_counts_t(
-            counts,
-            as_zarr_group(dst[group_path], name=group_path),
-            profile=profile,
-            resources=resources,
+        from ..assay.classification import is_rna_assay_type
+
+        # Prefer persisted assayTypes; fall back to assay group name.
+        type_name = assay_name
+        attr_root = (
+            dst if workspace is None else as_zarr_group(dst[workspace], name=workspace)
         )
+        raw_types = attr_root.attrs.get("assayTypes", {})
+        if isinstance(raw_types, dict) and assay_name in raw_types:
+            type_name = str(raw_types[assay_name])
+        if is_rna_assay_type(type_name):
+            write_counts_t(
+                counts,
+                as_zarr_group(dst[group_path], name=group_path),
+                profile=profile,
+                resources=resources,
+            )
         print(f"  {counts_path}: {array_info(counts)}")
 
 

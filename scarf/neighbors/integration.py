@@ -108,7 +108,7 @@ def _prediction_affinity(
 
 def _wnn_integration_many(
     modalities: list[tuple[str, np.ndarray, np.ndarray]],
-    n_threads: int,
+    nthreads: int,
     *,
     l2_normalize: bool = True,
 ) -> tuple[coo_matrix, np.ndarray]:
@@ -158,7 +158,7 @@ def _wnn_integration_many(
     merged_data = np.empty(output_size, dtype=np.float32)
     modality_weights = np.empty((n_cells, len(modalities)), dtype=np.float32)
 
-    with threadpool_limits(limits=n_threads):
+    with threadpool_limits(limits=nthreads):
         for cell_idx in iter_progress(
             range(n_cells),
             desc="Building WNN graph",
@@ -302,7 +302,7 @@ def wnn_integration(
     name2: str,
     indices2: np.ndarray,
     ld2: np.ndarray,
-    n_threads: int,
+    nthreads: int,
     *,
     l2_normalize: bool = True,
 ) -> tuple[coo_matrix, np.ndarray]:
@@ -326,6 +326,6 @@ def wnn_integration(
             (private_names[0], indices1, ld1),
             (private_names[1], indices2, ld2),
         ],
-        n_threads,
+        nthreads,
         l2_normalize=l2_normalize,
     )

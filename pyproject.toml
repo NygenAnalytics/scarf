@@ -53,6 +53,7 @@ dependencies = [
     "sgtsnepi",
     "huggingface-hub>=1.24.0",
     "zstandard>=0.25.0",
+    "igraph>=1.0.0",
 ]
 
 [project.optional-dependencies]
@@ -249,6 +250,7 @@ module = [
     "scarf.utils.numba",
     "scarf.clustering._paris_core",
     "scarf.embeddings.umap",
+    "scarf.assay.rna",
     "scarf.features.markers.*",
     "scarf.features.enrichment.aucell",
     "scarf.datastore._operations.features",

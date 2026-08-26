@@ -39,6 +39,12 @@ Provenance is only:
 The artifact also stores sibling attributes that are not part of provenance: execution options (for example local scratch policy) and whether the write completed successfully.
 Reuse matches on provenance only.
 
+Feature selections follow the same model.
+`mark_hvgs`, `mark_prevalent_peaks`, and manual selection return immutable references and publish plain labels for convenience.
+Pass a returned reference between stages when you want to pin a branch, or resolve one exact label with `ds.resolve_features(assay, label)`.
+There is no cell-key prefix, composite feature expression, or implicit latest feature selection.
+Use the reserved `all_features` label for the assay-wide universe.
+
 ### Analysis chain and reuse
 
 Downstream methods receive these references directly or resolve them from the assay's current {term}`analysis chain`.
@@ -48,6 +54,11 @@ Changing PCA dimensions creates a new reduction and new dependent results, while
 The current analysis chain is a convenience for a linear workflow, not the only history in the store.
 Side branches can be created without selecting them as current.
 See {doc}`../tutorials/graph_construction` for that relationship.
+
+Graph-derived methods accept `graph=`.
+When it is omitted, Scarf resolves the assay's current `connectivity_map` from `AssayState`.
+The graph's named lineage edges identify the normalized artifact and its feature selection, so graph consumers do not accept a second feature-selection argument.
+Imported-coordinate graphs have no normalized feature selection; integrated graphs can project zero, one, or several selections from their named sources.
 
 ## Inspect a result
 

@@ -3,21 +3,23 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from scarf import DataStore, H5adReader, H5adToZarr, configure_output
+from scarf.storage import ArtifactRef
 from scarf.storage.budget import resolve_budget
-from scarf.storage.sharding import write_counts_t
 from scarf.storage.stores import open_store
 from scarf.storage.types import as_zarr_array, as_zarr_group
 
 from profiling.config import (
+    CountMatrixConfig,
     StageName,
     StageResources,
-    StorageLayout,
+    StorageIoConfig,
     WorkflowParameters,
 )
 from profiling.metrics import ResourceMeasurement, ResourceSampler, StageTimer
@@ -57,10 +59,46 @@ class StageRunResult:
     operationIncrementalPeakBytes: int | None = None
     operationPeakSource: str | None = None
     cgroupPeakScope: str | None = None
+    processCpuSeconds: float | None = None
+    childCpuSeconds: float | None = None
     details: dict[str, Any] | None = None
+    provenance: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)
+
+
+def _count_matrix_policy(config: CountMatrixConfig | None) -> Any:
+    if config is None:
+        return None
+    from scarf.storage.count_matrix import CountMatrixPolicy
+
+    return CountMatrixPolicy(unitBytes=config.unitBytes, chunkBytes=config.chunkBytes)
+
+
+def _storage_io_policy(config: StorageIoConfig | None) -> Any:
+    if config is None:
+        return None
+    from scarf.storage.io_policy import StorageIoPolicy
+
+    return StorageIoPolicy(
+        readWorkers=config.readWorkers,
+        computeWorkers=config.computeWorkers,
+        writeWorkers=config.writeWorkers,
+    )
+
+
+def _wrap_store_probe(
+    storeUri: str, options: dict[str, Any] | None, storeProbe: Any
+) -> Any:
+    from scarf.storage.stores import make_store
+
+    from profiling.recording_store import wrap_recording_store
+
+    resolved = make_store(storeUri, storage_options=options)
+    if isinstance(resolved, str):
+        return storeUri
+    return wrap_recording_store(resolved, probe=storeProbe)
 
 
 def _open_datastore(
@@ -69,14 +107,20 @@ def _open_datastore(
     resources: StageResources,
     *,
     initialize: bool,
+    storeProbe: Any | None = None,
+    storageIo: StorageIoConfig | None = None,
 ) -> DataStore:
     options = storage_options(storeUri)
+    location: Any = storeUri
+    if storeProbe is not None:
+        location = _wrap_store_probe(storeUri, options, storeProbe)
     arguments: dict[str, Any] = {
         "nthreads": resources.workers,
         "zarr_mode": "r+",
         "zarrProfile": ("cloud" if storeUri.startswith("s3://") else "fast_local"),
         "storage_options": options,
         "mem_budget": resources.scarfMemoryBudget,
+        "storageIo": _storage_io_policy(storageIo),
     }
     if initialize:
         arguments.update(
@@ -84,10 +128,54 @@ def _open_datastore(
                 "assay_types": {workflow.assayName: "RNA"},
                 "default_assay": workflow.assayName,
                 "min_features_per_cell": workflow.minFeaturesPerCell,
-                "min_cells_per_feature": workflow.minCellsPerFeature,
             }
         )
-    return DataStore(storeUri, **arguments)
+    return DataStore(location, **arguments)
+
+
+def _reset_initialization_stats(
+    storeUri: str,
+    workflow: WorkflowParameters,
+) -> None:
+    from scarf.metadata import MetaData
+
+    root = open_store(
+        storeUri,
+        mode="r+",
+        storage_options=storage_options(storeUri),
+    )
+    cells = MetaData(as_zarr_group(root["cellData"], name="cellData"))
+    for name in (
+        f"{workflow.assayName}_nCounts",
+        f"{workflow.assayName}_nFeatures",
+        f"{workflow.assayName}_percentMito",
+        f"{workflow.assayName}_percentRibo",
+    ):
+        if name in cells.columns:
+            cells.drop(name)
+
+    assay = as_zarr_group(root[workflow.assayName], name=workflow.assayName)
+    features = MetaData(
+        as_zarr_group(
+            assay["featureData"],
+            name=f"{workflow.assayName}/featureData",
+        )
+    )
+    for name in ("nCells", "dropOuts"):
+        if name in features.columns:
+            features.drop(name)
+
+    percent_features = assay.attrs.get("percentFeatures", {})
+    if isinstance(percent_features, dict):
+        reset_names = {
+            f"{workflow.assayName}_percentMito",
+            f"{workflow.assayName}_percentRibo",
+        }
+        assay.attrs["percentFeatures"] = {
+            str(name): str(pattern)
+            for name, pattern in percent_features.items()
+            if str(name) not in reset_names
+        }
 
 
 def _close_h5ad_reader(reader: H5adReader) -> None:
@@ -101,9 +189,14 @@ def _prepare_create_store(
     storeUri: str,
     workflow: WorkflowParameters,
     resources: StageResources,
-    storageLayout: StorageLayout | None = None,
+    countMatrix: CountMatrixConfig | None = None,
+    storageIo: StorageIoConfig | None = None,
+    storeProbe: Any | None = None,
 ) -> tuple[H5adReader, H5adToZarr]:
     options = storage_options(storeUri)
+    location: Any = storeUri
+    if storeProbe is not None:
+        location = _wrap_store_probe(storeUri, options, storeProbe)
     reader = H5adReader(
         str(localH5adPath),
         matrix_key="X",
@@ -113,22 +206,19 @@ def _prepare_create_store(
         feature_ids_key="_index",
         feature_name_key="feature_name",
     )
-    layout_kwargs: dict[str, Any] = {}
-    if storageLayout is not None:
-        if storageLayout.targetChunkBytes is not None:
-            layout_kwargs["targetChunkBytes"] = storageLayout.targetChunkBytes
-        if storageLayout.targetShardBytes is not None:
-            layout_kwargs["targetShardBytes"] = storageLayout.targetShardBytes
     try:
         writer = H5adToZarr(
             reader,
-            storeUri,
+            location,
             assay_name=workflow.assayName,
             storage_options=options,
             mem_budget=resources.scarfMemoryBudget,
             nthreads=resources.workers,
-            **layout_kwargs,
+            profile=("cloud" if storeUri.startswith("s3://") else "fast_local"),
+            policy=_count_matrix_policy(countMatrix),
+            io=_storage_io_policy(storageIo),
         )
+        writer._parallelWriteLocation = storeUri
     except BaseException:
         _close_h5ad_reader(reader)
         raise
@@ -197,6 +287,7 @@ def _run_worker_in_subprocess(
     resources: StageResources,
     workDir: Path | None,
     workDirPrefix: str,
+    invalidateCache: bool = False,
 ) -> dict[str, Any]:
     worker_dir = (
         workDir if workDir is not None else Path(tempfile.mkdtemp(prefix=workDirPrefix))
@@ -205,17 +296,14 @@ def _run_worker_in_subprocess(
     request_path = worker_dir / "request.json"
     status_path = worker_dir / "status.json"
     status_path.unlink(missing_ok=True)
-    request_path.write_text(
-        json.dumps(
-            {
-                "storeUri": storeUri,
-                "workflow": workflow.model_dump(mode="json"),
-                "resources": resources.model_dump(mode="json"),
-                "statusPath": str(status_path),
-            }
-        ),
-        encoding="utf-8",
-    )
+    request: dict[str, Any] = {
+        "storeUri": storeUri,
+        "workflow": workflow.model_dump(mode="json"),
+        "resources": resources.model_dump(mode="json"),
+        "statusPath": str(status_path),
+        "invalidateCache": invalidateCache,
+    }
+    request_path.write_text(json.dumps(request), encoding="utf-8")
 
     command = [
         sys.executable,
@@ -224,6 +312,9 @@ def _run_worker_in_subprocess(
         "--request",
         str(request_path),
     ]
+    from profiling.metrics import child_cpu_seconds as read_child_cpu_seconds
+
+    cpu_before = read_child_cpu_seconds()
     process = subprocess.Popen(command)
     print(
         f"[{stageLabel}] child started pid={process.pid} module={workerModule} "
@@ -236,6 +327,7 @@ def _run_worker_in_subprocess(
         _stop_child_process(process)
         raise
 
+    child_cpu = max(0.0, read_child_cpu_seconds() - cpu_before)
     status = _read_worker_status(status_path, workerName=f"{stageLabel} worker")
     if return_code != 0:
         detail = status.get("error") if status is not None else None
@@ -246,6 +338,8 @@ def _run_worker_in_subprocess(
     if status is None or status.get("status") != "ok":
         raise RuntimeError(f"{stageLabel} worker exited without a successful status")
     print(f"[{stageLabel}] child completed pid={process.pid}", flush=True)
+    if "childCpuSeconds" not in status:
+        status["childCpuSeconds"] = child_cpu
     return status
 
 
@@ -255,6 +349,7 @@ def _run_leiden_in_subprocess(
     workflow: WorkflowParameters,
     resources: StageResources,
     workDir: Path | None,
+    invalidateCache: bool = False,
 ) -> dict[str, Any]:
     return _run_worker_in_subprocess(
         stageLabel="runLeiden",
@@ -264,24 +359,7 @@ def _run_leiden_in_subprocess(
         resources=resources,
         workDir=workDir,
         workDirPrefix="scarf-leiden-",
-    )
-
-
-def _run_paris_in_subprocess(
-    *,
-    storeUri: str,
-    workflow: WorkflowParameters,
-    resources: StageResources,
-    workDir: Path | None,
-) -> dict[str, Any]:
-    return _run_worker_in_subprocess(
-        stageLabel="runClustering",
-        workerModule="profiling.paris_worker",
-        storeUri=storeUri,
-        workflow=workflow,
-        resources=resources,
-        workDir=workDir,
-        workDirPrefix="scarf-paris-",
+        invalidateCache=invalidateCache,
     )
 
 
@@ -357,16 +435,17 @@ def _prepare_counts_t_write(
     storeUri: str,
     assayName: str,
     resources: StageResources,
+    storeProbe: Any | None = None,
 ) -> _CountsTWriteContext:
     budget = resolve_budget(
         memory=resources.scarfMemoryBudget,
         workers=resources.workers,
     )
-    root = open_store(
-        storeUri,
-        mode="r+",
-        storage_options=storage_options(storeUri),
-    )
+    options = storage_options(storeUri)
+    location: Any = storeUri
+    if storeProbe is not None:
+        location = _wrap_store_probe(storeUri, options, storeProbe)
+    root = open_store(location, mode="r+", storage_options=options)
     group = as_zarr_group(root[assayName], name=assayName)
     counts = as_zarr_array(group["counts"], name=f"{assayName}/counts")
     before_complete = None
@@ -385,21 +464,42 @@ def _write_counts_t(
     *,
     storeUri: str,
     assayName: str,
-    featureMajorLayout: bool = False,
-) -> Any:
+    countMatrix: CountMatrixConfig | None = None,
+    storageIo: StorageIoConfig | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    from scarf.storage.count_matrix import plan_count_matrix_pair
+    from scarf.storage.sharding import write_counts_t
+
+    profile = "cloud" if storeUri.startswith("s3://") else "fast_local"
+    policy = _count_matrix_policy(countMatrix)
+    pair_kwargs: dict[str, Any] = {"profile": profile}
+    if policy is not None:
+        pair_kwargs["policy"] = policy
+    pair = plan_count_matrix_pair(
+        int(context.counts.shape[0]),
+        int(context.counts.shape[1]),
+        context.counts.dtype,
+        **pair_kwargs,
+    )
+    writer_metrics: dict[str, Any] = {}
     counts_t = write_counts_t(
         context.counts,
         context.group,
-        profile="cloud" if storeUri.startswith("s3://") else "fast_local",
+        profile=profile,
         resources=context.budget,
-        feature_major_layout=featureMajorLayout,
+        policy=policy,
+        io=_storage_io_policy(storageIo),
+        metrics=writer_metrics,
     )
-    if counts_t is None:
-        raise RuntimeError(
-            f"write_counts_t skipped for {assayName} (Zarr format < 3); "
-            "cannot create countsT"
-        )
-    return counts_t
+    return counts_t, {
+        "writer": "product",
+        "fingerprint": pair.fingerprint,
+        "sourceDecodeAmplification": pair.sourceDecodeAmplification,
+        "countsTChunks": list(pair.countsT.chunks),
+        "countsTShards": list(pair.countsT.shards or ()),
+        "metrics": writer_metrics,
+        "kind": "observed",
+    }
 
 
 def _validate_counts_t(
@@ -416,16 +516,36 @@ def _validate_counts_t(
         raise RuntimeError(
             f"countsT rewrite finished without complete=True at {storeUri}"
         )
-    countsT.attrs["complete"] = False
 
     expected_shape = (int(context.counts.shape[1]), int(context.counts.shape[0]))
     if tuple(countsT.shape) != expected_shape:
+        countsT.attrs["complete"] = False
         raise RuntimeError(
             f"countsT shape {tuple(countsT.shape)} != expected {expected_shape}"
         )
     if np.dtype(countsT.dtype) != np.dtype(context.counts.dtype):
+        countsT.attrs["complete"] = False
         raise RuntimeError(
             f"countsT dtype {countsT.dtype} != counts dtype {context.counts.dtype}"
+        )
+
+    from scarf.storage.sharding import is_readable_counts_t_layout
+    from scarf.storage.types import array_metadata_shards
+
+    shards = array_metadata_shards(countsT)
+    layout_arguments = {
+        "shape": tuple(int(v) for v in countsT.shape),
+        "chunks": tuple(int(v) for v in countsT.chunks),
+        "shards": None if shards is None else tuple(int(v) for v in shards),
+        "dtype": countsT.dtype,
+    }
+    valid_layout = shards is not None and is_readable_counts_t_layout(
+        **layout_arguments
+    )
+    if not valid_layout:
+        countsT.attrs["complete"] = False
+        raise RuntimeError(
+            f"countsT at {storeUri} does not match the requested writer layout"
         )
 
     rng = np.random.default_rng(seed)
@@ -433,30 +553,35 @@ def _validate_counts_t(
     cell_chunk = max(1, int(countsT.chunks[1]))
     n_feats, n_cells = countsT.shape
     checks: list[dict[str, Any]] = []
-    for _ in range(max(0, nCheckTiles)):
-        feat_start = int(rng.integers(0, n_feats))
-        feat_start = (feat_start // feat_chunk) * feat_chunk
-        cell_start = int(rng.integers(0, n_cells))
-        cell_start = (cell_start // cell_chunk) * cell_chunk
-        feat_end = min(feat_start + feat_chunk, n_feats)
-        cell_end = min(cell_start + cell_chunk, n_cells)
-        got = np.asarray(countsT[feat_start:feat_end, cell_start:cell_end])
-        expect = np.asarray(context.counts[cell_start:cell_end, feat_start:feat_end]).T
-        if got.shape != expect.shape or not np.array_equal(got, expect):
-            raise RuntimeError(
-                "countsT tile mismatch after rewrite "
-                f"feat=[{feat_start}:{feat_end}] cell=[{cell_start}:{cell_end}]"
+    try:
+        for _ in range(max(0, nCheckTiles)):
+            feat_start = int(rng.integers(0, n_feats))
+            feat_start = (feat_start // feat_chunk) * feat_chunk
+            cell_start = int(rng.integers(0, n_cells))
+            cell_start = (cell_start // cell_chunk) * cell_chunk
+            feat_end = min(feat_start + feat_chunk, n_feats)
+            cell_end = min(cell_start + cell_chunk, n_cells)
+            got = np.asarray(countsT[feat_start:feat_end, cell_start:cell_end])
+            expect = np.asarray(
+                context.counts[cell_start:cell_end, feat_start:feat_end]
+            ).T
+            if got.shape != expect.shape or not np.array_equal(got, expect):
+                raise RuntimeError(
+                    "countsT tile mismatch after rewrite "
+                    f"feat=[{feat_start}:{feat_end}] cell=[{cell_start}:{cell_end}]"
+                )
+            checks.append(
+                {
+                    "featStart": feat_start,
+                    "featEnd": feat_end,
+                    "cellStart": cell_start,
+                    "cellEnd": cell_end,
+                }
             )
-        checks.append(
-            {
-                "featStart": feat_start,
-                "featEnd": feat_end,
-                "cellStart": cell_start,
-                "cellEnd": cell_end,
-            }
-        )
+    except Exception:
+        countsT.attrs["complete"] = False
+        raise
 
-    countsT.attrs["complete"] = True
     return {
         "assayName": assayName,
         "beforeComplete": context.beforeComplete,
@@ -469,6 +594,28 @@ def _validate_counts_t(
     }
 
 
+def install_stage_zarr_runtime(resources: StageResources) -> None:
+    """Install the process Zarr runtime once from the first stage budget."""
+    from scarf.storage.async_execution import (
+        configure_zarr_runtime,
+        resolve_execution_plan,
+        zarr_runtime_installed,
+    )
+
+    if zarr_runtime_installed():
+        return
+    runtime = resolve_execution_plan(
+        resolve_budget(
+            memory=resources.scarfMemoryBudget,
+            workers=resources.workers,
+        )
+    )
+    configure_zarr_runtime(
+        codecWorkers=runtime.codecWorkerLimit,
+        asyncConcurrency=runtime.zarrAsyncConcurrency,
+    )
+
+
 def run_stage(
     stage: StageName,
     *,
@@ -477,7 +624,8 @@ def run_stage(
     workflow: WorkflowParameters,
     resources: StageResources,
     localH5adPath: Path | None = None,
-    storageLayout: StorageLayout | None = None,
+    countMatrix: CountMatrixConfig | None = None,
+    storageIo: StorageIoConfig | None = None,
     workDir: Path | None = None,
     sampleIntervalSeconds: float = 0.25,
     containerMemoryMb: int | None = None,
@@ -485,8 +633,14 @@ def run_stage(
     containerCpuLimit: float | None = None,
     resetCgroupPeak: bool = True,
     invalidateCache: bool = False,
+    recordStoreOperations: bool = True,
+    clientProvenance: dict[str, Any] | None = None,
+    hvgRef: ArtifactRef | None = None,
+    session: dict[str, Any] | None = None,
 ) -> StageRunResult:
+    install_stage_zarr_runtime(resources)
     timer = StageTimer()
+    cpu_started = time.process_time()
     sampler = ResourceSampler(
         sampleIntervalSeconds=sampleIntervalSeconds,
         resetCgroupPeak=resetCgroupPeak,
@@ -496,158 +650,316 @@ def run_stage(
     measurement: ResourceMeasurement | None = None
     details: dict[str, Any] | None = None
     worker_timings: dict[str, Any] | None = None
+    store_probe: Any | None = None
+    if recordStoreOperations:
+        from profiling.recording_store import StoreProbe
 
-    with timer:
-        sampler.start()
-        try:
-            if stage == "createStore":
-                if localH5adPath is None:
-                    raise ValueError("createStore requires localH5adPath")
-                reader: H5adReader | None = None
-                writer: H5adToZarr | None = None
-                try:
-                    with timer.inputSetup():
-                        reader, writer = _prepare_create_store(
-                            localH5adPath=localH5adPath,
+        store_probe = StoreProbe(countOnly=True)
+    collected_reports: list[Any] = []
+
+    from scarf.storage.execution import execution_report_scope
+
+    _shared_store_stages = {
+        "filterCells",
+        "markHvgs",
+        "runNormalization",
+        "runPca",
+        "buildEmbeddingInitialization",
+        "buildAnnIndex",
+        "queryNeighbors",
+        "buildConnectivityMap",
+        "runUmap",
+        "findMarkers",
+        "importClusters",
+        "validateExperiment",
+    }
+
+    def _keep_store(opened: DataStore | None) -> None:
+        if session is not None and opened is not None:
+            session["store"] = opened
+
+    if hvgRef is None and session is not None:
+        session_hvg_ref = session.get("hvgRef")
+        if isinstance(session_hvg_ref, ArtifactRef):
+            hvgRef = session_hvg_ref
+
+    from profiling.metrics import child_cpu_seconds as read_child_cpu_seconds
+
+    child_cpu_before = read_child_cpu_seconds()
+    report_scope = execution_report_scope()
+    collected_reports = report_scope.__enter__()
+    try:
+        with timer:
+            sampler.start()
+            try:
+                if stage == "createStore":
+                    if localH5adPath is None:
+                        raise ValueError("createStore requires localH5adPath")
+                    reader: H5adReader | None = None
+                    writer: H5adToZarr | None = None
+                    try:
+                        with timer.inputSetup():
+                            reader, writer = _prepare_create_store(
+                                localH5adPath=localH5adPath,
+                                storeUri=storeUri,
+                                workflow=workflow,
+                                resources=resources,
+                                countMatrix=countMatrix,
+                                storageIo=storageIo,
+                                storeProbe=store_probe,
+                            )
+                        with timer.operation():
+                            assert writer is not None
+                            # Keep createStore = counts only. writeCountsT owns
+                            # paired countsT so the two stages stay measurable.
+                            writer._write_counts(batch_size=workflow.h5adBatchSize)
+                    finally:
+                        if writer is not None:
+                            details = {
+                                "h5adProducerWorkers": getattr(
+                                    writer,
+                                    "_lastImportProducerCount",
+                                    None,
+                                ),
+                                "h5adWriteWorkers": getattr(
+                                    writer,
+                                    "_lastImportWriteWorkers",
+                                    None,
+                                ),
+                                "h5adWorkersPerProcess": getattr(
+                                    writer,
+                                    "_lastImportWorkersPerProcess",
+                                    None,
+                                ),
+                            }
+                        writer = None
+                        if reader is not None:
+                            _close_h5ad_reader(reader)
+                            reader = None
+                elif stage == "writeCountsT":
+                    counts_context: _CountsTWriteContext | None = None
+                    counts_t: Any = None
+                    try:
+                        with timer.inputSetup():
+                            counts_context = _prepare_counts_t_write(
+                                storeUri=storeUri,
+                                assayName=workflow.assayName,
+                                resources=resources,
+                                storeProbe=store_probe,
+                            )
+                        with timer.operation():
+                            assert counts_context is not None
+                            counts_t, write_details = _write_counts_t(
+                                counts_context,
+                                storeUri=storeUri,
+                                assayName=workflow.assayName,
+                                countMatrix=countMatrix,
+                                storageIo=storageIo,
+                            )
+                        with timer.validationPersistence():
+                            assert counts_context is not None
+                            details = {
+                                **write_details,
+                                **_validate_counts_t(
+                                    counts_context,
+                                    counts_t,
+                                    storeUri=storeUri,
+                                    assayName=workflow.assayName,
+                                    resources=resources,
+                                    nCheckTiles=3,
+                                    seed=0,
+                                ),
+                            }
+                    finally:
+                        counts_t = None
+                        counts_context = None
+                elif stage == "initializeStore":
+                    store: DataStore | None = None
+                    try:
+                        if invalidateCache:
+                            _reset_initialization_stats(storeUri, workflow)
+                        with timer.operation():
+                            store = _open_datastore(
+                                storeUri,
+                                workflow,
+                                resources,
+                                initialize=True,
+                                storeProbe=store_probe,
+                                storageIo=storageIo,
+                            )
+                            _keep_store(store)
+                    finally:
+                        if session is None:
+                            store = None
+                elif stage == "reopenStore":
+                    store = None
+                    try:
+                        with timer.operation():
+                            store = _open_datastore(
+                                storeUri,
+                                workflow,
+                                resources,
+                                initialize=False,
+                                storeProbe=store_probe,
+                                storageIo=storageIo,
+                            )
+                    finally:
+                        if session is None:
+                            store = None
+                elif stage == "runLeiden":
+                    with timer.operation():
+                        worker_timings = _run_leiden_in_subprocess(
                             storeUri=storeUri,
                             workflow=workflow,
                             resources=resources,
-                            storageLayout=storageLayout,
-                        )
-                    with timer.operation():
-                        assert writer is not None
-                        writer.dump(batch_size=workflow.h5adBatchSize)
-                finally:
-                    writer = None
-                    if reader is not None:
-                        _close_h5ad_reader(reader)
-                        reader = None
-            elif stage == "writeCountsT":
-                counts_context: _CountsTWriteContext | None = None
-                counts_t: Any = None
-                try:
-                    with timer.inputSetup():
-                        counts_context = _prepare_counts_t_write(
-                            storeUri=storeUri,
-                            assayName=workflow.assayName,
-                            resources=resources,
-                        )
-                    with timer.operation():
-                        assert counts_context is not None
-                        counts_t = _write_counts_t(
-                            counts_context,
-                            storeUri=storeUri,
-                            assayName=workflow.assayName,
-                            featureMajorLayout=(
-                                workflow.countsTLayout == "featureMajor"
-                            ),
-                        )
-                    with timer.validationPersistence():
-                        assert counts_context is not None
-                        details = _validate_counts_t(
-                            counts_context,
-                            counts_t,
-                            storeUri=storeUri,
-                            assayName=workflow.assayName,
-                            resources=resources,
-                            nCheckTiles=3,
-                            seed=0,
-                        )
-                finally:
-                    counts_t = None
-                    counts_context = None
-            elif stage == "initializeStore":
-                store: DataStore | None = None
-                try:
-                    with timer.operation():
-                        store = _open_datastore(
-                            storeUri, workflow, resources, initialize=True
-                        )
-                finally:
-                    store = None
-            elif stage == "reopenStore":
-                store = None
-                try:
-                    with timer.operation():
-                        store = _open_datastore(
-                            storeUri, workflow, resources, initialize=False
-                        )
-                finally:
-                    store = None
-            elif stage == "runLeiden":
-                with timer.operation():
-                    worker_timings = _run_leiden_in_subprocess(
-                        storeUri=storeUri,
-                        workflow=workflow,
-                        resources=resources,
-                        workDir=workDir,
-                    )
-            elif stage == "runClustering":
-                with timer.operation():
-                    worker_timings = _run_paris_in_subprocess(
-                        storeUri=storeUri,
-                        workflow=workflow,
-                        resources=resources,
-                        workDir=workDir,
-                    )
-            else:
-                store = None
-                try:
-                    with timer.inputSetup():
-                        print(
-                            f"[run_stage] ENTER open_datastore stage={stage} "
-                            f"store={storeUri}",
-                            flush=True,
-                        )
-                        store = _open_datastore(
-                            storeUri, workflow, resources, initialize=False
-                        )
-                    with timer.operation():
-                        assert store is not None
-                        print(
-                            f"[run_stage] datastore open; ENTER analysis stage={stage}",
-                            flush=True,
-                        )
-                        _run_analysis(
-                            stage,
-                            store,
-                            workflow,
-                            resources,
+                            workDir=workDir,
                             invalidateCache=invalidateCache,
                         )
-                        print(
-                            f"[run_stage] analysis DONE stage={stage}",
-                            flush=True,
-                        )
-                finally:
+                else:
                     store = None
-        except Exception as exc:
-            status = "error"
-            error = f"{type(exc).__name__}: {exc}"
-        finally:
-            measurement = sampler.stop()
+                    reused = (
+                        session.get("store")
+                        if session is not None and stage in _shared_store_stages
+                        else None
+                    )
+                    try:
+                        if reused is not None:
+                            store = reused
+                        else:
+                            with timer.inputSetup():
+                                print(
+                                    f"[run_stage] ENTER open_datastore stage={stage} "
+                                    f"store={storeUri}",
+                                    flush=True,
+                                )
+                                store = _open_datastore(
+                                    storeUri,
+                                    workflow,
+                                    resources,
+                                    initialize=False,
+                                    storeProbe=store_probe,
+                                    storageIo=storageIo,
+                                )
+                                _keep_store(store)
+                        with timer.operation():
+                            assert store is not None
+                            print(
+                                f"[run_stage] datastore open; ENTER analysis stage={stage}",
+                                flush=True,
+                            )
+                            analysis_details = _run_analysis(
+                                stage,
+                                store,
+                                workflow,
+                                resources,
+                                invalidateCache=invalidateCache,
+                                hvgRef=hvgRef,
+                            )
+                            if analysis_details:
+                                details = {
+                                    **(details or {}),
+                                    **analysis_details,
+                                }
+                                if stage == "markHvgs" and session is not None:
+                                    artifact = analysis_details.get("artifact")
+                                    if not isinstance(artifact, dict):
+                                        raise ValueError(
+                                            "markHvgs did not return an artifact reference"
+                                        )
+                                    session["hvgRef"] = ArtifactRef.from_dict(artifact)
+                            print(
+                                f"[run_stage] analysis DONE stage={stage}",
+                                flush=True,
+                            )
+                    finally:
+                        if session is None:
+                            store = None
+            except Exception as exc:
+                status = "error"
+                error = (
+                    "".join(traceback.format_exception(exc))
+                    if isinstance(exc, BaseExceptionGroup)
+                    else f"{type(exc).__name__}: {exc}"
+                )
+            finally:
+                measurement = sampler.stop()
+    finally:
+        report_scope.__exit__(None, None, None)
 
     timings = timer.result
     seconds = timings.measuredOperationSeconds
     input_setup_seconds = timings.inputSetupSeconds
+    measured_child_cpu = max(0.0, read_child_cpu_seconds() - child_cpu_before)
+    child_cpu_seconds: float | None = (
+        measured_child_cpu if measured_child_cpu > 0 else None
+    )
     if worker_timings is not None:
         worker_setup = worker_timings.get("inputSetupSeconds")
         worker_operation = worker_timings.get("operationSeconds")
         worker_whole = worker_timings.get("wholeWorkerSeconds")
+        worker_child_cpu = worker_timings.get("childCpuSeconds")
+        worker_process_cpu = worker_timings.get("processCpuSeconds")
         if isinstance(worker_setup, int | float) and not isinstance(worker_setup, bool):
             input_setup_seconds = float(worker_setup)
         if isinstance(worker_operation, int | float) and not isinstance(
             worker_operation, bool
         ):
             seconds = float(worker_operation)
+        if isinstance(worker_child_cpu, int | float) and not isinstance(
+            worker_child_cpu, bool
+        ):
+            child_cpu_seconds = float(worker_child_cpu)
+        extra_details: dict[str, Any] = {}
         if isinstance(worker_whole, int | float) and not isinstance(worker_whole, bool):
-            details = {
-                "subprocessSeconds": timings.measuredOperationSeconds,
-                "workerWholeSeconds": float(worker_whole),
-            }
-    if stage == "createStore" and details is None:
-        details = {"countsWriteSeconds": seconds}
+            extra_details["subprocessSeconds"] = timings.measuredOperationSeconds
+            extra_details["workerWholeSeconds"] = float(worker_whole)
+        if isinstance(worker_process_cpu, int | float) and not isinstance(
+            worker_process_cpu, bool
+        ):
+            extra_details["workerProcessCpuSeconds"] = float(worker_process_cpu)
+        label_sha256 = worker_timings.get("labelSha256")
+        if isinstance(label_sha256, str):
+            extra_details["labelSha256"] = label_sha256
+        cluster_count = worker_timings.get("clusterCount")
+        if isinstance(cluster_count, int) and not isinstance(cluster_count, bool):
+            extra_details["clusterCount"] = cluster_count
+        if extra_details:
+            details = {**(details or {}), **extra_details}
+    if stage == "createStore":
+        counts_t_present = False
+        if status == "ok":
+            root = open_store(
+                storeUri,
+                mode="r",
+                storage_options=storage_options(storeUri),
+            )
+            assay = as_zarr_group(
+                root[workflow.assayName],
+                name=workflow.assayName,
+            )
+            counts_t_present = "countsT" in assay
+        details = {
+            "countsWriteSeconds": seconds,
+            "countsOnly": True,
+            "countsTPresent": counts_t_present,
+            **(details or {}),
+        }
+    if store_probe is not None:
+        details = {
+            **(details or {}),
+            "storeOperations": store_probe.to_json(),
+        }
+    if collected_reports:
+        from scarf.storage.execution import execution_reports_by_kind
+
+        details = {
+            **(details or {}),
+            "executionReports": execution_reports_by_kind(collected_reports),
+        }
     resource_summary = summarize_resource_measurement(measurement)
+    process_cpu_seconds = time.process_time() - cpu_started
+    from profiling.provenance import collect_run_provenance
+
     return StageRunResult(
         stage=stage,
         nRows=nRows,
@@ -673,8 +985,208 @@ def run_stage(
         validationPersistenceSeconds=timings.validationPersistenceSeconds,
         wholeFunctionSeconds=timings.wholeFunctionSeconds,
         details=details,
+        processCpuSeconds=process_cpu_seconds,
+        childCpuSeconds=child_cpu_seconds,
+        provenance=collect_run_provenance(
+            nonpreemptible=True,
+            clientProvenance=clientProvenance,
+        ),
         **resource_summary,
     )
+
+
+def _feature_consume_details(
+    workflow: WorkflowParameters,
+    resources: StageResources,
+    *,
+    unitKind: str | None = None,
+) -> dict[str, Any]:
+    from scarf.storage.execution import (
+        last_execution_report,
+        recorded_execution_reports,
+    )
+
+    payload: dict[str, Any] = {
+        "workers": resources.workers,
+        "scarfMemoryBudget": resources.scarfMemoryBudget,
+        "kind": "observed",
+    }
+    selected = None
+    reports = recorded_execution_reports()
+    if unitKind is not None:
+        matching = [report for report in reports if report.unitKind == unitKind]
+        if matching:
+            selected = matching[-1]
+    if selected is None:
+        selected = last_execution_report()
+    if selected is not None:
+        payload.update(selected.as_metrics())
+    return payload
+
+
+def validate_cluster_source_identity(
+    *,
+    sourceIds: np.ndarray,
+    targetIds: np.ndarray,
+    sourceActive: np.ndarray,
+    targetActive: np.ndarray,
+    labels: np.ndarray,
+) -> list[str]:
+    """Reject reordered, missing, duplicate, mismatched, or one-group labels."""
+    if sourceIds.shape != targetIds.shape:
+        raise ValueError(
+            "cluster source row count does not match the target store; "
+            "do not substitute labels by row count"
+        )
+    if not np.array_equal(sourceIds.astype(str), targetIds.astype(str)):
+        raise ValueError(
+            "cluster source cell ids are not identical in order; "
+            "reordered or mismatched identities are rejected"
+        )
+    if int(np.unique(sourceIds.astype(str)).shape[0]) != int(sourceIds.shape[0]):
+        raise ValueError("cluster source cell ids are not unique")
+    if not np.array_equal(
+        np.asarray(sourceActive).astype(bool),
+        np.asarray(targetActive).astype(bool),
+    ):
+        raise ValueError("cluster source active-cell mask does not match the target")
+    if labels.shape[0] != sourceIds.shape[0]:
+        raise ValueError("cluster source labels do not cover every row")
+    active_labels = labels[np.asarray(targetActive).astype(bool)]
+    if any(str(value) in {"", "nan", "None"} for value in active_labels):
+        raise ValueError("cluster source has missing labels on active cells")
+    groups = sorted({str(value) for value in active_labels})
+    if len(groups) < 2:
+        raise ValueError("cluster source must contain at least two groups")
+    return groups
+
+
+def validate_experiment_branches(
+    *,
+    pcaComplete: bool,
+    importedColumnPresent: bool,
+    markerComplete: bool,
+) -> dict[str, bool]:
+    """Validate the PCA branch and the imported-marker branch separately."""
+    if not pcaComplete:
+        raise ValueError(
+            "validateExperiment: PCA branch is missing a reduction artifact"
+        )
+    if not importedColumnPresent:
+        raise ValueError("validateExperiment: imported cluster column is missing")
+    if not markerComplete:
+        raise ValueError("validateExperiment: marker branch is missing a marker_table")
+    return {"pcaBranch": True, "markerBranch": True}
+
+
+def _ordered_id_digest(values: np.ndarray) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    digest.update(b"scarf-ordered-ids-v1\0")
+    digest.update(np.int64(values.shape[0]).tobytes())
+    for item in values:
+        if isinstance(item, bytes | bytearray | np.bytes_):
+            payload = bytes(item)
+        else:
+            payload = str(item).encode()
+        digest.update(len(payload).to_bytes(8, "little"))
+        digest.update(payload)
+    return digest.hexdigest()
+
+
+def _import_cluster_labels(
+    store: DataStore, workflow: WorkflowParameters
+) -> dict[str, Any]:
+    source_uri = workflow.clusterSourceUri
+    if source_uri is None or not source_uri.strip():
+        raise ValueError("importClusters requires workflow.clusterSourceUri")
+    options = storage_options(source_uri)
+    source = open_store(source_uri, mode="r", storage_options=options)
+    if "cellData" not in source:
+        raise ValueError(f"cluster source {source_uri} is missing cellData")
+    cell_data = source["cellData"]
+    if "ids" not in cell_data:
+        raise ValueError("cluster source is missing cell ids")
+    source_ids = np.asarray(cell_data["ids"][:])
+    target_ids = np.asarray(store.cells.fetch_all("ids"))
+    if workflow.cellKey not in cell_data:
+        raise ValueError("cluster source is missing the active-cell mask")
+    source_active = np.asarray(cell_data[workflow.cellKey][:]).astype(bool)
+    target_active = np.asarray(store.cells.fetch_all(workflow.cellKey)).astype(bool)
+    label_column = workflow.clusterLabelColumn
+    if label_column not in cell_data:
+        raise ValueError(f"cluster source is missing label column {label_column}")
+    labels = np.asarray(cell_data[label_column][:])
+    groups = validate_cluster_source_identity(
+        sourceIds=source_ids,
+        targetIds=target_ids,
+        sourceActive=source_active,
+        targetActive=target_active,
+        labels=labels,
+    )
+    dest_column = workflow.resolvedMarkerGroupKey
+    store.cells.insert(
+        dest_column,
+        labels,
+        fill_value=-1,
+        key="I",
+        overwrite=True,
+    )
+    source_artifact = None
+    if hasattr(cell_data[label_column], "attrs"):
+        source_artifact = dict(cell_data[label_column].attrs).get("source_artifact")
+    return {
+        "sourceUri": source_uri,
+        "sourceArtifact": source_artifact,
+        "destColumn": dest_column,
+        "rowSelectionFingerprint": _ordered_id_digest(source_ids),
+        "labelFingerprint": _ordered_id_digest(np.asarray(labels, dtype=object)),
+        "groupCount": len(groups),
+        "activeCells": int(target_active.sum()),
+        "kind": "observed",
+    }
+
+
+def _validate_experiment(
+    store: DataStore, workflow: WorkflowParameters
+) -> dict[str, Any]:
+    pca_refs = store.list_artifacts(
+        kind="reduction",
+        from_assay=workflow.assayName,
+        scope="assay",
+        complete_only=True,
+    )
+    marker_refs = store.list_artifacts(
+        kind="marker_table",
+        from_assay=workflow.assayName,
+        scope="assay",
+        complete_only=True,
+    )
+    pca_complete = bool(pca_refs) and store.inspect_artifact(pca_refs[-1]).complete
+    imported = workflow.resolvedMarkerGroupKey in store.cells.columns
+    marker_complete = (
+        bool(marker_refs) and store.inspect_artifact(marker_refs[-1]).complete
+    )
+    validate_experiment_branches(
+        pcaComplete=pca_complete,
+        importedColumnPresent=imported,
+        markerComplete=marker_complete,
+    )
+    pca_status = store.inspect_artifact(pca_refs[-1])
+    marker_status = store.inspect_artifact(marker_refs[-1])
+    return {
+        "pcaBranch": {
+            "artifactId": pca_refs[-1].artifact_id,
+            "complete": pca_status.complete,
+        },
+        "markerBranch": {
+            "artifactId": marker_refs[-1].artifact_id,
+            "complete": marker_status.complete,
+            "groupKey": workflow.resolvedMarkerGroupKey,
+        },
+        "kind": "observed",
+    }
 
 
 def _run_analysis(
@@ -684,7 +1196,8 @@ def _run_analysis(
     resources: StageResources,
     *,
     invalidateCache: bool = False,
-) -> None:
+    hvgRef: ArtifactRef | None = None,
+) -> dict[str, Any] | None:
     if stage == "filterCells":
         store.auto_filter_cells(
             attrs=workflow.filterAttrs,
@@ -693,27 +1206,40 @@ def _run_analysis(
             show_qc_plots=False,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "markHvgs":
-        store.mark_hvgs(
+        ref = store.mark_hvgs(
             from_assay=workflow.assayName,
             cell_key=workflow.cellKey,
             min_cells=workflow.hvgMinCells,
             top_n=workflow.topN,
             show_plot=False,
-            hvg_key_name=workflow.hvgKey,
+            label=workflow.hvgLabel,
             invalidate_cache=invalidateCache,
         )
-        return
+        return {
+            "artifact": ref.to_dict(),
+            "consume": _feature_consume_details(
+                workflow,
+                resources,
+                unitKind="countsTCellBand",
+            ),
+        }
     if stage == "runNormalization":
+        feature_selection = hvgRef
+        if feature_selection is None:
+            feature_selection = store.resolve_features(
+                workflow.assayName,
+                workflow.hvgLabel,
+            )
         store.run_normalization(
             from_assay=workflow.assayName,
             cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
+            features=feature_selection,
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "runPca":
         store.run_pca(
             from_assay=workflow.assayName,
@@ -723,7 +1249,7 @@ def _run_analysis(
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "buildEmbeddingInitialization":
         store.build_embedding_initialization(
             from_assay=workflow.assayName,
@@ -734,7 +1260,7 @@ def _run_analysis(
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "buildAnnIndex":
         store.build_ann_index(
             from_assay=workflow.assayName,
@@ -746,7 +1272,7 @@ def _run_analysis(
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "queryNeighbors":
         store.query_neighbors(
             from_assay=workflow.assayName,
@@ -754,19 +1280,18 @@ def _run_analysis(
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "buildConnectivityMap":
         store.build_connectivity_map(
             from_assay=workflow.assayName,
             update_state=True,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "runUmap":
         store.run_umap(
             from_assay=workflow.assayName,
             cell_key=workflow.cellKey,
-            feat_key=workflow.hvgKey,
             n_epochs=workflow.umapEpochs,
             random_seed=workflow.umapSeed,
             label=workflow.umapLabel,
@@ -774,21 +1299,39 @@ def _run_analysis(
             nthreads=resources.workers,
             invalidate_cache=invalidateCache,
         )
-        return
+        return None
     if stage == "runLeiden":
         raise AssertionError("runLeiden must execute in its child process")
     if stage == "findMarkers":
+        if workflow.markerFeatures == "all_features":
+            store._ensure_all_features(store._get_assay(workflow.assayName))
+            feature_selection = store.resolve_features(
+                workflow.assayName,
+                "all_features",
+            )
+        else:
+            feature_selection = store.resolve_features(
+                workflow.assayName,
+                workflow.markerFeatures,
+            )
         store.run_marker_search(
             from_assay=workflow.assayName,
             group_key=workflow.resolvedMarkerGroupKey,
             cell_key=workflow.cellKey,
-            feat_key=workflow.markerFeatureKey,
-            gene_batch_size=workflow.markerGeneBatchSize,
-            n_threads=resources.workers,
+            features=feature_selection,
+            nthreads=resources.workers,
             skip_save=False,
             invalidate_cache=invalidateCache,
         )
-        return
-    if stage == "runClustering":
-        raise AssertionError("runClustering must execute in its child process")
+        return {
+            "consume": _feature_consume_details(
+                workflow,
+                resources,
+                unitKind="countsTReadGroup",
+            )
+        }
+    if stage == "importClusters":
+        return _import_cluster_labels(store, workflow)
+    if stage == "validateExperiment":
+        return _validate_experiment(store, workflow)
     raise ValueError(f"No analysis operation for {stage}")

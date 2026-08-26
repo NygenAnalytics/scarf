@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -115,14 +116,83 @@ def object_size(uri: str) -> int | None:
     return int(meta["size"])
 
 
-def get_json(uri: str) -> dict[str, Any]:
+def object_metadata(uri: str) -> dict[str, Any] | None:
     store, key = open_r2_object(uri)
-    result = store.get(key)
-    body = bytes(result.bytes())
+    try:
+        meta = store.head(key)
+    except FileNotFoundError:
+        return None
+    e_tag = meta.get("e_tag")
+    return {
+        "size": int(meta["size"]),
+        "eTag": str(e_tag) if e_tag else None,
+    }
+
+
+def list_objects(
+    prefixUri: str,
+    *,
+    maxKeys: int = 256,
+) -> list[dict[str, Any]]:
+    if maxKeys < 1:
+        raise ValueError("maxKeys must be positive")
+    parsed = urlsplit(prefixUri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Expected an s3:// object URI, got: {prefixUri}")
+    prefix = parsed.path.lstrip("/")
+    store, _key = open_r2_object(prefixUri if prefix else f"{prefixUri.rstrip('/')}/.")
+    listed: list[dict[str, Any]] = []
+    for batch in store.list(prefix=prefix or None, chunk_size=min(50, maxKeys)):
+        for item in batch:
+            path = str(item["path"])
+            e_tag = item.get("e_tag")
+            listed.append(
+                {
+                    "uri": f"s3://{parsed.netloc}/{path}",
+                    "path": path,
+                    "size": int(item["size"]),
+                    "eTag": str(e_tag) if e_tag else None,
+                }
+            )
+            if len(listed) >= maxKeys:
+                return listed
+    return listed
+
+
+def list_common_prefixes(prefixUri: str) -> list[str]:
+    parsed = urlsplit(prefixUri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Expected an s3:// object URI, got: {prefixUri}")
+    prefix = parsed.path.lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    store, _key = open_r2_object(
+        prefixUri if parsed.path.lstrip("/") else f"{prefixUri.rstrip('/')}/."
+    )
+    result = store.list_with_delimiter(prefix or None)
+    prefixes = result.get("common_prefixes") or []
+    uris: list[str] = []
+    for item in prefixes:
+        path = str(item).strip("/")
+        uris.append(f"s3://{parsed.netloc}/{path}")
+    return uris
+
+
+def get_json(uri: str) -> dict[str, Any]:
+    body = get_bytes(uri)
     payload = json.loads(body.decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object at {uri}")
     return payload
+
+
+def get_bytes(uri: str) -> bytes:
+    store, key = open_r2_object(uri)
+    return bytes(store.get(key).bytes())
+
+
+def get_text(uri: str) -> str:
+    return get_bytes(uri).decode("utf-8")
 
 
 def _encode_json(value: dict[str, Any]) -> bytes:
@@ -137,11 +207,15 @@ def put_json(uri: str, value: dict[str, Any]) -> None:
 
 
 def put_json_if_absent(uri: str, value: dict[str, Any]) -> bool:
+    return put_bytes_if_absent(uri, _encode_json(value))
+
+
+def put_bytes_if_absent(uri: str, value: bytes) -> bool:
     store, key = open_r2_object(uri)
     try:
         store.put(
             key,
-            _encode_json(value),
+            value,
             mode="create",
             use_multipart=False,
         )
@@ -150,14 +224,19 @@ def put_json_if_absent(uri: str, value: dict[str, Any]) -> bool:
     return True
 
 
+def put_text_if_absent(uri: str, value: str) -> bool:
+    return put_bytes_if_absent(uri, value.encode("utf-8"))
+
+
 def download_file(
     uri: str,
     destination: str | Path,
     *,
     chunkBytes: int = _DEFAULT_TRANSFER_CHUNK_BYTES,
     maxAttempts: int = 8,
+    maxWorkers: int | None = None,
 ) -> ObjectDownload:
-    """Download with ranged GETs so large objects can resume after timeouts."""
+    """Download with concurrent ranged GETs into a preallocated file."""
     if chunkBytes <= 0:
         raise ValueError("chunkBytes must be positive")
     if maxAttempts <= 0:
@@ -169,32 +248,58 @@ def download_file(
     meta = store.head(key)
     total = int(meta["size"])
     part_path = destination_path.with_name(f".{destination_path.name}.part")
-    offset = part_path.stat().st_size if part_path.is_file() else 0
-    if offset > total:
+    if part_path.is_file() and part_path.stat().st_size != total:
         part_path.unlink()
-        offset = 0
+    if total == 0:
+        part_path.write_bytes(b"")
+        os.replace(part_path, destination_path)
+        e_tag = meta.get("e_tag")
+        return ObjectDownload(fileBytes=0, eTag=str(e_tag) if e_tag else None)
 
-    attempts = 0
-    while offset < total:
-        end = min(offset + chunkBytes, total)
-        try:
-            chunk = bytes(store.get_range(key, start=offset, end=end))
-        except Exception:
-            attempts += 1
-            if attempts >= maxAttempts:
-                raise
-            time.sleep(min(60.0, 2.0**attempts))
-            store, key = open_r2_object(uri)
-            continue
-        if not chunk:
-            raise RuntimeError(f"Empty range response for {uri} at offset {offset}")
-        with part_path.open("ab" if offset else "wb") as handle:
-            handle.write(chunk)
-        offset += len(chunk)
+    ranges = [
+        (start, min(start + chunkBytes, total)) for start in range(0, total, chunkBytes)
+    ]
+    workers = max(1, int(maxWorkers) if maxWorkers is not None else min(8, len(ranges)))
+    with part_path.open("wb") as handle:
+        handle.truncate(total)
+
+    def fetch_range(start: int, end: int) -> None:
         attempts = 0
+        while True:
+            try:
+                local_store, local_key = open_r2_object(uri)
+                chunk = bytes(local_store.get_range(local_key, start=start, end=end))
+            except Exception:
+                attempts += 1
+                if attempts >= maxAttempts:
+                    raise
+                time.sleep(min(60.0, 2.0**attempts))
+                continue
+            if not chunk:
+                raise RuntimeError(f"Empty range response for {uri} at offset {start}")
+            if start + len(chunk) > end:
+                raise RuntimeError(
+                    f"Range response for {uri} at offset {start} exceeded "
+                    f"{end - start} bytes"
+                )
+            with part_path.open("r+b") as handle:
+                handle.seek(start)
+                handle.write(chunk)
+            return
 
-    if offset != total:
-        raise RuntimeError(f"Downloaded {offset} bytes from {uri}, expected {total}")
+    if workers == 1 or len(ranges) == 1:
+        for start, end in ranges:
+            fetch_range(start, end)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(fetch_range, start, end) for start, end in ranges]
+            for future in as_completed(futures):
+                future.result()
+
+    if part_path.stat().st_size != total:
+        raise RuntimeError(
+            f"Downloaded {part_path.stat().st_size} bytes from {uri}, expected {total}"
+        )
     os.replace(part_path, destination_path)
     e_tag = meta.get("e_tag")
     return ObjectDownload(fileBytes=total, eTag=str(e_tag) if e_tag else None)

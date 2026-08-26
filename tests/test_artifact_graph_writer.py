@@ -5,7 +5,8 @@ import pytest
 
 from scarf import ArtifactRef
 from scarf.datastore.datastore import DataStore
-from scarf.storage.artifacts import parse_artifact_path
+from scarf.graph.feature_projection import resolve_native_graph_inputs
+from scarf.storage.artifacts import artifact_path
 from scarf.storage.schema import create_zarr_count_assay
 from scarf.graph.state import AssayState
 from tests.fixtures_datastore import build_neighbourhood_graph
@@ -17,7 +18,7 @@ def _graph_kwargs() -> dict:
     return {
         "from_assay": "RNA",
         "cell_key": "I",
-        "feat_key": "artifact_hvgs",
+        "features": "artifact_hvgs",
         "dims": 5,
         "k": 3,
         "n_centroids": 10,
@@ -26,15 +27,14 @@ def _graph_kwargs() -> dict:
     }
 
 
-def _prepare_features(datastore) -> None:
-    if "I__artifact_hvgs" not in datastore.get_assay("RNA").feats.columns:
-        datastore.mark_hvgs(
-            from_assay="RNA",
-            cell_key="I",
-            top_n=100,
-            hvg_key_name="artifact_hvgs",
-            show_plot=False,
-        )
+def _prepare_features(datastore) -> ArtifactRef:
+    return datastore.mark_hvgs(
+        from_assay="RNA",
+        cell_key="I",
+        top_n=100,
+        label="artifact_hvgs",
+        show_plot=False,
+    )
 
 
 def _state_refs(state: AssayState) -> dict[str, str]:
@@ -76,21 +76,6 @@ def test_graph_construction_chain_writes_only_artifacts_and_state(
 
     assert state is not None
     assert state.cell_key == "I"
-    assert state.feat_key == "artifact_hvgs"
-    stored = datastore._lookup_stored_graph("RNA", "I", "artifact_hvgs")
-    assert stored.reduction_method == "pca"
-    assert stored.dims == 5
-    assert stored.pca_cell_key == "I"
-    assert stored.feat_scaling is True
-    assert stored.ann_metric is not None
-    assert stored.ann_efc is not None
-    assert stored.ann_ef is not None
-    assert stored.ann_m is not None
-    assert stored.rand_state is not None
-    assert stored.k == 3
-    assert stored.local_connectivity is not None
-    assert stored.bandwidth is not None
-    assert stored.n_centroids == 10
     for field_name in (
         "normalized",
         "feature_scaling",
@@ -115,6 +100,14 @@ def test_graph_construction_chain_writes_only_artifacts_and_state(
             "complete",
         }
     assert state.reduction is not None
+    assert state.connectivity_map is not None
+    ancestry = resolve_native_graph_inputs(datastore.zw, state.connectivity_map)
+    assert ancestry.normalized == state.normalized
+    normalized_inputs = datastore.inspect_artifact(state.normalized).inputs or {}
+    feature_selection = ArtifactRef.from_dict(normalized_inputs["feature_selection"])
+    assert feature_selection == datastore.resolve_features("RNA", "artifact_hvgs")
+    assert datastore.inspect_artifact(state.reduction).parameters["dims"] == 5
+    assert datastore.inspect_artifact(state.neighbors).parameters["k"] == 3
     reduction_execution = datastore.inspect_artifact(state.reduction).execution_options
     assert reduction_execution is not None
     assert reduction_execution["local_cache"] is False
@@ -125,9 +118,6 @@ def test_graph_construction_chain_writes_only_artifacts_and_state(
     assert datastore.get_assay("RNA").attrs.get(
         "latest_cell_key"
     ) == assay_attrs_before.get("latest_cell_key")
-    assert datastore.get_assay("RNA").attrs.get(
-        "latest_feat_key"
-    ) == assay_attrs_before.get("latest_feat_key")
     assert "dataset_fingerprint" in datastore.get_assay("RNA").attrs
     assert "RNA/normed__I__artifact_hvgs" not in datastore.zw
     assert datastore.list_artifacts(
@@ -185,7 +175,11 @@ def test_graph_construction_chain_records_pca_selection(
     assert first is not None
 
     assert datastore.get_assay_state("RNA") == first
-    assert datastore._lookup_stored_graph().pca_cell_key == "pca_cells"
+    assert first.reduction is not None
+    assert (
+        datastore.inspect_artifact(first.reduction).execution_options["pca_cell_key"]
+        == "pca_cells"
+    )
 
 
 def test_lsi_artifact_replay_keeps_requested_dimensions(
@@ -205,11 +199,10 @@ def test_lsi_artifact_replay_keeps_requested_dimensions(
     assert state is not None and state.reduction is not None
     reduction = datastore.load_artifact(state.reduction)
     assert reduction["loadings"].shape[1] == 3
-    stored = datastore._lookup_stored_graph()
-    assert stored.reduction_method == "lsi"
-    assert stored.dims == 3
-    assert stored.pca_cell_key is None
-    assert stored.feat_scaling is False
+    status = datastore.inspect_artifact(state.reduction)
+    assert status.operation == "run_lsi"
+    assert status.parameters["dims"] == 3
+    assert status.parameters["skip_first"] is True
 
 
 def test_graph_construction_chain_treats_structurally_invalid_cache_as_missing(
@@ -243,7 +236,6 @@ def test_paris_writes_hierarchy_cut_and_dendrogram_artifacts(
     result = datastore.run_paris_clustering(
         from_assay="RNA",
         cell_key="I",
-        feat_key="artifact_hvgs",
         n_clusters=5,
         label="artifact_paris",
     )
@@ -262,7 +254,6 @@ def test_paris_writes_hierarchy_cut_and_dendrogram_artifacts(
     adaptive = datastore.run_paris_clustering(
         from_assay="RNA",
         cell_key="I",
-        feat_key="artifact_hvgs",
         n_clusters="auto",
         min_cluster_size=10,
         label="artifact_paris_auto",
@@ -273,7 +264,6 @@ def test_paris_writes_hierarchy_cut_and_dendrogram_artifacts(
     tree = datastore._prepare_cluster_tree(
         from_assay="RNA",
         cell_key="I",
-        feat_key="artifact_hvgs",
         cluster_key="RNA_artifact_paris",
     )
     assert tree["graph"].number_of_nodes() > 0
@@ -290,7 +280,7 @@ def test_integrated_graphs_use_random_artifacts_and_label_index(
         datastore,
         from_assay="assay2",
         cell_key="I",
-        feat_key="I",
+        features="all_features",
         dims=5,
         k=3,
         n_centroids=10,
@@ -303,34 +293,32 @@ def test_integrated_graphs_use_random_artifacts_and_label_index(
         label="artifact_snn",
         method="snn",
     )
-    path = datastore._resolve_integrated_graph_path("artifact_snn")
-    ref = parse_artifact_path(path)
+    ref = integrated
     assert integrated == ref
     assert ref.kind == "integrated_graph"
-    assert datastore.inspect_artifact(ref).complete
+    status = datastore.inspect_artifact(ref)
+    assert status.complete
+    assert set(status.inputs or {}) == {
+        "cell_selection",
+        "source_0",
+        "source_1",
+    }
+    for index, assay in enumerate(("RNA", "assay2")):
+        source = ArtifactRef.from_dict(status.inputs[f"source_{index}"])
+        assert source.kind == "connectivity_map"
+        assert source.assay == assay
     assert "integratedGraphs/artifact_snn" not in datastore.zw
 
-    umap_ref = datastore.run_umap(
-        integrated_graph="artifact_snn",
-        n_epochs=10,
-        label="UMAP",
-    )
+    umap_ref = datastore.run_umap(integrated, n_epochs=10, label="UMAP")
     assert "artifact_snn_UMAP1" in datastore.cells.columns
     assert datastore.run_umap(integrated, n_epochs=10, label="UMAP") == umap_ref
-    with pytest.raises(ValueError, match="not both"):
-        datastore.run_umap(
-            integrated,
-            integrated_graph="artifact_snn",
-            n_epochs=10,
-            label="UMAP",
-        )
     datastore.run_paris_clustering(
-        integrated_graph="artifact_snn",
+        integrated,
         n_clusters=3,
         label="paris",
     )
     tree = datastore._prepare_cluster_tree(
-        integrated_graph="artifact_snn",
+        graph=integrated,
         cluster_key="artifact_snn_paris",
     )
     assert tree["coalesced_location"].startswith(
@@ -360,16 +348,11 @@ def test_wnn_uses_exact_nondefault_cell_selection(
         np.where(np.arange(datastore.cells.N) % 2, "a", "b"),
         overwrite=True,
     )
-    datastore.RNA.feats.insert(
-        "wnn_cells__artifact_hvgs",
-        datastore.RNA.feats.fetch_all("I__artifact_hvgs"),
-        overwrite=True,
-    )
     build_neighbourhood_graph(
         datastore,
         from_assay="RNA",
         cell_key="wnn_cells",
-        feat_key="artifact_hvgs",
+        features="artifact_hvgs",
         dims=3,
         k=3,
         n_centroids=10,
@@ -382,7 +365,7 @@ def test_wnn_uses_exact_nondefault_cell_selection(
         datastore,
         from_assay="assay2",
         cell_key="wnn_cells",
-        feat_key="I",
+        features="all_features",
         dims=3,
         k=3,
         n_centroids=10,
@@ -395,17 +378,16 @@ def test_wnn_uses_exact_nondefault_cell_selection(
         raise AssertionError("WNN integration must read neighbors indices directly")
 
     monkeypatch.setattr(datastore, "load_graph", reject_load_graph)
-    datastore.integrate_assays(
+    ref = datastore.integrate_assays(
         ["RNA", "assay2"],
         label="artifact_wnn",
         method="wnn",
     )
 
-    path = datastore._resolve_integrated_graph_path("artifact_wnn")
+    path = artifact_path(ref)
     assert path.startswith("artifacts/integrated_graph/")
-    ref = parse_artifact_path(path)
     group = datastore.zw[path]
-    graph = load_graph(graph_loc=path)
+    graph = load_graph(ref)
     assert graph.shape[0] == int(cells.sum())
     assert group["edges"].dtype == np.dtype(np.uint32)
     assert group["weights"].dtype == np.dtype(np.float32)
@@ -424,8 +406,12 @@ def test_wnn_uses_exact_nondefault_cell_selection(
         "assays": ["RNA", "assay2"],
         "l2_normalize": True,
     }
-    assert set(status.inputs["RNA"]) == {"neighbors", "coordinates"}
-    assert set(status.inputs["assay2"]) == {"neighbors", "coordinates"}
+    assert set(status.inputs) == {"cell_selection", "source_0", "source_1"}
+    for index, assay in enumerate(("RNA", "assay2")):
+        source = status.inputs[f"source_{index}"]
+        assert set(source) == {"neighbors", "coordinates"}
+        assert ArtifactRef.from_dict(source["neighbors"]).assay == assay
+        assert ArtifactRef.from_dict(source["coordinates"]).assay == assay
 
     weight_columns = [
         "artifact_wnn_RNA_weight",
@@ -444,43 +430,46 @@ def test_wnn_uses_exact_nondefault_cell_selection(
 
     for column in weight_columns:
         datastore.cells.drop(column)
-    datastore.integrate_assays(
-        ["RNA", "assay2"],
-        label="artifact_wnn",
-        method="wnn",
+    assert (
+        datastore.integrate_assays(
+            ["RNA", "assay2"],
+            label="artifact_wnn",
+            method="wnn",
+        )
+        == ref
     )
-    assert datastore._resolve_integrated_graph_path("artifact_wnn") == path
     assert all(column in datastore.cells.columns for column in weight_columns)
 
-    datastore.integrate_assays(
+    raw_ref = datastore.integrate_assays(
         ["RNA", "assay2"],
         label="artifact_wnn_raw",
         method="wnn",
         l2_normalize=False,
     )
-    raw_path = datastore._resolve_integrated_graph_path("artifact_wnn_raw")
+    raw_path = artifact_path(raw_ref)
     assert raw_path != path
-    raw_ref = parse_artifact_path(raw_path)
     assert datastore.inspect_artifact(raw_ref).parameters["l2_normalize"] is False
-    datastore.integrate_assays(
-        ["RNA", "assay2"],
-        label="artifact_wnn_raw",
-        method="wnn",
-        l2_normalize=False,
+    assert (
+        datastore.integrate_assays(
+            ["RNA", "assay2"],
+            label="artifact_wnn_raw",
+            method="wnn",
+            l2_normalize=False,
+        )
+        == raw_ref
     )
-    assert datastore._resolve_integrated_graph_path("artifact_wnn_raw") == raw_path
 
     expected_edges = np.asarray(group["edges"][:])
     expected_weights = np.asarray(group["weights"][:])
     expected_modality_weights = np.asarray(group["modality_weights"][:])
-    datastore.integrate_assays(
+    rechunked_ref = datastore.integrate_assays(
         ["RNA", "assay2"],
         label="artifact_wnn_rechunked",
         method="wnn",
         chunk_size=17,
         invalidate_cache=True,
     )
-    rechunked_path = datastore._resolve_integrated_graph_path("artifact_wnn_rechunked")
+    rechunked_path = artifact_path(rechunked_ref)
     assert rechunked_path != path
     rechunked = datastore.zw[rechunked_path]
     np.testing.assert_array_equal(rechunked["edges"][:], expected_edges)
@@ -502,7 +491,7 @@ def test_three_way_wnn_persists_ordered_weights_and_reuses_artifact(
             datastore,
             from_assay=assay,
             cell_key="I",
-            feat_key="I",
+            features="all_features",
             dims=3,
             k=3,
             n_centroids=10,
@@ -533,9 +522,17 @@ def test_three_way_wnn_persists_ordered_weights_and_reuses_artifact(
         "assays": assays,
         "l2_normalize": True,
     }
-    assert all(
-        set(status.inputs[assay]) == {"neighbors", "coordinates"} for assay in assays
-    )
+    assert set(status.inputs) == {
+        "cell_selection",
+        "source_0",
+        "source_1",
+        "source_2",
+    }
+    for index, assay in enumerate(assays):
+        source = status.inputs[f"source_{index}"]
+        assert set(source) == {"neighbors", "coordinates"}
+        assert ArtifactRef.from_dict(source["neighbors"]).assay == assay
+        assert ArtifactRef.from_dict(source["coordinates"]).assay == assay
 
     columns = [
         "artifact_wnn_three_RNA_weight",
@@ -552,7 +549,7 @@ def test_three_way_wnn_persists_ordered_weights_and_reuses_artifact(
         assert attrs["source_value"] == "modality_weights"
         assert attrs["value_index"] == index
 
-    graph = datastore.load_graph(graph_loc=status.path)
+    graph = datastore.load_graph(integrated)
     assert graph.shape == (n_cells, n_cells)
     assert graph.nnz == n_cells * 3
     embedding = datastore.run_umap(integrated, n_epochs=10, label="three_way")

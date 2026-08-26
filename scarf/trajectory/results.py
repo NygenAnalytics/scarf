@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 
 from ..matrix import ChunkedArray
+from ..storage.refs import ArtifactRef
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -17,7 +18,7 @@ class FateMappingResult:
     assay: str
     graph_cell_key: str
     result_cell_key: str
-    feature_key: str
+    graph: ArtifactRef
     pseudotime_key: str
     sink_key: str
     values: np.ndarray = field(repr=False)
@@ -46,7 +47,7 @@ class PseudotimeScoreResult:
     assay: str
     graph_cell_key: str
     result_cell_key: str
-    feature_key: str
+    graph: ArtifactRef
     values: np.ndarray = field(repr=False)
     valid: np.ndarray = field(repr=False)
 
@@ -66,10 +67,19 @@ class PseudotimeMarkerResult:
     p_value_key: str
     assay: str
     cell_key: str
-    feature_key: str
+    feature_selection: ArtifactRef
     pseudotime_key: str
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.feature_selection, ArtifactRef)
+            or self.feature_selection.kind != "feature_selection"
+            or self.feature_selection.scope != "assay"
+            or self.feature_selection.assay != self.assay
+        ):
+            raise ValueError(
+                "Pseudotime marker feature selection must belong to its assay"
+            )
         required = {
             "feature_index",
             "feature_name",
@@ -104,10 +114,19 @@ class PseudotimeAggregationResult:
     storage_path: str
     assay: str
     cell_key: str
-    feature_key: str
+    feature_selection: ArtifactRef
     pseudotime_key: str
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.feature_selection, ArtifactRef)
+            or self.feature_selection.kind != "feature_selection"
+            or self.feature_selection.scope != "assay"
+            or self.feature_selection.assay != self.assay
+        ):
+            raise ValueError(
+                "Pseudotime aggregation feature selection must belong to its assay"
+            )
         if len(self.data.shape) != 2:
             raise ValueError("Pseudotime aggregation data must be two-dimensional")
         if self.feature_indices.ndim != 1 or self.feature_clusters.ndim != 1:

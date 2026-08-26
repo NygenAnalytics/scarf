@@ -64,22 +64,15 @@ def test_save_normalized_data_renorm_uses_fused_path(toy_crdir_ds, monkeypatch):
         return orig_normed(self, *args, **kwargs)
 
     monkeypatch.setattr(RNAassay, "normed", fake_normed)
-    monkeypatch.setattr(
-        rna,
-        "_get_cell_feat_idx",
-        lambda cell_key, feat_key: _subset_indices(rna),
-    )
-
+    cell_idx, feat_idx = _subset_indices(rna)
     rna.save_normalized_data(
-        cell_key="I",
-        feat_key="I",
+        cell_idx,
+        feat_idx,
         location="normed_fused_test",
         log_transform=False,
         renormalize_subset=True,
-        update_keys=False,
     )
     assert called["normed"] == 0
-    cell_idx, feat_idx = _subset_indices(rna)
     expected = _reference_renorm_subset(rna, cell_idx, feat_idx)
     np.testing.assert_allclose(rna.z["normed_fused_test/data"][:], expected, rtol=1e-5)
 
@@ -104,26 +97,17 @@ def test_save_normalized_data_without_renorm_still_uses_normed(
         "scarf.storage.materialize.write_renorm_subset_to_zarr",
         fake_fused,
     )
-    monkeypatch.setattr(
-        rna,
-        "_get_cell_feat_idx",
-        lambda cell_key, feat_key: _subset_indices(rna),
-    )
-
+    cell_idx, feat_idx = _subset_indices(rna)
     rna.save_normalized_data(
-        cell_key="I",
-        feat_key="I",
+        cell_idx,
+        feat_idx,
         location="normed_standard_test",
         log_transform=False,
         renormalize_subset=False,
-        update_keys=False,
     )
     assert called["normed"] == 1
     assert called["fused"] == 0
-    assert (
-        "normalization_identity"
-        not in rna.z["normed_standard_test"].attrs["subset_params"]
-    )
+    assert "subset_params" not in rna.z["normed_standard_test"].attrs
 
 
 def test_save_normalized_data_renorm_cache_hit(toy_crdir_ds, monkeypatch):
@@ -143,38 +127,26 @@ def test_save_normalized_data_renorm_cache_hit(toy_crdir_ds, monkeypatch):
         "scarf.storage.materialize.write_renorm_subset_to_zarr",
         counting_fused,
     )
-    monkeypatch.setattr(
-        rna,
-        "_get_cell_feat_idx",
-        lambda cell_key, feat_key: _subset_indices(rna),
-    )
-
+    cell_idx, feat_idx = _subset_indices(rna)
     kwargs = dict(
-        cell_key="I",
-        feat_key="I",
+        cell_idx=cell_idx,
+        feat_idx=feat_idx,
         location="normed_cache_test",
         log_transform=False,
         renormalize_subset=True,
-        update_keys=False,
     )
     rna.save_normalized_data(**kwargs)
     rna.save_normalized_data(**kwargs)
     assert called["fused"] == 1
 
 
-def test_atac_legacy_cache_rejects_missing_normalizer_identity(
+def test_atac_materialization_reuses_existing_explicit_location(
     atac_datastore,
     monkeypatch,
 ):
     assay = atac_datastore.ATAC
     cell_idx = np.arange(8, dtype=np.int64)
-    feat_idx = assay.feats.active_index("I")[:4]
-    monkeypatch.setattr(
-        assay,
-        "_get_cell_feat_idx",
-        lambda cell_key, feat_key: (cell_idx, feat_idx),
-    )
-
+    feat_idx = np.arange(min(4, assay.feats.N), dtype=np.int64)
     original = assay.normed
     calls = 0
 
@@ -185,26 +157,177 @@ def test_atac_legacy_cache_rejects_missing_normalizer_identity(
 
     monkeypatch.setattr(assay, "normed", counting_normed)
     kwargs = dict(
-        cell_key="I",
-        feat_key="I",
+        cell_idx=cell_idx,
+        feat_idx=feat_idx,
         location="atac_normalizer_identity_cache_test",
         log_transform=False,
         renormalize_subset=False,
-        update_keys=False,
     )
 
     assay.save_normalized_data(**kwargs)
     group = assay.z["atac_normalizer_identity_cache_test"]
-    current_params = dict(group.attrs["subset_params"])
-    assert current_params["normalization_identity"] == getattr(
-        assay.normMethod,
-        "artifact_identity",
+    assert "subset_params" not in group.attrs
+    assay.save_normalized_data(**kwargs)
+    assay.save_normalized_data(**kwargs)
+
+    assert calls == 1
+
+
+def test_feature_major_normalization_rejects_missing_or_unsorted_cells() -> None:
+    from types import SimpleNamespace
+
+    import pytest
+    import zarr
+    from zarr.storage import MemoryStore
+
+    from scarf.storage.budget import ResourceBudget
+    from scarf.storage.feature_stream import FeatureCellBand
+    from scarf.storage.materialize import (
+        _counts_t_renormalized_batches,
+        write_renorm_subset_to_zarr,
     )
+    from tests.test_feature_stream import _counts_t_with_plan
 
-    legacy_params = dict(current_params)
-    del legacy_params["normalization_identity"]
-    group.attrs["subset_params"] = legacy_params
-    assay.save_normalized_data(**kwargs)
-    assay.save_normalized_data(**kwargs)
+    values = np.arange(6 * 4, dtype=np.uint16).reshape(6, 4)
+    counts_t = _counts_t_with_plan(values)
+    assay = SimpleNamespace(rawDataT=None)
+    with pytest.raises(ValueError, match="requires countsT"):
+        list(
+            _counts_t_renormalized_batches(
+                assay,
+                np.arange(6),
+                np.arange(4),
+                scaleFactor=1.0,
+                logTransform=False,
+            )
+        )
+    assay = SimpleNamespace(rawDataT=counts_t)
+    with pytest.raises(ValueError, match="sorted unique cells"):
+        list(
+            _counts_t_renormalized_batches(
+                assay,
+                np.array([2, 0, 1]),
+                np.arange(4),
+                scaleFactor=1.0,
+                logTransform=False,
+            )
+        )
 
-    assert calls == 2
+    import scarf.storage.feature_stream as feature_stream_module
+
+    ready = SimpleNamespace(
+        rawDataT=counts_t,
+        resources=ResourceBudget(8 * 1024 * 1024, 1),
+        storageIo=None,
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        feature_stream_module, "map_feature_cell_bands", lambda *_a, **_k: iter(())
+    )
+    try:
+        with pytest.raises(RuntimeError, match="did not cover every selected cell"):
+            list(
+                _counts_t_renormalized_batches(
+                    ready,
+                    np.arange(6),
+                    np.arange(4),
+                    scaleFactor=1.0,
+                    logTransform=False,
+                )
+            )
+    finally:
+        monkeypatch.undo()
+
+    def empty_feature_group(_counts_t, process, **_kwargs):
+        yield process(
+            FeatureCellBand(
+                featStart=0,
+                featEnd=1,
+                cellStart=0,
+                cellEnd=2,
+                values=np.zeros((1, 2), dtype=np.uint16),
+                selectedLocal=np.array([0, 1], dtype=np.int64),
+                selectedDestinations=np.array([0, 1], dtype=np.int64),
+                readSec=0.0,
+                blockBytes=1,
+            )
+        )
+
+    monkeypatch.setattr(
+        feature_stream_module, "map_feature_cell_bands", empty_feature_group
+    )
+    try:
+        with pytest.raises(RuntimeError, match="did not contain selected features"):
+            list(
+                _counts_t_renormalized_batches(
+                    SimpleNamespace(
+                        rawDataT=counts_t,
+                        resources=ResourceBudget(8 * 1024 * 1024, 1),
+                        storageIo=None,
+                    ),
+                    np.arange(6),
+                    np.array([2, 3], dtype=np.int64),
+                    scaleFactor=1.0,
+                    logTransform=False,
+                )
+            )
+    finally:
+        monkeypatch.undo()
+
+    def split_cells(_counts_t, process, **_kwargs):
+        yield process(
+            FeatureCellBand(
+                featStart=0,
+                featEnd=4,
+                cellStart=0,
+                cellEnd=2,
+                values=np.zeros((4, 2), dtype=np.uint16),
+                selectedLocal=np.array([0, 1], dtype=np.int64),
+                selectedDestinations=np.array([0, 2], dtype=np.int64),
+                readSec=0.0,
+                blockBytes=1,
+            )
+        )
+
+    monkeypatch.setattr(feature_stream_module, "map_feature_cell_bands", split_cells)
+    try:
+        with pytest.raises(ValueError, match="contiguous selected-cell bands"):
+            list(
+                _counts_t_renormalized_batches(
+                    ready,
+                    np.arange(6),
+                    np.arange(4),
+                    scaleFactor=1.0,
+                    logTransform=False,
+                )
+            )
+    finally:
+        monkeypatch.undo()
+
+    root = zarr.open_group(store=MemoryStore(), mode="w")
+    raw = np.arange(12, dtype=np.float32).reshape(3, 4)
+    missing_sf = SimpleNamespace(rawData=raw, rawDataT=None, sf=None)
+    with pytest.raises(ValueError, match="size factor"):
+        write_renorm_subset_to_zarr(
+            missing_sf,
+            np.arange(3),
+            np.arange(4),
+            root,
+            "missing_sf",
+            1,
+        )
+    write_renorm_subset_to_zarr(
+        SimpleNamespace(
+            rawData=raw,
+            rawDataT=None,
+            sf=1000.0,
+            resources=ResourceBudget(8 * 1024 * 1024, 1),
+            storageIo=None,
+        ),
+        np.arange(3),
+        np.arange(4),
+        root,
+        "from_counts",
+        1,
+    )
+    assert "from_counts" in root

@@ -11,6 +11,7 @@ from scarf.graph.state import read_assay_state
 from scarf.readers._rds import R_INT_NA, RdsClosedError
 from scarf.readers.seurat import SeuratImportError, SeuratReader
 from scarf.storage.artifacts import artifact_group
+from scarf.storage.count_matrix import CountMatrixPolicy
 from scarf.writers.seurat import SeuratImportResult, SeuratToZarr
 from tests.test_seurat_reader import (
     _Wire,
@@ -196,8 +197,7 @@ def _new_writer(reader: SeuratReader, destination: MemoryStore) -> SeuratToZarr:
         destination,
         mem_budget="64M",
         nthreads=1,
-        targetChunkBytes=1024,
-        targetShardBytes=4096,
+        policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
     )
 
 
@@ -224,8 +224,7 @@ def test_import_materializes_metadata_counts_membership_and_pca(
             destination,
             mem_budget="64M",
             nthreads=1,
-            targetChunkBytes=1024,
-            targetShardBytes=4096,
+            policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
         ).dump(batch_size=1)
 
     root = zarr.open_group(store=destination, mode="r")
@@ -329,8 +328,7 @@ def test_assay5_subclass_preserves_partial_cell_membership(
             destination,
             mem_budget="64M",
             nthreads=1,
-            targetChunkBytes=1024,
-            targetShardBytes=4096,
+            policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
         ).dump(batch_size=1)
 
     root = zarr.open_group(store=destination, mode="r")
@@ -349,14 +347,12 @@ def test_imported_store_is_readable_by_datastore(tmp_path: Path) -> None:
             destination,
             mem_budget="64M",
             nthreads=1,
-            targetChunkBytes=1024,
-            targetShardBytes=4096,
+            policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
         ).dump(batch_size=2)
 
     store = DataStore(
         destination,
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
         mem_budget="64M",
     )
@@ -381,8 +377,7 @@ def test_chromatin_assay_streams_counts_and_round_trips_to_zarr(
             destination,
             mem_budget="64M",
             nthreads=1,
-            targetChunkBytes=1024,
-            targetShardBytes=4096,
+            policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
         ).dump(batch_size=1)
 
     root = zarr.open_group(store=destination, mode="r")
@@ -401,7 +396,6 @@ def test_chromatin_assay_streams_counts_and_round_trips_to_zarr(
     store = DataStore(
         destination,
         min_features_per_cell=0,
-        min_cells_per_feature=0,
         nthreads=1,
         mem_budget="64M",
     )
@@ -424,8 +418,7 @@ def test_import_normalizes_seurat_reduction_name_for_assay_state(
             destination,
             mem_budget="64M",
             nthreads=1,
-            targetChunkBytes=1024,
-            targetShardBytes=4096,
+            policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
         ).dump(batch_size=1)
 
     root = zarr.open_group(store=destination, mode="r")
@@ -495,8 +488,7 @@ def test_reader_must_remain_open_until_dump_finishes(tmp_path: Path) -> None:
         destination,
         mem_budget="64M",
         nthreads=1,
-        targetChunkBytes=1024,
-        targetShardBytes=4096,
+        policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
     )
     reader.close()
 
@@ -510,7 +502,6 @@ def test_reader_must_remain_open_until_dump_finishes(tmp_path: Path) -> None:
         DataStore(
             destination,
             min_features_per_cell=0,
-            min_cells_per_feature=0,
             nthreads=1,
             mem_budget="64M",
         )
@@ -528,8 +519,7 @@ def test_matrix_metadata_and_reduction_reads_stay_bounded(
             destination,
             mem_budget="64M",
             nthreads=1,
-            targetChunkBytes=1024,
-            targetShardBytes=4096,
+            policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
         )
         matrix_reads: dict[str, list[tuple[int, int]]] = {}
         for assay_name in reader.assayNames:
@@ -790,8 +780,7 @@ def test_dense_assay_import_rejects_a_budget_below_one_output_band(
             destination,
             mem_budget="1K",
             nthreads=1,
-            targetChunkBytes=1024,
-            targetShardBytes=4096,
+            policy=CountMatrixPolicy(unitBytes=4096, chunkBytes=1024),
         )
         with pytest.raises(
             MemoryError,
@@ -866,7 +855,6 @@ def test_failed_conversion_stays_incomplete_and_retry_replaces_partial_output(
             DataStore(
                 destination,
                 min_features_per_cell=0,
-                min_cells_per_feature=0,
                 nthreads=1,
                 mem_budget="64M",
             )

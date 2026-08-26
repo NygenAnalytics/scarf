@@ -19,18 +19,22 @@ It does not reveal one universally optimal number of cell types.
 A useful partition should be stable enough for the question, preserve known biology, avoid groups driven only by technical covariates, and support interpretable markers.
 
 This guide compares Leiden resolutions and Paris cuts with several diagnostics.
+The downloaded PBMC store is structurally repacked and used only as the matrix and metadata source; a separate mounted store owns every selection, graph, layout, and clustering artifact created below.
 
 ## 1. Build the shared graph
 
 ```{code-cell} ipython3
 from dataclasses import asdict
 from itertools import combinations
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import pandas as pd
 
 import scarf
 import scarf.plotting as splt
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="WARNING", progress=True)
 
@@ -39,8 +43,17 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = str(Path(analysis_directory.name) / "counts.zarr")
+repack_store(
     f"{dataset}/data.zarr",
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=str(Path(analysis_directory.name) / "clustering_analysis.zarr"),
+    default_assay="RNA",
     nthreads=4,
     min_features_per_cell=10,
 )
@@ -50,13 +63,12 @@ ds.filter_cells(
     lows=[1000, 500, 0],
     reset_previous=True,
 )
-if "I__hvgs" not in ds.RNA.feats.columns:
-    ds.mark_hvgs(
-        min_cells=20,
-        top_n=500,
-        show_plot=False,
-    )
-ds.run_normalization(feat_key="hvgs")
+hvg_ref = ds.mark_hvgs(
+    min_cells=20,
+    top_n=500,
+    show_plot=False,
+)
+ds.run_normalization(features=hvg_ref)
 pca = ds.run_pca(dims=15)
 ds.build_embedding_initialization()
 ds.build_ann_index()
@@ -260,12 +272,7 @@ Membership strength is the fraction of a cell's graph neighbours assigned to its
 Low values often occur near boundaries or in weakly supported groups.
 
 ```{code-cell} ipython3
-ds.calc_membership_strength(
-    "RNA",
-    "I",
-    "hvgs",
-    chosen_key,
-)
+ds.calc_membership_strength(chosen_key)
 membership_key = "RNA_I_cluster_membership_strength"
 ```
 
@@ -291,7 +298,6 @@ ds.plots.cluster_connectivity(
     group_by=chosen_key,
     layout_key="RNA_UMAP",
     from_assay="RNA",
-    feat_key="hvgs",
     show_cells=True,
 )
 ```
@@ -408,10 +414,12 @@ ds.plots.cluster_tree(
 ## 7. Review marker specificity
 
 ```{code-cell} ipython3
-ds.run_marker_search(group_key=chosen_key)
+all_features = ds.resolve_features("RNA", "all_features")
+marker_ref = ds.run_marker_search(group_key=chosen_key, features=all_features)
 largest_group = chosen_sizes.index[-1]
 smallest_group = chosen_sizes.index[0]
 markers = ds.get_markers(
+    marker=marker_ref,
     group_key=chosen_key,
     group_id=largest_group,
 )
@@ -429,6 +437,7 @@ markers[
 
 ```{code-cell} ipython3
 small_markers = ds.get_markers(
+    marker=marker_ref,
     group_key=chosen_key,
     group_id=smallest_group,
 )
@@ -449,6 +458,7 @@ small_markers[
 
 ```{code-cell} ipython3
 ds.plots.marker_heatmap(
+    marker=marker_ref,
     group_key=chosen_key,
     topn=5,
     figsize=(5, 9),
@@ -505,7 +515,7 @@ ds.plots.embedding(
 ```
 
 ```{code-cell} ipython3
-ds.mark_hvgs(
+focus_features = ds.mark_hvgs(
     cell_key="focus_cells",
     min_cells=10,
     top_n=500,
@@ -513,7 +523,7 @@ ds.mark_hvgs(
 )
 ds.run_normalization(
     cell_key="focus_cells",
-    feat_key="hvgs",
+    features=focus_features,
 )
 ds.run_pca(dims=15)
 ds.build_embedding_initialization()

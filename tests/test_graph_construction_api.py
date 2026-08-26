@@ -6,13 +6,116 @@ from zarr.storage import MemoryStore
 
 from scarf.datastore._operations import graph as graph_operations
 from scarf.embeddings.harmony import fit_harmony
-from scarf.graph.state import stored_assay_graph_from_ref
+from scarf.graph.feature_projection import resolve_native_graph_inputs
 from scarf.storage.artifacts import ArtifactRef, artifact_path
 from scarf.storage.budget import ResourceBudget
 from scarf.utils import logger
 from tests import full_path
 
 pytestmark = pytest.mark.slow
+
+_RELEASED_KNN_FEATURE_INDICES = (
+    57,
+    1363,
+    2059,
+    2060,
+    2061,
+    2176,
+    2279,
+    2344,
+    2663,
+    3545,
+    4334,
+    4377,
+    4667,
+    5639,
+    7096,
+    7880,
+    8072,
+    8357,
+    8446,
+    8473,
+    8510,
+    9685,
+    9828,
+    9831,
+    10108,
+    10153,
+    10398,
+    10557,
+    11134,
+    11280,
+    11381,
+    11689,
+    13034,
+    13347,
+    13430,
+    14081,
+    14254,
+    15065,
+    16512,
+    17128,
+    17465,
+    17834,
+    18148,
+    18216,
+    18447,
+    18735,
+    18927,
+    18970,
+    19037,
+    19793,
+    19928,
+    19989,
+    20349,
+    20837,
+    21083,
+    21106,
+    21202,
+    21209,
+    21227,
+    22897,
+    23170,
+    23856,
+    24023,
+    24024,
+    24440,
+    24559,
+    24791,
+    24990,
+    24992,
+    24994,
+    24995,
+    26633,
+    26651,
+    27766,
+    28904,
+    28917,
+    29157,
+    29440,
+    29478,
+    29726,
+    30726,
+    31204,
+    31413,
+    31655,
+    32134,
+    32546,
+    32925,
+    33201,
+    33524,
+    34021,
+    34397,
+    34657,
+    34659,
+    34661,
+    35044,
+    35464,
+    35985,
+    36085,
+    36233,
+    36424,
+)
 
 
 def test_streaming_lsi_block_rows_respect_memory_budget() -> None:
@@ -48,16 +151,15 @@ def test_streaming_lsi_block_rows_respect_memory_budget() -> None:
         )
 
 
-def _prepare_graph_features(datastore) -> None:
+def _prepare_graph_features(datastore) -> ArtifactRef:
     datastore.auto_filter_cells(show_qc_plots=False)
-    if "I__graph_hvgs" not in datastore.get_assay("RNA").feats.columns:
-        datastore.mark_hvgs(
-            from_assay="RNA",
-            cell_key="I",
-            top_n=100,
-            hvg_key_name="graph_hvgs",
-            show_plot=False,
-        )
+    return datastore.mark_hvgs(
+        from_assay="RNA",
+        cell_key="I",
+        top_n=100,
+        label="graph_hvgs",
+        show_plot=False,
+    )
 
 
 def test_graph_construction_methods_chain_refs_and_select_current_results(
@@ -69,7 +171,7 @@ def test_graph_construction_methods_chain_refs_and_select_current_results(
     normalized = datastore.run_normalization(
         from_assay="RNA",
         cell_key="I",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     pca = datastore.run_pca(normalized, dims=5, batch_size=100)
     ann = datastore.build_ann_index(pca, batch_size=100)
@@ -164,7 +266,7 @@ def test_graph_construction_methods_chain_refs_and_select_current_results(
     assert state.ann_index == ann
     assert state.neighbors == neighbors
     assert state.connectivity_map == graph
-    loaded = datastore.load_graph(graph_loc=artifact_path(graph))
+    loaded = datastore.load_graph(graph)
     assert loaded.shape[0] == int(datastore.cells.fetch_all("I").sum())
     assert np.isfinite(loaded.data).all()
 
@@ -175,7 +277,7 @@ def test_ann_index_logs_rebuild_and_reuse_accurately(datastore_ephemeral) -> Non
     normalized = datastore.run_normalization(
         from_assay="RNA",
         cell_key="I",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     reduction = datastore.run_pca(normalized, dims=3)
     messages: list[str] = []
@@ -201,7 +303,7 @@ def test_reduction_rejects_invalid_dimensions(datastore_ephemeral, dims) -> None
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
 
     with pytest.raises((TypeError, ValueError), match="dims"):
@@ -217,7 +319,7 @@ def test_reduction_rejects_invalid_batch_sizes(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
 
     with pytest.raises((TypeError, ValueError), match="batch_size"):
@@ -250,7 +352,7 @@ def test_pca_rejects_empty_fit_selection(datastore_ephemeral) -> None:
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     datastore.cells.insert(
         "no_pca_cells",
@@ -272,7 +374,7 @@ def test_custom_reduction_rejects_invalid_loadings(datastore_ephemeral) -> None:
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
 
     with pytest.raises(ValueError, match="two-dimensional"):
@@ -298,7 +400,7 @@ def test_graph_construction_operations_reuse_persistent_local_cache(
     )
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
         update_state=False,
     )
     normalized_data = datastore.load_artifact(normalized)["data"]
@@ -327,7 +429,6 @@ def test_graph_construction_operations_reuse_persistent_local_cache(
     assert datastore.inspect_artifact(normalized).execution_options == {
         "from_assay": "RNA",
         "cell_key": "I",
-        "feat_key": "graph_hvgs",
         "update_state": False,
         "invalidate_cache": False,
     }
@@ -349,7 +450,7 @@ def test_temporary_local_cache_is_removed_after_success(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
         update_state=False,
     )
     cache_root = tmp_path / str(local_cache).lower()
@@ -384,7 +485,7 @@ def test_temporary_local_cache_is_removed_after_failure(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
         update_state=False,
     )
     cache_root = tmp_path / "failed"
@@ -414,7 +515,7 @@ def test_new_reduction_becomes_current_and_clears_downstream_refs(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     first = datastore.run_pca(normalized, dims=4)
     ann = datastore.build_ann_index(first)
@@ -443,7 +544,7 @@ def test_embedding_initialization_preserves_same_reduction_graph_state(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     reduction = datastore.run_pca(normalized, dims=4)
     ann = datastore.build_ann_index(reduction)
@@ -479,7 +580,7 @@ def test_connectivity_rejects_invalid_kernel_parameters(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     reduction = datastore.run_pca(normalized, dims=4)
     ann = datastore.build_ann_index(reduction)
@@ -509,7 +610,7 @@ def test_ann_index_rejects_invalid_runtime_parameters(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     reduction = datastore.run_pca(normalized, dims=4)
 
@@ -536,7 +637,7 @@ def test_neighbor_count_changes_only_neighbor_and_connectivity_artifacts(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
         update_state=False,
     )
     reduction = datastore.run_pca(
@@ -570,7 +671,7 @@ def test_neighbor_count_changes_only_neighbor_and_connectivity_artifacts(
     assert (
         datastore.run_normalization(
             from_assay="RNA",
-            feat_key="graph_hvgs",
+            features="graph_hvgs",
             update_state=False,
         )
         == normalized
@@ -688,7 +789,7 @@ def test_update_state_false_keeps_current_selection(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     current = datastore.run_pca(normalized, dims=4)
     detached = datastore.run_pca(
@@ -709,11 +810,11 @@ def test_update_state_false_keeps_current_selection(
     assert state.ann_index == ann
 
 
-def test_reused_normalization_updates_requested_selection_aliases(
+def test_reused_normalization_updates_requested_cell_route(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
-    _prepare_graph_features(datastore)
+    features = _prepare_graph_features(datastore)
     source_mask = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
     datastore.cells.insert(
         "normalization_source",
@@ -725,63 +826,42 @@ def test_reused_normalization_updates_requested_selection_aliases(
         source_mask,
         overwrite=True,
     )
-    feature_mask = np.asarray(
-        datastore.RNA.feats.fetch_all("I__graph_hvgs"),
-        dtype=bool,
-    )
-    datastore.RNA.feats.insert(
-        "normalization_source__graph_hvgs",
-        feature_mask,
-        overwrite=True,
-    )
-    datastore.RNA.feats.insert(
-        "normalization_alias__graph_hvgs",
-        feature_mask,
-        overwrite=True,
-    )
     original = datastore.run_normalization(
         from_assay="RNA",
         cell_key="normalization_source",
-        feat_key="graph_hvgs",
+        features=features,
         update_state=False,
     )
     reused = datastore.run_normalization(
         from_assay="RNA",
         cell_key="normalization_alias",
-        feat_key="graph_hvgs",
+        features=features,
     )
 
     assert reused == original
     state = datastore.get_assay_state("RNA")
     assert state is not None
     assert state.cell_key == "normalization_alias"
-    assert state.feat_key == "graph_hvgs"
+    normalized_inputs = datastore.inspect_artifact(reused).inputs or {}
+    assert ArtifactRef.from_dict(normalized_inputs["feature_selection"]) == features
 
     reduction = datastore.run_pca(reused, dims=4)
     state = datastore.get_assay_state("RNA")
     assert state is not None
     assert state.reduction == reduction
     assert state.cell_key == "normalization_alias"
-    assert state.feat_key == "graph_hvgs"
+    assert not hasattr(state, "feature_selection")
 
 
-def test_explicit_graph_preserves_prefixed_logical_feature_key(
+def test_explicit_graph_preserves_exact_feature_selection_ref(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
-    _prepare_graph_features(datastore)
-    datastore.RNA.feats.insert(
-        "I__I__prefixed",
-        np.asarray(
-            datastore.RNA.feats.fetch_all("I__graph_hvgs"),
-            dtype=bool,
-        ),
-        overwrite=True,
-    )
+    features = _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
         cell_key="I",
-        feat_key="I__prefixed",
+        features=features,
         update_state=False,
     )
     reduction = datastore.run_pca(normalized, dims=3, update_state=False)
@@ -791,35 +871,26 @@ def test_explicit_graph_preserves_prefixed_logical_feature_key(
         neighbors,
         update_state=False,
     )
-    stored = stored_assay_graph_from_ref(datastore.zw, connectivity)
+    ancestry = resolve_native_graph_inputs(datastore.zw, connectivity)
 
-    assert stored.cell_key == "I"
-    assert stored.feat_key == "I__prefixed"
+    assert ancestry.feature_selection == features
+    cell_status = datastore.inspect_artifact(ancestry.cell_selection)
+    assert cell_status.execution_options == {"source_column": "I"}
 
 
-def test_historical_neighbors_use_normalized_execution_keys(
+def test_historical_neighbors_preserve_named_lineage_inputs(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
-    _prepare_graph_features(datastore)
+    features = _prepare_graph_features(datastore)
     mask = np.asarray(datastore.cells.fetch_all("I"), dtype=bool)
     datastore.cells.insert("selection_a", mask, overwrite=True)
     datastore.cells.insert("selection_b", mask, overwrite=True)
-    datastore._ensure_cell_selection("selection_a")
-    feature_mask = np.asarray(
-        datastore.RNA.feats.fetch_all("I__graph_hvgs"),
-        dtype=bool,
-    )
-    datastore.RNA.feats.insert(
-        "selection_b__graph_hvgs",
-        feature_mask,
-        overwrite=True,
-    )
 
     normalized = datastore.run_normalization(
         from_assay="RNA",
         cell_key="selection_b",
-        feat_key="graph_hvgs",
+        features=features,
     )
     reduction = datastore.run_pca(normalized, dims=4)
     ann = datastore.build_ann_index(reduction)
@@ -827,21 +898,13 @@ def test_historical_neighbors_use_normalized_execution_keys(
     datastore.run_normalization(
         from_assay="RNA",
         cell_key="I",
-        feat_key="graph_hvgs",
+        features=features,
     )
 
-    stale = mask.copy()
-    selected = np.flatnonzero(stale)
-    excluded = np.flatnonzero(~stale)
-    assert len(selected) > 0 and len(excluded) > 0
-    stale[selected[0]] = False
-    stale[excluded[0]] = True
-    datastore.cells.insert("selection_a", stale, overwrite=True, force=True)
-
-    assert datastore._keys_from_knn_path(
-        "RNA",
-        artifact_path(neighbors),
-    ) == ("selection_b", "graph_hvgs")
+    ancestry = resolve_native_graph_inputs(datastore.zw, neighbors)
+    assert ancestry.feature_selection == features
+    cell_status = datastore.inspect_artifact(ancestry.cell_selection)
+    assert cell_status.execution_options == {"source_column": "selection_b"}
 
 
 def test_reduction_and_harmony_reject_changed_normalized_selection(
@@ -851,7 +914,7 @@ def test_reduction_and_harmony_reject_changed_normalized_selection(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     reduction = datastore.run_pca(normalized, dims=4)
     datastore.cells.insert(
@@ -889,7 +952,7 @@ def test_datastore_inspects_and_loads_artifact_read_only(
     _prepare_graph_features(datastore)
     ref = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
 
     status = datastore.inspect_artifact(ref)
@@ -913,7 +976,7 @@ def test_graph_harmony_becomes_default_ann_coordinates(
     datastore.cells.insert("graph_batch", batches, overwrite=True)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     pca = datastore.run_pca(normalized, dims=5)
     pca_scores = datastore.load_artifact(pca)["data"][:]
@@ -980,10 +1043,10 @@ def test_lsi_and_custom_reduction_have_distinct_public_methods(
     datastore_ephemeral,
 ) -> None:
     datastore = datastore_ephemeral
-    _prepare_graph_features(datastore)
+    features = _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features=features,
     )
     lsi = datastore.run_lsi(
         normalized,
@@ -1023,20 +1086,27 @@ def test_lsi_and_custom_reduction_have_distinct_public_methods(
         neighbors,
         update_state=False,
     )
-    stored = stored_assay_graph_from_ref(datastore.zw, connectivity)
-    assert stored.reduction_method == "custom"
-    assert stored.dims == 2
-    assert stored.pca_cell_key is None
-    assert stored.feat_scaling is False
+    ancestry = resolve_native_graph_inputs(datastore.zw, connectivity)
+    assert ancestry.reduction == custom
+    custom_status = datastore.inspect_artifact(custom)
+    assert custom_status.operation == "run_custom_reduction"
+    assert custom_status.parameters["dims"] == 2
+    assert custom_status.parameters["feat_scaling"] is False
 
 
 def test_graph_chain_matches_released_knn_golden(
     analyzed_datastore_ephemeral,
 ) -> None:
     datastore = analyzed_datastore_ephemeral
+    features = datastore.set_feature_selection(
+        from_assay="RNA",
+        feature_indexes=_RELEASED_KNN_FEATURE_INDICES,
+        label="released_knn_features",
+        invalidate_cache=True,
+    )
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="hvgs",
+        features=features,
         update_state=False,
         invalidate_cache=True,
     )
@@ -1079,7 +1149,7 @@ def test_connectivity_rebuild_requires_named_distance_metric(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     reduction = datastore.run_pca(normalized, dims=4)
     ann = datastore.build_ann_index(reduction)
@@ -1125,7 +1195,7 @@ def test_corrupt_ann_bytes_are_not_reused(
     _prepare_graph_features(datastore)
     normalized = datastore.run_normalization(
         from_assay="RNA",
-        feat_key="graph_hvgs",
+        features="graph_hvgs",
     )
     reduction = datastore.run_pca(normalized, dims=3)
     current = datastore.build_ann_index(reduction)

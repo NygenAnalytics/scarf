@@ -21,6 +21,7 @@ from scarf.metrics import (
     silhouette_scoring,
 )
 from scarf.metrics.lisi import _effective_perplexity, _neighbor_probabilities
+from scarf.storage.errors import ArtifactResolutionError
 
 
 def _uniform_self_free_knn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -35,6 +36,21 @@ def _uniform_self_free_knn() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     distances = np.ones_like(indices, dtype=np.float64)
     labels = np.array([0, 0, 1, 1])
     return distances, indices, labels
+
+
+def test_compute_lisi_single_category_is_one():
+    metadata = pd.DataFrame({"batch": np.zeros(4, dtype=np.int8)})
+    distances, indices, _labels = _uniform_self_free_knn()
+
+    scores = compute_lisi(
+        distances,
+        indices,
+        metadata,
+        label_colnames=["batch"],
+        perplexity=1,
+    )
+
+    assert np.allclose(scores[:, 0], 1.0)
 
 
 def test_compute_lisi_uses_all_stored_neighbors():
@@ -326,20 +342,6 @@ def test_graph_connectivity_validates_inputs():
             np.array([[0, 1]]),
             np.array([0, np.nan]),
         )
-
-
-def test_metric_lisi_single_category_is_one(datastore, graph_artifacts):
-    labels = np.zeros(datastore.cells.N, dtype=np.int8)
-    datastore.cells.insert(
-        column_name="single_batch",
-        values=labels,
-        overwrite=True,
-    )
-    lisi = datastore.metric_lisi(
-        label_columns=["single_batch"],
-    )
-
-    assert np.allclose(lisi["single_batch"], 1)
 
 
 def test_knn_without_affinities_preserves_distances():
@@ -811,6 +813,18 @@ def test_metric_label_concordance(datastore, graph_artifacts, leiden_clustering)
 
 def test_datastore_scib_metrics(datastore, graph_artifacts, leiden_clustering):
     label_colname = "RNA_leiden_cluster"
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    assert state.connectivity_map is not None
+
+    labels = np.zeros(datastore.cells.N, dtype=np.int8)
+    datastore.cells.insert(
+        column_name="single_batch",
+        values=labels,
+        overwrite=True,
+    )
+    lisi = datastore.metric_lisi(label_columns=["single_batch"])
+    assert np.allclose(lisi["single_batch"], 1)
 
     ilisi = datastore.metric_ilisi(label_colname)
     clisi = datastore.metric_clisi(label_colname)
@@ -818,26 +832,21 @@ def test_datastore_scib_metrics(datastore, graph_artifacts, leiden_clustering):
         label_colname,
         from_assay="RNA",
         cell_key="I",
-        feat_key="hvgs",
-    )
-    graph_loc = datastore.get_latest_graph_loc(
-        from_assay="RNA",
-        cell_key="I",
-        feat_key="hvgs",
     )
     explicit_connectivity = datastore.metric_graph_connectivity(
         label_colname,
-        graph_loc=graph_loc,
+        state.connectivity_map,
     )
 
     assert 0 <= ilisi <= 1
     assert 0 <= clisi <= 1
     assert 0 <= latest_connectivity <= 1
     assert explicit_connectivity == pytest.approx(latest_connectivity)
-    with pytest.raises(ValueError, match="cell-key provenance"):
+    assert state.neighbors is not None
+    with pytest.raises(ValueError, match="connectivity map or an integrated graph"):
         datastore.metric_graph_connectivity(
             label_colname,
-            graph_loc=f"{datastore._integratedGraphsLoc}/test",
+            state.neighbors,
         )
 
 
@@ -852,29 +861,64 @@ def test_metric_lisi_rejects_invalid_inputs(datastore, graph_artifacts):
         datastore.metric_lisi(["names", "names"])
     with pytest.raises(KeyError, match="__missing_lisi_column__"):
         datastore.metric_lisi(["__missing_lisi_column__"])
-    with pytest.raises(ValueError, match="KNN graph location"):
+    with pytest.raises(TypeError, match="artifact reference"):
         datastore.metric_lisi(
             ["names"],
-            use_latest_knn=False,
-            knn_loc=None,
+            neighbors="not-a-ref",
         )
-    with pytest.raises(ValueError, match="Could not find the knn graph"):
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    assert state.connectivity_map is not None
+    with pytest.raises(ValueError, match="neighbors artifact"):
         datastore.metric_lisi(
             ["names"],
-            use_latest_knn=False,
-            knn_loc="__missing__/neighbors",
+            neighbors=state.connectivity_map,
         )
-    with pytest.raises(ValueError, match="Not a neighbors artifact"):
+    assert state.neighbors is not None
+    with pytest.raises(ValueError, match="different assay"):
         datastore.metric_lisi(
             ["names"],
-            use_latest_knn=False,
-            from_assay="RNA",
-            knn_loc=datastore.get_latest_graph_loc(
-                from_assay="RNA",
-                cell_key="I",
-                feat_key="hvgs",
-            ),
+            neighbors=state.neighbors,
+            from_assay="missing",
         )
+
+
+def test_metric_lisi_revalidates_explicit_neighbor_cell_selection(
+    datastore,
+    graph_artifacts,
+    monkeypatch,
+):
+    del graph_artifacts
+    state = datastore.get_assay_state("RNA")
+    assert state is not None
+    assert state.neighbors is not None
+    column = datastore.zw["cellData/I"]
+    original = np.asarray(column[:], dtype=bool)
+    selected = np.flatnonzero(original)
+    excluded = np.flatnonzero(~original)
+    assert selected.size and excluded.size
+    changed = original.copy()
+    changed[selected[0]] = False
+    changed[excluded[0]] = True
+    column[:] = changed
+
+    def reject_current_state_read(*_args, **_kwargs):
+        raise AssertionError("explicit neighbors resolved the current state")
+
+    monkeypatch.setattr(
+        "scarf.datastore._operations.integration_metrics.read_assay_state",
+        reject_current_state_read,
+    )
+    try:
+        with pytest.raises(ArtifactResolutionError) as error:
+            datastore.metric_lisi(
+                ["names"],
+                neighbors=state.neighbors,
+                perplexity=1,
+            )
+        assert error.value.code == "selection_values_changed"
+    finally:
+        column[:] = original
 
 
 def test_silhouette_scoring_missing_cluster_labels(datastore):

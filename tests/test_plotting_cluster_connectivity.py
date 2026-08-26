@@ -11,6 +11,8 @@ from scipy import sparse
 from scarf.plotting._contracts import CategoricalScale, SizeScale
 from scarf.plotting._figure import PlotResult
 from scarf.plotting.cluster_connectivity import cluster_connectivity
+from scarf.graph.state import GraphSelection
+from scarf.storage.artifacts import ArtifactRef
 
 
 class _FakeCells:
@@ -31,8 +33,8 @@ class _FakeStore:
         self.graph = graph
         self.graph_calls = []
 
-    def load_graph(self, **kwargs):
-        self.graph_calls.append(kwargs)
+    def load_graph(self, graph=None, **kwargs):
+        self.graph_calls.append((graph, kwargs))
         return self.graph
 
 
@@ -69,13 +71,36 @@ def _store():
 
 
 def _plot(store, **kwargs):
-    return cluster_connectivity(
-        store,
-        group_by="cluster",
-        layout_key="layout",
-        show=False,
-        **kwargs,
+    from unittest.mock import patch
+
+    graph_ref = kwargs.pop(
+        "graph",
+        ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="connectivity_map",
+            artifact_id="1" * 64,
+        ),
     )
+    selection = GraphSelection(
+        graph_loc="RNA/artifacts/connectivity_map/" + graph_ref.artifact_id,
+        graph_ref=graph_ref,
+        from_assay=kwargs.get("from_assay") or "RNA",
+        cell_key=kwargs.get("cell_key") or "I",
+        integrated_label=None,
+    )
+    with patch(
+        "scarf.plotting.cluster_connectivity.resolve_graph_selection",
+        return_value=selection,
+    ):
+        return cluster_connectivity(
+            store,
+            group_by="cluster",
+            layout_key="layout",
+            graph=graph_ref,
+            show=False,
+            **kwargs,
+        )
 
 
 def test_cluster_connectivity_aggregates_reciprocals_once():
@@ -84,8 +109,6 @@ def test_cluster_connectivity_aggregates_reciprocals_once():
         store,
         cell_key="selected",
         from_assay="RNA",
-        feat_key="variable",
-        graph_loc="graphs/connectivity",
         minimum_edge_weight=0.0,
     )
 
@@ -98,13 +121,19 @@ def test_cluster_connectivity_aggregates_reciprocals_once():
         ("cluster", "selected"),
     ]
     assert store.graph_calls == [
-        {
-            "from_assay": "RNA",
-            "cell_key": "selected",
-            "feat_key": "variable",
-            "graph_loc": "graphs/connectivity",
-            "symmetric": True,
-        }
+        (
+            ArtifactRef(
+                scope="assay",
+                assay="RNA",
+                kind="connectivity_map",
+                artifact_id="1" * 64,
+            ),
+            {
+                "from_assay": "RNA",
+                "cell_key": "selected",
+                "symmetric": True,
+            },
+        )
     ]
 
     nodes = result.tables["nodes"]

@@ -5,6 +5,8 @@ import numpy as np
 
 from ..storage.types import as_zarr_group
 from ..readers import CSVReader
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -21,7 +23,19 @@ class CSVtoZarr:
         cr: A CSVReader object
         zarr_loc: The file name for the Zarr hierarchy.
         assay_name: A label for the assay. Ex. "RNA" or "ATAC"
+        workspace: Workspace name in the destination store. None uses the
+                   legacy layout without a workspace group.
         dtype: the dtype of the data.
+        storage_options: Backend options passed when opening the Zarr store.
+        mem_budget: Memory available to the conversion. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
+        nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
 
     Attributes:
         csvr: A CSVReader object
@@ -40,8 +54,8 @@ class CSVtoZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -56,6 +70,8 @@ class CSVtoZarr:
         validate_assay_name(self.assayName)
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.policy = policy
+        self.io = io
         self.workspace = workspace
         self.storage_options = storage_options
         self.z = load_zarr(zarr_loc, mode="w", storage_options=storage_options)
@@ -80,14 +96,11 @@ class CSVtoZarr:
             feat_names=self.csvr.feature_ids(),
             dtype=str(self.dtype),
             profile=self.profile,
-            targetChunkBytes=targetChunkBytes,
-            targetShardBytes=targetShardBytes,
+            policy=policy,
         )
 
     def dump(self) -> None:
         """Writes the count values into the Zarr matrix.
-
-        Args:
 
         Raises:
             AssertionError: Catches eventual bugs in the class, if number of cells does not match after transformation.
@@ -136,6 +149,7 @@ class CSVtoZarr:
             count_batches(),
             msg="Writing CSV counts",
             resources=self.resources,
+            io=self.io,
         )
         if e != self.csvr.nCells:
             raise AssertionError(
@@ -145,4 +159,15 @@ class CSVtoZarr:
         logger.info(
             f"Wrote {self.csvr.nCells} cells and {self.csvr.nFeatures} features "
             f"from CSV to assay {self.assayName}"
+        )
+        from .counts_t import finalize_writer_counts_t
+
+        finalize_writer_counts_t(
+            self.z,
+            self.assayName,
+            self.workspace,
+            resources=self.resources,
+            profile=self.profile,
+            policy=self.policy,
+            io=self.io,
         )

@@ -111,9 +111,16 @@ def copy_zarr_group_tree(
     dst: zarr.Group,
     *,
     overwrite: bool = True,
+    exclude_members: set[str] | frozenset[str] | None = None,
 ) -> None:
-    """Recursively copy a Zarr group tree."""
+    """Recursively copy a Zarr group tree.
+
+    ``exclude_members`` applies only to immediate members of ``src``. Child
+    groups are copied recursively without inheriting the parent exclusions.
+    """
     for name, node in src.members():
+        if exclude_members is not None and name in exclude_members:
+            continue
         if isinstance(node, zarr.Group):
             child = dst.create_group(name, overwrite=overwrite)
             copy_zarr_group_tree(node, child, overwrite=overwrite)

@@ -1,7 +1,9 @@
 """Milestone C: MetaData.iter_row_blocks parity and make_bulk cell_key semantics."""
 
 import numpy as np
+import pandas as pd
 
+from scarf.datastore._operations.features import _aligned_feature_labels
 from scarf.utils.logging import logger
 
 _PSEUDO_REP_WARNING = (
@@ -155,6 +157,26 @@ def test_make_bulk_pseudo_reps_warns_without_changing_values(
             rtol=1e-5,
             atol=1e-6,
         )
+
+
+def test_aligned_feature_labels_accepts_pandas_string_array() -> None:
+    values = pd.array(["gene_a", "gene_b", "gene_c"], dtype="string")
+    labels = _aligned_feature_labels(np.asarray(values), pd.Index([0, 2]))
+    frame = pd.DataFrame([[1.0], [2.0]])
+    frame.set_index(labels, inplace=True)
+    assert list(frame.index) == ["gene_a", "gene_c"]
+
+
+def test_make_bulk_feature_name_index_is_hashable(leiden_clustering, datastore):
+    bulk = datastore.make_bulk(
+        group_key="RNA_leiden_cluster",
+        feature_label="name",
+        aggr_type="sum",
+        remove_empty_features=True,
+    )
+    names = np.asarray(datastore.RNA.feats.fetch_all("names"), dtype=object)
+    assert not bulk.empty
+    assert set(bulk.index).issubset(set(names))
 
 
 def test_column_partition_digest_matches_factorization(datastore):

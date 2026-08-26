@@ -9,24 +9,42 @@ from typing import Any
 import numpy as np
 import zarr
 
-from .arrays import create_numeric_array
+from .async_execution import AsyncStorageRunner
 from .budget import (
     ResourceBudget,
     admitted_worker_split,
     resolve_budget,
 )
+from .execution import (
+    ExecutionReport,
+    OperationPlan,
+    WorkShape,
+    plan_operation,
+    record_execution_report,
+)
+from .count_matrix import (
+    DEFAULT_COUNT_MATRIX_POLICY,
+    CountMatrixPolicy,
+    create_count_matrix_array,
+    load_count_matrix_plan,
+    persist_count_matrix_plan,
+    plan_count_matrix_pair,
+    policy_from_payload,
+    validate_count_matrix_source,
+)
+from .io_policy import DEFAULT_STORAGE_IO_POLICY, StorageIoPolicy
 from .geometry import ArrayGeometry, array_geometry
 from .layout import (
     ZarrArraySpec,
     _encoded_chunk_bound,
     _group_zarr_format,
     array_shard_rows,
-    get_compressors,
     iter_shard_row_slices,
 )
 from .parallel import _close_iterator, stream_shards
 from .partition import affordable_width
 from .profiles import StorageProfile, resolve_storage_profile
+from .types import array_metadata_shards, as_zarr_array
 from ..utils.arrays import canonicalize_sparse, checked_sparse_cast
 
 
@@ -384,16 +402,56 @@ def _resolve_sparse_import_geometries(
     )
 
 
+def aligned_row_windows(
+    nRows: int,
+    shardRows: int,
+    nWindows: int,
+) -> list[tuple[int, int]]:
+    """Split rows into shard-aligned windows for disjoint producers."""
+    rows = max(0, int(nRows))
+    shard = max(1, int(shardRows))
+    if rows == 0:
+        return []
+    n_shards = (rows + shard - 1) // shard
+    windows = max(1, min(int(nWindows), n_shards))
+    base, extra = divmod(n_shards, windows)
+    ranges: list[tuple[int, int]] = []
+    shard_index = 0
+    for window in range(windows):
+        count = base + (1 if window < extra else 0)
+        start = shard_index * shard
+        shard_index += count
+        end = min(rows, shard_index * shard)
+        if start < end:
+            ranges.append((start, end))
+    return ranges
+
+
 class SparseShardBuffer:
     """Accumulate sparse source batches into immutable destination row bands."""
 
-    def __init__(self, destination: zarr.Array) -> None:
-        self.nRows = max(0, int(destination.shape[0]))
-        self.nColumns = max(0, int(destination.shape[1]))
-        self.shardRows = array_shard_rows(destination)
-        self.dtype = np.dtype(destination.dtype)
-        self.rows = 0
-        self._nextFlush = self.shardRows
+    def __init__(
+        self,
+        destination: zarr.Array | ZarrArraySpec,
+        *,
+        startRow: int = 0,
+        endRow: int | None = None,
+    ) -> None:
+        geometry, dtype = _destination_geometry(destination)
+        self.nRows = max(0, int(geometry.shape[0]))
+        self.nColumns = max(0, int(geometry.shape[1]))
+        self.shardRows = geometry.axisShard(0)
+        self.dtype = dtype
+        self.startRow = max(0, int(startRow))
+        self.endRow = self.nRows if endRow is None else int(endRow)
+        if self.startRow > self.endRow or self.endRow > self.nRows:
+            raise ValueError("Sparse buffer row window is outside the destination")
+        self.rows = self.startRow
+        if self.startRow < self.endRow:
+            next_boundary = ((self.startRow // self.shardRows) + 1) * self.shardRows
+            self._nextFlush = min(self.endRow, next_boundary)
+        else:
+            self._nextFlush = self.startRow
         self._rows: list[np.ndarray] = []
         self._columns: list[np.ndarray] = []
         self._data: list[np.ndarray] = []
@@ -423,14 +481,14 @@ class SparseShardBuffer:
         self.rows += int(coo.shape[0])
         while self._nextFlush <= self.rows:
             end = self._nextFlush
-            start = end - self.shardRows
+            start = max(self.startRow, end - self.shardRows)
             self._nextFlush += self.shardRows
             yield self._take(start, end)
 
     def finish(self) -> Iterator[SparseRowBand]:
-        if self.rows != self.nRows:
+        if self.rows != self.endRow:
             raise ValueError(
-                f"Sparse stream contains {self.rows} rows, expected {self.nRows}"
+                f"Sparse stream contains {self.rows} rows, expected {self.endRow}"
             )
         trailing_start = self._nextFlush - self.shardRows
         if trailing_start < self.rows:
@@ -529,19 +587,21 @@ def _writer_count(
     destination: zarr.Array,
     resources: ResourceBudget,
     nTasks: int,
+    io: StorageIoPolicy | None = None,
 ) -> tuple[int, int]:
     dense_bytes, inner_bytes, n_chunks = _band_geometry(destination)
-    return admitted_worker_split(
+    operation = plan_operation(
         resources,
-        nTasks=nTasks,
-        taskBytes=lambda inner: _row_band_task_peak(
-            sourceBytes=0,
-            denseBytes=dense_bytes,
-            innerChunkBytes=inner_bytes,
-            nChunks=n_chunks,
-            innerConcurrency=inner,
+        WorkShape(
+            nUnits=max(1, int(nTasks)),
+            unitBytes=max(1, dense_bytes),
+            decodeBytes=max(0, inner_bytes),
+            writes=True,
+            chunksPerShard=max(1, n_chunks),
         ),
+        policy=io,
     )
+    return operation.writeWorkers, operation.ioConcurrency
 
 
 def _sparse_task_working_bytes(
@@ -598,16 +658,35 @@ def write_sparse_bands(
     producerReserveBytes: int = 0,
     msg: str | None = None,
     total: int | None = None,
+    io: StorageIoPolicy | None = None,
 ) -> None:
     """Densify and write complete sparse row bands within CPU and memory limits."""
     pending: deque[SparseWriteBand] = deque()
     source = iter(writes)
     exhausted = False
     progress = None
+    resolved_io = io or DEFAULT_STORAGE_IO_POLICY
     if msg is not None:
         from ..utils.progress import tqdmbar
 
         progress = tqdmbar(desc=msg, total=total)
+
+    operation = None
+    actual_write_workers = 0
+
+    def _plan_pending() -> OperationPlan:
+        unit = max(_sparse_task_working_bytes(write, 1) for write in pending)
+        return plan_operation(
+            resources,
+            WorkShape(
+                nUnits=max(1, int(total) if total else len(pending)),
+                unitBytes=unit,
+                residentBytes=residentBytes,
+                writes=True,
+                ordered=False,
+            ),
+            policy=resolved_io,
+        )
 
     def pull() -> SparseWriteBand:
         sparse_bytes = sum(write.band.sparseBytes for write in pending)
@@ -624,7 +703,7 @@ def write_sparse_bands(
         return next(source)
 
     def fill() -> None:
-        nonlocal exhausted
+        nonlocal exhausted, operation
         if not pending and not exhausted:
             try:
                 pending.append(pull())
@@ -632,6 +711,7 @@ def write_sparse_bands(
                 exhausted = True
                 return
         while not exhausted:
+            operation = _plan_pending()
             capacity, _ = _sparse_batch_plan(
                 pending,
                 resources,
@@ -639,6 +719,7 @@ def write_sparse_bands(
                 producerReserveBytes,
                 resources.workers,
             )
+            capacity = min(capacity, operation.writeWorkers)
             if len(pending) >= capacity:
                 return
             try:
@@ -652,6 +733,7 @@ def write_sparse_bands(
     try:
         fill()
         while pending:
+            operation = _plan_pending()
             admitted, inner = _sparse_batch_plan(
                 pending,
                 resources,
@@ -659,6 +741,9 @@ def write_sparse_bands(
                 producerReserveBytes,
                 len(pending),
             )
+            admitted = min(admitted, operation.writeWorkers)
+            inner = min(inner, operation.ioConcurrency)
+            actual_write_workers = max(actual_write_workers, admitted)
             batch = [pending.popleft() for _ in range(admitted)]
             for _ in stream_shards(
                 batch,
@@ -675,6 +760,16 @@ def write_sparse_bands(
         _close_iterator(source)
         if progress is not None:
             progress.close()
+        if operation is not None:
+            record_execution_report(
+                ExecutionReport(
+                    plan=operation,
+                    unitKind="countsImportBand",
+                    actualReadWorkers=1,
+                    actualComputeWorkers=operation.computeWorkers,
+                    actualWriteWorkers=actual_write_workers or operation.writeWorkers,
+                )
+            )
 
 
 def write_dense_from_row_batches(
@@ -684,6 +779,7 @@ def write_dense_from_row_batches(
     dtype: Any | None = None,
     msg: str | None = None,
     resources: ResourceBudget | None = None,
+    io: StorageIoPolicy | None = None,
 ) -> int:
     """Align source batches to destination row bands and write them in parallel."""
     resources = resources or resolve_budget()
@@ -750,7 +846,7 @@ def write_dense_from_row_batches(
 
     n_bands = (int(dst.shape[0]) + shard_rows - 1) // shard_rows
     try:
-        workers, inner = _writer_count(dst, resources, n_bands)
+        workers, inner = _writer_count(dst, resources, n_bands, io=io)
     except BaseException:
         _close_iterator(source)
         raise
@@ -788,6 +884,7 @@ def write_dense_in_shard_rows(
     resources: ResourceBudget | None = None,
     summarize: Callable[[np.ndarray], Any] | None = None,
     merge_summary: Callable[[Any, Any], Any] | None = None,
+    io: StorageIoPolicy | None = None,
 ) -> Any | None:
     """Produce and write complete destination row bands in the same worker."""
     if (summarize is None) != (merge_summary is None):
@@ -804,7 +901,21 @@ def write_dense_in_shard_rows(
     ):
         raise ValueError("Mirror array must have matching shape and row-band layout")
     slices = list(iter_shard_row_slices(n_rows, rows))
-    workers, inner = _writer_count(dst, resources, len(slices))
+    dense_bytes, inner_bytes, n_chunks = _band_geometry(dst)
+    operation = plan_operation(
+        resources,
+        WorkShape(
+            nUnits=max(1, len(slices)),
+            unitBytes=max(1, dense_bytes),
+            decodeBytes=max(0, inner_bytes),
+            writes=True,
+            ordered=True,
+            chunksPerShard=max(1, n_chunks),
+        ),
+        policy=io,
+    )
+    workers = operation.writeWorkers
+    inner = operation.ioConcurrency
 
     def produce_and_write(bounds: tuple[int, int]) -> Any:
         start, end = bounds
@@ -820,18 +931,30 @@ def write_dense_in_shard_rows(
         return None if summarize is None else summarize(block)
 
     summary: Any | None = None
+    completed = 0
     for result in stream_shards(
         slices,
         produce_and_write,
         workers=workers,
-        within_block_threads=1,
+        within_block_threads=operation.threadsPerComputeWorker,
         io_concurrency=inner,
         msg=msg or "Writing Zarr array",
         total=len(slices),
     ):
+        completed += 1
         if summarize is not None:
             assert merger is not None
             summary = result if summary is None else merger(summary, result)
+    record_execution_report(
+        ExecutionReport(
+            plan=operation,
+            unitKind="countsRowBand",
+            actualReadWorkers=operation.readWorkers,
+            actualComputeWorkers=operation.computeWorkers,
+            actualWriteWorkers=workers,
+            unitsCompleted=completed,
+        )
+    )
     return summary
 
 
@@ -843,6 +966,7 @@ def accumulate_sparse_to_shards(
     residentBytes: int = 0,
     producerReserveBytes: int,
     msg: str | None = None,
+    io: StorageIoPolicy | None = None,
 ) -> int:
     """Write one complete dense row band per sparse destination object."""
     resources = resources or resolve_budget()
@@ -889,31 +1013,11 @@ def accumulate_sparse_to_shards(
             msg=msg,
             total=(int(dst.shape[0]) + array_shard_rows(dst) - 1)
             // array_shard_rows(dst),
+            io=io,
         )
     finally:
         _close_iterator(source)
     return buffer.rows
-
-
-def _counts_t_layout(
-    n_cells: int,
-    n_feats: int,
-    source_rows: int,
-    feature_chunk_source: int,
-    dtype: Any,
-    profile: StorageProfile,
-) -> ZarrArraySpec:
-    feature_chunk = max(1, min(max(1, n_feats), int(feature_chunk_source)))
-    cell_chunk = max(1, min(max(1, n_cells), int(source_rows)))
-    return ZarrArraySpec(
-        shape=(n_feats, n_cells),
-        chunks=(feature_chunk, cell_chunk),
-        dtype=dtype,
-        compressors=get_compressors(profile, zarrFormat=3),
-        shards=None,
-        fillValue=0,
-        overwrite=True,
-    )
 
 
 def counts_t_spec(
@@ -921,21 +1025,54 @@ def counts_t_spec(
     *,
     profile: StorageProfile,
 ) -> ZarrArraySpec:
-    """Return the unsharded feature-major layout derived from counts."""
+    """Return the paired rotateOnce feature-major layout derived from counts."""
     if len(counts.shape) != 2 or len(counts.chunks) != 2:
         raise ValueError("counts must be a two-dimensional array specification")
     n_cells = int(counts.shape[0])
     n_feats = int(counts.shape[1])
-    source_rows = (
-        int(counts.chunks[0]) if counts.shards is None else int(counts.shards[0])
-    )
-    return _counts_t_layout(
+    return plan_count_matrix_pair(
         n_cells,
         n_feats,
-        source_rows,
-        int(counts.chunks[1]),
         counts.dtype,
-        profile,
+        profile=profile,
+    ).countsT
+
+
+def is_paired_counts_t_layout(
+    *,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    shards: tuple[int, ...] | None,
+    dtype: Any,
+) -> bool:
+    """Return True for a structurally valid paired countsT lattice."""
+    del dtype
+    if len(shape) != 2 or len(chunks) != 2:
+        return False
+    if shards is None or len(shards) != 2:
+        return False
+    n_feats, n_cells = (int(value) for value in shape)
+    chunk_f, chunk_c = (int(value) for value in chunks)
+    shard_f, shard_c = (int(value) for value in shards)
+    if n_feats < 0 or n_cells < 0:
+        return False
+    if min(chunk_f, chunk_c, shard_f, shard_c) < 1:
+        return False
+    if shard_f % chunk_f or shard_c % chunk_c:
+        return False
+    return True
+
+
+def is_readable_counts_t_layout(
+    *,
+    shape: tuple[int, ...],
+    chunks: tuple[int, ...],
+    shards: tuple[int, ...] | None,
+    dtype: Any,
+) -> bool:
+    """Return True for a countsT array the bounded reader can consume."""
+    return is_paired_counts_t_layout(
+        shape=shape, chunks=chunks, shards=shards, dtype=dtype
     )
 
 
@@ -945,33 +1082,109 @@ def preflight_counts_t_spec(
     profile: StorageProfile,
     resources: ResourceBudget,
     residentBytes: int = 0,
+    policy: CountMatrixPolicy | None = None,
 ) -> ZarrArraySpec:
-    """Admit countsT construction before creating the destination."""
-    transpose = counts_t_spec(counts, profile=profile)
-    n_feats, n_cells = (int(value) for value in transpose.shape)
-    feature_chunk, cell_chunk = (int(value) for value in transpose.chunks)
-    if n_cells == 0 or n_feats == 0:
-        return transpose
-    inner_bytes = (
-        feature_chunk * cell_chunk * max(1, int(np.dtype(transpose.dtype).itemsize))
+    """Admit paired ``countsT`` construction from the destination-shard writer."""
+    if len(counts.shape) != 2:
+        raise ValueError("counts must be a two-dimensional array specification")
+    plan = plan_count_matrix_pair(
+        int(counts.shape[0]),
+        int(counts.shape[1]),
+        counts.dtype,
+        policy=policy or DEFAULT_COUNT_MATRIX_POLICY,
+        profile=profile,
     )
-    n_tasks = row_band_task_count(n_cells, cell_chunk) * row_band_task_count(
-        n_feats,
-        feature_chunk,
+    needed = (
+        int(plan.destinationBufferBytes)
+        + int(plan.sourceBufferBytes)
+        + max(0, int(residentBytes))
     )
-    admitted_worker_split(
-        resources,
-        nTasks=n_tasks,
-        residentBytes=max(0, int(residentBytes)),
-        taskBytes=lambda concurrency: _row_band_task_peak(
-            sourceBytes=inner_bytes,
-            denseBytes=inner_bytes,
-            innerChunkBytes=inner_bytes,
-            nChunks=1,
-            innerConcurrency=concurrency,
-        ),
+    if needed > int(resources.memoryBytes):
+        raise MemoryError(
+            "countsT write needs at least "
+            f"{needed} bytes, but the operation limit is "
+            f"{int(resources.memoryBytes)} bytes"
+        )
+    return plan.countsT
+
+
+def _counts_t_matches_plan(counts_t: zarr.Array, plan: Any) -> bool:
+    if counts_t.attrs.get("complete") is not True:
+        return False
+    try:
+        recorded = load_count_matrix_plan(counts_t)
+    except ValueError:
+        return False
+    if recorded.get("fingerprint") != plan.fingerprint:
+        return False
+    stored = array_metadata_shards(counts_t)
+    stored_shards = None if stored is None else tuple(int(value) for value in stored)
+    return bool(
+        tuple(int(value) for value in counts_t.shape) == plan.countsT.shape
+        and tuple(int(value) for value in counts_t.chunks) == plan.countsT.chunks
+        and stored_shards == plan.countsT.shards
     )
-    return transpose
+
+
+class _SharedSourceDecode:
+    """Share a source decode across concurrent destination consumers."""
+
+    def __init__(self) -> None:
+        self._futures: dict[tuple[int, int, int, int], asyncio.Future[np.ndarray]] = {}
+        self._held: dict[tuple[int, int, int, int], int] = {}
+        self._users: dict[tuple[int, int, int, int], int] = {}
+        self._lock = asyncio.Lock()
+
+    async def get(
+        self,
+        key: tuple[int, int, int, int],
+        read_bytes: int,
+        runner: AsyncStorageRunner,
+        load: Callable[[], Coroutine[Any, Any, np.ndarray]],
+    ) -> tuple[np.ndarray, bool]:
+        async with self._lock:
+            future = self._futures.get(key)
+            if future is None:
+                future = asyncio.get_running_loop().create_future()
+                self._futures[key] = future
+                owner = True
+            else:
+                owner = False
+            self._users[key] = self._users.get(key, 0) + 1
+        if owner:
+            try:
+                await runner.ledger.acquire(read_bytes)
+                self._held[key] = read_bytes
+                async with runner.read_lane():
+                    payload = await load()
+                future.set_result(payload)
+            except BaseException as exc:
+                if not future.done():
+                    future.set_exception(exc)
+                held = self._held.pop(key, 0)
+                if held:
+                    await runner.ledger.release(held)
+                async with self._lock:
+                    self._futures.pop(key, None)
+                    self._users.pop(key, None)
+                raise
+        return await future, owner
+
+    async def release(
+        self,
+        key: tuple[int, int, int, int],
+        runner: AsyncStorageRunner,
+    ) -> None:
+        async with self._lock:
+            left = self._users.get(key, 1) - 1
+            if left > 0:
+                self._users[key] = left
+                return
+            self._users.pop(key, None)
+            self._futures.pop(key, None)
+            held = self._held.pop(key, 0)
+        if held:
+            await runner.ledger.release(held)
 
 
 def write_counts_t(
@@ -980,128 +1193,569 @@ def write_counts_t(
     *,
     profile: StorageProfile | None = None,
     resources: ResourceBudget | None = None,
-    feature_major_layout: bool = False,
     residentBytes: int = 0,
-) -> zarr.Array | None:
-    """Write the optional feature-major count matrix using public Zarr APIs."""
-    from ..utils.logging import logger
-    from ..utils.progress import tqdmbar
-
+    policy: CountMatrixPolicy | None = None,
+    io: StorageIoPolicy | None = None,
+    metrics: dict[str, Any] | None = None,
+) -> zarr.Array:
+    """Write paired rotateOnce feature-major ``countsT``."""
     if _group_zarr_format(group) < 3:
-        return None
+        raise ValueError("paired countsT requires Zarr format 3")
     resources = resources or resolve_budget()
     resolved_profile = profile or resolve_storage_profile(group.store)
-    n_cells = int(counts.shape[0])
-    n_feats = int(counts.shape[1])
-    itemsize = max(1, int(np.dtype(counts.dtype).itemsize))
-    if feature_major_layout:
-        chunk_elements = max(1, int(np.prod(counts.chunks, dtype=np.int64)))
-        cell_chunk = max(1, min(max(1, n_cells), chunk_elements))
-        feature_chunk = max(
-            1,
-            min(
-                max(1, n_feats),
-                chunk_elements // cell_chunk,
-            ),
-        )
-        layout = ZarrArraySpec(
-            shape=(n_feats, n_cells),
-            chunks=(feature_chunk, cell_chunk),
-            dtype=counts.dtype,
-            compressors=get_compressors(resolved_profile, zarrFormat=3),
-            shards=None,
-            fillValue=0,
-            overwrite=True,
-        )
+    if policy is None:
+        resolved_policy = policy_from_payload(load_count_matrix_plan(counts))
     else:
-        layout = _counts_t_layout(
-            n_cells,
-            n_feats,
-            array_shard_rows(counts),
-            int(counts.chunks[1]),
-            counts.dtype,
-            resolved_profile,
-        )
-        feature_chunk, cell_chunk = (int(value) for value in layout.chunks)
-    inner_bytes = feature_chunk * cell_chunk * itemsize
-
-    counts_t = create_numeric_array(
-        group,
-        "countsT",
-        layout,
+        resolved_policy = policy
+    resolved_io = io or DEFAULT_STORAGE_IO_POLICY
+    plan = plan_count_matrix_pair(
+        int(counts.shape[0]),
+        int(counts.shape[1]),
+        counts.dtype,
+        policy=resolved_policy,
+        profile=resolved_profile,
+    )
+    validate_count_matrix_source(counts, expected=plan)
+    if "countsT" in group:
+        existing = as_zarr_array(group["countsT"], name="countsT")
+        if existing.attrs.get("complete") is True and _counts_t_matches_plan(
+            existing, plan
+        ):
+            persist_count_matrix_plan(group, plan)
+            persist_count_matrix_plan(counts, plan)
+            persist_count_matrix_plan(existing, plan)
+            return existing
+    counts_t = as_zarr_array(
+        create_count_matrix_array(group, "countsT", plan.countsT),
+        name="countsT",
     )
     counts_t.attrs["complete"] = False
+    persist_count_matrix_plan(group, plan)
+    persist_count_matrix_plan(counts, plan)
+    persist_count_matrix_plan(counts_t, plan)
+    n_cells = int(counts.shape[0])
+    n_feats = int(counts.shape[1])
     if n_cells == 0 or n_feats == 0:
         counts_t.attrs["complete"] = True
         return counts_t
-
-    n_tasks = (
-        (n_cells + cell_chunk - 1)
-        // cell_chunk
-        * ((n_feats + feature_chunk - 1) // feature_chunk)
-    )
-    workers, inner = admitted_worker_split(
-        resources,
-        nTasks=n_tasks,
+    preflight_counts_t_spec(
+        plan.counts,
+        profile=resolved_profile,
+        resources=resources,
         residentBytes=max(0, int(residentBytes)),
-        taskBytes=lambda concurrency: _row_band_task_peak(
-            sourceBytes=inner_bytes,
-            denseBytes=inner_bytes,
-            innerChunkBytes=inner_bytes,
-            nChunks=1,
-            innerConcurrency=concurrency,
+        policy=resolved_policy,
+    )
+    owners: set[tuple[int, int]] = set()
+    dest_feat_shard = int(plan.countsT.shards[0]) if plan.countsT.shards else n_feats
+    dest_cell_band = int(plan.countsT.shards[1]) if plan.countsT.shards else n_cells
+    source_cell_chunk = int(plan.counts.chunks[0])
+    source_feat_chunk = int(plan.counts.chunks[1])
+    source_feat_shard = int(plan.counts.shards[1]) if plan.counts.shards else n_feats
+    max_group_chunks = max(1, source_feat_shard // source_feat_chunk)
+    itemsize = int(np.dtype(counts.dtype).itemsize)
+    dest_unit_bytes = max(1, dest_feat_shard * dest_cell_band * itemsize)
+    source_chunk_bytes = max(1, source_cell_chunk * source_feat_chunk * itemsize)
+    resident_bytes = max(0, int(residentBytes))
+    available_bytes = max(0, int(resources.memoryBytes) - resident_bytes)
+    cell_chunks_per_dest = max(1, -(-dest_cell_band // max(1, source_cell_chunk)))
+    feat_chunks_per_dest = max(1, -(-dest_feat_shard // max(1, source_feat_chunk)))
+    touched_source_chunks = cell_chunks_per_dest * feat_chunks_per_dest
+    destination_cell_jobs = max(1, -(-n_cells // max(1, dest_cell_band)))
+    destination_feature_jobs = max(1, -(-n_feats // max(1, dest_feat_shard)))
+    max_destinations_per_set = 1
+    n_dest_sets = destination_cell_jobs * -(
+        -destination_feature_jobs // max_destinations_per_set
+    )
+    planned_destination_set_bytes = dest_unit_bytes * max_destinations_per_set
+    requested_read_workers = (
+        resources.workers
+        if resolved_io.readWorkers is None
+        else int(resolved_io.readWorkers)
+    )
+    transpose_io = StorageIoPolicy(
+        readWorkers=max(1, requested_read_workers),
+        computeWorkers=resolved_io.computeWorkers,
+        writeWorkers=resolved_io.writeWorkers,
+    )
+    operation = plan_operation(
+        resources,
+        WorkShape(
+            nUnits=n_dest_sets,
+            unitBytes=planned_destination_set_bytes,
+            residentBytes=resident_bytes,
+            innerReadBytes=max(int(plan.sourceBufferBytes), source_chunk_bytes),
+            writes=True,
+            chunksPerShard=max(max_group_chunks, touched_source_chunks),
         ),
+        policy=transpose_io,
     )
-    logger.debug(
-        f"Writing countsT shape=({n_feats}, {n_cells}) "
-        f"chunks=({feature_chunk}, {cell_chunk}) "
-        f"tasks={n_tasks} workers={workers}"
+    resolved_read_group_chunks = 1
+    source_reads_per_destination = operation.innerReads
+    requested_reads_in_flight = operation.requestedReadWorkers or operation.innerReads
+    requested_commits_in_flight = (
+        operation.requestedWriteWorkers or operation.writeWorkers
     )
-    progress = tqdmbar(desc="Writing transposed counts", total=n_tasks)
+    requested_compute_workers = (
+        operation.requestedComputeWorkers or operation.computeWorkers
+    )
+    effective_reads_in_flight = source_reads_per_destination
+    effective_commits_in_flight = operation.writeWorkers
+    effective_compute_workers = operation.computeWorkers
+    dest_in_flight = operation.readWorkers
+    observed: dict[str, Any] = {
+        "mode": "destination-shard",
+        **operation.as_metrics(),
+        "readGroupChunks": resolved_read_group_chunks,
+        "requestedSourceReadsInFlight": requested_reads_in_flight,
+        "requestedDestCommitsInFlight": requested_commits_in_flight,
+        "requestedDestShardsInFlight": operation.requestedReadWorkers or dest_in_flight,
+        "effectiveDestShardsInFlight": dest_in_flight,
+        "effectiveDestinationShardsInFlight": dest_in_flight,
+        "requestedComputeWorkers": requested_compute_workers,
+        "effectiveSourceReadsInFlight": dest_in_flight * source_reads_per_destination,
+        "sourceReadsPerDestination": source_reads_per_destination,
+        "sourceChunksPerDestinationInFlight": (
+            source_reads_per_destination * resolved_read_group_chunks
+        ),
+        "sourceReadGroups": 0,
+        "sourceLogicalBytes": 0,
+        "sourceDecodeBytes": 0,
+        "sourceRepeatedDecodeCount": 0,
+        "sourceRepeatedDecodeBytes": 0,
+        "destinationCommits": 0,
+        "destinationLogicalBytes": 0,
+        "destinationOwners": 0,
+        "fusedDestinationStrips": 0,
+        "destinationSets": n_dest_sets,
+        "plannedDestinationSetBytes": planned_destination_set_bytes,
+        "kind": "observed",
+    }
+    seen_source_chunks: set[tuple[int, int]] = set()
 
-    def inner_chunk_values(
-        task: tuple[int, int],
-    ) -> tuple[tuple[slice, slice], np.ndarray]:
-        feat_start, cell_start = task
-        feat_end = min(feat_start + feature_chunk, n_feats)
-        cell_end = min(cell_start + cell_chunk, n_cells)
-        block = np.asarray(
-            counts[cell_start:cell_end, feat_start:feat_end],
-        )
-        return (
-            (slice(feat_start, feat_end), slice(cell_start, cell_end)),
-            np.ascontiguousarray(block.T),
-        )
+    def _shard_key(feat_start: int, cell_start: int) -> tuple[int, int]:
+        return (feat_start // dest_feat_shard, cell_start // dest_cell_band)
 
-    async def copy_all() -> None:
-        remaining = (
-            (feat_start, cell_start)
-            for cell_start in range(0, n_cells, cell_chunk)
-            for feat_start in range(0, n_feats, feature_chunk)
-        )
+    def _destination_ranges(
+        feat_start: int,
+        feat_end: int,
+    ) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        start = feat_start
+        while start < feat_end:
+            boundary = ((start // dest_feat_shard) + 1) * dest_feat_shard
+            end = min(feat_end, boundary)
+            ranges.append((start, end))
+            start = end
+        return ranges
 
-        async def copy_worker() -> None:
-            for task in remaining:
-                selection, values = await asyncio.to_thread(
-                    inner_chunk_values,
-                    task,
+    def _source_feature_ranges(
+        feat_start: int,
+        feat_end: int,
+    ) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        shard_start = (feat_start // source_feat_shard) * source_feat_shard
+        group_width = resolved_read_group_chunks * source_feat_chunk
+        start = shard_start + ((feat_start - shard_start) // group_width) * group_width
+        while start < feat_end:
+            shard_end = ((start // source_feat_shard) + 1) * source_feat_shard
+            end = min(n_feats, shard_end, start + group_width)
+            if end <= start:
+                raise RuntimeError("source read-group planner did not advance")
+            ranges.append((start, end))
+            start = end
+        return ranges
+
+    def _source_cell_ranges(
+        cell_start: int,
+        cell_end: int,
+    ) -> list[tuple[int, int]]:
+        ranges: list[tuple[int, int]] = []
+        start = (cell_start // source_cell_chunk) * source_cell_chunk
+        while start < cell_end:
+            end = min(n_cells, start + source_cell_chunk)
+            if end <= start:
+                raise RuntimeError("source cell-range planner did not advance")
+            ranges.append((start, end))
+            start = end
+        return ranges
+
+    def _source_read_admission_bytes(
+        source_feat_start: int,
+        source_feat_end: int,
+    ) -> int:
+        first_chunk = source_feat_start // source_feat_chunk
+        last_chunk = (source_feat_end - 1) // source_feat_chunk
+        touched_chunks = last_chunk - first_chunk + 1
+        return source_cell_chunk * touched_chunks * source_feat_chunk * itemsize
+
+    async def _operation(runner: AsyncStorageRunner) -> None:
+        source = counts.async_array
+        destination = counts_t.async_array
+        shared_decodes: _SharedSourceDecode | None = None
+
+        async def _process_destination_set(
+            destination_ranges: list[tuple[int, int]],
+            *,
+            cell_start: int,
+            cell_end: int,
+        ) -> None:
+            if not destination_ranges:
+                return
+            output_bytes = sum(
+                (feat_end - feat_start) * (cell_end - cell_start) * itemsize
+                for feat_start, feat_end in destination_ranges
+            )
+            min_feat = destination_ranges[0][0]
+            max_feat = destination_ranges[-1][1]
+            source_ranges = _source_feature_ranges(min_feat, max_feat)
+            max_read_bytes = max(
+                _source_read_admission_bytes(start, end) for start, end in source_ranges
+            )
+            available_for_reads = available_bytes - output_bytes
+            if available_for_reads < max_read_bytes:
+                raise MemoryError(
+                    "countsT cannot admit one source read while "
+                    "holding its destination buffer"
                 )
-                await counts_t.async_array.setitem(selection, values)
-                del selection, values
-                progress.update()
+            effective_reads = min(
+                effective_reads_in_flight,
+                max(1, available_for_reads // max_read_bytes),
+            )
+            observed["effectiveSourceReadsInFlight"] = max(
+                int(observed["effectiveSourceReadsInFlight"]),
+                int(dest_in_flight * effective_reads),
+            )
+            observed["sourceReadsPerDestination"] = max(
+                int(observed["sourceReadsPerDestination"]),
+                int(effective_reads),
+            )
+            observed["sourceChunksPerDestinationInFlight"] = max(
+                int(observed["sourceChunksPerDestinationInFlight"]),
+                int(effective_reads * resolved_read_group_chunks),
+            )
 
-        async with asyncio.TaskGroup() as group_tasks:
-            for _ in range(workers):
-                group_tasks.create_task(copy_worker())
+            async with runner.reserve_bytes(output_bytes):
+                buffers = {
+                    (feat_start, feat_end): np.empty(
+                        (feat_end - feat_start, cell_end - cell_start),
+                        dtype=counts.dtype,
+                    )
+                    for feat_start, feat_end in destination_ranges
+                }
 
-    with zarr.config.set({"async.concurrency": inner}):
-        try:
-            _run_async(copy_all)
-        except ExceptionGroup as error:
-            if len(error.exceptions) == 1:
-                raise error.exceptions[0] from error
-            raise
-        finally:
-            progress.close()
+                read_work = [
+                    (
+                        source_cell_start,
+                        source_cell_end,
+                        source_feat_start,
+                        source_feat_end,
+                    )
+                    for source_cell_start, source_cell_end in _source_cell_ranges(
+                        cell_start, cell_end
+                    )
+                    for source_feat_start, source_feat_end in source_ranges
+                ]
+
+                async def _read_and_scatter(
+                    source_cell_start: int,
+                    source_cell_end: int,
+                    source_feat_start: int,
+                    source_feat_end: int,
+                    read_bytes: int,
+                ) -> None:
+                    key = (
+                        source_cell_start,
+                        source_cell_end,
+                        source_feat_start,
+                        source_feat_end,
+                    )
+
+                    async def _load() -> np.ndarray:
+                        return np.asarray(
+                            await source.getitem(
+                                (
+                                    slice(source_cell_start, source_cell_end),
+                                    slice(source_feat_start, source_feat_end),
+                                )
+                            )
+                        )
+
+                    if shared_decodes is None:
+                        raise RuntimeError("source decode cache is not ready")
+                    payload, loaded = await shared_decodes.get(
+                        key, read_bytes, runner, _load
+                    )
+                    try:
+
+                        def _scatter() -> None:
+                            for (
+                                destination_feat_start,
+                                destination_feat_end,
+                            ), buffer in buffers.items():
+                                overlap_start = max(
+                                    source_feat_start,
+                                    destination_feat_start,
+                                )
+                                overlap_end = min(
+                                    source_feat_end,
+                                    destination_feat_end,
+                                )
+                                if overlap_start >= overlap_end:
+                                    continue
+                                source_slice = slice(
+                                    overlap_start - source_feat_start,
+                                    overlap_end - source_feat_start,
+                                )
+                                cell_overlap_start = max(source_cell_start, cell_start)
+                                cell_overlap_end = min(source_cell_end, cell_end)
+                                if cell_overlap_start >= cell_overlap_end:
+                                    continue
+                                source_cell_slice = slice(
+                                    cell_overlap_start - source_cell_start,
+                                    cell_overlap_end - source_cell_start,
+                                )
+                                destination_slice = slice(
+                                    overlap_start - destination_feat_start,
+                                    overlap_end - destination_feat_start,
+                                )
+                                cell_slice = slice(
+                                    cell_overlap_start - cell_start,
+                                    cell_overlap_end - cell_start,
+                                )
+                                buffer[destination_slice, cell_slice] = payload[
+                                    source_cell_slice, source_slice
+                                ].T
+
+                        await runner.compute(_scatter)
+                        observed["sourceReadGroups"] = (
+                            int(observed["sourceReadGroups"]) + 1
+                        )
+                        observed["sourceLogicalBytes"] = int(
+                            observed["sourceLogicalBytes"]
+                        ) + int(payload.nbytes)
+                        if loaded:
+                            cell_chunk_index = source_cell_start // source_cell_chunk
+                            first_feature_chunk = source_feat_start // source_feat_chunk
+                            last_feature_chunk = (
+                                source_feat_end - 1
+                            ) // source_feat_chunk
+                            for feature_chunk_index in range(
+                                first_feature_chunk,
+                                last_feature_chunk + 1,
+                            ):
+                                chunk_key = (cell_chunk_index, feature_chunk_index)
+                                decode_bytes = (
+                                    source_cell_chunk * source_feat_chunk * itemsize
+                                )
+                                observed["sourceDecodeBytes"] = (
+                                    int(observed["sourceDecodeBytes"]) + decode_bytes
+                                )
+                                if chunk_key in seen_source_chunks:
+                                    observed["sourceRepeatedDecodeCount"] = (
+                                        int(observed["sourceRepeatedDecodeCount"]) + 1
+                                    )
+                                    observed["sourceRepeatedDecodeBytes"] = (
+                                        int(observed["sourceRepeatedDecodeBytes"])
+                                        + decode_bytes
+                                    )
+                                else:
+                                    seen_source_chunks.add(chunk_key)
+                    finally:
+                        await shared_decodes.release(key, runner)
+
+                pending: set[asyncio.Task[None]] = set()
+                async with asyncio.TaskGroup() as read_tasks:
+                    for (
+                        source_cell_start,
+                        source_cell_end,
+                        source_feat_start,
+                        source_feat_end,
+                    ) in read_work:
+                        read_bytes = _source_read_admission_bytes(
+                            source_feat_start,
+                            source_feat_end,
+                        )
+                        task = read_tasks.create_task(
+                            _read_and_scatter(
+                                source_cell_start,
+                                source_cell_end,
+                                source_feat_start,
+                                source_feat_end,
+                                read_bytes,
+                            )
+                        )
+                        pending.add(task)
+                        if len(pending) >= effective_reads:
+                            done, pending = await asyncio.wait(
+                                pending,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            for completed in done:
+                                completed.result()
+
+                async def _commit(
+                    feat_start: int,
+                    feat_end: int,
+                    buffer: np.ndarray,
+                ) -> None:
+                    async with runner.commit_lane():
+                        await destination.setitem(
+                            (
+                                slice(feat_start, feat_end),
+                                slice(cell_start, cell_end),
+                            ),
+                            buffer,
+                        )
+                    observed["destinationCommits"] = (
+                        int(observed["destinationCommits"]) + 1
+                    )
+                    observed["destinationLogicalBytes"] = int(
+                        observed["destinationLogicalBytes"]
+                    ) + int(buffer.nbytes)
+
+                pending_commits: set[asyncio.Task[None]] = set()
+                async with asyncio.TaskGroup() as commit_tasks:
+                    for (feat_start, feat_end), buffer in buffers.items():
+                        task = commit_tasks.create_task(
+                            _commit(feat_start, feat_end, buffer)
+                        )
+                        pending_commits.add(task)
+                        if len(pending_commits) >= effective_commits_in_flight:
+                            done, pending_commits = await asyncio.wait(
+                                pending_commits,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            for completed in done:
+                                completed.result()
+
+        dest_jobs: list[tuple[int, int, int, int]] = []
+        for cell_start in range(0, n_cells, dest_cell_band):
+            cell_end = min(cell_start + dest_cell_band, n_cells)
+            for feat_start in range(0, n_feats, dest_feat_shard):
+                feat_end = min(feat_start + dest_feat_shard, n_feats)
+                key = _shard_key(feat_start, cell_start)
+                if key in owners:
+                    raise RuntimeError(f"destination shard {key} already has an owner")
+                owners.add(key)
+                dest_jobs.append((feat_start, feat_end, cell_start, cell_end))
+
+        dest_sets: list[list[tuple[int, int, int, int]]] = []
+        index = 0
+        while index < len(dest_jobs):
+            current = dest_jobs[index]
+            destination_set = [current]
+            if index + 1 < len(dest_jobs):
+                following = dest_jobs[index + 1]
+                same_cell_band = current[2:] == following[2:]
+                adjacent = current[1] == following[0]
+                shared_source_chunk = (
+                    current[1] - 1
+                ) // source_feat_chunk == following[0] // source_feat_chunk
+                if same_cell_band and adjacent and shared_source_chunk:
+                    destination_set.append(following)
+                    index += 1
+            dest_sets.append(destination_set)
+            index += 1
+        shared_decodes = _SharedSourceDecode()
+        observed["fusedDestinationStrips"] = sum(
+            1 for destination_set in dest_sets if len(destination_set) > 1
+        )
+        observed["destinationSets"] = len(dest_sets)
+
+        async def _one_destination_set(
+            jobs: list[tuple[int, int, int, int]],
+        ) -> None:
+            cell_start = jobs[0][2]
+            cell_end = jobs[0][3]
+            await _process_destination_set(
+                [(feat_start, feat_end) for feat_start, feat_end, _, _ in jobs],
+                cell_start=cell_start,
+                cell_end=cell_end,
+            )
+
+        pending_dest: set[asyncio.Task[None]] = set()
+        async with asyncio.TaskGroup() as dest_tasks:
+            for jobs in dest_sets:
+                pending_dest.add(dest_tasks.create_task(_one_destination_set(jobs)))
+                if len(pending_dest) >= dest_in_flight:
+                    done, pending_dest = await asyncio.wait(
+                        pending_dest,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for completed in done:
+                        completed.result()
+
+    dest_chunk_feats = int(plan.countsT.chunks[0])
+    runner = AsyncStorageRunner(
+        ResourceBudget(max(1, available_bytes), resources.workers),
+        operation=operation,
+        chunksPerShard=max(1, dest_feat_shard // max(1, dest_chunk_feats)),
+        readGroupsInFlight=effective_reads_in_flight,
+        destinationCommitsInFlight=effective_commits_in_flight,
+        computeWorkerLimit=effective_compute_workers,
+    )
+    try:
+        runner.run(_operation)
+    except BaseException:
+        observed["terminalStatus"] = "error"
+        observed["peakLedgerBytes"] = runner.ledger.peak_bytes()
+        observed["heldLedgerBytes"] = runner.ledger.held_bytes()
+        if metrics is not None:
+            metrics.clear()
+            metrics.update(observed)
+        counts_t.attrs["complete"] = False
+        raise
+    observed["destinationOwners"] = len(owners)
+    observed["effectiveComputeWorkers"] = runner.plan.computeWorkerLimit
+    observed["effectiveComputeWorkerLimit"] = runner.plan.computeWorkerLimit
+    observed["effectiveDestCommitsInFlight"] = effective_commits_in_flight
+    observed["terminalStatus"] = "ok"
+    observed["peakLedgerBytes"] = runner.ledger.peak_bytes()
+    observed["heldLedgerBytes"] = runner.ledger.held_bytes()
+    observed["plannedDestinationBufferBytes"] = plan.destinationBufferBytes
+    observed["plannedSourceBufferBytes"] = plan.sourceBufferBytes
+    observed["sourceDecodeAmplification"] = plan.sourceDecodeAmplification
+    if metrics is not None:
+        metrics.clear()
+        metrics.update(observed)
+    record_execution_report(
+        ExecutionReport(
+            plan=operation,
+            unitKind="countsRowShard",
+            actualReadWorkers=dest_in_flight,
+            actualComputeWorkers=int(observed["effectiveComputeWorkers"]),
+            actualWriteWorkers=effective_commits_in_flight,
+            unitsCompleted=int(observed["destinationOwners"]),
+            peakHeldBytes=int(observed["peakLedgerBytes"]),
+            extra=observed,
+        )
+    )
     counts_t.attrs["complete"] = True
     return counts_t
+
+
+def finalize_rna_counts_t(
+    counts: zarr.Array,
+    group: zarr.Group,
+    *,
+    profile: StorageProfile | None = None,
+    resources: ResourceBudget | None = None,
+    mem_budget: int | str | None = None,
+    nthreads: int | None = None,
+    residentBytes: int = 0,
+    policy: CountMatrixPolicy | None = None,
+    io: StorageIoPolicy | None = None,
+) -> zarr.Array:
+    """Write mandatory paired ``countsT`` after RNA ``counts`` is complete."""
+    resolved = resources
+    if resolved is None:
+        resolved = resolve_budget(mem_budget, nthreads)
+    return write_counts_t(
+        counts,
+        group,
+        profile=profile,
+        resources=resolved,
+        residentBytes=residentBytes,
+        policy=policy,
+        io=io,
+    )

@@ -189,7 +189,7 @@ def prepare_network(
     if feature_names.ndim != 1 or raw_feature_index.ndim != 1:
         raise ValueError("Active feature names and indices must be one-dimensional")
     if len(feature_names) == 0:
-        raise ValueError("Feature key selects no active features")
+        raise ValueError("Feature selection contains no active features")
     if len(feature_names) != len(raw_feature_index):
         raise ValueError("Active feature names and indices must be aligned")
     if not np.issubdtype(raw_feature_index.dtype, np.integer):

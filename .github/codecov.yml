@@ -6,5 +6,15 @@ github_checks: false
 
 coverage:
   precision: 2
-  round: up
-  range: "75...100"
+  round: down
+  range: "85...90"
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 0.5%
+    patch:
+      default:
+        target: 95%
+        threshold: 0%
+        informational: true

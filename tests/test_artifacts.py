@@ -270,6 +270,15 @@ def test_artifact_ref_rejects_malformed_values() -> None:
     del missing_type["type"]
     with pytest.raises(ValueError, match="type must be"):
         ArtifactRef.from_dict(missing_type)
+    with pytest.raises(ValueError, match="fields do not match"):
+        ArtifactRef.from_dict({**_ref().to_dict(), "path": "RNA/legacy"})
+    datastore_ref = ArtifactRef(
+        scope="datastore",
+        kind="integrated_graph",
+        artifact_id="b" * 64,
+    )
+    with pytest.raises(ValueError, match="fields do not match"):
+        ArtifactRef.from_dict({**datastore_ref.to_dict(), "assay": "RNA"})
 
 
 def test_artifact_path_parser_normalizes_boundaries_and_rejects_corruption() -> None:
@@ -351,7 +360,7 @@ def test_external_artifact_ref_rejects_malformed_values() -> None:
                 "ref": {**assay_ref.to_dict(), "path": "reference.zarr"},
             }
         )
-    with pytest.raises(ValueError, match="assay-scoped"):
+    with pytest.raises(ValueError, match="declared scope"):
         ExternalArtifactRef.from_dict(
             {
                 **serialized,

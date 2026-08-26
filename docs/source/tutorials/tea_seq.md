@@ -1,5 +1,5 @@
 ---
-description: Inspect a prepared TEA-seq store and demonstrate three-way WNN integration.
+description: Inspect a prepared TEA-seq store and its three-way WNN integration artifact.
 jupytext:
   text_representation:
     extension: .md
@@ -15,7 +15,7 @@ kernelspec:
 # Three-way RNA, ATAC, and protein integration with TEA-seq
 
 TEA-seq measures gene expression, chromatin accessibility, and surface proteins in the same cells.
-This tutorial opens a prepared store, inspects the three modality-specific analyses, and reuses a three-way weighted nearest neighbour (WNN) artifact.
+This tutorial opens a prepared store, inspects the three modality-specific analyses, and follows a three-way weighted nearest neighbour (WNN) artifact by reference.
 
 The expensive import and preprocessing steps have already run.
 The executable work here is limited to downloading the analyzed store, reading its artifacts, and plotting their results.
@@ -30,7 +30,7 @@ The executable work here is limited to downloading the analyzed store, reading i
 
 - Inspect matched RNA, ATAC, and ADT assays without materializing their count matrices
 - Compare modality-specific layouts with a three-way SNN layout
-- Reuse a stored RNA plus ATAC plus ADT WNN graph
+- Inspect a stored RNA plus ATAC plus ADT WNN graph and its exact inputs
 - Validate and visualize one modality weight per cell and assay
 
 ## 1. Dataset and cell selection
@@ -195,6 +195,8 @@ Each modality has a 20-neighbour self-free row over the same active cells.
 Those matched rows feed both integrations.
 SNN merges shared edge support with equal standing for each source graph.
 WNN estimates a separate local contribution for each assay and cell.
+Integration provenance stores ordered `source_i` inputs matching the `assays` parameter.
+SNN sources are exact connectivity-map references; WNN sources pair each neighbor reference with the exact native reduction or batch-correction coordinates it names.
 
 ## 3. Compare modality-specific and SNN layouts
 
@@ -244,14 +246,14 @@ snn_markers = ds.plots.embedding(
 snn_markers.figure.set_size_inches(10, 8)
 ```
 
-## 4. Reuse the three-way WNN graph
+## 4. Inspect the three-way WNN graph
 
-Calling `integrate_assays` with the recorded parameters resolves to the existing immutable artifact.
-The assertion verifies reuse rather than recomputation.
+The prepared WNN result has an immutable artifact reference and records its assays in order.
+New calls to `integrate_assays` pair each `source_i` neighbour artifact with the exact native coordinate artifact it names, capture every source before planning, and never search for a latest graph or decode a storage path. This prepared download predates that final input schema and retains legacy analysis state, so it is inspected as a historical result rather than used as input to a new computation.
 
 ```{code-cell} ipython3
 assays = ["RNA", "ATAC", "ADT"]
-existing_wnn = next(
+wnn_ref = next(
     ref
     for ref in ds.list_artifacts(
         scope="datastore",
@@ -261,21 +263,16 @@ existing_wnn = next(
     if (ds.inspect_artifact(ref).execution_options or {}).get("label")
     == "RNA+ATAC+ADT_wnn"
 )
-reused_wnn = ds.integrate_assays(
-    assays=assays,
-    label="RNA+ATAC+ADT_wnn",
-    method="wnn",
-    l2_normalize=True,
-)
-wnn_status = ds.inspect_artifact(reused_wnn)
+wnn_status = ds.inspect_artifact(wnn_ref)
 
-assert reused_wnn == existing_wnn
 assert wnn_status.parameters["assays"] == assays
 pd.Series(
     {
-        "artifact reused": reused_wnn == existing_wnn,
-        "artifact id": reused_wnn.artifact_id,
+        "artifact kind": wnn_ref.kind,
+        "artifact id": wnn_ref.artifact_id,
         "complete": wnn_status.complete,
+        "ordered assays": ", ".join(wnn_status.parameters["assays"]),
+        "historical input roles": ", ".join(sorted(wnn_status.inputs)),
     }
 )
 ```
@@ -433,7 +430,7 @@ Data attribution:
 
 ## Common mistakes
 
-- Recomputing the expensive assay pipelines when the prepared artifacts already match
+- Recomputing the expensive assay pipelines when direct artifact inspection is sufficient
 - Treating the three modality weights as expression, accessibility, or protein abundance
 - Comparing graphs built over different cell selections or neighbour counts
 - Assuming a visually cleaner integrated layout is the more accurate result

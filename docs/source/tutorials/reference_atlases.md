@@ -25,10 +25,14 @@ It is not a complete reimplementation of every option in the Symphony R package.
 ## 1. Open the reference and query
 
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import numpy as np
 import pandas as pd
 
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="WARNING", progress=True)
 
@@ -43,17 +47,38 @@ stim_path = repository.download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds_ctrl = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+ctrl_counts_path = Path(analysis_directory.name) / "control_counts.zarr"
+stim_counts_path = Path(analysis_directory.name) / "stimulated_counts.zarr"
+ctrl_analysis_path = Path(analysis_directory.name) / "reference.zarr"
+stim_analysis_path = Path(analysis_directory.name) / "query.zarr"
+repack_store(
     f"{ctrl_path}/data.zarr",
-    nthreads=4,
-    zarr_mode="r+",
+    str(ctrl_counts_path),
+    nthreads=2,
 )
-ds_stim = scarf.DataStore(
+repack_store(
     f"{stim_path}/data.zarr",
+    str(stim_counts_path),
+    nthreads=2,
+)
+ds_ctrl = scarf.mount_datastore(
+    str(ctrl_counts_path),
+    at=str(ctrl_analysis_path),
+    default_assay="RNA",
     nthreads=4,
-    zarr_mode="r+",
+)
+ds_stim = scarf.mount_datastore(
+    str(stim_counts_path),
+    at=str(stim_analysis_path),
+    default_assay="RNA",
+    nthreads=4,
 )
 ```
+
+Both published stores remain unchanged.
+Each is structurally repacked into its own temporary source with the current RNA count layout.
+Mounting those sources copies literal cell metadata into two separate page-local targets, while the current reference and mapping artifacts are written only there.
 
 `reference_batch` must represent technical structure such as donor, preparation, or sequencing batch.
 The single control label below only exercises the API.
@@ -96,6 +121,7 @@ pd.Series(
     {
         "method": reference.method,
         "assay": reference.assay_name,
+        "feature_selection": reference.feature_selection,
         "selected_cells": reference.selected_cell_count,
         "n_features": reference.model.n_features,
         "n_dims": reference.model.n_dims,
@@ -117,7 +143,7 @@ ds_ctrl.plots.embedding(
 
 This plot uses the pre-published `RNA_UMAP` already on the datastore.
 `umap=False` above skipped recomputing UMAP for the Harmony neighbour chain, so the layout is a viewing aid rather than part of the packaged mapping reference.
-`MappingReference` stores the feature set, PCA basis, corrected coordinates, and neighbour index; it does not store an embedding.
+`MappingReference` stores the exact immutable `feature_selection` reference, PCA basis, corrected coordinates, and neighbour index; it does not store an embedding.
 Mapping places query weight onto reference cells without moving those cells.
 
 In a later session, reopen the reference store and load the named mapping reference.

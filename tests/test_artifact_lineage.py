@@ -4,7 +4,7 @@ import zarr
 from zarr.storage import MemoryStore
 
 from scarf.datastore.base_datastore import BaseDataStore
-from scarf.lineage import ArtifactLineage
+from scarf.storage.lineage import ArtifactLineage
 from scarf.mapping.reference import MappingReference
 from scarf.storage.artifacts import (
     ArtifactRef,

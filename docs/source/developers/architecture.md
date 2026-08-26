@@ -38,7 +38,7 @@ These calls do not create module-load cycles.
 
 ### Foundation
 
-- `storage/` owns stores, layouts, schemas, arrays, sharding, copying, resource budgets, storage profiles, materialization, ANN persistence, and Zarr runtime guards.
+- `storage/` owns stores, layouts, schemas, arrays, sharding, copying, resource budgets, storage profiles, materialization, ANN persistence, Zarr runtime guards, and artifact lineage reports.
 - `matrix/` owns the lazy blockwise matrix abstraction used over NumPy and Zarr arrays.
   Its arithmetic, indexing, and reduction behavior keeps it separate from low-level storage mechanics.
 - `utils/` owns generic array, compute, logging, prefetch, process, and progress helpers.
@@ -52,8 +52,10 @@ Column prefetch uses `storage.parallel` because read-ahead limits and I/O concur
 
 - `metadata/` owns Zarr-backed metadata tables, row streaming, and table queries.
   It is shared by datastore cell metadata and assay feature metadata, so neither `datastore`, `assay`, nor `storage` owns it.
-- `assay/` owns assay state, normalization, summary persistence, and the RNA, ATAC, and ADT assay types.
-- `graph/` owns `AssayState` and the encoded assay-graph path grammar in `encoded_paths`.
+- `assay/` owns assay state, normalization, blockwise feature-summary computation, and the RNA, ATAC, and ADT assay types.
+  `DataStore` owns planning and persistence of feature-summary artifacts; a bare `Assay.score_features` remains computation-only.
+- `graph/` owns `AssayState`, graph feature projection through named artifact inputs, and the legacy encoded-path grammar used only for diagnostics and rejection fixtures.
+  Analysis execution must not resolve current inputs by parsing encoded paths.
 
 Data-model modules may call domain algorithms from the method that needs them.
 They must not import those packages at module load time.
@@ -75,7 +77,7 @@ A domain that persists an artifact may use a narrow, named `storage` adapter.
 
 ### Import and export
 
-- `cytebase` lists, downloads, and opens public datasets.
+- `cytebase/` lists, downloads, and opens public datasets.
 - `readers/` parses supported input formats.
 - `writers/` materializes Scarf stores and exports supported formats.
 - `merge/` combines assays and datasets without importing `DataStore` during normal module loading.
@@ -145,6 +147,9 @@ New production code should import its canonical implementation directly unless i
 
 Compatibility policy for the 1.x series:
 
+- Feature selection and analysis state use a hard-break artifact contract.
+  There is no feature-key alias, encoded feature-column fallback, silent state migration, or implicit latest-result lookup.
+  Legacy feature fields in `AssayState` fail before computation or writes.
 - Mapping references and query projections follow a hard-break contract.
   Incompatible artifacts fail with an explicit error rather than a silent upgrade.
   Read the current mapping and graph APIs for the supported paths.

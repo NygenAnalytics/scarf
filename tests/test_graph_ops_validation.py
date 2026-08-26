@@ -9,16 +9,19 @@ import zarr
 from zarr.storage import MemoryStore
 
 import scarf.graph.state as graph_state
-from scarf.assay import ATACassay
 from scarf.datastore._operations.graph import _sampling_fraction
 from scarf.datastore.graph_datastore import GraphDataStore
+from scarf.graph.feature_projection import resolve_native_graph_inputs
+from scarf.graph.state import GraphSelection
 from scarf.storage.artifacts import (
     ArtifactRef,
     artifact_path,
+    fingerprint_array,
     fingerprint_strings,
     make_provenance,
     new_artifact_id,
 )
+from scarf.storage.errors import ArtifactResolutionError
 
 
 class _BareGraphStore(GraphDataStore):
@@ -103,27 +106,6 @@ def test_sampling_fraction_validates_type_and_range():
         _sampling_fraction(float("nan"), "frac")
 
 
-def test_get_latest_keys_requires_default_assay_and_skips_resolution_when_explicit():
-    store = _bare_store()
-    with pytest.raises(ValueError, match="No default assay"):
-        store._get_latest_keys(None, None, None)
-
-    store._defaultAssay = "RNA"
-    store._get_latest_cell_key = Mock(
-        side_effect=AssertionError("explicit keys must not resolve cell key")
-    )
-    store._get_latest_feat_key = Mock(
-        side_effect=AssertionError("explicit keys must not resolve feat key")
-    )
-    assert store._get_latest_keys("ADT", "custom", "feats") == (
-        "ADT",
-        "custom",
-        "feats",
-    )
-    store._get_latest_cell_key.assert_not_called()
-    store._get_latest_feat_key.assert_not_called()
-
-
 def test_require_complete_artifact_rejects_kind_and_assay_mismatch(monkeypatch):
     store = _bare_store()
     ref = ArtifactRef(
@@ -192,6 +174,47 @@ def test_run_lsi_and_custom_reduction_validate_before_work():
     store._run_reduction_artifact.assert_not_called()
 
 
+def test_explicit_normalized_ref_can_rebuild_past_unavailable_current_graph(
+    monkeypatch,
+):
+    store = _bare_store()
+    store.zarr_loc = "memory"
+    missing_graph = _ref("connectivity_map", "9")
+    state_group = store.zw.create_group("RNA/state")
+    state_group.attrs["state"] = graph_state.AssayState(
+        assay="RNA",
+        cell_key="I",
+        connectivity_map=missing_graph,
+    ).to_dict()
+    normalized = _complete_artifact(
+        store,
+        "normalized",
+        execution_options={"cell_key": "I"},
+        arrays={"data": np.zeros((4, 3), dtype=np.float32)},
+    )
+    expected = _ref("reduction", "8")
+
+    def reduction_without_numerics(_store, **kwargs):
+        assert kwargs["normalized"] == normalized
+        return expected
+
+    monkeypatch.setattr(
+        type(store),
+        "_run_reduction_artifact_impl",
+        reduction_without_numerics,
+    )
+
+    assert (
+        store.run_pca(
+            normalized,
+            dims=2,
+            local_cache=False,
+            update_state=False,
+        )
+        == expected
+    )
+
+
 def test_artifact_chain_rejects_corrupt_coordinate_links():
     store = _bare_store()
     first_coordinates = _complete_artifact(store, "reduction")
@@ -228,70 +251,9 @@ def test_artifact_chain_rejects_corrupt_coordinate_links():
     )
     with pytest.raises(
         ValueError,
-        match="Imported coordinates are not part of the normalized AssayState",
+        match="Imported-coordinate artifact has no cell_key",
     ):
         store._artifact_chain_state(imported_ann)
-
-
-def test_artifact_chain_requires_paired_selection_overrides():
-    store = _bare_store()
-    normalized = _complete_artifact(
-        store,
-        "normalized",
-        execution_options={"cell_key": "cells", "feat_key": "features"},
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="cell_key and feat_key overrides must be provided together",
-    ):
-        store._artifact_chain_state(
-            normalized,
-            cell_key_override="other_cells",
-        )
-
-
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    [
-        ({"log_transform": "yes"}, "log_transform must be a boolean"),
-        (
-            {"renormalize_subset": 1},
-            "renormalize_subset must be a boolean",
-        ),
-    ],
-)
-def test_run_normalization_validates_atac_boolean_parameters_before_work(
-    kwargs,
-    message,
-):
-    store = _bare_store()
-    store._defaultAssay = "RNA"
-    assay = object.__new__(ATACassay)
-    assay.z = store.zw.create_group("RNA")
-    assay.z.create_group("featureData")
-    assay.feats = SimpleNamespace(
-        columns=["I"],
-        fetch_all=Mock(return_value=np.ones(3, dtype=bool)),
-    )
-    assay.normMethod = "tfidf"
-    assay.sf = None
-    store.cells = SimpleNamespace(
-        fetch_all=Mock(return_value=np.ones(3, dtype=bool)),
-    )
-    store._get_assay = Mock(return_value=assay)
-    store._resolve_selection_input = Mock(
-        side_effect=AssertionError("selection artifacts must not be resolved")
-    )
-
-    with pytest.raises(TypeError, match=message):
-        store.run_normalization(
-            from_assay="RNA",
-            feat_key="I",
-            **kwargs,
-        )
-
-    store._resolve_selection_input.assert_not_called()
 
 
 def test_build_ann_index_rejects_invalid_coordinate_contracts_before_loading():
@@ -304,12 +266,6 @@ def test_build_ann_index_rejects_invalid_coordinate_contracts_before_loading():
         kind="reduction",
         artifact_id="1" * 64,
     )
-    imported = ArtifactRef(
-        scope="assay",
-        assay="RNA",
-        kind="imported_coordinates",
-        artifact_id="2" * 64,
-    )
     reduction = ArtifactRef(
         scope="assay",
         assay="RNA",
@@ -319,11 +275,6 @@ def test_build_ann_index_rejects_invalid_coordinate_contracts_before_loading():
 
     with pytest.raises(ValueError, match="Coordinate artifact has no assay"):
         store.build_ann_index(detached)
-    with pytest.raises(
-        ValueError,
-        match="Imported coordinates cannot activate AssayState",
-    ):
-        store.build_ann_index(imported)
     with pytest.raises(TypeError, match="ann_parallel must be a boolean"):
         store.build_ann_index(reduction, ann_parallel="yes")
 
@@ -394,16 +345,15 @@ def test_query_neighbors_rejects_ann_coordinate_contracts_before_loading():
 
 def test_assay_state_rejects_malformed_models_and_storage() -> None:
     with pytest.raises(ValueError, match="valid assay name"):
-        graph_state.AssayState(assay="", cell_key="I", feat_key="I")
-    with pytest.raises(ValueError, match="requires cell_key and feat_key"):
-        graph_state.AssayState(assay="RNA", cell_key="", feat_key="I")
+        graph_state.AssayState(assay="", cell_key="I")
+    with pytest.raises(ValueError, match="non-empty cell_key"):
+        graph_state.AssayState(assay="RNA", cell_key="")
 
     detached = _ref("normalized", "1", scope="datastore", assay=None)
     with pytest.raises(ValueError, match="must reference assay"):
         graph_state.AssayState(
             assay="RNA",
             cell_key="I",
-            feat_key="I",
             normalized=detached,
         )
 
@@ -412,137 +362,43 @@ def test_assay_state_rejects_malformed_models_and_storage() -> None:
         graph_state.AssayState(
             assay="RNA",
             cell_key="I",
-            feat_key="I",
             named_results={"mapping_reference": wrong_named_kind},
         )
 
-    valid_fields = {"assay": "RNA", "cell_key": "I", "feat_key": "I"}
-    with pytest.raises(TypeError, match="named_results must be a mapping"):
+    valid_fields = {"assay": "RNA", "cell_key": "I"}
+    with pytest.raises(ValueError, match="named_results must be a mapping"):
         graph_state.AssayState.from_dict({**valid_fields, "named_results": []})
-    with pytest.raises(TypeError, match="Every named result"):
+    with pytest.raises(ValueError, match="Every named result"):
         graph_state.AssayState.from_dict(
             {**valid_fields, "named_results": {1: wrong_named_kind.to_dict()}}
         )
+    with pytest.raises(
+        graph_state.IncompatibleAnalysisStateError,
+        match="missing required fields",
+    ) as missing:
+        graph_state.AssayState.from_dict(valid_fields)
+    assert missing.value.code == "invalid_analysis_state"
+    with pytest.raises(
+        graph_state.IncompatibleAnalysisStateError,
+        match="removed feature-key contract",
+    ) as legacy:
+        graph_state.AssayState.from_dict({**valid_fields, "feat_key": "I"})
+    assert legacy.value.code == "legacy_feature_contract"
     with pytest.raises(ValueError, match="Invalid assay name"):
         graph_state.assay_state_path("RNA/bad")
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
     state_group = root.create_group("RNA/state")
     state_group.attrs["state"] = []
-    with pytest.raises(TypeError, match="must be a mapping"):
+    with pytest.raises(ValueError, match="must be a mapping"):
         graph_state.read_assay_state(root, "RNA")
 
     state_group.attrs["state"] = graph_state.AssayState(
         assay="ADT",
         cell_key="I",
-        feat_key="I",
     ).to_dict()
     with pytest.raises(ValueError, match="names assay 'ADT'"):
         graph_state.read_assay_state(root, "RNA")
-
-
-def test_legacy_graph_selection_reports_unresolvable_and_stale_inputs() -> None:
-    store = _bare_store()
-    with pytest.raises(ValueError, match="provenance cannot be resolved"):
-        graph_state.validate_legacy_graph_selection(
-            store,
-            "not-an-encoded-graph",
-            "RNA",
-            "I",
-            "I",
-        )
-
-    graph_loc = "RNA/normed__I__I/reduction__pca__2__I/ann__l2__50__50__48__1/knn__2"
-    with pytest.raises(ValueError, match="normalized data is missing"):
-        graph_state.validate_legacy_graph_selection(
-            store,
-            graph_loc,
-            "RNA",
-            "I",
-            "I",
-        )
-
-    normalized = store.zw.create_group("RNA/normed__I__I")
-    normalized.attrs["subset_hash"] = 0
-    store.cells = SimpleNamespace(active_index=Mock(return_value=np.array([0])))
-    store._get_assay = Mock(
-        return_value=SimpleNamespace(
-            feats=SimpleNamespace(active_index=Mock(side_effect=KeyError("gone")))
-        )
-    )
-    with pytest.raises(ValueError, match="selection columns cannot be validated"):
-        graph_state.validate_legacy_graph_selection(
-            store,
-            graph_loc,
-            "RNA",
-            "I",
-            "I",
-        )
-
-
-def test_named_result_and_selected_paths_reject_stale_state() -> None:
-    store = _bare_store()
-    mapping = _complete_artifact(store, "mapping_reference", inputs={})
-    batch_correction = _ref("batch_correction", "3")
-    corrected_state = graph_state.AssayState(
-        assay="RNA",
-        cell_key="I",
-        feat_key="I",
-        batch_correction=batch_correction,
-    )
-    assert (
-        graph_state.named_result_mismatch(
-            store.zw,
-            "mapping_reference",
-            mapping,
-            corrected_state,
-        )
-        == "Plain PCA mapping reference cannot select batch correction"
-    )
-
-    empty_state = graph_state.AssayState(assay="RNA", cell_key="I", feat_key="I")
-    reason = graph_state.named_result_mismatch(
-        store.zw,
-        "mapping_reference",
-        mapping,
-        empty_state,
-    )
-    assert reason is not None
-    assert reason.startswith("Mapping reference state is missing")
-
-    with pytest.raises(ValueError, match="Mapping reference state is missing"):
-        graph_state.write_assay_state(
-            store.zw,
-            graph_state.AssayState(
-                assay="RNA",
-                cell_key="I",
-                feat_key="I",
-                named_results={"mapping_reference": mapping},
-            ),
-        )
-
-    missing_normalized = _ref("normalized", "4")
-    store.zw.create_group("RNA/state").attrs["state"] = graph_state.AssayState(
-        assay="RNA",
-        cell_key="I",
-        feat_key="I",
-        normalized=missing_normalized,
-    ).to_dict()
-    with pytest.raises(KeyError, match="normalized artifact does not exist"):
-        graph_state.normalized_path_from_state(store.zw, "RNA", "I", "I")
-
-    store.zw["RNA/state"].attrs["state"] = empty_state.to_dict()
-    with pytest.raises(KeyError, match="no selected embedding initialization"):
-        graph_state.embedding_initialization_path_from_state(
-            store.zw,
-            "RNA",
-            "I",
-            "I",
-        )
-
-    assert graph_state._parameters(store.zw, missing_normalized) == {}
-    with pytest.raises(ValueError, match="has no 'coordinates' artifact input"):
-        graph_state._input_ref(store.zw, mapping, "coordinates")
 
 
 def test_integrated_graph_resolution_rejects_bad_indexes_and_missing_labels() -> None:
@@ -563,17 +419,72 @@ def test_integrated_graph_resolution_rejects_bad_indexes_and_missing_labels() ->
     with pytest.raises(KeyError, match="not registered under a label"):
         graph_state.integrated_graph_label(store, integrated)
 
-    store._get_latest_keys = Mock(return_value=("RNA", "I", "I"))
-    store._resolve_integrated_graph_path = Mock(return_value="missing/integrated")
-    with pytest.raises(KeyError, match="does not exist"):
-        graph_state.resolve_graph_selection(
-            store,
-            None,
-            from_assay=None,
-            cell_key=None,
-            feat_key=None,
-            integrated_graph="missing",
-        )
+
+@pytest.mark.parametrize(
+    ("kind", "state_fields", "expected_code"),
+    [
+        (
+            "connectivity_map",
+            {"assay": "RNA", "cell_key": "I", "feat_key": "I"},
+            "legacy_feature_contract",
+        ),
+        (
+            "integrated_graph",
+            {"assay": "RNA", "cell_key": "I", "unexpected": True},
+            "invalid_analysis_state",
+        ),
+    ],
+)
+def test_explicit_graph_rejects_incompatible_state_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    state_fields: dict[str, object],
+    expected_code: str,
+) -> None:
+    store = _bare_store()
+    store._integratedGraphsLoc = "integratedGraphs"
+    store._get_assay = Mock(return_value=SimpleNamespace(name="RNA"))
+    store._store_to_sparse = Mock(
+        side_effect=AssertionError("graph execution must not start")
+    )
+    selection = _complete_artifact(
+        store,
+        "cell_selection",
+        assay=None,
+        execution_options={"source_column": "I"},
+    )
+    graph = _complete_artifact(
+        store,
+        kind,
+        assay="RNA" if kind == "connectivity_map" else None,
+    )
+    if kind == "integrated_graph":
+        store.zw.create_group("integratedGraphs").attrs["artifacts"] = {
+            "joint": graph.to_dict()
+        }
+    state_group = store.zw.create_group("RNA/state")
+    state_group.attrs["state"] = state_fields
+    before = dict(state_group.attrs)
+    monkeypatch.setattr(
+        "scarf.graph.feature_projection.graph_cell_selection",
+        lambda *_args: selection,
+    )
+    monkeypatch.setattr(
+        "scarf.graph.feature_projection.graph_source_assays",
+        lambda *_args: ("RNA",),
+    )
+    monkeypatch.setattr(
+        graph_state,
+        "validate_cell_selection_artifact",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(graph_state.IncompatibleAnalysisStateError) as error:
+        store.load_graph(graph, from_assay="RNA")
+
+    assert error.value.code == expected_code
+    store._store_to_sparse.assert_not_called()
+    assert dict(state_group.attrs) == before
 
 
 def test_selection_artifact_rejects_changed_array_geometry() -> None:
@@ -591,11 +502,11 @@ def test_selection_artifact_rejects_changed_array_geometry() -> None:
     )
 
     with pytest.raises(
-        graph_state.ArtifactSelectionError,
-        match="no longer matches its artifact",
+        ArtifactResolutionError,
+        match="row identity does not match its metadata table",
     ) as error:
         graph_state.validate_cell_selection_artifact(store.zw, selection, "I")
-    assert error.value.code == "selection_values_changed"
+    assert error.value.code == "row_identity_mismatch"
 
 
 def _imported_coordinate_store(
@@ -613,7 +524,10 @@ def _imported_coordinate_store(
         store,
         "cell_selection",
         assay=None,
-        inputs={"ordered_row_ids_fingerprint": fingerprint_strings(ids)},
+        inputs={
+            "ordered_row_ids_fingerprint": fingerprint_strings(ids),
+            "values_fingerprint": fingerprint_array(np.ones(2, dtype=bool)),
+        },
         execution_options={"source_column": "I"},
         arrays={"values": np.ones(2, dtype=bool)},
     )
@@ -670,20 +584,17 @@ def test_graph_selection_validators_reject_detached_and_mixed_chains() -> None:
             store.zw,
             detached_connectivity,
             "I",
-            "I",
         )
     with pytest.raises(ValueError, match="has no assay"):
         graph_state.validate_neighbors_artifact_selection(
             store.zw,
             detached_neighbors,
             "I",
-            "I",
         )
     with pytest.raises(ValueError, match="has no assay"):
         graph_state.validate_normalized_artifact_selection(
             store.zw,
             detached_normalized,
-            "I",
             "I",
         )
 
@@ -706,7 +617,6 @@ def test_graph_selection_validators_reject_detached_and_mixed_chains() -> None:
             store.zw,
             neighbors,
             "I",
-            "I",
         )
 
     first_reduction = _complete_artifact(store, "reduction")
@@ -728,7 +638,6 @@ def test_graph_selection_validators_reject_detached_and_mixed_chains() -> None:
         graph_state.validate_neighbors_artifact_selection(
             store.zw,
             mismatched_neighbors,
-            "I",
             "I",
         )
 
@@ -767,23 +676,26 @@ def _connectivity_chain(
     )
 
 
-def test_stored_graph_resolution_rejects_invalid_artifact_chains() -> None:
+def test_native_graph_projection_rejects_invalid_artifact_chains() -> None:
     store = _bare_store()
-    with pytest.raises(ValueError, match="must be assay-scoped"):
-        graph_state.stored_assay_graph_from_ref(
+    with pytest.raises(ArtifactResolutionError) as wrong_scope:
+        resolve_native_graph_inputs(
             store.zw,
             _ref("connectivity_map", "9", scope="datastore", assay=None),
         )
-    with pytest.raises(ValueError, match="Expected a connectivity_map"):
-        graph_state.stored_assay_graph_from_ref(
+    assert wrong_scope.value.code == "wrong_scope"
+    with pytest.raises(ArtifactResolutionError) as wrong_kind:
+        resolve_native_graph_inputs(
             store.zw,
-            _ref("neighbors", "a"),
+            _ref("ann_index", "a"),
         )
+    assert wrong_kind.value.code == "unsupported_graph_kind"
 
     imported = _complete_artifact(store, "imported_coordinates")
-    invalid = _connectivity_chain(store, imported)
-    with pytest.raises(ValueError, match="reduction or batch_correction"):
-        graph_state.stored_assay_graph_from_ref(store.zw, invalid)
+    imported_graph = _connectivity_chain(store, imported)
+    with pytest.raises(ArtifactResolutionError) as imported_error:
+        resolve_native_graph_inputs(store.zw, imported_graph)
+    assert imported_error.value.code == "corrupt_payload"
 
     reduction = _complete_artifact(store, "reduction")
     other_reduction = _complete_artifact(store, "reduction")
@@ -792,8 +704,12 @@ def test_stored_graph_resolution_rejects_invalid_artifact_chains() -> None:
         reduction,
         ann_coordinates=other_reduction,
     )
-    with pytest.raises(ValueError, match="different coordinates"):
-        graph_state.stored_assay_graph_from_ref(store.zw, mismatched)
+    with pytest.raises(
+        ArtifactResolutionError,
+        match="different coordinate artifacts",
+    ) as mismatched_error:
+        resolve_native_graph_inputs(store.zw, mismatched)
+    assert mismatched_error.value.code == "corrupt_payload"
 
     normalized = _complete_artifact(store, "normalized", execution_options={})
     scaling = _complete_artifact(store, "feature_scaling")
@@ -803,56 +719,21 @@ def test_stored_graph_resolution_rejects_invalid_artifact_chains() -> None:
         normalized=normalized,
         feature_scaling=scaling,
     )
-    with pytest.raises(ValueError, match="selection keys are missing"):
-        graph_state.stored_assay_graph_from_ref(
-            store.zw,
-            missing_selection_keys,
-        )
+    with pytest.raises(
+        ArtifactResolutionError, match="cell_selection"
+    ) as missing_error:
+        resolve_native_graph_inputs(store.zw, missing_selection_keys)
+    assert missing_error.value.code == "corrupt_payload"
 
 
-def test_provenance_scalar_helpers_reject_wrong_types() -> None:
-    assert graph_state._optional_str(None) is None
-    assert graph_state._optional_bool(None) is None
-    with pytest.raises(TypeError, match="must be a string"):
-        graph_state._optional_str(1)
-    with pytest.raises(TypeError, match="must be an integer"):
-        graph_state._optional_int(True)
-    with pytest.raises(TypeError, match="must be boolean"):
-        graph_state._optional_bool("yes")
-    with pytest.raises(TypeError, match="must be a string"):
-        graph_state._required_str({"value": 1}, "value", "test")
-    with pytest.raises(TypeError, match="must be an integer"):
-        graph_state._required_int({"value": True}, "value", "test")
-    with pytest.raises(TypeError, match="must be numeric"):
-        graph_state._required_float({"value": "one"}, "value", "test")
-    with pytest.raises(TypeError, match="must be boolean"):
-        graph_state._required_bool({"value": 1}, "value", "test")
-
-
-def test_normalization_rejects_missing_and_invalid_selections() -> None:
+def test_normalization_requires_explicit_feature_selection() -> None:
     store = _bare_store()
     with pytest.raises(ValueError, match="No assay was provided"):
-        store.run_normalization(feat_key="I")
+        store.run_normalization(features="all_features")
 
     store._defaultAssay = "RNA"
-    with pytest.raises(ValueError, match="feat_key is required"):
+    with pytest.raises(TypeError, match="required keyword-only argument: 'features'"):
         store.run_normalization()
-
-    feats = SimpleNamespace(columns=[], fetch_all=Mock())
-    assay = SimpleNamespace(feats=feats)
-    store._get_assay = Mock(return_value=assay)
-    with pytest.raises(KeyError, match="Feature selection column"):
-        store.run_normalization(feat_key="I")
-
-    feats.columns = ["I"]
-    store.cells = SimpleNamespace(fetch_all=Mock(return_value=np.ones(2, dtype=int)))
-    feats.fetch_all.return_value = np.ones(2, dtype=bool)
-    with pytest.raises(TypeError, match="selections must be boolean"):
-        store.run_normalization(feat_key="I")
-
-    store.cells.fetch_all.return_value = np.zeros(2, dtype=bool)
-    with pytest.raises(ValueError, match="requires selected cells and features"):
-        store.run_normalization(feat_key="I")
 
 
 def _reduction_validation_store(
@@ -868,9 +749,7 @@ def _reduction_validation_store(
         return_value=SimpleNamespace(
             path="normalized",
             execution_options=(
-                {"cell_key": "I", "feat_key": "I"}
-                if execution_options is None
-                else execution_options
+                {"cell_key": "I"} if execution_options is None else execution_options
             ),
         )
     )
@@ -924,7 +803,7 @@ def test_reduction_stages_validate_contracts_before_compute(
         )
 
     store, normalized = _reduction_validation_store((4, 4), execution_options={})
-    with pytest.raises(ValueError, match="has no cell_key or feat_key"):
+    with pytest.raises(ValueError, match="has no cell_key"):
         _run_reduction_validation(
             store,
             normalized,
@@ -1031,9 +910,7 @@ def test_harmony_validates_artifact_and_batch_contracts(
     )
     store = _bare_store()
     store._require_complete_artifact = Mock(
-        return_value=SimpleNamespace(
-            execution_options={"cell_key": "I", "feat_key": "I"}
-        )
+        return_value=SimpleNamespace(execution_options={"cell_key": "I"})
     )
     with pytest.raises(ValueError, match="Reduction artifact has no assay"):
         store.run_harmony(
@@ -1046,9 +923,7 @@ def test_harmony_validates_artifact_and_batch_contracts(
     store._artifact_input_ref = Mock(return_value=normalized)
     store._require_complete_artifact = Mock(
         side_effect=lambda ref, *_args, **_kwargs: SimpleNamespace(
-            execution_options=(
-                {"cell_key": "I", "feat_key": "I"} if ref == normalized else {}
-            )
+            execution_options=({"cell_key": "I"} if ref == normalized else {})
         )
     )
     with pytest.raises(ValueError, match="non-empty list"):
@@ -1059,7 +934,7 @@ def test_harmony_validates_artifact_and_batch_contracts(
     store._require_complete_artifact = Mock(
         side_effect=lambda *_args, **_kwargs: SimpleNamespace(execution_options={})
     )
-    with pytest.raises(ValueError, match="has no cell_key or feat_key"):
+    with pytest.raises(ValueError, match="has no cell_key"):
         store.run_harmony(["batch"], reduction=reduction)
 
 
@@ -1129,7 +1004,9 @@ def _neighbor_query_store(
     return store, ann, coordinates
 
 
-def test_neighbor_query_and_connectivity_fail_before_expensive_work() -> None:
+def test_neighbor_query_and_connectivity_fail_before_expensive_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     store = _bare_store()
     store._require_complete_artifact = Mock(
         return_value=SimpleNamespace(inputs={}, parameters={}, path="ann")
@@ -1156,9 +1033,22 @@ def test_neighbor_query_and_connectivity_fail_before_expensive_work() -> None:
     store._plan_assay_artifact = Mock(
         return_value=SimpleNamespace(ref=result, reused=False)
     )
-    store._resolve_ann_index = Mock(return_value=None)
-    with pytest.raises(RuntimeError, match="no readable index"):
+    store._resolve_ann_index = Mock(
+        side_effect=ArtifactResolutionError(
+            "ANN artifact has no persisted Zarr index bytes",
+            code="corrupt_payload",
+            context={"artifact_id": ann.artifact_id},
+        )
+    )
+    start_write = Mock(side_effect=AssertionError("artifact write must not start"))
+    monkeypatch.setattr(
+        "scarf.datastore._operations.graph.start_artifact",
+        start_write,
+    )
+    with pytest.raises(ArtifactResolutionError) as caught:
         store.query_neighbors(ann, update_state=False)
+    assert caught.value.code == "corrupt_payload"
+    start_write.assert_not_called()
 
     detached_neighbors = _ref("neighbors", "7", scope="datastore", assay=None)
     store._require_complete_artifact = Mock(
@@ -1166,3 +1056,32 @@ def test_neighbor_query_and_connectivity_fail_before_expensive_work() -> None:
     )
     with pytest.raises(ValueError, match="Neighbors artifact has no assay"):
         store.build_connectivity_map(detached_neighbors, update_state=False)
+
+
+def test_run_umap_rejects_cell_key_that_does_not_match_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _bare_store()
+    graph = _complete_artifact(store, "connectivity_map")
+    cells = _complete_artifact(store, "cell_selection", assay=None)
+    other_cells = _complete_artifact(store, "cell_selection", assay=None)
+    monkeypatch.setattr(
+        "scarf.datastore._operations.embeddings.resolve_graph_selection",
+        lambda *_args, **_kwargs: GraphSelection(
+            graph_loc=artifact_path(graph),
+            graph_ref=graph,
+            from_assay="RNA",
+            cell_key="I",
+            integrated_label=None,
+        ),
+    )
+    monkeypatch.setattr(store, "load_graph", Mock(return_value=np.eye(2)))
+    monkeypatch.setattr(
+        store,
+        "_get_ini_embed",
+        Mock(return_value=(np.zeros((2, 2)), graph)),
+    )
+    monkeypatch.setattr(store, "_ensure_cell_selection", Mock(return_value=cells))
+    monkeypatch.setattr(store, "_graph_cell_selection", Mock(return_value=other_cells))
+    with pytest.raises(ValueError, match="cell_key does not match the graph"):
+        store.run_umap(graph, n_epochs=1)

@@ -31,6 +31,13 @@ Export paths write Matrix Market or H5AD.
 Scarf does not write Seurat `.rds` or `.h5seurat` files.
 See {doc}`../scanpy_and_seurat` for Scanpy and Seurat workflow mapping.
 
+RNA writers write both a cell-major `counts` array and a gene-major `countsT` copy.
+Every newly written assay starts with an all-true physical feature column `I`.
+Opening computes `nCells` and `dropOuts` but does not turn feature rows off; use a feature-selection producer for analysis filtering.
+That second copy is what later HVG and marker stages stream from.
+Non-RNA assays write `counts` only.
+See {doc}`../concepts/memory_and_execution` for why the two orientations exist.
+
 ## Prerequisites
 
 - Scarf installed with the optional dependencies required by the source format
@@ -93,6 +100,7 @@ The cell prints each returned path.
 Scarf stores data as dense, compressed chunks in Zarr.
 `CrH5Reader` and `CrToZarr` convert Cell Ranger HDF5 into that layout.
 Assay type is inferred from the H5 feature types (RNA, ATAC, or multimodal).
+This ATAC file needs `mem_budget="8G"` so one source row and one destination row band fit.
 
 ```{code-cell} ipython3
 # Assay type is inferred from the H5 contents (RNA, ATAC, or multimodal).
@@ -101,8 +109,9 @@ reader = scarf.CrH5Reader(f'{tenx_h5}/data.h5')
 # change value of `zarr_loc` to your choice of filename and path
 writer = scarf.CrToZarr(
     reader,
-    zarr_loc='scarf_datasets/pbmc_atac.zarr'  
-)  
+    zarr_loc='scarf_datasets/pbmc_atac.zarr',
+    mem_budget="8G",
+)
 writer.dump()
 ```
 
@@ -459,6 +468,7 @@ ds_sparse
 ## 10. Merge DataStores
 
 `DataStoreMerge` merges multiple full DataStores (all assays per dataset) into one Zarr file.
+Merged RNA assays receive both `counts` and `countsT`.
 The example below merges two tiny stores created with `SparseToZarr`.
 For single-assay merges pass `assays=["RNA"]` (or the assay name you need).
 
@@ -500,9 +510,9 @@ ds_merged.cells.head()
 Loom import remains available through `LoomReader` and `LoomToZarr` with the same dump pattern as the readers above.
 This page does not execute a Loom example.
 
-### 11.2 Dask arrays
+### 11.2 Chunked arrays
 
-`dask_to_zarr` writes from a Dask array when lazy out-of-core conversion is needed.
+`chunked_to_zarr` writes from a Scarf `ChunkedArray` when lazy out-of-core conversion is needed.
 
 ### 11.3 Remote Zarr destinations
 
@@ -529,6 +539,7 @@ writer.dump()
 - Fetching a prepared Zarr store when the aim is to demonstrate source-format conversion
 - Reusing an existing Zarr output path without confirming that it can be overwritten
 - Exporting normalized values when a downstream method requires raw counts
+- Expecting an older RNA Zarr store without `countsT` to open in the current Scarf version
 - Using `DataStoreMerge` without `assays=` when you only need one modality from multi-assay stores
 - Assuming an H5AD file uses `X` for raw counts without inspecting its layers
 - Expecting sparse or malformed `obsm` arrays to be imported as embeddings

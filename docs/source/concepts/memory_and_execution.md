@@ -32,14 +32,22 @@ Opt-in parallel UMAP, tSNE, and ANN index builds record the resolved worker coun
 
 ## Count orientations
 
-`counts` is the primary cell-major count array.
-It supports cell-wise scans used by normalization and graph construction.
-A store may also contain `countsT`, a derived feature-major orientation used by gene-wise stages such as HVG and marker calculations.
+Most analysis steps walk the matrix by cell.
+Quality control, library-size normalization, and graph construction read rows of `counts`.
+Gene-wise steps such as highly variable gene selection and marker search walk the matrix by feature.
 
-These are two orientations of the same assay matrix, not independent datastores.
-Ordinary converters write cell-major `counts` only.
-`countsT` is optional later via merge (RNA default), `repack_zarr`, or `write_counts_t`, and can reduce repeated strided reads.
-A store without `countsT` remains valid.
+Those two access patterns fight each other on a single layout.
+Scarf therefore stores RNA counts twice: `counts` is cell-major, and `countsT` is the same values in gene-major order.
+They are two orientations of one assay matrix, not two datastores.
+Import, subset, merge, and `repack_zarr` write both on Zarr v3.
+The extra copy roughly doubles stored RNA counts.
+ATAC, ADT, and other non-RNA assays keep only `counts`.
+
+Opening an RNA assay fails if `countsT` is missing, incomplete, not a Zarr v3 sharded array, or does not match `counts`.
+There is no silent rewrite on open.
+Rebuild the store from the source, or run `python -m scarf.tools.repack_zarr`.
+After a rewrite, recompute HVG, normalization, PCA, graph, and marker results.
+Do not resume those artefacts from the pre-rewrite store.
 
 ## Storage profiles
 

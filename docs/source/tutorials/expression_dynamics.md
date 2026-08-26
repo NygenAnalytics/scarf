@@ -32,12 +32,16 @@ Group features with similar pseudotime expression patterns, store module means a
 ## Dataset
 
 This page uses the Bastidas-Ponce pancreas store from {doc}`pseudotime`.
-The setup below is standalone: it downloads the store, opens a `DataStore`, and always runs pseudotime scoring.
+The setup below is standalone: it downloads the store, mounts its counts and literal metadata into a temporary writable analysis store, builds a current graph lineage, and always runs pseudotime scoring.
+The catalog snapshot is structurally repacked inside the temporary directory first so it has the current RNA count layout; mounting then starts a clean analysis state.
 
 ```{code-cell} ipython3
+from tempfile import TemporaryDirectory
+
 import pandas as pd
 
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
 
@@ -47,13 +51,33 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     zarr=True,
 )
 
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = f'{analysis_directory.name}/counts.zarr'
+repack_store(
     f'{dataset}/data.zarr',
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=f'{analysis_directory.name}/analysis.zarr',
     nthreads=4,
     default_assay='RNA',
 )
+hvg_ref = ds.mark_hvgs(
+    top_n=2000,
+    show_plot=False,
+    label='expression_hvgs',
+)
+normalized = ds.run_normalization(features=hvg_ref)
+reduction = ds.run_pca(normalized, dims=15)
+ann_index = ds.build_ann_index(reduction)
+neighbors = ds.query_neighbors(ann_index, k=11)
+graph = ds.build_connectivity_map(neighbors)
+all_features = ds.resolve_features('RNA', 'all_features')
 
 pseudotime = ds.run_pseudotime_scoring(
+    graph,
     source_sink_key='clusters',
     sources=['Ductal'],
     sinks=['Alpha', 'Beta', 'Delta'],
@@ -85,6 +109,7 @@ It then applies KNN and Paris clustering to identify features with similar expre
 
 ```{code-cell} ipython3
 modules = ds.run_pseudotime_aggregation(
+    features=all_features,
     cell_key=validity_key,
     pseudotime_key=pseudotime_key,
     cluster_label='pseudotime_clusters',
@@ -94,7 +119,7 @@ modules = ds.run_pseudotime_aggregation(
 )
 ```
 
-The returned result contains the lazy binned matrix in `modules.data`, the aligned physical feature indices, and their cluster assignments.
+The returned result contains the lazy binned matrix in `modules.data`, the aligned physical feature indices, their cluster assignments, and the exact `modules.feature_selection` reference.
 It also exposes the feature column as `modules.cluster_key`.
 
 Features with mean expression below `min_exp` or with no variation along the ordering are treated as invalid.
@@ -128,7 +153,7 @@ genes_to_label = representatives.iloc[::3].tolist()
 
 ds.plots.pseudotime_heatmap(
     cell_key=modules.cell_key,
-    feat_key=modules.feature_key,
+    features=modules.feature_selection,
     feature_cluster_key=modules.cluster_key,
     pseudotime_key=modules.pseudotime_key,
     show_features=genes_to_label,

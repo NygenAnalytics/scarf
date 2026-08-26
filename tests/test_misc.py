@@ -11,7 +11,6 @@ def test_export_knn_to_mtx(datastore, graph_artifacts, tmp_path):
     graph = datastore.load_graph(
         from_assay="RNA",
         cell_key="I",
-        feat_key="hvgs",
         symmetric=False,
         upper_only=False,
     )

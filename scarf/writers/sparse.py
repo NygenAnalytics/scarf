@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import coo_matrix, csr_matrix
 
+from ..storage.count_matrix import CountMatrixPolicy
+from ..storage.io_policy import StorageIoPolicy
 from ..storage.profiles import (
     StorageProfile,
     ZarrLocation,
@@ -24,6 +26,21 @@ class SparseToZarr:
         cell_ids: Cell IDs for the cells in the dataset.
         feature_ids: Feature IDs for the features in the dataset.
         assay_name: Name for the output assay. If not provided then automatically set to RNA.
+        workspace: Workspace name in the destination store. None uses the
+                   legacy layout without a workspace group.
+        feature_names: Optional display names aligned with ``feature_ids``.
+        matrix_dtype: Storage dtype for counts. When None, the sparse matrix
+                      dtype is used.
+        storage_options: Backend options passed when opening the Zarr store.
+        mem_budget: Memory available to the conversion. Accepts bytes, a
+                    suffixed size (e.g. '8G'), or a fraction of total system memory (e.g. '0.6').
+        nthreads: Worker count for write-time concurrency. When None, auto-detected.
+        profile: Zarr encoding profile (``fast_local`` or ``cloud``). When
+                 None, chosen from the destination location.
+        policy: Count-matrix geometry policy. When None, the default
+                unitBytes and chunkBytes plan is used.
+        io: Optional explicit read, compute, and write widths. Unset values
+            stay under automatic planning.
 
     Raises:
         ValueError: Raised if number of input cell or feature IDs does not match the matrix.
@@ -50,8 +67,8 @@ class SparseToZarr:
         mem_budget: int | str | None = None,
         nthreads: int | None = None,
         profile: StorageProfile | None = None,
-        targetChunkBytes: int | None = None,
-        targetShardBytes: int | None = None,
+        policy: CountMatrixPolicy | None = None,
+        io: StorageIoPolicy | None = None,
     ) -> None:
         from ..storage.budget import resolve_budget
         from ..storage.schema import (
@@ -64,6 +81,8 @@ class SparseToZarr:
         self.mat = csr_mat
         self.resources = resolve_budget(mem_budget, nthreads)
         self.profile = resolve_storage_profile(zarr_loc, profile)
+        self.policy = policy
+        self.io = io
         self.workspace = workspace
         self.storage_options = storage_options
         cell_ids = np.array(cell_ids)
@@ -106,8 +125,7 @@ class SparseToZarr:
             feat_names=feature_names,
             dtype=str(self.matrixDtype),
             profile=self.profile,
-            targetChunkBytes=targetChunkBytes,
-            targetShardBytes=targetShardBytes,
+            policy=policy,
         )
 
     def dump(self, batch_size: int | None = None) -> None:
@@ -179,6 +197,7 @@ class SparseToZarr:
             residentBytes=resident_bytes,
             producerReserveBytes=plan.producerReserveBytes,
             msg="Writing sparse counts",
+            io=self.io,
         )
         if e != self.nCells:
             raise AssertionError(
@@ -188,6 +207,17 @@ class SparseToZarr:
         logger.info(
             f"Wrote {self.nCells} cells and {self.nFeatures} features "
             f"to assay {self.assayName}"
+        )
+        from .counts_t import finalize_writer_counts_t
+
+        finalize_writer_counts_t(
+            self.z,
+            self.assayName,
+            self.workspace,
+            resources=self.resources,
+            profile=self.profile,
+            policy=self.policy,
+            io=self.io,
         )
 
 

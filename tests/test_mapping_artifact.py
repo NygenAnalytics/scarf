@@ -269,6 +269,12 @@ def test_load_rejects_metadata_model_and_payload_tampering(
     original_metadata = dict(group.attrs["reference_metadata"])
 
     metadata = dict(original_metadata)
+    metadata["feature_key"] = "I"
+    group.attrs["reference_metadata"] = metadata
+    with pytest.raises(ValueError, match="removed feature-key contract"):
+        load_artifact_mapping_reference(datastore, reference.ref)
+
+    metadata = dict(original_metadata)
     metadata["assay"] = "other"
     group.attrs["reference_metadata"] = metadata
     with pytest.raises(ValueError, match="metadata does not match"):
@@ -343,7 +349,6 @@ def test_write_artifact_mapping_reference_persists_required_pca_arrays() -> None
             "assay": "RNA",
             "method": "pca",
             "cell_key": "I",
-            "feature_key": "I",
             "ann_metric": "l2",
             "dataset_fingerprint": "fp",
             "selected_cell_count": 2,

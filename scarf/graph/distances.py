@@ -3,24 +3,15 @@
 from collections.abc import Mapping
 from typing import Any
 
-from ..storage.artifacts import ArtifactRef, inspect_artifact, parse_artifact_path
+from ..storage.artifacts import ArtifactRef, inspect_artifact
 
 NEIGHBOR_DISTANCE_METRICS = frozenset({"l2", "cosine"})
 
 
-def validate_distance_provenance(zw: Any, knn_loc: str) -> None:
-    """Check that the distances stored at ``knn_loc`` have a known metric.
-
-    Encoded locations carry no provenance and are read as written. Artifact
-    locations must name the metric of their stored distances and agree with the
-    index those distances were queried from.
-    """
-    try:
-        ref = parse_artifact_path(knn_loc)
-    except ValueError:
-        return
+def validate_distance_provenance(zw: Any, ref: ArtifactRef) -> None:
+    """Check that a neighbors artifact stores distances in its named metric."""
     if ref.kind != "neighbors":
-        return
+        raise ValueError("Distance provenance requires a neighbors artifact")
     status = inspect_artifact(zw, ref)
     metric = (status.parameters or {}).get("distance_metric")
     if metric not in NEIGHBOR_DISTANCE_METRICS:

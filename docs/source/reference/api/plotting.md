@@ -3,6 +3,8 @@
 `scarf.plotting` is Scarf's plotting API.
 Import it as `splt` and call functions such as `splt.embedding(...)`, `splt.dotplot(...)`, and `splt.cluster_tree(...)`.
 For functions whose first argument is a datastore, `ds.plots.embedding(...)` and related accessor methods provide the same behavior with that argument already bound.
+Store-backed graph plotters mirror their `DataStore` counterparts: `graph=None` uses the current connectivity map and an explicit `graph=` pins a branch.
+Feature-consuming plotters require `features=` as a feature-selection label or reference.
 Diagnostics remain standalone: `qc` takes a DataFrame, `elbow` and `highly_variable_features` take arrays, and `graph_qc` takes a sparse graph.
 
 Store-backed plotters and diagnostics generally return a `PlotResult` and render by default with `show=True`.

@@ -21,13 +21,19 @@ This guide checks those dependencies on the Bastidas-Ponce pancreas dataset afte
 
 ## Standalone setup
 
+The catalog snapshot is structurally repacked inside a temporary directory, mounted into a clean writable analysis target, and given a current graph lineage before the validation checks run.
+Literal annotations and UMAP coordinates are preserved, while legacy analysis state is not reused.
+
 ```{code-cell} ipython3
+from tempfile import TemporaryDirectory
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
 import scarf
 import scarf.plotting as splt
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level="WARNING", progress=True)
 
@@ -36,17 +42,37 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
     destination="scarf_datasets",
     zarr=True,
 )
-ds = scarf.DataStore(
+analysis_directory = TemporaryDirectory()
+repacked_counts = f"{analysis_directory.name}/counts.zarr"
+repack_store(
     f"{dataset}/data.zarr",
+    repacked_counts,
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    repacked_counts,
+    at=f"{analysis_directory.name}/analysis.zarr",
     nthreads=4,
     default_assay="RNA",
 )
+hvg_ref = ds.mark_hvgs(
+    top_n=2000,
+    show_plot=False,
+    label="trajectory_hvgs",
+)
+normalized = ds.run_normalization(features=hvg_ref)
+reduction = ds.run_pca(normalized, dims=15)
+ann_index = ds.build_ann_index(reduction)
+neighbors = ds.query_neighbors(ann_index, k=11)
+graph = ds.build_connectivity_map(neighbors)
+all_features = ds.resolve_features("RNA", "all_features")
 ```
 
 This section opens the prepared datastore used by {doc}`pseudotime` and fits the same multi-sink baseline so the page can run independently.
 
 ```{code-cell} ipython3
 multi_sink = ds.run_pseudotime_scoring(
+    graph,
     source_sink_key="clusters",
     sources=["Ductal"],
     sinks=["Alpha", "Beta", "Delta"],
@@ -74,6 +100,7 @@ Compare the multi-sink baseline with a narrower ductal-to-Beta question.
 
 ```{code-cell} ipython3
 beta_sink = ds.run_pseudotime_scoring(
+    graph,
     source_sink_key="clusters",
     sources=["Ductal"],
     sinks=["Beta"],
@@ -257,6 +284,7 @@ Benjamini-Hochberg correction is applied only across the tested features in this
 
 ```{code-cell} ipython3
 markers = ds.run_pseudotime_marker_search(
+    features=all_features,
     cell_key=multi_sink.validity_key,
     pseudotime_key=multi_sink.pseudotime_key,
 )
@@ -292,6 +320,7 @@ module_results = {}
 module_rows = []
 for name, n_clusters in {"coarse": 6, "fine": 12}.items():
     result = ds.run_pseudotime_aggregation(
+        features=all_features,
         cell_key=multi_sink.validity_key,
         pseudotime_key=multi_sink.pseudotime_key,
         cluster_label=f"trajectory_modules_{name}",
@@ -353,7 +382,7 @@ for name, modules in module_results.items():
     print(f"{name} modules ({modules.cluster_key})")
     ds.plots.pseudotime_heatmap(
         cell_key=modules.cell_key,
-        feat_key=modules.feature_key,
+        features=modules.feature_selection,
         feature_cluster_key=modules.cluster_key,
         pseudotime_key=modules.pseudotime_key,
         show_features=labels,
@@ -372,9 +401,18 @@ modules = fine_modules
 assigned = module_features[
     module_features[modules.cluster_key] != -1
 ]
-ds.run_marker_search(group_key="clusters")
+cluster_marker_ref = ds.run_marker_search(
+    group_key="clusters",
+    cell_key="I",
+    features=all_features,
+)
 beta_markers = set(
-    ds.get_markers(group_key="clusters", group_id="Beta").feature_name
+    ds.get_markers(
+        marker=cluster_marker_ref,
+        cell_key="I",
+        group_key="clusters",
+        group_id="Beta",
+    ).feature_name
 )
 module_overlap = (
     assigned.groupby(modules.cluster_key)["names"]
@@ -392,6 +430,7 @@ Cells in a terminal boundary should have probability one for their own fate.
 
 ```{code-cell} ipython3
 fate = ds.run_fate_mapping(
+    graph,
     cell_key="I",
     subset_cell_key=multi_sink.validity_key,
     pseudotime_key=multi_sink.pseudotime_key,

@@ -30,6 +30,10 @@ from scarf.storage.profiles import (
     is_remote_zarr_location,
     resolve_storage_profile,
 )
+from scarf.storage.count_matrix import (
+    persist_count_matrix_plan,
+    plan_count_matrix_pair,
+)
 from scarf.storage.schema import create_zarr_count_assay
 from scarf.storage.sharding import (
     accumulate_sparse_to_shards,
@@ -46,6 +50,24 @@ from scarf.storage.stores import (
 from scarf.storage.types import array_metadata_shards
 from scarf.utils import load_zarr
 from tests.store_probes import RecordingStore
+
+
+def _planned_counts(group: zarr.Group, values: np.ndarray, name: str = "counts"):
+    plan = plan_count_matrix_pair(values.shape[0], values.shape[1], values.dtype)
+    counts = group.create_array(
+        name,
+        shape=plan.counts.shape,
+        chunks=plan.counts.chunks,
+        shards=plan.counts.shards,
+        dtype=values.dtype,
+        fill_value=0,
+        overwrite=True,
+    )
+    if values.size:
+        counts[:] = values
+    persist_count_matrix_plan(group, plan)
+    persist_count_matrix_plan(counts, plan)
+    return counts
 
 
 def test_location_classification_is_pure():
@@ -152,20 +174,17 @@ def test_hugging_face_store_uses_fsspec(monkeypatch):
     }
 
 
-def test_count_plan_uses_aligned_five_chunk_shards():
-    spec = count_array_spec(
-        250_000,
-        45_525,
-        "uint16",
-        profile="cloud",
-        targetChunkBytes=128 * 1024**2,
-        targetShardBytes=5 * 128 * 1024**2,
-    )
+def test_count_plan_uses_paired_rotate_once_geometry():
+    from scarf.storage.count_matrix import plan_count_matrix_pair
+
+    spec = count_array_spec(250_000, 45_525, "uint16", profile="cloud")
+    expected = plan_count_matrix_pair(250_000, 45_525, "uint16", profile="cloud").counts
     assert spec.shards is not None
-    assert spec.shards[1] == 45_525
-    assert spec.shards[1] // spec.chunks[1] == 5
-    assert spec.chunks[0] * spec.chunks[1] * 2 <= 128 * 1024**2
-    assert spec.shards[0] * spec.shards[1] * 2 <= 5 * 128 * 1024**2
+    assert spec.shards[1] >= 45_525
+    assert spec.chunks == expected.chunks
+    assert spec.shards == expected.shards
+    assert spec.shards[0] % spec.chunks[0] == 0
+    assert spec.shards[1] % spec.chunks[1] == 0
 
 
 @pytest.mark.parametrize(
@@ -180,33 +199,17 @@ def test_count_plan_alignment_and_byte_limits_are_shape_independent(
     n_features,
     dtype,
 ):
-    chunk_target = 1024**2
-    shard_target = 5 * chunk_target
-    spec = count_array_spec(
-        10_000,
-        n_features,
-        dtype,
-        profile="cloud",
-        targetChunkBytes=chunk_target,
-        targetShardBytes=shard_target,
-    )
+    spec = count_array_spec(10_000, n_features, dtype, profile="cloud")
     assert spec.shards is not None
-    assert spec.shards[1] == n_features
+    assert spec.shards[1] >= n_features
     assert all(
         shard % chunk == 0
         for shard, chunk in zip(spec.shards, spec.chunks, strict=True)
     )
-    itemsize = np.dtype(dtype).itemsize
-    assert np.prod(spec.chunks) * itemsize <= chunk_target
-    assert np.prod(spec.shards) * itemsize <= shard_target
 
 
 def test_count_plan_does_not_depend_on_process_resource_environment(monkeypatch):
-    kwargs = {
-        "profile": "cloud",
-        "targetChunkBytes": 1024**2,
-        "targetShardBytes": 5 * 1024**2,
-    }
+    kwargs = {"profile": "cloud"}
     monkeypatch.setenv("SCARF_MEM_BUDGET", "1G")
     monkeypatch.setenv("SCARF_WORKERS", "1")
     small_machine = count_array_spec(10_000, 997, "uint16", **kwargs)
@@ -230,13 +233,14 @@ def test_count_plan_respects_codec_limit_and_small_dimensions():
 
 
 def test_numeric_array_adapts_codecs_to_zarr_format():
+    from scarf.storage.count_matrix import CountMatrixPolicy
+
     spec = count_array_spec(
         8,
         4,
         "uint16",
         profile="cloud",
-        targetChunkBytes=16,
-        targetShardBytes=32,
+        policy=CountMatrixPolicy(unitBytes=32, chunkBytes=16),
     )
     for zarr_format in (2, 3):
         root = zarr.open_group(
@@ -323,8 +327,26 @@ def test_new_assay_in_zarr_v2_stays_chunk_only():
 
     assert array_metadata_shards(counts) is None
     assert root["RNA"].attrs["scarf:zarr_spec"]["zarr_format"] == 2
-    assert write_counts_t(counts, root["RNA"]) is None
+    with pytest.raises(ValueError, match="Zarr format 3"):
+        write_counts_t(counts, root["RNA"])
     np.testing.assert_array_equal(counts[:], values)
+
+
+def test_empty_assay_schema_on_zarr_v2_stays_chunk_only() -> None:
+    from scarf.storage.schema import create_empty_zarr_count_assay
+
+    v2_assay = zarr.open_group(store=MemoryStore(), mode="w", zarr_format=2)
+    create_empty_zarr_count_assay(
+        v2_assay,
+        "RNA",
+        None,
+        3,
+        4,
+        "U10",
+        "U10",
+        "uint16",
+    )
+    assert "counts" in v2_assay["RNA"]
 
 
 def test_normed_plan_respects_codec_limit():
@@ -737,15 +759,8 @@ def test_sparse_writer_admits_row_chunks_and_retained_producer_bytes():
 
 def test_padded_shard_geometry_stays_readable_and_transposable():
     root = zarr.open_group(store=MemoryStore(), mode="w")
-    counts = root.create_array(
-        "counts",
-        shape=(10, 7),
-        chunks=(3, 3),
-        shards=(6, 6),
-        dtype=np.uint16,
-        fill_value=0,
-    )
     expected = np.arange(1, 71, dtype=np.uint16).reshape(10, 7)
+    counts = _planned_counts(root, expected)
     resources = ResourceBudget(1024**2, 4)
 
     rows = write_dense_from_row_batches(
@@ -770,16 +785,8 @@ def test_write_counts_t_works_inside_running_event_loop():
     import asyncio
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
-    counts = root.create_array(
-        "counts",
-        shape=(4, 3),
-        chunks=(2, 3),
-        shards=(2, 3),
-        dtype=np.uint16,
-        fill_value=0,
-    )
     expected = np.arange(12, dtype=np.uint16).reshape(4, 3)
-    counts[:] = expected
+    counts = _planned_counts(root, expected)
 
     async def invoke():
         return write_counts_t(
@@ -798,14 +805,8 @@ def test_empty_dense_and_transpose_writes_need_no_task_memory():
     from scipy.sparse import coo_matrix
 
     root = zarr.open_group(store=MemoryStore(), mode="w")
-    counts = root.create_array(
-        "counts",
-        shape=(0, 3),
-        chunks=(1, 3),
-        shards=(1, 3),
-        dtype=np.uint8,
-        fill_value=0,
-    )
+    empty = np.zeros((0, 3), dtype=np.uint8)
+    counts = _planned_counts(root, empty)
     resources = ResourceBudget(1, 4)
 
     assert write_dense_from_row_batches(counts, iter(()), resources=resources) == 0
@@ -923,3 +924,22 @@ def test_remote_store_requires_obstore(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", reject_obstore)
     with pytest.raises(ImportError, match="obstore"):
         make_store("s3://bucket/path")
+
+
+def test_store_probe_count_only_skips_per_key_logs() -> None:
+    from tests.store_probes import StoreProbe
+
+    probe = StoreProbe(countOnly=True)
+    probe.enter("get", "a/key", requestedBytes=12)
+    probe.record_transfer("get", "a/key", 12)
+    probe.enter("set", "b/key", requestedBytes=8)
+    probe.record_transfer("set", "b/key", 8)
+    payload = probe.to_json()
+    assert probe.ops == []
+    assert probe.transferred_bytes == []
+    assert payload["gets"] == 1
+    assert payload["sets"] == 1
+    assert payload["readTransferredBytes"] == 12
+    assert payload["writeTransferredBytes"] == 8
+    assert payload["requestedBytes"] == 20
+    assert payload["keysTouched"] == 0

@@ -3,6 +3,7 @@
 import argparse
 import gzip
 import hashlib
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -22,9 +23,6 @@ _REPOSITORY = "scarf_tests"
 _CYTEBASE_FIXTURES = {
     "1K_pbmc_citeseq.h5": (
         "e3dd57c5a8c3426dc5a7dc012a78608554facbddf4c6d1d62671089d197b1053"
-    ),
-    "1K_pbmc_citeseq.zarr.tar.gz": (
-        "53166c8a12f4c621d8d2d10883ae40054a8dd9856bcbf8c62149f9d736106ac6"
     ),
     "500_pbmc_atac.zarr.tar.gz": (
         "f54c79229e674ea2956c048a931aadb4a9d54e75778df17b4bd84608c0e06493"
@@ -145,10 +143,69 @@ def _download_cytebase_fixtures(target: Path, *, force: bool) -> None:
         _verify_digest(dest, expected)
 
 
+def _citeseq_zarr_ready(archive: Path) -> bool:
+    """Return True when the archive opens as current RNA count-matrix layout."""
+    if not archive.is_file():
+        return False
+    import zarr
+
+    from scarf.storage.counts_t_contract import inspect_counts_t
+
+    with tempfile.TemporaryDirectory(prefix="scarf_citeseq_zarr_check_") as tmp:
+        with tarfile.open(archive, "r:gz") as tar:
+            tar.extractall(tmp, filter="data")
+        root = zarr.open_group(tmp, mode="r")
+        if "RNA" not in root or "assay2" not in root:
+            return False
+        return inspect_counts_t(root, "RNA").status == "ready"
+
+
+def build_citeseq_zarr_fixture(*, force: bool = False) -> None:
+    """Write ``1K_pbmc_citeseq.zarr.tar.gz`` from the Cell Ranger H5.
+
+    Tests expect the Antibody Capture assay to be named ``assay2``. The
+    published Cytebase archive is not rebuilt here because its persisted
+    layout no longer replays against the current planner.
+    """
+    archive = datasets_dir() / "1K_pbmc_citeseq.zarr.tar.gz"
+    if not force and _citeseq_zarr_ready(archive):
+        return
+
+    h5_path = datasets_dir() / "1K_pbmc_citeseq.h5"
+    if not h5_path.is_file():
+        raise RuntimeError(
+            "Cannot build 1K_pbmc_citeseq.zarr.tar.gz without "
+            f"{h5_path.name}; download core fixtures first."
+        )
+
+    from scarf.readers import CrH5Reader
+    from scarf.writers import CrToZarr
+
+    with tempfile.TemporaryDirectory(prefix="scarf_citeseq_zarr_build_") as tmp:
+        store = Path(tmp) / "store.zarr"
+        reader = CrH5Reader(str(h5_path))
+        if "ADT" in reader.assayFeats.columns:
+            reader.rename_assays({"ADT": "assay2"})
+        CrToZarr(reader, zarr_loc=str(store), nthreads=2).dump()
+        staging = Path(tmp) / "archive.tar.gz"
+        with tarfile.open(staging, "w:gz") as tar:
+            for item in sorted(store.iterdir(), key=lambda path: path.name):
+                tar.add(item, arcname=item.name)
+        if not _citeseq_zarr_ready(staging):
+            raise RuntimeError(
+                "Built 1K_pbmc_citeseq.zarr.tar.gz is not a current RNA store"
+            )
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        # Path.replace is rename(2) and fails when /tmp and the workspace
+        # are different filesystems (GitHub Actions: Errno 18).
+        shutil.move(staging, archive)
+
+
 def download_fixtures(*, force: bool = False) -> None:
     target = datasets_dir()
     target.mkdir(parents=True, exist_ok=True)
     _download_cytebase_fixtures(target, force=force)
+    build_citeseq_zarr_fixture(force=force)
 
 
 def build_mtx_dir_fixture() -> None:
@@ -265,7 +322,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Re-download fixtures even when files already exist.",
+        help=(
+            "Re-download Cytebase fixtures and rebuild "
+            "1K_pbmc_citeseq.zarr.tar.gz even when files already exist."
+        ),
     )
     parser.add_argument(
         "--with-h5ad",

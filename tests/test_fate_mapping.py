@@ -4,8 +4,13 @@ from typing import Any
 import numpy as np
 import pytest
 from scipy.sparse import csr_matrix, diags
+from zarr.storage import MemoryStore
+import zarr
 
 from scarf.datastore.graph_datastore import GraphDataStore
+from scarf.graph.state import GraphSelection
+from scarf.storage.artifacts import ArtifactRef, artifact_path
+from scarf.storage.selections import resolve_selection_artifact
 from scarf.trajectory.fate import (
     _make_transition,
     _normalize_pseudotime,
@@ -571,13 +576,23 @@ def test_localized_solver_error_fails_residual_validation(
 
 
 class _FateCells:
-    def __init__(self, pseudotime: np.ndarray, labels: np.ndarray):
+    def __init__(
+        self,
+        pseudotime: np.ndarray,
+        labels: np.ndarray,
+        root: zarr.Group,
+    ):
         self.values: dict[str, np.ndarray] = {
             "I": np.ones(pseudotime.shape[0], dtype=bool),
+            "ids": np.asarray([f"cell_{index}" for index in range(len(labels))]),
             "ptime": pseudotime,
             "state": labels,
         }
         self.insertions: list[str] = []
+        self.root = root
+        cell_data = root.create_group("cellData")
+        for name, values in self.values.items():
+            cell_data.create_array(name, data=values)
 
     @property
     def columns(self) -> list[str]:
@@ -609,35 +624,94 @@ class _FateCells:
         filled[selected] = values
         self.values[column_name] = filled
         self.insertions.append(column_name)
+        cell_data = self.root["cellData"]
+        if column_name in cell_data:
+            del cell_data[column_name]
+        cell_data.create_array(column_name, data=filled)
 
 
 class _FateStore:
     def __init__(self):
+        self.zw = zarr.open_group(store=MemoryStore(), mode="w")
         self.graph, pseudotime, labels = _y_graph()
-        self.cells = _FateCells(pseudotime, labels)
+        self.cells = _FateCells(pseudotime, labels, self.zw)
         self.assay = SimpleNamespace(name="RNA", cells=self.cells)
         self.graph_loads = 0
-
-    @staticmethod
-    def _get_latest_keys(
-        _from_assay: str | None,
-        _cell_key: str | None,
-        _feat_key: str | None,
-    ) -> tuple[str, str, str]:
-        return "RNA", "I", "I"
+        self.graph_ref = ArtifactRef(
+            scope="assay",
+            assay="RNA",
+            kind="connectivity_map",
+            artifact_id="f" * 64,
+        )
 
     def _get_assay(self, _from_assay: str) -> SimpleNamespace:
         return self.assay
 
-    def load_graph(self, **_kwargs: Any) -> csr_matrix:
+    def load_graph(
+        self,
+        _graph: ArtifactRef | None = None,
+        **_kwargs: Any,
+    ) -> csr_matrix:
         self.graph_loads += 1
         return self.graph.copy()
+
+    def _ensure_cell_selection(self, column: str) -> ArtifactRef:
+        return resolve_selection_artifact(
+            self.zw,
+            scope="datastore",
+            kind="cell_selection",
+            values=self.cells.fetch_all(column),
+            row_ids=self.cells.fetch_all("ids"),
+            operation="manual_selection",
+            parameters={},
+            inputs={},
+            source_column=column,
+        )
+
+    def _graph_cell_selection(self, _graph: ArtifactRef) -> ArtifactRef:
+        return self._ensure_cell_selection("I")
+
+    @staticmethod
+    def _selection_artifacts_match(
+        first: ArtifactRef,
+        second: ArtifactRef,
+    ) -> bool:
+        return first == second
+
+    @staticmethod
+    def _resolve_cell_data_provenance_input(
+        column: str,
+        *,
+        cell_key: str,
+    ) -> dict[str, str]:
+        return {"column": column, "cell_key": cell_key}
 
     @staticmethod
     def _col_renamer(from_assay: str, cell_key: str, suffix: str) -> str:
         if cell_key == "I":
             return f"{from_assay}_{suffix}"
         return f"{from_assay}_{cell_key}_{suffix}"
+
+
+@pytest.fixture(autouse=True)
+def _resolve_fate_graph(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scarf.datastore._operations import trajectory as trajectory_operations
+
+    def resolve(store, graph, *, from_assay, cell_key):
+        ref = graph or store.graph_ref
+        return GraphSelection(
+            graph_loc=artifact_path(ref),
+            graph_ref=ref,
+            from_assay=from_assay or "RNA",
+            cell_key=cell_key or "I",
+            integrated_label=None,
+        )
+
+    monkeypatch.setattr(
+        trajectory_operations,
+        "resolve_graph_selection",
+        resolve,
+    )
 
 
 def test_datastore_method_writes_aligned_fate_and_validity_columns():
@@ -654,6 +728,7 @@ def test_datastore_method_writes_aligned_fate_and_validity_columns():
     assert result.fate_keys == ("RNA_fate_A", "RNA_fate_B")
     assert result.validity_key == "RNA_fate__valid"
     assert result.sink_labels == ("A", "B")
+    assert result.graph == store.graph_ref
     assert store.cells.insertions == [
         "RNA_fate_A",
         "RNA_fate_B",

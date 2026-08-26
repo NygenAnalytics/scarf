@@ -30,10 +30,14 @@ Use the result to create a smaller Zarr store for workflows that do not need eve
 ## Dataset
 
 ```{code-cell} ipython3
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
 import matplotlib.pyplot as plt
 import pandas as pd
 
 import scarf
+from scarf.tools.repack_zarr import repack_store
 
 scarf.configure_output(level='WARNING', progress=True)
 ```
@@ -42,7 +46,9 @@ scarf.configure_output(level='WARNING', progress=True)
 
 TopACeDo samples from a KNN graph and needs Paris cluster labels to balance across partitions, plus the Paris dendrogram for that graph.
 Arbitrary cluster partitions or Leiden-only labels are not enough.
-The published PBMC store already has the Paris cut and dendrogram, so nothing has to be recomputed here.
+The published PBMC store supplies counts and a literal UMAP layout.
+It is structurally repacked into a temporary source with the current RNA count layout, then mounted into a fresh analysis store.
+The current graph and Paris artifacts are built there, leaving the published source untouched.
 {doc}`scrna_seq` shows how the {term}`analysis chain` is built, and {doc}`clustering` covers the Paris cut.
 
 ```{code-cell} ipython3
@@ -54,11 +60,37 @@ dataset = scarf.cytebase.connect("scarf_docs").download_dataset(
 ```
 
 ```{code-cell} ipython3
-ds = scarf.DataStore(f'{dataset}/data.zarr')
+analysis_directory = TemporaryDirectory()
+repacked_counts_path = Path(analysis_directory.name) / 'counts.zarr'
+analysis_path = Path(analysis_directory.name) / 'downsampling.zarr'
+repack_store(
+    f'{dataset}/data.zarr',
+    str(repacked_counts_path),
+    nthreads=2,
+)
+ds = scarf.mount_datastore(
+    str(repacked_counts_path),
+    at=str(analysis_path),
+    default_assay='RNA',
+    nthreads=4,
+)
+
+hvg_ref = ds.mark_hvgs(min_cells=20, top_n=500, show_plot=False)
+normalized = ds.run_normalization(features=hvg_ref)
+pca = ds.run_pca(normalized, dims=15)
+ds.build_embedding_initialization(pca)
+ann = ds.build_ann_index(pca)
+neighbors = ds.query_neighbors(ann, k=11)
+graph = ds.build_connectivity_map(neighbors)
+paris = ds.run_paris_clustering(
+    graph=graph,
+    label='downsampling_paris',
+)
+paris_key = paris.label_key
 
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_paris_cluster',
+    color_by=paris_key,
 )
 ```
 
@@ -71,7 +103,8 @@ TopACeDo selects a topology-preserving subset from Scarf's KNN graph while keepi
 
 ```{code-cell} ipython3
 ds.run_topacedo_sampler(
-    cluster_key='RNA_paris_cluster',
+    graph=graph,
+    cluster_key=paris_key,
     max_sampling_rate=0.1
 )
 if 'RNA_sketched' not in ds.cells.columns:
@@ -92,11 +125,11 @@ Per-cluster counts show that sampling stays balanced rather than draining one pa
 
 ```{code-cell} ipython3
 sampling = ds.cells.to_pandas_dataframe(
-    columns=['RNA_paris_cluster', 'RNA_sketched', 'RNA_sketch_seeds'],
+    columns=[paris_key, 'RNA_sketched', 'RNA_sketch_seeds'],
     key='I',
 )
-cluster_sampling = sampling.groupby('RNA_paris_cluster', sort=True).agg(
-    cells=('RNA_paris_cluster', 'size'),
+cluster_sampling = sampling.groupby(paris_key, sort=True).agg(
+    cells=(paris_key, 'size'),
     seeds=('RNA_sketch_seeds', 'sum'),
     selected=('RNA_sketched', 'sum'),
 )
@@ -113,7 +146,7 @@ The right panel should still cover the main clusters:
 figure, axes = plt.subplots(1, 2, figsize=(10, 4))
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_paris_cluster',
+    color_by=paris_key,
     legend_loc='on_data',
     show_titles=False,
     target=axes[0],
@@ -122,7 +155,7 @@ ds.plots.embedding(
 axes[0].set_title('Full')
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_paris_cluster',
+    color_by=paris_key,
     subset_by='RNA_sketched',
     legend_loc='on_data',
     show_titles=False,
@@ -139,7 +172,7 @@ Seed cells are a smaller set used to initialize the sampler:
 ```{code-cell} ipython3
 ds.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_paris_cluster',
+    color_by=paris_key,
     subset_by='RNA_sketch_seeds',
 )
 ```
@@ -205,9 +238,9 @@ It does not create a smaller counts store.
 Use it for a manually annotated population, a QC selection, or the `RNA_sketched` selection below.
 
 ```{code-cell} ipython3
-subset_path = f'{dataset}/subset.zarr'
+subset_path = Path(analysis_directory.name) / 'subset.zarr'
 writer = scarf.SubsetZarr(
-    zarr_loc=subset_path,
+    zarr_loc=str(subset_path),
     assays=[ds.RNA],
     cell_key='RNA_sketched',
     reset_cell_filter=False,
@@ -223,7 +256,7 @@ Use `to_anndata(feature_names=...)` when both axes need to be reduced before dis
 Open the downsampled store as a new `DataStore`:
 
 ```{code-cell} ipython3
-ds2 = scarf.DataStore(subset_path)
+ds2 = scarf.DataStore(str(subset_path))
 {
     "source cells": ds.cells.N,
     "subset cells": ds2.cells.N,
@@ -237,7 +270,7 @@ Cell metadata, including UMAP coordinates and cluster labels, is copied into the
 ```{code-cell} ipython3
 ds2.plots.embedding(
     layout_key='RNA_UMAP',
-    color_by='RNA_paris_cluster',
+    color_by=paris_key,
 )
 ```
 
