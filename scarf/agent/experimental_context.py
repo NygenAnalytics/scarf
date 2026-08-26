@@ -1071,13 +1071,13 @@ class ExperimentalContextAgent:
         user_prompt = (
             dedent(
                 """
-            Characterize this experiment's metadata and decide whether Harmony
-            should be evaluated.
+                Characterize this experiment's metadata and decide whether Harmony
+                should be evaluated.
 
-            Study context: {study_context}
-            Active cell selection: {cell_key}
-            Caller directions: {directions}
-            """
+                Study context: {study_context}
+                Active cell selection: {cell_key}
+                Caller directions: {directions}
+                """
             )
             .strip()
             .format(

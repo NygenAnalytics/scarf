@@ -29,6 +29,7 @@ from .experimental_context import (
 from .ingest import IngestResult, detect_format, ingest
 from .parameter_tuning import (
     ParameterCandidate,
+    ParameterSearchPlan,
     ParameterTuningAgent,
     ParameterTuningReport,
     get_default_parameter_candidates,
@@ -68,6 +69,7 @@ __all__ = [
     "IngestResult",
     "NeedsInput",
     "ParameterCandidate",
+    "ParameterSearchPlan",
     "ParameterTuningAgent",
     "ParameterTuningReport",
     "StageResult",

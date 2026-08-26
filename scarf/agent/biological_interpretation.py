@@ -1,16 +1,16 @@
 """Grounded biological interpretation of Scarf cluster results."""
 
+import math
 from collections import Counter, defaultdict
 from collections.abc import Mapping
-import math
 from textwrap import dedent
 from typing import Any, Literal
 
 import numpy as np
 from pydantic import Field
 
+from .config import CONFIG, AgentRunConfig
 from .config.agent_exec import run_agent_sync
-from .config import AgentRunConfig, CONFIG
 from .tools import artifact_reference, core_artifact_reference
 from .types import (
     AgentDataModel,
@@ -361,7 +361,8 @@ class BiologicalInterpretationDependencies(AgentDataModel):
         )
 
 
-_SYSTEM_PROMPT = dedent("""
+_SYSTEM_PROMPT = dedent(
+    """
         You are Scarf's Biological Interpretation Agent. Use only the supplied
         tools and caller context. First inspect cluster composition, then inspect
         markers for every cluster you interpret. Tool calls execute Scarf
@@ -379,7 +380,8 @@ _SYSTEM_PROMPT = dedent("""
         artifact is missing. Do not write exploratory code, use a shell, access
         files, or call arbitrary Scarf methods. Return only fields defined by the
         structured output schema.
-    """).strip()
+    """
+).strip()
 
 
 def _string_value(value: Any) -> str:
@@ -1052,22 +1054,22 @@ class BiologicalInterpretationAgent:
         user_prompt = (
             dedent(
                 """
-            Review the cluster results named {cluster_column} for cell selection
-            {cell_key}. The exact cluster artifact is {cluster_artifact}. The exact
-            marker artifact is {marker_state}; creating a marker artifact is
-            authorized={allow_marker_search}. Review no more
-            than {max_clusters} clusters and return no more than {max_markers}
-            markers per tool call.
+                Review the cluster results named {cluster_column} for cell selection
+                {cell_key}. The exact cluster artifact is {cluster_artifact}. The exact
+                marker artifact is {marker_state}; creating a marker artifact is
+                authorized={allow_marker_search}. Review no more
+                than {max_clusters} clusters and return no more than {max_markers}
+                markers per tool call.
 
-            Caller biological context:
-            {biological_context}
+                Caller biological context:
+                {biological_context}
 
-            Experimental design context:
-            {experimental_context}
+                Experimental design context:
+                {experimental_context}
 
-            Begin by calling inspect_cluster_composition. If markers cannot be
-            inspected, return needsInput and state the exact missing input.
-            """
+                Begin by calling inspect_cluster_composition. If markers cannot be
+                inspected, return needsInput and state the exact missing input.
+                """
             )
             .strip()
             .format(

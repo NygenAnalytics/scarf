@@ -11,7 +11,6 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelResponse,
     ToolCallPart,
-    ToolReturnPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -21,19 +20,25 @@ from scarf.agent.parameter_tuning import (
     ParameterCandidate,
     ParameterCandidateEvaluation,
     ParameterMetrics,
+    ParameterSearchPlan,
     ParameterTuningAgent,
     ParameterTuningDependencies,
     ParameterTuningNeedsInput,
     ParameterTuningReport,
+    build_initial_parameter_candidates,
     evaluate_parameter_candidate,
+    execute_parameter_candidate,
     get_default_parameter_candidates,
+    parameter_search_prompt,
+    parameter_search_system_prompt,
     parameter_tuning_prompt,
     parameter_tuning_system_prompt,
     tune_parameters,
+    validate_parameter_search_plan,
     validate_parameter_tuning_report,
 )
-from scarf.agent.types import AgentDataModel
 from scarf.agent.types import (
+    AgentDataModel,
     BatchSafetyEvidence,
     ExperimentalTuningHandoff,
 )
@@ -173,6 +178,7 @@ def _evaluate(
         ParameterCandidate,
         ParameterMetrics,
         ParameterCandidateEvaluation,
+        ParameterSearchPlan,
         ParameterTuningNeedsInput,
         ParameterTuningReport,
         ParameterTuningDependencies,
@@ -209,24 +215,57 @@ def test_default_candidates_are_explicit_unique_one_factor_variants() -> None:
     )
 
 
+def test_harmony_pairing_covers_every_initial_candidate() -> None:
+    seeds = get_default_parameter_candidates()
+
+    candidates = build_initial_parameter_candidates(seeds, pair_harmony=True)
+
+    assert len(candidates) == 10
+    for index, seed in enumerate(seeds):
+        uncorrected, corrected = candidates[index * 2 : index * 2 + 2]
+        assert uncorrected == seed
+        assert corrected.candidateId == f"{seed.candidateId}_harmony"
+        assert corrected.useHarmony is True
+        assert corrected.model_dump(exclude={"candidateId", "useHarmony"}) == (
+            seed.model_dump(exclude={"candidateId", "useHarmony"})
+        )
+
+
 def test_prompts_include_only_explicit_candidate_context() -> None:
-    candidates = [ParameterCandidate.get_example()]
+    evaluation = ParameterCandidateEvaluation.get_example()
+    plan = ParameterSearchPlan(status="complete")
+    planning_system_prompt = parameter_search_system_prompt()
+    planning_prompt = parameter_search_prompt(
+        from_assay="RNA",
+        cell_key="I",
+        evaluations=[evaluation],
+        batch_columns=["batch"],
+        preservation_columns=["cell_type"],
+        harmony_authorized=True,
+        max_refined_candidates=3,
+    )
     system_prompt = parameter_tuning_system_prompt(20)
     user_prompt = parameter_tuning_prompt(
         from_assay="RNA",
         cell_key="I",
-        candidates=candidates,
+        evaluations=[evaluation],
         batch_columns=["batch"],
         preservation_columns=["cell_type"],
-        max_candidates=3,
+        search_plan=plan,
     )
 
-    assert system_prompt.startswith("You are Scarf's parameter tuning agent.")
+    assert planning_system_prompt.startswith(
+        "You are planning one bounded refinement pass"
+    )
+    assert '"candidateId": "baseline"' in planning_prompt
+    assert '"harmony"' in planning_prompt
+    assert "Maximum refined candidates: 3" in planning_prompt
+    assert system_prompt.startswith("You are Scarf's parameter tuning selection agent.")
     assert "20 cells" in system_prompt
     assert '"candidateId": "baseline"' in user_prompt
-    assert "evaluate_parameter_candidate" in system_prompt
+    assert "Do not request tools" in system_prompt
     assert "one comparison for every non-selected successful candidate" in system_prompt
-    assert "Maximum distinct candidate executions: 3" in user_prompt
+    assert "Validated refinement plan" in user_prompt
 
 
 def test_unknown_candidate_is_rejected_without_store_calls() -> None:
@@ -315,6 +354,128 @@ def test_candidate_budget_prevents_another_execution() -> None:
     assert result.status == "failed"
     assert "limit 1 reached" in (result.error or "")
     assert len(store.calls) == call_count
+
+
+def test_refinement_plan_is_bounded_by_initial_evidence_and_envelope() -> None:
+    store = _FakeStore()
+    candidates = [
+        ParameterCandidate.get_example(),
+        ParameterCandidate(candidateId="pca_15", dimensions=15),
+    ]
+    deps = _dependencies(store, candidates=candidates, max_candidates=3)
+    baseline = execute_parameter_candidate(deps, "baseline")
+    pca_15 = execute_parameter_candidate(deps, "pca_15")
+    plan = ParameterSearchPlan(
+        status="refine",
+        candidates=[ParameterCandidate(candidateId="refined_pca_18", dimensions=18)],
+        basedOnCandidateIds=["baseline", "pca_15"],
+        objectives=["Resolve the dimension tradeoff."],
+        rationale="The initial candidates bracket a narrower dimension choice.",
+        evidenceIds=[baseline.evidenceIds[0], pca_15.evidenceIds[0]],
+        stoppingCriteria=["Execute the proposed candidate once."],
+    )
+
+    validated = validate_parameter_search_plan(
+        plan,
+        deps,
+        initial_candidate_ids=["baseline", "pca_15"],
+        max_refined_candidates=2,
+    )
+
+    assert validated == plan
+    plan.candidates[0].dimensions = 30
+    with pytest.raises(ValueError, match="initial search envelope"):
+        validate_parameter_search_plan(
+            plan,
+            deps,
+            initial_candidate_ids=["baseline", "pca_15"],
+            max_refined_candidates=2,
+        )
+
+
+def test_refinement_plan_requires_authorized_matched_harmony_evidence() -> None:
+    store = _FakeStore()
+    candidates = [
+        ParameterCandidate.get_example(),
+        ParameterCandidate(candidateId="pca_15", dimensions=15),
+    ]
+    deps = _dependencies(store, candidates=candidates, max_candidates=3)
+    baseline = execute_parameter_candidate(deps, "baseline")
+    pca_15 = execute_parameter_candidate(deps, "pca_15")
+    plan = ParameterSearchPlan(
+        status="refine",
+        candidates=[
+            ParameterCandidate(
+                candidateId="refined_pca_18_harmony",
+                dimensions=18,
+                useHarmony=True,
+            )
+        ],
+        basedOnCandidateIds=["baseline", "pca_15"],
+        objectives=["Resolve the dimension tradeoff."],
+        rationale="The initial candidates bracket a narrower dimension choice.",
+        evidenceIds=[baseline.evidenceIds[0], pca_15.evidenceIds[0]],
+        stoppingCriteria=["Execute the proposed candidate once."],
+    )
+
+    with pytest.raises(ValueError, match="not authorized for Harmony"):
+        validate_parameter_search_plan(
+            plan,
+            deps,
+            initial_candidate_ids=["baseline", "pca_15"],
+            max_refined_candidates=2,
+        )
+
+    corrected = [
+        ParameterCandidate(
+            candidateId="baseline_harmony",
+            useHarmony=True,
+        ),
+        ParameterCandidate(
+            candidateId="pca_15_harmony",
+            dimensions=15,
+            useHarmony=True,
+        ),
+    ]
+    deps.candidates.update(
+        {candidate.candidateId: candidate for candidate in corrected}
+    )
+    deps.maxCandidates = 4
+    deps.harmonyAuthorized = True
+    baseline_harmony = execute_parameter_candidate(deps, "baseline_harmony")
+    pca_15_harmony = execute_parameter_candidate(deps, "pca_15_harmony")
+    initial_ids = ["baseline", "pca_15", "baseline_harmony", "pca_15_harmony"]
+    plan.basedOnCandidateIds = ["baseline_harmony", "pca_15_harmony"]
+    plan.evidenceIds = [
+        baseline_harmony.evidenceIds[0],
+        pca_15_harmony.evidenceIds[0],
+    ]
+    with pytest.raises(ValueError, match="matched corrected and uncorrected"):
+        validate_parameter_search_plan(
+            plan,
+            deps,
+            initial_candidate_ids=initial_ids,
+            max_refined_candidates=2,
+        )
+
+    plan.basedOnCandidateIds = ["pca_15", "pca_15_harmony"]
+    plan.evidenceIds = [pca_15.evidenceIds[0], pca_15_harmony.evidenceIds[0]]
+    plan.harmonyBatchColumns = ["other"]
+    with pytest.raises(ValueError, match="cannot modify"):
+        validate_parameter_search_plan(
+            plan,
+            deps,
+            initial_candidate_ids=initial_ids,
+            max_refined_candidates=2,
+        )
+    plan.harmonyBatchColumns = []
+    validated = validate_parameter_search_plan(
+        plan,
+        deps,
+        initial_candidate_ids=initial_ids,
+        max_refined_candidates=2,
+    )
+    assert validated.harmonyBatchColumns == ["batch"]
 
 
 def test_small_cluster_marks_candidate_ineligible() -> None:
@@ -627,26 +788,24 @@ def test_parameter_tuning_agent_delegates_with_its_model_and_config(
     assert captured["config"] is agent.config
 
 
-def test_parameter_tuning_agent_waits_for_the_allowlisted_tool() -> None:
-    seen_tools: set[str] = set()
+def test_parameter_tuning_agent_executes_before_two_model_calls() -> None:
+    model_calls = 0
+    seen_function_tools: list[set[str]] = []
 
     async def reply(
         messages: list[ModelMessage],
         info: AgentInfo,
     ) -> ModelResponse:
-        seen_tools.update(tool.name for tool in info.function_tools)
-        returns = [
-            part
-            for message in messages
-            for part in message.parts
-            if isinstance(part, ToolReturnPart)
-        ]
-        if not returns:
+        nonlocal model_calls
+        model_calls += 1
+        seen_function_tools.append({tool.name for tool in info.function_tools})
+        if model_calls == 1:
+            plan = ParameterSearchPlan(status="complete")
             return ModelResponse(
                 parts=[
                     ToolCallPart(
-                        tool_name="evaluate_parameter_candidate",
-                        args={"candidate_id": "baseline"},
+                        tool_name=info.output_tools[0].name,
+                        args=plan.model_dump(),
                     )
                 ]
             )
@@ -678,8 +837,150 @@ def test_parameter_tuning_agent_waits_for_the_allowlisted_tool() -> None:
 
     assert result.status == "done"
     assert result.recommendedCandidateId == "baseline"
+    assert result.searchPlan is not None
+    assert result.searchPlan.status == "complete"
+    assert result.searchPlan.runInfo.agentName == "parameter_search_planning"
     assert result.runInfo.agentName == "parameter_tuning"
-    assert [call.toolName for call in result.runInfo.toolCalls] == [
-        "evaluate_parameter_candidate"
+    assert result.runInfo.toolCalls == []
+    assert model_calls == 2
+    assert seen_function_tools == [set(), set()]
+
+
+def test_two_pass_tuning_pairs_exact_multicolumn_harmony_and_runs_refinement() -> None:
+    initial_ids = [
+        "baseline",
+        "baseline_harmony",
+        "pca_15",
+        "pca_15_harmony",
+        "pca_30",
+        "pca_30_harmony",
+        "leiden_0_5",
+        "leiden_0_5_harmony",
+        "leiden_1_5",
+        "leiden_1_5_harmony",
     ]
-    assert seen_tools == {"evaluate_parameter_candidate"}
+    selected_id = "refined_pca_18_harmony"
+    model_calls = 0
+
+    async def reply(
+        messages: list[ModelMessage],
+        info: AgentInfo,
+    ) -> ModelResponse:
+        nonlocal model_calls
+        model_calls += 1
+        assert info.function_tools == []
+        if model_calls == 1:
+            plan = ParameterSearchPlan(
+                status="refine",
+                candidates=[
+                    ParameterCandidate(
+                        candidateId=selected_id,
+                        dimensions=18,
+                        leidenResolution=1.0,
+                        neighborsK=11,
+                        useHarmony=True,
+                    )
+                ],
+                basedOnCandidateIds=["pca_15", "pca_15_harmony"],
+                objectives=["Resolve the corrected dimension tradeoff."],
+                rationale="The corrected initial branches bracket a narrower choice.",
+                evidenceIds=[
+                    "candidate:pca_15:clusters",
+                    "candidate:pca_15_harmony:clusters",
+                ],
+                stoppingCriteria=["Execute the proposed corrected branch once."],
+            )
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name=info.output_tools[0].name,
+                        args=plan.model_dump(),
+                    )
+                ]
+            )
+        selected_evidence = f"candidate:{selected_id}:clusters"
+        report = ParameterTuningReport(
+            status="done",
+            recommendedCandidateId=selected_id,
+            confidence="medium",
+            rationale="The refined corrected branch is eligible.",
+            evidenceIds=[selected_evidence],
+            comparisons=[
+                CandidateComparison(
+                    candidateId=candidate_id,
+                    summary="The refined branch was selected after bounded comparison.",
+                    evidenceIds=[
+                        selected_evidence,
+                        f"candidate:{candidate_id}:clusters",
+                    ],
+                )
+                for candidate_id in initial_ids
+            ],
+            stopReason="The validated refinement pass completed.",
+        )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args=report.model_dump(),
+                )
+            ]
+        )
+
+    handoff = ExperimentalTuningHandoff(
+        batchAction="evaluateHarmony",
+        batchColumns=["batch", "site"],
+        preservationColumns=["disease"],
+        coefficientsOfInterest=["disease"],
+        batchSafety=[
+            BatchSafetyEvidence(
+                coefficient="disease",
+                coefficientKind="categorical",
+                observationUnit="sample",
+                batchColumns=["batch", "site"],
+                unitConstantBatchColumns=["batch", "site"],
+                status="safe",
+                evidenceId="batchEstimability:disease:batch,site",
+            )
+        ],
+        evidenceIds=["batchEstimability:disease:batch,site"],
+    )
+    store = _FakeStore()
+
+    result = ParameterTuningAgent(FunctionModel(reply)).run(
+        store,
+        normalized=_artifact("normalized", 1),
+        from_assay="RNA",
+        experimental_handoff=handoff,
+        max_refined_candidates=2,
+    )
+
+    assert model_calls == 2
+    assert [evaluation.candidateId for evaluation in result.evaluations] == [
+        *initial_ids,
+        selected_id,
+    ]
+    assert [evaluation.phase for evaluation in result.evaluations] == [
+        *(["initial"] * len(initial_ids)),
+        "refined",
+    ]
+    harmony_calls = [
+        (args, kwargs) for name, args, kwargs in store.calls if name == "run_harmony"
+    ]
+    assert len(harmony_calls) == 6
+    assert all(args[0] == ["batch", "site"] for args, _kwargs in harmony_calls)
+    assert all(
+        evaluation.harmonyBatchColumns == ["batch", "site"]
+        for evaluation in result.evaluations
+        if evaluation.parameters.useHarmony
+    )
+    assert all(
+        evaluation.harmonyBatchColumns == []
+        for evaluation in result.evaluations
+        if not evaluation.parameters.useHarmony
+    )
+    assert result.searchPlan is not None
+    assert result.searchPlan.candidates[0].useHarmony is True
+    assert result.searchPlan.harmonyBatchColumns == ["batch", "site"]
+    assert result.searchPlan.runInfo.agentName == "parameter_search_planning"
+    assert result.recommendedCandidateId == selected_id
