@@ -109,14 +109,15 @@ def _statistical_storage_columns(
     For Kruskal-Wallis the primary table is always the omnibus result,
     whether or not a post-hoc test was requested.
     """
-    base: tuple[str, ...]
-    if method == "mann_whitney":
-        base = MANN_WHITNEY_COLUMNS
-    elif method == "wilcoxon":
-        base = WILCOXON_COLUMNS
-    else:
-        base = KRUSKAL_WALLIS_COLUMNS
-    return (*base, "p_value_adjusted")
+    base_map: dict[str, tuple[str, ...]] = {
+        "mann_whitney": MANN_WHITNEY_COLUMNS,
+        "wilcoxon": WILCOXON_COLUMNS,
+    }
+    if method == "kruskal_wallis":
+        return (*KRUSKAL_WALLIS_COLUMNS, "p_value_adjusted")
+    if method in base_map:
+        return (*base_map[method], "p_value_adjusted")
+    raise ValueError(f"Unknown statistical test method: {method!r}")
 
 
 def _statistical_posthoc_columns(
@@ -203,6 +204,15 @@ def _normalized_variant_comparisons(
     )
 
 
+def _statistical_equal_var(method: str | None) -> bool | None:
+    """Return the equal-variance flag persisted for a test method.
+
+    Welch's t-test always uses unequal variances; other tests do not carry
+    the parameter.
+    """
+    return False if method in ("welch", "t_test") else None
+
+
 def _statistical_variant_digest(
     *,
     tested_features: tuple[str, ...],
@@ -212,8 +222,19 @@ def _statistical_variant_digest(
     sample_by: str | None,
     pair_by: str | None,
     subset_by: str | None,
+    sample_stat: str = "mean",
+    expression_cutoff: float = 0.0,
+    normalization: dict[str, Any] | None = None,
+    alternative: str = "two-sided",
+    equal_var: bool | None = None,
 ) -> str:
-    """Deterministic digest identifying one retrievable test variant."""
+    """Deterministic digest identifying one retrievable test variant.
+
+    The digest keys on explicit variant parameters only. Underlying column
+    and selection content changes are captured by
+    ``OperationArguments`` provenance for reuse decisions and mirrored in
+    slot attributes by ``statistical_reuse_is_valid``.
+    """
     return provenance_hash(
         {
             "tested_features": tested_features,
@@ -223,6 +244,11 @@ def _statistical_variant_digest(
             "sample_by": sample_by,
             "pair_by": pair_by,
             "subset_by": subset_by,
+            "sample_stat": sample_stat,
+            "expression_cutoff": float(expression_cutoff),
+            "normalization": normalization,
+            "alternative": alternative,
+            "equal_var": equal_var,
         }
     )[:16]
 
@@ -2323,6 +2349,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         test: Literal["auto", "mann_whitney", "kruskal_wallis", "wilcoxon"] = "auto",
         posthoc: Literal["dunn"] | None = None,
         adjustment: Literal["fdr_bh", "bonferroni", "holm", "none"] = "fdr_bh",
+        alternative: Literal["two-sided", "less", "greater"] = "two-sided",
         sample_by: str | None = None,
         study_design: "StudyDesign | None" = None,
         pair_by: str | None = None,
@@ -2373,6 +2400,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             test: Statistical test, or ``"auto"`` to pick from the design.
             posthoc: Pairwise test to run after Kruskal-Wallis (``"dunn"``).
             adjustment: Multiple-testing correction across keys and rows.
+            alternative: Direction of the alternative hypothesis. Only the
+                Welch t-test honours it; other tests remain two-sided.
             sample_by: Cell metadata column identifying biological samples.
             study_design: Study design supplying ``sample_by`` and ``pair_by``.
             pair_by: Cell metadata column identifying subjects or donors for
@@ -2405,6 +2434,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             raise ValueError(
                 "adjustment must be 'fdr_bh', 'bonferroni', 'holm', or 'none'"
             )
+        if alternative not in ("two-sided", "less", "greater"):
+            raise ValueError("alternative must be 'two-sided', 'less', or 'greater'")
         if posthoc not in (None, "dunn"):
             raise ValueError("posthoc must be 'dunn' or None")
         if sample_stat not in ("mean", "median", "fraction"):
@@ -2541,6 +2572,21 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             native_groups = _normalized_variant_groups(groups)
             native_comparisons = _normalized_variant_comparisons(comparisons)
             cell_key_key = _statistical_cell_key_key(cell_key)
+            normalization_digest = {
+                "source": normalization.source,
+                "transform": normalization.transform,
+            }
+            group_fingerprint = _value_fingerprint(groups_arr)
+            subset_fingerprint = (
+                _value_fingerprint(subset_vals) if subset_vals is not None else None
+            )
+            sample_fingerprint = (
+                _value_fingerprint(sample_arr) if sample_arr is not None else None
+            )
+            pair_fingerprint = (
+                _value_fingerprint(pair_arr) if pair_arr is not None else None
+            )
+            equal_var = _statistical_equal_var(effective_method)
             variant_digest = _statistical_variant_digest(
                 tested_features=tuple(tested_features),
                 groups=native_groups,
@@ -2549,6 +2595,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 sample_by=sample_by,
                 pair_by=pair_by,
                 subset_by=subset_by,
+                sample_stat=sample_stat,
+                expression_cutoff=expression_cutoff,
+                normalization=normalization_digest,
+                alternative=alternative,
+                equal_var=equal_var,
             )
             slot_name = f"{cell_key_key}__{group_by}__{effective_method}"
             if posthoc is not None:
@@ -2577,24 +2628,17 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 comparisons=native_comparisons,
                 sample_by=sample_by,
                 pair_by=pair_by,
-                normalization={
-                    "source": normalization.source,
-                    "transform": normalization.transform,
-                },
+                normalization=normalization_digest,
+                alternative=alternative,
+                equal_var=equal_var,
                 n_groups=n_groups,
                 n_cells=n,
                 cell_selection_hash=_value_fingerprint(cell_idx),
                 tested_features=tuple(tested_features),
-                group_fingerprint=_value_fingerprint(groups_arr),
-                subset_fingerprint=(
-                    _value_fingerprint(subset_vals) if subset_vals is not None else None
-                ),
-                sample_fingerprint=(
-                    _value_fingerprint(sample_arr) if sample_arr is not None else None
-                ),
-                pair_fingerprint=(
-                    _value_fingerprint(pair_arr) if pair_arr is not None else None
-                ),
+                group_fingerprint=group_fingerprint,
+                subset_fingerprint=subset_fingerprint,
+                sample_fingerprint=sample_fingerprint,
+                pair_fingerprint=pair_fingerprint,
                 from_assay=from_assay,
                 cell_key=cell_key,
                 group_key=group_by,
@@ -2633,6 +2677,23 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                         expected_posthoc_columns
                     ):
                         return False
+                    secondary_guard = {
+                        "sample_stat": sample_stat,
+                        "expression_cutoff": float(expression_cutoff),
+                        "normalization": normalization_digest,
+                        "alternative": alternative,
+                        "equal_var": equal_var,
+                        "group_fingerprint": group_fingerprint,
+                        "subset_fingerprint": subset_fingerprint,
+                        "sample_fingerprint": sample_fingerprint,
+                        "pair_fingerprint": pair_fingerprint,
+                    }
+                    for attr_name, expected_value in secondary_guard.items():
+                        stored = candidate.attrs.get(attr_name)
+                        if isinstance(stored, np.generic):
+                            stored = _native_artifact_value(stored)
+                        if stored != expected_value:
+                            return False
                     main_numeric = [
                         column
                         for column in expected_stat_columns
@@ -2771,6 +2832,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 result,
                 key_labels=key_labels,
                 cell_selection_hash=_value_fingerprint(cell_idx),
+                alternative=alternative,
+                equal_var=equal_var,
+                normalization=normalization_digest,
+                group_fingerprint=group_fingerprint,
+                subset_fingerprint=subset_fingerprint,
+                sample_fingerprint=sample_fingerprint,
+                pair_fingerprint=pair_fingerprint,
             )
             finish_artifact(remote_slot, planned)
             select_statistical_artifact(planned.ref)
@@ -2787,6 +2855,13 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         *,
         key_labels: list[str],
         cell_selection_hash: str,
+        alternative: str = "two-sided",
+        equal_var: bool | None = None,
+        normalization: dict[str, Any] | None = None,
+        group_fingerprint: str | None = None,
+        subset_fingerprint: str | None = None,
+        sample_fingerprint: str | None = None,
+        pair_fingerprint: str | None = None,
     ) -> None:
         storage_columns = _statistical_storage_columns(result.method, result.posthoc)
         posthoc_columns = _statistical_posthoc_columns(result.posthoc)
@@ -2813,6 +2888,15 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         group.attrs["pair_by"] = result.pair_by
         group.attrs["sample_stat"] = result.sample_stat
         group.attrs["expression_cutoff"] = result.expression_cutoff
+        group.attrs["alternative"] = alternative
+        group.attrs["equal_var"] = equal_var
+        group.attrs["normalization"] = (
+            dict(normalization) if normalization is not None else {}
+        )
+        group.attrs["group_fingerprint"] = group_fingerprint
+        group.attrs["subset_fingerprint"] = subset_fingerprint
+        group.attrs["sample_fingerprint"] = sample_fingerprint
+        group.attrs["pair_fingerprint"] = pair_fingerprint
         group.attrs["n_groups"] = result.n_groups
         group.attrs["n_cells"] = result.n_cells
         group.attrs["tested_features"] = list(result.tested_features)
@@ -2947,6 +3031,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             pair_by=slot_group.attrs.get("pair_by"),
             sample_stat=str(slot_group.attrs.get("sample_stat", "mean")),
             expression_cutoff=float(slot_group.attrs.get("expression_cutoff", 0.0)),
+            alternative=str(slot_group.attrs.get("alternative", "two-sided")),
+            equal_var=slot_group.attrs.get("equal_var"),
             n_groups=int(slot_group.attrs.get("n_groups", 0)),
             n_cells=int(slot_group.attrs.get("n_cells", 0)),
             tested_features=tuple(slot_group.attrs.get("tested_features", [])),
@@ -2970,13 +3056,18 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         sample_by: str | None = None,
         pair_by: str | None = None,
         subset_by: str | None = None,
+        sample_stat: Literal["mean", "median", "fraction"] = "mean",
+        expression_cutoff: float = 0.0,
+        alternative: Literal["two-sided", "less", "greater"] = "two-sided",
+        normalization: "NormalizationSpec | None" = None,
     ) -> StatisticalTestResult:
         """Return statistical test results from `run_statistical_testing`.
 
         Because every distinct variant (tested keys, ``groups``, pairwise
-        ``comparisons``, ``adjustment``, and sample or subset columns) is
-        stored under its own retrievable slot, the variant parameters must be
-        repeated here exactly as they were passed to ``run_statistical_testing``.
+        ``comparisons``, ``adjustment``, test direction, aggregation knobs,
+        value normalization, and sample or subset columns) is stored under its
+        own retrievable slot, the variant parameters must be repeated here
+        exactly as they were passed to ``run_statistical_testing``.
 
         Args:
             from_assay: Name of the assay used when the results were stored.
@@ -2984,7 +3075,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 default; ``None`` matches the all-cells run).
             group_key: Grouping column used when the results were stored.
             method: Test method used when the results were stored
-                (``"mann_whitney"``, ``"kruskal_wallis"``, or ``"wilcoxon"``).
+                (``"mann_whitney"``, ``"kruskal_wallis"``, ``"wilcoxon"``,
+                ``"welch"``, or ``"one_way_anova"``).
             posthoc: Post-hoc test used when the results were stored.
             keys: Keys tested when the results were stored.
             groups: Group selection used when the results were stored.
@@ -2993,12 +3085,26 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             sample_by: Sample column used when the results were stored.
             pair_by: Pair column used when the results were stored.
             subset_by: Subset column used when the results were stored.
+            sample_stat: Aggregation statistic used when the results were
+                stored.
+            expression_cutoff: Detection cutoff used when the results were
+                stored.
+            alternative: Test direction used when the results were stored.
+            normalization: Value normalization used when the results were
+                stored.
 
         Returns:
             A :class:`~scarf.features.statistical.StatisticalTestResult`.
         """
-        from ...plotting._contracts import CellField, FeatureRef
+        from ...plotting._contracts import CellField, FeatureRef, NormalizationSpec
 
+        normalization = normalization or NormalizationSpec()
+        if adjustment not in ("fdr_bh", "bonferroni", "holm", "none"):
+            raise ValueError(
+                "adjustment must be 'fdr_bh', 'bonferroni', 'holm', or 'none'"
+            )
+        if alternative not in ("two-sided", "less", "greater"):
+            raise ValueError("alternative must be 'two-sided', 'less', or 'greater'")
         from_assay, cell_key = _resolve_assay_and_cell_key(
             self,
             from_assay,
@@ -3017,10 +3123,6 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         if keys is None:
             raise ValueError(
                 "ERROR: Please provide the keys tested in `run_statistical_testing`"
-            )
-        if adjustment not in ("fdr_bh", "bonferroni", "holm", "none"):
-            raise ValueError(
-                "adjustment must be 'fdr_bh', 'bonferroni', 'holm', or 'none'"
             )
         if isinstance(keys, (str, CellField, FeatureRef)):
             key_list: list[str | CellField | FeatureRef] = [keys]
@@ -3048,6 +3150,14 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             sample_by=sample_by,
             pair_by=pair_by,
             subset_by=subset_by,
+            sample_stat=sample_stat,
+            expression_cutoff=expression_cutoff,
+            normalization={
+                "source": normalization.source,
+                "transform": normalization.transform,
+            },
+            alternative=alternative,
+            equal_var=_statistical_equal_var(method),
         )
         slot_group = self._resolve_statistical_slot(
             from_assay,

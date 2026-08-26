@@ -386,6 +386,8 @@ class StatisticalTestingArguments(OperationArguments):
     method: str = parameter()
     posthoc: str | None = parameter()
     adjustment_method: str = parameter()
+    alternative: str = parameter()
+    equal_var: bool | None = parameter()
     sample_stat: str = parameter()
     expression_cutoff: float = parameter()
     groups: tuple[Any, ...] | None = parameter()

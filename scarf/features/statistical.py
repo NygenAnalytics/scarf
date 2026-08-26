@@ -125,6 +125,8 @@ class StatisticalTestResult:
     pair_by: str | None = None
     sample_stat: str = "mean"
     expression_cutoff: float = 0.0
+    alternative: str = "two-sided"
+    equal_var: bool | None = None
     n_groups: int = 0
     n_cells: int = 0
     tested_features: tuple[str, ...] = ()
@@ -186,6 +188,14 @@ def resolve_group_order(
     - A requested group that exists but had every cell removed by filtering
       (``full_groups`` supplied) emits a ``UserWarning`` and is excluded from
       the returned order; the contrast design is otherwise left untouched.
+
+    Plot alignment: this first-seen convention differs from
+    :func:`scarf.plotting.distribution`, which sorts categories with
+    ``sort_categories`` when no explicit order is given. Pass the same
+    ``groups`` selection to both APIs to keep violin panel order and test
+    contrasts aligned (the first selected group becomes ``group_1``); when no
+    explicit order is used, annotation helpers must read the displayed
+    category order from the plot instead of assuming it matches this order.
     """
     values = np.asarray(groups, dtype=object)
     valid = _valid_group_mask(values)
@@ -239,9 +249,34 @@ def _maybe_adjust(
     return frame
 
 
+def _is_missing_label(value: object) -> bool:
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_valid_group_label(value: object) -> bool:
+    if _is_missing_label(value):
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    return True
+
+
 def _valid_group_mask(groups: np.ndarray) -> np.ndarray:
-    as_str = np.asarray(groups, dtype=str)
-    return ~np.isin(as_str, ["", "nan", "None"])
+    """Mark entries usable as group labels.
+
+    Missing values (NaN, ``None``, pandas NA) are invalid. Empty or
+    whitespace-only labels are invalid only when they were originally
+    strings, so legitimate string categories such as ``"None"`` survive.
+    """
+    arr = np.asarray(groups, dtype=object)
+    return np.fromiter(
+        (_is_valid_group_label(value) for value in arr),
+        dtype=bool,
+        count=arr.size,
+    )
 
 
 def aggregate_samples(

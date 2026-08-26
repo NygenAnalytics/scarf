@@ -393,6 +393,7 @@ _CONTRACTS = (
             **_classified(
                 "derived",
                 "method",
+                "equal_var",
                 "n_groups",
                 "n_cells",
                 "key_labels",
