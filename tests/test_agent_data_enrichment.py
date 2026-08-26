@@ -326,6 +326,46 @@ def test_data_enrichment_validates_policy_and_assay() -> None:
         agent.run(ReadOnlyStore(), assays=["ADT"])
 
 
+def test_enrichment_copies_caller_context_instead_of_model_paraphrases() -> None:
+    inspection = AssayFeatureInspection(
+        assay="RNA",
+        species="unknown",
+        evidenceIds=["assay:RNA:species"],
+    )
+    deps = DataEnrichmentDependencies(
+        store=ReadOnlyStore(),
+        context=DataEnrichmentContext(
+            tissueReferences=["peripheral blood"],
+            cellTypeReferences=["T cell"],
+            experimentalDetails=["10x 3 prime RNA-seq", "single donor"],
+        ),
+        assays=["RNA"],
+        inspections={"RNA": inspection},
+        evidenceIds={"assay:RNA:species"},
+    )
+    report = DataEnrichmentReport(
+        status="done",
+        policies=[
+            FeatureSelectionPolicy(
+                assay="RNA",
+                tissueReferences=[],
+                cellTypeReferences=[],
+                experimentalReferences=["10x 5K PBMC"],
+                evidenceIds=["assay:RNA:species"],
+            )
+        ],
+    )
+
+    validated = validate_data_enrichment_report(deps, report)
+
+    assert validated.policies[0].tissueReferences == ["peripheral blood"]
+    assert validated.policies[0].cellTypeReferences == ["T cell"]
+    assert validated.policies[0].experimentalReferences == [
+        "10x 3 prime RNA-seq",
+        "single donor",
+    ]
+
+
 def test_enrichment_rejects_protected_family_exclusion() -> None:
     family = FeatureFamilyEvidence(
         family="cellCycle",

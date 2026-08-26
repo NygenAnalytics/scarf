@@ -233,6 +233,50 @@ def test_sync_runner_does_not_attribute_history_tool_calls_to_current_run() -> N
     assert result.runInfo.toolCalls == []
 
 
+def test_sync_runner_works_when_an_event_loop_is_already_running() -> None:
+    async def inspect_value() -> dict[str, str]:
+        return {"status": "observed"}
+
+    async def reply(
+        messages: list[ModelMessage],
+        info: AgentInfo,
+    ) -> ModelResponse:
+        returns = [
+            part
+            for message in messages
+            for part in message.parts
+            if isinstance(part, ToolReturnPart)
+        ]
+        if not returns:
+            return ModelResponse(
+                parts=[ToolCallPart(tool_name="inspect_value", args="{}")]
+            )
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name=info.output_tools[0].name,
+                    args=ExampleOutput.get_example().model_dump(),
+                )
+            ]
+        )
+
+    async def call_from_running_loop() -> object:
+        return run_agent_sync(
+            model=FunctionModel(reply),
+            output_type=ExampleOutput,
+            system_prompt="Use the tool.",
+            user_prompt="Inspect the value.",
+            tools=[inspect_value],
+            name="notebook-host",
+        )
+
+    result = asyncio.run(call_from_running_loop())
+
+    assert result.output == ExampleOutput.get_example()
+    assert result.runInfo.agentName == "notebook-host"
+    assert [call.toolName for call in result.runInfo.toolCalls] == ["inspect_value"]
+
+
 def test_async_runner_returns_structured_output() -> None:
     result = asyncio.run(
         run_agent(

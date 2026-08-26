@@ -929,10 +929,7 @@ class BiologicalInterpretationAgent:
         config: AgentRunConfig | None = None,
     ) -> None:
         self.model = model
-        self.config = config or AgentRunConfig(
-            requestLimit=16,
-            toolCallLimit=16,
-        )
+        self.config = config or AgentRunConfig()
 
     def run(
         self,

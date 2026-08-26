@@ -1,8 +1,10 @@
 """Common bounded execution for the four Scarf domain agents."""
 
+import asyncio
 import sys
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from inspect import isawaitable, iscoroutinefunction
 from typing import Any
 
@@ -214,33 +216,48 @@ def run_agent_sync(
     output_validator: Callable[[Any], Any] | None = None,
     message_history: Sequence[Any] = (),
 ) -> AgentExecutionResult:
-    """Run one synchronous agent loop and return its bounded audit record."""
-    run_config = config or AgentRunConfig()
-    agent = _build_agent(
-        model=model,
-        output_type=output_type,
-        system_prompt=system_prompt,
-        tools=tools,
-        deps_type=deps_type,
-        config=run_config,
-        name=name,
-        output_validator=output_validator,
-        normalize_sync_function_model=True,
-    )
-    started = time.monotonic()
-    result = agent.run_sync(
-        user_prompt,
-        deps=deps,
-        message_history=message_history,
-        usage_limits=get_usage_limits(run_config),
-    )
-    return _execution_result(
-        result=result,
-        model=model,
-        name=name,
-        started=started,
-        tools=tools,
-    )
+    """Run one synchronous agent loop and return its bounded audit record.
+
+    Jupyter and other hosts already have a running event loop. Pydantic AI's
+    ``run_sync`` cannot drive that loop, so this hops to a worker thread with
+    its own idle loop in that case.
+    """
+
+    def execute() -> AgentExecutionResult:
+        run_config = config or AgentRunConfig()
+        agent = _build_agent(
+            model=model,
+            output_type=output_type,
+            system_prompt=system_prompt,
+            tools=tools,
+            deps_type=deps_type,
+            config=run_config,
+            name=name,
+            output_validator=output_validator,
+            normalize_sync_function_model=True,
+        )
+        started = time.monotonic()
+        result = agent.run_sync(
+            user_prompt,
+            deps=deps,
+            message_history=message_history,
+            usage_limits=get_usage_limits(run_config),
+        )
+        return _execution_result(
+            result=result,
+            model=model,
+            name=name,
+            started=started,
+            tools=tools,
+        )
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return execute()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(execute).result()
 
 
 async def run_agent(

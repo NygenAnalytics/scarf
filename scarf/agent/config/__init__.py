@@ -70,12 +70,12 @@ class Config:
 class AgentRunConfig(AgentDataModel):
     """Bound one agent run without selecting a scientific workflow."""
 
-    requestLimit: int = 8
-    toolCallLimit: int = 8
+    requestLimit: int = 128
+    toolCallLimit: int = 64
     inputTokenLimit: int | None = None
-    outputTokenLimit: int | None = 4096
+    outputTokenLimit: int | None = None
     totalTokenLimit: int | None = None
-    timeoutSeconds: float = 600.0
+    timeoutSeconds: float = 1800.0
     retries: int = 2
     temperature: float = 0.0
     seed: int = 4444
@@ -145,16 +145,22 @@ def get_model_settings(
             else str(getattr(model, "system", ""))
         )
         profile = "ollama" if model_system.casefold() == "ollama" else "unified"
-    expanded_bodies: dict[str, dict[str, Any]] = {
-        "unified": {},
-        "ollama": {"think": False},
-        "chatTemplate": {"chat_template_kwargs": {"thinking": False}},
-        "thinkingBody": {"thinking": {"type": "disabled"}},
-        "reasoningBody": {"reasoning": {"enabled": False}},
+    # expanded_bodies: dict[str, dict[str, Any]] = {
+    #     "unified": {},
+    #     "ollama": {"think": False},
+    #     "chatTemplate": {"chat_template_kwargs": {"thinking": False}},
+    #     "thinkingBody": {"thinking": {"type": "disabled"}},
+    #     "reasoningBody": {"reasoning": {"enabled": False}},
+    # }
+    extra_body = {
+        "thinking": {"type": "disabled"},
+        "reasoning_effort": None,
+        "chat_template_kwargs": {"thinking": False},  # for together-ai
+        "reasoning": {"enabled": False},  # for openrouter
     }
-    extra_body = expanded_bodies[profile]
+    #  expanded_bodies[profile]
     settings = ModelSettings(
-        temperature=run_config.temperature,
+        gtemperature=run_config.temperature,
         seed=run_config.seed,
         timeout=run_config.timeoutSeconds,
         parallel_tool_calls=not run_config.sequentialTools,

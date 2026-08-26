@@ -1018,10 +1018,7 @@ class ExperimentalContextAgent:
         config: AgentRunConfig | None = None,
     ) -> None:
         self.model = model
-        self.config = config or AgentRunConfig(
-            requestLimit=8,
-            toolCallLimit=6,
-        )
+        self.config = config or AgentRunConfig()
         self.system_prompt = dedent(
             """
             You are Scarf's Experimental Context Agent. Work only through the

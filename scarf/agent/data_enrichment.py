@@ -51,8 +51,10 @@ _SYSTEM_PROMPT = (
         individual feature in a policy. Treat Ensembl release misses as unresolved,
         not artificial. Mitochondrial, ribosomal, and histone families may be
         exclusion candidates. Sex-linked and cell-cycle families are protected by
-        default in this initial implementation. Return a bounded report with
-        citations copied from tool or context evidence IDs.
+        default in this initial implementation. Do not invent or rephrase tissue,
+        cell-type, or experiment labels. The validator copies those from the
+        supplied caller context. Return a bounded report with citations copied
+        from tool or context evidence IDs.
         Do not write code, mutate the datastore, or request arbitrary Scarf calls.
         """
     )
@@ -666,22 +668,9 @@ def validate_data_enrichment_report(
             raise ValueError(
                 f"policy cites unknown evidence IDs: {sorted(unknown_evidence)}"
             )
-        unknown_tissues = set(policy.tissueReferences) - set(
-            deps.context.tissueReferences
-        )
-        unknown_cell_types = set(policy.cellTypeReferences) - set(
-            deps.context.cellTypeReferences
-        )
-        unknown_experiments = set(policy.experimentalReferences) - set(
-            deps.context.experimentalDetails
-        )
-        if unknown_tissues or unknown_cell_types or unknown_experiments:
-            raise ValueError(
-                "policy context references must be copied from the supplied context: "
-                f"tissues={sorted(unknown_tissues)}, "
-                f"cellTypes={sorted(unknown_cell_types)}, "
-                f"experiments={sorted(unknown_experiments)}"
-            )
+        policy.tissueReferences = list(deps.context.tissueReferences)
+        policy.cellTypeReferences = list(deps.context.cellTypeReferences)
+        policy.experimentalReferences = list(deps.context.experimentalDetails)
 
     report.inspections = [deps.inspections[name] for name in deps.assays]
     report.toolCalls = list(deps.toolCalls)
@@ -705,10 +694,7 @@ class DataEnrichmentAgent:
         config: AgentRunConfig | None = None,
     ) -> None:
         self.model = model
-        self.config = config or AgentRunConfig(
-            requestLimit=8,
-            toolCallLimit=12,
-        )
+        self.config = config or AgentRunConfig()
 
     def run(
         self,
