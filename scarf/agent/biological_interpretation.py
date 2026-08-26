@@ -391,16 +391,18 @@ _SYSTEM_PROMPT = dedent(
 
         Treat cell identities as hypotheses unless the caller supplied a trusted
         label. Do not invent genes, cell types, statistics, artifact identifiers,
-        or evidence identifiers. Cite only evidenceIds returned by tools. Cluster
-        abundance summaries are descriptive, not tests of significance or causal
-        effects. Treatment observations must compare two returned sample-level
-        condition summaries for the same cluster. Marker p-values describe
-        cluster-versus-rest marker specificity, not condition effects. Keep
-        treatment content out of cluster identity interpretations. Recommend a
-        named follow-up operation when replication, a covariate, or an exact
-        artifact is missing. Do not write exploratory code, use a shell, access
-        files, or call arbitrary Scarf methods. Return only fields defined by the
-        structured output schema.
+        or evidence identifiers. Cite only evidenceIds returned by tools. For each
+        cluster interpretation, copy the exact non-empty marker evidenceId returned
+        for that cluster into its evidenceIds. Do not interpret a cluster whose
+        marker evidenceId is empty. Cluster abundance summaries are descriptive,
+        not tests of significance or causal effects. Treatment observations must
+        compare two returned sample-level condition summaries for the same cluster.
+        Marker p-values describe cluster-versus-rest marker specificity, not
+        condition effects. Keep treatment content out of cluster identity
+        interpretations. Recommend a named follow-up operation when replication, a
+        covariate, or an exact artifact is missing. Do not write exploratory code,
+        use a shell, access files, or call arbitrary Scarf methods. Return only
+        fields defined by the structured output schema.
     """
 ).strip()
 
@@ -838,18 +840,22 @@ def validate_biological_interpretation_report(
     )
     if unknown_clusters:
         raise ModelRetry(f"Unknown cluster ids: {sorted(unknown_clusters)}")
+    canonical_interpretations: list[ClusterInterpretation] = []
+    omitted_interpretation_clusters: list[str] = []
     for interpretation in report.clusterInterpretations:
         marker_id = deps.markerEvidenceIds.get(interpretation.clusterId)
-        if marker_id is None or marker_id not in interpretation.evidenceIds:
-            raise ModelRetry(
-                "Every cluster interpretation must cite non-empty marker evidence."
-            )
+        if marker_id is None:
+            omitted_interpretation_clusters.append(interpretation.clusterId)
+            continue
         non_marker_evidence = sorted(set(interpretation.evidenceIds) - {marker_id})
         if non_marker_evidence:
             raise ModelRetry(
                 "Cluster identity interpretations may cite only their exact marker "
                 f"evidence: {non_marker_evidence}"
             )
+        canonical_interpretations.append(
+            interpretation.model_copy(update={"evidenceIds": [marker_id]})
+        )
 
     if report.treatmentObservations and deps.conditionColumn is None:
         raise ModelRetry("Treatment observations require a condition column.")
@@ -939,9 +945,20 @@ def validate_biological_interpretation_report(
         canonical_observations.append(
             observation.model_copy(update={"observation": canonical_text})
         )
-    if report.status == "done" and not report.clusterInterpretations:
-        raise ModelRetry("A done report must contain a cluster interpretation.")
+    if report.status == "done" and not canonical_interpretations:
+        raise ModelRetry(
+            "A done report must contain at least one cluster interpretation with "
+            "non-empty marker evidence."
+        )
     limitations = list(report.limitations)
+    if omitted_interpretation_clusters:
+        omitted_clusters = ", ".join(sorted(set(omitted_interpretation_clusters)))
+        marker_limitation = (
+            "Cluster identity interpretations without non-empty marker evidence "
+            f"were omitted for clusters: {omitted_clusters}."
+        )
+        if marker_limitation not in limitations:
+            limitations.append(marker_limitation)
     if canonical_observations:
         descriptive_limitation = (
             "Condition-level cluster fractions are descriptive summaries, not "
@@ -963,7 +980,18 @@ def validate_biological_interpretation_report(
                 limitations.append(design_limitation)
     return report.model_copy(
         update={
+            "clusterInterpretations": canonical_interpretations,
             "treatmentObservations": canonical_observations,
+            "evidenceIds": sorted(
+                {
+                    *report.evidenceIds,
+                    *(
+                        evidence_id
+                        for interpretation in canonical_interpretations
+                        for evidence_id in interpretation.evidenceIds
+                    ),
+                }
+            ),
             "limitations": limitations,
             "clusterArtifact": expected_cluster_artifact,
             "markerArtifact": (

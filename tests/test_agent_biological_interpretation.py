@@ -292,6 +292,81 @@ def test_empty_marker_table_does_not_create_marker_evidence() -> None:
     assert run_context.deps.markerEvidenceIds == {}
 
 
+def test_validator_attaches_exact_marker_evidence_when_omitted() -> None:
+    store = FakeStore()
+    run_context = context(store, marker=store.marker)
+    asyncio.run(inspect_cluster_composition(run_context))
+    marker = asyncio.run(inspect_cluster_markers(run_context, cluster_id="0"))
+    report = BiologicalInterpretationReport(
+        status="done",
+        clusterInterpretations=[
+            ClusterInterpretation(
+                clusterId="0",
+                proposedIdentity="macrophage-like",
+                evidenceIds=[],
+            )
+        ],
+    )
+
+    validated = validate_biological_interpretation_report(
+        report,
+        run_context.deps,
+    )
+
+    assert validated.clusterInterpretations[0].evidenceIds == [marker.evidenceId]
+    assert marker.evidenceId in validated.evidenceIds
+
+
+def test_validator_omits_interpretations_without_marker_evidence() -> None:
+    store = FakeStore()
+    run_context = context(store, marker=store.marker)
+    asyncio.run(inspect_cluster_composition(run_context))
+    marker = asyncio.run(inspect_cluster_markers(run_context, cluster_id="0"))
+    report = BiologicalInterpretationReport(
+        status="done",
+        clusterInterpretations=[
+            ClusterInterpretation(
+                clusterId="0",
+                proposedIdentity="macrophage-like",
+            ),
+            ClusterInterpretation(
+                clusterId="1",
+                proposedIdentity="T cell-like",
+            ),
+        ],
+    )
+
+    validated = validate_biological_interpretation_report(
+        report,
+        run_context.deps,
+    )
+
+    assert [item.clusterId for item in validated.clusterInterpretations] == ["0"]
+    assert validated.clusterInterpretations[0].evidenceIds == [marker.evidenceId]
+    assert any(
+        "were omitted for clusters: 1" in limitation
+        for limitation in validated.limitations
+    )
+
+
+def test_done_report_requires_at_least_one_supported_interpretation() -> None:
+    store = FakeStore()
+    run_context = context(store, marker=store.marker)
+    asyncio.run(inspect_cluster_composition(run_context))
+    report = BiologicalInterpretationReport(
+        status="done",
+        clusterInterpretations=[
+            ClusterInterpretation(
+                clusterId="1",
+                proposedIdentity="T cell-like",
+            )
+        ],
+    )
+
+    with pytest.raises(ModelRetry, match="at least one cluster interpretation"):
+        validate_biological_interpretation_report(report, run_context.deps)
+
+
 def test_validator_rejects_unobserved_evidence() -> None:
     store = FakeStore()
     run_context = context(store, marker=store.marker)

@@ -210,7 +210,7 @@ def test_agent_runs_only_read_only_tools_and_returns_a_grounded_report() -> None
                                 name: unit.model_dump()
                                 for name, unit in decision.unitsOfInference.items()
                             },
-                            "batch_columns": decision.batchCorrection.batchColumns,
+                            "batch_columns": decision.batchCorrection.batchColumns[0],
                         },
                     )
                 ]

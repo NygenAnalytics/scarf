@@ -425,7 +425,7 @@ async def analyze_experimental_design(
     column_domains: dict[str, ColumnDomain],
     coefficients_of_interest: list[str],
     units_of_inference: dict[str, InferenceUnit],
-    batch_columns: list[str] | None = None,
+    batch_columns: list[str] | str | None = None,
 ) -> CovariateEvidence:
     """Validate proposed domains and inference units and compute confounding.
 
@@ -435,6 +435,7 @@ async def analyze_experimental_design(
         coefficients_of_interest: Biological columns representing study contrasts.
         units_of_inference: Observation and independent units for each coefficient.
         batch_columns: Exact technical columns proposed for Harmony evaluation.
+            A single column may be supplied as either a string or a one-item list.
     """
     directions = dict(ctx.deps.directions)
     directed_domains = dict(column_domains)
@@ -466,7 +467,11 @@ async def analyze_experimental_design(
     if characterization.status == "failed":
         raise ModelRetry("; ".join(characterization.notes))
 
-    proposed_batch_columns = list(batch_columns or [])
+    proposed_batch_columns = (
+        [batch_columns]
+        if isinstance(batch_columns, str)
+        else list(batch_columns or [])
+    )
     canonical_batch_columns = sorted(set(proposed_batch_columns))
     if len(canonical_batch_columns) != len(proposed_batch_columns):
         raise ModelRetry("Proposed batch columns must be unique")
@@ -1035,7 +1040,8 @@ class ExperimentalContextAgent:
             exact batch-column set being considered. You may call
             score_current_representation at most once when a current graph can add
             evidence. Do not split metadata, coefficients, or batch columns across
-            calls, and do not repeat a tool call.
+            calls, and do not repeat a tool call. Pass batch_columns as a JSON array,
+            including when the array contains exactly one column.
 
             A batch column must be categorical and technical. Never use donor,
             sample, observation-unit, independent-unit, biological, cluster, or
