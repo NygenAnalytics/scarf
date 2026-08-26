@@ -169,6 +169,8 @@ profiling = [
     "pydantic>=2.13.4",
 ]
 dev = [
+    "ipykernel>=7.3.0",
+    "ipython>=9.16.1",
     "mypy>=2.1.0",
     "ruff>=0.15.20",
 ]

@@ -1,18 +1,21 @@
 """Grounded structured decisions over evidence IDs."""
 
 from collections.abc import Sequence
+from textwrap import dedent
 from typing import Any
 
-from ._deps import require_pydantic_ai
+from .config.agent_exec import run_agent_sync
 from .types import Decision, EvidenceItem
 
-_SYSTEM_PROMPT = (
-    "Choose exactly one evidence id that answers the question. "
-    "selectedId must be copied exactly from the id= values. "
-    "Do not put labels or summaries in selectedId. "
-    "evidenceIds must include selectedId and only provided ids. "
-    "Keep the rationale to one short sentence."
-)
+_SYSTEM_PROMPT = dedent(
+    """
+        Choose exactly one evidence id that answers the question. selectedId
+        must be copied exactly from the id= values. Do not put labels or
+        summaries in selectedId. evidenceIds must include selectedId and only
+        provided ids. Keep the rationale to one short sentence. Return only
+        fields defined by the structured output schema.
+        """
+).strip()
 
 
 class DecisionValidationError(ValueError):
@@ -79,18 +82,28 @@ def validate_decision(
 
 
 def _format_user_prompt(question: str, evidence: Sequence[EvidenceItem]) -> str:
-    lines = [
-        question.strip(),
-        "",
-        "Choose selectedId from these exact id values:",
-    ]
-    for item in evidence:
-        lines.append(f"- id={item.id} | label={item.label} | summary={item.summary}")
-    lines.append("")
-    lines.append(
-        f"Allowed selectedId values: {', '.join(item.id for item in evidence)}"
+    evidence_lines = "\n".join(
+        f"- id={item.id} | label={item.label} | summary={item.summary}"
+        for item in evidence
     )
-    return "\n".join(lines)
+    return (
+        dedent(
+            """
+            {question}
+
+            Choose selectedId from these exact id values:
+            {evidence_lines}
+
+            Allowed selectedId values: {allowed_ids}
+            """
+        )
+        .strip()
+        .format(
+            question=question.strip(),
+            evidence_lines=evidence_lines,
+            allowed_ids=", ".join(item.id for item in evidence),
+        )
+    )
 
 
 def decide(
@@ -98,7 +111,7 @@ def decide(
     model: Any,
     question: str,
     evidence: Sequence[EvidenceItem],
-    systemPrompt: str = _SYSTEM_PROMPT,
+    system_prompt: str = _SYSTEM_PROMPT,
 ) -> Decision:
     """Ask the model to choose among evidence IDs and validate citations."""
     if not question.strip():
@@ -117,15 +130,11 @@ def decide(
             f"evidence ids must be unique; duplicates: {sorted(duplicates)}"
         )
 
-    require_pydantic_ai()
-    from pydantic_ai import Agent
-    from pydantic_ai.settings import ModelSettings
-
-    agent = Agent(
-        model,
+    execution = run_agent_sync(
+        model=model,
         output_type=Decision,
-        system_prompt=systemPrompt,
-        model_settings=ModelSettings(thinking=False, extra_body={"think": False}),
+        system_prompt=system_prompt,
+        user_prompt=_format_user_prompt(question, evidence),
+        name="decision",
     )
-    result = agent.run_sync(_format_user_prompt(question, evidence))
-    return validate_decision(result.output, evidence)
+    return validate_decision(execution.output, evidence)
