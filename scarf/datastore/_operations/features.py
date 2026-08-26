@@ -70,11 +70,6 @@ from ...metadata.arguments import (
     StatisticalTestingArguments,
     WaggrArguments,
 )
-from ...metadata.artifacts import (
-    categorical_display,
-    feature_column_display,
-    link_feature_data_column,
-)
 from ...utils.arrays import array_digest
 from ...utils.compute import controlled_compute
 from ...utils.logging import logger
