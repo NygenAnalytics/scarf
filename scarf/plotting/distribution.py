@@ -1,6 +1,7 @@
 """Distribution plots for metadata and feature values."""
 
-from collections.abc import Iterator, Sequence
+import warnings
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any, Hashable, Literal
 
@@ -471,6 +472,118 @@ def _mean_color_limits(
     return [reference] * len(arrays), reference
 
 
+def _format_stat_p_text(p_value: float, show_p_value: bool) -> str:
+    if not show_p_value:
+        if p_value <= 0.001:
+            return "***"
+        if p_value <= 0.01:
+            return "**"
+        if p_value <= 0.05:
+            return "*"
+        return "ns"
+    if p_value < 0.001:
+        return f"p={p_value:.1e}"
+    return f"p={p_value:.2g}"
+
+
+def _annotate_distribution_stats(
+    ax: Any,
+    frame: pd.DataFrame,
+    *,
+    method: str,
+    group_order: list[Any],
+    orientation: Literal["vertical", "horizontal"],
+    bracket_height: float,
+    show_p_value: bool,
+) -> bool:
+    """Draw significance brackets over an existing violin/box panel.
+
+    Pure matplotlib: ``ax.plot`` plus ``ax.text`` on positions derived from
+    the seaborn category order, so the seaborn backend stays untouched.
+    Pairwise tables provide their own groups; a one-way ANOVA omnibus table
+    spans every displayed group. Returns whether anything was drawn.
+    """
+    p_column = "p_value_adjusted" if "p_value_adjusted" in frame.columns else "p_value"
+    if p_column not in frame.columns or frame.empty:
+        return False
+    grouped_categories = ["group_1", "group_2"]
+    pairwise = all(column in frame.columns for column in grouped_categories)
+    if pairwise:
+        rows: list[tuple[int, int, float]] = []
+        for _, row in frame.iterrows():
+            try:
+                pos_1 = group_order.index(row["group_1"])
+                pos_2 = group_order.index(row["group_2"])
+            except ValueError:
+                continue
+            p_value = float(row[p_column])
+            if np.isfinite(p_value):
+                rows.append((pos_1, pos_2, p_value))
+    elif method == "one_way_anova":
+        p_value = float(frame.iloc[0][p_column])
+        rows = (
+            [(0, len(group_order) - 1, p_value)]
+            if len(group_order) > 1 and np.isfinite(p_value)
+            else []
+        )
+    else:
+        return False
+    if not rows:
+        return False
+    step = bracket_height * 1.6
+    text_offset = bracket_height / 3
+    any_drawn = False
+    if orientation == "vertical":
+        value_bottom, base_top = ax.get_ylim()
+        highest = base_top
+        for level, (pos_1, pos_2, p_value) in enumerate(rows):
+            y = base_top + level * step
+            elbow = y + bracket_height / 3
+            ax.plot(
+                [pos_1, pos_1, pos_2, pos_2],
+                [y, elbow, elbow, y],
+                color="black",
+                lw=0.9,
+                clip_on=False,
+            )
+            ax.text(
+                (pos_1 + pos_2) / 2,
+                elbow + text_offset,
+                _format_stat_p_text(p_value, show_p_value),
+                ha="center",
+                va="bottom",
+                fontsize=7,
+            )
+            highest = max(highest, elbow + step)
+        ax.set_ylim(value_bottom, max(float(base_top), highest))
+        any_drawn = True
+    else:
+        value_left, base_right = ax.get_xlim()
+        farthest = base_right
+        for level, (pos_1, pos_2, p_value) in enumerate(rows):
+            x = base_right + level * step
+            elbow = x + bracket_height / 3
+            ax.plot(
+                [x, elbow, elbow, x],
+                [pos_1, pos_1, pos_2, pos_2],
+                color="black",
+                lw=0.9,
+                clip_on=False,
+            )
+            ax.text(
+                elbow + text_offset,
+                (pos_1 + pos_2) / 2,
+                _format_stat_p_text(p_value, show_p_value),
+                ha="left",
+                va="center",
+                fontsize=7,
+            )
+            farthest = max(farthest, elbow + step)
+        ax.set_xlim(float(value_left), max(float(base_right), farthest))
+        any_drawn = True
+    return any_drawn
+
+
 def _render_color_limits(lo: float, hi: float) -> tuple[float, float]:
     """Return colourbar limits, padding degenerate scales so a bar renders."""
     if hi > lo:
@@ -554,6 +667,11 @@ def distribution(
     title: str | None = None,
     theme: str = "notebook",
     show_legend: bool = True,
+    stats_results: Any = None,
+    stats_keys: Sequence[str] | None = None,
+    stats_method: str | None = None,
+    stats_bracket_height: float | None = None,
+    stats_show_p: bool = True,
     show: bool = True,
 ) -> PlotResult:
     """Compare value distributions for QC metrics or genes.
@@ -582,6 +700,16 @@ def distribution(
     Set ``sample_by`` or ``study_design`` to summarize cells within biological
     samples before plotting. ``split_by`` draws two violin halves for a second
     categorical variable.
+
+    Pass ``stats_results`` (a single
+    :class:`~scarf.features.statistical.StatisticalTestResult`, or a mapping
+    from panel label to one) to annotate significance brackets over the drawn
+    violins or boxes. Brackets are pure matplotlib overlays positioned by the
+    displayed category order; pairwise tables place one bracket per row and a
+    one-way ANOVA omnibus result spans every group. The annotation prefers
+    ``p_value_adjusted`` when present. Nothing is recomputed here; when
+    ``stats_results`` does not match the plotted selection, panels are skipped
+    with a warning instead of raising.
 
     For ``kind="stacked_violin"``, pass ``color_by="mean"`` to colour each
     stacked violin by its group mean expression on a continuous scale. Pass a
@@ -652,6 +780,15 @@ def distribution(
         raise ValueError("row_standardize is available only for stacked_violin")
     if share_y is not None and kind not in ("violin", "stacked_violin", "box"):
         raise ValueError("share_y applies only to violin and box plots")
+    if stats_results is not None:
+        if group_by is None:
+            raise ValueError("stats_results requires group_by")
+        if kind not in ("violin", "stacked_violin", "box"):
+            raise ValueError(
+                "stats annotation applies only to violin, stacked_violin, and box plots"
+            )
+        if stats_bracket_height is not None and stats_bracket_height <= 0:
+            raise ValueError("stats_bracket_height must be positive when provided")
     if violin_linewidth < 0:
         raise ValueError("violin_linewidth must be non-negative")
     if not 0 <= violin_alpha <= 1 or not 0 <= point_alpha <= 1:
@@ -1088,6 +1225,86 @@ def distribution(
                     else:
                         ax.set_xlim(ymin - pad, ymax + pad)
 
+        stats_annotated_any = False
+        stats_annotated_keys: list[str] = []
+        stats_methods: set[str] = set()
+        stats_adjustments: set[str] = set()
+        if stats_results is not None:
+            display_order = list(group_order or [])
+            allowed_stats_keys = (
+                None if stats_keys is None else {str(value) for value in stats_keys}
+            )
+            warned_validation: set[str] = set()
+
+            def _warn_once(reason_key: str, message: str) -> None:
+                if reason_key not in warned_validation:
+                    warnings.warn(message, UserWarning, stacklevel=2)
+                    warned_validation.add(reason_key)
+
+            for index, (_vals, label, _is_feature) in enumerate(series_list):
+                str_label = str(panel_keys[index])
+                if allowed_stats_keys is not None and str_label not in (
+                    allowed_stats_keys
+                ):
+                    continue
+                result_for_panel = (
+                    stats_results.get(str_label)
+                    if isinstance(stats_results, Mapping)
+                    else stats_results
+                )
+                if result_for_panel is None:
+                    continue
+                if result_for_panel.group_key != group_by:
+                    _warn_once(
+                        "group_by",
+                        "stats_results.group_key does not match group_by; "
+                        "skipping statistical annotations",
+                    )
+                    continue
+                if result_for_panel.cell_key != cell_key:
+                    _warn_once(
+                        "cell_key",
+                        "stats_results.cell_key does not match cell_key; "
+                        "skipping statistical annotations",
+                    )
+                    continue
+                if result_for_panel.n_cells != n:
+                    _warn_once(
+                        "n_cells",
+                        f"stats_results was computed on {result_for_panel.n_cells} "
+                        f"cells but the plot shows {n}; skipping statistical "
+                        "annotations",
+                    )
+                    continue
+                table_to_annotate = result_for_panel.tables.get(str_label)
+                if table_to_annotate is None:
+                    continue
+                ax_panel = axes[panel_keys[index]]
+                value_lo, value_hi = (
+                    ax_panel.get_ylim()
+                    if orientation == "vertical"
+                    else ax_panel.get_xlim()
+                )
+                span = float(value_hi - value_lo)
+                resolved_height = (
+                    stats_bracket_height
+                    if stats_bracket_height is not None
+                    else max(0.06 * span, 1e-12)
+                )
+                if _annotate_distribution_stats(
+                    ax_panel,
+                    table_to_annotate,
+                    method=result_for_panel.method,
+                    group_order=display_order,
+                    orientation=orientation,
+                    bracket_height=float(resolved_height),
+                    show_p_value=stats_show_p,
+                ):
+                    stats_annotated_any = True
+                    stats_annotated_keys.append(str_label)
+                    stats_methods.add(result_for_panel.method)
+                    stats_adjustments.add(result_for_panel.adjustment_method)
+
         if title is not None:
             fig.suptitle(title)
         apply_figure_chrome(fig, theme)
@@ -1228,6 +1445,16 @@ def distribution(
                     "transform": normalization.transform,
                 },
                 "assays": sorted(feature_assays),
+                **(
+                    {
+                        "stats_method": sorted(stats_methods),
+                        "stats_adjustment": sorted(stats_adjustments),
+                        "stats_annotated": stats_annotated_any,
+                        "stats_annotated_keys": stats_annotated_keys,
+                    }
+                    if stats_results is not None
+                    else {}
+                ),
             },
         ),
         owns_figure=owns,

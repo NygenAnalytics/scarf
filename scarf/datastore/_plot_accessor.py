@@ -581,9 +581,20 @@ class DataStorePlotAccessor:
         title: str | None = None,
         theme: str = "notebook",
         show_legend: bool = True,
+        stats_results: Any = None,
+        stats_keys: Sequence[str] | None = None,
+        stats_method: str | None = None,
+        stats_bracket_height: float | None = None,
+        stats_show_p: bool = True,
         show: bool = True,
     ) -> "PlotResult":
-        """Plot distributions of cell metadata or feature values."""
+        """Plot distributions of cell metadata or feature values.
+
+        ``stats_results`` overlays significance brackets from
+        :meth:`run_statistical_testing` results onto the drawn violins or
+        boxes; see :func:`scarf.plotting.distribution` for the full
+        behaviour.
+        """
         from ..plotting import distribution
 
         return distribution(
@@ -624,6 +635,11 @@ class DataStorePlotAccessor:
             title=title,
             theme=theme,
             show_legend=show_legend,
+            stats_results=stats_results,
+            stats_keys=stats_keys,
+            stats_method=stats_method,
+            stats_bracket_height=stats_bracket_height,
+            stats_show_p=stats_show_p,
             show=show,
         )
 
