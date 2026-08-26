@@ -14,12 +14,17 @@ Tests are standard for zero-inflated, non-normal single-cell values:
 - Three or more independent groups: Kruskal-Wallis with an optional Dunn's
   post-hoc test for pairwise significance.
 - Paired samples (aggregated to biological samples): Wilcoxon signed-rank.
+- Explicitly requested parametric alternatives operate on raw cell-level
+  values: Welch's t-test (``test="welch"``, aliased by ``"t_test"``) with a
+  configurable ``alternative``, and one-way ANOVA (``test="one_way_anova"``).
+  Both are descriptive distribution testing on single cells, which violates
+  normality assumptions, so keep them beside the rank-based defaults.
 
 Multiple-testing correction is delegated to ``statsmodels.stats.multitest``
 (the same backend the marker statistics use).
 
-Phase 1 is explicitly non-parametric. Parametric test requests raise
-``NotImplementedError``. Cell-level testing (no ``samples``) is descriptive
+Non-implemented parametric aliases still raise ``NotImplementedError``.
+Cell-level testing (no ``samples``) is descriptive
 distribution testing and emits a ``UserWarning``; sample-level aggregation
 (``sample_stat`` over ``samples``) is "sample-level distribution summary
 testing" and is not a replacement for replicate-aware differential
@@ -34,22 +39,31 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
-from scipy.stats import kruskal, norm, wilcoxon
+from scipy.stats import f_oneway, kruskal, norm, ttest_ind, wilcoxon
 
 from .markers.rank import mannwhitneyu_from_ranks
 
-TestMethod = Literal["auto", "mann_whitney", "kruskal_wallis", "wilcoxon"]
+TestMethod = Literal[
+    "auto",
+    "mann_whitney",
+    "kruskal_wallis",
+    "wilcoxon",
+    "welch",
+    "t_test",
+    "one_way_anova",
+]
 PosthocMethod = Literal["dunn"]
 AdjustmentMethod = Literal["fdr_bh", "bonferroni", "holm", "none"]
 SampleStatistic = Literal["mean", "median", "fraction"]
 SummaryScope = Literal["cell", "sample"]
+Alternative = Literal["two-sided", "less", "greater"]
 
+_ALTERNATIVES = ("two-sided", "less", "greater")
+_CELL_LEVEL_PARAMETRIC_TESTS = frozenset({"welch", "t_test", "one_way_anova"})
+# Aliases that stay rejected until their dedicated implementations exist.
 _PARAMETRIC_TESTS = frozenset(
     {
         "anova",
-        "one_way_anova",
-        "t_test",
-        "welch",
         "welch_t_test",
         "paired_t_test",
         "student_t_test",
@@ -59,8 +73,11 @@ _PARAMETRIC_TESTS = frozenset(
 _CELL_LEVEL_WARNING = (
     "Cell-level statistical testing treats each cell as an independent "
     "observation. Results are descriptive distribution testing, not "
-    "population-level condition or disease inference. Aggregate cells to "
-    "biological samples with sample_by for sample-level summary testing."
+    "population-level condition or disease inference; this applies equally "
+    "to explicitly requested parametric tests on single cells (welch, "
+    "one_way_anova), which must survive zero-inflated, non-normal data. "
+    "Aggregate cells to biological samples with sample_by for sample-level "
+    "summary testing."
 )
 
 MANN_WHITNEY_COLUMNS = (
@@ -77,19 +94,37 @@ MANN_WHITNEY_COLUMNS = (
 KRUSKAL_WALLIS_COLUMNS = ("kruskal_statistic", "df", "p_value")
 DUNN_COLUMNS = ("group_1", "group_2", "z", "p_value")
 WILCOXON_COLUMNS = ("group_1", "group_2", "n_pairs", "statistic", "p_value")
+WELCH_COLUMNS = (
+    "group_1",
+    "group_2",
+    "n_1",
+    "n_2",
+    "t_statistic",
+    "df",
+    "mean_1",
+    "mean_2",
+    "mean_difference",
+    "p_value",
+)
+ANOVA_COLUMNS = ("f_statistic", "df_between", "df_within", "p_value")
 
 _METHOD_COLUMNS: dict[str, tuple[str, ...]] = {
     "mann_whitney": MANN_WHITNEY_COLUMNS,
     "kruskal_wallis": KRUSKAL_WALLIS_COLUMNS,
     "wilcoxon": WILCOXON_COLUMNS,
+    "welch": WELCH_COLUMNS,
+    "t_test": WELCH_COLUMNS,
+    "one_way_anova": ANOVA_COLUMNS,
 }
 
 __all__ = [
+    "ANOVA_COLUMNS",
     "DUNN_COLUMNS",
     "GroupComparisonResult",
     "KRUSKAL_WALLIS_COLUMNS",
     "MANN_WHITNEY_COLUMNS",
     "StatisticalTestResult",
+    "WELCH_COLUMNS",
     "WILCOXON_COLUMNS",
     "adjust_pvalues",
     "aggregate_samples",
@@ -391,6 +426,120 @@ def _mann_whitney(
     )
 
 
+def _welch_ttest(
+    values: np.ndarray,
+    groups: np.ndarray,
+    present: list[Any],
+    comparisons: Sequence[tuple[Any, Any]] | None,
+    *,
+    alternative: Alternative = "two-sided",
+) -> pd.DataFrame:
+    """Welch's t-test on raw cell-level values for exactly two groups."""
+    if len(present) != 2:
+        raise ValueError(
+            "welch requires exactly two groups; use groups= to select two "
+            "groups or one_way_anova for three or more"
+        )
+    g1, g2 = present
+    if comparisons is not None:
+        for left, right in comparisons:
+            if {_native(left), _native(right)} != {g1, g2}:
+                raise ValueError(
+                    "welch comparisons must reference the two selected "
+                    f"groups ({g1!r}, {g2!r})"
+                )
+    m1 = values[groups == g1]
+    m2 = values[groups == g2]
+    n1 = len(m1)
+    n2 = len(m2)
+    if n1 < 2 or n2 < 2:
+        raise ValueError("welch requires at least two cells in every group")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        result = ttest_ind(
+            m1,
+            m2,
+            equal_var=False,
+            alternative=alternative,
+            nan_policy="omit",
+        )
+    statistic = float(result.statistic)
+    p_value = float(result.pvalue)
+    df_attr = getattr(result, "df", None)
+    if df_attr is not None and np.isfinite(df_attr):
+        df_stat = float(df_attr)
+    else:
+        var_1 = float(np.var(m1, ddof=1))
+        var_2 = float(np.var(m2, ddof=1))
+        numerator = (var_1 / n1 + var_2 / n2) ** 2
+        denominator = (var_1 / n1) ** 2 / (n1 - 1) + (var_2 / n2) ** 2 / (n2 - 1)
+        df_stat = (
+            float(numerator / denominator) if denominator > 0 else float(n1 + n2 - 2)
+        )
+    if not np.isfinite(statistic) or not np.isfinite(p_value):
+        statistic = 0.0
+        p_value = 1.0
+    if not np.isfinite(df_stat):
+        df_stat = float(n1 + n2 - 2)
+    mean_1 = float(np.mean(m1))
+    mean_2 = float(np.mean(m2))
+    return pd.DataFrame(
+        [
+            {
+                "group_1": g1,
+                "group_2": g2,
+                "n_1": n1,
+                "n_2": n2,
+                "t_statistic": statistic,
+                "df": df_stat,
+                "mean_1": mean_1,
+                "mean_2": mean_2,
+                "mean_difference": mean_1 - mean_2,
+                "p_value": p_value,
+            }
+        ],
+        columns=list(WELCH_COLUMNS),
+    )
+
+
+def _one_way_anova(
+    values: np.ndarray,
+    groups: np.ndarray,
+    present: list[Any],
+) -> pd.DataFrame:
+    """Classic one-way ANOVA (equal-variance F-test) on raw cell values.
+
+    Homoscedasticity is assumed; robust alternatives are deferred. With two
+    groups this reduces to the square of a Student's t-test under equal
+    variance, so prefer ``test="welch"`` for uneven group spreads.
+    """
+    if len(present) < 2:
+        raise ValueError(
+            "one_way_anova requires at least two groups; use groups= to "
+            "select them explicitly"
+        )
+    group_values = [values[groups == g] for g in present]
+    if any(len(v) < 2 for v in group_values):
+        raise ValueError("one_way_anova requires at least two cells in every group")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        statistic, p_value = f_oneway(*group_values)
+    if not np.isfinite(statistic) or not np.isfinite(p_value):
+        statistic = 0.0
+        p_value = 1.0
+    return pd.DataFrame(
+        [
+            {
+                "f_statistic": float(statistic),
+                "df_between": len(present) - 1,
+                "df_within": len(values) - len(present),
+                "p_value": float(p_value),
+            }
+        ],
+        columns=list(ANOVA_COLUMNS),
+    )
+
+
 def _kruskal_wallis(
     values: np.ndarray,
     groups: np.ndarray,
@@ -544,8 +693,9 @@ def compare_group_distributions(
     sample_stat: SampleStatistic = "mean",
     expression_cutoff: float = 0.0,
     group_order: Sequence[Any] | None = None,
+    alternative: Alternative = "two-sided",
 ) -> GroupComparisonResult:
-    """Compare one value array across groups with a non-parametric test.
+    """Compare one value array across groups with the configured test.
 
     ``values`` and ``groups`` must be one-dimensional and equal in length.
     When ``samples`` is provided, cells are aggregated to biological samples
@@ -554,21 +704,28 @@ def compare_group_distributions(
     aggregated sample data and therefore requires ``samples`` too.
 
     ``test`` is ``"auto"`` (pick by design: paired -> Wilcoxon, two groups ->
-    Mann-Whitney, three or more -> Kruskal-Wallis), ``"mann_whitney"``,
-    ``"kruskal_wallis"``, or ``"wilcoxon"``. ``posthoc="dunn"`` adds pairwise
-    Dunn's tests after Kruskal-Wallis and preserves the omnibus result in the
-    returned :class:`GroupComparisonResult`. ``comparisons`` restricts the
-    pairwise rows to the listed group pairs. ``group_order`` fixes the group
-    order (and therefore the contrast direction) exactly; when omitted,
-    first-seen order is used. ``adjustment`` corrects p-values within the
-    returned tables when they hold multiple comparisons; pass ``"none"`` to
-    adjust across keys in the caller instead.
+    Mann-Whitney, three or more -> Kruskal-Wallis), one of the non-parametric
+    methods, or an explicit cell-level parametric method. ``"auto"`` never
+    selects a parametric test; request ``"welch"`` (or the ``"t_test"``
+    alias) or ``"one_way_anova"`` to opt into them. The parametric options run
+    on raw unaggregated values only; passing ``samples`` or ``pairs`` with
+    them raises ``ValueError``.
+
+    ``alternative`` sets the alternative hypothesis direction for Welch's
+    t-test; other tests ignore it and remain two-sided. ``posthoc="dunn"``
+    adds pairwise Dunn's tests after Kruskal-Wallis and preserves the omnibus
+    result in the returned :class:`GroupComparisonResult`. ``comparisons``
+    restricts the pairwise rows to the listed group pairs. ``group_order``
+    fixes the group order (and therefore the contrast direction) exactly;
+    when omitted, first-seen order is used. ``adjustment`` corrects p-values
+    within the returned tables when they hold multiple comparisons; pass
+    ``"none"`` to adjust across keys in the caller instead.
 
     Returns:
         A :class:`GroupComparisonResult` whose ``table`` is the primary test
         table (one row per comparison for Mann-Whitney and Wilcoxon, a single
-        row for Kruskal-Wallis) and whose ``posthoc_table`` holds the pairwise
-        Dunn's table when ``posthoc="dunn"``.
+        row for Kruskal-Wallis, Welch, and ANOVA) and whose ``posthoc_table``
+        holds the pairwise Dunn's table when ``posthoc="dunn"``.
     """
     values = np.asarray(values, dtype=np.float64)
     groups = np.asarray(groups, dtype=object)
@@ -580,14 +737,12 @@ def compare_group_distributions(
         raise ValueError("values must contain only finite entries")
     if posthoc not in (None, "dunn"):
         raise ValueError("posthoc must be 'dunn' or None")
+    if alternative not in _ALTERNATIVES:
+        raise ValueError(
+            f"alternative must be 'two-sided', 'less', or 'greater'; got {alternative!r}"
+        )
     if comparisons is not None and not comparisons:
         raise ValueError("comparisons must be non-empty when provided")
-    if test in _PARAMETRIC_TESTS:
-        raise NotImplementedError(
-            "Phase 1 is explicitly non-parametric (mann_whitney, "
-            "kruskal_wallis, wilcoxon); parametric tests such as "
-            f"{test!r} are not supported."
-        )
     if samples is not None:
         samples = np.asarray(samples, dtype=object)
         if samples.shape != values.shape:
@@ -596,6 +751,20 @@ def compare_group_distributions(
         pairs = np.asarray(pairs, dtype=object)
         if pairs.shape != values.shape:
             raise ValueError("pairs length must match values")
+    if test in _CELL_LEVEL_PARAMETRIC_TESTS and (
+        samples is not None or pairs is not None
+    ):
+        raise ValueError(
+            "welch and one_way_anova run on cell-level values; "
+            "sample_by/pair_by aggregation is not supported for them"
+        )
+    if test in _PARAMETRIC_TESTS:
+        raise NotImplementedError(
+            "Scarf implements mann_whitney, kruskal_wallis, wilcoxon plus "
+            "the explicit cell-level parametric welch/t_test and "
+            f"one_way_anova; {test!r} is a non-parametric-phase alias with "
+            "no implementation."
+        )
     if group_order is not None:
         ordered_check = [_native(value) for value in group_order]
         if len(set(ordered_check)) != len(ordered_check):
@@ -664,10 +833,17 @@ def compare_group_distributions(
             test = "mann_whitney"
         else:
             test = "kruskal_wallis"
-    if test not in ("mann_whitney", "kruskal_wallis", "wilcoxon"):
+    implemented = (
+        "mann_whitney",
+        "kruskal_wallis",
+        "wilcoxon",
+        *_CELL_LEVEL_PARAMETRIC_TESTS,
+    )
+    if test not in implemented:
         raise ValueError(
-            "test must be 'auto', 'mann_whitney', 'kruskal_wallis', or "
-            f"'wilcoxon'; got {test!r}"
+            "test must be one of "
+            + ", ".join(f"'{name}'" for name in ("auto", *implemented))
+            + f"; got {test!r}"
         )
     if posthoc == "dunn" and test != "kruskal_wallis":
         raise ValueError("posthoc='dunn' requires test='kruskal_wallis'")
@@ -679,6 +855,22 @@ def compare_group_distributions(
             )
         assert aggregated is not None
         table = _wilcoxon_signed_rank(aggregated, present, comparisons)
+        return GroupComparisonResult(
+            _maybe_adjust(table, adjustment),
+        )
+    if test in ("welch", "t_test"):
+        table = _welch_ttest(
+            values,
+            groups,
+            present,
+            comparisons,
+            alternative=alternative,
+        )
+        return GroupComparisonResult(
+            _maybe_adjust(table, adjustment),
+        )
+    if test == "one_way_anova":
+        table = _one_way_anova(values, groups, present)
         return GroupComparisonResult(
             _maybe_adjust(table, adjustment),
         )
