@@ -130,6 +130,44 @@ Use marker tables for cluster interpretation.
 Do not treat within-group `p_value_adjusted` columns as replicate-aware differential expression results.
 ```
 
+## 1b. Descriptive group comparisons with run_statistical_testing
+
+`run_statistical_testing` compares one feature at a time across groups and persists each variant under its own slot.
+The rank-based defaults suit single-cell data: `mann_whitney` for two groups, `kruskal_wallis` (optionally with Dunn's post-hoc) for three or more, and paired Wilcoxon on aggregated samples.
+
+Explicitly requested parametric tests (`welch`, aliased by `t_test`, and `one_way_anova`) also run on raw cell-level values.
+They are descriptive only: cells violate normality, they cannot be combined with sample aggregation, and Welch honours the one-sided `alternative` while auto never selects them.
+
+```python
+# Welch t-test on raw normalized values, two groups selected explicitly
+result = ds.run_statistical_testing(
+    ['MALAT1'],
+    group_by='stat_group2',
+    groups=['g0', 'g1'],
+    test='welch',
+    alternative='greater',
+)
+# variant parameters must be repeated to read results back
+loaded = ds.get_statistical_tests(
+    group_key='stat_group2',
+    method='welch',
+    keys=['MALAT1'],
+    groups=['g0', 'g1'],
+    alternative='greater',
+)
+
+# overlay significance brackets onto the matching violin panel
+figure = ds.plots.distribution(
+    ['MALAT1'],
+    group_by='stat_group2',
+    kind='violin',
+    stats_results=result,
+    show=False,
+)
+```
+
+Brackets are drawn directly with matplotlib over the seaborn violins and prefer the pooled `p_value_adjusted` column when present.
+
 ## 2. Aggregate with make_bulk
 
 Cell counts per Leiden group set the scale for each bulk column:
