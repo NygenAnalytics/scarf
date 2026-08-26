@@ -53,11 +53,13 @@ from ...features.markers.table import (
     load_marker_table,
 )
 from ...features.statistical import (
+    ANOVA_COLUMNS,
     DUNN_COLUMNS,
     GroupComparisonResult,
     KRUSKAL_WALLIS_COLUMNS,
     MANN_WHITNEY_COLUMNS,
     StatisticalTestResult,
+    WELCH_COLUMNS,
     WILCOXON_COLUMNS,
     _PARAMETRIC_TESTS,
     adjust_pvalues,
@@ -112,6 +114,9 @@ def _statistical_storage_columns(
     base_map: dict[str, tuple[str, ...]] = {
         "mann_whitney": MANN_WHITNEY_COLUMNS,
         "wilcoxon": WILCOXON_COLUMNS,
+        "welch": WELCH_COLUMNS,
+        "t_test": WELCH_COLUMNS,
+        "one_way_anova": ANOVA_COLUMNS,
     }
     if method == "kruskal_wallis":
         return (*KRUSKAL_WALLIS_COLUMNS, "p_value_adjusted")
@@ -2346,7 +2351,15 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
         group_by: str,
         groups: Sequence[Any] | None = None,
         comparisons: Sequence[tuple[Any, Any]] | None = None,
-        test: Literal["auto", "mann_whitney", "kruskal_wallis", "wilcoxon"] = "auto",
+        test: Literal[
+            "auto",
+            "mann_whitney",
+            "kruskal_wallis",
+            "wilcoxon",
+            "welch",
+            "t_test",
+            "one_way_anova",
+        ] = "auto",
         posthoc: Literal["dunn"] | None = None,
         adjustment: Literal["fdr_bh", "bonferroni", "holm", "none"] = "fdr_bh",
         alternative: Literal["two-sided", "less", "greater"] = "two-sided",
@@ -2375,16 +2388,22 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
           ``posthoc="dunn"`` for pairwise significance.
         - ``"wilcoxon"``: paired samples on aggregated (pseudobulk) data.
           Requires ``sample_by`` and ``pair_by``.
+        - ``"welch"`` (alias ``"t_test"``): cell-level Welch's t-test on raw
+          normalized values for exactly two groups, honouring
+          ``alternative``. Descriptive only; no sample aggregation.
+        - ``"one_way_anova"``: cell-level one-way ANOVA omnibus test on raw
+          normalized values. Descriptive only; no post-hoc yet.
 
         With ``test="auto"`` the test is chosen from the design: paired data
         uses Wilcoxon, two groups use Mann-Whitney, and three or more use
-        Kruskal-Wallis. ``groups`` restricts the group set and fixes its order
-        (which sets the contrast direction); ``comparisons`` restricts
-        pairwise rows to the listed group pairs. With ``posthoc="dunn"`` both
-        the omnibus Kruskal-Wallis and the pairwise Dunn's results are
-        preserved. When multiple keys are tested, ``adjustment`` corrects
-        p-values across keys in one pooled pass (default ``"fdr_bh"``);
-        post-hoc p-values are corrected separately.
+        Kruskal-Wallis. Auto never picks a parametric method. ``groups``
+        restricts the group set and fixes its order (which sets the contrast
+        direction); ``comparisons`` restricts pairwise rows to the listed
+        group pairs. With ``posthoc="dunn"`` both the omnibus Kruskal-Wallis
+        and the pairwise Dunn's results are preserved. When multiple keys are
+        tested, ``adjustment`` corrects p-values across keys in one pooled
+        pass (default ``"fdr_bh"``); post-hoc p-values are corrected
+        separately.
 
         Results are persisted as an immutable artifact under
         ``statistical_tests`` unless ``skip_save`` is ``True``. Every distinct
@@ -2440,15 +2459,25 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             raise ValueError("posthoc must be 'dunn' or None")
         if sample_stat not in ("mean", "median", "fraction"):
             raise ValueError("sample_stat must be 'mean', 'median', or 'fraction'")
-        if test not in ("auto", "mann_whitney", "kruskal_wallis", "wilcoxon"):
+        if test not in (
+            "auto",
+            "mann_whitney",
+            "kruskal_wallis",
+            "wilcoxon",
+            "welch",
+            "t_test",
+            "one_way_anova",
+        ):
             if test in _PARAMETRIC_TESTS:
                 raise NotImplementedError(
-                    "Phase 1 is explicitly non-parametric (mann_whitney, "
-                    "kruskal_wallis, wilcoxon); parametric tests such as "
-                    f"{test!r} are not supported."
+                    "Scarf implements mann_whitney, kruskal_wallis, wilcoxon "
+                    "plus the explicit cell-level parametric welch/t_test "
+                    f"and one_way_anova; {test!r} is a non-parametric-phase "
+                    "alias with no implementation."
                 )
             raise ValueError(
-                "test must be 'auto', 'mann_whitney', 'kruskal_wallis', or 'wilcoxon'"
+                "test must be 'auto', 'mann_whitney', 'kruskal_wallis', "
+                "'wilcoxon', 'welch', 't_test', or 'one_way_anova'"
             )
         normalization = normalization or NormalizationSpec()
         if study_design is not None:
@@ -2555,6 +2584,11 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 raise ValueError(
                     "Explicit statistical group selections must all retain at "
                     "least one valid cell"
+                )
+            if effective_method in ("welch", "t_test") and n_groups != 2:
+                raise ValueError(
+                    "welch requires exactly two groups; use groups= to select "
+                    "two groups or one_way_anova for three or more"
                 )
         if posthoc == "dunn" and effective_method != "kruskal_wallis":
             raise ValueError("posthoc='dunn' requires test='kruskal_wallis'")
@@ -2790,6 +2824,7 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
                 sample_stat=sample_stat,
                 expression_cutoff=expression_cutoff,
                 group_order=present,
+                alternative=alternative,
             )
 
         tables = _pool_adjust(
@@ -2815,6 +2850,8 @@ class _FeatureOperationsMixin(_FeatureOperationsBase):
             pair_by=pair_by,
             sample_stat=sample_stat,
             expression_cutoff=expression_cutoff,
+            alternative=alternative,
+            equal_var=_statistical_equal_var(effective_method),
             n_groups=n_groups,
             n_cells=n,
             tested_features=tuple(tested_features),
