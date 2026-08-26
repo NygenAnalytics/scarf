@@ -3,10 +3,11 @@ import warnings
 import numpy as np
 import pandas as pd
 import pytest
-from scipy.stats import kruskal
+from scipy.stats import f_oneway, kruskal
 from scipy.stats import mannwhitneyu as scipy_mannwhitneyu
 from scipy.stats import norm
 from scipy.stats import rankdata
+from scipy.stats import ttest_ind
 from scipy.stats import wilcoxon as scipy_wilcoxon
 from statsmodels.stats.multitest import multipletests
 
@@ -548,6 +549,190 @@ def test_cell_level_testing_warns_user():
             test="mann_whitney",
             samples=samples,
         )
+
+
+def test_welch_matches_scipy_two_sided():
+    rng = np.random.default_rng(30)
+    values = np.concatenate([rng.normal(0, 1, 40), rng.normal(1.0, 1.4, 40)])
+    groups = _seeded_groups(rng, 80, 2)
+    table = compare_group_distributions(values, groups, test="welch").table
+    g1 = table.loc[0, "group_1"]
+    g2 = table.loc[0, "group_2"]
+    a = values[groups == g1]
+    b = values[groups == g2]
+    expected_stat, expected_p = ttest_ind(
+        a,
+        b,
+        equal_var=False,
+        alternative="two-sided",
+    )
+    assert table.loc[0, "n_1"] == len(a)
+    assert table.loc[0, "n_2"] == len(b)
+    assert np.isclose(table.loc[0, "t_statistic"], float(expected_stat))
+    var_a = float(np.var(a, ddof=1))
+    var_b = float(np.var(b, ddof=1))
+    expected_df = (var_a / len(a) + var_b / len(b)) ** 2 / (
+        (var_a / len(a)) ** 2 / (len(a) - 1) + (var_b / len(b)) ** 2 / (len(b) - 1)
+    )
+    assert np.isclose(table.loc[0, "df"], expected_df)
+    assert np.isclose(table.loc[0, "p_value"], float(expected_p))
+    assert table.columns.tolist() == [
+        "group_1",
+        "group_2",
+        "n_1",
+        "n_2",
+        "t_statistic",
+        "df",
+        "mean_1",
+        "mean_2",
+        "mean_difference",
+        "p_value",
+    ]
+
+
+def test_welch_alternative_less_and_greater():
+    rng = np.random.default_rng(31)
+    values = rng.normal(size=80) + 0.8
+    groups = _seeded_groups(rng, 80, 2)
+    less_table = compare_group_distributions(
+        values,
+        groups,
+        test="welch",
+        alternative="less",
+    ).table
+    greater_table = compare_group_distributions(
+        values,
+        groups,
+        test="welch",
+        alternative="greater",
+    ).table
+    two_sided_table = compare_group_distributions(
+        values,
+        groups,
+        test="welch",
+        alternative="two-sided",
+    ).table
+    g1 = less_table.loc[0, "group_1"]
+    g2 = less_table.loc[0, "group_2"]
+    expected_less_p = ttest_ind(
+        values[groups == g1],
+        values[groups == g2],
+        equal_var=False,
+        alternative="less",
+    ).pvalue
+    expected_greater_p = ttest_ind(
+        values[groups == g1],
+        values[groups == g2],
+        equal_var=False,
+        alternative="greater",
+    ).pvalue
+    assert np.isclose(less_table.loc[0, "p_value"], float(expected_less_p))
+    assert np.isclose(greater_table.loc[0, "p_value"], float(expected_greater_p))
+    assert np.isclose(
+        greater_table.loc[0, "p_value"] + less_table.loc[0, "p_value"],
+        1.0,
+    )
+    assert two_sided_table.loc[0, "p_value"] <= max(
+        less_table.loc[0, "p_value"],
+        greater_table.loc[0, "p_value"],
+    )
+
+
+def test_welch_requires_two_groups_and_cells():
+    rng = np.random.default_rng(32)
+    values = rng.normal(size=90)
+    groups = _seeded_groups(rng, 90, 3)
+    with pytest.raises(ValueError, match="exactly two groups"):
+        compare_group_distributions(values, groups, test="welch")
+    two_cells = values[:2]
+    two_groups = np.array(["g0", "g1"], dtype=object)
+    with pytest.raises(ValueError, match="at least two cells"):
+        compare_group_distributions(two_cells, two_groups)
+    lopsided_values = np.arange(3, dtype=float)
+    lopsided_groups = np.array(["g0", "g0", "g1"], dtype=object)
+    with pytest.raises(ValueError, match="at least two cells"):
+        compare_group_distributions(lopsided_values, lopsided_groups)
+
+
+def test_one_way_anova_matches_scipy():
+    rng = np.random.default_rng(33)
+    values = np.concatenate(
+        [rng.normal(0, 1, 40), rng.normal(0.7, 1, 40), rng.normal(1.4, 1, 40)]
+    )
+    groups = _seeded_groups(rng, 120, 3)
+    table = compare_group_distributions(values, groups, test="one_way_anova").table
+    expected_stat, expected_p = f_oneway(
+        values[groups == "g0"],
+        values[groups == "g1"],
+        values[groups == "g2"],
+    )
+    assert np.isclose(table.loc[0, "f_statistic"], float(expected_stat))
+    assert np.isclose(table.loc[0, "p_value"], float(expected_p))
+    assert table.loc[0, "df_between"] == 2
+    assert table.loc[0, "df_within"] == 117
+
+
+def test_one_way_anova_handles_all_tied_values():
+    values = np.zeros(60)
+    groups = _seeded_groups(np.random.default_rng(34), 60, 3)
+    table = compare_group_distributions(values, groups, test="one_way_anova").table
+    assert table.loc[0, "f_statistic"] == 0.0
+    assert table.loc[0, "p_value"] == 1.0
+    assert table.loc[0, "df_between"] == 2
+    assert table.loc[0, "df_within"] == 57
+
+
+def test_compare_rejects_bad_alternative_and_mismatched_posthoc():
+    rng = np.random.default_rng(35)
+    values = rng.normal(size=60)
+    groups = _seeded_groups(rng, 60, 2)
+    with pytest.raises(ValueError, match="alternative must be"):
+        compare_group_distributions(values, groups, test="welch", alternative="up")
+    with pytest.raises(ValueError, match="requires test"):
+        compare_group_distributions(
+            values,
+            groups,
+            test="welch",
+            posthoc="dunn",
+        )
+    with pytest.raises(ValueError, match="not supported for them"):
+        compare_group_distributions(
+            values,
+            groups,
+            test="one_way_anova",
+            samples=np.array([f"s{i % 6}" for i in range(60)], dtype=object),
+        )
+    with pytest.raises(NotImplementedError, match="non-parametric-phase"):
+        compare_group_distributions(values, groups, test="student_t_test")
+
+
+def test_group_order_controls_welch_direction():
+    rng = np.random.default_rng(36)
+    n = 80
+    values = np.concatenate([rng.normal(0, 1, n // 2), rng.normal(1.2, 1, n // 2)])
+    groups = np.array(["A"] * (n // 2) + ["B"] * (n // 2), dtype=object)
+    forward = compare_group_distributions(
+        values,
+        groups,
+        test="welch",
+        group_order=["B", "A"],
+    ).table
+    reversed_order = compare_group_distributions(
+        values,
+        groups,
+        test="welch",
+        group_order=["A", "B"],
+    ).table
+    assert forward.loc[0, "group_1"] == "B"
+    assert forward.loc[0, "group_2"] == "A"
+    assert reversed_order.loc[0, "group_1"] == "A"
+    assert reversed_order.loc[0, "group_2"] == "B"
+    assert forward.loc[0, "t_statistic"] == pytest.approx(
+        -reversed_order.loc[0, "t_statistic"]
+    )
+    assert forward.loc[0, "mean_difference"] > 0
+    assert reversed_order.loc[0, "mean_difference"] < 0
+    assert forward.loc[0, "p_value"] == reversed_order.loc[0, "p_value"]
 
 
 def test_summary_scope_tracks_sample_aggregation():

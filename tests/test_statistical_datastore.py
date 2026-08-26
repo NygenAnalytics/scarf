@@ -2,7 +2,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scarf.features.statistical import StatisticalTestResult
+from scarf.features.statistical import (
+    ANOVA_COLUMNS,
+    StatisticalTestResult,
+    WELCH_COLUMNS,
+)
 from scarf.plotting import StudyDesign
 
 pytestmark = pytest.mark.filterwarnings("ignore:Cell-level statistical testing")
@@ -493,3 +497,149 @@ def test_get_statistical_tests_errors(datastore_ephemeral):
             method="wilcoxon",
             keys=["MALAT1"],
         )
+
+
+def test_run_statistical_testing_welch_cell_level(datastore_ephemeral):
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    result = ds.run_statistical_testing(
+        ["MALAT1"],
+        group_by="stat_group2",
+        test="welch",
+        alternative="less",
+    )
+    assert result.method == "welch"
+    assert result.alternative == "less"
+    assert result.equal_var is False
+    table = result.tables["MALAT1"]
+    assert tuple(table.columns) == (*WELCH_COLUMNS, "p_value_adjusted")
+    assert table["p_value"].between(0, 1).all()
+    assert bool((table["df"] > 0).all())
+    loaded = ds.get_statistical_tests(
+        group_key="stat_group2",
+        method="welch",
+        keys=["MALAT1"],
+        alternative="less",
+    )
+    assert loaded.alternative == "less"
+    assert loaded.tables["MALAT1"].to_dict("records") == table.to_dict("records")
+
+
+def test_welch_groups_restriction_and_contrast_direction(datastore_ephemeral):
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    forward = ds.run_statistical_testing(
+        ["MALAT1"],
+        group_by="stat_group3",
+        groups=["g2", "g0"],
+        test="welch",
+    )
+    assert forward.n_groups == 2
+    row = forward.tables["MALAT1"].iloc[0]
+    assert row["group_1"] == "g2"
+    assert row["group_2"] == "g0"
+    assert row["mean_difference"] == row["mean_1"] - row["mean_2"]
+    with pytest.raises(ValueError, match="exactly two groups"):
+        ds.run_statistical_testing(
+            ["MALAT1"],
+            group_by="stat_group3",
+            test="welch",
+        )
+
+
+def test_one_way_anova_omnibus_roundtrip(datastore_ephemeral):
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    result = ds.run_statistical_testing(
+        ["MALAT1", "B2M"],
+        group_by="stat_group3",
+        test="one_way_anova",
+    )
+    assert result.method == "one_way_anova"
+    assert result.n_groups == 3
+    for key in ("MALAT1", "B2M"):
+        table = result.tables[key]
+        assert set(ANOVA_COLUMNS) <= set(table.columns)
+        assert table.loc[0, "df_between"] == 2
+        assert table["p_value"].between(0, 1).all()
+    loaded = ds.get_statistical_tests(
+        group_key="stat_group3",
+        method="one_way_anova",
+        keys=["MALAT1", "B2M"],
+    )
+    assert loaded.equal_var is None
+    for key in result.tables:
+        assert loaded.tables[key].to_dict("records") == result.tables[key].to_dict(
+            "records"
+        )
+
+
+def test_welch_variant_slots_distinct_by_alternative(datastore_ephemeral):
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    ds.run_statistical_testing(
+        ["MALAT1"],
+        group_by="stat_group2",
+        test="welch",
+        alternative="less",
+    )
+    artifacts_after_less = dict(ds.zw["RNA"]["statistical_tests"].attrs["artifacts"])
+    ds.run_statistical_testing(
+        ["MALAT1"],
+        group_by="stat_group2",
+        test="welch",
+        alternative="greater",
+    )
+    artifacts_after_greater = dict(ds.zw["RNA"]["statistical_tests"].attrs["artifacts"])
+    new_slots = set(artifacts_after_greater) - set(artifacts_after_less)
+    assert len(new_slots) == 1
+    distinct_ids = {
+        artifacts_after_less[key]["artifact_id"] for key in artifacts_after_less
+    } | {artifacts_after_greater[key]["artifact_id"] for key in new_slots}
+    assert len(distinct_ids) >= 2
+
+
+def test_welch_alternative_roundtrip_dtypes(datastore_ephemeral):
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    ds.run_statistical_testing(
+        ["MALAT1"],
+        group_by="stat_group2",
+        test="welch",
+        alternative="greater",
+    )
+    loaded = ds.get_statistical_tests(
+        group_key="stat_group2",
+        method="welch",
+        keys=["MALAT1"],
+        alternative="greater",
+    )
+    table = loaded.tables["MALAT1"]
+    assert table["group_1"].dtype.kind in {"O", "U"}
+    assert table["group_2"].dtype.kind in {"O", "U"}
+    assert table["t_statistic"].dtype.kind == "f"
+    assert str(table["t_statistic"].dtype) == "float64"
+    assert str(table["df"].dtype) == "float64"
+
+
+def test_plotting_distribution_annotates_welch_brackets(datastore_ephemeral):
+    ds = datastore_ephemeral
+    _insert_group_columns(ds)
+    baseline = ds.plots.distribution(["MALAT1"], group_by="stat_group2", show=False)
+    baseline_lines = len(baseline.axes["MALAT1"].lines)
+    result = ds.run_statistical_testing(
+        ["MALAT1"],
+        group_by="stat_group2",
+        test="welch",
+    )
+    annotated = ds.plots.distribution(
+        ["MALAT1"],
+        group_by="stat_group2",
+        stats_results=result,
+        show=False,
+    )
+    texts = [text.get_text() for text in annotated.axes["MALAT1"].texts]
+    assert any(text.startswith("p=") for text in texts)
+    assert len(annotated.axes["MALAT1"].lines) > baseline_lines
+    assert annotated.owns_figure == baseline.owns_figure
+    assert annotated.provenance.extras.get("stats_annotated") is True
