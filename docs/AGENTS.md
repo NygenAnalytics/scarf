@@ -19,7 +19,7 @@ These instructions cover documentation sources, execution, cache management, and
 Install the same documentation and test extras used by CI:
 
 ```bash
-uv sync --extra docs --extra test --extra extra
+uv sync --extra agent --extra docs --extra test --extra extra
 ```
 
 Run the cache tests and strict reference build:
@@ -55,7 +55,7 @@ Use Modal only after the user confirms authentication and the `scarf_profiling` 
 available. This path uses an ephemeral app and does not require deployment:
 
 ```bash
-uv sync --group docs-modal --extra docs --extra extra
+uv sync --group docs-modal --extra agent --extra docs --extra extra
 make -C docs execute-docs-modal
 make -C docs execute-docs-modal PAGES="scrna_seq cite_seq"
 ```

@@ -216,7 +216,7 @@ def test_baseten_request_disables_reasoning_at_wire_level() -> None:
     assert len(bodies) == 1
     assert bodies[0]["reasoning_effort"] == "none"
     assert bodies[0]["temperature"] == 0
-    assert bodies[0]["max_completion_tokens"] == 4096
+    assert bodies[0]["max_completion_tokens"] == 32768
 
 
 def test_model_name_preserves_string_model_identifier() -> None:

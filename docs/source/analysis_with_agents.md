@@ -8,6 +8,7 @@ description: Use Scarf safely in an autonomous or AI-assisted single-cell analys
 This page is a routing and reasoning guide for an AI agent that uses Scarf to analyse data.
 It does not replace the workflow tutorials or define one correct analysis.
 The study question, experimental design, and user instructions remain authoritative.
+For an executable example of the four bounded Scarf agents and their validated handoffs, see {doc}`tutorials/agent_workflow`.
 
 ## Scope and authority
 

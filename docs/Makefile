@@ -35,11 +35,11 @@ resume-docs:
 # Execute all pages concurrently on Modal and publish the cache locally.
 # Set PAGES="cite_seq batch_correction" for a partial run.
 execute-docs-modal:
-	@cd .. && MODAL_ENVIRONMENT=scarf_profiling uv run --group docs-modal --extra docs --extra extra modal run -m docs.modal_docs $(if $(strip $(PAGES)),--pages "$(strip $(PAGES))",)
+	@cd .. && MODAL_ENVIRONMENT=scarf_profiling uv run --group docs-modal --extra agent --extra docs --extra extra modal run -m docs.modal_docs $(if $(strip $(PAGES)),--pages "$(strip $(PAGES))",)
 
 # Resume the failed Modal run scope using matching staged page results.
 resume-docs-modal:
-	@cd .. && MODAL_ENVIRONMENT=scarf_profiling uv run --group docs-modal --extra docs --extra extra modal run -m docs.modal_docs --resume $(if $(strip $(PAGES)),--pages "$(strip $(PAGES))",)
+	@cd .. && MODAL_ENVIRONMENT=scarf_profiling uv run --group docs-modal --extra agent --extra docs --extra extra modal run -m docs.modal_docs --resume $(if $(strip $(PAGES)),--pages "$(strip $(PAGES))",)
 
 # Validate the committed cache without changing it.
 validate-cache:
