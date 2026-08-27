@@ -555,7 +555,15 @@ def _kruskal_wallis(
         raise ValueError("kruskal_wallis requires at least two cells in every group")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        statistic, p_value = kruskal(*group_values)
+        try:
+            statistic, p_value = kruskal(*group_values)
+        except ValueError as exc:
+            # scipy <1.15 raises for the degenerate all-tied case where
+            # newer releases return NaN; both mean "no evidence of
+            # differences", so normalize to statistic 0 and p-value 1.
+            if "identical" not in str(exc):
+                raise
+            statistic, p_value = 0.0, 1.0
     if not np.isfinite(statistic) or not np.isfinite(p_value):
         statistic = 0.0
         p_value = 1.0
