@@ -591,7 +591,7 @@ class DataStorePlotAccessor:
         """Plot distributions of cell metadata or feature values.
 
         ``stats_results`` overlays significance brackets from
-        :meth:`run_statistical_testing` results onto the drawn violins or
+        ``run_statistical_testing`` results onto the drawn violins or
         boxes; see :func:`scarf.plotting.distribution` for the full
         behaviour.
         """

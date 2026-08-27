@@ -101,6 +101,9 @@ The recommended workflow is in {doc}`../../tutorials/cite_seq`; method compariso
 .. autoclass:: scarf.EnrichmentResult
     :members:
 
+.. autoclass:: scarf.features.statistical.StatisticalTestResult
+    :members:
+
 .. autoclass:: scarf.clustering.ParisClusteringResult
     :members:
 
