@@ -145,7 +145,11 @@ def test_detect_workers_uses_process_cgroup_path(monkeypatch):
 
     monkeypatch.setattr("pathlib.Path.read_text", read_text)
     monkeypatch.setattr("os.cpu_count", lambda: 16)
-    monkeypatch.setattr("os.sched_getaffinity", lambda pid: set(range(16)))
+    monkeypatch.setattr(
+        "os.sched_getaffinity",
+        lambda pid: set(range(16)),
+        raising=False,
+    )
 
     assert detect_workers() == 2
 
@@ -171,7 +175,11 @@ def test_detect_workers_uses_combined_legacy_controller_mount(monkeypatch):
 
     monkeypatch.setattr("pathlib.Path.read_text", read_text)
     monkeypatch.setattr("os.cpu_count", lambda: 16)
-    monkeypatch.setattr("os.sched_getaffinity", lambda pid: set(range(16)))
+    monkeypatch.setattr(
+        "os.sched_getaffinity",
+        lambda pid: set(range(16)),
+        raising=False,
+    )
 
     assert detect_workers() == 2
 
